@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! # sasql — Safe SQL for Rust
 //!
 //! **If it compiles, the SQL is correct.**

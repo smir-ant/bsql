@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Proc macros for sasql.
 //!
 //! This crate is an implementation detail. Use [`sasql`] instead.

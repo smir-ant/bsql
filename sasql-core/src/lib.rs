@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Runtime support for sasql.
 //!
 //! This crate provides the types that `sasql::query!` generated code depends on:
