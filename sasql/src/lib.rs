@@ -23,7 +23,7 @@
 //! ```
 //!
 //! Then:
-//! ```rust,no_run
+//! ```rust,ignore
 //! use sasql::Pool;
 //!
 //! # async fn example() -> Result<(), sasql::SasqlError> {
@@ -31,9 +31,10 @@
 //!
 //! // Every query is validated against the real database at compile time.
 //! // If this compiles, the SQL is correct — tables, columns, types, all checked.
-//! let user = sasql::query! {
-//!     SELECT id, login, active FROM users WHERE id = $id: i32
-//! }.fetch_one(&pool).await?;
+//! let id = 1i32;
+//! let user = sasql::query!(
+//!     "SELECT id, login, active FROM users WHERE id = $id: i32"
+//! ).fetch_one(&pool).await?;
 //!
 //! // The result struct has typed fields:
 //! // user.id: i32, user.login: String, user.active: bool

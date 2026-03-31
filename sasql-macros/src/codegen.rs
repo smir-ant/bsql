@@ -41,7 +41,7 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
     let struct_name = result_struct_name(parsed);
     let fields = validation.columns.iter().enumerate().map(|(i, col)| {
         let field_name = format_ident!("{}", sanitize_column_name(&col.name, i));
-        let field_type = parse_rust_type(&col.rust_type);
+        let field_type = parse_result_type(&col.rust_type);
         quote! { pub #field_name: #field_type }
     });
 
@@ -57,6 +57,7 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
 /// Generate the executor struct (captures query parameters).
 fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     let struct_name = executor_struct_name(parsed);
+    let needs_lifetime = has_reference_params(parsed);
 
     if parsed.params.is_empty() {
         quote! {
@@ -70,10 +71,20 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
             quote! { #name: #ty }
         });
 
-        quote! {
-            #[allow(non_camel_case_types)]
-            struct #struct_name {
-                #(#fields,)*
+        if needs_lifetime {
+            quote! {
+                #[allow(non_camel_case_types)]
+                struct #struct_name<'_sasql> {
+                    #(#fields,)*
+                    _marker: ::std::marker::PhantomData<&'_sasql ()>,
+                }
+            }
+        } else {
+            quote! {
+                #[allow(non_camel_case_types)]
+                struct #struct_name {
+                    #(#fields,)*
+                }
             }
         }
     }
@@ -83,11 +94,12 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
     let sql_lit = &parsed.positional_sql;
+    let needs_lifetime = has_reference_params(parsed);
 
     // Build the params slice: &[&self.id, &self.name, ...]
     let param_refs: Vec<TokenStream> = parsed.params.iter().map(|p| {
         let name = format_ident!("{}", p.name);
-        quote! { &self.#name as &(dyn ::tokio_postgres::types::ToSql + Sync) }
+        quote! { &self.#name as &(dyn ::sasql_core::pg::ToSql + Sync) }
     }).collect();
 
     let params_slice = if param_refs.is_empty() {
@@ -157,13 +169,25 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         }
     };
 
-    quote! {
-        #[allow(non_camel_case_types)]
-        impl #executor_name {
-            #fetch_methods
-            #execute_method
+    let impl_block = if needs_lifetime {
+        quote! {
+            #[allow(non_camel_case_types)]
+            impl<'_sasql> #executor_name<'_sasql> {
+                #fetch_methods
+                #execute_method
+            }
         }
-    }
+    } else {
+        quote! {
+            #[allow(non_camel_case_types)]
+            impl #executor_name {
+                #fetch_methods
+                #execute_method
+            }
+        }
+    };
+
+    impl_block
 }
 
 /// Generate row field decoding: `field_name: row.get(0), ...`
@@ -189,14 +213,40 @@ fn gen_constructor(parsed: &ParsedQuery) -> TokenStream {
             quote! { #name }
         });
 
-        quote! { #executor_name { #(#field_inits),* } }
+        if has_reference_params(parsed) {
+            quote! { #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData } }
+        } else {
+            quote! { #executor_name { #(#field_inits),* } }
+        }
     }
+}
+
+/// Check if any parameter type contains a reference (`&`).
+fn has_reference_params(parsed: &ParsedQuery) -> bool {
+    parsed.params.iter().any(|p| p.rust_type.contains('&'))
 }
 
 /// Parse a Rust type string into a TokenStream.
 ///
 /// Handles: `i32`, `String`, `Option<i32>`, `Vec<u8>`, `Vec<Vec<u8>>`, `&str`, `&[u8]`, etc.
+/// For executor struct fields, reference types get the `'_sasql` lifetime.
 fn parse_rust_type(type_str: &str) -> TokenStream {
+    // Add lifetime to reference types for the executor struct
+    let with_lifetime = type_str
+        .replace("&str", "&'_sasql str")
+        .replace("&[", "&'_sasql [");
+
+    with_lifetime.parse().unwrap_or_else(|_| {
+        // Fallback: try original string
+        type_str.parse().unwrap_or_else(|_| {
+            let ident = format_ident!("{}", type_str);
+            quote! { #ident }
+        })
+    })
+}
+
+/// Parse a Rust type for result struct fields (no lifetime needed — these are owned).
+fn parse_result_type(type_str: &str) -> TokenStream {
     type_str.parse().unwrap_or_else(|_| {
         let ident = format_ident!("{}", type_str);
         quote! { #ident }

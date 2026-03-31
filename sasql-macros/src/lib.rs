@@ -48,16 +48,21 @@ use proc_macro::TokenStream;
 /// - Invalid SQL produces a compile error, not a runtime error
 #[proc_macro]
 pub fn query(input: TokenStream) -> TokenStream {
-    let input_str = input.to_string();
-    match query_impl(&input_str) {
+    let input2: proc_macro2::TokenStream = input.into();
+    match query_impl(input2) {
         Ok(output) => output.into(),
         Err(err) => err.to_compile_error().into(),
     }
 }
 
-fn query_impl(sql: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
+fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStream, syn::Error> {
+    // Extract the SQL string from the input.
+    // Accepts either a string literal: query!("SELECT ...")
+    // or raw tokens: query! { SELECT ... } converted to string.
+    let sql = extract_sql(input)?;
+
     // 1. Parse: extract params, query kind, normalize SQL
-    let parsed = parse::parse_query(sql).map_err(|msg| {
+    let parsed = parse::parse_query(&sql).map_err(|msg| {
         syn::Error::new(proc_macro2::Span::call_site(), msg)
     })?;
 
@@ -78,4 +83,12 @@ fn query_impl(sql: &str) -> Result<proc_macro2::TokenStream, syn::Error> {
 
     // 5. Generate Rust code
     Ok(codegen::generate_query_code(&parsed, &validation))
+}
+
+/// Extract the SQL text from the macro input.
+///
+/// Accepts a string literal: `query!("SELECT ...")`
+fn extract_sql(input: proc_macro2::TokenStream) -> Result<String, syn::Error> {
+    let lit: syn::LitStr = syn::parse2(input)?;
+    Ok(lit.value())
 }
