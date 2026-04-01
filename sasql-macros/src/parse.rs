@@ -157,6 +157,23 @@ fn extract_params(sql: &str) -> Result<(String, Vec<Param>, Vec<OptionalClause>)
         if b == b'[' {
             let clause_idx = optional_clauses.len();
             let (clause, end) = parse_optional_clause(sql, i, &params)?;
+
+            // Check for duplicate param names across optional clauses
+            for prev_clause in &optional_clauses {
+                for prev_param in &prev_clause.params {
+                    for new_param in &clause.params {
+                        if prev_param.name == new_param.name {
+                            return Err(format!(
+                                "parameter `${}` appears in multiple optional clauses \
+                                 (clause {} and clause {}). Each optional clause must \
+                                 have its own unique parameter.",
+                                new_param.name, prev_clause.index, clause_idx
+                            ));
+                        }
+                    }
+                }
+            }
+
             optional_clauses.push(OptionalClause {
                 sql_fragment: clause.sql_fragment,
                 params: clause.params,
@@ -257,11 +274,31 @@ fn parse_optional_clause(
 
             if clause_params.is_empty() {
                 return Err(
-                    "optional clause `[...]` must contain at least one `$param: Option<T>` \
+                    "optional clause `[...]` must contain exactly one `$param: Option<T>` \
                      parameter. If this is not an optional clause, remove the brackets. \
                      For PostgreSQL array subscripts, use parentheses or the ARRAY keyword."
                         .into(),
                 );
+            }
+
+            // Each optional clause must have exactly ONE unique parameter.
+            // The clause is included/excluded based on that single Option.
+            // Multiple independent params would require checking all of them,
+            // and partial-Some is ambiguous. Use separate clauses instead:
+            //   [AND a >= $lo: Option<i32>] [AND a <= $hi: Option<i32>]
+            let unique_params: Vec<&str> = clause_params
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            if unique_params.len() > 1 {
+                return Err(format!(
+                    "optional clause `[...]` must have exactly one parameter, found {}: {}. \
+                     Split into separate clauses: [AND a = $p1: Option<T>] [AND b = $p2: Option<T>]",
+                    unique_params.len(),
+                    unique_params.join(", ")
+                ));
             }
 
             return Ok((
@@ -1299,7 +1336,7 @@ mod tests {
         assert!(r.is_err());
         let err = r.unwrap_err();
         assert!(
-            err.contains("must contain at least one"),
+            err.contains("must contain exactly one"),
             "should explain brackets need Option params: {err}"
         );
     }
@@ -1310,8 +1347,34 @@ mod tests {
         assert!(r.is_err());
         let err = r.unwrap_err();
         assert!(
-            err.contains("must contain at least one"),
+            err.contains("must contain exactly one"),
             "should explain brackets need params: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_param_optional_clause_rejected() {
+        let result = parse_query(
+            "SELECT id FROM t WHERE 1 = 1 [AND a BETWEEN $lo: Option<i32> AND $hi: Option<i32>]",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("exactly one parameter"),
+            "should reject multi-param clause: {err}"
+        );
+    }
+
+    #[test]
+    fn same_param_across_clauses_rejected() {
+        let result = parse_query(
+            "SELECT id FROM t WHERE 1 = 1 [AND a = $x: Option<i32>] [AND b = $x: Option<i32>]",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("multiple optional clauses"),
+            "should reject same param in different clauses: {err}"
         );
     }
 }
