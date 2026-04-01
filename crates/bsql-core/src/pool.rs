@@ -7,7 +7,7 @@
 //! - **PgBouncer detection**: on pool creation, bsql detects whether the
 //!   connection goes through PgBouncer and adjusts prepared statement strategy.
 //! - **Singleflight** (v0.7): identical concurrent SELECT queries are coalesced
-//!   into a single PG round-trip. The result is shared via `Arc<Vec<Row>>`.
+//!   into a single PG round-trip. The result is shared via `Arc<[Row]>`.
 //! - **Read/write splitting** (v0.7): when replicas are configured, SELECT
 //!   queries are routed to replicas. Writes always go to the primary.
 
@@ -307,17 +307,19 @@ impl Pool {
 
     /// Begin a new transaction.
     ///
-    /// Acquires a connection from the primary pool and sends `BEGIN`. The
-    /// connection is held for the lifetime of the returned [`Transaction`].
+    /// Acquires a connection from the primary pool. `BEGIN` is sent lazily
+    /// on the first query inside the transaction (see
+    /// [`Transaction::ensure_begun`]). This eliminates one PG round-trip
+    /// when the transaction is created.
+    ///
+    /// If the transaction is committed or dropped without executing any
+    /// queries, no `BEGIN`/`COMMIT`/`ROLLBACK` is sent at all and the
+    /// connection returns to the pool cleanly.
     ///
     /// **Fail-fast**: returns `BsqlError::Pool` immediately if no connections
     /// are available. See CREDO principle #17.
     pub async fn begin(&self) -> BsqlResult<Transaction> {
         let conn = self.acquire().await?;
-        conn.inner
-            .batch_execute("BEGIN")
-            .await
-            .map_err(BsqlError::from)?;
         Ok(Transaction::new(conn))
     }
 
@@ -372,7 +374,7 @@ impl Pool {
         &self,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
+    ) -> BsqlResult<Arc<[tokio_postgres::Row]>> {
         // Singleflight ONLY for parameterless queries.
         // Parameterized queries with different param values have the same SQL
         // text, so keying by SQL alone would return wrong results.
@@ -390,7 +392,7 @@ impl Pool {
         &self,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
+    ) -> BsqlResult<Arc<[tokio_postgres::Row]>> {
         if self.replicas.is_empty() {
             return self.query_raw_primary(sql, params).await;
         }
@@ -418,7 +420,7 @@ impl Pool {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
         use_replica: bool,
-    ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
+    ) -> BsqlResult<Arc<[tokio_postgres::Row]>> {
         match self.singleflight.try_join(key) {
             FlightStatus::Follower(mut rx) => {
                 // Wait for the leader to complete
@@ -449,7 +451,7 @@ impl Pool {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
         use_replica: bool,
-    ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
+    ) -> BsqlResult<Arc<[tokio_postgres::Row]>> {
         let raw_conn = if use_replica && !self.replicas.is_empty() {
             let idx = self
                 .replica_idx
@@ -470,7 +472,7 @@ impl Pool {
             .await
             .map_err(BsqlError::from)?;
 
-        Ok(Arc::new(rows))
+        Ok(Arc::from(rows))
     }
 }
 

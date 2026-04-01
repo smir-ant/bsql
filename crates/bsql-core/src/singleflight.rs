@@ -1,7 +1,7 @@
 //! Singleflight: coalesce identical concurrent queries into one PG round-trip.
 //!
 //! When N handlers execute the same `SELECT` with the same SQL simultaneously,
-//! only one query is sent to PostgreSQL. The result (`Arc<Vec<Row>>`) is shared
+//! only one query is sent to PostgreSQL. The result (`Arc<[Row]>`) is shared
 //! to all waiters via `broadcast`. Each consumer decodes from `&Row`
 //! independently -- zero cloning of row data.
 //!
@@ -25,7 +25,7 @@ pub(crate) struct Singleflight {
     ///
     /// The Mutex is held only for HashMap insert/remove (nanoseconds),
     /// never across await points.
-    in_flight: Mutex<HashMap<u64, broadcast::Sender<Arc<Vec<Row>>>>>,
+    in_flight: Mutex<HashMap<u64, broadcast::Sender<Arc<[Row]>>>>,
 }
 
 /// Result of checking the singleflight map.
@@ -33,7 +33,7 @@ pub(crate) enum FlightStatus {
     /// We are the first caller -- execute the query and broadcast.
     Leader,
     /// Another caller is already executing -- wait for their result.
-    Follower(broadcast::Receiver<Arc<Vec<Row>>>),
+    Follower(broadcast::Receiver<Arc<[Row]>>),
 }
 
 impl Singleflight {
@@ -63,7 +63,7 @@ impl Singleflight {
     }
 
     /// Broadcast a successful result to all waiters and remove the entry.
-    pub(crate) fn complete(&self, key: u64, rows: Arc<Vec<Row>>) {
+    pub(crate) fn complete(&self, key: u64, rows: Arc<[Row]>) {
         let tx = {
             let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
             map.remove(&key)
@@ -131,7 +131,7 @@ mod tests {
     fn complete_removes_entry() {
         let sf = Singleflight::new();
         let _ = sf.try_join(42);
-        sf.complete(42, Arc::new(Vec::new()));
+        sf.complete(42, Arc::from(Vec::<Row>::new()));
         // After complete, next caller should be leader again
         assert!(matches!(sf.try_join(42), FlightStatus::Leader));
     }

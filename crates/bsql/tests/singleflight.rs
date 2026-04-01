@@ -1,7 +1,7 @@
 //! Integration tests: singleflight query coalescing (v0.7).
 //!
 //! Verifies that identical concurrent queries share a single PG round-trip
-//! via `Arc<Vec<Row>>`. The singleflight is transparent -- all existing query
+//! via `Arc<[Row]>`. The singleflight is transparent -- all existing query
 //! semantics are preserved.
 //!
 //! Requires a running PostgreSQL with the test schema.
