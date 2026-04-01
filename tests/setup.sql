@@ -36,6 +36,7 @@ CREATE TABLE tickets (
     -- v0.2 columns for extended type tests
     deadline TIMESTAMPTZ,           -- nullable, feature-gated (time/chrono)
     ticket_uuid UUID NOT NULL DEFAULT gen_random_uuid(),
+    budget NUMERIC(10,2),             -- nullable, feature-gated (decimal)
     created_date DATE NOT NULL DEFAULT CURRENT_DATE,
     start_time TIME                 -- nullable
 );

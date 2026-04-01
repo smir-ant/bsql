@@ -1,0 +1,7 @@
+error: column "ticket_uuid": column type is UUID (OID 2950) — enable feature "uuid" in sasql
+ --> tests/compile_fail_features/missing_uuid.rs:5:13
+  |
+5 |     let _ = sasql::query!("SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `sasql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

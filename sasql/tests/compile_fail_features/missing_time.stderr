@@ -1,0 +1,7 @@
+error: column "deadline": column type is TIMESTAMPTZ (OID 1184) — enable feature "time" or "chrono" in sasql
+ --> tests/compile_fail_features/missing_time.rs:5:13
+  |
+5 |     let _ = sasql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `sasql::query` (in Nightly builds, run with -Z macro-backtrace for more info)
