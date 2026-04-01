@@ -171,7 +171,7 @@ sasql is a PostgreSQL library. Other databases are future considerations, not de
 - `pg_trgm` similarity search
 - `COPY` (future — complex wire protocol interaction)
 
-**Target version**: PostgreSQL 15+ (minimum). Optimized for PG 17.
+**Target version**: PostgreSQL 15+ (minimum). Optimized for PG 18.
 
 **Future database support** (feature-gated, not in v1.0):
 - SQLite via `feature = "sqlite"` — separate type mapping, different validation path.
@@ -1008,7 +1008,7 @@ CREATE TABLE IF NOT EXISTS _sasql_migrations (
 
 ## Benchmark Targets
 
-Measured on a local PostgreSQL 17 instance, single connection, prepared statements.
+Measured on a local PostgreSQL 18 instance, single connection, prepared statements.
 All values are median latency from 10,000 iterations after 1,000 warmup iterations.
 
 | Operation | sasql Target | sqlx 0.8 | Diesel 2.2 | tokio-postgres |
@@ -1059,7 +1059,7 @@ Numbers without methodology are marketing. Every performance claim in this docum
 
 ### Target numbers
 
-These are not aspirations. They are pass/fail criteria. If a release does not meet these numbers, it does not ship. Measured on PostgreSQL 17, local Unix socket, prepared statements, binary protocol.
+These are not aspirations. They are pass/fail criteria. If a release does not meet these numbers, it does not ship. Measured on PostgreSQL 18, local Unix socket, prepared statements, binary protocol.
 
 | Operation | sasql target | sqlx 0.8 current | speedup | notes |
 |-----------|:-------------|:-----------------|:--------|:------|
