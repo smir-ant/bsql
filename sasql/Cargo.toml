@@ -11,6 +11,7 @@ default = []
 time = ["sasql-core/time", "sasql-macros/time"]
 chrono = ["sasql-core/chrono", "sasql-macros/chrono"]
 uuid = ["sasql-core/uuid", "sasql-macros/uuid"]
+decimal = ["sasql-core/decimal", "sasql-macros/decimal"]
 
 [dependencies]
 sasql-core = { workspace = true }

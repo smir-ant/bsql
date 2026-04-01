@@ -48,22 +48,22 @@ DSLs inevitably diverge from the SQL they model. They cannot express the full po
 Not because users notice nanoseconds. Because the mindset that says "nanoseconds don't matter" produces millisecond-level bloat through a thousand "doesn't matter" decisions. sasql fights for every cycle.
 
 **In practice:**
-- **Arena allocation**: every query execution uses a bump allocator. All row data allocates in a contiguous arena. One deallocation for everything. 300 pointer bumps at ~2ns each vs. 300 malloc/free pairs at ~27ns each. 13x less allocation overhead.
-- **Binary protocol**: PostgreSQL's binary wire format eliminates parsing entirely for numeric types. `i32` is `i32::from_be_bytes()` --- one instruction. Timestamps are 8-byte memcpy. UUIDs are 16-byte memcpy. 50% less data on the wire for typical results.
-- **SIMD**: `simdutf` for UTF-8 validation (70 GB/s vs 3 GB/s scalar). `sonic-rs` for JSONB columns. `memchr` for enum string matching.
-- **Zero-copy deserialization**: `FromRow` reads directly from the wire buffer into struct fields. No intermediate `Row` type. No hash lookups. No string comparisons.
-- **Pipelining**: N queries sent on one connection in one round-trip. Same wall-clock latency as N parallel connections, 1/N the connection pressure.
-- **Pre-computed column offsets**: fixed-width columns (`i32`, `i64`, `bool`, `f64`, `uuid`) have their byte offsets computed at compile time as constants. Only variable-width columns need runtime offset calculation.
+- **Arena allocation** *(planned for v0.3)*: every query execution uses a bump allocator. All row data allocates in a contiguous arena. One deallocation for everything. 300 pointer bumps at ~2ns each vs. 300 malloc/free pairs at ~27ns each. 13x less allocation overhead.
+- **Binary protocol** *(planned for v0.3)*: PostgreSQL's binary wire format eliminates parsing entirely for numeric types. `i32` is `i32::from_be_bytes()` --- one instruction. Timestamps are 8-byte memcpy. UUIDs are 16-byte memcpy. 50% less data on the wire for typical results.
+- **SIMD** *(planned for v0.4)*: `simdutf` for UTF-8 validation (70 GB/s vs 3 GB/s scalar). `sonic-rs` for JSONB columns. `memchr` for enum string matching.
+- **Zero-copy deserialization** *(planned for v0.3)*: `FromRow` reads directly from the wire buffer into struct fields. No intermediate `Row` type. No hash lookups. No string comparisons.
+- **Pipelining** *(planned for v0.2)*: N queries sent on one connection in one round-trip. Same wall-clock latency as N parallel connections, 1/N the connection pressure.
+- **Pre-computed column offsets** *(planned for v0.3)*: fixed-width columns (`i32`, `i64`, `bool`, `f64`, `uuid`) have their byte offsets computed at compile time as constants. Only variable-width columns need runtime offset calculation.
 
 ---
 
-### 5. mimalloc is the recommended global allocator.
+### 5. mimalloc is the recommended global allocator. *(planned for v0.3)*
 
 For multi-threaded async workloads (which is every non-trivial web server), mimalloc outperforms glibc malloc, jemalloc, and the default Rust allocator. Smaller thread-local heaps, better cache locality, faster small-object allocation. The numbers are not close.
 
-sasql does not bundle or force an allocator. But the documentation, examples, and benchmarks use mimalloc. The `sasql::recommended_allocator!()` macro sets it up in one line. If you have a reason to use something else, you can. But you probably do not.
+sasql does not bundle or force an allocator. But the documentation, examples, and benchmarks will use mimalloc. The `sasql::recommended_allocator!()` macro will set it up in one line. If you have a reason to use something else, you can. But you probably do not.
 
-**In practice:**
+**In practice** *(not yet implemented --- planned for v0.3)*:
 - `#[global_allocator] static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;` in your `main.rs`.
 - Or: `sasql::recommended_allocator!();` --- expands to the above.
 - Benchmarks show the difference: mimalloc + arena allocation makes sasql's allocation profile essentially invisible in profiling.
@@ -81,28 +81,28 @@ Prepared statement names, query cache keys, deduplication hashes, schema fingerp
 
 ---
 
-### 7. bitcode for all persistence and serialization.
+### 7. bitcode for all persistence and serialization. *(planned for v0.2)*
 
 The offline schema cache (`.sasql/`), incremental validation state, any data that sasql writes to disk --- all serialized with bitcode. Not JSON. Not CBOR. Not MessagePack. Not bincode.
 
 bitcode is the fastest and most compact binary serialization format in the Rust ecosystem. ~10x faster than serde_json for serialize/deserialize. ~3x more compact than JSON. ~1.5x more compact than bincode. Zero-copy deserialization support. The compile-time cache is read on every `cargo build` --- speed here directly reduces developer iteration time.
 
-**In practice:**
+**In practice** *(not yet implemented --- v0.1 validates against a live PG instance; offline bitcode cache planned for v0.2)*:
 - `.sasql/schema.bitcode` and `.sasql/queries.bitcode` replace the JSON files from the spec.
 - `sasql prepare` writes bitcode. The proc macro reads bitcode. No JSON parsing during compilation.
 - Schema cache for 50 queries loads in ~100us (bitcode) vs ~5ms (JSON). 50x improvement on every build.
 
 ---
 
-### 8. Zero allocations where possible.
+### 8. Zero allocations where possible. *(partially implemented; arena planned for v0.3)*
 
-`fetch_one` and `fetch_optional` return stack-allocated structs. No heap allocation for the result container. String and byte-array fields borrow from the arena.
+`fetch_one` and `fetch_optional` return stack-allocated structs. No heap allocation for the result container. *(Currently uses owned `String`/`Vec` fields; arena-borrowed strings planned for v0.3.)*
 
-Multi-row results use the arena. All rows from a single query share one arena. When the result set is dropped, one deallocation frees everything.
+Multi-row results will use the arena. All rows from a single query share one arena. When the result set is dropped, one deallocation frees everything.
 
 Owned `String` only when data escapes the arena's lifetime --- and even then, consider whether the architecture can be restructured so it does not need to escape.
 
-**In practice:**
+**In practice** *(arena allocation not yet implemented --- planned for v0.3)*:
 - A typical web handler (query -> serialize to JSON -> respond) never converts arena strings to owned `String`. The serializer borrows from the arena. The arena lives until the response is sent. Zero string allocations.
 - `Vec<T>` for `fetch_all` is the only heap allocation in the common path. The `T` values inside contain arena-borrowed strings.
 - The arena is recycled from a thread-local pool. The arena object itself is never heap-allocated.

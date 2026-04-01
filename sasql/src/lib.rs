@@ -23,24 +23,27 @@
 //! ```
 //!
 //! Then:
-//! ```rust,ignore
-//! use sasql::Pool;
+//! ```rust,no_run
+//! use sasql::{Pool, SasqlError};
 //!
-//! # async fn example() -> Result<(), sasql::SasqlError> {
-//! let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), SasqlError> {
+//!     let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 //!
-//! // Every query is validated against the real database at compile time.
-//! // If this compiles, the SQL is correct — tables, columns, types, all checked.
-//! let id = 1i32;
-//! let user = sasql::query!(
-//!     "SELECT id, login, active FROM users WHERE id = $id: i32"
-//! ).fetch_one(&pool).await?;
+//!     // Every query is validated against the real database at compile time.
+//!     // If this compiles, the SQL is correct — tables, columns, types, all checked.
+//!     //
+//!     //   let id = 1i32;
+//!     //   let user = sasql::query!(
+//!     //       "SELECT id, login, active FROM users WHERE id = $id: i32"
+//!     //   ).fetch_one(&pool).await?;
+//!     //
+//!     // The result struct has typed fields:
+//!     //   user.id: i32, user.login: String, user.active: bool
+//!     //   println!("{}: {}", user.id, user.login);
 //!
-//! // The result struct has typed fields:
-//! // user.id: i32, user.login: String, user.active: bool
-//! println!("{}: {}", user.id, user.login);
-//! # Ok(())
-//! # }
+//!     Ok(())
+//! }
 //! ```
 //!
 //! ## No escape hatch

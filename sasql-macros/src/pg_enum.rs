@@ -544,4 +544,35 @@ mod tests {
             "missing first_byte check: {code}"
         );
     }
+
+    #[test]
+    fn accepts_checks_pg_type_name() {
+        // The generated `accepts` should check `ty.name() == "snake_case_name"`.
+        // For an enum named `TicketStatus`, the PG type name should be `ticket_status`.
+        let input = quote! {
+            enum TicketStatus {
+                #[sql("new")]
+                New,
+                #[sql("closed")]
+                Closed,
+            }
+        };
+
+        let output = parse_enum(input);
+        let code = output.to_string();
+
+        // Both FromSql::accepts and ToSql::accepts should check the type name
+        assert!(
+            code.contains("\"ticket_status\""),
+            "accepts should check for pg type name 'ticket_status': {code}"
+        );
+    }
+
+    #[test]
+    fn snake_case_conversion() {
+        assert_eq!(to_snake_case("TicketStatus"), "ticket_status");
+        assert_eq!(to_snake_case("Color"), "color");
+        assert_eq!(to_snake_case("HTTPCode"), "h_t_t_p_code");
+        assert_eq!(to_snake_case("A"), "a");
+    }
 }

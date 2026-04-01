@@ -76,6 +76,14 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
                 Err(feature_error("UUID", oid, &["uuid"]))
             }
         }
+        // --- NUMERIC / DECIMAL ---
+        1700 => {
+            if cfg!(feature = "decimal") {
+                Ok("::rust_decimal::Decimal")
+            } else {
+                Err(feature_error("NUMERIC", oid, &["decimal"]))
+            }
+        }
         // --- INTERVAL ---
         1186 => {
             Err(format!(
@@ -89,6 +97,7 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
         1182 => resolve_array("DATE[]", 1082, oid),
         1183 => resolve_array("TIME[]", 1083, oid),
         2951 => resolve_array("UUID[]", 2950, oid),
+        1231 => resolve_array("NUMERIC[]", 1700, oid),
         _ => {
             let name = sasql_core::types::pg_name_for_oid(oid).unwrap_or("unknown");
             Err(format!(
@@ -145,6 +154,13 @@ fn resolve_array(pg_name: &str, element_oid: u32, array_oid: u32) -> Result<&'st
                 Err(feature_error(pg_name, array_oid, &["uuid"]))
             }
         }
+        1700 => {
+            if cfg!(feature = "decimal") {
+                Ok("Vec<::rust_decimal::Decimal>")
+            } else {
+                Err(feature_error(pg_name, array_oid, &["decimal"]))
+            }
+        }
         _ => {
             Err(format!(
                 "unsupported PostgreSQL array type `{pg_name}` (OID {array_oid})."
@@ -189,6 +205,11 @@ pub fn is_param_compatible_extended(rust_type: &str, pg_oid: u32) -> bool {
 
         // --- uuid ---
         ("::uuid::Uuid" | "uuid::Uuid" | "Uuid", 2950) => cfg!(feature = "uuid"),
+
+        // --- rust_decimal ---
+        ("::rust_decimal::Decimal" | "rust_decimal::Decimal" | "Decimal", 1700) => {
+            cfg!(feature = "decimal")
+        }
 
         _ => false,
     }
@@ -296,5 +317,27 @@ mod tests {
         assert!(is_param_compatible_extended("chrono::NaiveDate", 1082));
         assert!(is_param_compatible_extended("NaiveDate", 1082));
         assert!(is_param_compatible_extended("::chrono::NaiveDateTime", 1114));
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn numeric_resolves_to_decimal() {
+        assert_eq!(resolve_rust_type(1700).unwrap(), "::rust_decimal::Decimal");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_param_compat() {
+        assert!(is_param_compatible_extended("::rust_decimal::Decimal", 1700));
+        assert!(is_param_compatible_extended("rust_decimal::Decimal", 1700));
+        assert!(is_param_compatible_extended("Decimal", 1700));
+    }
+
+    #[cfg(not(feature = "decimal"))]
+    #[test]
+    fn numeric_errors_without_feature() {
+        let err = resolve_rust_type(1700).unwrap_err();
+        assert!(err.contains("NUMERIC"), "unexpected error: {err}");
+        assert!(err.contains("decimal"), "should suggest decimal feature: {err}");
     }
 }

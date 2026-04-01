@@ -681,4 +681,58 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("conflicting types"), "unexpected error: {err}");
     }
+
+    // --- comment stripping: param inside comment is ignored ---
+
+    #[test]
+    fn line_comment_with_param_ignored() {
+        let r = parse_query(
+            "SELECT id FROM t WHERE id = $id: i32 -- $extra: i32",
+        )
+        .unwrap();
+        assert_eq!(r.params.len(), 1, "param inside line comment should be ignored");
+        assert_eq!(r.params[0].name, "id");
+    }
+
+    #[test]
+    fn block_comment_with_param_ignored() {
+        let r = parse_query(
+            "SELECT id FROM t WHERE id = $id: i32 /* $extra: i32 */",
+        )
+        .unwrap();
+        assert_eq!(r.params.len(), 1, "param inside block comment should be ignored");
+        assert_eq!(r.params[0].name, "id");
+    }
+
+    // --- nested block comments ---
+
+    #[test]
+    fn nested_block_comment_stripped() {
+        let r = parse_query(
+            "SELECT /* outer /* inner */ still comment */ id FROM t",
+        )
+        .unwrap();
+        assert_eq!(r.kind, QueryKind::Select);
+        // The nested block comment should be fully stripped
+        assert!(
+            r.positional_sql.contains("id"),
+            "id should remain: {}",
+            r.positional_sql
+        );
+        assert!(
+            !r.positional_sql.contains("outer"),
+            "comment text should be stripped: {}",
+            r.positional_sql
+        );
+        assert!(
+            !r.positional_sql.contains("inner"),
+            "nested comment text should be stripped: {}",
+            r.positional_sql
+        );
+        assert!(
+            !r.positional_sql.contains("still comment"),
+            "text between inner close and outer close should be stripped: {}",
+            r.positional_sql
+        );
+    }
 }

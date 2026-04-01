@@ -14,6 +14,7 @@ default = []
 time = []
 chrono = []
 uuid = []
+decimal = []
 
 [dependencies]
 syn = { workspace = true }

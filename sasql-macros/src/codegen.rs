@@ -557,4 +557,70 @@ mod tests {
         // Should NOT inject an additional LIMIT
         assert!(!code_str.contains("LIMIT 2"), "should not add LIMIT 2 when LIMIT exists: {code_str}");
     }
+
+    // --- FOR UPDATE should NOT get LIMIT 2 ---
+
+    #[test]
+    fn for_update_no_limit_injected() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32 FOR UPDATE").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            !code_str.contains("LIMIT 2"),
+            "FOR UPDATE query should NOT get LIMIT 2 injected: {code_str}"
+        );
+    }
+
+    #[test]
+    fn for_update_skip_locked_no_limit() {
+        let parsed =
+            parse_query("SELECT id FROM t WHERE id = $id: i32 FOR UPDATE SKIP LOCKED").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            !code_str.contains("LIMIT 2"),
+            "FOR UPDATE SKIP LOCKED should NOT get LIMIT 2: {code_str}"
+        );
+    }
+
+    // --- column dedup collision: ["id_1", "id", "id"] ---
+
+    #[test]
+    fn column_dedup_collision_with_existing_suffix() {
+        // If columns are ["id_1", "id", "id"], the second "id" must NOT
+        // become "id_1" (collision with first column). It should be "id_2".
+        let columns = vec![
+            col("id_1", "i32"),
+            col("id", "i32"),
+            col("id", "i32"),
+        ];
+        let names = deduplicate_column_names(&columns);
+        assert_eq!(names[0], "id_1");
+        assert_eq!(names[1], "id");
+        assert_eq!(names[2], "id_2", "should skip id_1 which is already taken: {names:?}");
+    }
+
+    #[test]
+    fn column_dedup_complex_collision() {
+        // ["a", "a", "a_1", "a"] should produce ["a", "a_1", "a_1_1", "a_2"]
+        // Wait — let me think through the algorithm:
+        // 1. "a" -> no collision -> ["a"]
+        // 2. "a" -> collision -> try "a_1" -> collision -> try "a_2" -> ok -> ["a", "a_2"]
+        // 3. "a_1" -> no collision -> ["a", "a_2", "a_1"]
+        // 4. "a" -> collision -> try "a_1" -> collision -> try "a_2" -> collision -> try "a_3" -> ok
+        let columns = vec![
+            col("a", "i32"),
+            col("a", "i32"),
+            col("a_1", "i32"),
+            col("a", "i32"),
+        ];
+        let names = deduplicate_column_names(&columns);
+        // All names must be unique
+        let unique: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        assert_eq!(unique.len(), 4, "all names must be unique: {names:?}");
+    }
 }

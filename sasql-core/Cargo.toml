@@ -11,6 +11,7 @@ default = []
 time = ["dep:time", "postgres-types/with-time-0_3"]
 chrono = ["dep:chrono", "postgres-types/with-chrono-0_4"]
 uuid = ["dep:uuid", "postgres-types/with-uuid-1"]
+decimal = ["dep:rust_decimal", "rust_decimal/db-tokio-postgres"]
 
 [dependencies]
 tokio-postgres = { workspace = true, features = ["runtime"] }
@@ -22,6 +23,7 @@ tokio = { workspace = true, features = ["rt"] }
 time = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
+rust_decimal = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

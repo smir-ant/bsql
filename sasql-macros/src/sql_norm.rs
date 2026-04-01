@@ -33,14 +33,22 @@ pub fn normalize_sql(sql: &str) -> String {
             continue;
         }
 
-        // Block comment: /* ... */
+        // Block comment: /* ... */ (with nesting support)
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
             i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+            let mut depth = 1u32;
+            while i + 1 < len && depth > 0 {
+                if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                    continue;
+                }
                 i += 1;
-            }
-            if i + 1 < len {
-                i += 2; // skip */
             }
             if !out.is_empty() && !out.ends_with(' ') {
                 out.push(' ');
@@ -329,6 +337,24 @@ mod tests {
         assert_eq!(
             normalize_sql(r#"SELECT "col""name" FROM t"#),
             r#"select "col""name" from t"#
+        );
+    }
+
+    // --- nested block comments ---
+
+    #[test]
+    fn nested_block_comment_stripped() {
+        assert_eq!(
+            normalize_sql("SELECT /* outer /* inner */ still comment */ id FROM t"),
+            "select id from t"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_block_comment() {
+        assert_eq!(
+            normalize_sql("SELECT /* a /* b /* c */ b */ a */ id FROM t"),
+            "select id from t"
         );
     }
 }
