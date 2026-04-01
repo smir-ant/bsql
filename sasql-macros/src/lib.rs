@@ -8,6 +8,7 @@ extern crate proc_macro;
 
 mod codegen;
 mod connection;
+mod dynamic;
 mod parse;
 mod pg_enum;
 mod sql_norm;
@@ -63,20 +64,41 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
     // or raw tokens: query! { SELECT ... } converted to string.
     let sql = extract_sql(input)?;
 
-    // 1. Parse: extract params, query kind, normalize SQL
+    // 1. Parse: extract params, query kind, normalize SQL, optional clauses
     let parsed = parse::parse_query(&sql)
         .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
 
-    // 2. Validate against PostgreSQL via PREPARE
-    let validation =
-        connection::with_connection(|rt, client| validate::validate_query(&parsed, rt, client))?;
-
-    // 3. Check parameter type compatibility
-    validate::check_param_types(&parsed, &validation)
+    // 2. Expand dynamic query variants (if any optional clauses)
+    let variants = dynamic::expand_variants(&parsed)
         .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
 
-    // 4. Generate Rust code
-    Ok(codegen::generate_query_code(&parsed, &validation))
+    if parsed.optional_clauses.is_empty() {
+        // Static query path — no optional clauses
+        // 3. Validate against PostgreSQL via PREPARE
+        let validation = connection::with_connection(|rt, client| {
+            validate::validate_query(&parsed, rt, client)
+        })?;
+
+        // 4. Check parameter type compatibility
+        validate::check_param_types(&parsed, &validation)
+            .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+
+        // 5. Generate Rust code
+        Ok(codegen::generate_query_code(&parsed, &validation))
+    } else {
+        // Dynamic query path — has optional clauses
+        // 3. Validate ALL variants against PostgreSQL and check param types
+        let validation = connection::with_connection(|rt, client| {
+            validate::validate_variants(&variants, &parsed, rt, client)
+        })?;
+
+        // 4. Generate dynamic Rust code with match dispatcher
+        Ok(codegen::generate_dynamic_query_code(
+            &parsed,
+            &validation,
+            &variants,
+        ))
+    }
 }
 
 /// Extract the SQL text from the macro input.

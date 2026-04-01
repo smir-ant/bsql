@@ -432,7 +432,11 @@ mod tests {
     fn all_base_types_have_pg_names() {
         for m in BASE_TYPE_MAP {
             assert!(!m.pg_name.is_empty(), "OID {} has empty pg_name", m.pg_oid);
-            assert!(!m.rust_type.is_empty(), "OID {} has empty rust_type", m.pg_oid);
+            assert!(
+                !m.rust_type.is_empty(),
+                "OID {} has empty rust_type",
+                m.pg_oid
+            );
         }
     }
 

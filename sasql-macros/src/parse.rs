@@ -22,6 +22,18 @@ pub struct Param {
     pub position: usize,
 }
 
+/// An optional clause: a SQL fragment wrapped in `[...]` that is
+/// included/excluded at runtime based on `Option` parameters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OptionalClause {
+    /// The SQL fragment inside `[...]` (with params replaced by `$N`).
+    pub sql_fragment: String,
+    /// Parameters declared inside this clause (must be `Option<T>`).
+    pub params: Vec<Param>,
+    /// 0-based index among optional clauses.
+    pub index: usize,
+}
+
 /// The kind of SQL statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {
@@ -36,11 +48,14 @@ pub enum QueryKind {
 pub struct ParsedQuery {
     /// Normalized SQL with params replaced by `$1`, `$2`, etc.
     /// Whitespace collapsed, keywords lowercased, comments stripped.
+    /// For dynamic queries, optional clause placeholders are `{OPT_N}`.
     pub normalized_sql: String,
     /// SQL with params replaced by `$1`, `$2`, etc. but NOT normalized
     /// (preserves original formatting for error messages).
+    /// For dynamic queries, optional clause placeholders are `{OPT_N}`.
     pub positional_sql: String,
-    /// Extracted parameters in order of appearance.
+    /// Extracted parameters in order of appearance (base query only).
+    /// Parameters inside optional clauses are in `optional_clauses[i].params`.
     pub params: Vec<Param>,
     /// What kind of DML this is.
     pub kind: QueryKind,
@@ -49,6 +64,8 @@ pub struct ParsedQuery {
     pub has_returning: bool,
     /// Prepared statement name: `s_{rapidhash:016x}`.
     pub statement_name: String,
+    /// Optional clauses extracted from `[...]` blocks.
+    pub optional_clauses: Vec<OptionalClause>,
 }
 
 /// Parse the raw SQL from a `query!` invocation.
@@ -60,7 +77,7 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
     }
 
     let comment_stripped = strip_comments(sql);
-    let (positional_sql, params) = extract_params(&comment_stripped)?;
+    let (positional_sql, params, optional_clauses) = extract_params(&comment_stripped)?;
     let normalized_sql = normalize_sql(&positional_sql);
     let kind = detect_query_kind(&normalized_sql)?;
     let has_returning = detect_returning(&normalized_sql);
@@ -73,19 +90,23 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
         kind,
         has_returning,
         statement_name: stmt_name,
+        optional_clauses,
     })
 }
 
 /// Extract `$name: Type` parameters from SQL, replacing them with `$1`, `$2`, ...
+/// Also extracts `[...]` optional clause blocks.
 ///
-/// Returns the rewritten SQL and the list of extracted parameters.
+/// Returns the rewritten SQL (with `{OPT_N}` placeholders for optional clauses),
+/// the list of base parameters, and the list of optional clauses.
 ///
 /// Uses `char_indices()` for iteration so multi-byte UTF-8 inside string
 /// literals is preserved verbatim (we slice the original `&str` by byte
 /// offset, never interpreting individual bytes as chars).
-fn extract_params(sql: &str) -> Result<(String, Vec<Param>), String> {
+fn extract_params(sql: &str) -> Result<(String, Vec<Param>, Vec<OptionalClause>), String> {
     let mut out = String::with_capacity(sql.len());
     let mut params: Vec<Param> = Vec::new();
+    let mut optional_clauses: Vec<OptionalClause> = Vec::new();
     let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut i = 0; // byte offset into `sql`
@@ -132,6 +153,26 @@ fn extract_params(sql: &str) -> Result<(String, Vec<Param>), String> {
             continue;
         }
 
+        // Optional clause: [SQL fragment with $param: Option<T>]
+        if b == b'[' {
+            let clause_idx = optional_clauses.len();
+            let (clause, end) = parse_optional_clause(sql, i, &params)?;
+            optional_clauses.push(OptionalClause {
+                sql_fragment: clause.sql_fragment,
+                params: clause.params,
+                index: clause_idx,
+            });
+            // Insert a placeholder that dynamic.rs will replace per variant
+            out.push_str(&format!("{{OPT_{clause_idx}}}"));
+            i = end;
+            continue;
+        }
+
+        // Unmatched ] outside a clause — error
+        if b == b']' {
+            return Err("unexpected `]` — not inside an optional clause `[...]`".into());
+        }
+
         // Parameter: $name: Type
         if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
             let (param, end) = parse_one_param(sql, i)?;
@@ -174,7 +215,170 @@ fn extract_params(sql: &str) -> Result<(String, Vec<Param>), String> {
         i += 1;
     }
 
-    Ok((out, params))
+    if optional_clauses.len() > 8 {
+        return Err(format!(
+            "query has {} optional clauses ({} variants) — maximum is 8 (256 variants). \
+             Split the query into smaller queries with fewer optional filters.",
+            optional_clauses.len(),
+            1u32 << optional_clauses.len()
+        ));
+    }
+
+    Ok((out, params, optional_clauses))
+}
+
+/// Parse a `[SQL fragment with $param: Option<T>]` optional clause starting at
+/// byte position `start` (which is the `[` character).
+///
+/// Returns the parsed clause and the byte position after the closing `]`.
+fn parse_optional_clause(
+    sql: &str,
+    start: usize,
+    base_params: &[Param],
+) -> Result<(OptionalClause, usize), String> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    // Skip opening [
+    let mut i = start + 1;
+
+    // Find the matching ] — respecting string literals and nested parens.
+    // Nested [] is NOT allowed (no nesting of optional clauses).
+    let mut clause_sql = String::new();
+    let mut clause_params: Vec<Param> = Vec::new();
+    // Position counter for params within the clause (will be renumbered by dynamic.rs)
+    let mut clause_param_pos = 0usize;
+
+    while i < len {
+        let b = bytes[i];
+
+        // Closing bracket — end of optional clause
+        if b == b']' {
+            i += 1; // skip ]
+
+            if clause_params.is_empty() {
+                return Err(
+                    "optional clause `[...]` must contain at least one `$param: Option<T>` \
+                     parameter. If this is not an optional clause, remove the brackets. \
+                     For PostgreSQL array subscripts, use parentheses or the ARRAY keyword."
+                        .into(),
+                );
+            }
+
+            return Ok((
+                OptionalClause {
+                    sql_fragment: clause_sql,
+                    params: clause_params,
+                    index: 0, // filled by caller
+                },
+                i,
+            ));
+        }
+
+        // Nested [ — error
+        if b == b'[' {
+            return Err("nested optional clauses `[[...]]` are not supported — \
+                 each optional clause must be a flat `[SQL fragment]`"
+                .into());
+        }
+
+        // String literal inside clause: copy verbatim
+        if b == b'\'' {
+            let lit_start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    i += 1;
+                    if i < len && bytes[i] == b'\'' {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            clause_sql.push_str(&sql[lit_start..i]);
+            continue;
+        }
+
+        // Dollar-quoted string inside clause
+        if b == b'$'
+            && i + 1 < len
+            && (bytes[i + 1] == b'$' || bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+        {
+            if let Some(end) = skip_dollar_quote(bytes, i) {
+                clause_sql.push_str(&sql[i..end]);
+                i = end;
+                continue;
+            }
+        }
+
+        // :: cast operator
+        if b == b':' && i + 1 < len && bytes[i + 1] == b':' {
+            clause_sql.push_str("::");
+            i += 2;
+            continue;
+        }
+
+        // Parameter inside clause: $name: Option<T>
+        if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
+            let (param, end) = parse_one_param(sql, i)?;
+
+            // Validate: params inside optional clauses MUST be Option<T>
+            if !param.rust_type.starts_with("Option<") {
+                return Err(format!(
+                    "parameter `${}` inside optional clause `[...]` must be \
+                     `Option<T>`, found `{}`. Wrap the type: `Option<{}>`",
+                    param.name, param.rust_type, param.rust_type
+                ));
+            }
+
+            // Check for duplicate in base params — not allowed (a param is
+            // either base or optional, not both)
+            if base_params.iter().any(|p| p.name == param.name) {
+                return Err(format!(
+                    "parameter `${}` appears both in the base query and in an \
+                     optional clause — each parameter must belong to exactly one scope",
+                    param.name
+                ));
+            }
+
+            // Check duplicate within this clause (reuse position)
+            if let Some(existing) = clause_params.iter().find(|p| p.name == param.name) {
+                if existing.rust_type != param.rust_type {
+                    return Err(format!(
+                        "parameter `${}` declared with conflicting types in optional \
+                         clause: `{}` and `{}`",
+                        param.name, existing.rust_type, param.rust_type
+                    ));
+                }
+                clause_sql.push_str(&format!("${{P_{}}}", existing.position));
+            } else {
+                clause_param_pos += 1;
+                clause_params.push(Param {
+                    name: param.name,
+                    rust_type: param.rust_type,
+                    position: clause_param_pos,
+                });
+                clause_sql.push_str(&format!("${{P_{clause_param_pos}}}"));
+            }
+            i = end;
+            continue;
+        }
+
+        // Reject manual positional inside clause
+        if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
+            return Err(
+                "manual positional parameters ($1, $2, ...) are not allowed \
+                 in sasql — use $name: Type syntax instead"
+                    .into(),
+            );
+        }
+
+        clause_sql.push(b as char);
+        i += 1;
+    }
+
+    Err("unclosed optional clause — missing `]`".into())
 }
 
 /// Parse a single `$name: Type` parameter starting at byte position `start`.
@@ -794,15 +998,13 @@ mod tests {
         let r = parse_query("WITH cte AS (SELECT 1)");
         assert!(r.is_err());
         let err = r.unwrap_err();
-        assert!(
-            err.contains("CTE"),
-            "should mention CTE: {err}"
-        );
+        assert!(err.contains("CTE"), "should mention CTE: {err}");
     }
 
     #[test]
     fn cte_with_update() {
-        let r = parse_query("WITH cte AS (SELECT 1 as val) UPDATE t SET a = 1 WHERE id = 1").unwrap();
+        let r =
+            parse_query("WITH cte AS (SELECT 1 as val) UPDATE t SET a = 1 WHERE id = 1").unwrap();
         assert_eq!(r.kind, QueryKind::Update);
     }
 
@@ -826,7 +1028,9 @@ mod tests {
 
     #[test]
     fn param_with_long_name() {
-        let r = parse_query("SELECT id FROM t WHERE id = $this_is_a_really_long_parameter_name: i32").unwrap();
+        let r =
+            parse_query("SELECT id FROM t WHERE id = $this_is_a_really_long_parameter_name: i32")
+                .unwrap();
         assert_eq!(r.params[0].name, "this_is_a_really_long_parameter_name");
     }
 
@@ -861,18 +1065,27 @@ mod tests {
     #[test]
     fn dollar_quoted_body_with_param_syntax_ignored() {
         let r = parse_query("SELECT $$has $dollar: signs$$ FROM t").unwrap();
-        assert_eq!(r.params.len(), 0, "content inside $$ should not be parsed as params");
+        assert_eq!(
+            r.params.len(),
+            0,
+            "content inside $$ should not be parsed as params"
+        );
     }
 
     #[test]
     fn tagged_dollar_quote_with_param_syntax_ignored() {
         let r = parse_query("SELECT $tag$has $param: i32 inside$tag$ FROM t").unwrap();
-        assert_eq!(r.params.len(), 0, "content inside $tag$ should not be parsed as params");
+        assert_eq!(
+            r.params.len(),
+            0,
+            "content inside $tag$ should not be parsed as params"
+        );
     }
 
     #[test]
     fn returning_in_update() {
-        let r = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32 RETURNING id, a").unwrap();
+        let r =
+            parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32 RETURNING id, a").unwrap();
         assert!(r.has_returning);
         assert_eq!(r.kind, QueryKind::Update);
     }
@@ -899,9 +1112,13 @@ mod tests {
 
     #[test]
     fn triple_duplicate_param_reuses_position() {
-        let r = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $x: i32 AND c = $x: i32").unwrap();
+        let r = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $x: i32 AND c = $x: i32")
+            .unwrap();
         assert_eq!(r.params.len(), 1);
-        assert_eq!(r.positional_sql, "SELECT id FROM t WHERE a = $1 AND b = $1 AND c = $1");
+        assert_eq!(
+            r.positional_sql,
+            "SELECT id FROM t WHERE a = $1 AND b = $1 AND c = $1"
+        );
     }
 
     #[test]
@@ -917,5 +1134,184 @@ mod tests {
         let r = parse_query("SELECT * FROM t WHERE a::text = $val: &str").unwrap();
         assert_eq!(r.params.len(), 1);
         assert!(r.positional_sql.contains("a::text"));
+    }
+
+    // --- optional clause parsing ---
+
+    #[test]
+    fn optional_clause_extracted() {
+        let r = parse_query("SELECT id FROM t WHERE 1 = 1 [AND a = $a: Option<i32>] ORDER BY id")
+            .unwrap();
+        assert_eq!(r.optional_clauses.len(), 1);
+        assert_eq!(r.optional_clauses[0].params.len(), 1);
+        assert_eq!(r.optional_clauses[0].params[0].name, "a");
+        assert_eq!(r.optional_clauses[0].params[0].rust_type, "Option<i32>");
+        assert_eq!(r.optional_clauses[0].index, 0);
+        // Base query should have no params
+        assert_eq!(r.params.len(), 0);
+        // Positional SQL should have placeholder, not raw bracket
+        assert!(
+            r.positional_sql.contains("{OPT_0}"),
+            "should contain placeholder: {}",
+            r.positional_sql
+        );
+        assert!(
+            !r.positional_sql.contains('['),
+            "should not contain [: {}",
+            r.positional_sql
+        );
+    }
+
+    #[test]
+    fn multiple_optional_clauses() {
+        let r = parse_query(
+            "SELECT id FROM t WHERE 1 = 1 \
+             [AND a = $a: Option<i32>] \
+             [AND b = $b: Option<&str>] ORDER BY id",
+        )
+        .unwrap();
+        assert_eq!(r.optional_clauses.len(), 2);
+        assert_eq!(r.optional_clauses[0].params[0].name, "a");
+        assert_eq!(r.optional_clauses[1].params[0].name, "b");
+        assert_eq!(r.optional_clauses[1].params[0].rust_type, "Option<&str>");
+    }
+
+    #[test]
+    fn optional_clause_with_base_params() {
+        let r = parse_query(
+            "SELECT id FROM t WHERE status = $s: &str \
+             [AND a = $a: Option<i32>]",
+        )
+        .unwrap();
+        assert_eq!(r.params.len(), 1);
+        assert_eq!(r.params[0].name, "s");
+        assert_eq!(r.optional_clauses.len(), 1);
+        assert_eq!(r.optional_clauses[0].params[0].name, "a");
+    }
+
+    #[test]
+    fn optional_clause_non_option_param_rejected() {
+        let r = parse_query("SELECT id FROM t WHERE 1 = 1 [AND a = $a: i32]");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(err.contains("Option<T>"), "should mention Option<T>: {err}");
+    }
+
+    #[test]
+    fn nested_brackets_rejected() {
+        let r = parse_query("SELECT id FROM t WHERE 1 = 1 [[AND a = $a: Option<i32>]]");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(err.contains("nested"), "should mention nested: {err}");
+    }
+
+    #[test]
+    fn unclosed_bracket_rejected() {
+        let r = parse_query("SELECT id FROM t WHERE 1 = 1 [AND a = $a: Option<i32>");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("unclosed") || err.contains("]"),
+            "should mention missing ]: {err}"
+        );
+    }
+
+    #[test]
+    fn unmatched_close_bracket_rejected() {
+        let r = parse_query("SELECT id FROM t WHERE 1 = 1 AND a = $a: i32]");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(err.contains("]"), "should mention ]: {err}");
+    }
+
+    #[test]
+    fn too_many_optional_clauses_rejected() {
+        // 9 optional clauses should be rejected (max 8)
+        let clauses: Vec<String> = (0..9)
+            .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
+            .collect();
+        let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
+        let r = parse_query(&sql);
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("9 optional clauses") && err.contains("maximum is 8"),
+            "should mention limit: {err}"
+        );
+    }
+
+    #[test]
+    fn eight_optional_clauses_accepted() {
+        let clauses: Vec<String> = (0..8)
+            .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
+            .collect();
+        let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
+        let r = parse_query(&sql).unwrap();
+        assert_eq!(r.optional_clauses.len(), 8);
+    }
+
+    #[test]
+    fn optional_clause_string_literal_preserved() {
+        let r = parse_query(
+            "SELECT id FROM t WHERE 1 = 1 [AND name ILIKE '%' || $s: Option<&str> || '%']",
+        )
+        .unwrap();
+        assert_eq!(r.optional_clauses.len(), 1);
+        assert!(
+            r.optional_clauses[0].sql_fragment.contains("'%'"),
+            "string literal lost: {}",
+            r.optional_clauses[0].sql_fragment
+        );
+    }
+
+    #[test]
+    fn optional_clause_cast_preserved() {
+        let r = parse_query("SELECT id FROM t WHERE 1 = 1 [AND status::text = $s: Option<&str>]")
+            .unwrap();
+        assert!(
+            r.optional_clauses[0].sql_fragment.contains("::text"),
+            "cast lost: {}",
+            r.optional_clauses[0].sql_fragment
+        );
+    }
+
+    #[test]
+    fn no_optional_clauses_empty_vec() {
+        let r = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        assert!(r.optional_clauses.is_empty());
+    }
+
+    #[test]
+    fn param_in_both_base_and_clause_rejected() {
+        let r = parse_query("SELECT id FROM t WHERE a = $x: i32 [AND b = $x: Option<i32>]");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("both in the base query and in an optional clause"),
+            "should mention scope conflict: {err}"
+        );
+    }
+
+    #[test]
+    fn bracket_without_option_param_rejected() {
+        // [1] is array subscript, not an optional clause
+        let r = parse_query("SELECT col[1] FROM t");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("must contain at least one"),
+            "should explain brackets need Option params: {err}"
+        );
+    }
+
+    #[test]
+    fn bracket_with_no_params_rejected() {
+        let r = parse_query("SELECT id FROM t WHERE 1 = 1 [AND status = 'active']");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("must contain at least one"),
+            "should explain brackets need params: {err}"
+        );
     }
 }

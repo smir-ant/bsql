@@ -9,15 +9,51 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+use crate::dynamic::QueryVariant;
 use crate::parse::ParsedQuery;
 use crate::validate::ValidationResult;
 
 /// Generate the complete Rust code for a `query!` invocation.
 pub fn generate_query_code(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
+    // Static queries (no optional clauses): original codegen path
+    if parsed.optional_clauses.is_empty() {
+        let result_struct = gen_result_struct(parsed, validation);
+        let executor_struct = gen_executor_struct(parsed);
+        let executor_impls = gen_executor_impls(parsed, validation);
+        let constructor = gen_constructor(parsed);
+
+        return quote! {
+            {
+                #result_struct
+                #executor_struct
+                #executor_impls
+                #constructor
+            }
+        };
+    }
+
+    // This should not be called for dynamic queries — use generate_dynamic_query_code
+    // But as a safety fallback, generate a compile error.
+    let msg = "internal error: generate_query_code called for dynamic query — use generate_dynamic_query_code";
+    quote! { compile_error!(#msg) }
+}
+
+/// Generate Rust code for a dynamic query with optional clauses.
+///
+/// The generated code includes:
+/// - A result struct (same for all variants — the SELECT list is identical)
+/// - An executor struct capturing all parameters (base + all optional)
+/// - A `match` dispatcher that selects the correct SQL variant and params
+///   based on which `Option` params are `Some`
+pub fn generate_dynamic_query_code(
+    parsed: &ParsedQuery,
+    validation: &ValidationResult,
+    variants: &[QueryVariant],
+) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
-    let executor_struct = gen_executor_struct(parsed);
-    let executor_impls = gen_executor_impls(parsed, validation);
-    let constructor = gen_constructor(parsed);
+    let executor_struct = gen_dynamic_executor_struct(parsed);
+    let executor_impls = gen_dynamic_executor_impls(parsed, validation, variants);
+    let constructor = gen_dynamic_constructor(parsed);
 
     quote! {
         {
@@ -197,6 +233,290 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 #execute_method
             }
         }
+    }
+}
+
+// ---- Dynamic query codegen ----
+
+/// Generate the executor struct for a dynamic query.
+///
+/// Captures all base params + all optional params (as their declared
+/// `Option<T>` types). Always has a lifetime because optional params
+/// may contain references.
+fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
+    let struct_name = executor_struct_name(parsed);
+
+    // Collect all fields: base params + optional clause params
+    let mut fields: Vec<TokenStream> = Vec::new();
+    let mut seen_names: Vec<String> = Vec::new();
+
+    for p in &parsed.params {
+        let name = format_ident!("{}", p.name);
+        let ty = inject_lifetime(&p.rust_type);
+        fields.push(quote! { #name: #ty });
+        seen_names.push(p.name.clone());
+    }
+
+    for clause in &parsed.optional_clauses {
+        for p in &clause.params {
+            if !seen_names.contains(&p.name) {
+                let name = format_ident!("{}", p.name);
+                let ty = inject_lifetime(&p.rust_type);
+                fields.push(quote! { #name: #ty });
+                seen_names.push(p.name.clone());
+            }
+        }
+    }
+
+    if fields.is_empty() {
+        // Unlikely: a dynamic query with no params at all
+        quote! {
+            #[allow(non_camel_case_types)]
+            struct #struct_name;
+        }
+    } else {
+        quote! {
+            #[allow(non_camel_case_types)]
+            struct #struct_name<'_sasql> {
+                #(#fields,)*
+                _marker: ::std::marker::PhantomData<&'_sasql ()>,
+            }
+        }
+    }
+}
+
+/// Generate the impl block for a dynamic query executor.
+///
+/// Contains `fetch_one`, `fetch_all`, `fetch_optional`, `execute` methods.
+/// Each method dispatches to the correct SQL variant via a `match` on
+/// which `Option` params are `Some`.
+fn gen_dynamic_executor_impls(
+    parsed: &ParsedQuery,
+    validation: &ValidationResult,
+    variants: &[QueryVariant],
+) -> TokenStream {
+    let executor_name = executor_struct_name(parsed);
+    let has_columns = !validation.columns.is_empty();
+    let has_any_params =
+        !parsed.params.is_empty() || parsed.optional_clauses.iter().any(|c| !c.params.is_empty());
+
+    // Build the match dispatcher that all methods share
+
+    let fetch_methods = if has_columns {
+        let result_name = result_struct_name(parsed);
+        let row_decode = gen_row_decode(validation);
+
+        // For fetch_one/fetch_optional: check if we can inject LIMIT 2
+        let needs_limit = has_columns
+            && parsed.kind == crate::parse::QueryKind::Select
+            && !parsed.normalized_sql.contains(" limit ")
+            && !parsed.normalized_sql.contains(" for ");
+
+        let fetch_one_dispatcher =
+            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit| {
+                quote! {
+                    let rows = executor.query_raw(#sql_lit, &params_slice[..]).await?;
+                    if rows.len() != 1 {
+                        return Err(::sasql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            rows.len() as u64,
+                        ));
+                    }
+                    let row = &rows[0];
+                    Ok(#result_name { #row_decode })
+                }
+            });
+
+        let fetch_all_dispatcher = gen_variant_dispatcher(parsed, variants, false, |sql_lit| {
+            quote! {
+                let rows = executor.query_raw(#sql_lit, &params_slice[..]).await?;
+                Ok(rows.iter().map(|row| #result_name { #row_decode }).collect())
+            }
+        });
+
+        let fetch_optional_dispatcher =
+            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit| {
+                quote! {
+                    let rows = executor.query_raw(#sql_lit, &params_slice[..]).await?;
+                    match rows.len() {
+                        0 => Ok(None),
+                        1 => {
+                            let row = &rows[0];
+                            Ok(Some(#result_name { #row_decode }))
+                        }
+                        n => Err(::sasql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
+                }
+            });
+
+        quote! {
+            pub async fn fetch_one<E: ::sasql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::sasql_core::SasqlResult<#result_name> {
+                #fetch_one_dispatcher
+            }
+
+            pub async fn fetch_all<E: ::sasql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::sasql_core::SasqlResult<Vec<#result_name>> {
+                #fetch_all_dispatcher
+            }
+
+            pub async fn fetch_optional<E: ::sasql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::sasql_core::SasqlResult<Option<#result_name>> {
+                #fetch_optional_dispatcher
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let execute_dispatcher = gen_variant_dispatcher(parsed, variants, false, |sql_lit| {
+        quote! {
+            executor.execute_raw(#sql_lit, &params_slice[..]).await
+        }
+    });
+
+    let execute_method = quote! {
+        pub async fn execute<E: ::sasql_core::Executor>(
+            self,
+            executor: &E,
+        ) -> ::sasql_core::SasqlResult<u64> {
+            #execute_dispatcher
+        }
+    };
+
+    if has_any_params {
+        quote! {
+            #[allow(non_camel_case_types)]
+            impl<'_sasql> #executor_name<'_sasql> {
+                #fetch_methods
+                #execute_method
+            }
+        }
+    } else {
+        quote! {
+            #[allow(non_camel_case_types)]
+            impl #executor_name {
+                #fetch_methods
+                #execute_method
+            }
+        }
+    }
+}
+
+/// Generate the variant match dispatcher.
+///
+/// Creates a `match (p0.is_some(), p1.is_some(), ...) { ... }` block
+/// where each arm builds the correct SQL string and params slice, then
+/// calls the provided `body_fn` closure.
+fn gen_variant_dispatcher<F>(
+    parsed: &ParsedQuery,
+    variants: &[QueryVariant],
+    inject_limit: bool,
+    body_fn: F,
+) -> TokenStream
+where
+    F: Fn(&str) -> TokenStream,
+{
+    let n = parsed.optional_clauses.len();
+    let discriminants: Vec<proc_macro2::Ident> = parsed
+        .optional_clauses
+        .iter()
+        .map(|c| format_ident!("{}", c.params[0].name))
+        .collect();
+
+    let match_tuple = quote! { (#(self.#discriminants.is_some()),*) };
+
+    let arms: Vec<TokenStream> = variants
+        .iter()
+        .map(|variant| {
+            // Build the match pattern: (true/false, true/false, ...)
+            let pattern_elements: Vec<TokenStream> = (0..n)
+                .map(|i| {
+                    if (variant.mask & (1 << i)) != 0 {
+                        quote! { true }
+                    } else {
+                        quote! { false }
+                    }
+                })
+                .collect();
+            let pattern = quote! { (#(#pattern_elements),*) };
+
+            // Build the SQL string
+            let sql_str = if inject_limit {
+                format!("{} LIMIT 2", variant.sql)
+            } else {
+                variant.sql.clone()
+            };
+
+            // Build the params slice for this variant
+            let param_bindings: Vec<TokenStream> = variant
+                .params
+                .iter()
+                .map(|p| {
+                    let name = format_ident!("{}", p.name);
+                    if p.rust_type.starts_with("Option<") {
+                        // Optional param — unwrap (we know it's Some in this arm)
+                        quote! { self.#name.as_ref().unwrap() as &(dyn ::sasql_core::pg::ToSql + Sync) }
+                    } else {
+                        quote! { &self.#name as &(dyn ::sasql_core::pg::ToSql + Sync) }
+                    }
+                })
+                .collect();
+
+            let body = body_fn(&sql_str);
+
+            quote! {
+                #pattern => {
+                    let params_slice: &[&(dyn ::sasql_core::pg::ToSql + Sync)] =
+                        &[#(#param_bindings),*];
+                    #body
+                }
+            }
+        })
+        .collect();
+
+    quote! {
+        match #match_tuple {
+            #(#arms)*
+        }
+    }
+}
+
+/// Generate the constructor for a dynamic query executor.
+fn gen_dynamic_constructor(parsed: &ParsedQuery) -> TokenStream {
+    let executor_name = executor_struct_name(parsed);
+
+    // Collect all field names: base + optional
+    let mut field_names: Vec<proc_macro2::Ident> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    for p in &parsed.params {
+        field_names.push(format_ident!("{}", p.name));
+        seen.push(p.name.clone());
+    }
+
+    for clause in &parsed.optional_clauses {
+        for p in &clause.params {
+            if !seen.contains(&p.name) {
+                field_names.push(format_ident!("{}", p.name));
+                seen.push(p.name.clone());
+            }
+        }
+    }
+
+    if field_names.is_empty() {
+        quote! { #executor_name }
+    } else {
+        quote! { #executor_name { #(#field_names,)* _marker: ::std::marker::PhantomData } }
     }
 }
 
@@ -698,8 +1018,14 @@ mod tests {
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(!code_str.contains("fetch_one"), "should not have fetch_one: {code_str}");
-        assert!(!code_str.contains("fetch_all"), "should not have fetch_all: {code_str}");
+        assert!(
+            !code_str.contains("fetch_one"),
+            "should not have fetch_one: {code_str}"
+        );
+        assert!(
+            !code_str.contains("fetch_all"),
+            "should not have fetch_all: {code_str}"
+        );
         assert!(code_str.contains("execute"), "missing execute: {code_str}");
     }
 
@@ -710,8 +1036,14 @@ mod tests {
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(code_str.contains("fetch_one"), "missing fetch_one: {code_str}");
-        assert!(code_str.contains("fetch_all"), "missing fetch_all: {code_str}");
+        assert!(
+            code_str.contains("fetch_one"),
+            "missing fetch_one: {code_str}"
+        );
+        assert!(
+            code_str.contains("fetch_all"),
+            "missing fetch_all: {code_str}"
+        );
     }
 
     // --- LIMIT injection edge cases ---
@@ -724,17 +1056,24 @@ mod tests {
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(!code_str.contains("LIMIT 2"), "INSERT RETURNING should NOT get LIMIT: {code_str}");
+        assert!(
+            !code_str.contains("LIMIT 2"),
+            "INSERT RETURNING should NOT get LIMIT: {code_str}"
+        );
     }
 
     #[test]
     fn update_returning_no_limit_injected() {
-        let parsed = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32 RETURNING id").unwrap();
+        let parsed =
+            parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32 RETURNING id").unwrap();
         let validation = make_validation(vec![col("id", "i32")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(!code_str.contains("LIMIT 2"), "UPDATE RETURNING should NOT get LIMIT: {code_str}");
+        assert!(
+            !code_str.contains("LIMIT 2"),
+            "UPDATE RETURNING should NOT get LIMIT: {code_str}"
+        );
     }
 
     #[test]
@@ -744,7 +1083,10 @@ mod tests {
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(!code_str.contains("LIMIT 2"), "FOR SHARE should NOT get LIMIT: {code_str}");
+        assert!(
+            !code_str.contains("LIMIT 2"),
+            "FOR SHARE should NOT get LIMIT: {code_str}"
+        );
     }
 
     // --- lifetime injection edge cases ---
@@ -753,28 +1095,38 @@ mod tests {
     fn inject_lifetime_vec_no_ref() {
         let ts = inject_lifetime("Vec<i32>");
         let s = ts.to_string();
-        assert!(!s.contains("'_sasql"), "Vec<i32> should have no lifetime: {s}");
+        assert!(
+            !s.contains("'_sasql"),
+            "Vec<i32> should have no lifetime: {s}"
+        );
     }
 
     #[test]
     fn inject_lifetime_option_i32_no_ref() {
         let ts = inject_lifetime("Option<i32>");
         let s = ts.to_string();
-        assert!(!s.contains("'_sasql"), "Option<i32> should have no lifetime: {s}");
+        assert!(
+            !s.contains("'_sasql"),
+            "Option<i32> should have no lifetime: {s}"
+        );
     }
 
     #[test]
     fn inject_lifetime_path_type() {
         let ts = inject_lifetime("time::OffsetDateTime");
         let s = ts.to_string();
-        assert!(!s.contains("'_sasql"), "time::OffsetDateTime needs no lifetime: {s}");
+        assert!(
+            !s.contains("'_sasql"),
+            "time::OffsetDateTime needs no lifetime: {s}"
+        );
     }
 
     // --- multiple params with refs and non-refs ---
 
     #[test]
     fn mixed_ref_and_owned_params() {
-        let parsed = parse_query("SELECT id FROM t WHERE a = $name: &str AND b = $id: i32").unwrap();
+        let parsed =
+            parse_query("SELECT id FROM t WHERE a = $name: &str AND b = $id: i32").unwrap();
         let validation = make_validation(vec![col("id", "i32")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
@@ -783,7 +1135,10 @@ mod tests {
         assert!(code_str.contains("name"), "missing name param: {code_str}");
         assert!(code_str.contains("id"), "missing id param: {code_str}");
         // The ref param should get a lifetime
-        assert!(code_str.contains("'_sasql"), "ref param should have lifetime: {code_str}");
+        assert!(
+            code_str.contains("'_sasql"),
+            "ref param should have lifetime: {code_str}"
+        );
     }
 
     // --- single column result struct ---
@@ -795,6 +1150,9 @@ mod tests {
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(code_str.contains("pub id : i32"), "single column struct: {code_str}");
+        assert!(
+            code_str.contains("pub id : i32"),
+            "single column struct: {code_str}"
+        );
     }
 }

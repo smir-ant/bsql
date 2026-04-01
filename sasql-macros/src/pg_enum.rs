@@ -600,8 +600,14 @@ mod tests {
         };
         let output = parse_enum(input);
         let code = output.to_string();
-        assert!(code.contains("\"high-priority\""), "missing hyphenated label: {code}");
-        assert!(code.contains("\"low priority\""), "missing spaced label: {code}");
+        assert!(
+            code.contains("\"high-priority\""),
+            "missing hyphenated label: {code}"
+        );
+        assert!(
+            code.contains("\"low priority\""),
+            "missing spaced label: {code}"
+        );
     }
 
     #[test]
@@ -614,7 +620,10 @@ mod tests {
         };
         let output = parse_enum(input);
         let code = output.to_string();
-        assert!(code.contains("this_is_a_very_long_sql_label"), "long label lost: {code}");
+        assert!(
+            code.contains("this_is_a_very_long_sql_label"),
+            "long label lost: {code}"
+        );
     }
 
     #[test]
@@ -640,7 +649,10 @@ mod tests {
         };
         let output = parse_enum(input);
         let code = output.to_string();
-        assert!(code.contains("pub (crate)"), "pub(crate) visibility lost: {code}");
+        assert!(
+            code.contains("pub (crate)"),
+            "pub(crate) visibility lost: {code}"
+        );
     }
 
     #[test]
@@ -733,7 +745,10 @@ mod tests {
         };
         let output = parse_enum(input);
         let code = output.to_string();
-        assert!(code.contains("to_sql_checked"), "missing to_sql_checked: {code}");
+        assert!(
+            code.contains("to_sql_checked"),
+            "missing to_sql_checked: {code}"
+        );
         assert!(code.contains("accepts"), "missing accepts check: {code}");
     }
 
