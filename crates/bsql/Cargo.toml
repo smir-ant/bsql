@@ -26,3 +26,4 @@ tokio-stream = { workspace = true }
 trybuild = "1"
 time = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+rust_decimal = { workspace = true }

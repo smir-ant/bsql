@@ -126,6 +126,7 @@ impl Drop for Transaction {
                 // connection. The pool slot is freed and a fresh connection
                 // will be created on the next acquire().
                 let _ = deadpool_postgres::Object::take(conn.inner);
+                #[cfg(debug_assertions)]
                 eprintln!(
                     "bsql: transaction dropped without commit() or rollback() \
                      — connection discarded from pool"

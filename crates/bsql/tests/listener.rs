@@ -254,3 +254,21 @@ async fn channel_name_sql_injection_attempt() {
     }
     // If it errored, that's also fine — the point is no injection
 }
+
+#[tokio::test]
+async fn listener_drop_cleans_up() {
+    {
+        let listener = Listener::connect(DB_URL).await.unwrap();
+        listener.listen("drop_test").await.unwrap();
+        // listener dropped here -- should not panic or leak
+    }
+    // If we got here, drop succeeded
+}
+
+#[tokio::test]
+async fn listener_debug_format() {
+    let listener = Listener::connect(DB_URL).await.unwrap();
+    let debug = format!("{:?}", listener);
+    assert!(debug.contains("Listener"), "debug: {debug}");
+    assert!(debug.contains("active"), "debug: {debug}");
+}

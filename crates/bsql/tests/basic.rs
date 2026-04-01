@@ -349,3 +349,46 @@ async fn array_column_type() {
     assert_eq!(user.id, 1);
     assert!(user.tag_ids.is_empty()); // default '{}'
 }
+
+#[tokio::test]
+async fn connect_invalid_url() {
+    let result = Pool::connect("not_a_url").await;
+    assert!(matches!(result, Err(BsqlError::Connect(_))));
+}
+
+#[tokio::test]
+async fn select_star() {
+    let pool = pool().await;
+    let id = 1i32;
+    let user = bsql::query!("SELECT * FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+}
+
+#[tokio::test]
+async fn pool_debug_format() {
+    let pool = pool().await;
+    let debug = format!("{:?}", pool);
+    assert!(debug.contains("Pool"), "debug: {debug}");
+    assert!(debug.contains("status"), "debug: {debug}");
+    assert!(debug.contains("is_pgbouncer"), "debug: {debug}");
+    assert!(debug.contains("replicas"), "debug: {debug}");
+}
+
+#[tokio::test]
+async fn pool_builder_url_method() {
+    let pool = Pool::builder()
+        .url("postgres://bsql:bsql@localhost/bsql_test")
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(users.len() >= 2);
+}

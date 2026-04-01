@@ -324,3 +324,59 @@ async fn insert_with_enum_literal() {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Enum string parameter tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn enum_string_as_param() {
+    let pool = pool().await;
+    let status = "new";
+    // Cast the enum column to text so &str param is accepted by PG.
+    let tickets = bsql::query!("SELECT id FROM tickets WHERE status::text = $status: &str")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!tickets.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Decimal tests (feature = "decimal")
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "decimal")]
+mod decimal_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn decimal_round_trip() {
+        let pool = pool().await;
+        let budget = rust_decimal::Decimal::new(12345, 2); // 123.45
+        let id = 1i32;
+
+        // Set budget
+        bsql::query!(
+            "UPDATE tickets SET budget = $budget: rust_decimal::Decimal WHERE id = $id: i32"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Read it back
+        let ticket = bsql::query!("SELECT id, budget FROM tickets WHERE id = $id: i32")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(ticket.id, 1);
+        let read_budget = ticket.budget.expect("budget should be set");
+        assert_eq!(read_budget, budget);
+
+        // Clean up -- set back to NULL
+        bsql::query!("UPDATE tickets SET budget = NULL WHERE id = $id: i32")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}

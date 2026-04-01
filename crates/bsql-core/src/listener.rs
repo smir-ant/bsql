@@ -228,6 +228,7 @@ async fn drive_connection<S, T>(
             Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => match tx.try_send(n) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    #[cfg(debug_assertions)]
                     eprintln!(
                         "bsql: listener notification dropped \
                              — channel buffer full (10000)"
@@ -239,7 +240,9 @@ async fn drive_connection<S, T>(
                 // Notices and other async messages — ignore
             }
             Some(Err(e)) => {
+                #[cfg(debug_assertions)]
                 eprintln!("bsql: listener connection error: {e}");
+                let _ = e; // suppress unused warning in release builds
                 return;
             }
             None => {

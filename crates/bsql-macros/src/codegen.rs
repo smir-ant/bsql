@@ -238,6 +238,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             ///
             /// Only available on `&Pool` — the returned stream holds a connection
             /// from the pool for its entire lifetime.
+            ///
+            /// The returned stream is `!Unpin`. Use `tokio::pin!` or `Box::pin`
+            /// before calling `StreamExt::next`.
             pub async fn fetch_stream(
                 self,
                 pool: &::bsql_core::Pool,
@@ -477,6 +480,9 @@ fn gen_dynamic_executor_impls(
             ///
             /// Only available on `&Pool` — the returned stream holds a connection
             /// from the pool for its entire lifetime.
+            ///
+            /// The returned stream is `!Unpin`. Use `tokio::pin!` or `Box::pin`
+            /// before calling `StreamExt::next`.
             pub async fn fetch_stream(
                 self,
                 pool: &::bsql_core::Pool,

@@ -1,0 +1,14 @@
+error: query has 9 optional clauses (512 variants) — maximum is 8 (256 variants). Split the query into smaller queries with fewer optional filters.
+  --> tests/compile_fail/too_many_optional_clauses.rs:11:13
+   |
+11 |       let _ = bsql::query!(
+   |  _____________^
+12 | |         "SELECT id FROM users WHERE 1=1
+13 | |          [AND id = $c0: Option<i32>]
+14 | |          [AND id = $c1: Option<i32>]
+...  |
+21 | |          [AND id = $c8: Option<i32>]"
+22 | |     );
+   | |_____^
+   |
+   = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

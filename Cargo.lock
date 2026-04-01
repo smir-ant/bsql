@@ -139,6 +139,7 @@ dependencies = [
  "bsql-core",
  "bsql-macros",
  "futures-core",
+ "rust_decimal",
  "time",
  "tokio",
  "tokio-stream",

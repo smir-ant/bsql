@@ -67,6 +67,36 @@ pub struct PoolBuilder {
 }
 
 impl PoolBuilder {
+    /// Configure the pool from a PostgreSQL connection URL.
+    ///
+    /// Parses `postgres://user:password@host:port/dbname` and fills in
+    /// host, port, dbname, user, and password. Other builder settings
+    /// (max_size, connect_timeout, replicas) are preserved.
+    ///
+    /// Returns an error if the URL cannot be parsed.
+    pub fn url(mut self, url: &str) -> Result<Self, BsqlError> {
+        let config: tokio_postgres::Config = url
+            .parse()
+            .map_err(|e: tokio_postgres::Error| ConnectError::create(e.to_string()))?;
+
+        self.host = config.get_hosts().first().map(|h| match h {
+            tokio_postgres::config::Host::Tcp(s) => s.clone(),
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+        });
+        self.port = config.get_ports().first().copied();
+        self.dbname = config.get_dbname().map(String::from);
+        self.user = config.get_user().map(String::from);
+        self.password =
+            match config.get_password() {
+                Some(p) => Some(String::from_utf8(p.to_vec()).map_err(|_| {
+                    ConnectError::create("database password contains invalid UTF-8")
+                })?),
+                None => None,
+            };
+        Ok(self)
+    }
+
     pub fn host(mut self, host: &str) -> Self {
         self.host = Some(host.into());
         self
@@ -153,7 +183,8 @@ impl PoolBuilder {
         let mut replicas = Vec::with_capacity(self.replica_urls.len());
         let mut merged_pgbouncer = pgbouncer;
         for url in &self.replica_urls {
-            let replica_pool = create_pool_from_url(url, self.max_size).await?;
+            let replica_pool =
+                create_pool_from_url(url, self.max_size, self.connect_timeout_secs).await?;
             let replica_pgb = detect_pgbouncer(&replica_pool).await?;
             if replica_pgb.detected {
                 merged_pgbouncer.detected = true;
@@ -443,6 +474,16 @@ impl Pool {
     }
 }
 
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pool")
+            .field("status", &self.status())
+            .field("is_pgbouncer", &self.pgbouncer.detected)
+            .field("replicas", &self.replicas.len())
+            .finish()
+    }
+}
+
 /// A connection borrowed from the pool.
 ///
 /// Returned to the pool when dropped.
@@ -469,7 +510,11 @@ pub struct PoolStatus {
 /// Create a deadpool-postgres pool from a connection URL.
 ///
 /// Used internally for both primary and replica pools.
-async fn create_pool_from_url(url: &str, max_size: usize) -> BsqlResult<deadpool_postgres::Pool> {
+async fn create_pool_from_url(
+    url: &str,
+    max_size: usize,
+    connect_timeout_secs: u64,
+) -> BsqlResult<deadpool_postgres::Pool> {
     let config: tokio_postgres::Config = url
         .parse()
         .map_err(|e: tokio_postgres::Error| ConnectError::create(e.to_string()))?;
@@ -490,7 +535,7 @@ async fn create_pool_from_url(url: &str, max_size: usize) -> BsqlResult<deadpool
         ),
         None => None,
     };
-    cfg.connect_timeout = Some(std::time::Duration::from_secs(5));
+    cfg.connect_timeout = Some(std::time::Duration::from_secs(connect_timeout_secs));
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     });
