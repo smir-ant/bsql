@@ -5,7 +5,7 @@
 - **Pure SQL, not a DSL.** Write real PostgreSQL — CTEs, JOINs, window functions, subqueries. If you know SQL, you know bsql.
 - **100% unsafe-free.** Guaranteed by the Rust compiler. No exceptions, no opt-outs.
 - **Fail-fast, not fail-silent.** No timeouts. No "wait and hope". Every failure is immediate and explicit.
-- **Dangerous SQL won't compile.** `UPDATE` without `WHERE`, wrong column type, nonexistent table — all caught before the binary is produced.
+- **Dangerous SQL won't compile.** Wrong column type, nonexistent table, SQL injection attempts — all caught before the binary is produced.
 
 ```rust
 let id = 42i32;
@@ -31,7 +31,7 @@ What bsql does differently:
 - **Inline SQL** — the query is where it's used. No jumping between files. Code review sees SQL and Rust in the same diff.
 - **No unchecked path** — not "be disciplined and use the safe function". There is only one function. It is safe.
 - **Dynamic queries** — optional clauses `[AND col = $param]` expand to every combination at compile time. Each combination is validated. No string concatenation.
-- **Built for performance** — arena allocation, binary PostgreSQL protocol, SIMD-accelerated processing, sonic-rs for JSONB. Not optimizations added later — architectural decisions.
+- **Built for performance** — optimized connection pooling, prepared statement caching, fail-fast error handling. Architecture designed for arena allocation, binary protocol, and SIMD (planned for v1.0).
 
 ## What Gets Checked at Compile Time
 
@@ -41,8 +41,8 @@ What bsql does differently:
 | Column doesn't exist | `column "naem" not found in table "users"` |
 | Wrong parameter type | `expected i32, found &str for column "users.id"` |
 | Nullable column | Automatically becomes `Option<T>` — you can't forget to handle NULL |
-| `UPDATE` without `WHERE` | Won't compile — prevents accidental full-table updates |
-| `DELETE` without `WHERE` | Won't compile — same protection |
+| `UPDATE` without `WHERE` | Compile warning — flags accidental full-table updates (planned) |
+| `DELETE` without `WHERE` | Compile warning — same protection (planned) |
 | SQL syntax error | PostgreSQL's own error message, at compile time |
 
 ## Quick Start
