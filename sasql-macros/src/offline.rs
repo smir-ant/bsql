@@ -487,10 +487,10 @@ mod tests {
         assert_eq!(validation.columns.len(), 2);
         assert_eq!(validation.columns[0].name, "id");
         assert_eq!(validation.columns[0].pg_oid, 23);
-        assert_eq!(validation.columns[0].is_nullable, false);
+        assert!(!validation.columns[0].is_nullable);
         assert_eq!(validation.columns[0].rust_type, "i32");
         assert_eq!(validation.columns[1].name, "name");
-        assert_eq!(validation.columns[1].is_nullable, true);
+        assert!(validation.columns[1].is_nullable);
         assert_eq!(validation.columns[1].rust_type, "Option<String>");
         assert_eq!(validation.param_pg_oids, vec![23]);
         assert_eq!(validation.param_is_pg_enum, vec![false]);
