@@ -9,8 +9,10 @@ extern crate proc_macro;
 mod codegen;
 mod connection;
 mod parse;
+mod pg_enum;
 mod sql_norm;
 mod stmt_name;
+pub(crate) mod types;
 mod validate;
 
 use proc_macro::TokenStream;
@@ -86,4 +88,41 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
 fn extract_sql(input: proc_macro2::TokenStream) -> Result<String, syn::Error> {
     let lit: syn::LitStr = syn::parse2(input)?;
     Ok(lit.value())
+}
+
+/// Derive PostgreSQL enum <-> Rust enum mapping with `FromSql` and `ToSql`.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// #[sasql::pg_enum]
+/// pub enum TicketStatus {
+///     #[sql("new")]
+///     New,
+///     #[sql("in_progress")]
+///     InProgress,
+///     #[sql("resolved")]
+///     Resolved,
+///     #[sql("closed")]
+///     Closed,
+/// }
+/// ```
+///
+/// Each variant must have a `#[sql("label")]` attribute mapping it to the
+/// exact PostgreSQL enum label. The macro generates:
+/// - `FromSql` — deserializes from PostgreSQL text representation
+/// - `ToSql` — serializes to PostgreSQL text representation
+/// - `Display` — formats as the SQL label
+/// - Derives: `Debug, Clone, Copy, PartialEq, Eq, Hash`
+///
+/// If PostgreSQL sends a variant not present in the Rust enum, `FromSql`
+/// returns an error describing the schema mismatch.
+#[proc_macro_attribute]
+pub fn pg_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr2: proc_macro2::TokenStream = attr.into();
+    let item2: proc_macro2::TokenStream = item.into();
+    match pg_enum::expand_pg_enum(attr2, item2) {
+        Ok(output) => output.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
 }

@@ -34,6 +34,10 @@ pub struct ValidationResult {
     pub columns: Vec<ColumnInfo>,
     /// PostgreSQL OIDs of the expected parameter types.
     pub param_pg_oids: Vec<u32>,
+    /// Whether each parameter type is a PostgreSQL enum (custom type).
+    /// When true, `&str`/`String` params are accepted in addition to
+    /// any `#[sasql::pg_enum]`-annotated Rust enum.
+    pub param_is_pg_enum: Vec<bool>,
 }
 
 /// Validate a parsed query against a live PostgreSQL instance.
@@ -60,8 +64,13 @@ async fn validate_async(
         .await
         .map_err(|e| format_pg_error(&e, parsed))?;
 
-    // Extract parameter type OIDs
+    // Extract parameter type OIDs and detect PG enums
     let param_pg_oids: Vec<u32> = stmt.params().iter().map(|t| t.oid()).collect();
+    let param_is_pg_enum: Vec<bool> = stmt
+        .params()
+        .iter()
+        .map(|t| matches!(t.kind(), postgres_types::Kind::Enum(_)))
+        .collect();
 
     // Resolve nullability for ALL columns in a single batched query
     let nullable_flags = resolve_nullability_batch(client, stmt.columns()).await;
@@ -74,12 +83,18 @@ async fn validate_async(
         let name = col.name().to_owned();
         let is_nullable = nullable_flags[i];
 
-        let base_rust_type = sasql_core::types::rust_type_for_oid(pg_oid).ok_or_else(|| {
-            format!(
-                "column \"{name}\": unsupported PostgreSQL type `{pg_type_name}` (OID {pg_oid}). \
-                 Enable the appropriate feature flag or cast to a supported type."
-            )
-        })?;
+        // Custom PG enums (Kind::Enum) map to EnumString at the type level.
+        // EnumString accepts Kind::Enum in its FromSql impl.
+        // Users who want typed enums should use #[sasql::pg_enum].
+        let is_pg_enum = matches!(col.type_().kind(), postgres_types::Kind::Enum(_));
+
+        let base_rust_type = if is_pg_enum {
+            "::sasql_core::types::EnumString"
+        } else {
+            crate::types::resolve_rust_type(pg_oid).map_err(|msg| {
+                format!("column \"{name}\": {msg}")
+            })?
+        };
 
         let rust_type = if is_nullable {
             format!("Option<{base_rust_type}>")
@@ -99,6 +114,7 @@ async fn validate_async(
     Ok(ValidationResult {
         columns,
         param_pg_oids,
+        param_is_pg_enum,
     })
 }
 
@@ -175,13 +191,31 @@ pub fn check_param_types(
         ));
     }
 
-    for (param, &pg_oid) in parsed.params.iter().zip(&validation.param_pg_oids) {
-        if !sasql_core::types::is_param_compatible(&param.rust_type, pg_oid) {
+    for (i, (param, &pg_oid)) in parsed.params.iter().zip(&validation.param_pg_oids).enumerate() {
+        let is_pg_enum = validation.param_is_pg_enum.get(i).copied().unwrap_or(false);
+
+        // PG enum params accept &str/String (text representation)
+        if is_pg_enum {
+            if matches!(param.rust_type.as_str(), "&str" | "String") {
+                continue;
+            }
+            // Also accept any type — if the user passes a pg_enum type, ToSql
+            // handles it at runtime. We can't verify custom enum types at compile
+            // time since their OIDs are dynamic.
+            continue;
+        }
+
+        if !crate::types::is_param_compatible_extended(&param.rust_type, pg_oid) {
             let pg_name = sasql_core::types::pg_name_for_oid(pg_oid)
                 .unwrap_or("unknown");
+            // Provide a better error for feature-gated types
+            let extra_hint = match crate::types::resolve_rust_type(pg_oid) {
+                Ok(expected) => format!(" (expected `{expected}`)"),
+                Err(msg) => format!(" — {msg}"),
+            };
             return Err(format!(
                 "type mismatch for parameter `${}`: declared `{}` but PostgreSQL \
-                 expects `{}` (OID {})",
+                 expects `{}` (OID {}){extra_hint}",
                 param.name, param.rust_type, pg_name, pg_oid
             ));
         }

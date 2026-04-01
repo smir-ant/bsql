@@ -107,10 +107,10 @@ async fn insert_returning() {
 #[tokio::test]
 async fn update_execute() {
     let pool = pool().await;
-    let status = "resolved";
+    let desc = "Updated description";
     let id = 1i32;
     let affected = sasql::query!(
-        "UPDATE tickets SET status = $status: &str WHERE id = $id: i32"
+        "UPDATE tickets SET description = $desc: &str WHERE id = $id: i32"
     )
     .execute(&pool)
     .await

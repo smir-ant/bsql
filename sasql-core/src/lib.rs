@@ -7,6 +7,11 @@
 //!
 //! You should not depend on this crate directly — use [`sasql`] instead.
 
+/// Re-export `postgres_types` so generated code (pg_enum) can reference it
+/// via `::sasql_core::pg_types::*` without requiring users to add
+/// `postgres-types` as a direct dependency.
+pub use postgres_types as pg_types;
+
 pub mod error;
 pub mod executor;
 pub mod pool;

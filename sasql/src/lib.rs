@@ -58,11 +58,17 @@
 //! | `.fetch_optional(&pool)` | `Option<T>` | 2+ rows |
 //! | `.execute(&pool)` | `u64` (affected rows) | never |
 
-// Re-export the query! macro
+// Re-export the query! macro and pg_enum attribute macro
 pub use sasql_macros::query;
+pub use sasql_macros::pg_enum;
 
 // Re-export all runtime types
 pub use sasql_core::error::{self, SasqlError, SasqlResult};
 pub use sasql_core::executor::Executor;
 pub use sasql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 pub use sasql_core::types;
+
+// Re-export the postgres_types crate so pg_enum generated code can access it
+// via `::sasql_core::pg_types::*` paths.
+#[doc(hidden)]
+pub use sasql_core::pg_types;

@@ -4,6 +4,10 @@
 DROP TABLE IF EXISTS ticket_events CASCADE;
 DROP TABLE IF EXISTS tickets CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
+DROP TYPE IF EXISTS ticket_status CASCADE;
+
+-- v0.2: PostgreSQL enum type for pg_enum tests
+CREATE TYPE ticket_status AS ENUM ('new', 'in_progress', 'resolved', 'closed');
 
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
@@ -24,11 +28,16 @@ CREATE TABLE tickets (
     id SERIAL PRIMARY KEY,
     title TEXT NOT NULL,
     description TEXT,               -- nullable
-    status TEXT NOT NULL DEFAULT 'new',
+    status ticket_status NOT NULL DEFAULT 'new',
     department_id INTEGER,          -- nullable
     assignee_id INTEGER,            -- nullable
     created_by_user_id INTEGER NOT NULL REFERENCES users(id),
-    deleted_at TIMESTAMP WITH TIME ZONE  -- nullable
+    deleted_at TIMESTAMP WITH TIME ZONE,  -- nullable, for timestamptz test
+    -- v0.2 columns for extended type tests
+    deadline TIMESTAMPTZ,           -- nullable, feature-gated (time/chrono)
+    ticket_uuid UUID NOT NULL DEFAULT gen_random_uuid(),
+    created_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    start_time TIME                 -- nullable
 );
 
 -- Seed data

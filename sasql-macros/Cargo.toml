@@ -9,6 +9,12 @@ description = "Proc macros for sasql — compile-time safe SQL for Rust"
 [lib]
 proc-macro = true
 
+[features]
+default = []
+time = []
+chrono = []
+uuid = []
+
 [dependencies]
 syn = { workspace = true }
 quote = { workspace = true }

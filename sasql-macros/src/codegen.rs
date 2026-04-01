@@ -351,6 +351,7 @@ mod tests {
         ValidationResult {
             columns,
             param_pg_oids: vec![],
+            param_is_pg_enum: vec![],
         }
     }
 

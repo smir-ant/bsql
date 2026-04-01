@@ -95,6 +95,64 @@ pub fn is_param_compatible(rust_type: &str, pg_oid: u32) -> bool {
     )
 }
 
+/// A `String` that can be deserialized from PostgreSQL enum types.
+///
+/// PostgreSQL sends enum values as text (UTF-8 byte slices), but `String`'s
+/// `FromSql` implementation only accepts `TEXT`, `VARCHAR`, `BPCHAR`, `NAME`,
+/// and `UNKNOWN`. This wrapper adds `Kind::Enum` acceptance.
+///
+/// Generated code uses this for PG enum columns mapped to `String`. Users
+/// who want typed enums should use `#[sasql::pg_enum]` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EnumString(pub String);
+
+impl std::fmt::Display for EnumString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for EnumString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for EnumString {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for EnumString {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl<'a> postgres_types::FromSql<'a> for EnumString {
+    fn from_sql(
+        _ty: &postgres_types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let s = std::str::from_utf8(raw)?;
+        Ok(EnumString(s.to_owned()))
+    }
+
+    fn accepts(ty: &postgres_types::Type) -> bool {
+        // Accept both text-like types AND custom enum types
+        matches!(
+            *ty,
+            postgres_types::Type::VARCHAR
+                | postgres_types::Type::TEXT
+                | postgres_types::Type::BPCHAR
+                | postgres_types::Type::NAME
+                | postgres_types::Type::UNKNOWN
+        ) || matches!(ty.kind(), postgres_types::Kind::Enum(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

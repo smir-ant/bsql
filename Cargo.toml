@@ -23,6 +23,11 @@ proc-macro2 = "1.0.106"
 # Performance
 rapidhash = "4.4.1"
 
+# Feature-gated type support
+time = { version = "0.3", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+uuid = { version = "1", default-features = false }
+
 # Internal
 sasql-core = { path = "sasql-core", version = "0.1.0" }
 sasql-macros = { path = "sasql-macros", version = "0.1.0" }

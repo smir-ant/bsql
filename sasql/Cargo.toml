@@ -8,6 +8,9 @@ description = "Safe SQL for Rust — if it compiles, the SQL is correct"
 
 [features]
 default = []
+time = ["sasql-core/time", "sasql-macros/time"]
+chrono = ["sasql-core/chrono", "sasql-macros/chrono"]
+uuid = ["sasql-core/uuid", "sasql-macros/uuid"]
 
 [dependencies]
 sasql-core = { workspace = true }
@@ -16,3 +19,5 @@ sasql-macros = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 trybuild = "1"
+time = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
