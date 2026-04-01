@@ -135,7 +135,19 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 - **Not an ORM.** You write SQL, not method chains.
 - **Not a query builder.** No `.filter()`, `.select()`, `.join()`.
 - **Not database-agnostic.** PostgreSQL only.
-- **Not a migration tool.** Use dbmate, sqitch, or whatever you prefer.
+- **Not a migration tool.** Use dbmate, sqitch, refinery, or whatever you prefer.
+
+## What bsql Doesn't Cover (and Why)
+
+95%+ of application code is regular SELECT/INSERT/UPDATE/DELETE with fixed table names. bsql covers that with absolute compile-time safety. The remaining cases are intentionally outside bsql's scope:
+
+**DDL / Migrations.** `CREATE TABLE`, `DROP INDEX`, `ALTER TABLE`, `GRANT` — PostgreSQL's `PREPARE` does not accept DDL statements, so compile-time validation is impossible. More importantly, migrations *change* the schema that bsql validates against — checking them against the current schema is meaningless. Use a dedicated migration tool (dbmate, sqitch, refinery, sqlx-cli).
+
+**Dynamic table/column names.** `SELECT * FROM {runtime_table_name}` — `PREPARE` does not accept parameters in identifier positions (`$1` works for values, not for table or column names). Multi-tenant applications with per-tenant tables (`tenant_123_orders`) or admin panels browsing arbitrary tables fall into this category. Solution: a fixed set of `query!()` calls per known table, or use `tokio-postgres` directly for these specific admin/infrastructure queries.
+
+**Server-side dynamic SQL.** `DO $$ BEGIN EXECUTE format(...); END $$` — PostgreSQL validates the outer `DO` block at `PREPARE` time but does not validate the dynamically constructed SQL inside `EXECUTE format(...)`. It runs only at execution time.
+
+Migrations, admin panels, and multi-tenant dynamic tables are infrastructure — they don't belong in application business logic. bsql secures the 95% that does. For the remaining 5%, use `tokio-postgres` alongside bsql — two tools, each for its purpose.
 
 ## Roadmap
 
