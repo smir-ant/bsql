@@ -778,6 +778,32 @@ mod tests {
         assert_eq!(r.kind, QueryKind::Insert);
     }
 
+    #[test]
+    fn detect_cte_insert_with_select_tail() {
+        // The inner SELECT is at depth > 0 (inside parens).
+        // The INSERT is the first depth-0 DML keyword after WITH.
+        // The trailing SELECT (after INSERT INTO t) is also depth-0 but
+        // INSERT is encountered first — correctly classified as INSERT.
+        let r = parse_query(
+            "WITH data AS (SELECT id, name FROM source WHERE active = true) \
+             INSERT INTO target (id, name) SELECT id, name FROM data",
+        )
+        .unwrap();
+        assert_eq!(r.kind, QueryKind::Insert);
+    }
+
+    #[test]
+    fn detect_cte_recursive_select() {
+        // RECURSIVE CTE: the inner SELECT is at depth > 0.
+        // The outer SELECT at depth=0 is the main statement.
+        let r = parse_query(
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 10) \
+             SELECT * FROM t",
+        )
+        .unwrap();
+        assert_eq!(r.kind, QueryKind::Select);
+    }
+
     // --- RETURNING ---
 
     #[test]

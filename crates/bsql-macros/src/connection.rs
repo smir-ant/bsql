@@ -51,6 +51,11 @@ static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| 
         }
     });
 
+    // Set a statement timeout so that a runaway PREPARE or EXPLAIN
+    // at compile time cannot hang the build indefinitely.
+    rt.block_on(client.simple_query("SET statement_timeout = '30s'"))
+        .map_err(|e| format!("bsql: failed to set statement_timeout: {e}"))?;
+
     Ok(MacroConnection {
         runtime: rt,
         client,

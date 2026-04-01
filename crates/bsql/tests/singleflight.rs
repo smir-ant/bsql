@@ -46,23 +46,28 @@ async fn singleflight_fetch_all_works() {
 /// We can't directly observe singleflight coalescing from the outside,
 /// but we can verify that N concurrent identical queries all return
 /// correct results without errors.
+///
+/// Uses `tokio::spawn` so all 10 queries are genuinely concurrent --
+/// a sequential for-loop would never actually race and would not
+/// exercise the singleflight coalescing path.
 #[tokio::test]
 async fn concurrent_identical_queries_all_succeed() {
-    let pool = pool().await;
+    use std::sync::Arc;
+
+    let pool = Arc::new(pool().await);
 
     let mut handles = Vec::new();
     for _ in 0..10 {
-        let pool_ref = &pool;
-        handles.push(async move {
+        let pool = Arc::clone(&pool);
+        handles.push(tokio::spawn(async move {
             bsql::query!("SELECT id, login FROM users ORDER BY id")
-                .fetch_all(pool_ref)
+                .fetch_all(pool.as_ref())
                 .await
-        });
+        }));
     }
 
-    let results = futures_core_join_all(handles).await;
-    for result in results {
-        let users = result.unwrap();
+    for handle in handles {
+        let users = handle.await.expect("task panicked").unwrap();
         assert!(users.len() >= 2);
         assert_eq!(users[0].login, "alice");
     }
@@ -129,17 +134,4 @@ async fn execute_not_affected_by_singleflight() {
         .await
         .unwrap();
     assert_eq!(affected, 1);
-}
-
-/// Helper to join multiple futures. We avoid adding tokio::join! for N futures
-/// by collecting into a Vec and using select_all-style iteration.
-async fn futures_core_join_all<F, T>(futures: Vec<F>) -> Vec<T>
-where
-    F: std::future::Future<Output = T>,
-{
-    let mut results = Vec::with_capacity(futures.len());
-    for fut in futures {
-        results.push(fut.await);
-    }
-    results
 }

@@ -115,6 +115,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 
     if parsed.params.is_empty() {
         quote! {
+            #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
             #[allow(non_camel_case_types)]
             struct #struct_name;
         }
@@ -126,6 +127,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         });
 
         quote! {
+            #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
             #[allow(non_camel_case_types)]
             struct #struct_name<'_bsql> {
                 #(#fields,)*
@@ -350,11 +352,13 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     if fields.is_empty() {
         // Unlikely: a dynamic query with no params at all
         quote! {
+            #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
             #[allow(non_camel_case_types)]
             struct #struct_name;
         }
     } else {
         quote! {
+            #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
             #[allow(non_camel_case_types)]
             struct #struct_name<'_bsql> {
                 #(#fields,)*
@@ -1281,14 +1285,17 @@ mod tests {
         let code_str = code.to_string();
 
         assert!(
-            !code_str.contains("fetch_one"),
-            "should not have fetch_one: {code_str}"
+            !code_str.contains("fn fetch_one"),
+            "should not have fn fetch_one: {code_str}"
         );
         assert!(
-            !code_str.contains("fetch_all"),
-            "should not have fetch_all: {code_str}"
+            !code_str.contains("fn fetch_all"),
+            "should not have fn fetch_all: {code_str}"
         );
-        assert!(code_str.contains("execute"), "missing execute: {code_str}");
+        assert!(
+            code_str.contains("fn execute"),
+            "missing fn execute: {code_str}"
+        );
     }
 
     #[test]

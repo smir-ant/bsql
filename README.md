@@ -94,6 +94,18 @@ bsql = { version = "0.7", features = ["time", "uuid", "decimal"] }
 
 If your query touches a column that needs a feature you haven't enabled, you get a compile error naming the exact feature to add.
 
+## Compile-Time EXPLAIN Plans
+
+Enable the `explain` feature to see the query plan at compile time:
+
+```toml
+bsql = { version = "0.7", features = ["explain"] }
+```
+
+When enabled, bsql runs `EXPLAIN` on every query during compilation and embeds the plan as a doc comment on the generated result struct. Hover over any query result type in your IDE to see the plan — no round-trip to `psql` needed.
+
+This is a development-only tool. Disable it in CI and release builds to avoid the extra PG round-trip per query.
+
 ## PostgreSQL Enums
 
 ```rust

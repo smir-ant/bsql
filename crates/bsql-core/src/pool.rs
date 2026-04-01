@@ -145,10 +145,22 @@ impl PoolBuilder {
         // FIX 11: detect PgBouncer -- propagate connection failure
         let pgbouncer = detect_pgbouncer(&pool).await?;
 
-        // Build replica pools
+        // Build replica pools, detecting PgBouncer on each.
+        // If ANY pool (primary or replica) is behind PgBouncer, we disable
+        // named prepared statements globally. This is conservative but safe:
+        // a mixed topology is unusual, and the performance cost of unnamed
+        // statements is negligible compared to a hard failure.
         let mut replicas = Vec::with_capacity(self.replica_urls.len());
+        let mut merged_pgbouncer = pgbouncer;
         for url in &self.replica_urls {
             let replica_pool = create_pool_from_url(url, self.max_size).await?;
+            let replica_pgb = detect_pgbouncer(&replica_pool).await?;
+            if replica_pgb.detected {
+                merged_pgbouncer.detected = true;
+                if !replica_pgb.supports_named_stmts {
+                    merged_pgbouncer.supports_named_stmts = false;
+                }
+            }
             replicas.push(replica_pool);
         }
 
@@ -156,7 +168,7 @@ impl PoolBuilder {
             primary: pool,
             replicas,
             replica_idx: std::sync::atomic::AtomicUsize::new(0),
-            pgbouncer,
+            pgbouncer: merged_pgbouncer,
             singleflight: Singleflight::new(),
         })
     }

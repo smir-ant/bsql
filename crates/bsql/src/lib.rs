@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! bsql = "0.6"
+//! bsql = "0.7"
 //! tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 //! ```
 //!

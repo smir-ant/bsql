@@ -22,21 +22,21 @@ use tokio_postgres::NoTls;
 use crate::error::{BsqlError, BsqlResult, ConnectError};
 
 /// A notification received from PostgreSQL via LISTEN/NOTIFY.
+///
+/// Zero-copy wrapper around `tokio_postgres::Notification` — avoids
+/// allocating two `String`s per notification.
 #[derive(Debug, Clone)]
-pub struct Notification {
-    channel: String,
-    payload: String,
-}
+pub struct Notification(tokio_postgres::Notification);
 
 impl Notification {
     /// The channel name this notification was raised on.
     pub fn channel(&self) -> &str {
-        &self.channel
+        self.0.channel()
     }
 
     /// The payload string attached to the notification (may be empty).
     pub fn payload(&self) -> &str {
-        &self.payload
+        self.0.payload()
     }
 }
 
@@ -151,10 +151,7 @@ impl Listener {
         self.rx
             .recv()
             .await
-            .map(|n| Notification {
-                channel: n.channel().to_owned(),
-                payload: n.payload().to_owned(),
-            })
+            .map(Notification)
             .ok_or_else(|| ConnectError::create("listener connection closed"))
     }
 
@@ -297,24 +294,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn notification_accessors() {
-        let n = Notification {
-            channel: "test".into(),
-            payload: "hello".into(),
-        };
-        assert_eq!(n.channel(), "test");
-        assert_eq!(n.payload(), "hello");
-    }
-
-    #[test]
-    fn notification_clone() {
-        let n = Notification {
-            channel: "ch".into(),
-            payload: "data".into(),
-        };
-        let cloned = n.clone();
-        assert_eq!(cloned.channel(), "ch");
-        assert_eq!(cloned.payload(), "data");
-    }
+    // Notification accessor and clone tests are exercised by the integration
+    // tests (listener.rs) via a real PostgreSQL LISTEN/NOTIFY round-trip.
+    // Unit-level construction is not possible because tokio_postgres::Notification
+    // has private fields with no public constructor.
 }
