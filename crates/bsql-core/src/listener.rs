@@ -17,6 +17,7 @@
 //! channel.
 
 use tokio::sync::mpsc;
+#[cfg(not(feature = "tls"))]
 use tokio_postgres::NoTls;
 
 use crate::error::{BsqlError, BsqlResult, ConnectError};
@@ -88,15 +89,32 @@ impl Listener {
     /// Opens a dedicated connection (not from any pool). The connection
     /// is driven by a background tokio task.
     pub async fn connect(url: &str) -> BsqlResult<Self> {
-        let (client, connection) = tokio_postgres::connect(url, NoTls)
-            .await
-            .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
-
         let (tx, rx) = mpsc::channel(NOTIFICATION_BUFFER_SIZE);
 
-        let handle = tokio::spawn(async move {
-            drive_connection(connection, tx).await;
-        });
+        #[cfg(feature = "tls")]
+        let (client, handle) = {
+            let tls = crate::pool::make_rustls_connect();
+            let (client, connection) = tokio_postgres::connect(url, tls)
+                .await
+                .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
+            let tx = tx;
+            let handle = tokio::spawn(async move {
+                drive_connection(connection, tx).await;
+            });
+            (client, handle)
+        };
+
+        #[cfg(not(feature = "tls"))]
+        let (client, handle) = {
+            let (client, connection) = tokio_postgres::connect(url, NoTls)
+                .await
+                .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
+            let tx = tx;
+            let handle = tokio::spawn(async move {
+                drive_connection(connection, tx).await;
+            });
+            (client, handle)
+        };
 
         Ok(Listener {
             client,

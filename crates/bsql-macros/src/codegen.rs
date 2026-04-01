@@ -796,8 +796,8 @@ mod tests {
     fn make_validation(columns: Vec<ColumnInfo>) -> ValidationResult {
         ValidationResult {
             columns,
-            param_pg_oids: vec![],
-            param_is_pg_enum: vec![],
+            param_pg_oids: smallvec::smallvec![],
+            param_is_pg_enum: smallvec::smallvec![],
             #[cfg(feature = "explain")]
             explain_plan: None,
         }

@@ -4,6 +4,8 @@
 //! Each variant is a complete SQL string with correct parameter numbering,
 //! ready for PREPARE validation and runtime execution.
 
+use smallvec::SmallVec;
+
 use crate::parse::{Param, ParsedQuery};
 
 /// A single concrete SQL variant with a specific combination of
@@ -14,7 +16,7 @@ pub struct QueryVariant {
     pub sql: String,
     /// All parameters for this variant, in positional order.
     /// Base params first, then included optional clause params.
-    pub params: Vec<Param>,
+    pub params: SmallVec<[Param; 4]>,
     /// Bitmask of which optional clauses are included.
     /// Bit 0 = clause 0, bit 1 = clause 1, etc.
     pub mask: u32,
@@ -60,7 +62,7 @@ pub fn expand_variants(parsed: &ParsedQuery) -> Result<Vec<QueryVariant>, String
 /// Build a single variant for the given bitmask.
 fn build_variant(parsed: &ParsedQuery, mask: u32) -> Result<QueryVariant, String> {
     // Collect all params for this variant: base params + included clause params
-    let mut all_params: Vec<Param> = Vec::with_capacity(parsed.params.len() + 4);
+    let mut all_params: SmallVec<[Param; 4]> = SmallVec::with_capacity(parsed.params.len() + 4);
 
     // Start with base params (they are always present)
     for p in &parsed.params {

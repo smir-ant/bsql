@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/bsql", "crates/bsql-core", "crates/bsql-macros"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -31,15 +31,23 @@ rapidhash = "4.4.1"
 # Serialization (offline cache)
 bitcode = { version = "0.6.9", features = ["derive"] }
 
+# TLS
+tokio-postgres-rustls = { version = "0.13.0", default-features = false }
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }
+webpki-roots = { version = "1.0.6", default-features = false }
+
 # Feature-gated type support
 time = { version = "0.3", default-features = false, features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 uuid = { version = "1", default-features = false }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
+# Proc-macro optimization
+smallvec = { version = "1", default-features = false }
+
 # Internal
-bsql-core = { path = "crates/bsql-core", version = "0.7.0" }
-bsql-macros = { path = "crates/bsql-macros", version = "0.7.0" }
+bsql-core = { path = "crates/bsql-core", version = "0.8.0" }
+bsql-macros = { path = "crates/bsql-macros", version = "0.8.0" }
 
 # --- Build profiles ---
 # NOTE: these only affect workspace-internal builds (tests, benchmarks).

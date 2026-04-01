@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
+#[cfg(not(feature = "tls"))]
 use tokio_postgres::NoTls;
 use tokio_postgres::types::ToSql;
 
@@ -139,9 +140,7 @@ impl PoolBuilder {
             ..Default::default()
         });
 
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| ConnectError::create(e.to_string()))?;
+        let pool = create_deadpool(cfg)?;
 
         // FIX 11: detect PgBouncer -- propagate connection failure
         let mut pgbouncer = detect_pgbouncer(&pool).await?;
@@ -476,9 +475,7 @@ async fn create_pool_from_url(
         ..Default::default()
     });
 
-    let pool = cfg
-        .create_pool(Some(Runtime::Tokio1), NoTls)
-        .map_err(|e| ConnectError::create(e.to_string()))?;
+    let pool = create_deadpool(cfg)?;
 
     // Verify connectivity
     let _conn = pool
@@ -487,6 +484,38 @@ async fn create_pool_from_url(
         .map_err(|e| ConnectError::with_source(format!("failed to connect to replica: {e}"), e))?;
 
     Ok(pool)
+}
+
+/// Create a `deadpool_postgres::Pool` from a `Config`.
+///
+/// When the `tls` feature is enabled, connections use rustls with Mozilla's
+/// bundled root certificates. When disabled, connections use `NoTls`.
+fn create_deadpool(cfg: Config) -> BsqlResult<deadpool_postgres::Pool> {
+    #[cfg(feature = "tls")]
+    {
+        let tls = make_rustls_connect();
+        cfg.create_pool(Some(Runtime::Tokio1), tls)
+            .map_err(|e| ConnectError::create(e.to_string()))
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        cfg.create_pool(Some(Runtime::Tokio1), NoTls)
+            .map_err(|e| ConnectError::create(e.to_string()))
+    }
+}
+
+/// Build a `MakeRustlsConnect` using Mozilla's bundled root certificates.
+///
+/// This avoids a runtime dependency on the OS certificate store.
+/// `pub(crate)` so `listener.rs` can reuse it.
+#[cfg(feature = "tls")]
+pub(crate) fn make_rustls_connect() -> tokio_postgres_rustls::MakeRustlsConnect {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tokio_postgres_rustls::MakeRustlsConnect::new(config)
 }
 
 /// Detect PgBouncer on the first connection from the pool.

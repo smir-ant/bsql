@@ -8,6 +8,8 @@
 //! Everything else is passed through to PostgreSQL verbatim. PG does the real
 //! SQL parsing via PREPARE.
 
+use smallvec::SmallVec;
+
 use crate::sql_norm::normalize_sql;
 use crate::stmt_name::statement_name;
 
@@ -29,7 +31,8 @@ pub struct OptionalClause {
     /// The SQL fragment inside `[...]` (with params replaced by `$N`).
     pub sql_fragment: String,
     /// Parameters declared inside this clause (must be `Option<T>`).
-    pub params: Vec<Param>,
+    /// Typically 1 param per clause (enforced by parser).
+    pub params: SmallVec<[Param; 2]>,
     /// 0-based index among optional clauses.
     pub index: usize,
 }
@@ -56,13 +59,13 @@ pub struct ParsedQuery {
     pub positional_sql: String,
     /// Extracted parameters in order of appearance (base query only).
     /// Parameters inside optional clauses are in `optional_clauses[i].params`.
-    pub params: Vec<Param>,
+    pub params: SmallVec<[Param; 4]>,
     /// What kind of DML this is.
     pub kind: QueryKind,
     /// Prepared statement name: `s_{rapidhash:016x}`.
     pub statement_name: String,
     /// Optional clauses extracted from `[...]` blocks.
-    pub optional_clauses: Vec<OptionalClause>,
+    pub optional_clauses: SmallVec<[OptionalClause; 4]>,
 }
 
 /// Parse the raw SQL from a `query!` invocation.
@@ -98,10 +101,12 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
 /// Uses `char_indices()` for iteration so multi-byte UTF-8 inside string
 /// literals is preserved verbatim (we slice the original `&str` by byte
 /// offset, never interpreting individual bytes as chars).
-fn extract_params(sql: &str) -> Result<(String, Vec<Param>, Vec<OptionalClause>), String> {
+fn extract_params(
+    sql: &str,
+) -> Result<(String, SmallVec<[Param; 4]>, SmallVec<[OptionalClause; 4]>), String> {
     let mut out = String::with_capacity(sql.len());
-    let mut params: Vec<Param> = Vec::new();
-    let mut optional_clauses: Vec<OptionalClause> = Vec::new();
+    let mut params: SmallVec<[Param; 4]> = SmallVec::new();
+    let mut optional_clauses: SmallVec<[OptionalClause; 4]> = SmallVec::new();
     let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut i = 0; // byte offset into `sql`
@@ -244,7 +249,7 @@ fn parse_optional_clause(
     // Find the matching ] — respecting string literals and nested parens.
     // Nested [] is NOT allowed (no nesting of optional clauses).
     let mut clause_sql = String::new();
-    let mut clause_params: Vec<Param> = Vec::new();
+    let mut clause_params: SmallVec<[Param; 2]> = SmallVec::new();
     // Position counter for params within the clause (will be renumbered by dynamic.rs)
     let mut clause_param_pos = 0usize;
 

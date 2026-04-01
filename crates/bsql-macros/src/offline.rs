@@ -215,8 +215,8 @@ fn cached_to_validation(cached: &CachedQuery) -> ValidationResult {
 
     ValidationResult {
         columns,
-        param_pg_oids: cached.param_pg_oids.clone(),
-        param_is_pg_enum: cached.param_is_pg_enum.clone(),
+        param_pg_oids: cached.param_pg_oids.iter().copied().collect(),
+        param_is_pg_enum: cached.param_is_pg_enum.iter().copied().collect(),
         #[cfg(feature = "explain")]
         explain_plan: None,
     }
@@ -307,8 +307,8 @@ fn validation_to_cached(
         sql_hash: hash,
         normalized_sql: parsed.normalized_sql.clone(),
         columns,
-        param_pg_oids: validation.param_pg_oids.clone(),
-        param_is_pg_enum: validation.param_is_pg_enum.clone(),
+        param_pg_oids: validation.param_pg_oids.to_vec(),
+        param_is_pg_enum: validation.param_is_pg_enum.to_vec(),
     }
 }
 
@@ -474,8 +474,8 @@ mod tests {
         assert_eq!(validation.columns[1].name, "name");
         assert!(validation.columns[1].is_nullable);
         assert_eq!(validation.columns[1].rust_type, "Option<String>");
-        assert_eq!(validation.param_pg_oids, vec![23]);
-        assert_eq!(validation.param_is_pg_enum, vec![false]);
+        assert_eq!(validation.param_pg_oids.as_slice(), &[23u32]);
+        assert_eq!(validation.param_is_pg_enum.as_slice(), &[false]);
     }
 
     #[test]
@@ -488,8 +488,8 @@ mod tests {
                 is_nullable: false,
                 rust_type: "i64".into(),
             }],
-            param_pg_oids: vec![25, 23],
-            param_is_pg_enum: vec![false, false],
+            param_pg_oids: smallvec::smallvec![25, 23],
+            param_is_pg_enum: smallvec::smallvec![false, false],
             #[cfg(feature = "explain")]
             explain_plan: None,
         };

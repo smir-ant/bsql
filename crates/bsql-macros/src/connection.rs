@@ -36,7 +36,22 @@ static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| 
     pg_config.connect_timeout(std::time::Duration::from_secs(10));
 
     let (client, connection) = rt
-        .block_on(pg_config.connect(tokio_postgres::NoTls))
+        .block_on(async {
+            #[cfg(feature = "tls")]
+            {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let tls_config = rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
+                pg_config.connect(tls).await
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                pg_config.connect(tokio_postgres::NoTls).await
+            }
+        })
         .map_err(|e| {
             format!(
                 "bsql: failed to connect to PostgreSQL at compile time: {e}. \

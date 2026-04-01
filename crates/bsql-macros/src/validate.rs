@@ -4,6 +4,7 @@
 //! each query by preparing it. Introspects column types and nullability
 //! from `pg_catalog`.
 
+use smallvec::SmallVec;
 use tokio::runtime::Runtime;
 use tokio_postgres::Client;
 
@@ -31,11 +32,11 @@ pub struct ValidationResult {
     /// Output columns (for SELECT or RETURNING queries).
     pub columns: Vec<ColumnInfo>,
     /// PostgreSQL OIDs of the expected parameter types.
-    pub param_pg_oids: Vec<u32>,
+    pub param_pg_oids: SmallVec<[u32; 8]>,
     /// Whether each parameter type is a PostgreSQL enum (custom type).
     /// When true, `&str`/`String` params are accepted in addition to
     /// any `#[bsql::pg_enum]`-annotated Rust enum.
-    pub param_is_pg_enum: Vec<bool>,
+    pub param_is_pg_enum: SmallVec<[bool; 8]>,
     /// EXPLAIN plan summary (only populated when `explain` feature is enabled).
     #[cfg(feature = "explain")]
     pub explain_plan: Option<String>,
@@ -63,8 +64,8 @@ async fn validate_async(parsed: &ParsedQuery, client: &Client) -> Result<Validat
         .map_err(|e| format_pg_error(&e, parsed))?;
 
     // Extract parameter type OIDs and detect PG enums
-    let param_pg_oids: Vec<u32> = stmt.params().iter().map(|t| t.oid()).collect();
-    let param_is_pg_enum: Vec<bool> = stmt
+    let param_pg_oids: SmallVec<[u32; 8]> = stmt.params().iter().map(|t| t.oid()).collect();
+    let param_is_pg_enum: SmallVec<[bool; 8]> = stmt
         .params()
         .iter()
         .map(|t| matches!(t.kind(), postgres_types::Kind::Enum(_)))
@@ -297,8 +298,8 @@ async fn validate_variant_async(
         .await
         .map_err(|e| format_variant_error(&e, variant, parsed, variant_index))?;
 
-    let param_pg_oids: Vec<u32> = stmt.params().iter().map(|t| t.oid()).collect();
-    let param_is_pg_enum: Vec<bool> = stmt
+    let param_pg_oids: SmallVec<[u32; 8]> = stmt.params().iter().map(|t| t.oid()).collect();
+    let param_is_pg_enum: SmallVec<[bool; 8]> = stmt
         .params()
         .iter()
         .map(|t| matches!(t.kind(), postgres_types::Kind::Enum(_)))
