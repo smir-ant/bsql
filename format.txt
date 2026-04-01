@@ -1,0 +1,1834 @@
+Run cargo fmt --all -- --check
+  cargo fmt --all -- --check
+  shell: /usr/bin/bash -e {0}
+  env:
+    CARGO_TERM_COLOR: always
+    SASQL_DATABASE_URL: ***localhost/sasql_test
+    CARGO_HOME: /home/runner/.cargo
+    CARGO_INCREMENTAL: 0
+Diff in /home/runner/work/sasql/sasql/sasql/src/lib.rs:62:
+ //! | `.execute(&pool)` | `u64` (affected rows) | never |
+ 
+ // Re-export the query! macro and pg_enum attribute macro
+-pub use sasql_macros::query;
+ pub use sasql_macros::pg_enum;
++pub use sasql_macros::query;
+ 
+ // Re-export all runtime types
+ pub use sasql_core::error::{self, SasqlError, SasqlResult};
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:15:
+ async fn select_fetch_one() {
+     let pool = pool().await;
+     let id = 1i32;
+-    let user = sasql::query!(
+-        "SELECT id, login, first_name, last_name FROM users WHERE id = $id: i32"
+-    )
+-    .fetch_one(&pool)
+-    .await
+-    .unwrap();
++    let user =
++        sasql::query!("SELECT id, login, first_name, last_name FROM users WHERE id = $id: i32")
++            .fetch_one(&pool)
++            .await
++            .unwrap();
+ 
+     assert_eq!(user.id, 1);
+     assert_eq!(user.login, "alice");
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:31:
+ #[tokio::test]
+ async fn select_fetch_all() {
+     let pool = pool().await;
+-    let users = sasql::query!(
+-        "SELECT id, login FROM users WHERE active = true ORDER BY id"
+-    )
+-    .fetch_all(&pool)
+-    .await
+-    .unwrap();
++    let users = sasql::query!("SELECT id, login FROM users WHERE active = true ORDER BY id")
++        .fetch_all(&pool)
++        .await
++        .unwrap();
+ 
+     assert_eq!(users.len(), 2);
+     assert_eq!(users[0].login, "alice");
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:47:
+ async fn select_fetch_optional_found() {
+     let pool = pool().await;
+     let login = "alice";
+-    let user = sasql::query!(
+-        "SELECT id, login FROM users WHERE login = $login: &str"
+-    )
+-    .fetch_optional(&pool)
+-    .await
+-    .unwrap();
++    let user = sasql::query!("SELECT id, login FROM users WHERE login = $login: &str")
++        .fetch_optional(&pool)
++        .await
++        .unwrap();
+ 
+     assert!(user.is_some());
+     assert_eq!(user.unwrap().login, "alice");
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:62:
+ async fn select_fetch_optional_not_found() {
+     let pool = pool().await;
+     let login = "nonexistent";
+-    let user = sasql::query!(
+-        "SELECT id, login FROM users WHERE login = $login: &str"
+-    )
+-    .fetch_optional(&pool)
+-    .await
+-    .unwrap();
++    let user = sasql::query!("SELECT id, login FROM users WHERE login = $login: &str")
++        .fetch_optional(&pool)
++        .await
++        .unwrap();
+ 
+     assert!(user.is_none());
+ }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:76:
+ async fn select_nullable_column() {
+     let pool = pool().await;
+     let id = 1i32;
+-    let user = sasql::query!(
+-        "SELECT id, middle_name FROM users WHERE id = $id: i32"
+-    )
+-    .fetch_one(&pool)
+-    .await
+-    .unwrap();
++    let user = sasql::query!("SELECT id, middle_name FROM users WHERE id = $id: i32")
++        .fetch_one(&pool)
++        .await
++        .unwrap();
+ 
+     assert_eq!(user.id, 1);
+     assert!(user.middle_name.is_none());
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:109:
+     let pool = pool().await;
+     let desc = "Updated description";
+     let id = 1i32;
+-    let affected = sasql::query!(
+-        "UPDATE tickets SET description = $desc: &str WHERE id = $id: i32"
+-    )
+-    .execute(&pool)
+-    .await
+-    .unwrap();
++    let affected =
++        sasql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
++            .execute(&pool)
++            .await
++            .unwrap();
+ 
+     assert_eq!(affected, 1);
+ }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:134:
+     .unwrap();
+ 
+     let ticket_id = ticket.id;
+-    let affected = sasql::query!(
+-        "DELETE FROM tickets WHERE id = $ticket_id: i32"
+-    )
+-    .execute(&pool)
+-    .await
+-    .unwrap();
++    let affected = sasql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
++        .execute(&pool)
++        .await
++        .unwrap();
+ 
+     assert_eq!(affected, 1);
+ }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:148:
+ async fn fetch_one_zero_rows_errors() {
+     let pool = pool().await;
+     let id = 999999i32;
+-    let result = sasql::query!(
+-        "SELECT id, login FROM users WHERE id = $id: i32"
+-    )
+-    .fetch_one(&pool)
+-    .await;
++    let result = sasql::query!("SELECT id, login FROM users WHERE id = $id: i32")
++        .fetch_one(&pool)
++        .await;
+ 
+     assert!(result.is_err());
+     match result.unwrap_err() {
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:159:
+         SasqlError::Query(e) => {
+-            assert!(e.message.contains("exactly 1 row"), "unexpected: {}", e.message);
++            assert!(
++                e.message.contains("exactly 1 row"),
++                "unexpected: {}",
++                e.message
++            );
+         }
+         other => panic!("expected Query error, got: {other:?}"),
+     }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:187:
+ async fn select_count_expression() {
+     // COUNT(*) is a computed column — should be i64, nullable by default
+     let pool = pool().await;
+-    let result = sasql::query!(
+-        "SELECT COUNT(*) as cnt FROM users"
+-    ).fetch_one(&pool).await.unwrap();
++    let result = sasql::query!("SELECT COUNT(*) as cnt FROM users")
++        .fetch_one(&pool)
++        .await
++        .unwrap();
+     // COUNT(*) never returns NULL (returns 0 for empty sets)
+     // but our system defaults computed columns to nullable → Option<i64>
+     assert!(result.cnt.is_some());
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:205:
+          FROM tickets t
+          JOIN users u ON u.id = t.created_by_user_id
+          WHERE t.id = $id: i32"
+-    ).fetch_one(&pool).await.unwrap();
++    )
++    .fetch_one(&pool)
++    .await
++    .unwrap();
+     assert_eq!(result.ticket_id, 1);
+     assert_eq!(result.title, "Fix login bug");
+     assert_eq!(result.creator, "alice");
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:219:
+             SELECT id, login FROM users WHERE active = true
+         )
+         SELECT id, login FROM active_users ORDER BY id"
+-    ).fetch_all(&pool).await.unwrap();
++    )
++    .fetch_all(&pool)
++    .await
++    .unwrap();
+     assert_eq!(results.len(), 2);
+     assert_eq!(results[0].login, "alice");
+ }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:228:
+ async fn fetch_all_empty_result() {
+     let pool = pool().await;
+     let login = "absolutely_nobody_has_this_login";
+-    let results = sasql::query!(
+-        "SELECT id, login FROM users WHERE login = $login: &str"
+-    ).fetch_all(&pool).await.unwrap();
++    let results = sasql::query!("SELECT id, login FROM users WHERE login = $login: &str")
++        .fetch_all(&pool)
++        .await
++        .unwrap();
+     assert!(results.is_empty());
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:237:
+ #[tokio::test]
+ async fn select_expression_arithmetic() {
+     let pool = pool().await;
+-    let result = sasql::query!(
+-        "SELECT 1 + 1 as sum_val"
+-    ).fetch_one(&pool).await.unwrap();
++    let result = sasql::query!("SELECT 1 + 1 as sum_val")
++        .fetch_one(&pool)
++        .await
++        .unwrap();
+     // Computed expression → nullable by default
+     assert_eq!(result.sum_val, Some(2i32));
+ }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:256:
+         "INSERT INTO users (login, first_name, last_name, email)
+          VALUES ($login: &str, $first_name: &str, $last_name: &str, $email: &str)
+          ON CONFLICT (login) DO NOTHING"
+-    ).execute(&pool).await.unwrap();
++    )
++    .execute(&pool)
++    .await
++    .unwrap();
+     assert_eq!(affected, 0);
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:269:
+         "INSERT INTO tickets (title, status, created_by_user_id)
+          VALUES ($title: &str, 'new', $uid: i32)
+          RETURNING id"
+-    ).fetch_one(&pool).await.unwrap();
++    )
++    .fetch_one(&pool)
++    .await
++    .unwrap();
+ 
+     let id = ticket.id;
+-    let deleted = sasql::query!(
+-        "DELETE FROM tickets WHERE id = $id: i32 RETURNING id, title"
+-    ).fetch_all(&pool).await.unwrap();
++    let deleted = sasql::query!("DELETE FROM tickets WHERE id = $id: i32 RETURNING id, title")
++        .fetch_all(&pool)
++        .await
++        .unwrap();
+     assert_eq!(deleted.len(), 1);
+     assert_eq!(deleted[0].id, id);
+ }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:283:
+ async fn param_reuse_in_real_query() {
+     let pool = pool().await;
+     let id = 1i32;
+-    let user = sasql::query!(
+-        "SELECT id, login FROM users WHERE id = $id: i32 AND id = $id: i32"
+-    ).fetch_one(&pool).await.unwrap();
++    let user = sasql::query!("SELECT id, login FROM users WHERE id = $id: i32 AND id = $id: i32")
++        .fetch_one(&pool)
++        .await
++        .unwrap();
+     assert_eq!(user.id, 1);
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:293:
+ async fn fetch_optional_multiple_rows_errors() {
+     let pool = pool().await;
+     // users table has 2+ rows with active=true — fetch_optional must error
+-    let result = sasql::query!(
+-        "SELECT id, login FROM users WHERE active = true"
+-    ).fetch_optional(&pool).await;
++    let result = sasql::query!("SELECT id, login FROM users WHERE active = true")
++        .fetch_optional(&pool)
++        .await;
+ 
+     assert!(result.is_err());
+     match result.unwrap_err() {
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:302:
+         SasqlError::Query(e) => {
+-            assert!(e.message.contains("0 or 1 rows"), "unexpected: {}", e.message);
++            assert!(
++                e.message.contains("0 or 1 rows"),
++                "unexpected: {}",
++                e.message
++            );
+         }
+         other => panic!("expected Query error, got: {other:?}"),
+     }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:312:
+     let avatar: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+     let id = 1i32;
+     // Set avatar
+-    sasql::query!(
+-        "UPDATE users SET avatar = $avatar: &[u8] WHERE id = $id: i32"
+-    ).execute(&pool).await.unwrap();
++    sasql::query!("UPDATE users SET avatar = $avatar: &[u8] WHERE id = $id: i32")
++        .execute(&pool)
++        .await
++        .unwrap();
+ 
+     // Read it back
+-    let user = sasql::query!(
+-        "SELECT id, avatar FROM users WHERE id = $id: i32"
+-    ).fetch_one(&pool).await.unwrap();
++    let user = sasql::query!("SELECT id, avatar FROM users WHERE id = $id: i32")
++        .fetch_one(&pool)
++        .await
++        .unwrap();
+ 
+     assert_eq!(user.id, 1);
+     assert_eq!(user.avatar.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+Diff in /home/runner/work/sasql/sasql/sasql/tests/basic.rs:329:
+ async fn array_column_type() {
+     let pool = pool().await;
+     let id = 1i32;
+-    let user = sasql::query!(
+-        "SELECT id, tag_ids FROM users WHERE id = $id: i32"
+-    ).fetch_one(&pool).await.unwrap();
++    let user = sasql::query!("SELECT id, tag_ids FROM users WHERE id = $id: i32")
++        .fetch_one(&pool)
++        .await
++        .unwrap();
+ 
+     assert_eq!(user.id, 1);
+     assert!(user.tag_ids.is_empty()); // default '{}'
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:33:
+     // Without pg_enum integration in query!, enum columns map to String.
+     let pool = pool().await;
+     let id = 1i32;
+-    let ticket = sasql::query!(
+-        "SELECT id, status FROM tickets WHERE id = $id: i32"
+-    )
+-    .fetch_one(&pool)
+-    .await
+-    .unwrap();
++    let ticket = sasql::query!("SELECT id, status FROM tickets WHERE id = $id: i32")
++        .fetch_one(&pool)
++        .await
++        .unwrap();
+ 
+     assert_eq!(ticket.id, 1);
+     assert_eq!(ticket.status, "new");
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:83:
+     async fn select_uuid_column() {
+         let pool = pool().await;
+         let id = 1i32;
+-        let ticket = sasql::query!(
+-            "SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32"
+-        )
+-        .fetch_one(&pool)
+-        .await
+-        .unwrap();
++        let ticket = sasql::query!("SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32")
++            .fetch_one(&pool)
++            .await
++            .unwrap();
+ 
+         assert_eq!(ticket.id, 1);
+         // UUID was generated by gen_random_uuid() — just verify it's valid
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:116:
+ 
+         // Clean up
+         let inserted_id = ticket.id;
+-        sasql::query!(
+-            "DELETE FROM tickets WHERE id = $inserted_id: i32"
+-        )
+-        .execute(&pool)
+-        .await
+-        .unwrap();
++        sasql::query!("DELETE FROM tickets WHERE id = $inserted_id: i32")
++            .execute(&pool)
++            .await
++            .unwrap();
+     }
+ 
+     #[tokio::test]
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:130:
+         let id = 1i32;
+ 
+         // First get the UUID of ticket 1
+-        let ticket = sasql::query!(
+-            "SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32"
+-        )
+-        .fetch_one(&pool)
+-        .await
+-        .unwrap();
++        let ticket = sasql::query!("SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32")
++            .fetch_one(&pool)
++            .await
++            .unwrap();
+ 
+         let target_uuid = ticket.ticket_uuid;
+ 
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:142:
+         // Now query by UUID
+-        let found = sasql::query!(
+-            "SELECT id FROM tickets WHERE ticket_uuid = $target_uuid: uuid::Uuid"
+-        )
+-        .fetch_one(&pool)
+-        .await
+-        .unwrap();
++        let found =
++            sasql::query!("SELECT id FROM tickets WHERE ticket_uuid = $target_uuid: uuid::Uuid")
++                .fetch_one(&pool)
++                .await
++                .unwrap();
+ 
+         assert_eq!(found.id, 1);
+     }
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:164:
+         // deadline is nullable TIMESTAMPTZ
+         let pool = pool().await;
+         let id = 1i32;
+-        let ticket = sasql::query!(
+-            "SELECT id, deadline FROM tickets WHERE id = $id: i32"
+-        )
+-        .fetch_one(&pool)
+-        .await
+-        .unwrap();
++        let ticket = sasql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32")
++            .fetch_one(&pool)
++            .await
++            .unwrap();
+ 
+         assert_eq!(ticket.id, 1);
+         // Default is NULL
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:191:
+         .unwrap();
+ 
+         // Read it back
+-        let ticket = sasql::query!(
+-            "SELECT id, deadline FROM tickets WHERE id = $id: i32"
+-        )
+-        .fetch_one(&pool)
+-        .await
+-        .unwrap();
++        let ticket = sasql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32")
++            .fetch_one(&pool)
++            .await
++            .unwrap();
+ 
+         let deadline = ticket.deadline.expect("deadline should be set");
+         // PostgreSQL stores microsecond precision, so we compare to within 1ms
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:204:
+         assert!(diff < 2, "timestamps differ by {diff}ms");
+ 
+         // Clean up — set back to NULL
+-        sasql::query!(
+-            "UPDATE tickets SET deadline = NULL WHERE id = $id: i32"
+-        )
+-        .execute(&pool)
+-        .await
+-        .unwrap();
++        sasql::query!("UPDATE tickets SET deadline = NULL WHERE id = $id: i32")
++            .execute(&pool)
++            .await
++            .unwrap();
+     }
+ 
+     #[tokio::test]
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:216:
+     async fn select_date_column() {
+         let pool = pool().await;
+         let id = 1i32;
+-        let ticket = sasql::query!(
+-            "SELECT id, created_date FROM tickets WHERE id = $id: i32"
+-        )
+-        .fetch_one(&pool)
+-        .await
+-        .unwrap();
++        let ticket = sasql::query!("SELECT id, created_date FROM tickets WHERE id = $id: i32")
++            .fetch_one(&pool)
++            .await
++            .unwrap();
+ 
+         assert_eq!(ticket.id, 1);
+         // Should be today's date (or whenever setup.sql ran)
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:232:
+     async fn select_nullable_time_column() {
+         let pool = pool().await;
+         let id = 1i32;
+-        let ticket = sasql::query!(
+-            "SELECT id, start_time FROM tickets WHERE id = $id: i32"
+-        )
+-        .fetch_one(&pool)
+-        .await
+-        .unwrap();
++        let ticket = sasql::query!("SELECT id, start_time FROM tickets WHERE id = $id: i32")
++            .fetch_one(&pool)
++            .await
++            .unwrap();
+ 
+         assert_eq!(ticket.id, 1);
+         // Default is NULL
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:250:
+         let t = time::Time::from_hms(14, 30, 0).expect("valid time");
+         let id = 1i32;
+ 
+-        sasql::query!(
+-            "UPDATE tickets SET start_time = $t: time::Time WHERE id = $id: i32"
+-        )
+-        .execute(&pool)
+-        .await
+-        .unwrap();
++        sasql::query!("UPDATE tickets SET start_time = $t: time::Time WHERE id = $id: i32")
++            .execute(&pool)
++            .await
++            .unwrap();
+ 
+-        let ticket = sasql::query!(
+-            "SELECT id, start_time FROM tickets WHERE id = $id: i32"
+-        )
+-        .fetch_one(&pool)
+-        .await
+-        .unwrap();
++        let ticket = sasql::query!("SELECT id, start_time FROM tickets WHERE id = $id: i32")
++            .fetch_one(&pool)
++            .await
++            .unwrap();
+ 
+         let start_time = ticket.start_time.expect("start_time should be set");
+         assert_eq!(start_time.hour(), 14);
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:269:
+         assert_eq!(start_time.minute(), 30);
+ 
+         // Clean up
+-        sasql::query!(
+-            "UPDATE tickets SET start_time = NULL WHERE id = $id: i32"
+-        )
+-        .execute(&pool)
+-        .await
+-        .unwrap();
++        sasql::query!("UPDATE tickets SET start_time = NULL WHERE id = $id: i32")
++            .execute(&pool)
++            .await
++            .unwrap();
+     }
+ 
+     #[tokio::test]
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:282:
+         let pool = pool().await;
+         let today = time::OffsetDateTime::now_utc().date();
+         // Query tickets created today
+-        let tickets = sasql::query!(
+-            "SELECT id FROM tickets WHERE created_date = $today: time::Date"
+-        )
+-        .fetch_all(&pool)
+-        .await
+-        .unwrap();
++        let tickets =
++            sasql::query!("SELECT id FROM tickets WHERE created_date = $today: time::Date")
++                .fetch_all(&pool)
++                .await
++                .unwrap();
+ 
+         // All seed tickets were created today
+         assert!(!tickets.is_empty());
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:302:
+ async fn enum_column_maps_to_string() {
+     let pool = pool().await;
+     let id = 1i32;
+-    let ticket = sasql::query!(
+-        "SELECT id, status FROM tickets WHERE id = $id: i32"
+-    )
+-    .fetch_one(&pool)
+-    .await
+-    .unwrap();
++    let ticket = sasql::query!("SELECT id, status FROM tickets WHERE id = $id: i32")
++        .fetch_one(&pool)
++        .await
++        .unwrap();
+ 
+     assert_eq!(ticket.id, 1);
+     assert_eq!(ticket.status, "new");
+Diff in /home/runner/work/sasql/sasql/sasql/tests/v02_types.rs:332:
+ 
+     // Clean up
+     let del_id = ticket.id;
+-    sasql::query!(
+-        "DELETE FROM tickets WHERE id = $del_id: i32"
+-    )
+-    .execute(&pool)
+-    .await
+-    .unwrap();
++    sasql::query!("DELETE FROM tickets WHERE id = $del_id: i32")
++        .execute(&pool)
++        .await
++        .unwrap();
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/error.rs:116:
+ 
+ impl std::error::Error for PoolError {
+     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+-        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
++        self.source
++            .as_ref()
++            .map(|e| &**e as &(dyn std::error::Error + 'static))
+     }
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/error.rs:123:
+ impl std::error::Error for QueryError {
+     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+-        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
++        self.source
++            .as_ref()
++            .map(|e| &**e as &(dyn std::error::Error + 'static))
+     }
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/error.rs:130:
+ 
+ impl std::error::Error for ConnectError {
+     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+-        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
++        self.source
++            .as_ref()
++            .map(|e| &**e as &(dyn std::error::Error + 'static))
+     }
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/error.rs:177:
+         })
+     }
+ 
+-    pub fn with_source(msg: impl Into<String>, source: impl std::error::Error + Send + Sync + 'static) -> SasqlError {
++    pub fn with_source(
++        msg: impl Into<String>,
++        source: impl std::error::Error + Send + Sync + 'static,
++    ) -> SasqlError {
+         SasqlError::Connect(ConnectError {
+             message: msg.into(),
+             source: Some(Box::new(source)),
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/error.rs:221:
+     #[test]
+     fn query_error_without_code_display() {
+         let e = QueryError::row_count("exactly 1 row", 0);
+-        assert_eq!(e.to_string(), "query error: expected exactly 1 row, got 0 rows");
++        assert_eq!(
++            e.to_string(),
++            "query error: expected exactly 1 row, got 0 rows"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/executor.rs:45:
+         conn.query_raw(sql, params).await
+     }
+ 
+-    async fn execute_raw(
+-        &self,
+-        sql: &str,
+-        params: &[&(dyn ToSql + Sync)],
+-    ) -> SasqlResult<u64> {
++    async fn execute_raw(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> SasqlResult<u64> {
+         let conn = self.acquire().await?;
+         conn.execute_raw(sql, params).await
+     }
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/executor.rs:75:
+             .map_err(SasqlError::from)
+     }
+ 
+-    async fn execute_raw(
+-        &self,
+-        sql: &str,
+-        params: &[&(dyn ToSql + Sync)],
+-    ) -> SasqlResult<u64> {
++    async fn execute_raw(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> SasqlResult<u64> {
+         let stmt = self
+             .inner
+             .prepare_cached(sql)
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/pool.rs:189:
+     /// **Fail-fast**: returns `SasqlError::Pool` immediately if no connections
+     /// are available. Does not wait. Does not timeout. See CREDO principle #17.
+     pub async fn acquire(&self) -> SasqlResult<PoolConnection> {
+-        let conn = self
+-            .inner
+-            .get()
+-            .await
+-            .map_err(SasqlError::from)?;
++        let conn = self.inner.get().await.map_err(SasqlError::from)?;
+ 
+         Ok(PoolConnection {
+             inner: conn,
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/pool.rs:256:
+ /// returning `DIRECT`. A pool that can't connect on creation is broken.
+ async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> SasqlResult<PgBouncerInfo> {
+     let conn = pool.get().await.map_err(|e| {
+-        ConnectError::with_source(
+-            format!("failed to establish initial connection: {e}"),
+-            e,
+-        )
++        ConnectError::with_source(format!("failed to establish initial connection: {e}"), e)
+     })?;
+ 
+     // PgBouncer responds to `SHOW POOLS`; PostgreSQL does not.
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/pool.rs:266:
+-    let is_pgbouncer = conn
+-        .simple_query("SHOW POOLS")
+-        .await
+-        .is_ok();
++    let is_pgbouncer = conn.simple_query("SHOW POOLS").await.is_ok();
+ 
+     if !is_pgbouncer {
+         return Ok(PgBouncerInfo::DIRECT);
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/pool.rs:276:
+     let supports_named = match conn.simple_query("SHOW CONFIG").await {
+         Ok(messages) => messages.iter().any(|msg| {
+             if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+-                row.get(0) == Some("prepared_statements")
+-                    && row.get(1) == Some("yes")
++                row.get(0) == Some("prepared_statements") && row.get(1) == Some("yes")
+             } else {
+                 false
+             }
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/types.rs:23:
+ /// <https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat>
+ pub const BASE_TYPE_MAP: &[TypeMapping] = &[
+     // Scalar types
+-    TypeMapping { pg_oid: 16,   pg_name: "bool",    rust_type: "bool",       is_array: false },
+-    TypeMapping { pg_oid: 21,   pg_name: "int2",    rust_type: "i16",        is_array: false },
+-    TypeMapping { pg_oid: 23,   pg_name: "int4",    rust_type: "i32",        is_array: false },
+-    TypeMapping { pg_oid: 20,   pg_name: "int8",    rust_type: "i64",        is_array: false },
+-    TypeMapping { pg_oid: 700,  pg_name: "float4",  rust_type: "f32",        is_array: false },
+-    TypeMapping { pg_oid: 701,  pg_name: "float8",  rust_type: "f64",        is_array: false },
+-    TypeMapping { pg_oid: 25,   pg_name: "text",    rust_type: "String",     is_array: false },
+-    TypeMapping { pg_oid: 1043, pg_name: "varchar",  rust_type: "String",    is_array: false },
+-    TypeMapping { pg_oid: 1042, pg_name: "bpchar",   rust_type: "String",    is_array: false },
+-    TypeMapping { pg_oid: 17,   pg_name: "bytea",    rust_type: "Vec<u8>",   is_array: false },
+-    TypeMapping { pg_oid: 26,   pg_name: "oid",      rust_type: "u32",       is_array: false },
+-    TypeMapping { pg_oid: 2278, pg_name: "void",     rust_type: "()",        is_array: false },
++    TypeMapping {
++        pg_oid: 16,
++        pg_name: "bool",
++        rust_type: "bool",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 21,
++        pg_name: "int2",
++        rust_type: "i16",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 23,
++        pg_name: "int4",
++        rust_type: "i32",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 20,
++        pg_name: "int8",
++        rust_type: "i64",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 700,
++        pg_name: "float4",
++        rust_type: "f32",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 701,
++        pg_name: "float8",
++        rust_type: "f64",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 25,
++        pg_name: "text",
++        rust_type: "String",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 1043,
++        pg_name: "varchar",
++        rust_type: "String",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 1042,
++        pg_name: "bpchar",
++        rust_type: "String",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 17,
++        pg_name: "bytea",
++        rust_type: "Vec<u8>",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 26,
++        pg_name: "oid",
++        rust_type: "u32",
++        is_array: false,
++    },
++    TypeMapping {
++        pg_oid: 2278,
++        pg_name: "void",
++        rust_type: "()",
++        is_array: false,
++    },
+     // Array types
+-    TypeMapping { pg_oid: 1000, pg_name: "_bool",    rust_type: "Vec<bool>",       is_array: true },
+-    TypeMapping { pg_oid: 1005, pg_name: "_int2",    rust_type: "Vec<i16>",        is_array: true },
+-    TypeMapping { pg_oid: 1007, pg_name: "_int4",    rust_type: "Vec<i32>",        is_array: true },
+-    TypeMapping { pg_oid: 1016, pg_name: "_int8",    rust_type: "Vec<i64>",        is_array: true },
+-    TypeMapping { pg_oid: 1021, pg_name: "_float4",  rust_type: "Vec<f32>",        is_array: true },
+-    TypeMapping { pg_oid: 1022, pg_name: "_float8",  rust_type: "Vec<f64>",        is_array: true },
+-    TypeMapping { pg_oid: 1009, pg_name: "_text",    rust_type: "Vec<String>",     is_array: true },
+-    TypeMapping { pg_oid: 1015, pg_name: "_varchar",  rust_type: "Vec<String>",    is_array: true },
+-    TypeMapping { pg_oid: 1001, pg_name: "_bytea",    rust_type: "Vec<Vec<u8>>",   is_array: true },
++    TypeMapping {
++        pg_oid: 1000,
++        pg_name: "_bool",
++        rust_type: "Vec<bool>",
++        is_array: true,
++    },
++    TypeMapping {
++        pg_oid: 1005,
++        pg_name: "_int2",
++        rust_type: "Vec<i16>",
++        is_array: true,
++    },
++    TypeMapping {
++        pg_oid: 1007,
++        pg_name: "_int4",
++        rust_type: "Vec<i32>",
++        is_array: true,
++    },
++    TypeMapping {
++        pg_oid: 1016,
++        pg_name: "_int8",
++        rust_type: "Vec<i64>",
++        is_array: true,
++    },
++    TypeMapping {
++        pg_oid: 1021,
++        pg_name: "_float4",
++        rust_type: "Vec<f32>",
++        is_array: true,
++    },
++    TypeMapping {
++        pg_oid: 1022,
++        pg_name: "_float8",
++        rust_type: "Vec<f64>",
++        is_array: true,
++    },
++    TypeMapping {
++        pg_oid: 1009,
++        pg_name: "_text",
++        rust_type: "Vec<String>",
++        is_array: true,
++    },
++    TypeMapping {
++        pg_oid: 1015,
++        pg_name: "_varchar",
++        rust_type: "Vec<String>",
++        is_array: true,
++    },
++    TypeMapping {
++        pg_oid: 1001,
++        pg_name: "_bytea",
++        rust_type: "Vec<Vec<u8>>",
++        is_array: true,
++    },
+ ];
+ 
+ /// Look up the Rust type for a PostgreSQL OID.
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/types.rs:52:
+ /// Returns `None` for unrecognized OIDs. The caller should emit a compile error
+ /// suggesting the user enable the appropriate feature flag.
+ pub fn rust_type_for_oid(oid: u32) -> Option<&'static str> {
+-    BASE_TYPE_MAP.iter().find(|m| m.pg_oid == oid).map(|m| m.rust_type)
++    BASE_TYPE_MAP
++        .iter()
++        .find(|m| m.pg_oid == oid)
++        .map(|m| m.rust_type)
+ }
+ 
+ /// Look up the PostgreSQL type name for an OID (for error messages).
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/types.rs:59:
+ pub fn pg_name_for_oid(oid: u32) -> Option<&'static str> {
+-    BASE_TYPE_MAP.iter().find(|m| m.pg_oid == oid).map(|m| m.pg_name)
++    BASE_TYPE_MAP
++        .iter()
++        .find(|m| m.pg_oid == oid)
++        .map(|m| m.pg_name)
+ }
+ 
+ /// Check whether a user-declared Rust parameter type is compatible with a PG OID.
+Diff in /home/runner/work/sasql/sasql/sasql-core/src/types.rs:234:
+ 
+     #[test]
+     fn param_incompatible_rejects_wrong_type() {
+-        assert!(!is_param_compatible("&str", 23));   // &str for int4
+-        assert!(!is_param_compatible("i32", 20));    // i32 for int8 (no widening)
+-        assert!(!is_param_compatible("i64", 23));    // i64 for int4 (no narrowing)
+-        assert!(!is_param_compatible("bool", 25));   // bool for text
++        assert!(!is_param_compatible("&str", 23)); // &str for int4
++        assert!(!is_param_compatible("i32", 20)); // i32 for int8 (no widening)
++        assert!(!is_param_compatible("i64", 23)); // i64 for int4 (no narrowing)
++        assert!(!is_param_compatible("bool", 25)); // bool for text
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:13:
+ use crate::validate::ValidationResult;
+ 
+ /// Generate the complete Rust code for a `query!` invocation.
+-pub fn generate_query_code(
+-    parsed: &ParsedQuery,
+-    validation: &ValidationResult,
+-) -> TokenStream {
++pub fn generate_query_code(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
+     let result_struct = gen_result_struct(parsed, validation);
+     let executor_struct = gen_executor_struct(parsed);
+     let executor_impls = gen_executor_impls(parsed, validation);
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:95:
+     let has_params = !parsed.params.is_empty();
+ 
+     // Build the params slice: &[&self.id, &self.name, ...]
+-    let param_refs: Vec<TokenStream> = parsed.params.iter().map(|p| {
+-        let name = format_ident!("{}", p.name);
+-        quote! { &self.#name as &(dyn ::sasql_core::pg::ToSql + Sync) }
+-    }).collect();
++    let param_refs: Vec<TokenStream> = parsed
++        .params
++        .iter()
++        .map(|p| {
++            let name = format_ident!("{}", p.name);
++            quote! { &self.#name as &(dyn ::sasql_core::pg::ToSql + Sync) }
++        })
++        .collect();
+ 
+     let params_slice = if param_refs.is_empty() {
+         quote! { &[] }
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:253:
+     match ty {
+         syn::Type::Reference(mut r) => {
+             if r.lifetime.is_none() {
+-                r.lifetime = Some(syn::Lifetime::new("'_sasql", proc_macro2::Span::call_site()));
++                r.lifetime = Some(syn::Lifetime::new(
++                    "'_sasql",
++                    proc_macro2::Span::call_site(),
++                ));
+             }
+             r.elem = Box::new(add_lifetime_to_refs(*r.elem));
+             syn::Type::Reference(r)
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:334:
+     // Replace non-alphanumeric/underscore chars with underscore
+     let sanitized: String = name
+         .chars()
+-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
++        .map(|c| {
++            if c.is_ascii_alphanumeric() || c == '_' {
++                c
++            } else {
++                '_'
++            }
++        })
+         .collect();
+ 
+     // Ensure it doesn't start with a digit
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:372:
+     #[test]
+     fn generates_result_struct_with_fields() {
+         let parsed = parse_query("SELECT id, name FROM users WHERE 1 = $a: i32").unwrap();
+-        let validation = make_validation(vec![
+-            col("id", "i32"),
+-            col("name", "String"),
+-        ]);
++        let validation = make_validation(vec![col("id", "i32"), col("name", "String")]);
+         let code = generate_query_code(&parsed, &validation);
+         let code_str = code.to_string();
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:382:
+-        assert!(code_str.contains("pub id : i32"), "missing id field: {code_str}");
+-        assert!(code_str.contains("pub name : String"), "missing name field: {code_str}");
++        assert!(
++            code_str.contains("pub id : i32"),
++            "missing id field: {code_str}"
++        );
++        assert!(
++            code_str.contains("pub name : String"),
++            "missing name field: {code_str}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:387:
+     fn generates_nullable_field_as_option() {
+         let parsed = parse_query("SELECT bio FROM users WHERE 1 = $a: i32").unwrap();
+-        let validation = make_validation(vec![
+-            col("bio", "Option<String>"),
+-        ]);
++        let validation = make_validation(vec![col("bio", "Option<String>")]);
+         let code = generate_query_code(&parsed, &validation);
+         let code_str = code.to_string();
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:395:
+-        assert!(code_str.contains("Option < String >") || code_str.contains("Option<String>"),
+-            "missing Option<String>: {code_str}");
++        assert!(
++            code_str.contains("Option < String >") || code_str.contains("Option<String>"),
++            "missing Option<String>: {code_str}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:403:
+         let code = generate_query_code(&parsed, &validation);
+         let code_str = code.to_string();
+ 
+-        assert!(code_str.contains("fetch_one"), "missing fetch_one: {code_str}");
+-        assert!(code_str.contains("fetch_all"), "missing fetch_all: {code_str}");
+-        assert!(code_str.contains("fetch_optional"), "missing fetch_optional: {code_str}");
++        assert!(
++            code_str.contains("fetch_one"),
++            "missing fetch_one: {code_str}"
++        );
++        assert!(
++            code_str.contains("fetch_all"),
++            "missing fetch_all: {code_str}"
++        );
++        assert!(
++            code_str.contains("fetch_optional"),
++            "missing fetch_optional: {code_str}"
++        );
+         assert!(code_str.contains("execute"), "missing execute: {code_str}");
+     }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:417:
+         let code_str = code.to_string();
+ 
+         // Unit struct executor (no fields, no braces in constructor)
+-        assert!(code_str.contains("struct SasqlExecutor_"), "missing executor: {code_str}");
++        assert!(
++            code_str.contains("struct SasqlExecutor_"),
++            "missing executor: {code_str}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:427:
+         let code = generate_query_code(&parsed, &validation);
+         let code_str = code.to_string();
+ 
+-        assert!(!code_str.contains("SasqlResult_"), "should not have result struct: {code_str}");
++        assert!(
++            !code_str.contains("SasqlResult_"),
++            "should not have result struct: {code_str}"
++        );
+         assert!(code_str.contains("execute"), "missing execute: {code_str}");
+     }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:439:
+         let code_str = code.to_string();
+ 
+         // The constructor should reference the variable name `id` and include PhantomData
+-        assert!(code_str.contains("id ,") || code_str.contains("id,"),
+-            "missing param capture: {code_str}");
+-        assert!(code_str.contains("PhantomData"),
+-            "missing PhantomData: {code_str}");
++        assert!(
++            code_str.contains("id ,") || code_str.contains("id,"),
++            "missing param capture: {code_str}"
++        );
++        assert!(
++            code_str.contains("PhantomData"),
++            "missing PhantomData: {code_str}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:453:
+         let code_str = code.to_string();
+ 
+         // The generated code should use positional SQL ($1), not named ($id)
+-        assert!(code_str.contains("$1"), "should contain positional $1: {code_str}");
+-        assert!(!code_str.contains("$id"), "should not contain named $id: {code_str}");
++        assert!(
++            code_str.contains("$1"),
++            "should contain positional $1: {code_str}"
++        );
++        assert!(
++            !code_str.contains("$id"),
++            "should not contain named $id: {code_str}"
++        );
+     }
+ 
+     // --- FIX 5: lifetime injection via syn ---
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:477:
+     fn inject_lifetime_option_ref() {
+         let ts = inject_lifetime("Option<&str>");
+         let s = ts.to_string();
+-        assert!(s.contains("'_sasql"), "missing lifetime in Option<&str>: {s}");
++        assert!(
++            s.contains("'_sasql"),
++            "missing lifetime in Option<&str>: {s}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:492:
+         let ts = inject_lifetime("&[&str]");
+         let s = ts.to_string();
+         // Both references should get lifetimes
+-        assert_eq!(s.matches("'_sasql").count(), 2,
+-            "expected 2 lifetimes in &[&str]: {s}");
++        assert_eq!(
++            s.matches("'_sasql").count(),
++            2,
++            "expected 2 lifetimes in &[&str]: {s}"
++        );
+     }
+ 
+     // --- FIX 6: duplicate column names ---
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:500:
+ 
+     #[test]
+     fn duplicate_column_names_deduplicated() {
+-        let columns = vec![
+-            col("id", "i32"),
+-            col("id", "i32"),
+-            col("name", "String"),
+-        ];
++        let columns = vec![col("id", "i32"), col("id", "i32"), col("name", "String")];
+         let names = deduplicate_column_names(&columns);
+         assert_eq!(names, vec!["id", "id_1", "name"]);
+     }
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:511:
+ 
+     #[test]
+     fn three_duplicate_columns() {
+-        let columns = vec![
+-            col("id", "i32"),
+-            col("id", "i32"),
+-            col("id", "i32"),
+-        ];
++        let columns = vec![col("id", "i32"), col("id", "i32"), col("id", "i32")];
+         let names = deduplicate_column_names(&columns);
+         assert_eq!(names, vec!["id", "id_1", "id_2"]);
+     }
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:523:
+     #[test]
+     fn generates_result_struct_with_deduplicated_fields() {
+         let parsed = parse_query("SELECT 1").unwrap();
+-        let validation = make_validation(vec![
+-            col("id", "i32"),
+-            col("id", "i32"),
+-        ]);
++        let validation = make_validation(vec![col("id", "i32"), col("id", "i32")]);
+         let code = generate_query_code(&parsed, &validation);
+         let code_str = code.to_string();
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:544:
+         let code_str = code.to_string();
+ 
+         // fetch_one should use "... LIMIT 2", fetch_all should use original SQL
+-        assert!(code_str.contains("LIMIT 2"), "missing LIMIT 2 in fetch_one: {code_str}");
++        assert!(
++            code_str.contains("LIMIT 2"),
++            "missing LIMIT 2 in fetch_one: {code_str}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:555:
+         let code_str = code.to_string();
+ 
+         // Should NOT inject an additional LIMIT
+-        assert!(!code_str.contains("LIMIT 2"), "should not add LIMIT 2 when LIMIT exists: {code_str}");
++        assert!(
++            !code_str.contains("LIMIT 2"),
++            "should not add LIMIT 2 when LIMIT exists: {code_str}"
++        );
+     }
+ 
+     // --- FOR UPDATE should NOT get LIMIT 2 ---
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:593:
+     fn column_dedup_collision_with_existing_suffix() {
+         // If columns are ["id_1", "id", "id"], the second "id" must NOT
+         // become "id_1" (collision with first column). It should be "id_2".
+-        let columns = vec![
+-            col("id_1", "i32"),
+-            col("id", "i32"),
+-            col("id", "i32"),
+-        ];
++        let columns = vec![col("id_1", "i32"), col("id", "i32"), col("id", "i32")];
+         let names = deduplicate_column_names(&columns);
+         assert_eq!(names[0], "id_1");
+         assert_eq!(names[1], "id");
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/codegen.rs:604:
+-        assert_eq!(names[2], "id_2", "should skip id_1 which is already taken: {names:?}");
++        assert_eq!(
++            names[2], "id_2",
++            "should skip id_1 which is already taken: {names:?}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/connection.rs:31:
+     let rt = Runtime::new().map_err(|e| format!("sasql: failed to create tokio runtime: {e}"))?;
+ 
+     let (client, connection) = rt
+-        .block_on(tokio_postgres::connect(&database_url, tokio_postgres::NoTls))
++        .block_on(tokio_postgres::connect(
++            &database_url,
++            tokio_postgres::NoTls,
++        ))
+         .map_err(|e| {
+             format!(
+                 "sasql: failed to connect to PostgreSQL at compile time: {e}. \
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/connection.rs:60:
+ where
+     F: FnOnce(&Runtime, &Client) -> Result<T, String>,
+ {
+-    let conn = MACRO_CONN.as_ref().map_err(|msg| {
+-        syn::Error::new(proc_macro2::Span::call_site(), msg)
+-    })?;
+-    f(&conn.runtime, &conn.client).map_err(|msg| {
+-        syn::Error::new(proc_macro2::Span::call_site(), msg)
+-    })
++    let conn = MACRO_CONN
++        .as_ref()
++        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
++    f(&conn.runtime, &conn.client)
++        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))
+ }
+ 
+ #[cfg(test)]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/lib.rs:64:
+     let sql = extract_sql(input)?;
+ 
+     // 1. Parse: extract params, query kind, normalize SQL
+-    let parsed = parse::parse_query(&sql).map_err(|msg| {
+-        syn::Error::new(proc_macro2::Span::call_site(), msg)
+-    })?;
++    let parsed = parse::parse_query(&sql)
++        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+ 
+     // 2. Validate against PostgreSQL via PREPARE
+-    let validation = connection::with_connection(|rt, client| {
+-        validate::validate_query(&parsed, rt, client)
+-    })?;
++    let validation =
++        connection::with_connection(|rt, client| validate::validate_query(&parsed, rt, client))?;
+ 
+     // 3. Check parameter type compatibility
+-    validate::check_param_types(&parsed, &validation).map_err(|msg| {
+-        syn::Error::new(proc_macro2::Span::call_site(), msg)
+-    })?;
++    validate::check_param_types(&parsed, &validation)
++        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+ 
+     // 4. Generate Rust code
+     Ok(codegen::generate_query_code(&parsed, &validation))
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:116:
+         // Dollar-quoted string: copy verbatim
+         if b == b'$'
+             && i + 1 < len
+-            && (bytes[i + 1] == b'$'
+-                || bytes[i + 1].is_ascii_alphabetic()
+-                || bytes[i + 1] == b'_')
++            && (bytes[i + 1] == b'$' || bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+         {
+             if let Some(end) = skip_dollar_quote(bytes, i) {
+                 out.push_str(&sql[i..end]);
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:291:
+             while i < len {
+                 if bytes[i] == b'\'' {
+                     i += 1;
+-                    if i < len && bytes[i] == b'\'' { i += 1; continue; }
++                    if i < len && bytes[i] == b'\'' {
++                        i += 1;
++                        continue;
++                    }
+                     break;
+                 }
+                 i += 1;
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:312:
+         // Line comment: skip to end of line
+         if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+             i += 2;
+-            while i < len && bytes[i] != b'\n' { i += 1; }
++            while i < len && bytes[i] != b'\n' {
++                i += 1;
++            }
+             out.push(' ');
+             continue;
+         }
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:322:
+             i += 2;
+             let mut depth = 1u32;
+             while i + 1 < len && depth > 0 {
+-                if bytes[i] == b'/' && bytes[i + 1] == b'*' { depth += 1; i += 2; continue; }
+-                if bytes[i] == b'*' && bytes[i + 1] == b'/' { depth -= 1; i += 2; continue; }
++                if bytes[i] == b'/' && bytes[i + 1] == b'*' {
++                    depth += 1;
++                    i += 2;
++                    continue;
++                }
++                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
++                    depth -= 1;
++                    i += 2;
++                    continue;
++                }
+                 i += 1;
+             }
+             out.push(' ');
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:377:
+ 
+ /// Detect the query kind from the first keyword.
+ fn detect_query_kind(normalized: &str) -> Result<QueryKind, String> {
+-    let first_word = normalized
+-        .split_whitespace()
+-        .next()
+-        .unwrap_or("");
++    let first_word = normalized.split_whitespace().next().unwrap_or("");
+ 
+     // Handle CTEs: WITH ... SELECT/INSERT/UPDATE/DELETE
+     if first_word == "with" {
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:391:
+             let opens = word.matches('(').count() as i32;
+             let closes = word.matches(')').count() as i32;
+             depth += opens - closes;
+-            if depth < 0 { depth = 0; } // malformed SQL — PG will catch it
++            if depth < 0 {
++                depth = 0;
++            } // malformed SQL — PG will catch it
+ 
+             match word {
+                 "select" if depth == 0 => return Ok(QueryKind::Select),
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:418:
+ /// Check if the normalized SQL contains a RETURNING clause (outside string literals).
+ fn detect_returning(normalized: &str) -> bool {
+     // After normalization, RETURNING is lowercase. We look for the word boundary.
+-    normalized
+-        .split_whitespace()
+-        .any(|w| w == "returning")
++    normalized.split_whitespace().any(|w| w == "returning")
+ }
+ 
+ #[cfg(test)]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:442:
+ 
+     #[test]
+     fn multiple_params() {
+-        let result = parse_query(
+-            "INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)",
+-        )
+-        .unwrap();
++        let result =
++            parse_query("INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)")
++                .unwrap();
+         assert_eq!(result.params.len(), 2);
+         assert_eq!(result.params[0].name, "name");
+         assert_eq!(result.params[0].rust_type, "&str");
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:457:
+ 
+     #[test]
+     fn generic_type_param() {
+-        let result = parse_query(
+-            "SELECT id FROM t WHERE ids = ANY($ids: &[i32])",
+-        )
+-        .unwrap();
++        let result = parse_query("SELECT id FROM t WHERE ids = ANY($ids: &[i32])").unwrap();
+         assert_eq!(result.params[0].rust_type, "&[i32]");
+     }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:467:
+     #[test]
+     fn vec_type_param() {
+-        let result = parse_query(
+-            "SELECT id FROM t WHERE id = ANY($ids: Vec<i32>)",
+-        )
+-        .unwrap();
++        let result = parse_query("SELECT id FROM t WHERE id = ANY($ids: Vec<i32>)").unwrap();
+         assert_eq!(result.params[0].rust_type, "Vec<i32>");
+     }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:618:
+     #[test]
+     fn utf8_cyrillic_in_string_literal() {
+         let r = parse_query("SELECT * FROM t WHERE name = 'Москва' AND id = $id: i32").unwrap();
+-        assert!(r.positional_sql.contains("'Москва'"), "Cyrillic mangled: {}", r.positional_sql);
++        assert!(
++            r.positional_sql.contains("'Москва'"),
++            "Cyrillic mangled: {}",
++            r.positional_sql
++        );
+         assert_eq!(r.params.len(), 1);
+     }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:625:
+     #[test]
+     fn utf8_umlaut_in_string_literal() {
+         let r = parse_query("SELECT * FROM t WHERE name = 'Müller' AND id = $id: i32").unwrap();
+-        assert!(r.positional_sql.contains("'Müller'"), "Umlaut mangled: {}", r.positional_sql);
++        assert!(
++            r.positional_sql.contains("'Müller'"),
++            "Umlaut mangled: {}",
++            r.positional_sql
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:632:
+     fn utf8_in_dollar_quote() {
+         let r = parse_query("SELECT $$Привет$$").unwrap();
+-        assert!(r.positional_sql.contains("$$Привет$$"), "Dollar-quote UTF-8 mangled: {}", r.positional_sql);
++        assert!(
++            r.positional_sql.contains("$$Привет$$"),
++            "Dollar-quote UTF-8 mangled: {}",
++            r.positional_sql
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:638:
+     fn normalized_sql_preserves_utf8() {
+         let r = parse_query("SELECT * FROM t WHERE name = 'Москва' AND id = $id: i32").unwrap();
+-        assert!(r.normalized_sql.contains("'Москва'"), "Normalized Cyrillic mangled: {}", r.normalized_sql);
++        assert!(
++            r.normalized_sql.contains("'Москва'"),
++            "Normalized Cyrillic mangled: {}",
++            r.normalized_sql
++        );
+     }
+ 
+     // --- FIX 3: reject manual positional parameters ---
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:647:
+         let result = parse_query("SELECT id FROM t WHERE id = $1");
+         assert!(result.is_err());
+         let err = result.unwrap_err();
+-        assert!(err.contains("manual positional parameters"), "unexpected error: {err}");
++        assert!(
++            err.contains("manual positional parameters"),
++            "unexpected error: {err}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:655:
+         let result = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $1");
+         assert!(result.is_err());
+         let err = result.unwrap_err();
+-        assert!(err.contains("manual positional parameters"), "unexpected error: {err}");
++        assert!(
++            err.contains("manual positional parameters"),
++            "unexpected error: {err}"
++        );
+     }
+ 
+     // --- FIX 7: duplicate parameter names ---
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:662:
+ 
+     #[test]
+     fn duplicate_param_same_type_reuses_position() {
+-        let r = parse_query(
+-            "SELECT id FROM t WHERE a = $x: i32 AND b = $x: i32",
+-        )
+-        .unwrap();
++        let r = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $x: i32").unwrap();
+         assert_eq!(r.params.len(), 1);
+         assert_eq!(r.params[0].name, "x");
+         assert_eq!(r.params[0].position, 1);
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:674:
+ 
+     #[test]
+     fn duplicate_param_conflicting_types_errors() {
+-        let result = parse_query(
+-            "SELECT id FROM t WHERE a = $x: i32 AND b = $x: &str",
+-        );
++        let result = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $x: &str");
+         assert!(result.is_err());
+         let err = result.unwrap_err();
+         assert!(err.contains("conflicting types"), "unexpected error: {err}");
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:686:
+ 
+     #[test]
+     fn line_comment_with_param_ignored() {
+-        let r = parse_query(
+-            "SELECT id FROM t WHERE id = $id: i32 -- $extra: i32",
+-        )
+-        .unwrap();
+-        assert_eq!(r.params.len(), 1, "param inside line comment should be ignored");
++        let r = parse_query("SELECT id FROM t WHERE id = $id: i32 -- $extra: i32").unwrap();
++        assert_eq!(
++            r.params.len(),
++            1,
++            "param inside line comment should be ignored"
++        );
+         assert_eq!(r.params[0].name, "id");
+     }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:697:
+     #[test]
+     fn block_comment_with_param_ignored() {
+-        let r = parse_query(
+-            "SELECT id FROM t WHERE id = $id: i32 /* $extra: i32 */",
+-        )
+-        .unwrap();
+-        assert_eq!(r.params.len(), 1, "param inside block comment should be ignored");
++        let r = parse_query("SELECT id FROM t WHERE id = $id: i32 /* $extra: i32 */").unwrap();
++        assert_eq!(
++            r.params.len(),
++            1,
++            "param inside block comment should be ignored"
++        );
+         assert_eq!(r.params[0].name, "id");
+     }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/parse.rs:708:
+ 
+     #[test]
+     fn nested_block_comment_stripped() {
+-        let r = parse_query(
+-            "SELECT /* outer /* inner */ still comment */ id FROM t",
+-        )
+-        .unwrap();
++        let r = parse_query("SELECT /* outer /* inner */ still comment */ id FROM t").unwrap();
+         assert_eq!(r.kind, QueryKind::Select);
+         // The nested block comment should be fully stripped
+         assert!(
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:53:
+ }
+ 
+ /// Parse and generate code for `#[pg_enum]`.
+-pub fn expand_pg_enum(
+-    _attr: TokenStream,
+-    item: TokenStream,
+-) -> Result<TokenStream, syn::Error> {
++pub fn expand_pg_enum(_attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Error> {
+     let input: syn::ItemEnum = syn::parse2(item)?;
+ 
+     // Validate: must be a C-like enum (no fields on variants)
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:157:
+             let label: syn::LitStr = attr.parse_args()?;
+             let value = label.value();
+             if value.is_empty() {
+-                return Err(syn::Error::new_spanned(
+-                    attr,
+-                    "SQL label cannot be empty",
+-                ));
++                return Err(syn::Error::new_spanned(attr, "SQL label cannot be empty"));
+             }
+             return Ok(value);
+         }
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:178:
+ ///
+ /// For enums with <=8 variants, uses a (len, first_byte) match for efficiency.
+ /// For larger enums, falls back to a simple byte-slice comparison chain.
+-fn gen_from_sql(enum_name: &syn::Ident, variants: &[EnumVariant], pg_type_name: &str) -> TokenStream {
++fn gen_from_sql(
++    enum_name: &syn::Ident,
++    variants: &[EnumVariant],
++    pg_type_name: &str,
++) -> TokenStream {
+     let match_body = gen_from_sql_match(enum_name, variants);
+     let enum_name_str = enum_name.to_string();
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:227:
+ 
+ /// Fast path: match on (s.len(), s.as_bytes()[0]) then compare full string
+ /// only when (len, first_byte) collides.
+-fn gen_from_sql_len_first_byte(
+-    enum_name: &syn::Ident,
+-    variants: &[EnumVariant],
+-) -> TokenStream {
++fn gen_from_sql_len_first_byte(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
+     // Group variants by (len, first_byte)
+     let mut groups: std::collections::BTreeMap<(usize, u8), Vec<&EnumVariant>> =
+         std::collections::BTreeMap::new();
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:414:
+         assert!(code.contains("Display"), "missing Display: {code}");
+         // Should contain the SQL labels
+         assert!(code.contains("\"new\""), "missing 'new' label: {code}");
+-        assert!(code.contains("\"active\""), "missing 'active' label: {code}");
+-        assert!(code.contains("\"closed\""), "missing 'closed' label: {code}");
++        assert!(
++            code.contains("\"active\""),
++            "missing 'active' label: {code}"
++        );
++        assert!(
++            code.contains("\"closed\""),
++            "missing 'closed' label: {code}"
++        );
+         // Should have derive attributes
+         assert!(code.contains("Debug"), "missing Debug derive: {code}");
+         assert!(code.contains("Clone"), "missing Clone derive: {code}");
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:422:
+         assert!(code.contains("Copy"), "missing Copy derive: {code}");
+-        assert!(code.contains("PartialEq"), "missing PartialEq derive: {code}");
++        assert!(
++            code.contains("PartialEq"),
++            "missing PartialEq derive: {code}"
++        );
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:436:
+         let result = expand_pg_enum(TokenStream::new(), input);
+         assert!(result.is_err());
+         let err = result.unwrap_err().to_string();
+-        assert!(
+-            err.contains("missing #[sql"),
+-            "unexpected error: {err}"
+-        );
++        assert!(err.contains("missing #[sql"), "unexpected error: {err}");
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:454:
+         let result = expand_pg_enum(TokenStream::new(), input);
+         assert!(result.is_err());
+         let err = result.unwrap_err().to_string();
+-        assert!(
+-            err.contains("unit variants"),
+-            "unexpected error: {err}"
+-        );
++        assert!(err.contains("unit variants"), "unexpected error: {err}");
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/pg_enum.rs:502:
+         let result = expand_pg_enum(TokenStream::new(), input);
+         assert!(result.is_err());
+         let err = result.unwrap_err().to_string();
+-        assert!(
+-            err.contains("cannot be empty"),
+-            "unexpected error: {err}"
+-        );
++        assert!(err.contains("cannot be empty"), "unexpected error: {err}");
+     }
+ 
+     #[test]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:62:
+         }
+         // --- Time with time zone (TIMETZ) ---
+         // 1266 is TIMETZ, rare but handle it
+-        1266 => {
+-            Err(format!(
+-                "column type is TIMETZ (OID {oid}) which is not supported by sasql. \
++        1266 => Err(format!(
++            "column type is TIMETZ (OID {oid}) which is not supported by sasql. \
+                  Use TIME or TIMESTAMPTZ instead."
+-            ))
+-        }
++        )),
+         // --- UUID ---
+         2950 => {
+             if cfg!(feature = "uuid") {
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:85:
+             }
+         }
+         // --- INTERVAL ---
+-        1186 => {
+-            Err(format!(
+-                "column type is INTERVAL (OID {oid}) which is not yet supported by sasql. \
++        1186 => Err(format!(
++            "column type is INTERVAL (OID {oid}) which is not yet supported by sasql. \
+                  Cast to a supported type or track the sasql issue for INTERVAL support."
+-            ))
+-        }
++        )),
+         // --- Timestamp/Date/Time arrays ---
+         1115 => resolve_array("TIMESTAMP[]", 1114, oid),
+         1185 => resolve_array("TIMESTAMPTZ[]", 1184, oid),
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:161:
+                 Err(feature_error(pg_name, array_oid, &["decimal"]))
+             }
+         }
+-        _ => {
+-            Err(format!(
+-                "unsupported PostgreSQL array type `{pg_name}` (OID {array_oid})."
+-            ))
+-        }
++        _ => Err(format!(
++            "unsupported PostgreSQL array type `{pg_name}` (OID {array_oid})."
++        )),
+     }
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:190:
+         ("::time::Time" | "time::Time", 1083) => cfg!(feature = "time"),
+ 
+         // --- chrono types ---
+-        ("::chrono::DateTime<::chrono::Utc>" | "chrono::DateTime<chrono::Utc>" | "chrono::DateTime<Utc>", 1184) => {
++        (
++            "::chrono::DateTime<::chrono::Utc>"
++            | "chrono::DateTime<chrono::Utc>"
++            | "chrono::DateTime<Utc>",
++            1184,
++        ) => {
+             cfg!(feature = "chrono")
+         }
+         ("::chrono::NaiveDateTime" | "chrono::NaiveDateTime" | "NaiveDateTime", 1114) => {
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:222:
+         .map(|f| format!("\"{f}\""))
+         .collect::<Vec<_>>()
+         .join(" or ");
+-    format!(
+-        "column type is {pg_type} (OID {oid}) — enable feature {features_str} in sasql"
+-    )
++    format!("column type is {pg_type} (OID {oid}) — enable feature {features_str} in sasql")
+ }
+ 
+ #[cfg(test)]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:250:
+     #[test]
+     fn timestamptz_resolves_to_time() {
+         assert_eq!(resolve_rust_type(1184).unwrap(), "::time::OffsetDateTime");
+-        assert_eq!(resolve_rust_type(1114).unwrap(), "::time::PrimitiveDateTime");
++        assert_eq!(
++            resolve_rust_type(1114).unwrap(),
++            "::time::PrimitiveDateTime"
++        );
+         assert_eq!(resolve_rust_type(1082).unwrap(), "::time::Date");
+         assert_eq!(resolve_rust_type(1083).unwrap(), "::time::Time");
+     }
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:304:
+     #[cfg(all(feature = "chrono", not(feature = "time")))]
+     #[test]
+     fn timestamptz_resolves_to_chrono() {
+-        assert_eq!(resolve_rust_type(1184).unwrap(), "::chrono::DateTime<::chrono::Utc>");
++        assert_eq!(
++            resolve_rust_type(1184).unwrap(),
++            "::chrono::DateTime<::chrono::Utc>"
++        );
+         assert_eq!(resolve_rust_type(1114).unwrap(), "::chrono::NaiveDateTime");
+         assert_eq!(resolve_rust_type(1082).unwrap(), "::chrono::NaiveDate");
+         assert_eq!(resolve_rust_type(1083).unwrap(), "::chrono::NaiveTime");
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:316:
+         assert!(is_param_compatible_extended("::chrono::NaiveDate", 1082));
+         assert!(is_param_compatible_extended("chrono::NaiveDate", 1082));
+         assert!(is_param_compatible_extended("NaiveDate", 1082));
+-        assert!(is_param_compatible_extended("::chrono::NaiveDateTime", 1114));
++        assert!(is_param_compatible_extended(
++            "::chrono::NaiveDateTime",
++            1114
++        ));
+     }
+ 
+     #[cfg(feature = "decimal")]
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:328:
+     #[cfg(feature = "decimal")]
+     #[test]
+     fn decimal_param_compat() {
+-        assert!(is_param_compatible_extended("::rust_decimal::Decimal", 1700));
++        assert!(is_param_compatible_extended(
++            "::rust_decimal::Decimal",
++            1700
++        ));
+         assert!(is_param_compatible_extended("rust_decimal::Decimal", 1700));
+         assert!(is_param_compatible_extended("Decimal", 1700));
+     }
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/types.rs:338:
+     fn numeric_errors_without_feature() {
+         let err = resolve_rust_type(1700).unwrap_err();
+         assert!(err.contains("NUMERIC"), "unexpected error: {err}");
+-        assert!(err.contains("decimal"), "should suggest decimal feature: {err}");
++        assert!(
++            err.contains("decimal"),
++            "should suggest decimal feature: {err}"
++        );
+     }
+ }
+ 
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/validate.rs:54:
+     rt.block_on(validate_async(parsed, client))
+ }
+ 
+-async fn validate_async(
+-    parsed: &ParsedQuery,
+-    client: &Client,
+-) -> Result<ValidationResult, String> {
++async fn validate_async(parsed: &ParsedQuery, client: &Client) -> Result<ValidationResult, String> {
+     // Prepare the query — this validates syntax, tables, columns, types.
+     let stmt = client
+         .prepare(&parsed.positional_sql)
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/validate.rs:91:
+         let base_rust_type = if is_pg_enum {
+             "::sasql_core::types::EnumString"
+         } else {
+-            crate::types::resolve_rust_type(pg_oid).map_err(|msg| {
+-                format!("column \"{name}\": {msg}")
+-            })?
++            crate::types::resolve_rust_type(pg_oid)
++                .map_err(|msg| format!("column \"{name}\": {msg}"))?
+         };
+ 
+         let rust_type = if is_nullable {
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/validate.rs:191:
+         ));
+     }
+ 
+-    for (i, (param, &pg_oid)) in parsed.params.iter().zip(&validation.param_pg_oids).enumerate() {
++    for (i, (param, &pg_oid)) in parsed
++        .params
++        .iter()
++        .zip(&validation.param_pg_oids)
++        .enumerate()
++    {
+         let is_pg_enum = validation.param_is_pg_enum.get(i).copied().unwrap_or(false);
+ 
+         // PG enum params accept &str/String (text representation)
+Diff in /home/runner/work/sasql/sasql/sasql-macros/src/validate.rs:206:
+         }
+ 
+         if !crate::types::is_param_compatible_extended(&param.rust_type, pg_oid) {
+-            let pg_name = sasql_core::types::pg_name_for_oid(pg_oid)
+-                .unwrap_or("unknown");
++            let pg_name = sasql_core::types::pg_name_for_oid(pg_oid).unwrap_or("unknown");
+             // Provide a better error for feature-gated types
+             let extra_hint = match crate::types::resolve_rust_type(pg_oid) {
+                 Ok(expected) => format!(" (expected `{expected}`)"),

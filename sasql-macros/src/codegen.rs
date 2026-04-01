@@ -13,10 +13,7 @@ use crate::parse::ParsedQuery;
 use crate::validate::ValidationResult;
 
 /// Generate the complete Rust code for a `query!` invocation.
-pub fn generate_query_code(
-    parsed: &ParsedQuery,
-    validation: &ValidationResult,
-) -> TokenStream {
+pub fn generate_query_code(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
     let executor_struct = gen_executor_struct(parsed);
     let executor_impls = gen_executor_impls(parsed, validation);
@@ -95,10 +92,14 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     let has_params = !parsed.params.is_empty();
 
     // Build the params slice: &[&self.id, &self.name, ...]
-    let param_refs: Vec<TokenStream> = parsed.params.iter().map(|p| {
-        let name = format_ident!("{}", p.name);
-        quote! { &self.#name as &(dyn ::sasql_core::pg::ToSql + Sync) }
-    }).collect();
+    let param_refs: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
+            let name = format_ident!("{}", p.name);
+            quote! { &self.#name as &(dyn ::sasql_core::pg::ToSql + Sync) }
+        })
+        .collect();
 
     let params_slice = if param_refs.is_empty() {
         quote! { &[] }
@@ -180,7 +181,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         }
     };
 
-    let impl_block = if has_params {
+    if has_params {
         quote! {
             #[allow(non_camel_case_types)]
             impl<'_sasql> #executor_name<'_sasql> {
@@ -196,9 +197,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 #execute_method
             }
         }
-    };
-
-    impl_block
+    }
 }
 
 /// Generate row field decoding: `field_name: row.get(0), ...`
@@ -253,7 +252,10 @@ fn add_lifetime_to_refs(ty: syn::Type) -> syn::Type {
     match ty {
         syn::Type::Reference(mut r) => {
             if r.lifetime.is_none() {
-                r.lifetime = Some(syn::Lifetime::new("'_sasql", proc_macro2::Span::call_site()));
+                r.lifetime = Some(syn::Lifetime::new(
+                    "'_sasql",
+                    proc_macro2::Span::call_site(),
+                ));
             }
             r.elem = Box::new(add_lifetime_to_refs(*r.elem));
             syn::Type::Reference(r)
@@ -334,7 +336,13 @@ fn sanitize_column_name(name: &str, index: usize) -> String {
     // Replace non-alphanumeric/underscore chars with underscore
     let sanitized: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
 
     // Ensure it doesn't start with a digit
@@ -372,28 +380,31 @@ mod tests {
     #[test]
     fn generates_result_struct_with_fields() {
         let parsed = parse_query("SELECT id, name FROM users WHERE 1 = $a: i32").unwrap();
-        let validation = make_validation(vec![
-            col("id", "i32"),
-            col("name", "String"),
-        ]);
+        let validation = make_validation(vec![col("id", "i32"), col("name", "String")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(code_str.contains("pub id : i32"), "missing id field: {code_str}");
-        assert!(code_str.contains("pub name : String"), "missing name field: {code_str}");
+        assert!(
+            code_str.contains("pub id : i32"),
+            "missing id field: {code_str}"
+        );
+        assert!(
+            code_str.contains("pub name : String"),
+            "missing name field: {code_str}"
+        );
     }
 
     #[test]
     fn generates_nullable_field_as_option() {
         let parsed = parse_query("SELECT bio FROM users WHERE 1 = $a: i32").unwrap();
-        let validation = make_validation(vec![
-            col("bio", "Option<String>"),
-        ]);
+        let validation = make_validation(vec![col("bio", "Option<String>")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(code_str.contains("Option < String >") || code_str.contains("Option<String>"),
-            "missing Option<String>: {code_str}");
+        assert!(
+            code_str.contains("Option < String >") || code_str.contains("Option<String>"),
+            "missing Option<String>: {code_str}"
+        );
     }
 
     #[test]
@@ -403,9 +414,18 @@ mod tests {
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(code_str.contains("fetch_one"), "missing fetch_one: {code_str}");
-        assert!(code_str.contains("fetch_all"), "missing fetch_all: {code_str}");
-        assert!(code_str.contains("fetch_optional"), "missing fetch_optional: {code_str}");
+        assert!(
+            code_str.contains("fetch_one"),
+            "missing fetch_one: {code_str}"
+        );
+        assert!(
+            code_str.contains("fetch_all"),
+            "missing fetch_all: {code_str}"
+        );
+        assert!(
+            code_str.contains("fetch_optional"),
+            "missing fetch_optional: {code_str}"
+        );
         assert!(code_str.contains("execute"), "missing execute: {code_str}");
     }
 
@@ -417,7 +437,10 @@ mod tests {
         let code_str = code.to_string();
 
         // Unit struct executor (no fields, no braces in constructor)
-        assert!(code_str.contains("struct SasqlExecutor_"), "missing executor: {code_str}");
+        assert!(
+            code_str.contains("struct SasqlExecutor_"),
+            "missing executor: {code_str}"
+        );
     }
 
     #[test]
@@ -427,7 +450,10 @@ mod tests {
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        assert!(!code_str.contains("SasqlResult_"), "should not have result struct: {code_str}");
+        assert!(
+            !code_str.contains("SasqlResult_"),
+            "should not have result struct: {code_str}"
+        );
         assert!(code_str.contains("execute"), "missing execute: {code_str}");
     }
 
@@ -439,10 +465,14 @@ mod tests {
         let code_str = code.to_string();
 
         // The constructor should reference the variable name `id` and include PhantomData
-        assert!(code_str.contains("id ,") || code_str.contains("id,"),
-            "missing param capture: {code_str}");
-        assert!(code_str.contains("PhantomData"),
-            "missing PhantomData: {code_str}");
+        assert!(
+            code_str.contains("id ,") || code_str.contains("id,"),
+            "missing param capture: {code_str}"
+        );
+        assert!(
+            code_str.contains("PhantomData"),
+            "missing PhantomData: {code_str}"
+        );
     }
 
     #[test]
@@ -453,8 +483,14 @@ mod tests {
         let code_str = code.to_string();
 
         // The generated code should use positional SQL ($1), not named ($id)
-        assert!(code_str.contains("$1"), "should contain positional $1: {code_str}");
-        assert!(!code_str.contains("$id"), "should not contain named $id: {code_str}");
+        assert!(
+            code_str.contains("$1"),
+            "should contain positional $1: {code_str}"
+        );
+        assert!(
+            !code_str.contains("$id"),
+            "should not contain named $id: {code_str}"
+        );
     }
 
     // --- FIX 5: lifetime injection via syn ---
@@ -477,7 +513,10 @@ mod tests {
     fn inject_lifetime_option_ref() {
         let ts = inject_lifetime("Option<&str>");
         let s = ts.to_string();
-        assert!(s.contains("'_sasql"), "missing lifetime in Option<&str>: {s}");
+        assert!(
+            s.contains("'_sasql"),
+            "missing lifetime in Option<&str>: {s}"
+        );
     }
 
     #[test]
@@ -492,30 +531,25 @@ mod tests {
         let ts = inject_lifetime("&[&str]");
         let s = ts.to_string();
         // Both references should get lifetimes
-        assert_eq!(s.matches("'_sasql").count(), 2,
-            "expected 2 lifetimes in &[&str]: {s}");
+        assert_eq!(
+            s.matches("'_sasql").count(),
+            2,
+            "expected 2 lifetimes in &[&str]: {s}"
+        );
     }
 
     // --- FIX 6: duplicate column names ---
 
     #[test]
     fn duplicate_column_names_deduplicated() {
-        let columns = vec![
-            col("id", "i32"),
-            col("id", "i32"),
-            col("name", "String"),
-        ];
+        let columns = vec![col("id", "i32"), col("id", "i32"), col("name", "String")];
         let names = deduplicate_column_names(&columns);
         assert_eq!(names, vec!["id", "id_1", "name"]);
     }
 
     #[test]
     fn three_duplicate_columns() {
-        let columns = vec![
-            col("id", "i32"),
-            col("id", "i32"),
-            col("id", "i32"),
-        ];
+        let columns = vec![col("id", "i32"), col("id", "i32"), col("id", "i32")];
         let names = deduplicate_column_names(&columns);
         assert_eq!(names, vec!["id", "id_1", "id_2"]);
     }
@@ -523,10 +557,7 @@ mod tests {
     #[test]
     fn generates_result_struct_with_deduplicated_fields() {
         let parsed = parse_query("SELECT 1").unwrap();
-        let validation = make_validation(vec![
-            col("id", "i32"),
-            col("id", "i32"),
-        ]);
+        let validation = make_validation(vec![col("id", "i32"), col("id", "i32")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
@@ -544,7 +575,10 @@ mod tests {
         let code_str = code.to_string();
 
         // fetch_one should use "... LIMIT 2", fetch_all should use original SQL
-        assert!(code_str.contains("LIMIT 2"), "missing LIMIT 2 in fetch_one: {code_str}");
+        assert!(
+            code_str.contains("LIMIT 2"),
+            "missing LIMIT 2 in fetch_one: {code_str}"
+        );
     }
 
     #[test]
@@ -555,7 +589,10 @@ mod tests {
         let code_str = code.to_string();
 
         // Should NOT inject an additional LIMIT
-        assert!(!code_str.contains("LIMIT 2"), "should not add LIMIT 2 when LIMIT exists: {code_str}");
+        assert!(
+            !code_str.contains("LIMIT 2"),
+            "should not add LIMIT 2 when LIMIT exists: {code_str}"
+        );
     }
 
     // --- FOR UPDATE should NOT get LIMIT 2 ---
@@ -593,15 +630,14 @@ mod tests {
     fn column_dedup_collision_with_existing_suffix() {
         // If columns are ["id_1", "id", "id"], the second "id" must NOT
         // become "id_1" (collision with first column). It should be "id_2".
-        let columns = vec![
-            col("id_1", "i32"),
-            col("id", "i32"),
-            col("id", "i32"),
-        ];
+        let columns = vec![col("id_1", "i32"), col("id", "i32"), col("id", "i32")];
         let names = deduplicate_column_names(&columns);
         assert_eq!(names[0], "id_1");
         assert_eq!(names[1], "id");
-        assert_eq!(names[2], "id_2", "should skip id_1 which is already taken: {names:?}");
+        assert_eq!(
+            names[2], "id_2",
+            "should skip id_1 which is already taken: {names:?}"
+        );
     }
 
     #[test]

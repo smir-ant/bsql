@@ -66,12 +66,30 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: sasql_test
+          POSTGRES_USER: sasql
+          POSTGRES_PASSWORD: sasql
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sasql -d sasql_test"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Setup test schema
+        run: PGPASSWORD=sasql psql -h localhost -U sasql -d sasql_test -f tests/setup.sql
+      - run: cargo clippy --workspace --all-targets --features "time,uuid,decimal" -- -D warnings
+        env:
+          SASQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
 
   fmt:
     name: Format

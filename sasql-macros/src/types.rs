@@ -62,12 +62,10 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
         }
         // --- Time with time zone (TIMETZ) ---
         // 1266 is TIMETZ, rare but handle it
-        1266 => {
-            Err(format!(
-                "column type is TIMETZ (OID {oid}) which is not supported by sasql. \
+        1266 => Err(format!(
+            "column type is TIMETZ (OID {oid}) which is not supported by sasql. \
                  Use TIME or TIMESTAMPTZ instead."
-            ))
-        }
+        )),
         // --- UUID ---
         2950 => {
             if cfg!(feature = "uuid") {
@@ -85,12 +83,10 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
             }
         }
         // --- INTERVAL ---
-        1186 => {
-            Err(format!(
-                "column type is INTERVAL (OID {oid}) which is not yet supported by sasql. \
+        1186 => Err(format!(
+            "column type is INTERVAL (OID {oid}) which is not yet supported by sasql. \
                  Cast to a supported type or track the sasql issue for INTERVAL support."
-            ))
-        }
+        )),
         // --- Timestamp/Date/Time arrays ---
         1115 => resolve_array("TIMESTAMP[]", 1114, oid),
         1185 => resolve_array("TIMESTAMPTZ[]", 1184, oid),
@@ -161,11 +157,9 @@ fn resolve_array(pg_name: &str, element_oid: u32, array_oid: u32) -> Result<&'st
                 Err(feature_error(pg_name, array_oid, &["decimal"]))
             }
         }
-        _ => {
-            Err(format!(
-                "unsupported PostgreSQL array type `{pg_name}` (OID {array_oid})."
-            ))
-        }
+        _ => Err(format!(
+            "unsupported PostgreSQL array type `{pg_name}` (OID {array_oid})."
+        )),
     }
 }
 
@@ -190,7 +184,12 @@ pub fn is_param_compatible_extended(rust_type: &str, pg_oid: u32) -> bool {
         ("::time::Time" | "time::Time", 1083) => cfg!(feature = "time"),
 
         // --- chrono types ---
-        ("::chrono::DateTime<::chrono::Utc>" | "chrono::DateTime<chrono::Utc>" | "chrono::DateTime<Utc>", 1184) => {
+        (
+            "::chrono::DateTime<::chrono::Utc>"
+            | "chrono::DateTime<chrono::Utc>"
+            | "chrono::DateTime<Utc>",
+            1184,
+        ) => {
             cfg!(feature = "chrono")
         }
         ("::chrono::NaiveDateTime" | "chrono::NaiveDateTime" | "NaiveDateTime", 1114) => {
@@ -222,9 +221,7 @@ fn feature_error(pg_type: &str, oid: u32, features: &[&str]) -> String {
         .map(|f| format!("\"{f}\""))
         .collect::<Vec<_>>()
         .join(" or ");
-    format!(
-        "column type is {pg_type} (OID {oid}) — enable feature {features_str} in sasql"
-    )
+    format!("column type is {pg_type} (OID {oid}) — enable feature {features_str} in sasql")
 }
 
 #[cfg(test)]
@@ -250,7 +247,10 @@ mod tests {
     #[test]
     fn timestamptz_resolves_to_time() {
         assert_eq!(resolve_rust_type(1184).unwrap(), "::time::OffsetDateTime");
-        assert_eq!(resolve_rust_type(1114).unwrap(), "::time::PrimitiveDateTime");
+        assert_eq!(
+            resolve_rust_type(1114).unwrap(),
+            "::time::PrimitiveDateTime"
+        );
         assert_eq!(resolve_rust_type(1082).unwrap(), "::time::Date");
         assert_eq!(resolve_rust_type(1083).unwrap(), "::time::Time");
     }
@@ -304,7 +304,10 @@ mod tests {
     #[cfg(all(feature = "chrono", not(feature = "time")))]
     #[test]
     fn timestamptz_resolves_to_chrono() {
-        assert_eq!(resolve_rust_type(1184).unwrap(), "::chrono::DateTime<::chrono::Utc>");
+        assert_eq!(
+            resolve_rust_type(1184).unwrap(),
+            "::chrono::DateTime<::chrono::Utc>"
+        );
         assert_eq!(resolve_rust_type(1114).unwrap(), "::chrono::NaiveDateTime");
         assert_eq!(resolve_rust_type(1082).unwrap(), "::chrono::NaiveDate");
         assert_eq!(resolve_rust_type(1083).unwrap(), "::chrono::NaiveTime");
@@ -316,7 +319,10 @@ mod tests {
         assert!(is_param_compatible_extended("::chrono::NaiveDate", 1082));
         assert!(is_param_compatible_extended("chrono::NaiveDate", 1082));
         assert!(is_param_compatible_extended("NaiveDate", 1082));
-        assert!(is_param_compatible_extended("::chrono::NaiveDateTime", 1114));
+        assert!(is_param_compatible_extended(
+            "::chrono::NaiveDateTime",
+            1114
+        ));
     }
 
     #[cfg(feature = "decimal")]
@@ -328,7 +334,10 @@ mod tests {
     #[cfg(feature = "decimal")]
     #[test]
     fn decimal_param_compat() {
-        assert!(is_param_compatible_extended("::rust_decimal::Decimal", 1700));
+        assert!(is_param_compatible_extended(
+            "::rust_decimal::Decimal",
+            1700
+        ));
         assert!(is_param_compatible_extended("rust_decimal::Decimal", 1700));
         assert!(is_param_compatible_extended("Decimal", 1700));
     }
@@ -338,6 +347,9 @@ mod tests {
     fn numeric_errors_without_feature() {
         let err = resolve_rust_type(1700).unwrap_err();
         assert!(err.contains("NUMERIC"), "unexpected error: {err}");
-        assert!(err.contains("decimal"), "should suggest decimal feature: {err}");
+        assert!(
+            err.contains("decimal"),
+            "should suggest decimal feature: {err}"
+        );
     }
 }

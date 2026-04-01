@@ -64,19 +64,16 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
     let sql = extract_sql(input)?;
 
     // 1. Parse: extract params, query kind, normalize SQL
-    let parsed = parse::parse_query(&sql).map_err(|msg| {
-        syn::Error::new(proc_macro2::Span::call_site(), msg)
-    })?;
+    let parsed = parse::parse_query(&sql)
+        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
 
     // 2. Validate against PostgreSQL via PREPARE
-    let validation = connection::with_connection(|rt, client| {
-        validate::validate_query(&parsed, rt, client)
-    })?;
+    let validation =
+        connection::with_connection(|rt, client| validate::validate_query(&parsed, rt, client))?;
 
     // 3. Check parameter type compatibility
-    validate::check_param_types(&parsed, &validation).map_err(|msg| {
-        syn::Error::new(proc_macro2::Span::call_site(), msg)
-    })?;
+    validate::check_param_types(&parsed, &validation)
+        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
 
     // 4. Generate Rust code
     Ok(codegen::generate_query_code(&parsed, &validation))

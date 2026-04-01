@@ -31,7 +31,10 @@ static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| 
     let rt = Runtime::new().map_err(|e| format!("sasql: failed to create tokio runtime: {e}"))?;
 
     let (client, connection) = rt
-        .block_on(tokio_postgres::connect(&database_url, tokio_postgres::NoTls))
+        .block_on(tokio_postgres::connect(
+            &database_url,
+            tokio_postgres::NoTls,
+        ))
         .map_err(|e| {
             format!(
                 "sasql: failed to connect to PostgreSQL at compile time: {e}. \
@@ -60,12 +63,11 @@ pub fn with_connection<F, T>(f: F) -> Result<T, syn::Error>
 where
     F: FnOnce(&Runtime, &Client) -> Result<T, String>,
 {
-    let conn = MACRO_CONN.as_ref().map_err(|msg| {
-        syn::Error::new(proc_macro2::Span::call_site(), msg)
-    })?;
-    f(&conn.runtime, &conn.client).map_err(|msg| {
-        syn::Error::new(proc_macro2::Span::call_site(), msg)
-    })
+    let conn = MACRO_CONN
+        .as_ref()
+        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+    f(&conn.runtime, &conn.client)
+        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))
 }
 
 #[cfg(test)]

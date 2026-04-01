@@ -62,8 +62,8 @@
 //! | `.execute(&pool)` | `u64` (affected rows) | never |
 
 // Re-export the query! macro and pg_enum attribute macro
-pub use sasql_macros::query;
 pub use sasql_macros::pg_enum;
+pub use sasql_macros::query;
 
 // Re-export all runtime types
 pub use sasql_core::error::{self, SasqlError, SasqlResult};

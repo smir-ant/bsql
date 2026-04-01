@@ -54,10 +54,7 @@ pub fn validate_query(
     rt.block_on(validate_async(parsed, client))
 }
 
-async fn validate_async(
-    parsed: &ParsedQuery,
-    client: &Client,
-) -> Result<ValidationResult, String> {
+async fn validate_async(parsed: &ParsedQuery, client: &Client) -> Result<ValidationResult, String> {
     // Prepare the query — this validates syntax, tables, columns, types.
     let stmt = client
         .prepare(&parsed.positional_sql)
@@ -91,9 +88,8 @@ async fn validate_async(
         let base_rust_type = if is_pg_enum {
             "::sasql_core::types::EnumString"
         } else {
-            crate::types::resolve_rust_type(pg_oid).map_err(|msg| {
-                format!("column \"{name}\": {msg}")
-            })?
+            crate::types::resolve_rust_type(pg_oid)
+                .map_err(|msg| format!("column \"{name}\": {msg}"))?
         };
 
         let rust_type = if is_nullable {
@@ -140,7 +136,7 @@ async fn resolve_nullability_batch(
         match (col.table_oid(), col.column_id()) {
             (Some(t), Some(c)) if t != 0 && c != 0 => {
                 table_oids.push(t);
-                col_nums.push(c as i16);
+                col_nums.push(c);
                 col_indices.push(i);
             }
             _ => {} // computed → stays true (nullable)
@@ -191,7 +187,12 @@ pub fn check_param_types(
         ));
     }
 
-    for (i, (param, &pg_oid)) in parsed.params.iter().zip(&validation.param_pg_oids).enumerate() {
+    for (i, (param, &pg_oid)) in parsed
+        .params
+        .iter()
+        .zip(&validation.param_pg_oids)
+        .enumerate()
+    {
         let is_pg_enum = validation.param_is_pg_enum.get(i).copied().unwrap_or(false);
 
         // PG enum params accept &str/String (text representation)
@@ -206,8 +207,7 @@ pub fn check_param_types(
         }
 
         if !crate::types::is_param_compatible_extended(&param.rust_type, pg_oid) {
-            let pg_name = sasql_core::types::pg_name_for_oid(pg_oid)
-                .unwrap_or("unknown");
+            let pg_name = sasql_core::types::pg_name_for_oid(pg_oid).unwrap_or("unknown");
             // Provide a better error for feature-gated types
             let extra_hint = match crate::types::resolve_rust_type(pg_oid) {
                 Ok(expected) => format!(" (expected `{expected}`)"),

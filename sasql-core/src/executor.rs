@@ -45,11 +45,7 @@ impl Executor for Pool {
         conn.query_raw(sql, params).await
     }
 
-    async fn execute_raw(
-        &self,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> SasqlResult<u64> {
+    async fn execute_raw(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> SasqlResult<u64> {
         let conn = self.acquire().await?;
         conn.execute_raw(sql, params).await
     }
@@ -75,11 +71,7 @@ impl Executor for PoolConnection {
             .map_err(SasqlError::from)
     }
 
-    async fn execute_raw(
-        &self,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> SasqlResult<u64> {
+    async fn execute_raw(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> SasqlResult<u64> {
         let stmt = self
             .inner
             .prepare_cached(sql)

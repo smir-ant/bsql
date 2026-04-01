@@ -15,12 +15,11 @@ async fn pool() -> Pool {
 async fn select_fetch_one() {
     let pool = pool().await;
     let id = 1i32;
-    let user = sasql::query!(
-        "SELECT id, login, first_name, last_name FROM users WHERE id = $id: i32"
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let user =
+        sasql::query!("SELECT id, login, first_name, last_name FROM users WHERE id = $id: i32")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(user.id, 1);
     assert_eq!(user.login, "alice");
@@ -31,12 +30,10 @@ async fn select_fetch_one() {
 #[tokio::test]
 async fn select_fetch_all() {
     let pool = pool().await;
-    let users = sasql::query!(
-        "SELECT id, login FROM users WHERE active = true ORDER BY id"
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let users = sasql::query!("SELECT id, login FROM users WHERE active = true ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(users.len(), 2);
     assert_eq!(users[0].login, "alice");
@@ -47,12 +44,10 @@ async fn select_fetch_all() {
 async fn select_fetch_optional_found() {
     let pool = pool().await;
     let login = "alice";
-    let user = sasql::query!(
-        "SELECT id, login FROM users WHERE login = $login: &str"
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    let user = sasql::query!("SELECT id, login FROM users WHERE login = $login: &str")
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
 
     assert!(user.is_some());
     assert_eq!(user.unwrap().login, "alice");
@@ -62,12 +57,10 @@ async fn select_fetch_optional_found() {
 async fn select_fetch_optional_not_found() {
     let pool = pool().await;
     let login = "nonexistent";
-    let user = sasql::query!(
-        "SELECT id, login FROM users WHERE login = $login: &str"
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    let user = sasql::query!("SELECT id, login FROM users WHERE login = $login: &str")
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
 
     assert!(user.is_none());
 }
@@ -76,12 +69,10 @@ async fn select_fetch_optional_not_found() {
 async fn select_nullable_column() {
     let pool = pool().await;
     let id = 1i32;
-    let user = sasql::query!(
-        "SELECT id, middle_name FROM users WHERE id = $id: i32"
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let user = sasql::query!("SELECT id, middle_name FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(user.id, 1);
     assert!(user.middle_name.is_none());
@@ -109,12 +100,11 @@ async fn update_execute() {
     let pool = pool().await;
     let desc = "Updated description";
     let id = 1i32;
-    let affected = sasql::query!(
-        "UPDATE tickets SET description = $desc: &str WHERE id = $id: i32"
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let affected =
+        sasql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
+            .execute(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(affected, 1);
 }
@@ -134,12 +124,10 @@ async fn delete_execute() {
     .unwrap();
 
     let ticket_id = ticket.id;
-    let affected = sasql::query!(
-        "DELETE FROM tickets WHERE id = $ticket_id: i32"
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let affected = sasql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(affected, 1);
 }
@@ -148,16 +136,18 @@ async fn delete_execute() {
 async fn fetch_one_zero_rows_errors() {
     let pool = pool().await;
     let id = 999999i32;
-    let result = sasql::query!(
-        "SELECT id, login FROM users WHERE id = $id: i32"
-    )
-    .fetch_one(&pool)
-    .await;
+    let result = sasql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
         SasqlError::Query(e) => {
-            assert!(e.message.contains("exactly 1 row"), "unexpected: {}", e.message);
+            assert!(
+                e.message.contains("exactly 1 row"),
+                "unexpected: {}",
+                e.message
+            );
         }
         other => panic!("expected Query error, got: {other:?}"),
     }
@@ -187,9 +177,10 @@ async fn select_multiple_types() {
 async fn select_count_expression() {
     // COUNT(*) is a computed column — should be i64, nullable by default
     let pool = pool().await;
-    let result = sasql::query!(
-        "SELECT COUNT(*) as cnt FROM users"
-    ).fetch_one(&pool).await.unwrap();
+    let result = sasql::query!("SELECT COUNT(*) as cnt FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     // COUNT(*) never returns NULL (returns 0 for empty sets)
     // but our system defaults computed columns to nullable → Option<i64>
     assert!(result.cnt.is_some());
@@ -205,7 +196,10 @@ async fn select_with_join_and_aliases() {
          FROM tickets t
          JOIN users u ON u.id = t.created_by_user_id
          WHERE t.id = $id: i32"
-    ).fetch_one(&pool).await.unwrap();
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(result.ticket_id, 1);
     assert_eq!(result.title, "Fix login bug");
     assert_eq!(result.creator, "alice");
@@ -219,7 +213,10 @@ async fn select_with_cte() {
             SELECT id, login FROM users WHERE active = true
         )
         SELECT id, login FROM active_users ORDER BY id"
-    ).fetch_all(&pool).await.unwrap();
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].login, "alice");
 }
@@ -228,18 +225,20 @@ async fn select_with_cte() {
 async fn fetch_all_empty_result() {
     let pool = pool().await;
     let login = "absolutely_nobody_has_this_login";
-    let results = sasql::query!(
-        "SELECT id, login FROM users WHERE login = $login: &str"
-    ).fetch_all(&pool).await.unwrap();
+    let results = sasql::query!("SELECT id, login FROM users WHERE login = $login: &str")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
     assert!(results.is_empty());
 }
 
 #[tokio::test]
 async fn select_expression_arithmetic() {
     let pool = pool().await;
-    let result = sasql::query!(
-        "SELECT 1 + 1 as sum_val"
-    ).fetch_one(&pool).await.unwrap();
+    let result = sasql::query!("SELECT 1 + 1 as sum_val")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     // Computed expression → nullable by default
     assert_eq!(result.sum_val, Some(2i32));
 }
@@ -256,7 +255,10 @@ async fn insert_on_conflict_do_nothing() {
         "INSERT INTO users (login, first_name, last_name, email)
          VALUES ($login: &str, $first_name: &str, $last_name: &str, $email: &str)
          ON CONFLICT (login) DO NOTHING"
-    ).execute(&pool).await.unwrap();
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_eq!(affected, 0);
 }
 
@@ -269,12 +271,16 @@ async fn delete_returning() {
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
-    ).fetch_one(&pool).await.unwrap();
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     let id = ticket.id;
-    let deleted = sasql::query!(
-        "DELETE FROM tickets WHERE id = $id: i32 RETURNING id, title"
-    ).fetch_all(&pool).await.unwrap();
+    let deleted = sasql::query!("DELETE FROM tickets WHERE id = $id: i32 RETURNING id, title")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
     assert_eq!(deleted.len(), 1);
     assert_eq!(deleted[0].id, id);
 }
@@ -283,9 +289,10 @@ async fn delete_returning() {
 async fn param_reuse_in_real_query() {
     let pool = pool().await;
     let id = 1i32;
-    let user = sasql::query!(
-        "SELECT id, login FROM users WHERE id = $id: i32 AND id = $id: i32"
-    ).fetch_one(&pool).await.unwrap();
+    let user = sasql::query!("SELECT id, login FROM users WHERE id = $id: i32 AND id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(user.id, 1);
 }
 
@@ -293,14 +300,18 @@ async fn param_reuse_in_real_query() {
 async fn fetch_optional_multiple_rows_errors() {
     let pool = pool().await;
     // users table has 2+ rows with active=true — fetch_optional must error
-    let result = sasql::query!(
-        "SELECT id, login FROM users WHERE active = true"
-    ).fetch_optional(&pool).await;
+    let result = sasql::query!("SELECT id, login FROM users WHERE active = true")
+        .fetch_optional(&pool)
+        .await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
         SasqlError::Query(e) => {
-            assert!(e.message.contains("0 or 1 rows"), "unexpected: {}", e.message);
+            assert!(
+                e.message.contains("0 or 1 rows"),
+                "unexpected: {}",
+                e.message
+            );
         }
         other => panic!("expected Query error, got: {other:?}"),
     }
@@ -312,14 +323,16 @@ async fn bytea_column_round_trip() {
     let avatar: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
     let id = 1i32;
     // Set avatar
-    sasql::query!(
-        "UPDATE users SET avatar = $avatar: &[u8] WHERE id = $id: i32"
-    ).execute(&pool).await.unwrap();
+    sasql::query!("UPDATE users SET avatar = $avatar: &[u8] WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Read it back
-    let user = sasql::query!(
-        "SELECT id, avatar FROM users WHERE id = $id: i32"
-    ).fetch_one(&pool).await.unwrap();
+    let user = sasql::query!("SELECT id, avatar FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(user.id, 1);
     assert_eq!(user.avatar.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
@@ -329,9 +342,10 @@ async fn bytea_column_round_trip() {
 async fn array_column_type() {
     let pool = pool().await;
     let id = 1i32;
-    let user = sasql::query!(
-        "SELECT id, tag_ids FROM users WHERE id = $id: i32"
-    ).fetch_one(&pool).await.unwrap();
+    let user = sasql::query!("SELECT id, tag_ids FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(user.id, 1);
     assert!(user.tag_ids.is_empty()); // default '{}'

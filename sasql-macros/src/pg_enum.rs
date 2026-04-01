@@ -53,10 +53,7 @@ struct EnumVariant {
 }
 
 /// Parse and generate code for `#[pg_enum]`.
-pub fn expand_pg_enum(
-    _attr: TokenStream,
-    item: TokenStream,
-) -> Result<TokenStream, syn::Error> {
+pub fn expand_pg_enum(_attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Error> {
     let input: syn::ItemEnum = syn::parse2(item)?;
 
     // Validate: must be a C-like enum (no fields on variants)
@@ -157,10 +154,7 @@ fn extract_sql_attr(variant: &syn::Variant) -> Result<String, syn::Error> {
             let label: syn::LitStr = attr.parse_args()?;
             let value = label.value();
             if value.is_empty() {
-                return Err(syn::Error::new_spanned(
-                    attr,
-                    "SQL label cannot be empty",
-                ));
+                return Err(syn::Error::new_spanned(attr, "SQL label cannot be empty"));
             }
             return Ok(value);
         }
@@ -178,7 +172,11 @@ fn extract_sql_attr(variant: &syn::Variant) -> Result<String, syn::Error> {
 ///
 /// For enums with <=8 variants, uses a (len, first_byte) match for efficiency.
 /// For larger enums, falls back to a simple byte-slice comparison chain.
-fn gen_from_sql(enum_name: &syn::Ident, variants: &[EnumVariant], pg_type_name: &str) -> TokenStream {
+fn gen_from_sql(
+    enum_name: &syn::Ident,
+    variants: &[EnumVariant],
+    pg_type_name: &str,
+) -> TokenStream {
     let match_body = gen_from_sql_match(enum_name, variants);
     let enum_name_str = enum_name.to_string();
 
@@ -227,10 +225,7 @@ fn gen_from_sql_match(enum_name: &syn::Ident, variants: &[EnumVariant]) -> Token
 
 /// Fast path: match on (s.len(), s.as_bytes()[0]) then compare full string
 /// only when (len, first_byte) collides.
-fn gen_from_sql_len_first_byte(
-    enum_name: &syn::Ident,
-    variants: &[EnumVariant],
-) -> TokenStream {
+fn gen_from_sql_len_first_byte(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
     // Group variants by (len, first_byte)
     let mut groups: std::collections::BTreeMap<(usize, u8), Vec<&EnumVariant>> =
         std::collections::BTreeMap::new();
@@ -414,13 +409,22 @@ mod tests {
         assert!(code.contains("Display"), "missing Display: {code}");
         // Should contain the SQL labels
         assert!(code.contains("\"new\""), "missing 'new' label: {code}");
-        assert!(code.contains("\"active\""), "missing 'active' label: {code}");
-        assert!(code.contains("\"closed\""), "missing 'closed' label: {code}");
+        assert!(
+            code.contains("\"active\""),
+            "missing 'active' label: {code}"
+        );
+        assert!(
+            code.contains("\"closed\""),
+            "missing 'closed' label: {code}"
+        );
         // Should have derive attributes
         assert!(code.contains("Debug"), "missing Debug derive: {code}");
         assert!(code.contains("Clone"), "missing Clone derive: {code}");
         assert!(code.contains("Copy"), "missing Copy derive: {code}");
-        assert!(code.contains("PartialEq"), "missing PartialEq derive: {code}");
+        assert!(
+            code.contains("PartialEq"),
+            "missing PartialEq derive: {code}"
+        );
     }
 
     #[test]
@@ -436,10 +440,7 @@ mod tests {
         let result = expand_pg_enum(TokenStream::new(), input);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("missing #[sql"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("missing #[sql"), "unexpected error: {err}");
     }
 
     #[test]
@@ -454,10 +455,7 @@ mod tests {
         let result = expand_pg_enum(TokenStream::new(), input);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unit variants"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("unit variants"), "unexpected error: {err}");
     }
 
     #[test]
@@ -502,10 +500,7 @@ mod tests {
         let result = expand_pg_enum(TokenStream::new(), input);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("cannot be empty"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("cannot be empty"), "unexpected error: {err}");
     }
 
     #[test]

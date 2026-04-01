@@ -23,28 +23,133 @@ pub struct TypeMapping {
 /// <https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat>
 pub const BASE_TYPE_MAP: &[TypeMapping] = &[
     // Scalar types
-    TypeMapping { pg_oid: 16,   pg_name: "bool",    rust_type: "bool",       is_array: false },
-    TypeMapping { pg_oid: 21,   pg_name: "int2",    rust_type: "i16",        is_array: false },
-    TypeMapping { pg_oid: 23,   pg_name: "int4",    rust_type: "i32",        is_array: false },
-    TypeMapping { pg_oid: 20,   pg_name: "int8",    rust_type: "i64",        is_array: false },
-    TypeMapping { pg_oid: 700,  pg_name: "float4",  rust_type: "f32",        is_array: false },
-    TypeMapping { pg_oid: 701,  pg_name: "float8",  rust_type: "f64",        is_array: false },
-    TypeMapping { pg_oid: 25,   pg_name: "text",    rust_type: "String",     is_array: false },
-    TypeMapping { pg_oid: 1043, pg_name: "varchar",  rust_type: "String",    is_array: false },
-    TypeMapping { pg_oid: 1042, pg_name: "bpchar",   rust_type: "String",    is_array: false },
-    TypeMapping { pg_oid: 17,   pg_name: "bytea",    rust_type: "Vec<u8>",   is_array: false },
-    TypeMapping { pg_oid: 26,   pg_name: "oid",      rust_type: "u32",       is_array: false },
-    TypeMapping { pg_oid: 2278, pg_name: "void",     rust_type: "()",        is_array: false },
+    TypeMapping {
+        pg_oid: 16,
+        pg_name: "bool",
+        rust_type: "bool",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 21,
+        pg_name: "int2",
+        rust_type: "i16",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 23,
+        pg_name: "int4",
+        rust_type: "i32",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 20,
+        pg_name: "int8",
+        rust_type: "i64",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 700,
+        pg_name: "float4",
+        rust_type: "f32",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 701,
+        pg_name: "float8",
+        rust_type: "f64",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 25,
+        pg_name: "text",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 1043,
+        pg_name: "varchar",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 1042,
+        pg_name: "bpchar",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 17,
+        pg_name: "bytea",
+        rust_type: "Vec<u8>",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 26,
+        pg_name: "oid",
+        rust_type: "u32",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 2278,
+        pg_name: "void",
+        rust_type: "()",
+        is_array: false,
+    },
     // Array types
-    TypeMapping { pg_oid: 1000, pg_name: "_bool",    rust_type: "Vec<bool>",       is_array: true },
-    TypeMapping { pg_oid: 1005, pg_name: "_int2",    rust_type: "Vec<i16>",        is_array: true },
-    TypeMapping { pg_oid: 1007, pg_name: "_int4",    rust_type: "Vec<i32>",        is_array: true },
-    TypeMapping { pg_oid: 1016, pg_name: "_int8",    rust_type: "Vec<i64>",        is_array: true },
-    TypeMapping { pg_oid: 1021, pg_name: "_float4",  rust_type: "Vec<f32>",        is_array: true },
-    TypeMapping { pg_oid: 1022, pg_name: "_float8",  rust_type: "Vec<f64>",        is_array: true },
-    TypeMapping { pg_oid: 1009, pg_name: "_text",    rust_type: "Vec<String>",     is_array: true },
-    TypeMapping { pg_oid: 1015, pg_name: "_varchar",  rust_type: "Vec<String>",    is_array: true },
-    TypeMapping { pg_oid: 1001, pg_name: "_bytea",    rust_type: "Vec<Vec<u8>>",   is_array: true },
+    TypeMapping {
+        pg_oid: 1000,
+        pg_name: "_bool",
+        rust_type: "Vec<bool>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 1005,
+        pg_name: "_int2",
+        rust_type: "Vec<i16>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 1007,
+        pg_name: "_int4",
+        rust_type: "Vec<i32>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 1016,
+        pg_name: "_int8",
+        rust_type: "Vec<i64>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 1021,
+        pg_name: "_float4",
+        rust_type: "Vec<f32>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 1022,
+        pg_name: "_float8",
+        rust_type: "Vec<f64>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 1009,
+        pg_name: "_text",
+        rust_type: "Vec<String>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 1015,
+        pg_name: "_varchar",
+        rust_type: "Vec<String>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 1001,
+        pg_name: "_bytea",
+        rust_type: "Vec<Vec<u8>>",
+        is_array: true,
+    },
 ];
 
 /// Look up the Rust type for a PostgreSQL OID.
@@ -52,12 +157,18 @@ pub const BASE_TYPE_MAP: &[TypeMapping] = &[
 /// Returns `None` for unrecognized OIDs. The caller should emit a compile error
 /// suggesting the user enable the appropriate feature flag.
 pub fn rust_type_for_oid(oid: u32) -> Option<&'static str> {
-    BASE_TYPE_MAP.iter().find(|m| m.pg_oid == oid).map(|m| m.rust_type)
+    BASE_TYPE_MAP
+        .iter()
+        .find(|m| m.pg_oid == oid)
+        .map(|m| m.rust_type)
 }
 
 /// Look up the PostgreSQL type name for an OID (for error messages).
 pub fn pg_name_for_oid(oid: u32) -> Option<&'static str> {
-    BASE_TYPE_MAP.iter().find(|m| m.pg_oid == oid).map(|m| m.pg_name)
+    BASE_TYPE_MAP
+        .iter()
+        .find(|m| m.pg_oid == oid)
+        .map(|m| m.pg_name)
 }
 
 /// Check whether a user-declared Rust parameter type is compatible with a PG OID.
@@ -234,10 +345,10 @@ mod tests {
 
     #[test]
     fn param_incompatible_rejects_wrong_type() {
-        assert!(!is_param_compatible("&str", 23));   // &str for int4
-        assert!(!is_param_compatible("i32", 20));    // i32 for int8 (no widening)
-        assert!(!is_param_compatible("i64", 23));    // i64 for int4 (no narrowing)
-        assert!(!is_param_compatible("bool", 25));   // bool for text
+        assert!(!is_param_compatible("&str", 23)); // &str for int4
+        assert!(!is_param_compatible("i32", 20)); // i32 for int8 (no widening)
+        assert!(!is_param_compatible("i64", 23)); // i64 for int4 (no narrowing)
+        assert!(!is_param_compatible("bool", 25)); // bool for text
     }
 
     #[test]

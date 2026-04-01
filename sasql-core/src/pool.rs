@@ -110,7 +110,7 @@ impl PoolBuilder {
 
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| ConnectError::new(e.to_string()))?;
+            .map_err(|e| ConnectError::create(e.to_string()))?;
 
         // FIX 11: detect PgBouncer — propagate connection failure
         let pgbouncer = detect_pgbouncer(&pool).await?;
@@ -129,7 +129,7 @@ impl Pool {
     pub async fn connect(url: &str) -> SasqlResult<Self> {
         let config: tokio_postgres::Config = url
             .parse()
-            .map_err(|e: tokio_postgres::Error| ConnectError::new(e.to_string()))?;
+            .map_err(|e: tokio_postgres::Error| ConnectError::create(e.to_string()))?;
 
         let mut cfg = Config::new();
         cfg.host = config.get_hosts().first().map(|h| match h {
@@ -160,7 +160,7 @@ impl Pool {
 
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| ConnectError::new(e.to_string()))?;
+            .map_err(|e| ConnectError::create(e.to_string()))?;
 
         // FIX 11: detect PgBouncer — propagate connection failure
         let pgbouncer = detect_pgbouncer(&pool).await?;
@@ -189,11 +189,7 @@ impl Pool {
     /// **Fail-fast**: returns `SasqlError::Pool` immediately if no connections
     /// are available. Does not wait. Does not timeout. See CREDO principle #17.
     pub async fn acquire(&self) -> SasqlResult<PoolConnection> {
-        let conn = self
-            .inner
-            .get()
-            .await
-            .map_err(SasqlError::from)?;
+        let conn = self.inner.get().await.map_err(SasqlError::from)?;
 
         Ok(PoolConnection {
             inner: conn,
@@ -256,17 +252,11 @@ pub struct PoolStatus {
 /// returning `DIRECT`. A pool that can't connect on creation is broken.
 async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> SasqlResult<PgBouncerInfo> {
     let conn = pool.get().await.map_err(|e| {
-        ConnectError::with_source(
-            format!("failed to establish initial connection: {e}"),
-            e,
-        )
+        ConnectError::with_source(format!("failed to establish initial connection: {e}"), e)
     })?;
 
     // PgBouncer responds to `SHOW POOLS`; PostgreSQL does not.
-    let is_pgbouncer = conn
-        .simple_query("SHOW POOLS")
-        .await
-        .is_ok();
+    let is_pgbouncer = conn.simple_query("SHOW POOLS").await.is_ok();
 
     if !is_pgbouncer {
         return Ok(PgBouncerInfo::DIRECT);
@@ -276,8 +266,7 @@ async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> SasqlResult<PgBounc
     let supports_named = match conn.simple_query("SHOW CONFIG").await {
         Ok(messages) => messages.iter().any(|msg| {
             if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-                row.get(0) == Some("prepared_statements")
-                    && row.get(1) == Some("yes")
+                row.get(0) == Some("prepared_statements") && row.get(1) == Some("yes")
             } else {
                 false
             }

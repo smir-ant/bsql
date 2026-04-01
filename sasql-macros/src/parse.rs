@@ -116,9 +116,7 @@ fn extract_params(sql: &str) -> Result<(String, Vec<Param>), String> {
         // Dollar-quoted string: copy verbatim
         if b == b'$'
             && i + 1 < len
-            && (bytes[i + 1] == b'$'
-                || bytes[i + 1].is_ascii_alphabetic()
-                || bytes[i + 1] == b'_')
+            && (bytes[i + 1] == b'$' || bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
         {
             if let Some(end) = skip_dollar_quote(bytes, i) {
                 out.push_str(&sql[i..end]);
@@ -291,7 +289,10 @@ fn strip_comments(sql: &str) -> String {
             while i < len {
                 if bytes[i] == b'\'' {
                     i += 1;
-                    if i < len && bytes[i] == b'\'' { i += 1; continue; }
+                    if i < len && bytes[i] == b'\'' {
+                        i += 1;
+                        continue;
+                    }
                     break;
                 }
                 i += 1;
@@ -312,7 +313,9 @@ fn strip_comments(sql: &str) -> String {
         // Line comment: skip to end of line
         if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
             i += 2;
-            while i < len && bytes[i] != b'\n' { i += 1; }
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
             out.push(' ');
             continue;
         }
@@ -322,8 +325,16 @@ fn strip_comments(sql: &str) -> String {
             i += 2;
             let mut depth = 1u32;
             while i + 1 < len && depth > 0 {
-                if bytes[i] == b'/' && bytes[i + 1] == b'*' { depth += 1; i += 2; continue; }
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' { depth -= 1; i += 2; continue; }
+                if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                    continue;
+                }
                 i += 1;
             }
             out.push(' ');
@@ -377,10 +388,7 @@ fn skip_dollar_quote(bytes: &[u8], start: usize) -> Option<usize> {
 
 /// Detect the query kind from the first keyword.
 fn detect_query_kind(normalized: &str) -> Result<QueryKind, String> {
-    let first_word = normalized
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
+    let first_word = normalized.split_whitespace().next().unwrap_or("");
 
     // Handle CTEs: WITH ... SELECT/INSERT/UPDATE/DELETE
     if first_word == "with" {
@@ -391,7 +399,9 @@ fn detect_query_kind(normalized: &str) -> Result<QueryKind, String> {
             let opens = word.matches('(').count() as i32;
             let closes = word.matches(')').count() as i32;
             depth += opens - closes;
-            if depth < 0 { depth = 0; } // malformed SQL — PG will catch it
+            if depth < 0 {
+                depth = 0;
+            } // malformed SQL — PG will catch it
 
             match word {
                 "select" if depth == 0 => return Ok(QueryKind::Select),
@@ -418,9 +428,7 @@ fn detect_query_kind(normalized: &str) -> Result<QueryKind, String> {
 /// Check if the normalized SQL contains a RETURNING clause (outside string literals).
 fn detect_returning(normalized: &str) -> bool {
     // After normalization, RETURNING is lowercase. We look for the word boundary.
-    normalized
-        .split_whitespace()
-        .any(|w| w == "returning")
+    normalized.split_whitespace().any(|w| w == "returning")
 }
 
 #[cfg(test)]
@@ -442,10 +450,9 @@ mod tests {
 
     #[test]
     fn multiple_params() {
-        let result = parse_query(
-            "INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)",
-        )
-        .unwrap();
+        let result =
+            parse_query("INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)")
+                .unwrap();
         assert_eq!(result.params.len(), 2);
         assert_eq!(result.params[0].name, "name");
         assert_eq!(result.params[0].rust_type, "&str");
@@ -457,19 +464,13 @@ mod tests {
 
     #[test]
     fn generic_type_param() {
-        let result = parse_query(
-            "SELECT id FROM t WHERE ids = ANY($ids: &[i32])",
-        )
-        .unwrap();
+        let result = parse_query("SELECT id FROM t WHERE ids = ANY($ids: &[i32])").unwrap();
         assert_eq!(result.params[0].rust_type, "&[i32]");
     }
 
     #[test]
     fn vec_type_param() {
-        let result = parse_query(
-            "SELECT id FROM t WHERE id = ANY($ids: Vec<i32>)",
-        )
-        .unwrap();
+        let result = parse_query("SELECT id FROM t WHERE id = ANY($ids: Vec<i32>)").unwrap();
         assert_eq!(result.params[0].rust_type, "Vec<i32>");
     }
 
@@ -618,26 +619,42 @@ mod tests {
     #[test]
     fn utf8_cyrillic_in_string_literal() {
         let r = parse_query("SELECT * FROM t WHERE name = 'Москва' AND id = $id: i32").unwrap();
-        assert!(r.positional_sql.contains("'Москва'"), "Cyrillic mangled: {}", r.positional_sql);
+        assert!(
+            r.positional_sql.contains("'Москва'"),
+            "Cyrillic mangled: {}",
+            r.positional_sql
+        );
         assert_eq!(r.params.len(), 1);
     }
 
     #[test]
     fn utf8_umlaut_in_string_literal() {
         let r = parse_query("SELECT * FROM t WHERE name = 'Müller' AND id = $id: i32").unwrap();
-        assert!(r.positional_sql.contains("'Müller'"), "Umlaut mangled: {}", r.positional_sql);
+        assert!(
+            r.positional_sql.contains("'Müller'"),
+            "Umlaut mangled: {}",
+            r.positional_sql
+        );
     }
 
     #[test]
     fn utf8_in_dollar_quote() {
         let r = parse_query("SELECT $$Привет$$").unwrap();
-        assert!(r.positional_sql.contains("$$Привет$$"), "Dollar-quote UTF-8 mangled: {}", r.positional_sql);
+        assert!(
+            r.positional_sql.contains("$$Привет$$"),
+            "Dollar-quote UTF-8 mangled: {}",
+            r.positional_sql
+        );
     }
 
     #[test]
     fn normalized_sql_preserves_utf8() {
         let r = parse_query("SELECT * FROM t WHERE name = 'Москва' AND id = $id: i32").unwrap();
-        assert!(r.normalized_sql.contains("'Москва'"), "Normalized Cyrillic mangled: {}", r.normalized_sql);
+        assert!(
+            r.normalized_sql.contains("'Москва'"),
+            "Normalized Cyrillic mangled: {}",
+            r.normalized_sql
+        );
     }
 
     // --- FIX 3: reject manual positional parameters ---
@@ -647,7 +664,10 @@ mod tests {
         let result = parse_query("SELECT id FROM t WHERE id = $1");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("manual positional parameters"), "unexpected error: {err}");
+        assert!(
+            err.contains("manual positional parameters"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -655,17 +675,17 @@ mod tests {
         let result = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $1");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("manual positional parameters"), "unexpected error: {err}");
+        assert!(
+            err.contains("manual positional parameters"),
+            "unexpected error: {err}"
+        );
     }
 
     // --- FIX 7: duplicate parameter names ---
 
     #[test]
     fn duplicate_param_same_type_reuses_position() {
-        let r = parse_query(
-            "SELECT id FROM t WHERE a = $x: i32 AND b = $x: i32",
-        )
-        .unwrap();
+        let r = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $x: i32").unwrap();
         assert_eq!(r.params.len(), 1);
         assert_eq!(r.params[0].name, "x");
         assert_eq!(r.params[0].position, 1);
@@ -674,9 +694,7 @@ mod tests {
 
     #[test]
     fn duplicate_param_conflicting_types_errors() {
-        let result = parse_query(
-            "SELECT id FROM t WHERE a = $x: i32 AND b = $x: &str",
-        );
+        let result = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $x: &str");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("conflicting types"), "unexpected error: {err}");
@@ -686,21 +704,23 @@ mod tests {
 
     #[test]
     fn line_comment_with_param_ignored() {
-        let r = parse_query(
-            "SELECT id FROM t WHERE id = $id: i32 -- $extra: i32",
-        )
-        .unwrap();
-        assert_eq!(r.params.len(), 1, "param inside line comment should be ignored");
+        let r = parse_query("SELECT id FROM t WHERE id = $id: i32 -- $extra: i32").unwrap();
+        assert_eq!(
+            r.params.len(),
+            1,
+            "param inside line comment should be ignored"
+        );
         assert_eq!(r.params[0].name, "id");
     }
 
     #[test]
     fn block_comment_with_param_ignored() {
-        let r = parse_query(
-            "SELECT id FROM t WHERE id = $id: i32 /* $extra: i32 */",
-        )
-        .unwrap();
-        assert_eq!(r.params.len(), 1, "param inside block comment should be ignored");
+        let r = parse_query("SELECT id FROM t WHERE id = $id: i32 /* $extra: i32 */").unwrap();
+        assert_eq!(
+            r.params.len(),
+            1,
+            "param inside block comment should be ignored"
+        );
         assert_eq!(r.params[0].name, "id");
     }
 
@@ -708,10 +728,7 @@ mod tests {
 
     #[test]
     fn nested_block_comment_stripped() {
-        let r = parse_query(
-            "SELECT /* outer /* inner */ still comment */ id FROM t",
-        )
-        .unwrap();
+        let r = parse_query("SELECT /* outer /* inner */ still comment */ id FROM t").unwrap();
         assert_eq!(r.kind, QueryKind::Select);
         // The nested block comment should be fully stripped
         assert!(

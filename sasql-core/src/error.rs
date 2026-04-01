@@ -116,13 +116,17 @@ impl std::error::Error for SasqlError {
 
 impl std::error::Error for PoolError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
+        self.source
+            .as_ref()
+            .map(|e| &**e as &(dyn std::error::Error + 'static))
     }
 }
 
 impl std::error::Error for QueryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
+        self.source
+            .as_ref()
+            .map(|e| &**e as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -130,7 +134,9 @@ impl std::error::Error for DecodeError {}
 
 impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
+        self.source
+            .as_ref()
+            .map(|e| &**e as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -170,14 +176,17 @@ impl PoolError {
 }
 
 impl ConnectError {
-    pub fn new(msg: impl Into<String>) -> SasqlError {
+    pub fn create(msg: impl Into<String>) -> SasqlError {
         SasqlError::Connect(ConnectError {
             message: msg.into(),
             source: None,
         })
     }
 
-    pub fn with_source(msg: impl Into<String>, source: impl std::error::Error + Send + Sync + 'static) -> SasqlError {
+    pub fn with_source(
+        msg: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> SasqlError {
         SasqlError::Connect(ConnectError {
             message: msg.into(),
             source: Some(Box::new(source)),
@@ -221,7 +230,10 @@ mod tests {
     #[test]
     fn query_error_without_code_display() {
         let e = QueryError::row_count("exactly 1 row", 0);
-        assert_eq!(e.to_string(), "query error: expected exactly 1 row, got 0 rows");
+        assert_eq!(
+            e.to_string(),
+            "query error: expected exactly 1 row, got 0 rows"
+        );
     }
 
     #[test]
@@ -239,7 +251,7 @@ mod tests {
 
     #[test]
     fn connect_error_display() {
-        let e = ConnectError::new("connection refused");
+        let e = ConnectError::create("connection refused");
         assert_eq!(e.to_string(), "connect error: connection refused");
     }
 
