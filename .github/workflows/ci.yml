@@ -58,10 +58,10 @@ jobs:
         run: cargo test --workspace --features "time,uuid,decimal,chrono"
 
       - name: Doc tests
-        run: cargo test --doc --features "time,uuid,decimal"
+        run: cargo test --doc --features "time,uuid,decimal,chrono"
 
       - name: Check no warnings
-        run: cargo check --workspace --features "time,uuid,decimal" 2>&1 | grep -v "dead_code\|unused" | grep "warning" && exit 1 || true
+        run: cargo check --workspace --features "time,uuid,decimal,chrono" 2>&1 | grep -v "dead_code\|unused" | grep "warning" && exit 1 || true
 
   clippy:
     name: Clippy
@@ -87,7 +87,7 @@ jobs:
           components: clippy
       - name: Setup test schema
         run: PGPASSWORD=sasql psql -h localhost -U sasql -d sasql_test -f tests/setup.sql
-      - run: cargo clippy --workspace --all-targets --features "time,uuid,decimal" -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features "time,uuid,decimal,chrono" -- -D warnings
         env:
           SASQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
 
