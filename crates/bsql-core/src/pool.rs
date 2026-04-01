@@ -330,29 +330,40 @@ impl Pool {
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
-        let key = sql_key(sql);
-        self.query_with_singleflight(key, sql, params, false).await
+        // Singleflight ONLY for parameterless queries.
+        // Parameterized queries with different param values have the same SQL
+        // text, so keying by SQL alone would return wrong results.
+        if params.is_empty() {
+            let key = sql_key(sql);
+            self.query_with_singleflight(key, sql, params, false).await
+        } else {
+            self.execute_on_pool(sql, params, false).await
+        }
     }
 
     /// Execute a read-only query. Routes to a replica if available,
-    /// falls back to primary. Uses singleflight on whichever pool is chosen.
+    /// falls back to primary. Singleflight only for parameterless queries.
     pub(crate) async fn query_raw_read(
         &self,
         sql: &str,
         params: &[&(dyn ToSql + Sync)],
     ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
-        let key = sql_key(sql);
-
         if self.replicas.is_empty() {
-            return self.query_with_singleflight(key, sql, params, false).await;
+            return self.query_raw_primary(sql, params).await;
         }
 
-        // Try a replica (round-robin)
-        match self.query_with_singleflight(key, sql, params, true).await {
-            Ok(rows) => Ok(rows),
-            Err(_) => {
-                // Replica failed -- fall back to primary
-                self.query_with_singleflight(key, sql, params, false).await
+        if params.is_empty() {
+            let key = sql_key(sql);
+            // Try replica with singleflight
+            match self.query_with_singleflight(key, sql, params, true).await {
+                Ok(rows) => Ok(rows),
+                Err(_) => self.query_with_singleflight(key, sql, params, false).await,
+            }
+        } else {
+            // Parameterized — no singleflight, try replica with fallback
+            match self.execute_on_pool(sql, params, true).await {
+                Ok(rows) => Ok(rows),
+                Err(_) => self.execute_on_pool(sql, params, false).await,
             }
         }
     }

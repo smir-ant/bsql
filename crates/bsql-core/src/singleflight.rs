@@ -48,7 +48,7 @@ impl Singleflight {
     ///
     /// If `Leader`, the caller MUST call `complete` or `abandon` afterwards.
     pub(crate) fn try_join(&self, key: u64) -> FlightStatus {
-        let mut map = self.in_flight.lock().expect("singleflight lock poisoned");
+        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = map.get(&key) {
             FlightStatus::Follower(tx.subscribe())
         } else {
@@ -65,7 +65,7 @@ impl Singleflight {
     /// Broadcast a successful result to all waiters and remove the entry.
     pub(crate) fn complete(&self, key: u64, rows: Arc<Vec<Row>>) {
         let tx = {
-            let mut map = self.in_flight.lock().expect("singleflight lock poisoned");
+            let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
             map.remove(&key)
         };
         if let Some(tx) = tx {
@@ -77,7 +77,7 @@ impl Singleflight {
     /// Remove the entry without broadcasting (on error). Waiters' receivers
     /// will get `RecvError::Closed`, which callers handle by retrying.
     pub(crate) fn abandon(&self, key: u64) {
-        let mut map = self.in_flight.lock().expect("singleflight lock poisoned");
+        let mut map = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(&key);
         // Sender drops here -> all receivers get RecvError::Closed
     }
@@ -85,8 +85,9 @@ impl Singleflight {
 
 /// Hash the SQL string to produce a singleflight key.
 ///
-/// For v0.7 singleflight only coalesces based on SQL text identity.
-/// Parameterized queries with different param values will have the same SQL
+/// Singleflight only applies to parameterless queries (params.is_empty()).
+/// Parameterized queries bypass singleflight entirely because different param
+/// values produce the same SQL text but different results.
 /// string, so singleflight key-generation is done at the codegen level where
 /// concrete param types (which implement `Hash`) are available.
 pub(crate) fn sql_key(sql: &str) -> u64 {
