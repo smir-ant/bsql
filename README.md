@@ -47,16 +47,19 @@ What sasql does differently:
 
 ## Quick Start
 
+`Cargo.toml`:
 ```toml
 [dependencies]
 sasql = { version = "0.2", features = ["time", "uuid"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
+Terminal — set the database URL for compile-time validation:
 ```bash
 export SASQL_DATABASE_URL="postgres://user:pass@localhost/mydb"
 ```
 
+`src/main.rs`:
 ```rust
 use sasql::Pool;
 
@@ -76,6 +79,8 @@ async fn main() -> Result<(), sasql::SasqlError> {
 
 ## Optional Type Support
 
+Out of the box, sasql works with basic types: integers, floats, booleans, strings, byte arrays. This is enough for most queries. For specialized PostgreSQL types like timestamps or UUIDs, enable the corresponding feature:
+
 ```toml
 sasql = { version = "0.2", features = ["time", "uuid", "decimal"] }
 ```
@@ -87,7 +92,7 @@ sasql = { version = "0.2", features = ["time", "uuid", "decimal"] }
 | `uuid` | UUID | `uuid::Uuid` |
 | `decimal` | NUMERIC, DECIMAL | `rust_decimal::Decimal` |
 
-No default features. If a column needs a feature you haven't enabled — clear compile error with the feature name.
+If your query touches a column that needs a feature you haven't enabled, you get a compile error naming the exact feature to add.
 
 ## PostgreSQL Enums
 
@@ -110,7 +115,7 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 | `.fetch_one(&pool)` | `T` | Exactly one row expected |
 | `.fetch_all(&pool)` | `Vec<T>` | All matching rows |
 | `.fetch_optional(&pool)` | `Option<T>` | Row might not exist |
-| `.execute(&pool)` | `u64` | INSERT/UPDATE/DELETE without RETURNING |
+| `.execute(&pool)` | `u64` (number of affected rows) | INSERT/UPDATE/DELETE without RETURNING |
 
 ## What sasql Is Not
 
