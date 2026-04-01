@@ -498,3 +498,47 @@ async fn error_display_format() {
     // std::error::Error trait is implemented
     let _: &dyn std::error::Error = &err;
 }
+
+// ---------------------------------------------------------------------------
+// connection warmup
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn warmup_prepares_known_queries() {
+    let pool = pool().await;
+    // Warmup with SQL strings that match our test queries
+    pool.warmup(&[
+        "SELECT id, login, first_name, last_name FROM users WHERE id = $1",
+        "SELECT id, login FROM users WHERE active = true ORDER BY id",
+    ])
+    .await
+    .unwrap();
+
+    // Subsequent queries should work (statements already cached on connection)
+    let id = 1i32;
+    let user =
+        bsql::query!("SELECT id, login, first_name, last_name FROM users WHERE id = $id: i32")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(user.id, 1);
+}
+
+#[tokio::test]
+async fn warmup_empty_slice_is_noop() {
+    let pool = pool().await;
+    // Should succeed immediately with no SQL
+    pool.warmup(&[]).await.unwrap();
+}
+
+#[tokio::test]
+async fn warmup_invalid_sql_returns_error() {
+    let pool = pool().await;
+    let result = pool
+        .warmup(&["SELECT nonexistent_column FROM nonexistent_table"])
+        .await;
+    assert!(
+        result.is_err(),
+        "warmup with invalid SQL should return an error"
+    );
+}

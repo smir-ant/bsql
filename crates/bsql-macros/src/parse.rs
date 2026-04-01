@@ -80,6 +80,10 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
     let (positional_sql, params, optional_clauses) = extract_params(&comment_stripped)?;
     let normalized_sql = normalize_sql(&positional_sql);
     let kind = detect_query_kind(&normalized_sql)?;
+
+    // Safety gate: UPDATE/DELETE without WHERE is a compile error.
+    check_safety_gates(kind, &normalized_sql, &optional_clauses)?;
+
     let stmt_name = statement_name(&normalized_sql);
 
     Ok(ParsedQuery {
@@ -611,6 +615,52 @@ fn skip_dollar_quote(bytes: &[u8], start: usize) -> Option<usize> {
     }
 
     None
+}
+
+/// Safety gate: UPDATE/DELETE without WHERE is almost always a mistake.
+///
+/// The check fires only when there is NO `where` keyword anywhere in the
+/// query — not in the base SQL, not in any optional clause fragment.
+/// The escape hatch is `WHERE true` (compiles, signals intent).
+fn check_safety_gates(
+    kind: QueryKind,
+    normalized_sql: &str,
+    optional_clauses: &[OptionalClause],
+) -> Result<(), String> {
+    match kind {
+        QueryKind::Update | QueryKind::Delete => {}
+        _ => return Ok(()),
+    }
+
+    // Check the base (normalized) SQL for a standalone "where" keyword.
+    let base_has_where = has_where_keyword(normalized_sql);
+
+    // Check every optional clause fragment for a "where" keyword.
+    // If any clause provides a WHERE, the user intentionally wrote a
+    // conditional WHERE pattern (e.g. `[WHERE id = $id: Option<i32>]`).
+    let clause_has_where = optional_clauses
+        .iter()
+        .any(|c| has_where_keyword(&c.sql_fragment.to_ascii_lowercase()));
+
+    if !base_has_where && !clause_has_where {
+        let verb = if kind == QueryKind::Update {
+            "UPDATE"
+        } else {
+            "DELETE"
+        };
+        return Err(format!(
+            "{verb} without WHERE clause will affect every row in the table. \
+             Add a WHERE clause, or use `WHERE true` if this is intentional."
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check if a normalized (lowercased, whitespace-collapsed) SQL string
+/// contains "where" as a standalone keyword.
+fn has_where_keyword(sql: &str) -> bool {
+    sql.split_whitespace().any(|w| w == "where")
 }
 
 /// Detect the query kind from the first keyword.
@@ -1353,6 +1403,111 @@ mod tests {
         assert!(
             err.contains("multiple optional clauses"),
             "should reject same param in different clauses: {err}"
+        );
+    }
+
+    // --- safety gates: UPDATE/DELETE without WHERE ---
+
+    #[test]
+    fn update_without_where_rejected() {
+        let r = parse_query("UPDATE t SET a = $a: i32");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("UPDATE without WHERE"),
+            "should mention UPDATE without WHERE: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_without_where_rejected() {
+        let r = parse_query("DELETE FROM t");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("DELETE without WHERE"),
+            "should mention DELETE without WHERE: {err}"
+        );
+    }
+
+    #[test]
+    fn update_with_where_accepted() {
+        let r = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn delete_with_where_accepted() {
+        let r = parse_query("DELETE FROM t WHERE id = $id: i32");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn update_where_true_accepted() {
+        let r = parse_query("UPDATE t SET a = $a: i32 WHERE true");
+        assert!(r.is_ok(), "WHERE true is the escape hatch");
+    }
+
+    #[test]
+    fn delete_where_true_accepted() {
+        let r = parse_query("DELETE FROM t WHERE true");
+        assert!(r.is_ok(), "WHERE true is the escape hatch");
+    }
+
+    #[test]
+    fn update_with_optional_where_accepted() {
+        let r = parse_query("UPDATE t SET a = $a: i32 [WHERE id = $id: Option<i32>]");
+        assert!(r.is_ok(), "optional WHERE clause makes it safe");
+    }
+
+    #[test]
+    fn delete_with_optional_where_accepted() {
+        let r = parse_query("DELETE FROM t [WHERE id = $id: Option<i32>]");
+        assert!(r.is_ok(), "optional WHERE clause makes it safe");
+    }
+
+    #[test]
+    fn select_without_where_accepted() {
+        // Safety gates only apply to UPDATE/DELETE, not SELECT
+        let r = parse_query("SELECT id FROM t");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn insert_without_where_accepted() {
+        // Safety gates only apply to UPDATE/DELETE, not INSERT
+        let r = parse_query("INSERT INTO t (a) VALUES ($a: i32)");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn update_with_where_in_optional_and_clause_accepted() {
+        let r = parse_query(
+            "UPDATE t SET a = $a: i32 WHERE status = $s: &str \
+             [AND dept = $d: Option<i32>]",
+        );
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn cte_update_without_where_rejected() {
+        let r = parse_query("WITH vals AS (SELECT 1 AS v) UPDATE t SET a = (SELECT v FROM vals)");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("UPDATE without WHERE"),
+            "CTE UPDATE without WHERE should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn cte_delete_without_where_rejected() {
+        let r = parse_query("WITH cte AS (SELECT 1) DELETE FROM t");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("DELETE without WHERE"),
+            "CTE DELETE without WHERE should be rejected: {err}"
         );
     }
 }

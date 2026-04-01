@@ -1,0 +1,7 @@
+error: UPDATE without WHERE clause will affect every row in the table. Add a WHERE clause, or use `WHERE true` if this is intentional.
+ --> tests/compile_fail/update_without_where.rs:2:13
+  |
+2 |     let _ = bsql::query!("UPDATE users SET login = $login: &str");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

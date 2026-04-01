@@ -262,6 +262,41 @@ impl Pool {
         Ok(QueryStream::new(conn, row_stream))
     }
 
+    /// Pre-prepare SQL statements on a connection from the pool.
+    ///
+    /// Acquires one connection and calls `prepare_cached` for each SQL
+    /// string. This populates the connection's statement cache so the
+    /// first real query on that connection pays zero PREPARE overhead.
+    ///
+    /// Call this once after creating the pool with the SQL strings your
+    /// application uses. The easiest source is your `query!()` calls:
+    ///
+    /// ```rust,ignore
+    /// pool.warmup(&[
+    ///     "SELECT id, login FROM users WHERE id = $1",
+    ///     "UPDATE tickets SET status = $1 WHERE id = $2",
+    /// ]).await?;
+    /// ```
+    ///
+    /// **Best-effort**: if the pool is exhausted or a PREPARE fails
+    /// (e.g. table was dropped), the error is returned but partial
+    /// warmup of earlier statements still takes effect.
+    ///
+    /// Calling warmup with an empty slice is a no-op.
+    pub async fn warmup(&self, sqls: &[&str]) -> BsqlResult<()> {
+        if sqls.is_empty() {
+            return Ok(());
+        }
+        let conn = self.acquire().await?;
+        for sql in sqls {
+            conn.inner
+                .prepare_cached(sql)
+                .await
+                .map_err(BsqlError::from)?;
+        }
+        Ok(())
+    }
+
     /// Current pool status: available and total connections.
     pub fn status(&self) -> PoolStatus {
         let status = self.primary.status();

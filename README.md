@@ -50,7 +50,7 @@ What bsql does differently:
 `Cargo.toml`:
 ```toml
 [dependencies]
-bsql = { version = "0.8", features = ["time", "uuid"] }
+bsql = { version = "0.9", features = ["time", "uuid"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -82,7 +82,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. This is enough for most queries. For specialized PostgreSQL types like timestamps or UUIDs, enable the corresponding feature:
 
 ```toml
-bsql = { version = "0.8", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.9", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature | PostgreSQL types | Rust types |
@@ -99,7 +99,7 @@ If your query touches a column that needs a feature you haven't enabled, you get
 Enable the `explain` feature to see the query plan at compile time:
 
 ```toml
-bsql = { version = "0.8", features = ["explain"] }
+bsql = { version = "0.9", features = ["explain"] }
 ```
 
 When enabled, bsql runs `EXPLAIN` on every query during compilation and embeds the plan as a doc comment on the generated result struct. Hover over any query result type in your IDE to see the plan — no round-trip to `psql` needed.
@@ -148,7 +148,8 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 | v0.5 | Released | Transactions: `begin()`, `commit()`, `rollback()`, auto-rollback on drop |
 | v0.6 | Released | Streaming results, LISTEN/NOTIFY |
 | v0.7 | Released | Singleflight request coalescing, read/write splitting, EXPLAIN at compile time |
-| v0.8 | **Current** | TLS support, connection warmup, SmallVec optimizations |
+| v0.8 | Released | TLS support, SmallVec optimizations |
+| v0.9 | **Current** | Connection warmup, safety gates (UPDATE/DELETE without WHERE) |
 
 ## About the Development Process
 
