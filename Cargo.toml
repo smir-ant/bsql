@@ -42,5 +42,5 @@ incremental = true
 
 [profile.release]
 codegen-units = 1   # max LLVM optimization (single codegen unit)
-lto = "thin"        # link-time optimization — thin is fast + effective
+lto = "fat"         # maximum link-time optimization (slower build, best codegen)
 opt-level = 3       # maximum speed (not size)
