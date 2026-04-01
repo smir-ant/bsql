@@ -17,7 +17,7 @@ let user = sasql::query!(
 
 ---
 
-## Why Not the Alternatives?
+## Why?
 
 | Library | What's missing |
 |---------|---------------|
