@@ -50,7 +50,7 @@ What sasql does differently:
 `Cargo.toml`:
 ```toml
 [dependencies]
-sasql = { version = "0.3", features = ["time", "uuid"] }
+sasql = { version = "0.4", features = ["time", "uuid"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -82,7 +82,7 @@ async fn main() -> Result<(), sasql::SasqlError> {
 Out of the box, sasql works with basic types: integers, floats, booleans, strings, byte arrays. This is enough for most queries. For specialized PostgreSQL types like timestamps or UUIDs, enable the corresponding feature:
 
 ```toml
-sasql = { version = "0.3", features = ["time", "uuid", "decimal"] }
+sasql = { version = "0.4", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature | PostgreSQL types | Rust types |
@@ -130,8 +130,8 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 |---------|--------|------|
 | v0.1 | Released | `query!` macro, compile-time validation, base types, pool |
 | v0.2 | Released | `time`, `uuid`, `decimal`, `chrono`, PG enums, CI on PG 15-18 |
-| v0.3 | **Current** | Dynamic queries: `[optional clauses]`, sort enums |
-| v0.4 | Planned | Offline mode: `sasql prepare` + bitcode cache. Configurable database URL sources beyond env vars |
+| v0.3 | Released | Dynamic queries: `[optional clauses]`, sort enums |
+| v0.4 | **Current** | Offline mode: bitcode cache, auto-populated during build. Configurable database URL sources beyond env vars |
 | v0.5 | Planned | Transactions: `begin()`, `commit()`, `rollback()`, auto-rollback on drop |
 | v0.6 | Planned | Singleflight request coalescing, streaming, LISTEN/NOTIFY |
 | v0.7 | Planned | Cross-query analysis, EXPLAIN at compile time, read/write splitting |

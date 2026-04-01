@@ -9,6 +9,7 @@ extern crate proc_macro;
 mod codegen;
 mod connection;
 mod dynamic;
+mod offline;
 mod parse;
 mod pg_enum;
 mod sql_norm;
@@ -74,25 +75,48 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
 
     if parsed.optional_clauses.is_empty() {
         // Static query path — no optional clauses
-        // 3. Validate against PostgreSQL via PREPARE
-        let validation = connection::with_connection(|rt, client| {
-            validate::validate_query(&parsed, rt, client)
-        })?;
+        let validation = if offline::is_offline() {
+            // OFFLINE: read cached validation result
+            offline::lookup_cached_validation(&parsed)
+                .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
+        } else {
+            // ONLINE: validate against PostgreSQL via PREPARE
+            let result = connection::with_connection(|rt, client| {
+                validate::validate_query(&parsed, rt, client)
+            })?;
 
-        // 4. Check parameter type compatibility
+            // Write to offline cache for future use
+            offline::write_cache(&parsed, &result);
+
+            result
+        };
+
+        // Check parameter type compatibility
         validate::check_param_types(&parsed, &validation)
             .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
 
-        // 5. Generate Rust code
+        // Generate Rust code
         Ok(codegen::generate_query_code(&parsed, &validation))
     } else {
         // Dynamic query path — has optional clauses
-        // 3. Validate ALL variants against PostgreSQL and check param types
-        let validation = connection::with_connection(|rt, client| {
-            validate::validate_variants(&variants, &parsed, rt, client)
-        })?;
+        let validation = if offline::is_offline() {
+            // OFFLINE: read cached validation result for the base variant
+            // Dynamic queries cache the canonical (variant 0) result
+            offline::lookup_cached_validation(&parsed)
+                .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
+        } else {
+            // ONLINE: validate ALL variants against PostgreSQL and check param types
+            let result = connection::with_connection(|rt, client| {
+                validate::validate_variants(&variants, &parsed, rt, client)
+            })?;
 
-        // 4. Generate dynamic Rust code with match dispatcher
+            // Write to offline cache for future use
+            offline::write_cache(&parsed, &result);
+
+            result
+        };
+
+        // Generate dynamic Rust code with match dispatcher
         Ok(codegen::generate_dynamic_query_code(
             &parsed,
             &validation,
