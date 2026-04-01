@@ -16,6 +16,7 @@ time = []
 chrono = []
 uuid = []
 decimal = []
+explain = []
 
 [dependencies]
 syn = { workspace = true }

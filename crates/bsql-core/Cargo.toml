@@ -20,6 +20,7 @@ deadpool-postgres = { workspace = true }
 postgres-types = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 futures-core = { workspace = true }
+rapidhash = { workspace = true }
 
 # Feature-gated type crates (optional)
 time = { workspace = true, optional = true }

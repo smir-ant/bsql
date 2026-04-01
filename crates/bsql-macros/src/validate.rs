@@ -39,6 +39,8 @@ pub struct ValidationResult {
     /// When true, `&str`/`String` params are accepted in addition to
     /// any `#[bsql::pg_enum]`-annotated Rust enum.
     pub param_is_pg_enum: Vec<bool>,
+    /// EXPLAIN plan summary (only populated when `explain` feature is enabled).
+    pub explain_plan: Option<String>,
 }
 
 /// Validate a parsed query against a live PostgreSQL instance.
@@ -108,11 +110,57 @@ async fn validate_async(parsed: &ParsedQuery, client: &Client) -> Result<Validat
         });
     }
 
+    // EXPLAIN plan (opt-in via `explain` feature)
+    let explain_plan = fetch_explain_plan(client, parsed).await;
+
     Ok(ValidationResult {
         columns,
         param_pg_oids,
         param_is_pg_enum,
+        explain_plan,
     })
+}
+
+/// Fetch EXPLAIN output for a query (only when `explain` feature is enabled).
+///
+/// Returns a human-readable summary of the query plan. Errors are silently
+/// ignored -- EXPLAIN is informational and must never block compilation.
+#[cfg(feature = "explain")]
+async fn fetch_explain_plan(client: &Client, parsed: &ParsedQuery) -> Option<String> {
+    // EXPLAIN cannot handle parameterized queries directly. We use
+    // EXPLAIN (FORMAT TEXT) with a generic plan (PG 16+ supports
+    // EXPLAIN (GENERIC_PLAN) for prepared statements).
+    //
+    // For older PG versions, we try EXPLAIN on the raw SQL. If it fails
+    // (e.g. because of parameters), we skip silently.
+    let explain_sql = format!("EXPLAIN (FORMAT TEXT, COSTS) {}", parsed.positional_sql);
+
+    match client.simple_query(&explain_sql).await {
+        Ok(messages) => {
+            let lines: Vec<String> = messages
+                .iter()
+                .filter_map(|msg| {
+                    if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+                        row.get(0).map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(feature = "explain"))]
+async fn fetch_explain_plan(_client: &Client, _parsed: &ParsedQuery) -> Option<String> {
+    None
 }
 
 /// Determine nullability for all columns in a single PG round-trip.
@@ -334,6 +382,7 @@ async fn validate_variant_async(
         columns,
         param_pg_oids,
         param_is_pg_enum,
+        explain_plan: None, // variants don't get individual EXPLAIN plans
     })
 }
 

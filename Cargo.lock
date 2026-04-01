@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bsql-core",
  "bsql-macros",
@@ -148,12 +148,13 @@ dependencies = [
 
 [[package]]
 name = "bsql-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "deadpool-postgres",
  "futures-core",
  "postgres-types",
+ "rapidhash",
  "rust_decimal",
  "time",
  "tokio",
@@ -163,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bitcode",
  "bsql-core",

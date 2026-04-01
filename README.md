@@ -50,7 +50,7 @@ What bsql does differently:
 `Cargo.toml`:
 ```toml
 [dependencies]
-bsql = { version = "0.6", features = ["time", "uuid"] }
+bsql = { version = "0.7", features = ["time", "uuid"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -82,7 +82,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. This is enough for most queries. For specialized PostgreSQL types like timestamps or UUIDs, enable the corresponding feature:
 
 ```toml
-bsql = { version = "0.6", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.7", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature | PostgreSQL types | Rust types |
@@ -134,8 +134,8 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 | v0.3 | Released | Dynamic queries: `[optional clauses]`, sort enums |
 | v0.4 | Released | Offline mode: bitcode cache, auto-populated during build |
 | v0.5 | Released | Transactions: `begin()`, `commit()`, `rollback()`, auto-rollback on drop |
-| v0.6 | **Current** | Streaming results, LISTEN/NOTIFY |
-| v0.7 | Planned | Singleflight request coalescing, cross-query analysis, EXPLAIN at compile time, read/write splitting |
+| v0.6 | Released | Streaming results, LISTEN/NOTIFY |
+| v0.7 | **Current** | Singleflight request coalescing, read/write splitting, EXPLAIN at compile time |
 | v0.8+ | Planned | Arena allocation, binary protocol, SIMD, pipelining |
 
 ## About the Development Process

@@ -1,26 +1,40 @@
-//! Connection pool with fail-fast semantics and PgBouncer detection.
+//! Connection pool with fail-fast semantics, PgBouncer detection,
+//! singleflight query coalescing, and read/write splitting.
 //!
-//! The pool wraps `deadpool-postgres` with two key behaviors:
+//! The pool wraps `deadpool-postgres` with key behaviors:
 //! - **Fail-fast**: `acquire()` returns `PoolExhausted` immediately when no
 //!   connections are available. It does not wait. See CREDO principle #17.
 //! - **PgBouncer detection**: on pool creation, bsql detects whether the
 //!   connection goes through PgBouncer and adjusts prepared statement strategy.
+//! - **Singleflight** (v0.7): identical concurrent SELECT queries are coalesced
+//!   into a single PG round-trip. The result is shared via `Arc<Vec<Row>>`.
+//! - **Read/write splitting** (v0.7): when replicas are configured, SELECT
+//!   queries are routed to replicas. Writes always go to the primary.
+
+use std::sync::Arc;
 
 use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 use tokio_postgres::types::ToSql;
 
 use crate::error::{BsqlError, BsqlResult, ConnectError};
+use crate::singleflight::{FlightStatus, Singleflight, sql_key};
 use crate::stream::QueryStream;
 use crate::transaction::Transaction;
 
 /// A PostgreSQL connection pool.
 ///
-/// Wraps `deadpool-postgres` with fail-fast acquire semantics.
-/// All connections are returned to the pool when `PoolConnection` is dropped.
+/// Wraps `deadpool-postgres` with fail-fast acquire semantics, singleflight
+/// query coalescing, and optional read/write splitting.
 pub struct Pool {
-    inner: deadpool_postgres::Pool,
+    primary: deadpool_postgres::Pool,
+    /// Replica pools for read-only queries. Round-robin selection.
+    /// Empty when no replicas are configured.
+    replicas: Vec<deadpool_postgres::Pool>,
+    /// Atomic counter for round-robin replica selection.
+    replica_idx: std::sync::atomic::AtomicUsize,
     pgbouncer: PgBouncerInfo,
+    singleflight: Singleflight,
 }
 
 /// PgBouncer detection result.
@@ -49,6 +63,7 @@ pub struct PoolBuilder {
     password: Option<String>,
     max_size: usize,
     connect_timeout_secs: u64,
+    replica_urls: Vec<String>,
 }
 
 impl PoolBuilder {
@@ -82,10 +97,22 @@ impl PoolBuilder {
         self
     }
 
-    /// TCP connect timeout in seconds. This is the ONLY timeout in bsql —
+    /// TCP connect timeout in seconds. This is the ONLY timeout in bsql --
     /// it exists because TCP itself will wait forever on a dead network.
     pub fn connect_timeout(mut self, secs: u64) -> Self {
         self.connect_timeout_secs = secs;
+        self
+    }
+
+    /// Add a read replica. SELECT queries will be routed to replicas when
+    /// the executor uses `query_raw_readonly` (generated for SELECT queries).
+    ///
+    /// Multiple replicas are selected round-robin. If a replica is unavailable,
+    /// the query falls back to the primary.
+    ///
+    /// Format: `postgres://user:password@host:port/dbname`
+    pub fn replica(mut self, url: &str) -> Self {
+        self.replica_urls.push(url.into());
         self
     }
 
@@ -100,7 +127,7 @@ impl PoolBuilder {
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         });
-        // FIX 2: fail-fast — zero wait timeout means acquire() never blocks
+        // FIX 2: fail-fast -- zero wait timeout means acquire() never blocks
         cfg.pool = Some(deadpool_postgres::PoolConfig {
             max_size: self.max_size,
             timeouts: deadpool_postgres::Timeouts {
@@ -115,12 +142,22 @@ impl PoolBuilder {
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| ConnectError::create(e.to_string()))?;
 
-        // FIX 11: detect PgBouncer — propagate connection failure
+        // FIX 11: detect PgBouncer -- propagate connection failure
         let pgbouncer = detect_pgbouncer(&pool).await?;
 
+        // Build replica pools
+        let mut replicas = Vec::with_capacity(self.replica_urls.len());
+        for url in &self.replica_urls {
+            let replica_pool = create_pool_from_url(url, self.max_size).await?;
+            replicas.push(replica_pool);
+        }
+
         Ok(Pool {
-            inner: pool,
+            primary: pool,
+            replicas,
+            replica_idx: std::sync::atomic::AtomicUsize::new(0),
             pgbouncer,
+            singleflight: Singleflight::new(),
         })
     }
 }
@@ -154,7 +191,7 @@ impl Pool {
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         });
-        // FIX 2: fail-fast — zero wait timeout means acquire() never blocks
+        // FIX 2: fail-fast -- zero wait timeout means acquire() never blocks
         cfg.pool = Some(deadpool_postgres::PoolConfig {
             max_size: 16,
             timeouts: deadpool_postgres::Timeouts {
@@ -169,12 +206,15 @@ impl Pool {
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| ConnectError::create(e.to_string()))?;
 
-        // FIX 11: detect PgBouncer — propagate connection failure
+        // FIX 11: detect PgBouncer -- propagate connection failure
         let pgbouncer = detect_pgbouncer(&pool).await?;
 
         Ok(Pool {
-            inner: pool,
+            primary: pool,
+            replicas: Vec::new(),
+            replica_idx: std::sync::atomic::AtomicUsize::new(0),
             pgbouncer,
+            singleflight: Singleflight::new(),
         })
     }
 
@@ -188,15 +228,16 @@ impl Pool {
             password: None,
             max_size: 16,
             connect_timeout_secs: 5,
+            replica_urls: Vec::new(),
         }
     }
 
-    /// Acquire a connection from the pool.
+    /// Acquire a connection from the primary pool.
     ///
     /// **Fail-fast**: returns `BsqlError::Pool` immediately if no connections
     /// are available. Does not wait. Does not timeout. See CREDO principle #17.
     pub async fn acquire(&self) -> BsqlResult<PoolConnection> {
-        let conn = self.inner.get().await.map_err(BsqlError::from)?;
+        let conn = self.primary.get().await.map_err(BsqlError::from)?;
 
         Ok(PoolConnection {
             inner: conn,
@@ -216,10 +257,15 @@ impl Pool {
         self.pgbouncer.supports_named_stmts
     }
 
+    /// Whether read replicas are configured.
+    pub fn has_replicas(&self) -> bool {
+        !self.replicas.is_empty()
+    }
+
     /// Begin a new transaction.
     ///
-    /// Acquires a connection from the pool and sends `BEGIN`. The connection
-    /// is held for the lifetime of the returned [`Transaction`].
+    /// Acquires a connection from the primary pool and sends `BEGIN`. The
+    /// connection is held for the lifetime of the returned [`Transaction`].
     ///
     /// **Fail-fast**: returns `BsqlError::Pool` immediately if no connections
     /// are available. See CREDO principle #17.
@@ -268,12 +314,109 @@ impl Pool {
 
     /// Current pool status: available and total connections.
     pub fn status(&self) -> PoolStatus {
-        let status = self.inner.status();
+        let status = self.primary.status();
         PoolStatus {
             available: status.available,
             size: status.size,
             max_size: status.max_size,
         }
+    }
+
+    // -- Internal singleflight + routing methods --
+
+    /// Execute a query on the primary with singleflight coalescing.
+    pub(crate) async fn query_raw_primary(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
+        let key = sql_key(sql);
+        self.query_with_singleflight(key, sql, params, false).await
+    }
+
+    /// Execute a read-only query. Routes to a replica if available,
+    /// falls back to primary. Uses singleflight on whichever pool is chosen.
+    pub(crate) async fn query_raw_read(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
+        let key = sql_key(sql);
+
+        if self.replicas.is_empty() {
+            return self.query_with_singleflight(key, sql, params, false).await;
+        }
+
+        // Try a replica (round-robin)
+        match self.query_with_singleflight(key, sql, params, true).await {
+            Ok(rows) => Ok(rows),
+            Err(_) => {
+                // Replica failed -- fall back to primary
+                self.query_with_singleflight(key, sql, params, false).await
+            }
+        }
+    }
+
+    /// Core singleflight execution. Acquires from primary or replica pool.
+    async fn query_with_singleflight(
+        &self,
+        key: u64,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        use_replica: bool,
+    ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
+        match self.singleflight.try_join(key) {
+            FlightStatus::Follower(mut rx) => {
+                // Wait for the leader to complete
+                match rx.recv().await {
+                    Ok(rows) => Ok(rows),
+                    Err(_) => {
+                        // Leader failed or channel closed -- execute ourselves
+                        self.execute_on_pool(sql, params, use_replica).await
+                    }
+                }
+            }
+            FlightStatus::Leader => match self.execute_on_pool(sql, params, use_replica).await {
+                Ok(rows) => {
+                    self.singleflight.complete(key, Arc::clone(&rows));
+                    Ok(rows)
+                }
+                Err(e) => {
+                    self.singleflight.abandon(key);
+                    Err(e)
+                }
+            },
+        }
+    }
+
+    /// Execute a query on the appropriate pool (primary or replica).
+    async fn execute_on_pool(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+        use_replica: bool,
+    ) -> BsqlResult<Arc<Vec<tokio_postgres::Row>>> {
+        let raw_conn = if use_replica && !self.replicas.is_empty() {
+            let idx = self
+                .replica_idx
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % self.replicas.len();
+            self.replicas[idx].get().await.map_err(BsqlError::from)?
+        } else {
+            self.primary.get().await.map_err(BsqlError::from)?
+        };
+
+        let stmt = raw_conn
+            .prepare_cached(sql)
+            .await
+            .map_err(BsqlError::from)?;
+
+        let rows = raw_conn
+            .query(&stmt, params)
+            .await
+            .map_err(BsqlError::from)?;
+
+        Ok(Arc::new(rows))
     }
 }
 
@@ -300,9 +443,60 @@ pub struct PoolStatus {
     pub max_size: usize,
 }
 
+/// Create a deadpool-postgres pool from a connection URL.
+///
+/// Used internally for both primary and replica pools.
+async fn create_pool_from_url(url: &str, max_size: usize) -> BsqlResult<deadpool_postgres::Pool> {
+    let config: tokio_postgres::Config = url
+        .parse()
+        .map_err(|e: tokio_postgres::Error| ConnectError::create(e.to_string()))?;
+
+    let mut cfg = Config::new();
+    cfg.host = config.get_hosts().first().map(|h| match h {
+        tokio_postgres::config::Host::Tcp(s) => s.clone(),
+        #[cfg(unix)]
+        tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+    });
+    cfg.port = config.get_ports().first().copied();
+    cfg.dbname = config.get_dbname().map(String::from);
+    cfg.user = config.get_user().map(String::from);
+    cfg.password = match config.get_password() {
+        Some(p) => Some(
+            String::from_utf8(p.to_vec())
+                .map_err(|_| ConnectError::create("database password contains invalid UTF-8"))?,
+        ),
+        None => None,
+    };
+    cfg.connect_timeout = Some(std::time::Duration::from_secs(5));
+    cfg.manager = Some(ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    });
+    cfg.pool = Some(deadpool_postgres::PoolConfig {
+        max_size,
+        timeouts: deadpool_postgres::Timeouts {
+            wait: Some(std::time::Duration::ZERO),
+            create: None,
+            recycle: None,
+        },
+        ..Default::default()
+    });
+
+    let pool = cfg
+        .create_pool(Some(Runtime::Tokio1), NoTls)
+        .map_err(|e| ConnectError::create(e.to_string()))?;
+
+    // Verify connectivity
+    let _conn = pool
+        .get()
+        .await
+        .map_err(|e| ConnectError::with_source(format!("failed to connect to replica: {e}"), e))?;
+
+    Ok(pool)
+}
+
 /// Detect PgBouncer on the first connection from the pool.
 ///
-/// Strategy: try `SHOW POOLS` — only PgBouncer responds to this.
+/// Strategy: try `SHOW POOLS` -- only PgBouncer responds to this.
 /// If PgBouncer is detected, check `SHOW CONFIG` for `prepared_statements`.
 ///
 /// FIX 11: returns `Err` if the initial connection fails, instead of silently
@@ -346,6 +540,7 @@ mod tests {
         let b = Pool::builder();
         assert_eq!(b.max_size, 16);
         assert_eq!(b.connect_timeout_secs, 5);
+        assert!(b.replica_urls.is_empty());
     }
 
     #[test]
@@ -366,6 +561,14 @@ mod tests {
         assert_eq!(b.password.as_deref(), Some("secret"));
         assert_eq!(b.max_size, 8);
         assert_eq!(b.connect_timeout_secs, 10);
+    }
+
+    #[test]
+    fn builder_replicas() {
+        let b = Pool::builder()
+            .replica("postgres://replica1:5432/db")
+            .replica("postgres://replica2:5432/db");
+        assert_eq!(b.replica_urls.len(), 2);
     }
 
     #[test]

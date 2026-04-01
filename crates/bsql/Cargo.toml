@@ -13,6 +13,7 @@ time = ["bsql-core/time", "bsql-macros/time"]
 chrono = ["bsql-core/chrono", "bsql-macros/chrono"]
 uuid = ["bsql-core/uuid", "bsql-macros/uuid"]
 decimal = ["bsql-core/decimal", "bsql-macros/decimal"]
+explain = ["bsql-macros/explain"]
 
 [dependencies]
 bsql-core = { workspace = true }

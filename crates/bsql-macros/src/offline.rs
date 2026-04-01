@@ -220,6 +220,7 @@ fn cached_to_validation(cached: &CachedQuery) -> ValidationResult {
         columns,
         param_pg_oids: cached.param_pg_oids.clone(),
         param_is_pg_enum: cached.param_is_pg_enum.clone(),
+        explain_plan: None, // EXPLAIN is online-only
     }
 }
 
@@ -508,6 +509,7 @@ mod tests {
             }],
             param_pg_oids: vec![25, 23],
             param_is_pg_enum: vec![false, false],
+            explain_plan: None,
         };
 
         let parsed = crate::parse::parse_query(

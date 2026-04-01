@@ -79,7 +79,24 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
         quote! { pub #field_name: #field_type }
     });
 
+    // EXPLAIN plan as doc comment (v0.7, opt-in via `explain` feature)
+    let explain_doc = if let Some(ref plan) = validation.explain_plan {
+        let doc_lines: Vec<TokenStream> = std::iter::once(quote! { #[doc = ""] })
+            .chain(std::iter::once(quote! { #[doc = "**Query plan:**"] }))
+            .chain(std::iter::once(quote! { #[doc = "```text"] }))
+            .chain(plan.lines().map(|line| {
+                let line_str = format!("{line}");
+                quote! { #[doc = #line_str] }
+            }))
+            .chain(std::iter::once(quote! { #[doc = "```"] }))
+            .collect();
+        quote! { #(#doc_lines)* }
+    } else {
+        TokenStream::new()
+    };
+
     quote! {
+        #explain_doc
         #[derive(Debug)]
         #[allow(non_camel_case_types)]
         pub struct #struct_name {
@@ -122,10 +139,21 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 ///
 /// FIX 10: for `fetch_one` and `fetch_optional`, if the SQL has no LIMIT clause,
 /// inject `LIMIT 2` so PG stops early instead of fetching an entire table.
+///
+/// v0.7: SELECT queries call `query_raw_readonly` (routes to replicas when
+/// available). Writes use `query_raw` (always primary).
 fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
     let sql_lit = &parsed.positional_sql;
     let has_params = !parsed.params.is_empty();
+
+    // v0.7: SELECT -> query_raw_readonly (replica-aware), writes -> query_raw (primary)
+    let is_select = parsed.kind == crate::parse::QueryKind::Select;
+    let query_method = if is_select {
+        quote! { query_raw_readonly }
+    } else {
+        quote! { query_raw }
+    };
 
     // Build the params slice: &[&self.id, &self.name, ...]
     let param_refs: Vec<TokenStream> = parsed
@@ -146,9 +174,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     let has_columns = !validation.columns.is_empty();
 
     // FIX 10: generate a LIMIT 2 variant for fetch_one/fetch_optional.
-    // Only for SELECT queries — LIMIT cannot be appended to INSERT/UPDATE/DELETE RETURNING.
+    // Only for SELECT queries -- LIMIT cannot be appended to INSERT/UPDATE/DELETE RETURNING.
     let needs_limit = has_columns
-        && parsed.kind == crate::parse::QueryKind::Select
+        && is_select
         && !parsed.normalized_sql.contains(" limit ")
         && !parsed.normalized_sql.contains(" for ");
     let limited_sql = if needs_limit {
@@ -167,7 +195,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<#result_name> {
-                let rows = executor.query_raw(#limited_sql_lit, #params_slice).await?;
+                let rows = executor.#query_method(#limited_sql_lit, #params_slice).await?;
                 if rows.len() != 1 {
                     return Err(::bsql_core::error::QueryError::row_count(
                         "exactly 1 row",
@@ -182,7 +210,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                let rows = executor.query_raw(#sql_lit, #params_slice).await?;
+                let rows = executor.#query_method(#sql_lit, #params_slice).await?;
                 Ok(rows.iter().map(|row| #result_name { #row_decode }).collect())
             }
 
@@ -190,7 +218,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                let rows = executor.query_raw(#limited_sql_lit, #params_slice).await?;
+                let rows = executor.#query_method(#limited_sql_lit, #params_slice).await?;
                 match rows.len() {
                     0 => Ok(None),
                     1 => {
@@ -353,20 +381,29 @@ fn gen_dynamic_executor_impls(
 
     // Build the match dispatcher that all methods share
 
+    // v0.7: SELECT -> query_raw_readonly (replica-aware), writes -> query_raw
+    let is_select = parsed.kind == crate::parse::QueryKind::Select;
+    let query_method = if is_select {
+        quote! { query_raw_readonly }
+    } else {
+        quote! { query_raw }
+    };
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let row_decode = gen_row_decode(validation);
 
         // For fetch_one/fetch_optional: check if we can inject LIMIT 2
         let needs_limit = has_columns
-            && parsed.kind == crate::parse::QueryKind::Select
+            && is_select
             && !parsed.normalized_sql.contains(" limit ")
             && !parsed.normalized_sql.contains(" for ");
 
+        let qm = &query_method;
         let fetch_one_dispatcher =
             gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit| {
                 quote! {
-                    let rows = executor.query_raw(#sql_lit, &params_slice[..]).await?;
+                    let rows = executor.#qm(#sql_lit, &params_slice[..]).await?;
                     if rows.len() != 1 {
                         return Err(::bsql_core::error::QueryError::row_count(
                             "exactly 1 row",
@@ -380,7 +417,7 @@ fn gen_dynamic_executor_impls(
 
         let fetch_all_dispatcher = gen_variant_dispatcher(parsed, variants, false, |sql_lit| {
             quote! {
-                let rows = executor.query_raw(#sql_lit, &params_slice[..]).await?;
+                let rows = executor.#qm(#sql_lit, &params_slice[..]).await?;
                 Ok(rows.iter().map(|row| #result_name { #row_decode }).collect())
             }
         });
@@ -388,7 +425,7 @@ fn gen_dynamic_executor_impls(
         let fetch_optional_dispatcher =
             gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit| {
                 quote! {
-                    let rows = executor.query_raw(#sql_lit, &params_slice[..]).await?;
+                    let rows = executor.#qm(#sql_lit, &params_slice[..]).await?;
                     match rows.len() {
                         0 => Ok(None),
                         1 => {
@@ -820,6 +857,7 @@ mod tests {
             columns,
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
+            explain_plan: None,
         }
     }
 
@@ -1395,5 +1433,110 @@ mod tests {
         );
         // Should NOT contain bare `type` as a field name (which would be invalid Rust)
         // The suffixed version `type_` is a valid identifier
+    }
+
+    // --- v0.7: read/write routing ---
+
+    #[test]
+    fn select_uses_query_raw_readonly() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("query_raw_readonly"),
+            "SELECT should use query_raw_readonly: {code_str}"
+        );
+    }
+
+    #[test]
+    fn insert_uses_query_raw_not_readonly() {
+        let parsed = parse_query("INSERT INTO t (a) VALUES ($a: i32) RETURNING id").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // INSERT should NOT use query_raw_readonly
+        assert!(
+            !code_str.contains("query_raw_readonly"),
+            "INSERT should NOT use query_raw_readonly: {code_str}"
+        );
+        // It should use query_raw (for the RETURNING fetch methods)
+        assert!(
+            code_str.contains("query_raw"),
+            "INSERT RETURNING should use query_raw: {code_str}"
+        );
+    }
+
+    #[test]
+    fn update_uses_execute_raw() {
+        let parsed = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            !code_str.contains("query_raw_readonly"),
+            "UPDATE should not use query_raw_readonly: {code_str}"
+        );
+        assert!(
+            code_str.contains("execute_raw"),
+            "UPDATE should use execute_raw: {code_str}"
+        );
+    }
+
+    #[test]
+    fn delete_uses_execute_raw() {
+        let parsed = parse_query("DELETE FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            !code_str.contains("query_raw_readonly"),
+            "DELETE should not use query_raw_readonly: {code_str}"
+        );
+        assert!(
+            code_str.contains("execute_raw"),
+            "DELETE should use execute_raw: {code_str}"
+        );
+    }
+
+    // --- v0.7: EXPLAIN doc comment ---
+
+    #[test]
+    fn explain_plan_embedded_as_doc_comment() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = ValidationResult {
+            columns: vec![col("id", "i32")],
+            param_pg_oids: vec![],
+            param_is_pg_enum: vec![],
+            explain_plan: Some("Seq Scan on t  (cost=0.00..1.00 rows=1)".into()),
+        };
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("Query plan"),
+            "should contain EXPLAIN header: {code_str}"
+        );
+        assert!(
+            code_str.contains("Seq Scan"),
+            "should embed plan text: {code_str}"
+        );
+    }
+
+    #[test]
+    fn no_explain_plan_no_doc_comment() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            !code_str.contains("Query plan"),
+            "should NOT contain EXPLAIN header when explain_plan is None: {code_str}"
+        );
     }
 }

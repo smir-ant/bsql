@@ -16,6 +16,7 @@ pub mod error;
 pub mod executor;
 pub mod listener;
 pub mod pool;
+pub(crate) mod singleflight;
 pub mod stream;
 pub mod transaction;
 pub mod types;
