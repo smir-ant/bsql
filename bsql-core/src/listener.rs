@@ -19,7 +19,7 @@
 use tokio::sync::mpsc;
 use tokio_postgres::NoTls;
 
-use crate::error::{ConnectError, BsqlError, BsqlResult};
+use crate::error::{BsqlError, BsqlResult, ConnectError};
 
 /// A notification received from PostgreSQL via LISTEN/NOTIFY.
 #[derive(Debug, Clone)]
@@ -60,8 +60,14 @@ impl Notification {
 /// ```
 pub struct Listener {
     client: tokio_postgres::Client,
-    rx: mpsc::UnboundedReceiver<tokio_postgres::Notification>,
+    rx: mpsc::Receiver<tokio_postgres::Notification>,
     _conn_handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self._conn_handle.abort();
+    }
 }
 
 impl std::fmt::Debug for Listener {
@@ -82,7 +88,7 @@ impl Listener {
             .await
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(10_000);
 
         let handle = tokio::spawn(async move {
             drive_connection(connection, tx).await;
@@ -98,14 +104,14 @@ impl Listener {
     /// Subscribe to a named notification channel.
     ///
     /// The channel name is properly quoted as a PostgreSQL identifier to
-    /// prevent SQL injection.
+    /// prevent SQL injection. Rejects empty names and names containing null bytes.
     pub async fn listen(&self, channel: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "LISTEN channel name must not be empty",
             ));
         }
-        let quoted = quote_ident(channel);
+        let quoted = quote_ident(channel)?;
         self.client
             .batch_execute(&format!("LISTEN {quoted}"))
             .await
@@ -115,13 +121,14 @@ impl Listener {
     /// Unsubscribe from a named notification channel.
     ///
     /// The channel name is properly quoted as a PostgreSQL identifier.
+    /// Rejects empty names and names containing null bytes.
     pub async fn unlisten(&self, channel: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "UNLISTEN channel name must not be empty",
             ));
         }
-        let quoted = quote_ident(channel);
+        let quoted = quote_ident(channel)?;
         self.client
             .batch_execute(&format!("UNLISTEN {quoted}"))
             .await
@@ -155,13 +162,19 @@ impl Listener {
     ///
     /// Convenience method — in production, NOTIFY is typically sent from
     /// a pooled connection or trigger, not the listener connection.
+    /// Rejects empty channel names and null bytes in channel or payload.
     pub async fn notify(&self, channel: &str, payload: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "NOTIFY channel name must not be empty",
             ));
         }
-        let quoted_channel = quote_ident(channel);
+        if payload.contains('\0') {
+            return Err(ConnectError::create(
+                "NOTIFY payload must not contain null bytes",
+            ));
+        }
+        let quoted_channel = quote_ident(channel)?;
         let escaped_payload = payload.replace('\'', "''");
         self.client
             .batch_execute(&format!("NOTIFY {quoted_channel}, '{escaped_payload}'"))
@@ -175,7 +188,14 @@ impl Listener {
 /// This is the standard PG identifier quoting rule. It prevents SQL injection
 /// in LISTEN/UNLISTEN/NOTIFY commands, where the channel name is an identifier
 /// (not a parameter — `$1` binding does not work with LISTEN).
-fn quote_ident(name: &str) -> String {
+///
+/// Returns an error if `name` contains null bytes (PostgreSQL rejects them).
+fn quote_ident(name: &str) -> BsqlResult<String> {
+    if name.contains('\0') {
+        return Err(ConnectError::create(
+            "identifier must not contain null bytes",
+        ));
+    }
     let mut quoted = String::with_capacity(name.len() + 2);
     quoted.push('"');
     for c in name.chars() {
@@ -185,17 +205,17 @@ fn quote_ident(name: &str) -> String {
         quoted.push(c);
     }
     quoted.push('"');
-    quoted
+    Ok(quoted)
 }
 
 /// Drive the connection future, forwarding notifications to the channel.
 ///
 /// Runs until the connection closes or encounters an unrecoverable error.
-/// When the mpsc sender is dropped (receiver side dropped), send errors
-/// are silently ignored — the listener is shutting down.
+/// When the channel buffer is full, notifications are dropped with a warning.
+/// When the receiver is dropped, the loop exits.
 async fn drive_connection<S, T>(
     mut connection: tokio_postgres::Connection<S, T>,
-    tx: mpsc::UnboundedSender<tokio_postgres::Notification>,
+    tx: mpsc::Sender<tokio_postgres::Notification>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -208,12 +228,16 @@ async fn drive_connection<S, T>(
             std::future::poll_fn(|cx| std::pin::Pin::new(&mut connection).poll_message(cx)).await;
 
         match message {
-            Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
-                // If the receiver is dropped, stop driving the connection
-                if tx.send(n).is_err() {
-                    return;
+            Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => match tx.try_send(n) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    eprintln!(
+                        "bsql: listener notification dropped \
+                             — channel buffer full (10000)"
+                    );
                 }
-            }
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            },
             Some(Ok(_)) => {
                 // Notices and other async messages — ignore
             }
@@ -235,36 +259,42 @@ mod tests {
 
     #[test]
     fn quote_ident_simple() {
-        assert_eq!(quote_ident("my_channel"), "\"my_channel\"");
+        assert_eq!(quote_ident("my_channel").unwrap(), "\"my_channel\"");
     }
 
     #[test]
     fn quote_ident_with_double_quotes() {
-        assert_eq!(quote_ident("my\"channel"), "\"my\"\"channel\"");
+        assert_eq!(quote_ident("my\"channel").unwrap(), "\"my\"\"channel\"");
     }
 
     #[test]
     fn quote_ident_empty() {
-        assert_eq!(quote_ident(""), "\"\"");
+        assert_eq!(quote_ident("").unwrap(), "\"\"");
     }
 
     #[test]
     fn quote_ident_with_spaces() {
-        assert_eq!(quote_ident("my channel"), "\"my channel\"");
+        assert_eq!(quote_ident("my channel").unwrap(), "\"my channel\"");
     }
 
     #[test]
     fn quote_ident_with_semicolon() {
         // SQL injection attempt: semicolons are harmless inside quoted identifier
         assert_eq!(
-            quote_ident("foo; DROP TABLE users"),
+            quote_ident("foo; DROP TABLE users").unwrap(),
             "\"foo; DROP TABLE users\""
         );
     }
 
     #[test]
     fn quote_ident_multiple_quotes() {
-        assert_eq!(quote_ident("a\"b\"c"), "\"a\"\"b\"\"c\"");
+        assert_eq!(quote_ident("a\"b\"c").unwrap(), "\"a\"\"b\"\"c\"");
+    }
+
+    #[test]
+    fn quote_ident_rejects_null_bytes() {
+        let result = quote_ident("chan\0nel");
+        assert!(result.is_err());
     }
 
     #[test]

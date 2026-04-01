@@ -3,7 +3,7 @@
 //! Requires a running PostgreSQL.
 //! Set BSQL_DATABASE_URL=postgres://sasql:sasql@localhost/sasql_test
 
-use bsql::{Listener, BsqlError};
+use bsql::{BsqlError, Listener};
 
 const DB_URL: &str = "postgres://sasql:sasql@localhost/sasql_test";
 
@@ -179,6 +179,61 @@ async fn notification_is_clone() {
     let cloned = notif.clone();
     assert_eq!(cloned.channel(), notif.channel());
     assert_eq!(cloned.payload(), notif.payload());
+}
+
+#[tokio::test]
+async fn receive_notify_from_separate_connection() {
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+    listener.listen("cross_conn_test").await.unwrap();
+
+    // Send from a separate connection — different PG backend than the listener
+    let sender = Listener::connect(DB_URL).await.unwrap();
+    sender
+        .notify("cross_conn_test", "from_sender")
+        .await
+        .unwrap();
+
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv())
+        .await
+        .expect("timed out waiting for cross-connection notification")
+        .unwrap();
+
+    assert_eq!(n.channel(), "cross_conn_test");
+    assert_eq!(n.payload(), "from_sender");
+}
+
+#[tokio::test]
+async fn null_byte_in_channel_rejected() {
+    let listener = Listener::connect(DB_URL).await.unwrap();
+    let result = listener.listen("chan\0nel").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        BsqlError::Connect(e) => {
+            assert!(
+                e.message.contains("null bytes"),
+                "unexpected: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Connect error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn null_byte_in_payload_rejected() {
+    let listener = Listener::connect(DB_URL).await.unwrap();
+    let result = listener.notify("test", "pay\0load").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        BsqlError::Connect(e) => {
+            assert!(
+                e.message.contains("null bytes"),
+                "unexpected: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Connect error, got: {other:?}"),
+    }
 }
 
 #[tokio::test]

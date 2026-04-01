@@ -3,7 +3,7 @@
 //! Requires a running PostgreSQL with the test schema.
 //! Set BSQL_DATABASE_URL=postgres://sasql:sasql@localhost/sasql_test
 
-use bsql::{Pool, BsqlError};
+use bsql::{BsqlError, Pool};
 
 async fn pool() -> Pool {
     Pool::connect("postgres://sasql:sasql@localhost/sasql_test")

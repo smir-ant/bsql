@@ -3,7 +3,7 @@
 //! Requires a running PostgreSQL with the test schema.
 //! Set BSQL_DATABASE_URL=postgres://sasql:sasql@localhost/sasql_test
 
-use bsql::{Pool, BsqlError};
+use bsql::{BsqlError, Pool};
 
 async fn pool() -> Pool {
     Pool::connect("postgres://sasql:sasql@localhost/sasql_test")
@@ -100,11 +100,10 @@ async fn update_execute() {
     let pool = pool().await;
     let desc = "Updated description";
     let id = 1i32;
-    let affected =
-        bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
-            .execute(&pool)
-            .await
-            .unwrap();
+    let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(affected, 1);
 }

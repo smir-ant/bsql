@@ -58,3 +58,15 @@ impl Stream for QueryStream {
         (0, None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn _assert_send<T: Send>() {}
+
+    #[test]
+    fn query_stream_is_send() {
+        _assert_send::<QueryStream>();
+    }
+}

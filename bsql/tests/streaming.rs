@@ -138,3 +138,25 @@ async fn stream_with_params_and_join() {
     assert_eq!(row.creator, "alice");
     assert!(stream.next().await.is_none());
 }
+
+#[tokio::test]
+async fn stream_with_optional_clause() {
+    let pool = pool().await;
+    let dept: Option<i32> = None;
+    let mut stream = bsql::query!(
+        "SELECT id, title FROM tickets
+         WHERE deleted_at IS NULL
+         [AND department_id = $dept: Option<i32>]
+         ORDER BY id"
+    )
+    .fetch_stream(&pool)
+    .await
+    .unwrap();
+
+    let mut count = 0;
+    while let Some(row) = stream.next().await {
+        let _ = row.unwrap();
+        count += 1;
+    }
+    assert!(count >= 2);
+}

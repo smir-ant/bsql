@@ -115,6 +115,7 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 | `.fetch_one(&pool)` | `T` | Exactly one row expected |
 | `.fetch_all(&pool)` | `Vec<T>` | All matching rows |
 | `.fetch_optional(&pool)` | `Option<T>` | Row might not exist |
+| `.fetch_stream(&pool)` | `impl Stream<Item = Result<T>>` | Large result sets, row-by-row processing |
 | `.execute(&pool)` | `u64` (number of affected rows) | INSERT/UPDATE/DELETE without RETURNING |
 
 ## What bsql Is Not
@@ -133,8 +134,8 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 | v0.3 | Released | Dynamic queries: `[optional clauses]`, sort enums |
 | v0.4 | Released | Offline mode: bitcode cache, auto-populated during build |
 | v0.5 | Released | Transactions: `begin()`, `commit()`, `rollback()`, auto-rollback on drop |
-| v0.6 | **Current** | Singleflight request coalescing, streaming results, LISTEN/NOTIFY |
-| v0.7 | Planned | Cross-query analysis, EXPLAIN at compile time, read/write splitting |
+| v0.6 | **Current** | Streaming results, LISTEN/NOTIFY |
+| v0.7 | Planned | Singleflight request coalescing, cross-query analysis, EXPLAIN at compile time, read/write splitting |
 | v1.0 | Planned | Arena allocation, binary protocol, SIMD, stable API |
 
 ## About the Development Process

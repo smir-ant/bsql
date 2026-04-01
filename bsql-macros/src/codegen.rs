@@ -679,10 +679,7 @@ fn add_lifetime_to_refs(ty: syn::Type) -> syn::Type {
     match ty {
         syn::Type::Reference(mut r) => {
             if r.lifetime.is_none() {
-                r.lifetime = Some(syn::Lifetime::new(
-                    "'_bsql",
-                    proc_macro2::Span::call_site(),
-                ));
+                r.lifetime = Some(syn::Lifetime::new("'_bsql", proc_macro2::Span::call_site()));
             }
             r.elem = Box::new(add_lifetime_to_refs(*r.elem));
             syn::Type::Reference(r)

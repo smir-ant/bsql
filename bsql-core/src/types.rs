@@ -1,7 +1,7 @@
 //! PostgreSQL OID to Rust type mapping.
 //!
 //! This table is the single source of truth for how PostgreSQL types map to Rust
-//! types in bsql v0.1. Both the proc macro (at compile time) and the runtime
+//! types in bsql. Both the proc macro (at compile time) and the runtime
 //! (for error messages) reference this mapping.
 
 /// A single entry in the PG-to-Rust type map.
@@ -17,7 +17,7 @@ pub struct TypeMapping {
     pub is_array: bool,
 }
 
-/// Base type mappings for bsql v0.1. No feature-gated types.
+/// Base type mappings. No feature-gated types.
 ///
 /// OIDs sourced from `pg_type.dat` in the PostgreSQL source tree.
 /// <https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat>

@@ -10,7 +10,7 @@ use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 use tokio_postgres::types::ToSql;
 
-use crate::error::{ConnectError, BsqlError, BsqlResult};
+use crate::error::{BsqlError, BsqlResult, ConnectError};
 use crate::stream::QueryStream;
 use crate::transaction::Transaction;
 
