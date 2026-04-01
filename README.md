@@ -162,6 +162,7 @@ Migrations, admin panels, and multi-tenant dynamic tables are infrastructure —
 | v0.7 | Released | Singleflight request coalescing, read/write splitting, EXPLAIN at compile time |
 | v0.8 | Released | TLS support, SmallVec optimizations |
 | v0.9 | **Current** | Connection warmup, safety gates (UPDATE/DELETE without WHERE) |
+| v0.10 | Planned | Custom PG wire protocol driver (bsql-driver): binary protocol, arena allocation, zero-copy row decoding, built-in connection pool, pipelining. Replaces tokio-postgres + deadpool. |
 
 ## About the Development Process
 

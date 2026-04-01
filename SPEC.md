@@ -1243,6 +1243,42 @@ The pool becomes smarter than the developer.
 - **Connection affinity**: route queries to connections that already have the relevant prepared statements cached. The runtime tracks which statements are prepared on each connection (via the compile-time statement index bitmap). When acquiring a connection, prefer one that already has the needed statement. Eliminates PREPARE overhead after warmup.
 - **Adaptive statement eviction**: track statement usage frequency per connection. If a connection has 100+ prepared statements but only 20 are used frequently, DEALLOCATE the cold ones to free PG backend memory (~1KB per statement). Re-prepare on demand. The eviction threshold and frequency are configurable.
 
+### v0.10 — Custom PG Wire Protocol Driver (bsql-driver)
+
+The most ambitious version. Replaces tokio-postgres + deadpool with a purpose-built
+PostgreSQL driver optimized for bsql's specific use case.
+
+**What it replaces:**
+- `tokio-postgres` — general-purpose PG driver with text protocol, per-field allocation,
+  separate connection task, support for features bsql never uses
+- `deadpool-postgres` — generic connection pool with unnecessary abstraction layers
+
+**What bsql-driver provides:**
+- **Binary protocol only** — i32 = 4-byte memcpy (not ASCII parse), UUID = 16 bytes
+  (not 36), timestamps = 8 bytes (not 25). ~2-4x faster deserialization.
+- **Arena allocation** — all row data from one query in a single contiguous buffer.
+  300 string fields = 1 allocation (not 300). Bump allocator with thread-local recycling.
+- **Zero-copy row decoding** — struct fields are `&str` pointing into the arena buffer,
+  not owned `String`. No data copying between wire buffer and user struct.
+- **Built-in connection pool** — LIFO ordering (warm connections first), fail-fast acquire,
+  no external pool dependency.
+- **Pipelining** — PREPARE + BIND + EXECUTE in a single TCP write. One round-trip instead
+  of three for first-use queries.
+- **Inline connection task** — no separate spawned task per connection (tokio-postgres
+  requires this). Responses processed inline in the calling task.
+
+**What stays the same:**
+- User API: `bsql::query!("...").fetch_one(&pool).await?` — identical
+- Compile-time validation pipeline (proc macro) — unchanged
+- All existing features (dynamic queries, transactions, streaming, LISTEN/NOTIFY, etc.)
+- `#![forbid(unsafe_code)]` — the driver is written in safe Rust
+
+**Architecture:**
+- New crate: `crates/bsql-driver/` — PG wire protocol implementation
+- `bsql-core` switches from `tokio-postgres` + `deadpool-postgres` to `bsql-driver`
+- Dependencies removed: `tokio-postgres`, `deadpool-postgres`, `postgres-types`, `deadpool`
+- The PG wire protocol is stable since PG 7.4 (2003) — no per-version maintenance needed
+
 ### v1.0 — Stable Release
 
 - Full documentation with examples
