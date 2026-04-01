@@ -1,0 +1,10 @@
+error: expected type after `$id:` at position 32
+ --> tests/compile_fail/param_empty_type.rs:3:13
+  |
+3 |       let _ = sasql::query!(
+  |  _____________^
+4 | |         "SELECT id FROM users WHERE id = $id:"
+5 | |     );
+  | |_____^
+  |
+  = note: this error originates in the macro `sasql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

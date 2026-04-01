@@ -659,4 +659,142 @@ mod tests {
         let unique: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
         assert_eq!(unique.len(), 4, "all names must be unique: {names:?}");
     }
+
+    // --- bad-path coverage: sanitize_column_name ---
+
+    #[test]
+    fn sanitize_unnamed_column() {
+        assert_eq!(sanitize_column_name("?column?", 0), "col_0");
+        assert_eq!(sanitize_column_name("?column?", 3), "col_3");
+    }
+
+    #[test]
+    fn sanitize_empty_column_name() {
+        assert_eq!(sanitize_column_name("", 0), "col_0");
+    }
+
+    #[test]
+    fn sanitize_column_starting_with_digit() {
+        assert_eq!(sanitize_column_name("1abc", 0), "col_1abc");
+    }
+
+    #[test]
+    fn sanitize_column_with_special_chars() {
+        assert_eq!(sanitize_column_name("my-col.name", 0), "my_col_name");
+    }
+
+    #[test]
+    fn sanitize_normal_column_passthrough() {
+        assert_eq!(sanitize_column_name("id", 0), "id");
+        assert_eq!(sanitize_column_name("user_name", 0), "user_name");
+    }
+
+    // --- codegen: INSERT/UPDATE/DELETE without RETURNING has no result struct ---
+
+    #[test]
+    fn insert_no_returning_has_execute_only() {
+        let parsed = parse_query("INSERT INTO t (a) VALUES ($a: i32)").unwrap();
+        let validation = make_validation(vec![]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(!code_str.contains("fetch_one"), "should not have fetch_one: {code_str}");
+        assert!(!code_str.contains("fetch_all"), "should not have fetch_all: {code_str}");
+        assert!(code_str.contains("execute"), "missing execute: {code_str}");
+    }
+
+    #[test]
+    fn delete_with_returning_has_fetch_methods() {
+        let parsed = parse_query("DELETE FROM t WHERE id = $id: i32 RETURNING id").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(code_str.contains("fetch_one"), "missing fetch_one: {code_str}");
+        assert!(code_str.contains("fetch_all"), "missing fetch_all: {code_str}");
+    }
+
+    // --- LIMIT injection edge cases ---
+
+    #[test]
+    fn insert_returning_no_limit_injected() {
+        // LIMIT cannot be appended to INSERT...RETURNING
+        let parsed = parse_query("INSERT INTO t (a) VALUES ($a: i32) RETURNING id").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(!code_str.contains("LIMIT 2"), "INSERT RETURNING should NOT get LIMIT: {code_str}");
+    }
+
+    #[test]
+    fn update_returning_no_limit_injected() {
+        let parsed = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32 RETURNING id").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(!code_str.contains("LIMIT 2"), "UPDATE RETURNING should NOT get LIMIT: {code_str}");
+    }
+
+    #[test]
+    fn for_share_no_limit_injected() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32 FOR SHARE").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(!code_str.contains("LIMIT 2"), "FOR SHARE should NOT get LIMIT: {code_str}");
+    }
+
+    // --- lifetime injection edge cases ---
+
+    #[test]
+    fn inject_lifetime_vec_no_ref() {
+        let ts = inject_lifetime("Vec<i32>");
+        let s = ts.to_string();
+        assert!(!s.contains("'_sasql"), "Vec<i32> should have no lifetime: {s}");
+    }
+
+    #[test]
+    fn inject_lifetime_option_i32_no_ref() {
+        let ts = inject_lifetime("Option<i32>");
+        let s = ts.to_string();
+        assert!(!s.contains("'_sasql"), "Option<i32> should have no lifetime: {s}");
+    }
+
+    #[test]
+    fn inject_lifetime_path_type() {
+        let ts = inject_lifetime("time::OffsetDateTime");
+        let s = ts.to_string();
+        assert!(!s.contains("'_sasql"), "time::OffsetDateTime needs no lifetime: {s}");
+    }
+
+    // --- multiple params with refs and non-refs ---
+
+    #[test]
+    fn mixed_ref_and_owned_params() {
+        let parsed = parse_query("SELECT id FROM t WHERE a = $name: &str AND b = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // Both params should appear
+        assert!(code_str.contains("name"), "missing name param: {code_str}");
+        assert!(code_str.contains("id"), "missing id param: {code_str}");
+        // The ref param should get a lifetime
+        assert!(code_str.contains("'_sasql"), "ref param should have lifetime: {code_str}");
+    }
+
+    // --- single column result struct ---
+
+    #[test]
+    fn single_column_result_struct() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(code_str.contains("pub id : i32"), "single column struct: {code_str}");
+    }
 }

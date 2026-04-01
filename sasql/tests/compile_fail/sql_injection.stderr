@@ -1,0 +1,7 @@
+error: PostgreSQL error: cannot insert multiple commands into a prepared statement
+ --> tests/compile_fail/sql_injection.rs:2:13
+  |
+2 |     let _ = sasql::query!("SELECT 1; DROP TABLE users");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `sasql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

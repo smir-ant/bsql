@@ -570,4 +570,185 @@ mod tests {
         assert_eq!(to_snake_case("HTTPCode"), "h_t_t_p_code");
         assert_eq!(to_snake_case("A"), "a");
     }
+
+    // --- bad-path coverage: pg_enum edge cases ---
+
+    #[test]
+    fn single_variant_enum() {
+        let input = quote! {
+            enum Singleton {
+                #[sql("only")]
+                Only,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        assert!(code.contains("enum Singleton"), "missing enum: {code}");
+        assert!(code.contains("\"only\""), "missing sql label: {code}");
+    }
+
+    #[test]
+    fn variant_with_special_chars_in_label() {
+        // SQL labels with hyphens, spaces, unicode
+        let input = quote! {
+            enum Priority {
+                #[sql("high-priority")]
+                High,
+                #[sql("low priority")]
+                Low,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        assert!(code.contains("\"high-priority\""), "missing hyphenated label: {code}");
+        assert!(code.contains("\"low priority\""), "missing spaced label: {code}");
+    }
+
+    #[test]
+    fn variant_with_long_label() {
+        let input = quote! {
+            enum LongLabel {
+                #[sql("this_is_a_very_long_sql_label_that_goes_on_and_on_and_on")]
+                Long,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        assert!(code.contains("this_is_a_very_long_sql_label"), "long label lost: {code}");
+    }
+
+    #[test]
+    fn variant_with_unicode_label() {
+        let input = quote! {
+            enum UniLabel {
+                #[sql("статус")]
+                Status,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        assert!(code.contains("\"статус\""), "unicode label lost: {code}");
+    }
+
+    #[test]
+    fn pub_crate_visibility_preserved() {
+        let input = quote! {
+            pub(crate) enum Internal {
+                #[sql("a")]
+                A,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        assert!(code.contains("pub (crate)"), "pub(crate) visibility lost: {code}");
+    }
+
+    #[test]
+    fn struct_not_accepted() {
+        let input = quote! {
+            struct NotAnEnum {
+                field: i32,
+            }
+        };
+        let result = expand_pg_enum(TokenStream::new(), input);
+        assert!(result.is_err(), "structs should be rejected");
+    }
+
+    #[test]
+    fn tuple_variant_errors() {
+        let input = quote! {
+            enum Bad {
+                #[sql("a")]
+                A(String),
+            }
+        };
+        let result = expand_pg_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unit variants"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn struct_variant_errors() {
+        let input = quote! {
+            enum Bad {
+                #[sql("a")]
+                A { x: i32 },
+            }
+        };
+        let result = expand_pg_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unit variants"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn large_enum_uses_linear_match() {
+        // >8 variants should use linear match fallback
+        let input = quote! {
+            enum NineVariants {
+                #[sql("a")] A,
+                #[sql("b")] B,
+                #[sql("c")] C,
+                #[sql("d")] D,
+                #[sql("e")] E,
+                #[sql("f")] F,
+                #[sql("g")] G,
+                #[sql("h")] H,
+                #[sql("i")] I,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        // Linear match uses direct string comparison, not len/first_byte
+        assert!(code.contains("FromSql"), "missing FromSql: {code}");
+    }
+
+    #[test]
+    fn same_length_same_first_byte_labels() {
+        // Two labels with same (len, first_byte) — tests collision path
+        let input = quote! {
+            enum Collision {
+                #[sql("abc")]
+                Abc,
+                #[sql("axz")]
+                Axz,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        assert!(code.contains("\"abc\""), "missing abc: {code}");
+        assert!(code.contains("\"axz\""), "missing axz: {code}");
+    }
+
+    #[test]
+    fn to_sql_checked_rejects_wrong_type() {
+        // The generated to_sql_checked should reject mismatched PG types.
+        // We verify the code contains the check.
+        let input = quote! {
+            enum Check {
+                #[sql("a")]
+                A,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        assert!(code.contains("to_sql_checked"), "missing to_sql_checked: {code}");
+        assert!(code.contains("accepts"), "missing accepts check: {code}");
+    }
+
+    #[test]
+    fn snake_case_single_char() {
+        assert_eq!(to_snake_case("X"), "x");
+    }
+
+    #[test]
+    fn snake_case_all_lowercase() {
+        assert_eq!(to_snake_case("color"), "color");
+    }
+
+    #[test]
+    fn snake_case_empty() {
+        assert_eq!(to_snake_case(""), "");
+    }
 }

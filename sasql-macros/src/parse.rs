@@ -752,4 +752,170 @@ mod tests {
             r.positional_sql
         );
     }
+
+    // --- bad-path coverage: additional edge cases ---
+
+    #[test]
+    fn comment_only_sql_errors() {
+        // After stripping comments, the remaining text is empty/whitespace
+        let r = parse_query("-- just a comment");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn block_comment_only_sql_errors() {
+        let r = parse_query("/* nothing here */");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn truncate_rejected() {
+        let r = parse_query("TRUNCATE users");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("unsupported statement type"));
+    }
+
+    #[test]
+    fn grant_rejected() {
+        let r = parse_query("GRANT SELECT ON users TO public");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("unsupported statement type"));
+    }
+
+    #[test]
+    fn revoke_rejected() {
+        let r = parse_query("REVOKE SELECT ON users FROM public");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("unsupported statement type"));
+    }
+
+    #[test]
+    fn cte_without_dml_errors() {
+        let r = parse_query("WITH cte AS (SELECT 1)");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("CTE"),
+            "should mention CTE: {err}"
+        );
+    }
+
+    #[test]
+    fn cte_with_update() {
+        let r = parse_query("WITH cte AS (SELECT 1 as val) UPDATE t SET a = 1 WHERE id = 1").unwrap();
+        assert_eq!(r.kind, QueryKind::Update);
+    }
+
+    #[test]
+    fn cte_with_delete() {
+        let r = parse_query("WITH cte AS (SELECT 1) DELETE FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.kind, QueryKind::Delete);
+    }
+
+    #[test]
+    fn param_with_underscore_name() {
+        let r = parse_query("SELECT id FROM t WHERE id = $my_id: i32").unwrap();
+        assert_eq!(r.params[0].name, "my_id");
+    }
+
+    #[test]
+    fn param_with_digits_in_name() {
+        let r = parse_query("SELECT id FROM t WHERE id = $id2: i32").unwrap();
+        assert_eq!(r.params[0].name, "id2");
+    }
+
+    #[test]
+    fn param_with_long_name() {
+        let r = parse_query("SELECT id FROM t WHERE id = $this_is_a_really_long_parameter_name: i32").unwrap();
+        assert_eq!(r.params[0].name, "this_is_a_really_long_parameter_name");
+    }
+
+    #[test]
+    fn many_params() {
+        let sql = "INSERT INTO t (a,b,c,d,e,f,g,h,i,j) VALUES ($a: i32,$b: i32,$c: i32,$d: i32,$e: i32,$f: i32,$g: i32,$h: i32,$i: i32,$j: i32)";
+        let r = parse_query(sql).unwrap();
+        assert_eq!(r.params.len(), 10);
+        assert_eq!(r.params[9].position, 10);
+        assert!(r.positional_sql.contains("$10"));
+    }
+
+    #[test]
+    fn path_type_param() {
+        let r = parse_query("SELECT id FROM t WHERE id = $id: time::OffsetDateTime").unwrap();
+        assert_eq!(r.params[0].rust_type, "time::OffsetDateTime");
+    }
+
+    #[test]
+    fn dollar_sign_in_string_literal_not_a_param() {
+        let r = parse_query("SELECT * FROM t WHERE price = '$100'").unwrap();
+        assert_eq!(r.params.len(), 0);
+    }
+
+    #[test]
+    fn escaped_single_quote_in_literal() {
+        let r = parse_query("SELECT * FROM t WHERE name = 'O''Brien' AND id = $id: i32").unwrap();
+        assert_eq!(r.params.len(), 1);
+        assert!(r.positional_sql.contains("'O''Brien'"));
+    }
+
+    #[test]
+    fn dollar_quoted_body_with_param_syntax_ignored() {
+        let r = parse_query("SELECT $$has $dollar: signs$$ FROM t").unwrap();
+        assert_eq!(r.params.len(), 0, "content inside $$ should not be parsed as params");
+    }
+
+    #[test]
+    fn tagged_dollar_quote_with_param_syntax_ignored() {
+        let r = parse_query("SELECT $tag$has $param: i32 inside$tag$ FROM t").unwrap();
+        assert_eq!(r.params.len(), 0, "content inside $tag$ should not be parsed as params");
+    }
+
+    #[test]
+    fn returning_in_update() {
+        let r = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32 RETURNING id, a").unwrap();
+        assert!(r.has_returning);
+        assert_eq!(r.kind, QueryKind::Update);
+    }
+
+    #[test]
+    fn no_params_select() {
+        let r = parse_query("SELECT 1 + 1 AS val").unwrap();
+        assert!(r.params.is_empty());
+        assert_eq!(r.kind, QueryKind::Select);
+    }
+
+    #[test]
+    fn case_insensitive_keywords() {
+        let r = parse_query("sElEcT id FrOm t WhErE id = $id: i32").unwrap();
+        assert_eq!(r.kind, QueryKind::Select);
+        // normalized should be lowercase
+        assert!(r.normalized_sql.starts_with("select"));
+    }
+
+    #[test]
+    fn multiple_positional_params_rejected() {
+        assert!(parse_query("SELECT id FROM t WHERE a = $1 AND b = $2").is_err());
+    }
+
+    #[test]
+    fn triple_duplicate_param_reuses_position() {
+        let r = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $x: i32 AND c = $x: i32").unwrap();
+        assert_eq!(r.params.len(), 1);
+        assert_eq!(r.positional_sql, "SELECT id FROM t WHERE a = $1 AND b = $1 AND c = $1");
+    }
+
+    #[test]
+    fn param_at_end_of_sql() {
+        let r = parse_query("DELETE FROM t WHERE id = $id: i32").unwrap();
+        assert_eq!(r.params.len(), 1);
+        assert!(r.positional_sql.ends_with("$1"));
+    }
+
+    #[test]
+    fn double_colon_cast_after_param() {
+        // $val: &str followed by ::text should work
+        let r = parse_query("SELECT * FROM t WHERE a::text = $val: &str").unwrap();
+        assert_eq!(r.params.len(), 1);
+        assert!(r.positional_sql.contains("a::text"));
+    }
 }

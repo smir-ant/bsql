@@ -355,4 +355,151 @@ mod tests {
     fn param_incompatible_unknown_oid() {
         assert!(!is_param_compatible("i32", 99999));
     }
+
+    // --- bad-path coverage: type mapping edge cases ---
+
+    #[test]
+    fn no_implicit_widening_i16_to_i32() {
+        assert!(!is_param_compatible("i16", 23)); // i16 for int4
+    }
+
+    #[test]
+    fn no_implicit_narrowing_i64_to_i32() {
+        assert!(!is_param_compatible("i64", 23)); // i64 for int4
+    }
+
+    #[test]
+    fn f32_not_compatible_with_f64() {
+        assert!(!is_param_compatible("f32", 701)); // f32 for float8
+    }
+
+    #[test]
+    fn f64_not_compatible_with_f32() {
+        assert!(!is_param_compatible("f64", 700)); // f64 for float4
+    }
+
+    #[test]
+    fn string_owned_for_text() {
+        assert!(is_param_compatible("String", 25));
+    }
+
+    #[test]
+    fn string_owned_for_varchar() {
+        assert!(is_param_compatible("String", 1043));
+    }
+
+    #[test]
+    fn str_ref_for_bpchar() {
+        assert!(is_param_compatible("&str", 1042));
+    }
+
+    #[test]
+    fn vec_u8_for_bytea() {
+        assert!(is_param_compatible("Vec<u8>", 17));
+    }
+
+    #[test]
+    fn bool_not_for_int() {
+        assert!(!is_param_compatible("bool", 23));
+    }
+
+    #[test]
+    fn int_not_for_bool() {
+        assert!(!is_param_compatible("i32", 16));
+    }
+
+    #[test]
+    fn u32_for_oid() {
+        assert!(is_param_compatible("u32", 26));
+    }
+
+    #[test]
+    fn i32_not_for_oid() {
+        assert!(!is_param_compatible("i32", 26));
+    }
+
+    #[test]
+    fn vec_string_for_text_array() {
+        assert!(is_param_compatible("Vec<String>", 1009));
+    }
+
+    #[test]
+    fn vec_i32_not_for_text_array() {
+        assert!(!is_param_compatible("Vec<i32>", 1009));
+    }
+
+    #[test]
+    fn all_base_types_have_pg_names() {
+        for m in BASE_TYPE_MAP {
+            assert!(!m.pg_name.is_empty(), "OID {} has empty pg_name", m.pg_oid);
+            assert!(!m.rust_type.is_empty(), "OID {} has empty rust_type", m.pg_oid);
+        }
+    }
+
+    #[test]
+    fn array_types_flagged_correctly() {
+        for m in BASE_TYPE_MAP {
+            if m.pg_name.starts_with('_') {
+                assert!(m.is_array, "{} should be flagged as array", m.pg_name);
+            } else {
+                assert!(!m.is_array, "{} should not be flagged as array", m.pg_name);
+            }
+        }
+    }
+
+    #[test]
+    fn void_type_maps_to_unit() {
+        assert_eq!(rust_type_for_oid(2278), Some("()"));
+    }
+
+    // --- EnumString tests ---
+
+    #[test]
+    fn enum_string_display() {
+        let es = EnumString("active".into());
+        assert_eq!(format!("{es}"), "active");
+    }
+
+    #[test]
+    fn enum_string_deref_to_str() {
+        let es = EnumString("test".into());
+        let s: &str = &es;
+        assert_eq!(s, "test");
+    }
+
+    #[test]
+    fn enum_string_eq_str() {
+        let es = EnumString("hello".into());
+        assert_eq!(es, "hello");
+        assert_eq!(es, *"hello");
+    }
+
+    #[test]
+    fn enum_string_ne_str() {
+        let es = EnumString("hello".into());
+        assert_ne!(es, "world");
+    }
+
+    #[test]
+    fn enum_string_clone() {
+        let es = EnumString("x".into());
+        let cloned = es.clone();
+        assert_eq!(es, cloned);
+    }
+
+    #[test]
+    fn enum_string_debug() {
+        let es = EnumString("debug".into());
+        let dbg = format!("{es:?}");
+        assert!(dbg.contains("debug"), "debug format: {dbg}");
+    }
+
+    #[test]
+    fn enum_string_hash_eq() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(EnumString("a".into()));
+        set.insert(EnumString("a".into()));
+        assert_eq!(set.len(), 1);
+    }
 }
