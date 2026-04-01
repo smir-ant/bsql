@@ -1,0 +1,26 @@
+[package]
+name = "bsql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Safe SQL for Rust — if it compiles, the SQL is correct"
+
+[features]
+default = []
+time = ["bsql-core/time", "bsql-macros/time"]
+chrono = ["bsql-core/chrono", "bsql-macros/chrono"]
+uuid = ["bsql-core/uuid", "bsql-macros/uuid"]
+decimal = ["bsql-core/decimal", "bsql-macros/decimal"]
+
+[dependencies]
+bsql-core = { workspace = true }
+bsql-macros = { workspace = true }
+futures-core = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-stream = { workspace = true }
+trybuild = "1"
+time = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

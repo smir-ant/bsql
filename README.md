@@ -1,15 +1,15 @@
-# sasql
+# bsql
 
 - **If it compiles, every SQL query is correct.** Validated against a real PostgreSQL instance during `cargo build`. Not at runtime. Not "if you use the right function". Always.
 - **No escape hatch exists.** There is no function that accepts unchecked SQL. Not deprecated, not hidden — it does not exist.
-- **Pure SQL, not a DSL.** Write real PostgreSQL — CTEs, JOINs, window functions, subqueries. If you know SQL, you know sasql.
+- **Pure SQL, not a DSL.** Write real PostgreSQL — CTEs, JOINs, window functions, subqueries. If you know SQL, you know bsql.
 - **100% unsafe-free.** Guaranteed by the Rust compiler. No exceptions, no opt-outs.
 - **Fail-fast, not fail-silent.** No timeouts. No "wait and hope". Every failure is immediate and explicit.
 - **Dangerous SQL won't compile.** `UPDATE` without `WHERE`, wrong column type, nonexistent table — all caught before the binary is produced.
 
 ```rust
 let id = 42i32;
-let user = sasql::query!(
+let user = bsql::query!(
     "SELECT id, login, active FROM users WHERE id = $id: i32"
 ).fetch_one(&pool).await?;
 // user.id: i32, user.login: String, user.active: bool
@@ -26,7 +26,7 @@ let user = sasql::query!(
 | **SeaORM** | No compile-time SQL checking at all. Every error is discovered when the query hits PostgreSQL in production. |
 | **Cornucopia / Clorinde** | SQL in separate `.sql` files — either one unreadable giant file or dozens of scattered ones. File-hopping hell. No dynamic queries. |
 
-What sasql does differently:
+What bsql does differently:
 
 - **Inline SQL** — the query is where it's used. No jumping between files. Code review sees SQL and Rust in the same diff.
 - **No unchecked path** — not "be disciplined and use the safe function". There is only one function. It is safe.
@@ -50,25 +50,25 @@ What sasql does differently:
 `Cargo.toml`:
 ```toml
 [dependencies]
-sasql = { version = "0.6", features = ["time", "uuid"] }
+bsql = { version = "0.6", features = ["time", "uuid"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 Terminal — set the database URL for compile-time validation:
 ```bash
-export SASQL_DATABASE_URL="postgres://user:pass@localhost/mydb"
+export BSQL_DATABASE_URL="postgres://user:pass@localhost/mydb"
 ```
 
 `src/main.rs`:
 ```rust
-use sasql::Pool;
+use bsql::Pool;
 
 #[tokio::main]
-async fn main() -> Result<(), sasql::SasqlError> {
+async fn main() -> Result<(), bsql::BsqlError> {
     let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 
     let id = 1i32;
-    let user = sasql::query!(
+    let user = bsql::query!(
         "SELECT id, login, first_name FROM users WHERE id = $id: i32"
     ).fetch_one(&pool).await?;
 
@@ -79,10 +79,10 @@ async fn main() -> Result<(), sasql::SasqlError> {
 
 ## Optional Type Support
 
-Out of the box, sasql works with basic types: integers, floats, booleans, strings, byte arrays. This is enough for most queries. For specialized PostgreSQL types like timestamps or UUIDs, enable the corresponding feature:
+Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. This is enough for most queries. For specialized PostgreSQL types like timestamps or UUIDs, enable the corresponding feature:
 
 ```toml
-sasql = { version = "0.6", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.6", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature | PostgreSQL types | Rust types |
@@ -97,7 +97,7 @@ If your query touches a column that needs a feature you haven't enabled, you get
 ## PostgreSQL Enums
 
 ```rust
-#[sasql::pg_enum]
+#[bsql::pg_enum]
 enum TicketStatus {
     #[sql("new")]         New,
     #[sql("in_progress")] InProgress,
@@ -117,7 +117,7 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 | `.fetch_optional(&pool)` | `Option<T>` | Row might not exist |
 | `.execute(&pool)` | `u64` (number of affected rows) | INSERT/UPDATE/DELETE without RETURNING |
 
-## What sasql Is Not
+## What bsql Is Not
 
 - **Not an ORM.** You write SQL, not method chains.
 - **Not a query builder.** No `.filter()`, `.select()`, `.join()`.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["sasql", "sasql-core", "sasql-macros"]
+members = ["bsql", "bsql-core", "bsql-macros"]
 
 [workspace.package]
 version = "0.6.0"
@@ -37,12 +37,12 @@ uuid = { version = "1", default-features = false }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
 # Internal
-sasql-core = { path = "sasql-core", version = "0.6.0" }
-sasql-macros = { path = "sasql-macros", version = "0.6.0" }
+bsql-core = { path = "bsql-core", version = "0.6.0" }
+bsql-macros = { path = "bsql-macros", version = "0.6.0" }
 
 # --- Build profiles ---
 # NOTE: these only affect workspace-internal builds (tests, benchmarks).
-# When sasql is used as a library, the CONSUMER's Cargo.toml profile applies.
+# When bsql is used as a library, the CONSUMER's Cargo.toml profile applies.
 
 [profile.dev]
 incremental = true

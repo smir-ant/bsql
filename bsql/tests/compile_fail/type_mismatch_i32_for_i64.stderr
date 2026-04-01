@@ -1,0 +1,10 @@
+error: type mismatch for parameter `$id`: declared `i32` but PostgreSQL expects `int2` (OID 21) (expected `i16`)
+ --> tests/compile_fail/type_mismatch_i32_for_i64.rs:4:13
+  |
+4 |       let _ = bsql::query!(
+  |  _____________^
+5 | |         "SELECT id FROM users WHERE score = $id: i32"
+6 | |     );
+  | |_____^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

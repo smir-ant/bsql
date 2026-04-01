@@ -1,0 +1,10 @@
+error: type mismatch for parameter `$name`: declared `&str` but PostgreSQL expects `int4` (OID 23) (expected `i32`)
+ --> tests/compile_fail/type_mismatch_str_for_int.rs:4:13
+  |
+4 |       let _ = bsql::query!(
+  |  _____________^
+5 | |         "SELECT id FROM users WHERE id = $name: &str"
+6 | |     );
+  | |_____^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,4 +1,4 @@
--- Test schema for sasql integration tests.
+-- Test schema for bsql integration tests.
 -- Run against sasql_test database before running tests.
 
 DROP TABLE IF EXISTS ticket_events CASCADE;

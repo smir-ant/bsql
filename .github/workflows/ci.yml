@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SASQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
+  BSQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
 
 jobs:
   test:
@@ -89,7 +89,7 @@ jobs:
         run: PGPASSWORD=sasql psql -h localhost -U sasql -d sasql_test -f tests/setup.sql
       - run: cargo clippy --workspace --all-targets --features "time,uuid,decimal,chrono" -- -D warnings
         env:
-          SASQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
+          BSQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
 
   fmt:
     name: Format

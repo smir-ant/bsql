@@ -1,0 +1,7 @@
+error: unsupported statement type: `grant`. bsql supports SELECT, INSERT, UPDATE, DELETE
+ --> tests/compile_fail/grant_rejected.rs:2:13
+  |
+2 |     let _ = bsql::query!("GRANT SELECT ON users TO public");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

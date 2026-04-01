@@ -1,0 +1,7 @@
+error: unsupported statement type: `truncate`. bsql supports SELECT, INSERT, UPDATE, DELETE
+ --> tests/compile_fail/truncate_rejected.rs:2:13
+  |
+2 |     let _ = bsql::query!("TRUNCATE users");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

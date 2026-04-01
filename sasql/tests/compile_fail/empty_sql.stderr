@@ -1,7 +1,0 @@
-error: empty SQL query
- --> tests/compile_fail/empty_sql.rs:2:13
-  |
-2 |     let _ = sasql::query!("");
-  |             ^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `sasql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

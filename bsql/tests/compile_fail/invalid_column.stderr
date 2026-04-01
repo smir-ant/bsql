@@ -1,0 +1,12 @@
+error: PostgreSQL error: column "nonexistent_column_xyz" does not exist
+         position: Original(8)
+         SQL: SELECT nonexistent_column_xyz FROM users WHERE id = $1
+ --> tests/compile_fail/invalid_column.rs:3:13
+  |
+3 |       let _ = bsql::query!(
+  |  _____________^
+4 | |         "SELECT nonexistent_column_xyz FROM users WHERE id = $id: i32"
+5 | |     );
+  | |_____^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

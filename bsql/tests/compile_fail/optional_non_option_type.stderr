@@ -1,0 +1,10 @@
+error: parameter `$a` inside optional clause `[...]` must be `Option<T>`, found `i32`. Wrap the type: `Option<i32>`
+ --> tests/compile_fail/optional_non_option_type.rs:3:13
+  |
+3 |       let _ = bsql::query!(
+  |  _____________^
+4 | |         "SELECT id FROM tickets WHERE 1 = 1 [AND department_id = $a: i32]"
+5 | |     );
+  | |_____^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

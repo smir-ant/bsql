@@ -1,0 +1,31 @@
+[package]
+name = "bsql-macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Proc macros for bsql — compile-time safe SQL for Rust"
+
+[lib]
+proc-macro = true
+
+[features]
+default = []
+time = []
+chrono = []
+uuid = []
+decimal = []
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+tokio-postgres = { workspace = true, features = ["runtime"] }
+postgres-types = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+rapidhash = { workspace = true }
+bitcode = { workspace = true }
+bsql-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

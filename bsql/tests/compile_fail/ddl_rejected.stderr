@@ -1,0 +1,10 @@
+error: unsupported statement type: `create`. bsql supports SELECT, INSERT, UPDATE, DELETE
+ --> tests/compile_fail/ddl_rejected.rs:2:13
+  |
+2 |       let _ = bsql::query!(
+  |  _____________^
+3 | |         "CREATE TABLE should_not_work (id int)"
+4 | |     );
+  | |_____^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

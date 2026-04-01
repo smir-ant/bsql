@@ -1,0 +1,10 @@
+error: parameter `$x` declared with conflicting types: `i32` and `&str`
+ --> tests/compile_fail/param_conflicting_types.rs:3:13
+  |
+3 |       let _ = bsql::query!(
+  |  _____________^
+4 | |         "SELECT id FROM users WHERE id = $x: i32 AND login = $x: &str"
+5 | |     );
+  | |_____^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

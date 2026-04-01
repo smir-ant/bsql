@@ -1,7 +1,0 @@
-error: unsupported statement type: `alter`. sasql supports SELECT, INSERT, UPDATE, DELETE
- --> tests/compile_fail/alter_rejected.rs:2:13
-  |
-2 |     let _ = sasql::query!("ALTER TABLE users ADD COLUMN x INT");
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `sasql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

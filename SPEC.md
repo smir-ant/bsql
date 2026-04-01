@@ -1,6 +1,6 @@
-# sasql — Safe SQL for Rust
+# bsql — Safe SQL for Rust
 
-> **sasql** = "Safe SQL" / "Smirnov Anton SQL"
+> **bsql** = "Safe SQL" / "Smirnov Anton SQL"
 >
 > **Core promise: if it compiles, every SQL query is correct.**
 >
@@ -12,15 +12,15 @@
 
 This library exists because the Rust ecosystem failed to deliver on a simple promise: **if it compiles, it works.** Every existing SQL library has a backdoor. A function that bypasses the type system. An escape hatch that lets you write raw SQL that might crash at 3 AM on a production server with 700,000 tickets and an angry customer on the phone.
 
-sasql has no backdoor. There is no `unsafe_query()`. There is no `raw_sql()`. There is no `trust_me_bro()`. There is `query!` — validated at compile time, every parameter typed, every column checked, every NULL mapped to `Option<T>`. If it compiles, the SQL is correct.
+bsql has no backdoor. There is no `unsafe_query()`. There is no `raw_sql()`. There is no `trust_me_bro()`. There is `query!` — validated at compile time, every parameter typed, every column checked, every NULL mapped to `Option<T>`. If it compiles, the SQL is correct.
 
 This is not a convenience library. This is a safety guarantee.
 
-The night you lose production data to a typo in a SQL string — a column renamed in a migration but missed in one handler, an `i64` passed where the schema expects `i32`, a nullable column read as `NOT NULL` because the ORM swallowed the distinction — that is the night you understand why sasql exists. Not because SQL is hard. Because the tools that promised to protect you had a side door, and Murphy walked through it at the worst possible moment.
+The night you lose production data to a typo in a SQL string — a column renamed in a migration but missed in one handler, an `i64` passed where the schema expects `i32`, a nullable column read as `NOT NULL` because the ORM swallowed the distinction — that is the night you understand why bsql exists. Not because SQL is hard. Because the tools that promised to protect you had a side door, and Murphy walked through it at the worst possible moment.
 
 Every alternative says "be disciplined." Don't call the unchecked function. Don't forget to update the query when the schema changes. Don't mix up column indices.
 
-sasql says: **discipline is not a safety mechanism.** The only safety mechanism is a compiler that refuses to produce a binary containing invalid SQL. There is no unchecked function to be disciplined about. There is no escape hatch to avoid. There is one macro. It checks everything. If it passes, the SQL is correct. If it fails, the binary is not produced. There is no third state.
+bsql says: **discipline is not a safety mechanism.** The only safety mechanism is a compiler that refuses to produce a binary containing invalid SQL. There is no unchecked function to be disciplined about. There is no escape hatch to avoid. There is one macro. It checks everything. If it passes, the SQL is correct. If it fails, the binary is not produced. There is no third state.
 
 ---
 
@@ -59,20 +59,20 @@ The gap is clear:
 | SeaORM | no (DSL) | no | partial (DSL) | yes (no raw API) |
 | Cornucopia | no (.sql files) | yes | no | yes |
 | tokio-postgres | yes | no | no | no |
-| **sasql** | **yes** | **yes** | **yes** | **yes** |
+| **bsql** | **yes** | **yes** | **yes** | **yes** |
 
-No existing tool gives you all four. sasql does.
+No existing tool gives you all four. bsql does.
 
 ---
 
 ## The Solution
 
-sasql is a proc macro library that:
+bsql is a proc macro library that:
 
 1. **Validates SQL against a real PostgreSQL instance at compile time** — like sqlx, but
    without the escape hatch.
-2. **Has no unchecked runtime SQL API** — there is no `sasql::query()` function. Only
-   `sasql::query!()` macro. You cannot construct or execute unchecked SQL through sasql.
+2. **Has no unchecked runtime SQL API** — there is no `bsql::query()` function. Only
+   `bsql::query!()` macro. You cannot construct or execute unchecked SQL through bsql.
    The unsafe path does not exist.
 3. **Supports dynamic/conditional SQL via compile-time verified fragments** — unlike
    Cornucopia, where every query variant requires a separate file.
@@ -87,15 +87,15 @@ sasql is a proc macro library that:
 
 1. **No escape hatch. Period.** If it compiles, the SQL is correct. Not "probably correct". Not "correct if you used the right function". Correct. Always. There is no `raw_query()` hidden in a submodule. There is no `#[allow(unchecked)]` annotation. There is no "advanced users only" API that bypasses validation. The attack surface for runtime SQL errors is zero — not small, not minimized, *zero*. This is the load-bearing promise. Everything else in this document serves it.
 
-2. **The fastest safe code is the same speed as unsafe code.** Arena allocation, binary protocol, zero-copy deserialization, SIMD string processing — these are not premature optimization. They are the architecture. When someone asks "what's the performance cost of compile-time safety?", the answer is negative. sasql's generated code is faster than hand-written `query()` calls because the proc macro has information the runtime never will: exact column types, exact parameter counts, exact result shapes. It generates tighter code than a human would write. Performance is not bolted on. It is designed in from the first line.
+2. **The fastest safe code is the same speed as unsafe code.** Arena allocation, binary protocol, zero-copy deserialization, SIMD string processing — these are not premature optimization. They are the architecture. When someone asks "what's the performance cost of compile-time safety?", the answer is negative. bsql's generated code is faster than hand-written `query()` calls because the proc macro has information the runtime never will: exact column types, exact parameter counts, exact result shapes. It generates tighter code than a human would write. Performance is not bolted on. It is designed in from the first line.
 
-3. **SQL is the query language. Rust is the host language.** sasql does not invent a DSL. It does not provide `.filter()` methods that approximate `WHERE` clauses. It does not have a query builder that produces SQL as a side effect. You write SQL — real PostgreSQL SQL, with CTEs and window functions and `LATERAL` joins — and the macro validates it against the actual database. The contract is: you bring the SQL knowledge, sasql brings the compile-time guarantee. Neither tries to do the other's job.
+3. **SQL is the query language. Rust is the host language.** bsql does not invent a DSL. It does not provide `.filter()` methods that approximate `WHERE` clauses. It does not have a query builder that produces SQL as a side effect. You write SQL — real PostgreSQL SQL, with CTEs and window functions and `LATERAL` joins — and the macro validates it against the actual database. The contract is: you bring the SQL knowledge, bsql brings the compile-time guarantee. Neither tries to do the other's job.
 
 4. **Dynamic does not mean unchecked.** Optional clauses are expanded at compile time into every concrete SQL variant. Each variant is independently validated against the running PostgreSQL instance. The runtime dispatcher is a `match` on an enum — one arm per combination, each arm pointing to a pre-validated, pre-prepared statement. No string concatenation. No SQL injection surface. No runtime parsing. The query that runs at 3 AM is the same query that was validated at build time. Every time. Every variant.
 
-5. **Dependencies are liabilities.** Every crate in `Cargo.toml` is an attack surface, a compile-time cost, a version conflict waiting to happen, and a maintenance burden that compounds over years. sasql's core has 5 runtime dependencies. Not 50. Not 15. Five. Each one was chosen because the alternative — implementing it from scratch — would be worse by every measurable metric. If a dependency stops earning its keep, it gets replaced. The dependency list is not a résumé of the Rust ecosystem. It is a liability ledger, and every entry must justify its cost.
+5. **Dependencies are liabilities.** Every crate in `Cargo.toml` is an attack surface, a compile-time cost, a version conflict waiting to happen, and a maintenance burden that compounds over years. bsql's core has 5 runtime dependencies. Not 50. Not 15. Five. Each one was chosen because the alternative — implementing it from scratch — would be worse by every measurable metric. If a dependency stops earning its keep, it gets replaced. The dependency list is not a résumé of the Rust ecosystem. It is a liability ledger, and every entry must justify its cost.
 
-6. **Every nanosecond matters.** Not because users notice nanoseconds. Because the mindset that says "nanoseconds don't matter" is the same mindset that produces millisecond-level bloat through a thousand "doesn't matter" decisions. Each allocation that could be a pointer bump. Each text-format integer that could be a 4-byte memcpy. Each round-trip that could be pipelined. Individually invisible. Collectively, they are the difference between a library that benchmarks within 10% of raw C and one that benchmarks within 200% "but that's fine for most use cases." sasql does not build for "most use cases." It builds for the use case where performance is the requirement.
+6. **Every nanosecond matters.** Not because users notice nanoseconds. Because the mindset that says "nanoseconds don't matter" is the same mindset that produces millisecond-level bloat through a thousand "doesn't matter" decisions. Each allocation that could be a pointer bump. Each text-format integer that could be a 4-byte memcpy. Each round-trip that could be pipelined. Individually invisible. Collectively, they are the difference between a library that benchmarks within 10% of raw C and one that benchmarks within 200% "but that's fine for most use cases." bsql does not build for "most use cases." It builds for the use case where performance is the requirement.
 
 7. **Doc-tests are the contract.** Every public API has a doc-test that compiles, runs, and demonstrates the correct usage. The doc-test is not a suggestion. It is a specification. If the doc-test fails, the release does not ship. If the doc-test demonstrates incorrect usage, the API is broken. The README is generated from doc-tests. The examples directory is generated from doc-tests. There is one source of truth, and it runs in CI.
 
@@ -125,17 +125,17 @@ The generated code must be indistinguishable from hand-written tokio-postgres in
   deserialization call based on the feature flag.
 
 **Non-goals**: custom allocators (jemalloc, mimalloc) are the caller's decision, not the
-library's. sasql does not bundle or configure allocators.
+library's. bsql does not bundle or configure allocators.
 
 ### R2: Compile-Time Guarantee
 
 This is the load-bearing requirement. Everything else serves this.
 
-- **Every SQL string** passed to `sasql::query!` is sent to a real PostgreSQL instance during
-  `cargo build`. The proc macro connects to the database specified by `SASQL_DATABASE_URL`
+- **Every SQL string** passed to `bsql::query!` is sent to a real PostgreSQL instance during
+  `cargo build`. The proc macro connects to the database specified by `BSQL_DATABASE_URL`
   (or `DATABASE_URL` as fallback) and executes `PREPARE` to validate syntax, column names,
   table names, type compatibility, and parameter binding.
-- **No public API accepts raw SQL at runtime.** The `sasql` crate exports macros and traits.
+- **No public API accepts raw SQL at runtime.** The `bsql` crate exports macros and traits.
   It does not export any function that takes `&str` SQL. There is no `query()`, no
   `raw_query()`, no `sql()`. The escape hatch does not exist.
 - **Type mapping is verified at compile time.** If a column is `INTEGER NOT NULL`, the
@@ -147,13 +147,13 @@ This is the load-bearing requirement. Everything else serves this.
   expected PostgreSQL type.
 - **Column existence is verified.** `SELECT naem FROM users` produces a compile error with
   a "did you mean `name`?" suggestion.
-- **Offline mode**: `sasql prepare` introspects the database and generates a JSON schema
-  cache (`.sasql/`). When `SASQL_OFFLINE=true`, the proc macro validates against this cache
+- **Offline mode**: `bsql prepare` introspects the database and generates a JSON schema
+  cache (`.bsql/`). When `BSQL_OFFLINE=true`, the proc macro validates against this cache
   instead of a live database. This enables CI without a running PostgreSQL instance.
 
 ### R3: PostgreSQL First
 
-sasql is a PostgreSQL library. Other databases are future considerations, not design drivers.
+bsql is a PostgreSQL library. Other databases are future considerations, not design drivers.
 
 **Supported PostgreSQL features:**
 - Standard DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `UPSERT` (`ON CONFLICT`)
@@ -188,10 +188,10 @@ for databases that are not yet supported.
 - **Clear error messages**: the proc macro captures PostgreSQL's error output and maps it
   back to the Rust source span. Column typos get "did you mean?" suggestions via
   Levenshtein distance against the actual schema.
-- **Migration support**: `sasql migrate` generates timestamped migration files, tracks
-  applied migrations in a `_sasql_migrations` table, and runs pending migrations.
+- **Migration support**: `bsql migrate` generates timestamped migration files, tracks
+  applied migrations in a `_bsql_migrations` table, and runs pending migrations.
   Migrations are plain `.sql` files — no Rust DSL.
-- **Schema introspection**: `sasql schema` dumps the current database schema as a
+- **Schema introspection**: `bsql schema` dumps the current database schema as a
   human-readable report (tables, columns, types, constraints, indexes).
 
 ### R5: Pure SQL, No DSL
@@ -199,11 +199,11 @@ for databases that are not yet supported.
 Write PostgreSQL SQL. Not a Rust approximation of SQL.
 
 There is no query builder. No method chaining. No `.filter()`, `.select()`, `.join()`.
-If you know PostgreSQL SQL, you know sasql. The macro is a validator and code generator,
+If you know PostgreSQL SQL, you know bsql. The macro is a validator and code generator,
 not a query language.
 
 This is a deliberate constraint. DSLs inevitably diverge from the SQL they model. They
-cannot express the full power of PostgreSQL without escape hatches. sasql avoids this
+cannot express the full power of PostgreSQL without escape hatches. bsql avoids this
 problem by not having a DSL at all.
 
 ### R6: Dynamic Queries — The Differentiator
@@ -216,11 +216,11 @@ department, or assignee, or any combination. In sqlx, you either:
 - Write separate `query!` invocations for each combination — which is O(2^n) boilerplate.
 - Drop to unchecked `query()` with string concatenation — which defeats the purpose of sqlx.
 
-sasql solves this with **optional clauses**: SQL fragments wrapped in `[]` brackets that
+bsql solves this with **optional clauses**: SQL fragments wrapped in `[]` brackets that
 are included or excluded at runtime based on `Option` parameters.
 
 ```rust
-let tickets = sasql::query! {
+let tickets = bsql::query! {
     SELECT t.id, t.title, t.status::text
     FROM tickets t
     WHERE t.deleted_at IS NULL
@@ -252,7 +252,7 @@ filters.
 `ORDER BY` clauses:
 
 ```rust
-#[sasql::sort]
+#[bsql::sort]
 enum TicketSort {
     #[sql("t.updated_at DESC, t.id DESC")]
     UpdatedAt,
@@ -281,7 +281,7 @@ that are co-dependent.
   compile errors with the expected error messages.
 - **Fuzz testing**: `cargo-fuzz` on the SQL parser to ensure it does not panic on malformed
   input.
-- **Benchmark suite**: `criterion` benchmarks comparing sasql to tokio-postgres, sqlx, and
+- **Benchmark suite**: `criterion` benchmarks comparing bsql to tokio-postgres, sqlx, and
   Diesel on identical queries.
 
 ### R8: Minimal Dependencies
@@ -319,12 +319,12 @@ Every other feature is opt-in.
 ## Architecture
 
 ```
-sasql/
-├── sasql/                  # Main crate (user-facing, re-exports everything)
-│   ├── src/lib.rs          # pub use sasql_macros::query; pub use sasql_core::*;
+bsql/
+├── bsql/                  # Main crate (user-facing, re-exports everything)
+│   ├── src/lib.rs          # pub use bsql_macros::query; pub use bsql_core::*;
 │   └── Cargo.toml
 │
-├── sasql-macros/           # Proc macro crate (compile-time only)
+├── bsql-macros/           # Proc macro crate (compile-time only)
 │   ├── src/
 │   │   ├── lib.rs          # #[proc_macro] query!, #[proc_macro_derive] sort
 │   │   ├── parse.rs        # SQL tokenizer + AST (minimal, PG-aware)
@@ -333,23 +333,23 @@ sasql/
 │   │   ├── dynamic.rs      # Expand optional clauses, generate variant dispatcher
 │   │   ├── types.rs        # PG OID → Rust type mapping table
 │   │   ├── error.rs        # Diagnostic formatting, "did you mean?" suggestions
-│   │   └── cache.rs        # Read/write .sasql/ offline validation cache
+│   │   └── cache.rs        # Read/write .bsql/ offline validation cache
 │   └── Cargo.toml
 │
-├── sasql-core/             # Runtime support (minimal footprint)
+├── bsql-core/             # Runtime support (minimal footprint)
 │   ├── src/
 │   │   ├── lib.rs
 │   │   ├── pool.rs         # Pool<Postgres> — thin wrapper over deadpool
 │   │   ├── transaction.rs  # Transaction wrapper with begin/commit/rollback
 │   │   ├── row.rs          # FromRow trait (generated by proc macro, not user-implemented)
-│   │   ├── error.rs        # SasqlError: Pool | Query | Decode | Connect
+│   │   ├── error.rs        # BsqlError: Pool | Query | Decode | Connect
 │   │   └── types.rs        # Re-exports of postgres-types traits
 │   └── Cargo.toml
 │
-├── sasql-cli/              # CLI binary
+├── bsql-cli/              # CLI binary
 │   ├── src/
 │   │   ├── main.rs         # Subcommand dispatch
-│   │   ├── prepare.rs      # Introspect DB → .sasql/ cache
+│   │   ├── prepare.rs      # Introspect DB → .bsql/ cache
 │   │   ├── schema.rs       # Dump DB schema
 │   │   └── migrate.rs      # Migration runner
 │   └── Cargo.toml
@@ -365,17 +365,17 @@ sasql/
 
 **Crate dependency graph:**
 ```
-sasql (user-facing)
-├── sasql-macros (proc macro, compile-time only)
+bsql (user-facing)
+├── bsql-macros (proc macro, compile-time only)
 │   ├── syn, quote, proc-macro2
 │   └── tokio-postgres (for compile-time validation connection)
-└── sasql-core (runtime)
+└── bsql-core (runtime)
     ├── tokio-postgres
     ├── deadpool-postgres
     └── postgres-types
 ```
 
-The proc macro crate (`sasql-macros`) has its own `tokio-postgres` dependency for the
+The proc macro crate (`bsql-macros`) has its own `tokio-postgres` dependency for the
 compile-time database connection. This is not duplicated at runtime — Cargo deduplicates
 identical versions.
 
@@ -420,7 +420,7 @@ Binary format eliminates parsing entirely for numeric types. `i32` is `i32::from
 
 The bandwidth savings compound: a 100-row result with columns `(i32, i64, timestamptz, uuid, bool)` is ~7,600 bytes in text format vs. ~3,700 bytes in binary. Less data on the wire. Less parsing on arrival. Both directions win.
 
-tokio-postgres already supports binary format — sasql requests it by default for all queries. Text format is available as a per-query opt-in for the rare case where PostgreSQL's binary representation is inconvenient (e.g., `NUMERIC` with arbitrary precision).
+tokio-postgres already supports binary format — bsql requests it by default for all queries. Text format is available as a per-query opt-in for the rare case where PostgreSQL's binary representation is inconvenient (e.g., `NUMERIC` with arbitrary precision).
 
 ### P3: Query Pipelining
 
@@ -439,7 +439,7 @@ let unread  = count_unread(&pool, user_id).await?;           // RTT 3
 With `tokio::join!` these run concurrently on separate connections — 1 RTT wall-clock but 3 connections consumed. With pipelining, all three run on a single connection in a single round-trip:
 
 ```rust
-let (user, ticket, unread) = sasql::pipeline! {
+let (user, ticket, unread) = bsql::pipeline! {
     SELECT id, login, first_name, last_name, role::text
     FROM users WHERE id = $1: i32,
 
@@ -467,9 +467,9 @@ Each query in the pipeline is independently validated at compile time. Each gets
 
 When bytes arrive from PostgreSQL, they must be validated and transformed before they become Rust types. The naive approach — scalar byte-by-byte processing — leaves performance on the table.
 
-**UTF-8 validation** on TEXT/VARCHAR columns: Every string from PostgreSQL must be valid UTF-8 (PostgreSQL guarantees this for `UTF8` encoding, but sasql validates defensively). Scalar UTF-8 validation processes ~3 GB/s. SIMD validation via `simdutf` processes ~70 GB/s — a 23x improvement. On a 100-row result with 10 TEXT columns averaging 50 bytes each, that is 50KB of validation: 17µs scalar vs. 0.7µs SIMD.
+**UTF-8 validation** on TEXT/VARCHAR columns: Every string from PostgreSQL must be valid UTF-8 (PostgreSQL guarantees this for `UTF8` encoding, but bsql validates defensively). Scalar UTF-8 validation processes ~3 GB/s. SIMD validation via `simdutf` processes ~70 GB/s — a 23x improvement. On a 100-row result with 10 TEXT columns averaging 50 bytes each, that is 50KB of validation: 17µs scalar vs. 0.7µs SIMD.
 
-**HTML escaping** for template engines consuming sasql results: SIMD-accelerated scanning for `<>&"'` characters. The common case (no special characters) is handled in bulk — 32 bytes per instruction cycle. Only when a special character is found does the code drop to scalar replacement.
+**HTML escaping** for template engines consuming bsql results: SIMD-accelerated scanning for `<>&"'` characters. The common case (no special characters) is handled in bulk — 32 bytes per instruction cycle. Only when a special character is found does the code drop to scalar replacement.
 
 **JSONB columns** (with `feature = "json"`): deserialized via `sonic-rs`, which uses SIMD for JSON structural scanning. 2-3x faster than `serde_json` on typical JSONB payloads.
 
@@ -479,7 +479,7 @@ SIMD features are compile-time detected via `#[cfg(target_feature)]` — no runt
 
 ### P5: Prepared Statement Management
 
-Every query that passes through `sasql::query!` is a prepared statement. But preparation is not free — it requires a PG round-trip, parse, and plan. sasql amortizes this to zero.
+Every query that passes through `bsql::query!` is a prepared statement. But preparation is not free — it requires a PG round-trip, parse, and plan. bsql amortizes this to zero.
 
 **Statement naming**: each statement is named by the FNV-1a hash of its SQL text. FNV-1a is fast (single pass, no multiplication) and collision-resistant for short inputs. A 200-byte SQL string hashes in ~20ns. The name is a hex string of the 64-bit hash — `s_a1b2c3d4e5f67890`.
 
@@ -487,7 +487,7 @@ Every query that passes through `sasql::query!` is a prepared statement. But pre
 
 **Memory impact**: each prepared statement in the PG backend costs ~1KB (parse tree + plan). For a 50-query application with a 32-connection pool: 50 statements × 1KB = 50KB per connection, 1.6MB total. Negligible.
 
-**Pre-warming**: when `Pool::connect()` is called, sasql can optionally prepare all known statements on each initial connection. This moves the first-use preparation cost from request time to startup time. For a 50-query app, this is ~50 PREPARE round-trips per connection — ~25ms per connection at 0.5ms RTT. Done once at startup, never again.
+**Pre-warming**: when `Pool::connect()` is called, bsql can optionally prepare all known statements on each initial connection. This moves the first-use preparation cost from request time to startup time. For a 50-query app, this is ~50 PREPARE round-trips per connection — ~25ms per connection at 0.5ms RTT. Done once at startup, never again.
 
 ### P6: Zero-Copy Row Deserialization
 
@@ -522,7 +522,7 @@ The generated code is `#[inline(always)]` — the compiler sees through the func
 
 ### P7: Connection Pool Optimization
 
-deadpool-postgres is the default pool in v0.1. It is adequate. It is not optimal. sasql's architecture allows replacing it without changing user-facing API, and the roadmap includes a custom pool with these properties:
+deadpool-postgres is the default pool in v0.1. It is adequate. It is not optimal. bsql's architecture allows replacing it without changing user-facing API, and the roadmap includes a custom pool with these properties:
 
 **LIFO ordering**: return the most recently used connection first. PostgreSQL's backend process maintains query plan caches, prepared statement caches, and working memory. A LIFO pool reuses the "warmest" connection — the one most likely to have relevant plans and buffers in memory. FIFO pools (deadpool's default) rotate through all connections equally, keeping none warm.
 
@@ -536,15 +536,15 @@ deadpool-postgres is the default pool in v0.1. It is adequate. It is not optimal
 
 ### P8: Compile-Time Optimizations
 
-The proc macro itself must be fast. Slow compile times are a tax on every developer, every `cargo build`, every CI run. sasql treats macro execution time as a performance metric.
+The proc macro itself must be fast. Slow compile times are a tax on every developer, every `cargo build`, every CI run. bsql treats macro execution time as a performance metric.
 
-**Connection reuse**: the proc macro maintains a shared tokio runtime and connection pool across macro invocations within a single `cargo build`. The first `sasql::query!` invocation pays the connection cost (~5ms). Subsequent invocations reuse the connection. For a 50-query project: 5ms + 49 × 0.5ms = ~30ms total validation time, vs. 50 × 5ms = 250ms if each invocation connected independently.
+**Connection reuse**: the proc macro maintains a shared tokio runtime and connection pool across macro invocations within a single `cargo build`. The first `bsql::query!` invocation pays the connection cost (~5ms). Subsequent invocations reuse the connection. For a 50-query project: 5ms + 49 × 0.5ms = ~30ms total validation time, vs. 50 × 5ms = 250ms if each invocation connected independently.
 
 **Parallel validation**: when the proc macro encounters multiple queries in the same compilation unit, it validates them concurrently using the pooled connection. tokio-postgres supports pipelining within the proc macro — 50 PREPARE statements pipelined in a single batch complete in ~25ms instead of ~25ms × 50 sequential round-trips.
 
 **Incremental revalidation**: the proc macro tracks a mapping of `(file_path, byte_offset) → query_hash`. On recompilation, only queries whose hash has changed are re-validated. Editing one query in a 50-query project revalidates 1 query, not 50.
 
-**Offline cache format**: when `SASQL_OFFLINE=true`, the proc macro reads validation results from `.sasql/` in a minimal binary format — fixed-size records with pre-computed type information. No JSON parsing during compilation. The binary format loads in ~100µs for 50 queries. sqlx's JSON-based `.sqlx/` cache takes ~5ms for equivalent data.
+**Offline cache format**: when `BSQL_OFFLINE=true`, the proc macro reads validation results from `.bsql/` in a minimal binary format — fixed-size records with pre-computed type information. No JSON parsing during compilation. The binary format loads in ~100µs for 50 queries. sqlx's JSON-based `.sqlx/` cache takes ~5ms for equivalent data.
 
 ---
 
@@ -553,7 +553,7 @@ The proc macro itself must be fast. Slow compile times are a tax on every develo
 ### Pool and Connection
 
 ```rust
-use sasql::Pool;
+use bsql::Pool;
 
 // Connect with a URL
 let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
@@ -575,7 +575,7 @@ let pool = Pool::builder()
 
 ```rust
 // Fetch one row (error if zero or multiple rows)
-let user = sasql::query! {
+let user = bsql::query! {
     SELECT id, login, first_name, last_name, role::text
     FROM users
     WHERE id = $id: i32
@@ -589,13 +589,13 @@ let user = sasql::query! {
 // user.role: String
 
 // Fetch optional (None if no rows, error if multiple)
-let user = sasql::query! {
+let user = bsql::query! {
     SELECT id, login FROM users WHERE login = $login: &str
 }.fetch_optional(&pool).await?;
 // Returns Option<{id: i32, login: String}>
 
 // Fetch all
-let users = sasql::query! {
+let users = bsql::query! {
     SELECT id, login FROM users WHERE active = true ORDER BY login
 }.fetch_all(&pool).await?;
 // Returns Vec<{id: i32, login: String}>
@@ -604,7 +604,7 @@ let users = sasql::query! {
 ### INSERT with RETURNING
 
 ```rust
-let ticket = sasql::query! {
+let ticket = bsql::query! {
     INSERT INTO tickets (title, description, status, created_by_user_id)
     VALUES ($title: &str, $desc: &str, 'new', $creator: i32)
     RETURNING id, created_at
@@ -618,7 +618,7 @@ let ticket = sasql::query! {
 
 ```rust
 // execute() returns the number of affected rows
-let affected = sasql::query! {
+let affected = bsql::query! {
     UPDATE tickets
     SET status = $status: &str, updated_at = NOW()
     WHERE id = $id: i32
@@ -626,7 +626,7 @@ let affected = sasql::query! {
 // affected: u64
 
 // DELETE with RETURNING
-let deleted = sasql::query! {
+let deleted = bsql::query! {
     DELETE FROM notifications
     WHERE user_id = $uid: i32 AND created_at < NOW() - INTERVAL '3 days'
     RETURNING id
@@ -638,13 +638,13 @@ let deleted = sasql::query! {
 ```rust
 let mut tx = pool.begin().await?;
 
-let ticket_id = sasql::query! {
+let ticket_id = bsql::query! {
     INSERT INTO tickets (title, status, created_by_user_id)
     VALUES ($title: &str, 'new', $uid: i32)
     RETURNING id
 }.fetch_one(&mut tx).await?.id;
 
-sasql::query! {
+bsql::query! {
     INSERT INTO ticket_events (ticket_id, user_id, event_type, comment)
     VALUES ($ticket_id: i32, $uid: i32, 'created', $comment: &str)
 }.execute(&mut tx).await?;
@@ -656,7 +656,7 @@ tx.commit().await?;
 ### CTEs and Complex Queries
 
 ```rust
-let accessible = sasql::query! {
+let accessible = bsql::query! {
     WITH user_ticket_access AS (
         SELECT t.id
         FROM tickets t
@@ -682,7 +682,7 @@ let accessible = sasql::query! {
 ### Window Functions
 
 ```rust
-let ranked = sasql::query! {
+let ranked = bsql::query! {
     SELECT
         id,
         title,
@@ -700,7 +700,7 @@ let ranked = sasql::query! {
 ### Dynamic Queries (Optional Clauses)
 
 ```rust
-#[sasql::sort]
+#[bsql::sort]
 enum TicketSort {
     #[sql("t.updated_at DESC, t.id DESC")]
     UpdatedAt,
@@ -710,7 +710,7 @@ enum TicketSort {
     Id,
 }
 
-let tickets = sasql::query! {
+let tickets = bsql::query! {
     SELECT
         t.id,
         t.title,
@@ -738,7 +738,7 @@ on the `Option` parameters selects the correct prepared statement.
 The generated code is conceptually equivalent to:
 
 ```rust
-// Auto-generated by sasql (simplified)
+// Auto-generated by bsql (simplified)
 match (depts.is_some(), assignee.is_some(), creator.is_some(), search.is_some()) {
     (false, false, false, false) => {
         conn.query(STMT_0, &[&statuses, &sort_sql, &limit]).await
@@ -761,13 +761,13 @@ adjusted for the included parameters.
 
 ```rust
 // Batch insert using unnest (PostgreSQL idiom)
-sasql::query! {
+bsql::query! {
     INSERT INTO notifications (user_id, ticket_id, notification_type, message)
     SELECT unnest($user_ids: &[i32]), $ticket_id: i32, $ntype: &str, $msg: &str
 }.execute(&pool).await?;
 
 // Batch update
-sasql::query! {
+bsql::query! {
     UPDATE users
     SET active = false, deactivated_at = NOW()
     WHERE id = ANY($ids: &[i32])
@@ -777,7 +777,7 @@ sasql::query! {
 ### LISTEN / NOTIFY
 
 ```rust
-use sasql::Listener;
+use bsql::Listener;
 
 let mut listener = Listener::connect("postgres://...").await?;
 listener.listen("ticket_updates").await?;
@@ -801,7 +801,7 @@ Error quality is a first-class concern. A confusing error message is a bug.
 ### Column not found
 
 ```
-error[sasql]: column "naem" not found in table "users"
+error[bsql]: column "naem" not found in table "users"
   --> src/routes/profile.rs:42:5
    |
 42 |     SELECT naem FROM users WHERE id = $id: i32
@@ -814,7 +814,7 @@ error[sasql]: column "naem" not found in table "users"
 ### Type mismatch
 
 ```
-error[sasql]: type mismatch for parameter $id
+error[bsql]: type mismatch for parameter $id
   --> src/routes/tickets.rs:15:42
    |
 15 |     WHERE id = $id: &str
@@ -825,7 +825,7 @@ error[sasql]: type mismatch for parameter $id
 ### Invalid optional clause
 
 ```
-error[sasql]: optional clause produces invalid SQL when included
+error[bsql]: optional clause produces invalid SQL when included
   --> src/routes/tickets.rs:18:5
    |
 18 |     [AND t.department_id = $dept: Option<String>]
@@ -836,7 +836,7 @@ error[sasql]: optional clause produces invalid SQL when included
 ### Table not found
 
 ```
-error[sasql]: table "tcikets" not found
+error[bsql]: table "tcikets" not found
   --> src/routes/list.rs:10:10
    |
 10 |     FROM tcikets t
@@ -849,7 +849,7 @@ error[sasql]: table "tcikets" not found
 ### Too many optional clauses
 
 ```
-error[sasql]: query has 12 optional clauses (4096 variants)
+error[bsql]: query has 12 optional clauses (4096 variants)
   --> src/routes/search.rs:5:1
    |
    = note: maximum is 8 optional clauses (256 variants)
@@ -859,7 +859,7 @@ error[sasql]: query has 12 optional clauses (4096 variants)
 ### Nullable column without Option
 
 ```
-error[sasql]: column "deadline" is nullable but result type is not Optional
+error[bsql]: column "deadline" is nullable but result type is not Optional
   --> src/routes/tickets.rs:8:12
    |
  8 |     SELECT deadline FROM tickets WHERE id = $id: i32
@@ -917,9 +917,9 @@ PostgreSQL custom enums are mapped to Rust enums:
 
 ```rust
 // PostgreSQL: CREATE TYPE ticket_status AS ENUM ('new', 'in_progress', 'resolved', 'closed');
-// sasql detects this and generates (or validates) the Rust mapping:
+// bsql detects this and generates (or validates) the Rust mapping:
 
-#[sasql::pg_enum]
+#[bsql::pg_enum]
 enum TicketStatus {
     #[sql("new")]
     New,
@@ -932,7 +932,7 @@ enum TicketStatus {
 }
 
 // Now usable in queries:
-let tickets = sasql::query! {
+let tickets = bsql::query! {
     SELECT id, title FROM tickets WHERE status = $status: TicketStatus
 }.fetch_all(&pool).await?;
 ```
@@ -945,16 +945,16 @@ For CI environments without a live PostgreSQL instance.
 
 ```bash
 # Developer runs this locally (requires live PG):
-sasql prepare
+bsql prepare
 
 # This introspects the database and writes:
-# .sasql/schema.json    — table schemas, column types, constraints
-# .sasql/queries.json   — validated query hashes + type info
+# .bsql/schema.json    — table schemas, column types, constraints
+# .bsql/queries.json   — validated query hashes + type info
 # These files are committed to version control.
 
 # In CI:
-export SASQL_OFFLINE=true
-cargo build  # proc macro reads from .sasql/ instead of connecting to PG
+export BSQL_OFFLINE=true
+cargo build  # proc macro reads from .bsql/ instead of connecting to PG
 ```
 
 The offline cache is a JSON file containing:
@@ -963,7 +963,7 @@ The offline cache is a JSON file containing:
 - PostgreSQL version the cache was generated against
 
 If the query SQL changes and the hash does not match the cache, the proc macro emits an
-error: "query not found in offline cache — run `sasql prepare` to update."
+error: "query not found in offline cache — run `bsql prepare` to update."
 
 ---
 
@@ -971,32 +971,32 @@ error: "query not found in offline cache — run `sasql prepare` to update."
 
 ```bash
 # Install
-cargo install sasql-cli
+cargo install bsql-cli
 
 # Commands
-sasql prepare           # Generate offline validation cache
-sasql schema            # Print current database schema
-sasql schema --table users  # Print schema for specific table
-sasql migrate new "add_deadline_to_tickets"   # Create migration file
-sasql migrate run       # Run pending migrations
-sasql migrate status    # Show migration status
-sasql migrate revert    # Revert last migration
+bsql prepare           # Generate offline validation cache
+bsql schema            # Print current database schema
+bsql schema --table users  # Print schema for specific table
+bsql migrate new "add_deadline_to_tickets"   # Create migration file
+bsql migrate run       # Run pending migrations
+bsql migrate status    # Show migration status
+bsql migrate revert    # Revert last migration
 ```
 
 ### Migrations
 
 ```bash
-sasql migrate new "add_deadline_to_tickets"
+bsql migrate new "add_deadline_to_tickets"
 # Creates:
 # migrations/20260331_120000_add_deadline_to_tickets/up.sql
 # migrations/20260331_120000_add_deadline_to_tickets/down.sql
 ```
 
-Migrations are plain SQL files. No Rust DSL. The `_sasql_migrations` table tracks which
+Migrations are plain SQL files. No Rust DSL. The `_bsql_migrations` table tracks which
 migrations have been applied:
 
 ```sql
-CREATE TABLE IF NOT EXISTS _sasql_migrations (
+CREATE TABLE IF NOT EXISTS _bsql_migrations (
     version     BIGINT PRIMARY KEY,     -- timestamp prefix
     name        TEXT NOT NULL,
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1011,7 +1011,7 @@ CREATE TABLE IF NOT EXISTS _sasql_migrations (
 Measured on a local PostgreSQL 18 instance, single connection, prepared statements.
 All values are median latency from 10,000 iterations after 1,000 warmup iterations.
 
-| Operation | sasql Target | sqlx 0.8 | Diesel 2.2 | tokio-postgres |
+| Operation | bsql Target | sqlx 0.8 | Diesel 2.2 | tokio-postgres |
 |-----------|:------------:|:--------:|:----------:|:--------------:|
 | `SELECT` 1 row (3 cols) | < 50 us | ~60 us | ~55 us | ~45 us |
 | `SELECT` 100 rows (5 cols) | < 200 us | ~250 us | ~230 us | ~180 us |
@@ -1041,7 +1041,7 @@ Numbers without methodology are marketing. Every performance claim in this docum
 
 **Memory profiling**: `DHAT` (Valgrind's heap profiler) for allocation counts, total bytes allocated, and peak heap usage. Every allocation is a potential fragmentation event, a potential cache miss, and a potential page fault. The allocation count is tracked as a primary metric, not an afterthought.
 
-**Competitors**: every benchmark runs the identical query against `sqlx 0.8`, `diesel 2.3`, `tokio-postgres` raw (hand-written deserialization), and `libpq` C driver (via FFI harness). The C driver is the floor — if sasql is slower than C, something is wrong. The goal is to be within measurement noise of it.
+**Competitors**: every benchmark runs the identical query against `sqlx 0.8`, `diesel 2.3`, `tokio-postgres` raw (hand-written deserialization), and `libpq` C driver (via FFI harness). The C driver is the floor — if bsql is slower than C, something is wrong. The goal is to be within measurement noise of it.
 
 ### What we measure per query type
 
@@ -1053,7 +1053,7 @@ Numbers without methodology are marketing. Every performance claim in this docum
 | INSERT with RETURNING | latency p50/p99, WAL bytes generated | Write path overhead |
 | Batch INSERT (1,000 rows via unnest) | throughput rows/sec, pipelining benefit | Bulk write, parameter encoding pressure |
 | CTE recursive (depth 20) | latency, PG plan time vs. client overhead | Complex query where client overhead should be invisible next to PG time |
-| Dynamic query (3 optional clauses) | dispatch overhead, prepared statement hit rate | The overhead of sasql's variant matching vs. a static query |
+| Dynamic query (3 optional clauses) | dispatch overhead, prepared statement hit rate | The overhead of bsql's variant matching vs. a static query |
 | Pipeline (5 parallel queries) | total latency vs. sequential, connections consumed | Validates pipelining claim: same latency, fewer connections |
 | Pool acquire + release | operation time p50/p99 under contention | Pool overhead under realistic load (64 concurrent tasks, 16 connections) |
 
@@ -1061,7 +1061,7 @@ Numbers without methodology are marketing. Every performance claim in this docum
 
 These are not aspirations. They are pass/fail criteria. If a release does not meet these numbers, it does not ship. Measured on PostgreSQL 18, local Unix socket, prepared statements, binary protocol.
 
-| Operation | sasql target | sqlx 0.8 current | speedup | notes |
+| Operation | bsql target | sqlx 0.8 current | speedup | notes |
 |-----------|:-------------|:-----------------|:--------|:------|
 | Pool acquire (uncontended) | < 100ns | ~5µs | 50x | crossbeam channel vs tokio semaphore |
 | Pool acquire (64 tasks, 16 conns) | < 1µs p99 | ~8µs p99 | 8x | contention test |
@@ -1078,13 +1078,13 @@ The "sqlx current" column is measured, not estimated. The measurements are in th
 
 ---
 
-## What sasql Is Not
+## What bsql Is Not
 
 - **Not an ORM.** There is no `User::find(42)`, no `user.save()`, no `belongs_to`. If you
   want an ORM, use SeaORM or Diesel.
 - **Not a query builder.** There is no `.filter()`, `.select()`, `.join()`. Write SQL.
 - **Not a migration-only tool.** The migration feature exists for convenience. If you prefer
-  `dbmate` or `sqitch`, use them. sasql validates queries against whatever schema exists.
+  `dbmate` or `sqitch`, use them. bsql validates queries against whatever schema exists.
 - **Not database-agnostic.** It is PostgreSQL-first. SQLite and MySQL support may come later,
   but the API will never be constrained by lowest-common-denominator SQL.
 
@@ -1109,15 +1109,15 @@ swapping the backend.
 
 ### Why not support `query()` alongside `query!()`?
 
-This is the most important design decision in sasql. The answer is: **because the entire
-point of sasql is that you cannot write unchecked SQL.**
+This is the most important design decision in bsql. The answer is: **because the entire
+point of bsql is that you cannot write unchecked SQL.**
 
 If `query()` existed, even as `#[deprecated]` or behind an `unsafe` block, some developer
 somewhere would use it. One unchecked query in a codebase of 500 checked queries means the
 guarantee is broken. The guarantee is binary — 100% or meaningless.
 
 sqlx made the pragmatic choice to provide `query()` for migration tooling, dynamic table
-names, and other edge cases. sasql takes the uncompromising position: those edge cases must
+names, and other edge cases. bsql takes the uncompromising position: those edge cases must
 be solved differently (compile-time macros, code generation, or separate crates) rather than
 by weakening the guarantee.
 
@@ -1151,12 +1151,12 @@ read path.
 
 The minimum viable library. Validates SQL, generates typed code, runs queries.
 
-- `sasql::query!` macro: parse SQL, connect to PG, validate, generate struct + execute
+- `bsql::query!` macro: parse SQL, connect to PG, validate, generate struct + execute
 - Type mapping: `i16`, `i32`, `i64`, `f32`, `f64`, `bool`, `String`, `&str`, `Vec<u8>`,
   `&[u8]`
 - Execution: `fetch_one`, `fetch_all`, `fetch_optional`, `execute`
 - `Pool` wrapper over deadpool-postgres
-- `SasqlError` type with `Pool`, `Query`, `Decode`, `Connect` variants
+- `BsqlError` type with `Pool`, `Query`, `Decode`, `Connect` variants
 - Basic error messages (column not found, type mismatch, table not found)
 - PgBouncer compatibility: detect PgBouncer at pool creation; PgBouncer 1.21+ with
   `prepared_statements=yes` uses named statements normally; older PgBouncer falls back
@@ -1169,16 +1169,16 @@ Complete PostgreSQL type coverage.
 
 - Feature-gated types: `time`, `chrono`, `uuid`, `decimal`, `json`, `net`, `bit`
 - Array types: `Vec<T>` for all supported `T`
-- Custom PG enums via `#[sasql::pg_enum]`
+- Custom PG enums via `#[bsql::pg_enum]`
 - NULL safety: `Option<T>` generated for nullable columns, `T` for `NOT NULL`
 - Cast expressions: `status::text`, `id::bigint`
 
 ### v0.3 — Dynamic Queries (2 weeks) — THE DIFFERENTIATOR
 
-The feature that justifies sasql's existence as a separate library.
+The feature that justifies bsql's existence as a separate library.
 
 - `[optional clause]` syntax: parse, expand, validate all combinations
-- `$[sort: Enum]` syntax with `#[sasql::sort]` derive
+- `$[sort: Enum]` syntax with `#[bsql::sort]` derive
 - Combinatorial expansion with 2^N limit (N <= 8)
 - Runtime variant dispatcher (match on Option parameters)
 - Prepared statement caching per variant per connection
@@ -1188,8 +1188,8 @@ The feature that justifies sasql's existence as a separate library.
 
 Polish for daily use.
 
-- `sasql prepare` — offline validation cache
-- `sasql schema` — schema introspection
+- `bsql prepare` — offline validation cache
+- `bsql schema` — schema introspection
 - "Did you mean?" suggestions (Levenshtein distance)
 - Improved error spans (point to exact token in SQL)
 - rust-analyzer compatibility testing
@@ -1215,7 +1215,7 @@ Polish for daily use.
 
 Exploiting total query knowledge — optimizations that require seeing every query.
 
-- **SQL safety gates** — a finite set of compile-time checks for objectively dangerous SQL patterns. sasql is not a SQL linter. It does not optimize query style or suggest JOIN reordering. It catches patterns that are bombs in production — always, unconditionally, regardless of database version. The list is closed, not extensible:
+- **SQL safety gates** — a finite set of compile-time checks for objectively dangerous SQL patterns. bsql is not a SQL linter. It does not optimize query style or suggest JOIN reordering. It catches patterns that are bombs in production — always, unconditionally, regardless of database version. The list is closed, not extensible:
 
   **Hard errors (will not compile):**
   - `UPDATE` / `DELETE` without `WHERE` — accidental full-table modification
@@ -1227,11 +1227,11 @@ Exploiting total query knowledge — optimizations that require seeing every que
   - `COUNT(*)` without `WHERE` — full table scan in PostgreSQL (no count cache)
 
   **Runtime detection (feature = "diagnostics"):**
-  - N+1 pattern — proc macros cannot see surrounding control flow (loops). Instead, the runtime tracks `(query_hash, thread_id, call_count)`. If the same query executes 10+ times within 100ms on the same thread, emits `tracing::warn!` with a rewrite suggestion. Catches N+1 in development/testing. A separate `sasql-lint` tool (MIR-level analysis) may provide compile-time detection in the future.
+  - N+1 pattern — proc macros cannot see surrounding control flow (loops). Instead, the runtime tracks `(query_hash, thread_id, call_count)`. If the same query executes 10+ times within 100ms on the same thread, emits `tracing::warn!` with a rewrite suggestion. Catches N+1 in development/testing. A separate `bsql-lint` tool (MIR-level analysis) may provide compile-time detection in the future.
 
-  Everything else — CTE vs subquery, window function tuning, index selection, `NOT IN` vs `NOT EXISTS` — is the territory of `EXPLAIN ANALYZE` and human judgment. sasql validates SQL *correctness*. SQL *quality* beyond the six rules above is not sasql's scope. Attempting to lint all SQL patterns is an infinite, database-version-specific maintenance burden that would reject valid code.
+  Everything else — CTE vs subquery, window function tuning, index selection, `NOT IN` vs `NOT EXISTS` — is the territory of `EXPLAIN ANALYZE` and human judgment. bsql validates SQL *correctness*. SQL *quality* beyond the six rules above is not bsql's scope. Attempting to lint all SQL patterns is an infinite, database-version-specific maintenance burden that would reject valid code.
 
-- **Compile-time cross-query analysis**: the proc macro sees all queries in the compilation unit. It detects potential deadlocks (query A locks table X then Y, query B locks Y then X) and generates a table dependency graph. Emitted as `#[warn(sasql::cross_query)]` diagnostics, suppressible with `#[allow]`.
+- **Compile-time cross-query analysis**: the proc macro sees all queries in the compilation unit. It detects potential deadlocks (query A locks table X then Y, query B locks Y then X) and generates a table dependency graph. Emitted as `#[warn(bsql::cross_query)]` diagnostics, suppressible with `#[allow]`.
 - **Compile-time query timing estimates**: the proc macro runs `EXPLAIN ANALYZE` during compilation (on the development database). Estimated cost and plan type are embedded in doc comments on the generated struct: `/// Estimated: 0.1ms (index scan on users_pkey)`. Developers see query performance in their IDE without executing anything. Gated behind `feature = "explain"` — requires a database with representative data.
 - **Automatic read/write splitting**: the proc macro knows at compile time whether a query is SELECT (read) or INSERT/UPDATE/DELETE (write). The Pool transparently routes reads to replicas and writes to primary. The user configures `Pool::builder().primary(url).replica(url)` — routing is derived from the SQL, not annotations. Transactions always go to primary. Single-primary setups work unchanged (the replica list is optional).
 
@@ -1239,7 +1239,7 @@ Exploiting total query knowledge — optimizations that require seeing every que
 
 The pool becomes smarter than the developer.
 
-- **Local result cache with automatic invalidation**: since every write goes through sasql, the runtime knows which tables are modified. SELECT results are cached in a local LRU keyed by `(query_hash, params_hash)`. When an INSERT/UPDATE/DELETE touches a table, all cache entries for that table are invalidated. This is impossible in libraries with escape hatches — they cannot know about all writes. Table names are extracted at compile time. Invalidation is table-level for correctness; row-level is a future refinement. Cache is opt-in per Pool: `Pool::builder().result_cache(1024)`.
+- **Local result cache with automatic invalidation**: since every write goes through bsql, the runtime knows which tables are modified. SELECT results are cached in a local LRU keyed by `(query_hash, params_hash)`. When an INSERT/UPDATE/DELETE touches a table, all cache entries for that table are invalidated. This is impossible in libraries with escape hatches — they cannot know about all writes. Table names are extracted at compile time. Invalidation is table-level for correctness; row-level is a future refinement. Cache is opt-in per Pool: `Pool::builder().result_cache(1024)`.
 - **Connection affinity**: route queries to connections that already have the relevant prepared statements cached. The runtime tracks which statements are prepared on each connection (via the compile-time statement index bitmap). When acquiring a connection, prefer one that already has the needed statement. Eliminates PREPARE overhead after warmup.
 - **Adaptive statement eviction**: track statement usage frequency per connection. If a connection has 100+ prepared statements but only 20 are used frequently, DEALLOCATE the cold ones to free PG backend memory (~1KB per statement). Re-prepare on demand. The eviction threshold and frequency are configurable.
 
@@ -1255,9 +1255,9 @@ The pool becomes smarter than the developer.
 
 Optimizations that benefit from production runtime data.
 
-- **Predictive pipelining**: if runtime telemetry shows that queries A, B, C are always called in sequence, suggest `sasql::pipeline!` at compile time. The compiler tells the developer to batch — it does not silently do it for them.
-- **Query playground / REPL**: `sasql playground` opens an interactive REPL where you write queries with sasql syntax, see generated Rust types, inspect EXPLAIN output, and test with live data. IDE integration via LSP for autocomplete of table names, column names, and parameter types within `query!` blocks.
-- **Automatic migration generation**: if a `sasql::query!` references a column that doesn't exist, `sasql fix` generates the `ALTER TABLE` migration. The proc macro knows the expected type from the parameter annotation. Not a replacement for deliberate schema design — a convenience for rapid prototyping.
+- **Predictive pipelining**: if runtime telemetry shows that queries A, B, C are always called in sequence, suggest `bsql::pipeline!` at compile time. The compiler tells the developer to batch — it does not silently do it for them.
+- **Query playground / REPL**: `bsql playground` opens an interactive REPL where you write queries with bsql syntax, see generated Rust types, inspect EXPLAIN output, and test with live data. IDE integration via LSP for autocomplete of table names, column names, and parameter types within `query!` blocks.
+- **Automatic migration generation**: if a `bsql::query!` references a column that doesn't exist, `bsql fix` generates the `ALTER TABLE` migration. The proc macro knows the expected type from the parameter annotation. Not a replacement for deliberate schema design — a convenience for rapid prototyping.
 
 ---
 
@@ -1388,7 +1388,7 @@ Status: **confirmed**
 4. `NOT IN (subquery)` — quadratic; suggest `NOT EXISTS`
 5. `COUNT(*)` without `WHERE` — full table scan (PG has no count cache)
 6. Cartesian product (`FROM a, b` without JOIN/WHERE) — hard error
-Opt-in: `feature = "lint"` or `#[sasql::lint]`. Silent by default.
+Opt-in: `feature = "lint"` or `#[bsql::lint]`. Silent by default.
 Status: **confirmed**
 
 **Runtime N+1 detection** — track `(query_hash, thread_id, call_count)` at runtime. If same query executes 10+ times within 100ms on the same thread, emit `tracing::warn!` with rewrite suggestion. Feature-gated: `feature = "diagnostics"`.
@@ -1402,16 +1402,16 @@ Status: **confirmed**
 **Transaction Drop behavior** — dropped transaction without explicit commit/rollback issues ROLLBACK, marks connection dirty, discards from pool with warning. The next pool user gets a clean connection.
 Status: **confirmed**
 
-**PREPARE-vs-runtime gap** — compile-time PREPARE validates syntax and types but cannot catch: triggers that reject data, RLS policies that deny access, deferred constraints that fail at COMMIT, domain CHECK constraints evaluated at write time. Document these gaps prominently. They are PostgreSQL limitations, not sasql bugs.
+**PREPARE-vs-runtime gap** — compile-time PREPARE validates syntax and types but cannot catch: triggers that reject data, RLS policies that deny access, deferred constraints that fail at COMMIT, domain CHECK constraints evaluated at write time. Document these gaps prominently. They are PostgreSQL limitations, not bsql bugs.
 Status: **confirmed** — documentation
 
 **NUMERIC precision** — NUMERIC/DECIMAL has arbitrary precision in PG. Binary protocol sends exact digits. `rust_decimal::Decimal` has 96-bit mantissa (28-29 significant digits). Values exceeding this silently truncate. Detect and error on overflow during decode.
 Status: **confirmed**
 
-**Schema drift detection** — embed schema version hash in offline cache. On startup (or optionally at runtime), compare hash against live database. Warn on mismatch: cached schema may be stale. `sasql prepare` regenerates the cache.
+**Schema drift detection** — embed schema version hash in offline cache. On startup (or optionally at runtime), compare hash against live database. Warn on mismatch: cached schema may be stale. `bsql prepare` regenerates the cache.
 Status: **confirmed**
 
-**::text cast enum loophole** — `status::text` bypasses enum type checking (any enum casts to text). Warn when a PG enum column is cast to text if a corresponding `#[sasql::pg_enum]` exists. Suggest using the typed enum directly.
+**::text cast enum loophole** — `status::text` bypasses enum type checking (any enum casts to text). Warn when a PG enum column is cast to text if a corresponding `#[bsql::pg_enum]` exists. Suggest using the typed enum directly.
 Status: **confirmed** — compile-time warning
 
 ---
@@ -1424,9 +1424,9 @@ An honest assessment of adding SQLite support. Conclusion: feasible and worthwhi
 
 | Component | Shared % | Notes |
 |-----------|:--------:|-------|
-| SQL parser (`parse.rs`, `dynamic.rs`) | ~60% | Parameter extraction, optional clauses, sort enum splicing are database-agnostic. Extract into `sasql-parse` crate. |
+| SQL parser (`parse.rs`, `dynamic.rs`) | ~60% | Parameter extraction, optional clauses, sort enum splicing are database-agnostic. Extract into `bsql-parse` crate. |
 | Codegen templates | ~40% | Struct generation, fetch methods, variant dispatcher, sort enums. Type mapping and deserialization code differ. |
-| Error types | ~80% | `SasqlError` variants (`Pool`, `Query`, `Decode`, `Connect`) apply to both. Messages differ. |
+| Error types | ~80% | `BsqlError` variants (`Pool`, `Query`, `Decode`, `Connect`) apply to both. Messages differ. |
 | Offline cache format | ~90% | bitcode schema metadata structure is identical. Type names differ semantically. |
 | CLI structure | ~70% | `prepare`, `schema`, `migrate` commands apply. Implementations differ (SQLite introspection != `pg_catalog`). |
 | Pool abstraction | ~30% | `Pool` trait with `acquire()/release()` works for both. Implementations are radically different. |
@@ -1435,7 +1435,7 @@ An honest assessment of adding SQLite support. Conclusion: feasible and worthwhi
 
 **Compile-time validator** — PG: TCP connection, async `PREPARE`, `pg_catalog` introspection. SQLite: local file, synchronous `sqlite3_prepare_v2`, C API column metadata. Shared trait: `CompileTimeValidator::validate(&self, sql: &str) -> Result<QueryMetadata, Error>`.
 
-**Type system** — SQLite has 5 storage classes (INTEGER/i64, REAL/f64, TEXT/String, BLOB/Vec<u8>, NULL) with loose affinity rules. A column declared INTEGER can hold TEXT at runtime. sasql-sqlite validates declared affinity, but type safety is weaker than PG. This limitation must be documented prominently.
+**Type system** — SQLite has 5 storage classes (INTEGER/i64, REAL/f64, TEXT/String, BLOB/Vec<u8>, NULL) with loose affinity rules. A column declared INTEGER can hold TEXT at runtime. bsql-sqlite validates declared affinity, but type safety is weaker than PG. This limitation must be documented prominently.
 
 **Wire protocol / data access** — No wire protocol; in-process C API via `rusqlite`. Arena still useful (rusqlite Row borrows are invalidated on next `step()`), but binary protocol, SIMD UTF-8, and pipelining are irrelevant. Performance margin vs raw rusqlite: ~20-30% (vs ~3-4x over sqlx for PG).
 
@@ -1448,14 +1448,14 @@ An honest assessment of adding SQLite support. Conclusion: feasible and worthwhi
 Separate crates, not a feature flag. Feature flags are additive (pulling in rusqlite + SQLite C library for PG-only users is unacceptable), contaminate the API surface, and double the test matrix.
 
 ```
-sasql-core/             # Shared: Pool trait, error types, arena
-sasql-parse/            # Shared: SQL parser, optional clause expansion
-sasql-postgres/         # PG-specific: types, binary protocol, pool
-sasql-postgres-macros/  # PG-specific: validator, codegen
-sasql-sqlite/           # SQLite-specific: types, rusqlite integration
-sasql-sqlite-macros/    # SQLite-specific: validator, codegen
-sasql/                  # User-facing: re-exports sasql-postgres
-sasql-lite/             # User-facing: re-exports sasql-sqlite
+bsql-core/             # Shared: Pool trait, error types, arena
+bsql-parse/            # Shared: SQL parser, optional clause expansion
+bsql-postgres/         # PG-specific: types, binary protocol, pool
+bsql-postgres-macros/  # PG-specific: validator, codegen
+bsql-sqlite/           # SQLite-specific: types, rusqlite integration
+bsql-sqlite-macros/    # SQLite-specific: validator, codegen
+bsql/                  # User-facing: re-exports bsql-postgres
+bsql-lite/             # User-facing: re-exports bsql-sqlite
 ```
 
 PG performance is not compromised: the shared `Pool` trait monomorphizes away (each crate uses one concrete type). Arena implementation stays in database-specific crates to avoid constraining PG-specific optimizations.
@@ -1478,7 +1478,7 @@ Realistic: **6-7 weeks** accounting for SQLite edge cases and PG-code refactorin
 
 ### Verdict
 
-Worth doing, but not before PostgreSQL v1.0. The PG crate must be stable and feature-complete first. Target sasql-lite for v1.1 or v2.0. During v1.0 development, design internal interfaces (parser, validator trait, codegen template) with SQLite in mind to spread the 9-day refactoring cost across normal development. The 24-day SQLite-specific work begins after v1.0 ships.
+Worth doing, but not before PostgreSQL v1.0. The PG crate must be stable and feature-complete first. Target bsql-lite for v1.1 or v2.0. During v1.0 development, design internal interfaces (parser, validator trait, codegen template) with SQLite in mind to spread the 9-day refactoring cost across normal development. The 24-day SQLite-specific work begins after v1.0 ships.
 
 ---
 
@@ -1492,18 +1492,18 @@ These are unresolved design decisions that will be settled during implementation
    management within a proc macro). sqlx uses a shared connection — investigate their
    approach.
 
-2. **Prepared statement naming.** Should sasql use named prepared statements (stable across
+2. **Prepared statement naming.** Should bsql use named prepared statements (stable across
    connections) or unnamed (parsed per connection)? Named statements risk collisions if
    multiple versions of the application share a connection pool. Unnamed statements have no
    amortized parse cost. The answer likely depends on whether deadpool-postgres reuses PG
    backend processes.
 
 3. **Schema change detection.** When the database schema changes, cached offline validation
-   becomes stale. Should `sasql prepare` detect schema drift and warn? Should the proc macro
+   becomes stale. Should `bsql prepare` detect schema drift and warn? Should the proc macro
    embed a schema version hash in the generated code and check it at startup?
 
 4. **Custom type registration.** How should users register custom PostgreSQL types (domains,
-   composite types) for use in queries? A `#[sasql::pg_type]` derive? A configuration file?
+   composite types) for use in queries? A `#[bsql::pg_type]` derive? A configuration file?
 
 5. **Multi-database.** When a project connects to multiple PostgreSQL databases, how does
    the proc macro know which database to validate against? Per-query annotation
@@ -1517,27 +1517,27 @@ These are unresolved design decisions that will be settled during implementation
 
 ## Appendix A: Comparison with sqlx Internals
 
-sasql's proc macro follows a similar architecture to sqlx's `query!` macro, with key
+bsql's proc macro follows a similar architecture to sqlx's `query!` macro, with key
 differences:
 
-| Aspect | sqlx | sasql |
+| Aspect | sqlx | bsql |
 |--------|------|-------|
 | SQL parsing | `sqlparser` crate | Custom minimal parser (PG-only) |
 | Validation | `PREPARE` via compile-time connection | Same approach |
 | Type resolution | `pg_catalog` introspection | Same approach |
 | Code generation | Anonymous struct | Named struct (better IDE support) |
-| Offline mode | `.sqlx/` directory with JSON | `.sasql/` directory with JSON |
+| Offline mode | `.sqlx/` directory with JSON | `.bsql/` directory with JSON |
 | Dynamic queries | Not supported | Core feature (`[]` clauses) |
 | Escape hatch | `query()` function | Does not exist |
 | Caching | Per-invocation connection | Shared connection (investigate) |
 
-The custom SQL parser is justified because sasql only needs to:
+The custom SQL parser is justified because bsql only needs to:
 1. Identify parameter bindings (`$name: Type`)
 2. Identify optional clauses (`[...]`)
 3. Identify sort placeholders (`$[sort: Enum]`)
 4. Pass the rest through to PostgreSQL verbatim
 
-A full SQL parser (like `sqlparser`) is unnecessary overhead. sasql does not need to
+A full SQL parser (like `sqlparser`) is unnecessary overhead. bsql does not need to
 understand SQL semantics — PostgreSQL does that during `PREPARE`.
 
 ## Appendix B: Dynamic Query Expansion — Detailed Algorithm
@@ -1591,4 +1591,4 @@ specific optional clause that caused the failure.
 
 ---
 
-*sasql: because "it compiles" should mean "it works."*
+*bsql: because "it compiles" should mean "it works."*

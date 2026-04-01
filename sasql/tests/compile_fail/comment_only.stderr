@@ -1,7 +1,0 @@
-error: unsupported statement type: ``. sasql supports SELECT, INSERT, UPDATE, DELETE
- --> tests/compile_fail/comment_only.rs:2:13
-  |
-2 |     let _ = sasql::query!("-- just a comment");
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `sasql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

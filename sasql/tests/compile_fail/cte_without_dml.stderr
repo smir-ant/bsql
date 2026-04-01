@@ -1,7 +1,0 @@
-error: CTE (WITH) must be followed by SELECT, INSERT, UPDATE, or DELETE
- --> tests/compile_fail/cte_without_dml.rs:3:13
-  |
-3 |     let _ = sasql::query!("WITH cte AS (SELECT 1)");
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the macro `sasql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

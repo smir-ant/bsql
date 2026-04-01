@@ -1,0 +1,7 @@
+error: column "budget": column type is NUMERIC (OID 1700) — enable feature "decimal" in bsql
+ --> tests/compile_fail_features/missing_decimal.rs:5:13
+  |
+5 |     let _ = bsql::query!("SELECT id, budget FROM tickets WHERE id = $id: i32");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)
