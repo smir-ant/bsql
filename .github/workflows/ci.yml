@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  SASQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
+
+jobs:
+  test:
+    name: Test (PG ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pg: [16, 17]
+
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_DB: sasql_test
+          POSTGRES_USER: sasql
+          POSTGRES_PASSWORD: sasql
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sasql -d sasql_test"
+          --health-interval=2s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Setup test schema
+        run: PGPASSWORD=sasql psql -h localhost -U sasql -d sasql_test -f tests/setup.sql
+
+      - name: Test (no features)
+        run: cargo test --workspace
+
+      - name: Test (all features)
+        run: cargo test --workspace --features "time,uuid,decimal,chrono"
+
+      - name: Doc tests
+        run: cargo test --doc --features "time,uuid,decimal"
+
+      - name: Check no warnings
+        run: cargo check --workspace --features "time,uuid,decimal" 2>&1 | grep -v "dead_code\|unused" | grep "warning" && exit 1 || true
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
