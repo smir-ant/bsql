@@ -35,7 +35,7 @@ fn bench_sqlite_join_aggregate(c: &mut Criterion) {
         LIMIT 100";
 
     // Warm up
-    rt.block_on(async {
+    {
         let _rows = bsql::query!(
             "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
              FROM bench_users u
@@ -46,15 +46,14 @@ fn bench_sqlite_join_aggregate(c: &mut Criterion) {
              LIMIT 100"
         )
         .fetch_all(&bsql_pool)
-        .await
         .unwrap();
-    });
+    }
 
     let mut group = c.benchmark_group("sqlite_join_aggregate");
 
-    // -- bsql --
+    // -- bsql (sync) --
     group.bench_function("bsql", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let _rows = bsql::query!(
                 "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
                  FROM bench_users u
@@ -65,7 +64,6 @@ fn bench_sqlite_join_aggregate(c: &mut Criterion) {
                  LIMIT 100"
             )
             .fetch_all(&bsql_pool)
-            .await
             .unwrap();
         });
     });
@@ -129,15 +127,14 @@ fn bench_sqlite_subquery(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("sqlite_subquery");
 
-    // -- bsql --
+    // -- bsql (sync) --
     group.bench_function("bsql", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let _rows = bsql::query!(
                 "SELECT id, name, email FROM bench_users
                  WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)"
             )
             .fetch_all(&bsql_pool)
-            .await
             .unwrap();
         });
     });

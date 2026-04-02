@@ -31,14 +31,13 @@ fn bench_sqlite_fetch_one(c: &mut Criterion) {
     let mut diesel_conn = SqliteConnection::establish(&path).unwrap();
 
     // Warm up
-    rt.block_on(async {
+    {
         let id = 42i64;
         let _row =
             bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i64")
                 .fetch_one(&bsql_pool)
-                .await
                 .unwrap();
-    });
+    }
     rt.block_on(async {
         let _row: (i64, String, String) =
             sqlx::query_as("SELECT id, name, email FROM bench_users WHERE id = ?1")
@@ -69,14 +68,13 @@ fn bench_sqlite_fetch_one(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("sqlite_fetch_one");
 
-    // -- bsql --
+    // -- bsql (sync) --
     group.bench_function("bsql", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let id = 42i64;
             let _user =
                 bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i64")
                     .fetch_one(&bsql_pool)
-                    .await
                     .unwrap();
         });
     });

@@ -29,16 +29,15 @@ fn bench_sqlite_insert_single(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("sqlite_insert_single");
 
-    // -- bsql: single INSERT RETURNING --
+    // -- bsql: single INSERT RETURNING (sync) --
     group.bench_function("bsql", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let name = "bench_insert";
             let email = "bench@example.com";
             let _row = bsql::query!(
                 "INSERT INTO bench_users (name, email, active, score) VALUES ($name: &str, $email: &str, 1, 0.0) RETURNING id"
             )
             .fetch_one(&bsql_pool)
-            .await
             .unwrap();
         });
     });
@@ -96,10 +95,10 @@ fn bench_sqlite_insert_batch(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("sqlite_insert_batch_100");
 
-    // -- bsql: 100 INSERTs in a transaction --
+    // -- bsql: 100 INSERTs in a transaction (sync) --
     group.bench_function("bsql", |b| {
-        b.to_async(&rt).iter(|| async {
-            let tx = bsql_pool.begin().await.unwrap();
+        b.iter(|| {
+            let tx = bsql_pool.begin().unwrap();
             for i in 0..100i32 {
                 let name = format!("batch_{i}");
                 let email = format!("batch_{i}@example.com");
@@ -107,10 +106,9 @@ fn bench_sqlite_insert_batch(c: &mut Criterion) {
                     "INSERT INTO bench_users (name, email, active, score) VALUES ($name: String, $email: String, 1, 0.0)"
                 )
                 .execute(&bsql_pool)
-                .await
                 .unwrap();
             }
-            tx.commit().await.unwrap();
+            tx.commit().unwrap();
         });
     });
 

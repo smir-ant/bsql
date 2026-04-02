@@ -31,29 +31,27 @@ fn bench_sqlite_fetch_many(c: &mut Criterion) {
     let mut diesel_conn = SqliteConnection::establish(&path).unwrap();
 
     // Warm up
-    rt.block_on(async {
+    {
         let n = 10i64;
         let _rows = bsql::query!(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
         )
         .fetch_all(&bsql_pool)
-        .await
         .unwrap();
-    });
+    }
 
     let row_counts: &[i64] = &[10, 100, 1_000, 10_000];
 
     let mut group = c.benchmark_group("sqlite_fetch_many");
 
     for &n in row_counts {
-        // -- bsql --
+        // -- bsql (sync) --
         group.bench_with_input(BenchmarkId::new("bsql", n), &n, |b, &n| {
-            b.to_async(&rt).iter(|| async {
+            b.iter(|| {
                 let _rows = bsql::query!(
                     "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
                 )
                 .fetch_all(&bsql_pool)
-                .await
                 .unwrap();
             });
         });
