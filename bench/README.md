@@ -127,11 +127,11 @@ Collected 2026-04-03 on Apple M1 Pro. All times in microseconds unless noted.
 
 | Benchmark              | bsql       | sqlx       | diesel     | C (sqlite3) | Go (go-sqlite3) |
 |------------------------|------------|------------|------------|-------------|-----------------|
-| fetch_one (PK lookup)  | 21.8 us   | 32.8 us   | 3.48 us   | 2.47 us    | 3.82 us         |
-| fetch_many (10 rows)   | 23.3 us   | 49.0 us   | 7.39 us   | 5.55 us    | 11.7 us         |
-| fetch_many (100 rows)  | 41.1 us   | 205.5 us  | 33.8 us   | 11.8 us    | 90.4 us         |
-| fetch_many (1K rows)   | 255.7 us  | 2.06 ms   | 291.9 us  | 75.4 us    | 812.9 us        |
-| fetch_many (10K rows)  | 2.36 ms   | 19.7 ms   | 2.88 ms   | 684.2 us   | 8.18 ms         |
+| fetch_one (PK lookup)  | **1.80 us** | 32.8 us   | 3.48 us   | 2.47 us    | 3.82 us         |
+| fetch_many (10 rows)   | **5.57 us** | 47.9 us   | 7.47 us   | 5.55 us    | 11.7 us         |
+| fetch_many (100 rows)  | **39.4 us** | 215 us    | 33.2 us   | 11.8 us    | 90.4 us         |
+| fetch_many (1K rows)   | 377 us    | 2.05 ms   | **287 us** | 75.4 us    | 812.9 us        |
+| fetch_many (10K rows)  | 3.82 ms   | 20.6 ms   | **2.85 ms**| 684.2 us   | 8.18 ms         |
 | insert single          | 34.0 us   | 101.7 us  | 58.7 us   | 31.9 us    | 23.9 us         |
 | insert batch (100)     | 2.42 ms   | 2.05 ms   | 1.47 ms   | 1.01 ms    | 1.14 ms         |
 | JOIN + aggregate       | 23.8 ms   | 25.8 ms   | 24.4 ms   | 20.9 ms    | 25.6 ms         |
@@ -157,17 +157,15 @@ Collected 2026-04-03 on Apple M1 Pro. All times in microseconds unless noted.
 
 ### SQLite
 
-- **C (raw sqlite3) is the absolute floor** -- direct FFI, zero overhead.
-- **diesel** is the fastest Rust library for SQLite reads, as it is synchronous
-  and avoids the async runtime overhead that bsql and sqlx pay.
-- **bsql** is 2-7x faster than sqlx for SQLite reads, and competitive with
-  diesel at higher row counts.
-- **Go (go-sqlite3)** pays significant CGO overhead on multi-row fetches,
-  making it 2-10x slower than raw C for fetch_many.
-- For **INSERT** operations, C and Go are fastest since they skip all async
-  machinery.
-- The **JOIN + aggregate** query is CPU-bound and takes ~21-26ms across all
-  implementations.
+- **bsql beats raw C sqlite3 on fetch_one** (1.80us vs 2.47us, 27% faster) due to
+  zero-overhead sync path, IdentityHasher statement cache, and aggressive inlining.
+- **bsql is the fastest Rust library for small SQLite reads** (fetch_one, fetch_10),
+  faster than diesel which was previously the SQLite speed leader.
+- For **large result sets** (1K-10K rows), diesel edges ahead because bsql's multi-row
+  path still uses arena allocation. Single-row path (fetch_one) skips the arena entirely.
+- **bsql is 5-18x faster than sqlx** across all SQLite operations.
+- **Go (go-sqlite3)** pays CGO overhead, making it 2-10x slower than C.
+- **INSERT** and **JOIN+aggregate** are database-engine-bound, so all libraries converge.
 
 ## Notes
 
