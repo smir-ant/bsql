@@ -1,0 +1,45 @@
+[package]
+name = "bsql-examples"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# This is a standalone examples directory — NOT a workspace member.
+# It depends on bsql from the parent workspace via path.
+#
+# To run an example:
+#   cd examples/
+#   BSQL_DATABASE_URL=postgres://user:pass@localhost/mydb cargo run --bin pg_basic
+
+[dependencies]
+bsql = { path = "../crates/bsql", features = ["time", "uuid"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+futures = "0.3"
+
+[[bin]]
+name = "pg_basic"
+path = "pg_basic.rs"
+
+[[bin]]
+name = "pg_dynamic"
+path = "pg_dynamic.rs"
+
+[[bin]]
+name = "pg_transactions"
+path = "pg_transactions.rs"
+
+[[bin]]
+name = "pg_streaming"
+path = "pg_streaming.rs"
+
+[[bin]]
+name = "pg_listener"
+path = "pg_listener.rs"
+
+[[bin]]
+name = "sqlite_basic"
+path = "sqlite_basic.rs"
+
+[[bin]]
+name = "sqlite_dynamic"
+path = "sqlite_dynamic.rs"
