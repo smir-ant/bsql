@@ -736,7 +736,7 @@ async fn error_invalid_sql_has_code() {
 
     match result {
         Err(DriverError::Server { code, message, .. }) => {
-            assert_eq!(code, "42P01", "should be undefined_table error");
+            assert_eq!(&*code, "42P01", "should be undefined_table error");
             assert!(
                 message.contains("does not exist"),
                 "message should mention nonexistence: {message}"
@@ -766,7 +766,7 @@ async fn error_simple_query_reports_server_error() {
 
     match result {
         Err(DriverError::Server { code, .. }) => {
-            assert_eq!(code, "42P01");
+            assert_eq!(&*code, "42P01");
         }
         Err(e) => panic!("expected Server error, got: {e}"),
         Ok(_) => panic!("expected error"),
@@ -783,4 +783,187 @@ async fn query_zero_columns() {
 
     // A DO block returns no columns and no rows
     conn.simple_query("DO $$ BEGIN END $$").await.unwrap();
+}
+
+// --- Pool race condition test ---
+
+#[tokio::test]
+async fn pool_concurrent_acquire_race() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(5).build().await.unwrap();
+
+    // Spawn 20 concurrent tasks all racing to acquire from a pool of 5.
+    // With the CAS loop fix, open_count must never exceed max_size.
+    let pool = std::sync::Arc::new(pool);
+    let mut handles = Vec::new();
+
+    for _ in 0..20 {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            match pool.acquire().await {
+                Ok(mut conn) => {
+                    let _ = conn.simple_query("SELECT 1").await;
+                    // Hold briefly
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    drop(conn);
+                    Ok(())
+                }
+                Err(DriverError::Pool(_)) => {
+                    // Expected when pool is exhausted
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+
+    // open_count must never exceed max_size
+    assert!(pool.open_count() <= pool.max_size());
+}
+
+// --- Pool LIFO ordering test ---
+
+#[tokio::test]
+async fn pool_lifo_ordering() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(3).build().await.unwrap();
+
+    // Acquire 3 connections, record their PIDs
+    let mut conn1 = pool.acquire().await.unwrap();
+    conn1.simple_query("SELECT 1").await.unwrap();
+    let _pid1 = conn1.pid();
+
+    let mut conn2 = pool.acquire().await.unwrap();
+    conn2.simple_query("SELECT 1").await.unwrap();
+    let pid2 = conn2.pid();
+
+    let mut conn3 = pool.acquire().await.unwrap();
+    conn3.simple_query("SELECT 1").await.unwrap();
+    let pid3 = conn3.pid();
+
+    // Return in order: 1, 2, 3
+    drop(conn1);
+    drop(conn2);
+    drop(conn3);
+
+    // LIFO: next acquire should get conn3 (last returned = top of stack)
+    let conn = pool.acquire().await.unwrap();
+    assert_eq!(conn.pid(), pid3);
+    drop(conn);
+
+    // Next should get conn3 again (just returned it)
+    let conn = pool.acquire().await.unwrap();
+    assert_eq!(conn.pid(), pid3);
+    drop(conn);
+
+    // Drain two: should get conn3 then conn2
+    let c_a = pool.acquire().await.unwrap();
+    let c_b = pool.acquire().await.unwrap();
+    assert_eq!(c_a.pid(), pid3);
+    assert_eq!(c_b.pid(), pid2);
+    drop(c_a);
+    drop(c_b);
+}
+
+// --- Codec edge cases ---
+
+#[tokio::test]
+async fn codec_nan_and_infinity() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    // NaN
+    let sql = "SELECT $1::float4 AS f4, $2::float8 AS f8";
+    let hash = hash_sql(sql);
+    let result = conn
+        .query(sql, hash, &[&f32::NAN, &f64::NAN], &mut arena)
+        .await
+        .unwrap();
+    let row = result.row(0, &arena);
+    assert!(row.get_f32(0).unwrap().is_nan());
+    assert!(row.get_f64(1).unwrap().is_nan());
+
+    // Positive infinity
+    arena.reset();
+    let result = conn
+        .query(sql, hash, &[&f32::INFINITY, &f64::INFINITY], &mut arena)
+        .await
+        .unwrap();
+    let row = result.row(0, &arena);
+    assert!(row.get_f32(0).unwrap().is_infinite());
+    assert!(row.get_f64(1).unwrap().is_infinite());
+
+    // Negative infinity
+    arena.reset();
+    let result = conn
+        .query(
+            sql,
+            hash,
+            &[&f32::NEG_INFINITY, &f64::NEG_INFINITY],
+            &mut arena,
+        )
+        .await
+        .unwrap();
+    let row = result.row(0, &arena);
+    assert!(row.get_f32(0).unwrap().is_infinite());
+    assert!(row.get_f64(1).unwrap().is_infinite());
+}
+
+#[tokio::test]
+async fn codec_empty_string_and_max_i64() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    // Empty string
+    let sql = "SELECT $1::text AS val";
+    let hash = hash_sql(sql);
+    let empty = "";
+    let result = conn.query(sql, hash, &[&empty], &mut arena).await.unwrap();
+    assert_eq!(result.row(0, &arena).get_str(0), Some(""));
+
+    // Max i64
+    arena.reset();
+    let sql2 = "SELECT $1::int8 AS val";
+    let hash2 = hash_sql(sql2);
+    let result = conn
+        .query(sql2, hash2, &[&i64::MAX], &mut arena)
+        .await
+        .unwrap();
+    assert_eq!(result.row(0, &arena).get_i64(0), Some(i64::MAX));
+
+    // Min i64
+    arena.reset();
+    let result = conn
+        .query(sql2, hash2, &[&i64::MIN], &mut arena)
+        .await
+        .unwrap();
+    assert_eq!(result.row(0, &arena).get_i64(0), Some(i64::MIN));
+}
+
+// --- Config validation tests ---
+
+#[test]
+fn config_rejects_empty_host() {
+    let result = Config::from_url("postgres://user:pass@/db");
+    assert!(result.is_err());
+}
+
+#[test]
+fn config_rejects_empty_user() {
+    let result = Config::from_url("postgres://:pass@localhost/db");
+    assert!(result.is_err());
+}
+
+#[test]
+fn config_url_decodes_host() {
+    let cfg = Config::from_url("postgres://user:pass@local%2Dhost/db").unwrap();
+    assert_eq!(cfg.host, "local-host");
 }

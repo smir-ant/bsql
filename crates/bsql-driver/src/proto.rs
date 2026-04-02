@@ -23,6 +23,7 @@ use crate::DriverError;
 const PROTOCOL_VERSION: i32 = 196608; // 3 << 16
 
 /// SSLRequest magic code.
+#[cfg(feature = "tls")]
 const SSL_REQUEST_CODE: i32 = 80877103;
 
 // Frontend message type bytes
@@ -32,6 +33,7 @@ const MSG_PARSE: u8 = b'P';
 const MSG_BIND: u8 = b'B';
 const MSG_EXECUTE: u8 = b'E';
 const MSG_DESCRIBE: u8 = b'D';
+#[allow(dead_code)]
 const MSG_CLOSE: u8 = b'C';
 const MSG_SYNC: u8 = b'S';
 const MSG_TERMINATE: u8 = b'X';
@@ -61,6 +63,7 @@ const _BACKEND_PARAM_DESC: u8 = b't';
 /// `RowDescription`, `DataRow`, `ErrorResponse`, and `NoticeResponse` carry raw byte
 /// slices — their contents are parsed lazily only when accessed.
 #[derive(Debug)]
+#[allow(dead_code)] // Variant fields are part of the complete protocol representation
 pub enum BackendMessage<'a> {
     AuthOk,
     AuthCleartext,
@@ -152,6 +155,7 @@ pub fn write_startup(buf: &mut Vec<u8>, user: &str, database: &str) {
 }
 
 /// SSLRequest — 8 bytes, no type byte: `[length=8: i32] [code=80877103: i32]`
+#[cfg(feature = "tls")]
 pub fn write_ssl_request(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&8i32.to_be_bytes());
     buf.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
@@ -183,12 +187,18 @@ pub fn write_parse(buf: &mut Vec<u8>, name: &str, sql: &str, param_oids: &[u32])
 }
 
 /// Bind message — bind parameters to a prepared statement, requesting binary format
-/// for both parameters and results.
+/// for both parameters and results. Encodes parameters inline into the write buffer,
+/// eliminating intermediate `Vec<Vec<u8>>` allocation.
 ///
 /// Format: `'B' [len] [portal\0] [stmt\0] [num_fmt_codes: i16] [fmt_code: i16]...
 ///          [num_params: i16] ([param_len: i32] [param_data]...)
 ///          [num_result_fmt_codes: i16] [result_fmt_code: i16]...`
-pub fn write_bind(buf: &mut Vec<u8>, portal: &str, statement: &str, params: &[Option<&[u8]>]) {
+pub fn write_bind_params(
+    buf: &mut Vec<u8>,
+    portal: &str,
+    statement: &str,
+    params: &[&dyn crate::codec::Encode],
+) {
     buf.push(MSG_BIND);
     let len_pos = buf.len();
     buf.extend_from_slice(&[0u8; 4]); // placeholder
@@ -209,18 +219,14 @@ pub fn write_bind(buf: &mut Vec<u8>, portal: &str, statement: &str, params: &[Op
         buf.extend_from_slice(&1i16.to_be_bytes()); // binary
     }
 
-    // Parameter values
+    // Parameter values — encoded inline, no intermediate Vec<Vec<u8>>
     buf.extend_from_slice(&(params.len() as i16).to_be_bytes());
     for param in params {
-        match param {
-            Some(data) => {
-                buf.extend_from_slice(&(data.len() as i32).to_be_bytes());
-                buf.extend_from_slice(data);
-            }
-            None => {
-                buf.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
-            }
-        }
+        let len_pos_param = buf.len();
+        buf.extend_from_slice(&[0u8; 4]); // placeholder for param length
+        param.encode_binary(buf);
+        let data_len = (buf.len() - len_pos_param - 4) as i32;
+        buf[len_pos_param..len_pos_param + 4].copy_from_slice(&data_len.to_be_bytes());
     }
 
     // Result format codes: all binary
@@ -262,6 +268,7 @@ pub fn write_describe(buf: &mut Vec<u8>, kind: u8, name: &str) {
 }
 
 /// Close message — close a statement ('S') or portal ('P').
+#[allow(dead_code)]
 pub fn write_close(buf: &mut Vec<u8>, kind: u8, name: &str) {
     let payload_len = 1 + name.len() + 1;
     buf.push(MSG_CLOSE);
@@ -319,6 +326,7 @@ pub fn write_sasl_response(buf: &mut Vec<u8>, data: &[u8]) {
 /// The buffer is cleared before reading (caller must process the previous message first).
 ///
 /// Wire format: `[type: u8] [length: i32 BE] [payload: length - 4 bytes]`
+#[allow(dead_code)]
 pub async fn read_message<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut Vec<u8>,
@@ -340,6 +348,16 @@ pub async fn read_message<S: AsyncRead + Unpin>(
         )));
     }
 
+    // Reject unreasonably large messages (128 MB) to prevent OOM from malicious
+    // or corrupted streams.
+    const MAX_MESSAGE_LEN: i32 = 128 * 1024 * 1024;
+    if len > MAX_MESSAGE_LEN {
+        return Err(DriverError::Protocol(format!(
+            "message length {len} exceeds maximum ({MAX_MESSAGE_LEN}) for type '{}'",
+            msg_type as char
+        )));
+    }
+
     let payload_len = (len - 4) as usize;
 
     // Store payload starting at offset 0
@@ -356,6 +374,7 @@ pub async fn read_message<S: AsyncRead + Unpin>(
 }
 
 /// Flush the write buffer to the stream.
+#[allow(dead_code)]
 pub async fn flush<S: AsyncWrite + Unpin>(stream: &mut S, buf: &[u8]) -> Result<(), DriverError> {
     stream.write_all(buf).await.map_err(DriverError::Io)?;
     stream.flush().await.map_err(DriverError::Io)?;
@@ -500,6 +519,7 @@ pub struct ColumnInfo {
     pub name: Box<str>,
     pub type_oid: u32,
     pub type_size: i16,
+    #[allow(dead_code)]
     pub format: i16,
 }
 
@@ -555,7 +575,9 @@ pub fn parse_row_description(data: &[u8]) -> Result<Vec<ColumnInfo>, DriverError
 // --- ErrorResponse parsing ---
 
 /// Parsed fields from an ErrorResponse or NoticeResponse.
+#[derive(Debug)]
 pub struct ErrorFields {
+    #[allow(dead_code)]
     pub severity: String,
     pub code: String,
     pub message: String,
@@ -656,6 +678,7 @@ mod tests {
         assert_eq!(*buf.last().unwrap(), 0); // trailing NUL
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn ssl_request_format() {
         let mut buf = Vec::new();
@@ -782,9 +805,9 @@ mod tests {
     #[test]
     fn bind_message_binary_format() {
         let mut buf = Vec::new();
-        let param_data = 42i32.to_be_bytes();
-        let params: Vec<Option<&[u8]>> = vec![Some(&param_data)];
-        write_bind(&mut buf, "", "s_test", &params);
+        let val = 42i32;
+        let params: Vec<&dyn crate::codec::Encode> = vec![&val];
+        write_bind_params(&mut buf, "", "s_test", &params);
 
         assert_eq!(buf[0], b'B');
         // Verify it contains binary format codes
@@ -792,12 +815,11 @@ mod tests {
     }
 
     #[test]
-    fn bind_null_parameter() {
+    fn bind_no_params() {
         let mut buf = Vec::new();
-        let params: Vec<Option<&[u8]>> = vec![None];
-        write_bind(&mut buf, "", "s_test", &params);
+        let params: Vec<&dyn crate::codec::Encode> = vec![];
+        write_bind_params(&mut buf, "", "s_test", &params);
         assert_eq!(buf[0], b'B');
-        // Should contain -1 (NULL marker) for the parameter length
     }
 
     #[test]

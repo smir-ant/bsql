@@ -46,7 +46,6 @@ pub mod pool;
 
 mod auth;
 mod conn;
-#[allow(dead_code)]
 mod proto;
 #[cfg(feature = "tls")]
 mod tls;
@@ -92,9 +91,9 @@ pub enum DriverError {
     /// Server-reported error (invalid SQL, constraint violation, etc.).
     Server {
         /// Five-character SQLSTATE code (e.g. "42P01" for undefined table).
-        code: String,
+        code: Box<str>,
         /// Human-readable error message.
-        message: String,
+        message: Box<str>,
         /// Optional detail text.
         detail: Option<String>,
         /// Optional hint text.
@@ -176,7 +175,7 @@ mod tests {
         let e = DriverError::Server {
             code: "42P01".into(),
             message: "relation does not exist".into(),
-            detail: Some("table was dropped".into()),
+            detail: Some("table was dropped".to_owned()),
             hint: None,
         };
         let s = e.to_string();
@@ -188,8 +187,8 @@ mod tests {
     #[test]
     fn driver_error_display_server_no_detail() {
         let e = DriverError::Server {
-            code: "23505".into(),
-            message: "duplicate key".into(),
+            code: Box::from("23505"),
+            message: Box::from("duplicate key"),
             detail: None,
             hint: None,
         };

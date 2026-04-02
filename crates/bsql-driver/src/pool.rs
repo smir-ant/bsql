@@ -15,7 +15,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 
 use crate::DriverError;
 use crate::arena::Arena;
@@ -42,7 +42,10 @@ pub struct Pool {
 }
 
 struct PoolInner {
-    stack: Mutex<Vec<Connection>>,
+    /// Idle connections. Uses std::sync::Mutex because the critical section is
+    /// trivial (push/pop — no I/O). This lets PoolGuard::Drop return connections
+    /// synchronously without spawning a task.
+    stack: std::sync::Mutex<Vec<Connection>>,
     max_size: usize,
     open_count: AtomicUsize,
     config: Config,
@@ -69,9 +72,11 @@ impl Pool {
     /// connection is created. If the pool is at max_size, returns
     /// `DriverError::Pool` immediately — no blocking.
     pub async fn acquire(&self) -> Result<PoolGuard, DriverError> {
-        // Try to pop an idle connection (fast path)
+        // Try to pop an idle connection (fast path).
+        // std::sync::Mutex — trivial critical section (no I/O), safe to unwrap
+        // because we never panic while holding this lock.
         {
-            let mut stack = self.inner.stack.lock().await;
+            let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(conn) = stack.pop() {
                 return Ok(PoolGuard {
                     conn: Some(conn),
@@ -80,32 +85,24 @@ impl Pool {
             }
         }
 
-        // No idle connections — try to open a new one
-        let current = self.inner.open_count.load(Ordering::Acquire);
-        if current >= self.inner.max_size {
-            return Err(DriverError::Pool(format!(
-                "pool exhausted: all {max} connections in use",
-                max = self.inner.max_size
-            )));
-        }
-
-        // Try to claim a slot
-        if self
-            .inner
-            .open_count
-            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            // Another task claimed the slot — check if we're now at max
-            let updated = self.inner.open_count.load(Ordering::Acquire);
-            if updated >= self.inner.max_size {
-                return Err(DriverError::Pool(format!(
-                    "pool exhausted: all {max} connections in use",
-                    max = self.inner.max_size
-                )));
+        // No idle connections — try to claim a slot with a proper CAS loop.
+        // This avoids the race where a fetch_add fallback could overshoot max_size.
+        loop {
+            let current = self.inner.open_count.load(Ordering::Acquire);
+            if current >= self.inner.max_size {
+                return Err(DriverError::Pool(
+                    "pool exhausted: all connections in use".into(),
+                ));
             }
-            // Retry claim
-            self.inner.open_count.fetch_add(1, Ordering::AcqRel);
+            if self
+                .inner
+                .open_count
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            // CAS failed — another task incremented. Retry.
         }
 
         // Open a new connection
@@ -195,7 +192,7 @@ impl PoolBuilder {
 
         Ok(Pool {
             inner: Arc::new(PoolInner {
-                stack: Mutex::new(Vec::with_capacity(self.max_size)),
+                stack: std::sync::Mutex::new(Vec::with_capacity(self.max_size)),
                 max_size: self.max_size,
                 open_count: AtomicUsize::new(0),
                 config,
@@ -233,20 +230,17 @@ impl DerefMut for PoolGuard {
 impl Drop for PoolGuard {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            let pool = self.pool.clone();
-
             // If the connection is in a failed transaction state, discard it
             if conn.is_in_failed_transaction() {
-                pool.open_count.fetch_sub(1, Ordering::AcqRel);
+                self.pool.open_count.fetch_sub(1, Ordering::AcqRel);
                 return;
             }
 
-            // Return to pool via a spawned task (Drop can't be async)
-            // For LIFO: push to the top of the stack
-            tokio::spawn(async move {
-                let mut stack = pool.stack.lock().await;
-                stack.push(conn);
-            });
+            // Return to pool synchronously. The critical section is trivial
+            // (Vec::push — no I/O), so std::sync::Mutex is appropriate here
+            // and avoids spawning an async task in Drop.
+            let mut stack = self.pool.stack.lock().unwrap_or_else(|e| e.into_inner());
+            stack.push(conn);
         }
     }
 }

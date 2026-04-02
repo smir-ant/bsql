@@ -60,18 +60,18 @@ pub struct ScramClient {
 
 impl ScramClient {
     /// Create a new SCRAM client for the given credentials.
-    pub fn new(user: &str, password: &str) -> Self {
-        let nonce = generate_nonce();
+    pub fn new(user: &str, password: &str) -> Result<Self, DriverError> {
+        let nonce = generate_nonce()?;
         let client_first_bare = format!("n={user},r={nonce}");
 
-        Self {
+        Ok(Self {
             password: password.to_owned(),
             nonce,
             client_first_bare,
             server_first: String::new(),
             salted_password: [0u8; 32],
             auth_message: String::new(),
-        }
+        })
     }
 
     /// Generate the client-first message: `n,,n=user,r=nonce`.
@@ -206,19 +206,28 @@ impl ScramClient {
 // --- Helpers ---
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    // HMAC-SHA256 accepts any key length, so new_from_slice cannot fail in practice.
+    // We handle the Result anyway to avoid panics from expect().
+    let mut mac = match HmacSha256::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => {
+            // Unreachable for SHA-256 (no key length restriction), but return zeroes
+            // defensively rather than panicking.
+            return [0u8; 32];
+        }
+    };
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
 
 /// Generate a 24-byte random nonce, base64-encoded.
-fn generate_nonce() -> String {
+fn generate_nonce() -> Result<String, DriverError> {
     use rand::TryRngCore;
     let mut bytes = [0u8; 24];
     rand::rngs::OsRng
         .try_fill_bytes(&mut bytes)
-        .expect("OS RNG failed to generate random bytes");
-    B64.encode(bytes)
+        .map_err(|e| DriverError::Auth(format!("OS RNG failed: {e}")))?;
+    Ok(B64.encode(bytes))
 }
 
 /// Constant-time comparison to prevent timing attacks on auth signatures.
@@ -293,7 +302,7 @@ mod tests {
 
     #[test]
     fn scram_client_first_message_format() {
-        let client = ScramClient::new("testuser", "testpass");
+        let client = ScramClient::new("testuser", "testpass").unwrap();
         let msg = client.client_first_message();
         let s = std::str::from_utf8(&msg).unwrap();
         assert!(s.starts_with("n,,n=testuser,r="));
@@ -301,8 +310,8 @@ mod tests {
 
     #[test]
     fn scram_nonce_is_unique() {
-        let n1 = generate_nonce();
-        let n2 = generate_nonce();
+        let n1 = generate_nonce().unwrap();
+        let n2 = generate_nonce().unwrap();
         assert_ne!(n1, n2);
     }
 
@@ -336,7 +345,7 @@ mod tests {
     #[test]
     fn scram_roundtrip() {
         // Simulate a SCRAM exchange with known values
-        let mut client = ScramClient::new("user", "pencil");
+        let mut client = ScramClient::new("user", "pencil").unwrap();
         let _first = client.client_first_message();
 
         // Construct a fake server-first with the client's nonce prefix
@@ -355,7 +364,7 @@ mod tests {
 
     #[test]
     fn scram_rejects_bad_nonce() {
-        let mut client = ScramClient::new("user", "pass");
+        let mut client = ScramClient::new("user", "pass").unwrap();
         let _first = client.client_first_message();
         let result = client.process_server_first(b"r=wrongnonce,s=c2FsdA==,i=4096");
         assert!(result.is_err());

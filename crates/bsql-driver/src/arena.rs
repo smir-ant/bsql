@@ -45,6 +45,9 @@ const SHRINK_THRESHOLD: usize = 64 * 1024;
 /// ```
 pub struct Arena {
     chunks: Vec<Vec<u8>>,
+    /// Cached cumulative chunk capacities for O(1) offset resolution.
+    /// `prefix_sums[i]` = sum of capacities of chunks 0..i.
+    prefix_sums: Vec<usize>,
     current: usize,
     offset: usize,
 }
@@ -55,6 +58,7 @@ impl Arena {
         let chunk = Vec::with_capacity(INITIAL_CHUNK_SIZE);
         Self {
             chunks: vec![chunk],
+            prefix_sums: vec![0],
             current: 0,
             offset: 0,
         }
@@ -145,6 +149,9 @@ impl Arena {
             chunk.clear();
         }
 
+        // Rebuild prefix_sums
+        self.rebuild_prefix_sums();
+
         self.current = 0;
         self.offset = 0;
     }
@@ -194,15 +201,30 @@ impl Arena {
             return;
         }
 
-        // Allocate a new chunk
+        // Allocate a new chunk and update prefix_sums
         let new_chunk = Vec::with_capacity(new_cap);
+        let prefix = self.prefix_sums[self.chunks.len() - 1]
+            + self.chunks.last().map_or(0, |c| c.capacity());
         if next_idx < self.chunks.len() {
             self.chunks[next_idx] = new_chunk;
+            // Rebuild prefix_sums since a chunk capacity changed
+            self.rebuild_prefix_sums();
         } else {
             self.chunks.push(new_chunk);
+            self.prefix_sums.push(prefix);
         }
         self.current = next_idx;
         self.offset = 0;
+    }
+
+    /// Rebuild the prefix_sums cache from current chunk capacities.
+    fn rebuild_prefix_sums(&mut self) {
+        self.prefix_sums.clear();
+        let mut sum = 0;
+        for chunk in &self.chunks {
+            self.prefix_sums.push(sum);
+            sum += chunk.capacity();
+        }
     }
 
     /// Compute the global offset for the current position.
@@ -211,27 +233,26 @@ impl Arena {
     }
 
     /// Compute a global offset from chunk index and local offset.
+    /// O(1) using cached prefix_sums.
     fn global_offset_at(&self, chunk_idx: usize, local_offset: usize) -> usize {
-        let mut global = 0;
-        for i in 0..chunk_idx {
-            global += self.chunks[i].capacity();
-        }
-        global + local_offset
+        self.prefix_sums[chunk_idx] + local_offset
     }
 
     /// Resolve a global offset to (chunk_index, local_offset).
+    /// O(log n) using binary search on prefix_sums.
     fn resolve_offset(&self, global_offset: usize) -> (usize, usize) {
-        let mut remaining = global_offset;
-        for (i, chunk) in self.chunks.iter().enumerate() {
-            if remaining < chunk.capacity() {
-                return (i, remaining);
-            }
-            remaining -= chunk.capacity();
-        }
-        panic!(
-            "arena offset {global_offset} out of bounds (total capacity: {})",
-            self.capacity()
+        // Binary search: find the last chunk whose prefix_sum <= global_offset
+        let idx = match self.prefix_sums.binary_search(&global_offset) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        let local = global_offset - self.prefix_sums[idx];
+        debug_assert!(
+            local < self.chunks[idx].capacity(),
+            "arena offset {global_offset} out of bounds in chunk {idx} (cap={})",
+            self.chunks[idx].capacity()
         );
+        (idx, local)
     }
 }
 
@@ -441,5 +462,62 @@ mod tests {
         assert_eq!(arena.allocated(), 5);
         arena.alloc_copy(b"67890");
         assert_eq!(arena.allocated(), 10);
+    }
+
+    #[test]
+    fn alloc_at_exact_8kb_boundary() {
+        let mut arena = Arena::new();
+
+        // Fill exactly to the 8KB boundary
+        let filler = vec![0xAA; INITIAL_CHUNK_SIZE];
+        let o1 = arena.alloc_copy(&filler);
+        assert_eq!(arena.get(o1, INITIAL_CHUNK_SIZE)[0], 0xAA);
+        assert_eq!(arena.chunks.len(), 1);
+
+        // Next alloc (even 1 byte) must trigger a new chunk
+        let o2 = arena.alloc_copy(b"x");
+        assert_eq!(arena.get(o2, 1), b"x");
+        assert!(arena.chunks.len() >= 2, "should have grown past 8KB chunk");
+
+        // Data from both chunks must still be accessible
+        assert_eq!(arena.get(o1, INITIAL_CHUNK_SIZE)[0], 0xAA);
+        assert_eq!(
+            arena.get(o1, INITIAL_CHUNK_SIZE)[INITIAL_CHUNK_SIZE - 1],
+            0xAA
+        );
+    }
+
+    #[test]
+    fn prefix_sums_correct_after_multi_chunk() {
+        let mut arena = Arena::new();
+        let mut offsets = Vec::new();
+
+        // Force 4 chunks
+        for i in 0..4 {
+            let data = vec![i as u8; INITIAL_CHUNK_SIZE + 1];
+            offsets.push((arena.alloc_copy(&data), data.len()));
+        }
+
+        // Verify all data is retrievable (exercises prefix_sums-based resolve_offset)
+        for (idx, &(offset, len)) in offsets.iter().enumerate() {
+            let data = arena.get(offset, len);
+            assert!(data.iter().all(|&b| b == idx as u8));
+        }
+    }
+
+    #[test]
+    fn prefix_sums_correct_after_reset() {
+        let mut arena = Arena::new();
+
+        // Force a second chunk
+        let big = vec![0xBB; INITIAL_CHUNK_SIZE + 1];
+        arena.alloc_copy(&big);
+        assert!(arena.chunks.len() >= 2);
+
+        arena.reset();
+
+        // After reset, alloc should work correctly with rebuilt prefix_sums
+        let o = arena.alloc_copy(b"after reset");
+        assert_eq!(arena.get(o, 11), b"after reset");
     }
 }

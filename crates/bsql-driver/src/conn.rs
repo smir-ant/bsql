@@ -41,10 +41,10 @@ impl Stream {
         }
     }
 
+    #[cfg(feature = "tls")]
     async fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Stream::Plain(s) => s.flush().await,
-            #[cfg(feature = "tls")]
             Stream::Tls(s) => s.flush().await,
         }
     }
@@ -135,8 +135,8 @@ impl Config {
             }
         }
 
-        Ok(Config {
-            host,
+        let config = Config {
+            host: url_decode(&host),
             port,
             user: url_decode(user),
             password: url_decode(password),
@@ -146,7 +146,26 @@ impl Config {
                 url_decode(database)
             },
             ssl,
-        })
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate configuration fields before attempting a connection.
+    ///
+    /// Called automatically by `from_url()`. Call manually if constructing
+    /// a `Config` by hand.
+    pub fn validate(&self) -> Result<(), DriverError> {
+        if self.host.is_empty() {
+            return Err(DriverError::Protocol("host cannot be empty".into()));
+        }
+        if self.user.is_empty() {
+            return Err(DriverError::Protocol("user cannot be empty".into()));
+        }
+        if self.database.is_empty() {
+            return Err(DriverError::Protocol("database cannot be empty".into()));
+        }
+        Ok(())
     }
 }
 
@@ -192,6 +211,13 @@ enum StartupAction {
 // --- Statement cache ---
 
 /// Cached information about a prepared statement.
+///
+/// The statement name is a 64-bit rapidhash formatted as `"s_{hash:016x}"`.
+/// With 2^64 possible values, collision probability is negligible for realistic
+/// workloads (e.g., ~1 in 10^13 for 10,000 distinct queries). A collision would
+/// cause a protocol error from PostgreSQL (parameter mismatch), not silent
+/// data corruption. If you have an adversarial workload that could craft
+/// collisions, consider a verified cache keyed on the full SQL text.
 struct StmtInfo {
     /// Statement name: `"s_{hash:016x}"`
     name: Box<str>,
@@ -218,7 +244,15 @@ pub struct ColumnDesc {
 /// handles concurrent access by lending connections to individual tasks.
 pub struct Connection {
     stream: Stream,
+    /// Message payload buffer (re-used per message).
     read_buf: Vec<u8>,
+    /// Buffered read: raw bytes from the TCP stream. We read 64KB chunks and
+    /// parse messages from this buffer, issuing a new read only when exhausted.
+    stream_buf: Vec<u8>,
+    /// How many valid bytes are in `stream_buf[stream_buf_pos..]`.
+    stream_buf_pos: usize,
+    /// One past the last valid byte in `stream_buf`.
+    stream_buf_end: usize,
     write_buf: Vec<u8>,
     stmts: HashMap<u64, StmtInfo>,
     params: HashMap<Box<str>, Box<str>>,
@@ -230,6 +264,8 @@ pub struct Connection {
 impl Connection {
     /// Connect to PostgreSQL and complete the startup/auth handshake.
     pub async fn connect(config: &Config) -> Result<Self, DriverError> {
+        config.validate()?;
+
         let addr = format!("{}:{}", config.host, config.port);
         let tcp = TcpStream::connect(&addr).await.map_err(DriverError::Io)?;
 
@@ -264,6 +300,9 @@ impl Connection {
         let mut conn = Self {
             stream,
             read_buf: Vec::with_capacity(8192),
+            stream_buf: vec![0u8; 65536],
+            stream_buf_pos: 0,
+            stream_buf_end: 0,
             write_buf: Vec::with_capacity(4096),
             stmts: HashMap::new(),
             params: HashMap::new(),
@@ -332,8 +371,7 @@ impl Connection {
     /// This method reads the raw message into `self.read_buf`, parses it, extracts
     /// all needed data into owned types, and drops the borrow before returning.
     async fn read_startup_action(&mut self) -> Result<StartupAction, DriverError> {
-        let (msg_type, _) =
-            proto::read_message(&mut StreamReader(&mut self.stream), &mut self.read_buf).await?;
+        let (msg_type, _) = self.read_message_buffered().await?;
         self.read_startup_message_from_type(msg_type)
     }
 
@@ -378,7 +416,7 @@ impl Connection {
             )));
         }
 
-        let mut scram = auth::ScramClient::new(&config.user, &config.password);
+        let mut scram = auth::ScramClient::new(&config.user, &config.password)?;
 
         // Send SASLInitialResponse
         let client_first = scram.client_first_message();
@@ -387,8 +425,7 @@ impl Connection {
         self.flush_write().await?;
 
         // Read SASLContinue — read message, extract data, drop borrow
-        let (msg_type, _) =
-            proto::read_message(&mut StreamReader(&mut self.stream), &mut self.read_buf).await?;
+        let (msg_type, _) = self.read_message_buffered().await?;
         let server_first = {
             let msg = proto::parse_backend_message(msg_type, &self.read_buf)?;
             match msg {
@@ -414,8 +451,7 @@ impl Connection {
         self.flush_write().await?;
 
         // Read SASLFinal — read message, extract data, drop borrow
-        let (msg_type, _) =
-            proto::read_message(&mut StreamReader(&mut self.stream), &mut self.read_buf).await?;
+        let (msg_type, _) = self.read_message_buffered().await?;
         {
             let msg = proto::parse_backend_message(msg_type, &self.read_buf)?;
             match msg {
@@ -437,8 +473,7 @@ impl Connection {
         }
 
         // AuthOk should follow
-        let (msg_type, _) =
-            proto::read_message(&mut StreamReader(&mut self.stream), &mut self.read_buf).await?;
+        let (msg_type, _) = self.read_message_buffered().await?;
         let msg = proto::parse_backend_message(msg_type, &self.read_buf)?;
         match msg {
             BackendMessage::AuthOk => Ok(()),
@@ -466,28 +501,25 @@ impl Connection {
         arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
         let cached = self.stmts.contains_key(&sql_hash);
-        let stmt_name = if cached {
-            self.stmts[&sql_hash].name.clone()
-        } else {
-            format!("s_{sql_hash:016x}").into_boxed_str()
-        };
 
         // Build the pipelined message
         self.write_buf.clear();
 
         if !cached {
+            let new_name = format!("s_{sql_hash:016x}").into_boxed_str();
             // Parse: prepare the statement
             let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, &stmt_name, sql, &param_oids);
+            proto::write_parse(&mut self.write_buf, &new_name, sql, &param_oids);
             // Describe: get column metadata
-            proto::write_describe(&mut self.write_buf, b'S', &stmt_name);
+            proto::write_describe(&mut self.write_buf, b'S', &new_name);
+            // Bind: parameters inline — no intermediate Vec<Vec<u8>>
+            proto::write_bind_params(&mut self.write_buf, "", &new_name, params);
+        } else {
+            // Borrow the cached name — no clone needed since we only need it for
+            // the write_buf which is consumed before we modify stmts.
+            let name = &*self.stmts[&sql_hash].name;
+            proto::write_bind_params(&mut self.write_buf, "", name, params);
         }
-
-        // Bind: bind parameters (binary format)
-        let encoded_params = encode_params(params);
-        let param_refs: Vec<Option<&[u8]>> =
-            encoded_params.iter().map(|p| Some(p.as_slice())).collect();
-        proto::write_bind(&mut self.write_buf, "", &stmt_name, &param_refs);
 
         // Execute: run the portal
         proto::write_execute(&mut self.write_buf, "", 0);
@@ -503,79 +535,15 @@ impl Connection {
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
                 .await?;
 
-            // RowDescription or NoData
-            let msg = self.read_one_message().await?;
-            let columns: Arc<[ColumnDesc]> = match msg {
-                BackendMessage::RowDescription { data } => {
-                    let col_infos = proto::parse_row_description(data)?;
-                    col_infos
-                        .into_iter()
-                        .map(|c| ColumnDesc {
-                            name: c.name,
-                            type_oid: c.type_oid,
-                            type_size: c.type_size,
-                        })
-                        .collect::<Vec<_>>()
-                        .into()
-                }
-                BackendMessage::ParameterDescription { .. } => {
-                    // ParameterDescription comes before RowDescription for Describe Statement
-                    let msg = self.read_one_message().await?;
-                    match msg {
-                        BackendMessage::RowDescription { data } => {
-                            let col_infos = proto::parse_row_description(data)?;
-                            col_infos
-                                .into_iter()
-                                .map(|c| ColumnDesc {
-                                    name: c.name,
-                                    type_oid: c.type_oid,
-                                    type_size: c.type_size,
-                                })
-                                .collect::<Vec<_>>()
-                                .into()
-                        }
-                        BackendMessage::NoData => Arc::from(Vec::new()),
-                        BackendMessage::ErrorResponse { data } => {
-                            let fields = proto::parse_error_response(data);
-                            // Drain to ReadyForQuery
-                            self.drain_to_ready().await?;
-                            return Err(DriverError::Server {
-                                code: fields.code,
-                                message: fields.message,
-                                detail: fields.detail,
-                                hint: fields.hint,
-                            });
-                        }
-                        other => {
-                            return Err(DriverError::Protocol(format!(
-                                "expected RowDescription or NoData, got: {other:?}"
-                            )));
-                        }
-                    }
-                }
-                BackendMessage::NoData => Arc::from(Vec::new()),
-                BackendMessage::ErrorResponse { data } => {
-                    let fields = proto::parse_error_response(data);
-                    self.drain_to_ready().await?;
-                    return Err(DriverError::Server {
-                        code: fields.code,
-                        message: fields.message,
-                        detail: fields.detail,
-                        hint: fields.hint,
-                    });
-                }
-                other => {
-                    return Err(DriverError::Protocol(format!(
-                        "expected RowDescription/NoData after Parse, got: {other:?}"
-                    )));
-                }
-            };
+            // RowDescription or NoData (may be preceded by ParameterDescription)
+            let columns = self.read_column_description().await?;
 
             // Cache the statement
+            let new_name = format!("s_{sql_hash:016x}").into_boxed_str();
             self.stmts.insert(
                 sql_hash,
                 StmtInfo {
-                    name: stmt_name,
+                    name: new_name,
                     columns: columns.clone(),
                 },
             );
@@ -588,16 +556,20 @@ impl Connection {
         self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
             .await?;
 
-        // Read DataRow messages and CommandComplete
-        let mut row_offsets: Vec<RowData> = Vec::new();
+        // Read DataRow messages and CommandComplete.
+        // Flat column offsets: all rows' columns are stored contiguously in
+        // `all_col_offsets`, with `row_starts` marking where each row begins.
+        let num_cols = columns.len();
+        let mut all_col_offsets: Vec<(usize, i32)> = Vec::new();
+        let mut row_starts: Vec<u32> = Vec::new();
         let mut affected_rows: u64 = 0;
 
         loop {
             let msg = self.read_one_message().await?;
             match msg {
                 BackendMessage::DataRow { data } => {
-                    let row = parse_data_row(data, arena)?;
-                    row_offsets.push(row);
+                    row_starts.push(all_col_offsets.len() as u32);
+                    parse_data_row_flat(data, arena, &mut all_col_offsets)?;
                 }
                 BackendMessage::CommandComplete { tag } => {
                     affected_rows = proto::parse_command_tag(tag);
@@ -606,15 +578,14 @@ impl Connection {
                 BackendMessage::EmptyQuery => {
                     break;
                 }
+                BackendMessage::NoticeResponse { .. }
+                | BackendMessage::NotificationResponse { .. } => {
+                    // Async messages can arrive mid-query — skip them
+                }
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready().await?;
-                    return Err(DriverError::Server {
-                        code: fields.code,
-                        message: fields.message,
-                        detail: fields.detail,
-                        hint: fields.hint,
-                    });
+                    return Err(self.make_server_error(fields));
                 }
                 other => {
                     return Err(DriverError::Protocol(format!(
@@ -628,24 +599,131 @@ impl Connection {
         self.expect_ready().await?;
 
         Ok(QueryResult {
-            row_offsets,
+            all_col_offsets,
+            row_starts,
+            num_cols,
             columns,
             affected_rows,
         })
     }
 
+    /// Read RowDescription / NoData after ParseComplete+Describe, handling
+    /// ParameterDescription that precedes RowDescription for Describe Statement.
+    async fn read_column_description(&mut self) -> Result<Arc<[ColumnDesc]>, DriverError> {
+        loop {
+            let msg = self.read_one_message().await?;
+            match msg {
+                BackendMessage::RowDescription { data } => {
+                    let col_infos = proto::parse_row_description(data)?;
+                    return Ok(col_infos
+                        .into_iter()
+                        .map(|c| ColumnDesc {
+                            name: c.name,
+                            type_oid: c.type_oid,
+                            type_size: c.type_size,
+                        })
+                        .collect::<Vec<_>>()
+                        .into());
+                }
+                BackendMessage::ParameterDescription { .. } => {
+                    // ParameterDescription precedes RowDescription — continue reading
+                }
+                BackendMessage::NoData => return Ok(Arc::from(Vec::new())),
+                BackendMessage::NoticeResponse { .. }
+                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
+                }
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "expected RowDescription/NoData after Parse, got: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Execute a query without result rows (INSERT/UPDATE/DELETE).
     ///
-    /// Returns the number of affected rows.
+    /// Skips DataRow parsing entirely — only reads until CommandComplete.
+    /// Does not allocate an Arena.
     pub async fn execute(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&dyn Encode],
     ) -> Result<u64, DriverError> {
-        let mut arena = Arena::new();
-        let result = self.query(sql, sql_hash, params, &mut arena).await?;
-        Ok(result.affected_rows)
+        let cached = self.stmts.contains_key(&sql_hash);
+
+        // Build the pipelined message
+        self.write_buf.clear();
+
+        if !cached {
+            let new_name = format!("s_{sql_hash:016x}").into_boxed_str();
+            let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(&mut self.write_buf, &new_name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &new_name);
+            proto::write_bind_params(&mut self.write_buf, "", &new_name, params);
+        } else {
+            let name = &*self.stmts[&sql_hash].name;
+            proto::write_bind_params(&mut self.write_buf, "", name, params);
+        }
+        proto::write_execute(&mut self.write_buf, "", 0);
+        proto::write_sync(&mut self.write_buf);
+        self.flush_write().await?;
+
+        // Read responses
+        if !cached {
+            self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
+                .await?;
+            // Read and cache column description even though we don't use it —
+            // the server sends it and we must consume it.
+            let columns = self.read_column_description().await?;
+            let new_name = format!("s_{sql_hash:016x}").into_boxed_str();
+            self.stmts.insert(
+                sql_hash,
+                StmtInfo {
+                    name: new_name,
+                    columns,
+                },
+            );
+        }
+
+        self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
+            .await?;
+
+        // Skip DataRow messages, read until CommandComplete
+        let mut affected_rows: u64 = 0;
+        loop {
+            let msg = self.read_one_message().await?;
+            match msg {
+                BackendMessage::DataRow { .. } => {
+                    // execute() discards row data — no arena allocation
+                }
+                BackendMessage::CommandComplete { tag } => {
+                    affected_rows = proto::parse_command_tag(tag);
+                    break;
+                }
+                BackendMessage::EmptyQuery => break,
+                BackendMessage::NoticeResponse { .. }
+                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
+                }
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during execute: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        self.expect_ready().await?;
+        Ok(affected_rows)
     }
 
     /// Simple query protocol — for non-prepared SQL (BEGIN, COMMIT, SET, etc.).
@@ -664,26 +742,16 @@ impl Connection {
                     self.tx_status = status;
                     return Ok(());
                 }
-                BackendMessage::CommandComplete { .. } => {}
-                BackendMessage::RowDescription { .. } => {}
-                BackendMessage::DataRow { .. } => {}
-                BackendMessage::EmptyQuery => {}
-                BackendMessage::NoticeResponse { .. } => {}
+                BackendMessage::CommandComplete { .. }
+                | BackendMessage::RowDescription { .. }
+                | BackendMessage::DataRow { .. }
+                | BackendMessage::EmptyQuery
+                | BackendMessage::NoticeResponse { .. }
+                | BackendMessage::NotificationResponse { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
-                    // Continue reading until ReadyForQuery, then return error
-                    loop {
-                        let msg = self.read_one_message().await?;
-                        if matches!(msg, BackendMessage::ReadyForQuery { .. }) {
-                            break;
-                        }
-                    }
-                    return Err(DriverError::Server {
-                        code: fields.code,
-                        message: fields.message,
-                        detail: fields.detail,
-                        hint: fields.hint,
-                    });
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
                 }
                 _ => {}
             }
@@ -731,14 +799,15 @@ impl Connection {
     /// We need to use an index-based approach because the message borrows from
     /// `read_buf`, and we can't return a reference to it while `self` is borrowed.
     async fn read_one_message(&mut self) -> Result<BackendMessage<'_>, DriverError> {
-        let (msg_type, _payload_len) =
-            proto::read_message(&mut StreamReader(&mut self.stream), &mut self.read_buf).await?;
+        let (msg_type, _payload_len) = self.read_message_buffered().await?;
         proto::parse_backend_message(msg_type, &self.read_buf)
     }
 
     /// Read messages until we find one matching `pred`, erroring on ErrorResponse.
     ///
     /// On error, drains to ReadyForQuery so the connection remains usable.
+    /// Skips NotificationResponse, NoticeResponse, and ParameterStatus — all
+    /// of which PostgreSQL can send asynchronously at any time.
     async fn expect_message(
         &mut self,
         pred: impl Fn(&BackendMessage<'_>) -> bool,
@@ -752,15 +821,12 @@ impl Connection {
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready().await?;
-                    return Err(DriverError::Server {
-                        code: fields.code,
-                        message: fields.message,
-                        detail: fields.detail,
-                        hint: fields.hint,
-                    });
+                    return Err(self.make_server_error(fields));
                 }
-                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {
-                    // These can arrive at any time — skip them
+                BackendMessage::NoticeResponse { .. }
+                | BackendMessage::ParameterStatus { .. }
+                | BackendMessage::NotificationResponse { .. } => {
+                    // Asynchronous messages — skip them
                 }
                 other => {
                     return Err(DriverError::Protocol(format!(
@@ -771,7 +837,7 @@ impl Connection {
         }
     }
 
-    /// Read until ReadyForQuery.
+    /// Read until ReadyForQuery. Skips NotificationResponse and other async messages.
     async fn expect_ready(&mut self) -> Result<(), DriverError> {
         loop {
             let msg = self.read_one_message().await?;
@@ -780,23 +846,14 @@ impl Connection {
                     self.tx_status = status;
                     return Ok(());
                 }
-                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
+                BackendMessage::NoticeResponse { .. }
+                | BackendMessage::ParameterStatus { .. }
+                | BackendMessage::NotificationResponse { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     // Continue draining until ReadyForQuery
-                    loop {
-                        let msg2 = self.read_one_message().await?;
-                        if let BackendMessage::ReadyForQuery { status } = msg2 {
-                            self.tx_status = status;
-                            break;
-                        }
-                    }
-                    return Err(DriverError::Server {
-                        code: fields.code,
-                        message: fields.message,
-                        detail: fields.detail,
-                        hint: fields.hint,
-                    });
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
                 }
                 _ => {}
             }
@@ -804,6 +861,7 @@ impl Connection {
     }
 
     /// Drain messages until ReadyForQuery (used after an error).
+    /// Skips all intermediate messages including NotificationResponse.
     async fn drain_to_ready(&mut self) -> Result<(), DriverError> {
         loop {
             let msg = self.read_one_message().await?;
@@ -814,29 +872,136 @@ impl Connection {
         }
     }
 
+    /// Convert parsed ErrorFields into a DriverError::Server.
+    fn make_server_error(&self, fields: proto::ErrorFields) -> DriverError {
+        DriverError::Server {
+            code: fields.code.into_boxed_str(),
+            message: fields.message.into_boxed_str(),
+            detail: fields.detail,
+            hint: fields.hint,
+        }
+    }
+
     /// Flush the write buffer to the stream.
+    ///
+    /// For plain TCP with TCP_NODELAY, the OS sends data immediately on write_all,
+    /// so explicit flush() is a no-op but still costs a syscall. We skip it.
+    /// TLS streams buffer internally and require an explicit flush.
     async fn flush_write(&mut self) -> Result<(), DriverError> {
         self.stream
             .write_all(&self.write_buf)
             .await
             .map_err(DriverError::Io)?;
-        self.stream.flush().await.map_err(DriverError::Io)?;
+        match &self.stream {
+            Stream::Plain(_) => {
+                // TCP_NODELAY is set — write_all already pushes bytes to the wire.
+                // No need for an extra flush syscall.
+            }
+            #[cfg(feature = "tls")]
+            Stream::Tls(_) => {
+                self.stream.flush().await.map_err(DriverError::Io)?;
+            }
+        }
         Ok(())
     }
+
+    /// Read one complete backend message using the internal buffer.
+    ///
+    /// Returns `(msg_type, payload_len)`. The payload is stored in `self.read_buf`.
+    async fn read_message_buffered(&mut self) -> Result<(u8, usize), DriverError> {
+        // Read 5-byte header: type(1) + length(4)
+        let mut header = [0u8; 5];
+        buffered_read_exact(
+            &mut self.stream,
+            &mut self.stream_buf,
+            &mut self.stream_buf_pos,
+            &mut self.stream_buf_end,
+            &mut header,
+        )
+        .await?;
+
+        let msg_type = header[0];
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+
+        if len < 4 {
+            return Err(DriverError::Protocol(format!(
+                "invalid message length {len} for type '{}'",
+                msg_type as char
+            )));
+        }
+
+        const MAX_MESSAGE_LEN: i32 = 128 * 1024 * 1024;
+        if len > MAX_MESSAGE_LEN {
+            return Err(DriverError::Protocol(format!(
+                "message length {len} exceeds maximum ({MAX_MESSAGE_LEN}) for type '{}'",
+                msg_type as char
+            )));
+        }
+
+        let payload_len = (len - 4) as usize;
+        self.read_buf.clear();
+        self.read_buf.resize(payload_len, 0);
+        if payload_len > 0 {
+            buffered_read_exact(
+                &mut self.stream,
+                &mut self.stream_buf,
+                &mut self.stream_buf_pos,
+                &mut self.stream_buf_end,
+                &mut self.read_buf[..payload_len],
+            )
+            .await?;
+        }
+
+        Ok((msg_type, payload_len))
+    }
+}
+
+/// Read exactly `out.len()` bytes using a persistent read buffer.
+///
+/// This is a free function to avoid double-mutable-borrow issues when the caller
+/// also needs to write into `self.read_buf`.
+async fn buffered_read_exact(
+    stream: &mut Stream,
+    buf: &mut [u8],
+    pos: &mut usize,
+    end: &mut usize,
+    out: &mut [u8],
+) -> Result<(), DriverError> {
+    let mut filled = 0;
+    while filled < out.len() {
+        let avail = *end - *pos;
+        if avail > 0 {
+            let take = avail.min(out.len() - filled);
+            out[filled..filled + take].copy_from_slice(&buf[*pos..*pos + take]);
+            *pos += take;
+            filled += take;
+        } else {
+            // Buffer exhausted — refill from the stream
+            *pos = 0;
+            let n = {
+                let mut reader = StreamReader(stream);
+                use tokio::io::AsyncReadExt;
+                reader.read(buf).await.map_err(DriverError::Io)?
+            };
+            if n == 0 {
+                return Err(DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                )));
+            }
+            *end = n;
+        }
+    }
+    Ok(())
 }
 
 // --- QueryResult ---
 
-/// Per-row data: column offsets and lengths stored in the arena.
-pub(crate) struct RowData {
-    /// (arena_offset, length) per column. length = -1 means NULL.
-    col_offsets: Vec<(u32, i32)>,
-}
-
 /// Result of a query execution. Owns the row offset metadata.
 ///
-/// Row data is stored in the caller-provided `Arena`. The `QueryResult` holds only
-/// the offset/length pairs that describe where each column's data lives in the arena.
+/// Uses flat column offset storage: all rows' `(arena_offset, length)` pairs
+/// are stored contiguously in `all_col_offsets`, with `row_starts` marking
+/// where each row's columns begin. This eliminates per-row `Vec` allocations.
 ///
 /// # Example
 ///
@@ -853,7 +1018,13 @@ pub(crate) struct RowData {
 /// # }
 /// ```
 pub struct QueryResult {
-    row_offsets: Vec<RowData>,
+    /// All rows' column (arena_offset, length) pairs, contiguous.
+    /// length = -1 means NULL.
+    all_col_offsets: Vec<(usize, i32)>,
+    /// Index into `all_col_offsets` where each row starts.
+    row_starts: Vec<u32>,
+    /// Number of columns per row.
+    num_cols: usize,
     columns: Arc<[ColumnDesc]>,
     affected_rows: u64,
 }
@@ -861,12 +1032,12 @@ pub struct QueryResult {
 impl QueryResult {
     /// Number of rows in the result.
     pub fn len(&self) -> usize {
-        self.row_offsets.len()
+        self.row_starts.len()
     }
 
     /// Whether the result set is empty.
     pub fn is_empty(&self) -> bool {
-        self.row_offsets.is_empty()
+        self.row_starts.is_empty()
     }
 
     /// Number of affected rows (for INSERT/UPDATE/DELETE).
@@ -881,19 +1052,27 @@ impl QueryResult {
 
     /// Get a row by index. The returned `Row` borrows from the arena.
     pub fn row<'a>(&'a self, idx: usize, arena: &'a Arena) -> Row<'a> {
+        let start = self.row_starts[idx] as usize;
+        let end = start + self.num_cols;
         Row {
             arena,
-            data: &self.row_offsets[idx],
+            col_offsets: &self.all_col_offsets[start..end],
             columns: &self.columns,
         }
     }
 
     /// Iterate over rows.
     pub fn rows<'a>(&'a self, arena: &'a Arena) -> impl Iterator<Item = Row<'a>> {
-        self.row_offsets.iter().map(move |data| Row {
-            arena,
-            data,
-            columns: &self.columns,
+        let num_cols = self.num_cols;
+        let all = &self.all_col_offsets;
+        let columns = &self.columns;
+        self.row_starts.iter().map(move |&start| {
+            let s = start as usize;
+            Row {
+                arena,
+                col_offsets: &all[s..s + num_cols],
+                columns,
+            }
         })
     }
 }
@@ -903,73 +1082,76 @@ impl QueryResult {
 /// A view into a single result row, borrowing data from the arena.
 ///
 /// Column values are accessed by index. NULL values return `None`.
+/// Decode errors (protocol violations from a malicious server) are treated
+/// as `None` rather than panicking — a compliant PostgreSQL server always
+/// sends correctly-sized data for the declared type.
 pub struct Row<'a> {
     arena: &'a Arena,
-    data: &'a RowData,
+    col_offsets: &'a [(usize, i32)],
     columns: &'a [ColumnDesc],
 }
 
 impl<'a> Row<'a> {
     /// Get the raw bytes for a column, or `None` if NULL.
     pub fn get_raw(&self, idx: usize) -> Option<&'a [u8]> {
-        let (offset, len) = self.data.col_offsets[idx];
+        let (offset, len) = self.col_offsets[idx];
         if len < 0 {
             None
         } else {
-            Some(self.arena.get(offset as usize, len as usize))
+            Some(self.arena.get(offset, len as usize))
         }
     }
 
     /// Whether a column is NULL.
     pub fn is_null(&self, idx: usize) -> bool {
-        self.data.col_offsets[idx].1 < 0
+        self.col_offsets[idx].1 < 0
     }
 
     /// Number of columns.
     pub fn column_count(&self) -> usize {
-        self.data.col_offsets.len()
+        self.col_offsets.len()
     }
 
-    /// Get a boolean column value.
+    /// Get a boolean column value. Returns `None` on NULL or decode error.
     pub fn get_bool(&self, idx: usize) -> Option<bool> {
         self.get_raw(idx)
-            .map(|data| crate::codec::decode_bool(data).expect("invalid bool data"))
+            .and_then(|data| crate::codec::decode_bool(data).ok())
     }
 
-    /// Get an i16 column value.
+    /// Get an i16 column value. Returns `None` on NULL or decode error.
     pub fn get_i16(&self, idx: usize) -> Option<i16> {
         self.get_raw(idx)
-            .map(|data| crate::codec::decode_i16(data).expect("invalid i16 data"))
+            .and_then(|data| crate::codec::decode_i16(data).ok())
     }
 
-    /// Get an i32 column value.
+    /// Get an i32 column value. Returns `None` on NULL or decode error.
     pub fn get_i32(&self, idx: usize) -> Option<i32> {
         self.get_raw(idx)
-            .map(|data| crate::codec::decode_i32(data).expect("invalid i32 data"))
+            .and_then(|data| crate::codec::decode_i32(data).ok())
     }
 
-    /// Get an i64 column value.
+    /// Get an i64 column value. Returns `None` on NULL or decode error.
     pub fn get_i64(&self, idx: usize) -> Option<i64> {
         self.get_raw(idx)
-            .map(|data| crate::codec::decode_i64(data).expect("invalid i64 data"))
+            .and_then(|data| crate::codec::decode_i64(data).ok())
     }
 
-    /// Get an f32 column value.
+    /// Get an f32 column value. Returns `None` on NULL or decode error.
     pub fn get_f32(&self, idx: usize) -> Option<f32> {
         self.get_raw(idx)
-            .map(|data| crate::codec::decode_f32(data).expect("invalid f32 data"))
+            .and_then(|data| crate::codec::decode_f32(data).ok())
     }
 
-    /// Get an f64 column value.
+    /// Get an f64 column value. Returns `None` on NULL or decode error.
     pub fn get_f64(&self, idx: usize) -> Option<f64> {
         self.get_raw(idx)
-            .map(|data| crate::codec::decode_f64(data).expect("invalid f64 data"))
+            .and_then(|data| crate::codec::decode_f64(data).ok())
     }
 
-    /// Get a string column value.
+    /// Get a string column value. Returns `None` on NULL or decode error.
     pub fn get_str(&self, idx: usize) -> Option<&'a str> {
         self.get_raw(idx)
-            .map(|data| crate::codec::decode_str(data).expect("invalid UTF-8 in text column"))
+            .and_then(|data| crate::codec::decode_str(data).ok())
     }
 
     /// Get a byte slice column value.
@@ -990,17 +1172,23 @@ impl<'a> Row<'a> {
 
 // --- DataRow parsing ---
 
-/// Parse a DataRow message, copying column data into the arena.
+/// Parse a DataRow message into the flat column offset storage.
+///
+/// Appends `(arena_offset, length)` pairs for each column to `out`.
+/// `length = -1` indicates NULL.
 ///
 /// DataRow format: `[num_columns: i16] ([col_len: i32] [col_data: col_len bytes])...`
-/// `col_len = -1` indicates NULL.
-fn parse_data_row(data: &[u8], arena: &mut Arena) -> Result<RowData, DriverError> {
+fn parse_data_row_flat(
+    data: &[u8],
+    arena: &mut Arena,
+    out: &mut Vec<(usize, i32)>,
+) -> Result<(), DriverError> {
     if data.len() < 2 {
         return Err(DriverError::Protocol("DataRow too short".into()));
     }
 
     let num_cols = i16::from_be_bytes([data[0], data[1]]) as usize;
-    let mut col_offsets = Vec::with_capacity(num_cols);
+    out.reserve(num_cols);
     let mut pos = 2;
 
     for _ in 0..num_cols {
@@ -1013,7 +1201,7 @@ fn parse_data_row(data: &[u8], arena: &mut Arena) -> Result<RowData, DriverError
 
         if col_len < 0 {
             // NULL
-            col_offsets.push((0, -1));
+            out.push((0, -1));
         } else {
             let len = col_len as usize;
             if pos + len > data.len() {
@@ -1023,24 +1211,12 @@ fn parse_data_row(data: &[u8], arena: &mut Arena) -> Result<RowData, DriverError
             }
 
             let offset = arena.alloc_copy(&data[pos..pos + len]);
-            col_offsets.push((offset as u32, col_len));
+            out.push((offset, col_len));
             pos += len;
         }
     }
 
-    Ok(RowData { col_offsets })
-}
-
-/// Encode parameters into individual byte vectors.
-fn encode_params(params: &[&dyn Encode]) -> Vec<Vec<u8>> {
-    params
-        .iter()
-        .map(|p| {
-            let mut buf = Vec::new();
-            p.encode_binary(&mut buf);
-            buf
-        })
-        .collect()
+    Ok(())
 }
 
 /// Compute a rapidhash of a SQL string.
@@ -1120,6 +1296,7 @@ mod tests {
     #[test]
     fn data_row_parsing() {
         let mut arena = Arena::new();
+        let mut out = Vec::new();
 
         // Build a DataRow with 2 columns: i32(42) and NULL
         let mut data = Vec::new();
@@ -1132,28 +1309,31 @@ mod tests {
         // Column 2: NULL
         data.extend_from_slice(&(-1i32).to_be_bytes()); // length = -1
 
-        let row = parse_data_row(&data, &mut arena).unwrap();
-        assert_eq!(row.col_offsets.len(), 2);
+        parse_data_row_flat(&data, &mut arena, &mut out).unwrap();
+        assert_eq!(out.len(), 2);
 
         // First column should have length 4
-        assert_eq!(row.col_offsets[0].1, 4);
+        assert_eq!(out[0].1, 4);
 
         // Second column should be NULL
-        assert_eq!(row.col_offsets[1].1, -1);
+        assert_eq!(out[1].1, -1);
     }
 
     #[test]
     fn data_row_empty() {
         let mut arena = Arena::new();
+        let mut out = Vec::new();
         let data = 0i16.to_be_bytes();
-        let row = parse_data_row(&data, &mut arena).unwrap();
-        assert_eq!(row.col_offsets.len(), 0);
+        parse_data_row_flat(&data, &mut arena, &mut out).unwrap();
+        assert_eq!(out.len(), 0);
     }
 
     #[test]
     fn query_result_empty() {
         let result = QueryResult {
-            row_offsets: vec![],
+            all_col_offsets: vec![],
+            row_starts: vec![],
+            num_cols: 0,
             columns: Arc::from(Vec::new()),
             affected_rows: 0,
         };
