@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! bsql = "0.7"
+//! bsql = "0.10"
 //! tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 //! ```
 //!
@@ -59,7 +59,6 @@
 //! | `.fetch_one(&pool)` | `T` | 0 rows, or 2+ rows |
 //! | `.fetch_all(&pool)` | `Vec<T>` | never (empty = empty vec) |
 //! | `.fetch_optional(&pool)` | `Option<T>` | 2+ rows |
-//! | `.fetch_stream(&pool)` | `impl Stream<Item = Result<T>>` | never |
 //! | `.execute(&pool)` | `u64` (affected rows) | never |
 
 // Re-export the query! macro and pg_enum attribute macro
@@ -68,16 +67,12 @@ pub use bsql_macros::query;
 
 // Re-export all runtime types
 pub use bsql_core::error::{self, BsqlError, BsqlResult};
-pub use bsql_core::executor::Executor;
+pub use bsql_core::executor::{Executor, OwnedResult};
 pub use bsql_core::listener::{Listener, Notification};
 pub use bsql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 pub use bsql_core::stream::QueryStream;
 pub use bsql_core::transaction::Transaction;
-// Re-export the postgres_types crate so pg_enum generated code can access it
-// via `::bsql_core::pg_types::*` paths.
-#[doc(hidden)]
-pub use bsql_core::pg_types;
 
-// Re-export Stream trait so users can consume QueryStream without
-// adding futures-core as a direct dependency.
-pub use bsql_core::Stream;
+// Re-export driver types used by generated code
+#[doc(hidden)]
+pub use bsql_core::driver;

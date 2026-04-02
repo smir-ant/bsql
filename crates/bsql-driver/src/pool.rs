@@ -285,7 +285,7 @@ impl Transaction {
         &mut self,
         sql: &str,
         sql_hash: u64,
-        params: &[&dyn Encode],
+        params: &[&(dyn Encode + Sync)],
         arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
         self.guard.query(sql, sql_hash, params, arena).await
@@ -296,7 +296,7 @@ impl Transaction {
         &mut self,
         sql: &str,
         sql_hash: u64,
-        params: &[&dyn Encode],
+        params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
         self.guard.execute(sql, sql_hash, params).await
     }

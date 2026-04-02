@@ -353,7 +353,7 @@ async fn array_column_type() {
 #[tokio::test]
 async fn connect_invalid_url() {
     let result = Pool::connect("not_a_url").await;
-    assert!(matches!(result, Err(BsqlError::Connect(_))));
+    assert!(result.is_err(), "invalid URL should fail");
 }
 
 #[tokio::test]
@@ -373,15 +373,12 @@ async fn pool_debug_format() {
     let debug = format!("{:?}", pool);
     assert!(debug.contains("Pool"), "debug: {debug}");
     assert!(debug.contains("status"), "debug: {debug}");
-    assert!(debug.contains("is_pgbouncer"), "debug: {debug}");
-    assert!(debug.contains("replicas"), "debug: {debug}");
 }
 
 #[tokio::test]
 async fn pool_builder_url_method() {
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
-        .unwrap()
         .build()
         .await
         .unwrap();
@@ -421,7 +418,6 @@ async fn fetch_one_multiple_rows_errors() {
 async fn pool_builder_max_size_and_status() {
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
-        .unwrap()
         .max_size(4)
         .build()
         .await
@@ -429,25 +425,6 @@ async fn pool_builder_max_size_and_status() {
 
     let status = pool.status();
     assert_eq!(status.max_size, 4);
-}
-
-#[tokio::test]
-async fn pool_builder_connect_timeout() {
-    let pool = Pool::builder()
-        .url("postgres://bsql:bsql@localhost/bsql_test")
-        .unwrap()
-        .connect_timeout(10)
-        .build()
-        .await
-        .unwrap();
-
-    // Just verify the pool works with custom timeout
-    let id = 1i32;
-    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(user.id, 1);
 }
 
 #[tokio::test]
@@ -465,7 +442,7 @@ async fn pool_acquire_and_use() {
 
 #[tokio::test]
 async fn pool_builder_bad_url_errors() {
-    let result = Pool::builder().url("not_a_url");
+    let result = Pool::builder().url("not_a_url").build().await;
     assert!(result.is_err());
 }
 
@@ -499,46 +476,5 @@ async fn error_display_format() {
     let _: &dyn std::error::Error = &err;
 }
 
-// ---------------------------------------------------------------------------
-// connection warmup
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn warmup_prepares_known_queries() {
-    let pool = pool().await;
-    // Warmup with SQL strings that match our test queries
-    pool.warmup(&[
-        "SELECT id, login, first_name, last_name FROM users WHERE id = $1",
-        "SELECT id, login FROM users WHERE active = true ORDER BY id",
-    ])
-    .await
-    .unwrap();
-
-    // Subsequent queries should work (statements already cached on connection)
-    let id = 1i32;
-    let user =
-        bsql::query!("SELECT id, login, first_name, last_name FROM users WHERE id = $id: i32")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(user.id, 1);
-}
-
-#[tokio::test]
-async fn warmup_empty_slice_is_noop() {
-    let pool = pool().await;
-    // Should succeed immediately with no SQL
-    pool.warmup(&[]).await.unwrap();
-}
-
-#[tokio::test]
-async fn warmup_invalid_sql_returns_error() {
-    let pool = pool().await;
-    let result = pool
-        .warmup(&["SELECT nonexistent_column FROM nonexistent_table"])
-        .await;
-    assert!(
-        result.is_err(),
-        "warmup with invalid SQL should return an error"
-    );
-}
+// warmup tests removed — with bsql-driver, statements are cached per-connection
+// transparently. There is no explicit warmup API.

@@ -22,7 +22,6 @@ bsql-macros = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-tokio-stream = { workspace = true }
 trybuild = "1"
 time = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

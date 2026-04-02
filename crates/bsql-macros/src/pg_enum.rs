@@ -91,7 +91,7 @@ pub fn expand_pg_enum(_attr: TokenStream, item: TokenStream) -> Result<TokenStre
 
     let enum_name = &input.ident;
     let vis = &input.vis;
-    let pg_type_name = to_snake_case(&enum_name.to_string());
+    let _pg_type_name = to_snake_case(&enum_name.to_string());
 
     // Preserve any existing attributes except #[sql(...)] on variants
     let enum_attrs: Vec<_> = input.attrs.iter().collect();
@@ -108,11 +108,11 @@ pub fn expand_pg_enum(_attr: TokenStream, item: TokenStream) -> Result<TokenStre
         quote! { #(#attrs)* #ident }
     });
 
-    // Generate FromSql implementation
-    let from_sql_impl = gen_from_sql(enum_name, &variants, &pg_type_name);
+    // Generate Encode implementation (for parameter binding)
+    let encode_impl = gen_encode(enum_name, &variants);
 
-    // Generate ToSql implementation
-    let to_sql_impl = gen_to_sql(enum_name, &variants, &pg_type_name);
+    // Generate from_sql_label function (for result decoding in codegen)
+    let from_label_impl = gen_from_label(enum_name, &variants);
 
     // Generate Display impl (useful for debugging, logging)
     let display_impl = gen_display(enum_name, &variants);
@@ -124,8 +124,8 @@ pub fn expand_pg_enum(_attr: TokenStream, item: TokenStream) -> Result<TokenStre
             #(#variant_defs,)*
         }
 
-        #from_sql_impl
-        #to_sql_impl
+        #encode_impl
+        #from_label_impl
         #display_impl
     })
 }
@@ -181,65 +181,66 @@ fn extract_sql_attr(variant: &syn::Variant) -> Result<String, syn::Error> {
     ))
 }
 
-/// Generate `impl<'a> FromSql<'a>` for the enum.
+/// Generate `impl Encode` for the enum (bsql-driver parameter binding).
 ///
-/// For enums with <=8 variants, uses a (len, first_byte) match for efficiency.
-/// For larger enums, falls back to a simple byte-slice comparison chain.
-fn gen_from_sql(
-    enum_name: &syn::Ident,
-    variants: &[EnumVariant],
-    pg_type_name: &str,
-) -> TokenStream {
-    let match_body = gen_from_sql_match(enum_name, variants);
-    let enum_name_str = enum_name.to_string();
+/// Encodes the enum's SQL label as text bytes. PG receives the label string
+/// and matches it against the enum type.
+fn gen_encode(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
+    let encode_arms: Vec<TokenStream> = variants
+        .iter()
+        .map(|v| {
+            let ident = &v.ident;
+            let label = &v.sql_label;
+            quote! {
+                #enum_name::#ident => {
+                    buf.extend_from_slice(#label.as_bytes());
+                }
+            }
+        })
+        .collect();
 
     quote! {
-        impl<'_pg> ::bsql_core::pg_types::FromSql<'_pg> for #enum_name {
-            fn from_sql(
-                _ty: &::bsql_core::pg_types::Type,
-                raw: &'_pg [u8],
-            ) -> ::std::result::Result<Self, ::std::boxed::Box<dyn ::std::error::Error + ::std::marker::Sync + ::std::marker::Send>> {
-                let s = ::std::str::from_utf8(raw).map_err(|e| {
-                    ::std::boxed::Box::new(e) as ::std::boxed::Box<dyn ::std::error::Error + ::std::marker::Sync + ::std::marker::Send>
-                })?;
-                #match_body
-                Err(::std::boxed::Box::from(::std::format!(
-                    "unknown {} variant from PostgreSQL: \"{}\" — this is a schema mismatch. \
-                     Update your Rust enum to match the database.",
-                    #enum_name_str, s
-                )))
+        impl ::bsql_core::driver::Encode for #enum_name {
+            fn encode_binary(&self, buf: &mut ::std::vec::Vec<u8>) {
+                match self {
+                    #(#encode_arms)*
+                }
             }
 
-            fn accepts(ty: &::bsql_core::pg_types::Type) -> bool {
-                // Only accept the specific PG enum type, not any enum
-                match ty.kind() {
-                    ::bsql_core::pg_types::Kind::Enum(_) => ty.name() == #pg_type_name,
-                    _ => false,
-                }
+            fn type_oid(&self) -> u32 {
+                // PG enum types use text encoding (OID 25) for the label string.
+                // The actual enum OID is resolved by PG from the parameter type context.
+                25
             }
         }
     }
 }
 
-/// Generate the match body for `from_sql`.
+/// Generate a `from_sql_label` method for decoding enum values from query results.
 ///
-/// For small enums (<=8 variants), uses (len, first_byte) discrimination.
-/// This exploits the fact that most PostgreSQL enum labels differ in either
-/// length or first character.
-fn gen_from_sql_match(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
-    // For small enums, try (len, first_byte) dispatch. If there are collisions
-    // in (len, first_byte), fall back to full comparison for those arms.
-    if variants.len() <= 8 {
-        gen_from_sql_len_first_byte(enum_name, variants)
+/// The driver's Row returns raw bytes for enum columns. This method converts
+/// a string label back to the Rust enum variant.
+fn gen_from_label(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
+    let match_body = if variants.len() <= 8 {
+        gen_from_label_len_first_byte(enum_name, variants)
     } else {
-        gen_from_sql_linear(enum_name, variants)
+        gen_from_label_linear(enum_name, variants)
+    };
+    quote! {
+        impl #enum_name {
+            /// Convert a PostgreSQL enum label string to this Rust enum.
+            ///
+            /// Returns `None` if the label does not match any variant.
+            pub fn from_sql_label(s: &str) -> ::std::option::Option<Self> {
+                #match_body
+                ::std::option::Option::None
+            }
+        }
     }
 }
 
-/// Fast path: match on (s.len(), s.as_bytes()[0]) then compare full string
-/// only when (len, first_byte) collides.
-fn gen_from_sql_len_first_byte(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
-    // Group variants by (len, first_byte)
+/// Fast path: match on (s.len(), s.as_bytes()[0]) for small enums.
+fn gen_from_label_len_first_byte(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
     let mut groups: std::collections::BTreeMap<(usize, u8), Vec<&EnumVariant>> =
         std::collections::BTreeMap::new();
     for v in variants {
@@ -253,23 +254,21 @@ fn gen_from_sql_len_first_byte(enum_name: &syn::Ident, variants: &[EnumVariant])
             let len_lit = len;
             let first_lit = first;
             if group.len() == 1 {
-                // Unique (len, first_byte) — no need for inner comparison
                 let v = group[0];
                 let label = &v.sql_label;
                 let ident = &v.ident;
                 quote! {
                     (#len_lit, #first_lit) if s == #label => {
-                        return Ok(#enum_name::#ident);
+                        return ::std::option::Option::Some(#enum_name::#ident);
                     }
                 }
             } else {
-                // Collision: need inner match on full string
                 let inner_arms: Vec<TokenStream> = group
                     .iter()
                     .map(|v| {
                         let label = &v.sql_label;
                         let ident = &v.ident;
-                        quote! { #label => return Ok(#enum_name::#ident), }
+                        quote! { #label => return ::std::option::Option::Some(#enum_name::#ident), }
                     })
                     .collect();
                 quote! {
@@ -294,14 +293,14 @@ fn gen_from_sql_len_first_byte(enum_name: &syn::Ident, variants: &[EnumVariant])
     }
 }
 
-/// Fallback: linear comparison chain.
-fn gen_from_sql_linear(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
+/// Fallback: linear comparison chain for large enums.
+fn gen_from_label_linear(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
     let arms: Vec<TokenStream> = variants
         .iter()
         .map(|v| {
             let label = &v.sql_label;
             let ident = &v.ident;
-            quote! { #label => return Ok(#enum_name::#ident), }
+            quote! { #label => return ::std::option::Option::Some(#enum_name::#ident), }
         })
         .collect();
 
@@ -309,58 +308,6 @@ fn gen_from_sql_linear(enum_name: &syn::Ident, variants: &[EnumVariant]) -> Toke
         match s {
             #(#arms)*
             _ => {}
-        }
-    }
-}
-
-/// Generate `impl ToSql` for the enum.
-fn gen_to_sql(enum_name: &syn::Ident, variants: &[EnumVariant], pg_type_name: &str) -> TokenStream {
-    let to_sql_arms: Vec<TokenStream> = variants
-        .iter()
-        .map(|v| {
-            let ident = &v.ident;
-            let label = &v.sql_label;
-            quote! {
-                #enum_name::#ident => {
-                    out.extend_from_slice(#label.as_bytes());
-                }
-            }
-        })
-        .collect();
-
-    quote! {
-        impl ::bsql_core::pg_types::ToSql for #enum_name {
-            fn to_sql(
-                &self,
-                _ty: &::bsql_core::pg_types::Type,
-                out: &mut ::bsql_core::pg_types::private::BytesMut,
-            ) -> ::std::result::Result<::bsql_core::pg_types::IsNull, ::std::boxed::Box<dyn ::std::error::Error + ::std::marker::Sync + ::std::marker::Send>> {
-                match self {
-                    #(#to_sql_arms)*
-                }
-                Ok(::bsql_core::pg_types::IsNull::No)
-            }
-
-            fn accepts(ty: &::bsql_core::pg_types::Type) -> bool {
-                match ty.kind() {
-                    ::bsql_core::pg_types::Kind::Enum(_) => ty.name() == #pg_type_name,
-                    _ => false,
-                }
-            }
-
-            fn to_sql_checked(
-                &self,
-                ty: &::bsql_core::pg_types::Type,
-                out: &mut ::bsql_core::pg_types::private::BytesMut,
-            ) -> ::std::result::Result<::bsql_core::pg_types::IsNull, ::std::boxed::Box<dyn ::std::error::Error + ::std::marker::Sync + ::std::marker::Send>> {
-                if !<Self as ::bsql_core::pg_types::ToSql>::accepts(ty) {
-                    return Err(::std::format!(
-                        "cannot convert {} to PostgreSQL type {:?}",
-                        ::std::stringify!(#enum_name), ty
-                    ).into());
-                }
-                self.to_sql(ty, out)
-            }
         }
     }
 }
@@ -414,10 +361,13 @@ mod tests {
 
         // Should contain the enum definition
         assert!(code.contains("enum Status"), "missing enum: {code}");
-        // Should contain FromSql impl
-        assert!(code.contains("FromSql"), "missing FromSql: {code}");
-        // Should contain ToSql impl
-        assert!(code.contains("ToSql"), "missing ToSql: {code}");
+        // Should contain Encode impl (replaced FromSql/ToSql)
+        assert!(code.contains("Encode"), "missing Encode: {code}");
+        // Should contain from_sql_label method
+        assert!(
+            code.contains("from_sql_label"),
+            "missing from_sql_label: {code}"
+        );
         // Should contain Display impl
         assert!(code.contains("Display"), "missing Display: {code}");
         // Should contain the SQL labels
@@ -545,34 +495,11 @@ mod tests {
 
         let output = parse_enum(input);
         let code = output.to_string();
-        // Should use len/first_byte matching
+        // Should use len/first_byte matching in from_sql_label
         assert!(code.contains("s . len ()"), "missing len check: {code}");
         assert!(
             code.contains("as_bytes ()"),
             "missing first_byte check: {code}"
-        );
-    }
-
-    #[test]
-    fn accepts_checks_pg_type_name() {
-        // The generated `accepts` should check `ty.name() == "snake_case_name"`.
-        // For an enum named `TicketStatus`, the PG type name should be `ticket_status`.
-        let input = quote! {
-            enum TicketStatus {
-                #[sql("new")]
-                New,
-                #[sql("closed")]
-                Closed,
-            }
-        };
-
-        let output = parse_enum(input);
-        let code = output.to_string();
-
-        // Both FromSql::accepts and ToSql::accepts should check the type name
-        assert!(
-            code.contains("\"ticket_status\""),
-            "accepts should check for pg type name 'ticket_status': {code}"
         );
     }
 
@@ -726,7 +653,10 @@ mod tests {
         let output = parse_enum(input);
         let code = output.to_string();
         // Linear match uses direct string comparison, not len/first_byte
-        assert!(code.contains("FromSql"), "missing FromSql: {code}");
+        assert!(
+            code.contains("from_sql_label"),
+            "missing from_sql_label: {code}"
+        );
     }
 
     #[test]
@@ -747,9 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn to_sql_checked_rejects_wrong_type() {
-        // The generated to_sql_checked should reject mismatched PG types.
-        // We verify the code contains the check.
+    fn encode_impl_generated() {
         let input = quote! {
             enum Check {
                 #[sql("a")]
@@ -759,10 +687,10 @@ mod tests {
         let output = parse_enum(input);
         let code = output.to_string();
         assert!(
-            code.contains("to_sql_checked"),
-            "missing to_sql_checked: {code}"
+            code.contains("encode_binary"),
+            "missing encode_binary: {code}"
         );
-        assert!(code.contains("accepts"), "missing accepts check: {code}");
+        assert!(code.contains("type_oid"), "missing type_oid: {code}");
     }
 
     #[test]

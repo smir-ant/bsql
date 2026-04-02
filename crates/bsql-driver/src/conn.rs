@@ -515,7 +515,7 @@ impl Connection {
         &mut self,
         sql: &str,
         sql_hash: u64,
-        params: &[&dyn Encode],
+        params: &[&(dyn Encode + Sync)],
         arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
         let cached = self.stmts.contains_key(&sql_hash);
@@ -659,7 +659,7 @@ impl Connection {
         &mut self,
         sql: &str,
         sql_hash: u64,
-        params: &[&dyn Encode],
+        params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
         let cached = self.stmts.contains_key(&sql_hash);
 

@@ -1,55 +1,65 @@
 //! Streaming query results.
 //!
-//! [`QueryStream`] wraps a `RowStream` from tokio-postgres alongside the
-//! `PoolConnection` that produced it, keeping the connection alive for the
+//! [`QueryStream`] wraps a `QueryResult` and its `Arena` alongside the
+//! `PoolGuard` that produced them, keeping the connection alive for the
 //! lifetime of the stream. When the stream is dropped, the connection returns
-//! to the pool.
+//! to the pool and the arena is recycled.
 //!
-//! Users consume the stream via `futures_core::Stream` (or `tokio_stream`).
-//! The generated `fetch_stream` method wraps this with typed row decoding.
+//! NOTE: With bsql-driver, all rows are loaded into the arena before
+//! iteration begins. This is not true streaming (all rows in memory), but
+//! it maintains API compatibility with the old `futures_core::Stream` interface.
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use bsql_driver::arena::release_arena;
+use bsql_driver::{Arena, QueryResult};
 
-use futures_core::Stream;
-use tokio_postgres::RowStream;
-
-use crate::error::{BsqlError, BsqlResult};
-use crate::pool::PoolConnection;
-
-/// A stream of `tokio_postgres::Row` values that keeps its connection alive.
+/// A stream of rows that keeps its connection and arena alive.
 ///
 /// Created by [`Pool::query_stream`](crate::pool::Pool::query_stream).
-/// Implements `Stream<Item = BsqlResult<tokio_postgres::Row>>`.
 ///
-/// The `PoolConnection` is held until the stream is fully consumed or dropped,
+/// The `PoolGuard` is held until the stream is fully consumed or dropped,
 /// at which point it returns to the pool.
 pub struct QueryStream {
-    /// Held to keep the connection alive while streaming. Drops after `stream`.
-    _conn: PoolConnection,
-    /// The underlying row stream. Boxed because `RowStream` is `!Unpin`.
-    stream: Pin<Box<RowStream>>,
+    /// Held to keep the connection alive while streaming. Drops after `result`/`arena`.
+    _guard: bsql_driver::PoolGuard,
+    arena: Option<Arena>,
+    result: QueryResult,
+    position: usize,
 }
 
 impl QueryStream {
-    /// Create a new `QueryStream` from a pool connection and a raw row stream.
-    ///
-    /// The connection must be the same one that produced the `RowStream`.
-    pub(crate) fn new(conn: PoolConnection, stream: RowStream) -> Self {
+    /// Create a new `QueryStream` from a pool guard, arena, and query result.
+    pub(crate) fn new(guard: bsql_driver::PoolGuard, arena: Arena, result: QueryResult) -> Self {
         Self {
-            _conn: conn,
-            stream: Box::pin(stream),
+            _guard: guard,
+            arena: Some(arena),
+            result,
+            position: 0,
         }
+    }
+
+    /// Get the next row from the stream.
+    ///
+    /// Returns `None` when all rows have been consumed.
+    pub fn next_row(&mut self) -> Option<bsql_driver::Row<'_>> {
+        let arena = self.arena.as_ref()?;
+        if self.position >= self.result.len() {
+            return None;
+        }
+        let row = self.result.row(self.position, arena);
+        self.position += 1;
+        Some(row)
+    }
+
+    /// Number of remaining rows.
+    pub fn remaining(&self) -> usize {
+        self.result.len().saturating_sub(self.position)
     }
 }
 
-impl Stream for QueryStream {
-    type Item = BsqlResult<tokio_postgres::Row>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.stream
-            .as_mut()
-            .poll_next(cx)
-            .map(|opt| opt.map(|r| r.map_err(BsqlError::from)))
+impl Drop for QueryStream {
+    fn drop(&mut self) {
+        if let Some(arena) = self.arena.take() {
+            release_arena(arena);
+        }
     }
 }

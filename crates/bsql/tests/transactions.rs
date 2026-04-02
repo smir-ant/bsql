@@ -262,10 +262,7 @@ async fn transaction_read_your_writes() {
 async fn begin_on_exhausted_pool_fails_fast() {
     // Create a pool with exactly 1 connection.
     let pool = Pool::builder()
-        .host("localhost")
-        .dbname("bsql_test")
-        .user("bsql")
-        .password("bsql")
+        .url("postgres://bsql:bsql@localhost/bsql_test")
         .max_size(1)
         .build()
         .await
@@ -328,7 +325,6 @@ async fn transaction_commit_without_queries_is_noop() {
     // would be dirty and the pool slot lost).
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
-        .unwrap()
         .max_size(1)
         .build()
         .await
@@ -352,7 +348,6 @@ async fn transaction_commit_without_queries_is_noop() {
 async fn transaction_rollback_without_queries_is_noop() {
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
-        .unwrap()
         .max_size(1)
         .build()
         .await
@@ -374,7 +369,6 @@ async fn transaction_rollback_without_queries_is_noop() {
 async fn transaction_drop_without_queries_returns_connection_clean() {
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
-        .unwrap()
         .max_size(1)
         .build()
         .await
@@ -425,9 +419,6 @@ async fn transaction_debug_format() {
 
     let debug = format!("{:?}", tx);
     assert!(debug.contains("Transaction"), "debug: {debug}");
-    assert!(debug.contains("active"), "debug: {debug}");
-    assert!(debug.contains("committed"), "debug: {debug}");
-    assert!(debug.contains("begun"), "debug: {debug}");
 
     tx.rollback().await.unwrap();
 }

@@ -9,18 +9,15 @@ description = "Runtime support for bsql — compile-time safe SQL for Rust"
 
 [features]
 default = []
-time = ["dep:time", "postgres-types/with-time-0_3"]
-chrono = ["dep:chrono", "postgres-types/with-chrono-0_4"]
-uuid = ["dep:uuid", "postgres-types/with-uuid-1"]
-decimal = ["dep:rust_decimal", "rust_decimal/db-tokio-postgres"]
-tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:webpki-roots"]
+time = ["dep:time", "bsql-driver/time"]
+chrono = ["dep:chrono", "bsql-driver/chrono"]
+uuid = ["dep:uuid", "bsql-driver/uuid"]
+decimal = ["dep:rust_decimal", "bsql-driver/decimal"]
+tls = ["bsql-driver/tls"]
 
 [dependencies]
-tokio-postgres = { workspace = true, features = ["runtime"] }
-deadpool-postgres = { workspace = true }
-postgres-types = { workspace = true }
+bsql-driver = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
-futures-core = { workspace = true }
 rapidhash = { workspace = true }
 
 # Feature-gated type crates (optional)
@@ -28,11 +25,6 @@ time = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 rust_decimal = { workspace = true, optional = true }
-
-# TLS (optional)
-tokio-postgres-rustls = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

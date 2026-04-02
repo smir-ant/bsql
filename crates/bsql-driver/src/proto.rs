@@ -197,7 +197,7 @@ pub fn write_bind_params(
     buf: &mut Vec<u8>,
     portal: &str,
     statement: &str,
-    params: &[&dyn crate::codec::Encode],
+    params: &[&(dyn crate::codec::Encode + Sync)],
 ) {
     buf.push(MSG_BIND);
     let len_pos = buf.len();
@@ -806,7 +806,7 @@ mod tests {
     fn bind_message_binary_format() {
         let mut buf = Vec::new();
         let val = 42i32;
-        let params: Vec<&dyn crate::codec::Encode> = vec![&val];
+        let params: Vec<&(dyn crate::codec::Encode + Sync)> = vec![&val];
         write_bind_params(&mut buf, "", "s_test", &params);
 
         assert_eq!(buf[0], b'B');
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn bind_no_params() {
         let mut buf = Vec::new();
-        let params: Vec<&dyn crate::codec::Encode> = vec![];
+        let params: Vec<&(dyn crate::codec::Encode + Sync)> = vec![];
         write_bind_params(&mut buf, "", "s_test", &params);
         assert_eq!(buf[0], b'B');
     }

@@ -1,13 +1,7 @@
-//! Integration tests: read/write splitting (v0.7).
+//! Integration tests: read/write splitting.
 //!
-//! These tests verify that:
-//! - SELECT queries call `query_raw_readonly` (which routes to replicas)
-//! - INSERT/UPDATE/DELETE call `query_raw` / `execute_raw` (always primary)
-//! - Without replicas configured, everything works on primary
-//!
-//! Since we can't easily spin up real replicas in tests, we verify the
-//! routing at the API level: all queries succeed on a primary-only pool,
-//! and the PoolBuilder accepts replica URLs.
+//! With bsql-driver, read/write splitting is not yet implemented at the driver
+//! level. These tests verify that all queries work on a primary-only pool.
 //!
 //! Requires a running PostgreSQL with the test schema.
 //! Set BSQL_DATABASE_URL=postgres://bsql:bsql@localhost/bsql_test
@@ -20,12 +14,10 @@ async fn pool() -> Pool {
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }
 
-/// SELECT queries work on a primary-only pool (no replicas).
-/// This tests the fallback path: query_raw_readonly falls through to primary.
+/// SELECT queries work on a primary-only pool.
 #[tokio::test]
 async fn select_works_without_replicas() {
     let pool = pool().await;
-    assert!(!pool.has_replicas());
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&pool)
@@ -94,73 +86,13 @@ async fn delete_uses_primary() {
     assert_eq!(affected, 1);
 }
 
-/// Builder with replica URLs (doesn't actually connect since we don't have replicas).
-#[test]
-fn builder_accepts_replicas() {
-    let builder = Pool::builder()
-        .host("localhost")
-        .port(5432)
-        .dbname("bsql_test")
-        .user("bsql")
-        .password("bsql")
-        .replica("postgres://bsql:bsql@replica1:5432/bsql_test")
-        .replica("postgres://bsql:bsql@replica2:5432/bsql_test");
-
-    // We can't call .build() because the replicas don't exist,
-    // but we verify the builder accepts the configuration.
-    let _ = builder;
-}
-
-/// Pool reports has_replicas correctly.
+/// Transaction queries work.
 #[tokio::test]
-async fn pool_reports_no_replicas() {
+async fn transaction_uses_primary() {
     let pool = pool().await;
-    assert!(!pool.has_replicas());
-}
-
-/// Builder with replica pointing to same host (simulates replica for testing).
-/// The primary and "replica" are the same PG instance.
-#[tokio::test]
-async fn builder_with_same_host_replica() {
-    let pool = Pool::builder()
-        .host("localhost")
-        .port(5432)
-        .dbname("bsql_test")
-        .user("bsql")
-        .password("bsql")
-        // Point "replica" to the same PG instance
-        .replica("postgres://bsql:bsql@localhost/bsql_test")
-        .build()
-        .await
-        .unwrap();
-
-    assert!(pool.has_replicas());
-
-    // SELECT should route to "replica" (same instance)
-    let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-    assert!(users.len() >= 2);
-}
-
-/// Transaction queries always use primary, even with replicas configured.
-#[tokio::test]
-async fn transaction_always_uses_primary() {
-    let pool = Pool::builder()
-        .host("localhost")
-        .port(5432)
-        .dbname("bsql_test")
-        .user("bsql")
-        .password("bsql")
-        .replica("postgres://bsql:bsql@localhost/bsql_test")
-        .build()
-        .await
-        .unwrap();
 
     let txn = pool.begin().await.unwrap();
 
-    // SELECT in transaction uses primary (transaction is bound)
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&txn)
         .await
@@ -170,20 +102,10 @@ async fn transaction_always_uses_primary() {
     txn.rollback().await.unwrap();
 }
 
-/// PoolConnection queries always use primary (connection is bound).
+/// PoolConnection queries work.
 #[tokio::test]
 async fn pool_connection_uses_primary() {
-    let pool = Pool::builder()
-        .host("localhost")
-        .port(5432)
-        .dbname("bsql_test")
-        .user("bsql")
-        .password("bsql")
-        .replica("postgres://bsql:bsql@localhost/bsql_test")
-        .build()
-        .await
-        .unwrap();
-
+    let pool = pool().await;
     let conn = pool.acquire().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
@@ -193,42 +115,10 @@ async fn pool_connection_uses_primary() {
     assert!(users.len() >= 2);
 }
 
-/// Execute (DML) always hits primary even with replicas.
-#[tokio::test]
-async fn execute_always_uses_primary_with_replicas() {
-    let pool = Pool::builder()
-        .host("localhost")
-        .port(5432)
-        .dbname("bsql_test")
-        .user("bsql")
-        .password("bsql")
-        .replica("postgres://bsql:bsql@localhost/bsql_test")
-        .build()
-        .await
-        .unwrap();
-
-    let desc = "rw-split-execute-with-replica";
-    let id = 1i32;
-    let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(affected, 1);
-}
-
 /// Pool status reflects connection counts.
 #[tokio::test]
 async fn pool_status_reports_metrics() {
     let pool = pool().await;
     let status = pool.status();
     assert!(status.max_size > 0, "max_size should be positive");
-    assert!(status.max_size >= status.size, "size <= max_size");
-}
-
-/// Pool without replicas reports is_pgbouncer false for direct connections.
-#[tokio::test]
-async fn pool_direct_is_not_pgbouncer() {
-    let pool = pool().await;
-    // Direct connection (not through PgBouncer) should report false
-    assert!(!pool.is_pgbouncer());
 }

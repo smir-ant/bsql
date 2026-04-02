@@ -28,6 +28,7 @@ postgres-types = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 bitcode = { workspace = true }
 bsql-core = { workspace = true }
+bsql-driver = { workspace = true }
 smallvec = { workspace = true }
 
 # TLS (optional)

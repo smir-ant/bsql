@@ -143,25 +143,37 @@ fn boxed_source(
 
 // --- From conversions ---
 
-impl From<tokio_postgres::Error> for BsqlError {
-    fn from(e: tokio_postgres::Error) -> Self {
-        let pg_code = e.code().map(|c| c.code().to_owned());
-        let message = Cow::Owned(e.to_string());
-        BsqlError::Query(QueryError {
-            message,
-            pg_code,
-            source: Some(Box::new(e)),
-        })
-    }
-}
-
-impl From<deadpool_postgres::PoolError> for BsqlError {
-    fn from(e: deadpool_postgres::PoolError) -> Self {
-        let message = Cow::Owned(e.to_string());
-        BsqlError::Pool(PoolError {
-            message,
-            source: Some(Box::new(e)),
-        })
+impl From<bsql_driver::DriverError> for BsqlError {
+    fn from(e: bsql_driver::DriverError) -> Self {
+        match e {
+            bsql_driver::DriverError::Io(io_err) => BsqlError::Connect(ConnectError {
+                message: Cow::Owned(io_err.to_string()),
+                source: Some(Box::new(io_err)),
+            }),
+            bsql_driver::DriverError::Auth(msg) => BsqlError::Connect(ConnectError {
+                message: Cow::Owned(msg),
+                source: None,
+            }),
+            bsql_driver::DriverError::Protocol(msg) => BsqlError::Query(QueryError {
+                message: Cow::Owned(msg),
+                pg_code: None,
+                source: None,
+            }),
+            bsql_driver::DriverError::Server {
+                code,
+                message,
+                detail: _,
+                hint: _,
+            } => BsqlError::Query(QueryError {
+                message: Cow::Owned(message.to_string()),
+                pg_code: Some(code.to_string()),
+                source: None,
+            }),
+            bsql_driver::DriverError::Pool(msg) => BsqlError::Pool(PoolError {
+                message: Cow::Owned(msg),
+                source: None,
+            }),
+        }
     }
 }
 

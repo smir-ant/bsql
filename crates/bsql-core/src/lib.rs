@@ -7,30 +7,39 @@
 //!
 //! You should not depend on this crate directly — use [`bsql`] instead.
 
-/// Re-export `postgres_types` so generated code (pg_enum) can reference it
-/// via `::bsql_core::pg_types::*` without requiring users to add
-/// `postgres-types` as a direct dependency.
-pub use postgres_types as pg_types;
-
 pub mod error;
 pub mod executor;
 pub mod listener;
 pub mod pool;
-pub(crate) mod singleflight;
 pub mod stream;
 pub mod transaction;
 pub mod types;
 
-/// Re-exports from `tokio-postgres` and `postgres-types` used by generated code.
-/// This avoids requiring users to add `tokio-postgres` to their dependencies.
-pub mod pg {
-    pub use postgres_types::ToSql;
-    pub use tokio_postgres::Row;
-}
+/// Re-export bsql_driver types used by generated code.
+/// Users do not need to depend on bsql-driver directly.
+pub mod driver {
+    pub use bsql_driver::arena::{acquire_arena, release_arena};
+    pub use bsql_driver::hash_sql;
+    pub use bsql_driver::{Arena, Encode, QueryResult, Row};
 
-/// Re-export `futures_core::Stream` so consumers can use `QueryStream`
-/// without adding `futures-core` as a direct dependency.
-pub use futures_core::Stream;
+    // Array decode functions for generated code
+    pub use bsql_driver::codec::{
+        decode_array_bool, decode_array_bytea, decode_array_f32, decode_array_f64,
+        decode_array_i16, decode_array_i32, decode_array_i64, decode_array_str,
+    };
+
+    // Feature-gated decode functions for generated code
+    #[cfg(feature = "decimal")]
+    pub use bsql_driver::codec::decode_numeric_decimal;
+    #[cfg(feature = "uuid")]
+    pub use bsql_driver::codec::decode_uuid_type;
+    #[cfg(feature = "chrono")]
+    pub use bsql_driver::codec::{
+        decode_date_chrono, decode_time_chrono, decode_timestamptz_chrono,
+    };
+    #[cfg(feature = "time")]
+    pub use bsql_driver::codec::{decode_date_time, decode_time_time, decode_timestamptz_time};
+}
 
 pub use error::{BsqlError, BsqlResult};
 pub use executor::Executor;
