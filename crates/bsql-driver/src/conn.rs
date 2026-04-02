@@ -80,6 +80,11 @@ pub struct Config {
     pub password: String,
     pub database: String,
     pub ssl: SslMode,
+    /// PG-side statement timeout in seconds. Default: 30. 0 = no timeout.
+    ///
+    /// After connecting, the driver sends `SET statement_timeout = '{N}s'`.
+    /// If a query exceeds this duration, PostgreSQL kills it and returns an error.
+    pub statement_timeout_secs: u32,
 }
 
 /// SSL/TLS connection mode.
@@ -124,6 +129,7 @@ impl Config {
         };
 
         let mut ssl = SslMode::Prefer;
+        let mut statement_timeout_secs: u32 = 30;
         for param in params.split('&') {
             if let Some(val) = param.strip_prefix("sslmode=") {
                 ssl = match val {
@@ -132,6 +138,8 @@ impl Config {
                     "require" => SslMode::Require,
                     _ => SslMode::Prefer,
                 };
+            } else if let Some(val) = param.strip_prefix("statement_timeout=") {
+                statement_timeout_secs = val.parse::<u32>().unwrap_or(30);
             }
         }
 
@@ -146,6 +154,7 @@ impl Config {
                 url_decode(database)
             },
             ssl,
+            statement_timeout_secs,
         };
         config.validate()?;
         Ok(config)
@@ -300,7 +309,7 @@ impl Connection {
         let mut conn = Self {
             stream,
             read_buf: Vec::with_capacity(8192),
-            stream_buf: vec![0u8; 65536],
+            stream_buf: vec![0u8; 32768],
             stream_buf_pos: 0,
             stream_buf_end: 0,
             write_buf: Vec::with_capacity(4096),
@@ -312,6 +321,15 @@ impl Connection {
         };
 
         conn.startup(config).await?;
+
+        if config.statement_timeout_secs > 0 {
+            conn.simple_query(&format!(
+                "SET statement_timeout = '{}s'",
+                config.statement_timeout_secs
+            ))
+            .await?;
+        }
+
         Ok(conn)
     }
 
@@ -505,45 +523,35 @@ impl Connection {
         // Build the pipelined message
         self.write_buf.clear();
 
-        if !cached {
-            let new_name = format!("s_{sql_hash:016x}").into_boxed_str();
-            // Parse: prepare the statement
+        // Compute statement name once, reuse for write + cache insert.
+        let new_name = if !cached {
+            let name = format!("s_{sql_hash:016x}").into_boxed_str();
             let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, &new_name, sql, &param_oids);
-            // Describe: get column metadata
-            proto::write_describe(&mut self.write_buf, b'S', &new_name);
-            // Bind: parameters inline — no intermediate Vec<Vec<u8>>
-            proto::write_bind_params(&mut self.write_buf, "", &new_name, params);
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_bind_params(&mut self.write_buf, "", &name, params);
+            Some(name)
         } else {
-            // Borrow the cached name — no clone needed since we only need it for
-            // the write_buf which is consumed before we modify stmts.
             let name = &*self.stmts[&sql_hash].name;
             proto::write_bind_params(&mut self.write_buf, "", name, params);
-        }
+            None
+        };
 
-        // Execute: run the portal
         proto::write_execute(&mut self.write_buf, "", 0);
-
-        // Sync: end pipeline
         proto::write_sync(&mut self.write_buf);
-
         self.flush_write().await?;
 
         // Read responses
-        let columns = if !cached {
-            // ParseComplete
+        let columns = if let Some(stmt_name) = new_name {
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
                 .await?;
 
-            // RowDescription or NoData (may be preceded by ParameterDescription)
             let columns = self.read_column_description().await?;
 
-            // Cache the statement
-            let new_name = format!("s_{sql_hash:016x}").into_boxed_str();
             self.stmts.insert(
                 sql_hash,
                 StmtInfo {
-                    name: new_name,
+                    name: stmt_name,
                     columns: columns.clone(),
                 },
             );
@@ -558,17 +566,15 @@ impl Connection {
 
         // Read DataRow messages and CommandComplete.
         // Flat column offsets: all rows' columns are stored contiguously in
-        // `all_col_offsets`, with `row_starts` marking where each row begins.
+        // `all_col_offsets`. Row N starts at index `N * num_cols`.
         let num_cols = columns.len();
-        let mut all_col_offsets: Vec<(usize, i32)> = Vec::new();
-        let mut row_starts: Vec<u32> = Vec::new();
+        let mut all_col_offsets: Vec<(usize, i32)> = Vec::with_capacity(num_cols * 64);
         let mut affected_rows: u64 = 0;
 
         loop {
             let msg = self.read_one_message().await?;
             match msg {
                 BackendMessage::DataRow { data } => {
-                    row_starts.push(all_col_offsets.len() as u32);
                     parse_data_row_flat(data, arena, &mut all_col_offsets)?;
                 }
                 BackendMessage::CommandComplete { tag } => {
@@ -597,10 +603,10 @@ impl Connection {
 
         // ReadyForQuery
         self.expect_ready().await?;
+        self.shrink_buffers();
 
         Ok(QueryResult {
             all_col_offsets,
-            row_starts,
             num_cols,
             columns,
             affected_rows,
@@ -660,32 +666,31 @@ impl Connection {
         // Build the pipelined message
         self.write_buf.clear();
 
-        if !cached {
-            let new_name = format!("s_{sql_hash:016x}").into_boxed_str();
+        let new_name = if !cached {
+            let name = format!("s_{sql_hash:016x}").into_boxed_str();
             let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, &new_name, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', &new_name);
-            proto::write_bind_params(&mut self.write_buf, "", &new_name, params);
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_bind_params(&mut self.write_buf, "", &name, params);
+            Some(name)
         } else {
             let name = &*self.stmts[&sql_hash].name;
             proto::write_bind_params(&mut self.write_buf, "", name, params);
-        }
+            None
+        };
         proto::write_execute(&mut self.write_buf, "", 0);
         proto::write_sync(&mut self.write_buf);
         self.flush_write().await?;
 
         // Read responses
-        if !cached {
+        if let Some(stmt_name) = new_name {
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
                 .await?;
-            // Read and cache column description even though we don't use it —
-            // the server sends it and we must consume it.
             let columns = self.read_column_description().await?;
-            let new_name = format!("s_{sql_hash:016x}").into_boxed_str();
             self.stmts.insert(
                 sql_hash,
                 StmtInfo {
-                    name: new_name,
+                    name: stmt_name,
                     columns,
                 },
             );
@@ -723,6 +728,7 @@ impl Connection {
         }
 
         self.expect_ready().await?;
+        self.shrink_buffers();
         Ok(affected_rows)
     }
 
@@ -793,6 +799,19 @@ impl Connection {
     }
 
     // --- Internal helpers ---
+
+    /// Reclaim memory if buffers grew beyond normal thresholds.
+    ///
+    /// Called after query()/execute() to prevent a single large result from
+    /// permanently bloating the connection's buffers.
+    fn shrink_buffers(&mut self) {
+        if self.read_buf.capacity() > 64 * 1024 {
+            self.read_buf = Vec::with_capacity(8192);
+        }
+        if self.write_buf.capacity() > 16 * 1024 {
+            self.write_buf = Vec::with_capacity(4096);
+        }
+    }
 
     /// Read one backend message. The returned message borrows from `self.read_buf`.
     ///
@@ -877,8 +896,8 @@ impl Connection {
         DriverError::Server {
             code: fields.code.into_boxed_str(),
             message: fields.message.into_boxed_str(),
-            detail: fields.detail,
-            hint: fields.hint,
+            detail: fields.detail.map(String::into_boxed_str),
+            hint: fields.hint.map(String::into_boxed_str),
         }
     }
 
@@ -1000,8 +1019,8 @@ async fn buffered_read_exact(
 /// Result of a query execution. Owns the row offset metadata.
 ///
 /// Uses flat column offset storage: all rows' `(arena_offset, length)` pairs
-/// are stored contiguously in `all_col_offsets`, with `row_starts` marking
-/// where each row's columns begin. This eliminates per-row `Vec` allocations.
+/// are stored contiguously in `all_col_offsets`. Row N starts at index
+/// `N * num_cols`. No separate `row_starts` Vec needed.
 ///
 /// # Example
 ///
@@ -1021,8 +1040,6 @@ pub struct QueryResult {
     /// All rows' column (arena_offset, length) pairs, contiguous.
     /// length = -1 means NULL.
     all_col_offsets: Vec<(usize, i32)>,
-    /// Index into `all_col_offsets` where each row starts.
-    row_starts: Vec<u32>,
     /// Number of columns per row.
     num_cols: usize,
     columns: Arc<[ColumnDesc]>,
@@ -1032,12 +1049,15 @@ pub struct QueryResult {
 impl QueryResult {
     /// Number of rows in the result.
     pub fn len(&self) -> usize {
-        self.row_starts.len()
+        if self.num_cols == 0 {
+            return 0;
+        }
+        self.all_col_offsets.len() / self.num_cols
     }
 
     /// Whether the result set is empty.
     pub fn is_empty(&self) -> bool {
-        self.row_starts.is_empty()
+        self.all_col_offsets.is_empty()
     }
 
     /// Number of affected rows (for INSERT/UPDATE/DELETE).
@@ -1052,7 +1072,7 @@ impl QueryResult {
 
     /// Get a row by index. The returned `Row` borrows from the arena.
     pub fn row<'a>(&'a self, idx: usize, arena: &'a Arena) -> Row<'a> {
-        let start = self.row_starts[idx] as usize;
+        let start = idx * self.num_cols;
         let end = start + self.num_cols;
         Row {
             arena,
@@ -1064,16 +1084,14 @@ impl QueryResult {
     /// Iterate over rows.
     pub fn rows<'a>(&'a self, arena: &'a Arena) -> impl Iterator<Item = Row<'a>> {
         let num_cols = self.num_cols;
-        let all = &self.all_col_offsets;
         let columns = &self.columns;
-        self.row_starts.iter().map(move |&start| {
-            let s = start as usize;
-            Row {
+        self.all_col_offsets
+            .chunks(num_cols.max(1))
+            .map(move |chunk| Row {
                 arena,
-                col_offsets: &all[s..s + num_cols],
+                col_offsets: chunk,
                 columns,
-            }
-        })
+            })
     }
 }
 
@@ -1332,7 +1350,6 @@ mod tests {
     fn query_result_empty() {
         let result = QueryResult {
             all_col_offsets: vec![],
-            row_starts: vec![],
             num_cols: 0,
             columns: Arc::from(Vec::new()),
             affected_rows: 0,

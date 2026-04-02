@@ -49,6 +49,7 @@ async fn connect_wrong_port() {
         password: "".into(),
         database: "nonexistent".into(),
         ssl: bsql_driver::SslMode::Disable,
+        statement_timeout_secs: 30,
     })
     .await;
 
@@ -966,4 +967,107 @@ fn config_rejects_empty_user() {
 fn config_url_decodes_host() {
     let cfg = Config::from_url("postgres://user:pass@local%2Dhost/db").unwrap();
     assert_eq!(cfg.host, "local-host");
+}
+
+#[test]
+fn config_statement_timeout_default() {
+    let cfg = Config::from_url("postgres://user:pass@localhost/db").unwrap();
+    assert_eq!(cfg.statement_timeout_secs, 30);
+}
+
+#[test]
+fn config_statement_timeout_custom() {
+    let cfg = Config::from_url("postgres://user:pass@localhost/db?statement_timeout=60").unwrap();
+    assert_eq!(cfg.statement_timeout_secs, 60);
+}
+
+#[test]
+fn config_statement_timeout_zero() {
+    let cfg = Config::from_url("postgres://user:pass@localhost/db?statement_timeout=0").unwrap();
+    assert_eq!(cfg.statement_timeout_secs, 0);
+}
+
+// --- NoticeResponse handling ---
+
+#[tokio::test]
+async fn notice_response_does_not_break_query() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+
+    // RAISE WARNING produces a NoticeResponse — the query should succeed.
+    conn.simple_query("DO $$ BEGIN RAISE WARNING 'test warning from bsql'; END $$")
+        .await
+        .unwrap();
+
+    // Connection should still be usable afterward.
+    conn.simple_query("SELECT 1").await.unwrap();
+    assert!(conn.is_idle());
+}
+
+// --- Large result set ---
+
+#[tokio::test]
+async fn query_100k_rows() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT generate_series(1, 100000)::int4 AS n";
+    let hash = hash_sql(sql);
+    let result = conn.query(sql, hash, &[], &mut arena).await.unwrap();
+
+    assert_eq!(result.len(), 100_000);
+    // Spot-check first and last rows
+    assert_eq!(result.row(0, &arena).get_i32(0), Some(1));
+    assert_eq!(result.row(99_999, &arena).get_i32(0), Some(100_000));
+}
+
+// --- Wide query (many columns) ---
+
+#[tokio::test]
+async fn query_wide_50_columns() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    // Build SELECT 1 AS c01, 2 AS c02, ... , 50 AS c50
+    let mut sql = String::with_capacity(512);
+    sql.push_str("SELECT ");
+    for i in 1..=50 {
+        if i > 1 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("{i}::int4 AS c{i:02}"));
+    }
+    let hash = hash_sql(&sql);
+    let result = conn.query(&sql, hash, &[], &mut arena).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let row = result.row(0, &arena);
+    assert_eq!(row.column_count(), 50);
+    for i in 0..50 {
+        assert_eq!(row.get_i32(i), Some((i + 1) as i32));
+    }
+}
+
+// --- Unicode column name ---
+
+#[tokio::test]
+async fn query_unicode_column_name() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT 1 AS \"colonn\u{00e9}\u{00e9}\"";
+    let hash = hash_sql(sql);
+    let result = conn.query(sql, hash, &[], &mut arena).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let row = result.row(0, &arena);
+    assert_eq!(row.column_name(0), "colonn\u{00e9}\u{00e9}");
+    assert_eq!(row.get_i32(0), Some(1));
 }

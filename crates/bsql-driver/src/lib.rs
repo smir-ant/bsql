@@ -95,9 +95,9 @@ pub enum DriverError {
         /// Human-readable error message.
         message: Box<str>,
         /// Optional detail text.
-        detail: Option<String>,
+        detail: Option<Box<str>>,
         /// Optional hint text.
-        hint: Option<String>,
+        hint: Option<Box<str>>,
     },
     /// Connection pool error (exhaustion, misconfiguration).
     Pool(String),
@@ -175,7 +175,7 @@ mod tests {
         let e = DriverError::Server {
             code: "42P01".into(),
             message: "relation does not exist".into(),
-            detail: Some("table was dropped".to_owned()),
+            detail: Some("table was dropped".into()),
             hint: None,
         };
         let s = e.to_string();
