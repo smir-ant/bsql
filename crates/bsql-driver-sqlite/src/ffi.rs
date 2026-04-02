@@ -206,7 +206,8 @@ impl DbHandle {
     /// Get number of changes from last INSERT/UPDATE/DELETE.
     pub fn changes(&self) -> u64 {
         // SAFETY: self.ptr is a valid open database handle.
-        (unsafe { raw::sqlite3_changes(self.ptr) }) as u64
+        // Clamp negative values to 0 to avoid wrapping when cast to u64.
+        (unsafe { raw::sqlite3_changes(self.ptr) }).max(0) as u64
     }
 
     /// Get last error message.

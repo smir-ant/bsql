@@ -32,6 +32,7 @@ fn bench_sqlite_fetch_one(c: &mut Criterion) {
 
     // Warm up
     rt.block_on(async {
+        let id = 42i64;
         let _row =
             bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i64")
                 .fetch_one(&bsql_pool)

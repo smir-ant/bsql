@@ -28,6 +28,7 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
 
     // Warm up: run a small query on each backend
     rt.block_on(async {
+        let n = 10i64;
         let _rows = bsql::query!(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
         )
@@ -52,7 +53,7 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
     for &n in row_counts {
         // -- bsql --
         group.bench_with_input(BenchmarkId::new("bsql", n), &n, |b, &n| {
-            b.to_async(&rt).iter(|| async move {
+            b.to_async(&rt).iter(|| async {
                 let _rows = bsql::query!(
                     "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
                 )
@@ -64,7 +65,7 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
 
         // -- sqlx --
         group.bench_with_input(BenchmarkId::new("sqlx", n), &n, |b, &n| {
-            b.to_async(&rt).iter(|| async move {
+            b.to_async(&rt).iter(|| async {
                 let _rows: Vec<(i32, String, String, bool, f64)> = sqlx::query_as(
                     "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1",
                 )

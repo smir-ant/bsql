@@ -28,6 +28,7 @@ fn bench_pg_fetch_one(c: &mut Criterion) {
 
     // Warm up: run the query once on each backend
     rt.block_on(async {
+        let id = 42i32;
         let _row = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
             .fetch_one(&bsql_pool)
             .await

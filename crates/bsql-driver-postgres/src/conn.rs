@@ -1063,6 +1063,8 @@ impl Connection {
         // is just num_cols; for fetch_all we grow dynamically. The previous
         // `num_cols * 64` over-allocates for single-row queries.
         let num_cols = columns.len();
+        // .max(1) prevents zero-capacity allocation when num_cols is 0 (e.g., INSERT/UPDATE/DELETE
+        // with no RETURNING clause), ensuring Vec has a reasonable initial capacity.
         let mut all_col_offsets: Vec<(usize, i32)> = Vec::with_capacity(num_cols.max(1) * 8);
         let mut affected_rows: u64 = 0;
 
@@ -1716,7 +1718,7 @@ async fn buffered_read_exact(
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), bsql_driver_postgres::DriverError> {
-/// # let mut conn: bsql_driver_postgres::Connection = todo!();
+/// # let mut conn: bsql_driver_postgres::Connection = unimplemented!();
 /// # let mut arena = bsql_driver_postgres::Arena::new();
 /// let result = conn.query("SELECT 1 as n", 0, &[], &mut arena).await?;
 /// for i in 0..result.len() {
@@ -1801,6 +1803,8 @@ impl QueryResult {
         let num_cols = self.num_cols;
         let columns = &self.columns;
         self.all_col_offsets
+            // .max(1) prevents a panic from chunks(0) when num_cols is 0
+            // (e.g., commands with no columns like INSERT without RETURNING).
             .chunks(num_cols.max(1))
             .map(move |chunk| Row {
                 arena,

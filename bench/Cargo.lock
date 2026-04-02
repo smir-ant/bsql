@@ -125,6 +125,7 @@ name = "bsql-bench"
 version = "0.1.0"
 dependencies = [
  "bsql",
+ "bsql-core",
  "criterion",
  "diesel",
  "sqlx",

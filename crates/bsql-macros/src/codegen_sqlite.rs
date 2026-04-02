@@ -165,6 +165,7 @@ fn gen_executor_impls(
                         result.len() as u64,
                     ));
                 }
+                let _bsql_row_idx: usize = 0;
                 Ok(#result_name { #row_decode })
             }
 

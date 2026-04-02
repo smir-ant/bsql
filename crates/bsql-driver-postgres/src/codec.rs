@@ -361,7 +361,8 @@ impl Encode for chrono::NaiveDate {
 impl Encode for chrono::NaiveTime {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight valid");
+        // Midnight (00:00:00) is infallibly valid — this .expect() can never fail.
+        let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
         let diff = *self - midnight;
 
         // Panic on None instead of silently encoding midnight (0).

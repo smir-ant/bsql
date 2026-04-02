@@ -13,8 +13,6 @@
 //! but exist because the protocol is complete.
 use std::fmt;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
 use crate::DriverError;
 
 // --- Protocol constants ---
@@ -40,24 +38,12 @@ const MSG_CLOSE: u8 = b'C';
 const MSG_SYNC: u8 = b'S';
 const MSG_TERMINATE: u8 = b'X';
 
-// Backend message type bytes (for documentation; used as match arms)
-const _BACKEND_AUTH: u8 = b'R';
-const _BACKEND_PARAM_STATUS: u8 = b'S';
-const _BACKEND_KEY_DATA: u8 = b'K';
-const _BACKEND_READY: u8 = b'Z';
-const _BACKEND_PARSE_COMPLETE: u8 = b'1';
-const _BACKEND_BIND_COMPLETE: u8 = b'2';
-const _BACKEND_CLOSE_COMPLETE: u8 = b'3';
-const _BACKEND_ROW_DESC: u8 = b'T';
-const _BACKEND_DATA_ROW: u8 = b'D';
-const _BACKEND_CMD_COMPLETE: u8 = b'C';
-const _BACKEND_ERROR: u8 = b'E';
-const _BACKEND_NOTICE: u8 = b'N';
-const _BACKEND_NOTIFICATION: u8 = b'A';
-const _BACKEND_EMPTY_QUERY: u8 = b'I';
-const _BACKEND_NO_DATA: u8 = b'n';
-const _BACKEND_PARAM_DESC: u8 = b't';
-const _BACKEND_PORTAL_SUSPENDED: u8 = b's';
+// Backend message type bytes (documented inline in BackendMessage match arms):
+// 'R' = Auth, 'S' = ParameterStatus, 'K' = BackendKeyData, 'Z' = ReadyForQuery,
+// '1' = ParseComplete, '2' = BindComplete, '3' = CloseComplete, 'T' = RowDescription,
+// 'D' = DataRow, 'C' = CommandComplete, 'E' = ErrorResponse, 'N' = NoticeResponse,
+// 'A' = NotificationResponse, 'I' = EmptyQueryResponse, 'n' = NoData,
+// 't' = ParameterDescription, 's' = PortalSuspended
 
 // --- Backend message types ---
 
@@ -241,7 +227,7 @@ pub fn write_bind_params(
         buf.extend_from_slice(&1i16.to_be_bytes()); // binary
     }
 
-    // Truncation checked at call site via write_bind_params_checked.
+    // Truncate to i16::MAX — the PG wire protocol uses i16 for param count.
     let param_count = params.len().min(i16::MAX as usize) as i16;
 
     // Parameter values — encoded inline, no intermediate Vec<Vec<u8>>
@@ -266,25 +252,6 @@ pub fn write_bind_params(
     // Patch length
     let len = (buf.len() - len_pos) as i32;
     buf[len_pos..len_pos + 4].copy_from_slice(&len.to_be_bytes());
-}
-
-/// Checked version of `write_bind_params` that returns an error if param count exceeds i16::MAX.
-#[allow(dead_code)]
-pub fn write_bind_params_checked(
-    buf: &mut Vec<u8>,
-    portal: &str,
-    statement: &str,
-    params: &[&(dyn crate::codec::Encode + Sync)],
-) -> Result<(), DriverError> {
-    if params.len() > i16::MAX as usize {
-        return Err(DriverError::Protocol(format!(
-            "parameter count {} exceeds maximum {} for PG wire protocol",
-            params.len(),
-            i16::MAX
-        )));
-    }
-    write_bind_params(buf, portal, statement, params);
-    Ok(())
 }
 
 /// Execute message — execute a bound portal.
@@ -379,67 +346,6 @@ pub fn write_sasl_response(buf: &mut Vec<u8>, data: &[u8]) {
 }
 
 // --- Backend message reading ---
-
-/// Read one complete backend message from the stream into `buf`.
-///
-/// Returns `(msg_type, payload)` where payload borrows from `buf`.
-/// The buffer is cleared before reading (caller must process the previous message first).
-///
-/// Wire format: `[type: u8] [length: i32 BE] [payload: length - 4 bytes]`
-#[allow(dead_code)]
-pub async fn read_message<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    buf: &mut Vec<u8>,
-) -> Result<(u8, usize), DriverError> {
-    // Read 5-byte header: type(1) + length(4)
-    let mut header = [0u8; 5];
-    stream
-        .read_exact(&mut header)
-        .await
-        .map_err(DriverError::Io)?;
-
-    let msg_type = header[0];
-    let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-
-    if len < 4 {
-        return Err(DriverError::Protocol(format!(
-            "invalid message length {len} for type '{}'",
-            msg_type as char
-        )));
-    }
-
-    // Reject unreasonably large messages (128 MB) to prevent OOM from malicious
-    // or corrupted streams.
-    const MAX_MESSAGE_LEN: i32 = 128 * 1024 * 1024;
-    if len > MAX_MESSAGE_LEN {
-        return Err(DriverError::Protocol(format!(
-            "message length {len} exceeds maximum ({MAX_MESSAGE_LEN}) for type '{}'",
-            msg_type as char
-        )));
-    }
-
-    let payload_len = (len - 4) as usize;
-
-    // Store payload starting at offset 0
-    buf.clear();
-    buf.resize(payload_len, 0);
-    if payload_len > 0 {
-        stream
-            .read_exact(&mut buf[..payload_len])
-            .await
-            .map_err(DriverError::Io)?;
-    }
-
-    Ok((msg_type, payload_len))
-}
-
-/// Flush the write buffer to the stream.
-#[allow(dead_code)]
-pub async fn flush<S: AsyncWrite + Unpin>(stream: &mut S, buf: &[u8]) -> Result<(), DriverError> {
-    stream.write_all(buf).await.map_err(DriverError::Io)?;
-    stream.flush().await.map_err(DriverError::Io)?;
-    Ok(())
-}
 
 // --- Backend message parsing ---
 
@@ -1168,15 +1074,6 @@ mod tests {
     fn copy_done_rejected() {
         let result = parse_backend_message(b'c', &[]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn bind_params_checked_rejects_overflow() {
-        let mut buf = Vec::new();
-        // Create a huge param slice that exceeds i16::MAX
-        // We can't actually create 32768 params, but we can test the check fn
-        let result = write_bind_params_checked(&mut buf, "", "s_test", &[]);
-        assert!(result.is_ok(), "0 params should be fine");
     }
 
     // --- Audit gap tests ---

@@ -96,41 +96,6 @@ pub fn resolve_sqlite_type(declared_type: Option<&str>) -> &'static str {
     "String"
 }
 
-/// Check whether a user-declared Rust parameter type is compatible with a
-/// SQLite column. SQLite doesn't type parameters at prepare time, so we
-/// accept any type that has a `SqliteEncode` impl.
-#[allow(dead_code)]
-pub fn is_sqlite_param_compatible(rust_type: &str) -> bool {
-    matches!(
-        rust_type,
-        "bool"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "f32"
-            | "f64"
-            | "&str"
-            | "String"
-            | "&[u8]"
-            | "Vec<u8>"
-    )
-}
-
-/// Check whether a Rust type with an `Option<>` wrapper has a valid inner
-/// type for SQLite parameters.
-#[allow(dead_code)]
-pub fn is_sqlite_option_param_compatible(rust_type: &str) -> bool {
-    if let Some(inner) = rust_type
-        .strip_prefix("Option<")
-        .and_then(|s| s.strip_suffix('>'))
-    {
-        is_sqlite_param_compatible(inner)
-    } else {
-        is_sqlite_param_compatible(rust_type)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,41 +182,6 @@ mod tests {
         assert_eq!(resolve_sqlite_type(Some("text")), "String");
         assert_eq!(resolve_sqlite_type(Some("Real")), "f64");
         assert_eq!(resolve_sqlite_type(Some("boolean")), "bool");
-    }
-
-    // --- is_sqlite_param_compatible ---
-
-    #[test]
-    fn param_compat_scalars() {
-        assert!(is_sqlite_param_compatible("bool"));
-        assert!(is_sqlite_param_compatible("i8"));
-        assert!(is_sqlite_param_compatible("i16"));
-        assert!(is_sqlite_param_compatible("i32"));
-        assert!(is_sqlite_param_compatible("i64"));
-        assert!(is_sqlite_param_compatible("f32"));
-        assert!(is_sqlite_param_compatible("f64"));
-        assert!(is_sqlite_param_compatible("&str"));
-        assert!(is_sqlite_param_compatible("String"));
-        assert!(is_sqlite_param_compatible("&[u8]"));
-        assert!(is_sqlite_param_compatible("Vec<u8>"));
-    }
-
-    #[test]
-    fn param_compat_rejects_unknown() {
-        assert!(!is_sqlite_param_compatible("u32"));
-        assert!(!is_sqlite_param_compatible("u64"));
-        assert!(!is_sqlite_param_compatible("SomeEnum"));
-    }
-
-    // --- is_sqlite_option_param_compatible ---
-
-    #[test]
-    fn option_param_compat() {
-        assert!(is_sqlite_option_param_compatible("Option<i64>"));
-        assert!(is_sqlite_option_param_compatible("Option<String>"));
-        assert!(is_sqlite_option_param_compatible("Option<&str>"));
-        assert!(is_sqlite_option_param_compatible("i32"));
-        assert!(!is_sqlite_option_param_compatible("Option<u32>"));
     }
 
     // --- Feature-gated types ---

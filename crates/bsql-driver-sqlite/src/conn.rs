@@ -48,12 +48,9 @@ impl Hasher for IdentityHasher {
 type IdentityBuildHasher = BuildHasherDefault<IdentityHasher>;
 type StmtCache = HashMap<u64, CachedStmt, IdentityBuildHasher>;
 
-/// Cached prepared statement with pre-computed metadata.
+/// Cached prepared statement.
 struct CachedStmt {
     handle: StmtHandle,
-    /// Column count cached at prepare time. Used for pre-allocation.
-    #[allow(dead_code)]
-    column_count: i32,
 }
 
 /// Hash a SQL string with rapidhash. Used as the statement cache key.
@@ -453,14 +450,7 @@ impl SqliteConnection {
     fn get_or_prepare(&mut self, sql: &str, sql_hash: u64) -> Result<&StmtHandle, SqliteError> {
         if !self.stmts.contains_key(&sql_hash) {
             let handle = self.db.prepare(sql)?;
-            let col_count = handle.column_count();
-            self.stmts.insert(
-                sql_hash,
-                CachedStmt {
-                    handle,
-                    column_count: col_count,
-                },
-            );
+            self.stmts.insert(sql_hash, CachedStmt { handle });
         }
         Ok(&self.stmts.get(&sql_hash).unwrap().handle)
     }

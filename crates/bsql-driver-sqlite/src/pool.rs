@@ -116,8 +116,10 @@ pub struct StreamingState {
     pub inner: StreamingQuery,
 }
 
-// StreamingState is Send because it only contains scalar values (u64, usize, bool).
-// No raw pointers or references.
+// SAFETY: StreamingState is Send because StreamingQuery contains only scalar
+// values (u64, usize, bool) — no raw pointers, references, or Rc. The struct
+// is passed between the caller task and the dedicated SQLite thread via crossbeam
+// channels, which require Send.
 unsafe impl Send for StreamingState {}
 
 // --- DedicatedThread ---
@@ -397,6 +399,10 @@ pub struct SqlitePool {
     readers: Vec<DedicatedThread>,
     writer: DedicatedThread,
     closed: Arc<AtomicBool>,
+    /// Round-robin counter for distributing read queries across reader threads.
+    /// Tracked separately from StreamingState because it is pool-level state (shared
+    /// across all callers), whereas StreamingState is per-query state passed between
+    /// the caller and a specific reader thread.
     reader_idx: AtomicUsize,
 }
 

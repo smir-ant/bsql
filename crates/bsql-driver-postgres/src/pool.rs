@@ -531,7 +531,10 @@ impl PoolGuard {
     /// Opens a new TCP connection and sends a CancelRequest to PG.
     /// The cancel connection is closed immediately after.
     pub async fn cancel(&self) -> Result<(), DriverError> {
-        let conn = self.conn.as_ref().expect("connection already taken");
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
         conn.cancel(&self.pool.config).await
     }
 }
