@@ -68,7 +68,7 @@ func benchFetchOne(ctx context.Context, conn *pgx.Conn) {
 	mustNoErr(conn.QueryRow(ctx, sql, 42).Scan(&id, &name, &email))
 
 	start := time.Now()
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		_ = conn.QueryRow(ctx, sql, 42).Scan(&id, &name, &email)
 	}
 	elapsed := time.Since(start)
@@ -96,7 +96,7 @@ func benchFetchMany(ctx context.Context, conn *pgx.Conn, limit int) {
 	}
 
 	start := time.Now()
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		rows, _ := conn.Query(ctx, sql, limit)
 		for rows.Next() {
 			var id int32
@@ -128,7 +128,7 @@ func benchInsertSingle(ctx context.Context, conn *pgx.Conn) {
 	mustNoErr(conn.QueryRow(ctx, sql, "bench_insert", "bench@example.com").Scan(&id))
 
 	start := time.Now()
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		_ = conn.QueryRow(ctx, sql, "bench_insert", "bench@example.com").Scan(&id)
 	}
 	elapsed := time.Since(start)
@@ -141,9 +141,9 @@ func benchInsertBatch(ctx context.Context, conn *pgx.Conn) {
 	iters := 1000
 
 	start := time.Now()
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		tx := must(conn.Begin(ctx))
-		for j := 0; j < 100; j++ {
+		for j := range 100 {
 			name := fmt.Sprintf("batch_%d", j)
 			email := fmt.Sprintf("batch_%d@example.com", j)
 			_, _ = tx.Exec(ctx, sql, name, email)
@@ -176,7 +176,7 @@ func benchJoinAggregate(ctx context.Context, conn *pgx.Conn) {
 
 	iters := 1000
 	start := time.Now()
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		rows, _ := conn.Query(ctx, sql)
 		for rows.Next() {
 			var name string
@@ -206,7 +206,7 @@ func benchSubquery(ctx context.Context, conn *pgx.Conn) {
 
 	iters := 5000
 	start := time.Now()
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		rows, _ := conn.Query(ctx, sql)
 		for rows.Next() {
 			var id int32

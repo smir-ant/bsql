@@ -73,7 +73,7 @@ func benchFetchOne(db *sql.DB) {
 	mustNoErr(stmt.QueryRow(42).Scan(&id, &name, &email))
 
 	start := time.Now()
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		_ = stmt.QueryRow(42).Scan(&id, &name, &email)
 	}
 	elapsed := time.Since(start)
@@ -104,7 +104,7 @@ func benchFetchMany(db *sql.DB, limit int) {
 	}
 
 	start := time.Now()
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		rows, _ := stmt.Query(limit)
 		for rows.Next() {
 			var id int64
@@ -139,7 +139,7 @@ func benchInsertSingle(db *sql.DB) {
 	mustNoErr(stmt.QueryRow("bench_insert", "bench@example.com").Scan(&id))
 
 	start := time.Now()
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		_ = stmt.QueryRow("bench_insert", "bench@example.com").Scan(&id)
 	}
 	elapsed := time.Since(start)
@@ -156,9 +156,9 @@ func benchInsertBatch(db *sql.DB) {
 	iters := 1000
 
 	start := time.Now()
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		tx := must(db.Begin())
-		for j := 0; j < 100; j++ {
+		for j := range 100 {
 			name := fmt.Sprintf("batch_%d", j)
 			email := fmt.Sprintf("batch_%d@example.com", j)
 			_, _ = tx.Stmt(stmt).Exec(name, email)
@@ -194,7 +194,7 @@ func benchJoinAggregate(db *sql.DB) {
 
 	iters := 1000
 	start := time.Now()
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		rows, _ := stmt.Query()
 		for rows.Next() {
 			var name string
@@ -227,7 +227,7 @@ func benchSubquery(db *sql.DB) {
 
 	iters := 5000
 	start := time.Now()
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		rows, _ := stmt.Query()
 		for rows.Next() {
 			var id int64

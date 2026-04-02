@@ -1,1 +1,6 @@
-bench/target/
+target/
+*.db
+*.db-shm
+*.db-wal
+c/pg_bench
+c/sqlite_bench
