@@ -146,7 +146,6 @@ impl Pool {
     /// Current pool status: open connections and max size.
     pub fn status(&self) -> PoolStatus {
         PoolStatus {
-            available: 0, // driver pool doesn't expose idle count
             size: self.inner.open_count(),
             max_size: self.inner.max_size(),
         }
@@ -176,7 +175,6 @@ pub struct PoolConnection {
 /// Snapshot of pool utilization.
 #[derive(Debug, Clone, Copy)]
 pub struct PoolStatus {
-    pub available: usize,
     pub size: usize,
     pub max_size: usize,
 }

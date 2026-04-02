@@ -318,3 +318,72 @@ async fn optional_clause_ilike_pattern_none() {
     // No search filter — returns all non-deleted tickets
     assert!(results.len() >= 2);
 }
+
+// --- T-2: Streaming + dynamic queries ---
+
+#[tokio::test]
+async fn stream_with_optional_clause_none() {
+    let pool = pool().await;
+    let dept: Option<i32> = None;
+    let mut stream = bsql::query!(
+        "SELECT id, title FROM tickets
+         WHERE deleted_at IS NULL
+         [AND department_id = $dept: Option<i32>]
+         ORDER BY id"
+    )
+    .fetch_stream(&pool)
+    .await
+    .unwrap();
+
+    let mut count = 0;
+    while let Some(ticket) = stream.next().await.unwrap() {
+        count += 1;
+        assert!(!ticket.title.is_empty());
+    }
+    // dept=None — all non-deleted tickets
+    assert!(count >= 2, "expected at least 2 tickets, got {count}");
+}
+
+#[tokio::test]
+async fn stream_with_optional_clause_some() {
+    let pool = pool().await;
+    let dept: Option<i32> = Some(999);
+    let mut stream = bsql::query!(
+        "SELECT id, title FROM tickets
+         WHERE deleted_at IS NULL
+         [AND department_id = $dept: Option<i32>]
+         ORDER BY id"
+    )
+    .fetch_stream(&pool)
+    .await
+    .unwrap();
+
+    let mut count = 0;
+    while let Some(_ticket) = stream.next().await.unwrap() {
+        count += 1;
+    }
+    // dept=999 — no tickets
+    assert_eq!(count, 0, "no tickets in dept 999, got {count}");
+}
+
+#[tokio::test]
+async fn stream_with_optional_clause_and_base_params() {
+    let pool = pool().await;
+    let uid = 1i32;
+    let dept: Option<i32> = None;
+    let mut stream = bsql::query!(
+        "SELECT id, title FROM tickets
+         WHERE created_by_user_id = $uid: i32
+         [AND department_id = $dept: Option<i32>]
+         ORDER BY id"
+    )
+    .fetch_stream(&pool)
+    .await
+    .unwrap();
+
+    let mut count = 0;
+    while let Some(_ticket) = stream.next().await.unwrap() {
+        count += 1;
+    }
+    assert!(count >= 1, "alice should have tickets, got {count}");
+}

@@ -53,7 +53,8 @@ impl OwnedResult {
 impl Drop for OwnedResult {
     fn drop(&mut self) {
         // Swap out the arena to return it to the thread-local pool.
-        let arena = std::mem::replace(&mut self.arena, Arena::new());
+        // Arena implements Default, so take() avoids the explicit Arena::new().
+        let arena = std::mem::take(&mut self.arena);
         release_arena(arena);
     }
 }

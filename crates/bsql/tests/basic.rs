@@ -494,3 +494,103 @@ async fn warmup_prepares_statements() {
     assert_eq!(user.id, 1);
     assert_eq!(user.login, "alice");
 }
+
+// ---------------------------------------------------------------------------
+// T-1: basic streaming integration test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_stream_basic() {
+    let pool = pool().await;
+    let mut stream = bsql::query!("SELECT id, login FROM users ORDER BY id")
+        .fetch_stream(&pool)
+        .await
+        .unwrap();
+
+    let mut count = 0;
+    while let Some(user) = stream.next().await.unwrap() {
+        count += 1;
+        assert!(!user.login.is_empty());
+    }
+    assert!(count >= 2, "expected at least 2 users, got {count}");
+}
+
+// ---------------------------------------------------------------------------
+// T-4: streaming with bind parameters
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_stream_with_bind_params() {
+    let pool = pool().await;
+    let active = true;
+    let mut stream =
+        bsql::query!("SELECT id, login FROM users WHERE active = $active: bool ORDER BY id")
+            .fetch_stream(&pool)
+            .await
+            .unwrap();
+
+    let mut count = 0;
+    while let Some(user) = stream.next().await.unwrap() {
+        count += 1;
+        assert!(!user.login.is_empty());
+    }
+    assert!(count >= 2, "expected at least 2 active users, got {count}");
+}
+
+// ---------------------------------------------------------------------------
+// T-10: streaming drop mid-iteration (connection should not be returned
+//       to pool in broken state)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_stream_drop_mid_iteration() {
+    let pool = pool().await;
+
+    // Open a stream and drop it after reading only the first row.
+    {
+        let mut stream = bsql::query!("SELECT id, login FROM users ORDER BY id")
+            .fetch_stream(&pool)
+            .await
+            .unwrap();
+
+        let first = stream.next().await.unwrap();
+        assert!(first.is_some(), "should have at least one row");
+        // stream dropped here — connection discarded (not returned to pool)
+    }
+
+    // The pool should still be usable: a new connection can be acquired and
+    // queries succeed without protocol-state corruption.
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+}
+
+// ---------------------------------------------------------------------------
+// T-10b: streaming fully consumed leaves pool healthy
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_stream_fully_consumed() {
+    let pool = pool().await;
+
+    {
+        let mut stream = bsql::query!("SELECT id, login FROM users ORDER BY id")
+            .fetch_stream(&pool)
+            .await
+            .unwrap();
+
+        while let Some(_user) = stream.next().await.unwrap() {}
+        // stream dropped after full consumption — connection returned to pool
+    }
+
+    // Pool should work fine after a fully consumed stream.
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+}

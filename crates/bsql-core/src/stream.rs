@@ -141,11 +141,19 @@ impl QueryStream {
         }
 
         let num_cols = self.columns.len();
-        let mut all_col_offsets: Vec<(usize, i32)> =
-            Vec::with_capacity(num_cols * STREAM_CHUNK_SIZE as usize);
+
+        // Reclaim the Vec from the previous chunk result to reuse its allocation.
+        let mut col_offsets = match self.current_result.as_mut() {
+            Some(result) => {
+                let mut v = result.take_col_offsets();
+                v.clear();
+                v
+            }
+            None => Vec::with_capacity(num_cols * STREAM_CHUNK_SIZE as usize),
+        };
 
         let more = guard
-            .streaming_next_chunk(arena, &mut all_col_offsets)
+            .streaming_next_chunk(arena, &mut col_offsets)
             .await
             .map_err(crate::error::BsqlError::from)?;
 
@@ -154,14 +162,14 @@ impl QueryStream {
         }
         self.needs_execute = more; // if more rows, next call needs Execute+Sync
 
-        if all_col_offsets.is_empty() && !more {
+        if col_offsets.is_empty() && !more {
             self.current_result = None;
             self.position = 0;
             return Ok(false);
         }
 
         self.current_result = Some(QueryResult::from_parts(
-            all_col_offsets,
+            col_offsets,
             num_cols,
             self.columns.clone(),
             0,

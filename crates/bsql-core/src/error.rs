@@ -162,13 +162,24 @@ impl From<bsql_driver::DriverError> for BsqlError {
             bsql_driver::DriverError::Server {
                 code,
                 message,
-                detail: _,
-                hint: _,
-            } => BsqlError::Query(QueryError {
-                message: Cow::Owned(message.to_string()),
-                pg_code: Some(code.to_string()),
-                source: None,
-            }),
+                detail,
+                hint,
+            } => {
+                let mut msg = message.to_string();
+                if let Some(d) = &detail {
+                    msg.push_str("\n  detail: ");
+                    msg.push_str(d);
+                }
+                if let Some(h) = &hint {
+                    msg.push_str("\n  hint: ");
+                    msg.push_str(h);
+                }
+                BsqlError::Query(QueryError {
+                    message: Cow::Owned(msg),
+                    pg_code: Some(code.to_string()),
+                    source: None,
+                })
+            }
             bsql_driver::DriverError::Pool(msg) => BsqlError::Pool(PoolError {
                 message: Cow::Owned(msg),
                 source: None,
@@ -323,6 +334,59 @@ mod tests {
         let inner = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
         let e = ConnectError::with_source("connection failed", inner);
         assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn server_error_preserves_detail_and_hint() {
+        let driver_err = bsql_driver::DriverError::Server {
+            code: "23505".into(),
+            message: "duplicate key".into(),
+            detail: Some("Key (login)=(alice) already exists.".into()),
+            hint: Some("Use ON CONFLICT to handle duplicates.".into()),
+        };
+        let e = BsqlError::from(driver_err);
+        let display = e.to_string();
+        assert!(
+            display.contains("duplicate key"),
+            "missing message: {display}"
+        );
+        assert!(
+            display.contains("detail: Key (login)=(alice) already exists."),
+            "missing detail: {display}"
+        );
+        assert!(
+            display.contains("hint: Use ON CONFLICT to handle duplicates."),
+            "missing hint: {display}"
+        );
+        // pg_code should be preserved
+        match &e {
+            BsqlError::Query(qe) => assert_eq!(qe.pg_code.as_deref(), Some("23505")),
+            other => panic!("expected Query, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_error_without_detail_hint() {
+        let driver_err = bsql_driver::DriverError::Server {
+            code: "42P01".into(),
+            message: "relation does not exist".into(),
+            detail: None,
+            hint: None,
+        };
+        let e = BsqlError::from(driver_err);
+        let display = e.to_string();
+        assert!(
+            display.contains("relation does not exist"),
+            "missing message: {display}"
+        );
+        assert!(
+            !display.contains("detail:"),
+            "should not contain detail: {display}"
+        );
+        assert!(
+            !display.contains("hint:"),
+            "should not contain hint: {display}"
+        );
     }
 
     #[test]

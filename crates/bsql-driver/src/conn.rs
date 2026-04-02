@@ -144,14 +144,14 @@ impl Config {
         }
 
         let config = Config {
-            host: url_decode(&host),
+            host: url_decode(&host)?,
             port,
-            user: url_decode(user),
-            password: url_decode(password),
+            user: url_decode(user)?,
+            password: url_decode(password)?,
             database: if database.is_empty() {
-                url_decode(user)
+                url_decode(user)?
             } else {
-                url_decode(database)
+                url_decode(database)?
             },
             ssl,
             statement_timeout_secs,
@@ -179,28 +179,39 @@ impl Config {
 }
 
 /// Minimal percent-decoding for connection URL components.
-fn url_decode(s: &str) -> String {
+///
+/// Returns an error if a `%` is not followed by exactly two hex digits.
+fn url_decode(s: &str) -> Result<String, DriverError> {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.as_bytes().iter();
     while let Some(&b) = chars.next() {
         if b == b'%' {
-            let hi = chars.next().copied().unwrap_or(0);
-            let lo = chars.next().copied().unwrap_or(0);
-            let val = hex_val(hi) * 16 + hex_val(lo);
-            result.push(val as char);
+            let hi = *chars.next().ok_or_else(|| {
+                DriverError::Protocol(format!("malformed percent-encoding in URL: '{s}'"))
+            })?;
+            let lo = *chars.next().ok_or_else(|| {
+                DriverError::Protocol(format!("malformed percent-encoding in URL: '{s}'"))
+            })?;
+            let hi_val = hex_val(hi).ok_or_else(|| {
+                DriverError::Protocol(format!("invalid hex digit '{}' in URL: '{s}'", hi as char))
+            })?;
+            let lo_val = hex_val(lo).ok_or_else(|| {
+                DriverError::Protocol(format!("invalid hex digit '{}' in URL: '{s}'", lo as char))
+            })?;
+            result.push((hi_val * 16 + lo_val) as char);
         } else {
             result.push(b as char);
         }
     }
-    result
+    Ok(result)
 }
 
-fn hex_val(b: u8) -> u8 {
+fn hex_val(b: u8) -> Option<u8> {
     match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -1296,6 +1307,14 @@ impl QueryResult {
         }
     }
 
+    /// Take the `col_offsets` vec out of this result, leaving it empty.
+    ///
+    /// Used by `QueryStream` to reclaim and reuse the allocation between chunks
+    /// instead of allocating a new `Vec` per chunk.
+    pub fn take_col_offsets(&mut self) -> Vec<(usize, i32)> {
+        std::mem::take(&mut self.all_col_offsets)
+    }
+
     /// Iterate over rows.
     pub fn rows<'a>(&'a self, arena: &'a Arena) -> impl Iterator<Item = Row<'a>> {
         let num_cols = self.num_cols;
@@ -1575,9 +1594,37 @@ mod tests {
 
     #[test]
     fn url_decode_works() {
-        assert_eq!(url_decode("hello%20world"), "hello world");
-        assert_eq!(url_decode("no%20escape"), "no escape");
-        assert_eq!(url_decode("plain"), "plain");
-        assert_eq!(url_decode("a%40b"), "a@b");
+        assert_eq!(url_decode("hello%20world").unwrap(), "hello world");
+        assert_eq!(url_decode("no%20escape").unwrap(), "no escape");
+        assert_eq!(url_decode("plain").unwrap(), "plain");
+        assert_eq!(url_decode("a%40b").unwrap(), "a@b");
+    }
+
+    #[test]
+    fn url_decode_malformed_percent_trailing() {
+        // Truncated percent sequence at end of string
+        let result = url_decode("abc%2");
+        assert!(result.is_err(), "truncated %2 should error");
+    }
+
+    #[test]
+    fn url_decode_malformed_percent_no_digits() {
+        // % followed by no digits at all
+        let result = url_decode("abc%");
+        assert!(result.is_err(), "bare % at end should error");
+    }
+
+    #[test]
+    fn url_decode_invalid_hex_digit() {
+        // %GG — 'G' is not a valid hex digit
+        let result = url_decode("abc%GG");
+        assert!(result.is_err(), "%GG should error");
+    }
+
+    #[test]
+    fn url_decode_invalid_hex_second_digit() {
+        // %2Z — 'Z' is not a valid hex digit
+        let result = url_decode("abc%2Z");
+        assert!(result.is_err(), "%2Z should error");
     }
 }
