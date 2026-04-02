@@ -537,6 +537,148 @@ impl Connection {
         Ok(())
     }
 
+    /// Begin a streaming query using the PG extended query protocol with
+    /// `Execute(max_rows=chunk_size)`.
+    ///
+    /// Returns column metadata and puts the connection into streaming mode.
+    /// The caller must repeatedly call `streaming_next_chunk()` until it returns
+    /// `Ok(false)` (all rows consumed) before issuing any other query on this
+    /// connection.
+    ///
+    /// Uses the unnamed portal `""` which stays open between Execute calls
+    /// as long as Sync is NOT sent. We use Flush (not Sync) to force PG to
+    /// send buffered output without destroying the portal. Sync is only sent
+    /// after CommandComplete to cleanly end the query cycle.
+    pub async fn query_streaming_start(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        chunk_size: i32,
+    ) -> Result<(Arc<[ColumnDesc]>, bool), DriverError> {
+        let cached = self.stmts.contains_key(&sql_hash);
+
+        self.write_buf.clear();
+
+        let new_name = if !cached {
+            let name = format!("s_{sql_hash:016x}").into_boxed_str();
+            let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_bind_params(&mut self.write_buf, "", &name, params);
+            Some(name)
+        } else {
+            let name = &*self.stmts[&sql_hash].name;
+            proto::write_bind_params(&mut self.write_buf, "", name, params);
+            None
+        };
+
+        proto::write_execute(&mut self.write_buf, "", chunk_size);
+        // Use Flush (not Sync!) to keep the portal alive between chunks.
+        proto::write_flush(&mut self.write_buf);
+        self.flush_write().await?;
+
+        // Read responses for Parse+Describe if needed
+        let columns = if let Some(stmt_name) = new_name {
+            self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
+                .await?;
+            let columns = self.read_column_description().await?;
+            self.stmts.insert(
+                sql_hash,
+                StmtInfo {
+                    name: stmt_name,
+                    columns: columns.clone(),
+                },
+            );
+            columns
+        } else {
+            self.stmts[&sql_hash].columns.clone()
+        };
+
+        // BindComplete
+        self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
+            .await?;
+
+        Ok((columns, false))
+    }
+
+    /// Read the next chunk of rows from an in-progress streaming query.
+    ///
+    /// Returns `Ok(true)` if more rows are available (PortalSuspended),
+    /// `Ok(false)` when all rows have been consumed (CommandComplete).
+    ///
+    /// After CommandComplete, this method sends Sync and reads ReadyForQuery,
+    /// returning the connection to a clean protocol state.
+    pub async fn streaming_next_chunk(
+        &mut self,
+        arena: &mut Arena,
+        all_col_offsets: &mut Vec<(usize, i32)>,
+    ) -> Result<bool, DriverError> {
+        all_col_offsets.clear();
+
+        loop {
+            let msg = self.read_one_message().await?;
+            match msg {
+                BackendMessage::DataRow { data } => {
+                    parse_data_row_flat(data, arena, all_col_offsets)?;
+                }
+                BackendMessage::PortalSuspended => {
+                    // More rows available. The portal stays open because we
+                    // used Flush (not Sync). The caller will call
+                    // streaming_send_execute() to request the next chunk.
+                    return Ok(true);
+                }
+                BackendMessage::CommandComplete { .. } => {
+                    // All rows consumed. Send Sync to end the query cycle
+                    // and read ReadyForQuery to restore clean state.
+                    self.write_buf.clear();
+                    proto::write_sync(&mut self.write_buf);
+                    self.flush_write().await?;
+                    self.expect_ready().await?;
+                    self.shrink_buffers();
+                    return Ok(false);
+                }
+                BackendMessage::EmptyQuery => {
+                    self.write_buf.clear();
+                    proto::write_sync(&mut self.write_buf);
+                    self.flush_write().await?;
+                    self.expect_ready().await?;
+                    return Ok(false);
+                }
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    // Send Sync to reset and drain to ReadyForQuery
+                    self.write_buf.clear();
+                    proto::write_sync(&mut self.write_buf);
+                    self.flush_write().await?;
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. }
+                | BackendMessage::NotificationResponse { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during streaming: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Send Execute+Flush for the next chunk of a streaming query.
+    ///
+    /// Must be called before `streaming_next_chunk()` on the 2nd and
+    /// subsequent chunks (the first chunk's Execute is sent by
+    /// `query_streaming_start`).
+    ///
+    /// Uses Flush (not Sync) to keep the unnamed portal alive.
+    pub async fn streaming_send_execute(&mut self, chunk_size: i32) -> Result<(), DriverError> {
+        self.write_buf.clear();
+        proto::write_execute(&mut self.write_buf, "", chunk_size);
+        proto::write_flush(&mut self.write_buf);
+        self.flush_write().await
+    }
+
     /// Execute a prepared query and return rows in arena-allocated storage.
     ///
     /// If the statement is not yet cached, Parse+Describe+Bind+Execute+Sync are
@@ -1103,6 +1245,23 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
+    /// Construct a `QueryResult` from its constituent parts.
+    ///
+    /// Used by `bsql-core`'s streaming layer to assemble per-chunk results.
+    pub fn from_parts(
+        all_col_offsets: Vec<(usize, i32)>,
+        num_cols: usize,
+        columns: Arc<[ColumnDesc]>,
+        affected_rows: u64,
+    ) -> Self {
+        Self {
+            all_col_offsets,
+            num_cols,
+            columns,
+            affected_rows,
+        }
+    }
+
     /// Number of rows in the result.
     pub fn len(&self) -> usize {
         if self.num_cols == 0 {

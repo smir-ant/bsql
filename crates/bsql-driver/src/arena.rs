@@ -126,11 +126,13 @@ impl Arena {
     }
 
     /// Retrieve a str slice from the arena. Returns `None` if not valid UTF-8.
+    ///
+    /// Uses SIMD-accelerated UTF-8 validation via `simdutf8`.
     pub fn get_str(&self, global_offset: usize, len: usize) -> Option<&str> {
         if len == 0 {
             return Some("");
         }
-        std::str::from_utf8(self.get(global_offset, len)).ok()
+        simdutf8::basic::from_utf8(self.get(global_offset, len)).ok()
     }
 
     /// Reset the arena for reuse. Keeps allocated memory but resets the bump pointer.

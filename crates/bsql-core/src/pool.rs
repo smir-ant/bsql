@@ -97,8 +97,9 @@ impl Pool {
     /// Acquires a connection from the pool and returns a [`QueryStream`]
     /// that holds the connection alive until the stream is consumed or dropped.
     ///
-    /// NOTE: In the bsql-driver architecture, all rows are loaded into the arena
-    /// before iteration. This is not true streaming, but maintains API compatibility.
+    /// Uses true PG-level streaming via `Execute(max_rows=64)`. Only 64 rows
+    /// are in memory at a time. The stream fetches additional chunks on demand
+    /// via the `PortalSuspended` / re-`Execute` protocol.
     pub async fn query_stream(
         &self,
         sql: &str,
@@ -107,11 +108,28 @@ impl Pool {
     ) -> BsqlResult<QueryStream> {
         let mut guard = self.inner.acquire().await.map_err(BsqlError::from)?;
         let mut arena = acquire_arena();
-        let result = guard
-            .query(sql, sql_hash, params, &mut arena)
+
+        // chunk_size=64 rows per Execute call
+        const CHUNK_SIZE: i32 = 64;
+
+        let (columns, _) = guard
+            .query_streaming_start(sql, sql_hash, params, CHUNK_SIZE)
             .await
             .map_err(BsqlError::from)?;
-        Ok(QueryStream::new(guard, arena, result))
+
+        let num_cols = columns.len();
+        let mut all_col_offsets: Vec<(usize, i32)> =
+            Vec::with_capacity(num_cols * CHUNK_SIZE as usize);
+
+        let more = guard
+            .streaming_next_chunk(&mut arena, &mut all_col_offsets)
+            .await
+            .map_err(BsqlError::from)?;
+
+        let first_result =
+            bsql_driver::QueryResult::from_parts(all_col_offsets, num_cols, columns.clone(), 0);
+
+        Ok(QueryStream::new(guard, arena, first_result, columns, !more))
     }
 
     /// Set the SQL statements to pre-PREPARE on new connections.

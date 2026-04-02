@@ -170,9 +170,17 @@ pub fn generate_sort_query_code(
 
             #[allow(non_camel_case_types)]
             impl #stream_name {
-                pub fn next(&mut self) -> Option<#result_name> {
-                    let row = self.inner.next_row()?;
-                    Some(#result_name { #row_decode })
+                pub async fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    if let Some(row) = self.inner.next_row() {
+                        return Ok(Some(#result_name { #row_decode }));
+                    }
+                    if !self.inner.fetch_next_chunk().await? {
+                        return Ok(None);
+                    }
+                    match self.inner.next_row() {
+                        Some(row) => Ok(Some(#result_name { #row_decode })),
+                        None => Ok(None),
+                    }
                 }
 
                 pub fn remaining(&self) -> usize {
@@ -475,12 +483,25 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             #[allow(non_camel_case_types)]
             impl #stream_name {
                 /// Get the next typed row, or `None` when all rows have been consumed.
-                pub fn next(&mut self) -> Option<#result_name> {
-                    let row = self.inner.next_row()?;
-                    Some(#result_name { #row_decode })
+                ///
+                /// Fetches the next chunk from PG when the current chunk is exhausted
+                /// (true streaming via `Execute(max_rows=64)`).
+                pub async fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    // Try the current chunk first
+                    if let Some(row) = self.inner.next_row() {
+                        return Ok(Some(#result_name { #row_decode }));
+                    }
+                    // Current chunk exhausted — fetch next from PG
+                    if !self.inner.fetch_next_chunk().await? {
+                        return Ok(None);
+                    }
+                    match self.inner.next_row() {
+                        Some(row) => Ok(Some(#result_name { #row_decode })),
+                        None => Ok(None),
+                    }
                 }
 
-                /// Number of remaining rows.
+                /// Number of remaining rows in the current chunk.
                 pub fn remaining(&self) -> usize {
                     self.inner.remaining()
                 }
@@ -670,12 +691,20 @@ fn gen_dynamic_executor_impls(
             #[allow(non_camel_case_types)]
             impl #stream_name {
                 /// Get the next typed row, or `None` when all rows have been consumed.
-                pub fn next(&mut self) -> Option<#result_name> {
-                    let row = self.inner.next_row()?;
-                    Some(#result_name { #row_decode })
+                pub async fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    if let Some(row) = self.inner.next_row() {
+                        return Ok(Some(#result_name { #row_decode }));
+                    }
+                    if !self.inner.fetch_next_chunk().await? {
+                        return Ok(None);
+                    }
+                    match self.inner.next_row() {
+                        Some(row) => Ok(Some(#result_name { #row_decode })),
+                        None => Ok(None),
+                    }
                 }
 
-                /// Number of remaining rows.
+                /// Number of remaining rows in the current chunk.
                 pub fn remaining(&self) -> usize {
                     self.inner.remaining()
                 }

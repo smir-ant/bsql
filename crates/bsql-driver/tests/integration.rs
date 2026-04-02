@@ -1071,3 +1071,275 @@ async fn query_unicode_column_name() {
     assert_eq!(row.column_name(0), "colonn\u{00e9}\u{00e9}");
     assert_eq!(row.get_i32(0), Some(1));
 }
+
+// --- True streaming tests ---
+
+#[tokio::test]
+async fn streaming_1000_rows() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT generate_series(1, 1000) AS n";
+    let hash = hash_sql(sql);
+
+    let (columns, _) = conn
+        .query_streaming_start(sql, hash, &[], 64)
+        .await
+        .unwrap();
+    assert_eq!(columns.len(), 1);
+
+    let mut total_rows = 0;
+    let mut all_values = Vec::new();
+    let mut first_chunk = true;
+
+    loop {
+        let num_cols = columns.len();
+        let mut col_offsets: Vec<(usize, i32)> = Vec::new();
+
+        if !first_chunk {
+            conn.streaming_send_execute(64).await.unwrap();
+        }
+        first_chunk = false;
+
+        let more = conn
+            .streaming_next_chunk(&mut arena, &mut col_offsets)
+            .await
+            .unwrap();
+
+        let row_count = if num_cols > 0 {
+            col_offsets.len() / num_cols
+        } else {
+            0
+        };
+
+        for i in 0..row_count {
+            let (offset, len) = col_offsets[i * num_cols];
+            if len >= 0 {
+                let data = arena.get(offset, len as usize);
+                let val = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                all_values.push(val);
+            }
+        }
+
+        total_rows += row_count;
+
+        if !more {
+            break;
+        }
+        arena.reset();
+    }
+
+    assert_eq!(total_rows, 1000);
+    assert_eq!(all_values.len(), 1000);
+    // Verify values are 1..=1000
+    for (i, &val) in all_values.iter().enumerate() {
+        assert_eq!(val, (i + 1) as i32, "mismatch at index {i}");
+    }
+}
+
+#[tokio::test]
+async fn streaming_chunk_boundary_exact() {
+    // 64 rows exactly — should get one chunk with PortalSuspended, then a
+    // second empty chunk with CommandComplete.
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT generate_series(1, 64) AS n";
+    let hash = hash_sql(sql);
+
+    let (columns, _) = conn
+        .query_streaming_start(sql, hash, &[], 64)
+        .await
+        .unwrap();
+
+    let num_cols = columns.len();
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
+    let more = conn
+        .streaming_next_chunk(&mut arena, &mut col_offsets)
+        .await
+        .unwrap();
+
+    let first_chunk_rows = col_offsets.len() / num_cols;
+
+    if more {
+        // PG may return 64 rows + PortalSuspended. Next chunk should be empty + CommandComplete.
+        arena.reset();
+        col_offsets.clear();
+        conn.streaming_send_execute(64).await.unwrap();
+        let more2 = conn
+            .streaming_next_chunk(&mut arena, &mut col_offsets)
+            .await
+            .unwrap();
+        let second_chunk_rows = if num_cols > 0 && !col_offsets.is_empty() {
+            col_offsets.len() / num_cols
+        } else {
+            0
+        };
+        assert!(!more2, "should be done after second chunk");
+        assert_eq!(first_chunk_rows + second_chunk_rows, 64);
+    } else {
+        // PG returned all 64 in one chunk with CommandComplete
+        assert_eq!(first_chunk_rows, 64);
+    }
+}
+
+#[tokio::test]
+async fn streaming_zero_rows() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT 1 AS n WHERE false";
+    let hash = hash_sql(sql);
+
+    let (columns, _) = conn
+        .query_streaming_start(sql, hash, &[], 64)
+        .await
+        .unwrap();
+
+    let num_cols = columns.len();
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
+    let more = conn
+        .streaming_next_chunk(&mut arena, &mut col_offsets)
+        .await
+        .unwrap();
+
+    assert!(!more, "zero-row query should not have more chunks");
+    let rows = if num_cols > 0 && !col_offsets.is_empty() {
+        col_offsets.len() / num_cols
+    } else {
+        0
+    };
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn streaming_single_row() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT 42::int4 AS n";
+    let hash = hash_sql(sql);
+
+    let (columns, _) = conn
+        .query_streaming_start(sql, hash, &[], 64)
+        .await
+        .unwrap();
+
+    let num_cols = columns.len();
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
+    let more = conn
+        .streaming_next_chunk(&mut arena, &mut col_offsets)
+        .await
+        .unwrap();
+
+    assert!(!more, "single-row query should not have more chunks");
+    let rows = col_offsets.len() / num_cols;
+    assert_eq!(rows, 1);
+
+    let (offset, len) = col_offsets[0];
+    assert_eq!(len, 4);
+    let data = arena.get(offset, len as usize);
+    let val = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    assert_eq!(val, 42);
+}
+
+#[tokio::test]
+async fn streaming_early_drop() {
+    // Consume only the first chunk, then drop. The connection should remain
+    // usable (protocol state is clean after ReadyForQuery).
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+    let mut guard = pool.acquire().await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT generate_series(1, 200) AS n";
+    let hash = hash_sql(sql);
+
+    let (_, _) = guard
+        .query_streaming_start(sql, hash, &[], 64)
+        .await
+        .unwrap();
+
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
+    let more = guard
+        .streaming_next_chunk(&mut arena, &mut col_offsets)
+        .await
+        .unwrap();
+    assert!(more, "200 rows with chunk_size=64 should have more");
+
+    // Drop guard WITHOUT consuming remaining chunks. This returns the
+    // connection to the pool.
+    drop(guard);
+
+    // Acquire again — the connection should be reusable.
+    let mut guard2 = pool.acquire().await.unwrap();
+    // The unnamed portal is auto-cleaned on next Bind. Run a normal query.
+    arena.reset();
+    let sql2 = "SELECT 99::int4 AS n";
+    let hash2 = hash_sql(sql2);
+    let result = guard2.query(sql2, hash2, &[], &mut arena).await.unwrap();
+    assert_eq!(result.len(), 1);
+    let row = result.row(0, &arena);
+    assert_eq!(row.get_i32(0), Some(99));
+}
+
+// --- SIMD UTF-8 validation tests ---
+
+#[tokio::test]
+async fn simd_utf8_text_column() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT $1::text AS val";
+    let hash = hash_sql(sql);
+    let text = "Hello, world! Rust + PG";
+    let result = conn.query(sql, hash, &[&text], &mut arena).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let row = result.row(0, &arena);
+    assert_eq!(row.get_str(0), Some("Hello, world! Rust + PG"));
+}
+
+#[tokio::test]
+async fn simd_utf8_multibyte() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).await.unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT $1::text AS val";
+    let hash = hash_sql(sql);
+    // Japanese, emoji, accented Latin — exercises multi-byte UTF-8 paths
+    let text = "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}\u{4e16}\u{754c} \u{1f600} caf\u{00e9}";
+    let result = conn.query(sql, hash, &[&text], &mut arena).await.unwrap();
+
+    assert_eq!(result.len(), 1);
+    let row = result.row(0, &arena);
+    assert_eq!(row.get_str(0), Some(text));
+}
+
+#[test]
+fn simd_utf8_rejects_invalid() {
+    use bsql_driver::codec::decode_str;
+    assert!(decode_str(&[0xFF, 0xFE]).is_err());
+    assert!(decode_str(&[0xC0, 0xAF]).is_err()); // overlong encoding
+    assert!(decode_str(&[0xED, 0xA0, 0x80]).is_err()); // surrogate half
+}
+
+#[test]
+fn simd_utf8_accepts_valid() {
+    use bsql_driver::codec::decode_str;
+    assert_eq!(decode_str(b"hello").unwrap(), "hello");
+    assert_eq!(decode_str(b"").unwrap(), "");
+    assert_eq!(decode_str("\u{1f600}".as_bytes()).unwrap(), "\u{1f600}");
+}

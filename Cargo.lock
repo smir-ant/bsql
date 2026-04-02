@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bsql-core",
  "bsql-macros",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bsql-driver",
  "chrono",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-driver"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64",
  "chrono",
@@ -187,6 +187,7 @@ dependencies = [
  "rust_decimal",
  "rustls",
  "sha2 0.10.9",
+ "simdutf8",
  "time",
  "tokio",
  "tokio-rustls",
@@ -196,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-macros"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bitcode",
  "bsql-core",

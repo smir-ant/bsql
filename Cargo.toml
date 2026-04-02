@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/bsql", "crates/bsql-core", "crates/bsql-driver", "crates/bsql-macros"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -46,9 +46,9 @@ rust_decimal = { version = "1", default-features = false, features = ["std"] }
 smallvec = { version = "1", default-features = false }
 
 # Internal
-bsql-core = { path = "crates/bsql-core", version = "0.11.0" }
-bsql-driver = { path = "crates/bsql-driver", version = "0.11.0" }
-bsql-macros = { path = "crates/bsql-macros", version = "0.11.0" }
+bsql-core = { path = "crates/bsql-core", version = "0.12.0" }
+bsql-driver = { path = "crates/bsql-driver", version = "0.12.0" }
+bsql-macros = { path = "crates/bsql-macros", version = "0.12.0" }
 
 # --- Build profiles ---
 # NOTE: these only affect workspace-internal builds (tests, benchmarks).

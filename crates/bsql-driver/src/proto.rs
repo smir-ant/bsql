@@ -55,6 +55,7 @@ const _BACKEND_NOTIFICATION: u8 = b'A';
 const _BACKEND_EMPTY_QUERY: u8 = b'I';
 const _BACKEND_NO_DATA: u8 = b'n';
 const _BACKEND_PARAM_DESC: u8 = b't';
+const _BACKEND_PORTAL_SUSPENDED: u8 = b's';
 
 // --- Backend message types ---
 
@@ -118,6 +119,7 @@ pub enum BackendMessage<'a> {
         payload: &'a str,
     },
     EmptyQuery,
+    PortalSuspended,
 }
 
 // --- Frontend message writers ---
@@ -252,8 +254,20 @@ pub fn write_execute(buf: &mut Vec<u8>, portal: &str, max_rows: i32) {
 }
 
 /// Sync message — marks the end of a message pipeline.
+///
+/// Causes PG to close the implicit transaction (if outside BEGIN) and destroy
+/// all portals (including the unnamed portal). Always sends ReadyForQuery.
 pub fn write_sync(buf: &mut Vec<u8>) {
     write_message(buf, MSG_SYNC, &[]);
+}
+
+/// Flush message — forces PG to send any buffered output.
+///
+/// Unlike Sync, Flush does NOT close portals or end transactions. This is
+/// essential for streaming: between Execute calls, use Flush to get the
+/// PortalSuspended response without destroying the portal.
+pub fn write_flush(buf: &mut Vec<u8>) {
+    write_message(buf, b'H', &[]);
 }
 
 /// Describe message — request description of a statement ('S') or portal ('P').
@@ -407,6 +421,7 @@ pub fn parse_backend_message(
         b'N' => Ok(BackendMessage::NoticeResponse { data: payload }),
         b'A' => parse_notification(payload),
         b'I' => Ok(BackendMessage::EmptyQuery),
+        b's' => Ok(BackendMessage::PortalSuspended),
         _ => Err(DriverError::Protocol(format!(
             "unknown backend message type: '{}' (0x{:02x})",
             msg_type as char, msg_type
@@ -898,5 +913,24 @@ mod tests {
         assert_eq!(cols[0].type_oid, 23);
         assert_eq!(cols[0].type_size, 4);
         assert_eq!(cols[0].format, 1);
+    }
+
+    #[test]
+    fn portal_suspended_parses() {
+        let msg = parse_backend_message(b's', &[]).unwrap();
+        assert!(matches!(msg, BackendMessage::PortalSuspended));
+    }
+
+    #[test]
+    fn execute_with_max_rows() {
+        let mut buf = Vec::new();
+        write_execute(&mut buf, "", 64);
+        assert_eq!(buf[0], b'E');
+        // Portal name "" (1 byte NUL) + max_rows (4 bytes) = 5 bytes payload
+        // Message: type(1) + length(4) + portal_NUL(1) + max_rows(4) = 10 bytes
+        assert_eq!(buf.len(), 10);
+        // Last 4 bytes should be max_rows=64 in big-endian
+        let max_rows = i32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+        assert_eq!(max_rows, 64);
     }
 }

@@ -87,6 +87,7 @@ impl Pool {
                 return Ok(PoolGuard {
                     conn: Some(conn),
                     pool: self.inner.clone(),
+                    discard: false,
                 });
             }
         }
@@ -121,6 +122,7 @@ impl Pool {
                 Ok(PoolGuard {
                     conn: Some(conn),
                     pool: self.inner.clone(),
+                    discard: false,
                 })
             }
             Err(e) => {
@@ -277,11 +279,15 @@ impl PoolBuilder {
 
 /// A borrowed connection from the pool. Returns to the pool on drop.
 ///
-/// If the connection is in a failed transaction state or broken, it is discarded
-/// instead of returned.
+/// If the connection is in a failed transaction state, broken, or marked for
+/// discard, it is dropped (decrements open_count) instead of returned.
 pub struct PoolGuard {
     conn: Option<Connection>,
     pool: Arc<PoolInner>,
+    /// When true, the connection is dropped instead of returned to the pool.
+    /// Used by streaming queries that are dropped mid-iteration (the connection
+    /// is in an indeterminate protocol state and cannot be reused).
+    discard: bool,
 }
 
 impl Deref for PoolGuard {
@@ -298,11 +304,23 @@ impl DerefMut for PoolGuard {
     }
 }
 
+impl PoolGuard {
+    /// Mark this connection for discard — it will NOT be returned to the pool
+    /// on drop. The open_count is decremented and the TCP connection is closed.
+    ///
+    /// Used by streaming queries that are dropped mid-iteration: the connection
+    /// may be in an indeterminate protocol state (portal open, no ReadyForQuery)
+    /// and cannot be safely reused.
+    pub fn mark_discard(&mut self) {
+        self.discard = true;
+    }
+}
+
 impl Drop for PoolGuard {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            // If the connection is in a failed transaction state, discard it
-            if conn.is_in_failed_transaction() {
+            // Discard if: failed transaction, or explicitly marked
+            if self.discard || conn.is_in_failed_transaction() {
                 self.pool.open_count.fetch_sub(1, Ordering::AcqRel);
                 return;
             }

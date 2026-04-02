@@ -467,9 +467,11 @@ pub fn decode_f64(data: &[u8]) -> Result<f64, DriverError> {
 /// Decode a UTF-8 string from binary format (variable length).
 ///
 /// Returns the string slice directly — zero-copy when data lives in the arena.
+/// Uses SIMD-accelerated validation (SSE4.2/AVX2 on x86_64, NEON on aarch64)
+/// via `simdutf8`, falling back to scalar on unsupported targets.
 #[inline]
 pub fn decode_str(data: &[u8]) -> Result<&str, DriverError> {
-    std::str::from_utf8(data)
+    simdutf8::basic::from_utf8(data)
         .map_err(|e| DriverError::Protocol(format!("invalid UTF-8 in text column: {e}")))
 }
 
