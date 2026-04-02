@@ -107,8 +107,8 @@ impl Singleflight {
     /// Compute a singleflight key from sql_hash and parameter data.
     ///
     /// Uses rapidhash to combine the sql_hash with a hash of all parameter
-    /// bytes. Two queries with the same SQL and same parameter values produce
-    /// the same key.
+    /// bytes (including actual encoded values). Two queries with the same SQL
+    /// and same parameter values produce the same key.
     pub fn compute_key(
         sql_hash: u64,
         params: &[&(dyn bsql_driver_postgres::Encode + Sync)],
@@ -116,11 +116,16 @@ impl Singleflight {
         use std::hash::{Hash, Hasher};
         let mut hasher = rapidhash::quality::RapidHasher::default();
         sql_hash.hash(&mut hasher);
-        // Hash each parameter's type OID and encoded bytes
+        let mut scratch = Vec::with_capacity(64);
+        // Hash each parameter's actual encoded bytes (not just type OID)
         for param in params {
-            param.type_oid().hash(&mut hasher);
-            // Hash the is_null flag
-            param.is_null().hash(&mut hasher);
+            if param.is_null() {
+                hasher.write_u8(0xFF); // NULL marker
+            } else {
+                scratch.clear();
+                param.encode_binary(&mut scratch);
+                hasher.write(&scratch);
+            }
         }
         hasher.finish()
     }

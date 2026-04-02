@@ -203,12 +203,7 @@ impl SqlitePool {
         let sql = sql.to_owned();
         let (first_result, first_arena, state, reader_idx) =
             tokio::task::spawn_blocking(move || {
-                // Pick a reader index from the pool (use fetch_add pattern)
-                let idx = pool
-                    .reader_count()
-                    .min(1) // at least 1
-                    .wrapping_sub(1); // 0-based reader index hint
-                let (result, arena, state) = pool
+                let (result, arena, state, idx) = pool
                     .query_streaming(&sql, sql_hash, params, chunk_size)
                     .map_err(BsqlError::from_sqlite)?;
                 Ok::<_, BsqlError>((result, arena, state, idx))
@@ -533,30 +528,9 @@ impl Drop for SqliteStreamingQuery {
     }
 }
 
-/// Validate a savepoint name: must be a valid SQL identifier.
+/// Delegate to shared savepoint name validator.
 fn validate_savepoint_name(name: &str) -> BsqlResult<()> {
-    if name.is_empty() {
-        return Err(crate::error::ConnectError::create(
-            "savepoint name must not be empty",
-        ));
-    }
-    if name.len() > 63 {
-        return Err(crate::error::ConnectError::create(
-            "savepoint name must not exceed 63 characters",
-        ));
-    }
-    let first = name.as_bytes()[0];
-    if !first.is_ascii_alphabetic() && first != b'_' {
-        return Err(crate::error::ConnectError::create(
-            "savepoint name must start with a letter or underscore",
-        ));
-    }
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return Err(crate::error::ConnectError::create(
-            "savepoint name must contain only ASCII letters, digits, and underscores",
-        ));
-    }
-    Ok(())
+    crate::util::validate_savepoint_name(name)
 }
 
 impl Clone for SqlitePool {

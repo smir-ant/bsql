@@ -17,7 +17,7 @@ use bsql_driver_postgres::arena::acquire_arena;
 use bsql_driver_postgres::codec::Encode;
 use tokio::sync::Mutex;
 
-use crate::error::{BsqlError, BsqlResult, ConnectError};
+use crate::error::{BsqlError, BsqlResult, QueryError};
 use crate::executor::OwnedResult;
 
 /// Transaction isolation levels supported by PostgreSQL.
@@ -73,6 +73,15 @@ impl Transaction {
         }
     }
 
+    /// Return a "transaction already consumed" error.
+    fn consumed_error() -> BsqlError {
+        BsqlError::Query(QueryError {
+            message: "transaction already consumed".into(),
+            pg_code: None,
+            source: None,
+        })
+    }
+
     /// Commit the transaction and return the connection to the pool.
     ///
     /// Consumes `self` — the transaction cannot be used after commit.
@@ -83,7 +92,7 @@ impl Transaction {
             .lock()
             .await
             .take()
-            .expect("transaction already consumed");
+            .ok_or_else(Self::consumed_error)?;
         tx.commit().await.map_err(BsqlError::from)
     }
 
@@ -97,7 +106,7 @@ impl Transaction {
             .lock()
             .await
             .take()
-            .expect("transaction already consumed");
+            .ok_or_else(Self::consumed_error)?;
         tx.rollback().await.map_err(BsqlError::from)
     }
 
@@ -109,7 +118,7 @@ impl Transaction {
         validate_savepoint_name(name)?;
         let sql = format!("SAVEPOINT {name}");
         let mut guard = self.inner.lock().await;
-        let tx = guard.as_mut().expect("transaction already consumed");
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql)
             .await
             .map_err(BsqlError::from_driver_query)
@@ -122,7 +131,7 @@ impl Transaction {
         validate_savepoint_name(name)?;
         let sql = format!("RELEASE SAVEPOINT {name}");
         let mut guard = self.inner.lock().await;
-        let tx = guard.as_mut().expect("transaction already consumed");
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql)
             .await
             .map_err(BsqlError::from_driver_query)
@@ -135,7 +144,7 @@ impl Transaction {
         validate_savepoint_name(name)?;
         let sql = format!("ROLLBACK TO SAVEPOINT {name}");
         let mut guard = self.inner.lock().await;
-        let tx = guard.as_mut().expect("transaction already consumed");
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql)
             .await
             .map_err(BsqlError::from_driver_query)
@@ -149,7 +158,7 @@ impl Transaction {
     pub async fn set_isolation(&self, level: IsolationLevel) -> BsqlResult<()> {
         let sql = format!("SET TRANSACTION ISOLATION LEVEL {}", level.as_sql());
         let mut guard = self.inner.lock().await;
-        let tx = guard.as_mut().expect("transaction already consumed");
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql)
             .await
             .map_err(BsqlError::from_driver_query)
@@ -163,7 +172,7 @@ impl Transaction {
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
         let mut guard = self.inner.lock().await;
-        let tx = guard.as_mut().expect("transaction already consumed");
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         let mut arena = acquire_arena();
         let result = tx
             .query(sql, sql_hash, params, &mut arena)
@@ -180,7 +189,7 @@ impl Transaction {
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
         let mut guard = self.inner.lock().await;
-        let tx = guard.as_mut().expect("transaction already consumed");
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.execute(sql, sql_hash, params)
             .await
             .map_err(BsqlError::from_driver_query)
@@ -210,33 +219,9 @@ impl Drop for Transaction {
     }
 }
 
-/// Validate a savepoint name: must be a valid SQL identifier.
-///
-/// Rules:
-/// - Non-empty, at most 63 characters (PG's `NAMEDATALEN - 1`)
-/// - Starts with an ASCII letter or underscore
-/// - Contains only ASCII letters, digits, and underscores
+/// Delegate to shared savepoint name validator.
 fn validate_savepoint_name(name: &str) -> BsqlResult<()> {
-    if name.is_empty() {
-        return Err(ConnectError::create("savepoint name must not be empty"));
-    }
-    if name.len() > 63 {
-        return Err(ConnectError::create(
-            "savepoint name must not exceed 63 characters",
-        ));
-    }
-    let first = name.as_bytes()[0];
-    if !first.is_ascii_alphabetic() && first != b'_' {
-        return Err(ConnectError::create(
-            "savepoint name must start with a letter or underscore",
-        ));
-    }
-    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return Err(ConnectError::create(
-            "savepoint name must contain only ASCII letters, digits, and underscores",
-        ));
-    }
-    Ok(())
+    crate::util::validate_savepoint_name(name)
 }
 
 #[cfg(test)]

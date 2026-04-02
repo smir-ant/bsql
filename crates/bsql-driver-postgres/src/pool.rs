@@ -386,8 +386,8 @@ impl PoolBuilder {
         self
     }
 
-    /// Set the acquire timeout. Default: 5 seconds.
-    /// Set to None for fail-fast (no waiting).
+    /// Set the acquire timeout. Default: None (fail-fast, per CREDO #17).
+    /// Set to a Duration to enable waiting when the pool is exhausted.
     pub fn acquire_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.acquire_timeout = timeout;
         self

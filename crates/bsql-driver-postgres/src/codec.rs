@@ -187,7 +187,10 @@ impl<T: Encode> Encode for Option<T> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        // For NULL, we return 0 (unspecified). PG will infer the type.
+        // For NULL, we return 0 (unspecified). This is safe because the Parse
+        // message's param_oids array always gets explicit, concrete type OIDs
+        // from codegen — the Encode::type_oid for Option is only used in the
+        // fallback path and PG infers the type from context when it sees 0.
         match self {
             Some(val) => val.type_oid(),
             None => 0,
@@ -249,7 +252,9 @@ impl Encode for time::Date {
         // PG stores date as i32 days since 2000-01-01
         let pg_epoch = time::Date::from_calendar_date(2000, time::Month::January, 1)
             .expect("PG epoch date is valid");
-        let days = (*self - pg_epoch).whole_days() as i32;
+        let days_i64 = (*self - pg_epoch).whole_days();
+        let days =
+            i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX });
         buf.extend_from_slice(&days.to_be_bytes());
     }
 
@@ -308,7 +313,7 @@ impl Encode for chrono::NaiveDateTime {
         // TIMESTAMP has same binary format: i64 microseconds since PG epoch
         let pg_epoch_unix_micros: i64 = 946_684_800 * 1_000_000;
         let unix_micros = self.and_utc().timestamp_micros();
-        let pg_micros = unix_micros - pg_epoch_unix_micros;
+        let pg_micros = unix_micros.saturating_sub(pg_epoch_unix_micros);
         buf.extend_from_slice(&pg_micros.to_be_bytes());
     }
 
@@ -325,7 +330,7 @@ impl Encode for chrono::DateTime<chrono::Utc> {
         // PG epoch: 2000-01-01 00:00:00 UTC = Unix timestamp 946684800
         let pg_epoch_unix_micros: i64 = 946_684_800 * 1_000_000;
         let unix_micros = self.timestamp_micros();
-        let pg_micros = unix_micros - pg_epoch_unix_micros;
+        let pg_micros = unix_micros.saturating_sub(pg_epoch_unix_micros);
         buf.extend_from_slice(&pg_micros.to_be_bytes());
     }
 
@@ -340,7 +345,9 @@ impl Encode for chrono::NaiveDate {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("PG epoch date valid");
-        let days = (*self - pg_epoch).num_days() as i32;
+        let days_i64 = (*self - pg_epoch).num_days();
+        let days =
+            i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX });
         buf.extend_from_slice(&days.to_be_bytes());
     }
 
@@ -384,10 +391,11 @@ impl Encode for rust_decimal::Decimal {
 
         if self.is_zero() {
             // ndigits=0, weight=0, sign=+, dscale=scale
+            let dscale = i16::try_from(self.scale()).unwrap_or(i16::MAX);
             buf.extend_from_slice(&0i16.to_be_bytes()); // ndigits
             buf.extend_from_slice(&0i16.to_be_bytes()); // weight
             buf.extend_from_slice(&0x0000i16.to_be_bytes()); // sign
-            buf.extend_from_slice(&(self.scale() as i16).to_be_bytes()); // dscale
+            buf.extend_from_slice(&dscale.to_be_bytes()); // dscale
             return;
         }
 
@@ -458,10 +466,11 @@ impl Encode for rust_decimal::Decimal {
             w.clamp(i16::MIN as i32, i16::MAX as i32) as i16
         };
 
+        let dscale = i16::try_from(scale).unwrap_or(i16::MAX);
         buf.extend_from_slice(&ndigits.to_be_bytes());
         buf.extend_from_slice(&weight.to_be_bytes());
         buf.extend_from_slice(&sign.to_be_bytes());
-        buf.extend_from_slice(&(scale as i16).to_be_bytes());
+        buf.extend_from_slice(&dscale.to_be_bytes());
         for d in &pg_digits {
             buf.extend_from_slice(&d.to_be_bytes());
         }
@@ -924,13 +933,37 @@ impl Encode for &[&[u8]] {
     }
 }
 
-impl Encode for Vec<Vec<u8>> {
+impl Encode for [Vec<u8>] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 17);
         for val in self {
             buf.extend_from_slice(&(val.len() as i32).to_be_bytes());
             buf.extend_from_slice(val);
         }
+    }
+
+    #[inline]
+    fn type_oid(&self) -> u32 {
+        1001 // bytea[]
+    }
+}
+
+impl Encode for &[Vec<u8>] {
+    #[inline]
+    fn encode_binary(&self, buf: &mut Vec<u8>) {
+        (**self).encode_binary(buf);
+    }
+
+    #[inline]
+    fn type_oid(&self) -> u32 {
+        1001
+    }
+}
+
+impl Encode for Vec<Vec<u8>> {
+    #[inline]
+    fn encode_binary(&self, buf: &mut Vec<u8>) {
+        self.as_slice().encode_binary(buf);
     }
 
     #[inline]

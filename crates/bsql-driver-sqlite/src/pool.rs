@@ -470,14 +470,16 @@ impl SqlitePool {
 
     /// Start a streaming query on a reader thread.
     ///
-    /// Returns the first chunk of rows and a `StreamingState` to continue.
+    /// Returns `(result, arena, state, reader_idx)`. The `reader_idx` must be
+    /// passed to `streaming_next` / `streaming_drop` so subsequent chunks are
+    /// routed to the same reader that owns the open statement.
     pub fn query_streaming(
         &self,
         sql: &str,
         sql_hash: u64,
         params: SmallVec<[ParamValue; 8]>,
         chunk_size: usize,
-    ) -> Result<(QueryResult, Arena, StreamingState), SqliteError> {
+    ) -> Result<(QueryResult, Arena, StreamingState, usize), SqliteError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(SqliteError::Pool("pool is closed".into()));
         }
@@ -493,9 +495,10 @@ impl SqlitePool {
                 reply: reply_tx,
             })
             .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?;
-        reply_rx
+        let (result, arena, state) = reply_rx
             .recv()
-            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?
+            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))??;
+        Ok((result, arena, state, idx))
     }
 
     /// Fetch the next chunk from a streaming query.
@@ -1662,7 +1665,7 @@ mod tests {
 
         let sql = "SELECT id FROM t ORDER BY id";
         let h = hash_sql(sql);
-        let (first_result, first_arena, mut state) =
+        let (first_result, first_arena, mut state, reader_idx) =
             pool.query_streaming(sql, h, SmallVec::new(), 3).unwrap();
 
         assert!(first_result.row_count > 0);
@@ -1671,7 +1674,7 @@ mod tests {
         // Continue fetching until done
         let mut total_rows = first_result.row_count;
         while !state.inner.finished {
-            let (result, _arena, new_state) = pool.streaming_next(state, 0).unwrap();
+            let (result, _arena, new_state) = pool.streaming_next(state, reader_idx).unwrap();
             total_rows += result.row_count;
             state = new_state;
         }

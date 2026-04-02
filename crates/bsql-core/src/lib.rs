@@ -17,6 +17,7 @@ pub mod sqlite_pool;
 pub mod stream;
 pub mod transaction;
 pub mod types;
+pub mod util;
 
 /// Re-export bsql_driver_postgres types used by generated code.
 /// Users do not need to depend on bsql-driver directly.

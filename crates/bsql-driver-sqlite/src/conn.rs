@@ -282,7 +282,9 @@ impl SqliteConnection {
             .stmts
             .get(&streaming.sql_hash)
             .map(|c| &c.handle)
-            .expect("streaming query: statement not in cache");
+            .ok_or_else(|| {
+                SqliteError::Internal("streaming query: statement not in cache".into())
+            })?;
 
         let col_count = streaming.col_count;
         let mut col_offsets: Vec<(usize, i32)> =
@@ -348,7 +350,9 @@ impl SqliteConnection {
                 .stmts
                 .get(&streaming.sql_hash)
                 .map(|c| &c.handle)
-                .expect("streaming query: statement not in cache");
+                .ok_or_else(|| {
+                    SqliteError::Internal("streaming query: statement not in cache".into())
+                })?;
             stmt.reset()?;
         }
 

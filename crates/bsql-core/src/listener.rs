@@ -348,6 +348,8 @@ async fn drive_listener(
     channels: Arc<Mutex<HashSet<String>>>,
 ) {
     /// Counter for dropped notifications (buffer full).
+    /// Intentionally process-wide: gives a single global view of notification
+    /// back-pressure across all Listener instances in the process.
     static DROPPED_NOTIFICATIONS: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
 
