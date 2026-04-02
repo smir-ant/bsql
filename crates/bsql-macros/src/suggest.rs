@@ -223,9 +223,6 @@ pub fn enhance_error(
                 "\n  did you mean \"{suggestion}\"? (in table \"{tbl}\")"
             ));
         }
-
-        // No close match in any table — give a generic hint
-        return Some("\n  check the column name and table alias".to_owned());
     }
 
     None

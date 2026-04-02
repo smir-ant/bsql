@@ -85,6 +85,8 @@ impl From<std::io::Error> for SqliteError {
 mod tests {
     use super::*;
 
+    // --- Display ---
+
     #[test]
     fn error_display_sqlite() {
         let e = SqliteError::Sqlite {
@@ -92,6 +94,33 @@ mod tests {
             message: "near syntax error".into(),
         };
         assert_eq!(e.to_string(), "SQLite error [1]: near syntax error");
+    }
+
+    #[test]
+    fn error_display_sqlite_code_zero() {
+        let e = SqliteError::Sqlite {
+            code: 0,
+            message: "not an error".into(),
+        };
+        assert_eq!(e.to_string(), "SQLite error [0]: not an error");
+    }
+
+    #[test]
+    fn error_display_sqlite_negative_code() {
+        let e = SqliteError::Sqlite {
+            code: -1,
+            message: "unknown".into(),
+        };
+        assert_eq!(e.to_string(), "SQLite error [-1]: unknown");
+    }
+
+    #[test]
+    fn error_display_sqlite_empty_message() {
+        let e = SqliteError::Sqlite {
+            code: 19,
+            message: String::new(),
+        };
+        assert_eq!(e.to_string(), "SQLite error [19]: ");
     }
 
     #[test]
@@ -105,9 +134,31 @@ mod tests {
     }
 
     #[test]
+    fn error_display_io_permission_denied() {
+        let e = SqliteError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "access denied",
+        ));
+        assert!(e.to_string().contains("I/O error"));
+        assert!(e.to_string().contains("access denied"));
+    }
+
+    #[test]
     fn error_display_internal() {
         let e = SqliteError::Internal("null in path".into());
         assert_eq!(e.to_string(), "internal error: null in path");
+    }
+
+    #[test]
+    fn error_display_internal_empty() {
+        let e = SqliteError::Internal(String::new());
+        assert_eq!(e.to_string(), "internal error: ");
+    }
+
+    #[test]
+    fn error_display_internal_unicode() {
+        let e = SqliteError::Internal("ошибка в пути".into());
+        assert_eq!(e.to_string(), "internal error: ошибка в пути");
     }
 
     #[test]
@@ -117,6 +168,14 @@ mod tests {
     }
 
     #[test]
+    fn error_display_pool_empty() {
+        let e = SqliteError::Pool(String::new());
+        assert_eq!(e.to_string(), "pool error: ");
+    }
+
+    // --- source() ---
+
+    #[test]
     fn error_source_io() {
         let inner = std::io::Error::new(std::io::ErrorKind::Other, "test");
         let e = SqliteError::Io(inner);
@@ -124,15 +183,87 @@ mod tests {
     }
 
     #[test]
-    fn error_source_non_io() {
+    fn error_source_sqlite_is_none() {
+        let e = SqliteError::Sqlite {
+            code: 1,
+            message: "err".into(),
+        };
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    #[test]
+    fn error_source_internal_is_none() {
         let e = SqliteError::Internal("test".into());
         assert!(std::error::Error::source(&e).is_none());
     }
+
+    #[test]
+    fn error_source_pool_is_none() {
+        let e = SqliteError::Pool("test".into());
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    // --- From<io::Error> ---
 
     #[test]
     fn error_from_io() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
         let e: SqliteError = io_err.into();
         assert!(matches!(e, SqliteError::Io(_)));
+    }
+
+    #[test]
+    fn error_from_io_preserves_kind() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let e: SqliteError = io_err.into();
+        match e {
+            SqliteError::Io(inner) => {
+                assert_eq!(inner.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            _ => panic!("expected Io variant"),
+        }
+    }
+
+    #[test]
+    fn error_from_io_preserves_message() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "custom message");
+        let e: SqliteError = io_err.into();
+        assert!(e.to_string().contains("custom message"));
+    }
+
+    // --- Debug ---
+
+    #[test]
+    fn error_debug_sqlite() {
+        let e = SqliteError::Sqlite {
+            code: 1,
+            message: "err".into(),
+        };
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("Sqlite"));
+        assert!(dbg.contains("code: 1"));
+    }
+
+    #[test]
+    fn error_debug_io() {
+        let e = SqliteError::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("Io"));
+    }
+
+    #[test]
+    fn error_debug_internal() {
+        let e = SqliteError::Internal("bad".into());
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("Internal"));
+        assert!(dbg.contains("bad"));
+    }
+
+    #[test]
+    fn error_debug_pool() {
+        let e = SqliteError::Pool("exhausted".into());
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("Pool"));
+        assert!(dbg.contains("exhausted"));
     }
 }

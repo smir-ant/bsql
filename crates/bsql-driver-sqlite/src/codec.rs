@@ -190,9 +190,46 @@ mod tests {
     }
 
     #[test]
-    fn decode_i64_wrong_length() {
-        assert_eq!(decode_i64(&[1, 2, 3]), None);
+    fn decode_i64_zero() {
+        let bytes = 0i64.to_le_bytes();
+        assert_eq!(decode_i64(&bytes), Some(0));
+    }
+
+    #[test]
+    fn decode_i64_min() {
+        let bytes = i64::MIN.to_le_bytes();
+        assert_eq!(decode_i64(&bytes), Some(i64::MIN));
+    }
+
+    #[test]
+    fn decode_i64_max() {
+        let bytes = i64::MAX.to_le_bytes();
+        assert_eq!(decode_i64(&bytes), Some(i64::MAX));
+    }
+
+    #[test]
+    fn decode_i64_wrong_length_empty() {
         assert_eq!(decode_i64(&[]), None);
+    }
+
+    #[test]
+    fn decode_i64_wrong_length_3() {
+        assert_eq!(decode_i64(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn decode_i64_wrong_length_7() {
+        assert_eq!(decode_i64(&[1, 2, 3, 4, 5, 6, 7]), None);
+    }
+
+    #[test]
+    fn decode_i64_wrong_length_9() {
+        assert_eq!(decode_i64(&[1, 2, 3, 4, 5, 6, 7, 8, 9]), None);
+    }
+
+    #[test]
+    fn decode_i64_wrong_length_1() {
+        assert_eq!(decode_i64(&[1]), None);
     }
 
     #[test]
@@ -203,8 +240,55 @@ mod tests {
     }
 
     #[test]
-    fn decode_f64_wrong_length() {
+    fn decode_f64_zero() {
+        let bytes = 0.0f64.to_le_bytes();
+        assert_eq!(decode_f64(&bytes), Some(0.0));
+    }
+
+    #[test]
+    fn decode_f64_negative_zero() {
+        let bytes = (-0.0f64).to_le_bytes();
+        let val = decode_f64(&bytes).unwrap();
+        assert!(val == 0.0);
+    }
+
+    #[test]
+    fn decode_f64_infinity() {
+        let bytes = f64::INFINITY.to_le_bytes();
+        assert_eq!(decode_f64(&bytes), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn decode_f64_neg_infinity() {
+        let bytes = f64::NEG_INFINITY.to_le_bytes();
+        assert_eq!(decode_f64(&bytes), Some(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn decode_f64_nan() {
+        let bytes = f64::NAN.to_le_bytes();
+        let val = decode_f64(&bytes).unwrap();
+        assert!(val.is_nan());
+    }
+
+    #[test]
+    fn decode_f64_wrong_length_empty() {
+        assert_eq!(decode_f64(&[]), None);
+    }
+
+    #[test]
+    fn decode_f64_wrong_length_3() {
         assert_eq!(decode_f64(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn decode_f64_wrong_length_7() {
+        assert_eq!(decode_f64(&[1, 2, 3, 4, 5, 6, 7]), None);
+    }
+
+    #[test]
+    fn decode_f64_wrong_length_9() {
+        assert_eq!(decode_f64(&[1, 2, 3, 4, 5, 6, 7, 8, 9]), None);
     }
 
     #[test]
@@ -226,8 +310,36 @@ mod tests {
     }
 
     #[test]
-    fn decode_bool_wrong_length() {
+    fn decode_bool_negative_is_true() {
+        let bytes = (-1i64).to_le_bytes();
+        assert_eq!(decode_bool(&bytes), Some(true));
+    }
+
+    #[test]
+    fn decode_bool_i64_max_is_true() {
+        let bytes = i64::MAX.to_le_bytes();
+        assert_eq!(decode_bool(&bytes), Some(true));
+    }
+
+    #[test]
+    fn decode_bool_i64_min_is_true() {
+        let bytes = i64::MIN.to_le_bytes();
+        assert_eq!(decode_bool(&bytes), Some(true));
+    }
+
+    #[test]
+    fn decode_bool_wrong_length_empty() {
+        assert_eq!(decode_bool(&[]), None);
+    }
+
+    #[test]
+    fn decode_bool_wrong_length_1() {
         assert_eq!(decode_bool(&[1]), None);
+    }
+
+    #[test]
+    fn decode_bool_wrong_length_4() {
+        assert_eq!(decode_bool(&[1, 2, 3, 4]), None);
     }
 
     #[test]
@@ -246,15 +358,62 @@ mod tests {
     }
 
     #[test]
+    fn decode_str_unicode() {
+        let s = "\u{1F600}\u{4e16}\u{754c}";
+        assert_eq!(decode_str(s.as_bytes()), Some(s));
+    }
+
+    #[test]
+    fn decode_str_lone_surrogate_bytes() {
+        // Invalid: lone UTF-16 surrogate encoded in CESU-8 style
+        assert_eq!(decode_str(&[0xED, 0xA0, 0x80]), None);
+    }
+
+    #[test]
     fn decode_i32_valid() {
         let bytes = 42i64.to_le_bytes();
         assert_eq!(decode_i32(&bytes), Some(42));
     }
 
     #[test]
+    fn decode_i32_negative() {
+        let bytes = (-42i64).to_le_bytes();
+        assert_eq!(decode_i32(&bytes), Some(-42));
+    }
+
+    #[test]
+    fn decode_i32_wrong_length() {
+        assert_eq!(decode_i32(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn decode_i32_truncates_large() {
+        // i64 value beyond i32 range is truncated
+        let bytes = (i64::from(i32::MAX) + 1).to_le_bytes();
+        assert_eq!(decode_i32(&bytes), Some(i32::MIN)); // wraps
+    }
+
+    #[test]
     fn decode_i16_valid() {
         let bytes = 123i64.to_le_bytes();
         assert_eq!(decode_i16(&bytes), Some(123));
+    }
+
+    #[test]
+    fn decode_i16_negative() {
+        let bytes = (-123i64).to_le_bytes();
+        assert_eq!(decode_i16(&bytes), Some(-123));
+    }
+
+    #[test]
+    fn decode_i16_wrong_length() {
+        assert_eq!(decode_i16(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn decode_i16_truncates_large() {
+        let bytes = (i64::from(i16::MAX) + 1).to_le_bytes();
+        assert_eq!(decode_i16(&bytes), Some(i16::MIN)); // wraps
     }
 
     // --- Encode integration tests (require a real database) ---
@@ -264,8 +423,11 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir();
-        format!("{}/bsql_test_codec_{}.db", dir.display(), id)
+        let pid = std::process::id();
+        format!("{}/bsql_test_codec_{}_{}.db", dir.display(), pid, id)
     }
+
+    // --- i64 roundtrips ---
 
     #[test]
     fn encode_i64_roundtrip() {
@@ -289,6 +451,50 @@ mod tests {
     }
 
     #[test]
+    fn encode_i64_min_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: i64 = i64::MIN;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(i64::MIN));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_i64_zero_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: i64 = 0;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(0));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- i32 roundtrips ---
+
+    #[test]
     fn encode_i32_roundtrip() {
         let path = temp_db_path();
         let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
@@ -308,6 +514,50 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn encode_i32_boundary_min() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: i32 = i32::MIN;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(i64::from(i32::MIN)));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_i32_boundary_max() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: i32 = i32::MAX;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(i64::from(i32::MAX)));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- i16 roundtrips ---
 
     #[test]
     fn encode_i16_roundtrip() {
@@ -331,6 +581,50 @@ mod tests {
     }
 
     #[test]
+    fn encode_i16_boundary_min() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: i16 = i16::MIN;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(i64::from(i16::MIN)));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_i16_boundary_max() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: i16 = i16::MAX;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(i64::from(i16::MAX)));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- i8 roundtrips ---
+
+    #[test]
     fn encode_i8_roundtrip() {
         let path = temp_db_path();
         let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
@@ -350,6 +644,50 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn encode_i8_boundary_min() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: i8 = i8::MIN;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(i64::from(i8::MIN)));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_i8_boundary_max() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: i8 = i8::MAX;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(i64::from(i8::MAX)));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- f64 roundtrips ---
 
     #[test]
     fn encode_f64_roundtrip() {
@@ -374,6 +712,71 @@ mod tests {
     }
 
     #[test]
+    fn encode_f64_infinity_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val REAL)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: f64 = f64::INFINITY;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_f64(0, 0, &arena), Some(f64::INFINITY));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_f64_neg_infinity_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val REAL)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: f64 = f64::NEG_INFINITY;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_f64(0, 0, &arena), Some(f64::NEG_INFINITY));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_f64_zero_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val REAL)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: f64 = 0.0;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_f64(0, 0, &arena), Some(0.0));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- f32 roundtrips ---
+
+    #[test]
     fn encode_f32_roundtrip() {
         let path = temp_db_path();
         let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
@@ -394,6 +797,50 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn encode_f32_infinity_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val REAL)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: f32 = f32::INFINITY;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_f64(0, 0, &arena), Some(f64::INFINITY));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_f32_neg_infinity_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val REAL)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: f32 = f32::NEG_INFINITY;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_f64(0, 0, &arena), Some(f64::NEG_INFINITY));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- bool roundtrips ---
 
     #[test]
     fn encode_bool_roundtrip() {
@@ -420,6 +867,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // --- string roundtrips ---
+
     #[test]
     fn encode_string_roundtrip() {
         let path = temp_db_path();
@@ -440,6 +889,52 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn encode_empty_string_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (name TEXT)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: &str = "";
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT name FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert!(!result.is_null(0, 0));
+        // Empty string produces a 0-length text value in the arena
+        let bytes = result.get_bytes(0, 0, &arena);
+        assert!(bytes.is_some());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_very_long_string_roundtrip() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (name TEXT)").unwrap();
+
+        let big = "z".repeat(100_000);
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        conn.execute(sql, hash, &[&big.as_str()]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT name FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_str(0, 0, &arena), Some(big.as_str()));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- blob roundtrips ---
 
     #[test]
     fn encode_vec_u8_roundtrip() {
@@ -464,6 +959,29 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn encode_blob_with_null_bytes() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (data BLOB)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: Vec<u8> = vec![0x00, 0x01, 0x00, 0xFF, 0x00];
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT data FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_bytes(0, 0, &arena), Some(&val[..]));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Option roundtrips ---
 
     #[test]
     fn encode_option_some() {
@@ -495,6 +1013,132 @@ mod tests {
         let sql = "INSERT INTO t VALUES (?1)";
         let hash = crate::conn::hash_sql(sql);
         let val: Option<i64> = None;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert!(result.is_null(0, 0));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_option_string_some() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val TEXT)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: Option<String> = Some("hello".into());
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_str(0, 0, &arena), Some("hello"));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_option_string_none() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val TEXT)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: Option<String> = None;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert!(result.is_null(0, 0));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_option_vec_u8_some() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val BLOB)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: Option<Vec<u8>> = Some(vec![1, 2, 3]);
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_bytes(0, 0, &arena), Some(&[1, 2, 3][..]));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_option_vec_u8_none() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val BLOB)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: Option<Vec<u8>> = None;
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert!(result.is_null(0, 0));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_option_bool_some() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: Option<bool> = Some(true);
+        conn.execute(sql, hash, &[&val]).unwrap();
+
+        let mut arena = bsql_arena::Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = crate::conn::hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_bool(0, 0, &arena), Some(true));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn encode_option_bool_none() {
+        let path = temp_db_path();
+        let mut conn = crate::conn::SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::conn::hash_sql(sql);
+        let val: Option<bool> = None;
         conn.execute(sql, hash, &[&val]).unwrap();
 
         let mut arena = bsql_arena::Arena::new();

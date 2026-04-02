@@ -1,5 +1,4 @@
 error: PostgreSQL error: relation "nonexistent_table_xyz" does not exist
-         position: Original(16)
          SQL: SELECT id FROM nonexistent_table_xyz WHERE id = 1
          available tables: tickets, users
  --> tests/compile_fail/invalid_table.rs:2:13

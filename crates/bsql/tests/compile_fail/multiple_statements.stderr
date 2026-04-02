@@ -1,5 +1,4 @@
-error: PostgreSQL error: cannot insert multiple commands into a prepared statement
-         SQL: SELECT 1; SELECT 2
+error: multiple statements not allowed — use separate query! calls. Semicolons are not permitted in bsql queries.
  --> tests/compile_fail/multiple_statements.rs:2:13
   |
 2 |     let _ = bsql::query!("SELECT 1; SELECT 2");
