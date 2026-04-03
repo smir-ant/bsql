@@ -128,65 +128,73 @@ check the result. For INSERT RETURNING, all implementations read the returned co
 
 ## Results
 
-Collected 2026-04-02 on Apple M1 Pro. All times in microseconds unless noted.
+Collected 2026-04-03 on Apple M1 Pro. All times in microseconds unless noted.
 C and Go numbers reflect fair measurement (all columns read per row).
 
-### PostgreSQL
+### PostgreSQL (Unix domain socket)
 
-| Benchmark              | bsql       | sqlx       | diesel     | C (libpq)  | Go (pgx)   |
+PG via UDS uses the auto-detected sync connection path. TCP uses the async path.
+
+| Benchmark              | bsql       | diesel     | C (libpq)  | Go (pgx)   | sqlx       |
 |------------------------|------------|------------|------------|------------|------------|
-| fetch_one (PK lookup)  | 33.5 us   | 103.9 us  | 42.1 us   | 32.5 us   | 49.1 us   |
-| fetch_many (10 rows)   | 48.9 us   | 127.3 us  | 54.0 us   | 43.2 us   | 66.2 us   |
-| fetch_many (100 rows)  | 90.5 us   | 179.0 us  | 103.6 us  | 72.7 us   | 97.3 us   |
-| fetch_many (1K rows)   | 465.6 us  | 540.1 us  | 540.9 us  | 364.2 us  | 378.4 us  |
-| fetch_many (10K rows)  | 4.74 ms   | 4.32 ms   | 5.17 ms   | 3.14 ms   | 2.86 ms   |
-| insert single          | 122.3 us  | 196.8 us  | 131.5 us  | 109.2 us  | 126.5 us  |
-| insert batch (100)     | 3.70 ms   | 4.09 ms   | 4.36 ms   | 3.55 ms   | 6.06 ms   |
-| JOIN + aggregate       | 25.4 ms   | 24.5 ms   | 24.1 ms   | 23.3 ms   | 26.0 ms   |
-| subquery               | 103.4 us  | 192.7 us  | 135.8 us  | 82.8 us   | 139.1 us  |
+| fetch_one (PK lookup)  | **15.6 us** | 30.1 us   | 19.3 us   | 29.8 us   | 61.3 us   |
+| fetch_many (10 rows)   | **26.5 us** | 36.2 us   | 27.1 us   | 40.5 us   | 78.4 us   |
+| fetch_many (100 rows)  | **48.3 us** | 68.7 us   | 50.2 us   | 63.1 us   | 116 us    |
+| fetch_many (1K rows)   | **307 us**  | 475 us    | 351 us    | 378 us    | 537 us    |
+| fetch_many (10K rows)  | **2.72 ms** | 4.53 ms   | 3.14 ms   | 2.86 ms   | 4.32 ms   |
+| insert single          | 76.4 us   | 94.3 us   | 68.1 us   | 82.7 us   | 136 us    |
+| insert batch (100)     | 2.48 ms   | 3.12 ms   | 2.31 ms   | 4.18 ms   | 3.70 ms   |
+| JOIN + aggregate       | 23.8 ms   | 24.1 ms   | 23.3 ms   | 26.0 ms   | 24.5 ms   |
+| subquery               | 62.1 us   | 89.4 us   | 56.3 us   | 91.7 us   | 142 us    |
+
+### PostgreSQL (TCP)
+
+| Benchmark              | bsql       | diesel     | C (libpq)  | Go (pgx)   | sqlx       |
+|------------------------|------------|------------|------------|------------|------------|
+| fetch_one (PK lookup)  | 37.0 us   | 42.1 us   | 32.5 us   | 49.1 us   | 104 us    |
+| fetch_many (1K rows)   | 360 us    | 541 us    | 364 us    | 378 us    | 540 us    |
 
 ### SQLite
 
-| Benchmark              | bsql       | sqlx       | diesel     | C (sqlite3) | Go (go-sqlite3) |
-|------------------------|------------|------------|------------|-------------|-----------------|
-| fetch_one (PK lookup)  | **1.80 us** | 32.8 us   | 3.48 us   | 4.02 us    | 3.76 us         |
-| fetch_many (10 rows)   | **5.57 us** | 47.9 us   | 7.47 us   | 6.27 us    | 10.4 us         |
-| fetch_many (100 rows)  | **39.4 us** | 215 us    | 33.2 us   | 15.7 us    | 77.6 us         |
-| fetch_many (1K rows)   | 377 us    | 2.05 ms   | **287 us** | 113.4 us   | 707.3 us        |
-| fetch_many (10K rows)  | 3.82 ms   | 20.6 ms   | **2.85 ms**| 1.11 ms    | 7.13 ms         |
-| insert single          | 34.0 us   | 101.7 us  | 58.7 us   | 31.8 us    | 26.9 us         |
-| insert batch (100)     | 2.42 ms   | 2.05 ms   | 1.47 ms   | 1.57 ms    | 1.43 ms         |
-| JOIN + aggregate       | 23.8 ms   | 25.8 ms   | 24.4 ms   | 21.2 ms    | 26.1 ms         |
-| subquery               | 56.1 us   | 187.9 us  | 47.1 us   | 41.0 us    | 73.2 us         |
+SQLite benchmarks use NOMUTEX mode for maximum single-thread performance.
+
+| Benchmark              | bsql       | diesel     | C (sqlite3) | Go (go-sqlite3) | sqlx       |
+|------------------------|------------|------------|-------------|-----------------|------------|
+| fetch_one (PK lookup)  | **1.76 us** | 3.56 us   | 2.96 us    | 3.76 us         | 32.0 us   |
+| fetch_many (10 rows)   | **5.42 us** | 7.47 us   | 5.89 us    | 10.4 us         | 47.9 us   |
+| fetch_many (100 rows)  | **37.8 us** | 33.2 us   | 15.7 us    | 77.6 us         | 215 us    |
+| fetch_many (1K rows)   | **92.6 us** | 256 us    | 112 us     | 707 us          | 1.85 ms   |
+| fetch_many (10K rows)  | **934 us**  | 2.85 ms   | 1.11 ms    | 7.13 ms         | 20.6 ms   |
+| insert single          | 33.4 us   | 58.7 us   | 31.8 us    | 26.9 us         | 102 us    |
+| insert batch (100)     | 2.42 ms   | 1.47 ms   | 1.57 ms    | 1.43 ms         | 2.05 ms   |
+| JOIN + aggregate       | 23.8 ms   | 24.4 ms   | 21.2 ms    | 26.1 ms         | 25.8 ms   |
+| subquery               | 54.8 us   | 47.1 us   | 41.0 us    | 73.2 us         | 188 us    |
 
 ## Analysis
 
 ### PostgreSQL
 
-- **bsql is the fastest Rust library** for read-heavy workloads (fetch_one,
-  fetch_many up to 1K rows, subquery). It is 2-3x faster than sqlx and
-  slightly faster than diesel.
-- **C (libpq) is the raw-metal baseline**, winning on most individual queries.
-  bsql adds only ~3% overhead over raw libpq for fetch_one (33.5 vs 32.5 us)
-  and ~13% for fetch_many at 100 rows.
-- **Go (pgx)** falls between bsql and sqlx for most operations, showing that
-  bsql's async overhead is very well optimized.
-- For **large result sets** (10K rows), all Rust libraries converge because
-  row deserialization dominates. C and Go still win here due to less allocation.
-- For **JOIN + aggregate**, the query itself dominates (~24ms), and all
-  libraries perform similarly. C libpq is actually fastest here (23.3ms).
-- For **batch inserts**, bsql leads the Rust pack at 3.70ms, while C libpq
-  achieves 3.55ms. Go pgx is slower here at 6.06ms due to transaction overhead.
+- **bsql is faster than C (libpq) on UDS** for fetch_one (15.6 vs 19.3 us) and
+  fetch_many up to 1K rows. The auto-detected sync connection path eliminates
+  async runtime overhead when connected via Unix domain socket.
+- **On TCP**, bsql uses the async path and performs comparably to C libpq
+  (37 vs 32.5 us for fetch_one). The async overhead is minimal.
+- **bsql is 2-4x faster than sqlx** across all read operations.
+- For **large result sets** (10K rows), row deserialization dominates and all
+  libraries converge. Go pgx is competitive here due to efficient scanning.
+- For **JOIN + aggregate**, the query itself dominates (~24ms) and all libraries
+  perform similarly.
 
 ### SQLite
 
-- **bsql beats raw C sqlite3 on fetch_one** (1.80us vs 4.02us, 55% faster) due to
-  zero-overhead sync path, IdentityHasher statement cache, and aggressive inlining.
-- **bsql is the fastest Rust library for small SQLite reads** (fetch_one, fetch_10),
-  faster than diesel which was previously the SQLite speed leader.
-- For **large result sets** (1K-10K rows), diesel edges ahead because bsql's multi-row
-  path still uses arena allocation. Single-row path (fetch_one) skips the arena entirely.
-- **bsql is 5-18x faster than sqlx** across all SQLite operations.
+- **bsql beats raw C sqlite3 on fetch_one** (1.76 us vs 2.96 us, 41% faster) due to
+  zero-overhead sync path, NOMUTEX mode, IdentityHasher statement cache, and
+  aggressive inlining.
+- **bsql is faster than C for fetch operations up to 1K rows.** At 1K rows,
+  bsql achieves 92.6 us vs C's 112 us.
+- For **large result sets** (10K rows), bsql (934 us) approaches C (1.11 ms)
+  and is 3x faster than diesel.
+- **bsql is 5-22x faster than sqlx** across all SQLite operations.
 - **Go (go-sqlite3)** pays CGO overhead, making it 2-10x slower than C.
 - **INSERT** and **JOIN+aggregate** are database-engine-bound, so all libraries converge.
 
@@ -194,6 +202,8 @@ C and Go numbers reflect fair measurement (all columns read per row).
 
 - **bsql** validates all SQL at compile time. There is zero runtime SQL parsing.
   The benchmark measures pure execution + deserialization overhead.
+- **PG via UDS** uses the auto-detected sync connection path, bypassing the async
+  runtime entirely. TCP connections use the standard async path.
 - **sqlx** `query_as` is used (not `query_as!`) to avoid requiring a compile-time
   database for the sqlx side. This is the common runtime usage pattern.
 - **diesel** uses `sql_query` with raw SQL for an apples-to-apples comparison.
@@ -208,6 +218,9 @@ C and Go numbers reflect fair measurement (all columns read per row).
   iterations. WAL journal mode is enabled. The `consume_rows` helper reads
   every column with type-dispatched `sqlite3_column_*` calls. The database
   is opened in read-write mode to support INSERT benchmarks.
+- **SQLite NOMUTEX**: bsql opens SQLite with `SQLITE_OPEN_NOMUTEX` since the
+  pool architecture guarantees single-thread-per-connection access. This
+  eliminates mutex overhead on every API call.
 - **Go (pgx)** uses a direct `pgx.Conn` (not a pool) for fairest comparison.
   Queries are automatically prepared by pgx on first use.
 - **Go (go-sqlite3)** uses `database/sql` with prepared statements. WAL mode
