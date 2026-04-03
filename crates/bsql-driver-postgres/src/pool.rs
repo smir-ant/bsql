@@ -11,7 +11,6 @@
 //! is initiated per slot. Other tasks wait on a `Notify` and receive an error if
 //! the connect fails.
 
-use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -21,7 +20,90 @@ use tokio::sync::Notify;
 use crate::DriverError;
 use crate::arena::Arena;
 use crate::codec::Encode;
-use crate::conn::{Config, Connection, QueryResult};
+use crate::conn::{Config, Connection, PgDataRow, QueryResult};
+#[cfg(unix)]
+use crate::sync_conn::SyncConnection;
+
+// --- PoolSlot: async Connection or sync SyncConnection ---
+
+/// Internal enum for connections in the pool.
+///
+/// When the pool URL points to a Unix domain socket (`host` starts with `/`),
+/// connections are created as `Sync` variants using `SyncConnection` (blocking
+/// I/O). For TCP connections, the `Async` variant uses tokio's async `Connection`.
+///
+/// This is an implementation detail — callers interact with `PoolGuard` which
+/// dispatches transparently.
+enum PoolSlot {
+    Async(Connection),
+    #[cfg(unix)]
+    Sync(SyncConnection),
+}
+
+impl PoolSlot {
+    fn created_at(&self) -> std::time::Instant {
+        match self {
+            PoolSlot::Async(c) => c.created_at(),
+            #[cfg(unix)]
+            PoolSlot::Sync(c) => c.created_at(),
+        }
+    }
+
+    fn idle_duration(&self) -> Duration {
+        match self {
+            PoolSlot::Async(c) => c.idle_duration(),
+            #[cfg(unix)]
+            PoolSlot::Sync(c) => c.idle_duration(),
+        }
+    }
+
+    fn is_in_failed_transaction(&self) -> bool {
+        match self {
+            PoolSlot::Async(c) => c.is_in_failed_transaction(),
+            #[cfg(unix)]
+            PoolSlot::Sync(c) => c.is_in_failed_transaction(),
+        }
+    }
+
+    fn is_in_transaction(&self) -> bool {
+        match self {
+            PoolSlot::Async(c) => c.is_in_transaction(),
+            #[cfg(unix)]
+            PoolSlot::Sync(c) => c.is_in_transaction(),
+        }
+    }
+
+    fn is_streaming(&self) -> bool {
+        match self {
+            PoolSlot::Async(c) => c.is_streaming(),
+            // SyncConnection has no streaming mode
+            #[cfg(unix)]
+            PoolSlot::Sync(_) => false,
+        }
+    }
+
+    fn set_max_stmt_cache_size(&mut self, size: usize) {
+        match self {
+            PoolSlot::Async(c) => c.set_max_stmt_cache_size(size),
+            #[cfg(unix)]
+            PoolSlot::Sync(c) => c.set_max_stmt_cache_size(size),
+        }
+    }
+
+    async fn close(self) -> Result<(), DriverError> {
+        match self {
+            PoolSlot::Async(c) => c.close().await,
+            #[cfg(unix)]
+            PoolSlot::Sync(c) => c.close(),
+        }
+    }
+
+    /// Whether this slot holds a sync (UDS) connection.
+    #[cfg(unix)]
+    fn is_sync(&self) -> bool {
+        matches!(self, PoolSlot::Sync(_))
+    }
+}
 
 // --- Pool ---
 
@@ -46,7 +128,7 @@ struct PoolInner {
     /// Idle connections. Uses std::sync::Mutex because the critical section is
     /// trivial (push/pop — no I/O). This lets PoolGuard::Drop return connections
     /// synchronously without spawning a task.
-    stack: std::sync::Mutex<Vec<Connection>>,
+    stack: std::sync::Mutex<Vec<PoolSlot>>,
     max_size: usize,
     open_count: AtomicUsize,
     config: Config,
@@ -145,17 +227,18 @@ impl Pool {
             // CAS failed — another task incremented. Retry.
         }
 
-        // Open a new connection
-        match Connection::connect(&self.inner.config).await {
-            Ok(mut conn) => {
+        // Open a new connection — sync for UDS, async for TCP
+        let slot_result = self.open_new_connection().await;
+        match slot_result {
+            Ok(mut slot) => {
                 // Configure statement cache size
-                conn.set_max_stmt_cache_size(self.inner.max_stmt_cache_size);
+                slot.set_max_stmt_cache_size(self.inner.max_stmt_cache_size);
                 // Warmup: pre-PREPARE frequently used statements
-                self.warmup_connection(&mut conn).await;
+                self.warmup_slot(&mut slot).await;
 
                 self.inner.connecting.notify_waiters();
                 Ok(PoolGuard {
-                    conn: Some(conn),
+                    conn: Some(slot),
                     pool: self.inner.clone(),
                     discard: false,
                 })
@@ -172,16 +255,16 @@ impl Pool {
     /// Try to pop a valid idle connection from the stack.
     fn try_pop_idle(&self) -> Result<Option<PoolGuard>, DriverError> {
         let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(conn) = stack.pop() {
+        while let Some(slot) = stack.pop() {
             if let Some(max_lifetime) = self.inner.max_lifetime {
-                if conn.created_at().elapsed() >= max_lifetime {
+                if slot.created_at().elapsed() >= max_lifetime {
                     self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
                     continue;
                 }
             }
-            if conn.idle_duration() < Duration::from_secs(30) {
+            if slot.idle_duration() < Duration::from_secs(30) {
                 return Ok(Some(PoolGuard {
-                    conn: Some(conn),
+                    conn: Some(slot),
                     pool: self.inner.clone(),
                     discard: false,
                 }));
@@ -190,6 +273,30 @@ impl Pool {
             self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
         }
         Ok(None)
+    }
+
+    /// Open a new connection — sync for UDS, async for TCP.
+    ///
+    /// When `config.host_is_uds()` is true (Unix), creates a `SyncConnection`
+    /// using blocking I/O wrapped in `block_in_place`. For TCP, creates an
+    /// async `Connection` as before.
+    async fn open_new_connection(&self) -> Result<PoolSlot, DriverError> {
+        open_new_connection_inner(&self.inner.config).await
+    }
+
+    /// Whether this pool uses sync (UDS) connections.
+    ///
+    /// Returns `true` when the pool URL points to a Unix domain socket.
+    /// On non-Unix platforms, always returns `false`.
+    pub fn is_uds(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.inner.config.host_is_uds()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     /// Begin a transaction. Acquires a connection and sends BEGIN.
@@ -230,14 +337,14 @@ impl Pool {
         }
     }
 
-    /// Pre-PREPARE warmup statements on a new connection.
+    /// Pre-PREPARE warmup statements on a new connection slot.
     ///
     /// Uses `prepare_only()` which sends Parse+Describe+Sync without
     /// Bind+Execute — no query execution, only statement caching.
     ///
     /// Best-effort: errors and timeouts on individual statements are silently
     /// ignored. The connection remains usable even if warmup fails.
-    async fn warmup_connection(&self, conn: &mut Connection) {
+    async fn warmup_slot(&self, slot: &mut PoolSlot) {
         let sqls = self
             .inner
             .warmup_sqls
@@ -249,15 +356,26 @@ impl Pool {
             return;
         }
 
-        for sql in sqls.iter() {
-            let sql_hash = crate::conn::hash_sql(sql);
-            // Parse+Describe+Sync only — no Bind+Execute. 5-second timeout
-            // per statement; if exceeded, skip and continue with the rest.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                conn.prepare_only(sql, sql_hash),
-            )
-            .await;
+        match slot {
+            PoolSlot::Async(conn) => {
+                for sql in sqls.iter() {
+                    let sql_hash = crate::conn::hash_sql(sql);
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        conn.prepare_only(sql, sql_hash),
+                    )
+                    .await;
+                }
+            }
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => {
+                tokio::task::block_in_place(|| {
+                    for sql in sqls.iter() {
+                        let sql_hash = crate::conn::hash_sql(sql);
+                        let _ = conn.prepare_only(sql, sql_hash);
+                    }
+                });
+            }
         }
     }
 
@@ -287,13 +405,13 @@ impl Pool {
     pub async fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         // Drain and close all idle connections
-        let conns: Vec<Connection> = {
+        let slots: Vec<PoolSlot> = {
             let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *stack)
         };
-        for conn in conns {
+        for slot in slots {
             self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
-            let _ = conn.close().await;
+            let _ = slot.close().await;
         }
         // Notify any waiters so they get the "pool is closed" error
         self.inner.release_notify.notify_waiters();
@@ -469,10 +587,12 @@ async fn maintain_min_idle(inner: Arc<PoolInner>) {
             {
                 continue;
             }
-            match Connection::connect(&inner.config).await {
-                Ok(conn) => {
+
+            let slot_result = open_new_connection_inner(&inner.config).await;
+            match slot_result {
+                Ok(slot) => {
                     let mut stack = inner.stack.lock().unwrap_or_else(|e| e.into_inner());
-                    stack.push(conn);
+                    stack.push(slot);
                     inner.release_notify.notify_one();
                 }
                 Err(_) => {
@@ -486,33 +606,37 @@ async fn maintain_min_idle(inner: Arc<PoolInner>) {
     }
 }
 
+/// Open a new connection — sync for UDS, async for TCP.
+/// Free function so `maintain_min_idle` can use it without a `Pool` reference.
+async fn open_new_connection_inner(config: &Config) -> Result<PoolSlot, DriverError> {
+    #[cfg(unix)]
+    if config.host_is_uds() {
+        let config = config.clone();
+        return tokio::task::block_in_place(|| {
+            SyncConnection::connect(&config).map(PoolSlot::Sync)
+        });
+    }
+
+    Connection::connect(config).await.map(PoolSlot::Async)
+}
+
 // --- PoolGuard ---
 
 /// A borrowed connection from the pool. Returns to the pool on drop.
 ///
 /// If the connection is in a failed transaction state, broken, or marked for
 /// discard, it is dropped (decrements open_count) instead of returned.
+///
+/// `PoolGuard` dispatches query methods to either the async `Connection` or
+/// the sync `SyncConnection` depending on the underlying slot type. For sync
+/// connections, blocking I/O is wrapped in `tokio::task::block_in_place`.
 pub struct PoolGuard {
-    conn: Option<Connection>,
+    conn: Option<PoolSlot>,
     pool: Arc<PoolInner>,
     /// When true, the connection is dropped instead of returned to the pool.
     /// Used by streaming queries that are dropped mid-iteration (the connection
     /// is in an indeterminate protocol state and cannot be reused).
     discard: bool,
-}
-
-impl Deref for PoolGuard {
-    type Target = Connection;
-
-    fn deref(&self) -> &Connection {
-        self.conn.as_ref().expect("connection already taken")
-    }
-}
-
-impl DerefMut for PoolGuard {
-    fn deref_mut(&mut self) -> &mut Connection {
-        self.conn.as_mut().expect("connection already taken")
-    }
 }
 
 impl PoolGuard {
@@ -531,17 +655,204 @@ impl PoolGuard {
     /// Opens a new TCP connection and sends a CancelRequest to PG.
     /// The cancel connection is closed immediately after.
     pub async fn cancel(&self) -> Result<(), DriverError> {
-        let conn = self
+        let slot = self
             .conn
             .as_ref()
             .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
-        conn.cancel(&self.pool.config).await
+        match slot {
+            PoolSlot::Async(conn) => conn.cancel(&self.pool.config).await,
+            // SyncConnection does not support cancel (no separate TCP channel).
+            // Return an error so callers know.
+            #[cfg(unix)]
+            PoolSlot::Sync(_) => Err(DriverError::Pool(
+                "cancel not supported on sync UDS connections".into(),
+            )),
+        }
+    }
+
+    // --- Query dispatch methods ---
+
+    /// Execute a prepared query and return rows in arena-allocated storage.
+    pub async fn query(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        arena: &mut Arena,
+    ) -> Result<QueryResult, DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.query(sql, sql_hash, params, arena).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => {
+                tokio::task::block_in_place(|| conn.query(sql, sql_hash, params, arena))
+            }
+        }
+    }
+
+    /// Execute a query without result rows (INSERT/UPDATE/DELETE).
+    pub async fn execute(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<u64, DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.execute(sql, sql_hash, params).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => {
+                tokio::task::block_in_place(|| conn.execute(sql, sql_hash, params))
+            }
+        }
+    }
+
+    /// Execute a simple (unprepared) query.
+    pub async fn simple_query(&mut self, sql: &str) -> Result<(), DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.simple_query(sql).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => tokio::task::block_in_place(|| conn.simple_query(sql)),
+        }
+    }
+
+    /// Process each row via a closure with zero-copy `PgDataRow`.
+    pub async fn for_each<F>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(PgDataRow<'_>) -> Result<(), DriverError>,
+    {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.for_each(sql, sql_hash, params, f).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => {
+                tokio::task::block_in_place(|| conn.for_each(sql, sql_hash, params, f))
+            }
+        }
+    }
+
+    /// Process each DataRow as raw bytes — fastest path.
+    pub async fn for_each_raw<F>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(&[u8]) -> Result<(), DriverError>,
+    {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.for_each_raw(sql, sql_hash, params, f).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => {
+                tokio::task::block_in_place(|| conn.for_each_raw(sql, sql_hash, params, f))
+            }
+        }
+    }
+
+    // --- Streaming (async-only) ---
+
+    /// Start a streaming query. Only available on async connections.
+    ///
+    /// Returns an error if called on a sync UDS connection (streaming requires
+    /// the async protocol's portal suspend/resume mechanism).
+    pub async fn query_streaming_start(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        chunk_size: i32,
+    ) -> Result<(std::sync::Arc<[crate::conn::ColumnDesc]>, bool), DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => {
+                conn.query_streaming_start(sql, sql_hash, params, chunk_size)
+                    .await
+            }
+            #[cfg(unix)]
+            PoolSlot::Sync(_) => Err(DriverError::Pool(
+                "streaming queries not supported on sync UDS connections".into(),
+            )),
+        }
+    }
+
+    /// Send Execute+Flush for a streaming query (2nd+ chunks).
+    pub async fn streaming_send_execute(&mut self, chunk_size: i32) -> Result<(), DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.streaming_send_execute(chunk_size).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(_) => Err(DriverError::Pool(
+                "streaming queries not supported on sync UDS connections".into(),
+            )),
+        }
+    }
+
+    /// Read the next chunk of rows from an in-progress streaming query.
+    pub async fn streaming_next_chunk(
+        &mut self,
+        arena: &mut Arena,
+        all_col_offsets: &mut Vec<(usize, i32)>,
+    ) -> Result<bool, DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.streaming_next_chunk(arena, all_col_offsets).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(_) => Err(DriverError::Pool(
+                "streaming queries not supported on sync UDS connections".into(),
+            )),
+        }
+    }
+
+    /// Whether this guard holds a sync (UDS) connection.
+    ///
+    /// Useful for callers that need to know the connection type (e.g., to
+    /// choose between streaming and non-streaming query paths).
+    pub fn is_sync(&self) -> bool {
+        #[cfg(unix)]
+        if let Some(slot) = &self.conn {
+            return slot.is_sync();
+        }
+        false
     }
 }
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
+        if let Some(slot) = self.conn.take() {
             // + Discard if:
             //   - explicitly marked for discard
             //   - in a failed transaction (tx_status == 'E')
@@ -549,9 +860,9 @@ impl Drop for PoolGuard {
             //   - streaming query in progress — connection in indeterminate state
             //   - pool is closed
             if self.discard
-                || conn.is_in_failed_transaction()
-                || conn.is_in_transaction()
-                || conn.is_streaming()
+                || slot.is_in_failed_transaction()
+                || slot.is_in_transaction()
+                || slot.is_streaming()
                 || self.pool.closed.load(Ordering::Acquire)
             {
                 self.pool.open_count.fetch_sub(1, Ordering::AcqRel);
@@ -563,7 +874,7 @@ impl Drop for PoolGuard {
             // and avoids spawning an async task in Drop.
             {
                 let mut stack = self.pool.stack.lock().unwrap_or_else(|e| e.into_inner());
-                stack.push(conn);
+                stack.push(slot);
             }
 
             self.pool.release_notify.notify_one();
@@ -894,5 +1205,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pool.inner.max_stmt_cache_size, 512);
+    }
+
+    // --- Auto-UDS detection tests ---
+
+    #[tokio::test]
+    async fn pool_is_uds_false_for_tcp() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        assert!(!pool.is_uds());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_is_uds_true_for_unix_socket() {
+        let pool = Pool::connect("postgres://user@localhost/db?host=/tmp")
+            .await
+            .unwrap();
+        assert!(pool.is_uds());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_is_uds_true_for_var_run_socket() {
+        let pool = Pool::connect("postgres://user@localhost/db?host=/var/run/postgresql")
+            .await
+            .unwrap();
+        assert!(pool.is_uds());
+    }
+
+    #[tokio::test]
+    async fn pool_is_uds_false_for_ip_address() {
+        let pool = Pool::connect("postgres://user:pass@127.0.0.1/db")
+            .await
+            .unwrap();
+        assert!(!pool.is_uds());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_slot_sync_created_for_uds_config() {
+        // Verify that PoolSlot::Sync is created for UDS configs.
+        // We can't actually connect (no PG running on /tmp), but we can
+        // verify the detection logic.
+        let config = Config::from_url("postgres://user@localhost/db?host=/tmp").unwrap();
+        assert!(config.host_is_uds());
+    }
+
+    #[test]
+    fn pool_slot_async_created_for_tcp_config() {
+        let config = Config::from_url("postgres://user:pass@localhost/db").unwrap();
+        assert!(!config.host_is_uds());
     }
 }

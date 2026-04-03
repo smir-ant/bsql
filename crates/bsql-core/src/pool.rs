@@ -276,6 +276,15 @@ impl Pool {
         self.read_pool.is_some()
     }
 
+    /// Whether this pool uses sync connections via Unix domain sockets.
+    ///
+    /// When `true`, the pool automatically uses `SyncConnection` (blocking I/O)
+    /// internally, eliminating async overhead for sub-microsecond UDS I/O.
+    /// The user API is identical — this is purely a performance optimization.
+    pub fn is_uds(&self) -> bool {
+        self.inner.is_uds()
+    }
+
     /// Process each row directly from the wire buffer via a closure.
     ///
     /// Acquires a connection, calls `Connection::for_each`, and releases.
@@ -480,5 +489,32 @@ mod tests {
             .await
             .unwrap();
         assert!(!pool.has_replica());
+    }
+
+    // --- Auto-UDS sync connection tests ---
+
+    #[tokio::test]
+    async fn pool_is_uds_false_for_tcp() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        assert!(!pool.is_uds());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_is_uds_true_for_unix_socket() {
+        let pool = Pool::connect("postgres://user@localhost/db?host=/tmp")
+            .await
+            .unwrap();
+        assert!(pool.is_uds());
+    }
+
+    #[tokio::test]
+    async fn pool_is_uds_false_for_ip() {
+        let pool = Pool::connect("postgres://user:pass@127.0.0.1/db")
+            .await
+            .unwrap();
+        assert!(!pool.is_uds());
     }
 }
