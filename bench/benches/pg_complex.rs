@@ -47,10 +47,10 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("pg_join_aggregate");
 
-    // -- bsql --
+    // -- bsql (for_each — zero allocation) --
     group.bench_function("bsql", |b| {
         b.to_async(&rt).iter(|| async {
-            let _rows = bsql::query!(
+            bsql::query!(
                 "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
                  FROM bench_users u
                  JOIN bench_orders o ON u.id = o.user_id
@@ -59,7 +59,7 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
                  ORDER BY SUM(o.amount) DESC
                  LIMIT 100"
             )
-            .fetch_all(&bsql_pool)
+            .for_each(&bsql_pool, |_row| Ok(()))
             .await
             .unwrap();
         });
@@ -119,14 +119,14 @@ fn bench_pg_subquery(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("pg_subquery");
 
-    // -- bsql --
+    // -- bsql (for_each — zero allocation) --
     group.bench_function("bsql", |b| {
         b.to_async(&rt).iter(|| async {
-            let _rows = bsql::query!(
+            bsql::query!(
                 "SELECT id, name, email FROM bench_users
                  WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)"
             )
-            .fetch_all(&bsql_pool)
+            .for_each(&bsql_pool, |_row| Ok(()))
             .await
             .unwrap();
         });
