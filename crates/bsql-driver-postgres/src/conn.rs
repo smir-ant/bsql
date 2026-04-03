@@ -1748,6 +1748,16 @@ impl Connection {
                 // ParameterStatus can arrive asynchronously during any query.
                 BackendMessage::ParameterStatus { .. } => {}
 
+                // Auth messages should not appear post-startup, but if the
+                // stream buffer contains leftover auth data (e.g. from a
+                // connection that was reused before auth completed), skip them.
+                BackendMessage::AuthOk
+                | BackendMessage::AuthSaslFinal { .. }
+                | BackendMessage::AuthSaslContinue { .. }
+                | BackendMessage::AuthSasl { .. }
+                | BackendMessage::AuthMd5 { .. }
+                | BackendMessage::AuthCleartext => {}
+
                 other => {
                     return Err(DriverError::Protocol(format!(
                         "unexpected message during simple_query: {other:?}"
