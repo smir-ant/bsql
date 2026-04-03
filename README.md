@@ -28,9 +28,13 @@ let user = bsql::query!(
 // Types are inferred from the database schema. Nullable columns become Option<T>.
 ```
 
+<p style="text-align:center"><img alt="––––––" src="https://user-images.githubusercontent.com/84059957/202746520-fed1115a-0ea3-4a39-a3e9-6b832dbc83e4.png" /></p>
+
 ## Performance
 
 [**You need to see this** 🫢](bench/README.md) — bsql vs C vs Go vs diesel vs sqlx, PostgreSQL and SQLite, full methodology and how to reproduce.
+
+<p style="text-align:center"><img alt="––––––" src="https://user-images.githubusercontent.com/84059957/202746520-fed1115a-0ea3-4a39-a3e9-6b832dbc83e4.png" /></p>
 
 ## Quick Start
 
@@ -110,21 +114,6 @@ See [examples/](examples/) for more complete, runnable programs.
 
 ---
 
-## Compile-Time Checks
-
-| Your mistake | What happens |
-|---|---|
-| Table name typo | `table "tcikets" not found -- did you mean "tickets"?` |
-| Column doesn't exist | `column "naem" not found in table "users"` |
-| Wrong parameter type | `expected i32, found &str for column "users.id"` |
-| Nullable column | Automatically becomes `Option<T>` -- you cannot forget to handle NULL |
-| `UPDATE` without `WHERE` | Compile error -- flags accidental full-table updates |
-| `DELETE` without `WHERE` | Compile error -- same protection |
-| SQL syntax error | PostgreSQL's own parser error message, at compile time |
-| Typo in any identifier | Levenshtein-based "did you mean?" suggestions |
-
----
-
 ## Safety
 
 - **PostgreSQL driver**: `#![forbid(unsafe_code)]` -- zero unsafe
@@ -142,6 +131,21 @@ In bsql, all unsafe code is confined to one file: `crates/bsql-driver-sqlite/src
 When a pure-Rust SQLite engine like [Limbo](https://github.com/penberg/limbo) reaches production readiness, this FFI layer can be replaced entirely.
 
 </details>
+
+---
+
+## Compile-Time Checks
+
+| Your mistake | What happens |
+|---|---|
+| Table name typo | `table "tcikets" not found -- did you mean "tickets"?` |
+| Column doesn't exist | `column "naem" not found in table "users"` |
+| Wrong parameter type | `expected i32, found &str for column "users.id"` |
+| Nullable column | Automatically becomes `Option<T>` -- you cannot forget to handle NULL |
+| `UPDATE` without `WHERE` | Compile error -- flags accidental full-table updates |
+| `DELETE` without `WHERE` | Compile error -- same protection |
+| SQL syntax error | PostgreSQL's own parser error message, at compile time |
+| Typo in any identifier | Levenshtein-based "did you mean?" suggestions |
 
 ---
 
@@ -318,31 +322,11 @@ The pool uses a single writer + N reader connections (default 4) behind `Mutex`,
 
 ---
 
-## Examples
-
-See [examples/](examples/) for complete, runnable programs:
-
-- [pg_basic.rs](examples/pg_basic.rs) -- CRUD operations (INSERT, SELECT, UPDATE, DELETE)
-- [pg_dynamic.rs](examples/pg_dynamic.rs) -- Optional WHERE clauses, sort enums, pagination
-- [pg_transactions.rs](examples/pg_transactions.rs) -- Transactions, savepoints, rollback
-- [pg_streaming.rs](examples/pg_streaming.rs) -- Streaming large result sets row-by-row
-- [pg_listener.rs](examples/pg_listener.rs) -- Real-time LISTEN/NOTIFY
-- [sqlite_basic.rs](examples/sqlite_basic.rs) -- SQLite CRUD operations
-- [sqlite_dynamic.rs](examples/sqlite_dynamic.rs) -- Dynamic queries with SQLite
-
-Setup instructions: [examples/README.md](examples/README.md)
-
-## Benchmarks
-
-See [bench/README.md](bench/README.md) for the full methodology, all numbers (including INSERT, JOIN, subquery, TCP vs UDS), and step-by-step instructions to reproduce everything on your own machine.
-
----
-
 ## About
 
 Built with [Claude Code](https://claude.ai/code). Seventeen design principles written before the first line of code. Specifications first, then implementation, then multiple rounds of architectural audit. 1,600+ tests proving not just that the code works, but that broken code is rejected.
 
-Run the benchmarks yourself, read the tests, check the code.
+Don't follow the author's name. Don't assume a library that's been around for 2 years is 12 times better than one that's been around for 2 months. Run the benchmarks yourself, read the tests, check the code.
 
 ## License
 
