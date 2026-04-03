@@ -41,7 +41,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	db := must(sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=NORMAL"))
+	db := must(sql.Open("sqlite3", path+"?_journal_mode=WAL&_synchronous=NORMAL&_mutex=no"))
 	defer db.Close()
 
 	// Verify connection
