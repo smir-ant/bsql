@@ -47,11 +47,14 @@ async fn multiple_channels() {
     let n1 = listener.recv().await.unwrap();
     let n2 = listener.recv().await.unwrap();
 
-    // Notifications arrive in order sent
-    assert_eq!(n1.channel(), "chan_a");
-    assert_eq!(n1.payload(), "from_a");
-    assert_eq!(n2.channel(), "chan_b");
-    assert_eq!(n2.payload(), "from_b");
+    // Both notifications received (order not guaranteed by PG)
+    let mut channels: Vec<&str> = vec![n1.channel(), n2.channel()];
+    channels.sort();
+    assert_eq!(channels, vec!["chan_a", "chan_b"]);
+
+    let mut payloads: Vec<&str> = vec![n1.payload(), n2.payload()];
+    payloads.sort();
+    assert_eq!(payloads, vec!["from_a", "from_b"]);
 }
 
 #[tokio::test]
