@@ -1238,6 +1238,56 @@ impl Connection {
         Ok(())
     }
 
+    /// Process each DataRow as raw bytes — no `PgDataRow`, no SmallVec, no
+    /// pre-scanning of column offsets.
+    ///
+    /// The closure receives the raw DataRow message payload (starting with the
+    /// `i16` column count). Generated code decodes columns sequentially inline,
+    /// advancing a position cursor through the bytes.
+    ///
+    /// This is faster than `for_each` because it eliminates the SmallVec
+    /// construction (~20-30ns per row) and the per-column method call overhead.
+    pub async fn for_each_raw<F>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        mut f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(&[u8]) -> Result<(), DriverError>,
+    {
+        let _columns = self.send_pipeline(sql, sql_hash, params).await?;
+
+        loop {
+            let msg = self.read_one_message().await?;
+            match msg {
+                BackendMessage::DataRow { data } => {
+                    f(data)?;
+                }
+                BackendMessage::CommandComplete { .. } => break,
+                BackendMessage::EmptyQuery => break,
+                BackendMessage::NoticeResponse { .. } => {}
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
+                }
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during for_each_raw: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        self.expect_ready().await?;
+        self.shrink_buffers();
+        self.touch();
+        Ok(())
+    }
+
     /// Simple query protocol — for non-prepared SQL (BEGIN, COMMIT, SET, etc.).
     ///
     /// Does not use the extended query protocol. Cannot have parameters.
@@ -1979,7 +2029,7 @@ impl<'a> PgDataRow<'a> {
     ///
     /// `data` is the DataRow message payload (after the 'D' type byte and
     /// 4-byte length prefix have been stripped by the framing layer).
-    fn new(data: &'a [u8]) -> Result<Self, DriverError> {
+    pub fn new(data: &'a [u8]) -> Result<Self, DriverError> {
         if data.len() < 2 {
             return Err(DriverError::Protocol("DataRow too short".into()));
         }
@@ -2775,5 +2825,260 @@ mod tests {
         for i in 0..16 {
             assert_eq!(row.get_raw(i), Some(&[0u8][..]));
         }
+    }
+
+    // --- Inline sequential decode tests (validates the raw-bytes pattern) ---
+
+    /// Validate inline sequential decode of a 5-column DataRow
+    /// (i32, str, str, bool, f64) — the same pattern the generated code uses.
+    #[test]
+    fn inline_sequential_decode_five_columns() {
+        let data = make_data_row(&[
+            Some(&42i32.to_be_bytes()),
+            Some(b"alice"),
+            Some(b"alice@example.com"),
+            Some(&[1u8]),
+            Some(&3.14f64.to_be_bytes()),
+        ]);
+
+        // Simulate generated inline decode
+        let mut pos: usize = 2; // skip i16 num_cols
+
+        // Column 0: i32
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        assert_eq!(len, 4);
+        let id = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += len as usize;
+        assert_eq!(id, 42);
+
+        // Column 1: str
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        assert_eq!(len, 5);
+        let name = std::str::from_utf8(&data[pos..pos + len as usize]).unwrap();
+        pos += len as usize;
+        assert_eq!(name, "alice");
+
+        // Column 2: str
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let email = std::str::from_utf8(&data[pos..pos + len as usize]).unwrap();
+        pos += len as usize;
+        assert_eq!(email, "alice@example.com");
+
+        // Column 3: bool
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        assert_eq!(len, 1);
+        let active = data[pos] != 0;
+        pos += len as usize;
+        assert!(active);
+
+        // Column 4: f64
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        assert_eq!(len, 8);
+        let score = f64::from_be_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]);
+        pos += len as usize;
+        assert!((score - 3.14).abs() < 1e-10);
+        assert_eq!(pos, data.len());
+    }
+
+    /// Validate inline decode with NULL columns.
+    #[test]
+    fn inline_sequential_decode_with_nulls() {
+        let data = make_data_row(&[
+            Some(&42i32.to_be_bytes()),
+            None, // NULL name
+            Some(b"text"),
+        ]);
+
+        let mut pos: usize = 2;
+
+        // Column 0: i32 NOT NULL
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let id = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += len as usize;
+        assert_eq!(id, 42);
+
+        // Column 1: str NULLABLE -> None
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let name: Option<&str> = if len < 0 {
+            None
+        } else {
+            let s = std::str::from_utf8(&data[pos..pos + len as usize]).unwrap();
+            pos += len as usize;
+            Some(s)
+        };
+        assert!(name.is_none());
+
+        // Column 2: str NOT NULL
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let txt = std::str::from_utf8(&data[pos..pos + len as usize]).unwrap();
+        pos += len as usize;
+        assert_eq!(txt, "text");
+        assert_eq!(pos, data.len());
+    }
+
+    /// Validate inline decode with all supported scalar types.
+    #[test]
+    fn inline_sequential_decode_all_scalar_types() {
+        let data = make_data_row(&[
+            Some(&[1u8]),                  // bool
+            Some(&7i16.to_be_bytes()),     // i16
+            Some(&42i32.to_be_bytes()),    // i32
+            Some(&12345i64.to_be_bytes()), // i64
+            Some(&2.5f32.to_be_bytes()),   // f32
+            Some(&3.14f64.to_be_bytes()),  // f64
+        ]);
+
+        let mut pos: usize = 2;
+
+        // bool
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let v_bool = data[pos] != 0;
+        pos += len as usize;
+        assert!(v_bool);
+
+        // i16
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let v_i16 = i16::from_be_bytes([data[pos], data[pos + 1]]);
+        pos += len as usize;
+        assert_eq!(v_i16, 7);
+
+        // i32
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let v_i32 = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += len as usize;
+        assert_eq!(v_i32, 42);
+
+        // i64
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let v_i64 = i64::from_be_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]);
+        pos += len as usize;
+        assert_eq!(v_i64, 12345);
+
+        // f32
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let v_f32 = f32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += len as usize;
+        assert!((v_f32 - 2.5).abs() < 1e-6);
+
+        // f64
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let v_f64 = f64::from_be_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]);
+        pos += len as usize;
+        assert!((v_f64 - 3.14).abs() < 1e-10);
+        assert_eq!(pos, data.len());
+    }
+
+    /// Validate PgDataRow::new is public (callable from external code).
+    #[test]
+    fn pg_data_row_new_is_public() {
+        let data = make_data_row(&[Some(&42i32.to_be_bytes())]);
+        // This compiles because PgDataRow::new is pub.
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_i32(0), Some(42));
+    }
+
+    /// Inline decode produces identical results to PgDataRow for mixed data.
+    #[test]
+    fn inline_decode_matches_pgdatarow() {
+        let data = make_data_row(&[
+            Some(&99i32.to_be_bytes()),
+            Some(b"hello world"),
+            None,
+            Some(&[0u8]),
+            Some(&1.23f64.to_be_bytes()),
+        ]);
+
+        // PgDataRow results
+        let row = PgDataRow::new(&data).unwrap();
+        let dr_i32 = row.get_i32(0);
+        let dr_str = row.get_str(1);
+        let dr_null = row.get_str(2);
+        let dr_bool = row.get_bool(3);
+        let dr_f64 = row.get_f64(4);
+
+        // Inline results
+        let mut pos: usize = 2;
+
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let in_i32 = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += len as usize;
+
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let in_str = std::str::from_utf8(&data[pos..pos + len as usize]).unwrap();
+        pos += len as usize;
+
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let in_null: Option<&str> = if len < 0 { None } else { unreachable!() };
+
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let in_bool = data[pos] != 0;
+        pos += len as usize;
+
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        let in_f64 = f64::from_be_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]);
+        pos += len as usize;
+
+        // Both paths must produce identical results
+        assert_eq!(dr_i32, Some(in_i32));
+        assert_eq!(dr_str, Some(in_str));
+        assert_eq!(dr_null, in_null);
+        assert_eq!(dr_bool, Some(in_bool));
+        assert!((dr_f64.unwrap() - in_f64).abs() < 1e-15);
+        assert_eq!(pos, data.len());
     }
 }

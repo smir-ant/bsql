@@ -573,14 +573,18 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
     let for_each_methods = if has_columns && is_select {
         let fe_row_name = pg_for_each_row_struct_name(parsed);
-        let fe_decode = gen_pg_for_each_decode(validation);
-        let fe_decode2 = gen_pg_for_each_decode(validation);
+
+        // Use inline raw-bytes decode (no PgDataRow, no SmallVec) for all queries.
+        // For feature-gated types that need PgDataRow, the raw-bytes decoder
+        // constructs a minimal single-column wrapper only for those columns.
+        let (fe_raw_stmts, fe_raw_inits) = gen_pg_for_each_raw_decode(validation);
+        let (fe_raw_stmts2, fe_raw_inits2) = gen_pg_for_each_raw_decode(validation);
 
         quote! {
             /// Process each row directly from the wire buffer via a closure.
             ///
-            /// Zero arena allocation — the closure receives a borrowed row that
-            /// reads columns directly from the PG DataRow message bytes.
+            /// Zero arena allocation, zero SmallVec — the generated code decodes
+            /// columns sequentially inline from the raw DataRow message bytes.
             pub async fn for_each<_BsqlForEachF>(
                 self,
                 pool: &::bsql_core::Pool,
@@ -589,13 +593,14 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             where
                 _BsqlForEachF: FnMut(#fe_row_name<'_>) -> Result<(), ::bsql_core::BsqlError>,
             {
-                pool.for_each_raw(
+                pool.__for_each_raw_bytes(
                     #sql_lit,
                     #sql_hash_val,
                     #params_slice,
                     true,
-                    |_bsql_row| -> ::bsql_core::BsqlResult<()> {
-                        let _bsql_typed = #fe_row_name { #fe_decode };
+                    |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                        #fe_raw_stmts
+                        let _bsql_typed = #fe_row_name { #fe_raw_inits };
                         f(_bsql_typed)
                     },
                 ).await
@@ -611,13 +616,14 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 _BsqlForEachF: FnMut(#fe_row_name<'_>) -> _BsqlForEachT,
             {
                 let mut _bsql_results: Vec<_BsqlForEachT> = Vec::new();
-                pool.for_each_raw(
+                pool.__for_each_raw_bytes(
                     #sql_lit,
                     #sql_hash_val,
                     #params_slice,
                     true,
-                    |_bsql_row| -> ::bsql_core::BsqlResult<()> {
-                        let _bsql_typed = #fe_row_name { #fe_decode2 };
+                    |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                        #fe_raw_stmts2
+                        let _bsql_typed = #fe_row_name { #fe_raw_inits2 };
                         _bsql_results.push(f(_bsql_typed));
                         Ok(())
                     },
@@ -825,19 +831,20 @@ fn gen_dynamic_executor_impls(
     // --- PG for_each for dynamic queries ---
     let for_each_methods = if has_columns && is_select {
         let fe_row_name = pg_for_each_row_struct_name(parsed);
-        let fe_decode = gen_pg_for_each_decode(validation);
-        let fe_decode2 = gen_pg_for_each_decode(validation);
+        let (fe_raw_stmts, fe_raw_inits) = gen_pg_for_each_raw_decode(validation);
+        let (fe_raw_stmts2, fe_raw_inits2) = gen_pg_for_each_raw_decode(validation);
 
         let for_each_dispatcher =
             gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
                 quote! {
-                    pool.for_each_raw(
+                    pool.__for_each_raw_bytes(
                         #sql_lit,
                         #sql_hash,
                         &params_slice[..],
                         true,
-                        |_bsql_row| -> ::bsql_core::BsqlResult<()> {
-                            let _bsql_typed = #fe_row_name { #fe_decode };
+                        |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                            #fe_raw_stmts
+                            let _bsql_typed = #fe_row_name { #fe_raw_inits };
                             f(_bsql_typed)
                         },
                     ).await
@@ -847,13 +854,14 @@ fn gen_dynamic_executor_impls(
         let for_each_map_dispatcher =
             gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
                 quote! {
-                    pool.for_each_raw(
+                    pool.__for_each_raw_bytes(
                         #sql_lit,
                         #sql_hash,
                         &params_slice[..],
                         true,
-                        |_bsql_row| -> ::bsql_core::BsqlResult<()> {
-                            let _bsql_typed = #fe_row_name { #fe_decode2 };
+                        |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                            #fe_raw_stmts2
+                            let _bsql_typed = #fe_row_name { #fe_raw_inits2 };
                             _bsql_results.push(f(_bsql_typed));
                             Ok(())
                         },
@@ -1110,20 +1118,38 @@ fn gen_pg_for_each_row_struct(parsed: &ParsedQuery, validation: &ValidationResul
     }
 }
 
-/// Generate PG for_each row decode. Reads from `_bsql_row` (a `PgDataRow`).
+// ---- PG for_each RAW BYTES inline decode (no PgDataRow, no SmallVec) ----
+
+/// Generate inline sequential decode for PG for_each raw-bytes path.
 ///
-/// For scalar types, identical to `gen_row_decode` but using `_bsql_row` variable.
-/// For String: returns `&str` (zero-copy) instead of `String` (owned).
-/// For Vec<u8>: returns `&[u8]` (zero-copy) instead of `Vec<u8>` (owned).
-fn gen_pg_for_each_decode(validation: &ValidationResult) -> TokenStream {
+/// Instead of constructing a `PgDataRow` and calling `.get_i32(idx)` etc.,
+/// this generates code that advances `_bsql_pos` through `_bsql_data` sequentially,
+/// reading each column's 4-byte length prefix followed by the column bytes.
+///
+/// For basic types (bool, i16, i32, i64, f32, f64, str, bytes): direct inline decode.
+/// For feature-gated types (uuid, time, chrono, decimal, arrays): extracts the raw
+/// column slice and calls the same `::bsql_core::driver::decode_*` functions.
+fn gen_pg_for_each_raw_decode(validation: &ValidationResult) -> (TokenStream, TokenStream) {
     let deduped_names = deduplicate_column_names(&validation.columns);
-    let fields = deduped_names.iter().enumerate().map(|(i, name)| {
-        let field_name = format_ident!("{}", name);
-        let idx = i;
-        let col = &validation.columns[i];
-        let decode_expr = gen_pg_for_each_column_decode(idx, &col.rust_type);
-        quote! { #field_name: #decode_expr }
-    });
+    let decode_stmts: Vec<TokenStream> = deduped_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let field_name = format_ident!("{}", name);
+            let col = &validation.columns[i];
+            gen_pg_raw_column_decode(&field_name, &col.rust_type)
+        })
+        .collect();
+
+    let field_inits: Vec<TokenStream> = deduped_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let field_name = format_ident!("{}", name);
+            let _ = i;
+            quote! { #field_name }
+        })
+        .collect();
 
     let needs_lifetime = validation.columns.iter().any(|col| {
         let rt = &col.rust_type;
@@ -1138,125 +1164,499 @@ fn gen_pg_for_each_decode(validation: &ValidationResult) -> TokenStream {
         quote! { , _marker: ::std::marker::PhantomData }
     };
 
-    quote! { #(#fields),* #phantom_init }
+    let stmts = quote! {
+        let mut _bsql_pos: usize = 2; // skip i16 num_cols
+        #(#decode_stmts)*
+    };
+    let inits = quote! {
+        #(#field_inits),* #phantom_init
+    };
+    (stmts, inits)
 }
 
-/// Generate decode for a single column in the PG for_each path.
-fn gen_pg_for_each_column_decode(idx: usize, rust_type: &str) -> TokenStream {
+/// Generate the inline decode for a single column in the raw-bytes path.
+///
+/// Emits: read 4-byte length, advance _bsql_pos, decode value, advance _bsql_pos.
+fn gen_pg_raw_column_decode(field_name: &proc_macro2::Ident, rust_type: &str) -> TokenStream {
     if let Some(inner) = rust_type
         .strip_prefix("Option<")
         .and_then(|s| s.strip_suffix('>'))
     {
-        gen_pg_for_each_nullable_decode(idx, inner)
+        gen_pg_raw_nullable_decode(field_name, inner)
     } else {
-        gen_pg_for_each_not_null_decode(idx, rust_type)
+        gen_pg_raw_not_null_decode(field_name, rust_type)
     }
 }
 
-/// NOT NULL decode for PG for_each. Reads from `_bsql_row` (PgDataRow).
-fn gen_pg_for_each_not_null_decode(idx: usize, rust_type: &str) -> TokenStream {
-    let col_idx = idx.to_string();
+/// NOT NULL decode for raw-bytes path.
+fn gen_pg_raw_not_null_decode(field_name: &proc_macro2::Ident, rust_type: &str) -> TokenStream {
+    let field_str = field_name.to_string();
     match rust_type {
-        "bool" => {
-            let err = gen_not_null_decode_error(&col_idx, "bool");
-            quote! { _bsql_row.get_bool(#idx).ok_or_else(|| #err)? }
-        }
-        "i16" => {
-            let err = gen_not_null_decode_error(&col_idx, "i16");
-            quote! { _bsql_row.get_i16(#idx).ok_or_else(|| #err)? }
-        }
-        "i32" => {
-            let err = gen_not_null_decode_error(&col_idx, "i32");
-            quote! { _bsql_row.get_i32(#idx).ok_or_else(|| #err)? }
-        }
-        "i64" => {
-            let err = gen_not_null_decode_error(&col_idx, "i64");
-            quote! { _bsql_row.get_i64(#idx).ok_or_else(|| #err)? }
-        }
-        "f32" => {
-            let err = gen_not_null_decode_error(&col_idx, "f32");
-            quote! { _bsql_row.get_f32(#idx).ok_or_else(|| #err)? }
-        }
-        "f64" => {
-            let err = gen_not_null_decode_error(&col_idx, "f64");
-            quote! { _bsql_row.get_f64(#idx).ok_or_else(|| #err)? }
-        }
-        // Zero-copy: borrow &str directly from PG wire buffer
-        "String" => {
-            let err = gen_not_null_decode_error(&col_idx, "&str");
-            quote! { _bsql_row.get_str(#idx).ok_or_else(|| #err)? }
-        }
-        // Zero-copy: borrow &[u8] directly from PG wire buffer
-        "Vec<u8>" => {
-            let err = gen_not_null_decode_error(&col_idx, "&[u8]");
-            quote! { _bsql_row.get_bytes(#idx).ok_or_else(|| #err)? }
-        }
-        "u32" => {
-            let err = gen_not_null_decode_error(&col_idx, "u32");
-            quote! { _bsql_row.get_i32(#idx).ok_or_else(|| #err)? as u32 }
-        }
-        "()" => quote! { () },
-        // For feature-gated types (uuid, time, chrono, decimal, arrays), fall back
-        // to the same get_raw decode as fetch_all but reading from _bsql_row.
-        _ => gen_pg_for_each_feature_decode(idx, rust_type),
+        "bool" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "bool", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL bool")),
+                ));
+            } else {
+                let _v = _bsql_data[_bsql_pos] != 0;
+                _bsql_pos += _bsql_len as usize;
+                _v
+            };
+        },
+        "i16" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "i16", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL i16")),
+                ));
+            } else {
+                let _v = i16::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                _v
+            };
+        },
+        "i32" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "i32", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL i32")),
+                ));
+            } else {
+                let _v = i32::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                _v
+            };
+        },
+        "i64" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "i64", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL i64")),
+                ));
+            } else {
+                let _v = i64::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                    _bsql_data[_bsql_pos + 4], _bsql_data[_bsql_pos + 5],
+                    _bsql_data[_bsql_pos + 6], _bsql_data[_bsql_pos + 7],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                _v
+            };
+        },
+        "f32" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "f32", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL f32")),
+                ));
+            } else {
+                let _v = f32::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                _v
+            };
+        },
+        "f64" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "f64", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL f64")),
+                ));
+            } else {
+                let _v = f64::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                    _bsql_data[_bsql_pos + 4], _bsql_data[_bsql_pos + 5],
+                    _bsql_data[_bsql_pos + 6], _bsql_data[_bsql_pos + 7],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                _v
+            };
+        },
+        // Zero-copy: borrow &str from raw bytes
+        "String" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "&str", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL &str")),
+                ));
+            } else {
+                let _end = _bsql_pos + _bsql_len as usize;
+                let _v = ::bsql_core::driver::decode_str(&_bsql_data[_bsql_pos.._end])
+                    .map_err(|e| ::bsql_core::error::DecodeError::with_source(
+                        #field_str, "&str", "invalid UTF-8", e,
+                    ))?;
+                _bsql_pos = _end;
+                _v
+            };
+        },
+        // Zero-copy: borrow &[u8] from raw bytes
+        "Vec<u8>" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "&[u8]", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL &[u8]")),
+                ));
+            } else {
+                let _end = _bsql_pos + _bsql_len as usize;
+                let _v = &_bsql_data[_bsql_pos.._end];
+                _bsql_pos = _end;
+                _v
+            };
+        },
+        "u32" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "u32", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL u32")),
+                ));
+            } else {
+                let _v = i32::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                ]) as u32;
+                _bsql_pos += _bsql_len as usize;
+                _v
+            };
+        },
+        "()" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            if _bsql_len > 0 { _bsql_pos += _bsql_len as usize; }
+            let #field_name = ();
+        },
+        // Feature-gated types: extract raw column slice and delegate to codec functions
+        _ => gen_pg_raw_feature_decode(field_name, rust_type),
     }
 }
 
-/// Nullable decode for PG for_each.
-fn gen_pg_for_each_nullable_decode(idx: usize, inner_type: &str) -> TokenStream {
+/// Nullable decode for raw-bytes path.
+fn gen_pg_raw_nullable_decode(field_name: &proc_macro2::Ident, inner_type: &str) -> TokenStream {
+    let field_str = field_name.to_string();
     match inner_type {
-        "bool" => quote! { _bsql_row.get_bool(#idx) },
-        "i16" => quote! { _bsql_row.get_i16(#idx) },
-        "i32" => quote! { _bsql_row.get_i32(#idx) },
-        "i64" => quote! { _bsql_row.get_i64(#idx) },
-        "f32" => quote! { _bsql_row.get_f32(#idx) },
-        "f64" => quote! { _bsql_row.get_f64(#idx) },
+        "bool" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<bool> = if _bsql_len < 0 { None } else {
+                let _v = _bsql_data[_bsql_pos] != 0;
+                _bsql_pos += _bsql_len as usize;
+                Some(_v)
+            };
+        },
+        "i16" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<i16> = if _bsql_len < 0 { None } else {
+                let _v = i16::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                Some(_v)
+            };
+        },
+        "i32" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<i32> = if _bsql_len < 0 { None } else {
+                let _v = i32::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                Some(_v)
+            };
+        },
+        "i64" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<i64> = if _bsql_len < 0 { None } else {
+                let _v = i64::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                    _bsql_data[_bsql_pos + 4], _bsql_data[_bsql_pos + 5],
+                    _bsql_data[_bsql_pos + 6], _bsql_data[_bsql_pos + 7],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                Some(_v)
+            };
+        },
+        "f32" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<f32> = if _bsql_len < 0 { None } else {
+                let _v = f32::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                Some(_v)
+            };
+        },
+        "f64" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<f64> = if _bsql_len < 0 { None } else {
+                let _v = f64::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                    _bsql_data[_bsql_pos + 4], _bsql_data[_bsql_pos + 5],
+                    _bsql_data[_bsql_pos + 6], _bsql_data[_bsql_pos + 7],
+                ]);
+                _bsql_pos += _bsql_len as usize;
+                Some(_v)
+            };
+        },
         // Zero-copy: Option<&str>
-        "String" => quote! { _bsql_row.get_str(#idx) },
+        "String" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<&str> = if _bsql_len < 0 { None } else {
+                let _end = _bsql_pos + _bsql_len as usize;
+                let _v = ::bsql_core::driver::decode_str(&_bsql_data[_bsql_pos.._end])
+                    .map_err(|e| ::bsql_core::error::DecodeError::with_source(
+                        #field_str, "&str", "invalid UTF-8", e,
+                    ))?;
+                _bsql_pos = _end;
+                Some(_v)
+            };
+        },
         // Zero-copy: Option<&[u8]>
-        "Vec<u8>" => quote! { _bsql_row.get_bytes(#idx) },
-        "u32" => quote! { _bsql_row.get_i32(#idx).map(|v| v as u32) },
-        _ => gen_pg_for_each_nullable_feature_decode(idx, inner_type),
+        "Vec<u8>" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<&[u8]> = if _bsql_len < 0 { None } else {
+                let _end = _bsql_pos + _bsql_len as usize;
+                let _v = &_bsql_data[_bsql_pos.._end];
+                _bsql_pos = _end;
+                Some(_v)
+            };
+        },
+        "u32" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name: Option<u32> = if _bsql_len < 0 { None } else {
+                let _v = i32::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                ]) as u32;
+                _bsql_pos += _bsql_len as usize;
+                Some(_v)
+            };
+        },
+        // Feature-gated nullable types
+        _ => gen_pg_raw_nullable_feature_decode(field_name, inner_type),
     }
 }
 
-/// Feature-gated NOT NULL decode for PG for_each.
-/// Uses `_bsql_row.get_raw(idx)` + codec decode functions.
-fn gen_pg_for_each_feature_decode(idx: usize, rust_type: &str) -> TokenStream {
-    // Delegate to the same gen_feature_gated_decode / gen_not_null_decode
-    // but replace `row` with `_bsql_row`. Since the getter API is identical,
-    // we can reuse the same logic by generating code that uses `_bsql_row`.
-    let col_idx = idx.to_string();
-    match rust_type {
-        "::uuid::Uuid" | "uuid::Uuid" => {
-            let err = gen_not_null_decode_error(&col_idx, "uuid");
+/// Feature-gated NOT NULL decode for raw-bytes path.
+///
+/// Extracts the raw column bytes inline and calls the same decode functions.
+fn gen_pg_raw_feature_decode(field_name: &proc_macro2::Ident, rust_type: &str) -> TokenStream {
+    let field_str = field_name.to_string();
+    // Read length and extract raw slice
+    let read_raw = quote! {
+        let _bsql_len = i32::from_be_bytes([
+            _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+            _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+        ]);
+        _bsql_pos += 4;
+        let _bsql_raw: &[u8] = if _bsql_len < 0 {
+            &[]
+        } else {
+            let _end = _bsql_pos + _bsql_len as usize;
+            let _v = &_bsql_data[_bsql_pos.._end];
+            _bsql_pos = _end;
+            _v
+        };
+    };
+
+    let decode_expr = match rust_type {
+        "::uuid::Uuid" | "uuid::Uuid" => quote! {
+            let #field_name = match ::bsql_core::driver::decode_uuid_type(_bsql_raw) {
+                Ok(v) => v,
+                Err(e) => return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "uuid", "invalid data", e,
+                )),
+            };
+        },
+        _ => {
+            // For all other feature-gated types, construct a temporary PgDataRow
+            // from the raw column slice. This is a fallback that still benefits
+            // from skipping the SmallVec pre-scan of ALL columns.
+            // We re-use the existing for_each decode via PgDataRow with a single column.
+            let col_idx_lit = 0usize;
+            let decode = gen_not_null_decode(col_idx_lit, rust_type);
             quote! {
-                match ::bsql_core::driver::decode_uuid_type(
-                    _bsql_row.get_raw(#idx).unwrap_or_default()
-                ) {
-                    Ok(v) => v,
-                    Err(_) => return Err(#err),
-                }
+                let #field_name = {
+                    // Build a single-column DataRow for the decode function
+                    let mut _bsql_tmp = Vec::with_capacity(6 + _bsql_raw.len());
+                    _bsql_tmp.extend_from_slice(&1i16.to_be_bytes());
+                    _bsql_tmp.extend_from_slice(&(_bsql_raw.len() as i32).to_be_bytes());
+                    _bsql_tmp.extend_from_slice(_bsql_raw);
+                    let _bsql_row = ::bsql_core::driver::PgDataRow::new(&_bsql_tmp)
+                        .map_err(|e| ::bsql_core::error::DecodeError::with_source(
+                            #field_str, "decode", "invalid data", e,
+                        ))?;
+                    let row = &_bsql_row;
+                    #decode
+                };
             }
         }
-        _ => {
-            // For complex types (time, chrono, decimal, arrays), we generate
-            // code that uses `_bsql_row` in place of `row`. These require
-            // owned copies anyway (they allocate), so no zero-copy benefit.
-            // Use the same decode pattern as fetch_all but with _bsql_row.
-            let decode = gen_not_null_decode(idx, rust_type);
-            // Replace `row.` with `_bsql_row.` in the generated tokens.
-            // Since gen_not_null_decode generates `row.get_*` calls, we
-            // simply alias `row` to `_bsql_row` in the generated block.
-            quote! { { let row = &_bsql_row; #decode } }
-        }
+    };
+
+    quote! {
+        #read_raw
+        #decode_expr
     }
 }
 
-/// Feature-gated nullable decode for PG for_each.
-fn gen_pg_for_each_nullable_feature_decode(idx: usize, inner_type: &str) -> TokenStream {
-    let decode = gen_nullable_decode(idx, inner_type);
-    quote! { { let row = &_bsql_row; #decode } }
+/// Feature-gated nullable decode for raw-bytes path.
+fn gen_pg_raw_nullable_feature_decode(
+    field_name: &proc_macro2::Ident,
+    inner_type: &str,
+) -> TokenStream {
+    let field_str = field_name.to_string();
+
+    match inner_type {
+        "::uuid::Uuid" | "uuid::Uuid" => quote! {
+            let #field_name = {
+                let _bsql_len = i32::from_be_bytes([
+                    _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                    _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                ]);
+                _bsql_pos += 4;
+                if _bsql_len < 0 {
+                    None
+                } else {
+                    let _end = _bsql_pos + _bsql_len as usize;
+                    let _raw = &_bsql_data[_bsql_pos.._end];
+                    _bsql_pos = _end;
+                    Some(match ::bsql_core::driver::decode_uuid_type(_raw) {
+                        Ok(v) => v,
+                        Err(e) => return Err(::bsql_core::error::DecodeError::with_source(
+                            #field_str, "uuid", "invalid data", e,
+                        )),
+                    })
+                }
+            };
+        },
+        _ => {
+            // Fallback for all other feature-gated nullable types
+            let col_idx_lit = 0usize;
+            let decode = gen_nullable_decode(col_idx_lit, inner_type);
+            quote! {
+                let #field_name = {
+                    let _bsql_len = i32::from_be_bytes([
+                        _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                        _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+                    ]);
+                    _bsql_pos += 4;
+                    if _bsql_len < 0 {
+                        None
+                    } else {
+                        let _end = _bsql_pos + _bsql_len as usize;
+                        let _raw = &_bsql_data[_bsql_pos.._end];
+                        _bsql_pos = _end;
+                        // Build a single-column DataRow for the decode function
+                        let mut _bsql_tmp = Vec::with_capacity(6 + _raw.len());
+                        _bsql_tmp.extend_from_slice(&1i16.to_be_bytes());
+                        _bsql_tmp.extend_from_slice(&(_raw.len() as i32).to_be_bytes());
+                        _bsql_tmp.extend_from_slice(_raw);
+                        let _bsql_row = ::bsql_core::driver::PgDataRow::new(&_bsql_tmp)
+                            .map_err(|e| ::bsql_core::error::DecodeError::with_source(
+                                #field_str, "decode", "invalid data", e,
+                            ))?;
+                        let row = &_bsql_row;
+                        #decode
+                    }
+                };
+            }
+        }
+    }
 }
 
 /// Generate row field decoding using typed getters from bsql_driver_postgres::Row.

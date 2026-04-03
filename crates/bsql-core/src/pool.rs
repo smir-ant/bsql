@@ -322,6 +322,48 @@ impl Pool {
         }
         driver_result.map_err(BsqlError::from_driver_query)
     }
+
+    /// Process each DataRow as raw bytes via inline sequential decode.
+    ///
+    /// Like `for_each_raw` but passes the raw `&[u8]` DataRow payload directly
+    /// to the closure — no `PgDataRow` construction, no SmallVec pre-scan.
+    /// The generated macro code decodes columns inline by advancing a position
+    /// cursor through the bytes.
+    #[doc(hidden)]
+    pub async fn __for_each_raw_bytes<F>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        readonly: bool,
+        mut f: F,
+    ) -> BsqlResult<()>
+    where
+        F: FnMut(&[u8]) -> BsqlResult<()>,
+    {
+        let pool = if readonly {
+            self.read_pool.as_ref().unwrap_or(&self.inner)
+        } else {
+            &self.inner
+        };
+        let mut guard = pool.acquire().await.map_err(BsqlError::from)?;
+        let mut user_err: Option<BsqlError> = None;
+        let driver_result = guard
+            .for_each_raw(sql, sql_hash, params, |data| match f(data) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    user_err = Some(e);
+                    Err(bsql_driver_postgres::DriverError::Protocol(
+                        "for_each closure error".into(),
+                    ))
+                }
+            })
+            .await;
+        if let Some(e) = user_err {
+            return Err(e);
+        }
+        driver_result.map_err(BsqlError::from_driver_query)
+    }
 }
 
 impl Clone for Pool {

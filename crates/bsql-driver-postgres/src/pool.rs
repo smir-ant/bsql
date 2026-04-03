@@ -641,6 +641,23 @@ impl Transaction {
         self.guard.for_each(sql, sql_hash, params, f).await
     }
 
+    /// Process each DataRow as raw bytes within a transaction.
+    ///
+    /// The closure receives the raw DataRow message payload. Generated code
+    /// decodes columns sequentially inline — no PgDataRow, no SmallVec.
+    pub async fn for_each_raw<F>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(&[u8]) -> Result<(), DriverError>,
+    {
+        self.guard.for_each_raw(sql, sql_hash, params, f).await
+    }
+
     /// Simple query within the transaction.
     pub async fn simple_query(&mut self, sql: &str) -> Result<(), DriverError> {
         self.guard.simple_query(sql).await

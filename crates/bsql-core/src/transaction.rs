@@ -228,6 +228,41 @@ impl Transaction {
         }
         driver_result.map_err(BsqlError::from_driver_query)
     }
+
+    /// Process each DataRow as raw bytes within this transaction.
+    ///
+    /// Like `for_each_raw` but passes the raw `&[u8]` DataRow payload directly
+    /// to the closure — no `PgDataRow` construction, no SmallVec pre-scan.
+    #[doc(hidden)]
+    pub async fn __for_each_raw_bytes<F>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        mut f: F,
+    ) -> BsqlResult<()>
+    where
+        F: FnMut(&[u8]) -> BsqlResult<()>,
+    {
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let mut user_err: Option<BsqlError> = None;
+        let driver_result = tx
+            .for_each_raw(sql, sql_hash, params, |data| match f(data) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    user_err = Some(e);
+                    Err(bsql_driver_postgres::DriverError::Protocol(
+                        "for_each closure error".into(),
+                    ))
+                }
+            })
+            .await;
+        if let Some(e) = user_err {
+            return Err(e);
+        }
+        driver_result.map_err(BsqlError::from_driver_query)
+    }
 }
 
 impl fmt::Debug for Transaction {

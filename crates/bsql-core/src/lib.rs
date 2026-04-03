@@ -26,6 +26,9 @@ pub mod driver {
     pub use bsql_driver_postgres::hash_sql;
     pub use bsql_driver_postgres::{Arena, Encode, PgDataRow, QueryResult, Row};
 
+    // Scalar decode functions for generated inline raw-bytes code
+    pub use bsql_driver_postgres::codec::decode_str;
+
     // Array decode functions for generated code
     pub use bsql_driver_postgres::codec::{
         decode_array_bool, decode_array_bytea, decode_array_f32, decode_array_f64,
