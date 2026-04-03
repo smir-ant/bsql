@@ -445,16 +445,26 @@ impl StmtHandle {
     ///
     /// Returns `None` if the column is NULL. The returned slice is valid until
     /// the next `step`, `reset`, or the statement is dropped.
+    ///
+    /// Computes length via null-terminator scan instead of calling
+    /// `sqlite3_column_bytes` — saves one FFI call per text column.
+    /// `sqlite3_column_text` always returns a null-terminated string, so
+    /// `CStr::from_ptr` is safe. For typical short strings (< 30 bytes),
+    /// scanning for the null byte is faster than the FFI overhead.
     #[inline]
     pub fn column_text(&self, idx: i32) -> Option<&[u8]> {
         // SAFETY: self.ptr is a valid statement that has been stepped to SQLITE_ROW.
         // The returned pointer is valid until the next step/reset/finalize.
+        // sqlite3_column_text always returns a NUL-terminated string (or NULL).
         let ptr = unsafe { raw::sqlite3_column_text(self.ptr, idx) };
         if ptr.is_null() {
             return None;
         }
-        let len = unsafe { raw::sqlite3_column_bytes(self.ptr, idx) } as usize;
-        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+        // SAFETY: sqlite3_column_text guarantees a NUL-terminated string.
+        // CStr::from_ptr scans for the NUL byte to compute the length,
+        // avoiding a separate sqlite3_column_bytes FFI call.
+        let cstr = unsafe { CStr::from_ptr(ptr as *const std::ffi::c_char) };
+        Some(cstr.to_bytes())
     }
 
     /// Get a column value as blob (raw bytes).

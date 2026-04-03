@@ -1247,6 +1247,10 @@ impl Connection {
     ///
     /// This is faster than `for_each` because it eliminates the SmallVec
     /// construction (~20-30ns per row) and the per-column method call overhead.
+    ///
+    /// Optimization: DataRow messages that fit entirely within `stream_buf` are
+    /// parsed directly from the buffer (zero-copy — no memcpy into `read_buf`).
+    /// Messages that span the buffer boundary fall back to `read_message_buffered`.
     pub async fn for_each_raw<F>(
         &mut self,
         sql: &str,
@@ -1259,29 +1263,151 @@ impl Connection {
     {
         let _columns = self.send_pipeline(sql, sql_hash, params).await?;
 
-        loop {
-            let msg = self.read_one_message().await?;
-            match msg {
-                BackendMessage::DataRow { data } => {
-                    f(data)?;
+        // Bulk DataRow loop: parse messages directly from stream_buf when possible.
+        'outer: loop {
+            // Inner loop: process all complete messages already in stream_buf.
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break; // need more data from TCP
                 }
-                BackendMessage::CommandComplete { .. } => break,
-                BackendMessage::EmptyQuery => break,
-                BackendMessage::NoticeResponse { .. } => {}
-                BackendMessage::ErrorResponse { data } => {
-                    let fields = proto::parse_error_response(data);
-                    self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                    self.drain_to_ready().await?;
-                    return Err(self.make_server_error(fields));
-                }
-                other => {
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
                     return Err(DriverError::Protocol(format!(
-                        "unexpected message during for_each_raw: {other:?}"
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
                     )));
                 }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len; // type(1) + length(4) + payload
+
+                if avail < total_msg_len {
+                    // Message doesn't fit in available buffer data.
+                    if total_msg_len > self.stream_buf.len() {
+                        // Message is larger than entire stream_buf — fall back to
+                        // read_message_buffered which handles arbitrary sizes.
+                        let msg = self.read_one_message().await?;
+                        match msg {
+                            BackendMessage::DataRow { data } => {
+                                f(data)?;
+                                continue;
+                            }
+                            BackendMessage::CommandComplete { .. } | BackendMessage::EmptyQuery => {
+                                break 'outer;
+                            }
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                                self.drain_to_ready().await?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during for_each_raw: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    // Partial message in buffer — compact and refill below.
+                    break;
+                }
+
+                // Full message is available in stream_buf — zero-copy path.
+                let payload_start = self.stream_buf_pos + 5;
+                let payload_end = payload_start + payload_len;
+
+                match msg_type {
+                    b'D' => {
+                        // DataRow — ZERO COPY from stream_buf.
+                        // Safety: payload_start..payload_end is within stream_buf bounds
+                        // (checked by `avail < total_msg_len` above).
+                        f(&self.stream_buf[payload_start..payload_end])?;
+                    }
+                    b'C' => {
+                        // CommandComplete — done.
+                        self.stream_buf_pos += total_msg_len;
+                        break 'outer;
+                    }
+                    b'E' => {
+                        // ErrorResponse — parse owned error fields from stream_buf slice,
+                        // then advance position before calling drain_to_ready.
+                        let fields = proto::parse_error_response(
+                            &self.stream_buf[payload_start..payload_end],
+                        );
+                        self.stream_buf_pos += total_msg_len;
+                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                        self.drain_to_ready().await?;
+                        return Err(self.make_server_error(fields));
+                    }
+                    b'A' => {
+                        // NotificationResponse — buffer it.
+                        // Parse from stream_buf, extract owned data, then advance.
+                        let msg = proto::parse_backend_message(
+                            msg_type,
+                            &self.stream_buf[payload_start..payload_end],
+                        )?;
+                        if let BackendMessage::NotificationResponse {
+                            pid,
+                            channel,
+                            payload,
+                        } = msg
+                        {
+                            let ch = channel.to_owned();
+                            let pl = payload.to_owned();
+                            self.buffer_notification(pid, &ch, &pl);
+                        }
+                    }
+                    b'I' => {
+                        // EmptyQuery — done.
+                        self.stream_buf_pos += total_msg_len;
+                        break 'outer;
+                    }
+                    _ => {
+                        // NoticeResponse (b'N'), ParameterStatus (b'S'), etc. — skip.
+                    }
+                }
+
+                self.stream_buf_pos += total_msg_len;
             }
+
+            // Compact: move unprocessed bytes to front of buffer.
+            let remaining = self.stream_buf_end - self.stream_buf_pos;
+            if remaining > 0 && self.stream_buf_pos > 0 {
+                self.stream_buf
+                    .copy_within(self.stream_buf_pos..self.stream_buf_end, 0);
+            }
+            self.stream_buf_pos = 0;
+            self.stream_buf_end = remaining;
+
+            // Read more from TCP.
+            let n = {
+                let mut reader = StreamReader(&mut self.stream);
+                use tokio::io::AsyncReadExt;
+                reader
+                    .read(&mut self.stream_buf[remaining..])
+                    .await
+                    .map_err(DriverError::Io)?
+            };
+            if n == 0 {
+                return Err(DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                )));
+            }
+            self.stream_buf_end = remaining + n;
         }
 
+        // Read ReadyForQuery.
         self.expect_ready().await?;
         self.shrink_buffers();
         self.touch();
