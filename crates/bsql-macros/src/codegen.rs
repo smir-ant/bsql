@@ -324,6 +324,12 @@ pub fn generate_sort_query_code(
                     #build_sql
                     executor.execute_raw(sql, sql_hash, #params_slice).await
                 }
+
+                /// Buffer this operation in a transaction for pipeline flush on commit.
+                pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+                    #build_sql
+                    tx.defer_execute(sql, sql_hash, #params_slice).await
+                }
             }
         }
     } else {
@@ -337,6 +343,12 @@ pub fn generate_sort_query_code(
                 ) -> ::bsql_core::BsqlResult<u64> {
                     #build_sql
                     executor.execute_raw(sql, sql_hash, #params_slice).await
+                }
+
+                /// Buffer this operation in a transaction for pipeline flush on commit.
+                pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+                    #build_sql
+                    tx.defer_execute(sql, sql_hash, #params_slice).await
                 }
             }
         }
@@ -564,6 +576,13 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         }
     };
 
+    let defer_method = quote! {
+        /// Buffer this operation in a transaction for pipeline flush on commit.
+        pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+            tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice).await
+        }
+    };
+
     // --- PG for_each ---
     let for_each_row_struct = if has_columns {
         gen_pg_for_each_row_struct(parsed, validation)
@@ -644,6 +663,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             #fetch_methods
             #for_each_methods
             #execute_method
+            #defer_method
         }
     }
 }
@@ -828,6 +848,19 @@ fn gen_dynamic_executor_impls(
         }
     };
 
+    let defer_dispatcher = gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+        quote! {
+            tx.defer_execute(#sql_lit, #sql_hash, &params_slice[..]).await
+        }
+    });
+
+    let defer_method = quote! {
+        /// Buffer this operation in a transaction for pipeline flush on commit.
+        pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+            #defer_dispatcher
+        }
+    };
+
     // --- PG for_each for dynamic queries ---
     let for_each_methods = if has_columns && is_select {
         let fe_row_name = pg_for_each_row_struct_name(parsed);
@@ -906,6 +939,7 @@ fn gen_dynamic_executor_impls(
             #fetch_methods
             #for_each_methods
             #execute_method
+            #defer_method
         }
     }
 }
