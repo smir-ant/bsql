@@ -69,9 +69,21 @@ static sqlite3_stmt *prepare(sqlite3 *db, const char *sql) {
 /* Consume all rows from a stepped statement */
 static int consume_rows(sqlite3_stmt *stmt) {
     int rows = 0;
+    int ncols = sqlite3_column_count(stmt);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        /* Access columns to force materialization */
-        (void)sqlite3_column_int64(stmt, 0);
+        /* Access ALL columns to force materialization — same work as Rust */
+        for (int i = 0; i < ncols; i++) {
+            int t = sqlite3_column_type(stmt, i);
+            switch (t) {
+                case SQLITE_INTEGER: (void)sqlite3_column_int64(stmt, i); break;
+                case SQLITE_FLOAT:   (void)sqlite3_column_double(stmt, i); break;
+                case SQLITE_TEXT:    (void)sqlite3_column_text(stmt, i);
+                                     (void)sqlite3_column_bytes(stmt, i); break;
+                case SQLITE_BLOB:    (void)sqlite3_column_blob(stmt, i);
+                                     (void)sqlite3_column_bytes(stmt, i); break;
+                default: break;
+            }
+        }
         rows++;
     }
     return rows;
