@@ -699,6 +699,7 @@ impl SqliteConnection {
     }
 
     /// Get a cached statement or prepare a new one.
+    #[inline]
     fn get_or_prepare(&mut self, sql: &str, sql_hash: u64) -> Result<&StmtHandle, SqliteError> {
         // Use the entry API to avoid a redundant lookup. The fallible prepare
         // must happen outside the entry closure (closures cannot return Result

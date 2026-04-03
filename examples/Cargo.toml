@@ -37,6 +37,10 @@ name = "pg_listener"
 path = "pg_listener.rs"
 
 [[bin]]
+name = "pg_batch_insert"
+path = "pg_batch_insert.rs"
+
+[[bin]]
 name = "sqlite_basic"
 path = "sqlite_basic.rs"
 

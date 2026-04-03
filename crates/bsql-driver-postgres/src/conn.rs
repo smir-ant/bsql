@@ -956,6 +956,9 @@ impl Connection {
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
+                // Reuse one scratch buffer across all params to avoid
+                // per-parameter heap allocation.
+                let mut scratch = Vec::new();
                 for (i, param) in params.iter().enumerate() {
                     let (data_offset, old_len) = tmpl.param_slots[i];
                     if param.is_null() {
@@ -963,7 +966,7 @@ impl Connection {
                         self.write_buf[len_offset..len_offset + 4]
                             .copy_from_slice(&(-1i32).to_be_bytes());
                     } else if old_len >= 0 {
-                        let mut scratch = Vec::new();
+                        scratch.clear();
                         param.encode_binary(&mut scratch);
                         if scratch.len() == old_len as usize {
                             self.write_buf[data_offset..data_offset + scratch.len()]
@@ -1171,6 +1174,9 @@ impl Connection {
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
+                // Reuse one scratch buffer across all params to avoid
+                // per-parameter heap allocation.
+                let mut scratch = Vec::new();
                 for (i, param) in params.iter().enumerate() {
                     let (data_offset, old_len) = tmpl.param_slots[i];
                     if param.is_null() {
@@ -1178,7 +1184,7 @@ impl Connection {
                         self.write_buf[len_offset..len_offset + 4]
                             .copy_from_slice(&(-1i32).to_be_bytes());
                     } else if old_len >= 0 {
-                        let mut scratch = Vec::new();
+                        scratch.clear();
                         param.encode_binary(&mut scratch);
                         if scratch.len() == old_len as usize {
                             self.write_buf[data_offset..data_offset + scratch.len()]

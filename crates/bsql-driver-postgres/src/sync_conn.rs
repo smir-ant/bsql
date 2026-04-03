@@ -452,6 +452,7 @@ impl SyncConnection {
     /// DataRow* + CommandComplete + ReadyForQuery directly from `stream_buf`,
     /// avoiding per-message `read_message_buffered` overhead. DataRow payloads
     /// are parsed in-place from stream_buf into arena storage.
+    #[inline]
     pub fn query(
         &mut self,
         sql: &str,
@@ -613,6 +614,7 @@ impl SyncConnection {
     /// We parse all three directly from `stream_buf` in one pass, avoiding
     /// per-message `read_message_buffered` overhead (no `read_buf` copies,
     /// no `BackendMessage` enum construction).
+    #[inline]
     pub fn execute(
         &mut self,
         sql: &str,
@@ -1124,6 +1126,7 @@ impl SyncConnection {
     ///
     /// Same zero-copy stream_buf optimization as the async `Connection::for_each_raw`,
     /// but with blocking I/O. No futures, no wakers, no poll overhead.
+    #[inline]
     pub fn for_each_raw<F>(
         &mut self,
         sql: &str,
@@ -1454,6 +1457,7 @@ impl SyncConnection {
     ///
     /// On cache hit with a valid bind template, uses the template for faster
     /// Bind message construction.
+    #[inline]
     fn send_pipeline(
         &mut self,
         sql: &str,
@@ -1490,6 +1494,9 @@ impl SyncConnection {
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
+                // Reuse one scratch buffer across all params to avoid
+                // per-parameter heap allocation.
+                let mut scratch = Vec::new();
                 for (i, param) in params.iter().enumerate() {
                     let (data_offset, old_len) = tmpl.param_slots[i];
                     if param.is_null() {
@@ -1498,8 +1505,7 @@ impl SyncConnection {
                         self.write_buf[len_offset..len_offset + 4]
                             .copy_from_slice(&(-1i32).to_be_bytes());
                     } else if old_len >= 0 {
-                        // Encode into a scratch buffer to get new data.
-                        let mut scratch = Vec::new();
+                        scratch.clear();
                         param.encode_binary(&mut scratch);
 
                         if scratch.len() == old_len as usize {
@@ -1660,6 +1666,7 @@ impl SyncConnection {
     }
 
     /// Read one backend message, auto-buffering notifications.
+    #[inline]
     fn read_one_message(&mut self) -> Result<BackendMessage<'_>, DriverError> {
         loop {
             let (msg_type, _payload_len) = self.read_message_buffered()?;
@@ -1726,6 +1733,7 @@ impl SyncConnection {
         }
     }
 
+    #[inline]
     fn drain_to_ready(&mut self) -> Result<(), DriverError> {
         loop {
             let msg = self.read_one_message()?;
@@ -1794,6 +1802,7 @@ impl SyncConnection {
     }
 
     /// Compact stream_buf and read more data from the socket. Blocking.
+    #[inline]
     fn refill_stream_buf(&mut self) -> Result<(), DriverError> {
         let remaining = self.stream_buf_end - self.stream_buf_pos;
         if remaining > 0 && self.stream_buf_pos > 0 {

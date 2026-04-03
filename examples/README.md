@@ -35,6 +35,7 @@ SQL
 | [pg_dynamic.rs](pg_dynamic.rs) | Optional WHERE clauses, sort enums, pagination |
 | [pg_transactions.rs](pg_transactions.rs) | Transactions with `.defer()` batching, savepoints, isolation levels |
 | [pg_streaming.rs](pg_streaming.rs) | Processing large result sets with `fetch_stream` (constant memory) |
+| [pg_batch_insert.rs](pg_batch_insert.rs) | Batch INSERT with `.defer()` pipelining (one round-trip for N inserts) |
 | [pg_listener.rs](pg_listener.rs) | Real-time LISTEN/NOTIFY with `listener.recv()` |
 
 ```bash
@@ -43,6 +44,7 @@ cargo run --bin pg_basic
 cargo run --bin pg_dynamic
 cargo run --bin pg_transactions
 cargo run --bin pg_streaming
+cargo run --bin pg_batch_insert
 cargo run --bin pg_listener
 ```
 
