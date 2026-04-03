@@ -447,6 +447,11 @@ impl SyncConnection {
     }
 
     /// Execute a prepared query and return rows in arena-allocated storage.
+    ///
+    /// Optimized path: after `send_pipeline` flushes, we parse BindComplete +
+    /// DataRow* + CommandComplete + ReadyForQuery directly from `stream_buf`,
+    /// avoiding per-message `read_message_buffered` overhead. DataRow payloads
+    /// are parsed in-place from stream_buf into arena storage.
     pub fn query(
         &mut self,
         sql: &str,
@@ -455,40 +460,141 @@ impl SyncConnection {
         arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
         let columns = self
-            .send_pipeline(sql, sql_hash, params, true, false)?
+            .send_pipeline(sql, sql_hash, params, true, true)?
             .expect("send_pipeline(need_columns=true) must return Some");
 
         let num_cols = columns.len();
         let mut all_col_offsets: Vec<(usize, i32)> = Vec::with_capacity(num_cols.max(1) * 8);
         let mut affected_rows: u64 = 0;
 
-        loop {
-            let msg = self.read_one_message()?;
-            match msg {
-                BackendMessage::DataRow { data } => {
-                    parse_data_row_flat(data, arena, &mut all_col_offsets)?;
+        // Inline response parsing: BindComplete + DataRow* + CommandComplete + ReadyForQuery.
+        'outer: loop {
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break; // need more data
                 }
-                BackendMessage::CommandComplete { tag } => {
-                    affected_rows = proto::parse_command_tag(tag);
-                    break;
-                }
-                BackendMessage::EmptyQuery => break,
-                BackendMessage::NoticeResponse { .. } => {}
-                BackendMessage::ErrorResponse { data } => {
-                    let fields = proto::parse_error_response(data);
-                    self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                    self.drain_to_ready()?;
-                    return Err(self.make_server_error(fields));
-                }
-                other => {
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
                     return Err(DriverError::Protocol(format!(
-                        "unexpected message during query: {other:?}"
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
                     )));
                 }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len;
+
+                if avail < total_msg_len {
+                    if total_msg_len > self.stream_buf.len() {
+                        // Oversized message — fall back to read_one_message.
+                        let msg = self.read_one_message()?;
+                        match msg {
+                            BackendMessage::BindComplete => continue,
+                            BackendMessage::DataRow { data } => {
+                                parse_data_row_flat(data, arena, &mut all_col_offsets)?;
+                                continue;
+                            }
+                            BackendMessage::CommandComplete { tag } => {
+                                affected_rows = proto::parse_command_tag(tag);
+                                continue;
+                            }
+                            BackendMessage::EmptyQuery => continue,
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
+                                break 'outer;
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                                self.drain_to_ready()?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during query: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    break; // partial message — compact and refill
+                }
+
+                // Full message in stream_buf — parse inline.
+                let payload_start = self.stream_buf_pos + 5;
+                let payload_end = payload_start + payload_len;
+
+                match msg_type {
+                    b'2' => {} // BindComplete — skip
+                    b'D' => {
+                        // DataRow — parse column offsets from stream_buf payload.
+                        parse_data_row_flat(
+                            &self.stream_buf[payload_start..payload_end],
+                            arena,
+                            &mut all_col_offsets,
+                        )?;
+                    }
+                    b'C' => {
+                        // CommandComplete — parse affected rows from tag bytes.
+                        affected_rows = proto::parse_command_tag_bytes(
+                            &self.stream_buf[payload_start..payload_end],
+                        );
+                    }
+                    b'I' => {} // EmptyQuery — skip
+                    b'Z' => {
+                        // ReadyForQuery — extract tx status and we're done.
+                        if payload_len >= 1 {
+                            self.tx_status = self.stream_buf[payload_start];
+                        }
+                        self.stream_buf_pos += total_msg_len;
+                        break 'outer;
+                    }
+                    b'E' => {
+                        // ErrorResponse — parse and return error.
+                        let fields = proto::parse_error_response(
+                            &self.stream_buf[payload_start..payload_end],
+                        );
+                        self.stream_buf_pos += total_msg_len;
+                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                        self.drain_to_ready()?;
+                        return Err(self.make_server_error(fields));
+                    }
+                    b'A' => {
+                        // NotificationResponse — buffer it.
+                        let msg = proto::parse_backend_message(
+                            msg_type,
+                            &self.stream_buf[payload_start..payload_end],
+                        )?;
+                        if let BackendMessage::NotificationResponse {
+                            pid,
+                            channel,
+                            payload,
+                        } = msg
+                        {
+                            let ch = channel.to_owned();
+                            let pl = payload.to_owned();
+                            self.buffer_notification(pid, &ch, &pl);
+                        }
+                    }
+                    _ => {} // NoticeResponse, ParameterStatus — skip
+                }
+
+                self.stream_buf_pos += total_msg_len;
             }
+
+            // Need more data — compact and refill.
+            self.refill_stream_buf()?;
         }
 
-        self.expect_ready()?;
         self.shrink_buffers();
         self.touch();
 
@@ -501,41 +607,142 @@ impl SyncConnection {
     }
 
     /// Execute a query without result rows (INSERT/UPDATE/DELETE).
+    ///
+    /// Optimized path: after `send_pipeline` flushes, the server sends
+    /// BindComplete + CommandComplete + ReadyForQuery (~31 bytes total).
+    /// We parse all three directly from `stream_buf` in one pass, avoiding
+    /// per-message `read_message_buffered` overhead (no `read_buf` copies,
+    /// no `BackendMessage` enum construction).
     pub fn execute(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
-        let _ = self.send_pipeline(sql, sql_hash, params, false, false)?;
+        let _ = self.send_pipeline(sql, sql_hash, params, false, true)?;
 
+        // Inline response parsing: BindComplete + DataRow* + CommandComplete + ReadyForQuery.
+        // All messages are parsed directly from stream_buf.
         let mut affected_rows: u64 = 0;
-        loop {
-            let msg = self.read_one_message()?;
-            match msg {
-                BackendMessage::DataRow { .. } => {}
-                BackendMessage::CommandComplete { tag } => {
-                    affected_rows = proto::parse_command_tag(tag);
-                    break;
+
+        'outer: loop {
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break; // need more data
                 }
-                BackendMessage::EmptyQuery => break,
-                BackendMessage::NoticeResponse { .. } => {}
-                BackendMessage::ErrorResponse { data } => {
-                    let fields = proto::parse_error_response(data);
-                    self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                    self.drain_to_ready()?;
-                    return Err(self.make_server_error(fields));
-                }
-                other => {
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
                     return Err(DriverError::Protocol(format!(
-                        "unexpected message during execute: {other:?}"
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
                     )));
                 }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len;
+
+                if avail < total_msg_len {
+                    if total_msg_len > self.stream_buf.len() {
+                        // Oversized message — fall back to read_one_message.
+                        let msg = self.read_one_message()?;
+                        match msg {
+                            BackendMessage::BindComplete | BackendMessage::DataRow { .. } => {
+                                continue;
+                            }
+                            BackendMessage::CommandComplete { tag } => {
+                                affected_rows = proto::parse_command_tag(tag);
+                                continue;
+                            }
+                            BackendMessage::EmptyQuery => continue,
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
+                                break 'outer;
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                                self.drain_to_ready()?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during execute: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    break; // partial message — compact and refill
+                }
+
+                // Full message in stream_buf — parse inline.
+                let payload_start = self.stream_buf_pos + 5;
+                let payload_end = payload_start + payload_len;
+
+                match msg_type {
+                    b'2' => {} // BindComplete — skip
+                    b'D' => {} // DataRow — skip (execute ignores rows)
+                    b'C' => {
+                        // CommandComplete — parse affected rows from tag bytes.
+                        affected_rows = proto::parse_command_tag_bytes(
+                            &self.stream_buf[payload_start..payload_end],
+                        );
+                    }
+                    b'I' => {} // EmptyQuery — skip
+                    b'Z' => {
+                        // ReadyForQuery — extract tx status and we're done.
+                        if payload_len >= 1 {
+                            self.tx_status = self.stream_buf[payload_start];
+                        }
+                        self.stream_buf_pos += total_msg_len;
+                        break 'outer;
+                    }
+                    b'E' => {
+                        // ErrorResponse — parse and return error.
+                        let fields = proto::parse_error_response(
+                            &self.stream_buf[payload_start..payload_end],
+                        );
+                        self.stream_buf_pos += total_msg_len;
+                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                        self.drain_to_ready()?;
+                        return Err(self.make_server_error(fields));
+                    }
+                    b'A' => {
+                        // NotificationResponse — buffer it.
+                        let msg = proto::parse_backend_message(
+                            msg_type,
+                            &self.stream_buf[payload_start..payload_end],
+                        )?;
+                        if let BackendMessage::NotificationResponse {
+                            pid,
+                            channel,
+                            payload,
+                        } = msg
+                        {
+                            let ch = channel.to_owned();
+                            let pl = payload.to_owned();
+                            self.buffer_notification(pid, &ch, &pl);
+                        }
+                    }
+                    _ => {} // NoticeResponse, ParameterStatus — skip
+                }
+
+                self.stream_buf_pos += total_msg_len;
             }
+
+            // Need more data — compact and refill.
+            self.refill_stream_buf()?;
         }
 
-        self.expect_ready()?;
-        self.shrink_buffers();
         self.touch();
         Ok(affected_rows)
     }
@@ -788,33 +995,126 @@ impl SyncConnection {
     where
         F: FnMut(PgDataRow<'_>) -> Result<(), DriverError>,
     {
-        let _ = self.send_pipeline(sql, sql_hash, params, false, false)?;
+        let _ = self.send_pipeline(sql, sql_hash, params, false, true)?;
 
-        loop {
-            let msg = self.read_one_message()?;
-            match msg {
-                BackendMessage::DataRow { data } => {
-                    let row = PgDataRow::new(data)?;
-                    f(row)?;
+        // Inline response parsing: BindComplete + DataRow* + CommandComplete + ReadyForQuery.
+        'outer: loop {
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break; // need more data
                 }
-                BackendMessage::CommandComplete { .. } => break,
-                BackendMessage::EmptyQuery => break,
-                BackendMessage::NoticeResponse { .. } => {}
-                BackendMessage::ErrorResponse { data } => {
-                    let fields = proto::parse_error_response(data);
-                    self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                    self.drain_to_ready()?;
-                    return Err(self.make_server_error(fields));
-                }
-                other => {
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
                     return Err(DriverError::Protocol(format!(
-                        "unexpected message during for_each: {other:?}"
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
                     )));
                 }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len;
+
+                if avail < total_msg_len {
+                    if total_msg_len > self.stream_buf.len() {
+                        // Oversized message — fall back to read_one_message.
+                        let msg = self.read_one_message()?;
+                        match msg {
+                            BackendMessage::BindComplete => continue,
+                            BackendMessage::DataRow { data } => {
+                                let row = PgDataRow::new(data)?;
+                                f(row)?;
+                                continue;
+                            }
+                            BackendMessage::CommandComplete { .. } | BackendMessage::EmptyQuery => {
+                                continue;
+                            }
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
+                                break 'outer;
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                                self.drain_to_ready()?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during for_each: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    break; // partial message — compact and refill
+                }
+
+                // Full message in stream_buf — parse inline.
+                let payload_start = self.stream_buf_pos + 5;
+                let payload_end = payload_start + payload_len;
+
+                match msg_type {
+                    b'2' => {} // BindComplete — skip
+                    b'D' => {
+                        // DataRow — construct PgDataRow from stream_buf slice.
+                        let row = PgDataRow::new(&self.stream_buf[payload_start..payload_end])?;
+                        f(row)?;
+                    }
+                    b'C' | b'I' => {} // CommandComplete / EmptyQuery — skip
+                    b'Z' => {
+                        // ReadyForQuery — extract tx status and we're done.
+                        if payload_len >= 1 {
+                            self.tx_status = self.stream_buf[payload_start];
+                        }
+                        self.stream_buf_pos += total_msg_len;
+                        break 'outer;
+                    }
+                    b'E' => {
+                        // ErrorResponse — parse and return error.
+                        let fields = proto::parse_error_response(
+                            &self.stream_buf[payload_start..payload_end],
+                        );
+                        self.stream_buf_pos += total_msg_len;
+                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                        self.drain_to_ready()?;
+                        return Err(self.make_server_error(fields));
+                    }
+                    b'A' => {
+                        // NotificationResponse — buffer it.
+                        let msg = proto::parse_backend_message(
+                            msg_type,
+                            &self.stream_buf[payload_start..payload_end],
+                        )?;
+                        if let BackendMessage::NotificationResponse {
+                            pid,
+                            channel,
+                            payload,
+                        } = msg
+                        {
+                            let ch = channel.to_owned();
+                            let pl = payload.to_owned();
+                            self.buffer_notification(pid, &ch, &pl);
+                        }
+                    }
+                    _ => {} // NoticeResponse, ParameterStatus — skip
+                }
+
+                self.stream_buf_pos += total_msg_len;
             }
+
+            // Need more data — compact and refill.
+            self.refill_stream_buf()?;
         }
 
-        self.expect_ready()?;
         self.shrink_buffers();
         self.touch();
         Ok(())
@@ -880,6 +1180,8 @@ impl SyncConnection {
         }
 
         // Bulk DataRow loop: parse messages directly from stream_buf.
+        // Continues through CommandComplete/EmptyQuery until ReadyForQuery,
+        // eliminating the separate expect_ready() call.
         'outer: loop {
             loop {
                 let avail = self.stream_buf_end - self.stream_buf_pos;
@@ -915,6 +1217,10 @@ impl SyncConnection {
                                 continue;
                             }
                             BackendMessage::CommandComplete { .. } | BackendMessage::EmptyQuery => {
+                                continue;
+                            }
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
                                 break 'outer;
                             }
                             BackendMessage::ErrorResponse { data } => {
@@ -942,7 +1248,12 @@ impl SyncConnection {
                     b'D' => {
                         f(&self.stream_buf[payload_start..payload_end])?;
                     }
-                    b'C' => {
+                    b'C' | b'I' => {} // CommandComplete / EmptyQuery — skip, wait for Z
+                    b'Z' => {
+                        // ReadyForQuery — extract tx status and we're done.
+                        if payload_len >= 1 {
+                            self.tx_status = self.stream_buf[payload_start];
+                        }
                         self.stream_buf_pos += total_msg_len;
                         break 'outer;
                     }
@@ -971,10 +1282,6 @@ impl SyncConnection {
                             self.buffer_notification(pid, &ch, &pl);
                         }
                     }
-                    b'I' => {
-                        self.stream_buf_pos += total_msg_len;
-                        break 'outer;
-                    }
                     _ => {
                         // NoticeResponse, ParameterStatus, etc. — skip.
                     }
@@ -986,7 +1293,6 @@ impl SyncConnection {
             self.refill_stream_buf()?;
         }
 
-        self.expect_ready()?;
         self.shrink_buffers();
         self.touch();
         Ok(())

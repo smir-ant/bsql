@@ -768,6 +768,36 @@ pub fn parse_command_tag(tag: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Parse the affected-row count from a CommandComplete tag stored as raw bytes.
+///
+/// The tag format is `"INSERT 0 N\0"`, `"UPDATE N\0"`, `"DELETE N\0"`, etc.
+/// We scan backwards from the NUL terminator (or end of slice) to find the
+/// last space, then parse the digits. This avoids UTF-8 validation overhead
+/// since the tag is always ASCII.
+#[inline]
+pub fn parse_command_tag_bytes(payload: &[u8]) -> u64 {
+    // Strip trailing NUL if present.
+    let data = match payload.last() {
+        Some(&0) => &payload[..payload.len() - 1],
+        _ => payload,
+    };
+    // Find the last space.
+    let space_pos = match data.iter().rposition(|&b| b == b' ') {
+        Some(p) => p,
+        None => return 0,
+    };
+    // Parse ASCII digits after the space.
+    let mut n: u64 = 0;
+    for &b in &data[space_pos + 1..] {
+        if b.is_ascii_digit() {
+            n = n * 10 + (b - b'0') as u64;
+        } else {
+            return 0;
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,6 +926,24 @@ mod tests {
         assert_eq!(parse_command_tag("DELETE 12"), 12);
         assert_eq!(parse_command_tag("BEGIN"), 0);
         assert_eq!(parse_command_tag("COMMIT"), 0);
+    }
+
+    #[test]
+    fn command_tag_bytes_parsing() {
+        // With NUL terminator (as received from the wire).
+        assert_eq!(parse_command_tag_bytes(b"SELECT 100\0"), 100);
+        assert_eq!(parse_command_tag_bytes(b"INSERT 0 5\0"), 5);
+        assert_eq!(parse_command_tag_bytes(b"UPDATE 3\0"), 3);
+        assert_eq!(parse_command_tag_bytes(b"DELETE 12\0"), 12);
+        assert_eq!(parse_command_tag_bytes(b"BEGIN\0"), 0);
+        assert_eq!(parse_command_tag_bytes(b"COMMIT\0"), 0);
+        assert_eq!(parse_command_tag_bytes(b"CREATE TABLE\0"), 0);
+        // Without NUL terminator.
+        assert_eq!(parse_command_tag_bytes(b"INSERT 0 1"), 1);
+        assert_eq!(parse_command_tag_bytes(b"DELETE 999"), 999);
+        // Empty / edge cases.
+        assert_eq!(parse_command_tag_bytes(b""), 0);
+        assert_eq!(parse_command_tag_bytes(b"\0"), 0);
     }
 
     #[test]
