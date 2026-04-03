@@ -1748,15 +1748,15 @@ impl Connection {
                 // ParameterStatus can arrive asynchronously during any query.
                 BackendMessage::ParameterStatus { .. } => {}
 
-                // Auth messages should not appear post-startup, but if the
-                // stream buffer contains leftover auth data (e.g. from a
-                // connection that was reused before auth completed), skip them.
+                // Startup messages should not appear post-startup, but if
+                // the stream buffer contains leftover data, skip them safely.
                 BackendMessage::AuthOk
                 | BackendMessage::AuthSaslFinal { .. }
                 | BackendMessage::AuthSaslContinue { .. }
                 | BackendMessage::AuthSasl { .. }
                 | BackendMessage::AuthMd5 { .. }
-                | BackendMessage::AuthCleartext => {}
+                | BackendMessage::AuthCleartext
+                | BackendMessage::BackendKeyData { .. } => {}
 
                 other => {
                     return Err(DriverError::Protocol(format!(
@@ -2142,12 +2142,11 @@ impl Connection {
     /// by TcpStream) may still buffer. Always flushing ensures data reaches
     /// the wire immediately for both plain TCP and TLS.
     async fn flush_write(&mut self) -> Result<(), DriverError> {
-        // TCP_NODELAY is set — write_all pushes to the kernel buffer immediately.
-        // No flush needed (TCP doesn't buffer at application level).
         self.stream
             .write_all(&self.write_buf)
             .await
             .map_err(DriverError::Io)?;
+        self.stream.flush().await.map_err(DriverError::Io)?;
         Ok(())
     }
 
