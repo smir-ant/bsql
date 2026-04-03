@@ -25,8 +25,9 @@ bsql-macros = { workspace = true }
 bsql-driver-sqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 trybuild = "1"
 time = { workspace = true }
+bsql-driver-postgres = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 rust_decimal = { workspace = true }

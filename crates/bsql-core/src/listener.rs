@@ -360,18 +360,22 @@ async fn drive_listener(
                 match cmd {
                     Some(Command::Listen(sql, resp)) => {
                         let result = conn.simple_query(&sql).await;
+                        drain_pending(&mut conn, &notif_tx);
                         let _ = resp.send(result);
                     }
                     Some(Command::Unlisten(sql, resp)) => {
                         let result = conn.simple_query(&sql).await;
+                        drain_pending(&mut conn, &notif_tx);
                         let _ = resp.send(result);
                     }
                     Some(Command::UnlistenAll(resp)) => {
                         let result = conn.simple_query("UNLISTEN *").await;
+                        drain_pending(&mut conn, &notif_tx);
                         let _ = resp.send(result);
                     }
                     Some(Command::Notify(sql, resp)) => {
                         let result = conn.simple_query(&sql).await;
+                        drain_pending(&mut conn, &notif_tx);
                         let _ = resp.send(result);
                     }
                     None => break, // Listener dropped, all senders gone
@@ -413,6 +417,23 @@ async fn drive_listener(
                 }
             }
         }
+    }
+}
+
+/// Drain any notifications that were buffered during `simple_query()` and
+/// forward them to the notification channel. This is necessary because
+/// `read_one_message` auto-buffers NotificationResponse messages in
+/// `pending_notifications` instead of returning them — so after any command
+/// that calls `simple_query`, self-notifications would be silently lost.
+fn drain_pending(
+    conn: &mut bsql_driver_postgres::Connection,
+    notif_tx: &mpsc::Sender<Notification>,
+) {
+    for notif in conn.drain_notifications() {
+        let _ = notif_tx.try_send(Notification {
+            channel: notif.channel,
+            payload: notif.payload,
+        });
     }
 }
 

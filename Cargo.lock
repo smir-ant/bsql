@@ -126,6 +126,7 @@ name = "bsql"
 version = "0.14.0"
 dependencies = [
  "bsql-core",
+ "bsql-driver-postgres",
  "bsql-driver-sqlite",
  "bsql-macros",
  "rust_decimal",
