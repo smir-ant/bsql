@@ -83,11 +83,12 @@ async fn main() -> Result<(), BsqlError> {
     tx.set_isolation(IsolationLevel::Serializable).await?;
 
     let account_id = 1i32;
-    let account = bsql::query!(
+    let accounts = bsql::query!(
         "SELECT id, name, balance FROM accounts WHERE id = $account_id: i32"
     )
-    .get(&tx) // also available: .fetch_one(&tx)
+    .fetch(&tx) // also available: .fetch_all(&tx)
     .await?;
+    let account = &accounts[0];
     println!(
         "Serializable read: account {} has balance {}",
         account.name, account.balance

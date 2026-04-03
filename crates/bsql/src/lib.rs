@@ -34,9 +34,10 @@
 //!     // If this compiles, the SQL is correct — tables, columns, types, all checked.
 //!     //
 //!     //   let id = 1i32;
-//!     //   let user = bsql::query!(
+//!     //   let users = bsql::query!(
 //!     //       "SELECT id, login, active FROM users WHERE id = $id: i32"
-//!     //   ).get(&pool).await?;
+//!     //   ).fetch(&pool).await?;
+//!     //   let user = &users[0];
 //!     //
 //!     // The result struct has typed fields:
 //!     //   user.id: i32, user.login: String, user.active: bool
@@ -54,14 +55,23 @@
 //!
 //! ## Execution methods
 //!
-//! | Method | Returns | Error if | Also available as |
-//! |--------|---------|----------|-------------------|
-//! | `.get(&pool)` | `T` | 0 rows, or 2+ rows | `.fetch_one()` |
-//! | `.fetch(&pool)` | `Vec<T>` | never (empty = empty vec) | `.fetch_all()` |
-//! | `.maybe(&pool)` | `Option<T>` | 2+ rows | `.fetch_optional()` |
-//! | `.run(&pool)` | `u64` (affected rows) | never | `.execute()` |
-//! | `.defer(&tx)` | `()` | pipeline error | |
-//! | `.stream(&pool)` | `impl Stream<Item = Result<T>>` | never | `.fetch_stream()` |
+//! **Simple API** (recommended):
+//!
+//! | Method | Returns | Use when |
+//! |--------|---------|----------|
+//! | `.fetch(&pool)` | `Vec<T>` | SELECT queries |
+//! | `.run(&pool)` | `u64` (affected rows) | INSERT/UPDATE/DELETE |
+//!
+//! **Full API** (power users):
+//!
+//! | Method | Returns | Use when |
+//! |--------|---------|----------|
+//! | `.fetch_one(&pool)` | `T` | Exactly one row expected |
+//! | `.fetch_all(&pool)` | `Vec<T>` | Same as `.fetch()` |
+//! | `.fetch_optional(&pool)` | `Option<T>` | Zero or one row |
+//! | `.fetch_stream(&pool)` | `impl Stream<Item = Result<T>>` | Large result sets |
+//! | `.execute(&pool)` | `u64` | Same as `.run()` |
+//! | `.defer(&tx)` | `()` | Buffer writes in a transaction pipeline |
 
 // Re-export the query! macro and attribute macros
 pub use bsql_macros::pg_enum;

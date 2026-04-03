@@ -6,10 +6,10 @@ Complete, runnable programs demonstrating bsql features. Each file is standalone
 
 | Example | What it shows |
 |---|---|
-| [pg_basic.rs](pg_basic.rs) | CRUD: INSERT, SELECT (get / maybe / fetch), UPDATE, DELETE |
+| [pg_basic.rs](pg_basic.rs) | CRUD: INSERT, SELECT (fetch / fetch_optional), UPDATE, DELETE |
 | [pg_dynamic.rs](pg_dynamic.rs) | Optional WHERE clauses, sort enums, pagination |
 | [pg_transactions.rs](pg_transactions.rs) | Transactions, savepoints, rollback, isolation levels |
-| [pg_streaming.rs](pg_streaming.rs) | Streaming large result sets row-by-row with constant memory |
+| [pg_streaming.rs](pg_streaming.rs) | Streaming large result sets row-by-row with fetch_stream |
 | [pg_listener.rs](pg_listener.rs) | Real-time LISTEN/NOTIFY for cache invalidation and job queues |
 
 ### Setup
@@ -41,7 +41,7 @@ BSQL_DATABASE_URL=postgres://user:pass@localhost/mydb cargo run --bin pg_listene
 
 | Example | What it shows |
 |---|---|
-| [sqlite_basic.rs](sqlite_basic.rs) | CRUD with SQLite: get, fetch, maybe, run (same `query!` macro as PostgreSQL) |
+| [sqlite_basic.rs](sqlite_basic.rs) | CRUD with SQLite: fetch, fetch_optional, run (same `query!` macro as PostgreSQL) |
 | [sqlite_dynamic.rs](sqlite_dynamic.rs) | Optional WHERE clauses and sort enums with SQLite |
 
 ### Setup

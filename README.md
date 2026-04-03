@@ -20,9 +20,10 @@ let id = 42i32;
 // This query is validated at compile time against your real database.
 // If the `users` table doesn't exist, or `login` isn't a column,
 // or `id` isn't an i32 -- this won't compile.
-let user = bsql::query!(
+let users = bsql::query!(
     "SELECT id, login, active FROM users WHERE id = $id: i32"
-).get(&pool).await?;
+).fetch(&pool).await?;
+let user = &users[0];
 
 // user.id: i32, user.login: String, user.active: bool
 // Types are inferred from the database schema. Nullable columns become Option<T>.
@@ -61,9 +62,10 @@ async fn main() -> Result<(), bsql::BsqlError> {
     let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 
     let id = 1i32;
-    let user = bsql::query!(
+    let users = bsql::query!(
         "SELECT id, login, first_name FROM users WHERE id = $id: i32"
-    ).get(&pool).await?;
+    ).fetch(&pool).await?;
+    let user = &users[0];
 
     println!("{} ({})", user.first_name, user.login);
     Ok(())
@@ -97,9 +99,10 @@ async fn main() -> Result<(), bsql::BsqlError> {
     let pool = SqlitePool::open("./myapp.db")?;
 
     let id = 1i64;
-    let user = bsql::query!(
+    let users = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i64"
-    ).get(&pool).await?;
+    ).fetch(&pool).await?;
+    let user = &users[0];
 
     println!("{}: active={}", user.login, user.active);
     Ok(())
@@ -191,14 +194,23 @@ No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variant
 <details>
 <summary>Execution methods</summary>
 
-| Method | Returns | Use when | Also available as |
-|---|---|---|---|
-| `.get(&pool)` | `T` | Exactly one row expected | `.fetch_one()` |
-| `.fetch(&pool)` | `Vec<T>` | All matching rows | `.fetch_all()` |
-| `.maybe(&pool)` | `Option<T>` | Row might not exist | `.fetch_optional()` |
-| `.stream(&pool)` | `impl Stream<Item = Result<T>>` | Large result sets, row-by-row processing | `.fetch_stream()` |
-| `.run(&pool)` | `u64` (affected rows) | INSERT/UPDATE/DELETE without RETURNING | `.execute()` |
-| `.defer(&tx)` | `()` | Buffer writes in a transaction pipeline | |
+**Simple API** (recommended):
+
+| Method | Returns | Use when |
+|---|---|---|
+| `.fetch(&pool)` | `Vec<T>` | SELECT queries |
+| `.run(&pool)` | `u64` (affected rows) | INSERT/UPDATE/DELETE |
+
+**Full API** (power users):
+
+| Method | Returns | Use when |
+|---|---|---|
+| `.fetch_one(&pool)` | `T` | Exactly one row expected |
+| `.fetch_all(&pool)` | `Vec<T>` | Same as `.fetch()` |
+| `.fetch_optional(&pool)` | `Option<T>` | Zero or one row |
+| `.fetch_stream(&pool)` | `impl Stream<Item = Result<T>>` | Large result sets |
+| `.execute(&pool)` | `u64` | Same as `.run()` |
+| `.defer(&tx)` | `()` | Buffer writes in a transaction pipeline |
 
 </details>
 
@@ -225,7 +237,7 @@ If the transaction is dropped without calling `commit()`, it automatically rolls
 ```rust
 let mut stream = bsql::query!(
     "SELECT id, login FROM users"
-).stream(&pool).await?;
+).fetch_stream(&pool).await?;
 
 while let Some(row) = stream.next().await {
     let user = row?;

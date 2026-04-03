@@ -99,7 +99,7 @@ pub fn generate_sort_query_code(
         .collect();
 
     let executor_struct = quote! {
-        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #executor_name<'_bsql> {
             #(#param_fields,)*
@@ -331,17 +331,9 @@ pub fn generate_sort_query_code(
                     tx.defer_execute(sql, sql_hash, #params_slice).await
                 }
 
-                // --- Simple API aliases ---
+                // --- Simple API ---
 
-                /// Fetch exactly one row. Alias for `fetch_one`.
-                pub async fn get<E: ::bsql_core::Executor>(
-                    self,
-                    executor: &E,
-                ) -> ::bsql_core::BsqlResult<#result_name> {
-                    self.fetch_one(executor).await
-                }
-
-                /// Fetch all rows. Alias for `fetch_all`.
+                /// Fetch all rows as a Vec.
                 pub async fn fetch<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
@@ -349,28 +341,12 @@ pub fn generate_sort_query_code(
                     self.fetch_all(executor).await
                 }
 
-                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
                 pub async fn run<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<u64> {
                     self.execute(executor).await
-                }
-
-                /// Fetch zero or one row. Alias for `fetch_optional`.
-                pub async fn maybe<E: ::bsql_core::Executor>(
-                    self,
-                    executor: &E,
-                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                    self.fetch_optional(executor).await
-                }
-
-                /// Stream rows one by one. Alias for `fetch_stream`.
-                pub async fn stream(
-                    self,
-                    pool: &::bsql_core::Pool,
-                ) -> ::bsql_core::BsqlResult<#stream_name> {
-                    self.fetch_stream(pool).await
                 }
             }
         }
@@ -393,7 +369,7 @@ pub fn generate_sort_query_code(
                     tx.defer_execute(sql, sql_hash, #params_slice).await
                 }
 
-                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
                 pub async fn run<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
@@ -487,7 +463,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         .collect();
 
     quote! {
-        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -704,42 +680,17 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
-    // --- Simple API aliases (get/fetch/run/maybe/stream) ---
+    // --- Simple API (fetch/run) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
-        let stream_name = stream_struct_name(parsed);
 
         quote! {
-            /// Fetch exactly one row. Alias for `fetch_one`.
-            pub async fn get<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<#result_name> {
-                self.fetch_one(executor).await
-            }
-
-            /// Fetch all rows. Alias for `fetch_all`.
+            /// Fetch all rows as a Vec.
             pub async fn fetch<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                 self.fetch_all(executor).await
-            }
-
-            /// Fetch zero or one row. Alias for `fetch_optional`.
-            pub async fn maybe<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                self.fetch_optional(executor).await
-            }
-
-            /// Stream rows one by one. Alias for `fetch_stream`.
-            pub async fn stream(
-                self,
-                pool: &::bsql_core::Pool,
-            ) -> ::bsql_core::BsqlResult<#stream_name> {
-                self.fetch_stream(pool).await
             }
         }
     } else {
@@ -747,7 +698,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     };
 
     let simple_api_run = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
         pub async fn run<E: ::bsql_core::Executor>(
             self,
             executor: &E,
@@ -799,7 +750,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     }
 
     quote! {
-        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -1035,42 +986,17 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
-    // --- Simple API aliases (get/fetch/run/maybe/stream) ---
+    // --- Simple API (fetch/run) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
-        let stream_name = stream_struct_name(parsed);
 
         quote! {
-            /// Fetch exactly one row. Alias for `fetch_one`.
-            pub async fn get<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<#result_name> {
-                self.fetch_one(executor).await
-            }
-
-            /// Fetch all rows. Alias for `fetch_all`.
+            /// Fetch all rows as a Vec.
             pub async fn fetch<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                 self.fetch_all(executor).await
-            }
-
-            /// Fetch zero or one row. Alias for `fetch_optional`.
-            pub async fn maybe<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                self.fetch_optional(executor).await
-            }
-
-            /// Stream rows one by one. Alias for `fetch_stream`.
-            pub async fn stream(
-                self,
-                pool: &::bsql_core::Pool,
-            ) -> ::bsql_core::BsqlResult<#stream_name> {
-                self.fetch_stream(pool).await
             }
         }
     } else {
@@ -1078,7 +1004,7 @@ fn gen_dynamic_executor_impls(
     };
 
     let simple_api_run = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
         pub async fn run<E: ::bsql_core::Executor>(
             self,
             executor: &E,
@@ -2505,21 +2431,24 @@ mod tests {
             "missing fetch_optional: {code_str}"
         );
         assert!(code_str.contains("execute"), "missing execute: {code_str}");
-        // Simple API aliases
-        assert!(code_str.contains("fn get"), "missing get alias: {code_str}");
+        // Simple API
         assert!(
-            // The `fetch` alias: look for `fn fetch <` or `fn fetch(` to avoid matching fetch_one/etc
-            code_str.contains("fn fetch <") || code_str.contains("fn fetch <"),
-            "missing fetch alias: {code_str}"
+            // The `fetch` alias: look for `fn fetch <` to avoid matching fetch_one/etc
+            code_str.contains("fn fetch <"),
+            "missing fetch method: {code_str}"
         );
         assert!(
-            code_str.contains("fn maybe"),
-            "missing maybe alias: {code_str}"
+            code_str.contains("fn run"),
+            "missing run method: {code_str}"
         );
-        assert!(code_str.contains("fn run"), "missing run alias: {code_str}");
+        // get and stream aliases should NOT be generated
         assert!(
-            code_str.contains("fn stream"),
-            "missing stream alias: {code_str}"
+            !code_str.contains("fn get"),
+            "get alias should be removed: {code_str}"
+        );
+        assert!(
+            !code_str.contains("fn stream"),
+            "stream alias should be removed: {code_str}"
         );
     }
 

@@ -1,6 +1,6 @@
 //! Basic SQLite operations with bsql.
 //!
-//! Demonstrates: SqlitePool::open, get, fetch, maybe, run.
+//! Demonstrates: SqlitePool::open, fetch, fetch_optional, run.
 //!
 //! bsql validates SQLite queries at compile time against the real database file,
 //! just like it does for PostgreSQL. Same query! macro, same guarantees.
@@ -30,24 +30,26 @@ async fn main() -> Result<(), BsqlError> {
 
     // --- SELECT one row ---
     // SQLite uses i64 for INTEGER PRIMARY KEY (ROWID alias).
+    // Use fetch + index. For power users: .fetch_one(&pool) errors if not exactly 1 row.
     let id = 1i64;
-    let user = bsql::query!(
+    let users = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i64"
     )
-    .get(&pool) // also available: .fetch_one(&pool)
+    .fetch(&pool) // also available: .fetch_all(&pool)
     .await?;
+    let user = &users[0];
     println!("User: {} (id={}, active={})", user.login, user.id, user.active);
 
     // --- SELECT optional ---
-    let maybe_id = 9999i64;
-    let maybe_user = bsql::query!(
-        "SELECT id, login FROM users WHERE id = $maybe_id: i64"
+    let lookup_id = 9999i64;
+    let optional_user = bsql::query!(
+        "SELECT id, login FROM users WHERE id = $lookup_id: i64"
     )
-    .maybe(&pool) // also available: .fetch_optional(&pool)
+    .fetch_optional(&pool)
     .await?;
-    match maybe_user {
+    match optional_user {
         Some(u) => println!("Found: {}", u.login),
-        None => println!("No user with id={maybe_id}"),
+        None => println!("No user with id={lookup_id}"),
     }
 
     // --- SELECT all ---

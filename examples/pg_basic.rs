@@ -1,6 +1,6 @@
 //! Basic PostgreSQL operations with bsql.
 //!
-//! Demonstrates: Pool::connect, get, fetch, maybe, run.
+//! Demonstrates: Pool::connect, fetch, fetch_optional, run.
 //!
 //! Requires a running PostgreSQL instance with a `users` table:
 //!   CREATE TABLE users (id SERIAL PRIMARY KEY, login TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true);
@@ -26,26 +26,28 @@ async fn main() -> Result<(), BsqlError> {
     println!("Inserted user '{login}'");
 
     // --- SELECT one row ---
-    // get returns the row directly, or errors if 0 or 2+ rows match.
+    // Use fetch + LIMIT 1 in SQL, then index into the result.
+    // For power users: .fetch_one(&pool) errors if not exactly 1 row.
     let id = 1i32;
-    let user = bsql::query!(
+    let users = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i32"
     )
-    .get(&pool) // also available: .fetch_one(&pool)
+    .fetch(&pool) // also available: .fetch_all(&pool)
     .await?;
+    let user = &users[0];
     println!("User: {} (id={}, active={})", user.login, user.id, user.active);
 
     // --- SELECT optional ---
-    // maybe returns None if no rows match.
-    let maybe_id = 9999i32;
-    let maybe_user = bsql::query!(
-        "SELECT id, login FROM users WHERE id = $maybe_id: i32"
+    // fetch_optional returns None if no rows match.
+    let lookup_id = 9999i32;
+    let optional_user = bsql::query!(
+        "SELECT id, login FROM users WHERE id = $lookup_id: i32"
     )
-    .maybe(&pool) // also available: .fetch_optional(&pool)
+    .fetch_optional(&pool)
     .await?;
-    match maybe_user {
+    match optional_user {
         Some(u) => println!("Found: {}", u.login),
-        None => println!("No user with id={maybe_id}"),
+        None => println!("No user with id={lookup_id}"),
     }
 
     // --- SELECT all rows ---

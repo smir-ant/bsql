@@ -384,7 +384,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         .collect();
 
     quote! {
-        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -802,14 +802,14 @@ fn gen_executor_impls(
         }
     };
 
-    // --- Simple API aliases (get/fetch/run/maybe/stream) ---
+    // --- Simple API (fetch/run) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
 
-        let fetch_alias = if use_arena {
+        let fetch_method = if use_arena {
             let arena_name = arena_result_struct_name(parsed);
             quote! {
-                /// Fetch all rows. Alias for `fetch_all`.
+                /// Fetch all rows as a Vec.
                 pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
@@ -819,7 +819,7 @@ fn gen_executor_impls(
             }
         } else {
             quote! {
-                /// Fetch all rows. Alias for `fetch_all`.
+                /// Fetch all rows as a Vec.
                 pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
@@ -830,38 +830,14 @@ fn gen_executor_impls(
         };
 
         quote! {
-            /// Fetch exactly one row. Alias for `fetch_one`.
-            pub fn get(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<#result_name> {
-                self.fetch_one(pool)
-            }
-
-            #fetch_alias
-
-            /// Fetch zero or one row. Alias for `fetch_optional`.
-            pub fn maybe(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                self.fetch_optional(pool)
-            }
-
-            /// Stream rows in chunks. Alias for `fetch_stream`.
-            pub fn stream(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<::bsql_core::SqliteStreamingQuery> {
-                self.fetch_stream(pool)
-            }
+            #fetch_method
         }
     } else {
         TokenStream::new()
     };
 
     let simple_api_run = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
         pub fn run(
             self,
             pool: &::bsql_core::SqlitePool,
@@ -1553,7 +1529,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     }
 
     quote! {
-        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -1904,14 +1880,14 @@ fn gen_dynamic_executor_impls(
         }
     };
 
-    // --- Simple API aliases (get/fetch/run/maybe/stream) ---
+    // --- Simple API (fetch/run) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
 
-        let fetch_alias = if use_arena {
+        let fetch_method = if use_arena {
             let arena_name = arena_result_struct_name(parsed);
             quote! {
-                /// Fetch all rows. Alias for `fetch_all`.
+                /// Fetch all rows as a Vec.
                 pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
@@ -1921,7 +1897,7 @@ fn gen_dynamic_executor_impls(
             }
         } else {
             quote! {
-                /// Fetch all rows. Alias for `fetch_all`.
+                /// Fetch all rows as a Vec.
                 pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
@@ -1932,38 +1908,14 @@ fn gen_dynamic_executor_impls(
         };
 
         quote! {
-            /// Fetch exactly one row. Alias for `fetch_one`.
-            pub fn get(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<#result_name> {
-                self.fetch_one(pool)
-            }
-
-            #fetch_alias
-
-            /// Fetch zero or one row. Alias for `fetch_optional`.
-            pub fn maybe(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                self.fetch_optional(pool)
-            }
-
-            /// Stream rows in chunks. Alias for `fetch_stream`.
-            pub fn stream(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<::bsql_core::SqliteStreamingQuery> {
-                self.fetch_stream(pool)
-            }
+            #fetch_method
         }
     } else {
         TokenStream::new()
     };
 
     let simple_api_run = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
         pub fn run(
             self,
             pool: &::bsql_core::SqlitePool,
@@ -2120,7 +2072,7 @@ pub fn generate_sort_sqlite_query_code(
         .collect();
 
     let executor_struct = quote! {
-        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #executor_name<'_bsql> {
             #(#param_fields,)*
@@ -2304,17 +2256,9 @@ pub fn generate_sort_sqlite_query_code(
                     pool.execute_direct(&sql, sql_hash, _bsql_params)
                 }
 
-                // --- Simple API aliases ---
+                // --- Simple API ---
 
-                /// Fetch exactly one row. Alias for `fetch_one`.
-                pub fn get(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<#result_name> {
-                    self.fetch_one(pool)
-                }
-
-                /// Fetch all rows. Alias for `fetch_all`.
+                /// Fetch all rows as a Vec.
                 pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
@@ -2322,15 +2266,7 @@ pub fn generate_sort_sqlite_query_code(
                     self.fetch_all(pool)
                 }
 
-                /// Fetch zero or one row. Alias for `fetch_optional`.
-                pub fn maybe(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                    self.fetch_optional(pool)
-                }
-
-                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
                 pub fn run(
                     self,
                     pool: &::bsql_core::SqlitePool,
@@ -2353,7 +2289,7 @@ pub fn generate_sort_sqlite_query_code(
                     pool.execute_direct(&sql, sql_hash, _bsql_params)
                 }
 
-                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
                 pub fn run(
                     self,
                     pool: &::bsql_core::SqlitePool,

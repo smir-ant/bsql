@@ -1,7 +1,7 @@
 //! Streaming large result sets from PostgreSQL with bsql.
 //!
-//! Demonstrates: stream (also available as fetch_stream) for row-by-row
-//! processing without loading the entire result set into memory.
+//! Demonstrates: fetch_stream for row-by-row processing without loading
+//! the entire result set into memory.
 //!
 //! Uses PostgreSQL's portal / extended query protocol to stream rows
 //! in batches. Each row is decoded and processed before the next batch
@@ -27,7 +27,7 @@ async fn main() -> Result<(), BsqlError> {
     let mut stream = bsql::query!(
         "SELECT id, kind, payload FROM events ORDER BY id"
     )
-    .stream(&pool) // also available: .fetch_stream(&pool)
+    .fetch_stream(&pool)
     .await?;
 
     let mut count = 0u64;
@@ -53,7 +53,7 @@ async fn main() -> Result<(), BsqlError> {
     let mut stream = bsql::query!(
         "SELECT id, kind, payload FROM events WHERE kind = $kind: &str ORDER BY id"
     )
-    .stream(&pool) // also available: .fetch_stream(&pool)
+    .fetch_stream(&pool)
     .await?;
 
     let mut signup_count = 0u64;
