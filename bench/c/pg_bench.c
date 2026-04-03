@@ -87,6 +87,12 @@ static void bench_fetch_one(PGconn *conn) {
     uint64_t start = now_ns();
     for (int i = 0; i < ITERATIONS; i++) {
         PGresult *res = PQexecPrepared(conn, "fetch_one", 1, vals, lens, fmts, 0);
+        int nrows = PQntuples(res);
+        for (int r = 0; r < nrows; r++) {
+            (void)PQgetvalue(res, r, 0);  /* id */
+            (void)PQgetvalue(res, r, 1);  /* name */
+            (void)PQgetvalue(res, r, 2);  /* email */
+        }
         PQclear(res);
     }
     uint64_t elapsed = now_ns() - start;
@@ -120,6 +126,14 @@ static void bench_fetch_many(PGconn *conn, int limit) {
     uint64_t start = now_ns();
     for (int i = 0; i < iters; i++) {
         PGresult *res = PQexecPrepared(conn, stmt_name, 1, vals, lens, fmts, 0);
+        int nrows = PQntuples(res);
+        for (int r = 0; r < nrows; r++) {
+            (void)PQgetvalue(res, r, 0);  /* id */
+            (void)PQgetvalue(res, r, 1);  /* name */
+            (void)PQgetvalue(res, r, 2);  /* email */
+            (void)PQgetvalue(res, r, 3);  /* active */
+            (void)PQgetvalue(res, r, 4);  /* score */
+        }
         PQclear(res);
     }
     uint64_t elapsed = now_ns() - start;
@@ -150,6 +164,10 @@ static void bench_insert_single(PGconn *conn) {
     uint64_t start = now_ns();
     for (int i = 0; i < ITERATIONS; i++) {
         PGresult *res = PQexecPrepared(conn, "insert_single", 2, vals, lens, fmts, 0);
+        int nrows = PQntuples(res);
+        for (int r = 0; r < nrows; r++) {
+            (void)PQgetvalue(res, r, 0);  /* id (RETURNING) */
+        }
         PQclear(res);
     }
     uint64_t elapsed = now_ns() - start;
@@ -212,6 +230,12 @@ static void bench_join_aggregate(PGconn *conn) {
     uint64_t start = now_ns();
     for (int i = 0; i < iters; i++) {
         PGresult *res = PQexecPrepared(conn, "join_agg", 0, NULL, NULL, NULL, 0);
+        int nrows = PQntuples(res);
+        for (int r = 0; r < nrows; r++) {
+            (void)PQgetvalue(res, r, 0);  /* name */
+            (void)PQgetvalue(res, r, 1);  /* order_count */
+            (void)PQgetvalue(res, r, 2);  /* total_amount */
+        }
         PQclear(res);
     }
     uint64_t elapsed = now_ns() - start;
@@ -237,6 +261,12 @@ static void bench_subquery(PGconn *conn) {
     uint64_t start = now_ns();
     for (int i = 0; i < iters; i++) {
         PGresult *res = PQexecPrepared(conn, "subquery", 0, NULL, NULL, NULL, 0);
+        int nrows = PQntuples(res);
+        for (int r = 0; r < nrows; r++) {
+            (void)PQgetvalue(res, r, 0);  /* id */
+            (void)PQgetvalue(res, r, 1);  /* name */
+            (void)PQgetvalue(res, r, 2);  /* email */
+        }
         PQclear(res);
     }
     uint64_t elapsed = now_ns() - start;

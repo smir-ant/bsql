@@ -46,7 +46,7 @@ static sqlite3 *open_db(void) {
     /* NOMUTEX: skip SQLite internal locking (same as bsql).
        Both benchmarks serialize access externally. */
     int rc = sqlite3_open_v2(path, &db,
-        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, NULL);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "Cannot open %s: %s\n", path, sqlite3_errmsg(db));
         sqlite3_close(db);
