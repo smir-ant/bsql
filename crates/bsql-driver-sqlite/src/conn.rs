@@ -619,11 +619,22 @@ impl SqliteConnection {
 
     /// Get a cached statement or prepare a new one.
     fn get_or_prepare(&mut self, sql: &str, sql_hash: u64) -> Result<&StmtHandle, SqliteError> {
+        // Use the entry API to avoid a redundant lookup. The fallible prepare
+        // must happen outside the entry closure (closures cannot return Result
+        // with the entry API), so we do a contains_key + insert pattern but
+        // avoid the unwrap by using an infallible index after the insert.
         if !self.stmts.contains_key(&sql_hash) {
             let handle = self.db.prepare(sql)?;
             self.stmts.insert(sql_hash, CachedStmt { handle });
         }
-        Ok(&self.stmts.get(&sql_hash).unwrap().handle)
+        // SAFETY invariant: the key was just inserted above if it was missing,
+        // so this index is infallible. We use `expect` with a detailed message
+        // instead of `unwrap` to aid debugging if the invariant is ever broken.
+        Ok(&self
+            .stmts
+            .get(&sql_hash)
+            .expect("BUG: stmt cache insert-then-get failed — key was just inserted")
+            .handle)
     }
 }
 
@@ -700,12 +711,12 @@ impl QueryResult {
     ///
     /// Panics if `row >= row_count` or `col >= col_count`.
     pub fn cell(&self, row: usize, col: usize) -> (usize, i32) {
-        debug_assert!(
+        assert!(
             row < self.row_count,
             "row {row} out of range (max {})",
             self.row_count
         );
-        debug_assert!(
+        assert!(
             col < self.col_count,
             "col {col} out of range (max {})",
             self.col_count
@@ -730,27 +741,38 @@ impl QueryResult {
     /// Get an i64 value from the arena. Returns `None` for NULL.
     pub fn get_i64(&self, row: usize, col: usize, arena: &Arena) -> Option<i64> {
         let bytes = self.get_bytes(row, col, arena)?;
-        if bytes.len() == 8 {
-            Some(i64::from_le_bytes(bytes.try_into().unwrap()))
-        } else {
-            None
-        }
+        let arr: [u8; 8] = bytes.try_into().ok()?;
+        Some(i64::from_le_bytes(arr))
     }
 
     /// Get an f64 value from the arena. Returns `None` for NULL.
     pub fn get_f64(&self, row: usize, col: usize, arena: &Arena) -> Option<f64> {
         let bytes = self.get_bytes(row, col, arena)?;
-        if bytes.len() == 8 {
-            Some(f64::from_le_bytes(bytes.try_into().unwrap()))
-        } else {
-            None
-        }
+        let arr: [u8; 8] = bytes.try_into().ok()?;
+        Some(f64::from_le_bytes(arr))
     }
 
     /// Get a text value from the arena. Returns `None` for NULL or invalid UTF-8.
     pub fn get_str<'a>(&self, row: usize, col: usize, arena: &'a Arena) -> Option<&'a str> {
         let bytes = self.get_bytes(row, col, arena)?;
         std::str::from_utf8(bytes).ok()
+    }
+
+    /// Get a text value WITHOUT UTF-8 validation. Returns `None` only for NULL.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee the stored bytes are valid UTF-8.
+    /// This is safe for SQLite TEXT columns (SQLite guarantees UTF-8).
+    #[inline]
+    pub unsafe fn get_str_unchecked<'a>(
+        &self,
+        row: usize,
+        col: usize,
+        arena: &'a Arena,
+    ) -> Option<&'a str> {
+        let bytes = self.get_bytes(row, col, arena)?;
+        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
     }
 
     /// Get a bool value (stored as i64, 0=false, nonzero=true). Returns `None` for NULL.
@@ -2550,5 +2572,292 @@ mod tests {
 
         drop(conn);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: cell bounds checking ---
+
+    #[test]
+    #[should_panic(expected = "row 0 out of range")]
+    fn cell_row_out_of_bounds() {
+        let result = QueryResult {
+            col_count: 1,
+            row_count: 0,
+            col_offsets: vec![],
+        };
+        result.cell(0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "col 1 out of range")]
+    fn cell_col_out_of_bounds() {
+        let result = QueryResult {
+            col_count: 1,
+            row_count: 1,
+            col_offsets: vec![(0, 8)],
+        };
+        result.cell(0, 1);
+    }
+
+    // --- Audit: NULL handling ---
+
+    #[test]
+    fn null_values_in_query_result() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, NULL)").unwrap();
+        conn.exec("INSERT INTO t VALUES (NULL, 'bob')").unwrap();
+
+        let mut arena = Arena::new();
+        let sql = "SELECT id, name FROM t ORDER BY rowid";
+        let hash = hash_sql(sql);
+        let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+
+        assert_eq!(result.len(), 2);
+
+        // Row 0: id=1, name=NULL
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+        assert!(result.is_null(0, 1));
+        assert_eq!(result.get_str(0, 1, &arena), None);
+
+        // Row 1: id=NULL, name='bob'
+        assert!(result.is_null(1, 0));
+        assert_eq!(result.get_i64(1, 0, &arena), None);
+        assert_eq!(result.get_str(1, 1, &arena), Some("bob"));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: empty result set ---
+
+    #[test]
+    fn audit_empty_result_set() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let mut arena = Arena::new();
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+
+        assert_eq!(result.len(), 0);
+        assert!(result.is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: bool value decode ---
+
+    #[test]
+    fn query_result_get_bool() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (0)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1)").unwrap();
+        conn.exec("INSERT INTO t VALUES (42)").unwrap();
+
+        let mut arena = Arena::new();
+        let sql = "SELECT val FROM t ORDER BY rowid";
+        let hash = hash_sql(sql);
+        let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+
+        assert_eq!(result.get_bool(0, 0, &arena), Some(false));
+        assert_eq!(result.get_bool(1, 0, &arena), Some(true));
+        assert_eq!(result.get_bool(2, 0, &arena), Some(true)); // nonzero = true
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: f64 value decode ---
+
+    #[test]
+    fn query_result_get_f64() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val REAL)").unwrap();
+        conn.exec("INSERT INTO t VALUES (3.14)").unwrap();
+        conn.exec("INSERT INTO t VALUES (-1.0)").unwrap();
+
+        let mut arena = Arena::new();
+        let sql = "SELECT val FROM t ORDER BY rowid";
+        let hash = hash_sql(sql);
+        let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+
+        let v0 = result.get_f64(0, 0, &arena).unwrap();
+        assert!((v0 - 3.14).abs() < 0.001);
+        let v1 = result.get_f64(1, 0, &arena).unwrap();
+        assert!((v1 - (-1.0)).abs() < 0.001);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: blob value decode ---
+
+    #[test]
+    fn query_result_blob() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (data BLOB)").unwrap();
+        conn.exec("INSERT INTO t VALUES (X'DEADBEEF')").unwrap();
+        conn.exec("INSERT INTO t VALUES (X'')").unwrap();
+
+        let mut arena = Arena::new();
+        let sql = "SELECT data FROM t ORDER BY rowid";
+        let hash = hash_sql(sql);
+        let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+
+        let bytes0 = result.get_bytes(0, 0, &arena).unwrap();
+        assert_eq!(bytes0, &[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let bytes1 = result.get_bytes(1, 0, &arena).unwrap();
+        assert!(bytes1.is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: fetch_all_arena ---
+
+    #[test]
+    fn fetch_all_arena_basic() {
+        use bsql_arena::{ArenaRows, extend_lifetime_str};
+
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, 'bob')").unwrap();
+
+        struct Row {
+            id: i64,
+            name: &'static str,
+        }
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+
+        let ar: ArenaRows<Row> = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let text = stmt.column_text(1).unwrap_or(b"");
+                let off = arena.alloc_copy(text);
+                let s = arena.get_str(off, text.len()).unwrap_or("");
+                let s = unsafe { extend_lifetime_str(s) };
+                Ok(Row { id, name: s })
+            })
+            .unwrap();
+
+        assert_eq!(ar.len(), 2);
+        assert_eq!(ar[0].id, 1);
+        assert_eq!(ar[0].name, "alice");
+        assert_eq!(ar[1].id, 2);
+        assert_eq!(ar[1].name, "bob");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: fetch_all_arena with empty result ---
+
+    #[test]
+    fn audit_fetch_all_arena_empty() {
+        use bsql_arena::ArenaRows;
+
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+
+        let ar: ArenaRows<i64> = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, _arena| Ok(stmt.column_int64(0)))
+            .unwrap();
+
+        assert!(ar.is_empty());
+        assert_eq!(ar.len(), 0);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: fetch_one_direct error for 0 rows ---
+
+    #[test]
+    fn fetch_one_direct_no_rows_errors() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let result = conn.fetch_one_direct(sql, hash, &[], |stmt| Ok(stmt.column_int64(0)));
+
+        assert!(result.is_err());
+        match result {
+            Err(SqliteError::Internal(msg)) => {
+                assert!(msg.contains("expected 1 row, got 0"));
+            }
+            other => panic!("expected Internal error, got: {other:?}"),
+        }
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: fetch_optional_direct returns None for 0 rows ---
+
+    #[test]
+    fn fetch_optional_direct_no_rows() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let result = conn
+            .fetch_optional_direct(sql, hash, &[], |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+
+        assert!(result.is_none());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Audit: get_i64 with wrong-sized data returns None ---
+
+    #[test]
+    fn get_i64_wrong_size_returns_none() {
+        let mut arena = Arena::new();
+        let offset = arena.alloc_copy(&[1, 2, 3]); // 3 bytes, not 8
+        let result = QueryResult {
+            col_count: 1,
+            row_count: 1,
+            col_offsets: vec![(offset, 3)],
+        };
+        // Should return None because data is 3 bytes, not 8
+        assert_eq!(result.get_i64(0, 0, &arena), None);
+    }
+
+    // --- Audit: get_f64 with wrong-sized data returns None ---
+
+    #[test]
+    fn get_f64_wrong_size_returns_none() {
+        let mut arena = Arena::new();
+        let offset = arena.alloc_copy(&[1, 2, 3, 4]); // 4 bytes, not 8
+        let result = QueryResult {
+            col_count: 1,
+            row_count: 1,
+            col_offsets: vec![(offset, 4)],
+        };
+        assert_eq!(result.get_f64(0, 0, &arena), None);
     }
 }

@@ -302,9 +302,9 @@ fn make_stmt_name(hash: u64) -> Box<str> {
         buf[2 + i * 2] = HEX[(b >> 4) as usize];
         buf[2 + i * 2 + 1] = HEX[(b & 0x0f) as usize];
     }
-    // SAFETY: buf contains only ASCII bytes — valid UTF-8.
-    // We use from_utf8_unchecked via a known-safe path.
-    let s = std::str::from_utf8(&buf).expect("hex is ASCII");
+    // buf contains only ASCII hex digits ('0'-'9','a'-'f') and 's','_'.
+    // from_utf8 is infallible here — the expect documents why.
+    let s = std::str::from_utf8(&buf).expect("BUG: stmt name buffer contains only ASCII hex");
     s.into()
 }
 

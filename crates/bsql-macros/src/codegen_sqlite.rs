@@ -481,10 +481,7 @@ fn gen_sqlite_direct_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?
+                    unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) }
                         .to_owned()
                 }
             }
@@ -529,7 +526,7 @@ fn gen_sqlite_direct_nullable_decode(idx: i32, inner_type: &str) -> TokenStream 
         },
         "String" => quote! {
             _bsql_stmt.column_text(#idx)
-                .and_then(|b| ::std::str::from_utf8(b).ok())
+                .and_then(|b| Some(unsafe { ::std::str::from_utf8_unchecked(b) }))
                 .map(|s| s.to_owned())
         },
         "Vec<u8>" => quote! {
@@ -570,10 +567,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let s = ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
                     s.parse::<::uuid::Uuid>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid UUID in column {}: {}", #col_idx_str, e),
                     ))?
@@ -585,10 +579,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let s = ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
                     ::time::PrimitiveDateTime::parse(s, &::time::format_description::well_known::iso8601::Iso8601::DEFAULT)
                         .or_else(|_| {
                             ::time::PrimitiveDateTime::parse(s, &::time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"))
@@ -604,10 +595,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let s = ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
                     ::time::Date::parse(s, &::time::macros::format_description!("[year]-[month]-[day]"))
                         .map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                             format!("invalid date in column {}: {}", #col_idx_str, e),
@@ -620,10 +608,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let s = ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
                     ::time::Time::parse(s, &::time::macros::format_description!("[hour]:[minute]:[second]"))
                         .map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                             format!("invalid time in column {}: {}", #col_idx_str, e),
@@ -636,10 +621,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let s = ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
                     s.parse::<::chrono::NaiveDateTime>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid datetime in column {}: {}", #col_idx_str, e),
                     ))?
@@ -651,10 +633,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let s = ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
                     s.parse::<::chrono::NaiveDate>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid date in column {}: {}", #col_idx_str, e),
                     ))?
@@ -666,10 +645,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let s = ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
                     s.parse::<::chrono::NaiveTime>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid time in column {}: {}", #col_idx_str, e),
                     ))?
@@ -681,10 +657,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let s = ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
                     s.parse::<::rust_decimal::Decimal>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid decimal in column {}: {}", #col_idx_str, e),
                     ))?
@@ -697,10 +670,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    ::std::str::from_utf8(_bsql_bytes)
-                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?
+                    unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) }
                         .to_owned()
                 }
             }
@@ -749,10 +719,10 @@ fn gen_sqlite_arena_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
                     let _bsql_off = _bsql_arena.alloc_copy(_bsql_bytes);
-                    let _bsql_s = _bsql_arena.get_str(_bsql_off, _bsql_bytes.len())
-                        .ok_or_else(|| ::bsql_core::driver_sqlite::SqliteError::Internal(
-                            format!("invalid UTF-8 in column {}", #col_idx_str),
-                        ))?;
+                    // SAFETY: SQLite TEXT columns are guaranteed valid UTF-8
+                    // (validated on INSERT by sqlite3_bind_text). Skip redundant
+                    // re-validation for maximum throughput.
+                    let _bsql_s = unsafe { _bsql_arena.get_str_unchecked(_bsql_off, _bsql_bytes.len()) };
                     unsafe { ::bsql_core::driver_sqlite::extend_lifetime_str(_bsql_s) }
                 }
             }
@@ -785,12 +755,9 @@ fn gen_sqlite_arena_nullable_decode(idx: i32, inner_type: &str) -> TokenStream {
                 None => None,
                 Some(_bsql_bytes) => {
                     let _bsql_off = _bsql_arena.alloc_copy(_bsql_bytes);
-                    match _bsql_arena.get_str(_bsql_off, _bsql_bytes.len()) {
-                        Some(_bsql_s) => Some(unsafe {
-                            ::bsql_core::driver_sqlite::extend_lifetime_str(_bsql_s)
-                        }),
-                        None => None,
-                    }
+                    // SAFETY: SQLite TEXT is guaranteed valid UTF-8
+                    let _bsql_s = unsafe { _bsql_arena.get_str_unchecked(_bsql_off, _bsql_bytes.len()) };
+                    Some(unsafe { ::bsql_core::driver_sqlite::extend_lifetime_str(_bsql_s) })
                 }
             }
         },

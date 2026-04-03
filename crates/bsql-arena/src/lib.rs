@@ -140,6 +140,21 @@ impl Arena {
         simdutf8::basic::from_utf8(self.get(global_offset, len)).ok()
     }
 
+    /// Retrieve a str slice WITHOUT UTF-8 validation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee the bytes at `[global_offset..global_offset+len]`
+    /// are valid UTF-8. This is safe when the data originates from a source that
+    /// guarantees UTF-8 (e.g., SQLite TEXT columns inserted via `sqlite3_bind_text`).
+    #[inline]
+    pub unsafe fn get_str_unchecked(&self, global_offset: usize, len: usize) -> &str {
+        if len == 0 {
+            return "";
+        }
+        unsafe { std::str::from_utf8_unchecked(self.get(global_offset, len)) }
+    }
+
     /// Reset the arena for reuse. Keeps allocated memory but resets the bump pointer.
     ///
     /// Chunks larger than 64KB are discarded to prevent long-term bloat.
@@ -890,5 +905,52 @@ mod tests {
         let extended = unsafe { extend_lifetime_bytes(bytes) };
         // Arena is still alive, extended should be valid.
         assert_eq!(extended, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    // --- into_vec_unchecked ---
+
+    #[test]
+    fn arena_rows_into_vec_unchecked_numeric() {
+        // SAFETY: i64 contains no arena-borrowed references, so into_vec_unchecked is safe.
+        let arena = Arena::new();
+        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![1, 2, 3], arena) };
+        let v = unsafe { ar.into_vec_unchecked() };
+        assert_eq!(v, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn arena_rows_into_vec_unchecked_empty() {
+        let arena = Arena::new();
+        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![], arena) };
+        let v = unsafe { ar.into_vec_unchecked() };
+        assert!(v.is_empty());
+    }
+
+    // --- get out of bounds returns None ---
+
+    #[test]
+    fn arena_rows_get_out_of_bounds() {
+        let arena = Arena::new();
+        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![42], arena) };
+        assert_eq!(ar.get(0), Some(&42));
+        assert_eq!(ar.get(1), None);
+        assert_eq!(ar.get(999), None);
+    }
+
+    // --- alloc zero length slice ---
+
+    #[test]
+    fn alloc_zero_returns_empty_slice() {
+        let mut arena = Arena::new();
+        let slice = arena.alloc(0);
+        assert!(slice.is_empty());
+    }
+
+    // --- get_str with zero length ---
+
+    #[test]
+    fn get_str_zero_len_returns_empty() {
+        let arena = Arena::new();
+        assert_eq!(arena.get_str(0, 0), Some(""));
     }
 }

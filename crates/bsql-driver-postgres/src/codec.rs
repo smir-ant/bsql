@@ -449,7 +449,7 @@ impl Encode for rust_decimal::Decimal {
 
         // Strip trailing zero groups from the fractional part
         let int_groups = (int_len + int_pad) / 4;
-        while pg_digits.len() > int_groups && *pg_digits.last().unwrap() == 0 {
+        while pg_digits.len() > int_groups && pg_digits.last().copied() == Some(0) {
             pg_digits.pop();
         }
 
