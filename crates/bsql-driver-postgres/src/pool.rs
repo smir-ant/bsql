@@ -742,6 +742,29 @@ impl PoolGuard {
         }
     }
 
+    /// Execute the same statement N times with different params in one pipeline.
+    ///
+    /// Sends all N Bind+Execute messages + one Sync. One round-trip for N operations.
+    /// Returns the affected row count for each parameter set.
+    pub async fn execute_pipeline(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        param_sets: &[&[&(dyn Encode + Sync)]],
+    ) -> Result<Vec<u64>, DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.execute_pipeline(sql, sql_hash, param_sets).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => {
+                tokio::task::block_in_place(|| conn.execute_pipeline(sql, sql_hash, param_sets))
+            }
+        }
+    }
+
     /// Execute a simple (unprepared) query.
     pub async fn simple_query(&mut self, sql: &str) -> Result<(), DriverError> {
         let slot = self
@@ -965,6 +988,19 @@ impl Transaction {
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
         self.guard.execute(sql, sql_hash, params).await
+    }
+
+    /// Execute the same statement N times with different params in one pipeline.
+    ///
+    /// All N Bind+Execute messages are sent with one Sync at the end.
+    /// One round-trip for N operations within the transaction.
+    pub async fn execute_pipeline(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        param_sets: &[&[&(dyn Encode + Sync)]],
+    ) -> Result<Vec<u64>, DriverError> {
+        self.guard.execute_pipeline(sql, sql_hash, param_sets).await
     }
 
     /// Process each row directly from the wire buffer within a transaction.

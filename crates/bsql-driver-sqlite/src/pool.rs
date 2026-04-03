@@ -372,6 +372,21 @@ impl SqlitePool {
         conn.execute_direct(sql, sql_hash, params)
     }
 
+    /// Execute the same statement N times with different parameter sets.
+    ///
+    /// Acquires the writer once for the entire batch. Prepares the statement
+    /// once, then binds+steps+resets for each parameter set. Returns the total
+    /// number of affected rows across all executions.
+    pub fn execute_batch(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        param_sets: &[&[&dyn SqliteEncode]],
+    ) -> Result<u64, SqliteError> {
+        let mut conn = self.acquire_writer()?;
+        conn.execute_batch(sql, sql_hash, param_sets)
+    }
+
     /// Start a streaming query on a reader connection.
     ///
     /// Returns `(result, arena, state, reader_idx)`. The `reader_idx` must be

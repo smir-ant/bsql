@@ -280,6 +280,25 @@ pub const EXECUTE_SYNC: &[u8] = &[
     b'S', 0, 0, 0, 4, // Sync
 ];
 
+/// Pre-built Execute(portal="", max_rows=0) message WITHOUT Sync.
+///
+/// Used by `execute_pipeline` to send N×(Bind+Execute) messages followed by
+/// one Sync at the end — true PG pipeline mode for batch operations.
+///
+/// Layout:
+///   Execute: 'E' [len=9: i32 BE] [portal="" NUL] [max_rows=0: i32 BE]
+pub const EXECUTE_ONLY: &[u8] = &[
+    b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0, // Execute(portal="", max_rows=0)
+];
+
+/// Pre-built Sync message — standalone, for terminating a pipeline.
+///
+/// Layout:
+///   Sync: 'S' [len=4: i32 BE]
+pub const SYNC_ONLY: &[u8] = &[
+    b'S', 0, 0, 0, 4, // Sync
+];
+
 /// Sync message — marks the end of a message pipeline.
 ///
 /// Causes PG to close the implicit transaction (if outside BEGIN) and destroy
@@ -929,6 +948,28 @@ mod tests {
         write_execute(&mut buf, "", 0);
         write_sync(&mut buf);
         assert_eq!(buf.as_slice(), EXECUTE_SYNC);
+    }
+
+    #[test]
+    fn execute_only_matches_execute_without_sync() {
+        let mut buf = Vec::new();
+        write_execute(&mut buf, "", 0);
+        assert_eq!(buf.as_slice(), EXECUTE_ONLY);
+    }
+
+    #[test]
+    fn sync_only_matches_sync() {
+        let mut buf = Vec::new();
+        write_sync(&mut buf);
+        assert_eq!(buf.as_slice(), SYNC_ONLY);
+    }
+
+    #[test]
+    fn execute_sync_equals_execute_only_plus_sync_only() {
+        let mut combined = Vec::new();
+        combined.extend_from_slice(EXECUTE_ONLY);
+        combined.extend_from_slice(SYNC_ONLY);
+        assert_eq!(combined.as_slice(), EXECUTE_SYNC);
     }
 
     #[test]

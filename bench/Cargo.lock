@@ -127,6 +127,7 @@ dependencies = [
  "bsql",
  "bsql-core",
  "bsql-driver-postgres",
+ "bsql-driver-sqlite",
  "criterion",
  "diesel",
  "sqlx",

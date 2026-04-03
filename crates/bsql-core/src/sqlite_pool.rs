@@ -263,6 +263,21 @@ impl SqlitePool {
             .map_err(BsqlError::from_sqlite)
     }
 
+    /// Execute the same statement N times with different parameter sets.
+    ///
+    /// Acquires the writer once for the entire batch. Returns the total
+    /// number of affected rows across all executions.
+    pub fn execute_batch(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        param_sets: &[&[&dyn bsql_driver_sqlite::codec::SqliteEncode]],
+    ) -> BsqlResult<u64> {
+        self.inner
+            .execute_batch(sql, sql_hash, param_sets)
+            .map_err(BsqlError::from_sqlite)
+    }
+
     /// Execute a simple SQL statement on the writer (PRAGMA, DDL).
     pub fn simple_exec(&self, sql: &str) -> BsqlResult<()> {
         self.inner.simple_exec(sql).map_err(BsqlError::from_sqlite)
@@ -392,6 +407,21 @@ impl SqliteTransaction {
     ) -> BsqlResult<u64> {
         self.pool
             .execute(sql, sql_hash, params)
+            .map_err(BsqlError::from_sqlite)
+    }
+
+    /// Execute the same statement N times with different parameter sets
+    /// within the transaction.
+    ///
+    /// Holds the writer for the entire batch. Returns the total affected rows.
+    pub fn execute_batch(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        param_sets: &[&[&dyn bsql_driver_sqlite::codec::SqliteEncode]],
+    ) -> BsqlResult<u64> {
+        self.pool
+            .execute_batch(sql, sql_hash, param_sets)
             .map_err(BsqlError::from_sqlite)
     }
 

@@ -195,6 +195,24 @@ impl Transaction {
             .map_err(BsqlError::from_driver_query)
     }
 
+    /// Execute the same statement N times with different params in one pipeline.
+    ///
+    /// Sends all N Bind+Execute messages + one Sync. One round-trip for
+    /// N operations within the transaction. Returns the affected row count
+    /// for each parameter set.
+    pub async fn execute_pipeline(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        param_sets: &[&[&(dyn Encode + Sync)]],
+    ) -> BsqlResult<Vec<u64>> {
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        tx.execute_pipeline(sql, sql_hash, param_sets)
+            .await
+            .map_err(BsqlError::from_driver_query)
+    }
+
     /// Process each row directly from the wire buffer within this transaction.
     ///
     /// Zero arena allocation — the closure receives a `PgDataRow` that reads

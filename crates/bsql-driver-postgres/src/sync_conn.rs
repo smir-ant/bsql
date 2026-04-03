@@ -540,6 +540,124 @@ impl SyncConnection {
         Ok(affected_rows)
     }
 
+    /// Execute the same prepared statement N times with different parameters
+    /// in a single pipeline round-trip.
+    ///
+    /// Sends all N Bind+Execute messages followed by one Sync. PostgreSQL
+    /// processes them in order and returns N BindComplete+CommandComplete
+    /// responses followed by one ReadyForQuery.
+    ///
+    /// This is a real optimization for bulk operations: N inserts in a
+    /// transaction become 1 round-trip instead of N round-trips.
+    ///
+    /// Returns the number of affected rows for each parameter set.
+    pub fn execute_pipeline(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        param_sets: &[&[&(dyn Encode + Sync)]],
+    ) -> Result<Vec<u64>, DriverError> {
+        if param_sets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug_assert_eq!(crate::conn::hash_sql(sql), sql_hash, "sql_hash mismatch");
+
+        self.write_buf.clear();
+
+        // Ensure statement is prepared.
+        if !self.stmts.contains_key(&sql_hash) {
+            let name = make_stmt_name(sql_hash);
+            let first_params = param_sets[0];
+            if first_params.len() > i16::MAX as usize {
+                return Err(DriverError::Protocol(format!(
+                    "parameter count {} exceeds maximum {}",
+                    first_params.len(),
+                    i16::MAX
+                )));
+            }
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                first_params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_sync(&mut self.write_buf);
+            self.flush_write()?;
+
+            self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+            let columns = self.read_column_description()?;
+            self.expect_ready()?;
+
+            self.query_counter += 1;
+            self.cache_stmt(
+                sql_hash,
+                StmtInfo {
+                    name,
+                    columns,
+                    last_used: self.query_counter,
+                    bind_template: None,
+                },
+            );
+
+            self.write_buf.clear();
+        }
+
+        // Build N x (Bind + Execute) + 1 x Sync
+        let stmt_name = self.stmts[&sql_hash].name.clone();
+        let count = param_sets.len();
+
+        for params in param_sets {
+            if params.len() > i16::MAX as usize {
+                return Err(DriverError::Protocol(format!(
+                    "parameter count {} exceeds maximum {}",
+                    params.len(),
+                    i16::MAX
+                )));
+            }
+            proto::write_bind_params(&mut self.write_buf, "", &stmt_name, params);
+            self.write_buf.extend_from_slice(proto::EXECUTE_ONLY);
+        }
+
+        self.write_buf.extend_from_slice(proto::SYNC_ONLY);
+        self.flush_write()?;
+
+        // Read N x (BindComplete + CommandComplete) + ReadyForQuery
+        let mut results = Vec::with_capacity(count);
+        for _ in 0..count {
+            self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
+
+            let mut affected_rows: u64 = 0;
+            loop {
+                let msg = self.read_one_message()?;
+                match msg {
+                    BackendMessage::DataRow { .. } => {}
+                    BackendMessage::CommandComplete { tag } => {
+                        affected_rows = proto::parse_command_tag(tag);
+                        break;
+                    }
+                    BackendMessage::EmptyQuery => break,
+                    BackendMessage::NoticeResponse { .. } => {}
+                    BackendMessage::ErrorResponse { data } => {
+                        let fields = proto::parse_error_response(data);
+                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                        self.drain_to_ready()?;
+                        return Err(self.make_server_error(fields));
+                    }
+                    other => {
+                        return Err(DriverError::Protocol(format!(
+                            "unexpected message during execute_pipeline: {other:?}"
+                        )));
+                    }
+                }
+            }
+            results.push(affected_rows);
+        }
+
+        self.expect_ready()?;
+        self.shrink_buffers();
+        self.touch();
+        Ok(results)
+    }
+
     /// Process each row via a closure with zero-copy `PgDataRow`.
     pub fn for_each<F>(
         &mut self,

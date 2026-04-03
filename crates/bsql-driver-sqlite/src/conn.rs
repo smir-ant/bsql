@@ -445,6 +445,42 @@ impl SqliteConnection {
         Ok(self.db.changes())
     }
 
+    /// Execute the same statement N times with different parameter sets.
+    ///
+    /// Prepares the statement once, then for each parameter set: clear bindings,
+    /// bind parameters, step, reset. This avoids the per-iteration overhead of
+    /// `get_or_prepare` (hash lookup + contains_key check) and holds the
+    /// connection for the entire batch without releasing and re-acquiring it.
+    ///
+    /// Returns the total number of affected rows across all executions.
+    pub fn execute_batch(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        param_sets: &[&[&dyn SqliteEncode]],
+    ) -> Result<u64, SqliteError> {
+        if param_sets.is_empty() {
+            return Ok(0);
+        }
+        // Ensure statement is prepared (one hash lookup for the entire batch).
+        let _ = self.get_or_prepare(sql, sql_hash)?;
+        let mut total_affected = 0u64;
+        for params in param_sets {
+            // Re-borrow stmt from the cache each iteration. The hash lookup is
+            // fast (identity hasher on pre-hashed key) and the borrow is scoped
+            // so db.changes() can be called after stmt.reset().
+            let stmt = &self.stmts[&sql_hash].handle;
+            stmt.clear_bindings();
+            for (i, param) in params.iter().enumerate() {
+                param.bind(stmt, (i + 1) as i32)?;
+            }
+            stmt.step()?;
+            stmt.reset()?;
+            total_affected += self.db.changes();
+        }
+        Ok(total_affected)
+    }
+
     /// Execute a query and return a streaming iterator.
     ///
     /// Unlike `query()`, this does not step all rows into an arena upfront.
@@ -2617,6 +2653,140 @@ mod tests {
         let hash = hash_sql(sql);
         let affected = conn.execute_direct(sql, hash, &[]).unwrap();
         assert_eq!(affected, 2);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- execute_batch ----
+
+    #[test]
+    fn execute_batch_inserts_multiple_rows() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1, ?2)";
+        let hash = hash_sql(sql);
+        let id1: i64 = 1;
+        let name1: &str = "alice";
+        let id2: i64 = 2;
+        let name2: &str = "bob";
+        let id3: i64 = 3;
+        let name3: &str = "charlie";
+
+        let p1: [&dyn SqliteEncode; 2] = [&id1, &name1];
+        let p2: [&dyn SqliteEncode; 2] = [&id2, &name2];
+        let p3: [&dyn SqliteEncode; 2] = [&id3, &name3];
+        let params: Vec<&[&dyn SqliteEncode]> = vec![&p1, &p2, &p3];
+        let total = conn.execute_batch(sql, hash, &params).unwrap();
+        assert_eq!(total, 3);
+
+        // Verify all rows were inserted
+        let mut arena = Arena::new();
+        let sel_sql = "SELECT id, name FROM t ORDER BY id";
+        let sel_hash = hash_sql(sel_sql);
+        let result = conn.query(sel_sql, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+        assert_eq!(result.get_str(0, 1, &arena), Some("alice"));
+        assert_eq!(result.get_i64(2, 0, &arena), Some(3));
+        assert_eq!(result.get_str(2, 1, &arena), Some("charlie"));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execute_batch_empty_returns_zero() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = hash_sql(sql);
+        let total = conn.execute_batch(sql, hash, &[]).unwrap();
+        assert_eq!(total, 0);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execute_batch_reuses_cached_statement() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = hash_sql(sql);
+
+        // First call prepares the statement
+        let v1: i64 = 1;
+        let p1: [&dyn SqliteEncode; 1] = [&v1];
+        let total = conn.execute_batch(sql, hash, &[&p1]).unwrap();
+        assert_eq!(total, 1);
+
+        // Second call reuses the cached statement
+        let v2: i64 = 2;
+        let v3: i64 = 3;
+        let p2: [&dyn SqliteEncode; 1] = [&v2];
+        let p3: [&dyn SqliteEncode; 1] = [&v3];
+        let total = conn.execute_batch(sql, hash, &[&p2, &p3]).unwrap();
+        assert_eq!(total, 2);
+
+        // Verify all 3 rows exist
+        let mut arena = Arena::new();
+        let sel = "SELECT COUNT(*) FROM t";
+        let result = conn.query(sel, hash_sql(sel), &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(3));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execute_batch_with_update() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, 'b')").unwrap();
+        conn.exec("INSERT INTO t VALUES (3, 'c')").unwrap();
+
+        let sql = "UPDATE t SET val = ?1 WHERE id = ?2";
+        let hash = hash_sql(sql);
+        let new1: &str = "x";
+        let id1: i64 = 1;
+        let new2: &str = "y";
+        let id2: i64 = 2;
+        let p1: [&dyn SqliteEncode; 2] = [&new1, &id1];
+        let p2: [&dyn SqliteEncode; 2] = [&new2, &id2];
+        let params: Vec<&[&dyn SqliteEncode]> = vec![&p1, &p2];
+        let total = conn.execute_batch(sql, hash, &params).unwrap();
+        assert_eq!(total, 2);
+
+        // Verify
+        let rows: Vec<(i64, String)> = conn
+            .fetch_all_direct(
+                "SELECT id, val FROM t ORDER BY id",
+                hash_sql("SELECT id, val FROM t ORDER BY id"),
+                &[],
+                |stmt| {
+                    let id = stmt.column_int64(0);
+                    let val = stmt
+                        .column_text(1)
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .map(|s| s.to_owned())
+                        .unwrap_or_default();
+                    Ok((id, val))
+                },
+            )
+            .unwrap();
+        assert_eq!(rows[0], (1, "x".to_owned()));
+        assert_eq!(rows[1], (2, "y".to_owned()));
+        assert_eq!(rows[2], (3, "c".to_owned()));
 
         drop(conn);
         let _ = std::fs::remove_file(&path);
