@@ -41,8 +41,12 @@ async fn multiple_channels() {
     listener.listen("chan_a").await.unwrap();
     listener.listen("chan_b").await.unwrap();
 
+    // Send notifications with a brief pause between to let the background
+    // task process each one before the next arrives.
     listener.notify("chan_a", "from_a").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     listener.notify("chan_b", "from_b").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let n1 = listener.recv().await.unwrap();
     let n2 = listener.recv().await.unwrap();
