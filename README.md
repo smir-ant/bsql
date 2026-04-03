@@ -28,17 +28,17 @@ let user = bsql::query!(
 // Types are inferred from the database schema. Nullable columns become Option<T>.
 ```
 
-<p style="text-align:center"><img alt="––––––" src="https://user-images.githubusercontent.com/84059957/202746520-fed1115a-0ea3-4a39-a3e9-6b832dbc83e4.png" /></p>
+---
 
 ## Performance
 
 [**You need to see this** 🫢](bench/README.md) — bsql vs C vs Go vs diesel vs sqlx, PostgreSQL and SQLite, full methodology and how to reproduce.
 
-<p style="text-align:center"><img alt="––––––" src="https://user-images.githubusercontent.com/84059957/202746520-fed1115a-0ea3-4a39-a3e9-6b832dbc83e4.png" /></p>
+---
 
 ## Quick Start
 
-<details open><summary>PostgreSQL</summary>
+<details><summary>PostgreSQL</summary>
 
 **Cargo.toml:**
 ```toml
