@@ -47,6 +47,8 @@ pub mod pool;
 mod auth;
 mod conn;
 mod proto;
+#[cfg(unix)]
+mod sync_conn;
 #[cfg(feature = "tls")]
 mod tls;
 
@@ -58,6 +60,8 @@ pub use conn::{
     SimpleRow, SslMode,
 };
 pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
+#[cfg(unix)]
+pub use sync_conn::SyncConnection;
 
 // --- DriverError ---
 

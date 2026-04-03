@@ -378,6 +378,30 @@ struct StmtInfo {
     /// Monotonic counter value at last use for LRU eviction.
     /// Cheaper than `Instant::now()` which is a syscall on macOS (~20-40ns).
     last_used: u64,
+    /// Pre-built Bind message template for fast re-execution.
+    ///
+    /// On the first execution of a cached statement, we snapshot the complete
+    /// Bind message bytes. On subsequent executions with fixed-size parameters,
+    /// we memcpy the template and patch only the parameter data in-place,
+    /// avoiding the full `write_bind_params` rebuild (~100-200ns savings per
+    /// query on the hot path).
+    ///
+    /// `None` until the first execution populates it.
+    bind_template: Option<BindTemplate>,
+}
+
+/// Pre-built Bind message template for fast re-execution.
+///
+/// Stores the complete Bind message bytes and the byte offsets where
+/// each parameter's data begins. On re-execution with same-sized params,
+/// we copy the template and overwrite param data in-place.
+struct BindTemplate {
+    /// Complete Bind message bytes (type 'B' + length + payload).
+    bytes: Vec<u8>,
+    /// For each parameter: `(data_offset, data_len)` within `bytes`.
+    /// `data_offset` points to the first byte of param data (after the i32 length).
+    /// `data_len` is the length of the param data. -1 means NULL.
+    param_slots: Vec<(usize, i32)>,
 }
 
 /// Description of a result column.
@@ -783,6 +807,7 @@ impl Connection {
                 name,
                 columns,
                 last_used: self.query_counter,
+                bind_template: None,
             },
         );
         Ok(())
@@ -921,11 +946,56 @@ impl Connection {
 
         // Single hash lookup via get_mut — avoids contains_key + index double-lookup.
         let columns = if let Some(info) = self.stmts.get_mut(&sql_hash) {
-            // Cache hit: Bind+Execute+Flush only
+            // Cache hit: try bind template, fall back to write_bind_params.
             self.query_counter += 1;
             info.last_used = self.query_counter;
-            proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+
+            let can_use_template = info
+                .bind_template
+                .as_ref()
+                .is_some_and(|t| t.param_slots.len() == params.len());
+
+            if can_use_template {
+                let tmpl = info.bind_template.as_ref().unwrap();
+                self.write_buf.extend_from_slice(&tmpl.bytes);
+
+                let mut template_ok = true;
+                for (i, param) in params.iter().enumerate() {
+                    let (data_offset, old_len) = tmpl.param_slots[i];
+                    if param.is_null() {
+                        let len_offset = data_offset - 4;
+                        self.write_buf[len_offset..len_offset + 4]
+                            .copy_from_slice(&(-1i32).to_be_bytes());
+                    } else if old_len >= 0 {
+                        let mut scratch = Vec::new();
+                        param.encode_binary(&mut scratch);
+                        if scratch.len() == old_len as usize {
+                            self.write_buf[data_offset..data_offset + scratch.len()]
+                                .copy_from_slice(&scratch);
+                        } else {
+                            template_ok = false;
+                            break;
+                        }
+                    } else {
+                        template_ok = false;
+                        break;
+                    }
+                }
+
+                if !template_ok {
+                    self.write_buf.clear();
+                    proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                    info.bind_template = None;
+                }
+            } else {
+                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+            }
+
             let cols = info.columns.clone();
+
+            if info.bind_template.is_none() && !self.write_buf.is_empty() {
+                info.bind_template = build_bind_template(&self.write_buf, params.len());
+            }
 
             proto::write_execute(&mut self.write_buf, "", chunk_size);
             // Use Flush (not Sync!) to keep the portal alive between chunks.
@@ -956,6 +1026,7 @@ impl Connection {
                     name,
                     columns: columns.clone(),
                     last_used: self.query_counter,
+                    bind_template: None,
                 },
             );
             columns
@@ -1089,10 +1160,52 @@ impl Connection {
 
         // Single hash lookup — get_mut avoids the contains_key + index double-lookup.
         let columns = if let Some(info) = self.stmts.get_mut(&sql_hash) {
-            // Cache hit: Bind+Execute+Sync only
+            // Cache hit: try bind template for fast path, fall back to write_bind_params.
             self.query_counter += 1;
             info.last_used = self.query_counter;
-            proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+
+            let can_use_template = info
+                .bind_template
+                .as_ref()
+                .is_some_and(|t| t.param_slots.len() == params.len());
+
+            if can_use_template {
+                // Fast path: copy template and patch param bytes in-place.
+                let tmpl = info.bind_template.as_ref().unwrap();
+                self.write_buf.extend_from_slice(&tmpl.bytes);
+
+                let mut template_ok = true;
+                for (i, param) in params.iter().enumerate() {
+                    let (data_offset, old_len) = tmpl.param_slots[i];
+                    if param.is_null() {
+                        let len_offset = data_offset - 4;
+                        self.write_buf[len_offset..len_offset + 4]
+                            .copy_from_slice(&(-1i32).to_be_bytes());
+                    } else if old_len >= 0 {
+                        let mut scratch = Vec::new();
+                        param.encode_binary(&mut scratch);
+                        if scratch.len() == old_len as usize {
+                            self.write_buf[data_offset..data_offset + scratch.len()]
+                                .copy_from_slice(&scratch);
+                        } else {
+                            template_ok = false;
+                            break;
+                        }
+                    } else {
+                        template_ok = false;
+                        break;
+                    }
+                }
+
+                if !template_ok {
+                    self.write_buf.clear();
+                    proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                    info.bind_template = None;
+                }
+            } else {
+                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+            }
+
             // Clone Arc only when caller needs columns (query path).
             // for_each_raw / execute skip this atomic increment.
             let cols = if need_columns {
@@ -1100,6 +1213,11 @@ impl Connection {
             } else {
                 None
             };
+
+            // Snapshot bind template on first use or after invalidation.
+            if info.bind_template.is_none() && !self.write_buf.is_empty() {
+                info.bind_template = build_bind_template(&self.write_buf, params.len());
+            }
 
             self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
             self.flush_write().await?;
@@ -1127,6 +1245,7 @@ impl Connection {
                     name,
                     columns: columns.clone(),
                     last_used: self.query_counter,
+                    bind_template: None,
                 },
             );
             if need_columns { Some(columns) } else { None }
@@ -2117,6 +2236,80 @@ async fn buffered_read_exact(
     Ok(())
 }
 
+// --- Bind template builder ---
+
+/// Build a `BindTemplate` from the current write_buf contents.
+///
+/// Parses the Bind message to locate each parameter's data offset and length.
+/// Returns `None` if the message cannot be parsed.
+fn build_bind_template(write_buf: &[u8], param_count: usize) -> Option<BindTemplate> {
+    if write_buf.is_empty() || write_buf[0] != b'B' {
+        return None;
+    }
+    if write_buf.len() < 5 {
+        return None;
+    }
+
+    let mut pos = 5; // skip type byte (1) + length (4)
+
+    // Skip portal name (NUL-terminated).
+    while pos < write_buf.len() && write_buf[pos] != 0 {
+        pos += 1;
+    }
+    pos += 1;
+
+    // Skip statement name (NUL-terminated).
+    while pos < write_buf.len() && write_buf[pos] != 0 {
+        pos += 1;
+    }
+    pos += 1;
+
+    // Skip format codes.
+    if pos + 2 > write_buf.len() {
+        return None;
+    }
+    let num_fmt_codes = i16::from_be_bytes([write_buf[pos], write_buf[pos + 1]]);
+    pos += 2;
+    pos += num_fmt_codes.max(0) as usize * 2;
+
+    // Parameter count.
+    if pos + 2 > write_buf.len() {
+        return None;
+    }
+    let wire_param_count = i16::from_be_bytes([write_buf[pos], write_buf[pos + 1]]) as usize;
+    pos += 2;
+
+    if wire_param_count != param_count {
+        return None;
+    }
+
+    let mut param_slots = Vec::with_capacity(param_count);
+    for _ in 0..param_count {
+        if pos + 4 > write_buf.len() {
+            return None;
+        }
+        let data_len = i32::from_be_bytes([
+            write_buf[pos],
+            write_buf[pos + 1],
+            write_buf[pos + 2],
+            write_buf[pos + 3],
+        ]);
+        pos += 4;
+
+        if data_len < 0 {
+            param_slots.push((pos, -1));
+        } else {
+            param_slots.push((pos, data_len));
+            pos += data_len as usize;
+        }
+    }
+
+    Some(BindTemplate {
+        bytes: write_buf.to_vec(),
+        param_slots,
+    })
+}
+
 // --- QueryResult ---
 
 /// Result of a query execution. Owns the row offset metadata.
@@ -2963,6 +3156,7 @@ mod tests {
             name: "s_test".into(),
             columns: Arc::from(Vec::new()),
             last_used: 42,
+            bind_template: None,
         };
         // Verify last_used counter is stored correctly
         assert_eq!(info.last_used, 42);

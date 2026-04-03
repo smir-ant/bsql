@@ -32,6 +32,15 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
         conn
     });
 
+    // -- bsql sync connection (UDS only, zero async overhead) --
+    #[cfg(unix)]
+    let mut bsql_sync = {
+        let config = bsql_driver_postgres::Config::from_url(&url).unwrap();
+        let mut sc = bsql_driver_postgres::SyncConnection::connect(&config).unwrap();
+        sc.prepare_only(sql_direct, sql_hash).unwrap();
+        sc
+    };
+
     // -- sqlx pool --
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
@@ -100,6 +109,22 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
                     }
                     start.elapsed()
                 })
+            });
+        });
+
+        // -- bsql_sync (UDS, zero async overhead) --
+        #[cfg(unix)]
+        group.bench_with_input(BenchmarkId::new("bsql_sync", n), &n, |b, &n| {
+            let n_param: i64 = n;
+            b.iter_custom(|iters| {
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&n_param];
+                    bsql_sync
+                        .for_each_raw(sql_direct, sql_hash, params, |_data| Ok(()))
+                        .unwrap();
+                }
+                start.elapsed()
             });
         });
 
