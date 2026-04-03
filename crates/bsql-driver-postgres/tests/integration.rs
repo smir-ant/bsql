@@ -682,7 +682,7 @@ async fn multiple_queries_same_connection() {
     // Different queries
     let sql1 = "SELECT 1::int4 AS a";
     let sql2 = "SELECT 'hello'::text AS b";
-    let sql3 = "SELECT 3.14::float8 AS c";
+    let sql3 = "SELECT 3.15::float8 AS c";
 
     let h1 = hash_sql(sql1);
     let h2 = hash_sql(sql2);

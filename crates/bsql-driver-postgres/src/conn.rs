@@ -77,10 +77,6 @@ impl Stream {
         }
     }
 
-    #[expect(
-        dead_code,
-        reason = "kept for completeness; may be needed for non-TCP_NODELAY paths"
-    )]
     async fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Stream::Plain(s) => s.flush().await,
