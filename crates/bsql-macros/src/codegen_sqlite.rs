@@ -187,11 +187,27 @@ fn gen_for_each_row_struct(parsed: &ParsedQuery, validation: &ValidationResult) 
         quote! { pub #field_name: #field_type }
     });
 
+    // Check if any column actually uses the 'a lifetime (String->& 'a str, Vec<u8>->& 'a [u8]).
+    // If not, we need a PhantomData marker to consume the unused lifetime parameter.
+    let needs_lifetime = validation.columns.iter().any(|col| {
+        let rt = &col.rust_type;
+        matches!(rt.as_str(), "String" | "Vec<u8>")
+            || rt.starts_with("Option<String>")
+            || rt.starts_with("Option<Vec<u8>>")
+    });
+
+    let phantom_field = if needs_lifetime {
+        TokenStream::new()
+    } else {
+        quote! { pub _marker: ::std::marker::PhantomData<&'a ()>, }
+    };
+
     quote! {
         #[derive(Debug)]
         #[allow(non_camel_case_types)]
         pub struct #struct_name<'a> {
             #(#fields,)*
+            #phantom_field
         }
     }
 }
@@ -207,7 +223,22 @@ fn gen_for_each_decode(validation: &ValidationResult) -> TokenStream {
         let decode_expr = gen_for_each_column_decode(col_idx, &col.rust_type);
         quote! { #field_name: #decode_expr }
     });
-    quote! { #(#fields),* }
+
+    // If no column uses the 'a lifetime, we emit a PhantomData marker field
+    let needs_lifetime = validation.columns.iter().any(|col| {
+        let rt = &col.rust_type;
+        matches!(rt.as_str(), "String" | "Vec<u8>")
+            || rt.starts_with("Option<String>")
+            || rt.starts_with("Option<Vec<u8>>")
+    });
+
+    let phantom_init = if needs_lifetime {
+        TokenStream::new()
+    } else {
+        quote! { , _marker: ::std::marker::PhantomData }
+    };
+
+    quote! { #(#fields),* #phantom_init }
 }
 
 fn gen_for_each_column_decode(idx: i32, rust_type: &str) -> TokenStream {
@@ -352,6 +383,51 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 
 // --- Executor impl ---
 
+/// Wrap a decode expression that may `return Err(SqliteError)` so it converts
+/// to `BsqlError`. The decode code was written for closures that return
+/// `Result<T, SqliteError>`, but inline code returns `BsqlResult<T>`.
+/// This wraps the construction in a closure to bridge the error type.
+fn wrap_decode_as_bsql(struct_name: &proc_macro2::Ident, decode: &TokenStream) -> TokenStream {
+    quote! {
+        (|| -> Result<#struct_name, ::bsql_core::driver_sqlite::SqliteError> {
+            Ok(#struct_name { #decode })
+        })().map_err(::bsql_core::BsqlError::from_sqlite)?
+    }
+}
+
+/// Same as `wrap_decode_as_bsql` but for for_each row structs with lifetime.
+fn wrap_for_each_decode_as_bsql(
+    struct_name: &proc_macro2::Ident,
+    decode: &TokenStream,
+) -> TokenStream {
+    quote! {
+        (|| -> Result<#struct_name<'_>, ::bsql_core::driver_sqlite::SqliteError> {
+            Ok(#struct_name { #decode })
+        })().map_err(::bsql_core::BsqlError::from_sqlite)?
+    }
+}
+
+/// Generate the inline parameter binding code for a given set of params.
+/// Binds each param to the stmt using the dyn SqliteEncode slice.
+fn gen_inline_param_bind() -> TokenStream {
+    quote! {
+        _bsql_stmt.clear_bindings();
+        for (_bsql_i, _bsql_p) in _bsql_params.iter().enumerate() {
+            _bsql_p.bind(_bsql_stmt, (_bsql_i + 1) as i32)
+                .map_err(::bsql_core::BsqlError::from_sqlite)?;
+        }
+    }
+}
+
+/// Generate the inline acquire expression -- reader or writer.
+fn gen_inline_acquire(is_write: bool) -> TokenStream {
+    if is_write {
+        quote! { pool.__inner().__acquire_writer().map_err(::bsql_core::BsqlError::from_sqlite)? }
+    } else {
+        quote! { pool.__inner().__acquire_reader().map_err(::bsql_core::BsqlError::from_sqlite)? }
+    }
+}
+
 fn gen_executor_impls(
     parsed: &ParsedQuery,
     validation: &ValidationResult,
@@ -433,87 +509,164 @@ fn gen_executor_impls(
         TokenStream::new()
     };
 
+    let inline_bind = gen_inline_param_bind();
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
 
+        // --- Inline fetch_one ---
+        let fetch_one_method = {
+            let inline_acquire_one = gen_inline_acquire(is_write);
+            let decode_one_inner = wrap_decode_as_bsql(&result_name, &direct_decode);
+            quote! {
+                /// Fetch exactly one row. Inline step loop — no cross-crate call overhead.
+                pub fn fetch_one(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<#result_name> {
+                    #direct_params_build
+                    let mut _bsql_conn = #inline_acquire_one;
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#limited_sql_lit, #limited_sql_hash_val)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #inline_bind
+                    match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                        ::bsql_core::driver_sqlite::StepResult::Row => {
+                            let _bsql_result = #decode_one_inner;
+                            // Check for extra rows (LIMIT 2 pattern)
+                            if let ::bsql_core::driver_sqlite::StepResult::Row =
+                                _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?
+                            {
+                                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                                drop(_bsql_conn);
+                                return Err(::bsql_core::BsqlError::from_sqlite(
+                                    ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                        "expected 1 row, got 2+".into(),
+                                    ),
+                                ));
+                            }
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            Ok(_bsql_result)
+                        }
+                        ::bsql_core::driver_sqlite::StepResult::Done => {
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            Err(::bsql_core::BsqlError::from_sqlite(
+                                ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                    "expected 1 row, got 0".into(),
+                                ),
+                            ))
+                        }
+                    }
+                }
+            }
+        };
+
+        // --- Inline fetch_optional ---
+        let fetch_optional_method = {
+            let inline_acquire_opt = gen_inline_acquire(is_write);
+            let decode_opt_inner = wrap_decode_as_bsql(&result_name, &direct_decode);
+            quote! {
+                /// Fetch zero or one row. Inline step loop — no cross-crate call overhead.
+                pub fn fetch_optional(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    #direct_params_build
+                    let mut _bsql_conn = #inline_acquire_opt;
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#limited_sql_lit, #limited_sql_hash_val)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #inline_bind
+                    match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                        ::bsql_core::driver_sqlite::StepResult::Row => {
+                            let _bsql_result = #decode_opt_inner;
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            Ok(Some(_bsql_result))
+                        }
+                        ::bsql_core::driver_sqlite::StepResult::Done => {
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            Ok(None)
+                        }
+                    }
+                }
+            }
+        };
+
+        // --- Inline fetch_all ---
         let fetch_all_method = if use_arena {
             let arena_name = arena_result_struct_name(parsed);
+            let inline_acquire_all = gen_inline_acquire(is_write);
+            let decode_arena = wrap_decode_as_bsql(&arena_name, &arena_decode);
             quote! {
-                /// Fetch all rows. Arena-backed — text/blob columns borrow from a
-                /// contiguous bump allocator instead of individual heap allocations.
+                /// Fetch all rows. Inline step loop with arena — no cross-crate call overhead.
                 pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ArenaRows<#arena_name>> {
                     #direct_params_build
-                    pool.fetch_all_arena(
-                        #sql_lit,
-                        #sql_hash_val,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt, _bsql_arena| {
-                            Ok(#arena_name { #arena_decode })
-                        },
-                    )
+                    let mut _bsql_conn = #inline_acquire_all;
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #inline_bind
+                    let mut _bsql_arena = ::bsql_core::driver_sqlite::acquire_arena();
+                    let mut _bsql_rows = Vec::new();
+                    loop {
+                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                            ::bsql_core::driver_sqlite::StepResult::Row => {
+                                _bsql_rows.push(#decode_arena);
+                            }
+                            ::bsql_core::driver_sqlite::StepResult::Done => break,
+                        }
+                    }
+                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    drop(_bsql_conn);
+                    // SAFETY: The decode code stored &'static str / &'static [u8]
+                    // that actually point into `_bsql_arena`. The ArenaRows struct
+                    // guarantees rows are dropped before arena (field order).
+                    Ok(unsafe {
+                        ::bsql_core::driver_sqlite::ArenaRows::from_raw_parts(
+                            _bsql_rows,
+                            _bsql_arena,
+                        )
+                    })
                 }
             }
         } else {
+            let inline_acquire_all = gen_inline_acquire(is_write);
+            let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
             quote! {
-                /// Fetch all rows. Zero-copy direct decode — no arena allocation.
+                /// Fetch all rows. Inline step loop — no cross-crate call overhead.
                 pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     #direct_params_build
-                    pool.fetch_all_direct(
-                        #sql_lit,
-                        #sql_hash_val,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt| {
-                            Ok(#result_name { #direct_decode })
-                        },
-                    )
+                    let mut _bsql_conn = #inline_acquire_all;
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #inline_bind
+                    let mut _bsql_rows = Vec::new();
+                    loop {
+                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                            ::bsql_core::driver_sqlite::StepResult::Row => {
+                                _bsql_rows.push(#decode_all);
+                            }
+                            ::bsql_core::driver_sqlite::StepResult::Done => break,
+                        }
+                    }
+                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    drop(_bsql_conn);
+                    Ok(_bsql_rows)
                 }
             }
         };
 
         quote! {
-            /// Fetch exactly one row. Zero-copy direct decode — no arena allocation.
-            pub fn fetch_one(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<#result_name> {
-                #direct_params_build
-                pool.fetch_one_direct(
-                    #limited_sql_lit,
-                    #limited_sql_hash_val,
-                    _bsql_params,
-                    #is_write,
-                    |_bsql_stmt| {
-                        Ok(#result_name { #direct_decode })
-                    },
-                )
-            }
-
+            #fetch_one_method
             #fetch_all_method
-
-            /// Fetch zero or one row. Zero-copy direct decode — no arena allocation.
-            pub fn fetch_optional(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                #direct_params_build
-                pool.fetch_optional_direct(
-                    #limited_sql_lit,
-                    #limited_sql_hash_val,
-                    _bsql_params,
-                    #is_write,
-                    |_bsql_stmt| {
-                        Ok(#result_name { #direct_decode })
-                    },
-                )
-            }
+            #fetch_optional_method
 
             /// Stream rows in chunks.
             pub fn fetch_stream(
@@ -532,12 +685,14 @@ fn gen_executor_impls(
         let for_each_row_name = for_each_row_struct_name(parsed);
         let for_each_decode = gen_for_each_decode(validation);
 
+        let inline_acquire_fe = gen_inline_acquire(is_write);
+        let inline_acquire_fem = gen_inline_acquire(is_write);
+        let decode_fe = wrap_for_each_decode_as_bsql(&for_each_row_name, &for_each_decode);
+        let decode_fem = wrap_for_each_decode_as_bsql(&for_each_row_name, &for_each_decode);
+
         quote! {
-            /// Process each row in-place via a closure. Zero-copy -- text/blob
-            /// columns borrow directly from SQLite's internal buffer.
-            ///
-            /// The row struct cannot escape the closure -- column pointers are
-            /// invalidated by the next step().
+            /// Process each row in-place via a closure. Inline step loop —
+            /// no cross-crate call overhead. Zero-copy text/blob.
             pub fn for_each<_BsqlForEachF>(
                 self,
                 pool: &::bsql_core::SqlitePool,
@@ -547,27 +702,26 @@ fn gen_executor_impls(
                 _BsqlForEachF: FnMut(#for_each_row_name<'_>) -> Result<(), ::bsql_core::BsqlError>,
             {
                 #direct_params_build
-                pool.for_each(
-                    #sql_lit,
-                    #sql_hash_val,
-                    _bsql_params,
-                    #is_write,
-                    |_bsql_stmt| {
-                        let _bsql_row = #for_each_row_name {
-                            #for_each_decode
-                        };
-                        f(_bsql_row).map_err(|e| match e {
-                            ::bsql_core::BsqlError::Query(q) => ::bsql_core::driver_sqlite::SqliteError::Internal(q.message.to_string()),
-                            other => ::bsql_core::driver_sqlite::SqliteError::Internal(other.to_string()),
-                        })
-                    },
-                )
+                let mut _bsql_conn = #inline_acquire_fe;
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #inline_bind
+                loop {
+                    match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                        ::bsql_core::driver_sqlite::StepResult::Row => {
+                            let _bsql_row = #decode_fe;
+                            f(_bsql_row)?;
+                        }
+                        ::bsql_core::driver_sqlite::StepResult::Done => break,
+                    }
+                }
+                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                drop(_bsql_conn);
+                Ok(())
             }
 
             /// Process each row in-place, collecting mapped results into a `Vec`.
-            ///
-            /// Same zero-copy semantics as `for_each`, but the closure returns a
-            /// value of type `T` that is collected.
+            /// Inline step loop — no cross-crate call overhead.
             pub fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
                 self,
                 pool: &::bsql_core::SqlitePool,
@@ -577,32 +731,49 @@ fn gen_executor_impls(
                 _BsqlForEachF: FnMut(#for_each_row_name<'_>) -> _BsqlForEachT,
             {
                 #direct_params_build
-                pool.for_each_collect(
-                    #sql_lit,
-                    #sql_hash_val,
-                    _bsql_params,
-                    #is_write,
-                    |_bsql_stmt| {
-                        let _bsql_row = #for_each_row_name {
-                            #for_each_decode
-                        };
-                        Ok(f(_bsql_row))
-                    },
-                )
+                let mut _bsql_conn = #inline_acquire_fem;
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #inline_bind
+                let mut _bsql_rows = Vec::new();
+                loop {
+                    match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                        ::bsql_core::driver_sqlite::StepResult::Row => {
+                            let _bsql_row = #decode_fem;
+                            _bsql_rows.push(f(_bsql_row));
+                        }
+                        ::bsql_core::driver_sqlite::StepResult::Done => break,
+                    }
+                }
+                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                drop(_bsql_conn);
+                Ok(_bsql_rows)
             }
         }
     } else {
         TokenStream::new()
     };
 
-    let execute_method = quote! {
-        /// Execute the statement (INSERT/UPDATE/DELETE), return affected rows.
-        pub fn execute(
-            self,
-            pool: &::bsql_core::SqlitePool,
-        ) -> ::bsql_core::BsqlResult<u64> {
-            #direct_params_build
-            pool.execute_direct(#sql_lit, #sql_hash_val, _bsql_params)
+    let execute_method = {
+        let inline_acquire_exec = gen_inline_acquire(/*is_write=*/ true);
+        quote! {
+            /// Execute the statement (INSERT/UPDATE/DELETE), return affected rows.
+            /// Inline — no cross-crate call overhead.
+            pub fn execute(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<u64> {
+                #direct_params_build
+                let mut _bsql_conn = #inline_acquire_exec;
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #inline_bind
+                _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                let _bsql_changes = _bsql_conn.__changes();
+                drop(_bsql_conn);
+                Ok(_bsql_changes)
+            }
         }
     };
 
@@ -1294,6 +1465,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 }
 
 /// Generate the impl block for a dynamic SQLite query executor.
+/// Uses inline step loops — same optimization as the static path.
 fn gen_dynamic_executor_impls(
     parsed: &ParsedQuery,
     validation: &ValidationResult,
@@ -1322,44 +1494,123 @@ fn gen_dynamic_executor_impls(
         let result_name = result_struct_name(parsed);
         let needs_limit = has_columns && is_select && !parsed.normalized_sql.contains(" limit ");
 
-        let fetch_one_dispatcher = gen_sqlite_direct_variant_dispatcher(
-            parsed,
-            variants,
-            needs_limit,
-            |sql_lit, sql_hash| {
-                quote! {
-                    pool.fetch_one_direct(
-                        #sql_lit,
-                        #sql_hash,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt| {
-                            Ok(#result_name { #direct_decode })
-                        },
-                    )
-                }
-            },
-        );
+        // --- Inline fetch_one ---
+        let fetch_one_dispatcher = {
+            let acq = gen_inline_acquire(is_write);
+            let bind = gen_inline_param_bind();
+            let decode_one = wrap_decode_as_bsql(&result_name, &direct_decode);
+            gen_sqlite_inline_variant_dispatcher(
+                parsed,
+                variants,
+                needs_limit,
+                |sql_lit, sql_hash| {
+                    quote! {
+                        let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                            .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        #bind
+                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                            ::bsql_core::driver_sqlite::StepResult::Row => {
+                                let _bsql_result = #decode_one;
+                                if let ::bsql_core::driver_sqlite::StepResult::Row =
+                                    _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?
+                                {
+                                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                                    drop(_bsql_conn);
+                                    return Err(::bsql_core::BsqlError::from_sqlite(
+                                        ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                            "expected 1 row, got 2+".into(),
+                                        ),
+                                    ));
+                                }
+                                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                                drop(_bsql_conn);
+                                return Ok(_bsql_result);
+                            }
+                            ::bsql_core::driver_sqlite::StepResult::Done => {
+                                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                                drop(_bsql_conn);
+                                return Err(::bsql_core::BsqlError::from_sqlite(
+                                    ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                        "expected 1 row, got 0".into(),
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                },
+                quote! { let mut _bsql_conn = #acq; },
+            )
+        };
 
+        // --- Inline fetch_optional ---
+        let fetch_optional_dispatcher = {
+            let acq = gen_inline_acquire(is_write);
+            let bind = gen_inline_param_bind();
+            let decode_opt = wrap_decode_as_bsql(&result_name, &direct_decode);
+            gen_sqlite_inline_variant_dispatcher(
+                parsed,
+                variants,
+                needs_limit,
+                |sql_lit, sql_hash| {
+                    quote! {
+                        let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                            .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        #bind
+                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                            ::bsql_core::driver_sqlite::StepResult::Row => {
+                                let _bsql_result = #decode_opt;
+                                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                                drop(_bsql_conn);
+                                return Ok(Some(_bsql_result));
+                            }
+                            ::bsql_core::driver_sqlite::StepResult::Done => {
+                                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                                drop(_bsql_conn);
+                                return Ok(None);
+                            }
+                        }
+                    }
+                },
+                quote! { let mut _bsql_conn = #acq; },
+            )
+        };
+
+        // --- Inline fetch_all ---
         let fetch_all_method = if use_arena {
             let arena_name = arena_result_struct_name(parsed);
-            let fetch_all_dispatcher = gen_sqlite_direct_variant_dispatcher(
+            let acq = gen_inline_acquire(is_write);
+            let bind = gen_inline_param_bind();
+            let decode_arena = wrap_decode_as_bsql(&arena_name, &arena_decode);
+            let fetch_all_dispatcher = gen_sqlite_inline_variant_dispatcher(
                 parsed,
                 variants,
                 false,
                 |sql_lit, sql_hash| {
                     quote! {
-                        pool.fetch_all_arena(
-                            #sql_lit,
-                            #sql_hash,
-                            _bsql_params,
-                            #is_write,
-                            |_bsql_stmt, _bsql_arena| {
-                                Ok(#arena_name { #arena_decode })
-                            },
-                        )
+                        let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                            .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        #bind
+                        let mut _bsql_arena = ::bsql_core::driver_sqlite::acquire_arena();
+                        let mut _bsql_rows = Vec::new();
+                        loop {
+                            match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                                ::bsql_core::driver_sqlite::StepResult::Row => {
+                                    _bsql_rows.push(#decode_arena);
+                                }
+                                ::bsql_core::driver_sqlite::StepResult::Done => break,
+                            }
+                        }
+                        _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        drop(_bsql_conn);
+                        return Ok(unsafe {
+                            ::bsql_core::driver_sqlite::ArenaRows::from_raw_parts(
+                                _bsql_rows,
+                                _bsql_arena,
+                            )
+                        });
                     }
                 },
+                quote! { let mut _bsql_conn = #acq; },
             );
             quote! {
                 pub fn fetch_all(
@@ -1370,23 +1621,33 @@ fn gen_dynamic_executor_impls(
                 }
             }
         } else {
-            let fetch_all_dispatcher = gen_sqlite_direct_variant_dispatcher(
+            let acq = gen_inline_acquire(is_write);
+            let bind = gen_inline_param_bind();
+            let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
+            let fetch_all_dispatcher = gen_sqlite_inline_variant_dispatcher(
                 parsed,
                 variants,
                 false,
                 |sql_lit, sql_hash| {
                     quote! {
-                        pool.fetch_all_direct(
-                            #sql_lit,
-                            #sql_hash,
-                            _bsql_params,
-                            #is_write,
-                            |_bsql_stmt| {
-                                Ok(#result_name { #direct_decode })
-                            },
-                        )
+                        let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                            .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        #bind
+                        let mut _bsql_rows = Vec::new();
+                        loop {
+                            match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                                ::bsql_core::driver_sqlite::StepResult::Row => {
+                                    _bsql_rows.push(#decode_all);
+                                }
+                                ::bsql_core::driver_sqlite::StepResult::Done => break,
+                            }
+                        }
+                        _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        drop(_bsql_conn);
+                        return Ok(_bsql_rows);
                     }
                 },
+                quote! { let mut _bsql_conn = #acq; },
             );
             quote! {
                 pub fn fetch_all(
@@ -1397,25 +1658,6 @@ fn gen_dynamic_executor_impls(
                 }
             }
         };
-
-        let fetch_optional_dispatcher = gen_sqlite_direct_variant_dispatcher(
-            parsed,
-            variants,
-            needs_limit,
-            |sql_lit, sql_hash| {
-                quote! {
-                    pool.fetch_optional_direct(
-                        #sql_lit,
-                        #sql_hash,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt| {
-                            Ok(#result_name { #direct_decode })
-                        },
-                    )
-                }
-            },
-        );
 
         quote! {
             pub fn fetch_one(
@@ -1442,48 +1684,64 @@ fn gen_dynamic_executor_impls(
         let for_each_row_name = for_each_row_struct_name(parsed);
         let for_each_decode = gen_for_each_decode(validation);
 
-        let for_each_dispatcher = gen_sqlite_direct_variant_dispatcher(
+        let for_each_acq = gen_inline_acquire(is_write);
+        let decode_fe = wrap_for_each_decode_as_bsql(&for_each_row_name, &for_each_decode);
+        let for_each_dispatcher = gen_sqlite_inline_variant_dispatcher(
             parsed,
             variants,
             false,
             |sql_lit, sql_hash| {
+                let bind = gen_inline_param_bind();
                 quote! {
-                    pool.for_each(
-                        #sql_lit,
-                        #sql_hash,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt| {
-                            let _bsql_row = #for_each_row_name {
-                                #for_each_decode
-                            };
-                            f(_bsql_row).map_err(|e| match e {
-                                ::bsql_core::BsqlError::Query(q) => ::bsql_core::driver_sqlite::SqliteError::Internal(q.message.to_string()),
-                                other => ::bsql_core::driver_sqlite::SqliteError::Internal(other.to_string()),
-                            })
-                        },
-                    )
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #bind
+                    loop {
+                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                            ::bsql_core::driver_sqlite::StepResult::Row => {
+                                let _bsql_row = #decode_fe;
+                                f(_bsql_row)?;
+                            }
+                            ::bsql_core::driver_sqlite::StepResult::Done => break,
+                        }
+                    }
+                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    drop(_bsql_conn);
+                    return Ok(());
                 }
             },
+            quote! { let mut _bsql_conn = #for_each_acq; },
         );
 
-        let for_each_map_dispatcher =
-            gen_sqlite_direct_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+        let for_each_map_acq = gen_inline_acquire(is_write);
+        let decode_fem = wrap_for_each_decode_as_bsql(&for_each_row_name, &for_each_decode);
+        let for_each_map_dispatcher = gen_sqlite_inline_variant_dispatcher(
+            parsed,
+            variants,
+            false,
+            |sql_lit, sql_hash| {
+                let bind = gen_inline_param_bind();
                 quote! {
-                    pool.for_each_collect(
-                        #sql_lit,
-                        #sql_hash,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt| {
-                            let _bsql_row = #for_each_row_name {
-                                #for_each_decode
-                            };
-                            Ok(f(_bsql_row))
-                        },
-                    )
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #bind
+                    let mut _bsql_rows = Vec::new();
+                    loop {
+                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                            ::bsql_core::driver_sqlite::StepResult::Row => {
+                                let _bsql_row = #decode_fem;
+                                _bsql_rows.push(f(_bsql_row));
+                            }
+                            ::bsql_core::driver_sqlite::StepResult::Done => break,
+                        }
+                    }
+                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    drop(_bsql_conn);
+                    return Ok(_bsql_rows);
                 }
-            });
+            },
+            quote! { let mut _bsql_conn = #for_each_map_acq; },
+        );
 
         quote! {
             pub fn for_each<_BsqlForEachF>(
@@ -1512,12 +1770,26 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
-    let execute_dispatcher =
-        gen_sqlite_direct_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+    let execute_acq = gen_inline_acquire(/*is_write=*/ true);
+    let execute_dispatcher = gen_sqlite_inline_variant_dispatcher(
+        parsed,
+        variants,
+        false,
+        |sql_lit, sql_hash| {
+            let bind = gen_inline_param_bind();
             quote! {
-                pool.execute_direct(#sql_lit, #sql_hash, _bsql_params)
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #bind
+                _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                let _bsql_changes = _bsql_conn.__changes();
+                drop(_bsql_conn);
+                return Ok(_bsql_changes);
             }
-        });
+        },
+        quote! { let mut _bsql_conn = #execute_acq; },
+    );
 
     let execute_method = quote! {
         pub fn execute(
@@ -1538,12 +1810,15 @@ fn gen_dynamic_executor_impls(
     }
 }
 
-/// Generate the match dispatcher for SQLite dynamic query variants (direct path — no arena).
-fn gen_sqlite_direct_variant_dispatcher<F>(
+/// Generate the inline match dispatcher for SQLite dynamic query variants.
+/// The connection is acquired once before the match, then each arm does
+/// inline prepare/bind/loop directly on the connection.
+fn gen_sqlite_inline_variant_dispatcher<F>(
     parsed: &ParsedQuery,
     variants: &[QueryVariant],
     inject_limit: bool,
     body_fn: F,
+    acquire_stmt: TokenStream,
 ) -> TokenStream
 where
     F: Fn(&str, u64) -> TokenStream,
@@ -1612,6 +1887,7 @@ where
         .collect();
 
     quote! {
+        #acquire_stmt
         match #match_tuple {
             #(#arms)*
         }

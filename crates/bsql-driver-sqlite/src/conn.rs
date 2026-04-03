@@ -693,6 +693,32 @@ impl SqliteConnection {
             .expect("BUG: stmt cache insert-then-get failed — key was just inserted")
             .handle)
     }
+
+    /// Get or prepare a cached statement. Returns a reference to the StmtHandle.
+    ///
+    /// # Doc-hidden
+    ///
+    /// Used by generated code from `bsql::query!`. Not part of the public API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __get_or_prepare(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+    ) -> Result<&StmtHandle, SqliteError> {
+        self.get_or_prepare(sql, sql_hash)
+    }
+
+    /// Get number of changes from the last INSERT/UPDATE/DELETE.
+    ///
+    /// # Doc-hidden
+    ///
+    /// Used by generated code from `bsql::query!`. Not part of the public API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __changes(&self) -> u64 {
+        self.db.changes()
+    }
 }
 
 // No manual Drop needed — `DbHandle` and `StmtHandle` handle cleanup via

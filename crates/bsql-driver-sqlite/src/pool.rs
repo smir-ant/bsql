@@ -143,6 +143,28 @@ impl SqlitePool {
             .map_err(|_| SqliteError::Pool("writer mutex poisoned".into()))
     }
 
+    /// Acquire a reader connection. Returns a MutexGuard.
+    ///
+    /// # Doc-hidden
+    ///
+    /// Used by generated code from `bsql::query!`. Not part of the public API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __acquire_reader(&self) -> Result<MutexGuard<'_, SqliteConnection>, SqliteError> {
+        self.acquire_reader()
+    }
+
+    /// Acquire the writer connection. Returns a MutexGuard.
+    ///
+    /// # Doc-hidden
+    ///
+    /// Used by generated code from `bsql::query!`. Not part of the public API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __acquire_writer(&self) -> Result<MutexGuard<'_, SqliteConnection>, SqliteError> {
+        self.acquire_writer()
+    }
+
     /// Route a read query to a reader (round-robin), returning results in an arena.
     pub fn query_readonly(
         &self,

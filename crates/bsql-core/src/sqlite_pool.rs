@@ -58,6 +58,17 @@ impl SqlitePoolBuilder {
 }
 
 impl SqlitePool {
+    /// Access the inner driver pool.
+    ///
+    /// # Doc-hidden
+    ///
+    /// Used by generated code from `bsql::query!`. Not part of the public API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __inner(&self) -> &bsql_driver_sqlite::pool::SqlitePool {
+        &self.inner
+    }
+
     /// Open a SQLite pool with default settings (4 reader connections).
     pub fn connect(path: &str) -> BsqlResult<Self> {
         let inner =
