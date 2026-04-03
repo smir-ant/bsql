@@ -1188,6 +1188,56 @@ impl Connection {
         Ok(affected_rows)
     }
 
+    /// Process each row directly from the wire buffer via a closure.
+    ///
+    /// Zero arena allocation — the closure receives a [`PgDataRow`] that reads
+    /// columns directly from the DataRow message bytes in the read buffer.
+    /// Column offsets are pre-scanned once per row into a stack-allocated SmallVec.
+    ///
+    /// This is the fastest path for row-by-row processing: no arena, no Vec of
+    /// offsets, no materialization of the entire result set.
+    pub async fn for_each<F>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        mut f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(PgDataRow<'_>) -> Result<(), DriverError>,
+    {
+        let _columns = self.send_pipeline(sql, sql_hash, params).await?;
+
+        loop {
+            let msg = self.read_one_message().await?;
+            match msg {
+                BackendMessage::DataRow { data } => {
+                    let row = PgDataRow::new(data)?;
+                    f(row)?;
+                }
+                BackendMessage::CommandComplete { .. } => break,
+                BackendMessage::EmptyQuery => break,
+                BackendMessage::NoticeResponse { .. } => {}
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
+                }
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during for_each: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        self.expect_ready().await?;
+        self.shrink_buffers();
+        self.touch();
+        Ok(())
+    }
+
     /// Simple query protocol — for non-prepared SQL (BEGIN, COMMIT, SET, etc.).
     ///
     /// Does not use the extended query protocol. Cannot have parameters.
@@ -1907,6 +1957,135 @@ impl<'a> Row<'a> {
     }
 }
 
+// --- PgDataRow (zero-copy row view for for_each) ---
+
+/// A temporary view of a single PostgreSQL DataRow message.
+///
+/// Reads columns directly from the wire buffer — no arena copy.
+/// Column offsets are pre-computed on construction using a `SmallVec`
+/// that is stack-allocated for up to 16 columns (zero heap allocation
+/// for the common case).
+///
+/// Lifetime `'a` borrows from `Connection::read_buf`.
+pub struct PgDataRow<'a> {
+    data: &'a [u8],
+    /// Pre-scanned `(byte_offset, wire_len)` pairs for each column.
+    /// `wire_len = -1` means NULL.
+    offsets: smallvec::SmallVec<[(usize, i32); 16]>,
+}
+
+impl<'a> PgDataRow<'a> {
+    /// Parse column boundaries from a raw DataRow payload.
+    ///
+    /// `data` is the DataRow message payload (after the 'D' type byte and
+    /// 4-byte length prefix have been stripped by the framing layer).
+    fn new(data: &'a [u8]) -> Result<Self, DriverError> {
+        if data.len() < 2 {
+            return Err(DriverError::Protocol("DataRow too short".into()));
+        }
+        let num_cols = i16::from_be_bytes([data[0], data[1]]);
+        if num_cols < 0 {
+            return Err(DriverError::Protocol(
+                "DataRow: negative column count".into(),
+            ));
+        }
+        let num_cols = num_cols as usize;
+        let mut offsets = smallvec::SmallVec::<[(usize, i32); 16]>::with_capacity(num_cols);
+        let mut pos = 2usize;
+        for _ in 0..num_cols {
+            if pos + 4 > data.len() {
+                return Err(DriverError::Protocol("DataRow truncated".into()));
+            }
+            let col_len =
+                i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+            offsets.push((pos, col_len));
+            if col_len > 0 {
+                pos += col_len as usize;
+            }
+        }
+        Ok(Self { data, offsets })
+    }
+
+    /// Get the raw bytes for a column, or `None` if NULL.
+    #[inline]
+    pub fn get_raw(&self, idx: usize) -> Option<&'a [u8]> {
+        let (offset, len) = self.offsets[idx];
+        if len < 0 {
+            None
+        } else {
+            Some(&self.data[offset..offset + len as usize])
+        }
+    }
+
+    /// Whether a column is NULL.
+    #[inline]
+    pub fn is_null(&self, idx: usize) -> bool {
+        self.offsets[idx].1 < 0
+    }
+
+    /// Number of columns.
+    #[inline]
+    pub fn column_count(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// Get a boolean column value. Returns `None` on NULL or decode error.
+    #[inline]
+    pub fn get_bool(&self, idx: usize) -> Option<bool> {
+        self.get_raw(idx)
+            .and_then(|data| crate::codec::decode_bool(data).ok())
+    }
+
+    /// Get an i16 column value.
+    #[inline]
+    pub fn get_i16(&self, idx: usize) -> Option<i16> {
+        self.get_raw(idx)
+            .and_then(|data| crate::codec::decode_i16(data).ok())
+    }
+
+    /// Get an i32 column value.
+    #[inline]
+    pub fn get_i32(&self, idx: usize) -> Option<i32> {
+        self.get_raw(idx)
+            .and_then(|data| crate::codec::decode_i32(data).ok())
+    }
+
+    /// Get an i64 column value.
+    #[inline]
+    pub fn get_i64(&self, idx: usize) -> Option<i64> {
+        self.get_raw(idx)
+            .and_then(|data| crate::codec::decode_i64(data).ok())
+    }
+
+    /// Get an f32 column value.
+    #[inline]
+    pub fn get_f32(&self, idx: usize) -> Option<f32> {
+        self.get_raw(idx)
+            .and_then(|data| crate::codec::decode_f32(data).ok())
+    }
+
+    /// Get an f64 column value.
+    #[inline]
+    pub fn get_f64(&self, idx: usize) -> Option<f64> {
+        self.get_raw(idx)
+            .and_then(|data| crate::codec::decode_f64(data).ok())
+    }
+
+    /// Get a string column value (zero-copy borrow from the wire buffer).
+    #[inline]
+    pub fn get_str(&self, idx: usize) -> Option<&'a str> {
+        self.get_raw(idx)
+            .and_then(|data| crate::codec::decode_str(data).ok())
+    }
+
+    /// Get a byte slice column value (zero-copy borrow from the wire buffer).
+    #[inline]
+    pub fn get_bytes(&self, idx: usize) -> Option<&'a [u8]> {
+        self.get_raw(idx)
+    }
+}
+
 // --- DataRow parsing ---
 
 /// Parse a DataRow message into the flat column offset storage.
@@ -2426,5 +2605,175 @@ mod tests {
         };
         // Verify last_used is recent
         assert!(info.last_used.elapsed().as_secs() < 1);
+    }
+
+    // --- PgDataRow tests ---
+
+    /// Build a DataRow payload: [i16 num_cols] ([i32 len] [bytes])...
+    /// len = -1 for NULL
+    fn make_data_row(columns: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+        for col in columns {
+            match col {
+                Some(data) => {
+                    buf.extend_from_slice(&(data.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(data);
+                }
+                None => {
+                    buf.extend_from_slice(&(-1i32).to_be_bytes());
+                }
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn pg_data_row_get_i32() {
+        let data = make_data_row(&[Some(&42i32.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_i32(0), Some(42));
+        assert_eq!(row.column_count(), 1);
+    }
+
+    #[test]
+    fn pg_data_row_get_i64() {
+        let data = make_data_row(&[Some(&12345i64.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_i64(0), Some(12345));
+    }
+
+    #[test]
+    fn pg_data_row_get_str() {
+        let data = make_data_row(&[Some(b"hello")]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_str(0), Some("hello"));
+    }
+
+    #[test]
+    fn pg_data_row_get_bytes() {
+        let data = make_data_row(&[Some(&[0xDE, 0xAD, 0xBE, 0xEF])]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_bytes(0), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+    }
+
+    #[test]
+    fn pg_data_row_get_bool() {
+        let data = make_data_row(&[Some(&[1u8])]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_bool(0), Some(true));
+
+        let data = make_data_row(&[Some(&[0u8])]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_bool(0), Some(false));
+    }
+
+    #[test]
+    fn pg_data_row_get_f64() {
+        let data = make_data_row(&[Some(&3.14f64.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert!((row.get_f64(0).unwrap() - 3.14).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pg_data_row_null_column() {
+        let data = make_data_row(&[None]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert!(row.is_null(0));
+        assert_eq!(row.get_i32(0), None);
+        assert_eq!(row.get_str(0), None);
+    }
+
+    #[test]
+    fn pg_data_row_multiple_columns() {
+        let data = make_data_row(&[
+            Some(&42i32.to_be_bytes()),
+            Some(b"alice"),
+            Some(b"alice@example.com"),
+            Some(&[1u8]),
+            Some(&3.14f64.to_be_bytes()),
+        ]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.column_count(), 5);
+        assert_eq!(row.get_i32(0), Some(42));
+        assert_eq!(row.get_str(1), Some("alice"));
+        assert_eq!(row.get_str(2), Some("alice@example.com"));
+        assert_eq!(row.get_bool(3), Some(true));
+        assert!((row.get_f64(4).unwrap() - 3.14).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pg_data_row_mixed_null() {
+        let data = make_data_row(&[Some(&42i32.to_be_bytes()), None, Some(b"text")]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_i32(0), Some(42));
+        assert!(row.is_null(1));
+        assert_eq!(row.get_str(1), None);
+        assert_eq!(row.get_str(2), Some("text"));
+    }
+
+    #[test]
+    fn pg_data_row_empty() {
+        let data = make_data_row(&[]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.column_count(), 0);
+    }
+
+    #[test]
+    fn pg_data_row_too_short() {
+        let data = vec![0u8]; // only 1 byte, need at least 2
+        assert!(PgDataRow::new(&data).is_err());
+    }
+
+    #[test]
+    fn pg_data_row_truncated() {
+        // Declare 2 columns but only include 1
+        let mut data = Vec::new();
+        data.extend_from_slice(&2i16.to_be_bytes());
+        data.extend_from_slice(&4i32.to_be_bytes());
+        data.extend_from_slice(&42i32.to_be_bytes());
+        // Missing second column
+        assert!(PgDataRow::new(&data).is_err());
+    }
+
+    #[test]
+    fn pg_data_row_get_i16() {
+        let data = make_data_row(&[Some(&7i16.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_i16(0), Some(7));
+    }
+
+    #[test]
+    fn pg_data_row_get_f32() {
+        let data = make_data_row(&[Some(&2.5f32.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert!((row.get_f32(0).unwrap() - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pg_data_row_get_raw_null() {
+        let data = make_data_row(&[None]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_raw(0), None);
+    }
+
+    #[test]
+    fn pg_data_row_get_raw_data() {
+        let data = make_data_row(&[Some(&[1, 2, 3])]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_raw(0), Some(&[1u8, 2, 3][..]));
+    }
+
+    #[test]
+    fn pg_data_row_stack_alloc_16_columns() {
+        // SmallVec<16> should not heap-allocate for <= 16 columns
+        let cols: Vec<Option<&[u8]>> = (0..16).map(|_| Some(&[0u8][..])).collect();
+        let data = make_data_row(&cols);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.column_count(), 16);
+        // All columns should be accessible
+        for i in 0..16 {
+            assert_eq!(row.get_raw(i), Some(&[0u8][..]));
+        }
     }
 }

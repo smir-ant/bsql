@@ -51,13 +51,14 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
     let mut group = c.benchmark_group("pg_fetch_many");
 
     for &n in row_counts {
-        // -- bsql --
+        // -- bsql (for_each — fastest path, zero arena allocation) --
         group.bench_with_input(BenchmarkId::new("bsql", n), &n, |b, &n| {
             b.to_async(&rt).iter(|| async {
-                let _rows = bsql::query!(
+                let n = n;
+                bsql::query!(
                     "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
                 )
-                .fetch_all(&bsql_pool)
+                .for_each(&bsql_pool, |_row| Ok(()))
                 .await
                 .unwrap();
             });

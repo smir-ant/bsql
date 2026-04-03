@@ -627,6 +627,20 @@ impl Transaction {
         self.guard.execute(sql, sql_hash, params).await
     }
 
+    /// Process each row directly from the wire buffer within a transaction.
+    pub async fn for_each<F>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(crate::conn::PgDataRow<'_>) -> Result<(), DriverError>,
+    {
+        self.guard.for_each(sql, sql_hash, params, f).await
+    }
+
     /// Simple query within the transaction.
     pub async fn simple_query(&mut self, sql: &str) -> Result<(), DriverError> {
         self.guard.simple_query(sql).await

@@ -275,6 +275,53 @@ impl Pool {
     pub fn has_replica(&self) -> bool {
         self.read_pool.is_some()
     }
+
+    /// Process each row directly from the wire buffer via a closure.
+    ///
+    /// Acquires a connection, calls `Connection::for_each`, and releases.
+    /// Zero arena allocation — the closure reads columns directly from
+    /// the DataRow message bytes.
+    ///
+    /// When `readonly` is true and a replica pool is configured, routes
+    /// to the replica pool; otherwise uses the primary.
+    pub async fn for_each_raw<F>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        readonly: bool,
+        mut f: F,
+    ) -> BsqlResult<()>
+    where
+        F: FnMut(bsql_driver_postgres::PgDataRow<'_>) -> BsqlResult<()>,
+    {
+        let pool = if readonly {
+            self.read_pool.as_ref().unwrap_or(&self.inner)
+        } else {
+            &self.inner
+        };
+        let mut guard = pool.acquire().await.map_err(BsqlError::from)?;
+        // Bridge BsqlError from the user closure into DriverError for the
+        // driver-level for_each. Any closure error is stashed in `user_err`
+        // and re-surfaced after the driver returns.
+        let mut user_err: Option<BsqlError> = None;
+        let driver_result = guard
+            .for_each(sql, sql_hash, params, |row| match f(row) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    user_err = Some(e);
+                    Err(bsql_driver_postgres::DriverError::Protocol(
+                        "for_each closure error".into(),
+                    ))
+                }
+            })
+            .await;
+        // If the user closure produced an error, return it directly.
+        if let Some(e) = user_err {
+            return Err(e);
+        }
+        driver_result.map_err(BsqlError::from_driver_query)
+    }
 }
 
 impl Clone for Pool {

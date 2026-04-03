@@ -54,8 +54,8 @@ pub use arena::Arena;
 pub use codec::Encode;
 pub use conn::hash_sql;
 pub use conn::{
-    ColumnDesc, Config, Connection, Notification, PrepareResult, QueryResult, Row, SimpleRow,
-    SslMode,
+    ColumnDesc, Config, Connection, Notification, PgDataRow, PrepareResult, QueryResult, Row,
+    SimpleRow, SslMode,
 };
 pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 

@@ -91,8 +91,7 @@ impl SqliteConnection {
     /// Thread safety is provided by `Mutex<SqliteConnection>` in the pool —
     /// SQLite's internal locking is redundant and adds ~15-20ns per API call.
     pub fn open(path: &str) -> Result<Self, SqliteError> {
-        let flags =
-            raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
+        let flags = raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
         let db = DbHandle::open(path, flags)?;
 
         db.exec("PRAGMA journal_mode = WAL")?;

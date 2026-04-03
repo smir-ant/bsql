@@ -24,7 +24,7 @@ pub mod util;
 pub mod driver {
     pub use bsql_driver_postgres::arena::{acquire_arena, release_arena};
     pub use bsql_driver_postgres::hash_sql;
-    pub use bsql_driver_postgres::{Arena, Encode, QueryResult, Row};
+    pub use bsql_driver_postgres::{Arena, Encode, PgDataRow, QueryResult, Row};
 
     // Array decode functions for generated code
     pub use bsql_driver_postgres::codec::{

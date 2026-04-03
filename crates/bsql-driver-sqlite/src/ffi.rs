@@ -593,8 +593,7 @@ mod tests {
 
     #[test]
     fn open_nonexistent_directory() {
-        let flags =
-            raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
+        let flags = raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
         let result = DbHandle::open("/no/such/directory/db.sqlite", flags);
         assert!(result.is_err());
     }

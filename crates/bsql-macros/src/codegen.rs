@@ -50,6 +50,7 @@ pub fn generate_dynamic_query_code(
     variants: &[QueryVariant],
 ) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
+    let for_each_row_struct = gen_pg_for_each_row_struct(parsed, validation);
     let executor_struct = gen_dynamic_executor_struct(parsed);
     let executor_impls = gen_dynamic_executor_impls(parsed, validation, variants);
     let constructor = gen_dynamic_constructor(parsed);
@@ -57,6 +58,7 @@ pub fn generate_dynamic_query_code(
     quote! {
         {
             #result_struct
+            #for_each_row_struct
             #executor_struct
             #executor_impls
             #constructor
@@ -340,6 +342,8 @@ pub fn generate_sort_query_code(
         }
     };
 
+    let for_each_row_struct = gen_pg_for_each_row_struct(parsed, validation);
+
     // Constructor: captures params + sort from scope
     let field_inits: Vec<proc_macro2::Ident> =
         parsed.params.iter().map(|p| param_ident(&p.name)).collect();
@@ -355,6 +359,7 @@ pub fn generate_sort_query_code(
     quote! {
         {
             #result_struct
+            #for_each_row_struct
             #executor_struct
             #fetch_methods
             #constructor
@@ -559,12 +564,79 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         }
     };
 
+    // --- PG for_each ---
+    let for_each_row_struct = if has_columns {
+        gen_pg_for_each_row_struct(parsed, validation)
+    } else {
+        TokenStream::new()
+    };
+
+    let for_each_methods = if has_columns && is_select {
+        let fe_row_name = pg_for_each_row_struct_name(parsed);
+        let fe_decode = gen_pg_for_each_decode(validation);
+        let fe_decode2 = gen_pg_for_each_decode(validation);
+
+        quote! {
+            /// Process each row directly from the wire buffer via a closure.
+            ///
+            /// Zero arena allocation — the closure receives a borrowed row that
+            /// reads columns directly from the PG DataRow message bytes.
+            pub async fn for_each<_BsqlForEachF>(
+                self,
+                pool: &::bsql_core::Pool,
+                mut f: _BsqlForEachF,
+            ) -> ::bsql_core::BsqlResult<()>
+            where
+                _BsqlForEachF: FnMut(#fe_row_name<'_>) -> Result<(), ::bsql_core::BsqlError>,
+            {
+                pool.for_each_raw(
+                    #sql_lit,
+                    #sql_hash_val,
+                    #params_slice,
+                    true,
+                    |_bsql_row| -> ::bsql_core::BsqlResult<()> {
+                        let _bsql_typed = #fe_row_name { #fe_decode };
+                        f(_bsql_typed)
+                    },
+                ).await
+            }
+
+            /// Process each row, collecting mapped results into a `Vec`.
+            pub async fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
+                self,
+                pool: &::bsql_core::Pool,
+                mut f: _BsqlForEachF,
+            ) -> ::bsql_core::BsqlResult<Vec<_BsqlForEachT>>
+            where
+                _BsqlForEachF: FnMut(#fe_row_name<'_>) -> _BsqlForEachT,
+            {
+                let mut _bsql_results: Vec<_BsqlForEachT> = Vec::new();
+                pool.for_each_raw(
+                    #sql_lit,
+                    #sql_hash_val,
+                    #params_slice,
+                    true,
+                    |_bsql_row| -> ::bsql_core::BsqlResult<()> {
+                        let _bsql_typed = #fe_row_name { #fe_decode2 };
+                        _bsql_results.push(f(_bsql_typed));
+                        Ok(())
+                    },
+                ).await?;
+                Ok(_bsql_results)
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
     quote! {
         #stream_struct
+        #for_each_row_struct
 
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
+            #for_each_methods
             #execute_method
         }
     }
@@ -750,12 +822,81 @@ fn gen_dynamic_executor_impls(
         }
     };
 
+    // --- PG for_each for dynamic queries ---
+    let for_each_methods = if has_columns && is_select {
+        let fe_row_name = pg_for_each_row_struct_name(parsed);
+        let fe_decode = gen_pg_for_each_decode(validation);
+        let fe_decode2 = gen_pg_for_each_decode(validation);
+
+        let for_each_dispatcher =
+            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+                quote! {
+                    pool.for_each_raw(
+                        #sql_lit,
+                        #sql_hash,
+                        &params_slice[..],
+                        true,
+                        |_bsql_row| -> ::bsql_core::BsqlResult<()> {
+                            let _bsql_typed = #fe_row_name { #fe_decode };
+                            f(_bsql_typed)
+                        },
+                    ).await
+                }
+            });
+
+        let for_each_map_dispatcher =
+            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+                quote! {
+                    pool.for_each_raw(
+                        #sql_lit,
+                        #sql_hash,
+                        &params_slice[..],
+                        true,
+                        |_bsql_row| -> ::bsql_core::BsqlResult<()> {
+                            let _bsql_typed = #fe_row_name { #fe_decode2 };
+                            _bsql_results.push(f(_bsql_typed));
+                            Ok(())
+                        },
+                    ).await
+                }
+            });
+
+        quote! {
+            pub async fn for_each<_BsqlForEachF>(
+                self,
+                pool: &::bsql_core::Pool,
+                mut f: _BsqlForEachF,
+            ) -> ::bsql_core::BsqlResult<()>
+            where
+                _BsqlForEachF: FnMut(#fe_row_name<'_>) -> Result<(), ::bsql_core::BsqlError>,
+            {
+                #for_each_dispatcher
+            }
+
+            pub async fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
+                self,
+                pool: &::bsql_core::Pool,
+                mut f: _BsqlForEachF,
+            ) -> ::bsql_core::BsqlResult<Vec<_BsqlForEachT>>
+            where
+                _BsqlForEachF: FnMut(#fe_row_name<'_>) -> _BsqlForEachT,
+            {
+                let mut _bsql_results: Vec<_BsqlForEachT> = Vec::new();
+                #for_each_map_dispatcher?;
+                Ok(_bsql_results)
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
     quote! {
         #stream_struct
 
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
+            #for_each_methods
             #execute_method
         }
     }
@@ -895,6 +1036,227 @@ fn gen_stream_struct(
             }
         }
     }
+}
+
+// ---- PG for_each codegen ----
+
+/// Name for the PG for_each row struct (borrowed lifetime version).
+fn pg_for_each_row_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
+    format_ident!("BsqlForEachRow_{}", &parsed.statement_name)
+}
+
+/// Convert a column rust_type to its PG for_each borrowed equivalent.
+///
+/// `String` -> `&'a str` (zero-copy from wire buffer),
+/// `Vec<u8>` -> `&'a [u8]`,
+/// `Option<String>` -> `Option<&'a str>`, etc.
+/// Scalar types (i32, i64, f64, bool) are Copy and remain as-is.
+fn pg_for_each_result_type(type_str: &str) -> TokenStream {
+    match type_str {
+        "String" => quote! { &'a str },
+        "Vec<u8>" => quote! { &'a [u8] },
+        _ => {
+            if let Some(inner) = type_str
+                .strip_prefix("Option<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                match inner {
+                    "String" => quote! { Option<&'a str> },
+                    "Vec<u8>" => quote! { Option<&'a [u8]> },
+                    _ => parse_result_type(type_str),
+                }
+            } else {
+                parse_result_type(type_str)
+            }
+        }
+    }
+}
+
+/// Generate the PG for_each row struct with borrowed lifetime.
+fn gen_pg_for_each_row_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
+    if validation.columns.is_empty() {
+        return TokenStream::new();
+    }
+
+    let struct_name = pg_for_each_row_struct_name(parsed);
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let fields = validation.columns.iter().enumerate().map(|(i, col)| {
+        let field_name = format_ident!("{}", deduped_names[i]);
+        let field_type = pg_for_each_result_type(&col.rust_type);
+        quote! { pub #field_name: #field_type }
+    });
+
+    // Check if any column actually uses the 'a lifetime.
+    let needs_lifetime = validation.columns.iter().any(|col| {
+        let rt = &col.rust_type;
+        matches!(rt.as_str(), "String" | "Vec<u8>")
+            || rt.starts_with("Option<String>")
+            || rt.starts_with("Option<Vec<u8>>")
+    });
+
+    let phantom_field = if needs_lifetime {
+        TokenStream::new()
+    } else {
+        quote! { pub _marker: ::std::marker::PhantomData<&'a ()>, }
+    };
+
+    quote! {
+        #[derive(Debug)]
+        #[allow(non_camel_case_types)]
+        pub struct #struct_name<'a> {
+            #(#fields,)*
+            #phantom_field
+        }
+    }
+}
+
+/// Generate PG for_each row decode. Reads from `_bsql_row` (a `PgDataRow`).
+///
+/// For scalar types, identical to `gen_row_decode` but using `_bsql_row` variable.
+/// For String: returns `&str` (zero-copy) instead of `String` (owned).
+/// For Vec<u8>: returns `&[u8]` (zero-copy) instead of `Vec<u8>` (owned).
+fn gen_pg_for_each_decode(validation: &ValidationResult) -> TokenStream {
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let fields = deduped_names.iter().enumerate().map(|(i, name)| {
+        let field_name = format_ident!("{}", name);
+        let idx = i;
+        let col = &validation.columns[i];
+        let decode_expr = gen_pg_for_each_column_decode(idx, &col.rust_type);
+        quote! { #field_name: #decode_expr }
+    });
+
+    let needs_lifetime = validation.columns.iter().any(|col| {
+        let rt = &col.rust_type;
+        matches!(rt.as_str(), "String" | "Vec<u8>")
+            || rt.starts_with("Option<String>")
+            || rt.starts_with("Option<Vec<u8>>")
+    });
+
+    let phantom_init = if needs_lifetime {
+        TokenStream::new()
+    } else {
+        quote! { , _marker: ::std::marker::PhantomData }
+    };
+
+    quote! { #(#fields),* #phantom_init }
+}
+
+/// Generate decode for a single column in the PG for_each path.
+fn gen_pg_for_each_column_decode(idx: usize, rust_type: &str) -> TokenStream {
+    if let Some(inner) = rust_type
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        gen_pg_for_each_nullable_decode(idx, inner)
+    } else {
+        gen_pg_for_each_not_null_decode(idx, rust_type)
+    }
+}
+
+/// NOT NULL decode for PG for_each. Reads from `_bsql_row` (PgDataRow).
+fn gen_pg_for_each_not_null_decode(idx: usize, rust_type: &str) -> TokenStream {
+    let col_idx = idx.to_string();
+    match rust_type {
+        "bool" => {
+            let err = gen_not_null_decode_error(&col_idx, "bool");
+            quote! { _bsql_row.get_bool(#idx).ok_or_else(|| #err)? }
+        }
+        "i16" => {
+            let err = gen_not_null_decode_error(&col_idx, "i16");
+            quote! { _bsql_row.get_i16(#idx).ok_or_else(|| #err)? }
+        }
+        "i32" => {
+            let err = gen_not_null_decode_error(&col_idx, "i32");
+            quote! { _bsql_row.get_i32(#idx).ok_or_else(|| #err)? }
+        }
+        "i64" => {
+            let err = gen_not_null_decode_error(&col_idx, "i64");
+            quote! { _bsql_row.get_i64(#idx).ok_or_else(|| #err)? }
+        }
+        "f32" => {
+            let err = gen_not_null_decode_error(&col_idx, "f32");
+            quote! { _bsql_row.get_f32(#idx).ok_or_else(|| #err)? }
+        }
+        "f64" => {
+            let err = gen_not_null_decode_error(&col_idx, "f64");
+            quote! { _bsql_row.get_f64(#idx).ok_or_else(|| #err)? }
+        }
+        // Zero-copy: borrow &str directly from PG wire buffer
+        "String" => {
+            let err = gen_not_null_decode_error(&col_idx, "&str");
+            quote! { _bsql_row.get_str(#idx).ok_or_else(|| #err)? }
+        }
+        // Zero-copy: borrow &[u8] directly from PG wire buffer
+        "Vec<u8>" => {
+            let err = gen_not_null_decode_error(&col_idx, "&[u8]");
+            quote! { _bsql_row.get_bytes(#idx).ok_or_else(|| #err)? }
+        }
+        "u32" => {
+            let err = gen_not_null_decode_error(&col_idx, "u32");
+            quote! { _bsql_row.get_i32(#idx).ok_or_else(|| #err)? as u32 }
+        }
+        "()" => quote! { () },
+        // For feature-gated types (uuid, time, chrono, decimal, arrays), fall back
+        // to the same get_raw decode as fetch_all but reading from _bsql_row.
+        _ => gen_pg_for_each_feature_decode(idx, rust_type),
+    }
+}
+
+/// Nullable decode for PG for_each.
+fn gen_pg_for_each_nullable_decode(idx: usize, inner_type: &str) -> TokenStream {
+    match inner_type {
+        "bool" => quote! { _bsql_row.get_bool(#idx) },
+        "i16" => quote! { _bsql_row.get_i16(#idx) },
+        "i32" => quote! { _bsql_row.get_i32(#idx) },
+        "i64" => quote! { _bsql_row.get_i64(#idx) },
+        "f32" => quote! { _bsql_row.get_f32(#idx) },
+        "f64" => quote! { _bsql_row.get_f64(#idx) },
+        // Zero-copy: Option<&str>
+        "String" => quote! { _bsql_row.get_str(#idx) },
+        // Zero-copy: Option<&[u8]>
+        "Vec<u8>" => quote! { _bsql_row.get_bytes(#idx) },
+        "u32" => quote! { _bsql_row.get_i32(#idx).map(|v| v as u32) },
+        _ => gen_pg_for_each_nullable_feature_decode(idx, inner_type),
+    }
+}
+
+/// Feature-gated NOT NULL decode for PG for_each.
+/// Uses `_bsql_row.get_raw(idx)` + codec decode functions.
+fn gen_pg_for_each_feature_decode(idx: usize, rust_type: &str) -> TokenStream {
+    // Delegate to the same gen_feature_gated_decode / gen_not_null_decode
+    // but replace `row` with `_bsql_row`. Since the getter API is identical,
+    // we can reuse the same logic by generating code that uses `_bsql_row`.
+    let col_idx = idx.to_string();
+    match rust_type {
+        "::uuid::Uuid" | "uuid::Uuid" => {
+            let err = gen_not_null_decode_error(&col_idx, "uuid");
+            quote! {
+                match ::bsql_core::driver::decode_uuid_type(
+                    _bsql_row.get_raw(#idx).unwrap_or_default()
+                ) {
+                    Ok(v) => v,
+                    Err(_) => return Err(#err),
+                }
+            }
+        }
+        _ => {
+            // For complex types (time, chrono, decimal, arrays), we generate
+            // code that uses `_bsql_row` in place of `row`. These require
+            // owned copies anyway (they allocate), so no zero-copy benefit.
+            // Use the same decode pattern as fetch_all but with _bsql_row.
+            let decode = gen_not_null_decode(idx, rust_type);
+            // Replace `row.` with `_bsql_row.` in the generated tokens.
+            // Since gen_not_null_decode generates `row.get_*` calls, we
+            // simply alias `row` to `_bsql_row` in the generated block.
+            quote! { { let row = &_bsql_row; #decode } }
+        }
+    }
+}
+
+/// Feature-gated nullable decode for PG for_each.
+fn gen_pg_for_each_nullable_feature_decode(idx: usize, inner_type: &str) -> TokenStream {
+    let decode = gen_nullable_decode(idx, inner_type);
+    quote! { { let row = &_bsql_row; #decode } }
 }
 
 /// Generate row field decoding using typed getters from bsql_driver_postgres::Row.

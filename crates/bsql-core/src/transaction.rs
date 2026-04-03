@@ -194,6 +194,40 @@ impl Transaction {
             .await
             .map_err(BsqlError::from_driver_query)
     }
+
+    /// Process each row directly from the wire buffer within this transaction.
+    ///
+    /// Zero arena allocation — the closure receives a `PgDataRow` that reads
+    /// columns directly from the DataRow message bytes.
+    pub async fn for_each_raw<F>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        mut f: F,
+    ) -> BsqlResult<()>
+    where
+        F: FnMut(bsql_driver_postgres::PgDataRow<'_>) -> BsqlResult<()>,
+    {
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let mut user_err: Option<BsqlError> = None;
+        let driver_result = tx
+            .for_each(sql, sql_hash, params, |row| match f(row) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    user_err = Some(e);
+                    Err(bsql_driver_postgres::DriverError::Protocol(
+                        "for_each closure error".into(),
+                    ))
+                }
+            })
+            .await;
+        if let Some(e) = user_err {
+            return Err(e);
+        }
+        driver_result.map_err(BsqlError::from_driver_query)
+    }
 }
 
 impl fmt::Debug for Transaction {

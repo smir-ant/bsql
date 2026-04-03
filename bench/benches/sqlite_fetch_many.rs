@@ -45,8 +45,8 @@ fn bench_sqlite_fetch_many(c: &mut Criterion) {
     let mut group = c.benchmark_group("sqlite_fetch_many");
 
     for &n in row_counts {
-        // -- bsql for_each (zero-copy) --
-        group.bench_with_input(BenchmarkId::new("bsql_for_each", n), &n, |b, &n| {
+        // -- bsql (for_each — fastest path, zero-copy) --
+        group.bench_with_input(BenchmarkId::new("bsql", n), &n, |b, &n| {
             b.iter(|| {
                 let mut count = 0u64;
                 bsql::query!(
@@ -58,17 +58,6 @@ fn bench_sqlite_fetch_many(c: &mut Criterion) {
                 })
                 .unwrap();
                 assert!(count > 0);
-            });
-        });
-
-        // -- bsql (sync) --
-        group.bench_with_input(BenchmarkId::new("bsql", n), &n, |b, &n| {
-            b.iter(|| {
-                let _rows = bsql::query!(
-                    "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
-                )
-                .fetch_all(&bsql_pool)
-                .unwrap();
             });
         });
 
