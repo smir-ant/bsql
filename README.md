@@ -1,5 +1,7 @@
 # bsql
 
+Your safest, fastest, lightweight SQL.
+
 Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 
 ## Why bsql
