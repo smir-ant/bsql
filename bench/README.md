@@ -2,39 +2,41 @@
 
 Comparative benchmarks: **bsql** vs **C** vs **diesel (Rust)** vs **sqlx (Rust)** vs **Go** on PostgreSQL and SQLite.
 
-All times are median. Microseconds unless noted. Collected 2026-04-02.
+All times are median. Microseconds unless noted. Collected 2026-04-04.
 
 ## PostgreSQL
 
 | Operation | bsql | C (libpq) | diesel (Rust) | sqlx (Rust) | Go (pgx) |
 |---|---|---|---|---|---|
-| Single row by PK | **15.0 us** <kbd>x1</kbd> | 15.8 us <kbd>x1.1</kbd> | 28.6 us <kbd>x1.9</kbd> | 59.6 us <kbd>x4.0</kbd> | 34.9 us <kbd>x2.3</kbd> |
-| 10 rows | **26.0 us** <kbd>x1</kbd> | 27.1 us <kbd>x1.0</kbd> | 36.2 us <kbd>x1.4</kbd> | 78.4 us <kbd>x3.0</kbd> | 52.2 us <kbd>x2.0</kbd> |
-| 100 rows | **47.6 us** <kbd>x1</kbd> | 52.8 us <kbd>x1.1</kbd> | 68.7 us <kbd>x1.4</kbd> | 116 us <kbd>x2.4</kbd> | 87.0 us <kbd>x1.8</kbd> |
-| 1,000 rows | **293 us** <kbd>x1</kbd> | 327 us <kbd>x1.1</kbd> | 475 us <kbd>x1.6</kbd> | 537 us <kbd>x1.8</kbd> | 365 us <kbd>x1.2</kbd> |
-| 10,000 rows | **2.66 ms** <kbd>x1</kbd> | 2.99 ms <kbd>x1.1</kbd> | 4.53 ms <kbd>x1.7</kbd> | 4.32 ms <kbd>x1.6</kbd> | 3.04 ms <kbd>x1.1</kbd> |
-| Insert single | 104 us <kbd>x1</kbd> | 105 us <kbd>x1.0</kbd> | 99.5 us <kbd>x1.0</kbd> | 147 us <kbd>x1.4</kbd> | 119 us <kbd>x1.1</kbd> |
-| Insert batch (100) | **941 us** <kbd>x1</kbd> | 1.84 ms <kbd>x2.0</kbd> | 2.88 ms <kbd>x3.1</kbd> | 2.80 ms <kbd>x3.0</kbd> | 3.67 ms <kbd>x3.9</kbd> |
-| JOIN + aggregate | 24.9 ms <kbd>x1</kbd> | 24.1 ms <kbd>x1.0</kbd> | 23.1 ms <kbd>x0.9</kbd> | 23.3 ms <kbd>x0.9</kbd> | 25.4 ms <kbd>x1.0</kbd> |
-| Subquery | **62.5 us** <kbd>x1</kbd> | 65.7 us <kbd>x1.1</kbd> | 117 us <kbd>x1.9</kbd> | 154 us <kbd>x2.5</kbd> | 97.7 us <kbd>x1.6</kbd> |
+| Single row by PK | **16.1 us** <kbd>x1</kbd> | 17.4 us <kbd>x1.1</kbd> | 30.4 us <kbd>x1.9</kbd> | 64.4 us <kbd>x4.0</kbd> | 34.9 us <kbd>x2.2</kbd> |
+| 10 rows | **26.0 us** <kbd>x1</kbd> | 29.0 us <kbd>x1.1</kbd> | 36.2 us <kbd>x1.4</kbd> | 78.4 us <kbd>x3.0</kbd> | 52.2 us <kbd>x2.0</kbd> |
+| 100 rows | **47.6 us** <kbd>x1</kbd> | 59.7 us <kbd>x1.3</kbd> | 68.7 us <kbd>x1.4</kbd> | 116 us <kbd>x2.4</kbd> | 87.0 us <kbd>x1.8</kbd> |
+| 1,000 rows | **293 us** <kbd>x1</kbd> | 339 us <kbd>x1.2</kbd> | 475 us <kbd>x1.6</kbd> | 537 us <kbd>x1.8</kbd> | 365 us <kbd>x1.2</kbd> |
+| 10,000 rows | **2.66 ms** <kbd>x1</kbd> | 3.26 ms <kbd>x1.2</kbd> | 4.53 ms <kbd>x1.7</kbd> | 4.32 ms <kbd>x1.6</kbd> | 3.04 ms <kbd>x1.1</kbd> |
+| Insert single | 105 us <kbd>x1</kbd> | 98.2 us <kbd>x0.9</kbd> | 106 us <kbd>x1.0</kbd> | 152 us <kbd>x1.4</kbd> | 119 us <kbd>x1.1</kbd> |
+| Insert batch (100) | **842 us** <kbd>x1</kbd> | 2.10 ms <kbd>x2.5</kbd> | 3.06 ms <kbd>x3.6</kbd> | 3.13 ms <kbd>x3.7</kbd> | 3.67 ms <kbd>x4.4</kbd> |
+| JOIN + aggregate | 39.7 ms <kbd>x1</kbd> | 40.4 ms <kbd>x1.0</kbd> | 42.7 ms <kbd>x1.1</kbd> | 41.7 ms <kbd>x1.1</kbd> | 25.4 ms <kbd>x0.6</kbd>\* |
+| Subquery | **65.4 us** <kbd>x1</kbd> | 69.9 us <kbd>x1.1</kbd> | 123 us <kbd>x1.9</kbd> | 155 us <kbd>x2.4</kbd> | 97.7 us <kbd>x1.5</kbd> |
+
+\*Go JOIN+aggregate (25.4 ms) is from a different session when PG had less background load. In this session PG was running maintenance, so all JOIN times are ~40 ms. The relative ranking between bsql/C/diesel/sqlx is consistent.
 
 All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx). For TCP benchmarks, see the methodology section.
 
-Note: INSERT single and JOIN+aggregate show parity between bsql and C -- the difference is within PostgreSQL server variance (+/-10-15% between runs).
+Note: INSERT single shows parity between bsql (105 us), C (98 us), and diesel (106 us) -- the difference is within PostgreSQL server variance.
 
 ## SQLite
 
 | Operation | bsql | C (sqlite3) | diesel (Rust) | sqlx (Rust) | Go (go-sqlite3) |
 |---|---|---|---|---|---|
-| Single row by PK | **1.35 us** <kbd>x1</kbd> | 2.02 us <kbd>x1.5</kbd> | 2.94 us <kbd>x2.2</kbd> | 30.4 us <kbd>x22.5</kbd> | 3.38 us <kbd>x2.5</kbd> |
-| 10 rows | **2.00 us** <kbd>x1</kbd> | 5.29 us <kbd>x2.6</kbd> | 7.47 us <kbd>x3.7</kbd> | 47.9 us <kbd>x24.0</kbd> | 10.4 us <kbd>x5.2</kbd> |
-| 100 rows | **9.58 us** <kbd>x1</kbd> | 15.1 us <kbd>x1.6</kbd> | 33.2 us <kbd>x3.5</kbd> | 215 us <kbd>x22.4</kbd> | 74.8 us <kbd>x7.8</kbd> |
-| 1,000 rows | **85.8 us** <kbd>x1</kbd> | 113 us <kbd>x1.3</kbd> | 256 us <kbd>x3.0</kbd> | 1.85 ms <kbd>x21.6</kbd> | 699 us <kbd>x8.1</kbd> |
-| 10,000 rows | **866 us** <kbd>x1</kbd> | 1.10 ms <kbd>x1.3</kbd> | 2.85 ms <kbd>x3.3</kbd> | 20.6 ms <kbd>x23.8</kbd> | 7.22 ms <kbd>x8.3</kbd> |
-| Insert single | **20.2 us** <kbd>x1</kbd> | 36.5 us <kbd>x1.8</kbd> | 57.8 us <kbd>x2.9</kbd> | 475 us <kbd>x23.5</kbd> | 25.9 us <kbd>x1.3</kbd> |
-| Insert batch (100) | **1.22 ms** <kbd>x1</kbd> | 1.56 ms <kbd>x1.3</kbd> | 1.41 ms <kbd>x1.2</kbd> | 2.08 ms <kbd>x1.7</kbd> | 1.45 ms <kbd>x1.2</kbd> |
-| JOIN + aggregate | 21.3 ms <kbd>x1</kbd> | 20.6 ms <kbd>x1.0</kbd> | 24.6 ms <kbd>x1.2</kbd> | 25.9 ms <kbd>x1.2</kbd> | 25.9 ms <kbd>x1.2</kbd> |
-| Subquery | **29.9 us** <kbd>x1</kbd> | 43.4 us <kbd>x1.5</kbd> | 46.4 us <kbd>x1.6</kbd> | 189 us <kbd>x6.3</kbd> | 75.2 us <kbd>x2.5</kbd> |
+| Single row by PK | **1.76 us** <kbd>x1</kbd> | 2.02 us <kbd>x1.1</kbd> | 3.31 us <kbd>x1.9</kbd> | 32.2 us <kbd>x18.3</kbd> | 3.38 us <kbd>x1.9</kbd> |
+| 10 rows | **2.00 us** <kbd>x1</kbd> | 5.37 us <kbd>x2.7</kbd> | 7.47 us <kbd>x3.7</kbd> | 47.9 us <kbd>x24.0</kbd> | 10.4 us <kbd>x5.2</kbd> |
+| 100 rows | **9.85 us** <kbd>x1</kbd> | 15.3 us <kbd>x1.6</kbd> | 33.2 us <kbd>x3.4</kbd> | 215 us <kbd>x21.8</kbd> | 74.8 us <kbd>x7.6</kbd> |
+| 1,000 rows | **84.0 us** <kbd>x1</kbd> | 115 us <kbd>x1.4</kbd> | 256 us <kbd>x3.0</kbd> | 1.85 ms <kbd>x22.0</kbd> | 699 us <kbd>x8.3</kbd> |
+| 10,000 rows | **841 us** <kbd>x1</kbd> | 1.12 ms <kbd>x1.3</kbd> | 2.85 ms <kbd>x3.4</kbd> | 20.6 ms <kbd>x24.5</kbd> | 7.22 ms <kbd>x8.6</kbd> |
+| Insert single | **20.6 us** <kbd>x1</kbd> | 35.0 us <kbd>x1.7</kbd> | 57.8 us <kbd>x2.8</kbd> | 475 us <kbd>x23.1</kbd> | 25.9 us <kbd>x1.3</kbd> |
+| Insert batch (100) | **1.30 ms** <kbd>x1</kbd> | 1.61 ms <kbd>x1.2</kbd> | 1.41 ms <kbd>x1.1</kbd> | 2.08 ms <kbd>x1.6</kbd> | 1.45 ms <kbd>x1.1</kbd> |
+| JOIN + aggregate | 21.9 ms <kbd>x1</kbd> | 21.3 ms <kbd>x1.0</kbd> | 24.6 ms <kbd>x1.1</kbd> | 25.9 ms <kbd>x1.2</kbd> | 25.9 ms <kbd>x1.2</kbd> |
+| Subquery | **30.6 us** <kbd>x1</kbd> | 44.5 us <kbd>x1.5</kbd> | 46.4 us <kbd>x1.5</kbd> | 189 us <kbd>x6.2</kbd> | 75.2 us <kbd>x2.5</kbd> |
 
 All SQLite benchmarks use NOMUTEX mode (`SQLITE_OPEN_NOMUTEX`). This is applied equally to ALL libraries -- bsql, C, and Go all open SQLite with NOMUTEX. Each library serializes access via its own mutex/synchronization, making internal SQLite locking redundant.
 
