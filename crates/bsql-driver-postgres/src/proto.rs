@@ -702,6 +702,12 @@ impl fmt::Display for ErrorFields {
 /// Parse an ErrorResponse / NoticeResponse payload into fields.
 ///
 /// Format: `([field_type: u8] [value\0])... [0x00]`
+///
+/// Marked `#[cold]` + `#[inline(never)]` because error responses are rare
+/// on the hot path. Keeping this out of the caller's instruction stream
+/// improves i-cache utilization for the common DataRow processing loop.
+#[cold]
+#[inline(never)]
 pub fn parse_error_response(data: &[u8]) -> ErrorFields {
     let mut severity: Box<str> = Box::from("");
     let mut code: Box<str> = Box::from("");

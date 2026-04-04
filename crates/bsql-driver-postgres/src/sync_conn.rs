@@ -534,59 +534,31 @@ impl SyncConnection {
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                match msg_type {
-                    b'2' => {} // BindComplete — skip
-                    b'D' => {
-                        // DataRow — parse column offsets from stream_buf payload.
-                        parse_data_row_flat(
-                            &self.stream_buf[payload_start..payload_end],
-                            arena,
-                            &mut all_col_offsets,
-                        )?;
+                // Happy path first: DataRow is ~99.9% of messages in a
+                // result set. Using if/else compiles to a single predicted
+                // branch instead of a jump table.
+                if msg_type == b'D' {
+                    // DataRow — parse column offsets from stream_buf payload.
+                    parse_data_row_flat(
+                        &self.stream_buf[payload_start..payload_end],
+                        arena,
+                        &mut all_col_offsets,
+                    )?;
+                } else if msg_type == b'Z' {
+                    // ReadyForQuery — extract tx status and we're done.
+                    if payload_len >= 1 {
+                        self.tx_status = self.stream_buf[payload_start];
                     }
-                    b'C' => {
-                        // CommandComplete — parse affected rows from tag bytes.
-                        affected_rows = proto::parse_command_tag_bytes(
-                            &self.stream_buf[payload_start..payload_end],
-                        );
-                    }
-                    b'I' => {} // EmptyQuery — skip
-                    b'Z' => {
-                        // ReadyForQuery — extract tx status and we're done.
-                        if payload_len >= 1 {
-                            self.tx_status = self.stream_buf[payload_start];
-                        }
-                        self.stream_buf_pos += total_msg_len;
-                        break 'outer;
-                    }
-                    b'E' => {
-                        // ErrorResponse — parse and return error.
-                        let fields = proto::parse_error_response(
-                            &self.stream_buf[payload_start..payload_end],
-                        );
-                        self.stream_buf_pos += total_msg_len;
-                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                        self.drain_to_ready()?;
-                        return Err(self.make_server_error(fields));
-                    }
-                    b'A' => {
-                        // NotificationResponse — buffer it.
-                        let msg = proto::parse_backend_message(
-                            msg_type,
-                            &self.stream_buf[payload_start..payload_end],
-                        )?;
-                        if let BackendMessage::NotificationResponse {
-                            pid,
-                            channel,
-                            payload,
-                        } = msg
-                        {
-                            let ch = channel.to_owned();
-                            let pl = payload.to_owned();
-                            self.buffer_notification(pid, &ch, &pl);
-                        }
-                    }
-                    _ => {} // NoticeResponse, ParameterStatus — skip
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else {
+                    self.handle_non_datarow_query(
+                        msg_type,
+                        payload_start,
+                        payload_end,
+                        sql_hash,
+                        &mut affected_rows,
+                    )?;
                 }
 
                 self.stream_buf_pos += total_msg_len;
@@ -690,52 +662,30 @@ impl SyncConnection {
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                match msg_type {
-                    b'2' => {} // BindComplete — skip
-                    b'D' => {} // DataRow — skip (execute ignores rows)
-                    b'C' => {
-                        // CommandComplete — parse affected rows from tag bytes.
-                        affected_rows = proto::parse_command_tag_bytes(
-                            &self.stream_buf[payload_start..payload_end],
-                        );
+                // Happy path first: for execute(), BindComplete (b'2') and
+                // CommandComplete (b'C') are the common messages. DataRow is
+                // skipped. Use if/else chain for predicted branches.
+                if msg_type == b'2' || msg_type == b'D' || msg_type == b'I' {
+                    // BindComplete / DataRow / EmptyQuery — skip
+                } else if msg_type == b'C' {
+                    // CommandComplete — parse affected rows from tag bytes.
+                    affected_rows = proto::parse_command_tag_bytes(
+                        &self.stream_buf[payload_start..payload_end],
+                    );
+                } else if msg_type == b'Z' {
+                    // ReadyForQuery — extract tx status and we're done.
+                    if payload_len >= 1 {
+                        self.tx_status = self.stream_buf[payload_start];
                     }
-                    b'I' => {} // EmptyQuery — skip
-                    b'Z' => {
-                        // ReadyForQuery — extract tx status and we're done.
-                        if payload_len >= 1 {
-                            self.tx_status = self.stream_buf[payload_start];
-                        }
-                        self.stream_buf_pos += total_msg_len;
-                        break 'outer;
-                    }
-                    b'E' => {
-                        // ErrorResponse — parse and return error.
-                        let fields = proto::parse_error_response(
-                            &self.stream_buf[payload_start..payload_end],
-                        );
-                        self.stream_buf_pos += total_msg_len;
-                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                        self.drain_to_ready()?;
-                        return Err(self.make_server_error(fields));
-                    }
-                    b'A' => {
-                        // NotificationResponse — buffer it.
-                        let msg = proto::parse_backend_message(
-                            msg_type,
-                            &self.stream_buf[payload_start..payload_end],
-                        )?;
-                        if let BackendMessage::NotificationResponse {
-                            pid,
-                            channel,
-                            payload,
-                        } = msg
-                        {
-                            let ch = channel.to_owned();
-                            let pl = payload.to_owned();
-                            self.buffer_notification(pid, &ch, &pl);
-                        }
-                    }
-                    _ => {} // NoticeResponse, ParameterStatus — skip
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else {
+                    self.handle_non_datarow_execute(
+                        msg_type,
+                        payload_start,
+                        payload_end,
+                        sql_hash,
+                    )?;
                 }
 
                 self.stream_buf_pos += total_msg_len;
@@ -1064,50 +1014,26 @@ impl SyncConnection {
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                match msg_type {
-                    b'2' => {} // BindComplete — skip
-                    b'D' => {
-                        // DataRow — construct PgDataRow from stream_buf slice.
-                        let row = PgDataRow::new(&self.stream_buf[payload_start..payload_end])?;
-                        f(row)?;
+                // Happy path first: DataRow is ~99.9% of messages during
+                // row iteration.
+                if msg_type == b'D' {
+                    // DataRow — construct PgDataRow from stream_buf slice.
+                    let row = PgDataRow::new(&self.stream_buf[payload_start..payload_end])?;
+                    f(row)?;
+                } else if msg_type == b'Z' {
+                    // ReadyForQuery — extract tx status and we're done.
+                    if payload_len >= 1 {
+                        self.tx_status = self.stream_buf[payload_start];
                     }
-                    b'C' | b'I' => {} // CommandComplete / EmptyQuery — skip
-                    b'Z' => {
-                        // ReadyForQuery — extract tx status and we're done.
-                        if payload_len >= 1 {
-                            self.tx_status = self.stream_buf[payload_start];
-                        }
-                        self.stream_buf_pos += total_msg_len;
-                        break 'outer;
-                    }
-                    b'E' => {
-                        // ErrorResponse — parse and return error.
-                        let fields = proto::parse_error_response(
-                            &self.stream_buf[payload_start..payload_end],
-                        );
-                        self.stream_buf_pos += total_msg_len;
-                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                        self.drain_to_ready()?;
-                        return Err(self.make_server_error(fields));
-                    }
-                    b'A' => {
-                        // NotificationResponse — buffer it.
-                        let msg = proto::parse_backend_message(
-                            msg_type,
-                            &self.stream_buf[payload_start..payload_end],
-                        )?;
-                        if let BackendMessage::NotificationResponse {
-                            pid,
-                            channel,
-                            payload,
-                        } = msg
-                        {
-                            let ch = channel.to_owned();
-                            let pl = payload.to_owned();
-                            self.buffer_notification(pid, &ch, &pl);
-                        }
-                    }
-                    _ => {} // NoticeResponse, ParameterStatus — skip
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else {
+                    self.handle_non_datarow_execute(
+                        msg_type,
+                        payload_start,
+                        payload_end,
+                        sql_hash,
+                    )?;
                 }
 
                 self.stream_buf_pos += total_msg_len;
@@ -1247,47 +1173,24 @@ impl SyncConnection {
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                match msg_type {
-                    b'D' => {
-                        f(&self.stream_buf[payload_start..payload_end])?;
+                // Happy path first: DataRow is ~99.9% of messages during
+                // bulk streaming. Single predicted branch.
+                if msg_type == b'D' {
+                    f(&self.stream_buf[payload_start..payload_end])?;
+                } else if msg_type == b'Z' {
+                    // ReadyForQuery — extract tx status and we're done.
+                    if payload_len >= 1 {
+                        self.tx_status = self.stream_buf[payload_start];
                     }
-                    b'C' | b'I' => {} // CommandComplete / EmptyQuery — skip, wait for Z
-                    b'Z' => {
-                        // ReadyForQuery — extract tx status and we're done.
-                        if payload_len >= 1 {
-                            self.tx_status = self.stream_buf[payload_start];
-                        }
-                        self.stream_buf_pos += total_msg_len;
-                        break 'outer;
-                    }
-                    b'E' => {
-                        let fields = proto::parse_error_response(
-                            &self.stream_buf[payload_start..payload_end],
-                        );
-                        self.stream_buf_pos += total_msg_len;
-                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                        self.drain_to_ready()?;
-                        return Err(self.make_server_error(fields));
-                    }
-                    b'A' => {
-                        let msg = proto::parse_backend_message(
-                            msg_type,
-                            &self.stream_buf[payload_start..payload_end],
-                        )?;
-                        if let BackendMessage::NotificationResponse {
-                            pid,
-                            channel,
-                            payload,
-                        } = msg
-                        {
-                            let ch = channel.to_owned();
-                            let pl = payload.to_owned();
-                            self.buffer_notification(pid, &ch, &pl);
-                        }
-                    }
-                    _ => {
-                        // NoticeResponse, ParameterStatus, etc. — skip.
-                    }
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else {
+                    self.handle_non_datarow_execute(
+                        msg_type,
+                        payload_start,
+                        payload_end,
+                        sql_hash,
+                    )?;
                 }
 
                 self.stream_buf_pos += total_msg_len;
@@ -1655,6 +1558,8 @@ impl SyncConnection {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn make_server_error(&self, fields: proto::ErrorFields) -> DriverError {
         DriverError::Server {
             code: fields.code,
@@ -1663,6 +1568,96 @@ impl SyncConnection {
             hint: fields.hint.map(String::into_boxed_str),
             position: fields.position,
         }
+    }
+
+    /// Handle non-DataRow messages during query() inline parsing.
+    ///
+    /// Separated from the hot loop so the compiler keeps DataRow processing
+    /// tight in the instruction cache. Handles CommandComplete, BindComplete,
+    /// EmptyQuery, ErrorResponse, NotificationResponse, and others.
+    #[cold]
+    #[inline(never)]
+    fn handle_non_datarow_query(
+        &mut self,
+        msg_type: u8,
+        payload_start: usize,
+        payload_end: usize,
+        sql_hash: u64,
+        affected_rows: &mut u64,
+    ) -> Result<(), DriverError> {
+        match msg_type {
+            b'2' | b'I' => {} // BindComplete / EmptyQuery — skip
+            b'C' => {
+                *affected_rows =
+                    proto::parse_command_tag_bytes(&self.stream_buf[payload_start..payload_end]);
+            }
+            b'E' => {
+                let fields =
+                    proto::parse_error_response(&self.stream_buf[payload_start..payload_end]);
+                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                self.drain_to_ready()?;
+                return Err(self.make_server_error(fields));
+            }
+            b'A' => {
+                let msg = proto::parse_backend_message(
+                    msg_type,
+                    &self.stream_buf[payload_start..payload_end],
+                )?;
+                if let BackendMessage::NotificationResponse {
+                    pid,
+                    channel,
+                    payload,
+                } = msg
+                {
+                    let ch = channel.to_owned();
+                    let pl = payload.to_owned();
+                    self.buffer_notification(pid, &ch, &pl);
+                }
+            }
+            _ => {} // NoticeResponse, ParameterStatus — skip
+        }
+        Ok(())
+    }
+
+    /// Handle non-DataRow messages during execute/for_each/for_each_raw inline
+    /// parsing. Same as `handle_non_datarow_query` but without `affected_rows`.
+    #[cold]
+    #[inline(never)]
+    fn handle_non_datarow_execute(
+        &mut self,
+        msg_type: u8,
+        payload_start: usize,
+        payload_end: usize,
+        sql_hash: u64,
+    ) -> Result<(), DriverError> {
+        match msg_type {
+            b'2' | b'C' | b'I' => {} // BindComplete / CommandComplete / EmptyQuery — skip
+            b'E' => {
+                let fields =
+                    proto::parse_error_response(&self.stream_buf[payload_start..payload_end]);
+                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                self.drain_to_ready()?;
+                return Err(self.make_server_error(fields));
+            }
+            b'A' => {
+                let msg = proto::parse_backend_message(
+                    msg_type,
+                    &self.stream_buf[payload_start..payload_end],
+                )?;
+                if let BackendMessage::NotificationResponse {
+                    pid,
+                    channel,
+                    payload,
+                } = msg
+                {
+                    let ch = channel.to_owned();
+                    let pl = payload.to_owned();
+                    self.buffer_notification(pid, &ch, &pl);
+                }
+            }
+            _ => {} // NoticeResponse, ParameterStatus — skip
+        }
+        Ok(())
     }
 
     /// Read one backend message, auto-buffering notifications.

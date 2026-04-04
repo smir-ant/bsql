@@ -1894,55 +1894,20 @@ impl Connection {
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                match msg_type {
-                    b'D' => {
-                        // DataRow — ZERO COPY from stream_buf.
-                        // Safety: payload_start..payload_end is within stream_buf bounds
-                        // (checked by `avail < total_msg_len` above).
-                        f(&self.stream_buf[payload_start..payload_end])?;
-                    }
-                    b'C' => {
-                        // CommandComplete — done.
-                        self.stream_buf_pos += total_msg_len;
-                        break 'outer;
-                    }
-                    b'E' => {
-                        // ErrorResponse — parse owned error fields from stream_buf slice,
-                        // then advance position before calling drain_to_ready.
-                        let fields = proto::parse_error_response(
-                            &self.stream_buf[payload_start..payload_end],
-                        );
-                        self.stream_buf_pos += total_msg_len;
-                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                        self.drain_to_ready().await?;
-                        return Err(self.make_server_error(fields));
-                    }
-                    b'A' => {
-                        // NotificationResponse — buffer it.
-                        // Parse from stream_buf, extract owned data, then advance.
-                        let msg = proto::parse_backend_message(
-                            msg_type,
-                            &self.stream_buf[payload_start..payload_end],
-                        )?;
-                        if let BackendMessage::NotificationResponse {
-                            pid,
-                            channel,
-                            payload,
-                        } = msg
-                        {
-                            let ch = channel.to_owned();
-                            let pl = payload.to_owned();
-                            self.buffer_notification(pid, &ch, &pl);
-                        }
-                    }
-                    b'I' => {
-                        // EmptyQuery — done.
-                        self.stream_buf_pos += total_msg_len;
-                        break 'outer;
-                    }
-                    _ => {
-                        // NoticeResponse (b'N'), ParameterStatus (b'S'), etc. — skip.
-                    }
+                // Happy path first: DataRow is ~99.9% of messages during
+                // bulk streaming. Single predicted branch.
+                if msg_type == b'D' {
+                    // DataRow — ZERO COPY from stream_buf.
+                    // Safety: payload_start..payload_end is within stream_buf bounds
+                    // (checked by `avail < total_msg_len` above).
+                    f(&self.stream_buf[payload_start..payload_end])?;
+                } else if msg_type == b'C' || msg_type == b'I' {
+                    // CommandComplete / EmptyQuery — done.
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else {
+                    self.handle_non_datarow_async(msg_type, payload_start, payload_end, sql_hash)
+                        .await?;
                 }
 
                 self.stream_buf_pos += total_msg_len;
@@ -2390,6 +2355,8 @@ impl Connection {
     }
 
     /// Convert parsed ErrorFields into a DriverError::Server.
+    #[cold]
+    #[inline(never)]
     fn make_server_error(&self, fields: proto::ErrorFields) -> DriverError {
         DriverError::Server {
             code: fields.code,
@@ -2398,6 +2365,47 @@ impl Connection {
             hint: fields.hint.map(String::into_boxed_str),
             position: fields.position,
         }
+    }
+
+    /// Handle non-DataRow messages during for_each_raw inline parsing (async).
+    ///
+    /// Separated from the hot loop so the compiler keeps DataRow processing
+    /// tight in the instruction cache.
+    #[cold]
+    async fn handle_non_datarow_async(
+        &mut self,
+        msg_type: u8,
+        payload_start: usize,
+        payload_end: usize,
+        sql_hash: u64,
+    ) -> Result<(), DriverError> {
+        match msg_type {
+            b'E' => {
+                let fields =
+                    proto::parse_error_response(&self.stream_buf[payload_start..payload_end]);
+                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                self.drain_to_ready().await?;
+                return Err(self.make_server_error(fields));
+            }
+            b'A' => {
+                let msg = proto::parse_backend_message(
+                    msg_type,
+                    &self.stream_buf[payload_start..payload_end],
+                )?;
+                if let BackendMessage::NotificationResponse {
+                    pid,
+                    channel,
+                    payload,
+                } = msg
+                {
+                    let ch = channel.to_owned();
+                    let pl = payload.to_owned();
+                    self.buffer_notification(pid, &ch, &pl);
+                }
+            }
+            _ => {} // NoticeResponse, ParameterStatus — skip
+        }
+        Ok(())
     }
 
     /// Flush the write buffer to the stream.
