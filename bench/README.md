@@ -20,7 +20,7 @@ All times are median. Microseconds unless noted. Collected 2026-04-02.
 
 All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx). For TCP benchmarks, see the methodology section.
 
-Note: INSERT single and JOIN+aggregate show parity (within PG server variance +/-5us per run).
+Note: INSERT single and JOIN+aggregate show parity between bsql and C -- the difference is within PostgreSQL server variance (+/-10-15% between runs).
 
 ## SQLite
 
@@ -77,6 +77,10 @@ Criterion reports with interactive charts are saved to `target/criterion/report/
 Apple M1 Pro (10-core), 16 GB RAM, macOS Darwin 25.0.0, Rust 1.96.0-nightly, Go 1.26.0, Apple clang 17.0.0, PostgreSQL 15.14, SQLite 3.51.0.
 
 ## Methodology
+
+Each Rust benchmark uses Criterion (100 samples x ~1,000 iterations per sample). For volatile operations (INSERT, JOIN), results vary +/-10-15% between runs due to PostgreSQL server state (WAL checkpointing, background writer, kernel scheduling). Numbers in the tables represent a single Criterion run. For the most accurate comparison, run all benchmarks in sequence on an idle system.
+
+All benchmarks run in the same process and share the same database connection conditions. The order is: fetch_one, fetch_many, insert, complex. This ensures consistent PG server state across libraries within each benchmark category.
 
 Every benchmark implementation (Rust, C, Go) does identical work per iteration:
 
