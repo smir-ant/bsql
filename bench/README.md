@@ -33,7 +33,7 @@ All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS elimi
 | 10,000 rows | **864 us** <kbd>x1</kbd> | 1.13 ms <kbd>x1.3</kbd> | 2.85 ms <kbd>x3.3</kbd> | 20.6 ms <kbd>x23.8</kbd> | 7.22 ms <kbd>x8.4</kbd> |
 | Insert single | **20.5 us** <kbd>x1</kbd> | 33.3 us <kbd>x1.6</kbd> | 57.8 us <kbd>x2.8</kbd> | 475 us <kbd>x23.2</kbd> | 25.9 us <kbd>x1.3</kbd> |
 | Insert batch (100) | **1.33 ms** <kbd>x1</kbd> | 1.71 ms <kbd>x1.3</kbd> | 1.41 ms <kbd>x1.1</kbd> | 2.08 ms <kbd>x1.6</kbd> | 1.45 ms <kbd>x1.1</kbd> |
-| JOIN + aggregate | 21.7 ms <kbd>x1.0</kbd> | 21.3 ms <kbd>x1</kbd> | 24.6 ms <kbd>x1.2</kbd> | 25.9 ms <kbd>x1.2</kbd> | 25.9 ms <kbd>x1.2</kbd> |
+| JOIN + aggregate\* | 21.7 ms <kbd>x1</kbd> | 21.3 ms <kbd>x0.98</kbd> | 24.6 ms <kbd>x1.1</kbd> | 25.9 ms <kbd>x1.2</kbd> | 25.9 ms <kbd>x1.2</kbd> |
 | Subquery | **30.3 us** <kbd>x1</kbd> | 44.9 us <kbd>x1.5</kbd> | 46.4 us <kbd>x1.5</kbd> | 189 us <kbd>x6.2</kbd> | 75.2 us <kbd>x2.5</kbd> |
 
 Benchmarks use system SQLite (same library as C benchmark) for equal comparison conditions. The bsql library default is bundled SQLite for portability.

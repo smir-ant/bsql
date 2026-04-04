@@ -1,15 +1,7 @@
-error[E0425]: cannot find function `decode_timestamptz_time` in module `::bsql_core::driver`
+error: column "deadline": column type is TIMESTAMPTZ (OID 1184) — enable feature "time" or "chrono" in bsql
  --> tests/compile_fail_features/missing_time.rs:5:13
   |
 5 |     let _ = bsql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32");
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `::bsql_core::driver`
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
-note: found an item that was configured out
- --> $WORKSPACE/crates/bsql-core/src/lib.rs
-  |
-  |     #[cfg(feature = "time")]
-  |           ---------------- the item is gated behind the `time` feature
-  |     pub use bsql_driver_postgres::codec::{
-  |         decode_date_time, decode_time_time, decode_timestamptz_time,
-  |                                             ^^^^^^^^^^^^^^^^^^^^^^^
   = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)
