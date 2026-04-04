@@ -41,12 +41,10 @@ async fn multiple_channels() {
     listener.listen("chan_a").await.unwrap();
     listener.listen("chan_b").await.unwrap();
 
-    // Send from a separate connection to avoid self-notification race.
-    let pool = bsql::Pool::connect(DB_URL).await.unwrap();
-    let mut guard = pool.acquire().await.unwrap();
-    guard.simple_query("NOTIFY chan_a, 'from_a'").await.unwrap();
-    guard.simple_query("NOTIFY chan_b, 'from_b'").await.unwrap();
-    drop(guard);
+    // notify() now uses a separate short-lived connection internally,
+    // avoiding the self-notification race condition entirely.
+    listener.notify("chan_a", "from_a").await.unwrap();
+    listener.notify("chan_b", "from_b").await.unwrap();
 
     let n1 = listener.recv().await.unwrap();
     let n2 = listener.recv().await.unwrap();

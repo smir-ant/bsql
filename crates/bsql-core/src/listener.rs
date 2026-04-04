@@ -111,6 +111,8 @@ pub struct Listener {
     _task_handle: tokio::task::JoinHandle<()>,
     /// Tracked subscribed channels for reconnection.
     channels: Arc<Mutex<HashSet<String>>>,
+    /// Connection config for creating notify connections.
+    config: bsql_driver_postgres::Config,
 }
 
 impl Drop for Listener {
@@ -154,6 +156,8 @@ impl Listener {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER_SIZE);
         let channels: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
+        let config_for_notify = listener_config.clone();
+
         let handle = tokio::spawn(drive_listener(
             conn,
             listener_config,
@@ -167,6 +171,7 @@ impl Listener {
             rx,
             _task_handle: handle,
             channels,
+            config: config_for_notify,
         })
     }
 
@@ -266,15 +271,17 @@ impl Listener {
         let escaped_payload = payload.replace('\'', "''");
         let sql = format!("NOTIFY {quoted_channel}, '{escaped_payload}'");
 
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        self.cmd_tx
-            .send(Command::Notify(sql, resp_tx))
+        // Send NOTIFY on a SEPARATE short-lived connection to avoid
+        // self-notification race on the listener connection. When NOTIFY
+        // is sent on the same connection that LISTENs, the notification
+        // arrives during simple_query's response read, creating duplicates.
+        let mut conn = bsql_driver_postgres::Connection::connect(&self.config)
             .await
-            .map_err(|_| ConnectError::create("listener background task exited"))?;
-        resp_rx
+            .map_err(|e| ConnectError::create(format!("notify connection failed: {e}")))?;
+        conn.simple_query(&sql)
             .await
-            .map_err(|_| ConnectError::create("listener background task exited"))?
-            .map_err(BsqlError::from)
+            .map_err(BsqlError::from_driver_query)?;
+        Ok(())
     }
 
     /// The set of currently subscribed channels.
