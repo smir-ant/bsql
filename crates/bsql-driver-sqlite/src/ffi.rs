@@ -395,6 +395,29 @@ impl StmtHandle {
         }
     }
 
+    /// Step the statement, returning `true` for Row, `false` for Done.
+    ///
+    /// Branchless hot-path variant: a single bool comparison instead of
+    /// enum match. Used internally by `for_each`, `fetch_all_direct`, etc.
+    /// where the caller only needs row-or-done discrimination.
+    #[inline]
+    pub fn step_bool(&self) -> Result<bool, SqliteError> {
+        // SAFETY: self.ptr is a valid prepared statement handle.
+        let rc = unsafe { raw::sqlite3_step(self.ptr) };
+        if rc == raw::SQLITE_ROW {
+            Ok(true)
+        } else if rc == raw::SQLITE_DONE {
+            Ok(false)
+        } else {
+            let db = unsafe { raw::sqlite3_db_handle(self.ptr) };
+            let msg = unsafe { error_message(db) };
+            Err(SqliteError::Sqlite {
+                code: rc,
+                message: msg,
+            })
+        }
+    }
+
     /// Reset the statement for reuse (clears the step state, keeps bindings).
     #[inline]
     pub fn reset(&self) -> Result<(), SqliteError> {

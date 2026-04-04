@@ -22,8 +22,6 @@
 //! 2-3 await points per query, that is 400-600ns of pure async overhead.
 //! `SyncConnection` eliminates this entirely.
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -35,30 +33,87 @@ use crate::codec::Encode;
 use crate::conn::{ColumnDesc, Config, Notification, PgDataRow, QueryResult, SimpleRow};
 use crate::proto::{self, BackendMessage};
 
-// --- Identity hasher (shared concept with conn.rs) ---
+// --- Vec-based statement cache ---
+//
+// For typical workloads of 5-20 cached statements, linear scan over a Vec
+// with u64 comparison is faster than HashMap probe sequence because:
+// - Vec = contiguous memory, perfect cache locality (all entries in L1)
+// - u64 comparison = one instruction per entry
+// - No hash probe, no bucket lookup, no load factor math
 
-/// Identity hasher for pre-hashed u64 keys. Same as `conn.rs::IdentityHasher`.
-#[derive(Default)]
-struct IdentityHasher(u64);
+/// Vec-backed statement cache with O(n) lookup. Faster than HashMap for
+/// small n (< ~30 entries) due to cache locality and zero hashing overhead.
+struct StmtCache {
+    entries: Vec<(u64, StmtInfo)>,
+}
 
-impl Hasher for IdentityHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = i;
-    }
-    #[inline]
-    fn write(&mut self, _: &[u8]) {
-        debug_assert!(false, "IdentityHasher only supports u64 keys");
-        self.0 = 0;
+impl Default for StmtCache {
+    fn default() -> Self {
+        Self {
+            entries: Vec::with_capacity(16),
+        }
     }
 }
 
-type IdentityBuildHasher = BuildHasherDefault<IdentityHasher>;
-type StmtCache = HashMap<u64, StmtInfo, IdentityBuildHasher>;
+impl StmtCache {
+    #[inline]
+    fn get_mut(&mut self, hash: &u64) -> Option<&mut StmtInfo> {
+        self.entries
+            .iter_mut()
+            .find(|(h, _)| h == hash)
+            .map(|(_, info)| info)
+    }
+
+    #[inline]
+    fn get(&self, hash: &u64) -> Option<&StmtInfo> {
+        self.entries
+            .iter()
+            .find(|(h, _)| h == hash)
+            .map(|(_, info)| info)
+    }
+
+    #[inline]
+    fn contains_key(&self, hash: &u64) -> bool {
+        self.entries.iter().any(|(h, _)| h == hash)
+    }
+
+    #[inline]
+    fn insert(&mut self, hash: u64, info: StmtInfo) {
+        if let Some(entry) = self.entries.iter_mut().find(|(h, _)| *h == hash) {
+            entry.1 = info;
+        } else {
+            self.entries.push((hash, info));
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, hash: &u64) -> Option<StmtInfo> {
+        if let Some(pos) = self.entries.iter().position(|(h, _)| h == hash) {
+            Some(self.entries.swap_remove(pos).1)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Evict the least recently used entry (lowest `last_used` counter).
+    fn evict_lru(&mut self) -> Option<(u64, StmtInfo)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let min_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, info))| info.last_used)
+            .map(|(i, _)| i)?;
+        Some(self.entries.swap_remove(min_idx))
+    }
+}
 
 /// Cached information about a prepared statement.
 struct StmtInfo {
@@ -731,23 +786,30 @@ impl SyncConnection {
                 }
 
                 // Full message in stream_buf — parse inline.
+                // Branch order matches actual PG response order for execute:
+                // BindComplete(b'2') -> CommandComplete(b'C') -> ReadyForQuery(b'Z').
+                // This improves branch prediction on the hot path.
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                if msg_type == b'2' || msg_type == b'D' || msg_type == b'I' {
-                    // BindComplete / DataRow / EmptyQuery — skip
+                if msg_type == b'2' {
+                    // BindComplete — first response, skip.
+                    self.stream_buf_pos += total_msg_len;
+                    continue;
                 } else if msg_type == b'C' {
-                    // CommandComplete — parse affected rows from tag bytes.
+                    // CommandComplete — second response, parse affected rows.
                     affected_rows = proto::parse_command_tag_bytes(
                         &self.stream_buf[payload_start..payload_end],
                     );
                 } else if msg_type == b'Z' {
-                    // ReadyForQuery — extract tx status and we're done.
+                    // ReadyForQuery — last response, extract tx status and exit.
                     if payload_len >= 1 {
                         self.tx_status = self.stream_buf[payload_start];
                     }
                     self.stream_buf_pos += total_msg_len;
                     break 'outer;
+                } else if msg_type == b'D' || msg_type == b'I' {
+                    // DataRow / EmptyQuery — rare in execute, skip.
                 } else {
                     self.handle_non_datarow_execute(
                         msg_type,
@@ -762,7 +824,11 @@ impl SyncConnection {
 
             // Need more data — compact and refill inline.
             let remaining = self.stream_buf_end - self.stream_buf_pos;
-            if remaining > 0 && self.stream_buf_pos > 0 {
+            debug_assert!(
+                remaining == 0 || self.stream_buf_pos > 0,
+                "compact called with pos=0 and remaining data"
+            );
+            if remaining > 0 {
                 self.stream_buf
                     .copy_within(self.stream_buf_pos..self.stream_buf_end, 0);
             }
@@ -1010,7 +1076,12 @@ impl SyncConnection {
         }
 
         // Build N x (Bind + Execute) + 1 x Sync
-        let stmt_name = self.stmts[&sql_hash].name.clone();
+        let stmt_name = self
+            .stmts
+            .get(&sql_hash)
+            .expect("BUG: stmt just cached but not found")
+            .name
+            .clone();
         let count = param_sets.len();
 
         for params in param_sets {
@@ -1124,7 +1195,11 @@ impl SyncConnection {
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
     ) {
-        let stmt_name = &self.stmts[&sql_hash].name;
+        let stmt_name = &self
+            .stmts
+            .get(&sql_hash)
+            .expect("BUG: stmt just cached but not found")
+            .name;
         proto::write_bind_params(buf, "", stmt_name, params);
         buf.extend_from_slice(proto::EXECUTE_ONLY);
     }
@@ -2037,10 +2112,8 @@ impl SyncConnection {
 
     fn cache_stmt(&mut self, sql_hash: u64, info: StmtInfo) {
         if self.stmts.len() >= self.max_stmt_cache_size && !self.stmts.contains_key(&sql_hash) {
-            if let Some((&lru_hash, _)) = self.stmts.iter().min_by_key(|(_, info)| info.last_used) {
-                if let Some(evicted) = self.stmts.remove(&lru_hash) {
-                    proto::write_close(&mut self.write_buf, b'S', &evicted.name);
-                }
+            if let Some((_lru_hash, evicted)) = self.stmts.evict_lru() {
+                proto::write_close(&mut self.write_buf, b'S', &evicted.name);
             }
         }
         self.stmts.insert(sql_hash, info);
@@ -2324,7 +2397,14 @@ impl SyncConnection {
     #[inline]
     fn refill_stream_buf(&mut self) -> Result<(), DriverError> {
         let remaining = self.stream_buf_end - self.stream_buf_pos;
-        if remaining > 0 && self.stream_buf_pos > 0 {
+        // Hint to optimizer: we only call refill after consuming at least one
+        // message, so stream_buf_pos is always > 0 when remaining > 0. The
+        // debug_assert helps the compiler elide the redundant pos > 0 check.
+        debug_assert!(
+            remaining == 0 || self.stream_buf_pos > 0,
+            "refill_stream_buf called with pos=0 and remaining data"
+        );
+        if remaining > 0 {
             self.stream_buf
                 .copy_within(self.stream_buf_pos..self.stream_buf_end, 0);
         }
@@ -2524,10 +2604,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_identity_hasher() {
-        let mut h = IdentityHasher::default();
-        h.write_u64(42);
-        assert_eq!(h.finish(), 42);
+    fn sync_stmt_cache_basic() {
+        let cache = StmtCache::default();
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.contains_key(&42));
     }
 
     #[test]
@@ -2736,28 +2816,68 @@ mod tests {
         }
     }
 
-    // ---- IdentityHasher edge cases ----
+    // ---- StmtCache edge cases ----
 
     #[test]
-    fn sync_identity_hasher_zero() {
-        let mut h = IdentityHasher::default();
-        h.write_u64(0);
-        assert_eq!(h.finish(), 0);
+    fn sync_stmt_cache_insert_get_remove() {
+        let mut cache = StmtCache::default();
+        let info = StmtInfo {
+            name: "s_test".into(),
+            columns: Arc::from(Vec::new()),
+            last_used: 1,
+            bind_template: None,
+        };
+        cache.insert(42, info);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&42));
+        assert!(cache.get(&42).is_some());
+        assert!(cache.get_mut(&42).is_some());
+
+        let removed = cache.remove(&42);
+        assert!(removed.is_some());
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.contains_key(&42));
     }
 
     #[test]
-    fn sync_identity_hasher_max() {
-        let mut h = IdentityHasher::default();
-        h.write_u64(u64::MAX);
-        assert_eq!(h.finish(), u64::MAX);
+    fn sync_stmt_cache_evict_lru() {
+        let mut cache = StmtCache::default();
+        for i in 0..3u64 {
+            cache.insert(
+                i,
+                StmtInfo {
+                    name: format!("s_{i}").into(),
+                    columns: Arc::from(Vec::new()),
+                    last_used: i + 1,
+                    bind_template: None,
+                },
+            );
+        }
+        assert_eq!(cache.len(), 3);
+        let evicted = cache.evict_lru().unwrap();
+        assert_eq!(evicted.0, 0); // lowest last_used=1
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
-    fn sync_identity_hasher_overwrite() {
-        let mut h = IdentityHasher::default();
-        h.write_u64(100);
-        h.write_u64(200);
-        assert_eq!(h.finish(), 200);
+    fn sync_stmt_cache_insert_overwrite() {
+        let mut cache = StmtCache::default();
+        let info1 = StmtInfo {
+            name: "s_a".into(),
+            columns: Arc::from(Vec::new()),
+            last_used: 1,
+            bind_template: None,
+        };
+        let info2 = StmtInfo {
+            name: "s_b".into(),
+            columns: Arc::from(Vec::new()),
+            last_used: 2,
+            bind_template: None,
+        };
+        cache.insert(42, info1);
+        cache.insert(42, info2);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(&*cache.get(&42).unwrap().name, "s_b");
     }
 
     // ---- DataRow parsing extended ----

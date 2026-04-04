@@ -11,37 +11,91 @@
 //! at `{host}/.s.PGSQL.{port}` (libpq convention). Use `?host=/tmp` in the connection
 //! URL to enable UDS. This avoids TCP overhead for localhost connections.
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use rapidhash::quality::RapidHasher;
 
-/// Identity hasher for pre-hashed u64 keys. Avoids SipHash overhead
-/// on keys that are already well-distributed rapidhash values.
-#[derive(Default)]
-struct IdentityHasher(u64);
+// --- Vec-based statement cache ---
+//
+// For typical workloads of 5-20 cached statements, linear scan over a Vec
+// with u64 comparison is faster than HashMap probe sequence because:
+// - Vec = contiguous memory, perfect cache locality (all entries in L1)
+// - u64 comparison = one instruction per entry
+// - No hash probe, no bucket lookup, no load factor math
 
-impl Hasher for IdentityHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = i;
-    }
-    #[inline]
-    fn write(&mut self, _: &[u8]) {
-        // never be hit (IdentityHasher only receives u64 keys from HashMap),
-        // but if it somehow is, zero the hash as a safe no-op fallback.
-        debug_assert!(false, "IdentityHasher only supports u64 keys");
-        self.0 = 0;
+/// Vec-backed statement cache with O(n) lookup. Faster than HashMap for
+/// small n (< ~30 entries) due to cache locality and zero hashing overhead.
+struct StmtCache {
+    entries: Vec<(u64, StmtInfo)>,
+}
+
+impl Default for StmtCache {
+    fn default() -> Self {
+        Self {
+            entries: Vec::with_capacity(16),
+        }
     }
 }
 
-type IdentityBuildHasher = BuildHasherDefault<IdentityHasher>;
-type StmtCache = HashMap<u64, StmtInfo, IdentityBuildHasher>;
+impl StmtCache {
+    #[inline]
+    fn get_mut(&mut self, hash: &u64) -> Option<&mut StmtInfo> {
+        self.entries
+            .iter_mut()
+            .find(|(h, _)| h == hash)
+            .map(|(_, info)| info)
+    }
+
+    #[inline]
+    fn get(&self, hash: &u64) -> Option<&StmtInfo> {
+        self.entries
+            .iter()
+            .find(|(h, _)| h == hash)
+            .map(|(_, info)| info)
+    }
+
+    #[inline]
+    fn contains_key(&self, hash: &u64) -> bool {
+        self.entries.iter().any(|(h, _)| h == hash)
+    }
+
+    #[inline]
+    fn insert(&mut self, hash: u64, info: StmtInfo) {
+        if let Some(entry) = self.entries.iter_mut().find(|(h, _)| *h == hash) {
+            entry.1 = info;
+        } else {
+            self.entries.push((hash, info));
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, hash: &u64) -> Option<StmtInfo> {
+        if let Some(pos) = self.entries.iter().position(|(h, _)| h == hash) {
+            Some(self.entries.swap_remove(pos).1)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Evict the least recently used entry (lowest `last_used` counter).
+    fn evict_lru(&mut self) -> Option<(u64, StmtInfo)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let min_idx = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, info))| info.last_used)
+            .map(|(i, _)| i)?;
+        Some(self.entries.swap_remove(min_idx))
+    }
+}
 
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -1484,7 +1538,12 @@ impl Connection {
         }
 
         // Build N x (Bind + Execute) + 1 x Sync
-        let stmt_name = self.stmts[&sql_hash].name.clone();
+        let stmt_name = self
+            .stmts
+            .get(&sql_hash)
+            .expect("BUG: stmt just cached but not found")
+            .name
+            .clone();
         let count = param_sets.len();
 
         for params in param_sets {
@@ -1609,7 +1668,11 @@ impl Connection {
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
     ) {
-        let stmt_name = &self.stmts[&sql_hash].name;
+        let stmt_name = &self
+            .stmts
+            .get(&sql_hash)
+            .expect("BUG: stmt just cached but not found")
+            .name;
         proto::write_bind_params(buf, "", stmt_name, params);
         buf.extend_from_slice(proto::EXECUTE_ONLY);
     }
@@ -2202,13 +2265,10 @@ impl Connection {
     fn cache_stmt(&mut self, sql_hash: u64, info: StmtInfo) {
         // Evict LRU if cache is full
         if self.stmts.len() >= self.max_stmt_cache_size && !self.stmts.contains_key(&sql_hash) {
-            // Find the least recently used entry via linear scan
-            if let Some((&lru_hash, _)) = self.stmts.iter().min_by_key(|(_, info)| info.last_used) {
-                if let Some(evicted) = self.stmts.remove(&lru_hash) {
-                    // Queue Close(Statement) to free server-side memory.
-                    // This will be sent on the next write+flush.
-                    proto::write_close(&mut self.write_buf, b'S', &evicted.name);
-                }
+            if let Some((_lru_hash, evicted)) = self.stmts.evict_lru() {
+                // Queue Close(Statement) to free server-side memory.
+                // This will be sent on the next write+flush.
+                proto::write_close(&mut self.write_buf, b'S', &evicted.name);
             }
         }
         self.stmts.insert(sql_hash, info);
@@ -2989,7 +3049,7 @@ fn parse_data_row_flat(
 ///
 /// Uses `str::hash()` via the `Hash` trait, matching `bsql_core::rapid_hash_str`.
 pub fn hash_sql(sql: &str) -> u64 {
-    use std::hash::Hash;
+    use std::hash::{Hash, Hasher};
     let mut hasher = RapidHasher::default();
     sql.hash(&mut hasher);
     hasher.finish()
@@ -3071,20 +3131,15 @@ mod tests {
         assert_eq!(cfg.ssl, SslMode::Require);
     }
 
-    /// IdentityHasher::write should not panic in release mode.
-    /// In debug mode, the debug_assert fires (expected behavior).
+    /// Vec-based StmtCache basic operations.
     #[test]
-    fn identity_hasher_write_no_panic_in_release() {
-        // In debug builds, this panics via debug_assert (correctly).
-        // In release builds, it falls through to self.0 = 0 (safe).
-        // We test that the fallback is correct by checking default state.
-        let h = IdentityHasher::default();
-        assert_eq!(h.0, 0);
-
-        // Test the normal path (write_u64) works
-        let mut h2 = IdentityHasher::default();
-        h2.write_u64(42);
-        assert_eq!(h2.finish(), 42);
+    fn stmt_cache_basic_ops() {
+        let mut cache = StmtCache::default();
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.contains_key(&42));
+        assert!(cache.get(&42).is_none());
+        assert!(cache.get_mut(&42).is_none());
+        assert!(cache.remove(&42).is_none());
     }
 
     /// Statement name formatting uses hex encoding.

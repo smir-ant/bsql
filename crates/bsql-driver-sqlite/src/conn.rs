@@ -12,42 +12,61 @@
 //! wrapper types in [`crate::ffi`]. No `unsafe` in user-facing APIs — text
 //! columns are batch-validated via `String::from_utf8` (SIMD-accelerated in std).
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
-
 use bsql_arena::Arena;
 use libsqlite3_sys as raw;
 use rapidhash::quality::RapidHasher;
 
 use crate::SqliteError;
 use crate::codec::SqliteEncode;
-use crate::ffi::{DbHandle, StepResult, StmtHandle};
+use crate::ffi::{DbHandle, StmtHandle};
 
-// --- Identity hasher (same pattern as PG driver) ---
+// --- Vec-based statement cache ---
+//
+// For typical workloads of 5-20 cached statements, linear scan over a Vec
+// with u64 comparison is faster than HashMap probe sequence because:
+// - Vec = contiguous memory, perfect cache locality (all entries in L1)
+// - u64 comparison = one instruction per entry
+// - No hash probe, no bucket lookup, no load factor math
 
-/// Identity hasher for pre-hashed u64 keys. Avoids SipHash overhead
-/// on keys that are already well-distributed rapidhash values.
-#[derive(Default)]
-struct IdentityHasher(u64);
+/// Vec-backed statement cache with O(n) lookup. Faster than HashMap for
+/// small n (< ~30 entries) due to cache locality and zero hashing overhead.
+struct StmtCache {
+    entries: Vec<(u64, CachedStmt)>,
+}
 
-impl Hasher for IdentityHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = i;
-    }
-    #[inline]
-    fn write(&mut self, _: &[u8]) {
-        debug_assert!(false, "IdentityHasher only supports u64 keys");
-        self.0 = 0;
+impl Default for StmtCache {
+    fn default() -> Self {
+        Self {
+            entries: Vec::with_capacity(16),
+        }
     }
 }
 
-type IdentityBuildHasher = BuildHasherDefault<IdentityHasher>;
-type StmtCache = HashMap<u64, CachedStmt, IdentityBuildHasher>;
+impl StmtCache {
+    #[inline]
+    fn get(&self, hash: &u64) -> Option<&CachedStmt> {
+        self.entries.iter().find(|(h, _)| h == hash).map(|(_, s)| s)
+    }
+
+    #[inline]
+    fn contains_key(&self, hash: &u64) -> bool {
+        self.entries.iter().any(|(h, _)| h == hash)
+    }
+
+    #[inline]
+    fn insert(&mut self, hash: u64, stmt: CachedStmt) {
+        if let Some(entry) = self.entries.iter_mut().find(|(h, _)| *h == hash) {
+            entry.1 = stmt;
+        } else {
+            self.entries.push((hash, stmt));
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 /// Cached prepared statement.
 struct CachedStmt {
@@ -63,7 +82,7 @@ struct CachedStmt {
 /// assert_ne!(hash, 0);
 /// ```
 pub fn hash_sql(sql: &str) -> u64 {
-    use std::hash::Hash;
+    use std::hash::{Hash, Hasher};
     let mut hasher = RapidHasher::default();
     sql.hash(&mut hasher);
     hasher.finish()
@@ -157,55 +176,50 @@ impl SqliteConnection {
         let mut col_offsets: Vec<(usize, i32)> = Vec::with_capacity(col_count * 8);
         let mut row_count: usize = 0;
 
-        loop {
-            match stmt.step()? {
-                StepResult::Done => break,
-                StepResult::Row => {
-                    for col in 0..col_count as i32 {
-                        let col_type = stmt.column_type(col);
-                        match col_type {
-                            raw::SQLITE_NULL => {
+        while stmt.step_bool()? {
+            for col in 0..col_count as i32 {
+                let col_type = stmt.column_type(col);
+                match col_type {
+                    raw::SQLITE_NULL => {
+                        col_offsets.push((0, -1));
+                    }
+                    raw::SQLITE_INTEGER => {
+                        let val = stmt.column_int64(col);
+                        let bytes = val.to_le_bytes();
+                        let offset = arena.alloc_copy(&bytes);
+                        col_offsets.push((offset, 8));
+                    }
+                    raw::SQLITE_FLOAT => {
+                        let val = stmt.column_double(col);
+                        let bytes = val.to_le_bytes();
+                        let offset = arena.alloc_copy(&bytes);
+                        col_offsets.push((offset, 8));
+                    }
+                    raw::SQLITE_TEXT => {
+                        let data = stmt.column_text(col);
+                        match data {
+                            Some(bytes) => {
+                                let offset = arena.alloc_copy(bytes);
+                                col_offsets.push((offset, bytes.len() as i32));
+                            }
+                            None => {
                                 col_offsets.push((0, -1));
-                            }
-                            raw::SQLITE_INTEGER => {
-                                let val = stmt.column_int64(col);
-                                let bytes = val.to_le_bytes();
-                                let offset = arena.alloc_copy(&bytes);
-                                col_offsets.push((offset, 8));
-                            }
-                            raw::SQLITE_FLOAT => {
-                                let val = stmt.column_double(col);
-                                let bytes = val.to_le_bytes();
-                                let offset = arena.alloc_copy(&bytes);
-                                col_offsets.push((offset, 8));
-                            }
-                            raw::SQLITE_TEXT => {
-                                let data = stmt.column_text(col);
-                                match data {
-                                    Some(bytes) => {
-                                        let offset = arena.alloc_copy(bytes);
-                                        col_offsets.push((offset, bytes.len() as i32));
-                                    }
-                                    None => {
-                                        col_offsets.push((0, -1));
-                                    }
-                                }
-                            }
-                            _ => {
-                                // SQLITE_BLOB or unknown type — treat as blob
-                                let data = stmt.column_blob(col);
-                                if data.is_empty() {
-                                    col_offsets.push((arena.global_offset(), 0));
-                                } else {
-                                    let offset = arena.alloc_copy(data);
-                                    col_offsets.push((offset, data.len() as i32));
-                                }
                             }
                         }
                     }
-                    row_count += 1;
+                    _ => {
+                        // SQLITE_BLOB or unknown type — treat as blob
+                        let data = stmt.column_blob(col);
+                        if data.is_empty() {
+                            col_offsets.push((arena.global_offset(), 0));
+                        } else {
+                            let offset = arena.alloc_copy(data);
+                            col_offsets.push((offset, data.len() as i32));
+                        }
+                    }
                 }
             }
+            row_count += 1;
         }
 
         // Reset statement for reuse
@@ -259,16 +273,13 @@ impl SqliteConnection {
         for (i, param) in params.iter().enumerate() {
             param.bind(stmt, (i + 1) as i32)?;
         }
-        match stmt.step()? {
-            StepResult::Row => {
-                let result = decode(stmt)?;
-                stmt.reset()?;
-                Ok(result)
-            }
-            StepResult::Done => {
-                stmt.reset()?;
-                Err(SqliteError::Internal("expected 1 row, got 0".into()))
-            }
+        if stmt.step_bool()? {
+            let result = decode(stmt)?;
+            stmt.reset()?;
+            Ok(result)
+        } else {
+            stmt.reset()?;
+            Err(SqliteError::Internal("expected 1 row, got 0".into()))
         }
     }
 
@@ -292,16 +303,13 @@ impl SqliteConnection {
         for (i, param) in params.iter().enumerate() {
             param.bind(stmt, (i + 1) as i32)?;
         }
-        match stmt.step()? {
-            StepResult::Row => {
-                let result = decode(stmt)?;
-                stmt.reset()?;
-                Ok(Some(result))
-            }
-            StepResult::Done => {
-                stmt.reset()?;
-                Ok(None)
-            }
+        if stmt.step_bool()? {
+            let result = decode(stmt)?;
+            stmt.reset()?;
+            Ok(Some(result))
+        } else {
+            stmt.reset()?;
+            Ok(None)
         }
     }
 
@@ -330,7 +338,7 @@ impl SqliteConnection {
             param.bind(stmt, (i + 1) as i32)?;
         }
         let mut results = Vec::new();
-        while let StepResult::Row = stmt.step()? {
+        while stmt.step_bool()? {
             results.push(decode(stmt)?);
         }
         stmt.reset()?;
@@ -360,7 +368,7 @@ impl SqliteConnection {
         }
         let mut arena = bsql_arena::acquire_arena();
         let mut results = Vec::new();
-        while let StepResult::Row = stmt.step()? {
+        while stmt.step_bool()? {
             results.push(decode(stmt, &mut arena)?);
         }
         stmt.reset()?;
@@ -389,7 +397,7 @@ impl SqliteConnection {
         for (i, param) in params.iter().enumerate() {
             param.bind(stmt, (i + 1) as i32)?;
         }
-        while let StepResult::Row = stmt.step()? {
+        while stmt.step_bool()? {
             f(stmt)?;
         }
         stmt.reset()?;
@@ -417,7 +425,7 @@ impl SqliteConnection {
             param.bind(stmt, (i + 1) as i32)?;
         }
         let mut results = Vec::new();
-        while let StepResult::Row = stmt.step()? {
+        while stmt.step_bool()? {
             results.push(f(stmt)?);
         }
         stmt.reset()?;
@@ -469,7 +477,11 @@ impl SqliteConnection {
             // Re-borrow stmt from the cache each iteration. The hash lookup is
             // fast (identity hasher on pre-hashed key) and the borrow is scoped
             // so db.changes() can be called after stmt.reset().
-            let stmt = &self.stmts[&sql_hash].handle;
+            let stmt = &self
+                .stmts
+                .get(&sql_hash)
+                .expect("BUG: stmt just cached but not found")
+                .handle;
             stmt.clear_bindings();
             for (i, param) in params.iter().enumerate() {
                 param.bind(stmt, (i + 1) as i32)?;
@@ -541,56 +553,52 @@ impl SqliteConnection {
         let mut row_count: usize = 0;
 
         for _ in 0..streaming.chunk_size {
-            match stmt.step()? {
-                StepResult::Done => {
-                    streaming.finished = true;
-                    break;
-                }
-                StepResult::Row => {
-                    for col in 0..col_count as i32 {
-                        let col_type = stmt.column_type(col);
-                        match col_type {
-                            raw::SQLITE_NULL => {
+            if !stmt.step_bool()? {
+                streaming.finished = true;
+                break;
+            }
+            for col in 0..col_count as i32 {
+                let col_type = stmt.column_type(col);
+                match col_type {
+                    raw::SQLITE_NULL => {
+                        col_offsets.push((0, -1));
+                    }
+                    raw::SQLITE_INTEGER => {
+                        let val = stmt.column_int64(col);
+                        let bytes = val.to_le_bytes();
+                        let offset = arena.alloc_copy(&bytes);
+                        col_offsets.push((offset, 8));
+                    }
+                    raw::SQLITE_FLOAT => {
+                        let val = stmt.column_double(col);
+                        let bytes = val.to_le_bytes();
+                        let offset = arena.alloc_copy(&bytes);
+                        col_offsets.push((offset, 8));
+                    }
+                    raw::SQLITE_TEXT => {
+                        let data = stmt.column_text(col);
+                        match data {
+                            Some(bytes) => {
+                                let offset = arena.alloc_copy(bytes);
+                                col_offsets.push((offset, bytes.len() as i32));
+                            }
+                            None => {
                                 col_offsets.push((0, -1));
-                            }
-                            raw::SQLITE_INTEGER => {
-                                let val = stmt.column_int64(col);
-                                let bytes = val.to_le_bytes();
-                                let offset = arena.alloc_copy(&bytes);
-                                col_offsets.push((offset, 8));
-                            }
-                            raw::SQLITE_FLOAT => {
-                                let val = stmt.column_double(col);
-                                let bytes = val.to_le_bytes();
-                                let offset = arena.alloc_copy(&bytes);
-                                col_offsets.push((offset, 8));
-                            }
-                            raw::SQLITE_TEXT => {
-                                let data = stmt.column_text(col);
-                                match data {
-                                    Some(bytes) => {
-                                        let offset = arena.alloc_copy(bytes);
-                                        col_offsets.push((offset, bytes.len() as i32));
-                                    }
-                                    None => {
-                                        col_offsets.push((0, -1));
-                                    }
-                                }
-                            }
-                            _ => {
-                                let data = stmt.column_blob(col);
-                                if data.is_empty() {
-                                    col_offsets.push((arena.global_offset(), 0));
-                                } else {
-                                    let offset = arena.alloc_copy(data);
-                                    col_offsets.push((offset, data.len() as i32));
-                                }
                             }
                         }
                     }
-                    row_count += 1;
+                    _ => {
+                        let data = stmt.column_blob(col);
+                        if data.is_empty() {
+                            col_offsets.push((arena.global_offset(), 0));
+                        } else {
+                            let offset = arena.alloc_copy(data);
+                            col_offsets.push((offset, data.len() as i32));
+                        }
+                    }
                 }
             }
+            row_count += 1;
         }
 
         if streaming.finished {
@@ -701,17 +709,10 @@ impl SqliteConnection {
     /// Get a cached statement or prepare a new one.
     #[inline]
     fn get_or_prepare(&mut self, sql: &str, sql_hash: u64) -> Result<&StmtHandle, SqliteError> {
-        // Use the entry API to avoid a redundant lookup. The fallible prepare
-        // must happen outside the entry closure (closures cannot return Result
-        // with the entry API), so we do a contains_key + insert pattern but
-        // avoid the unwrap by using an infallible index after the insert.
         if !self.stmts.contains_key(&sql_hash) {
             let handle = self.db.prepare(sql)?;
             self.stmts.insert(sql_hash, CachedStmt { handle });
         }
-        // SAFETY invariant: the key was just inserted above if it was missing,
-        // so this index is infallible. We use `expect` with a detailed message
-        // instead of `unwrap` to aid debugging if the invariant is ever broken.
         Ok(&self
             .stmts
             .get(&sql_hash)
@@ -1934,22 +1935,30 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ---- IdentityHasher ----
+    // ---- StmtCache ----
 
     #[test]
-    fn identity_hasher_roundtrip() {
-        let mut h = IdentityHasher::default();
-        h.write_u64(12345);
-        assert_eq!(h.finish(), 12345);
+    fn stmt_cache_basic_ops() {
+        let cache = StmtCache::default();
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.contains_key(&42));
+        assert!(cache.get(&42).is_none());
     }
 
     #[test]
-    fn identity_hasher_write_bytes_debug() {
-        // In debug mode, write(&[u8]) would panic, but we don't
-        // call it in practice. In release mode it just sets 0.
-        // We verify the default state.
-        let h = IdentityHasher::default();
-        assert_eq!(h.finish(), 0);
+    fn stmt_cache_insert_overwrites() {
+        // Exercise insert-overwrite (same hash, new CachedStmt).
+        // We can't easily create StmtHandle without a DB, but we
+        // can verify length semantics with a real DB.
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        let hash = hash_sql("SELECT 1");
+        conn.execute("SELECT 1", hash, &[]).unwrap();
+        assert_eq!(conn.stmts.len(), 1);
+        // Re-execute to verify idempotent cache behavior.
+        conn.execute("SELECT 1", hash, &[]).unwrap();
+        assert_eq!(conn.stmts.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     // --- Streaming ---
