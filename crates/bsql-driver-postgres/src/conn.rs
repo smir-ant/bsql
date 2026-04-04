@@ -386,14 +386,18 @@ struct StmtInfo {
     bind_template: Option<BindTemplate>,
 }
 
-/// Pre-built Bind message template for fast re-execution.
+/// Pre-built Bind+Execute+Sync message template for fast re-execution.
 ///
-/// Stores the complete Bind message bytes and the byte offsets where
-/// each parameter's data begins. On re-execution with same-sized params,
-/// we copy the template and overwrite param data in-place.
+/// Stores the complete Bind message bytes followed by EXECUTE_SYNC, and the
+/// byte offsets where each parameter's data begins. On re-execution with
+/// same-sized params, we copy the template and overwrite param data in-place
+/// via `encode_at` — no scratch buffer, no double-copy.
 struct BindTemplate {
-    /// Complete Bind message bytes (type 'B' + length + payload).
+    /// Bind message bytes + EXECUTE_SYNC (15 bytes) appended.
     bytes: Vec<u8>,
+    /// Offset where the Bind message ends (before EXECUTE_SYNC).
+    /// Used by streaming queries that need Execute+Flush instead.
+    bind_end: usize,
     /// For each parameter: `(data_offset, data_len)` within `bytes`.
     /// `data_offset` points to the first byte of param data (after the i32 length).
     /// `data_len` is the length of the param data. -1 means NULL.
@@ -489,9 +493,6 @@ pub struct Connection {
     /// Monotonic counter for LRU eviction — incremented on each cache access.
     /// Replaces `Instant::now()` to avoid syscall overhead (~20-40ns on macOS).
     query_counter: u64,
-    /// Persistent scratch buffer for bind template parameter encoding.
-    /// Reused across queries to avoid per-query heap allocation (~50-100ns).
-    bind_scratch: Vec<u8>,
 }
 
 impl Connection {
@@ -576,7 +577,6 @@ impl Connection {
             pending_notifications: Vec::new(),
             max_stmt_cache_size: 256,
             query_counter: 0,
-            bind_scratch: Vec::with_capacity(64),
         };
 
         conn.startup(config).await?;
@@ -956,10 +956,12 @@ impl Connection {
 
             if can_use_template {
                 let tmpl = info.bind_template.as_ref().unwrap();
-                self.write_buf.extend_from_slice(&tmpl.bytes);
+                // Copy only the Bind portion (not EXECUTE_SYNC) — streaming
+                // needs Execute+Flush instead.
+                self.write_buf
+                    .extend_from_slice(&tmpl.bytes[..tmpl.bind_end]);
 
                 let mut template_ok = true;
-                // Reuse persistent scratch buffer — avoids per-query heap allocation.
                 for (i, param) in params.iter().enumerate() {
                     let (data_offset, old_len) = tmpl.param_slots[i];
                     if param.is_null() {
@@ -967,12 +969,8 @@ impl Connection {
                         self.write_buf[len_offset..len_offset + 4]
                             .copy_from_slice(&(-1i32).to_be_bytes());
                     } else if old_len >= 0 {
-                        self.bind_scratch.clear();
-                        param.encode_binary(&mut self.bind_scratch);
-                        if self.bind_scratch.len() == old_len as usize {
-                            self.write_buf[data_offset..data_offset + self.bind_scratch.len()]
-                                .copy_from_slice(&self.bind_scratch);
-                        } else {
+                        let end = data_offset + old_len as usize;
+                        if !param.encode_at(&mut self.write_buf[data_offset..end]) {
                             template_ok = false;
                             break;
                         }
@@ -1169,13 +1167,16 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|t| t.param_slots.len() == params.len());
 
+            // Tracks whether write_buf already contains EXECUTE_SYNC (from template).
+            let mut has_exec_sync = false;
+
             if can_use_template {
-                // Fast path: copy template and patch param bytes in-place.
+                // Fast path: copy template (includes EXECUTE_SYNC) and patch params
+                // directly via encode_at — no scratch buffer, no double-copy.
                 let tmpl = info.bind_template.as_ref().unwrap();
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
-                // Reuse persistent scratch buffer — avoids per-query heap allocation.
                 for (i, param) in params.iter().enumerate() {
                     let (data_offset, old_len) = tmpl.param_slots[i];
                     if param.is_null() {
@@ -1183,22 +1184,21 @@ impl Connection {
                         self.write_buf[len_offset..len_offset + 4]
                             .copy_from_slice(&(-1i32).to_be_bytes());
                     } else if old_len >= 0 {
-                        self.bind_scratch.clear();
-                        param.encode_binary(&mut self.bind_scratch);
-                        if self.bind_scratch.len() == old_len as usize {
-                            self.write_buf[data_offset..data_offset + self.bind_scratch.len()]
-                                .copy_from_slice(&self.bind_scratch);
-                        } else {
+                        let end = data_offset + old_len as usize;
+                        if !param.encode_at(&mut self.write_buf[data_offset..end]) {
                             template_ok = false;
                             break;
                         }
                     } else {
+                        // Template had NULL here but now non-NULL — rebuild.
                         template_ok = false;
                         break;
                     }
                 }
 
-                if !template_ok {
+                if template_ok {
+                    has_exec_sync = true; // Template includes EXECUTE_SYNC.
+                } else {
                     self.write_buf.clear();
                     proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
                     info.bind_template = None;
@@ -1216,11 +1216,14 @@ impl Connection {
             };
 
             // Snapshot bind template on first use or after invalidation.
+            // build_bind_template appends EXECUTE_SYNC to the template bytes.
             if info.bind_template.is_none() && !self.write_buf.is_empty() {
                 info.bind_template = build_bind_template(&self.write_buf, params.len());
             }
 
-            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+            if !has_exec_sync {
+                self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+            }
             self.flush_write().await?;
 
             cols
@@ -2520,6 +2523,7 @@ async fn buffered_read_exact(
 /// Build a `BindTemplate` from the current write_buf contents.
 ///
 /// Parses the Bind message to locate each parameter's data offset and length.
+/// Appends EXECUTE_SYNC to the template bytes so the hot path is a single memcpy.
 /// Returns `None` if the message cannot be parsed.
 fn build_bind_template(write_buf: &[u8], param_count: usize) -> Option<BindTemplate> {
     if write_buf.is_empty() || write_buf[0] != b'B' {
@@ -2583,8 +2587,15 @@ fn build_bind_template(write_buf: &[u8], param_count: usize) -> Option<BindTempl
         }
     }
 
+    // Include EXECUTE_SYNC in the template so the hot path is one memcpy.
+    let bind_end = write_buf.len();
+    let mut bytes = Vec::with_capacity(bind_end + proto::EXECUTE_SYNC.len());
+    bytes.extend_from_slice(write_buf);
+    bytes.extend_from_slice(proto::EXECUTE_SYNC);
+
     Some(BindTemplate {
-        bytes: write_buf.to_vec(),
+        bytes,
+        bind_end,
         param_slots,
     })
 }

@@ -79,13 +79,14 @@ struct StmtInfo {
     bind_template: Option<BindTemplate>,
 }
 
-/// Pre-built Bind message template for fast re-execution.
+/// Pre-built Bind+Execute+Sync message template for fast re-execution.
 ///
-/// Stores the complete Bind message bytes and the byte offsets where
-/// each parameter's data begins (after the 4-byte length prefix).
-/// On re-execution, we copy the template and overwrite param data in-place.
+/// Stores the complete Bind message bytes followed by EXECUTE_SYNC, and the
+/// byte offsets where each parameter's data begins. On re-execution with
+/// same-sized params, we copy the template and overwrite param data in-place
+/// via `encode_at` — no scratch buffer, no double-copy.
 struct BindTemplate {
-    /// Complete Bind message bytes (type 'B' + length + payload).
+    /// Bind message bytes + EXECUTE_SYNC (15 bytes) appended.
     bytes: Vec<u8>,
     /// For each parameter: `(data_offset, data_len)` within `bytes`.
     /// `data_offset` points to the first byte of param data (after the i32 length).
@@ -165,9 +166,6 @@ pub struct SyncConnection {
     pending_notifications: Vec<Notification>,
     max_stmt_cache_size: usize,
     query_counter: u64,
-    /// Persistent scratch buffer for bind template parameter encoding.
-    /// Reused across queries to avoid per-query heap allocation (~50-100ns).
-    bind_scratch: Vec<u8>,
 }
 
 impl std::fmt::Debug for SyncConnection {
@@ -217,7 +215,6 @@ impl SyncConnection {
             pending_notifications: Vec::new(),
             max_stmt_cache_size: 256,
             query_counter: 0,
-            bind_scratch: Vec::with_capacity(64),
         };
 
         conn.startup(config)?;
@@ -1387,13 +1384,16 @@ impl SyncConnection {
                 .as_ref()
                 .is_some_and(|t| t.param_slots.len() == params.len());
 
+            // Tracks whether write_buf already contains EXECUTE_SYNC (from template).
+            let mut has_exec_sync = false;
+
             if can_use_template {
-                // Fast path: copy template and patch param bytes in-place.
+                // Fast path: copy template (includes EXECUTE_SYNC) and patch params
+                // directly via encode_at — no scratch buffer, no double-copy.
                 let tmpl = info.bind_template.as_ref().unwrap();
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
-                // Reuse persistent scratch buffer — avoids per-query heap allocation.
                 for (i, param) in params.iter().enumerate() {
                     let (data_offset, old_len) = tmpl.param_slots[i];
                     if param.is_null() {
@@ -1402,16 +1402,9 @@ impl SyncConnection {
                         self.write_buf[len_offset..len_offset + 4]
                             .copy_from_slice(&(-1i32).to_be_bytes());
                     } else if old_len >= 0 {
-                        self.bind_scratch.clear();
-                        param.encode_binary(&mut self.bind_scratch);
-
-                        if self.bind_scratch.len() == old_len as usize {
-                            // Same size — patch in place (common for fixed-size types).
-                            self.write_buf[data_offset..data_offset + self.bind_scratch.len()]
-                                .copy_from_slice(&self.bind_scratch);
-                        } else {
-                            // Different size — rebuild Bind from scratch and
-                            // re-snapshot the template with new sizes.
+                        let end = data_offset + old_len as usize;
+                        if !param.encode_at(&mut self.write_buf[data_offset..end]) {
+                            // Size mismatch — rebuild Bind from scratch.
                             template_ok = false;
                             break;
                         }
@@ -1423,7 +1416,9 @@ impl SyncConnection {
                     }
                 }
 
-                if !template_ok {
+                if template_ok {
+                    has_exec_sync = true; // Template includes EXECUTE_SYNC.
+                } else {
                     self.write_buf.clear();
                     proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
                     // Invalidate stale template so we re-snapshot below.
@@ -1441,11 +1436,14 @@ impl SyncConnection {
 
             // Snapshot bind template if we don't have one yet (first use or
             // after invalidation due to size mismatch).
+            // build_bind_template appends EXECUTE_SYNC to the template bytes.
             if info.bind_template.is_none() && !self.write_buf.is_empty() {
                 info.bind_template = build_bind_template(&self.write_buf, params.len());
             }
 
-            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+            if !has_exec_sync {
+                self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+            }
             self.flush_write()?;
 
             cols
@@ -1907,6 +1905,7 @@ fn parse_data_row_flat(
 /// Build a `BindTemplate` from the current write_buf contents.
 ///
 /// Parses the Bind message to locate each parameter's data offset and length.
+/// Appends EXECUTE_SYNC to the template bytes so the hot path is a single memcpy.
 /// Returns `None` if the Bind message cannot be parsed (e.g., write_buf is empty
 /// or contains non-Bind data).
 fn build_bind_template(write_buf: &[u8], param_count: usize) -> Option<BindTemplate> {
@@ -1976,10 +1975,12 @@ fn build_bind_template(write_buf: &[u8], param_count: usize) -> Option<BindTempl
         }
     }
 
-    Some(BindTemplate {
-        bytes: write_buf.to_vec(),
-        param_slots,
-    })
+    // Include EXECUTE_SYNC in the template so the hot path is one memcpy.
+    let mut bytes = Vec::with_capacity(write_buf.len() + proto::EXECUTE_SYNC.len());
+    bytes.extend_from_slice(write_buf);
+    bytes.extend_from_slice(proto::EXECUTE_SYNC);
+
+    Some(BindTemplate { bytes, param_slots })
 }
 
 #[cfg(test)]
@@ -2425,10 +2426,18 @@ mod tests {
         let mut buf = Vec::new();
         let val: i32 = 42;
         proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        let bind_len = buf.len();
         let tmpl = build_bind_template(&buf, 1).unwrap();
+        // Template bytes = Bind message + EXECUTE_SYNC appended.
         assert_eq!(
-            tmpl.bytes, buf,
-            "template bytes must match original write_buf"
+            &tmpl.bytes[..bind_len],
+            &buf[..],
+            "template must start with original Bind message"
+        );
+        assert_eq!(
+            &tmpl.bytes[bind_len..],
+            proto::EXECUTE_SYNC,
+            "template must end with EXECUTE_SYNC"
         );
     }
 

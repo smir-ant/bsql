@@ -37,6 +37,27 @@ pub trait Encode {
     fn is_null(&self) -> bool {
         false
     }
+
+    /// Encode the binary value directly into `dst` at position 0.
+    ///
+    /// Returns `true` if the encoded length matches `dst.len()` (i.e., same size
+    /// as the template slot). Returns `false` if the size differs, signaling the
+    /// caller to fall back to a full rebuild.
+    ///
+    /// The default implementation uses a small inline buffer and copies. Fixed-size
+    /// types (i32, i64, etc.) override this to write directly — eliminating the
+    /// scratch buffer double-copy on the bind-template hot path.
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        // Fallback: encode to a stack buffer, check size, copy.
+        let mut tmp = Vec::with_capacity(dst.len());
+        self.encode_binary(&mut tmp);
+        if tmp.len() == dst.len() {
+            dst.copy_from_slice(&tmp);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // --- Encode implementations ---
@@ -51,6 +72,15 @@ impl Encode for bool {
     fn type_oid(&self) -> u32 {
         16 // bool
     }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 1 {
+            return false;
+        }
+        dst[0] = if *self { 1 } else { 0 };
+        true
+    }
 }
 
 impl Encode for i16 {
@@ -62,6 +92,15 @@ impl Encode for i16 {
     #[inline]
     fn type_oid(&self) -> u32 {
         21 // int2
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 2 {
+            return false;
+        }
+        dst.copy_from_slice(&self.to_be_bytes());
+        true
     }
 }
 
@@ -75,6 +114,15 @@ impl Encode for i32 {
     fn type_oid(&self) -> u32 {
         23 // int4
     }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 4 {
+            return false;
+        }
+        dst.copy_from_slice(&self.to_be_bytes());
+        true
+    }
 }
 
 impl Encode for i64 {
@@ -86,6 +134,15 @@ impl Encode for i64 {
     #[inline]
     fn type_oid(&self) -> u32 {
         20 // int8
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 8 {
+            return false;
+        }
+        dst.copy_from_slice(&self.to_be_bytes());
+        true
     }
 }
 
@@ -99,6 +156,15 @@ impl Encode for f32 {
     fn type_oid(&self) -> u32 {
         700 // float4
     }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 4 {
+            return false;
+        }
+        dst.copy_from_slice(&self.to_be_bytes());
+        true
+    }
 }
 
 impl Encode for f64 {
@@ -110,6 +176,15 @@ impl Encode for f64 {
     #[inline]
     fn type_oid(&self) -> u32 {
         701 // float8
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 8 {
+            return false;
+        }
+        dst.copy_from_slice(&self.to_be_bytes());
+        true
     }
 }
 
@@ -171,6 +246,15 @@ impl Encode for u32 {
     fn type_oid(&self) -> u32 {
         26 // oid
     }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 4 {
+            return false;
+        }
+        dst.copy_from_slice(&self.to_be_bytes());
+        true
+    }
 }
 
 // --- Option<T> Encode — NULL parameter support ---
@@ -216,32 +300,59 @@ impl Encode for uuid::Uuid {
     fn type_oid(&self) -> u32 {
         2950 // uuid
     }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 16 {
+            return false;
+        }
+        dst.copy_from_slice(self.as_bytes());
+        true
+    }
 }
 
 #[cfg(feature = "time")]
 impl Encode for time::OffsetDateTime {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        // PG epoch: 2000-01-01 00:00:00 UTC
-        // PG stores timestamptz as i64 microseconds since PG epoch
-        let pg_epoch =
-            time::OffsetDateTime::from_unix_timestamp(946_684_800).expect("PG epoch is valid");
-        let diff = *self - pg_epoch;
-
-        // fits in i64, but extreme values from time::OffsetDateTime could overflow.
-        let micros_128 = diff.whole_microseconds();
-        let micros: i64 = if micros_128 >= i64::MIN as i128 && micros_128 <= i64::MAX as i128 {
-            micros_128 as i64
-        } else {
-            // Clamp to PG's valid range boundaries
-            if micros_128 < 0 { i64::MIN } else { i64::MAX }
-        };
-        buf.extend_from_slice(&micros.to_be_bytes());
+        buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
     }
 
     #[inline]
     fn type_oid(&self) -> u32 {
         1184 // timestamptz
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 8 {
+            return false;
+        }
+        dst.copy_from_slice(&self.encode_pg_micros().to_be_bytes());
+        true
+    }
+}
+
+#[cfg(feature = "time")]
+trait OffsetDateTimeExt {
+    fn encode_pg_micros(&self) -> i64;
+}
+
+#[cfg(feature = "time")]
+impl OffsetDateTimeExt for time::OffsetDateTime {
+    #[inline]
+    fn encode_pg_micros(&self) -> i64 {
+        // PG epoch: 2000-01-01 00:00:00 UTC
+        // PG stores timestamptz as i64 microseconds since PG epoch
+        let pg_epoch =
+            time::OffsetDateTime::from_unix_timestamp(946_684_800).expect("PG epoch is valid");
+        let diff = *self - pg_epoch;
+        let micros_128 = diff.whole_microseconds();
+        if micros_128 >= i64::MIN as i128 && micros_128 <= i64::MAX as i128 {
+            micros_128 as i64
+        } else {
+            if micros_128 < 0 { i64::MIN } else { i64::MAX }
+        }
     }
 }
 
@@ -249,18 +360,38 @@ impl Encode for time::OffsetDateTime {
 impl Encode for time::Date {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        // PG stores date as i32 days since 2000-01-01
-        let pg_epoch = time::Date::from_calendar_date(2000, time::Month::January, 1)
-            .expect("PG epoch date is valid");
-        let days_i64 = (*self - pg_epoch).whole_days();
-        let days =
-            i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX });
-        buf.extend_from_slice(&days.to_be_bytes());
+        buf.extend_from_slice(&self.encode_pg_days().to_be_bytes());
     }
 
     #[inline]
     fn type_oid(&self) -> u32 {
         1082 // date
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 4 {
+            return false;
+        }
+        dst.copy_from_slice(&self.encode_pg_days().to_be_bytes());
+        true
+    }
+}
+
+#[cfg(feature = "time")]
+trait DateExt {
+    fn encode_pg_days(&self) -> i32;
+}
+
+#[cfg(feature = "time")]
+impl DateExt for time::Date {
+    #[inline]
+    fn encode_pg_days(&self) -> i32 {
+        // PG stores date as i32 days since 2000-01-01
+        let pg_epoch = time::Date::from_calendar_date(2000, time::Month::January, 1)
+            .expect("PG epoch date is valid");
+        let days_i64 = (*self - pg_epoch).whole_days();
+        i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX })
     }
 }
 
@@ -268,16 +399,37 @@ impl Encode for time::Date {
 impl Encode for time::Time {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        // PG stores time as i64 microseconds since midnight
-        let midnight = time::Time::MIDNIGHT;
-        let diff = *self - midnight;
-        let micros = diff.whole_microseconds() as i64;
-        buf.extend_from_slice(&micros.to_be_bytes());
+        buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
     }
 
     #[inline]
     fn type_oid(&self) -> u32 {
         1083 // time
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 8 {
+            return false;
+        }
+        dst.copy_from_slice(&self.encode_pg_micros().to_be_bytes());
+        true
+    }
+}
+
+#[cfg(feature = "time")]
+trait TimeExt {
+    fn encode_pg_micros(&self) -> i64;
+}
+
+#[cfg(feature = "time")]
+impl TimeExt for time::Time {
+    #[inline]
+    fn encode_pg_micros(&self) -> i64 {
+        // PG stores time as i64 microseconds since midnight
+        let midnight = time::Time::MIDNIGHT;
+        let diff = *self - midnight;
+        diff.whole_microseconds() as i64
     }
 }
 
@@ -285,6 +437,33 @@ impl Encode for time::Time {
 impl Encode for time::PrimitiveDateTime {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
+    }
+
+    #[inline]
+    fn type_oid(&self) -> u32 {
+        1114 // timestamp (without timezone)
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 8 {
+            return false;
+        }
+        dst.copy_from_slice(&self.encode_pg_micros().to_be_bytes());
+        true
+    }
+}
+
+#[cfg(feature = "time")]
+trait PrimitiveDateTimeExt {
+    fn encode_pg_micros(&self) -> i64;
+}
+
+#[cfg(feature = "time")]
+impl PrimitiveDateTimeExt for time::PrimitiveDateTime {
+    #[inline]
+    fn encode_pg_micros(&self) -> i64 {
         // TIMESTAMP (without tz) has the same binary format as TIMESTAMPTZ:
         // i64 microseconds since PG epoch (2000-01-01 00:00:00)
         let pg_epoch =
@@ -292,17 +471,11 @@ impl Encode for time::PrimitiveDateTime {
         let as_utc = self.assume_utc();
         let diff = as_utc - pg_epoch;
         let micros_128 = diff.whole_microseconds();
-        let micros: i64 = if micros_128 >= i64::MIN as i128 && micros_128 <= i64::MAX as i128 {
+        if micros_128 >= i64::MIN as i128 && micros_128 <= i64::MAX as i128 {
             micros_128 as i64
         } else {
             if micros_128 < 0 { i64::MIN } else { i64::MAX }
-        };
-        buf.extend_from_slice(&micros.to_be_bytes());
-    }
-
-    #[inline]
-    fn type_oid(&self) -> u32 {
-        1114 // timestamp (without timezone)
+        }
     }
 }
 
@@ -310,16 +483,37 @@ impl Encode for time::PrimitiveDateTime {
 impl Encode for chrono::NaiveDateTime {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        // TIMESTAMP has same binary format: i64 microseconds since PG epoch
-        let pg_epoch_unix_micros: i64 = 946_684_800 * 1_000_000;
-        let unix_micros = self.and_utc().timestamp_micros();
-        let pg_micros = unix_micros.saturating_sub(pg_epoch_unix_micros);
-        buf.extend_from_slice(&pg_micros.to_be_bytes());
+        buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
     }
 
     #[inline]
     fn type_oid(&self) -> u32 {
         1114 // timestamp (without timezone)
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 8 {
+            return false;
+        }
+        dst.copy_from_slice(&self.encode_pg_micros().to_be_bytes());
+        true
+    }
+}
+
+#[cfg(feature = "chrono")]
+trait NaiveDateTimeExt {
+    fn encode_pg_micros(&self) -> i64;
+}
+
+#[cfg(feature = "chrono")]
+impl NaiveDateTimeExt for chrono::NaiveDateTime {
+    #[inline]
+    fn encode_pg_micros(&self) -> i64 {
+        // TIMESTAMP has same binary format: i64 microseconds since PG epoch
+        let pg_epoch_unix_micros: i64 = 946_684_800 * 1_000_000;
+        let unix_micros = self.and_utc().timestamp_micros();
+        unix_micros.saturating_sub(pg_epoch_unix_micros)
     }
 }
 
@@ -327,16 +521,37 @@ impl Encode for chrono::NaiveDateTime {
 impl Encode for chrono::DateTime<chrono::Utc> {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        // PG epoch: 2000-01-01 00:00:00 UTC = Unix timestamp 946684800
-        let pg_epoch_unix_micros: i64 = 946_684_800 * 1_000_000;
-        let unix_micros = self.timestamp_micros();
-        let pg_micros = unix_micros.saturating_sub(pg_epoch_unix_micros);
-        buf.extend_from_slice(&pg_micros.to_be_bytes());
+        buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
     }
 
     #[inline]
     fn type_oid(&self) -> u32 {
         1184 // timestamptz
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 8 {
+            return false;
+        }
+        dst.copy_from_slice(&self.encode_pg_micros().to_be_bytes());
+        true
+    }
+}
+
+#[cfg(feature = "chrono")]
+trait ChronoDateTimeUtcExt {
+    fn encode_pg_micros(&self) -> i64;
+}
+
+#[cfg(feature = "chrono")]
+impl ChronoDateTimeUtcExt for chrono::DateTime<chrono::Utc> {
+    #[inline]
+    fn encode_pg_micros(&self) -> i64 {
+        // PG epoch: 2000-01-01 00:00:00 UTC = Unix timestamp 946684800
+        let pg_epoch_unix_micros: i64 = 946_684_800 * 1_000_000;
+        let unix_micros = self.timestamp_micros();
+        unix_micros.saturating_sub(pg_epoch_unix_micros)
     }
 }
 
@@ -344,16 +559,36 @@ impl Encode for chrono::DateTime<chrono::Utc> {
 impl Encode for chrono::NaiveDate {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("PG epoch date valid");
-        let days_i64 = (*self - pg_epoch).num_days();
-        let days =
-            i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX });
-        buf.extend_from_slice(&days.to_be_bytes());
+        buf.extend_from_slice(&self.encode_pg_days().to_be_bytes());
     }
 
     #[inline]
     fn type_oid(&self) -> u32 {
         1082 // date
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 4 {
+            return false;
+        }
+        dst.copy_from_slice(&self.encode_pg_days().to_be_bytes());
+        true
+    }
+}
+
+#[cfg(feature = "chrono")]
+trait ChronoNaiveDateExt {
+    fn encode_pg_days(&self) -> i32;
+}
+
+#[cfg(feature = "chrono")]
+impl ChronoNaiveDateExt for chrono::NaiveDate {
+    #[inline]
+    fn encode_pg_days(&self) -> i32 {
+        let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("PG epoch date valid");
+        let days_i64 = (*self - pg_epoch).num_days();
+        i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX })
     }
 }
 
@@ -361,20 +596,39 @@ impl Encode for chrono::NaiveDate {
 impl Encode for chrono::NaiveTime {
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        // Midnight (00:00:00) is infallibly valid — this .expect() can never fail.
-        let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
-        let diff = *self - midnight;
-
-        // Panic on None instead of silently encoding midnight (0).
-        let micros = diff
-            .num_microseconds()
-            .expect("time-of-day difference always fits i64");
-        buf.extend_from_slice(&micros.to_be_bytes());
+        buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
     }
 
     #[inline]
     fn type_oid(&self) -> u32 {
         1083 // time
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if dst.len() != 8 {
+            return false;
+        }
+        dst.copy_from_slice(&self.encode_pg_micros().to_be_bytes());
+        true
+    }
+}
+
+#[cfg(feature = "chrono")]
+trait ChronoNaiveTimeExt {
+    fn encode_pg_micros(&self) -> i64;
+}
+
+#[cfg(feature = "chrono")]
+impl ChronoNaiveTimeExt for chrono::NaiveTime {
+    #[inline]
+    fn encode_pg_micros(&self) -> i64 {
+        // Midnight (00:00:00) is infallibly valid -- this .expect() can never fail.
+        let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
+        let diff = *self - midnight;
+        // Panic on None instead of silently encoding midnight (0).
+        diff.num_microseconds()
+            .expect("time-of-day difference always fits i64")
     }
 }
 
@@ -2332,5 +2586,103 @@ mod tests {
             elem_oid, 23,
             "element OID must be preserved for empty arrays"
         );
+    }
+
+    // --- encode_at tests ---
+
+    #[test]
+    fn encode_at_bool() {
+        let mut dst = [0u8; 1];
+        assert!(true.encode_at(&mut dst));
+        assert_eq!(dst[0], 1);
+        assert!(false.encode_at(&mut dst));
+        assert_eq!(dst[0], 0);
+        // Wrong size returns false.
+        assert!(!true.encode_at(&mut [0u8; 2]));
+    }
+
+    #[test]
+    fn encode_at_i16() {
+        let mut dst = [0u8; 2];
+        assert!(0x1234i16.encode_at(&mut dst));
+        assert_eq!(dst, [0x12, 0x34]);
+        assert!(!42i16.encode_at(&mut [0u8; 4]));
+    }
+
+    #[test]
+    fn encode_at_i32() {
+        let mut dst = [0u8; 4];
+        assert!(42i32.encode_at(&mut dst));
+        assert_eq!(dst, [0, 0, 0, 42]);
+        assert!(!42i32.encode_at(&mut [0u8; 8]));
+    }
+
+    #[test]
+    fn encode_at_i64() {
+        let mut dst = [0u8; 8];
+        assert!(1234567890123i64.encode_at(&mut dst));
+        assert_eq!(dst, 1234567890123i64.to_be_bytes());
+        assert!(!42i64.encode_at(&mut [0u8; 4]));
+    }
+
+    #[test]
+    fn encode_at_f32() {
+        let mut dst = [0u8; 4];
+        assert!(3.14f32.encode_at(&mut dst));
+        assert_eq!(dst, 3.14f32.to_be_bytes());
+        assert!(!3.14f32.encode_at(&mut [0u8; 8]));
+    }
+
+    #[test]
+    fn encode_at_f64() {
+        let mut dst = [0u8; 8];
+        assert!(3.14f64.encode_at(&mut dst));
+        assert_eq!(dst, 3.14f64.to_be_bytes());
+        assert!(!3.14f64.encode_at(&mut [0u8; 4]));
+    }
+
+    #[test]
+    fn encode_at_u32() {
+        let mut dst = [0u8; 4];
+        assert!(42u32.encode_at(&mut dst));
+        assert_eq!(dst, 42u32.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_at_str_default_fallback() {
+        // Variable-length types use the default encode_at fallback.
+        let s: &str = "hello";
+        let mut dst = [0u8; 5];
+        assert!(s.encode_at(&mut dst));
+        assert_eq!(&dst, b"hello");
+        // Wrong size returns false.
+        assert!(!s.encode_at(&mut [0u8; 3]));
+    }
+
+    #[test]
+    fn encode_at_matches_encode_binary() {
+        // Verify encode_at produces identical bytes to encode_binary for all
+        // fixed-size types.
+        fn check<T: Encode>(val: T, expected_len: usize) {
+            let mut buf = Vec::new();
+            val.encode_binary(&mut buf);
+            assert_eq!(buf.len(), expected_len);
+            let mut dst = vec![0u8; expected_len];
+            assert!(val.encode_at(&mut dst));
+            assert_eq!(
+                buf, dst,
+                "encode_at must produce same bytes as encode_binary"
+            );
+        }
+        check(true, 1);
+        check(false, 1);
+        check(42i16, 2);
+        check(i16::MAX, 2);
+        check(42i32, 4);
+        check(i32::MIN, 4);
+        check(42i64, 8);
+        check(3.14f32, 4);
+        check(3.14f64, 8);
+        check(42u32, 4);
     }
 }
