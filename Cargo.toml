@@ -4,7 +4,7 @@ members = ["crates/bsql", "crates/bsql-arena", "crates/bsql-core", "crates/bsql-
 exclude = ["bench"]
 
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -43,11 +43,11 @@ libsqlite3-sys = { version = "0.30" }
 crossbeam-channel = "0.5"
 
 # Internal
-bsql-core = { path = "crates/bsql-core", version = "0.15.0" }
-bsql-arena = { path = "crates/bsql-arena", version = "0.15.0" }
-bsql-driver-postgres = { path = "crates/bsql-driver-postgres", version = "0.15.0" }
-bsql-driver-sqlite = { path = "crates/bsql-driver-sqlite", version = "0.15.0" }
-bsql-macros = { path = "crates/bsql-macros", version = "0.15.0" }
+bsql-core = { path = "crates/bsql-core", version = "0.16.0" }
+bsql-arena = { path = "crates/bsql-arena", version = "0.16.0" }
+bsql-driver-postgres = { path = "crates/bsql-driver-postgres", version = "0.16.0" }
+bsql-driver-sqlite = { path = "crates/bsql-driver-sqlite", version = "0.16.0" }
+bsql-macros = { path = "crates/bsql-macros", version = "0.16.0" }
 
 # --- Build profiles ---
 # NOTE: these only affect workspace-internal builds (tests, benchmarks).

@@ -1,4 +1,4 @@
-# bsql
+bsql
 
 Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 
@@ -41,7 +41,7 @@ let user = &users[0];
 
 ```toml
 [dependencies]
-bsql = { version = "0.15", features = ["time", "uuid"] }
+bsql = { version = "0.16", features = ["time", "uuid"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -79,7 +79,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 
 ```toml
 [dependencies]
-bsql = { version = "0.15", features = ["sqlite"] }
+bsql = { version = "0.16", features = ["sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -162,7 +162,7 @@ When a pure-Rust SQLite engine like [Limbo](https://github.com/penberg/limbo) re
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. Enable features for specialized types:
 
 ```toml
-bsql = { version = "0.15", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.16", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature     | PostgreSQL types                   | Rust types                                   |
@@ -267,7 +267,7 @@ Real-time notifications for cache invalidation, job queues, live updates.
 <summary>Compile-time EXPLAIN plans</summary>
 
 ```toml
-bsql = { version = "0.15", features = ["explain"] }
+bsql = { version = "0.16", features = ["explain"] }
 ```
 
 Runs `EXPLAIN` on every query during compilation and embeds the plan as a doc comment. Hover over any query result type in your IDE to see the query plan. Development-only -- disable in CI and release builds.
