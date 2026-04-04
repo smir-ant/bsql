@@ -10,7 +10,7 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 
 - **Pure SQL** -- write real SQL. CTEs, JOINs, window functions, subqueries. No DSL, no method chains, no `.filter().select().join()` (hi, diesel). If PostgreSQL or SQLite supports it, bsql validates it.
 
-- **Faster than C** -- 0.9x-2.5x faster than raw C (libpq, sqlite3) across all benchmarks. Real-world performance, not synthetic tuning -- the same code paths that run in benchmarks run in your production app. See [benchmarks](bench/README.md).
+- **Faster than C** -- 1.05–2.5x faster than raw C (libpq, sqlite3) on every benchmark. Not synthetic tuning — the same code paths run in benchmarks and in your production app. See [benchmarks](bench/README.md).
 
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
 
