@@ -1553,4 +1553,108 @@ mod tests {
         let display = fields.to_string();
         assert!(display.contains("(at position 8)"));
     }
+
+    // --- Audit: parse_row_description rejects huge field count ---
+
+    #[test]
+    fn audit_row_description_huge_field_count() {
+        let data = 2001i16.to_be_bytes();
+        let result = parse_row_description(&data);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("exceeds maximum"));
+    }
+
+    // --- Audit: parse_backend_message rejects COPY protocol ---
+
+    #[test]
+    fn backend_message_copy_in_rejected() {
+        let result = parse_backend_message(b'G', &[]);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("COPY"));
+    }
+
+    #[test]
+    fn backend_message_copy_out_rejected() {
+        let result = parse_backend_message(b'H', &[]);
+        assert!(result.is_err());
+    }
+
+    // --- Audit: parse_command_tag handles empty and weird tags ---
+
+    #[test]
+    fn parse_command_tag_empty() {
+        assert_eq!(parse_command_tag(""), 0);
+    }
+
+    #[test]
+    fn parse_command_tag_no_number() {
+        assert_eq!(parse_command_tag("BEGIN"), 0);
+    }
+
+    #[test]
+    fn parse_command_tag_insert() {
+        assert_eq!(parse_command_tag("INSERT 0 5"), 5);
+    }
+
+    #[test]
+    fn parse_command_tag_bytes_empty() {
+        assert_eq!(parse_command_tag_bytes(&[]), 0);
+    }
+
+    #[test]
+    fn parse_command_tag_bytes_nul_terminated() {
+        assert_eq!(parse_command_tag_bytes(b"UPDATE 3\0"), 3);
+    }
+
+    // --- Audit: parse_auth rejects short payloads ---
+
+    #[test]
+    fn parse_auth_too_short() {
+        let result = parse_backend_message(b'R', &[0, 0]);
+        assert!(result.is_err());
+    }
+
+    // --- Audit: parse_simple_data_row rejects negative column count ---
+
+    #[test]
+    fn simple_data_row_negative_col_count() {
+        let data = (-1i16).to_be_bytes();
+        let result = parse_simple_data_row(&data);
+        assert!(result.is_err());
+    }
+
+    // --- Audit: read_cstring rejects offset beyond data ---
+
+    #[test]
+    fn read_cstring_offset_beyond_data() {
+        let result = read_cstring(b"hello\0", 100);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_cstring_no_nul_terminator() {
+        let result = read_cstring(b"hello", 0);
+        assert!(result.is_err());
+    }
+
+    // --- Audit: parse_parameter_description rejects negative count ---
+
+    #[test]
+    fn parameter_description_negative_count() {
+        let data = (-1i16).to_be_bytes();
+        let result = parse_parameter_description(&data);
+        assert!(result.is_err());
+    }
+
+    // --- Audit: unknown backend message type ---
+
+    #[test]
+    fn unknown_backend_message_type() {
+        let result = parse_backend_message(0xFF, &[]);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("unknown backend message type"));
+    }
 }

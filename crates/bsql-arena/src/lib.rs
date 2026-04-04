@@ -1338,4 +1338,64 @@ mod tests {
         assert_eq!(arena2.allocated(), 0, "recycled arena should be reset");
         release_arena(arena2);
     }
+
+    // --- Audit: arena cannot return stale data after reset ---
+
+    #[test]
+    fn arena_reset_clears_data_positions() {
+        let mut arena = Arena::new();
+        let o1 = arena.alloc_copy(b"first query data");
+        assert_eq!(arena.get(o1, 16), b"first query data");
+
+        arena.reset();
+        assert_eq!(arena.allocated(), 0);
+        assert_eq!(arena.current, 0);
+        assert_eq!(arena.offset, 0);
+
+        // After reset, a new alloc should produce offset 0 (same as o1)
+        // but the data is different. No stale data leaks.
+        let o2 = arena.alloc_copy(b"second query dat");
+        assert_eq!(o2, 0, "first alloc after reset should be at offset 0");
+        assert_eq!(arena.get(o2, 16), b"second query dat");
+    }
+
+    #[test]
+    fn arena_reset_discards_oversized_chunks() {
+        let mut arena = Arena::new();
+        // Allocate a 128KB blob (> SHRINK_THRESHOLD of 64KB)
+        let big = vec![0xAA; 128 * 1024];
+        arena.alloc_copy(&big);
+        let cap_before = arena.capacity();
+        assert!(cap_before >= 128 * 1024);
+
+        arena.reset();
+        let cap_after = arena.capacity();
+        // Oversized chunks should be discarded — capacity should shrink
+        assert!(
+            cap_after < cap_before,
+            "oversized chunks should be discarded on reset: before={cap_before}, after={cap_after}"
+        );
+    }
+
+    // --- Audit: alloc_copy zero-length returns stable offset ---
+
+    #[test]
+    fn alloc_copy_zero_length_returns_valid_offset() {
+        let mut arena = Arena::new();
+        let o1 = arena.alloc_copy(b"");
+        let o2 = arena.alloc_copy(b"hello");
+        // Zero-length alloc should return a valid global offset
+        // without advancing the bump pointer.
+        assert_eq!(o1, o2, "zero-length alloc should not advance offset");
+        assert_eq!(arena.get(o2, 5), b"hello");
+    }
+
+    // --- Audit: get with zero length returns empty slice ---
+
+    #[test]
+    fn get_zero_length_returns_empty() {
+        let arena = Arena::new();
+        assert_eq!(arena.get(0, 0), &[]);
+        assert_eq!(arena.get(9999, 0), &[]);
+    }
 }

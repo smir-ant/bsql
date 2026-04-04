@@ -1794,4 +1794,78 @@ mod tests {
         assert_eq!(pool.inner.min_idle, 1);
         assert_eq!(pool.inner.max_stmt_cache_size, 128);
     }
+
+    // --- Audit: PoolGuard drop discards connections in bad state ---
+
+    #[tokio::test]
+    async fn pool_max_size_zero_rejects_all_acquires() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(0)
+            .build()
+            .await
+            .unwrap();
+        let result = pool.acquire().await;
+        assert!(result.is_err());
+        match &result {
+            Err(DriverError::Pool(msg)) => assert!(msg.contains("exhausted")),
+            _ => panic!("expected pool exhausted error"),
+        }
+    }
+
+    // --- Audit: URL parsing edge cases ---
+
+    #[test]
+    fn url_parse_unknown_sslmode_returns_error() {
+        let result = Config::from_url("postgres://u:p@h/d?sslmode=bogus");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("unknown sslmode"));
+    }
+
+    #[test]
+    fn url_parse_invalid_port_returns_error() {
+        let result = Config::from_url("postgres://u:p@h:abc/d");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("invalid port"));
+    }
+
+    #[test]
+    fn url_parse_missing_at_sign_returns_error() {
+        let result = Config::from_url("postgres://u:plocalhost/d");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("missing @"));
+    }
+
+    #[test]
+    fn url_parse_empty_host_returns_error() {
+        let result = Config::from_url("postgres://u:p@/d");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn url_parse_empty_user_returns_error() {
+        let result = Config::from_url("postgres://:p@h/d");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn url_parse_statement_timeout_invalid_uses_default() {
+        let config = Config::from_url("postgres://u:p@h/d?statement_timeout=notnum").unwrap();
+        assert_eq!(config.statement_timeout_secs, 30);
+    }
+
+    #[test]
+    fn url_parse_malformed_percent_encoding() {
+        let result = Config::from_url("postgres://u%:p@h/d");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn url_parse_invalid_hex_in_percent_encoding() {
+        let result = Config::from_url("postgres://u%ZZ:p@h/d");
+        assert!(result.is_err());
+    }
 }

@@ -75,10 +75,6 @@ enum Command {
         tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>,
     ),
     UnlistenAll(tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>),
-    Notify(
-        String,
-        tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>,
-    ),
 }
 
 /// A dedicated LISTEN/NOTIFY connection to PostgreSQL.
@@ -391,11 +387,6 @@ async fn drive_listener(
                     }
                     Some(Command::UnlistenAll(resp)) => {
                         let result = conn.simple_query("UNLISTEN *").await;
-                        drain_pending(&mut conn, &notif_tx);
-                        let _ = resp.send(result);
-                    }
-                    Some(Command::Notify(sql, resp)) => {
-                        let result = conn.simple_query(&sql).await;
                         drain_pending(&mut conn, &notif_tx);
                         let _ = resp.send(result);
                     }

@@ -30,6 +30,9 @@ use crate::error::BsqlError;
 /// Shared result type broadcast to waiting tasks.
 type SharedResult = Arc<Result<Arc<OwnedResultSnapshot>, BsqlError>>;
 
+/// The in-flight map type: key -> broadcast sender.
+type InFlightMap = Arc<Mutex<HashMap<u64, broadcast::Sender<SharedResult>>>>;
+
 /// A snapshot of query results that can be shared across tasks.
 ///
 /// Unlike `OwnedResult`, this does not own an arena — the data has been
@@ -48,7 +51,8 @@ pub struct Singleflight {
     /// In-flight queries: key -> broadcast sender.
     /// Uses std::sync::Mutex because the critical section is trivial
     /// (HashMap insert/remove — no I/O).
-    in_flight: Mutex<HashMap<u64, broadcast::Sender<SharedResult>>>,
+    /// Wrapped in Arc so FlightLeader can hold a back-reference for cleanup on drop.
+    in_flight: InFlightMap,
 }
 
 /// Result of attempting to join a singleflight group.
@@ -60,21 +64,44 @@ pub enum FlightResult {
 }
 
 /// Handle for the leader task that will execute the query and broadcast results.
+///
+/// If the leader is dropped without calling `complete()` (e.g., the task panics),
+/// the `Drop` impl removes the key from the in-flight map so new requests don't
+/// join a dead channel. Followers on the dead channel receive a `RecvError` from
+/// the broadcast receiver, which surfaces as a query error.
 pub struct FlightLeader {
     key: u64,
     tx: broadcast::Sender<SharedResult>,
+    /// Back-reference to the in-flight map for cleanup on drop.
+    /// `None` after `complete()` has been called (key already removed).
+    in_flight: Option<InFlightMap>,
 }
 
 impl FlightLeader {
     /// Broadcast the result to all waiting followers and remove from in-flight map.
-    pub fn complete(self, sf: &Singleflight, result: SharedResult) {
+    pub fn complete(mut self, sf: &Singleflight, result: SharedResult) {
         // Remove from in-flight first so new requests don't join a completed flight
         sf.in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.key);
+        // Mark as completed so Drop doesn't double-remove
+        self.in_flight = None;
         // Broadcast to followers (ignore send errors — no receivers is fine)
         let _ = self.tx.send(result);
+    }
+}
+
+impl Drop for FlightLeader {
+    fn drop(&mut self) {
+        // If complete() was not called (e.g., leader task panicked), remove
+        // the key from the in-flight map. This ensures new requests become
+        // leaders instead of joining a dead broadcast channel.
+        if let Some(ref map) = self.in_flight {
+            map.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.key);
+        }
     }
 }
 
@@ -82,7 +109,7 @@ impl Singleflight {
     /// Create a new singleflight coalescing layer.
     pub fn new() -> Self {
         Self {
-            in_flight: Mutex::new(HashMap::new()),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -100,7 +127,11 @@ impl Singleflight {
             // Capacity 1: only one result will ever be sent
             let (tx, _) = broadcast::channel(1);
             map.insert(key, tx.clone());
-            FlightResult::Leader(FlightLeader { key, tx })
+            FlightResult::Leader(FlightLeader {
+                key,
+                tx,
+                in_flight: Some(Arc::clone(&self.in_flight)),
+            })
         }
     }
 
@@ -311,10 +342,10 @@ mod tests {
         assert!(r2.is_err());
     }
 
-    // --- Drop leader without completing -> key stays in map ---
+    // --- Drop leader without completing -> key is removed from map ---
 
     #[test]
-    fn drop_leader_without_complete_key_stays_in_map() {
+    fn drop_leader_without_complete_cleans_up_map() {
         let sf = Singleflight::new();
 
         let leader = match sf.try_join(42) {
@@ -322,17 +353,17 @@ mod tests {
             _ => panic!("expected leader"),
         };
 
-        // Drop leader without calling complete.
-        // The in-flight map still holds the broadcast sender (cloned on insert),
-        // so the key is NOT removed. New joiners become followers.
+        // Drop leader without calling complete (e.g., task panicked).
+        // The Drop impl removes the key from the in-flight map so new
+        // requests don't join a dead broadcast channel.
         drop(leader);
 
-        // A new try_join for the same key should still produce a follower
-        // (the entry is still in the map).
+        // A new try_join for the same key should produce a NEW leader
+        // (the entry was cleaned up on drop).
         let result = sf.try_join(42);
         assert!(
-            matches!(result, FlightResult::Follower(_)),
-            "key should still be in map after leader drop without complete"
+            matches!(result, FlightResult::Leader(_)),
+            "key should be removed from map after leader drop without complete"
         );
     }
 
@@ -441,5 +472,63 @@ mod tests {
         // Key should be removed
         let result = sf.try_join(42);
         assert!(matches!(result, FlightResult::Leader(_)));
+    }
+
+    // --- Audit: leader dropped while followers are waiting ---
+
+    #[tokio::test]
+    async fn follower_gets_error_when_leader_dropped_without_complete() {
+        let sf = Singleflight::new();
+
+        let leader = match sf.try_join(42) {
+            FlightResult::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+
+        let mut rx = match sf.try_join(42) {
+            FlightResult::Follower(rx) => rx,
+            _ => panic!("expected follower"),
+        };
+
+        // Drop leader without completing (simulates task panic).
+        drop(leader);
+
+        // Follower should get a RecvError (sender dropped).
+        let result = rx.recv().await;
+        assert!(
+            result.is_err(),
+            "follower should get RecvError when leader is dropped without complete"
+        );
+    }
+
+    // --- Audit: leader drop cleans up, new leader can succeed ---
+
+    #[tokio::test]
+    async fn new_leader_succeeds_after_previous_leader_dropped() {
+        let sf = Arc::new(Singleflight::new());
+
+        // First leader drops without completing (simulates panic).
+        let leader1 = match sf.try_join(42) {
+            FlightResult::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        drop(leader1);
+
+        // A new try_join should produce a fresh leader (not a follower on a dead channel).
+        let leader2 = match sf.try_join(42) {
+            FlightResult::Leader(l) => l,
+            _ => panic!("expected new leader after previous leader drop"),
+        };
+
+        let mut rx = match sf.try_join(42) {
+            FlightResult::Follower(rx) => rx,
+            _ => panic!("expected follower for second leader"),
+        };
+
+        let err = BsqlError::from(bsql_driver_postgres::DriverError::Pool("retry".into()));
+        leader2.complete(&sf, Arc::new(Err(err)));
+
+        let received = rx.recv().await.unwrap();
+        assert!(received.is_err());
     }
 }
