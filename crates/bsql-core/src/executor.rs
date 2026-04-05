@@ -154,6 +154,7 @@ impl Executor for Pool {
 }
 
 impl Executor for PoolConnection {
+    #[inline]
     fn query_raw(
         &self,
         sql: &str,
@@ -161,11 +162,10 @@ impl Executor for PoolConnection {
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let arena = Arena::new();
         let result = guard
             .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
-        Ok(OwnedResult::new(result, arena))
+        Ok(OwnedResult::without_arena(result))
     }
 
     #[inline]

@@ -183,11 +183,10 @@ impl Transaction {
     ) -> BsqlResult<OwnedResult> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
-        let arena = Arena::new();
         let result = tx
             .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
-        Ok(OwnedResult::new(result, arena))
+        Ok(OwnedResult::without_arena(result))
     }
 
     /// Execute without result rows within the transaction (used by Executor impl).
