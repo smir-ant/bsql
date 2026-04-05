@@ -65,9 +65,6 @@ pub struct Connection {
     secret: i32,
     tx_status: u8,
     last_used: std::time::Instant,
-    /// Whether a streaming query is in progress. When true, the
-    /// connection is in an indeterminate protocol state (portal open, no
-    /// ReadyForQuery) and cannot be reused.
     streaming_active: bool,
     created_at: std::time::Instant,
     pending_notifications: Vec<Notification>,
@@ -452,7 +449,11 @@ impl Connection {
         // Column offsets point into this buffer. After the loop, the buffer
         // is moved into the arena as a single block — ONE allocation for the
         // entire result set, like libpq's PGresult internal buffer.
-        let mut resp_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        // Response buffer starts empty. Vec grows via doubling as DataRow
+        // payloads arrive. No upfront 64KB malloc — actual allocation matches
+        // the result size. For 100 rows (~8KB), Vec grows to ~16KB capacity.
+        // For 1 row (~80B), Vec grows to ~128B. Right-sized for the workload.
+        let mut resp_buf: Vec<u8> = Vec::new();
 
         // Inline response parsing: BindComplete + DataRow* + CommandComplete + ReadyForQuery.
         'outer: loop {
