@@ -20,6 +20,10 @@ path = "mem/sqlx_pg.rs"
 name = "mem_diesel_pg"
 path = "mem/diesel_pg.rs"
 
+[[bin]]
+name = "bench_bsql_perf"
+path = "mem/bench_bsql_perf.rs"
+
 [[bench]]
 name = "pg_fetch_one"
 harness = false
