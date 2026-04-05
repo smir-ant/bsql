@@ -2292,3 +2292,232 @@ fn stmt_cache_len_with_prepare_only() {
     assert_eq!(r2.row(0, &arena).get_str(0), Some("hello world"));
     assert_eq!(conn.stmt_cache_len(), 2);
 }
+
+// =========================================================================
+// Gap tests: wait_for_notification — multi-thread
+// =========================================================================
+
+#[test]
+fn wait_for_notification_receives_notify() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+
+    // Listener connection
+    let mut listener_conn = Connection::connect(&config).unwrap();
+    listener_conn
+        .simple_query("LISTEN test_wait_notif")
+        .unwrap();
+
+    // Sender thread — sends NOTIFY after small delay
+    let config2 = config.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut sender = Connection::connect(&config2).unwrap();
+        sender
+            .simple_query("NOTIFY test_wait_notif, 'hello_from_thread'")
+            .unwrap();
+    });
+
+    // This blocks until notification arrives
+    let (channel, payload) = listener_conn.wait_for_notification().unwrap();
+    assert_eq!(channel, "test_wait_notif");
+    assert_eq!(payload, "hello_from_thread");
+
+    handle.join().unwrap();
+    listener_conn
+        .simple_query("UNLISTEN test_wait_notif")
+        .unwrap();
+}
+
+// =========================================================================
+// Gap tests: cancel() — idle connection
+// =========================================================================
+
+#[test]
+fn cancel_on_idle_connection_does_not_panic() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+
+    // Cancel on idle connection — PG ignores it, but the function should work.
+    // On UDS connections cancel() may fail (it always uses TCP), so accept either
+    // Ok or Err. The important thing is it does not panic.
+    let _ = conn.cancel();
+}
+
+// =========================================================================
+// Gap tests: touch / idle_duration
+// =========================================================================
+
+#[test]
+fn connection_touch_updates_idle_duration() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let before = conn.idle_duration();
+    assert!(
+        before >= std::time::Duration::from_millis(40),
+        "idle_duration should be >= 40ms after sleeping 50ms, got {before:?}"
+    );
+
+    conn.touch();
+    let after = conn.idle_duration();
+    assert!(
+        after < std::time::Duration::from_millis(10),
+        "idle_duration should be < 10ms right after touch(), got {after:?}"
+    );
+}
+
+// =========================================================================
+// Gap tests: query_counter
+// =========================================================================
+
+#[test]
+fn connection_query_counter_increments() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let before = conn.query_counter();
+
+    // query() increments query_counter
+    let sql = "SELECT 1::int4";
+    let hash = hash_sql(sql);
+    let _ = conn.query(sql, hash, &[]).unwrap();
+    let after_one = conn.query_counter();
+    assert!(
+        after_one > before,
+        "query_counter should increment after query(): before={before}, after={after_one}"
+    );
+
+    // execute() also increments
+    conn.simple_query("CREATE TEMP TABLE _driver_test_qc (id int)")
+        .unwrap();
+    let exec_sql = "INSERT INTO _driver_test_qc VALUES ($1::int4)";
+    let exec_hash = hash_sql(exec_sql);
+    let _ = conn.execute(exec_sql, exec_hash, &[&1i32]).unwrap();
+    let after_two = conn.query_counter();
+    assert!(
+        after_two > after_one,
+        "query_counter should increment after execute(): after_one={after_one}, after_two={after_two}"
+    );
+}
+
+// =========================================================================
+// Gap tests: created_at
+// =========================================================================
+
+#[test]
+fn connection_created_at_is_recent() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+
+    assert!(
+        conn.created_at().elapsed() < std::time::Duration::from_secs(5),
+        "created_at should be within the last 5 seconds"
+    );
+}
+
+// =========================================================================
+// Gap tests: drain_notifications after NOTIFY
+// =========================================================================
+
+#[test]
+fn connection_drain_notifications_after_notify() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("LISTEN drain_test_chan").unwrap();
+
+    // Send notification from a separate connection
+    let mut sender = Connection::connect(&config).unwrap();
+    sender
+        .simple_query("NOTIFY drain_test_chan, 'drain_payload'")
+        .unwrap();
+
+    // Give PG a moment to deliver
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Run a query to trigger notification buffering (read_one_message buffers
+    // NotificationResponse messages it sees while reading query results).
+    let _ = conn.simple_query("SELECT 1");
+
+    let notifs = conn.drain_notifications();
+    // May or may not have the notification depending on timing, but drain
+    // must not panic and must return a Vec.
+    assert!(notifs.len() <= 1);
+
+    // After drain, pending count should be zero.
+    assert_eq!(conn.pending_notification_count(), 0);
+
+    conn.simple_query("UNLISTEN drain_test_chan").unwrap();
+}
+
+// =========================================================================
+// Gap tests: pending_notification_count on fresh connection
+// =========================================================================
+
+#[test]
+fn connection_pending_notification_count_fresh() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+
+    // Fresh connection should have 0 pending notifications
+    assert_eq!(conn.pending_notification_count(), 0);
+}
+
+// =========================================================================
+// Gap tests: set_max_stmt_cache_size eviction
+// =========================================================================
+
+#[test]
+fn connection_set_max_stmt_cache_size_evicts() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.set_max_stmt_cache_size(5);
+
+    // Cache more than 5 statements — older ones should be evicted
+    for i in 0..10 {
+        let sql = format!("SELECT {i}::int4");
+        let hash = hash_sql(&sql);
+        let _ = conn.query(&sql, hash, &[]).unwrap();
+    }
+    assert!(
+        conn.stmt_cache_len() <= 5,
+        "cache should be capped at 5, got {}",
+        conn.stmt_cache_len()
+    );
+}
+
+// =========================================================================
+// Gap tests: set_read_timeout — notification timeout
+// =========================================================================
+
+#[test]
+fn connection_set_read_timeout() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    // LISTEN first, before setting the short timeout
+    conn.simple_query("LISTEN timeout_test_chan").unwrap();
+
+    // Now set a very short timeout so wait_for_notification will time out
+    conn.set_read_timeout(Some(std::time::Duration::from_millis(1)))
+        .unwrap();
+
+    let result = conn.wait_for_notification();
+    assert!(result.is_err(), "should timeout with 1ms read timeout");
+
+    // After a read timeout the connection's internal buffer state may be
+    // partially filled, so the connection is no longer reliably reusable.
+    // We just verify the timeout fired correctly and let the connection drop.
+    // PG will auto-UNLISTEN when the session closes.
+}
