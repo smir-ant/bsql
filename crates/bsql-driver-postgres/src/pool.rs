@@ -732,8 +732,11 @@ impl Drop for PoolGuard {
             }
 
             // Stamp last-used time for idle connection tracking.
-            // Instant::now() is ~20ns (macOS mach_absolute_time).
-            conn.touch();
+            // Amortized: only call Instant::now() every 64 returns.
+            // Max error: 64 queries × ~15us = ~1ms on a 30s idle threshold.
+            if conn.query_counter() & 63 == 0 {
+                conn.touch();
+            }
 
             // Return to pool
             {

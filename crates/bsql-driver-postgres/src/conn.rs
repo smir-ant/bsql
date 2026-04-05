@@ -2205,6 +2205,11 @@ impl Connection {
         self.last_used.elapsed()
     }
 
+    /// Monotonic query counter — incremented on every query/execute.
+    pub fn query_counter(&self) -> u64 {
+        self.query_counter
+    }
+
     /// Get a server parameter value.
     pub fn parameter(&self, name: &str) -> Option<&str> {
         self.params
