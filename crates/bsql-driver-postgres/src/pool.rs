@@ -20,7 +20,8 @@ use tokio::sync::Notify;
 use crate::DriverError;
 use crate::arena::Arena;
 use crate::codec::Encode;
-use crate::conn::{Config, Connection, PgDataRow, QueryResult};
+use crate::conn::Connection;
+use crate::types::{Config, PgDataRow, QueryResult};
 #[cfg(unix)]
 use crate::sync_conn::SyncConnection;
 

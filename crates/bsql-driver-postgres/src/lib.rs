@@ -43,10 +43,13 @@
 pub mod arena;
 pub mod codec;
 pub mod pool;
+pub(crate) mod types;
 
 mod auth;
 mod conn;
 mod proto;
+mod stmt_cache;
+mod sync_io;
 #[cfg(unix)]
 mod sync_conn;
 #[cfg(feature = "tls")]
@@ -54,12 +57,13 @@ mod tls;
 
 pub use arena::Arena;
 pub use codec::Encode;
-pub use conn::hash_sql;
-pub use conn::{
-    ColumnDesc, Config, Connection, Notification, PgDataRow, PrepareResult, QueryResult, Row,
+pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
+pub use types::{
+    hash_sql, ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, Row,
     SimpleRow, SslMode,
 };
-pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
+// Re-export Connection from conn module
+pub use conn::Connection;
 #[cfg(unix)]
 pub use sync_conn::SyncConnection;
 

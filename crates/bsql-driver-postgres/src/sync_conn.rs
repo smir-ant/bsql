@@ -30,153 +30,9 @@ use crate::DriverError;
 use crate::arena::Arena;
 use crate::auth;
 use crate::codec::Encode;
-use crate::conn::{ColumnDesc, Config, Notification, PgDataRow, QueryResult, SimpleRow};
 use crate::proto::{self, BackendMessage};
-
-// --- Vec-based statement cache ---
-//
-// For typical workloads of 5-20 cached statements, linear scan over a Vec
-// with u64 comparison is faster than HashMap probe sequence because:
-// - Vec = contiguous memory, perfect cache locality (all entries in L1)
-// - u64 comparison = one instruction per entry
-// - No hash probe, no bucket lookup, no load factor math
-
-/// Vec-backed statement cache with O(n) lookup. Faster than HashMap for
-/// small n (< ~30 entries) due to cache locality and zero hashing overhead.
-struct StmtCache {
-    entries: Vec<(u64, StmtInfo)>,
-}
-
-impl Default for StmtCache {
-    fn default() -> Self {
-        Self {
-            entries: Vec::with_capacity(16),
-        }
-    }
-}
-
-impl StmtCache {
-    #[inline]
-    fn get_mut(&mut self, hash: &u64) -> Option<&mut StmtInfo> {
-        self.entries
-            .iter_mut()
-            .find(|(h, _)| h == hash)
-            .map(|(_, info)| info)
-    }
-
-    #[inline]
-    fn get(&self, hash: &u64) -> Option<&StmtInfo> {
-        self.entries
-            .iter()
-            .find(|(h, _)| h == hash)
-            .map(|(_, info)| info)
-    }
-
-    #[inline]
-    fn contains_key(&self, hash: &u64) -> bool {
-        self.entries.iter().any(|(h, _)| h == hash)
-    }
-
-    #[inline]
-    fn insert(&mut self, hash: u64, info: StmtInfo) {
-        if let Some(entry) = self.entries.iter_mut().find(|(h, _)| *h == hash) {
-            entry.1 = info;
-        } else {
-            self.entries.push((hash, info));
-        }
-    }
-
-    #[inline]
-    fn remove(&mut self, hash: &u64) -> Option<StmtInfo> {
-        if let Some(pos) = self.entries.iter().position(|(h, _)| h == hash) {
-            Some(self.entries.swap_remove(pos).1)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Evict the least recently used entry (lowest `last_used` counter).
-    fn evict_lru(&mut self) -> Option<(u64, StmtInfo)> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let min_idx = self
-            .entries
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, (_, info))| info.last_used)
-            .map(|(i, _)| i)?;
-        Some(self.entries.swap_remove(min_idx))
-    }
-}
-
-/// Cached information about a prepared statement.
-struct StmtInfo {
-    /// Statement name: `"s_{hash:016x}"`
-    name: Box<str>,
-    /// Column metadata from RowDescription.
-    columns: Arc<[ColumnDesc]>,
-    /// Monotonic counter value at last use for LRU eviction.
-    last_used: u64,
-    /// Pre-built Bind message template for the cached statement.
-    ///
-    /// On the first execution, we snapshot the Bind message bytes from
-    /// `write_buf`. On subsequent executions with the same parameter count,
-    /// we memcpy this template and only patch the parameter data bytes,
-    /// avoiding the full `write_bind_params` rebuild (~100-200ns savings).
-    ///
-    /// `None` until the first execution populates it.
-    bind_template: Option<BindTemplate>,
-}
-
-/// Pre-built Bind+Execute+Sync message template for fast re-execution.
-///
-/// Stores the complete Bind message bytes followed by EXECUTE_SYNC, and the
-/// byte offsets where each parameter's data begins. On re-execution with
-/// same-sized params, we copy the template and overwrite param data in-place
-/// via `encode_at` — no scratch buffer, no double-copy.
-struct BindTemplate {
-    /// Bind message bytes + EXECUTE_SYNC (15 bytes) appended.
-    bytes: Vec<u8>,
-    /// For each parameter: `(data_offset, data_len)` within `bytes`.
-    /// `data_offset` points to the first byte of param data (after the i32 length).
-    /// `data_len` is the length of the param data. -1 means NULL.
-    param_slots: Vec<(usize, i32)>,
-}
-
-/// Format a statement name from a hash: `"s_{hash:016x}"`.
-#[inline]
-fn make_stmt_name(hash: u64) -> Box<str> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [0u8; 18];
-    buf[0] = b's';
-    buf[1] = b'_';
-    let bytes = hash.to_be_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        buf[2 + i * 2] = HEX[(b >> 4) as usize];
-        buf[2 + i * 2 + 1] = HEX[(b & 0x0f) as usize];
-    }
-    let s = std::str::from_utf8(&buf).expect("BUG: stmt name buffer contains only ASCII hex");
-    s.into()
-}
-
-/// Owned action from a startup message.
-enum StartupAction {
-    AuthOk,
-    AuthCleartext,
-    AuthMd5([u8; 4]),
-    AuthSasl(Vec<u8>),
-    ParameterStatus(Box<str>, Box<str>),
-    BackendKeyData(i32, i32),
-    ReadyForQuery(u8),
-    Error(String),
-    Notice,
-}
+use crate::stmt_cache::{build_bind_template, make_stmt_name, StmtCache, StmtInfo};
+use crate::types::{ColumnDesc, Config, Notification, PgDataRow, QueryResult, SimpleRow, StartupAction};
 
 // --- SyncConnection ---
 
@@ -871,7 +727,7 @@ impl SyncConnection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
-        debug_assert_eq!(crate::conn::hash_sql(sql), sql_hash, "sql_hash mismatch");
+        debug_assert_eq!(crate::types::hash_sql(sql), sql_hash, "sql_hash mismatch");
 
         if params.len() > i16::MAX as usize {
             return Err(DriverError::Protocol(format!(
@@ -1035,7 +891,7 @@ impl SyncConnection {
             return Ok(Vec::new());
         }
 
-        debug_assert_eq!(crate::conn::hash_sql(sql), sql_hash, "sql_hash mismatch");
+        debug_assert_eq!(crate::types::hash_sql(sql), sql_hash, "sql_hash mismatch");
 
         self.write_buf.clear();
 
@@ -1656,7 +1512,7 @@ impl SyncConnection {
     where
         F: FnMut(&[u8]) -> Result<(), DriverError>,
     {
-        debug_assert_eq!(crate::conn::hash_sql(sql), sql_hash, "sql_hash mismatch");
+        debug_assert_eq!(crate::types::hash_sql(sql), sql_hash, "sql_hash mismatch");
 
         if params.len() > i16::MAX as usize {
             return Err(DriverError::Protocol(format!(
@@ -1963,7 +1819,7 @@ impl SyncConnection {
         need_columns: bool,
         skip_bind_complete: bool,
     ) -> Result<Option<Arc<[ColumnDesc]>>, DriverError> {
-        debug_assert_eq!(crate::conn::hash_sql(sql), sql_hash, "sql_hash mismatch");
+        debug_assert_eq!(crate::types::hash_sql(sql), sql_hash, "sql_hash mismatch");
 
         if params.len() > i16::MAX as usize {
             return Err(DriverError::Protocol(format!(
@@ -2506,109 +2362,11 @@ fn parse_data_row_flat(
     Ok(())
 }
 
-// --- Bind template builder ---
-
-/// Build a `BindTemplate` from the current write_buf contents.
-///
-/// Parses the Bind message to locate each parameter's data offset and length.
-/// Appends EXECUTE_SYNC to the template bytes so the hot path is a single memcpy.
-/// Returns `None` if the Bind message cannot be parsed (e.g., write_buf is empty
-/// or contains non-Bind data).
-fn build_bind_template(write_buf: &[u8], param_count: usize) -> Option<BindTemplate> {
-    // Bind message starts with 'B'.
-    if write_buf.is_empty() || write_buf[0] != b'B' {
-        return None;
-    }
-
-    if write_buf.len() < 5 {
-        return None;
-    }
-
-    // Skip type byte (1) + length (4).
-    let mut pos = 5;
-
-    // Skip portal name (NUL-terminated).
-    while pos < write_buf.len() && write_buf[pos] != 0 {
-        pos += 1;
-    }
-    pos += 1; // skip NUL
-
-    // Skip statement name (NUL-terminated).
-    while pos < write_buf.len() && write_buf[pos] != 0 {
-        pos += 1;
-    }
-    pos += 1; // skip NUL
-
-    // Skip format codes.
-    if pos + 2 > write_buf.len() {
-        return None;
-    }
-    let num_fmt_codes = i16::from_be_bytes([write_buf[pos], write_buf[pos + 1]]);
-    pos += 2;
-    pos += num_fmt_codes.max(0) as usize * 2; // skip format code values
-
-    // Parameter count.
-    if pos + 2 > write_buf.len() {
-        return None;
-    }
-    let wire_param_count = i16::from_be_bytes([write_buf[pos], write_buf[pos + 1]]) as usize;
-    pos += 2;
-
-    if wire_param_count != param_count {
-        return None;
-    }
-
-    let mut param_slots = Vec::with_capacity(param_count);
-    for _ in 0..param_count {
-        if pos + 4 > write_buf.len() {
-            return None;
-        }
-        let data_len = i32::from_be_bytes([
-            write_buf[pos],
-            write_buf[pos + 1],
-            write_buf[pos + 2],
-            write_buf[pos + 3],
-        ]);
-        pos += 4;
-
-        if data_len < 0 {
-            // NULL param — no data bytes.
-            param_slots.push((pos, -1));
-        } else {
-            let data_offset = pos;
-            param_slots.push((data_offset, data_len));
-            pos += data_len as usize;
-        }
-    }
-
-    // Include EXECUTE_SYNC in the template so the hot path is one memcpy.
-    let mut bytes = Vec::with_capacity(write_buf.len() + proto::EXECUTE_SYNC.len());
-    bytes.extend_from_slice(write_buf);
-    bytes.extend_from_slice(proto::EXECUTE_SYNC);
-
-    Some(BindTemplate { bytes, param_slots })
-}
-
 #[cfg(test)]
 #[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
-    use crate::conn::hash_sql;
-
-    #[test]
-    fn sync_make_stmt_name() {
-        let name = make_stmt_name(0);
-        assert_eq!(&*name, "s_0000000000000000");
-        let name = make_stmt_name(0xDEADBEEF12345678);
-        assert_eq!(&*name, "s_deadbeef12345678");
-    }
-
-    #[test]
-    fn sync_stmt_cache_basic() {
-        let cache = StmtCache::default();
-        assert_eq!(cache.len(), 0);
-        assert!(!cache.contains_key(&42));
-    }
+    use crate::types::hash_sql;
 
     #[test]
     fn sync_config_rejects_tcp() {
@@ -2687,84 +2445,6 @@ mod tests {
         assert!(parse_data_row_flat(&data, &mut arena, &mut out).is_err());
     }
 
-    #[test]
-    fn build_bind_template_basic() {
-        let mut buf = Vec::new();
-        let val: i32 = 42;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
-
-        let tmpl = build_bind_template(&buf, 1);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots.len(), 1);
-        // i32 is 4 bytes
-        assert_eq!(tmpl.param_slots[0].1, 4);
-    }
-
-    #[test]
-    fn build_bind_template_null_param() {
-        let mut buf = Vec::new();
-        let val: Option<i32> = None;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
-
-        let tmpl = build_bind_template(&buf, 1);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots.len(), 1);
-        assert_eq!(tmpl.param_slots[0].1, -1); // NULL
-    }
-
-    #[test]
-    fn build_bind_template_multiple_params() {
-        let mut buf = Vec::new();
-        let id: i32 = 1;
-        let name: &str = "alice";
-        proto::write_bind_params(
-            &mut buf,
-            "",
-            "s_test",
-            &[&id as &(dyn Encode + Sync), &name as &(dyn Encode + Sync)],
-        );
-
-        let tmpl = build_bind_template(&buf, 2);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots.len(), 2);
-        assert_eq!(tmpl.param_slots[0].1, 4); // i32 = 4 bytes
-        assert_eq!(tmpl.param_slots[1].1, 5); // "alice" = 5 bytes
-    }
-
-    #[test]
-    fn build_bind_template_empty_buf() {
-        let tmpl = build_bind_template(&[], 0);
-        assert!(tmpl.is_none());
-    }
-
-    #[test]
-    fn build_bind_template_wrong_type() {
-        let tmpl = build_bind_template(&[b'E', 0, 0, 0, 4], 0);
-        assert!(tmpl.is_none());
-    }
-
-    #[test]
-    fn build_bind_template_param_count_mismatch() {
-        let mut buf = Vec::new();
-        let val: i32 = 42;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
-
-        // Ask for 2 params but only 1 in the message.
-        let tmpl = build_bind_template(&buf, 2);
-        assert!(tmpl.is_none());
-    }
-
-    #[test]
-    fn hash_sql_consistency() {
-        // Verify our module uses the same hash function as conn.rs.
-        let h = hash_sql("SELECT 1");
-        assert_eq!(h, hash_sql("SELECT 1"));
-        assert_ne!(h, hash_sql("SELECT 2"));
-    }
-
     // ---- TCP rejection ----
 
     #[test]
@@ -2784,100 +2464,6 @@ mod tests {
         let config = Config::from_url("postgres://user:pass@127.0.0.1:5432/db").unwrap();
         let result = SyncConnection::connect(&config);
         assert!(result.is_err());
-    }
-
-    // ---- make_stmt_name edge cases ----
-
-    #[test]
-    fn sync_make_stmt_name_max() {
-        let name = make_stmt_name(u64::MAX);
-        assert_eq!(&*name, "s_ffffffffffffffff");
-    }
-
-    #[test]
-    fn sync_make_stmt_name_one() {
-        let name = make_stmt_name(1);
-        assert_eq!(&*name, "s_0000000000000001");
-    }
-
-    #[test]
-    fn sync_make_stmt_name_powers_of_two() {
-        let name = make_stmt_name(256);
-        assert_eq!(&*name, "s_0000000000000100");
-    }
-
-    #[test]
-    fn sync_make_stmt_name_format_always_18_chars() {
-        for val in [0u64, 1, 0xFF, 0xFFFF, 0xFFFF_FFFF, u64::MAX] {
-            let name = make_stmt_name(val);
-            assert_eq!(name.len(), 18, "name len for {val:x}");
-            assert!(name.starts_with("s_"));
-            assert!(name[2..].chars().all(|c| c.is_ascii_hexdigit()));
-        }
-    }
-
-    // ---- StmtCache edge cases ----
-
-    #[test]
-    fn sync_stmt_cache_insert_get_remove() {
-        let mut cache = StmtCache::default();
-        let info = StmtInfo {
-            name: "s_test".into(),
-            columns: Arc::from(Vec::new()),
-            last_used: 1,
-            bind_template: None,
-        };
-        cache.insert(42, info);
-        assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key(&42));
-        assert!(cache.get(&42).is_some());
-        assert!(cache.get_mut(&42).is_some());
-
-        let removed = cache.remove(&42);
-        assert!(removed.is_some());
-        assert_eq!(cache.len(), 0);
-        assert!(!cache.contains_key(&42));
-    }
-
-    #[test]
-    fn sync_stmt_cache_evict_lru() {
-        let mut cache = StmtCache::default();
-        for i in 0..3u64 {
-            cache.insert(
-                i,
-                StmtInfo {
-                    name: format!("s_{i}").into(),
-                    columns: Arc::from(Vec::new()),
-                    last_used: i + 1,
-                    bind_template: None,
-                },
-            );
-        }
-        assert_eq!(cache.len(), 3);
-        let evicted = cache.evict_lru().unwrap();
-        assert_eq!(evicted.0, 0); // lowest last_used=1
-        assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
-    fn sync_stmt_cache_insert_overwrite() {
-        let mut cache = StmtCache::default();
-        let info1 = StmtInfo {
-            name: "s_a".into(),
-            columns: Arc::from(Vec::new()),
-            last_used: 1,
-            bind_template: None,
-        };
-        let info2 = StmtInfo {
-            name: "s_b".into(),
-            columns: Arc::from(Vec::new()),
-            last_used: 2,
-            bind_template: None,
-        };
-        cache.insert(42, info1);
-        cache.insert(42, info2);
-        assert_eq!(cache.len(), 1);
-        assert_eq!(&*cache.get(&42).unwrap().name, "s_b");
     }
 
     // ---- DataRow parsing extended ----
@@ -2977,114 +2563,6 @@ mod tests {
         assert_eq!(out[4].1, 5);
         let stored = arena.get(out[4].0, 5);
         assert_eq!(stored, b"hello");
-    }
-
-    // ---- build_bind_template extended ----
-
-    #[test]
-    fn build_bind_template_too_short_buf() {
-        let tmpl = build_bind_template(&[b'B', 0, 0], 0);
-        assert!(tmpl.is_none());
-    }
-
-    #[test]
-    fn build_bind_template_zero_params() {
-        let mut buf = Vec::new();
-        proto::write_bind_params(&mut buf, "", "s_test", &[]);
-        let tmpl = build_bind_template(&buf, 0);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots.len(), 0);
-    }
-
-    #[test]
-    fn build_bind_template_bool_param() {
-        let mut buf = Vec::new();
-        let val = true;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
-        let tmpl = build_bind_template(&buf, 1);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots.len(), 1);
-        assert_eq!(tmpl.param_slots[0].1, 1); // bool is 1 byte
-    }
-
-    #[test]
-    fn build_bind_template_i64_param() {
-        let mut buf = Vec::new();
-        let val: i64 = 123456789;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
-        let tmpl = build_bind_template(&buf, 1);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots[0].1, 8); // i64 is 8 bytes
-    }
-
-    #[test]
-    fn build_bind_template_f64_param() {
-        let mut buf = Vec::new();
-        let val: f64 = 3.14;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
-        let tmpl = build_bind_template(&buf, 1);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots[0].1, 8); // f64 is 8 bytes
-    }
-
-    #[test]
-    fn build_bind_template_str_param() {
-        let mut buf = Vec::new();
-        let val: &str = "hello world";
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
-        let tmpl = build_bind_template(&buf, 1);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots[0].1, 11); // "hello world" = 11 bytes
-    }
-
-    #[test]
-    fn build_bind_template_mixed_params_with_null() {
-        let mut buf = Vec::new();
-        let id: i32 = 1;
-        let name: Option<i32> = None;
-        let score: f64 = 9.9;
-        proto::write_bind_params(
-            &mut buf,
-            "",
-            "s_test",
-            &[
-                &id as &(dyn Encode + Sync),
-                &name as &(dyn Encode + Sync),
-                &score as &(dyn Encode + Sync),
-            ],
-        );
-        let tmpl = build_bind_template(&buf, 3);
-        assert!(tmpl.is_some());
-        let tmpl = tmpl.unwrap();
-        assert_eq!(tmpl.param_slots.len(), 3);
-        assert_eq!(tmpl.param_slots[0].1, 4); // i32
-        assert_eq!(tmpl.param_slots[1].1, -1); // NULL
-        assert_eq!(tmpl.param_slots[2].1, 8); // f64
-    }
-
-    #[test]
-    fn build_bind_template_preserves_bytes() {
-        let mut buf = Vec::new();
-        let val: i32 = 42;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
-        let bind_len = buf.len();
-        let tmpl = build_bind_template(&buf, 1).unwrap();
-        // Template bytes = Bind message + EXECUTE_SYNC appended.
-        assert_eq!(
-            &tmpl.bytes[..bind_len],
-            &buf[..],
-            "template must start with original Bind message"
-        );
-        assert_eq!(
-            &tmpl.bytes[bind_len..],
-            proto::EXECUTE_SYNC,
-            "template must end with EXECUTE_SYNC"
-        );
     }
 
     // ---- SyncConnection UDS connect (requires PG, skipped if unavailable) ----
