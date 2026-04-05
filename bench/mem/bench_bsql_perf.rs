@@ -256,5 +256,32 @@ fn main() -> Result<(), BsqlError> {
         println!("for_each(): {} us/op  ({n} iters)", elapsed.as_micros() / n as u128);
     }
 
+    // === Raw driver single-row: isolate pool/wrapper overhead ===
+    {
+        use bsql_driver_postgres::{Connection, Config, hash_sql, Encode};
+
+        let config = Config::from_url(&url)?;
+        let mut conn = Connection::connect(&config)?;
+
+        let sql_one = "SELECT id, name, email FROM bench_users WHERE id = $1";
+        let hash_one = hash_sql(sql_one);
+        let id = 42i32;
+        let params_one: &[&(dyn Encode + Sync)] = &[&id];
+
+        // warm
+        let _ = conn.query(sql_one, hash_one, params_one);
+
+        let n = 10000;
+        let start = Instant::now();
+        for _ in 0..n {
+            let _ = conn.query(sql_one, hash_one, params_one);
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "\n--- Raw driver single row ---\nquery():    {} ns/op  ({n} iters)",
+            elapsed.as_nanos() / n as u128
+        );
+    }
+
     Ok(())
 }
