@@ -164,5 +164,44 @@ fn main() -> Result<(), BsqlError> {
         );
     }
 
+    // === Raw driver-level comparison: query vs for_each on 10K rows ===
+    // This isolates the data copy overhead from Pool/codegen overhead.
+    {
+        use bsql_driver_postgres::{Connection, Config, Arena, hash_sql, Encode};
+
+        let config = Config::from_url(&url).unwrap();
+        let mut conn = Connection::connect(&config).unwrap();
+        let mut arena = Arena::new();
+
+        let sql = "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1";
+        let hash = hash_sql(sql);
+        let limit = 10000i64;
+        let params: &[&(dyn Encode + Sync)] = &[&limit];
+
+        // warm
+        let _ = conn.query(sql, hash, params, &mut arena).unwrap();
+        arena.reset();
+        conn.for_each(sql, hash, params, |_| Ok(())).unwrap();
+
+        // measure query (materializes Vec via arena)
+        let n = 200;
+        let start = Instant::now();
+        for _ in 0..n {
+            let _ = conn.query(sql, hash, params, &mut arena).unwrap();
+            arena.reset();
+        }
+        let elapsed = start.elapsed();
+        println!("\n--- Raw driver 10K rows ---");
+        println!("query():    {} us/op  ({n} iters)", elapsed.as_micros() / n as u128);
+
+        // measure for_each (zero-copy, processes in-place)
+        let start = Instant::now();
+        for _ in 0..n {
+            conn.for_each(sql, hash, params, |_| Ok(())).unwrap();
+        }
+        let elapsed = start.elapsed();
+        println!("for_each(): {} us/op  ({n} iters)", elapsed.as_micros() / n as u128);
+    }
+
     Ok(())
 }

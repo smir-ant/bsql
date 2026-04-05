@@ -18,8 +18,13 @@
 
 use std::cell::RefCell;
 
-/// Initial chunk size: 8KB covers most result sets.
-const INITIAL_CHUNK_SIZE: usize = 8 * 1024;
+/// Initial chunk size: 64KB covers most result sets without regrowth.
+///
+/// 64KB fits ~800 rows of typical width (80 bytes/row). The old 8KB caused
+/// chunk growth at ~100 rows, adding allocation + prefix_sums rebuild overhead
+/// that scaled with row count. 64KB eliminates regrowth for the common case
+/// while remaining small enough for thread-local pooling (4 × 64KB = 256KB).
+const INITIAL_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Maximum chunk size: 1MB cap to prevent runaway growth.
 const MAX_CHUNK_SIZE: usize = 1024 * 1024;
@@ -96,30 +101,52 @@ impl Arena {
     /// Copy `data` into the arena and return the global offset.
     ///
     /// The offset can be used with `get()` to retrieve the data later.
+    #[inline(always)]
     pub fn alloc_copy(&mut self, data: &[u8]) -> usize {
-        if data.is_empty() {
+        let len = data.len();
+        if len == 0 {
             return self.global_offset();
         }
 
+        // Fast path: data fits in current chunk's remaining capacity.
+        // No function calls, no branches — just memcpy and bump.
+        let chunk = &mut self.chunks[self.current];
+        let remaining = chunk.capacity() - self.offset;
+        if remaining >= len {
+            let start = self.offset;
+            // Append directly — extend_from_slice is the fastest way to
+            // copy data into a Vec when we know capacity is sufficient.
+            // It compiles to a single memcpy + length update.
+            if start == chunk.len() {
+                chunk.extend_from_slice(data);
+            } else {
+                let new_len = start + len;
+                if new_len > chunk.len() {
+                    chunk.resize(new_len, 0);
+                }
+                chunk[start..start + len].copy_from_slice(data);
+            }
+            let global = self.prefix_sums[self.current] + start;
+            self.offset = start + len;
+            return global;
+        }
+
+        // Slow path: need a new chunk.
+        self.alloc_copy_slow(data)
+    }
+
+    /// Slow path for alloc_copy — allocates a new chunk.
+    #[cold]
+    #[inline(never)]
+    fn alloc_copy_slow(&mut self, data: &[u8]) -> usize {
         self.ensure_capacity(data.len());
 
         let chunk = &mut self.chunks[self.current];
         let start = self.offset;
-        let new_len = start + data.len();
+        chunk.extend_from_slice(data);
 
-        // Common case: appending to the end of the chunk. Use extend_from_slice
-        // which copies data directly without zeroing first (unlike resize+copy).
-        if start == chunk.len() {
-            chunk.extend_from_slice(data);
-        } else {
-            if new_len > chunk.len() {
-                chunk.resize(new_len, 0);
-            }
-            chunk[start..new_len].copy_from_slice(data);
-        }
-
-        let global = self.global_offset_at(self.current, start);
-        self.offset = new_len;
+        let global = self.prefix_sums[self.current] + start;
+        self.offset = start + data.len();
         global
     }
 

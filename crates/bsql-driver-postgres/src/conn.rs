@@ -447,6 +447,12 @@ impl Connection {
         let mut all_col_offsets: Vec<(usize, i32)> = Vec::with_capacity(num_cols.max(1) * 8);
         let mut affected_rows: u64 = 0;
 
+        // Response buffer: DataRow payloads are appended here as raw bytes.
+        // Column offsets point into this buffer. After the loop, the buffer
+        // is moved into the arena as a single block — ONE allocation for the
+        // entire result set, like libpq's PGresult internal buffer.
+        let mut resp_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
         // Inline response parsing: BindComplete + DataRow* + CommandComplete + ReadyForQuery.
         'outer: loop {
             loop {
@@ -480,7 +486,11 @@ impl Connection {
                         match msg {
                             BackendMessage::BindComplete => continue,
                             BackendMessage::DataRow { data } => {
-                                parse_data_row_flat(data, arena, &mut all_col_offsets)?;
+                                parse_data_row_into_buf(
+                                    data,
+                                    &mut resp_buf,
+                                    &mut all_col_offsets,
+                                )?;
                                 continue;
                             }
                             BackendMessage::CommandComplete { tag } => {
@@ -513,18 +523,14 @@ impl Connection {
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                // Happy path first: DataRow is ~99.9% of messages in a
-                // result set. Using if/else compiles to a single predicted
-                // branch instead of a jump table.
                 if msg_type == b'D' {
-                    // DataRow — parse column offsets from stream_buf payload.
-                    parse_data_row_flat(
+                    // DataRow — append payload to response buffer, record offsets.
+                    parse_data_row_into_buf(
                         &self.stream_buf[payload_start..payload_end],
-                        arena,
+                        &mut resp_buf,
                         &mut all_col_offsets,
                     )?;
                 } else if msg_type == b'Z' {
-                    // ReadyForQuery — extract tx status and we're done.
                     if payload_len >= 1 {
                         self.tx_status = self.stream_buf[payload_start];
                     }
@@ -543,17 +549,19 @@ impl Connection {
                 self.stream_buf_pos += total_msg_len;
             }
 
-            // Need more data — compact and refill.
             self.refill_stream_buf()?;
         }
 
         self.shrink_buffers();
 
-        Ok(QueryResult::from_parts(
+        // QueryResult owns the response buffer directly — no arena copy.
+        // Column offsets already point into resp_buf.
+        Ok(QueryResult::from_parts_with_buf(
             all_col_offsets,
             num_cols,
             columns,
             affected_rows,
+            resp_buf,
         ))
     }
 
@@ -2707,7 +2715,74 @@ fn sync_buffered_read_exact(
 
 // --- DataRow parsing (duplicated here to avoid pub(crate) changes to conn.rs) ---
 
-/// Parse a DataRow message into flat column offset storage.
+/// Parse a DataRow into a response buffer (Vec<u8>) — zero-copy style.
+///
+/// Appends ONLY column data bytes to `buf` (no length prefixes — they're
+/// parsed and discarded). Column offsets point into `buf`.
+///
+/// Cost per row: one bounds check + walk column headers (no memcpy per column,
+/// one extend_from_slice per row for all non-NULL column data).
+#[inline(always)]
+fn parse_data_row_into_buf(
+    data: &[u8],
+    buf: &mut Vec<u8>,
+    out: &mut Vec<(usize, i32)>,
+) -> Result<(), DriverError> {
+    if data.len() < 2 {
+        return Err(DriverError::Protocol("DataRow too short".into()));
+    }
+
+    let num_cols = i16::from_be_bytes([data[0], data[1]]);
+    if num_cols < 0 {
+        return Err(DriverError::Protocol(
+            "DataRow: negative column count".into(),
+        ));
+    }
+    let num_cols = num_cols as usize;
+    out.reserve(num_cols);
+
+    // Bulk append: copy the entire column section into buf in ONE memcpy,
+    // then walk column boundaries. ONE extend_from_slice per DataRow.
+    let col_data = &data[2..];
+    let base = buf.len();
+    buf.extend_from_slice(col_data);
+
+    // Walk columns within the buffer — no copying, just record offsets.
+    let mut pos: usize = 0;
+    for _ in 0..num_cols {
+        if pos + 4 > col_data.len() {
+            return Err(DriverError::Protocol("DataRow truncated".into()));
+        }
+
+        let col_len = i32::from_be_bytes([
+            col_data[pos],
+            col_data[pos + 1],
+            col_data[pos + 2],
+            col_data[pos + 3],
+        ]);
+        pos += 4;
+
+        if col_len < 0 {
+            out.push((0, -1));
+        } else {
+            let len = col_len as usize;
+            if pos + len > col_data.len() {
+                return Err(DriverError::Protocol(
+                    "DataRow column data truncated".into(),
+                ));
+            }
+            // Offset within buf where this column's data starts.
+            out.push((base + pos, col_len));
+            pos += len;
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a DataRow message into flat column offset storage (arena version).
+///
+/// Used by streaming queries where arena is the storage backend.
 fn parse_data_row_flat(
     data: &[u8],
     arena: &mut Arena,
@@ -2725,27 +2800,34 @@ fn parse_data_row_flat(
     }
     let num_cols = num_cols_raw as usize;
     out.reserve(num_cols);
-    let mut pos = 2;
 
+    // Bulk copy: one alloc_copy for the entire DataRow payload (after column count).
+    // Column data with length prefixes is stored contiguously in the arena.
+    let col_data = &data[2..];
+    let base = arena.alloc_copy(col_data);
+
+    // Walk column boundaries within the arena block.
+    let mut pos: usize = 0;
     for _ in 0..num_cols {
-        if pos + 4 > data.len() {
+        if pos + 4 > col_data.len() {
             return Err(DriverError::Protocol("DataRow truncated".into()));
         }
 
-        let col_len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        let col_len =
+            i32::from_be_bytes([col_data[pos], col_data[pos + 1], col_data[pos + 2], col_data[pos + 3]]);
         pos += 4;
 
         if col_len < 0 {
             out.push((0, -1));
         } else {
             let len = col_len as usize;
-            if pos + len > data.len() {
+            if pos + len > col_data.len() {
                 return Err(DriverError::Protocol(
                     "DataRow column data truncated".into(),
                 ));
             }
-            let offset = arena.alloc_copy(&data[pos..pos + len]);
-            out.push((offset, col_len));
+            // Point directly into the bulk-copied block — no per-column copy.
+            out.push((base + pos, col_len));
             pos += len;
         }
     }

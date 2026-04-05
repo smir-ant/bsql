@@ -310,13 +310,18 @@ pub struct Notification {
 /// }
 /// ```
 pub struct QueryResult {
-    /// All rows' column (arena_offset, length) pairs, contiguous.
-    /// length = -1 means NULL.
+    /// All rows' column (offset, length) pairs, contiguous.
+    /// length = -1 means NULL. Offsets point into `data_buf` if present,
+    /// otherwise into the arena.
     pub(crate) all_col_offsets: Vec<(usize, i32)>,
     /// Number of columns per row.
     pub(crate) num_cols: usize,
     pub(crate) columns: Arc<[ColumnDesc]>,
     pub(crate) affected_rows: u64,
+    /// Inline data buffer for non-streaming queries.
+    /// When present, column offsets point here instead of the arena.
+    /// This eliminates the final arena.alloc_copy for entire result sets.
+    pub(crate) data_buf: Option<Vec<u8>>,
 }
 
 impl QueryResult {
@@ -334,6 +339,24 @@ impl QueryResult {
             num_cols,
             columns,
             affected_rows,
+            data_buf: None,
+        }
+    }
+
+    /// Construct with inline data buffer (zero-copy from wire).
+    pub fn from_parts_with_buf(
+        all_col_offsets: Vec<(usize, i32)>,
+        num_cols: usize,
+        columns: Arc<[ColumnDesc]>,
+        affected_rows: u64,
+        data_buf: Vec<u8>,
+    ) -> Self {
+        Self {
+            all_col_offsets,
+            num_cols,
+            columns,
+            affected_rows,
+            data_buf: if data_buf.is_empty() { None } else { Some(data_buf) },
         }
     }
 
@@ -360,11 +383,13 @@ impl QueryResult {
         &self.columns
     }
 
-    /// Get a row by index. The returned `Row` borrows from the arena.
+    /// Get a row by index. The returned `Row` borrows from the arena or
+    /// the inline data buffer.
     pub fn row<'a>(&'a self, idx: usize, arena: &'a Arena) -> Row<'a> {
         let start = idx * self.num_cols;
         let end = start + self.num_cols;
         Row {
+            data: self.data_buf.as_deref(),
             arena,
             col_offsets: &self.all_col_offsets[start..end],
             columns: &self.columns,
@@ -383,11 +408,11 @@ impl QueryResult {
     pub fn rows<'a>(&'a self, arena: &'a Arena) -> impl Iterator<Item = Row<'a>> {
         let num_cols = self.num_cols;
         let columns = &self.columns;
+        let data = self.data_buf.as_deref();
         self.all_col_offsets
-            // .max(1) prevents a panic from chunks(0) when num_cols is 0
-            // (e.g., commands with no columns like INSERT without RETURNING).
             .chunks(num_cols.max(1))
             .map(move |chunk| Row {
+                data,
                 arena,
                 col_offsets: chunk,
                 columns,
@@ -406,6 +431,9 @@ impl QueryResult {
 /// as `None` rather than panicking -- a compliant PostgreSQL server always
 /// sends correctly-sized data for the declared type.
 pub struct Row<'a> {
+    /// Inline data buffer (when QueryResult has data_buf).
+    /// If present, column offsets point here. Otherwise they point into arena.
+    data: Option<&'a [u8]>,
     arena: &'a Arena,
     col_offsets: &'a [(usize, i32)],
     columns: &'a [ColumnDesc],
@@ -417,6 +445,8 @@ impl<'a> Row<'a> {
         let (offset, len) = self.col_offsets[idx];
         if len < 0 {
             None
+        } else if let Some(buf) = self.data {
+            Some(&buf[offset..offset + len as usize])
         } else {
             Some(self.arena.get(offset, len as usize))
         }
@@ -1213,6 +1243,7 @@ mod tests {
             num_cols: 0,
             columns: Arc::from(Vec::new()),
             affected_rows: 0,
+            data_buf: None,
         };
         assert!(result.is_empty());
         assert_eq!(result.len(), 0);
@@ -1233,6 +1264,7 @@ mod tests {
             num_cols: 0,
             columns: Arc::from(Vec::new()),
             affected_rows: 42,
+            data_buf: None,
         };
         assert_eq!(result.affected_rows, 42);
         assert!(result.is_empty());

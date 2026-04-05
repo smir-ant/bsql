@@ -371,20 +371,21 @@ fn arena_reset_reuse() {
     let sql = "SELECT generate_series(1, 50)::int4";
     let hash = hash_sql(sql);
 
-    // First query
+    // First query — data goes to QueryResult's inline data_buf, not arena.
     let r1 = conn.query(sql, hash, &[], &mut arena).unwrap();
     assert_eq!(r1.len(), 50);
-    let alloc_1 = arena.allocated();
-    assert!(alloc_1 > 0);
 
-    // Reset and reuse
+    // Verify rows are accessible (data_buf path works)
+    let row = r1.row(0, &arena);
+    assert!(row.get_i32(0).is_some());
+
+    // Reset arena (no-op for data_buf queries, but must not crash)
     arena.reset();
-    assert_eq!(arena.allocated(), 0);
 
     let r2 = conn.query(sql, hash, &[], &mut arena).unwrap();
     assert_eq!(r2.len(), 50);
-    // Should reuse the same memory
-    assert_eq!(arena.allocated(), alloc_1);
+    let row2 = r2.row(49, &arena);
+    assert!(row2.get_i32(0).is_some());
 }
 
 // --- Pool tests ---
