@@ -27,11 +27,10 @@
 
 use bsql::{BsqlError, Pool};
 
-#[tokio::main]
-async fn main() -> Result<(), BsqlError> {
+fn main() -> Result<(), BsqlError> {
     // Pool::connect() opens a connection pool to PostgreSQL.
     // The URL here is for runtime; compile-time validation uses BSQL_DATABASE_URL.
-    let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+    let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
 
     // ---------------------------------------------------------------
     // INSERT — .run() returns the number of affected rows (u64)
@@ -41,8 +40,7 @@ async fn main() -> Result<(), BsqlError> {
     let affected = bsql::query!(
         "INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)"
     )
-    .run(&pool)
-    .await?;
+    .run(&pool)?;
     println!("Inserted {affected} row(s)");
 
     // ---------------------------------------------------------------
@@ -51,8 +49,7 @@ async fn main() -> Result<(), BsqlError> {
     // Each row is a generated struct with typed fields matching the columns.
     // user.id: i32, user.name: String, user.email: String
     let users = bsql::query!("SELECT id, name, email FROM users")
-        .fetch(&pool)
-        .await?;
+        .fetch(&pool)?;
 
     for user in &users {
         println!("id={}, name={}, email={}", user.id, user.name, user.email);
@@ -66,8 +63,7 @@ async fn main() -> Result<(), BsqlError> {
     let user = bsql::query!(
         "SELECT id, name, email FROM users WHERE id = $id: i32 LIMIT 1"
     )
-    .fetch(&pool)
-    .await?
+    .fetch(&pool)?
     .pop(); // Option<Row> — None if no match
 
     if let Some(user) = user {
@@ -81,16 +77,14 @@ async fn main() -> Result<(), BsqlError> {
     let updated = bsql::query!(
         "UPDATE users SET email = $new_email: &str WHERE id = $id: i32"
     )
-    .run(&pool)
-    .await?;
+    .run(&pool)?;
     println!("Updated {updated} row(s)");
 
     // ---------------------------------------------------------------
     // DELETE — .run() returns how many rows were removed
     // ---------------------------------------------------------------
     let deleted = bsql::query!("DELETE FROM users WHERE id = $id: i32")
-        .run(&pool)
-        .await?;
+        .run(&pool)?;
     println!("Deleted {deleted} row(s)");
 
     Ok(())

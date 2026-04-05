@@ -33,26 +33,23 @@
 //! ```
 
 use bsql::{BsqlError, Pool};
-use futures::StreamExt;
 
-#[tokio::main]
-async fn main() -> Result<(), BsqlError> {
-    let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+fn main() -> Result<(), BsqlError> {
+    let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
 
     // ---------------------------------------------------------------
     // Stream all rows — constant memory regardless of table size
     // ---------------------------------------------------------------
-    // fetch_stream returns a Stream<Item = Result<Row>>. Rows arrive
-    // in batches of 64, but are yielded one at a time.
+    // fetch_stream returns a Stream that yields rows one at a time.
+    // Use advance() to step forward, then next_row() to access the row.
     let mut stream = bsql::query!(
         "SELECT id, kind, payload FROM events ORDER BY id"
     )
-    .fetch_stream(&pool)
-    .await?;
+    .fetch_stream(&pool)?;
 
     let mut count = 0u64;
-    while let Some(event) = stream.next().await {
-        let event = event?;
+    while stream.advance()? {
+        let event = stream.next_row()?;
         count += 1;
 
         // Process each row without accumulating. In a real app, you
@@ -73,12 +70,11 @@ async fn main() -> Result<(), BsqlError> {
     let mut stream = bsql::query!(
         "SELECT id, kind, payload FROM events WHERE kind = $kind: &str ORDER BY id"
     )
-    .fetch_stream(&pool)
-    .await?;
+    .fetch_stream(&pool)?;
 
     let mut signup_count = 0u64;
-    while let Some(event) = stream.next().await {
-        let event = event?;
+    while stream.advance()? {
+        let event = stream.next_row()?;
         signup_count += 1;
 
         if signup_count <= 3 {

@@ -13,13 +13,15 @@ fn bench_sqlite_path() -> String {
 }
 
 fn bench_sqlite_fetch_many(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let path = bench_sqlite_path();
 
-    // -- bsql SQLite pool --
+    // sqlx is still async — it needs a runtime for its pool
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // -- bsql SQLite pool (sync) --
     let bsql_pool = bsql::SqlitePool::connect(&path).unwrap();
 
-    // -- sqlx SQLite pool --
+    // -- sqlx SQLite pool (async) --
     let sqlx_pool = rt.block_on(async {
         sqlx::SqlitePool::connect(&format!("sqlite:{path}"))
             .await
@@ -45,7 +47,7 @@ fn bench_sqlite_fetch_many(c: &mut Criterion) {
     let mut group = c.benchmark_group("sqlite_fetch_many");
 
     for &n in row_counts {
-        // -- bsql (for_each — fastest path, zero-copy) --
+        // -- bsql (for_each — fastest path, zero-copy, sync) --
         group.bench_with_input(BenchmarkId::new("bsql", n), &n, |b, &n| {
             b.iter(|| {
                 let mut count = 0u64;
@@ -61,16 +63,18 @@ fn bench_sqlite_fetch_many(c: &mut Criterion) {
             });
         });
 
-        // -- sqlx --
+        // -- sqlx (async — needs runtime) --
         group.bench_with_input(BenchmarkId::new("sqlx", n), &n, |b, &n| {
-            b.to_async(&rt).iter(|| async {
-                let _rows: Vec<(i64, String, String, bool, f64)> = sqlx::query_as(
-                    "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT ?1",
-                )
-                .bind(n)
-                .fetch_all(&sqlx_pool)
-                .await
-                .unwrap();
+            b.iter(|| {
+                rt.block_on(async {
+                    let _rows: Vec<(i64, String, String, bool, f64)> = sqlx::query_as(
+                        "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT ?1",
+                    )
+                    .bind(n)
+                    .fetch_all(&sqlx_pool)
+                    .await
+                    .unwrap();
+                });
             });
         });
 

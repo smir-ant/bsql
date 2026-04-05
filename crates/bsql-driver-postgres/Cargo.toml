@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 description = "PostgreSQL wire protocol driver for bsql — binary protocol, arena allocation, zero-copy"
 
 [features]

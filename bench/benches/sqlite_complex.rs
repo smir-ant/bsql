@@ -11,8 +11,10 @@ fn bench_sqlite_path() -> String {
 }
 
 fn bench_sqlite_join_aggregate(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let path = bench_sqlite_path();
+
+    // sqlx is still async — it needs a runtime for its pool
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
     let bsql_pool = bsql::SqlitePool::connect(&path).unwrap();
 
@@ -51,7 +53,7 @@ fn bench_sqlite_join_aggregate(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("sqlite_join_aggregate");
 
-    // -- bsql (for_each — zero allocation) --
+    // -- bsql (for_each — zero allocation, sync) --
     group.bench_function("bsql", |b| {
         b.iter(|| {
             bsql::query!(
@@ -68,13 +70,15 @@ fn bench_sqlite_join_aggregate(c: &mut Criterion) {
         });
     });
 
-    // -- sqlx --
+    // -- sqlx (async — needs runtime) --
     group.bench_function("sqlx", |b| {
-        b.to_async(&rt).iter(|| async {
-            let _rows: Vec<(String, i32, f64)> = sqlx::query_as(sql_text)
-                .fetch_all(&sqlx_pool)
-                .await
-                .unwrap();
+        b.iter(|| {
+            rt.block_on(async {
+                let _rows: Vec<(String, i32, f64)> = sqlx::query_as(sql_text)
+                    .fetch_all(&sqlx_pool)
+                    .await
+                    .unwrap();
+            });
         });
     });
 
@@ -106,8 +110,10 @@ fn bench_sqlite_join_aggregate(c: &mut Criterion) {
 }
 
 fn bench_sqlite_subquery(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let path = bench_sqlite_path();
+
+    // sqlx is still async — it needs a runtime for its pool
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
     let bsql_pool = bsql::SqlitePool::connect(&path).unwrap();
 
@@ -127,7 +133,7 @@ fn bench_sqlite_subquery(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("sqlite_subquery");
 
-    // -- bsql (for_each — zero allocation) --
+    // -- bsql (for_each — zero allocation, sync) --
     group.bench_function("bsql", |b| {
         b.iter(|| {
             bsql::query!(
@@ -139,13 +145,15 @@ fn bench_sqlite_subquery(c: &mut Criterion) {
         });
     });
 
-    // -- sqlx --
+    // -- sqlx (async — needs runtime) --
     group.bench_function("sqlx", |b| {
-        b.to_async(&rt).iter(|| async {
-            let _rows: Vec<(i64, String, String)> = sqlx::query_as(sql_text)
-                .fetch_all(&sqlx_pool)
-                .await
-                .unwrap();
+        b.iter(|| {
+            rt.block_on(async {
+                let _rows: Vec<(i64, String, String)> = sqlx::query_as(sql_text)
+                    .fetch_all(&sqlx_pool)
+                    .await
+                    .unwrap();
+            });
         });
     });
 

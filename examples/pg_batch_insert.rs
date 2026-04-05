@@ -22,9 +22,8 @@
 
 use bsql::{BsqlError, Pool};
 
-#[tokio::main]
-async fn main() -> Result<(), BsqlError> {
-    let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+fn main() -> Result<(), BsqlError> {
+    let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
 
     // Sample data — imagine hundreds or thousands of rows.
     let users = vec![
@@ -36,18 +35,17 @@ async fn main() -> Result<(), BsqlError> {
     // ---------------------------------------------------------------
     // Batch INSERT with .defer() — one round-trip for N inserts
     // ---------------------------------------------------------------
-    let tx = pool.begin().await?;
+    let tx = pool.begin()?;
 
     // .defer() buffers each INSERT — no network I/O yet.
     for (name, email) in &users {
         bsql::query!("INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)")
-            .defer(&tx)
-            .await?;
+            .defer(&tx)?;
     }
 
     // commit() sends ALL buffered INSERTs in one pipeline round-trip.
     // 3 inserts = 1 round-trip, not 3.
-    tx.commit().await?;
+    tx.commit()?;
 
     println!("Inserted {} users in one round-trip", users.len());
 
@@ -55,8 +53,7 @@ async fn main() -> Result<(), BsqlError> {
     // Verify the inserts
     // ---------------------------------------------------------------
     let rows = bsql::query!("SELECT id, name, email FROM users")
-        .fetch(&pool)
-        .await?;
+        .fetch(&pool)?;
 
     for row in &rows {
         println!("  id={}, name={}, email={}", row.id, row.name, row.email);

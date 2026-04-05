@@ -13,13 +13,15 @@ fn bench_database_url() -> String {
 }
 
 fn bench_pg_fetch_one(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let url = bench_database_url();
 
-    // -- bsql pool --
-    let bsql_pool = rt.block_on(async { bsql::Pool::connect(&url).await.unwrap() });
+    // sqlx is still async — it needs a runtime for its pool
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // -- sqlx pool --
+    // -- bsql pool (sync) --
+    let bsql_pool = bsql::Pool::connect(&url).unwrap();
+
+    // -- sqlx pool (async) --
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
     // -- diesel connection --
@@ -27,13 +29,12 @@ fn bench_pg_fetch_one(c: &mut Criterion) {
     let mut diesel_conn = PgConnection::establish(&url).unwrap();
 
     // Warm up: run the query once on each backend
-    rt.block_on(async {
+    {
         let id = 42i32;
         let _row = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
             .fetch_one(&bsql_pool)
-            .await
             .unwrap();
-    });
+    }
     rt.block_on(async {
         let _row: (i32, String, String) =
             sqlx::query_as("SELECT id, name, email FROM bench_users WHERE id = $1")
@@ -64,26 +65,27 @@ fn bench_pg_fetch_one(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("pg_fetch_one");
 
-    // -- bsql --
+    // -- bsql (sync) --
     group.bench_function("bsql", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             let id = 42i32;
             let _user = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
                 .fetch_one(&bsql_pool)
-                .await
                 .unwrap();
         });
     });
 
-    // -- sqlx --
+    // -- sqlx (async — needs runtime) --
     group.bench_function("sqlx", |b| {
-        b.to_async(&rt).iter(|| async {
-            let _user: (i32, String, String) =
-                sqlx::query_as("SELECT id, name, email FROM bench_users WHERE id = $1")
-                    .bind(42i32)
-                    .fetch_one(&sqlx_pool)
-                    .await
-                    .unwrap();
+        b.iter(|| {
+            rt.block_on(async {
+                let _user: (i32, String, String) =
+                    sqlx::query_as("SELECT id, name, email FROM bench_users WHERE id = $1")
+                        .bind(42i32)
+                        .fetch_one(&sqlx_pool)
+                        .await
+                        .unwrap();
+            });
         });
     });
 

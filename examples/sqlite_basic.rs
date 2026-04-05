@@ -26,8 +26,7 @@
 
 use bsql::{BsqlError, SqlitePool};
 
-#[tokio::main]
-async fn main() -> Result<(), BsqlError> {
+fn main() -> Result<(), BsqlError> {
     // SqlitePool::open() opens a pool with 1 writer + 4 reader connections.
     // WAL mode, mmap, and page cache are configured automatically.
     let pool = SqlitePool::open("./myapp.db")?;
@@ -40,16 +39,14 @@ async fn main() -> Result<(), BsqlError> {
     let affected = bsql::query!(
         "INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)"
     )
-    .run(&pool)
-    .await?;
+    .run(&pool)?;
     println!("Inserted {affected} row(s)");
 
     // ---------------------------------------------------------------
     // SELECT all — .fetch() returns Vec<Row>
     // ---------------------------------------------------------------
     let users = bsql::query!("SELECT id, name, email FROM users")
-        .fetch(&pool)
-        .await?;
+        .fetch(&pool)?;
 
     for user in &users {
         println!("id={}, name={}, email={}", user.id, user.name, user.email);
@@ -63,8 +60,7 @@ async fn main() -> Result<(), BsqlError> {
     let user = bsql::query!(
         "SELECT id, name, email FROM users WHERE id = $id: i64 LIMIT 1"
     )
-    .fetch(&pool)
-    .await?
+    .fetch(&pool)?
     .pop();
 
     if let Some(user) = user {
@@ -78,16 +74,14 @@ async fn main() -> Result<(), BsqlError> {
     let updated = bsql::query!(
         "UPDATE users SET email = $new_email: &str WHERE id = $id: i64"
     )
-    .run(&pool)
-    .await?;
+    .run(&pool)?;
     println!("Updated {updated} row(s)");
 
     // ---------------------------------------------------------------
     // DELETE
     // ---------------------------------------------------------------
     let deleted = bsql::query!("DELETE FROM users WHERE id = $id: i64")
-        .run(&pool)
-        .await?;
+        .run(&pool)?;
     println!("Deleted {deleted} row(s)");
 
     Ok(())

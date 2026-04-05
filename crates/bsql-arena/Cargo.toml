@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 description = "Bump allocator with thread-local recycling for bsql drivers"
 
 [dependencies]

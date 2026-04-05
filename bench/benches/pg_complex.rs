@@ -11,10 +11,12 @@ fn bench_database_url() -> String {
 }
 
 fn bench_pg_join_aggregate(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let url = bench_database_url();
 
-    let bsql_pool = rt.block_on(async { bsql::Pool::connect(&url).await.unwrap() });
+    // sqlx is still async — it needs a runtime for its pool
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let bsql_pool = bsql::Pool::connect(&url).unwrap();
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
     use diesel::prelude::*;
@@ -30,7 +32,7 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
         LIMIT 100";
 
     // Warm up
-    rt.block_on(async {
+    {
         let _rows = bsql::query!(
             "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
              FROM bench_users u
@@ -41,15 +43,14 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
              LIMIT 100"
         )
         .fetch_all(&bsql_pool)
-        .await
         .unwrap();
-    });
+    }
 
     let mut group = c.benchmark_group("pg_join_aggregate");
 
-    // -- bsql (for_each — zero allocation) --
+    // -- bsql (for_each — zero allocation, sync) --
     group.bench_function("bsql", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             bsql::query!(
                 "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
                  FROM bench_users u
@@ -60,18 +61,19 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
                  LIMIT 100"
             )
             .for_each(&bsql_pool, |_row| Ok(()))
-            .await
             .unwrap();
         });
     });
 
-    // -- sqlx --
+    // -- sqlx (async — needs runtime) --
     group.bench_function("sqlx", |b| {
-        b.to_async(&rt).iter(|| async {
-            let _rows: Vec<(String, i64, f64)> = sqlx::query_as(sql_text)
-                .fetch_all(&sqlx_pool)
-                .await
-                .unwrap();
+        b.iter(|| {
+            rt.block_on(async {
+                let _rows: Vec<(String, i64, f64)> = sqlx::query_as(sql_text)
+                    .fetch_all(&sqlx_pool)
+                    .await
+                    .unwrap();
+            });
         });
     });
 
@@ -103,10 +105,12 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
 }
 
 fn bench_pg_subquery(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
     let url = bench_database_url();
 
-    let bsql_pool = rt.block_on(async { bsql::Pool::connect(&url).await.unwrap() });
+    // sqlx is still async — it needs a runtime for its pool
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let bsql_pool = bsql::Pool::connect(&url).unwrap();
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
     use diesel::prelude::*;
@@ -119,26 +123,27 @@ fn bench_pg_subquery(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("pg_subquery");
 
-    // -- bsql (for_each — zero allocation) --
+    // -- bsql (for_each — zero allocation, sync) --
     group.bench_function("bsql", |b| {
-        b.to_async(&rt).iter(|| async {
+        b.iter(|| {
             bsql::query!(
                 "SELECT id, name, email FROM bench_users
                  WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)"
             )
             .for_each(&bsql_pool, |_row| Ok(()))
-            .await
             .unwrap();
         });
     });
 
-    // -- sqlx --
+    // -- sqlx (async — needs runtime) --
     group.bench_function("sqlx", |b| {
-        b.to_async(&rt).iter(|| async {
-            let _rows: Vec<(i32, String, String)> = sqlx::query_as(sql_text)
-                .fetch_all(&sqlx_pool)
-                .await
-                .unwrap();
+        b.iter(|| {
+            rt.block_on(async {
+                let _rows: Vec<(i32, String, String)> = sqlx::query_as(sql_text)
+                    .fetch_all(&sqlx_pool)
+                    .await
+                    .unwrap();
+            });
         });
     });
 

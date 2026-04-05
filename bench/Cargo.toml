@@ -58,16 +58,17 @@ bsql = { path = "../crates/bsql", features = ["time", "uuid", "sqlite"] }
 bsql-core = { path = "../crates/bsql-core", features = ["sqlite"] }
 bsql-driver-postgres = { path = "../crates/bsql-driver-postgres" }
 bsql-driver-sqlite = { path = "../crates/bsql-driver-sqlite", default-features = false, features = ["system"] }
-tokio = { version = "1", features = ["full"] }
+# tokio — only needed for sqlx (which is still async) and mem binaries
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-# sqlx (PostgreSQL + SQLite)
+# sqlx (PostgreSQL + SQLite) — still async, needs its own runtime
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite"] }
 
 # diesel (PostgreSQL + SQLite)
 diesel = { version = "2", features = ["postgres", "sqlite"] }
 
 # Benchmarking
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.5" }
 
 # Maximum optimization — cross-crate inlining is critical for bsql
 # because the hot path spans bsql-driver-sqlite (ffi.rs StmtHandle methods)

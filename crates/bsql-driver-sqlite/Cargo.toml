@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 description = "SQLite driver for bsql — direct FFI, arena allocation, dedicated-thread pool"
 
 [features]

@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "0.15.0"
+version = "0.17.0"
 dependencies = [
  "bsql-core",
  "bsql-driver-sqlite",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-arena"
-version = "0.15.0"
+version = "0.17.0"
 dependencies = [
  "simdutf8",
 ]
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-core"
-version = "0.15.0"
+version = "0.17.0"
 dependencies = [
  "bsql-arena",
  "bsql-driver-postgres",
@@ -144,13 +144,12 @@ dependencies = [
  "rapidhash",
  "smallvec",
  "time",
- "tokio",
  "uuid",
 ]
 
 [[package]]
 name = "bsql-driver-postgres"
-version = "0.15.0"
+version = "0.17.0"
 dependencies = [
  "base64",
  "bsql-arena",
@@ -164,14 +163,13 @@ dependencies = [
  "smallvec",
  "socket2 0.5.10",
  "time",
- "tokio",
  "uuid",
  "zeroize",
 ]
 
 [[package]]
 name = "bsql-driver-sqlite"
-version = "0.15.0"
+version = "0.17.0"
 dependencies = [
  "bsql-arena",
  "libsqlite3-sys",
@@ -181,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-macros"
-version = "0.15.0"
+version = "0.17.0"
 dependencies = [
  "bitcode",
  "bsql-core",
@@ -192,7 +190,6 @@ dependencies = [
  "quote",
  "smallvec",
  "syn",
- "tokio",
 ]
 
 [[package]]
@@ -343,7 +340,6 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
- "futures",
  "is-terminal",
  "itertools",
  "num-traits",
@@ -356,7 +352,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tinytemplate",
- "tokio",
  "walkdir",
 ]
 
@@ -579,16 +574,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
-name = "errno"
-version = "0.3.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "etcetera"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,20 +637,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "futures"
-version = "0.3.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-io",
- "futures-sink",
- "futures-task",
- "futures-util",
 ]
 
 [[package]]
@@ -1630,16 +1601,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "signal-hook-registry"
-version = "1.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
-dependencies = [
- "errno",
- "libc",
-]
-
-[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2055,9 +2016,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",

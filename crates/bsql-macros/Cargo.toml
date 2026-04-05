@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 description = "Proc macros for bsql — compile-time safe SQL for Rust"
 
 [lib]

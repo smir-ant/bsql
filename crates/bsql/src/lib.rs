@@ -5,9 +5,7 @@
 //! **If it compiles, the SQL is correct.**
 //!
 //! bsql validates every SQL query against a real database at compile time.
-//! There is no `query()` function. There is no escape hatch. There is `query!`
-//! — validated, typed, checked. If the binary is produced, every SQL query in
-//! it is correct.
+//! No runtime, no async — just safe, fast, synchronous SQL.
 //!
 //! ## Quick Start
 //!
@@ -16,50 +14,44 @@
 //! bsql = "0.17"
 //! ```
 //!
-//! Set the database URL for compile-time validation:
-//! ```bash
-//! export BSQL_DATABASE_URL="postgres://user:pass@localhost/mydb"
-//! ```
+//! ```rust,ignore
+//! use bsql::Pool;
 //!
-//! Then:
-//! ```rust,no_run
-//! use bsql::{Pool, BsqlError};
-//!
-//! fn main() -> Result<(), BsqlError> {
+//! fn main() -> Result<(), bsql::BsqlError> {
 //!     let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
 //!
-//!     // Every query is validated against the real database at compile time.
-//!     // If this compiles, the SQL is correct — tables, columns, types, all checked.
-//!     //
-//!     //   let id = 1i32;
-//!     //   let users = bsql::query!(
-//!     //       "SELECT id, login, active FROM users WHERE id = $id: i32"
-//!     //   ).fetch(&pool)?;
-//!     //   let user = &users[0];
-//!     //
-//!     // The result struct has typed fields:
-//!     //   user.id: i32, user.login: String, user.active: bool
-//!     //   println!("{}: {}", user.id, user.login);
+//!     let id = 1i32;
+//!     let users = bsql::query!(
+//!         "SELECT id, login, active FROM users WHERE id = $id: i32"
+//!     ).fetch(&pool)?;
 //!
+//!     let user = &users[0];
+//!     // user.id: i32, user.login: String, user.active: bool
+//!     println!("{}: active={}", user.login, user.active);
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ## Three methods — that's it
+//! ## Two methods — that's it
 //!
 //! | Method | Returns | Use |
 //! |--------|---------|-----|
 //! | `.fetch(&pool)` | `Vec<Row>` | SELECT queries |
 //! | `.run(&pool)` | `u64` | INSERT, UPDATE, DELETE |
-//! | `.defer(&tx)` | `()` | Buffer in transaction |
 //!
-//! Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also available.
+//! Also: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each`, `defer` (for transactions).
 //!
-//! ## No escape hatch
+//! ## Escape hatch
 //!
-//! There is no `bsql::query()` function. There is no `raw_sql()`. There is no
-//! way to execute unchecked SQL through bsql. If you need unchecked SQL, use
-//! a raw PostgreSQL driver directly. bsql will not become the thing it replaces.
+//! For rare cases requiring dynamic SQL (dynamic table names, pivots, DDL):
+//!
+//! ```rust,ignore
+//! let rows = pool.raw_query("SELECT * FROM pg_tables LIMIT 5")?;
+//! pool.raw_execute("CREATE INDEX CONCURRENTLY idx ON users (email)")?;
+//! ```
+//!
+//! `raw_query` / `raw_execute` bypass compile-time validation entirely.
+//! Use `query!` for everything else.
 
 // Re-export the query! macro and attribute macros
 pub use bsql_macros::pg_enum;
