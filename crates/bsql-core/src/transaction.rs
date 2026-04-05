@@ -14,7 +14,7 @@
 use std::fmt;
 use std::sync::Mutex;
 
-use bsql_driver_postgres::arena::acquire_arena;
+use bsql_driver_postgres::Arena;
 use bsql_driver_postgres::codec::Encode;
 
 use crate::error::{BsqlError, BsqlResult, QueryError};
@@ -183,9 +183,9 @@ impl Transaction {
     ) -> BsqlResult<OwnedResult> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
-        let mut arena = acquire_arena();
+        let arena = Arena::new();
         let result = tx
-            .query(sql, sql_hash, params, &mut arena)
+            .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }

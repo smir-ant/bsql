@@ -22,14 +22,13 @@
 //! # fn example() -> Result<(), bsql_driver_postgres::DriverError> {
 //! let pool = Pool::connect("postgres://user:pass@localhost/db")?;
 //! let mut conn = pool.acquire()?;
-//! let mut arena = Arena::new();
+//! let arena = Arena::new();
 //!
 //! let hash = bsql_driver_postgres::hash_sql("SELECT $1::int4 + $2::int4 AS sum");
 //! let result = conn.query(
 //!     "SELECT $1::int4 + $2::int4 AS sum",
 //!     hash,
 //!     &[&1i32, &2i32],
-//!     &mut arena,
 //! )?;
 //!
 //! let row = result.row(0, &arena);

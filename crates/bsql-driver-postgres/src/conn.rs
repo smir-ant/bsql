@@ -42,15 +42,17 @@ use crate::types::{
 /// # Example
 ///
 /// ```no_run
-/// use bsql_driver_postgres::{Connection, Config, Arena};
+/// # fn main() -> Result<(), bsql_driver_postgres::DriverError> {
+/// use bsql_driver_postgres::{Connection, Config};
 ///
-/// let config = Config::from_url("postgres://user:pass@localhost/db").unwrap();
-/// let mut conn = Connection::connect(&config).unwrap();
-/// let mut arena = Arena::new();
+/// let config = Config::from_url("postgres://user:pass@localhost/db")?;
+/// let mut conn = Connection::connect(&config)?;
 ///
 /// let hash = bsql_driver_postgres::hash_sql("SELECT 1 AS n");
-/// let result = conn.query("SELECT 1 AS n", hash, &[], &mut arena).unwrap();
+/// let result = conn.query("SELECT 1 AS n", hash, &[])?;
 /// assert_eq!(result.len(), 1);
+/// # Ok(())
+/// # }
 /// ```
 pub struct Connection {
     stream: Stream,
@@ -71,7 +73,8 @@ pub struct Connection {
     max_stmt_cache_size: usize,
     query_counter: u64,
     /// The config used to connect — stored for cancel() which needs host:port.
-    connect_config: Config,
+    /// Wrapped in Arc to avoid cloning 5 Strings per connection open.
+    connect_config: Arc<Config>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -97,6 +100,14 @@ impl Connection {
     /// Returns an error if the connection fails, TLS upgrade fails
     /// (when required), or authentication fails.
     pub fn connect(config: &Config) -> Result<Self, DriverError> {
+        Self::connect_arc(Arc::new(config.clone()))
+    }
+
+    /// Connect using a shared config. Avoids cloning the Config strings.
+    ///
+    /// Preferred by the connection pool, which holds `Arc<Config>` and opens
+    /// new connections without 5 String clones per open.
+    pub fn connect_arc(config: Arc<Config>) -> Result<Self, DriverError> {
         config.validate()?;
 
         let stream = if config.host_is_uds() {
@@ -192,7 +203,7 @@ impl Connection {
             connect_config: config.clone(),
         };
 
-        conn.startup(config)?;
+        conn.startup(&config)?;
         conn.validate_server_params()?;
 
         if config.statement_timeout_secs > 0 {
@@ -423,19 +434,22 @@ impl Connection {
         Ok(())
     }
 
-    /// Execute a prepared query and return rows in arena-allocated storage.
+    /// Execute a prepared query and return rows.
     ///
     /// Optimized path: after `send_pipeline` flushes, we parse BindComplete +
     /// DataRow* + CommandComplete + ReadyForQuery directly from `stream_buf`,
     /// avoiding per-message `read_message_buffered` overhead. DataRow payloads
-    /// are parsed in-place from stream_buf into arena storage.
+    /// are parsed in-place from stream_buf into a response buffer.
+    ///
+    /// Note: `arena` is not used — row data is stored in an inline `resp_buf`
+    /// owned by `QueryResult`. The parameter is kept for API compatibility
+    /// with the streaming path, but callers may pass any `&mut Arena`.
     #[inline]
     pub fn query(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-        arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
         let columns = self
             .send_pipeline(sql, sql_hash, params, true, true)?
@@ -2750,7 +2764,6 @@ fn parse_data_row_into_buf(
         ));
     }
     let num_cols = num_cols as usize;
-    out.reserve(num_cols);
 
     // Bulk append: copy the entire column section into buf in ONE memcpy,
     // then walk column boundaries. ONE extend_from_slice per DataRow.
@@ -3093,7 +3106,6 @@ mod tests {
     fn sync_query_with_params_if_pg_available() {
         let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
         let mut conn = Connection::connect(&config).unwrap();
-        let mut arena = Arena::new();
         let sql = "SELECT $1::int4 + $2::int4 AS sum";
         let hash = hash_sql(sql);
         let a: i32 = 10;
@@ -3103,7 +3115,6 @@ mod tests {
                 sql,
                 hash,
                 &[&a as &(dyn Encode + Sync), &b as &(dyn Encode + Sync)],
-                &mut arena,
             )
             .unwrap();
         assert_eq!(result.len(), 1);
@@ -3193,20 +3204,17 @@ mod tests {
     fn sync_stmt_cache_hit_miss_if_pg_available() {
         let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
         let mut conn = Connection::connect(&config).unwrap();
-        let mut arena = Arena::new();
         let sql1 = "SELECT 1";
         let hash1 = hash_sql(sql1);
-        conn.query(sql1, hash1, &[], &mut arena).unwrap();
+        conn.query(sql1, hash1, &[]).unwrap();
         assert_eq!(conn.stmt_cache_len(), 1);
         // Same query = cache hit
-        arena.reset();
-        conn.query(sql1, hash1, &[], &mut arena).unwrap();
+        conn.query(sql1, hash1, &[]).unwrap();
         assert_eq!(conn.stmt_cache_len(), 1);
         // Different query = cache miss
         let sql2 = "SELECT 2";
         let hash2 = hash_sql(sql2);
-        arena.reset();
-        conn.query(sql2, hash2, &[], &mut arena).unwrap();
+        conn.query(sql2, hash2, &[]).unwrap();
         assert_eq!(conn.stmt_cache_len(), 2);
         let _ = conn.close();
     }
@@ -3216,10 +3224,9 @@ mod tests {
     fn sync_invalid_sql_error_if_pg_available() {
         let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
         let mut conn = Connection::connect(&config).unwrap();
-        let mut arena = Arena::new();
         let sql = "SELECTTTT INVALID GARBAGE";
         let hash = hash_sql(sql);
-        let result = conn.query(sql, hash, &[], &mut arena);
+        let result = conn.query(sql, hash, &[]);
         assert!(result.is_err());
         // Connection should still be usable after error
         assert!(conn.is_idle());
@@ -3248,12 +3255,10 @@ mod tests {
         let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
         let mut conn = Connection::connect(&config).unwrap();
         conn.set_max_stmt_cache_size(3);
-        let mut arena = Arena::new();
         for i in 0..5 {
             let sql = format!("SELECT {}", i);
             let hash = hash_sql(&sql);
-            arena.reset();
-            conn.query(&sql, hash, &[], &mut arena).unwrap();
+            conn.query(&sql, hash, &[]).unwrap();
         }
         // Cache should not exceed max_stmt_cache_size
         assert!(
@@ -3286,12 +3291,11 @@ mod tests {
     fn sync_query_null_params_if_pg_available() {
         let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
         let mut conn = Connection::connect(&config).unwrap();
-        let mut arena = Arena::new();
         let sql = "SELECT $1::int4 IS NULL AS is_null";
         let hash = hash_sql(sql);
         let val: Option<i32> = None;
         let _result = conn
-            .query(sql, hash, &[&val as &(dyn Encode + Sync)], &mut arena)
+            .query(sql, hash, &[&val as &(dyn Encode + Sync)])
             .unwrap();
         let _ = conn.close();
     }
@@ -3301,7 +3305,6 @@ mod tests {
     fn sync_query_various_param_types_if_pg_available() {
         let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
         let mut conn = Connection::connect(&config).unwrap();
-        let mut arena = Arena::new();
         let sql = "SELECT $1::int4, $2::int8, $3::text, $4::bool, $5::float8";
         let hash = hash_sql(sql);
         let p1: i32 = 42;
@@ -3320,7 +3323,6 @@ mod tests {
                     &p4 as &(dyn Encode + Sync),
                     &p5 as &(dyn Encode + Sync),
                 ],
-                &mut arena,
             )
             .unwrap();
         assert_eq!(result.len(), 1);

@@ -44,7 +44,7 @@ struct PoolInner {
     stack: std::sync::Mutex<Vec<Connection>>,
     max_size: usize,
     open_count: AtomicUsize,
-    config: Config,
+    config: Arc<Config>,
     /// When true, no new acquires are accepted.
     closed: AtomicBool,
     /// Condvar pair for release notification. Waiters block on the Condvar
@@ -131,7 +131,7 @@ impl Pool {
         }
 
         // Open a new connection
-        let conn_result = Connection::connect(&self.inner.config);
+        let conn_result = Connection::connect_arc(self.inner.config.clone());
         match conn_result {
             Ok(mut conn) => {
                 // Configure statement cache size
@@ -411,7 +411,7 @@ impl PoolBuilder {
             .url
             .ok_or_else(|| DriverError::Pool("pool builder requires a URL".into()))?;
 
-        let config = Config::from_url(&url)?;
+        let config = Arc::new(Config::from_url(&url)?);
 
         let pool = Pool {
             inner: Arc::new(PoolInner {
@@ -466,7 +466,7 @@ fn maintain_min_idle(inner: Arc<PoolInner>) {
                 continue;
             }
 
-            match Connection::connect(&inner.config) {
+            match Connection::connect_arc(inner.config.clone()) {
                 Ok(conn) => {
                     let mut stack = inner.stack.lock().unwrap_or_else(|e| e.into_inner());
                     stack.push(conn);
@@ -538,18 +538,17 @@ impl PoolGuard {
 
     // --- Query dispatch methods ---
 
-    /// Execute a prepared query and return rows in arena-allocated storage.
+    /// Execute a prepared query and return rows.
     pub fn query(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-        arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
         self.conn
             .as_mut()
             .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .query(sql, sql_hash, params, arena)
+            .query(sql, sql_hash, params)
     }
 
     /// Execute a query without result rows (INSERT/UPDATE/DELETE).
@@ -805,12 +804,11 @@ impl Transaction {
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-        arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
         if self.deferred_count > 0 {
             self.flush_deferred()?;
         }
-        self.guard.query(sql, sql_hash, params, arena)
+        self.guard.query(sql, sql_hash, params)
     }
 
     /// Execute without result rows within the transaction.

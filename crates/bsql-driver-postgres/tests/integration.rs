@@ -116,11 +116,11 @@ fn query_select_int() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::int4 AS val";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[&42i32], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[&42i32]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -133,7 +133,7 @@ fn query_all_base_types() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::bool, $2::int2, $3::int4, $4::int8, $5::float4, $6::float8, $7::text, $8::bytea";
     let hash = hash_sql(sql);
@@ -152,7 +152,6 @@ fn query_all_base_types() {
                 &"hello",
                 &bytea_val,
             ],
-            &mut arena,
         )
         .unwrap();
 
@@ -173,11 +172,11 @@ fn query_nullable_columns() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT NULL::int4, NULL::text, 42::int4";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -194,11 +193,10 @@ fn query_empty_result() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
 
     let sql = "SELECT 1 WHERE false";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[]).unwrap();
     assert!(result.is_empty());
     assert_eq!(result.len(), 0);
 }
@@ -208,11 +206,11 @@ fn query_multiple_rows() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT generate_series(1, 100) AS n";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[]).unwrap();
     assert_eq!(result.len(), 100);
 
     for (i, row) in result.rows(&arena).enumerate() {
@@ -225,19 +223,18 @@ fn query_statement_cache_hit() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::int4 + $2::int4 AS sum";
     let hash = hash_sql(sql);
 
     // First call: Parse+Bind+Execute
-    let r1 = conn.query(sql, hash, &[&1i32, &2i32], &mut arena).unwrap();
+    let r1 = conn.query(sql, hash, &[&1i32, &2i32]).unwrap();
     assert_eq!(r1.row(0, &arena).get_i32(0), Some(3));
 
     // Second call: cache hit, only Bind+Execute
-    arena.reset();
     let r2 = conn
-        .query(sql, hash, &[&10i32, &20i32], &mut arena)
+        .query(sql, hash, &[&10i32, &20i32])
         .unwrap();
     assert_eq!(r2.row(0, &arena).get_i32(0), Some(30));
 }
@@ -268,7 +265,7 @@ fn query_insert_returning() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     conn.simple_query(
         "CREATE TEMP TABLE _driver_test_ret (id serial PRIMARY KEY, name text NOT NULL)",
@@ -277,7 +274,7 @@ fn query_insert_returning() {
 
     let sql = "INSERT INTO _driver_test_ret (name) VALUES ($1::text) RETURNING id, name";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[&"alice"], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[&"alice"]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -290,11 +287,10 @@ fn query_invalid_sql() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
 
     let sql = "SELECTT INVALID SYNTAX";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena);
+    let result = conn.query(sql, hash, &[]);
 
     match result {
         Err(DriverError::Server { code, message, .. }) => {
@@ -311,13 +307,13 @@ fn query_large_text() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     // 1MB text
     let big = "x".repeat(1_000_000);
     let sql = "SELECT $1::text AS big";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[&big.as_str()], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[&big.as_str()]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -331,7 +327,6 @@ fn query_long_sql() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
 
     // Build a very long SQL query (>100KB) using repeated UNION ALL
     let mut sql = String::from("SELECT 1 AS n");
@@ -339,7 +334,7 @@ fn query_long_sql() {
         sql.push_str(&format!(" UNION ALL SELECT {i}"));
     }
     let hash = hash_sql(&sql);
-    let result = conn.query(&sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(&sql, hash, &[]).unwrap();
     assert_eq!(result.len(), 500);
 }
 
@@ -350,11 +345,11 @@ fn arena_100_rows_single_chunk() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT generate_series(1, 100)::int4 AS n";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[]).unwrap();
     assert_eq!(result.len(), 100);
 
     // 100 int4 values = 400 bytes, should fit in initial 8KB chunk
@@ -366,13 +361,13 @@ fn arena_reset_reuse() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT generate_series(1, 50)::int4";
     let hash = hash_sql(sql);
 
     // First query — data goes to QueryResult's inline data_buf, not arena.
-    let r1 = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let r1 = conn.query(sql, hash, &[]).unwrap();
     assert_eq!(r1.len(), 50);
 
     // Verify rows are accessible (data_buf path works)
@@ -380,9 +375,8 @@ fn arena_reset_reuse() {
     assert!(row.get_i32(0).is_some());
 
     // Reset arena (no-op for data_buf queries, but must not crash)
-    arena.reset();
 
-    let r2 = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let r2 = conn.query(sql, hash, &[]).unwrap();
     assert_eq!(r2.len(), 50);
     let row2 = r2.row(49, &arena);
     assert!(row2.get_i32(0).is_some());
@@ -475,16 +469,15 @@ fn binary_roundtrip_bool() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::bool AS val";
     let hash = hash_sql(sql);
 
-    let r = conn.query(sql, hash, &[&true], &mut arena).unwrap();
+    let r = conn.query(sql, hash, &[&true]).unwrap();
     assert_eq!(r.row(0, &arena).get_bool(0), Some(true));
 
-    arena.reset();
-    let r = conn.query(sql, hash, &[&false], &mut arena).unwrap();
+    let r = conn.query(sql, hash, &[&false]).unwrap();
     assert_eq!(r.row(0, &arena).get_bool(0), Some(false));
 }
 
@@ -493,14 +486,13 @@ fn binary_roundtrip_i16() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::int2 AS val";
     let hash = hash_sql(sql);
 
     for val in [0i16, 1, -1, i16::MIN, i16::MAX] {
-        arena.reset();
-        let r = conn.query(sql, hash, &[&val], &mut arena).unwrap();
+        let r = conn.query(sql, hash, &[&val]).unwrap();
         assert_eq!(r.row(0, &arena).get_i16(0), Some(val));
     }
 }
@@ -510,14 +502,13 @@ fn binary_roundtrip_i32() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::int4 AS val";
     let hash = hash_sql(sql);
 
     for val in [0i32, 1, -1, i32::MIN, i32::MAX, 42, 1234567] {
-        arena.reset();
-        let r = conn.query(sql, hash, &[&val], &mut arena).unwrap();
+        let r = conn.query(sql, hash, &[&val]).unwrap();
         assert_eq!(r.row(0, &arena).get_i32(0), Some(val));
     }
 }
@@ -527,14 +518,13 @@ fn binary_roundtrip_i64() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::int8 AS val";
     let hash = hash_sql(sql);
 
     for val in [0i64, 1, -1, i64::MIN, i64::MAX, 9876543210] {
-        arena.reset();
-        let r = conn.query(sql, hash, &[&val], &mut arena).unwrap();
+        let r = conn.query(sql, hash, &[&val]).unwrap();
         assert_eq!(r.row(0, &arena).get_i64(0), Some(val));
     }
 }
@@ -544,14 +534,13 @@ fn binary_roundtrip_f32() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::float4 AS val";
     let hash = hash_sql(sql);
 
     for val in [0.0f32, 1.0, -1.0, 3.15, f32::MIN, f32::MAX] {
-        arena.reset();
-        let r = conn.query(sql, hash, &[&val], &mut arena).unwrap();
+        let r = conn.query(sql, hash, &[&val]).unwrap();
         let got = r.row(0, &arena).get_f32(0).unwrap();
         assert!((got - val).abs() < f32::EPSILON || got == val);
     }
@@ -562,14 +551,13 @@ fn binary_roundtrip_f64() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::float8 AS val";
     let hash = hash_sql(sql);
 
     for val in [0.0f64, 1.0, -1.0, std::f64::consts::PI] {
-        arena.reset();
-        let r = conn.query(sql, hash, &[&val], &mut arena).unwrap();
+        let r = conn.query(sql, hash, &[&val]).unwrap();
         let got = r.row(0, &arena).get_f64(0).unwrap();
         assert!((got - val).abs() < f64::EPSILON || got == val);
     }
@@ -580,14 +568,13 @@ fn binary_roundtrip_text() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::text AS val";
     let hash = hash_sql(sql);
 
     for val in ["", "hello", "unicode: \u{1F600}", "with\nnewlines\ttabs"] {
-        arena.reset();
-        let r = conn.query(sql, hash, &[&val], &mut arena).unwrap();
+        let r = conn.query(sql, hash, &[&val]).unwrap();
         assert_eq!(r.row(0, &arena).get_str(0), Some(val));
     }
 }
@@ -597,12 +584,12 @@ fn binary_roundtrip_bytea() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::bytea AS val";
     let hash = hash_sql(sql);
     let data: &[u8] = &[0, 1, 2, 255, 128, 64];
-    let result = conn.query(sql, hash, &[&data], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[&data]).unwrap();
     assert_eq!(result.row(0, &arena).get_bytes(0), Some(data));
 }
 
@@ -611,11 +598,11 @@ fn null_handling_all_types() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT NULL::bool, NULL::int2, NULL::int4, NULL::int8, NULL::float4, NULL::float8, NULL::text, NULL::bytea";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -660,7 +647,7 @@ fn multiple_queries_same_connection() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     // Different queries
     let sql1 = "SELECT 1::int4 AS a";
@@ -671,15 +658,13 @@ fn multiple_queries_same_connection() {
     let h2 = hash_sql(sql2);
     let h3 = hash_sql(sql3);
 
-    let r1 = conn.query(sql1, h1, &[], &mut arena).unwrap();
+    let r1 = conn.query(sql1, h1, &[]).unwrap();
     assert_eq!(r1.row(0, &arena).get_i32(0), Some(1));
 
-    arena.reset();
-    let r2 = conn.query(sql2, h2, &[], &mut arena).unwrap();
+    let r2 = conn.query(sql2, h2, &[]).unwrap();
     assert_eq!(r2.row(0, &arena).get_str(0), Some("hello"));
 
-    arena.reset();
-    let r3 = conn.query(sql3, h3, &[], &mut arena).unwrap();
+    let r3 = conn.query(sql3, h3, &[]).unwrap();
     let val = r3.row(0, &arena).get_f64(0).unwrap();
     assert!((val - 3.15).abs() < 1e-10);
 }
@@ -691,11 +676,10 @@ fn query_result_columns() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
 
     let sql = "SELECT 1::int4 AS id, 'test'::text AS name";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[]).unwrap();
 
     let cols = result.columns();
     assert_eq!(cols.len(), 2);
@@ -712,11 +696,11 @@ fn error_invalid_sql_has_code() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT * FROM _definitely_nonexistent_table_12345";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena);
+    let result = conn.query(sql, hash, &[]);
 
     match result {
         Err(DriverError::Server { code, message, .. }) => {
@@ -731,10 +715,9 @@ fn error_invalid_sql_has_code() {
     }
 
     // Connection should still be usable after error
-    arena.reset();
     let sql2 = "SELECT 1::int4";
     let hash2 = hash_sql(sql2);
-    let result = conn.query(sql2, hash2, &[], &mut arena).unwrap();
+    let result = conn.query(sql2, hash2, &[]).unwrap();
     assert_eq!(result.row(0, &arena).get_i32(0), Some(1));
 }
 
@@ -858,35 +841,32 @@ fn codec_nan_and_infinity() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     // NaN
     let sql = "SELECT $1::float4 AS f4, $2::float8 AS f8";
     let hash = hash_sql(sql);
     let result = conn
-        .query(sql, hash, &[&f32::NAN, &f64::NAN], &mut arena)
+        .query(sql, hash, &[&f32::NAN, &f64::NAN])
         .unwrap();
     let row = result.row(0, &arena);
     assert!(row.get_f32(0).unwrap().is_nan());
     assert!(row.get_f64(1).unwrap().is_nan());
 
     // Positive infinity
-    arena.reset();
     let result = conn
-        .query(sql, hash, &[&f32::INFINITY, &f64::INFINITY], &mut arena)
+        .query(sql, hash, &[&f32::INFINITY, &f64::INFINITY])
         .unwrap();
     let row = result.row(0, &arena);
     assert!(row.get_f32(0).unwrap().is_infinite());
     assert!(row.get_f64(1).unwrap().is_infinite());
 
     // Negative infinity
-    arena.reset();
     let result = conn
         .query(
             sql,
             hash,
             &[&f32::NEG_INFINITY, &f64::NEG_INFINITY],
-            &mut arena,
         )
         .unwrap();
     let row = result.row(0, &arena);
@@ -899,25 +879,23 @@ fn codec_empty_string_and_max_i64() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     // Empty string
     let sql = "SELECT $1::text AS val";
     let hash = hash_sql(sql);
     let empty = "";
-    let result = conn.query(sql, hash, &[&empty], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[&empty]).unwrap();
     assert_eq!(result.row(0, &arena).get_str(0), Some(""));
 
     // Max i64
-    arena.reset();
     let sql2 = "SELECT $1::int8 AS val";
     let hash2 = hash_sql(sql2);
-    let result = conn.query(sql2, hash2, &[&i64::MAX], &mut arena).unwrap();
+    let result = conn.query(sql2, hash2, &[&i64::MAX]).unwrap();
     assert_eq!(result.row(0, &arena).get_i64(0), Some(i64::MAX));
 
     // Min i64
-    arena.reset();
-    let result = conn.query(sql2, hash2, &[&i64::MIN], &mut arena).unwrap();
+    let result = conn.query(sql2, hash2, &[&i64::MIN]).unwrap();
     assert_eq!(result.row(0, &arena).get_i64(0), Some(i64::MIN));
 }
 
@@ -983,11 +961,11 @@ fn query_100k_rows() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT generate_series(1, 100000)::int4 AS n";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[]).unwrap();
 
     assert_eq!(result.len(), 100_000);
     // Spot-check first and last rows
@@ -1002,7 +980,7 @@ fn query_wide_50_columns() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     // Build SELECT 1 AS c01, 2 AS c02, ... , 50 AS c50
     let mut sql = String::with_capacity(512);
@@ -1014,7 +992,7 @@ fn query_wide_50_columns() {
         sql.push_str(&format!("{i}::int4 AS c{i:02}"));
     }
     let hash = hash_sql(&sql);
-    let result = conn.query(&sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(&sql, hash, &[]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -1031,11 +1009,11 @@ fn query_unicode_column_name() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT 1 AS \"colonn\u{00e9}\u{00e9}\"";
     let hash = hash_sql(sql);
-    let result = conn.query(sql, hash, &[], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -1228,10 +1206,9 @@ fn streaming_early_drop() {
     // Acquire again — the connection should be reusable.
     let mut guard2 = pool.acquire().unwrap();
     // The unnamed portal is auto-cleaned on next Bind. Run a normal query.
-    arena.reset();
     let sql2 = "SELECT 99::int4 AS n";
     let hash2 = hash_sql(sql2);
-    let result = guard2.query(sql2, hash2, &[], &mut arena).unwrap();
+    let result = guard2.query(sql2, hash2, &[]).unwrap();
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(99));
@@ -1244,12 +1221,12 @@ fn simd_utf8_text_column() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::text AS val";
     let hash = hash_sql(sql);
     let text = "Hello, world! Rust + PG";
-    let result = conn.query(sql, hash, &[&text], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[&text]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -1261,13 +1238,13 @@ fn simd_utf8_multibyte() {
     let url = require_db!();
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
 
     let sql = "SELECT $1::text AS val";
     let hash = hash_sql(sql);
     // Japanese, emoji, accented Latin — exercises multi-byte UTF-8 paths
     let text = "\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}\u{4e16}\u{754c} \u{1f600} caf\u{00e9}";
-    let result = conn.query(sql, hash, &[&text], &mut arena).unwrap();
+    let result = conn.query(sql, hash, &[&text]).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -1316,10 +1293,10 @@ fn defer_execute_commit_auto_flushes() {
 
     // Verify all 5 rows were inserted
     let mut conn = pool.acquire().unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
     let count_sql = "SELECT count(*)::int4 AS c FROM users WHERE login LIKE 'defer_commit_%'";
     let count_hash = hash_sql(count_sql);
-    let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
+    let result = conn.query(count_sql, count_hash, &[]).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(5));
 
@@ -1380,10 +1357,10 @@ fn defer_execute_auto_flushes_before_query() {
     assert_eq!(tx.deferred_count(), 1);
 
     // Query should auto-flush the deferred insert first
-    let mut arena = Arena::new();
+    let arena = Arena::new();
     let q_sql = "SELECT count(*)::int4 AS c FROM users WHERE login = 'defer_before_query'";
     let q_hash = hash_sql(q_sql);
-    let result = tx.query(q_sql, q_hash, &[], &mut arena).unwrap();
+    let result = tx.query(q_sql, q_hash, &[]).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(1));
     assert_eq!(tx.deferred_count(), 0);
@@ -1424,10 +1401,10 @@ fn defer_execute_100_inserts() {
 
     // Verify all 100 rows
     let mut conn = pool.acquire().unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
     let count_sql = "SELECT count(*)::int4 AS c FROM users WHERE login LIKE 'defer_100_%'";
     let count_hash = hash_sql(count_sql);
-    let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
+    let result = conn.query(count_sql, count_hash, &[]).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(100));
 
@@ -1477,10 +1454,10 @@ fn defer_execute_mixed_with_regular_execute() {
 
     // All 3 rows should exist
     let mut conn = pool.acquire().unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
     let count_sql = "SELECT count(*)::int4 AS c FROM users WHERE login LIKE 'defer_mixed_%'";
     let count_hash = hash_sql(count_sql);
-    let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
+    let result = conn.query(count_sql, count_hash, &[]).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(3));
 
@@ -1510,10 +1487,10 @@ fn defer_execute_rollback_discards_deferred() {
 
     // Verify nothing was inserted
     let mut conn = pool.acquire().unwrap();
-    let mut arena = Arena::new();
+    let arena = Arena::new();
     let count_sql = "SELECT count(*)::int4 AS c FROM users WHERE login = 'defer_rollback'";
     let count_hash = hash_sql(count_sql);
-    let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
+    let result = conn.query(count_sql, count_hash, &[]).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(0));
 }

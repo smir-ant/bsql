@@ -6,7 +6,7 @@
 //! The `query_raw` / `query_raw_readonly` methods use the bsql-driver's arena-based
 //! row storage. Generated code decodes columns from `Row` via typed getters.
 
-use bsql_driver_postgres::arena::{acquire_arena, release_arena};
+use bsql_driver_postgres::arena::release_arena;
 use bsql_driver_postgres::codec::Encode;
 use bsql_driver_postgres::{Arena, QueryResult};
 
@@ -105,9 +105,9 @@ impl Executor for Pool {
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
         let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        let mut arena = acquire_arena();
+        let arena = Arena::new();
         let result = guard
-            .query(sql, sql_hash, params, &mut arena)
+            .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
@@ -121,9 +121,9 @@ impl Executor for Pool {
         // Route to replica pool when configured; fall back to primary otherwise.
         let pool = self.read_pool.as_ref().unwrap_or(&self.inner);
         let mut guard = pool.acquire().map_err(BsqlError::from)?;
-        let mut arena = acquire_arena();
+        let arena = Arena::new();
         let result = guard
-            .query(sql, sql_hash, params, &mut arena)
+            .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
@@ -149,9 +149,9 @@ impl Executor for PoolConnection {
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut arena = acquire_arena();
+        let arena = Arena::new();
         let result = guard
-            .query(sql, sql_hash, params, &mut arena)
+            .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
