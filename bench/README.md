@@ -69,11 +69,11 @@ Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT querie
 
 | Library | Peak RSS | vs bsql |
 |---|---|---|
-| **bsql** | **1.85 MB** | <kbd>x1</kbd> |
-| C (libpq) | 6.50 MB | <kbd>x3.5</kbd> |
-| sqlx (Rust) | 6.59 MB | <kbd>x3.6</kbd> |
-| diesel (Rust) | 6.97 MB | <kbd>x3.8</kbd> |
-| Go (pgx) | 16.8 MB | <kbd>x9.1</kbd> |
+| **bsql** | **1.70 MB** | <kbd>x1</kbd> |
+| C (libpq) | 6.50 MB | <kbd>x3.8</kbd> |
+| sqlx (Rust) | 6.59 MB | <kbd>x3.9</kbd> |
+| diesel (Rust) | 6.97 MB | <kbd>x4.1</kbd> |
+| Go (pgx) | 16.8 MB | <kbd>x9.9</kbd> |
 
 Run the memory benchmarks:
 ```bash
