@@ -148,7 +148,7 @@ impl Executor for PoolConnection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut arena = acquire_arena();
         let result = guard
             .query(sql, sql_hash, params, &mut arena)
@@ -171,7 +171,7 @@ impl Executor for PoolConnection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .execute(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)

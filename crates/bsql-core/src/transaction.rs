@@ -108,7 +108,7 @@ impl Transaction {
         let tx = self
             .inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(Self::consumed_error)?;
         tx.commit().map_err(BsqlError::from)
@@ -122,7 +122,7 @@ impl Transaction {
         let tx = self
             .inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(Self::consumed_error)?;
         tx.rollback().map_err(BsqlError::from)
@@ -135,7 +135,7 @@ impl Transaction {
     pub fn savepoint(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("SAVEPOINT {name}");
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
@@ -146,7 +146,7 @@ impl Transaction {
     pub fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("RELEASE SAVEPOINT {name}");
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
@@ -157,7 +157,7 @@ impl Transaction {
     pub fn rollback_to(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("ROLLBACK TO SAVEPOINT {name}");
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
@@ -169,7 +169,7 @@ impl Transaction {
     /// data-modifying statement.
     pub fn set_isolation(&self, level: IsolationLevel) -> BsqlResult<()> {
         let sql = format!("SET TRANSACTION ISOLATION LEVEL {}", level.as_sql());
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
@@ -181,7 +181,7 @@ impl Transaction {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         let mut arena = acquire_arena();
         let result = tx
@@ -197,7 +197,7 @@ impl Transaction {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.execute(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)
@@ -214,7 +214,7 @@ impl Transaction {
         sql_hash: u64,
         param_sets: &[&[&(dyn Encode + Sync)]],
     ) -> BsqlResult<Vec<u64>> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.execute_pipeline(sql, sql_hash, param_sets)
             .map_err(BsqlError::from_driver_query)
@@ -243,7 +243,7 @@ impl Transaction {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<()> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.defer_execute(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)
@@ -255,7 +255,7 @@ impl Transaction {
     /// Returns the affected row count for each deferred operation.
     #[doc(hidden)]
     pub fn flush_deferred(&self) -> BsqlResult<Vec<u64>> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.flush_deferred().map_err(BsqlError::from_driver_query)
     }
@@ -267,7 +267,7 @@ impl Transaction {
     /// on commit or before any read.
     #[doc(hidden)]
     pub fn deferred_count(&self) -> usize {
-        let guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(tx) => tx.deferred_count(),
             None => 0,
@@ -288,7 +288,7 @@ impl Transaction {
     where
         F: FnMut(bsql_driver_postgres::PgDataRow<'_>) -> BsqlResult<()>,
     {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         let mut user_err: Option<BsqlError> = None;
         let driver_result = tx.for_each(sql, sql_hash, params, |row| match f(row) {
@@ -321,7 +321,7 @@ impl Transaction {
     where
         F: FnMut(&[u8]) -> BsqlResult<()>,
     {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         let mut user_err: Option<BsqlError> = None;
         let driver_result = tx.for_each_raw(sql, sql_hash, params, |data| match f(data) {

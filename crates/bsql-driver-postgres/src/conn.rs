@@ -609,7 +609,8 @@ impl Connection {
         let mut has_exec_sync = false;
 
         if can_use_template {
-            let tmpl = info.bind_template.as_ref().unwrap();
+            // SAFETY: can_use_template is true only when bind_template.is_some()
+            let tmpl = info.bind_template.as_ref().expect("guarded by can_use_template");
             self.write_buf.extend_from_slice(&tmpl.bytes);
 
             let mut template_ok = true;
@@ -1350,7 +1351,8 @@ impl Connection {
         let mut has_exec_sync = false;
 
         if can_use_template {
-            let tmpl = info.bind_template.as_ref().unwrap();
+            // SAFETY: can_use_template is true only when bind_template.is_some()
+            let tmpl = info.bind_template.as_ref().expect("guarded by can_use_template");
             self.write_buf.extend_from_slice(&tmpl.bytes);
 
             let mut template_ok = true;
@@ -1955,7 +1957,8 @@ impl Connection {
                 .is_some_and(|t| t.param_slots.len() == params.len());
 
             if can_use_template {
-                let tmpl = info.bind_template.as_ref().unwrap();
+                // SAFETY: can_use_template is true only when bind_template.is_some()
+                let tmpl = info.bind_template.as_ref().expect("guarded by can_use_template");
                 // Copy only the Bind portion (not EXECUTE_SYNC) — streaming
                 // needs Execute+Flush instead.
                 self.write_buf
@@ -2252,7 +2255,8 @@ impl Connection {
             if can_use_template {
                 // Fast path: copy template (includes EXECUTE_SYNC) and patch params
                 // directly via encode_at — no scratch buffer, no double-copy.
-                let tmpl = info.bind_template.as_ref().unwrap();
+                // SAFETY: can_use_template is true only when bind_template.is_some()
+                let tmpl = info.bind_template.as_ref().expect("guarded by can_use_template");
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
