@@ -110,6 +110,7 @@ pub trait Executor {
 }
 
 impl Executor for Pool {
+    #[inline]
     fn query_raw(
         &self,
         sql: &str,
@@ -123,6 +124,7 @@ impl Executor for Pool {
         Ok(OwnedResult::without_arena(result))
     }
 
+    #[inline]
     fn query_raw_readonly(
         &self,
         sql: &str,
@@ -137,6 +139,7 @@ impl Executor for Pool {
         Ok(OwnedResult::without_arena(result))
     }
 
+    #[inline]
     fn execute_raw(
         &self,
         sql: &str,
@@ -165,6 +168,7 @@ impl Executor for PoolConnection {
         Ok(OwnedResult::new(result, arena))
     }
 
+    #[inline]
     fn query_raw_readonly(
         &self,
         sql: &str,
@@ -174,6 +178,7 @@ impl Executor for PoolConnection {
         self.query_raw(sql, sql_hash, params)
     }
 
+    #[inline]
     fn execute_raw(
         &self,
         sql: &str,
@@ -197,6 +202,7 @@ impl Executor for Transaction {
         self.query_inner(sql, sql_hash, params)
     }
 
+    #[inline]
     fn query_raw_readonly(
         &self,
         sql: &str,
@@ -206,6 +212,7 @@ impl Executor for Transaction {
         self.query_raw(sql, sql_hash, params)
     }
 
+    #[inline]
     fn execute_raw(
         &self,
         sql: &str,

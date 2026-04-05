@@ -83,6 +83,7 @@ impl Pool {
     /// connection is created. If the pool is at max_size and no `acquire_timeout`
     /// is set, returns `DriverError::Pool` immediately. If `acquire_timeout` is
     /// set, blocks until a connection is returned or the timeout expires.
+    #[inline]
     pub fn acquire(&self) -> Result<PoolGuard, DriverError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(DriverError::Pool("pool is closed".into()));
@@ -154,6 +155,7 @@ impl Pool {
     }
 
     /// Try to pop a valid idle connection from the stack.
+    #[inline]
     fn try_pop_idle(&self) -> Result<Option<PoolGuard>, DriverError> {
         let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(conn) = stack.pop() {
@@ -539,6 +541,7 @@ impl PoolGuard {
     // --- Query dispatch methods ---
 
     /// Execute a prepared query and return rows.
+    #[inline]
     pub fn query(
         &mut self,
         sql: &str,
@@ -552,6 +555,7 @@ impl PoolGuard {
     }
 
     /// Execute a query without result rows (INSERT/UPDATE/DELETE).
+    #[inline]
     pub fn execute(
         &mut self,
         sql: &str,
