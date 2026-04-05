@@ -9,7 +9,7 @@ description = "PostgreSQL wire protocol driver for bsql — binary protocol, are
 
 [features]
 default = []
-tls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+tls = ["dep:rustls", "dep:webpki-roots"]
 time = ["dep:time"]
 chrono = ["dep:chrono"]
 uuid = ["dep:uuid"]
@@ -17,7 +17,6 @@ decimal = ["dep:rust_decimal"]
 
 [dependencies]
 bsql-arena = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time"] }
 rapidhash = { workspace = true }
 simdutf8 = { version = "0.1", default-features = false, features = ["std"] }
 smallvec = { workspace = true }
@@ -36,7 +35,6 @@ md-5 = { version = "0.10", default-features = false }
 rand = { version = "0.9", default-features = false, features = ["std", "os_rng"] }
 
 # TLS (optional)
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 

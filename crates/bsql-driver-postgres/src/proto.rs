@@ -534,7 +534,7 @@ fn read_cstring(data: &[u8], offset: usize) -> Result<&str, DriverError> {
 ///
 /// Format: `[num_fields: i16] ([name\0] [table_oid: i32] [col_attr: i16]
 ///           [type_oid: i32] [type_size: i16] [type_mod: i32] [format: i16])...`
-pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::conn::ColumnDesc>, DriverError> {
+pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::types::ColumnDesc>, DriverError> {
     if data.len() < 2 {
         return Err(DriverError::Protocol("RowDescription too short".into()));
     }
@@ -582,7 +582,7 @@ pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::conn::ColumnDesc>
         // type_mod (4) + format (2) = 6 bytes, skip
         pos += 6;
 
-        columns.push(crate::conn::ColumnDesc {
+        columns.push(crate::types::ColumnDesc {
             name: name.into(),
             type_oid,
             type_size,
