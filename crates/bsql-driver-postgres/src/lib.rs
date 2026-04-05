@@ -50,10 +50,11 @@ mod conn;
 mod proto;
 mod stmt_cache;
 mod sync_io;
-#[cfg(unix)]
 mod sync_conn;
 #[cfg(feature = "tls")]
 mod tls;
+#[cfg(feature = "tls")]
+mod tls_sync;
 
 pub use arena::Arena;
 pub use codec::Encode;
@@ -64,7 +65,6 @@ pub use types::{
 };
 // Re-export Connection from conn module
 pub use conn::Connection;
-#[cfg(unix)]
 pub use sync_conn::SyncConnection;
 
 // --- DriverError ---

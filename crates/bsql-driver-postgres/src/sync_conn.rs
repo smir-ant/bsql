@@ -1,29 +1,30 @@
-//! Synchronous PostgreSQL connection over Unix domain sockets.
+//! Synchronous PostgreSQL connection over TCP, TLS, or Unix domain sockets.
 //!
 //! `SyncConnection` provides the same query interface as `Connection` but uses
-//! blocking `std::os::unix::net::UnixStream` instead of tokio async I/O. This
-//! eliminates all async runtime overhead (future state machines, waker polling,
-//! task scheduling) for UDS connections where I/O completes in microseconds.
+//! blocking `std::io::Read` / `Write` via `sync_io::Stream` instead of tokio
+//! async I/O. This eliminates all async runtime overhead (future state machines,
+//! waker polling, task scheduling).
 //!
 //! # When to use
 //!
 //! Use `SyncConnection` when:
-//! - Connecting via Unix domain socket (localhost only)
+//! - You want a fully synchronous PostgreSQL connection (no tokio runtime)
 //! - Maximum single-query latency matters (benchmarks, hot-path lookups)
 //! - You are already on a blocking thread (e.g., `tokio::task::spawn_blocking`)
 //!
-//! For TCP connections, use the async `Connection` which integrates with tokio's
-//! event loop and does not block the runtime.
+//! # Transport
+//!
+//! Supports TCP, TLS (via rustls), and Unix domain sockets (on Unix platforms).
+//! The transport is selected automatically based on `Config`:
+//! - `host` starting with `/` -> Unix domain socket
+//! - Otherwise -> TCP (with optional TLS upgrade based on `ssl` mode)
 //!
 //! # Performance
 //!
-//! UDS write/read is kernel IPC (sub-microsecond). The async `Connection` adds
-//! ~200ns per `.await` point due to the future state machine poll cycle. With
-//! 2-3 await points per query, that is 400-600ns of pure async overhead.
-//! `SyncConnection` eliminates this entirely.
+//! UDS write/read is kernel IPC (sub-microsecond). TCP adds network latency
+//! but avoids all async runtime overhead (~200ns per `.await` point).
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use crate::DriverError;
@@ -32,14 +33,19 @@ use crate::auth;
 use crate::codec::Encode;
 use crate::proto::{self, BackendMessage};
 use crate::stmt_cache::{build_bind_template, make_stmt_name, StmtCache, StmtInfo};
-use crate::types::{ColumnDesc, Config, Notification, PgDataRow, QueryResult, SimpleRow, StartupAction};
+use crate::sync_io::Stream;
+use crate::types::{
+    ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, SimpleRow,
+    SslMode, StartupAction,
+};
 
 // --- SyncConnection ---
 
-/// A synchronous PostgreSQL connection over a Unix domain socket.
+/// A synchronous PostgreSQL connection over TCP, TLS, or Unix domain socket.
 ///
 /// This is the blocking counterpart to `Connection`. All I/O is synchronous
-/// using `std::os::unix::net::UnixStream`. No tokio runtime is required.
+/// using `sync_io::Stream` which wraps `TcpStream`, `UnixStream`, or
+/// `rustls::StreamOwned`. No tokio runtime is required.
 ///
 /// # Thread safety
 ///
@@ -52,7 +58,7 @@ use crate::types::{ColumnDesc, Config, Notification, PgDataRow, QueryResult, Sim
 /// ```no_run
 /// use bsql_driver_postgres::{SyncConnection, Config, Arena};
 ///
-/// let config = Config::from_url("postgres://user@localhost/db?host=/tmp").unwrap();
+/// let config = Config::from_url("postgres://user:pass@localhost/db").unwrap();
 /// let mut conn = SyncConnection::connect(&config).unwrap();
 /// let mut arena = Arena::new();
 ///
@@ -61,7 +67,7 @@ use crate::types::{ColumnDesc, Config, Notification, PgDataRow, QueryResult, Sim
 /// assert_eq!(result.len(), 1);
 /// ```
 pub struct SyncConnection {
-    stream: UnixStream,
+    stream: Stream,
     read_buf: Vec<u8>,
     stream_buf: Vec<u8>,
     stream_buf_pos: usize,
@@ -73,10 +79,16 @@ pub struct SyncConnection {
     secret: i32,
     tx_status: u8,
     last_used: std::time::Instant,
+    /// Whether a streaming query is in progress. When true, the
+    /// connection is in an indeterminate protocol state (portal open, no
+    /// ReadyForQuery) and cannot be reused.
+    streaming_active: bool,
     created_at: std::time::Instant,
     pending_notifications: Vec<Notification>,
     max_stmt_cache_size: usize,
     query_counter: u64,
+    /// The config used to connect — stored for cancel() which needs host:port.
+    connect_config: Config,
 }
 
 impl std::fmt::Debug for SyncConnection {
@@ -90,24 +102,91 @@ impl std::fmt::Debug for SyncConnection {
 }
 
 impl SyncConnection {
-    /// Connect to PostgreSQL via Unix domain socket and complete the
-    /// startup/auth handshake. Fully synchronous — no tokio runtime needed.
+    /// Connect to PostgreSQL and complete the startup/auth handshake.
+    /// Fully synchronous — no tokio runtime needed.
     ///
-    /// `config.host` must start with `/` (UDS directory path).
+    /// Transport is selected automatically based on `config`:
+    /// - `host` starting with `/` -> Unix domain socket
+    /// - Otherwise -> TCP (with optional TLS upgrade based on `ssl` mode)
     ///
     /// # Errors
     ///
-    /// Returns an error if the host is not a UDS path, connection fails,
-    /// or authentication fails.
+    /// Returns an error if the connection fails, TLS upgrade fails
+    /// (when required), or authentication fails.
     pub fn connect(config: &Config) -> Result<Self, DriverError> {
-        if !config.host_is_uds() {
-            return Err(DriverError::Protocol(
-                "SyncConnection requires a Unix domain socket path (host starting with '/')".into(),
-            ));
-        }
+        config.validate()?;
 
-        let path = config.uds_path();
-        let stream = UnixStream::connect(&path).map_err(DriverError::Io)?;
+        let stream = if config.host_is_uds() {
+            // UDS path
+            #[cfg(unix)]
+            {
+                let path = config.uds_path();
+                let unix =
+                    std::os::unix::net::UnixStream::connect(&path).map_err(DriverError::Io)?;
+                Stream::Unix(unix)
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(DriverError::Protocol(
+                    "Unix domain sockets are not supported on this platform".into(),
+                ));
+            }
+        } else {
+            // TCP path
+            let addr = format!("{}:{}", config.host, config.port);
+            let tcp = std::net::TcpStream::connect(&addr).map_err(DriverError::Io)?;
+
+            match config.ssl {
+                SslMode::Disable => {
+                    tcp.set_nodelay(true).map_err(DriverError::Io)?;
+                    let stream = Stream::Tcp(tcp);
+                    stream.set_keepalive()?;
+                    stream
+                }
+                SslMode::Prefer | SslMode::Require => {
+                    #[cfg(feature = "tls")]
+                    {
+                        match crate::tls_sync::try_upgrade(
+                            tcp,
+                            &config.host,
+                            config.ssl == SslMode::Require,
+                        ) {
+                            Ok(tls_stream) => {
+                                let stream = Stream::Tls(Box::new(tls_stream));
+                                stream.set_nodelay()?;
+                                stream.set_keepalive()?;
+                                stream
+                            }
+                            Err(e) => {
+                                if config.ssl == SslMode::Require {
+                                    return Err(e);
+                                }
+                                // Prefer mode: reconnect without TLS
+                                let tcp = std::net::TcpStream::connect(&addr)
+                                    .map_err(DriverError::Io)?;
+                                tcp.set_nodelay(true).map_err(DriverError::Io)?;
+                                let stream = Stream::Tcp(tcp);
+                                stream.set_keepalive()?;
+                                stream
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "tls"))]
+                    {
+                        if config.ssl == SslMode::Require {
+                            return Err(DriverError::Protocol(
+                                "sslmode=require but bsql was compiled without the 'tls' feature"
+                                    .into(),
+                            ));
+                        }
+                        tcp.set_nodelay(true).map_err(DriverError::Io)?;
+                        let stream = Stream::Tcp(tcp);
+                        stream.set_keepalive()?;
+                        stream
+                    }
+                }
+            }
+        };
 
         let mut conn = Self {
             stream,
@@ -122,10 +201,12 @@ impl SyncConnection {
             secret: 0,
             tx_status: b'I',
             last_used: std::time::Instant::now(),
+            streaming_active: false,
             created_at: std::time::Instant::now(),
             pending_notifications: Vec::new(),
             max_stmt_cache_size: 256,
             query_counter: 0,
+            connect_config: config.clone(),
         };
 
         conn.startup(config)?;
@@ -1725,6 +1806,320 @@ impl SyncConnection {
         }
     }
 
+    /// Prepare a statement without executing it (Parse+Describe+Sync only).
+    ///
+    /// Returns column and parameter metadata. Uses the unnamed statement `""`
+    /// so there is no cache pollution.
+    pub fn prepare_describe(&mut self, sql: &str) -> Result<PrepareResult, DriverError> {
+        self.write_buf.clear();
+        // Use unnamed statement "" — PG replaces it on every Parse,
+        // so there is no cache pollution.
+        proto::write_parse(&mut self.write_buf, "", sql, &[]);
+        proto::write_describe(&mut self.write_buf, b'S', "");
+        proto::write_sync(&mut self.write_buf);
+        self.flush_write()?;
+
+        // Read ParseComplete
+        self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+
+        // Read ParameterDescription + RowDescription/NoData
+        let mut param_oids: Vec<u32> = Vec::new();
+        let columns;
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::ParameterDescription { data } => {
+                    param_oids = proto::parse_parameter_description(data)?;
+                }
+                BackendMessage::RowDescription { data } => {
+                    columns = proto::parse_row_description(data)?;
+                    break;
+                }
+                BackendMessage::NoData => {
+                    columns = Vec::new();
+                    break;
+                }
+                BackendMessage::NoticeResponse { .. } => {}
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                }
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "expected ParameterDescription/RowDescription/NoData, got: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // ReadyForQuery
+        self.expect_ready()?;
+
+        Ok(PrepareResult {
+            columns,
+            param_oids,
+        })
+    }
+
+    /// Block until a NotificationResponse arrives on this connection.
+    ///
+    /// Reads raw messages from the stream and skips everything except
+    /// `NotificationResponse`. Returns the `(channel, payload)` pair.
+    /// Used by the listener to receive LISTEN/NOTIFY events.
+    ///
+    /// This method never returns `Ok` for non-notification messages -- it loops
+    /// internally, discarding `ParameterStatus`, `NoticeResponse`, etc.
+    pub fn wait_for_notification(&mut self) -> Result<(String, String), DriverError> {
+        loop {
+            let (msg_type, _payload_len) = self.read_message_buffered()?;
+            let msg = proto::parse_backend_message(msg_type, &self.read_buf)?;
+            match msg {
+                BackendMessage::NotificationResponse {
+                    channel, payload, ..
+                } => {
+                    return Ok((channel.to_owned(), payload.to_owned()));
+                }
+                BackendMessage::ParameterStatus { .. } | BackendMessage::NoticeResponse { .. } => {
+                    continue;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Cancel the currently running query on this connection.
+    ///
+    /// Opens a NEW TCP connection to the same host:port and sends a
+    /// CancelRequest message (16 bytes: length=16, code=80877102, pid, secret).
+    /// The cancel connection is closed immediately after sending.
+    pub fn cancel(&self) -> Result<(), DriverError> {
+        let addr = format!("{}:{}", self.connect_config.host, self.connect_config.port);
+        let mut tcp = std::net::TcpStream::connect(&addr).map_err(DriverError::Io)?;
+        let mut buf = Vec::with_capacity(16);
+        proto::write_cancel_request(&mut buf, self.pid, self.secret);
+        tcp.write_all(&buf).map_err(DriverError::Io)?;
+        tcp.flush().map_err(DriverError::Io)?;
+        // Close immediately — PG expects no further data
+        drop(tcp);
+        Ok(())
+    }
+
+    /// Set the read timeout on the underlying socket.
+    ///
+    /// Used by listeners to poll for notifications with a timeout.
+    /// `None` means block indefinitely.
+    pub fn set_read_timeout(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(), DriverError> {
+        self.stream
+            .set_read_timeout(timeout)
+            .map_err(DriverError::Io)
+    }
+
+    // --- Streaming ---
+
+    /// Begin a streaming query using the PG extended query protocol with
+    /// `Execute(max_rows=chunk_size)`.
+    ///
+    /// Returns column metadata and puts the connection into streaming mode.
+    /// The caller must repeatedly call `streaming_next_chunk()` until it returns
+    /// `Ok(false)` (all rows consumed) before issuing any other query on this
+    /// connection.
+    ///
+    /// Uses the unnamed portal `""` which stays open between Execute calls
+    /// as long as Sync is NOT sent. We use Flush (not Sync) to force PG to
+    /// send buffered output without destroying the portal.
+    pub fn query_streaming_start(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        chunk_size: i32,
+    ) -> Result<(Arc<[ColumnDesc]>, bool), DriverError> {
+        self.write_buf.clear();
+
+        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash) {
+            // Cache hit: try bind template, fall back to write_bind_params.
+            self.query_counter += 1;
+            info.last_used = self.query_counter;
+
+            let can_use_template = info
+                .bind_template
+                .as_ref()
+                .is_some_and(|t| t.param_slots.len() == params.len());
+
+            if can_use_template {
+                let tmpl = info.bind_template.as_ref().unwrap();
+                // Copy only the Bind portion (not EXECUTE_SYNC) — streaming
+                // needs Execute+Flush instead.
+                self.write_buf
+                    .extend_from_slice(&tmpl.bytes[..tmpl.bind_end]);
+
+                let mut template_ok = true;
+                for (i, param) in params.iter().enumerate() {
+                    let (data_offset, old_len) = tmpl.param_slots[i];
+                    if param.is_null() {
+                        let len_offset = data_offset - 4;
+                        self.write_buf[len_offset..len_offset + 4]
+                            .copy_from_slice(&(-1i32).to_be_bytes());
+                    } else if old_len >= 0 {
+                        let end = data_offset + old_len as usize;
+                        if !param.encode_at(&mut self.write_buf[data_offset..end]) {
+                            template_ok = false;
+                            break;
+                        }
+                    } else {
+                        template_ok = false;
+                        break;
+                    }
+                }
+
+                if !template_ok {
+                    self.write_buf.clear();
+                    proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                    info.bind_template = None;
+                }
+            } else {
+                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+            }
+
+            let cols = info.columns.clone();
+
+            if info.bind_template.is_none() && !self.write_buf.is_empty() {
+                info.bind_template = build_bind_template(&self.write_buf, params.len());
+            }
+
+            proto::write_execute(&mut self.write_buf, "", chunk_size);
+            // Use Flush (not Sync!) to keep the portal alive between chunks.
+            proto::write_flush(&mut self.write_buf);
+            self.flush_write()?;
+
+            cols
+        } else {
+            // Cache miss: Parse+Describe+Bind+Execute+Flush
+            let name = make_stmt_name(sql_hash);
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_bind_params(&mut self.write_buf, "", &name, params);
+
+            proto::write_execute(&mut self.write_buf, "", chunk_size);
+            proto::write_flush(&mut self.write_buf);
+            self.flush_write()?;
+
+            self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+            let columns = self.read_column_description()?;
+            self.query_counter += 1;
+            self.cache_stmt(
+                sql_hash,
+                StmtInfo {
+                    name,
+                    columns: columns.clone(),
+                    last_used: self.query_counter,
+                    bind_template: None,
+                },
+            );
+            columns
+        };
+
+        // BindComplete
+        self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
+
+        self.streaming_active = true;
+
+        Ok((columns, false))
+    }
+
+    /// Read the next chunk of rows from an in-progress streaming query.
+    ///
+    /// Returns `Ok(true)` if more rows are available (PortalSuspended),
+    /// `Ok(false)` when all rows have been consumed (CommandComplete).
+    ///
+    /// After CommandComplete, this method sends Sync and reads ReadyForQuery,
+    /// returning the connection to a clean protocol state.
+    pub fn streaming_next_chunk(
+        &mut self,
+        arena: &mut Arena,
+        all_col_offsets: &mut Vec<(usize, i32)>,
+    ) -> Result<bool, DriverError> {
+        all_col_offsets.clear();
+
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::DataRow { data } => {
+                    parse_data_row_flat(data, arena, all_col_offsets)?;
+                }
+                BackendMessage::PortalSuspended => {
+                    // More rows available. The portal stays open because we
+                    // used Flush (not Sync). The caller will call
+                    // streaming_send_execute() to request the next chunk.
+                    return Ok(true);
+                }
+                BackendMessage::CommandComplete { .. } => {
+                    // All rows consumed. Send Sync to end the query cycle
+                    // and read ReadyForQuery to restore clean state.
+                    self.write_buf.clear();
+                    proto::write_sync(&mut self.write_buf);
+                    self.flush_write()?;
+                    self.expect_ready()?;
+                    self.shrink_buffers();
+
+                    self.streaming_active = false;
+                    return Ok(false);
+                }
+                BackendMessage::EmptyQuery => {
+                    self.write_buf.clear();
+                    proto::write_sync(&mut self.write_buf);
+                    self.flush_write()?;
+                    self.expect_ready()?;
+
+                    self.streaming_active = false;
+                    return Ok(false);
+                }
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    // Send Sync to reset and drain to ReadyForQuery
+                    self.write_buf.clear();
+                    proto::write_sync(&mut self.write_buf);
+                    self.flush_write()?;
+                    self.drain_to_ready()?;
+
+                    self.streaming_active = false;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during streaming: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Send Execute+Flush for the next chunk of a streaming query.
+    ///
+    /// Must be called before `streaming_next_chunk()` on the 2nd and
+    /// subsequent chunks (the first chunk's Execute is sent by
+    /// `query_streaming_start`).
+    ///
+    /// Uses Flush (not Sync) to keep the unnamed portal alive.
+    pub fn streaming_send_execute(&mut self, chunk_size: i32) -> Result<(), DriverError> {
+        self.write_buf.clear();
+        proto::write_execute(&mut self.write_buf, "", chunk_size);
+        proto::write_flush(&mut self.write_buf);
+        self.flush_write()
+    }
+
+    /// Whether a streaming query is in progress.
+    pub fn is_streaming(&self) -> bool {
+        self.streaming_active
+    }
+
     /// Send Terminate and close the connection.
     pub fn close(mut self) -> Result<(), DriverError> {
         self.write_buf.clear();
@@ -1766,6 +2161,11 @@ impl SyncConnection {
             .iter()
             .find(|(k, _)| &**k == name)
             .map(|(_, v)| &**v)
+    }
+
+    /// All server parameters received during startup.
+    pub fn server_params(&self) -> &[(Box<str>, Box<str>)] {
+        &self.params
     }
 
     /// Backend process ID.
@@ -2194,7 +2594,7 @@ impl SyncConnection {
 
     // --- Synchronous I/O ---
 
-    /// Flush the write buffer to the Unix domain socket. Blocking.
+    /// Flush the write buffer to the stream. Blocking.
     #[inline]
     fn flush_write(&mut self) -> Result<(), DriverError> {
         self.stream
@@ -2285,7 +2685,7 @@ impl SyncConnection {
 /// Synchronous buffered read_exact — reads exactly `out.len()` bytes using
 /// a persistent read buffer. Pure blocking I/O via `std::io::Read`.
 fn sync_buffered_read_exact(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     buf: &mut [u8],
     pos: &mut usize,
     end: &mut usize,
@@ -2369,14 +2769,18 @@ mod tests {
     use crate::types::hash_sql;
 
     #[test]
-    fn sync_config_rejects_tcp() {
-        let config = Config::from_url("postgres://user:pass@localhost/db").unwrap();
+    fn sync_config_tcp_no_longer_rejected() {
+        // SyncConnection now supports TCP -- connecting to an invalid port
+        // should give an I/O error, not a "Unix domain socket" error.
+        let config = Config::from_url("postgres://user:pass@127.0.0.1:1/db").unwrap();
         let result = SyncConnection::connect(&config);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
+        // Should be an I/O error (connection refused), NOT a protocol error
+        // about Unix domain sockets.
         assert!(
-            err.contains("Unix domain socket"),
-            "error should mention UDS requirement: {err}"
+            !err.contains("Unix domain socket"),
+            "error should NOT mention UDS requirement: {err}"
         );
     }
 
@@ -2445,23 +2849,27 @@ mod tests {
         assert!(parse_data_row_flat(&data, &mut arena, &mut out).is_err());
     }
 
-    // ---- TCP rejection ----
+    // ---- TCP connect attempts ----
 
     #[test]
-    fn sync_connect_tcp_fails_with_uds_message() {
-        let config = Config::from_url("postgres://user:pass@localhost:5432/db").unwrap();
+    fn sync_connect_tcp_unreachable_port() {
+        // SyncConnection now supports TCP. Connecting to a refused port
+        // should give an I/O error (connection refused).
+        let config = Config::from_url("postgres://user:pass@127.0.0.1:1/db").unwrap();
         let result = SyncConnection::connect(&config);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("Unix domain socket"),
-            "error should mention UDS: {err}"
+            !err.contains("Unix domain socket"),
+            "error should NOT mention UDS: {err}"
         );
     }
 
     #[test]
-    fn sync_connect_ip_address_fails() {
-        let config = Config::from_url("postgres://user:pass@127.0.0.1:5432/db").unwrap();
+    fn sync_connect_ip_address_attempts_tcp() {
+        // SyncConnection now supports TCP — connecting to a refused port
+        // gives an I/O error, not a protocol rejection.
+        let config = Config::from_url("postgres://user:pass@127.0.0.1:1/db").unwrap();
         let result = SyncConnection::connect(&config);
         assert!(result.is_err());
     }
@@ -2869,5 +3277,159 @@ mod tests {
         assert!(fmt_str.contains("SyncConnection"));
         assert!(fmt_str.contains("pid"));
         assert!(fmt_str.contains("tx_status"));
+    }
+
+    // ---- TLS config tests (no real TLS server needed) ----
+
+    #[test]
+    fn sync_connect_sslmode_require_without_tls_feature() {
+        // When compiled without 'tls' feature, sslmode=require should error
+        // with a clear message (unless the tls feature is actually enabled).
+        // This test verifies the error path exists and handles correctly.
+        let mut config = Config::from_url("postgres://user:pass@127.0.0.1:1/db").unwrap();
+        config.ssl = SslMode::Require;
+        let result = SyncConnection::connect(&config);
+        assert!(result.is_err());
+        // The error will be either:
+        // - "sslmode=require but bsql was compiled without the 'tls' feature" (no tls feature)
+        // - I/O error (tls feature enabled, but connection refused)
+        // Both are valid.
+    }
+
+    #[test]
+    fn sync_connect_sslmode_disable_attempts_tcp() {
+        let mut config = Config::from_url("postgres://user:pass@127.0.0.1:1/db").unwrap();
+        config.ssl = SslMode::Disable;
+        let result = SyncConnection::connect(&config);
+        assert!(result.is_err());
+        // Should be an I/O error (connection refused), never a TLS error
+        assert!(matches!(result.unwrap_err(), DriverError::Io(_)));
+    }
+
+    #[test]
+    fn sync_connect_sslmode_prefer_attempts_tcp() {
+        let mut config = Config::from_url("postgres://user:pass@127.0.0.1:1/db").unwrap();
+        config.ssl = SslMode::Prefer;
+        let result = SyncConnection::connect(&config);
+        assert!(result.is_err());
+    }
+
+    // ---- Streaming state tests ----
+
+    #[test]
+    #[ignore] // requires PostgreSQL
+    fn sync_streaming_basic_if_pg_available() {
+        let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
+        let mut conn = SyncConnection::connect(&config).unwrap();
+        assert!(!conn.is_streaming());
+
+        let sql = "SELECT generate_series(1, 10)";
+        let hash = hash_sql(sql);
+
+        let (cols, _) = conn.query_streaming_start(sql, hash, &[], 3).unwrap();
+        assert!(!cols.is_empty());
+        assert!(conn.is_streaming());
+
+        let mut arena = Arena::new();
+        let mut offsets = Vec::new();
+        let mut total_rows = 0;
+
+        // Read chunks until done
+        loop {
+            let has_more = conn.streaming_next_chunk(&mut arena, &mut offsets).unwrap();
+            total_rows += offsets.len();
+            if !has_more {
+                break;
+            }
+            conn.streaming_send_execute(3).unwrap();
+        }
+
+        assert_eq!(total_rows, 10);
+        assert!(!conn.is_streaming());
+        let _ = conn.close();
+    }
+
+    // ---- prepare_describe tests ----
+
+    #[test]
+    #[ignore] // requires PostgreSQL
+    fn sync_prepare_describe_if_pg_available() {
+        let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
+        let mut conn = SyncConnection::connect(&config).unwrap();
+
+        let result = conn
+            .prepare_describe("SELECT $1::int4 + $2::int4 AS sum")
+            .unwrap();
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(&*result.columns[0].name, "sum");
+        assert_eq!(result.param_oids.len(), 2);
+        let _ = conn.close();
+    }
+
+    // ---- wait_for_notification test ----
+
+    #[test]
+    #[ignore] // requires PostgreSQL
+    fn sync_wait_for_notification_if_pg_available() {
+        let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
+        let mut conn = SyncConnection::connect(&config).unwrap();
+
+        conn.simple_query("LISTEN test_chan").unwrap();
+        conn.simple_query("NOTIFY test_chan, 'hello'").unwrap();
+
+        // Set a read timeout so we don't block forever if notification fails
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        let (channel, payload) = conn.wait_for_notification().unwrap();
+        assert_eq!(channel, "test_chan");
+        assert_eq!(payload, "hello");
+        let _ = conn.close();
+    }
+
+    // ---- cancel test ----
+
+    #[test]
+    #[ignore] // requires PostgreSQL
+    fn sync_cancel_if_pg_available() {
+        let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
+        let conn = SyncConnection::connect(&config).unwrap();
+        // Just verify cancel() doesn't panic — the query cancel itself
+        // requires a concurrent query on another thread.
+        let result = conn.cancel();
+        // Cancel may succeed or fail (no query running) — just verify no panic
+        let _ = result;
+        let _ = conn.close();
+    }
+
+    // ---- server_params test ----
+
+    #[test]
+    #[ignore] // requires PostgreSQL
+    fn sync_server_params_if_pg_available() {
+        let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
+        let conn = SyncConnection::connect(&config).unwrap();
+        let params = conn.server_params();
+        assert!(!params.is_empty(), "server should send parameters during startup");
+        // server_encoding should be present
+        assert!(
+            conn.parameter("server_encoding").is_some(),
+            "server_encoding should be present"
+        );
+        let _ = conn.close();
+    }
+
+    // ---- set_read_timeout test ----
+
+    #[test]
+    #[ignore] // requires PostgreSQL
+    fn sync_set_read_timeout_if_pg_available() {
+        let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
+        let conn = SyncConnection::connect(&config).unwrap();
+        // Set and clear read timeout
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        conn.set_read_timeout(None).unwrap();
+        let _ = conn.close();
     }
 }

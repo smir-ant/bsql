@@ -83,6 +83,7 @@ impl Stream {
     }
 
     /// Set the write timeout on the underlying socket.
+    #[allow(dead_code)] // used by future phases
     pub(crate) fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.set_write_timeout(dur),
@@ -96,6 +97,7 @@ impl Stream {
     /// Set TCP_NODELAY on the underlying socket (TCP/TLS only).
     ///
     /// No-op for Unix domain sockets (Nagle doesn't apply to UDS).
+    #[allow(dead_code)] // used when tls feature is enabled
     pub(crate) fn set_nodelay(&self) -> Result<(), DriverError> {
         match self {
             Stream::Tcp(s) => s.set_nodelay(true).map_err(DriverError::Io),
