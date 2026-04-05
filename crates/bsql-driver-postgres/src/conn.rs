@@ -1807,7 +1807,8 @@ impl Connection {
                 // (e.g., AuthSaslFinal delayed past ReadyForQuery in startup).
                 // Skip them defensively rather than treating as protocol error.
                 | BackendMessage::AuthOk
-                | BackendMessage::AuthSaslFinal { .. } => {}
+                | BackendMessage::AuthSaslFinal { .. }
+                | BackendMessage::BackendKeyData { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready()?;
@@ -1843,7 +1844,10 @@ impl Connection {
                 | BackendMessage::CommandComplete { .. }
                 | BackendMessage::EmptyQuery
                 | BackendMessage::NoticeResponse { .. }
-                | BackendMessage::ParameterStatus { .. } => {}
+                | BackendMessage::ParameterStatus { .. }
+                | BackendMessage::AuthOk
+                | BackendMessage::AuthSaslFinal { .. }
+                | BackendMessage::BackendKeyData { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready()?;
