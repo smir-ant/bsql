@@ -1469,7 +1469,7 @@ mod tests {
         arena.reset();
         // After reset, arena should be usable with a fresh chunk
         assert!(
-            arena.chunks.len() >= 1,
+            !arena.chunks.is_empty(),
             "reset should create initial chunk if empty"
         );
         assert_eq!(arena.allocated(), 0);

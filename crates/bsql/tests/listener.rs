@@ -4,29 +4,40 @@
 //! Set BSQL_DATABASE_URL=postgres://bsql:bsql@localhost/bsql_test
 
 use bsql::{BsqlError, Listener};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DB_URL: &str = "postgres://bsql:bsql@localhost/bsql_test";
 
+/// Generate a unique channel name to prevent cross-test interference.
+/// PG delivers NOTIFY to ALL sessions that LISTEN on the same channel,
+/// so parallel tests must use distinct names.
+fn unique_channel(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("{}_{}", prefix, COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
 #[test]
 fn listen_and_receive_notification() {
+    let ch = unique_channel("test_channel");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("test_channel").unwrap();
+    listener.listen(&ch).unwrap();
 
     // Send a notification from the same listener connection
-    listener.notify("test_channel", "hello world").unwrap();
+    listener.notify(&ch, "hello world").unwrap();
 
     let notif = listener.recv().unwrap();
-    assert_eq!(notif.channel(), "test_channel");
+    assert_eq!(notif.channel(), ch);
     assert_eq!(notif.payload(), "hello world");
 }
 
 #[test]
 fn notification_payload_preserved() {
+    let ch = unique_channel("payload_test");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("payload_test").unwrap();
+    listener.listen(&ch).unwrap();
 
     let payload = r#"{"event":"created","id":42}"#;
-    listener.notify("payload_test", payload).unwrap();
+    listener.notify(&ch, payload).unwrap();
 
     let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), payload);
@@ -34,14 +45,16 @@ fn notification_payload_preserved() {
 
 #[test]
 fn multiple_channels() {
+    let ch_a = unique_channel("chan_a");
+    let ch_b = unique_channel("chan_b");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("chan_a").unwrap();
-    listener.listen("chan_b").unwrap();
+    listener.listen(&ch_a).unwrap();
+    listener.listen(&ch_b).unwrap();
 
     // notify() now uses a separate short-lived connection internally,
     // avoiding the self-notification race condition entirely.
-    listener.notify("chan_a", "from_a").unwrap();
-    listener.notify("chan_b", "from_b").unwrap();
+    listener.notify(&ch_a, "from_a").unwrap();
+    listener.notify(&ch_b, "from_b").unwrap();
 
     let n1 = listener.recv().unwrap();
     let n2 = listener.recv().unwrap();
@@ -49,7 +62,9 @@ fn multiple_channels() {
     // Both notifications received (order not guaranteed by PG)
     let mut channels: Vec<&str> = vec![n1.channel(), n2.channel()];
     channels.sort();
-    assert_eq!(channels, vec!["chan_a", "chan_b"]);
+    let mut expected_channels = vec![ch_a.as_str(), ch_b.as_str()];
+    expected_channels.sort();
+    assert_eq!(channels, expected_channels);
 
     let mut payloads: Vec<&str> = vec![n1.payload(), n2.payload()];
     payloads.sort();
@@ -58,42 +73,45 @@ fn multiple_channels() {
 
 #[test]
 fn unlisten_stops_receiving() {
+    let ch = unique_channel("unlisten_test");
+    let ch_control = unique_channel("unlisten_control");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("unlisten_test").unwrap();
-    listener.unlisten("unlisten_test").unwrap();
+    listener.listen(&ch).unwrap();
+    listener.unlisten(&ch).unwrap();
 
     // Send a notification -- should NOT be received since we unlistened
-    listener
-        .notify("unlisten_test", "should_not_arrive")
-        .unwrap();
+    listener.notify(&ch, "should_not_arrive").unwrap();
 
     // Listen on a different channel and send there to prove recv works
-    listener.listen("unlisten_control").unwrap();
-    listener.notify("unlisten_control", "control").unwrap();
+    listener.listen(&ch_control).unwrap();
+    listener.notify(&ch_control, "control").unwrap();
 
     let notif = listener.recv().unwrap();
     // We should receive the control notification, not the unlistened one
-    assert_eq!(notif.channel(), "unlisten_control");
+    assert_eq!(notif.channel(), ch_control);
     assert_eq!(notif.payload(), "control");
 }
 
 #[test]
 fn unlisten_all() {
+    let ch_a = unique_channel("all_a");
+    let ch_b = unique_channel("all_b");
+    let ch_control = unique_channel("all_control");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("all_a").unwrap();
-    listener.listen("all_b").unwrap();
+    listener.listen(&ch_a).unwrap();
+    listener.listen(&ch_b).unwrap();
     listener.unlisten_all().unwrap();
 
     // Neither channel should receive
-    listener.notify("all_a", "no").unwrap();
-    listener.notify("all_b", "no").unwrap();
+    listener.notify(&ch_a, "no").unwrap();
+    listener.notify(&ch_b, "no").unwrap();
 
     // Listen on a control channel
-    listener.listen("all_control").unwrap();
-    listener.notify("all_control", "yes").unwrap();
+    listener.listen(&ch_control).unwrap();
+    listener.notify(&ch_control, "yes").unwrap();
 
     let notif = listener.recv().unwrap();
-    assert_eq!(notif.channel(), "all_control");
+    assert_eq!(notif.channel(), ch_control);
 }
 
 #[test]
@@ -116,35 +134,38 @@ fn empty_channel_name_rejected() {
 
 #[test]
 fn empty_payload_notification() {
+    let ch = unique_channel("empty_payload");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("empty_payload").unwrap();
+    listener.listen(&ch).unwrap();
 
-    listener.notify("empty_payload", "").unwrap();
+    listener.notify(&ch, "").unwrap();
 
     let notif = listener.recv().unwrap();
-    assert_eq!(notif.channel(), "empty_payload");
+    assert_eq!(notif.channel(), ch);
     assert_eq!(notif.payload(), "");
 }
 
 #[test]
 fn channel_name_with_special_chars() {
+    let ch = unique_channel("my-channel.v2");
     let mut listener = Listener::connect(DB_URL).unwrap();
     // Channel with dashes and dots -- valid PG identifier when quoted
-    listener.listen("my-channel.v2").unwrap();
+    listener.listen(&ch).unwrap();
 
-    listener.notify("my-channel.v2", "special").unwrap();
+    listener.notify(&ch, "special").unwrap();
 
     let notif = listener.recv().unwrap();
-    assert_eq!(notif.channel(), "my-channel.v2");
+    assert_eq!(notif.channel(), ch);
     assert_eq!(notif.payload(), "special");
 }
 
 #[test]
 fn payload_with_single_quotes() {
+    let ch = unique_channel("quote_test");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("quote_test").unwrap();
+    listener.listen(&ch).unwrap();
 
-    listener.notify("quote_test", "it's a test").unwrap();
+    listener.notify(&ch, "it's a test").unwrap();
 
     let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), "it's a test");
@@ -168,10 +189,11 @@ fn connect_bad_url_fails() {
 
 #[test]
 fn notification_is_clone() {
+    let ch = unique_channel("clone_test");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("clone_test").unwrap();
+    listener.listen(&ch).unwrap();
 
-    listener.notify("clone_test", "data").unwrap();
+    listener.notify(&ch, "data").unwrap();
 
     let notif = listener.recv().unwrap();
     let cloned = notif.clone();
@@ -181,17 +203,18 @@ fn notification_is_clone() {
 
 #[test]
 fn receive_notify_from_separate_connection() {
+    let ch = unique_channel("cross_conn_test");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("cross_conn_test").unwrap();
+    listener.listen(&ch).unwrap();
 
     // Send from a separate connection -- different PG backend than the listener
     let sender = Listener::connect(DB_URL).unwrap();
-    sender.notify("cross_conn_test", "from_sender").unwrap();
+    sender.notify(&ch, "from_sender").unwrap();
 
     // recv() blocks until a notification arrives (sync API)
     let n = listener.recv().unwrap();
 
-    assert_eq!(n.channel(), "cross_conn_test");
+    assert_eq!(n.channel(), ch);
     assert_eq!(n.payload(), "from_sender");
 }
 
@@ -214,8 +237,9 @@ fn null_byte_in_channel_rejected() {
 
 #[test]
 fn null_byte_in_payload_rejected() {
+    let ch = unique_channel("null_payload_test");
     let listener = Listener::connect(DB_URL).unwrap();
-    let result = listener.notify("test", "pay\0load");
+    let result = listener.notify(&ch, "pay\0load");
     assert!(result.is_err());
     match result.unwrap_err() {
         BsqlError::Connect(e) => {
@@ -249,8 +273,9 @@ fn channel_name_sql_injection_attempt() {
 #[test]
 fn listener_drop_cleans_up() {
     {
+        let ch = unique_channel("drop_test");
         let listener = Listener::connect(DB_URL).unwrap();
-        listener.listen("drop_test").unwrap();
+        listener.listen(&ch).unwrap();
         // listener dropped here -- should not panic or leak
     }
     // If we got here, drop succeeded
@@ -300,23 +325,25 @@ fn notify_empty_channel_rejected() {
 
 #[test]
 fn channel_name_with_double_quotes() {
+    let ch = unique_channel(r#"my"chan"#);
     let mut listener = Listener::connect(DB_URL).unwrap();
     // Channel name with embedded double quotes -- tests quote_ident escaping
-    listener.listen(r#"my"chan"#).unwrap();
-    listener.notify(r#"my"chan"#, "quoted").unwrap();
+    listener.listen(&ch).unwrap();
+    listener.notify(&ch, "quoted").unwrap();
 
     let notif = listener.recv().unwrap();
-    assert_eq!(notif.channel(), r#"my"chan"#);
+    assert_eq!(notif.channel(), ch);
     assert_eq!(notif.payload(), "quoted");
 }
 
 #[test]
 fn payload_with_multiple_quotes() {
+    let ch = unique_channel("multi_quote_test");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("multi_quote_test").unwrap();
+    listener.listen(&ch).unwrap();
 
     let payload = "it''s a ''test''";
-    listener.notify("multi_quote_test", payload).unwrap();
+    listener.notify(&ch, payload).unwrap();
 
     let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), payload);
@@ -324,11 +351,12 @@ fn payload_with_multiple_quotes() {
 
 #[test]
 fn payload_with_backslash() {
+    let ch = unique_channel("backslash_test");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("backslash_test").unwrap();
+    listener.listen(&ch).unwrap();
 
     let payload = r"C:\Users\test\file.txt";
-    listener.notify("backslash_test", payload).unwrap();
+    listener.notify(&ch, payload).unwrap();
 
     let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), payload);
@@ -336,11 +364,12 @@ fn payload_with_backslash() {
 
 #[test]
 fn payload_with_lone_quote() {
+    let ch = unique_channel("lone_quote_test");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("lone_quote_test").unwrap();
+    listener.listen(&ch).unwrap();
 
     let payload = "it's";
-    listener.notify("lone_quote_test", payload).unwrap();
+    listener.notify(&ch, payload).unwrap();
 
     let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), payload);
@@ -348,12 +377,13 @@ fn payload_with_lone_quote() {
 
 #[test]
 fn large_payload() {
+    let ch = unique_channel("large_payload_test");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("large_payload_test").unwrap();
+    listener.listen(&ch).unwrap();
 
     // PG NOTIFY payloads can be up to ~8000 bytes
     let payload = "x".repeat(4000);
-    listener.notify("large_payload_test", &payload).unwrap();
+    listener.notify(&ch, &payload).unwrap();
 
     let notif = listener.recv().unwrap();
     assert_eq!(notif.payload().len(), 4000);
@@ -365,16 +395,17 @@ fn large_payload() {
 
 #[test]
 fn listen_same_channel_twice() {
+    let ch = unique_channel("dup_listen_ch");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("dup_listen_ch").unwrap();
+    listener.listen(&ch).unwrap();
     // Second listen on the same channel should not error (PG LISTEN is idempotent).
-    listener.listen("dup_listen_ch").unwrap();
+    listener.listen(&ch).unwrap();
 
     // Sending one notification should produce exactly one received message.
-    listener.notify("dup_listen_ch", "once").unwrap();
+    listener.notify(&ch, "once").unwrap();
 
     let notif = listener.recv().unwrap();
-    assert_eq!(notif.channel(), "dup_listen_ch");
+    assert_eq!(notif.channel(), ch);
     assert_eq!(notif.payload(), "once");
 
     // Verify there is no duplicate notification waiting.
@@ -391,9 +422,10 @@ fn listen_same_channel_twice() {
 
 #[test]
 fn unlisten_never_listened_channel() {
+    let ch = unique_channel("never_listened_ch");
     let listener = Listener::connect(DB_URL).unwrap();
     // PG UNLISTEN on a channel we never LISTENed should not error.
-    let result = listener.unlisten("never_listened_ch");
+    let result = listener.unlisten(&ch);
     assert!(
         result.is_ok(),
         "unlisten on never-listened channel should succeed"
@@ -406,8 +438,9 @@ fn unlisten_never_listened_channel() {
 
 #[test]
 fn try_recv_empty() {
+    let ch = unique_channel("try_recv_empty_ch");
     let mut listener = Listener::connect(DB_URL).unwrap();
-    listener.listen("try_recv_empty_ch").unwrap();
+    listener.listen(&ch).unwrap();
 
     // No notifications have been sent — try_recv should return None.
     let result = listener.try_recv().unwrap();
@@ -423,6 +456,8 @@ fn try_recv_empty() {
 
 #[test]
 fn subscribed_channels_returns_list() {
+    let ch_a = unique_channel("sub_ch_a");
+    let ch_b = unique_channel("sub_ch_b");
     let listener = Listener::connect(DB_URL).unwrap();
 
     // Before any listen, subscribed_channels should be empty
@@ -430,39 +465,50 @@ fn subscribed_channels_returns_list() {
     assert!(channels.is_empty());
 
     // Listen to two channels
-    listener.listen("sub_ch_a").unwrap();
-    listener.listen("sub_ch_b").unwrap();
+    listener.listen(&ch_a).unwrap();
+    listener.listen(&ch_b).unwrap();
 
     let mut channels = listener.subscribed_channels();
     channels.sort();
-    assert_eq!(channels, vec!["sub_ch_a", "sub_ch_b"]);
+    let mut expected = vec![ch_a.as_str(), ch_b.as_str()];
+    expected.sort();
+    assert_eq!(channels, expected);
 }
 
 #[test]
 fn subscribed_channels_updates_on_unlisten() {
+    let ch_a = unique_channel("sub_ul_a");
+    let ch_b = unique_channel("sub_ul_b");
+    let ch_c = unique_channel("sub_ul_c");
     let listener = Listener::connect(DB_URL).unwrap();
 
-    listener.listen("sub_ul_a").unwrap();
-    listener.listen("sub_ul_b").unwrap();
-    listener.listen("sub_ul_c").unwrap();
+    listener.listen(&ch_a).unwrap();
+    listener.listen(&ch_b).unwrap();
+    listener.listen(&ch_c).unwrap();
 
     let mut channels = listener.subscribed_channels();
     channels.sort();
-    assert_eq!(channels, vec!["sub_ul_a", "sub_ul_b", "sub_ul_c"]);
+    let mut expected_abc = vec![ch_a.as_str(), ch_b.as_str(), ch_c.as_str()];
+    expected_abc.sort();
+    assert_eq!(channels, expected_abc);
 
-    listener.unlisten("sub_ul_b").unwrap();
+    listener.unlisten(&ch_b).unwrap();
 
     let mut channels = listener.subscribed_channels();
     channels.sort();
-    assert_eq!(channels, vec!["sub_ul_a", "sub_ul_c"]);
+    let mut expected_ac = vec![ch_a.as_str(), ch_c.as_str()];
+    expected_ac.sort();
+    assert_eq!(channels, expected_ac);
 }
 
 #[test]
 fn subscribed_channels_empty_after_unlisten_all() {
+    let ch_a = unique_channel("sub_ua_a");
+    let ch_b = unique_channel("sub_ua_b");
     let listener = Listener::connect(DB_URL).unwrap();
 
-    listener.listen("sub_ua_a").unwrap();
-    listener.listen("sub_ua_b").unwrap();
+    listener.listen(&ch_a).unwrap();
+    listener.listen(&ch_b).unwrap();
     assert_eq!(listener.subscribed_channels().len(), 2);
 
     listener.unlisten_all().unwrap();
@@ -471,13 +517,14 @@ fn subscribed_channels_empty_after_unlisten_all() {
 
 #[test]
 fn subscribed_channels_idempotent_listen() {
+    let ch = unique_channel("sub_idem");
     let listener = Listener::connect(DB_URL).unwrap();
 
-    listener.listen("sub_idem").unwrap();
-    listener.listen("sub_idem").unwrap(); // duplicate
+    listener.listen(&ch).unwrap();
+    listener.listen(&ch).unwrap(); // duplicate
 
     let channels = listener.subscribed_channels();
     // Should have exactly 1 entry, not 2
     assert_eq!(channels.len(), 1);
-    assert_eq!(channels[0], "sub_idem");
+    assert_eq!(channels[0], ch);
 }
