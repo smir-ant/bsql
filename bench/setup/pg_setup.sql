@@ -47,3 +47,18 @@ FROM generate_series(1, 100000) AS i;
 CREATE INDEX idx_bench_users_email ON bench_users(email);
 CREATE INDEX idx_bench_orders_user_id ON bench_orders(user_id);
 CREATE INDEX idx_bench_orders_status ON bench_orders(status);
+
+-- Disable autovacuum on bench tables — prevents background I/O during benchmarks.
+-- Autovacuum can cause 10-50% variance on INSERT/UPDATE by triggering WAL writes,
+-- page splits, and buffer evictions mid-benchmark.
+ALTER TABLE bench_users SET (autovacuum_enabled = false);
+ALTER TABLE bench_orders SET (autovacuum_enabled = false);
+
+-- Gather statistics for optimal query plans.
+ANALYZE bench_users;
+ANALYZE bench_orders;
+
+-- Force a WAL checkpoint so subsequent INSERTs don't trigger one mid-benchmark.
+-- Without this, PG may checkpoint during an INSERT run, adding 10-100ms of latency
+-- to one iteration while the rest are fast — distorting both median and mean.
+CHECKPOINT;

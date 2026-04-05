@@ -24,6 +24,13 @@ fn bench_pg_insert_single(c: &mut Criterion) {
     use diesel::prelude::*;
     let mut diesel_conn = PgConnection::establish(&url).unwrap();
 
+    // Clean up INSERT accumulation and force WAL checkpoint.
+    // Without this, previous bench runs leave rows that slow down autovacuum
+    // (even if disabled) and bloat table pages, degrading INSERT throughput.
+    bsql_pool
+        .raw_execute("DELETE FROM bench_users WHERE name = 'bench_insert'; CHECKPOINT")
+        .ok();
+
     let mut group = c.benchmark_group("pg_insert_single");
 
     // -- bsql: single INSERT RETURNING (sync) --

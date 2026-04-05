@@ -31,7 +31,7 @@ pub(crate) enum Stream {
 }
 
 impl Read for Stream {
-    #[inline]
+    #[inline(always)]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Stream::Tcp(s) => s.read(buf),
@@ -44,7 +44,7 @@ impl Read for Stream {
 }
 
 impl Write for Stream {
-    #[inline]
+    #[inline(always)]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Stream::Tcp(s) => s.write(buf),
@@ -55,7 +55,23 @@ impl Write for Stream {
         }
     }
 
-    #[inline]
+    /// Override write_all to dispatch once per call instead of per-chunk.
+    ///
+    /// The default std::io::Write::write_all loops calling write() — each call
+    /// goes through the Stream match. By overriding, the match happens once
+    /// and the inner stream's write_all handles the loop natively.
+    #[inline(always)]
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.write_all(buf),
+            #[cfg(unix)]
+            Stream::Unix(s) => s.write_all(buf),
+            #[cfg(feature = "tls")]
+            Stream::Tls(s) => s.write_all(buf),
+        }
+    }
+
+    #[inline(always)]
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.flush(),
