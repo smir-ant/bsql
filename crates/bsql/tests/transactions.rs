@@ -539,3 +539,315 @@ fn transaction_defer_execute_empty_flush_is_noop() {
     assert_eq!(tx.deferred_count(), 0);
     tx.commit().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// savepoints
+// ---------------------------------------------------------------------------
+
+#[test]
+fn savepoint_and_release() {
+    let pool = pool();
+
+    let tx = pool.begin().unwrap();
+
+    tx.savepoint("sp1").unwrap();
+
+    let title = "sp_release_test";
+    let uid = 1i32;
+    let ticket = bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id)
+         VALUES ($title: &str, 'new', $uid: i32)
+         RETURNING id"
+    )
+    .fetch_one(&tx)
+    .unwrap();
+    let ticket_id = ticket.id;
+
+    tx.release_savepoint("sp1").unwrap();
+    tx.commit().unwrap();
+
+    // Row should exist after commit because the savepoint was released (kept).
+    let found = bsql::query!("SELECT id FROM tickets WHERE id = $ticket_id: i32")
+        .fetch_optional(&pool)
+        .unwrap();
+    assert!(
+        found.is_some(),
+        "released savepoint row should persist after commit"
+    );
+
+    // Clean up.
+    bsql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
+        .execute(&pool)
+        .unwrap();
+}
+
+#[test]
+fn savepoint_and_rollback_to() {
+    let pool = pool();
+
+    let tx = pool.begin().unwrap();
+
+    tx.savepoint("sp_rb").unwrap();
+
+    let title = "sp_rollback_test";
+    let uid = 1i32;
+    bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id)
+         VALUES ($title: &str, 'new', $uid: i32)"
+    )
+    .execute(&tx)
+    .unwrap();
+
+    // Rollback to savepoint — the insert should be undone.
+    tx.rollback_to("sp_rb").unwrap();
+
+    // Verify the row does NOT exist within the transaction.
+    let search = "sp_rollback_test";
+    let found = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
+        .fetch_all(&tx)
+        .unwrap();
+    assert!(
+        found.is_empty(),
+        "rolled-back savepoint insert should not be visible"
+    );
+
+    tx.commit().unwrap();
+
+    // Also verify outside the transaction.
+    let found = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
+        .fetch_optional(&pool)
+        .unwrap();
+    assert!(
+        found.is_none(),
+        "rolled-back savepoint row should not persist"
+    );
+}
+
+#[test]
+fn nested_savepoints() {
+    let pool = pool();
+
+    let tx = pool.begin().unwrap();
+
+    // Savepoint A: insert row A.
+    tx.savepoint("sp_a").unwrap();
+    let title_a = "nested_sp_a";
+    let uid = 1i32;
+    bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id)
+         VALUES ($title_a: &str, 'new', $uid: i32)"
+    )
+    .execute(&tx)
+    .unwrap();
+
+    // Savepoint B: insert row B.
+    tx.savepoint("sp_b").unwrap();
+    let title_b = "nested_sp_b";
+    bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id)
+         VALUES ($title_b: &str, 'new', $uid: i32)"
+    )
+    .execute(&tx)
+    .unwrap();
+
+    // Rollback to B — only B's insert is undone.
+    tx.rollback_to("sp_b").unwrap();
+
+    // A's insert should still be visible.
+    let search_a = "nested_sp_a";
+    let found_a = bsql::query!("SELECT id FROM tickets WHERE title = $search_a: &str")
+        .fetch_all(&tx)
+        .unwrap();
+    assert_eq!(
+        found_a.len(),
+        1,
+        "savepoint A insert should survive rollback to B"
+    );
+
+    // B's insert should be gone.
+    let search_b = "nested_sp_b";
+    let found_b = bsql::query!("SELECT id FROM tickets WHERE title = $search_b: &str")
+        .fetch_all(&tx)
+        .unwrap();
+    assert!(
+        found_b.is_empty(),
+        "savepoint B insert should be rolled back"
+    );
+
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn rollback_to_nonexistent_savepoint_errors() {
+    let pool = pool();
+    let tx = pool.begin().unwrap();
+
+    // Force the transaction to be active (lazy BEGIN) with a harmless query.
+    let id = 1i32;
+    let _ = bsql::query!("SELECT id FROM users WHERE id = $id: i32")
+        .fetch_one(&tx)
+        .unwrap();
+
+    let result = tx.rollback_to("never_created_sp");
+    assert!(
+        result.is_err(),
+        "rollback to nonexistent savepoint should error"
+    );
+
+    // Transaction is now in aborted state; drop it.
+    drop(tx);
+}
+
+#[test]
+fn savepoint_invalid_name_rejected() {
+    let pool = pool();
+    let tx = pool.begin().unwrap();
+
+    // Empty name.
+    let result = tx.savepoint("");
+    assert!(result.is_err(), "empty savepoint name should be rejected");
+
+    // Special characters.
+    let result = tx.savepoint("sp;drop");
+    assert!(
+        result.is_err(),
+        "savepoint name with special chars should be rejected"
+    );
+
+    let result = tx.savepoint("sp name");
+    assert!(
+        result.is_err(),
+        "savepoint name with space should be rejected"
+    );
+
+    tx.rollback().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// isolation levels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_isolation_serializable() {
+    let pool = pool();
+    let tx = pool.begin().unwrap();
+
+    tx.set_isolation(bsql::IsolationLevel::Serializable)
+        .unwrap();
+
+    // Run a query to prove the transaction works with SERIALIZABLE.
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&tx)
+        .unwrap();
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+
+    tx.commit().unwrap();
+}
+
+#[test]
+fn set_isolation_read_committed() {
+    let pool = pool();
+    let tx = pool.begin().unwrap();
+
+    tx.set_isolation(bsql::IsolationLevel::ReadCommitted)
+        .unwrap();
+
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&tx)
+        .unwrap();
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+
+    tx.commit().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// deferred pipeline edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn flush_empty_deferred_queue() {
+    let pool = pool();
+
+    let tx = pool.begin().unwrap();
+
+    // Force the transaction active with a read.
+    let id = 1i32;
+    let _ = bsql::query!("SELECT id FROM users WHERE id = $id: i32")
+        .fetch_one(&tx)
+        .unwrap();
+
+    // Flush with nothing deferred — should be a no-op.
+    let results = tx.flush_deferred().unwrap();
+    assert!(results.is_empty());
+    assert_eq!(tx.deferred_count(), 0);
+
+    tx.commit().unwrap();
+}
+
+#[test]
+fn multiple_flush_calls() {
+    let pool = pool();
+
+    let tx = pool.begin().unwrap();
+
+    let title = "multi_flush_test";
+    let uid = 1i32;
+    let sql = "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($1, 'new', $2)";
+    let hash = bsql_driver_postgres::hash_sql(sql);
+    let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
+
+    // First batch: defer 3, flush.
+    tx.defer_execute(sql, hash, params).unwrap();
+    tx.defer_execute(sql, hash, params).unwrap();
+    tx.defer_execute(sql, hash, params).unwrap();
+    assert_eq!(tx.deferred_count(), 3);
+
+    let results1 = tx.flush_deferred().unwrap();
+    assert_eq!(results1.len(), 3);
+    assert_eq!(tx.deferred_count(), 0);
+
+    // Second batch: defer 3 more, flush.
+    tx.defer_execute(sql, hash, params).unwrap();
+    tx.defer_execute(sql, hash, params).unwrap();
+    tx.defer_execute(sql, hash, params).unwrap();
+    assert_eq!(tx.deferred_count(), 3);
+
+    let results2 = tx.flush_deferred().unwrap();
+    assert_eq!(results2.len(), 3);
+    assert_eq!(tx.deferred_count(), 0);
+
+    // All 6 rows should exist.
+    let search = "multi_flush_test";
+    let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
+        .fetch_all(&tx)
+        .unwrap();
+    assert_eq!(rows.len(), 6);
+
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn deferred_count_tracks_correctly() {
+    let pool = pool();
+
+    let tx = pool.begin().unwrap();
+
+    let title = "defer_count_test";
+    let uid = 1i32;
+    let sql = "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($1, 'new', $2)";
+    let hash = bsql_driver_postgres::hash_sql(sql);
+    let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
+
+    assert_eq!(tx.deferred_count(), 0);
+
+    for expected in 1..=5 {
+        tx.defer_execute(sql, hash, params).unwrap();
+        assert_eq!(tx.deferred_count(), expected);
+    }
+
+    tx.rollback().unwrap();
+}

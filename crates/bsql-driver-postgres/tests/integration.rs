@@ -946,7 +946,197 @@ fn notice_response_does_not_break_query() {
     assert!(conn.is_idle());
 }
 
+// --- Pool edge cases ---
+
+#[test]
+fn pool_max_size_1_sequential() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(1).build().unwrap();
+
+    // Acquire the single connection, use it, release it.
+    {
+        let mut conn = pool.acquire().unwrap();
+        conn.simple_query("SELECT 1").unwrap();
+    }
+
+    // Give the spawned return task a moment.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Acquire again -- should succeed because the connection was returned.
+    let mut conn2 = pool.acquire().unwrap();
+    conn2.simple_query("SELECT 2").unwrap();
+}
+
+#[test]
+fn pool_acquire_timeout_fires() {
+    let url = require_db!();
+    let pool = Pool::builder()
+        .url(&url)
+        .max_size(1)
+        .acquire_timeout(Some(std::time::Duration::from_millis(100)))
+        .build()
+        .unwrap();
+
+    // Hold the single connection.
+    let _conn1 = pool.acquire().unwrap();
+
+    // Second acquire should block then timeout.
+    let start = std::time::Instant::now();
+    let result = pool.acquire();
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "second acquire should timeout");
+    match result {
+        Err(DriverError::Pool(msg)) => {
+            assert!(
+                msg.contains("timeout") || msg.contains("exhausted"),
+                "unexpected error: {msg}"
+            );
+        }
+        Err(e) => panic!("expected Pool error, got: {e}"),
+        Ok(_) => panic!("expected timeout error"),
+    }
+    // Verify the timeout actually waited (~100ms, not instant).
+    assert!(
+        elapsed >= std::time::Duration::from_millis(50),
+        "timeout fired too fast: {elapsed:?}"
+    );
+}
+
 // --- Large result set ---
+
+#[test]
+fn query_10k_rows() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+    let arena = Arena::new();
+
+    let sql = "SELECT generate_series(1, 10000)::int4 AS n";
+    let hash = hash_sql(sql);
+    let result = conn.query(sql, hash, &[]).unwrap();
+
+    assert_eq!(result.len(), 10_000);
+    assert_eq!(result.row(0, &arena).get_i32(0), Some(1));
+    assert_eq!(result.row(9_999, &arena).get_i32(0), Some(10_000));
+}
+
+#[test]
+fn query_large_text_100kb() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+    let arena = Arena::new();
+
+    let sql = "SELECT repeat('x', 100000) AS big";
+    let hash = hash_sql(sql);
+    let result = conn.query(sql, hash, &[]).unwrap();
+
+    assert_eq!(result.len(), 1);
+    let row = result.row(0, &arena);
+    let val = row.get_str(0).unwrap();
+    assert_eq!(val.len(), 100_000);
+    assert!(val.chars().all(|c| c == 'x'));
+}
+
+// --- Streaming via pool guard ---
+
+#[test]
+fn streaming_basic_via_pool() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+    let mut guard = pool.acquire().unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT generate_series(1, 100)::int4 AS n";
+    let hash = hash_sql(sql);
+
+    let (columns, _) = guard.query_streaming_start(sql, hash, &[], 32).unwrap();
+    assert_eq!(columns.len(), 1);
+
+    let num_cols = columns.len();
+    let mut total_rows = 0;
+    let mut first_chunk = true;
+
+    loop {
+        let mut col_offsets: Vec<(usize, i32)> = Vec::new();
+
+        if !first_chunk {
+            guard.streaming_send_execute(32).unwrap();
+        }
+        first_chunk = false;
+
+        let more = guard
+            .streaming_next_chunk(&mut arena, &mut col_offsets)
+            .unwrap();
+
+        let row_count = col_offsets.len().checked_div(num_cols).unwrap_or(0);
+        total_rows += row_count;
+
+        if !more {
+            break;
+        }
+        arena.reset();
+    }
+
+    assert_eq!(total_rows, 100);
+}
+
+#[test]
+fn streaming_empty_result_via_pool() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+    let mut guard = pool.acquire().unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT 1 AS n WHERE false";
+    let hash = hash_sql(sql);
+
+    let (columns, _) = guard.query_streaming_start(sql, hash, &[], 32).unwrap();
+    let num_cols = columns.len();
+
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
+    let more = guard
+        .streaming_next_chunk(&mut arena, &mut col_offsets)
+        .unwrap();
+
+    assert!(!more, "empty result should have no more chunks");
+    let rows = if num_cols > 0 && !col_offsets.is_empty() {
+        col_offsets.len() / num_cols
+    } else {
+        0
+    };
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn streaming_single_row_via_pool() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+    let mut guard = pool.acquire().unwrap();
+    let mut arena = Arena::new();
+
+    let sql = "SELECT 42::int4 AS n";
+    let hash = hash_sql(sql);
+
+    let (columns, _) = guard.query_streaming_start(sql, hash, &[], 32).unwrap();
+    let num_cols = columns.len();
+
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
+    let more = guard
+        .streaming_next_chunk(&mut arena, &mut col_offsets)
+        .unwrap();
+
+    assert!(!more, "single-row result should have no more chunks");
+    let rows = col_offsets.len() / num_cols;
+    assert_eq!(rows, 1);
+
+    let (offset, len) = col_offsets[0];
+    assert_eq!(len, 4);
+    let data = arena.get(offset, len as usize);
+    let val = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    assert_eq!(val, 42);
+}
 
 #[test]
 fn query_100k_rows() {

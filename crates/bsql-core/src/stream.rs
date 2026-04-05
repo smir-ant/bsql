@@ -532,14 +532,20 @@ mod tests {
     #[test]
     fn make_stream_finished_true_needs_execute_false() {
         let stream = make_stream(3, 2, true);
-        assert!(!stream.needs_execute, "finished stream should not need execute");
+        assert!(
+            !stream.needs_execute,
+            "finished stream should not need execute"
+        );
         assert!(stream.finished);
     }
 
     #[test]
     fn make_stream_not_finished_needs_execute_true() {
         let stream = make_stream(3, 2, false);
-        assert!(stream.needs_execute, "unfinished stream should need execute");
+        assert!(
+            stream.needs_execute,
+            "unfinished stream should need execute"
+        );
         assert!(!stream.finished);
     }
 
@@ -578,7 +584,10 @@ mod tests {
         // After consuming last row: remaining=0, but has_more=true (server may have more)
         let _ = stream.next_row();
         assert_eq!(stream.remaining(), 0);
-        assert!(stream.has_more(), "unfinished stream should report has_more even with empty buffer");
+        assert!(
+            stream.has_more(),
+            "unfinished stream should report has_more even with empty buffer"
+        );
     }
 
     // --- Drop behavior ---

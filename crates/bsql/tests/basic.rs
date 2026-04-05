@@ -566,3 +566,45 @@ fn fetch_stream_fully_consumed() {
     let r = user.get().unwrap();
     assert_eq!(r.id, 1);
 }
+
+// ---------------------------------------------------------------------------
+// raw_query / raw_execute
+// ---------------------------------------------------------------------------
+
+#[test]
+fn raw_query_returns_rows() {
+    let pool = pool();
+    let rows = pool.raw_query("SELECT 1 AS n").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("1"));
+}
+
+#[test]
+fn raw_execute_creates_table() {
+    let pool = pool();
+
+    // Create a temp table via raw_execute.
+    pool.raw_execute("CREATE TEMP TABLE _raw_exec_test (val int)")
+        .unwrap();
+
+    // Verify the table exists by inserting and querying.
+    pool.raw_execute("INSERT INTO _raw_exec_test VALUES (42)")
+        .unwrap();
+    let rows = pool.raw_query("SELECT val FROM _raw_exec_test").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("42"));
+}
+
+#[test]
+fn raw_query_empty_result() {
+    let pool = pool();
+    let rows = pool.raw_query("SELECT 1 WHERE false").unwrap();
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn raw_query_syntax_error() {
+    let pool = pool();
+    let result = pool.raw_query("SELECTTTT");
+    assert!(result.is_err(), "syntax error should return Err");
+}

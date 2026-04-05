@@ -1166,12 +1166,14 @@ mod tests {
     #[test]
     fn config_unicode_password() {
         // "пароль" in UTF-8 is D0 BF D0 B0 D1 80 D0 BE D0 BB D1 8C
-        let cfg = Config::from_url(
-            "postgres://user:%D0%BF%D0%B0%D1%80%D0%BE%D0%BB%D1%8C@localhost/db",
-        )
-        .unwrap();
+        let cfg =
+            Config::from_url("postgres://user:%D0%BF%D0%B0%D1%80%D0%BE%D0%BB%D1%8C@localhost/db")
+                .unwrap();
         assert_eq!(cfg.user, "user");
-        assert_eq!(cfg.password, "\u{043F}\u{0430}\u{0440}\u{043E}\u{043B}\u{044C}"); // пароль
+        assert_eq!(
+            cfg.password,
+            "\u{043F}\u{0430}\u{0440}\u{043E}\u{043B}\u{044C}"
+        ); // пароль
         assert_eq!(cfg.host, "localhost");
         assert_eq!(cfg.database, "db");
     }
@@ -1256,10 +1258,8 @@ mod tests {
     // Multiple ampersands and empty param segments
     #[test]
     fn config_empty_param_segments() {
-        let cfg = Config::from_url(
-            "postgres://user:pass@localhost/db?&&statement_timeout=60&&",
-        )
-        .unwrap();
+        let cfg =
+            Config::from_url("postgres://user:pass@localhost/db?&&statement_timeout=60&&").unwrap();
         assert_eq!(cfg.statement_timeout_secs, 60);
     }
 

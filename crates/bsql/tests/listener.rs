@@ -358,3 +358,61 @@ fn large_payload() {
     let notif = listener.recv().unwrap();
     assert_eq!(notif.payload().len(), 4000);
 }
+
+// ---------------------------------------------------------------------------
+// edge case: listen same channel twice (idempotent)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn listen_same_channel_twice() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("dup_listen_ch").unwrap();
+    // Second listen on the same channel should not error (PG LISTEN is idempotent).
+    listener.listen("dup_listen_ch").unwrap();
+
+    // Sending one notification should produce exactly one received message.
+    listener.notify("dup_listen_ch", "once").unwrap();
+
+    let notif = listener.recv().unwrap();
+    assert_eq!(notif.channel(), "dup_listen_ch");
+    assert_eq!(notif.payload(), "once");
+
+    // Verify there is no duplicate notification waiting.
+    let maybe = listener.try_recv().unwrap();
+    assert!(
+        maybe.is_none(),
+        "should not receive a duplicate notification"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// edge case: unlisten a channel that was never listened
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unlisten_never_listened_channel() {
+    let listener = Listener::connect(DB_URL).unwrap();
+    // PG UNLISTEN on a channel we never LISTENed should not error.
+    let result = listener.unlisten("never_listened_ch");
+    assert!(
+        result.is_ok(),
+        "unlisten on never-listened channel should succeed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// edge case: try_recv when no notifications pending
+// ---------------------------------------------------------------------------
+
+#[test]
+fn try_recv_empty() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("try_recv_empty_ch").unwrap();
+
+    // No notifications have been sent — try_recv should return None.
+    let result = listener.try_recv().unwrap();
+    assert!(
+        result.is_none(),
+        "try_recv with no pending notifications should return None"
+    );
+}

@@ -513,7 +513,10 @@ mod tests {
 
     #[test]
     fn validate_savepoint_name_unicode_rejected() {
-        assert!(validate_savepoint_name("sp_\u{00e9}").is_err(), "unicode chars should be rejected");
+        assert!(
+            validate_savepoint_name("sp_\u{00e9}").is_err(),
+            "unicode chars should be rejected"
+        );
     }
 
     #[test]
