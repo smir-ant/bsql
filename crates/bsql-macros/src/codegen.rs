@@ -1136,16 +1136,23 @@ fn gen_dynamic_executor_impls(
             && !parsed.normalized_sql.contains(" limit ")
             && !parsed.normalized_sql.contains(" for ");
 
-        let fetch_dispatcher =
-            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+        let fetch_dispatcher = gen_variant_dispatcher(
+            parsed,
+            variants,
+            false,
+            |sql_lit, sql_hash| {
                 quote! {
                     let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
                     Ok(#r_rows_name { owned })
                 }
-            });
+            },
+        );
 
-        let fetch_one_dispatcher =
-            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
+        let fetch_one_dispatcher = gen_variant_dispatcher(
+            parsed,
+            variants,
+            needs_limit,
+            |sql_lit, sql_hash| {
                 quote! {
                     let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
                     if owned.len() != 1 {
@@ -1156,10 +1163,14 @@ fn gen_dynamic_executor_impls(
                     }
                     Ok(#r_single_name { owned })
                 }
-            });
+            },
+        );
 
-        let fetch_optional_dispatcher =
-            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
+        let fetch_optional_dispatcher = gen_variant_dispatcher(
+            parsed,
+            variants,
+            needs_limit,
+            |sql_lit, sql_hash| {
                 quote! {
                     let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
                     match owned.len() {
@@ -1171,7 +1182,8 @@ fn gen_dynamic_executor_impls(
                         )),
                     }
                 }
-            });
+            },
+        );
 
         quote! {
             /// Fetch all rows, returning a wrapper with zero-allocation borrowed access.
@@ -2464,10 +2476,7 @@ fn gen_borrowed_nullable_decode(idx: usize, inner_type: &str) -> TokenStream {
 
 /// Generate the `BsqlRows_xxx` wrapper struct, the `BsqlSingleRef_xxx` wrapper,
 /// and their impls, using the borrowed for_each row struct.
-fn gen_rows_struct(
-    parsed: &ParsedQuery,
-    validation: &ValidationResult,
-) -> TokenStream {
+fn gen_rows_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     if validation.columns.is_empty() {
         return TokenStream::new();
     }
@@ -3137,10 +3146,7 @@ mod tests {
     #[test]
     fn fetch_ref_borrowed_decode_no_to_owned() {
         let parsed = parse_query("SELECT name, data FROM t WHERE 1 = $a: i32").unwrap();
-        let validation = make_validation(vec![
-            col("name", "String"),
-            col("data", "Vec<u8>"),
-        ]);
+        let validation = make_validation(vec![col("name", "String"), col("data", "Vec<u8>")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
@@ -3149,7 +3155,9 @@ mod tests {
         let rows_impl_start = code_str.find("BsqlRows_").unwrap();
         let rows_section = &code_str[rows_impl_start..];
         // Find the next "impl" boundary after the BsqlRows impl to isolate the section
-        let section_end = rows_section.find("BsqlSingleRef_").unwrap_or(rows_section.len());
+        let section_end = rows_section
+            .find("BsqlSingleRef_")
+            .unwrap_or(rows_section.len());
         let rows_section = &rows_section[..section_end];
 
         assert!(
@@ -3175,7 +3183,9 @@ mod tests {
         // Isolate BsqlRows section
         let rows_impl_start = code_str.find("BsqlRows_").unwrap();
         let rows_section = &code_str[rows_impl_start..];
-        let section_end = rows_section.find("BsqlSingleRef_").unwrap_or(rows_section.len());
+        let section_end = rows_section
+            .find("BsqlSingleRef_")
+            .unwrap_or(rows_section.len());
         let rows_section = &rows_section[..section_end];
 
         assert!(

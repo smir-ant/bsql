@@ -40,7 +40,9 @@ thread_local! {
 }
 
 fn acquire_resp_buf() -> Vec<u8> {
-    RESP_BUF_POOL.with(|pool| pool.borrow_mut().pop()).unwrap_or_default()
+    RESP_BUF_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default()
 }
 
 /// Return a response buffer to the thread-local pool for reuse.
@@ -530,11 +532,7 @@ impl Connection {
                         match msg {
                             BackendMessage::BindComplete => continue,
                             BackendMessage::DataRow { data } => {
-                                parse_data_row_into_buf(
-                                    data,
-                                    &mut resp_buf,
-                                    &mut all_col_offsets,
-                                )?;
+                                parse_data_row_into_buf(data, &mut resp_buf, &mut all_col_offsets)?;
                                 continue;
                             }
                             BackendMessage::CommandComplete { tag } => {
@@ -652,7 +650,10 @@ impl Connection {
 
         if can_use_template {
             // SAFETY: can_use_template is true only when bind_template.is_some()
-            let tmpl = info.bind_template.as_ref().expect("guarded by can_use_template");
+            let tmpl = info
+                .bind_template
+                .as_ref()
+                .expect("guarded by can_use_template");
             self.write_buf.extend_from_slice(&tmpl.bytes);
 
             let mut template_ok = true;
@@ -1394,7 +1395,10 @@ impl Connection {
 
         if can_use_template {
             // SAFETY: can_use_template is true only when bind_template.is_some()
-            let tmpl = info.bind_template.as_ref().expect("guarded by can_use_template");
+            let tmpl = info
+                .bind_template
+                .as_ref()
+                .expect("guarded by can_use_template");
             self.write_buf.extend_from_slice(&tmpl.bytes);
 
             let mut template_ok = true;
@@ -2000,7 +2004,10 @@ impl Connection {
 
             if can_use_template {
                 // SAFETY: can_use_template is true only when bind_template.is_some()
-                let tmpl = info.bind_template.as_ref().expect("guarded by can_use_template");
+                let tmpl = info
+                    .bind_template
+                    .as_ref()
+                    .expect("guarded by can_use_template");
                 // Copy only the Bind portion (not EXECUTE_SYNC) — streaming
                 // needs Execute+Flush instead.
                 self.write_buf
@@ -2303,7 +2310,10 @@ impl Connection {
                 // Fast path: copy template (includes EXECUTE_SYNC) and patch params
                 // directly via encode_at — no scratch buffer, no double-copy.
                 // SAFETY: can_use_template is true only when bind_template.is_some()
-                let tmpl = info.bind_template.as_ref().expect("guarded by can_use_template");
+                let tmpl = info
+                    .bind_template
+                    .as_ref()
+                    .expect("guarded by can_use_template");
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
@@ -2710,14 +2720,7 @@ impl Connection {
     #[inline]
     fn refill_stream_buf(&mut self) -> Result<(), DriverError> {
         let remaining = self.stream_buf_end - self.stream_buf_pos;
-        // Hint to optimizer: we only call refill after consuming at least one
-        // message, so stream_buf_pos is always > 0 when remaining > 0. The
-        // debug_assert helps the compiler elide the redundant pos > 0 check.
-        debug_assert!(
-            remaining == 0 || self.stream_buf_pos > 0,
-            "refill_stream_buf called with pos=0 and remaining data"
-        );
-        if remaining > 0 {
+        if remaining > 0 && self.stream_buf_pos > 0 {
             self.stream_buf
                 .copy_within(self.stream_buf_pos..self.stream_buf_end, 0);
         }
@@ -2870,8 +2873,12 @@ fn parse_data_row_flat(
             return Err(DriverError::Protocol("DataRow truncated".into()));
         }
 
-        let col_len =
-            i32::from_be_bytes([col_data[pos], col_data[pos + 1], col_data[pos + 2], col_data[pos + 3]]);
+        let col_len = i32::from_be_bytes([
+            col_data[pos],
+            col_data[pos + 1],
+            col_data[pos + 2],
+            col_data[pos + 3],
+        ]);
         pos += 4;
 
         if col_len < 0 {

@@ -14,7 +14,6 @@
 use std::fmt;
 use std::sync::Mutex;
 
-use bsql_driver_postgres::Arena;
 use bsql_driver_postgres::codec::Encode;
 
 use crate::error::{BsqlError, BsqlResult, QueryError};

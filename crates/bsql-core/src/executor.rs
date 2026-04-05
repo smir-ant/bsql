@@ -6,7 +6,7 @@
 //! The `query_raw` / `query_raw_readonly` methods use the bsql-driver's arena-based
 //! row storage. Generated code decodes columns from `Row` via typed getters.
 
-use bsql_driver_postgres::arena::{acquire_arena, release_arena};
+use bsql_driver_postgres::arena::release_arena;
 use bsql_driver_postgres::codec::Encode;
 use bsql_driver_postgres::{Arena, QueryResult};
 
@@ -32,11 +32,6 @@ impl std::fmt::Debug for OwnedResult {
 }
 
 impl OwnedResult {
-    /// Create from a result and its arena.
-    pub(crate) fn new(result: QueryResult, arena: Arena) -> Self {
-        Self { result, arena }
-    }
-
     /// Create without arena — for queries that use data_buf instead of arena.
     /// Zero allocation: Arena::empty() allocates nothing.
     pub(crate) fn without_arena(result: QueryResult) -> Self {
@@ -248,10 +243,10 @@ mod tests {
 
         let col_offsets: Vec<(usize, i32)> = vec![(0, -1); num_rows * num_cols]; // NULL columns
         let result = QueryResult::from_parts(col_offsets, num_cols, cols, 0);
-        OwnedResult::new(result, arena)
+        OwnedResult { result, arena }
     }
 
-    // --- OwnedResult::new ---
+    // --- OwnedResult ---
 
     #[test]
     fn owned_result_new_zero_rows() {
@@ -329,7 +324,7 @@ mod tests {
         let arena = acquire_arena();
         let cols: Arc<[ColumnDesc]> = Arc::from(Vec::new());
         let result = QueryResult::from_parts(vec![], 0, cols, 42);
-        let owned = OwnedResult::new(result, arena);
+        let owned = OwnedResult { result, arena };
         assert_eq!(owned.len(), 0);
         assert!(owned.is_empty());
         assert_eq!(owned.result.affected_rows(), 42);

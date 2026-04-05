@@ -233,9 +233,7 @@ fn query_statement_cache_hit() {
     assert_eq!(r1.row(0, &arena).get_i32(0), Some(3));
 
     // Second call: cache hit, only Bind+Execute
-    let r2 = conn
-        .query(sql, hash, &[&10i32, &20i32])
-        .unwrap();
+    let r2 = conn.query(sql, hash, &[&10i32, &20i32]).unwrap();
     assert_eq!(r2.row(0, &arena).get_i32(0), Some(30));
 }
 
@@ -846,9 +844,7 @@ fn codec_nan_and_infinity() {
     // NaN
     let sql = "SELECT $1::float4 AS f4, $2::float8 AS f8";
     let hash = hash_sql(sql);
-    let result = conn
-        .query(sql, hash, &[&f32::NAN, &f64::NAN])
-        .unwrap();
+    let result = conn.query(sql, hash, &[&f32::NAN, &f64::NAN]).unwrap();
     let row = result.row(0, &arena);
     assert!(row.get_f32(0).unwrap().is_nan());
     assert!(row.get_f64(1).unwrap().is_nan());
@@ -863,11 +859,7 @@ fn codec_nan_and_infinity() {
 
     // Negative infinity
     let result = conn
-        .query(
-            sql,
-            hash,
-            &[&f32::NEG_INFINITY, &f64::NEG_INFINITY],
-        )
+        .query(sql, hash, &[&f32::NEG_INFINITY, &f64::NEG_INFINITY])
         .unwrap();
     let row = result.row(0, &arena);
     assert!(row.get_f32(0).unwrap().is_infinite());

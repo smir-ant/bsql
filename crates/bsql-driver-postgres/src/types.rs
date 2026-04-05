@@ -356,7 +356,11 @@ impl QueryResult {
             num_cols,
             columns,
             affected_rows,
-            data_buf: if data_buf.is_empty() { None } else { Some(data_buf) },
+            data_buf: if data_buf.is_empty() {
+                None
+            } else {
+                Some(data_buf)
+            },
         }
     }
 
