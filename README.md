@@ -19,7 +19,7 @@ let id = 42i32;
 // or `id` isn't an i32 -- this won't compile.
 let users = bsql::query!(
     "SELECT id, login, active FROM users WHERE id = $id: i32"
-).fetch(&pool).await?;
+).fetch(&pool)?;
 let user = &users[0];
 
 // user.id: i32, user.login: String, user.active: bool
@@ -42,8 +42,7 @@ let user = &users[0];
 
 ```toml
 [dependencies]
-bsql = { version = "0.16", features = ["time", "uuid"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+bsql = { version = "0.17", features = ["time", "uuid"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -57,14 +56,13 @@ export BSQL_DATABASE_URL="postgres://user:pass@localhost/mydb"
 ```rust
 use bsql::Pool;
 
-#[tokio::main]
-async fn main() -> Result<(), bsql::BsqlError> {
-    let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+fn main() -> Result<(), bsql::BsqlError> {
+    let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
 
     let id = 1i32;
     let users = bsql::query!(
         "SELECT id, login, first_name FROM users WHERE id = $id: i32"
-    ).fetch(&pool).await?;
+    ).fetch(&pool)?;
     let user = &users[0];
 
     println!("{} ({})", user.first_name, user.login);
@@ -80,8 +78,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 
 ```toml
 [dependencies]
-bsql = { version = "0.16", features = ["sqlite"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+bsql = { version = "0.17", features = ["sqlite"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -97,14 +94,13 @@ If you commit the `.bsql/` cache directory to your repo, teammates and CI can co
 ```rust
 use bsql::SqlitePool;
 
-#[tokio::main]
-async fn main() -> Result<(), bsql::BsqlError> {
+fn main() -> Result<(), bsql::BsqlError> {
     let pool = SqlitePool::open("./myapp.db")?;
 
     let id = 1i64;
     let users = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i64"
-    ).fetch(&pool).await?;
+    ).fetch(&pool)?;
     let user = &users[0];
 
     println!("{}: active={}", user.login, user.active);
@@ -163,7 +159,7 @@ When a pure-Rust SQLite engine like [Limbo](https://github.com/penberg/limbo) re
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. Enable features for specialized types:
 
 ```toml
-bsql = { version = "0.16", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.17", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature     | PostgreSQL types                   | Rust types                                   |
@@ -187,7 +183,7 @@ let tickets = bsql::query!(
     "SELECT id, title FROM tickets WHERE deleted_at IS NULL
      [AND department_id = $dept: Option<i64>]
      [AND assignee_id = $assignee: Option<i64>]"
-).fetch(&pool).await?;
+).fetch(&pool)?;
 ```
 
 No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variants, all validated at compile time.
@@ -211,16 +207,16 @@ Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also avai
 <summary>Transactions and batching</summary>
 
 ```rust
-let tx = pool.begin().await?;
+let tx = pool.begin()?;
 
 // .defer() buffers writes -- nothing hits the network yet
 bsql::query!("INSERT INTO audit_log (msg) VALUES ($msg: &str)")
-    .defer(&tx).await?;
+    .defer(&tx)?;
 bsql::query!("UPDATE accounts SET balance = balance - $amt: i32 WHERE id = $id: i32")
-    .defer(&tx).await?;
+    .defer(&tx)?;
 
 // commit() flushes all deferred operations in a single pipeline, then commits
-tx.commit().await?;
+tx.commit()?;
 ```
 
 Savepoints are also supported: `tx.savepoint("sp1")`, `tx.rollback_to("sp1")`.
@@ -235,11 +231,11 @@ If the transaction is dropped without calling `commit()`, it automatically rolls
 ```rust
 let mut stream = bsql::query!(
     "SELECT id, login FROM users"
-).fetch_stream(&pool).await?;
+).fetch_stream(&pool)?;
 
-while let Some(row) = stream.next().await {
-    let user = row?;
-    println!("{}: {}", user.id, user.login);
+while stream.advance()? {
+    let row = stream.next_row().unwrap();
+    println!("{}: {}", row.get_i32(0).unwrap(), row.get_str(1).unwrap());
 }
 ```
 
@@ -251,11 +247,11 @@ True PostgreSQL-level streaming. Rows are fetched in batches and yielded one at 
 <summary>LISTEN/NOTIFY (PostgreSQL)</summary>
 
 ```rust
-let mut listener = Listener::connect("postgres://...").await?;
-listener.listen("events").await?;
+let mut listener = Listener::connect("postgres://...")?;
+listener.listen("events")?;
 
 loop {
-    let n = listener.recv().await?;
+    let n = listener.recv()?;
     println!("channel={}, payload={}", n.channel(), n.payload());
 }
 ```
@@ -268,7 +264,7 @@ Real-time notifications for cache invalidation, job queues, live updates.
 <summary>Compile-time EXPLAIN plans</summary>
 
 ```toml
-bsql = { version = "0.16", features = ["explain"] }
+bsql = { version = "0.17", features = ["explain"] }
 ```
 
 Runs `EXPLAIN` on every query during compilation and embeds the plan as a doc comment. Hover over any query result type in your IDE to see the query plan. Development-only -- disable in CI and release builds.
@@ -298,7 +294,7 @@ Type-safe mapping between Rust enums and PostgreSQL enum types.
 ```rust
 let tickets = bsql::query!(
     "SELECT id, title FROM tickets ORDER BY $[sort: TicketSort] LIMIT $limit: i64"
-).fetch(&pool).await?;
+).fetch(&pool)?;
 ```
 
 Each sort variant's SQL is validated at compile time. The enum is exhaustive -- no default case, no fallback.
@@ -317,7 +313,7 @@ bsql automatically configures SQLite for optimal performance:
 - **`busy_timeout = 0`** -- fail-fast, no silent waiting
 - **Foreign keys ON** -- enforced by default
 
-The pool uses a single writer + N reader connections (default 4) behind `Mutex`, fully synchronous. No tokio dependency for SQLite.
+The pool uses a single writer + N reader connections (default 4) behind `Mutex`, fully synchronous.
 
 </details>
 

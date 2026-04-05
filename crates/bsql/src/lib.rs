@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! bsql = "0.16"
+//! bsql = "0.17"
 //! ```
 //!
 //! Set the database URL for compile-time validation:

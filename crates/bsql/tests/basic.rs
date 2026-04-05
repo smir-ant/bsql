@@ -5,20 +5,18 @@
 
 use bsql::{BsqlError, Pool};
 
-async fn pool() -> Pool {
+fn pool() -> Pool {
     Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
-        .await
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }
 
-#[tokio::test]
-async fn select_fetch_one() {
-    let pool = pool().await;
+#[test]
+fn select_fetch_one() {
+    let pool = pool();
     let id = 1i32;
     let user =
         bsql::query!("SELECT id, login, first_name, last_name FROM users WHERE id = $id: i32")
             .fetch_one(&pool)
-            .await
             .unwrap();
 
     assert_eq!(user.id, 1);
@@ -27,12 +25,11 @@ async fn select_fetch_one() {
     assert_eq!(user.last_name, "Smith");
 }
 
-#[tokio::test]
-async fn select_fetch_all() {
-    let pool = pool().await;
+#[test]
+fn select_fetch_all() {
+    let pool = pool();
     let users = bsql::query!("SELECT id, login FROM users WHERE active = true ORDER BY id")
         .fetch_all(&pool)
-        .await
         .unwrap();
 
     assert_eq!(users.len(), 2);
@@ -40,47 +37,44 @@ async fn select_fetch_all() {
     assert_eq!(users[1].login, "bob");
 }
 
-#[tokio::test]
-async fn select_fetch_optional_found() {
-    let pool = pool().await;
+#[test]
+fn select_fetch_optional_found() {
+    let pool = pool();
     let login = "alice";
     let user = bsql::query!("SELECT id, login FROM users WHERE login = $login: &str")
         .fetch_optional(&pool)
-        .await
         .unwrap();
 
     assert!(user.is_some());
     assert_eq!(user.unwrap().login, "alice");
 }
 
-#[tokio::test]
-async fn select_fetch_optional_not_found() {
-    let pool = pool().await;
+#[test]
+fn select_fetch_optional_not_found() {
+    let pool = pool();
     let login = "nonexistent";
     let user = bsql::query!("SELECT id, login FROM users WHERE login = $login: &str")
         .fetch_optional(&pool)
-        .await
         .unwrap();
 
     assert!(user.is_none());
 }
 
-#[tokio::test]
-async fn select_nullable_column() {
-    let pool = pool().await;
+#[test]
+fn select_nullable_column() {
+    let pool = pool();
     let id = 1i32;
     let user = bsql::query!("SELECT id, middle_name FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
 
     assert_eq!(user.id, 1);
     assert!(user.middle_name.is_none());
 }
 
-#[tokio::test]
-async fn insert_returning() {
-    let pool = pool().await;
+#[test]
+fn insert_returning() {
+    let pool = pool();
     let title = "Test ticket";
     let uid = 1i32;
     let ticket = bsql::query!(
@@ -89,28 +83,26 @@ async fn insert_returning() {
          RETURNING id"
     )
     .fetch_one(&pool)
-    .await
     .unwrap();
 
     assert!(ticket.id > 0);
 }
 
-#[tokio::test]
-async fn update_execute() {
-    let pool = pool().await;
+#[test]
+fn update_execute() {
+    let pool = pool();
     let desc = "Updated description";
     let id = 1i32;
     let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
         .execute(&pool)
-        .await
         .unwrap();
 
     assert_eq!(affected, 1);
 }
 
-#[tokio::test]
-async fn delete_execute() {
-    let pool = pool().await;
+#[test]
+fn delete_execute() {
+    let pool = pool();
     let title = "To be deleted";
     let uid = 1i32;
     let ticket = bsql::query!(
@@ -119,25 +111,22 @@ async fn delete_execute() {
          RETURNING id"
     )
     .fetch_one(&pool)
-    .await
     .unwrap();
 
     let ticket_id = ticket.id;
     let affected = bsql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
         .execute(&pool)
-        .await
         .unwrap();
 
     assert_eq!(affected, 1);
 }
 
-#[tokio::test]
-async fn fetch_one_zero_rows_errors() {
-    let pool = pool().await;
+#[test]
+fn fetch_one_zero_rows_errors() {
+    let pool = pool();
     let id = 999999i32;
     let result = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
-        .fetch_one(&pool)
-        .await;
+        .fetch_one(&pool);
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -152,16 +141,15 @@ async fn fetch_one_zero_rows_errors() {
     }
 }
 
-#[tokio::test]
-async fn select_multiple_types() {
-    let pool = pool().await;
+#[test]
+fn select_multiple_types() {
+    let pool = pool();
     let id = 1i32;
     let user = bsql::query!(
         "SELECT id, login, active, score, rating, balance
          FROM users WHERE id = $id: i32"
     )
     .fetch_one(&pool)
-    .await
     .unwrap();
 
     assert_eq!(user.id, 1i32);
@@ -172,23 +160,22 @@ async fn select_multiple_types() {
     assert!((user.balance - 100.50f64).abs() < f64::EPSILON);
 }
 
-#[tokio::test]
-async fn select_count_expression() {
-    // COUNT(*) is a computed column — should be i64, nullable by default
-    let pool = pool().await;
+#[test]
+fn select_count_expression() {
+    // COUNT(*) is a computed column -- should be i64, nullable by default
+    let pool = pool();
     let result = bsql::query!("SELECT COUNT(*) as cnt FROM users")
         .fetch_one(&pool)
-        .await
         .unwrap();
     // COUNT(*) never returns NULL (returns 0 for empty sets)
-    // but our system defaults computed columns to nullable → Option<i64>
+    // but our system defaults computed columns to nullable -> Option<i64>
     assert!(result.cnt.is_some());
     assert!(result.cnt.unwrap() >= 2);
 }
 
-#[tokio::test]
-async fn select_with_join_and_aliases() {
-    let pool = pool().await;
+#[test]
+fn select_with_join_and_aliases() {
+    let pool = pool();
     let id = 1i32;
     let result = bsql::query!(
         "SELECT t.id as ticket_id, t.title, u.login as creator
@@ -197,16 +184,15 @@ async fn select_with_join_and_aliases() {
          WHERE t.id = $id: i32"
     )
     .fetch_one(&pool)
-    .await
     .unwrap();
     assert_eq!(result.ticket_id, 1);
     assert_eq!(result.title, "Fix login bug");
     assert_eq!(result.creator, "alice");
 }
 
-#[tokio::test]
-async fn select_with_cte() {
-    let pool = pool().await;
+#[test]
+fn select_with_cte() {
+    let pool = pool();
     let results = bsql::query!(
         "WITH active_users AS (
             SELECT id, login FROM users WHERE active = true
@@ -214,38 +200,35 @@ async fn select_with_cte() {
         SELECT id, login FROM active_users ORDER BY id"
     )
     .fetch_all(&pool)
-    .await
     .unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].login, "alice");
 }
 
-#[tokio::test]
-async fn fetch_all_empty_result() {
-    let pool = pool().await;
+#[test]
+fn fetch_all_empty_result() {
+    let pool = pool();
     let login = "absolutely_nobody_has_this_login";
     let results = bsql::query!("SELECT id, login FROM users WHERE login = $login: &str")
         .fetch_all(&pool)
-        .await
         .unwrap();
     assert!(results.is_empty());
 }
 
-#[tokio::test]
-async fn select_expression_arithmetic() {
-    let pool = pool().await;
+#[test]
+fn select_expression_arithmetic() {
+    let pool = pool();
     let result = bsql::query!("SELECT 1 + 1 as sum_val")
         .fetch_one(&pool)
-        .await
         .unwrap();
-    // Computed expression → nullable by default
+    // Computed expression -> nullable by default
     assert_eq!(result.sum_val, Some(2i32));
 }
 
-#[tokio::test]
-async fn insert_on_conflict_do_nothing() {
-    let pool = pool().await;
-    // alice already exists — ON CONFLICT DO NOTHING returns 0 affected
+#[test]
+fn insert_on_conflict_do_nothing() {
+    let pool = pool();
+    // alice already exists -- ON CONFLICT DO NOTHING returns 0 affected
     let login = "alice";
     let first_name = "Alice";
     let last_name = "Smith";
@@ -256,14 +239,13 @@ async fn insert_on_conflict_do_nothing() {
          ON CONFLICT (login) DO NOTHING"
     )
     .execute(&pool)
-    .await
     .unwrap();
     assert_eq!(affected, 0);
 }
 
-#[tokio::test]
-async fn delete_returning() {
-    let pool = pool().await;
+#[test]
+fn delete_returning() {
+    let pool = pool();
     let title = "Ticket for RETURNING test";
     let uid = 1i32;
     let ticket = bsql::query!(
@@ -272,36 +254,32 @@ async fn delete_returning() {
          RETURNING id"
     )
     .fetch_one(&pool)
-    .await
     .unwrap();
 
     let id = ticket.id;
     let deleted = bsql::query!("DELETE FROM tickets WHERE id = $id: i32 RETURNING id, title")
         .fetch_all(&pool)
-        .await
         .unwrap();
     assert_eq!(deleted.len(), 1);
     assert_eq!(deleted[0].id, id);
 }
 
-#[tokio::test]
-async fn param_reuse_in_real_query() {
-    let pool = pool().await;
+#[test]
+fn param_reuse_in_real_query() {
+    let pool = pool();
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32 AND id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
 }
 
-#[tokio::test]
-async fn fetch_optional_multiple_rows_errors() {
-    let pool = pool().await;
-    // users table has 2+ rows with active=true — fetch_optional must error
+#[test]
+fn fetch_optional_multiple_rows_errors() {
+    let pool = pool();
+    // users table has 2+ rows with active=true -- fetch_optional must error
     let result = bsql::query!("SELECT id, login FROM users WHERE active = true")
-        .fetch_optional(&pool)
-        .await;
+        .fetch_optional(&pool);
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -316,76 +294,70 @@ async fn fetch_optional_multiple_rows_errors() {
     }
 }
 
-#[tokio::test]
-async fn bytea_column_round_trip() {
-    let pool = pool().await;
+#[test]
+fn bytea_column_round_trip() {
+    let pool = pool();
     let avatar: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
     let id = 1i32;
     // Set avatar
     bsql::query!("UPDATE users SET avatar = $avatar: &[u8] WHERE id = $id: i32")
         .execute(&pool)
-        .await
         .unwrap();
 
     // Read it back
     let user = bsql::query!("SELECT id, avatar FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
 
     assert_eq!(user.id, 1);
     assert_eq!(user.avatar.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
 }
 
-#[tokio::test]
-async fn array_column_type() {
-    let pool = pool().await;
+#[test]
+fn array_column_type() {
+    let pool = pool();
     let id = 1i32;
     let user = bsql::query!("SELECT id, tag_ids FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
 
     assert_eq!(user.id, 1);
     assert!(user.tag_ids.is_empty()); // default '{}'
 }
 
-#[tokio::test]
-async fn connect_invalid_url() {
-    let result = Pool::connect("not_a_url").await;
+#[test]
+fn connect_invalid_url() {
+    let result = Pool::connect("not_a_url");
     assert!(result.is_err(), "invalid URL should fail");
 }
 
-#[tokio::test]
-async fn select_star() {
-    let pool = pool().await;
+#[test]
+fn select_star() {
+    let pool = pool();
     let id = 1i32;
     let user = bsql::query!("SELECT * FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
 }
 
-#[tokio::test]
-async fn pool_debug_format() {
-    let pool = pool().await;
+#[test]
+fn pool_debug_format() {
+    let pool = pool();
     let debug = format!("{:?}", pool);
     assert!(debug.contains("Pool"), "debug: {debug}");
     assert!(debug.contains("status"), "debug: {debug}");
 }
 
-#[tokio::test]
-async fn pool_builder_url_method() {
+#[test]
+fn pool_builder_url_method() {
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
         .build()
-        .await
         .unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&pool)
-        .await
         .unwrap();
     assert!(users.len() >= 2);
 }
@@ -394,12 +366,11 @@ async fn pool_builder_url_method() {
 // additional coverage: error variant matching
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn fetch_one_multiple_rows_errors() {
-    let pool = pool().await;
+#[test]
+fn fetch_one_multiple_rows_errors() {
+    let pool = pool();
     let result = bsql::query!("SELECT id, login FROM users WHERE active = true")
-        .fetch_one(&pool)
-        .await;
+        .fetch_one(&pool);
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -414,56 +385,52 @@ async fn fetch_one_multiple_rows_errors() {
     }
 }
 
-#[tokio::test]
-async fn pool_builder_max_size_and_status() {
+#[test]
+fn pool_builder_max_size_and_status() {
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
         .max_size(4)
         .build()
-        .await
         .unwrap();
 
     let status = pool.status();
     assert_eq!(status.max_size, 4);
 }
 
-#[tokio::test]
-async fn pool_acquire_and_use() {
-    let pool = pool().await;
-    let conn = pool.acquire().await.unwrap();
+#[test]
+fn pool_acquire_and_use() {
+    let pool = pool();
+    let conn = pool.acquire().unwrap();
 
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&conn)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
 }
 
-#[tokio::test]
-async fn pool_builder_bad_url_errors() {
-    let result = Pool::builder().url("not_a_url").build().await;
+#[test]
+fn pool_builder_bad_url_errors() {
+    let result = Pool::builder().url("not_a_url").build();
     assert!(result.is_err());
 }
 
-#[tokio::test]
-async fn execute_returns_zero_for_no_match() {
-    let pool = pool().await;
+#[test]
+fn execute_returns_zero_for_no_match() {
+    let pool = pool();
     let id = 999999i32;
     let affected = bsql::query!("UPDATE tickets SET description = 'x' WHERE id = $id: i32")
         .execute(&pool)
-        .await
         .unwrap();
     assert_eq!(affected, 0);
 }
 
-#[tokio::test]
-async fn error_display_format() {
-    let pool = pool().await;
+#[test]
+fn error_display_format() {
+    let pool = pool();
     let id = 999999i32;
     let err = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap_err();
 
     let display = format!("{err}");
@@ -478,18 +445,17 @@ async fn error_display_format() {
 
 // --- warmup ---
 
-#[tokio::test]
-async fn warmup_prepares_statements() {
-    let pool = pool().await;
+#[test]
+fn warmup_prepares_statements() {
+    let pool = pool();
     pool.set_warmup_sqls(&["SELECT id, login FROM users WHERE id = $1::int4"]);
-    // Acquire forces warmup on the new connection — the statement is prepared
+    // Acquire forces warmup on the new connection -- the statement is prepared
     // via Parse+Describe+Sync (no Bind+Execute). Subsequent queries using the
     // same SQL skip the Parse round-trip because the statement is already cached.
-    let conn = pool.acquire().await.unwrap();
+    let conn = pool.acquire().unwrap();
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&conn)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
     assert_eq!(user.login, "alice");
@@ -499,16 +465,15 @@ async fn warmup_prepares_statements() {
 // T-1: basic streaming integration test
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn fetch_stream_basic() {
-    let pool = pool().await;
+#[test]
+fn fetch_stream_basic() {
+    let pool = pool();
     let mut stream = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_stream(&pool)
-        .await
         .unwrap();
 
     let mut count = 0;
-    while let Some(user) = stream.next().await.unwrap() {
+    while let Some(user) = stream.next().unwrap() {
         count += 1;
         assert!(!user.login.is_empty());
     }
@@ -519,18 +484,17 @@ async fn fetch_stream_basic() {
 // T-4: streaming with bind parameters
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn fetch_stream_with_bind_params() {
-    let pool = pool().await;
+#[test]
+fn fetch_stream_with_bind_params() {
+    let pool = pool();
     let active = true;
     let mut stream =
         bsql::query!("SELECT id, login FROM users WHERE active = $active: bool ORDER BY id")
             .fetch_stream(&pool)
-            .await
             .unwrap();
 
     let mut count = 0;
-    while let Some(user) = stream.next().await.unwrap() {
+    while let Some(user) = stream.next().unwrap() {
         count += 1;
         assert!(!user.login.is_empty());
     }
@@ -542,20 +506,19 @@ async fn fetch_stream_with_bind_params() {
 //       to pool in broken state)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn fetch_stream_drop_mid_iteration() {
-    let pool = pool().await;
+#[test]
+fn fetch_stream_drop_mid_iteration() {
+    let pool = pool();
 
     // Open a stream and drop it after reading only the first row.
     {
         let mut stream = bsql::query!("SELECT id, login FROM users ORDER BY id")
             .fetch_stream(&pool)
-            .await
             .unwrap();
 
-        let first = stream.next().await.unwrap();
+        let first = stream.next().unwrap();
         assert!(first.is_some(), "should have at least one row");
-        // stream dropped here — connection discarded (not returned to pool)
+        // stream dropped here -- connection discarded (not returned to pool)
     }
 
     // The pool should still be usable: a new connection can be acquired and
@@ -563,7 +526,6 @@ async fn fetch_stream_drop_mid_iteration() {
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
 }
@@ -572,25 +534,23 @@ async fn fetch_stream_drop_mid_iteration() {
 // T-10b: streaming fully consumed leaves pool healthy
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn fetch_stream_fully_consumed() {
-    let pool = pool().await;
+#[test]
+fn fetch_stream_fully_consumed() {
+    let pool = pool();
 
     {
         let mut stream = bsql::query!("SELECT id, login FROM users ORDER BY id")
             .fetch_stream(&pool)
-            .await
             .unwrap();
 
-        while let Some(_user) = stream.next().await.unwrap() {}
-        // stream dropped after full consumption — connection returned to pool
+        while let Some(_user) = stream.next().unwrap() {}
+        // stream dropped after full consumption -- connection returned to pool
     }
 
     // Pool should work fine after a fully consumed stream.
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
 }

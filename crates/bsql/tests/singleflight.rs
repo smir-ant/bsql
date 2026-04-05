@@ -9,20 +9,18 @@
 
 use bsql::Pool;
 
-async fn pool() -> Pool {
+fn pool() -> Pool {
     Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
-        .await
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }
 
 /// Basic: singleflight is transparent for a normal fetch_one.
-#[tokio::test]
-async fn singleflight_fetch_one_works() {
-    let pool = pool().await;
+#[test]
+fn singleflight_fetch_one_works() {
+    let pool = pool();
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
 
     assert_eq!(user.id, 1);
@@ -30,12 +28,11 @@ async fn singleflight_fetch_one_works() {
 }
 
 /// Basic: singleflight is transparent for fetch_all.
-#[tokio::test]
-async fn singleflight_fetch_all_works() {
-    let pool = pool().await;
+#[test]
+fn singleflight_fetch_all_works() {
+    let pool = pool();
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&pool)
-        .await
         .unwrap();
 
     assert!(users.len() >= 2);
@@ -47,27 +44,26 @@ async fn singleflight_fetch_all_works() {
 /// but we can verify that N concurrent identical queries all return
 /// correct results without errors.
 ///
-/// Uses `tokio::spawn` so all 10 queries are genuinely concurrent --
+/// Uses `std::thread::spawn` so all 10 queries are genuinely concurrent --
 /// a sequential for-loop would never actually race and would not
 /// exercise the singleflight coalescing path.
-#[tokio::test]
-async fn concurrent_identical_queries_all_succeed() {
+#[test]
+fn concurrent_identical_queries_all_succeed() {
     use std::sync::Arc;
 
-    let pool = Arc::new(pool().await);
+    let pool = Arc::new(pool());
 
     let mut handles = Vec::new();
     for _ in 0..10 {
         let pool = Arc::clone(&pool);
-        handles.push(tokio::spawn(async move {
+        handles.push(std::thread::spawn(move || {
             bsql::query!("SELECT id, login FROM users ORDER BY id")
                 .fetch_all(pool.as_ref())
-                .await
         }));
     }
 
     for handle in handles {
-        let users = handle.await.expect("task panicked").unwrap();
+        let users = handle.join().expect("thread panicked").unwrap();
         assert!(users.len() >= 2);
         assert_eq!(users[0].login, "alice");
     }
@@ -77,72 +73,67 @@ async fn concurrent_identical_queries_all_succeed() {
 /// (Singleflight keys by SQL text, so same-SQL queries may coalesce
 /// even with different params -- but the result is still correct because
 /// params are sent to PG.)
-#[tokio::test]
-async fn parameterized_query_works_with_singleflight() {
-    let pool = pool().await;
+#[test]
+fn parameterized_query_works_with_singleflight() {
+    let pool = pool();
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
 
     let id = 2i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 2);
 }
 
 /// Singleflight does NOT apply to transactions (snapshot isolation).
-#[tokio::test]
-async fn transaction_queries_are_not_coalesced() {
-    let pool = pool().await;
-    let txn = pool.begin().await.unwrap();
+#[test]
+fn transaction_queries_are_not_coalesced() {
+    let pool = pool();
+    let txn = pool.begin().unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&txn)
-        .await
         .unwrap();
     assert!(users.len() >= 2);
 
-    txn.rollback().await.unwrap();
+    txn.rollback().unwrap();
 }
 
 /// Singleflight does NOT apply to PoolConnection.
-#[tokio::test]
-async fn pool_connection_queries_not_coalesced() {
-    let pool = pool().await;
-    let conn = pool.acquire().await.unwrap();
+#[test]
+fn pool_connection_queries_not_coalesced() {
+    let pool = pool();
+    let conn = pool.acquire().unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&conn)
-        .await
         .unwrap();
     assert!(users.len() >= 2);
 }
 
 /// Execute (writes) are not affected by singleflight.
-#[tokio::test]
-async fn execute_not_affected_by_singleflight() {
-    let pool = pool().await;
+#[test]
+fn execute_not_affected_by_singleflight() {
+    let pool = pool();
     let desc = "singleflight-test-desc";
     let id = 1i32;
     let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
         .execute(&pool)
-        .await
         .unwrap();
     assert_eq!(affected, 1);
 }
 
 /// After concurrent queries complete, subsequent queries still work.
 /// Verifies singleflight does not leak entries or corrupt state.
-#[tokio::test]
-async fn queries_work_after_concurrent_burst() {
+#[test]
+fn queries_work_after_concurrent_burst() {
     use std::sync::Arc;
 
-    let pool = Arc::new(pool().await);
+    let pool = Arc::new(pool());
 
     // Burst of 20 concurrent identical queries.
     // Some may fail with pool exhaustion (fail-fast pool, max 10 connections).
@@ -150,15 +141,14 @@ async fn queries_work_after_concurrent_burst() {
     let mut handles = Vec::new();
     for _ in 0..20 {
         let pool = Arc::clone(&pool);
-        handles.push(tokio::spawn(async move {
+        handles.push(std::thread::spawn(move || {
             bsql::query!("SELECT id, login FROM users ORDER BY id")
                 .fetch_all(pool.as_ref())
-                .await
         }));
     }
 
     for handle in handles {
-        let result = handle.await.expect("task panicked");
+        let result = handle.join().expect("thread panicked");
         // Accept both success and pool exhaustion
         if let Ok(users) = &result {
             assert!(users.len() >= 2);
@@ -169,48 +159,44 @@ async fn queries_work_after_concurrent_burst() {
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(pool.as_ref())
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
     assert_eq!(user.login, "alice");
 }
 
 /// fetch_optional through singleflight path works.
-#[tokio::test]
-async fn singleflight_fetch_optional_works() {
-    let pool = pool().await;
+#[test]
+fn singleflight_fetch_optional_works() {
+    let pool = pool();
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_optional(&pool)
-        .await
         .unwrap();
     assert!(user.is_some());
     assert_eq!(user.unwrap().login, "alice");
 }
 
 /// Different SQL texts are independently handled by singleflight.
-#[tokio::test]
-async fn different_queries_are_independent() {
+#[test]
+fn different_queries_are_independent() {
     use std::sync::Arc;
 
-    let pool = Arc::new(pool().await);
+    let pool = Arc::new(pool());
 
     let pool1 = Arc::clone(&pool);
-    let h1 = tokio::spawn(async move {
+    let h1 = std::thread::spawn(move || {
         bsql::query!("SELECT id, login FROM users ORDER BY id")
             .fetch_all(pool1.as_ref())
-            .await
     });
 
     let pool2 = Arc::clone(&pool);
-    let h2 = tokio::spawn(async move {
+    let h2 = std::thread::spawn(move || {
         bsql::query!("SELECT id FROM tickets ORDER BY id")
             .fetch_all(pool2.as_ref())
-            .await
     });
 
-    let users = h1.await.expect("task panicked").unwrap();
-    let tickets = h2.await.expect("task panicked").unwrap();
+    let users = h1.join().expect("thread panicked").unwrap();
+    let tickets = h2.join().expect("thread panicked").unwrap();
 
     assert!(users.len() >= 2);
     assert!(!tickets.is_empty());

@@ -34,4 +34,3 @@ uuid = { workspace = true, optional = true }
 rust_decimal = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

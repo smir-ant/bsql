@@ -5,9 +5,8 @@
 
 use bsql::{BsqlError, Pool};
 
-async fn pool() -> Pool {
+fn pool() -> Pool {
     Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
-        .await
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }
 
@@ -15,37 +14,34 @@ async fn pool() -> Pool {
 // commit
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_commit_persists() {
-    let pool = pool().await;
+#[test]
+fn transaction_commit_persists() {
+    let pool = pool();
 
     let title = "tx_commit_test";
     let uid = 1i32;
 
     // Insert inside a transaction, then commit.
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
     let ticket = bsql::query!(
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
     .fetch_one(&tx)
-    .await
     .unwrap();
     let ticket_id = ticket.id;
-    tx.commit().await.unwrap();
+    tx.commit().unwrap();
 
     // Verify the row exists outside the transaction.
     let found = bsql::query!("SELECT id FROM tickets WHERE id = $ticket_id: i32")
         .fetch_optional(&pool)
-        .await
         .unwrap();
     assert!(found.is_some(), "committed row should persist");
 
     // Clean up.
     bsql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
         .execute(&pool)
-        .await
         .unwrap();
 }
 
@@ -53,29 +49,27 @@ async fn transaction_commit_persists() {
 // explicit rollback
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_rollback_discards() {
-    let pool = pool().await;
+#[test]
+fn transaction_rollback_discards() {
+    let pool = pool();
 
     let title = "tx_rollback_test";
     let uid = 1i32;
 
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
     let ticket = bsql::query!(
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
     .fetch_one(&tx)
-    .await
     .unwrap();
     let ticket_id = ticket.id;
-    tx.rollback().await.unwrap();
+    tx.rollback().unwrap();
 
     // Verify the row does NOT exist.
     let found = bsql::query!("SELECT id FROM tickets WHERE id = $ticket_id: i32")
         .fetch_optional(&pool)
-        .await
         .unwrap();
     assert!(found.is_none(), "rolled-back row should not persist");
 }
@@ -84,32 +78,30 @@ async fn transaction_rollback_discards() {
 // drop without commit (implicit discard)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_drop_without_commit_discards() {
-    let pool = pool().await;
+#[test]
+fn transaction_drop_without_commit_discards() {
+    let pool = pool();
     let ticket_id: i32;
 
     {
         let title = "tx_drop_test";
         let uid = 1i32;
 
-        let tx = pool.begin().await.unwrap();
+        let tx = pool.begin().unwrap();
         let ticket = bsql::query!(
             "INSERT INTO tickets (title, status, created_by_user_id)
              VALUES ($title: &str, 'new', $uid: i32)
              RETURNING id"
         )
         .fetch_one(&tx)
-        .await
         .unwrap();
         ticket_id = ticket.id;
-        // tx dropped here — connection discarded, insert not committed
+        // tx dropped here -- connection discarded, insert not committed
     }
 
     // Verify the row does NOT exist.
     let found = bsql::query!("SELECT id FROM tickets WHERE id = $ticket_id: i32")
         .fetch_optional(&pool)
-        .await
         .unwrap();
     assert!(found.is_none(), "dropped-tx row should not persist");
 }
@@ -118,11 +110,11 @@ async fn transaction_drop_without_commit_discards() {
 // multiple queries in one transaction
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_multiple_queries() {
-    let pool = pool().await;
+#[test]
+fn transaction_multiple_queries() {
+    let pool = pool();
 
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
 
     // Insert two tickets in the same transaction.
     let title1 = "tx_multi_1";
@@ -135,7 +127,6 @@ async fn transaction_multiple_queries() {
          RETURNING id"
     )
     .fetch_one(&tx)
-    .await
     .unwrap();
 
     let t2 = bsql::query!(
@@ -144,21 +135,18 @@ async fn transaction_multiple_queries() {
          RETURNING id"
     )
     .fetch_one(&tx)
-    .await
     .unwrap();
 
-    tx.commit().await.unwrap();
+    tx.commit().unwrap();
 
     // Both rows should exist.
     let id1 = t1.id;
     let id2 = t2.id;
     let found1 = bsql::query!("SELECT id FROM tickets WHERE id = $id1: i32")
         .fetch_optional(&pool)
-        .await
         .unwrap();
     let found2 = bsql::query!("SELECT id FROM tickets WHERE id = $id2: i32")
         .fetch_optional(&pool)
-        .await
         .unwrap();
     assert!(found1.is_some());
     assert!(found2.is_some());
@@ -166,11 +154,9 @@ async fn transaction_multiple_queries() {
     // Clean up.
     bsql::query!("DELETE FROM tickets WHERE id = $id1: i32")
         .execute(&pool)
-        .await
         .unwrap();
     bsql::query!("DELETE FROM tickets WHERE id = $id2: i32")
         .execute(&pool)
-        .await
         .unwrap();
 }
 
@@ -178,11 +164,11 @@ async fn transaction_multiple_queries() {
 // query error inside transaction rolls back
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_error_rolls_back() {
-    let pool = pool().await;
+#[test]
+fn transaction_error_rolls_back() {
+    let pool = pool();
 
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
 
     // Insert a valid row.
     let title = "tx_error_test";
@@ -193,7 +179,6 @@ async fn transaction_error_rolls_back() {
          RETURNING id"
     )
     .fetch_one(&tx)
-    .await
     .unwrap();
     let ticket_id = ticket.id;
 
@@ -205,8 +190,7 @@ async fn transaction_error_rolls_back() {
          VALUES ($bad_title: &str, 'new', $bad_uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
-    .await;
+    .fetch_one(&tx);
     assert!(result.is_err());
 
     // After a PG error, the transaction is in an aborted state.
@@ -216,7 +200,6 @@ async fn transaction_error_rolls_back() {
     // The first insert should NOT have persisted.
     let found = bsql::query!("SELECT id FROM tickets WHERE id = $ticket_id: i32")
         .fetch_optional(&pool)
-        .await
         .unwrap();
     assert!(found.is_none(), "error in tx should roll back all changes");
 }
@@ -225,11 +208,11 @@ async fn transaction_error_rolls_back() {
 // read-your-writes inside transaction
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_read_your_writes() {
-    let pool = pool().await;
+#[test]
+fn transaction_read_your_writes() {
+    let pool = pool();
 
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
 
     let title = "tx_read_write_test";
     let uid = 1i32;
@@ -239,40 +222,37 @@ async fn transaction_read_your_writes() {
          RETURNING id"
     )
     .fetch_one(&tx)
-    .await
     .unwrap();
     let ticket_id = ticket.id;
 
     // Read the row back within the same transaction.
     let found = bsql::query!("SELECT id, title FROM tickets WHERE id = $ticket_id: i32")
         .fetch_one(&tx)
-        .await
         .unwrap();
     assert_eq!(found.id, ticket_id);
     assert_eq!(found.title, "tx_read_write_test");
 
-    tx.rollback().await.unwrap();
+    tx.rollback().unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // begin on pool_exhausted errors immediately (fail-fast)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn begin_on_exhausted_pool_fails_fast() {
+#[test]
+fn begin_on_exhausted_pool_fails_fast() {
     // Create a pool with exactly 1 connection.
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
         .max_size(1)
         .build()
-        .await
         .unwrap();
 
     // Hold the one connection via a transaction.
-    let _tx = pool.begin().await.unwrap();
+    let _tx = pool.begin().unwrap();
 
     // Second begin() should fail immediately.
-    let result = pool.begin().await;
+    let result = pool.begin();
     assert!(result.is_err());
     match result.unwrap_err() {
         BsqlError::Pool(_) => {} // expected
@@ -284,12 +264,12 @@ async fn begin_on_exhausted_pool_fails_fast() {
 // independent transactions get independent connections
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn independent_transactions_are_isolated() {
-    let pool = pool().await;
+#[test]
+fn independent_transactions_are_isolated() {
+    let pool = pool();
 
-    let tx1 = pool.begin().await.unwrap();
-    let tx2 = pool.begin().await.unwrap();
+    let tx1 = pool.begin().unwrap();
+    let tx2 = pool.begin().unwrap();
 
     // Insert in tx1 only.
     let title = "tx_isolated_test";
@@ -299,27 +279,25 @@ async fn independent_transactions_are_isolated() {
          VALUES ($title: &str, 'new', $uid: i32)"
     )
     .execute(&tx1)
-    .await
     .unwrap();
 
     // tx2 should NOT see the uncommitted row (default READ COMMITTED isolation).
     let search = "tx_isolated_test";
     let seen = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
         .fetch_all(&tx2)
-        .await
         .unwrap();
     assert!(seen.is_empty(), "tx2 should not see tx1's uncommitted row");
 
-    tx1.rollback().await.unwrap();
-    tx2.rollback().await.unwrap();
+    tx1.rollback().unwrap();
+    tx2.rollback().unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// lazy BEGIN — transaction without queries never sends BEGIN
+// lazy BEGIN -- transaction without queries never sends BEGIN
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_commit_without_queries_is_noop() {
+#[test]
+fn transaction_commit_without_queries_is_noop() {
     // Create a pool with exactly 1 connection to prove the connection
     // returns cleanly (if BEGIN were sent without COMMIT, the connection
     // would be dirty and the pool slot lost).
@@ -327,56 +305,51 @@ async fn transaction_commit_without_queries_is_noop() {
         .url("postgres://bsql:bsql@localhost/bsql_test")
         .max_size(1)
         .build()
-        .await
         .unwrap();
 
-    // Begin and immediately commit — no queries executed.
+    // Begin and immediately commit -- no queries executed.
     // Lazy BEGIN means no BEGIN/COMMIT round-trips sent.
-    let tx = pool.begin().await.unwrap();
-    tx.commit().await.unwrap();
+    let tx = pool.begin().unwrap();
+    tx.commit().unwrap();
 
     // The single connection should be back in the pool, usable.
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
 }
 
-#[tokio::test]
-async fn transaction_rollback_without_queries_is_noop() {
+#[test]
+fn transaction_rollback_without_queries_is_noop() {
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
         .max_size(1)
         .build()
-        .await
         .unwrap();
 
-    let tx = pool.begin().await.unwrap();
-    tx.rollback().await.unwrap();
+    let tx = pool.begin().unwrap();
+    tx.rollback().unwrap();
 
     // Connection should be clean and returned to pool.
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
 }
 
-#[tokio::test]
-async fn transaction_drop_without_queries_returns_connection_clean() {
+#[test]
+fn transaction_drop_without_queries_returns_connection_clean() {
     let pool = Pool::builder()
         .url("postgres://bsql:bsql@localhost/bsql_test")
         .max_size(1)
         .build()
-        .await
         .unwrap();
 
     {
-        let _tx = pool.begin().await.unwrap();
-        // Drop without any queries — BEGIN was never sent.
+        let _tx = pool.begin().unwrap();
+        // Drop without any queries -- BEGIN was never sent.
         // Connection should return to pool CLEAN (not discarded).
     }
 
@@ -386,72 +359,69 @@ async fn transaction_drop_without_queries_returns_connection_clean() {
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
-        .await
         .unwrap();
     assert_eq!(user.id, 1, "connection should be clean and reusable");
 }
 
-#[tokio::test]
-async fn transaction_lazy_begin_first_query_triggers_begin() {
-    let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+#[test]
+fn transaction_lazy_begin_first_query_triggers_begin() {
+    let pool = pool();
+    let tx = pool.begin().unwrap();
 
     // First query inside tx triggers lazy BEGIN, then runs the query.
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&tx)
-        .await
         .unwrap();
     assert_eq!(user.id, 1);
     assert_eq!(user.login, "alice");
 
-    tx.commit().await.unwrap();
+    tx.commit().unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // transaction debug format
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_debug_format() {
-    let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+#[test]
+fn transaction_debug_format() {
+    let pool = pool();
+    let tx = pool.begin().unwrap();
 
     let debug = format!("{:?}", tx);
     assert!(debug.contains("Transaction"), "debug: {debug}");
 
-    tx.rollback().await.unwrap();
+    tx.rollback().unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // execute inside transaction
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_execute_returns_affected_rows() {
-    let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+#[test]
+fn transaction_execute_returns_affected_rows() {
+    let pool = pool();
+    let tx = pool.begin().unwrap();
 
     let desc = "tx_execute_test";
     let id = 1i32;
     let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
         .execute(&tx)
-        .await
         .unwrap();
     assert_eq!(affected, 1);
 
-    tx.rollback().await.unwrap();
+    tx.rollback().unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // deferred pipeline (defer_execute / flush_deferred / auto-flush)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn transaction_defer_execute_commit() {
-    let pool = pool().await;
+#[test]
+fn transaction_defer_execute_commit() {
+    let pool = pool();
 
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
 
     let title = "defer_commit_bsql";
     let uid = 1i32;
@@ -459,35 +429,33 @@ async fn transaction_defer_execute_commit() {
     let hash = bsql_driver_postgres::hash_sql(sql);
     let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
 
-    tx.defer_execute(sql, hash, params).await.unwrap();
-    tx.defer_execute(sql, hash, params).await.unwrap();
-    assert_eq!(tx.deferred_count().await, 2);
+    tx.defer_execute(sql, hash, params).unwrap();
+    tx.defer_execute(sql, hash, params).unwrap();
+    assert_eq!(tx.deferred_count(), 2);
 
-    tx.commit().await.unwrap();
+    tx.commit().unwrap();
 
     // Verify rows were inserted (use existing cached query by id pattern)
     let search = "defer_commit_bsql";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
         .fetch_all(&pool)
-        .await
         .unwrap();
     assert_eq!(rows.len(), 2);
 
-    // Clean up — delete by each id
+    // Clean up -- delete by each id
     for row in &rows {
         let id = row.id;
         bsql::query!("DELETE FROM tickets WHERE id = $id: i32")
             .execute(&pool)
-            .await
             .unwrap();
     }
 }
 
-#[tokio::test]
-async fn transaction_defer_execute_flush_returns_counts() {
-    let pool = pool().await;
+#[test]
+fn transaction_defer_execute_flush_returns_counts() {
+    let pool = pool();
 
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
 
     let title = "defer_flush_bsql";
     let uid = 1i32;
@@ -495,23 +463,23 @@ async fn transaction_defer_execute_flush_returns_counts() {
     let hash = bsql_driver_postgres::hash_sql(sql);
     let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
 
-    tx.defer_execute(sql, hash, params).await.unwrap();
-    tx.defer_execute(sql, hash, params).await.unwrap();
+    tx.defer_execute(sql, hash, params).unwrap();
+    tx.defer_execute(sql, hash, params).unwrap();
 
-    let results = tx.flush_deferred().await.unwrap();
+    let results = tx.flush_deferred().unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0], 1);
     assert_eq!(results[1], 1);
-    assert_eq!(tx.deferred_count().await, 0);
+    assert_eq!(tx.deferred_count(), 0);
 
-    tx.rollback().await.unwrap();
+    tx.rollback().unwrap();
 }
 
-#[tokio::test]
-async fn transaction_defer_execute_auto_flushes_before_read() {
-    let pool = pool().await;
+#[test]
+fn transaction_defer_execute_auto_flushes_before_read() {
+    let pool = pool();
 
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
 
     let title = "defer_autoflush_bsql";
     let uid = 1i32;
@@ -519,26 +487,25 @@ async fn transaction_defer_execute_auto_flushes_before_read() {
     let hash = bsql_driver_postgres::hash_sql(sql);
     let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
 
-    tx.defer_execute(sql, hash, params).await.unwrap();
-    assert_eq!(tx.deferred_count().await, 1);
+    tx.defer_execute(sql, hash, params).unwrap();
+    assert_eq!(tx.deferred_count(), 1);
 
     // SELECT triggers auto-flush, so we can read-your-writes
     let search = "defer_autoflush_bsql";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
         .fetch_all(&tx)
-        .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(tx.deferred_count().await, 0);
+    assert_eq!(tx.deferred_count(), 0);
 
-    tx.rollback().await.unwrap();
+    tx.rollback().unwrap();
 }
 
-#[tokio::test]
-async fn transaction_defer_execute_rollback_discards() {
-    let pool = pool().await;
+#[test]
+fn transaction_defer_execute_rollback_discards() {
+    let pool = pool();
 
-    let tx = pool.begin().await.unwrap();
+    let tx = pool.begin().unwrap();
 
     let title = "defer_rollback_bsql";
     let uid = 1i32;
@@ -546,25 +513,24 @@ async fn transaction_defer_execute_rollback_discards() {
     let hash = bsql_driver_postgres::hash_sql(sql);
     let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
 
-    tx.defer_execute(sql, hash, params).await.unwrap();
-    tx.rollback().await.unwrap();
+    tx.defer_execute(sql, hash, params).unwrap();
+    tx.rollback().unwrap();
 
     // Nothing should have been inserted
     let search = "defer_rollback_bsql";
     let found = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
         .fetch_optional(&pool)
-        .await
         .unwrap();
     assert!(found.is_none());
 }
 
-#[tokio::test]
-async fn transaction_defer_execute_empty_flush_is_noop() {
-    let pool = pool().await;
+#[test]
+fn transaction_defer_execute_empty_flush_is_noop() {
+    let pool = pool();
 
-    let tx = pool.begin().await.unwrap();
-    let results = tx.flush_deferred().await.unwrap();
+    let tx = pool.begin().unwrap();
+    let results = tx.flush_deferred().unwrap();
     assert!(results.is_empty());
-    assert_eq!(tx.deferred_count().await, 0);
-    tx.commit().await.unwrap();
+    assert_eq!(tx.deferred_count(), 0);
+    tx.commit().unwrap();
 }

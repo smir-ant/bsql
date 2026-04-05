@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "bsql-core",
  "bsql-driver-postgres",
@@ -131,21 +131,20 @@ dependencies = [
  "bsql-macros",
  "rust_decimal",
  "time",
- "tokio",
  "trybuild",
  "uuid",
 ]
 
 [[package]]
 name = "bsql-arena"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "simdutf8",
 ]
 
 [[package]]
 name = "bsql-core"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "bsql-arena",
  "bsql-driver-postgres",
@@ -155,13 +154,12 @@ dependencies = [
  "rust_decimal",
  "smallvec",
  "time",
- "tokio",
  "uuid",
 ]
 
 [[package]]
 name = "bsql-driver-postgres"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "base64",
  "bsql-arena",
@@ -178,7 +176,6 @@ dependencies = [
  "smallvec",
  "socket2",
  "time",
- "tokio",
  "uuid",
  "webpki-roots",
  "zeroize",
@@ -186,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-driver-sqlite"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "bsql-arena",
  "libsqlite3-sys",
@@ -196,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-macros"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "bitcode",
  "bsql-core",
@@ -604,12 +601,6 @@ dependencies = [
  "digest",
  "hmac",
 ]
-
-[[package]]
-name = "pin-project-lite"
-version = "0.2.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pkg-config"
@@ -1094,27 +1085,6 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
-
-[[package]]
-name = "tokio"
-version = "1.50.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
-dependencies = [
- "pin-project-lite",
- "tokio-macros",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c55a2eff8b69ce66c84f85e1da1c233edc36ceb85a2058d11b0d6a3c7e7569c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
 
 [[package]]
 name = "toml"

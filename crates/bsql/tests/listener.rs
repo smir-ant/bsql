@@ -7,47 +7,44 @@ use bsql::{BsqlError, Listener};
 
 const DB_URL: &str = "postgres://bsql:bsql@localhost/bsql_test";
 
-#[tokio::test]
-async fn listen_and_receive_notification() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("test_channel").await.unwrap();
+#[test]
+fn listen_and_receive_notification() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("test_channel").unwrap();
 
     // Send a notification from the same listener connection
-    listener
-        .notify("test_channel", "hello world")
-        .await
-        .unwrap();
+    listener.notify("test_channel", "hello world").unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.channel(), "test_channel");
     assert_eq!(notif.payload(), "hello world");
 }
 
-#[tokio::test]
-async fn notification_payload_preserved() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("payload_test").await.unwrap();
+#[test]
+fn notification_payload_preserved() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("payload_test").unwrap();
 
     let payload = r#"{"event":"created","id":42}"#;
-    listener.notify("payload_test", payload).await.unwrap();
+    listener.notify("payload_test", payload).unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), payload);
 }
 
-#[tokio::test]
-async fn multiple_channels() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("chan_a").await.unwrap();
-    listener.listen("chan_b").await.unwrap();
+#[test]
+fn multiple_channels() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("chan_a").unwrap();
+    listener.listen("chan_b").unwrap();
 
     // notify() now uses a separate short-lived connection internally,
     // avoiding the self-notification race condition entirely.
-    listener.notify("chan_a", "from_a").await.unwrap();
-    listener.notify("chan_b", "from_b").await.unwrap();
+    listener.notify("chan_a", "from_a").unwrap();
+    listener.notify("chan_b", "from_b").unwrap();
 
-    let n1 = listener.recv().await.unwrap();
-    let n2 = listener.recv().await.unwrap();
+    let n1 = listener.recv().unwrap();
+    let n2 = listener.recv().unwrap();
 
     // Both notifications received (order not guaranteed by PG)
     let mut channels: Vec<&str> = vec![n1.channel(), n2.channel()];
@@ -59,54 +56,48 @@ async fn multiple_channels() {
     assert_eq!(payloads, vec!["from_a", "from_b"]);
 }
 
-#[tokio::test]
-async fn unlisten_stops_receiving() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("unlisten_test").await.unwrap();
-    listener.unlisten("unlisten_test").await.unwrap();
+#[test]
+fn unlisten_stops_receiving() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("unlisten_test").unwrap();
+    listener.unlisten("unlisten_test").unwrap();
 
-    // Send a notification — should NOT be received since we unlistened
-    listener
-        .notify("unlisten_test", "should_not_arrive")
-        .await
-        .unwrap();
+    // Send a notification -- should NOT be received since we unlistened
+    listener.notify("unlisten_test", "should_not_arrive").unwrap();
 
     // Listen on a different channel and send there to prove recv works
-    listener.listen("unlisten_control").await.unwrap();
-    listener
-        .notify("unlisten_control", "control")
-        .await
-        .unwrap();
+    listener.listen("unlisten_control").unwrap();
+    listener.notify("unlisten_control", "control").unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     // We should receive the control notification, not the unlistened one
     assert_eq!(notif.channel(), "unlisten_control");
     assert_eq!(notif.payload(), "control");
 }
 
-#[tokio::test]
-async fn unlisten_all() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("all_a").await.unwrap();
-    listener.listen("all_b").await.unwrap();
-    listener.unlisten_all().await.unwrap();
+#[test]
+fn unlisten_all() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("all_a").unwrap();
+    listener.listen("all_b").unwrap();
+    listener.unlisten_all().unwrap();
 
     // Neither channel should receive
-    listener.notify("all_a", "no").await.unwrap();
-    listener.notify("all_b", "no").await.unwrap();
+    listener.notify("all_a", "no").unwrap();
+    listener.notify("all_b", "no").unwrap();
 
     // Listen on a control channel
-    listener.listen("all_control").await.unwrap();
-    listener.notify("all_control", "yes").await.unwrap();
+    listener.listen("all_control").unwrap();
+    listener.notify("all_control", "yes").unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.channel(), "all_control");
 }
 
-#[tokio::test]
-async fn empty_channel_name_rejected() {
-    let listener = Listener::connect(DB_URL).await.unwrap();
-    let result = listener.listen("").await;
+#[test]
+fn empty_channel_name_rejected() {
+    let listener = Listener::connect(DB_URL).unwrap();
+    let result = listener.listen("");
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -121,45 +112,45 @@ async fn empty_channel_name_rejected() {
     }
 }
 
-#[tokio::test]
-async fn empty_payload_notification() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("empty_payload").await.unwrap();
+#[test]
+fn empty_payload_notification() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("empty_payload").unwrap();
 
-    listener.notify("empty_payload", "").await.unwrap();
+    listener.notify("empty_payload", "").unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.channel(), "empty_payload");
     assert_eq!(notif.payload(), "");
 }
 
-#[tokio::test]
-async fn channel_name_with_special_chars() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    // Channel with dashes and dots — valid PG identifier when quoted
-    listener.listen("my-channel.v2").await.unwrap();
+#[test]
+fn channel_name_with_special_chars() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    // Channel with dashes and dots -- valid PG identifier when quoted
+    listener.listen("my-channel.v2").unwrap();
 
-    listener.notify("my-channel.v2", "special").await.unwrap();
+    listener.notify("my-channel.v2", "special").unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.channel(), "my-channel.v2");
     assert_eq!(notif.payload(), "special");
 }
 
-#[tokio::test]
-async fn payload_with_single_quotes() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("quote_test").await.unwrap();
+#[test]
+fn payload_with_single_quotes() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("quote_test").unwrap();
 
-    listener.notify("quote_test", "it's a test").await.unwrap();
+    listener.notify("quote_test", "it's a test").unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), "it's a test");
 }
 
-#[tokio::test]
-async fn connect_bad_url_fails() {
-    let result = Listener::connect("postgres://nobody:wrong@localhost:1/nope").await;
+#[test]
+fn connect_bad_url_fails() {
+    let result = Listener::connect("postgres://nobody:wrong@localhost:1/nope");
     assert!(result.is_err());
     match result.unwrap_err() {
         BsqlError::Connect(e) => {
@@ -173,44 +164,39 @@ async fn connect_bad_url_fails() {
     }
 }
 
-#[tokio::test]
-async fn notification_is_clone() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("clone_test").await.unwrap();
+#[test]
+fn notification_is_clone() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("clone_test").unwrap();
 
-    listener.notify("clone_test", "data").await.unwrap();
+    listener.notify("clone_test", "data").unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     let cloned = notif.clone();
     assert_eq!(cloned.channel(), notif.channel());
     assert_eq!(cloned.payload(), notif.payload());
 }
 
-#[tokio::test]
-async fn receive_notify_from_separate_connection() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("cross_conn_test").await.unwrap();
+#[test]
+fn receive_notify_from_separate_connection() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("cross_conn_test").unwrap();
 
-    // Send from a separate connection — different PG backend than the listener
-    let sender = Listener::connect(DB_URL).await.unwrap();
-    sender
-        .notify("cross_conn_test", "from_sender")
-        .await
-        .unwrap();
+    // Send from a separate connection -- different PG backend than the listener
+    let sender = Listener::connect(DB_URL).unwrap();
+    sender.notify("cross_conn_test", "from_sender").unwrap();
 
-    let n = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv())
-        .await
-        .expect("timed out waiting for cross-connection notification")
-        .unwrap();
+    // recv() blocks until a notification arrives (sync API)
+    let n = listener.recv().unwrap();
 
     assert_eq!(n.channel(), "cross_conn_test");
     assert_eq!(n.payload(), "from_sender");
 }
 
-#[tokio::test]
-async fn null_byte_in_channel_rejected() {
-    let listener = Listener::connect(DB_URL).await.unwrap();
-    let result = listener.listen("chan\0nel").await;
+#[test]
+fn null_byte_in_channel_rejected() {
+    let listener = Listener::connect(DB_URL).unwrap();
+    let result = listener.listen("chan\0nel");
     assert!(result.is_err());
     match result.unwrap_err() {
         BsqlError::Connect(e) => {
@@ -224,10 +210,10 @@ async fn null_byte_in_channel_rejected() {
     }
 }
 
-#[tokio::test]
-async fn null_byte_in_payload_rejected() {
-    let listener = Listener::connect(DB_URL).await.unwrap();
-    let result = listener.notify("test", "pay\0load").await;
+#[test]
+fn null_byte_in_payload_rejected() {
+    let listener = Listener::connect(DB_URL).unwrap();
+    let result = listener.notify("test", "pay\0load");
     assert!(result.is_err());
     match result.unwrap_err() {
         BsqlError::Connect(e) => {
@@ -241,47 +227,46 @@ async fn null_byte_in_payload_rejected() {
     }
 }
 
-#[tokio::test]
-async fn channel_name_sql_injection_attempt() {
-    // Attempt SQL injection via channel name — should be safely quoted
-    let listener = Listener::connect(DB_URL).await.unwrap();
-    let result = listener.listen(r#"test"; DROP TABLE users; --"#).await;
+#[test]
+fn channel_name_sql_injection_attempt() {
+    // Attempt SQL injection via channel name -- should be safely quoted
+    let listener = Listener::connect(DB_URL).unwrap();
+    let result = listener.listen(r#"test"; DROP TABLE users; --"#);
 
     // This should succeed (the channel name is just a weird identifier)
     // OR it should fail with a PG error, but NOT actually drop the table
     if result.is_ok() {
         // Verify users table still exists
-        let pool = bsql::Pool::connect(DB_URL).await.unwrap();
+        let pool = bsql::Pool::connect(DB_URL).unwrap();
         let users = bsql::query!("SELECT id FROM users LIMIT 1")
-            .fetch_optional(&pool)
-            .await;
+            .fetch_optional(&pool);
         assert!(users.is_ok(), "users table should still exist");
     }
-    // If it errored, that's also fine — the point is no injection
+    // If it errored, that's also fine -- the point is no injection
 }
 
-#[tokio::test]
-async fn listener_drop_cleans_up() {
+#[test]
+fn listener_drop_cleans_up() {
     {
-        let listener = Listener::connect(DB_URL).await.unwrap();
-        listener.listen("drop_test").await.unwrap();
+        let listener = Listener::connect(DB_URL).unwrap();
+        listener.listen("drop_test").unwrap();
         // listener dropped here -- should not panic or leak
     }
     // If we got here, drop succeeded
 }
 
-#[tokio::test]
-async fn listener_debug_format() {
-    let listener = Listener::connect(DB_URL).await.unwrap();
+#[test]
+fn listener_debug_format() {
+    let listener = Listener::connect(DB_URL).unwrap();
     let debug = format!("{:?}", listener);
     assert!(debug.contains("Listener"), "debug: {debug}");
     assert!(debug.contains("active"), "debug: {debug}");
 }
 
-#[tokio::test]
-async fn unlisten_empty_name_rejected() {
-    let listener = Listener::connect(DB_URL).await.unwrap();
-    let result = listener.unlisten("").await;
+#[test]
+fn unlisten_empty_name_rejected() {
+    let listener = Listener::connect(DB_URL).unwrap();
+    let result = listener.unlisten("");
     assert!(result.is_err());
     match result.unwrap_err() {
         BsqlError::Connect(e) => {
@@ -295,10 +280,10 @@ async fn unlisten_empty_name_rejected() {
     }
 }
 
-#[tokio::test]
-async fn notify_empty_channel_rejected() {
-    let listener = Listener::connect(DB_URL).await.unwrap();
-    let result = listener.notify("", "payload").await;
+#[test]
+fn notify_empty_channel_rejected() {
+    let listener = Listener::connect(DB_URL).unwrap();
+    let result = listener.notify("", "payload");
     assert!(result.is_err());
     match result.unwrap_err() {
         BsqlError::Connect(e) => {
@@ -312,66 +297,63 @@ async fn notify_empty_channel_rejected() {
     }
 }
 
-#[tokio::test]
-async fn channel_name_with_double_quotes() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    // Channel name with embedded double quotes — tests quote_ident escaping
-    listener.listen(r#"my"chan"#).await.unwrap();
-    listener.notify(r#"my"chan"#, "quoted").await.unwrap();
+#[test]
+fn channel_name_with_double_quotes() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    // Channel name with embedded double quotes -- tests quote_ident escaping
+    listener.listen(r#"my"chan"#).unwrap();
+    listener.notify(r#"my"chan"#, "quoted").unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.channel(), r#"my"chan"#);
     assert_eq!(notif.payload(), "quoted");
 }
 
-#[tokio::test]
-async fn payload_with_multiple_quotes() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("multi_quote_test").await.unwrap();
+#[test]
+fn payload_with_multiple_quotes() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("multi_quote_test").unwrap();
 
     let payload = "it''s a ''test''";
-    listener.notify("multi_quote_test", payload).await.unwrap();
+    listener.notify("multi_quote_test", payload).unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), payload);
 }
 
-#[tokio::test]
-async fn payload_with_backslash() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("backslash_test").await.unwrap();
+#[test]
+fn payload_with_backslash() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("backslash_test").unwrap();
 
     let payload = r"C:\Users\test\file.txt";
-    listener.notify("backslash_test", payload).await.unwrap();
+    listener.notify("backslash_test", payload).unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), payload);
 }
 
-#[tokio::test]
-async fn payload_with_lone_quote() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("lone_quote_test").await.unwrap();
+#[test]
+fn payload_with_lone_quote() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("lone_quote_test").unwrap();
 
     let payload = "it's";
-    listener.notify("lone_quote_test", payload).await.unwrap();
+    listener.notify("lone_quote_test", payload).unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.payload(), payload);
 }
 
-#[tokio::test]
-async fn large_payload() {
-    let mut listener = Listener::connect(DB_URL).await.unwrap();
-    listener.listen("large_payload_test").await.unwrap();
+#[test]
+fn large_payload() {
+    let mut listener = Listener::connect(DB_URL).unwrap();
+    listener.listen("large_payload_test").unwrap();
 
     // PG NOTIFY payloads can be up to ~8000 bytes
     let payload = "x".repeat(4000);
-    listener
-        .notify("large_payload_test", &payload)
-        .await
-        .unwrap();
+    listener.notify("large_payload_test", &payload).unwrap();
 
-    let notif = listener.recv().await.unwrap();
+    let notif = listener.recv().unwrap();
     assert_eq!(notif.payload().len(), 4000);
 }
