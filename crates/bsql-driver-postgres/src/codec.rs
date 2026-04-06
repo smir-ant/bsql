@@ -2800,4 +2800,85 @@ mod tests {
         assert!(decoded.is_nan());
         assert_eq!(decoded.to_bits(), f64::NAN.to_bits());
     }
+
+    mod proptest_fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn i32_roundtrip(val: i32) {
+                let mut buf = Vec::new();
+                val.encode_binary(&mut buf);
+                let decoded = decode_i32(&buf).unwrap();
+                prop_assert_eq!(decoded, val);
+            }
+
+            #[test]
+            fn i64_roundtrip(val: i64) {
+                let mut buf = Vec::new();
+                val.encode_binary(&mut buf);
+                let decoded = decode_i64(&buf).unwrap();
+                prop_assert_eq!(decoded, val);
+            }
+
+            #[test]
+            fn i16_roundtrip(val: i16) {
+                let mut buf = Vec::new();
+                val.encode_binary(&mut buf);
+                let decoded = decode_i16(&buf).unwrap();
+                prop_assert_eq!(decoded, val);
+            }
+
+            #[test]
+            fn f32_roundtrip(val: f32) {
+                let mut buf = Vec::new();
+                val.encode_binary(&mut buf);
+                let decoded = decode_f32(&buf).unwrap();
+                if val.is_nan() {
+                    prop_assert!(decoded.is_nan());
+                } else {
+                    prop_assert_eq!(decoded, val);
+                }
+            }
+
+            #[test]
+            fn f64_roundtrip(val: f64) {
+                let mut buf = Vec::new();
+                val.encode_binary(&mut buf);
+                let decoded = decode_f64(&buf).unwrap();
+                if val.is_nan() {
+                    prop_assert!(decoded.is_nan());
+                } else {
+                    prop_assert_eq!(decoded, val);
+                }
+            }
+
+            #[test]
+            fn bool_roundtrip(val: bool) {
+                let mut buf = Vec::new();
+                val.encode_binary(&mut buf);
+                let decoded = decode_bool(&buf).unwrap();
+                prop_assert_eq!(decoded, val);
+            }
+
+            #[test]
+            fn str_roundtrip(val in "\\PC*") {
+                let mut buf = Vec::new();
+                val.as_str().encode_binary(&mut buf);
+                let decoded = decode_str(&buf).unwrap();
+                prop_assert_eq!(decoded, val.as_str());
+            }
+
+            #[test]
+            fn decode_i32_arbitrary_never_panics(data in proptest::collection::vec(any::<u8>(), 0..16)) {
+                let _ = decode_i32(&data);
+            }
+
+            #[test]
+            fn decode_str_arbitrary_never_panics(data in proptest::collection::vec(any::<u8>(), 0..1024)) {
+                let _ = decode_str(&data);
+            }
+        }
+    }
 }

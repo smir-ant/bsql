@@ -538,4 +538,21 @@ mod tests {
         assert_eq!(mechs.len(), 2);
         assert!(!mechs.contains(&"SCRAM-SHA-256"));
     }
+
+    mod proptest_fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn parse_sasl_mechanisms_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
+                let _ = parse_sasl_mechanisms(&data);
+            }
+
+            #[test]
+            fn md5_password_never_panics(user in ".*", password in ".*", salt in proptest::array::uniform4(any::<u8>())) {
+                let _ = md5_password(&user, &password, &salt);
+            }
+        }
+    }
 }

@@ -1990,4 +1990,31 @@ mod tests {
             assert_eq!(row.get_i16(0), Some(val));
         }
     }
+
+    mod proptest_fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn config_from_url_never_panics(url in ".*") {
+                let _ = Config::from_url(&url);
+            }
+
+            #[test]
+            fn url_decode_never_panics(s in ".*") {
+                let _ = url_decode(&s);
+            }
+
+            #[test]
+            fn pg_data_row_new_never_panics(data in proptest::collection::vec(any::<u8>(), 0..8192)) {
+                let _ = PgDataRow::new(&data);
+            }
+
+            #[test]
+            fn hash_sql_never_panics(sql in ".*") {
+                let _ = hash_sql(&sql);
+            }
+        }
+    }
 }

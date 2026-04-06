@@ -1846,4 +1846,37 @@ mod tests {
         assert_eq!(&*cols[1].name, "name");
         assert_eq!(cols[1].type_oid, 25);
     }
+
+    mod proptest_fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn parse_backend_message_never_panics(msg_type: u8, payload in proptest::collection::vec(any::<u8>(), 0..1024)) {
+                // Must never panic — only return Ok or Err
+                let _ = parse_backend_message(msg_type, &payload);
+            }
+
+            #[test]
+            fn parse_error_response_never_panics(data in proptest::collection::vec(any::<u8>(), 0..1024)) {
+                let _ = parse_error_response(&data);
+            }
+
+            #[test]
+            fn parse_command_tag_never_panics(tag in ".*") {
+                let _ = parse_command_tag(&tag);
+            }
+
+            #[test]
+            fn parse_command_tag_bytes_never_panics(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+                let _ = parse_command_tag_bytes(&data);
+            }
+
+            #[test]
+            fn parse_simple_data_row_never_panics(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+                let _ = parse_simple_data_row(&data);
+            }
+        }
+    }
 }
