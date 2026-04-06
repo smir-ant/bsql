@@ -455,7 +455,6 @@ pub fn write_copy_done(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&4i32.to_be_bytes());
 }
 
-
 // --- Parse helpers ---
 
 /// Parse a CopyInResponse message.
