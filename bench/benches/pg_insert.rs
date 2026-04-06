@@ -187,8 +187,7 @@ fn bench_pg_insert_batch_pipeline(c: &mut Criterion) {
 
             // Pre-build parameter sets
             let names: Vec<String> = (0..100).map(|i| format!("batch_{i}")).collect();
-            let emails: Vec<String> =
-                (0..100).map(|i| format!("batch_{i}@example.com")).collect();
+            let emails: Vec<String> = (0..100).map(|i| format!("batch_{i}@example.com")).collect();
 
             let param_sets: Vec<[&(dyn bsql_driver_postgres::Encode + Sync); 2]> = names
                 .iter()

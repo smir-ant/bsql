@@ -76,26 +76,43 @@ fn main() {
                 .unwrap();
         }
         let elapsed = start.elapsed();
-        println!("pg_fetch_one:       {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS as u128, ITERATIONS);
+        println!(
+            "pg_fetch_one:       {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS as u128,
+            ITERATIONS
+        );
     }
 
     // fetch_many
     for limit in [10i64, 100, 1000, 10000] {
-        let iters = if limit >= 10000 { ITERATIONS_SLOW } else { ITERATIONS };
-        let _ = diesel::sql_query("SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1")
-            .bind::<BigInt, _>(limit)
-            .load::<User5>(&mut conn)
-            .unwrap();
+        let iters = if limit >= 10000 {
+            ITERATIONS_SLOW
+        } else {
+            ITERATIONS
+        };
+        let _ = diesel::sql_query(
+            "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1",
+        )
+        .bind::<BigInt, _>(limit)
+        .load::<User5>(&mut conn)
+        .unwrap();
 
         let start = Instant::now();
         for _ in 0..iters {
-            let _ = diesel::sql_query("SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1")
-                .bind::<BigInt, _>(limit)
-                .load::<User5>(&mut conn)
-                .unwrap();
+            let _ = diesel::sql_query(
+                "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1",
+            )
+            .bind::<BigInt, _>(limit)
+            .load::<User5>(&mut conn)
+            .unwrap();
         }
         let elapsed = start.elapsed();
-        println!("pg_fetch_many/{:<5} {} ns/op  ({} iters)", limit, elapsed.as_nanos() / iters as u128, iters);
+        println!(
+            "pg_fetch_many/{:<5} {} ns/op  ({} iters)",
+            limit,
+            elapsed.as_nanos() / iters as u128,
+            iters
+        );
     }
 
     // insert_single
@@ -109,7 +126,11 @@ fn main() {
                 .unwrap();
         }
         let elapsed = start.elapsed();
-        println!("pg_insert_single:   {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS as u128, ITERATIONS);
+        println!(
+            "pg_insert_single:   {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS as u128,
+            ITERATIONS
+        );
     }
 
     // insert_batch
@@ -130,7 +151,11 @@ fn main() {
             }).unwrap();
         }
         let elapsed = start.elapsed();
-        println!("pg_insert_batch/100: {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_SLOW as u128, ITERATIONS_SLOW);
+        println!(
+            "pg_insert_batch/100: {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS_SLOW as u128,
+            ITERATIONS_SLOW
+        );
     }
 
     // join_aggregate
@@ -145,7 +170,11 @@ fn main() {
             let _ = diesel::sql_query(sql).load::<JoinRow>(&mut conn).unwrap();
         }
         let elapsed = start.elapsed();
-        println!("pg_join_aggregate:  {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_JOIN as u128, ITERATIONS_JOIN);
+        println!(
+            "pg_join_aggregate:  {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS_JOIN as u128,
+            ITERATIONS_JOIN
+        );
     }
 
     // subquery
@@ -159,6 +188,10 @@ fn main() {
             let _ = diesel::sql_query(sql).load::<User3>(&mut conn).unwrap();
         }
         let elapsed = start.elapsed();
-        println!("pg_subquery:        {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_SUB as u128, ITERATIONS_SUB);
+        println!(
+            "pg_subquery:        {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS_SUB as u128,
+            ITERATIONS_SUB
+        );
     }
 }

@@ -207,6 +207,66 @@ static void bench_insert_batch(PGconn *conn) {
            (unsigned long long)(elapsed / iters), iters);
 }
 
+static void bench_insert_batch_pipelined(PGconn *conn) {
+    /* Same as bench_insert_batch but using libpq pipelining (PG 14+).
+     * Sends all 100 INSERTs in one round-trip via PQpipelineSync. */
+    PGresult *prep = PQprepare(conn, "insert_batch_pipe",
+        "INSERT INTO bench_users (name, email, active, score) "
+        "VALUES ($1, $2, true, 0.0)",
+        2, NULL);
+    die_if_bad(conn, prep, PGRES_COMMAND_OK);
+    PQclear(prep);
+
+    int iters = 1000;
+
+    uint64_t start = now_ns();
+    for (int i = 0; i < iters; i++) {
+        PGresult *begin = PQexec(conn, "BEGIN");
+        PQclear(begin);
+
+        /* Enter pipeline mode */
+        if (PQenterPipelineMode(conn) != 1) {
+            fprintf(stderr, "PQenterPipelineMode failed\n");
+            exit(1);
+        }
+
+        /* Send all 100 INSERTs without waiting for results */
+        for (int j = 0; j < 100; j++) {
+            char name[32], email[48];
+            snprintf(name, sizeof(name), "batch_%d", j);
+            snprintf(email, sizeof(email), "batch_%d@example.com", j);
+            const char *vals[2] = { name, email };
+            int lens[2] = { (int)strlen(name), (int)strlen(email) };
+            int fmts[2] = { 0, 0 };
+            PQsendQueryPrepared(conn, "insert_batch_pipe", 2, vals, lens, fmts, 0);
+        }
+
+        /* Sync — flush all pipelined commands */
+        PQpipelineSync(conn);
+
+        /* Consume all results */
+        for (int j = 0; j < 100; j++) {
+            PGresult *res = PQgetResult(conn);
+            PQclear(res);
+            res = PQgetResult(conn); /* NULL between results in pipeline */
+            if (res) PQclear(res);
+        }
+
+        /* Pipeline sync result */
+        PGresult *sync_res = PQgetResult(conn);
+        if (sync_res) PQclear(sync_res);
+
+        /* Exit pipeline mode */
+        PQexitPipelineMode(conn);
+
+        PGresult *commit = PQexec(conn, "COMMIT");
+        PQclear(commit);
+    }
+    uint64_t elapsed = now_ns() - start;
+    printf("pg_insert_batch_pipelined/100: %llu ns/op  (%d iters)\n",
+           (unsigned long long)(elapsed / iters), iters);
+}
+
 static void bench_join_aggregate(PGconn *conn) {
     const char *sql =
         "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount "
@@ -290,6 +350,7 @@ int main(void) {
     bench_fetch_many(conn, 10000);
     bench_insert_single(conn);
     bench_insert_batch(conn);
+    bench_insert_batch_pipelined(conn);
     bench_join_aggregate(conn);
     bench_subquery(conn);
 

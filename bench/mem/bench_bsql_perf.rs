@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use bsql::{Pool, BsqlError};
+use bsql::{BsqlError, Pool};
 
 const ITERATIONS: usize = 10000;
 const ITERATIONS_JOIN: usize = 3000;
@@ -43,7 +43,11 @@ fn main() -> Result<(), BsqlError> {
     // fetch_many — uses fetch (borrowed &str, like C's PQgetvalue returns char*)
     // Both C and bsql fetch() return pointers/references without heap allocation.
     for limit in [10i64, 100, 1000, 10000] {
-        let iters = if limit >= 10000 { ITERATIONS_SLOW } else { ITERATIONS };
+        let iters = if limit >= 10000 {
+            ITERATIONS_SLOW
+        } else {
+            ITERATIONS
+        };
         // warm up
         let _ = bsql::query!(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
@@ -213,7 +217,9 @@ fn main() -> Result<(), BsqlError> {
             fetch_elapsed.as_micros() / iters as u128
         );
         let pct = if fetch_all_elapsed > fetch_elapsed {
-            let saved = (fetch_all_elapsed - fetch_elapsed).as_nanos() as f64 / fetch_all_elapsed.as_nanos() as f64 * 100.0;
+            let saved = (fetch_all_elapsed - fetch_elapsed).as_nanos() as f64
+                / fetch_all_elapsed.as_nanos() as f64
+                * 100.0;
             format!("{:.1}% faster", saved)
         } else {
             "no improvement".to_string()
@@ -224,7 +230,7 @@ fn main() -> Result<(), BsqlError> {
     // === Raw driver-level comparison: query vs for_each on 10K rows ===
     // This isolates the data copy overhead from Pool/codegen overhead.
     {
-        use bsql_driver_postgres::{Connection, Config, hash_sql, Encode};
+        use bsql_driver_postgres::{Config, Connection, Encode, hash_sql};
 
         let config = Config::from_url(&url).unwrap();
         let mut conn = Connection::connect(&config).unwrap();
@@ -246,7 +252,10 @@ fn main() -> Result<(), BsqlError> {
         }
         let elapsed = start.elapsed();
         println!("\n--- Raw driver 10K rows ---");
-        println!("query():    {} us/op  ({n} iters)", elapsed.as_micros() / n as u128);
+        println!(
+            "query():    {} us/op  ({n} iters)",
+            elapsed.as_micros() / n as u128
+        );
 
         // measure for_each (zero-copy, processes in-place)
         let start = Instant::now();
@@ -254,12 +263,15 @@ fn main() -> Result<(), BsqlError> {
             conn.for_each(sql, hash, params, |_| Ok(())).unwrap();
         }
         let elapsed = start.elapsed();
-        println!("for_each(): {} us/op  ({n} iters)", elapsed.as_micros() / n as u128);
+        println!(
+            "for_each(): {} us/op  ({n} iters)",
+            elapsed.as_micros() / n as u128
+        );
     }
 
     // === Raw driver single-row: isolate pool/wrapper overhead ===
     {
-        use bsql_driver_postgres::{Connection, Config, hash_sql, Encode};
+        use bsql_driver_postgres::{Config, Connection, Encode, hash_sql};
 
         let config = Config::from_url(&url)?;
         let mut conn = Connection::connect(&config)?;

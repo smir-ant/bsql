@@ -138,19 +138,11 @@ fn query_impl_postgres(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenS
             offline::lookup_cached_validation(&parsed)
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
-            // ONLINE: validate all clause combinations at compile time.
-            // ≤10 clauses: full 2^N validation (100% guarantee).
-            // >10 clauses: O(N+1) linear validation (base + each clause).
+            // ONLINE: full 2^N validation — every combination checked.
+            // "If it compiles, the SQL is correct" — no exceptions.
             let result = connection::with_connection(|conn| {
-                let n = parsed.optional_clauses.len();
-                if n <= 10 {
-                    // Full 2^N validation — "if it compiles, the SQL is correct"
-                    let variants = dynamic::expand_variants(&parsed)?;
-                    validate::validate_variants(&variants, &parsed, conn)
-                } else {
-                    // Linear validation for many clauses (compile time matters)
-                    validate::validate_clauses_linear(&parsed, conn)
-                }
+                let variants = dynamic::expand_variants(&parsed)?;
+                validate::validate_variants(&variants, &parsed, conn)
             })?;
 
             // Write to offline cache for future use
@@ -207,15 +199,10 @@ fn query_impl_sqlite(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStr
             offline::lookup_cached_validation(&parsed)
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
-            // ≤10 clauses: full 2^N validation. >10: O(N+1) linear.
+            // Full 2^N validation — every combination checked.
             let result = connection::with_sqlite_connection(|conn| {
-                let n = parsed.optional_clauses.len();
-                if n <= 10 {
-                    let variants = dynamic::expand_variants(&parsed)?;
-                    validate_sqlite::validate_variants_sqlite(&variants, &parsed, conn)
-                } else {
-                    validate_sqlite::validate_clauses_linear_sqlite(&parsed, conn)
-                }
+                let variants = dynamic::expand_variants(&parsed)?;
+                validate_sqlite::validate_variants_sqlite(&variants, &parsed, conn)
             })?;
 
             offline::write_cache(&parsed, &result);

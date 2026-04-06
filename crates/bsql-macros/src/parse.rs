@@ -270,11 +270,15 @@ fn extract_params(sql: &str) -> Result<ExtractResult, String> {
         i += ch.len_utf8();
     }
 
-    if optional_clauses.len() > 64 {
+    if optional_clauses.len() > 10 {
         return Err(format!(
-            "too many optional clauses ({}) — maximum is 64. \
-             Consider splitting into multiple queries.",
+            "too many optional clauses ({}, producing {} combinations) — maximum is 10. \
+             All 2^N combinations are validated at compile time to guarantee \
+             \"if it compiles, the SQL is correct\". Split into multiple queries \
+             if you need more than 10 optional clauses.",
             optional_clauses.len(),
+            1u32.checked_shl(optional_clauses.len() as u32)
+                .unwrap_or(u32::MAX),
         ));
     }
 
@@ -1459,18 +1463,15 @@ mod tests {
 
     #[test]
     fn too_many_optional_clauses_rejected() {
-        // 65 optional clauses should be rejected (max 64)
-        let clauses: Vec<String> = (0..65)
+        // 11 optional clauses should be rejected (max 10)
+        let clauses: Vec<String> = (0..11)
             .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
             .collect();
         let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
         let r = parse_query(&sql);
         assert!(r.is_err());
         let err = r.unwrap_err();
-        assert!(
-            err.contains("65") && err.contains("maximum is 64"),
-            "should mention limit: {err}"
-        );
+        assert!(err.contains("maximum is 10"), "should mention limit: {err}");
     }
 
     #[test]
@@ -2009,26 +2010,26 @@ mod tests {
 
     // Exactly 64 optional clauses (boundary - max allowed)
     #[test]
-    fn exactly_sixty_four_optional_clauses_boundary() {
-        let clauses: Vec<String> = (0..64)
+    fn exactly_ten_optional_clauses_boundary() {
+        let clauses: Vec<String> = (0..10)
             .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
             .collect();
         let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
         let r = parse_query(&sql).unwrap();
-        assert_eq!(r.optional_clauses.len(), 64);
+        assert_eq!(r.optional_clauses.len(), 10);
     }
 
-    // 65 optional clauses (one over max)
+    // 11 optional clauses (one over max)
     #[test]
     fn sixty_five_optional_clauses_one_over_max() {
-        let clauses: Vec<String> = (0..65)
+        let clauses: Vec<String> = (0..11)
             .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
             .collect();
         let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
         let r = parse_query(&sql);
         assert!(r.is_err());
         let err = r.unwrap_err();
-        assert!(err.contains("maximum is 64"), "error: {err}");
+        assert!(err.contains("maximum is 10"), "error: {err}");
     }
 
     // Sort placeholder with extra whitespace around all tokens

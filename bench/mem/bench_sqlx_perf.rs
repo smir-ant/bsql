@@ -39,34 +39,49 @@ fn main() {
             });
         }
         let elapsed = start.elapsed();
-        println!("pg_fetch_one:       {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS as u128, ITERATIONS);
+        println!(
+            "pg_fetch_one:       {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS as u128,
+            ITERATIONS
+        );
     }
 
     // fetch_many
     for limit in [10i64, 100, 1000, 10000] {
-        let iters = if limit >= 10000 { ITERATIONS_SLOW } else { ITERATIONS };
+        let iters = if limit >= 10000 {
+            ITERATIONS_SLOW
+        } else {
+            ITERATIONS
+        };
         rt.block_on(async {
-            let _: Vec<(i32, String, String, bool, f64)> =
-                sqlx::query_as("SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1")
-                    .bind(limit)
-                    .fetch_all(&pool)
-                    .await
-                    .unwrap();
+            let _: Vec<(i32, String, String, bool, f64)> = sqlx::query_as(
+                "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         });
 
         let start = Instant::now();
         for _ in 0..iters {
             rt.block_on(async {
-                let _: Vec<(i32, String, String, bool, f64)> =
-                    sqlx::query_as("SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1")
-                        .bind(limit)
-                        .fetch_all(&pool)
-                        .await
-                        .unwrap();
+                let _: Vec<(i32, String, String, bool, f64)> = sqlx::query_as(
+                    "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
             });
         }
         let elapsed = start.elapsed();
-        println!("pg_fetch_many/{:<5} {} ns/op  ({} iters)", limit, elapsed.as_nanos() / iters as u128, iters);
+        println!(
+            "pg_fetch_many/{:<5} {} ns/op  ({} iters)",
+            limit,
+            elapsed.as_nanos() / iters as u128,
+            iters
+        );
     }
 
     // insert_single
@@ -85,7 +100,11 @@ fn main() {
             });
         }
         let elapsed = start.elapsed();
-        println!("pg_insert_single:   {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS as u128, ITERATIONS);
+        println!(
+            "pg_insert_single:   {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS as u128,
+            ITERATIONS
+        );
     }
 
     // insert_batch
@@ -108,7 +127,11 @@ fn main() {
             });
         }
         let elapsed = start.elapsed();
-        println!("pg_insert_batch/100: {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_SLOW as u128, ITERATIONS_SLOW);
+        println!(
+            "pg_insert_batch/100: {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS_SLOW as u128,
+            ITERATIONS_SLOW
+        );
     }
 
     // join_aggregate
@@ -123,11 +146,16 @@ fn main() {
         let start = Instant::now();
         for _ in 0..ITERATIONS_JOIN {
             rt.block_on(async {
-                let _: Vec<(String, i64, f64)> = sqlx::query_as(sql).fetch_all(&pool).await.unwrap();
+                let _: Vec<(String, i64, f64)> =
+                    sqlx::query_as(sql).fetch_all(&pool).await.unwrap();
             });
         }
         let elapsed = start.elapsed();
-        println!("pg_join_aggregate:  {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_JOIN as u128, ITERATIONS_JOIN);
+        println!(
+            "pg_join_aggregate:  {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS_JOIN as u128,
+            ITERATIONS_JOIN
+        );
     }
 
     // subquery
@@ -141,10 +169,15 @@ fn main() {
         let start = Instant::now();
         for _ in 0..ITERATIONS_SUB {
             rt.block_on(async {
-                let _: Vec<(i32, String, String)> = sqlx::query_as(sql).fetch_all(&pool).await.unwrap();
+                let _: Vec<(i32, String, String)> =
+                    sqlx::query_as(sql).fetch_all(&pool).await.unwrap();
             });
         }
         let elapsed = start.elapsed();
-        println!("pg_subquery:        {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_SUB as u128, ITERATIONS_SUB);
+        println!(
+            "pg_subquery:        {} ns/op  ({} iters)",
+            elapsed.as_nanos() / ITERATIONS_SUB as u128,
+            ITERATIONS_SUB
+        );
     }
 }
