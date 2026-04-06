@@ -12,8 +12,8 @@ publish = false
 #   BSQL_DATABASE_URL=postgres://user:pass@localhost/mydb cargo run --bin pg_basic
 
 [dependencies]
-bsql = { path = "../crates/bsql", version = "0.18", features = ["time", "uuid"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+bsql = { path = "../crates/bsql", version = "0.18", features = ["time", "uuid", "sqlite-bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [[bin]]
 name = "pg_basic"

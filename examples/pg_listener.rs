@@ -24,7 +24,7 @@
 //! cargo run --bin pg_listener
 //! ```
 
-use bsql::{BsqlError, Listener};
+use bsql::{BsqlError, Listener, Pool};
 
 #[tokio::main]
 async fn main() -> Result<(), BsqlError> {
@@ -44,29 +44,25 @@ async fn main() -> Result<(), BsqlError> {
     // Send notifications from a background task
     // ---------------------------------------------------------------
     // In production, notifications come from other processes or DB triggers.
-    // Here we spawn a task to demonstrate the full round-trip.
+    // Here we use a pool with raw_execute to send NOTIFY from a spawned task.
+    // (Listener is !Sync due to mpsc::Receiver, so we use Pool for the sender.)
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Each Listener::connect() opens a separate connection.
-        let notifier = Listener::connect("postgres://user:pass@localhost/mydb")
+        let pool = Pool::connect("postgres://user:pass@localhost/mydb")
             .await
             .expect("connect for notify");
 
-        // notify() sends a payload on a channel.
-        notifier
-            .notify("cache_invalidation", "users:42")
+        pool.raw_execute("NOTIFY cache_invalidation, 'users:42'")
             .await
             .expect("notify");
-        notifier
-            .notify("job_complete", r#"{"job_id": 7, "status": "ok"}"#)
+        pool.raw_execute("NOTIFY job_complete, '{\"job_id\": 7, \"status\": \"ok\"}'")
             .await
             .expect("notify");
         println!("Sent 2 notifications.");
 
         // Signal the listener to stop (for this example only).
-        notifier
-            .notify("cache_invalidation", "STOP")
+        pool.raw_execute("NOTIFY cache_invalidation, 'STOP'")
             .await
             .expect("notify stop");
     });

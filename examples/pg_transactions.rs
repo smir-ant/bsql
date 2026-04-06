@@ -105,7 +105,7 @@ async fn main() -> Result<(), BsqlError> {
         "INSERT INTO audit_log (account_id, delta, note)
          VALUES ($account_id: i32, $debit: i32, $note: &str)"
     )
-    .run(&tx);
+    .run(&tx).await;
 
     match audit_result {
         Ok(_) => println!("Audit log inserted."),
