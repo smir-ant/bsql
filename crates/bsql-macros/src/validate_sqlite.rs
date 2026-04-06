@@ -103,6 +103,9 @@ pub fn validate_query_sqlite(
 /// Each variant is prepared independently. The first variant's columns
 /// are used as the canonical result type (all variants return the same
 /// columns — the SELECT list is identical, only WHERE clauses differ).
+///
+/// Note: superseded by `validate_clauses_linear_sqlite` which uses O(N+1) PREPAREs.
+/// Kept for backward compatibility and tests.
 pub fn validate_variants_sqlite(
     variants: &[crate::dynamic::QueryVariant],
     _parsed: &ParsedQuery,
@@ -169,6 +172,112 @@ pub fn validate_variants_sqlite(
     }
 
     canonical.ok_or_else(|| "internal error: no canonical validation result".to_owned())
+}
+
+/// Validate a dynamic query with O(N+1) compile_validate calls instead of 2^N.
+///
+/// Validates base SQL (all clauses excluded) + each clause individually.
+pub fn validate_clauses_linear_sqlite(
+    parsed: &ParsedQuery,
+    conn: &mut SqliteConnection,
+) -> Result<ValidationResult, String> {
+    use crate::dynamic;
+
+    let n = parsed.optional_clauses.len();
+    if n == 0 {
+        return validate_query_sqlite(parsed, conn);
+    }
+
+    // 1. Validate base query (mask=0)
+    let base_variant = dynamic::build_variant(parsed, 0)
+        .map_err(|e| format!("internal error building base variant: {e}"))?;
+    let base_sqlite_sql = pg_to_sqlite_params(&base_variant.sql);
+
+    let (driver_columns, param_count) = conn.compile_validate(&base_sqlite_sql).map_err(|e| {
+        format!(
+            "SQLite compile-time validation failed for base query: {e}\n  SQL: {}",
+            base_sqlite_sql
+        )
+    })?;
+
+    if param_count != base_variant.params.len() {
+        return Err(format!(
+            "parameter count mismatch in base query: query declares {} \
+             parameters but SQLite expects {}.",
+            base_variant.params.len(),
+            param_count
+        ));
+    }
+
+    let base_columns: Vec<ColumnInfo> = driver_columns
+        .iter()
+        .map(|col| {
+            let base_rust_type =
+                crate::types_sqlite::resolve_sqlite_type(col.declared_type.as_deref());
+            let rust_type = if col.is_nullable {
+                format!("Option<{base_rust_type}>")
+            } else {
+                base_rust_type.to_owned()
+            };
+            ColumnInfo {
+                name: col.name.clone(),
+                pg_oid: 0,
+                pg_type_name: col
+                    .declared_type
+                    .clone()
+                    .unwrap_or_else(|| "(none)".to_owned()),
+                is_nullable: col.is_nullable,
+                rust_type,
+            }
+        })
+        .collect();
+
+    let base_col_count = base_columns.len();
+
+    // 2. Validate each clause individually (mask = 1<<i)
+    for i in 0..n {
+        let mask = 1u32 << i;
+        let clause_variant = dynamic::build_variant(parsed, mask)
+            .map_err(|e| format!("internal error building clause {i} variant: {e}"))?;
+        let clause_sqlite_sql = pg_to_sqlite_params(&clause_variant.sql);
+
+        let (clause_columns, clause_param_count) =
+            conn.compile_validate(&clause_sqlite_sql).map_err(|e| {
+                format!(
+                    "SQLite compile-time validation failed for clause {i} \
+                     `[{}]`: {e}\n  SQL: {}",
+                    parsed.optional_clauses[i].sql_fragment, clause_sqlite_sql
+                )
+            })?;
+
+        if clause_param_count != clause_variant.params.len() {
+            return Err(format!(
+                "parameter count mismatch in clause {i}: query declares {} \
+                 parameters but SQLite expects {}.",
+                clause_variant.params.len(),
+                clause_param_count
+            ));
+        }
+
+        if clause_columns.len() != base_col_count {
+            return Err(format!(
+                "clause {} `[{}]` changes the number of result columns ({} vs {}). \
+                 Optional clauses must not change the SELECT list.",
+                i,
+                parsed.optional_clauses[i].sql_fragment,
+                clause_columns.len(),
+                base_col_count
+            ));
+        }
+    }
+
+    Ok(ValidationResult {
+        columns: base_columns,
+        param_pg_oids: SmallVec::new(),
+        param_is_pg_enum: SmallVec::new(),
+        #[cfg(feature = "explain")]
+        explain_plan: None,
+    })
 }
 
 #[cfg(test)]

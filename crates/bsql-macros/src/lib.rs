@@ -98,10 +98,6 @@ fn query_impl_postgres(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenS
         return query_impl_sort(parsed);
     }
 
-    // 3. Expand dynamic query variants (if any optional clauses)
-    let variants = dynamic::expand_variants(&parsed)
-        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
-
     if parsed.optional_clauses.is_empty() {
         // Static query path — no optional clauses
         let validation = if offline::is_offline() {
@@ -127,23 +123,34 @@ fn query_impl_postgres(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenS
         // Generate Rust code
         Ok(codegen::generate_query_code(&parsed, &validation))
     } else {
-        // Dynamic query path — has optional clauses
+        // Dynamic query path — has optional clauses.
+        //
+        // Validation: O(N+1) PREPAREs — base query + one per clause.
+        // Codegen: O(N) runtime SQL builder (no 2^N match arms).
         let validation = if offline::is_offline() {
-            // OFFLINE: read cached validation result for the base variant.
+            // OFFLINE: read cached validation result for the base query.
             //
-            // The cache stores variant 0's param_pg_oids, which only covers
-            // the base params (not optional clause params). Param type
-            // checking is skipped here because:
-            //  1. The online build already validated ALL variants' param types.
-            //  2. The cached columns are identical across all variants (the
-            //     SELECT list never changes, only WHERE clauses differ).
-            //  3. Codegen only needs the column info, not per-variant param OIDs.
+            // The cache stores the base query's param_pg_oids (not optional
+            // clause params). Param type checking is skipped here because:
+            //  1. The online build already validated all clauses' param types.
+            //  2. The cached columns are identical (SELECT list never changes).
+            //  3. Codegen only needs the column info, not per-clause param OIDs.
             offline::lookup_cached_validation(&parsed)
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
-            // ONLINE: validate ALL variants against PostgreSQL and check param types
+            // ONLINE: validate all clause combinations at compile time.
+            // ≤10 clauses: full 2^N validation (100% guarantee).
+            // >10 clauses: O(N+1) linear validation (base + each clause).
             let result = connection::with_connection(|conn| {
-                validate::validate_variants(&variants, &parsed, conn)
+                let n = parsed.optional_clauses.len();
+                if n <= 10 {
+                    // Full 2^N validation — "if it compiles, the SQL is correct"
+                    let variants = dynamic::expand_variants(&parsed)?;
+                    validate::validate_variants(&variants, &parsed, conn)
+                } else {
+                    // Linear validation for many clauses (compile time matters)
+                    validate::validate_clauses_linear(&parsed, conn)
+                }
             })?;
 
             // Write to offline cache for future use
@@ -152,12 +159,8 @@ fn query_impl_postgres(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenS
             result
         };
 
-        // Generate dynamic Rust code with match dispatcher
-        Ok(codegen::generate_dynamic_query_code(
-            &parsed,
-            &validation,
-            &variants,
-        ))
+        // Generate dynamic Rust code with runtime SQL dispatcher
+        Ok(codegen::generate_dynamic_query_code(&parsed, &validation))
     }
 }
 
@@ -171,10 +174,6 @@ fn query_impl_sqlite(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStr
     if parsed.sort_placeholder.is_some() {
         return query_impl_sqlite_sort(parsed);
     }
-
-    // Expand dynamic query variants (if any optional clauses)
-    let variants = dynamic::expand_variants(&parsed)
-        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
 
     if parsed.optional_clauses.is_empty() {
         // Static query path — no optional clauses
@@ -201,14 +200,22 @@ fn query_impl_sqlite(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStr
             &validation,
         ))
     } else {
-        // Dynamic query path — has optional clauses
+        // Dynamic query path — has optional clauses.
+        // Validation: O(N+1) — base + each clause individually.
+        // Codegen: O(N) runtime SQL builder.
         let validation = if offline::is_offline() {
             offline::lookup_cached_validation(&parsed)
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
-            // Validate ALL variants against SQLite
+            // ≤10 clauses: full 2^N validation. >10: O(N+1) linear.
             let result = connection::with_sqlite_connection(|conn| {
-                validate_sqlite::validate_variants_sqlite(&variants, &parsed, conn)
+                let n = parsed.optional_clauses.len();
+                if n <= 10 {
+                    let variants = dynamic::expand_variants(&parsed)?;
+                    validate_sqlite::validate_variants_sqlite(&variants, &parsed, conn)
+                } else {
+                    validate_sqlite::validate_clauses_linear_sqlite(&parsed, conn)
+                }
             })?;
 
             offline::write_cache(&parsed, &result);
@@ -219,7 +226,6 @@ fn query_impl_sqlite(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStr
         Ok(codegen_sqlite::generate_dynamic_sqlite_query_code(
             &parsed,
             &validation,
-            &variants,
         ))
     }
 }

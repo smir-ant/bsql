@@ -26,6 +26,9 @@ pub struct QueryVariant {
 ///
 /// For queries with no optional clauses, returns a single variant identical
 /// to the original query (the common path pays no cost).
+///
+/// Note: this is only used for the legacy 2^N validation path. The default
+/// path now uses `validate_clauses_linear` with O(N+1) PREPAREs.
 pub fn expand_variants(parsed: &ParsedQuery) -> Result<Vec<QueryVariant>, String> {
     let n = parsed.optional_clauses.len();
 
@@ -38,13 +41,12 @@ pub fn expand_variants(parsed: &ParsedQuery) -> Result<Vec<QueryVariant>, String
         }]);
     }
 
-    // Hard limit: 2^N variants must not explode compile times.
-    // n <= 10 enforced by parser, but guard here too.
-    if n > 10 {
+    // Guard: expand_variants is only used for validation when N is small.
+    // For large N, use validate_clauses_linear (O(N+1)) instead.
+    if n > 20 {
         return Err(format!(
-            "too many optional clauses ({n}, producing {} variants) — maximum is 10 \
-             (1024 variants). Consider splitting into multiple queries.",
-            1u32 << n
+            "too many optional clauses ({n}) for full variant expansion. \
+             Use validate_clauses_linear for O(N) validation.",
         ));
     }
 
@@ -60,7 +62,7 @@ pub fn expand_variants(parsed: &ParsedQuery) -> Result<Vec<QueryVariant>, String
 }
 
 /// Build a single variant for the given bitmask.
-fn build_variant(parsed: &ParsedQuery, mask: u32) -> Result<QueryVariant, String> {
+pub fn build_variant(parsed: &ParsedQuery, mask: u32) -> Result<QueryVariant, String> {
     // Collect all params for this variant: base params + included clause params
     let mut all_params: SmallVec<[Param; 4]> = SmallVec::with_capacity(parsed.params.len() + 4);
 

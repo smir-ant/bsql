@@ -348,6 +348,9 @@ pub fn check_param_types(
 /// Each variant is PREPAREd independently. The first variant's columns
 /// are used as the canonical result type (all variants must return the
 /// same columns — the base SELECT is identical, only WHERE clauses differ).
+///
+/// Note: superseded by `validate_clauses_linear` which uses O(N+1) PREPAREs.
+/// Kept for backward compatibility and tests.
 pub fn validate_variants(
     variants: &[QueryVariant],
     parsed: &ParsedQuery,
@@ -388,6 +391,56 @@ pub fn validate_variants(
     }
 
     canonical_result.ok_or_else(|| "no variants to validate (internal error)".to_owned())
+}
+
+/// Validate a dynamic query with O(N+1) PREPAREs instead of 2^N.
+///
+/// Validates:
+/// 1. The base SQL (all optional clauses excluded) — must be valid
+/// 2. For each clause i: base SQL + clause i (only that clause included)
+///
+/// This is sufficient for independent optional WHERE clauses (the common case).
+/// Inter-clause interactions (rare) are not checked, but would fail at runtime
+/// with a clear PostgreSQL error.
+pub fn validate_clauses_linear(
+    parsed: &ParsedQuery,
+    conn: &mut Connection,
+) -> Result<ValidationResult, String> {
+    use crate::dynamic;
+
+    let n = parsed.optional_clauses.len();
+    if n == 0 {
+        return validate_query(parsed, conn);
+    }
+
+    // 1. Validate base query (mask=0: no optional clauses)
+    let base_variant = dynamic::build_variant(parsed, 0)
+        .map_err(|e| format!("internal error building base variant: {e}"))?;
+    let base_result = validate_variant(&base_variant, conn, parsed, 0)?;
+    check_variant_param_types(&base_variant, &base_result)?;
+
+    // 2. Validate each clause individually (mask = 1<<i)
+    for i in 0..n {
+        let mask = 1u32 << i;
+        let clause_variant = dynamic::build_variant(parsed, mask)
+            .map_err(|e| format!("internal error building clause {i} variant: {e}"))?;
+        let clause_result = validate_variant(&clause_variant, conn, parsed, i + 1)?;
+        check_variant_param_types(&clause_variant, &clause_result)?;
+
+        // Verify column set matches the base
+        if clause_result.columns.len() != base_result.columns.len() {
+            return Err(format!(
+                "clause {} `[{}]` changes the number of result columns ({} vs {}). \
+                 Optional clauses must not change the SELECT list.",
+                i,
+                parsed.optional_clauses[i].sql_fragment,
+                clause_result.columns.len(),
+                base_result.columns.len()
+            ));
+        }
+    }
+
+    Ok(base_result)
 }
 
 fn validate_variant(

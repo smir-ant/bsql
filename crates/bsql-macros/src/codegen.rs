@@ -9,7 +9,6 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::dynamic::QueryVariant;
 use crate::parse::ParsedQuery;
 use crate::validate::ValidationResult;
 
@@ -42,17 +41,16 @@ pub fn generate_query_code(parsed: &ParsedQuery, validation: &ValidationResult) 
 /// The generated code includes:
 /// - A result struct (same for all variants — the SELECT list is identical)
 /// - An executor struct capturing all parameters (base + all optional)
-/// - A `match` dispatcher that selects the correct SQL variant and params
-///   based on which `Option` params are `Some`
+/// - A runtime dispatcher that builds the SQL string by conditionally
+///   appending optional clause fragments (O(N) code, not 2^N match arms)
 pub fn generate_dynamic_query_code(
     parsed: &ParsedQuery,
     validation: &ValidationResult,
-    variants: &[QueryVariant],
 ) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
     let for_each_row_struct = gen_pg_for_each_row_struct(parsed, validation);
     let executor_struct = gen_dynamic_executor_struct(parsed);
-    let executor_impls = gen_dynamic_executor_impls(parsed, validation, variants);
+    let executor_impls = gen_dynamic_executor_impls(parsed, validation);
     let constructor = gen_dynamic_constructor(parsed);
 
     quote! {
@@ -876,11 +874,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 }
 
 /// Generate the impl block for a dynamic query executor.
-fn gen_dynamic_executor_impls(
-    parsed: &ParsedQuery,
-    validation: &ValidationResult,
-    variants: &[QueryVariant],
-) -> TokenStream {
+fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
     let has_columns = !validation.columns.is_empty();
 
@@ -914,38 +908,36 @@ fn gen_dynamic_executor_impls(
         let owned_fetch_one_optional = if is_select {
             TokenStream::new()
         } else {
-            let fetch_one_dispatcher =
-                gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
-                    quote! {
-                        let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
-                        if owned.len() != 1 {
-                            return Err(::bsql_core::error::QueryError::row_count(
-                                "exactly 1 row",
-                                owned.len() as u64,
-                            ));
-                        }
-                        let row = owned.row(0);
-                        Ok(#result_name { #row_decode })
+            let fetch_one_dispatcher = gen_runtime_dispatcher(parsed, needs_limit, |_| {
+                quote! {
+                    let owned = executor.#qm(&_bsql_sql, _bsql_hash, &_bsql_params[..])?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
                     }
-                });
+                    let row = owned.row(0);
+                    Ok(#result_name { #row_decode })
+                }
+            });
 
-            let fetch_optional_dispatcher =
-                gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
-                    quote! {
-                        let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
-                        match owned.len() {
-                            0 => Ok(None),
-                            1 => {
-                                let row = owned.row(0);
-                                Ok(Some(#result_name { #row_decode }))
-                            }
-                            n => Err(::bsql_core::error::QueryError::row_count(
-                                "0 or 1 rows",
-                                n as u64,
-                            )),
+            let fetch_optional_dispatcher = gen_runtime_dispatcher(parsed, needs_limit, |_| {
+                quote! {
+                    let owned = executor.#qm(&_bsql_sql, _bsql_hash, &_bsql_params[..])?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => {
+                            let row = owned.row(0);
+                            Ok(Some(#result_name { #row_decode }))
                         }
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
                     }
-                });
+                }
+            });
 
             quote! {
                 pub async fn fetch_one<E: ::bsql_core::Executor>(
@@ -964,25 +956,19 @@ fn gen_dynamic_executor_impls(
             }
         };
 
-        let fetch_all_dispatcher = gen_variant_dispatcher(
-            parsed,
-            variants,
-            false,
-            |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
-                    owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
-                }
-            },
-        );
+        let fetch_all_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
+            quote! {
+                let owned = executor.#qm(&_bsql_sql, _bsql_hash, &_bsql_params[..])?;
+                owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
+            }
+        });
 
-        let fetch_stream_dispatcher =
-            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
-                quote! {
-                    let inner = pool.query_stream(#sql_lit, #sql_hash, &params_slice[..]).await?;
-                    Ok(#stream_name { inner })
-                }
-            });
+        let fetch_stream_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
+            quote! {
+                let inner = pool.query_stream(&_bsql_sql, _bsql_hash, &_bsql_params[..]).await?;
+                Ok(#stream_name { inner })
+            }
+        });
 
         quote! {
             #owned_fetch_one_optional
@@ -1025,12 +1011,11 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
-    let execute_dispatcher =
-        gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
-            quote! {
-                executor.execute_raw(#sql_lit, #sql_hash, &params_slice[..])
-            }
-        });
+    let execute_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
+        quote! {
+            executor.execute_raw(&_bsql_sql, _bsql_hash, &_bsql_params[..])
+        }
+    });
 
     let execute_method = quote! {
         pub async fn execute<E: ::bsql_core::Executor>(
@@ -1041,9 +1026,9 @@ fn gen_dynamic_executor_impls(
         }
     };
 
-    let defer_dispatcher = gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+    let defer_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
         quote! {
-            tx.defer_execute(#sql_lit, #sql_hash, &params_slice[..]).await
+            tx.defer_execute(&_bsql_sql, _bsql_hash, &_bsql_params[..]).await
         }
     });
 
@@ -1060,40 +1045,38 @@ fn gen_dynamic_executor_impls(
         let (fe_raw_stmts, fe_raw_inits) = gen_pg_for_each_raw_decode(validation);
         let (fe_raw_stmts2, fe_raw_inits2) = gen_pg_for_each_raw_decode(validation);
 
-        let for_each_dispatcher =
-            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
-                quote! {
-                    pool.__for_each_raw_bytes(
-                        #sql_lit,
-                        #sql_hash,
-                        &params_slice[..],
-                        true,
-                        |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
-                            #fe_raw_stmts
-                            let _bsql_typed = #fe_row_name { #fe_raw_inits };
-                            f(_bsql_typed)
-                        },
-                    ).await
-                }
-            });
+        let for_each_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
+            quote! {
+                pool.__for_each_raw_bytes(
+                    &_bsql_sql,
+                    _bsql_hash,
+                    &_bsql_params[..],
+                    true,
+                    |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                        #fe_raw_stmts
+                        let _bsql_typed = #fe_row_name { #fe_raw_inits };
+                        f(_bsql_typed)
+                    },
+                ).await
+            }
+        });
 
-        let for_each_map_dispatcher =
-            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
-                quote! {
-                    pool.__for_each_raw_bytes(
-                        #sql_lit,
-                        #sql_hash,
-                        &params_slice[..],
-                        true,
-                        |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
-                            #fe_raw_stmts2
-                            let _bsql_typed = #fe_row_name { #fe_raw_inits2 };
-                            _bsql_results.push(f(_bsql_typed));
-                            Ok(())
-                        },
-                    ).await
-                }
-            });
+        let for_each_map_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
+            quote! {
+                pool.__for_each_raw_bytes(
+                    &_bsql_sql,
+                    _bsql_hash,
+                    &_bsql_params[..],
+                    true,
+                    |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                        #fe_raw_stmts2
+                        let _bsql_typed = #fe_row_name { #fe_raw_inits2 };
+                        _bsql_results.push(f(_bsql_typed));
+                        Ok(())
+                    },
+                ).await
+            }
+        });
 
         quote! {
             pub async fn for_each<_BsqlForEachF>(
@@ -1136,54 +1119,39 @@ fn gen_dynamic_executor_impls(
             && !parsed.normalized_sql.contains(" limit ")
             && !parsed.normalized_sql.contains(" for ");
 
-        let fetch_dispatcher = gen_variant_dispatcher(
-            parsed,
-            variants,
-            false,
-            |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
-                    Ok(#r_rows_name { owned })
-                }
-            },
-        );
+        let fetch_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
+            quote! {
+                let owned = executor.query_raw_readonly(&_bsql_sql, _bsql_hash, &_bsql_params[..])?;
+                Ok(#r_rows_name { owned })
+            }
+        });
 
-        let fetch_one_dispatcher = gen_variant_dispatcher(
-            parsed,
-            variants,
-            needs_limit,
-            |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
-                    if owned.len() != 1 {
-                        return Err(::bsql_core::error::QueryError::row_count(
-                            "exactly 1 row",
-                            owned.len() as u64,
-                        ));
-                    }
-                    Ok(#r_single_name { owned })
+        let fetch_one_dispatcher = gen_runtime_dispatcher(parsed, needs_limit, |_| {
+            quote! {
+                let owned = executor.query_raw_readonly(&_bsql_sql, _bsql_hash, &_bsql_params[..])?;
+                if owned.len() != 1 {
+                    return Err(::bsql_core::error::QueryError::row_count(
+                        "exactly 1 row",
+                        owned.len() as u64,
+                    ));
                 }
-            },
-        );
+                Ok(#r_single_name { owned })
+            }
+        });
 
-        let fetch_optional_dispatcher = gen_variant_dispatcher(
-            parsed,
-            variants,
-            needs_limit,
-            |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
-                    match owned.len() {
-                        0 => Ok(None),
-                        1 => Ok(Some(#r_single_name { owned })),
-                        n => Err(::bsql_core::error::QueryError::row_count(
-                            "0 or 1 rows",
-                            n as u64,
-                        )),
-                    }
+        let fetch_optional_dispatcher = gen_runtime_dispatcher(parsed, needs_limit, |_| {
+            quote! {
+                let owned = executor.query_raw_readonly(&_bsql_sql, _bsql_hash, &_bsql_params[..])?;
+                match owned.len() {
+                    0 => Ok(None),
+                    1 => Ok(Some(#r_single_name { owned })),
+                    n => Err(::bsql_core::error::QueryError::row_count(
+                        "0 or 1 rows",
+                        n as u64,
+                    )),
                 }
-            },
-        );
+            }
+        });
 
         quote! {
             /// Fetch all rows, returning a wrapper with zero-allocation borrowed access.
@@ -1241,75 +1209,242 @@ fn gen_dynamic_executor_impls(
     }
 }
 
-/// Generate the variant match dispatcher.
-fn gen_variant_dispatcher<F>(
-    parsed: &ParsedQuery,
-    variants: &[QueryVariant],
-    inject_limit: bool,
-    body_fn: F,
-) -> TokenStream
+/// Generate a runtime SQL dispatcher for dynamic queries with optional clauses.
+///
+/// Instead of generating 2^N match arms (one per optional-clause combination),
+/// generates O(N) code that builds the SQL string at runtime by conditionally
+/// appending each clause fragment when its `Option` parameter is `Some`.
+///
+/// The generated code:
+/// 1. Splits the base SQL at `{OPT_N}` placeholders (pre-computed at compile time)
+/// 2. For each clause: if `self.param.is_some()`, appends the fragment with
+///    a dynamically-numbered `$N` parameter placeholder
+/// 3. Computes the sql_hash via `::bsql_core::rapid_hash_str`
+/// 4. Calls `body_fn` with the constructed SQL + hash + params
+///
+/// The closure receives a unit argument (for compatibility with the call sites)
+/// and should reference the runtime variables `_bsql_sql`, `_bsql_hash`, and
+/// `_bsql_params` in its generated code.
+fn gen_runtime_dispatcher<F>(parsed: &ParsedQuery, inject_limit: bool, body_fn: F) -> TokenStream
 where
-    F: Fn(&str, u64) -> TokenStream,
+    F: Fn(()) -> TokenStream,
 {
-    let n = parsed.optional_clauses.len();
-    let discriminants: Vec<proc_macro2::Ident> = parsed
+    // Pre-split the positional SQL at {OPT_N} markers into N+1 segments.
+    // E.g. "SELECT id FROM t WHERE a IS NULL{OPT_0}{OPT_1} ORDER BY id"
+    // becomes ["SELECT id FROM t WHERE a IS NULL", "", " ORDER BY id"]
+    let mut segments: Vec<String> = Vec::new();
+    let mut remaining = parsed.positional_sql.as_str();
+    for i in 0..parsed.optional_clauses.len() {
+        let marker = format!("{{OPT_{i}}}");
+        if let Some(pos) = remaining.find(&marker) {
+            segments.push(remaining[..pos].to_owned());
+            remaining = &remaining[pos + marker.len()..];
+        } else {
+            // Should not happen if parse.rs is correct, but be defensive
+            segments.push(remaining.to_owned());
+            remaining = "";
+        }
+    }
+    segments.push(remaining.to_owned());
+
+    // Estimate total SQL length for String::with_capacity
+    let base_len: usize = segments.iter().map(|s| s.len()).sum();
+    let clause_len: usize = parsed
         .optional_clauses
         .iter()
-        .map(|c| param_ident(&c.params[0].name))
+        .map(|c| c.sql_fragment.len() + 8) // +8 for " " padding + "$NN"
+        .sum();
+    let capacity = base_len + clause_len + if inject_limit { 10 } else { 0 };
+
+    // The first segment is always present
+    let first_segment = &segments[0];
+
+    // Generate code to push base params
+    let base_param_pushes: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
+            let name = param_ident(&p.name);
+            quote! {
+                _bsql_params.push(&self.#name as &(dyn ::bsql_core::driver::Encode + Sync));
+            }
+        })
         .collect();
 
-    let match_tuple = quote! { (#(self.#discriminants.is_some()),*) };
-
-    let arms: Vec<TokenStream> = variants
+    // For each optional clause, generate the conditional append code
+    let clause_appends: Vec<TokenStream> = parsed
+        .optional_clauses
         .iter()
-        .map(|variant| {
-            let pattern_elements: Vec<TokenStream> = (0..n)
-                .map(|i| {
-                    if (variant.mask & (1 << i)) != 0 {
-                        quote! { true }
+        .enumerate()
+        .map(|(i, clause)| {
+            let param_name = param_ident(&clause.params[0].name);
+            // The trailing segment after this {OPT_N} marker
+            let trailing = &segments[i + 1];
+
+            // Pre-split the clause sql_fragment at ${P_N} markers to get
+            // text segments that we can emit as string literals.
+            // E.g. "AND dept_id = ${P_1}" -> ["AND dept_id = ", ""]
+            // At runtime we splice in "$<param_number>" between them.
+            let frag = &clause.sql_fragment;
+            let mut frag_parts: Vec<String> = Vec::new();
+            let mut frag_remaining = frag.as_str();
+
+            // Each clause has exactly one unique param (enforced by parser),
+            // but the param can appear multiple times. Split at all ${P_N}.
+            loop {
+                if let Some(pos) = frag_remaining.find("${P_") {
+                    frag_parts.push(frag_remaining[..pos].to_owned());
+                    // Skip past ${P_N}
+                    let after = &frag_remaining[pos + 4..];
+                    if let Some(end) = after.find('}') {
+                        frag_remaining = &after[end + 1..];
                     } else {
-                        quote! { false }
+                        frag_remaining = "";
+                        break;
+                    }
+                } else {
+                    frag_parts.push(frag_remaining.to_owned());
+                    break;
+                }
+            }
+
+            // Number of ${P_N} placeholders = frag_parts.len() - 1
+            let num_refs = frag_parts.len() - 1;
+
+            // Generate the fragment append code
+            let frag_append: Vec<TokenStream> = frag_parts
+                .iter()
+                .enumerate()
+                .map(|(j, part)| {
+                    if j == 0 {
+                        // First segment: push " " + text (leading space before clause)
+                        quote! {
+                            _bsql_sql.push(' ');
+                            _bsql_sql.push_str(#part);
+                        }
+                    } else {
+                        // After each ${P_N}: push "$<n>" then remaining text
+                        quote! {
+                            _bsql_sql.push('$');
+                            {
+                                // Inline itoa: avoid format! allocation for param numbers
+                                let _n = _bsql_params.len() + 1;
+                                if _n < 10 {
+                                    _bsql_sql.push((b'0' + _n as u8) as char);
+                                } else if _n < 100 {
+                                    _bsql_sql.push((b'0' + (_n / 10) as u8) as char);
+                                    _bsql_sql.push((b'0' + (_n % 10) as u8) as char);
+                                } else {
+                                    // Fallback for 100+ params (rare)
+                                    let _s = _n.to_string();
+                                    _bsql_sql.push_str(&_s);
+                                }
+                            }
+                            _bsql_sql.push_str(#part);
+                        }
                     }
                 })
                 .collect();
-            let pattern = quote! { (#(#pattern_elements),*) };
 
-            let sql_str = if inject_limit {
-                format!("{} LIMIT 2", variant.sql)
-            } else {
-                variant.sql.clone()
+            // Push the param reference (once, after all fragment parts that reference it)
+            let param_push = quote! {
+                _bsql_params.push(self.#param_name.as_ref().unwrap() as &(dyn ::bsql_core::driver::Encode + Sync));
             };
 
-            let sql_hash = bsql_core::rapid_hash_str(&sql_str);
+            // Also append any trailing segment after {OPT_N} (usually empty or " ORDER BY ...")
+            let trailing_push = if trailing.is_empty() {
+                TokenStream::new()
+            } else {
+                quote! { _bsql_sql.push_str(#trailing); }
+            };
 
-            let param_bindings: Vec<TokenStream> = variant
-                .params
-                .iter()
-                .map(|p| {
-                    let name = param_ident(&p.name);
-                    if p.rust_type.starts_with("Option<") {
-                        quote! { self.#name.as_ref().unwrap() as &(dyn ::bsql_core::driver::Encode + Sync) }
-                    } else {
-                        quote! { &self.#name as &(dyn ::bsql_core::driver::Encode + Sync) }
+            // For clauses where param appears multiple times in the fragment,
+            // we only push the param once but reference it with incrementing $N.
+            // However, each ${P_N} occurrence refers to the same param.
+            // We need to push the param N times so each $N gets its own slot.
+            // Actually no -- each appearance of the same param in one clause
+            // uses the SAME ${P_N} value, so it should be the same $N at runtime.
+            // Let me reconsider: the clause has one unique param but it can appear
+            // multiple times. In PG, each $N reference can reuse the same number.
+            // So we push the param once and emit the same $N for each occurrence.
+            //
+            // But wait: our fragment splitting above splits at EVERY ${P_N}.
+            // The issue is that if the same param appears twice, we get two splits
+            // but should emit the SAME $N for both. And push only once.
+            //
+            // Revised approach: push param first, then use that fixed $N for all refs.
+            if num_refs <= 1 {
+                // Common case: param appears exactly once in fragment
+                quote! {
+                    if self.#param_name.is_some() {
+                        #(#frag_append)*
+                        #param_push
                     }
-                })
-                .collect();
+                    #trailing_push
+                }
+            } else {
+                // Rare case: same param appears multiple times in fragment.
+                // Push param first, capture the $N, then emit all refs with same $N.
+                let frag_parts_multi: Vec<TokenStream> = frag_parts
+                    .iter()
+                    .enumerate()
+                    .map(|(j, part)| {
+                        if j == 0 {
+                            quote! {
+                                _bsql_sql.push(' ');
+                                _bsql_sql.push_str(#part);
+                            }
+                        } else {
+                            // All refs use the same _bsql_pn
+                            quote! {
+                                _bsql_sql.push_str(&_bsql_pn);
+                                _bsql_sql.push_str(#part);
+                            }
+                        }
+                    })
+                    .collect();
 
-            let body = body_fn(&sql_str, sql_hash);
-
-            quote! {
-                #pattern => {
-                    let params_slice: &[&(dyn ::bsql_core::driver::Encode + Sync)] =
-                        &[#(#param_bindings),*];
-                    #body
+                quote! {
+                    if self.#param_name.is_some() {
+                        #param_push
+                        let _bsql_pn = format!("${}", _bsql_params.len());
+                        #(#frag_parts_multi)*
+                    }
+                    #trailing_push
                 }
             }
         })
         .collect();
 
+    let limit_push = if inject_limit {
+        quote! { _bsql_sql.push_str(" LIMIT 2"); }
+    } else {
+        TokenStream::new()
+    };
+
+    let body = body_fn(());
+
+    let n_clauses = parsed.optional_clauses.len();
+    let max_params = parsed.params.len() + n_clauses;
+
     quote! {
-        match #match_tuple {
-            #(#arms)*
+        {
+            let mut _bsql_sql = ::std::string::String::with_capacity(#capacity);
+            _bsql_sql.push_str(#first_segment);
+            let mut _bsql_params: ::std::vec::Vec<&(dyn ::bsql_core::driver::Encode + Sync)> =
+                ::std::vec::Vec::with_capacity(#max_params);
+
+            // Base params (always present)
+            #(#base_param_pushes)*
+
+            // Optional clause fragments (conditionally appended)
+            #(#clause_appends)*
+
+            #limit_push
+
+            let _bsql_hash = ::bsql_core::rapid_hash_str(&_bsql_sql);
+
+            #body
         }
     }
 }

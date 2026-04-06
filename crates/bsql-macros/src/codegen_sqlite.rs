@@ -12,7 +12,6 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::dynamic::QueryVariant;
 use crate::parse::ParsedQuery;
 use crate::validate::ValidationResult;
 use crate::validate_sqlite::pg_to_sqlite_params;
@@ -1478,18 +1477,17 @@ fn deduplicate_column_names(columns: &[crate::validate::ColumnInfo]) -> Vec<Stri
 /// The generated code includes:
 /// - A result struct (same for all variants)
 /// - An executor struct capturing all parameters (base + all optional)
-/// - A `match` dispatcher that selects the correct SQL variant and params
-///   based on which `Option` params are `Some`
+/// - A runtime dispatcher that builds the SQL string by conditionally
+///   appending optional clause fragments (O(N) code, not 2^N match arms)
 pub fn generate_dynamic_sqlite_query_code(
     parsed: &ParsedQuery,
     validation: &ValidationResult,
-    variants: &[QueryVariant],
 ) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
     let arena_result_struct = gen_arena_result_struct(parsed, validation);
     let for_each_row_struct = gen_for_each_row_struct(parsed, validation);
     let executor_struct = gen_dynamic_executor_struct(parsed);
-    let executor_impls = gen_dynamic_executor_impls(parsed, validation, variants);
+    let executor_impls = gen_dynamic_executor_impls(parsed, validation);
     let constructor = gen_dynamic_constructor(parsed);
 
     quote! {
@@ -1539,12 +1537,8 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 }
 
 /// Generate the impl block for a dynamic SQLite query executor.
-/// Uses inline step loops — same optimization as the static path.
-fn gen_dynamic_executor_impls(
-    parsed: &ParsedQuery,
-    validation: &ValidationResult,
-    variants: &[QueryVariant],
-) -> TokenStream {
+/// Uses runtime SQL dispatch — O(N) code instead of 2^N match arms.
+fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
     let has_columns = !validation.columns.is_empty();
     let is_select = parsed.kind == crate::parse::QueryKind::Select;
@@ -1570,98 +1564,80 @@ fn gen_dynamic_executor_impls(
 
         // --- Inline fetch_one ---
         let fetch_one_dispatcher = {
-            let acq = gen_inline_acquire(is_write);
             let bind = gen_inline_param_bind();
             let decode_one = wrap_decode_as_bsql(&result_name, &direct_decode);
-            gen_sqlite_inline_variant_dispatcher(
-                parsed,
-                variants,
-                needs_limit,
-                |sql_lit, sql_hash| {
-                    quote! {
-                        let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
-                            .map_err(::bsql_core::BsqlError::from_sqlite)?;
-                        #bind
-                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
-                            ::bsql_core::driver_sqlite::StepResult::Row => {
-                                let _bsql_result = #decode_one;
-                                if let ::bsql_core::driver_sqlite::StepResult::Row =
-                                    _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?
-                                {
-                                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                                    drop(_bsql_conn);
-                                    return Err(::bsql_core::BsqlError::from_sqlite(
-                                        ::bsql_core::driver_sqlite::SqliteError::Internal(
-                                            "expected 1 row, got 2+".into(),
-                                        ),
-                                    ));
-                                }
-                                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                                drop(_bsql_conn);
-                                return Ok(_bsql_result);
-                            }
-                            ::bsql_core::driver_sqlite::StepResult::Done => {
+            gen_sqlite_runtime_dispatcher(parsed, needs_limit, is_write, |_| {
+                quote! {
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #bind
+                    match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                        ::bsql_core::driver_sqlite::StepResult::Row => {
+                            let _bsql_result = #decode_one;
+                            if let ::bsql_core::driver_sqlite::StepResult::Row =
+                                _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?
+                            {
                                 _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
                                 drop(_bsql_conn);
                                 return Err(::bsql_core::BsqlError::from_sqlite(
                                     ::bsql_core::driver_sqlite::SqliteError::Internal(
-                                        "expected 1 row, got 0".into(),
+                                        "expected 1 row, got 2+".into(),
                                     ),
                                 ));
                             }
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            return Ok(_bsql_result);
+                        }
+                        ::bsql_core::driver_sqlite::StepResult::Done => {
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            return Err(::bsql_core::BsqlError::from_sqlite(
+                                ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                    "expected 1 row, got 0".into(),
+                                ),
+                            ));
                         }
                     }
-                },
-                quote! { let mut _bsql_conn = #acq; },
-            )
+                }
+            })
         };
 
         // --- Inline fetch_optional ---
         let fetch_optional_dispatcher = {
-            let acq = gen_inline_acquire(is_write);
             let bind = gen_inline_param_bind();
             let decode_opt = wrap_decode_as_bsql(&result_name, &direct_decode);
-            gen_sqlite_inline_variant_dispatcher(
-                parsed,
-                variants,
-                needs_limit,
-                |sql_lit, sql_hash| {
-                    quote! {
-                        let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
-                            .map_err(::bsql_core::BsqlError::from_sqlite)?;
-                        #bind
-                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
-                            ::bsql_core::driver_sqlite::StepResult::Row => {
-                                let _bsql_result = #decode_opt;
-                                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                                drop(_bsql_conn);
-                                return Ok(Some(_bsql_result));
-                            }
-                            ::bsql_core::driver_sqlite::StepResult::Done => {
-                                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                                drop(_bsql_conn);
-                                return Ok(None);
-                            }
+            gen_sqlite_runtime_dispatcher(parsed, needs_limit, is_write, |_| {
+                quote! {
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #bind
+                    match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                        ::bsql_core::driver_sqlite::StepResult::Row => {
+                            let _bsql_result = #decode_opt;
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            return Ok(Some(_bsql_result));
+                        }
+                        ::bsql_core::driver_sqlite::StepResult::Done => {
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            return Ok(None);
                         }
                     }
-                },
-                quote! { let mut _bsql_conn = #acq; },
-            )
+                }
+            })
         };
 
         // --- Inline fetch_all ---
         let fetch_all_method = if use_arena {
             let arena_name = arena_result_struct_name(parsed);
-            let acq = gen_inline_acquire(is_write);
             let bind = gen_inline_param_bind();
             let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
-            let fetch_all_dispatcher = gen_sqlite_inline_variant_dispatcher(
-                parsed,
-                variants,
-                false,
-                |sql_lit, sql_hash| {
+            let fetch_all_dispatcher =
+                gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
                     quote! {
-                        let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                        let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                             .map_err(::bsql_core::BsqlError::from_sqlite)?;
                         #bind
                         let mut _bsql_text_buf: Vec<u8> = Vec::new();
@@ -1689,9 +1665,7 @@ fn gen_dynamic_executor_impls(
                             _bsql_blob_arena,
                         ));
                     }
-                },
-                quote! { let mut _bsql_conn = #acq; },
-            );
+                });
             quote! {
                 pub fn fetch_all(
                     self,
@@ -1701,16 +1675,12 @@ fn gen_dynamic_executor_impls(
                 }
             }
         } else {
-            let acq = gen_inline_acquire(is_write);
             let bind = gen_inline_param_bind();
             let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
-            let fetch_all_dispatcher = gen_sqlite_inline_variant_dispatcher(
-                parsed,
-                variants,
-                false,
-                |sql_lit, sql_hash| {
+            let fetch_all_dispatcher =
+                gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
                     quote! {
-                        let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                        let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                             .map_err(::bsql_core::BsqlError::from_sqlite)?;
                         #bind
                         let mut _bsql_rows = Vec::new();
@@ -1726,9 +1696,7 @@ fn gen_dynamic_executor_impls(
                         drop(_bsql_conn);
                         return Ok(_bsql_rows);
                     }
-                },
-                quote! { let mut _bsql_conn = #acq; },
-            );
+                });
             quote! {
                 pub fn fetch_all(
                     self,
@@ -1764,45 +1732,34 @@ fn gen_dynamic_executor_impls(
         let for_each_row_name = for_each_row_struct_name(parsed);
         let for_each_decode = gen_for_each_decode(validation);
 
-        let for_each_acq = gen_inline_acquire(is_write);
         let decode_fe = wrap_for_each_decode_as_bsql(&for_each_row_name, &for_each_decode);
-        let for_each_dispatcher = gen_sqlite_inline_variant_dispatcher(
-            parsed,
-            variants,
-            false,
-            |sql_lit, sql_hash| {
-                let bind = gen_inline_param_bind();
-                quote! {
-                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
-                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
-                    #bind
-                    loop {
-                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
-                            ::bsql_core::driver_sqlite::StepResult::Row => {
-                                let _bsql_row = #decode_fe;
-                                f(_bsql_row)?;
-                            }
-                            ::bsql_core::driver_sqlite::StepResult::Done => break,
+        let for_each_dispatcher = gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
+            let bind = gen_inline_param_bind();
+            quote! {
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #bind
+                loop {
+                    match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                        ::bsql_core::driver_sqlite::StepResult::Row => {
+                            let _bsql_row = #decode_fe;
+                            f(_bsql_row)?;
                         }
+                        ::bsql_core::driver_sqlite::StepResult::Done => break,
                     }
-                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                    drop(_bsql_conn);
-                    return Ok(());
                 }
-            },
-            quote! { let mut _bsql_conn = #for_each_acq; },
-        );
+                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                drop(_bsql_conn);
+                return Ok(());
+            }
+        });
 
-        let for_each_map_acq = gen_inline_acquire(is_write);
         let decode_fem = wrap_for_each_decode_as_bsql(&for_each_row_name, &for_each_decode);
-        let for_each_map_dispatcher = gen_sqlite_inline_variant_dispatcher(
-            parsed,
-            variants,
-            false,
-            |sql_lit, sql_hash| {
+        let for_each_map_dispatcher =
+            gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
                 let bind = gen_inline_param_bind();
                 quote! {
-                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #bind
                     let mut _bsql_rows = Vec::new();
@@ -1819,9 +1776,7 @@ fn gen_dynamic_executor_impls(
                     drop(_bsql_conn);
                     return Ok(_bsql_rows);
                 }
-            },
-            quote! { let mut _bsql_conn = #for_each_map_acq; },
-        );
+            });
 
         quote! {
             pub fn for_each<_BsqlForEachF>(
@@ -1850,15 +1805,11 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
-    let execute_acq = gen_inline_acquire(/*is_write=*/ true);
-    let execute_dispatcher = gen_sqlite_inline_variant_dispatcher(
-        parsed,
-        variants,
-        false,
-        |sql_lit, sql_hash| {
+    let execute_dispatcher =
+        gen_sqlite_runtime_dispatcher(parsed, false, /*is_write=*/ true, |_| {
             let bind = gen_inline_param_bind();
             quote! {
-                let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                     .map_err(::bsql_core::BsqlError::from_sqlite)?;
                 #bind
                 _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?;
@@ -1867,9 +1818,7 @@ fn gen_dynamic_executor_impls(
                 drop(_bsql_conn);
                 return Ok(_bsql_changes);
             }
-        },
-        quote! { let mut _bsql_conn = #execute_acq; },
-    );
+        });
 
     let execute_method = quote! {
         pub fn execute(
@@ -1936,86 +1885,207 @@ fn gen_dynamic_executor_impls(
     }
 }
 
-/// Generate the inline match dispatcher for SQLite dynamic query variants.
-/// The connection is acquired once before the match, then each arm does
-/// inline prepare/bind/loop directly on the connection.
-fn gen_sqlite_inline_variant_dispatcher<F>(
+/// Generate a runtime SQL dispatcher for SQLite dynamic queries.
+///
+/// Same concept as `gen_runtime_dispatcher` in codegen.rs but for SQLite:
+/// uses `?N` parameter syntax instead of `$N`, and builds a
+/// `Vec<&dyn SqliteEncode>` params slice.
+fn gen_sqlite_runtime_dispatcher<F>(
     parsed: &ParsedQuery,
-    variants: &[QueryVariant],
     inject_limit: bool,
+    is_write: bool,
     body_fn: F,
-    acquire_stmt: TokenStream,
 ) -> TokenStream
 where
-    F: Fn(&str, u64) -> TokenStream,
+    F: Fn(()) -> TokenStream,
 {
-    let n = parsed.optional_clauses.len();
-    let discriminants: Vec<proc_macro2::Ident> = parsed
+    // Convert the base positional SQL from PG-style $N to SQLite-style ?N
+    let pg_sql = &parsed.positional_sql;
+
+    // Pre-split at {OPT_N} markers
+    let mut segments: Vec<String> = Vec::new();
+    let mut remaining = pg_sql.as_str();
+    for i in 0..parsed.optional_clauses.len() {
+        let marker = format!("{{OPT_{i}}}");
+        if let Some(pos) = remaining.find(&marker) {
+            segments.push(pg_to_sqlite_params(&remaining[..pos]));
+            remaining = &remaining[pos + marker.len()..];
+        } else {
+            segments.push(pg_to_sqlite_params(remaining));
+            remaining = "";
+        }
+    }
+    segments.push(pg_to_sqlite_params(remaining));
+
+    let base_len: usize = segments.iter().map(|s| s.len()).sum();
+    let clause_len: usize = parsed
         .optional_clauses
         .iter()
-        .map(|c| param_ident(&c.params[0].name))
+        .map(|c| c.sql_fragment.len() + 8)
+        .sum();
+    let capacity = base_len + clause_len + if inject_limit { 10 } else { 0 };
+
+    let first_segment = &segments[0];
+
+    // Base param pushes
+    let base_param_pushes: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
+            let name = param_ident(&p.name);
+            let push = gen_direct_param_ref(&name, &p.rust_type);
+            quote! {
+                _bsql_params.push(#push);
+            }
+        })
         .collect();
 
-    let match_tuple = quote! { (#(self.#discriminants.is_some()),*) };
-
-    let arms: Vec<TokenStream> = variants
+    // Clause appends (same logic as PG but with ?N instead of $N)
+    let clause_appends: Vec<TokenStream> = parsed
+        .optional_clauses
         .iter()
-        .map(|variant| {
-            let pattern_elements: Vec<TokenStream> = (0..n)
-                .map(|i| {
-                    if (variant.mask & (1 << i)) != 0 {
-                        quote! { true }
+        .enumerate()
+        .map(|(i, clause)| {
+            let param_name = param_ident(&clause.params[0].name);
+            let trailing = &segments[i + 1];
+
+            // Split fragment at ${P_N} markers
+            let frag = &clause.sql_fragment;
+            let mut frag_parts: Vec<String> = Vec::new();
+            let mut frag_remaining = frag.as_str();
+            loop {
+                if let Some(pos) = frag_remaining.find("${P_") {
+                    frag_parts.push(frag_remaining[..pos].to_owned());
+                    let after = &frag_remaining[pos + 4..];
+                    if let Some(end) = after.find('}') {
+                        frag_remaining = &after[end + 1..];
                     } else {
-                        quote! { false }
+                        frag_remaining = "";
+                        break;
+                    }
+                } else {
+                    frag_parts.push(frag_remaining.to_owned());
+                    break;
+                }
+            }
+
+            let num_refs = frag_parts.len() - 1;
+
+            // Generate fragment append code using ?N (SQLite style)
+            let frag_append: Vec<TokenStream> = frag_parts
+                .iter()
+                .enumerate()
+                .map(|(j, part)| {
+                    if j == 0 {
+                        quote! {
+                            _bsql_sql.push(' ');
+                            _bsql_sql.push_str(#part);
+                        }
+                    } else {
+                        quote! {
+                            _bsql_sql.push('?');
+                            {
+                                let _n = _bsql_params.len() + 1;
+                                if _n < 10 {
+                                    _bsql_sql.push((b'0' + _n as u8) as char);
+                                } else if _n < 100 {
+                                    _bsql_sql.push((b'0' + (_n / 10) as u8) as char);
+                                    _bsql_sql.push((b'0' + (_n % 10) as u8) as char);
+                                } else {
+                                    let _s = _n.to_string();
+                                    _bsql_sql.push_str(&_s);
+                                }
+                            }
+                            _bsql_sql.push_str(#part);
+                        }
                     }
                 })
                 .collect();
-            let pattern = quote! { (#(#pattern_elements),*) };
 
-            let sqlite_sql = pg_to_sqlite_params(&variant.sql);
-            let sql_str = if inject_limit {
-                format!("{sqlite_sql} LIMIT 2")
-            } else {
-                sqlite_sql
+            // Push unwrapped param value
+            let inner_type = clause.params[0]
+                .rust_type
+                .strip_prefix("Option<")
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap_or(&clause.params[0].rust_type);
+            let inner_ref = direct_param_ref_inner(quote! { _bsql_val }, inner_type);
+
+            let param_push = quote! {
+                let _bsql_val = self.#param_name.as_ref().unwrap();
+                _bsql_params.push(#inner_ref);
             };
 
-            let sql_hash = bsql_core::rapid_hash_str(&sql_str);
-
-            // Build direct param refs for this variant
-            let direct_param_binds: Vec<TokenStream> = variant
-                .params
-                .iter()
-                .map(|p| {
-                    let name = param_ident(&p.name);
-                    gen_direct_param_ref(&name, &p.rust_type)
-                })
-                .collect();
-
-            let direct_params_build = if direct_param_binds.is_empty() {
-                quote! { let _bsql_params: &[&dyn ::bsql_core::driver_sqlite::SqliteEncode] = &[]; }
+            let trailing_push = if trailing.is_empty() {
+                TokenStream::new()
             } else {
+                quote! { _bsql_sql.push_str(#trailing); }
+            };
+
+            if num_refs <= 1 {
                 quote! {
-                    let _bsql_params: &[&dyn ::bsql_core::driver_sqlite::SqliteEncode] = &[
-                        #(#direct_param_binds),*
-                    ];
+                    if self.#param_name.is_some() {
+                        #(#frag_append)*
+                        #param_push
+                    }
+                    #trailing_push
                 }
-            };
+            } else {
+                let frag_parts_multi: Vec<TokenStream> = frag_parts
+                    .iter()
+                    .enumerate()
+                    .map(|(j, part)| {
+                        if j == 0 {
+                            quote! {
+                                _bsql_sql.push(' ');
+                                _bsql_sql.push_str(#part);
+                            }
+                        } else {
+                            quote! {
+                                _bsql_sql.push_str(&_bsql_pn);
+                                _bsql_sql.push_str(#part);
+                            }
+                        }
+                    })
+                    .collect();
 
-            let body = body_fn(&sql_str, sql_hash);
-
-            quote! {
-                #pattern => {
-                    #direct_params_build
-                    #body
+                quote! {
+                    if self.#param_name.is_some() {
+                        #param_push
+                        let _bsql_pn = format!("?{}", _bsql_params.len());
+                        #(#frag_parts_multi)*
+                    }
+                    #trailing_push
                 }
             }
         })
         .collect();
 
+    let limit_push = if inject_limit {
+        quote! { _bsql_sql.push_str(" LIMIT 2"); }
+    } else {
+        TokenStream::new()
+    };
+
+    let body = body_fn(());
+    let n_clauses = parsed.optional_clauses.len();
+    let max_params = parsed.params.len() + n_clauses;
+    let acquire = gen_inline_acquire(is_write);
+
     quote! {
-        #acquire_stmt
-        match #match_tuple {
-            #(#arms)*
+        {
+            let mut _bsql_sql = ::std::string::String::with_capacity(#capacity);
+            _bsql_sql.push_str(#first_segment);
+            let mut _bsql_params: ::std::vec::Vec<&dyn ::bsql_core::driver_sqlite::SqliteEncode> =
+                ::std::vec::Vec::with_capacity(#max_params);
+
+            #(#base_param_pushes)*
+            #(#clause_appends)*
+            #limit_push
+
+            let _bsql_hash = ::bsql_core::rapid_hash_str(&_bsql_sql);
+
+            let mut _bsql_conn = #acquire;
+            #body
         }
     }
 }
