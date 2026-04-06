@@ -32,6 +32,9 @@ type SharedResult = Arc<Result<Arc<OwnedResultSnapshot>, BsqlError>>;
 pub struct FlightState {
     result: Mutex<Option<SharedResult>>,
     condvar: Condvar,
+    /// Set to true when leader drops without completing.
+    /// Followers check this to break out of the wait loop.
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 /// The in-flight map type: key -> flight state.
@@ -100,13 +103,15 @@ impl FlightLeader {
 impl Drop for FlightLeader {
     fn drop(&mut self) {
         // If complete() was not called (e.g., leader thread panicked), remove
-        // the key from the in-flight map. This ensures new requests become
-        // leaders instead of waiting on a dead condvar.
+        // the key from the in-flight map and signal cancellation.
         if let Some(ref map) = self.in_flight {
             map.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&self.key);
-            // Wake all followers so they see None and error out
+            // Signal cancellation so followers break out of wait loop
+            self.state
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
             self.state.condvar.notify_all();
         }
     }
@@ -134,6 +139,7 @@ impl Singleflight {
             let state = Arc::new(FlightState {
                 result: Mutex::new(None),
                 condvar: Condvar::new(),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
             });
             map.insert(key, Arc::clone(&state));
             FlightResult::Leader(FlightLeader {
@@ -151,15 +157,11 @@ impl Singleflight {
     pub fn wait_for_result(state: &FlightState) -> Option<SharedResult> {
         let mut guard = state.result.lock().unwrap_or_else(|e| e.into_inner());
         while guard.is_none() {
+            // Check if leader dropped without completing (panic, error, etc.)
+            if state.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
             guard = state.condvar.wait(guard).unwrap_or_else(|e| e.into_inner());
-            // Check if the leader was dropped without completing — the condvar
-            // was notified but result is still None. In that case, the leader's
-            // Drop impl has removed the key from the map. We break out and
-            // return None to signal the caller to retry or error.
-            // However, we can't distinguish spurious wakeups from the leader
-            // dropping. We rely on the fact that if the leader dropped, the
-            // FlightState is no longer in the map, so we just check if result
-            // has been set.
         }
         guard.clone()
     }

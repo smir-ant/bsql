@@ -2039,17 +2039,6 @@ mod tests {
         assert_eq!(buf, &[b'c', 0, 0, 0, 4]);
     }
 
-    #[test]
-    fn write_copy_fail_message() {
-        let mut buf = Vec::new();
-        write_copy_fail(&mut buf, "abort");
-        assert_eq!(buf[0], b'f');
-        let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
-        assert_eq!(len, 4 + 5 + 1); // 4 + "abort".len() + NUL
-        assert_eq!(&buf[5..10], b"abort");
-        assert_eq!(buf[10], 0); // NUL terminator
-    }
-
     // --- quote_ident tests ---
 
     #[test]

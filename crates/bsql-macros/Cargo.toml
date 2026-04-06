@@ -30,6 +30,7 @@ proc-macro2 = { workspace = true }
 bitcode = { workspace = true }
 bsql-core = { workspace = true }
 bsql-driver-postgres = { workspace = true }
+log = { workspace = true }
 smallvec = { workspace = true }
 
 # SQLite (optional)

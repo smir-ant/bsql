@@ -426,7 +426,7 @@ fn drive_listener(
                     let count = DROPPED_NOTIFICATIONS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         + 1;
-                    eprintln!(
+                    log::warn!(
                         "bsql: notification buffer full, dropped notification on channel \
                          \"{channel}\" (total dropped: {count})"
                     );
@@ -438,7 +438,7 @@ fn drive_listener(
             }
             Err(_) => {
                 // Connection lost — attempt reconnection
-                eprintln!("bsql: listener connection lost, attempting reconnect...");
+                log::warn!("bsql: listener connection lost, attempting reconnect...");
                 match reconnect_with_backoff(&config, &channels) {
                     Some(new_conn) => {
                         conn = new_conn;
@@ -450,10 +450,10 @@ fn drive_listener(
                                       some notifications may have been missed"
                                 .to_owned(),
                         });
-                        eprintln!("bsql: listener reconnected successfully");
+                        log::info!("bsql: listener reconnected successfully");
                     }
                     None => {
-                        eprintln!("bsql: listener reconnection failed, thread exiting");
+                        log::error!("bsql: listener reconnection failed, thread exiting");
                         return;
                     }
                 }
@@ -499,14 +499,14 @@ fn reconnect_with_backoff(
                         Ok(quoted) => {
                             let sql = format!("LISTEN {quoted}");
                             if let Err(e) = new_conn.simple_query(&sql) {
-                                eprintln!(
+                                log::warn!(
                                     "bsql: failed to re-subscribe to channel \"{channel}\" \
                                      after reconnect: {e}"
                                 );
                             }
                         }
                         Err(e) => {
-                            eprintln!(
+                            log::warn!(
                                 "bsql: failed to quote channel \"{channel}\" for \
                                  re-subscribe: {e}"
                             );
@@ -517,7 +517,7 @@ fn reconnect_with_backoff(
                 return Some(new_conn);
             }
             Err(e) => {
-                eprintln!("bsql: listener reconnect attempt {attempt}/{max_attempts} failed: {e}");
+                log::warn!("bsql: listener reconnect attempt {attempt}/{max_attempts} failed: {e}");
                 delay = std::cmp::min(delay * 2, max_delay);
             }
         }

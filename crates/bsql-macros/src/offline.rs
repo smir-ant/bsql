@@ -315,7 +315,7 @@ fn cached_to_validation(cached: &CachedQuery) -> ValidationResult {
 pub fn write_cache(parsed: &ParsedQuery, validation: &ValidationResult) {
     if let Err(e) = write_cache_inner(parsed, validation) {
         // Log but do not fail the build
-        eprintln!("bsql: warning: failed to write offline cache: {e}");
+        log::warn!("bsql: failed to write offline cache: {e}");
     }
 }
 

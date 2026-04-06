@@ -1,12 +1,10 @@
-//! Connection pool — LIFO ordering, fail-fast acquire, Condvar-based waiting.
+//! Connection pool — LIFO ordering, Condvar-based waiting.
 //!
 //! The pool maintains a stack of idle connections. `acquire()` pops the top
 //! (most recently used = warmest caches). On drop, the guard pushes the
-//! connection back. If the pool is exhausted and no `acquire_timeout` is set,
-//! `acquire()` returns an error immediately — no blocking, no waiting.
-//!
-//! When `acquire_timeout` is set, blocked callers wait on a `Condvar` and are
-//! woken when a connection is returned to the pool.
+//! connection back. If the pool is exhausted, callers wait on a `Condvar`
+//! up to `acquire_timeout` (default: 5 seconds). Set `acquire_timeout` to
+//! `None` for fail-fast behavior (immediate error when exhausted).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -358,9 +356,9 @@ impl PoolBuilder {
             url: None,
             max_size: 10,
             max_lifetime: Some(Duration::from_secs(30 * 60)), // 30 min default
-            acquire_timeout: None,                            // fail-fast by default (CREDO #17)
-            min_idle: 0,                                      // no minimum by default
-            max_stmt_cache_size: 256,                         // LRU eviction at 256 stmts
+            acquire_timeout: Some(Duration::from_secs(5)), // 5s default (matches common pool defaults)
+            min_idle: 0,                                   // no minimum by default
+            max_stmt_cache_size: 256,                      // LRU eviction at 256 stmts
         }
     }
 
@@ -385,8 +383,8 @@ impl PoolBuilder {
         self
     }
 
-    /// Set the acquire timeout. Default: None (fail-fast, per CREDO #17).
-    /// Set to a Duration to enable waiting when the pool is exhausted.
+    /// Set the acquire timeout. Default: 5 seconds.
+    /// Set to None for fail-fast behavior when the pool is exhausted.
     pub fn acquire_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.acquire_timeout = timeout;
         self
@@ -1174,7 +1172,7 @@ mod tests {
 
         assert_eq!(pool.max_size(), 10);
         assert_eq!(pool.inner.max_lifetime, Some(Duration::from_secs(30 * 60)));
-        assert_eq!(pool.inner.acquire_timeout, None); // fail-fast by default (CREDO #17)
+        assert_eq!(pool.inner.acquire_timeout, Some(Duration::from_secs(5)));
         assert_eq!(pool.inner.min_idle, 0);
     }
 

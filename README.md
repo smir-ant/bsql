@@ -42,7 +42,7 @@ let user = &users[0];
 
 ```toml
 [dependencies]
-bsql = { version = "0.18", features = ["time", "uuid"] }
+bsql = { version = "0.19", features = ["time", "uuid"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -79,7 +79,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 
 ```toml
 [dependencies]
-bsql = { version = "0.18", features = ["sqlite"] }
+bsql = { version = "0.19", features = ["sqlite"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -161,7 +161,7 @@ When a pure-Rust SQLite engine like [Limbo](https://github.com/penberg/limbo) re
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. Enable features for specialized types:
 
 ```toml
-bsql = { version = "0.18", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.19", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature     | PostgreSQL types                   | Rust types                                   |
@@ -268,7 +268,7 @@ Real-time notifications for cache invalidation, job queues, live updates.
 <summary>Compile-time EXPLAIN plans</summary>
 
 ```toml
-bsql = { version = "0.18", features = ["explain"] }
+bsql = { version = "0.19", features = ["explain"] }
 ```
 
 Runs `EXPLAIN` on every query during compilation and embeds the plan as a doc comment. Hover over any query result type in your IDE to see the query plan. Development-only -- disable in CI and release builds.
@@ -336,14 +336,12 @@ The pool uses a single writer + N reader connections (default 4) behind `Mutex`,
 
 bsql implements the PostgreSQL extended query protocol. The following PG features are **not supported**:
 
-- **COPY protocol** (COPY FROM STDIN / COPY TO STDOUT) — use `psql` or a dedicated COPY tool
-- **SCRAM-SHA-256-PLUS** (channel binding) — only SCRAM-SHA-256 without channel binding
-- **GSSAPI / SSPI / LDAP / certificate authentication** — only cleartext, MD5, and SCRAM-SHA-256
+- **GSSAPI / SSPI / LDAP / certificate authentication** — only cleartext, MD5, SCRAM-SHA-256, and SCRAM-SHA-256-PLUS
 - **Logical replication protocol** — use pg_recvlogical or a dedicated replication tool
 - **Large Objects** (lo_read, lo_write) — use BYTEA columns instead
 - **SSL_KEY_LOG** for TLS debugging — not exposed
 
-Supported authentication: cleartext password, MD5, SCRAM-SHA-256.
+Supported authentication: cleartext password, MD5, SCRAM-SHA-256, SCRAM-SHA-256-PLUS (channel binding).
 Supported transports: TCP, Unix domain sockets, TLS (via rustls).
 
 </details>

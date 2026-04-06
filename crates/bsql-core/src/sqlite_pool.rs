@@ -497,7 +497,7 @@ impl std::fmt::Debug for SqliteTransaction {
 impl Drop for SqliteTransaction {
     fn drop(&mut self) {
         if !self.finished {
-            eprintln!(
+            log::warn!(
                 "bsql: SqliteTransaction dropped without commit() or rollback() — \
                  rolling back automatically."
             );

@@ -9,7 +9,7 @@
 //! If a `Transaction` is dropped without calling [`commit()`](Transaction::commit)
 //! or [`rollback()`](Transaction::rollback), the driver discards the connection
 //! from the pool. PostgreSQL auto-rollbacks when the connection closes. A warning
-//! is emitted via `eprintln!` to help detect forgotten commits during development.
+//! is emitted via `log::warn!` to help detect forgotten commits during development.
 
 use std::fmt;
 use std::sync::Mutex;
@@ -353,7 +353,7 @@ impl Drop for Transaction {
             // The driver-level Transaction::drop discards the connection from the
             // pool — PG server auto-rollbacks when it sees the disconnect.
             // Log a warning to help catch forgotten commits during development.
-            eprintln!(
+            log::warn!(
                 "bsql: Transaction dropped without commit() or rollback() — \
                  connection discarded from pool. This is safe but wasteful."
             );

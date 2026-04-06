@@ -23,6 +23,7 @@ sqlite-system = ["sqlite", "bsql-driver-sqlite/system"]
 [dependencies]
 bsql-arena = { workspace = true }
 bsql-driver-postgres = { workspace = true }
+log = { workspace = true }
 rapidhash = { workspace = true }
 smallvec = { workspace = true }
 

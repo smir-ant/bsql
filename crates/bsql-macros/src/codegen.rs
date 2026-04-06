@@ -156,72 +156,70 @@ pub fn generate_sort_query_code(
     };
     let limited_suffix_lit = &limited_suffix;
 
-    // Generate the sort SQL lookup helper that caches (String, u64) per sort fragment.
+    // Generate the sort SQL lookup helper that caches (&'static str, u64) per sort fragment.
     // Uses a static mutex-free DashMap-like approach: since sort enums have a small
     // finite number of variants and sort.sql() returns &'static str, we cache using
-    // the pointer value as key. First call per variant allocates once; all subsequent
-    // calls return (&str, u64) with zero allocation.
+    // the pointer value as key. First call per variant allocates once via Box::leak;
+    // all subsequent calls return (&'static str, u64) with zero allocation.
     //
-    // NOTE (M-2): The generated code contains `unsafe { &*sql }` to convert a raw
-    // pointer back to a reference. This is safe because the pointed-to String is
-    // stored in a static Vec that only appends and is never deallocated. The pointer
-    // remains valid for 'static. This cannot be refactored away without either
-    // leaking memory (Box::leak) or adding a dependency like `once_cell::Lazy`.
+    // Box::leak intentionally leaks one String per unique sort variant (typically
+    // 3-10 total). The leaked strings live for the process lifetime — same semantics
+    // as the previous raw-pointer approach but without any unsafe code.
     let build_sql = quote! {
-        // Cache: maps sort fragment &'static str pointer -> (full SQL, hash)
-        static SORT_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::OnceLock::new();
+        // Cache: maps sort fragment &'static str pointer -> (leaked &'static str, hash)
+        static SORT_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, &'static str, u64)>>> = ::std::sync::OnceLock::new();
         let sort_fragment: &'static str = self.sort.sql();
         let cache = SORT_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
         let key = sort_fragment.as_ptr() as usize;
         let (sql, sql_hash) = {
             let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.iter().find(|e| e.0 == key) {
-                (entry.1.as_str() as *const str, entry.2)
+                (entry.1, entry.2)
             } else {
                 drop(guard);
                 let built = format!("{}{}{}", #sql_prefix, sort_fragment, #sql_suffix);
                 let hash = ::bsql_core::driver::hash_sql(&built);
+                let leaked: &'static str = Box::leak(built.into_boxed_str());
                 let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                 // Double-check after re-acquiring lock
                 if let Some(entry) = guard.iter().find(|e| e.0 == key) {
-                    (entry.1.as_str() as *const str, entry.2)
+                    (entry.1, entry.2)
                 } else {
-                    guard.push((key, built, hash));
+                    guard.push((key, leaked, hash));
                     let entry = guard.last().unwrap();
-                    (entry.1.as_str() as *const str, entry.2)
+                    (entry.1, entry.2)
                 }
             }
         };
-        // SAFETY: the str is stored in the static Vec and never removed/moved because
-        // Vec only appends and lives for 'static. The pointer remains valid.
-        let sql: &str = unsafe { &*sql };
+        let sql: &str = sql;
     };
 
     let build_limited_sql = if needs_limit {
         quote! {
-            static SORT_LIMITED_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::OnceLock::new();
+            static SORT_LIMITED_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, &'static str, u64)>>> = ::std::sync::OnceLock::new();
             let sort_fragment: &'static str = self.sort.sql();
             let cache = SORT_LIMITED_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
             let key = sort_fragment.as_ptr() as usize;
             let (sql, sql_hash) = {
                 let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(entry) = guard.iter().find(|e| e.0 == key) {
-                    (entry.1.as_str() as *const str, entry.2)
+                    (entry.1, entry.2)
                 } else {
                     drop(guard);
                     let built = format!("{}{}{}", #sql_prefix, sort_fragment, #limited_suffix_lit);
                     let hash = ::bsql_core::driver::hash_sql(&built);
+                    let leaked: &'static str = Box::leak(built.into_boxed_str());
                     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = guard.iter().find(|e| e.0 == key) {
-                        (entry.1.as_str() as *const str, entry.2)
+                        (entry.1, entry.2)
                     } else {
-                        guard.push((key, built, hash));
+                        guard.push((key, leaked, hash));
                         let entry = guard.last().unwrap();
-                        (entry.1.as_str() as *const str, entry.2)
+                        (entry.1, entry.2)
                     }
                 }
             };
-            let sql: &str = unsafe { &*sql };
+            let sql: &str = sql;
         }
     } else {
         build_sql.clone()
