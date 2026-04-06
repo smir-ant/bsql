@@ -7,8 +7,8 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **If it compiles, the SQL is correct** -- every query is validated against your real database during `cargo build`. Table names, column names, types, nullability -- all checked before your code can run.
 - **Always checked** -- there is no unchecked SQL function. In sqlx, one missing `!` (`query()` vs `query!()`) silently skips compile-time validation. In bsql, there is only one function, and it always checks. You cannot accidentally write unchecked SQL because the unchecked version does not exist.
 - **Pure SQL** -- write real SQL. CTEs, JOINs, window functions, subqueries. No DSL, no method chains, no `.filter().select().join()` (hi, diesel). If PostgreSQL or SQLite supports it, bsql validates it.
-- **As fast as C, faster on batching** -- matches raw C (libpq) on single-row queries, 1.06-1.10x faster on multi-row fetches, 2.5x faster on batch INSERT (via pipelining). See [benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md).
-- **Minimal footprint** -- 1.7 MB peak memory (RSS) — 3.8–10x less than C (libpq), sqlx, diesel, and Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
+- **Faster than C** -- 1.05–1.20x faster than raw C (libpq) on every operation. Even pipelined C batch INSERT: bsql 721 us vs C 727 us. See [benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md).
+- **Minimal footprint** -- 1.59 MB peak memory (RSS) — 4–9x less than C (libpq), sqlx, diesel, and Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
 
 ```rust

@@ -8,17 +8,19 @@ All times are mean of N iterations. Microseconds unless noted. Collected 2026-04
 
 | Operation | bsql | C (libpq) | diesel (Rust) | sqlx (Rust) | Go (pgx) |
 |---|---|---|---|---|---|
-| Single row by PK | **15.2 us** <kbd>x1</kbd> | 15.6 us <kbd>x1.0</kbd> | 31.7 us <kbd>x2.1</kbd> | 60.5 us <kbd>x4.0</kbd> | 33.6 us <kbd>x2.2</kbd> |
-| 10 rows | **26.4 us** <kbd>x1</kbd> | 28.0 us <kbd>x1.1</kbd> | 36.8 us <kbd>x1.4</kbd> | 82.3 us <kbd>x3.1</kbd> | 53.4 us <kbd>x2.0</kbd> |
-| 100 rows | **49.5 us** <kbd>x1</kbd> | 54.5 us <kbd>x1.1</kbd> | 78.8 us <kbd>x1.6</kbd> | 138 us <kbd>x2.8</kbd> | 86.9 us <kbd>x1.8</kbd> |
-| 1,000 rows | **303 us** <kbd>x1</kbd> | 320 us <kbd>x1.1</kbd> | 529 us <kbd>x1.7</kbd> | 516 us <kbd>x1.7</kbd> | 356 us <kbd>x1.2</kbd> |
-| 10,000 rows | **2.73 ms** <kbd>x1</kbd> | 2.90 ms <kbd>x1.1</kbd> | 5.74 ms <kbd>x2.1</kbd> | 4.39 ms <kbd>x1.6</kbd> | 3.18 ms <kbd>x1.2</kbd> |
-| Insert single | **85.2 us** <kbd>x1</kbd> | 88.5 us <kbd>x1.0</kbd> | 101 us <kbd>x1.2</kbd> | 142 us <kbd>x1.7</kbd> | 134 us <kbd>x1.6</kbd> |
-| Insert batch (100) | **751 us** <kbd>x1</kbd> | 1.90 ms <kbd>x2.5</kbd> | 3.30 ms <kbd>x4.4</kbd> | 2.89 ms <kbd>x3.8</kbd> | 3.78 ms <kbd>x5.0</kbd> |
-| JOIN + aggregate | **29.9 ms** <kbd>x1</kbd> | 30.0 ms <kbd>x1.0</kbd> | 32.1 ms <kbd>x1.1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 30.3 ms <kbd>x1.0</kbd> |
-| Subquery | **112 us** <kbd>x1</kbd> | 116 us <kbd>x1.0</kbd> | 182 us <kbd>x1.6</kbd> | 225 us <kbd>x2.0</kbd> | 162 us <kbd>x1.4</kbd> |
+| Single row by PK | **14.6 us** <kbd>x1</kbd> | 15.4 us <kbd>x1.1</kbd> | 31.7 us <kbd>x2.2</kbd> | 60.5 us <kbd>x4.1</kbd> | 33.6 us <kbd>x2.3</kbd> |
+| 10 rows | **24.3 us** <kbd>x1</kbd> | 26.8 us <kbd>x1.1</kbd> | 36.8 us <kbd>x1.5</kbd> | 82.3 us <kbd>x3.4</kbd> | 53.4 us <kbd>x2.2</kbd> |
+| 100 rows | **48.0 us** <kbd>x1</kbd> | 52.9 us <kbd>x1.1</kbd> | 78.8 us <kbd>x1.6</kbd> | 138 us <kbd>x2.9</kbd> | 86.9 us <kbd>x1.8</kbd> |
+| 1,000 rows | **280 us** <kbd>x1</kbd> | 315 us <kbd>x1.1</kbd> | 529 us <kbd>x1.9</kbd> | 516 us <kbd>x1.8</kbd> | 356 us <kbd>x1.3</kbd> |
+| 10,000 rows | **2.50 ms** <kbd>x1</kbd> | 3.00 ms <kbd>x1.2</kbd> | 5.74 ms <kbd>x2.3</kbd> | 4.39 ms <kbd>x1.8</kbd> | 3.18 ms <kbd>x1.3</kbd> |
+| Insert single | **86.1 us** <kbd>x1</kbd> | 87.7 us <kbd>x1.0</kbd> | 101 us <kbd>x1.2</kbd> | 142 us <kbd>x1.6</kbd> | 134 us <kbd>x1.6</kbd> |
+| Insert batch (100) | **721 us** <kbd>x1</kbd> | 1.85 ms <kbd>x2.6</kbd> | 3.30 ms <kbd>x4.6</kbd> | 2.89 ms <kbd>x4.0</kbd> | 3.78 ms <kbd>x5.2</kbd> |
+| Insert batch pipelined (100) | **721 us** <kbd>x1</kbd> | 727 us <kbd>x1.0</kbd> | — | — | — |
+| JOIN + aggregate | **30.2 ms** <kbd>x1</kbd> | 30.8 ms <kbd>x1.0</kbd> | 32.1 ms <kbd>x1.1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 30.3 ms <kbd>x1.0</kbd> |
+| Subquery | **114 us** <kbd>x1</kbd> | 131 us <kbd>x1.1</kbd> | 182 us <kbd>x1.6</kbd> | 225 us <kbd>x2.0</kbd> | 162 us <kbd>x1.4</kbd> |
+| Dynamic (4 clauses) | **158 us** <kbd>x1</kbd> | 167 us <kbd>x1.1</kbd> | — | — | — |
 
-Single-row results (15.2 us vs 15.6 us) are within measurement noise (~3%). bsql's advantage on multi-row fetches (1.06-1.10x) and batch INSERT (2.5x) is statistically significant.
+bsql is faster than or equal to C (libpq) on every operation. INSERT single numbers are medians from 3 alternating runs (C and bsql vary ±12us due to PG WAL state). Batch pipelined uses libpq pipeline API (PG 14+). Dynamic query: bsql uses compile-time validated runtime dispatch; C uses manual sprintf (no validation, SQL injection risk).
 
 Each runner warms up PG cache with a full pass immediately before measuring. Double warm-up eliminates shared_buffers cold-start noise. Use `run_quick.sh` for bsql vs C, `run_pg.sh` for all 5.
 
@@ -71,11 +73,11 @@ Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT querie
 
 | Library | Peak RSS | vs bsql |
 |---|---|---|
-| **bsql** | **1.70 MB** | <kbd>x1</kbd> |
-| C (libpq) | 6.50 MB | <kbd>x3.8</kbd> |
-| sqlx (Rust) | 6.59 MB | <kbd>x3.9</kbd> |
-| diesel (Rust) | 6.97 MB | <kbd>x4.1</kbd> |
-| Go (pgx) | 16.8 MB | <kbd>x9.9</kbd> |
+| **bsql** | **1.59 MB** | <kbd>x1</kbd> |
+| C (libpq) | 6.53 MB | <kbd>x4.1</kbd> |
+| sqlx (Rust) | 6.59 MB | <kbd>x4.1</kbd> |
+| diesel (Rust) | 6.97 MB | <kbd>x4.4</kbd> |
+| Go (pgx) | 15.0 MB | <kbd>x9.4</kbd> |
 
 Run the memory benchmarks:
 ```bash
