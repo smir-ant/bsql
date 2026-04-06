@@ -7,7 +7,7 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **If it compiles, the SQL is correct** -- every query is validated against your real database during `cargo build`. Table names, column names, types, nullability -- all checked before your code can run.
 - **Always checked** -- there is no unchecked SQL function. In sqlx, one missing `!` (`query()` vs `query!()`) silently skips compile-time validation. In bsql, there is only one function, and it always checks. You cannot accidentally write unchecked SQL because the unchecked version does not exist.
 - **Pure SQL** -- write real SQL. CTEs, JOINs, window functions, subqueries. No DSL, no method chains, no `.filter().select().join()` (hi, diesel). If PostgreSQL or SQLite supports it, bsql validates it.
-- **Faster than C** -- 1.0–2.5x faster than raw C (libpq, sqlite3) on every benchmark. Not synthetic tuning — the same code paths run in benchmarks and in your production app. See [benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md).
+- **As fast as C, faster on batching** -- matches raw C (libpq) on single-row queries, 1.06-1.10x faster on multi-row fetches, 2.5x faster on batch INSERT (via pipelining). See [benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md).
 - **Minimal footprint** -- 1.7 MB peak memory (RSS) — 3.8–10x less than C (libpq), sqlx, diesel, and Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
 
@@ -190,6 +190,8 @@ let tickets = bsql::query!(
 
 No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variants, all validated at compile time.
 
+**Compile time**: N optional clauses generate 2^N SQL variants, each validated via PREPARE. For 6+ clauses, compile time may increase noticeably. Maximum: 10 clauses (1024 variants).
+
 </details>
 
 <details>
@@ -326,6 +328,23 @@ The pool uses a single writer + N reader connections (default 4) behind `Mutex`,
 - **Not a query builder.** No `.filter()`, `.select()`, `.join()`.
 - **Not database-agnostic.** PostgreSQL and SQLite only. No MySQL, no MSSQL.
 - **Not a migration tool.** Use dbmate, sqitch, refinery, or whatever you prefer.
+
+</details>
+
+<details>
+<summary>Protocol and feature limitations</summary>
+
+bsql implements the PostgreSQL extended query protocol. The following PG features are **not supported**:
+
+- **COPY protocol** (COPY FROM STDIN / COPY TO STDOUT) — use `psql` or a dedicated COPY tool
+- **SCRAM-SHA-256-PLUS** (channel binding) — only SCRAM-SHA-256 without channel binding
+- **GSSAPI / SSPI / LDAP / certificate authentication** — only cleartext, MD5, and SCRAM-SHA-256
+- **Logical replication protocol** — use pg_recvlogical or a dedicated replication tool
+- **Large Objects** (lo_read, lo_write) — use BYTEA columns instead
+- **SSL_KEY_LOG** for TLS debugging — not exposed
+
+Supported authentication: cleartext password, MD5, SCRAM-SHA-256.
+Supported transports: TCP, Unix domain sockets, TLS (via rustls).
 
 </details>
 

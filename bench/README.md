@@ -18,6 +18,8 @@ All times are mean of N iterations. Microseconds unless noted. Collected 2026-04
 | JOIN + aggregate | **29.9 ms** <kbd>x1</kbd> | 30.0 ms <kbd>x1.0</kbd> | 32.1 ms <kbd>x1.1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 30.3 ms <kbd>x1.0</kbd> |
 | Subquery | **112 us** <kbd>x1</kbd> | 116 us <kbd>x1.0</kbd> | 182 us <kbd>x1.6</kbd> | 225 us <kbd>x2.0</kbd> | 162 us <kbd>x1.4</kbd> |
 
+Single-row results (15.2 us vs 15.6 us) are within measurement noise (~3%). bsql's advantage on multi-row fetches (1.06-1.10x) and batch INSERT (2.5x) is statistically significant.
+
 Each runner warms up PG cache with a full pass immediately before measuring. Double warm-up eliminates shared_buffers cold-start noise. Use `run_quick.sh` for bsql vs C, `run_pg.sh` for all 5.
 
 All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx).
@@ -164,6 +166,8 @@ INSERT benchmarks grow the database over time. Re-run `setup/pg_setup.sql` or `s
 - **sqlx** uses `query_as` (not `query_as!`) to avoid requiring a compile-time database for the sqlx side. This is the common runtime usage pattern.
 - **diesel** uses `sql_query` with raw SQL for an apples-to-apples comparison, avoiding diesel's DSL overhead. diesel is fundamentally synchronous; benchmarks run without `to_async()`.
 - **C (libpq)** uses `PQexecPrepared` with prepared statements. Every benchmark reads every column via `PQgetvalue`. Insert batch uses 100 separate `PQexecPrepared` calls in a transaction (no pipelining -- libpq doesn't have built-in pipeline for this pattern).
+
+**Note on batch INSERT**: bsql uses pipeline batching (N Bind+Execute messages in one round-trip). The C benchmark uses sequential `PQexecPrepared` calls in a transaction (no pipelining). libpq supports pipelining since PG 14 (`PQpipelineSync`), which would narrow the gap. The batch INSERT comparison reflects the most common C usage pattern, not the theoretical best.
 - **C (sqlite3)** uses `sqlite3_prepare_v2` with statement reuse. WAL mode enabled. Type-dispatched `sqlite3_column_*` reads every column.
 - **Go (pgx)** uses a direct `pgx.Conn` (not a pool). Queries are automatically prepared on first use.
 - **Go (go-sqlite3)** uses `database/sql` with prepared statements. WAL mode enabled.
