@@ -334,6 +334,74 @@ static void bench_subquery(PGconn *conn) {
            (unsigned long long)(elapsed / iters), iters);
 }
 
+static void bench_dynamic_query(PGconn *conn) {
+    /* Dynamic query: build SQL at runtime with 4 optional WHERE clauses.
+     * All clauses active (worst case for string building).
+     * This is the C equivalent of bsql's optional clause feature.
+     *
+     * NOTE: In C, this is manual string concatenation — no compile-time
+     * validation, no SQL injection protection. A typo in the sprintf
+     * silently produces wrong SQL. bsql validates all combinations at
+     * compile time. */
+
+    int iters = ITERATIONS;
+    int has_name = 1, has_score = 1, has_active = 1, has_email = 1;
+
+    /* Warm up — build SQL once and prepare */
+    char sql[512];
+    int param_count = 0;
+    int pos = 0;
+    pos += snprintf(sql + pos, sizeof(sql) - pos,
+        "SELECT id, name, email FROM bench_users WHERE 1=1");
+    if (has_name)   pos += snprintf(sql + pos, sizeof(sql) - pos, " AND name LIKE $%d", ++param_count);
+    if (has_score)  pos += snprintf(sql + pos, sizeof(sql) - pos, " AND score > $%d", ++param_count);
+    if (has_active) pos += snprintf(sql + pos, sizeof(sql) - pos, " AND active = $%d", ++param_count);
+    if (has_email)  pos += snprintf(sql + pos, sizeof(sql) - pos, " AND email LIKE $%d", ++param_count);
+    pos += snprintf(sql + pos, sizeof(sql) - pos, " ORDER BY id LIMIT 100");
+
+    PGresult *prep = PQprepare(conn, "dynamic_q", sql, param_count, NULL);
+    die_if_bad(conn, prep, PGRES_COMMAND_OK);
+    PQclear(prep);
+
+    const char *name_val = "user_1%";
+    const char *score_val = "50.0";
+    const char *active_val = "t";
+    const char *email_val = "%example.com";
+    const char *vals[4] = { name_val, score_val, active_val, email_val };
+
+    PGresult *warm = PQexecPrepared(conn, "dynamic_q", 4, vals, NULL, NULL, 0);
+    die_if_bad(conn, warm, PGRES_TUPLES_OK);
+    PQclear(warm);
+
+    /* Bench — rebuild SQL each iteration (simulates runtime dispatch) */
+    uint64_t start = now_ns();
+    for (int i = 0; i < iters; i++) {
+        /* Rebuild SQL string (runtime dispatch overhead) */
+        param_count = 0;
+        pos = 0;
+        pos += snprintf(sql + pos, sizeof(sql) - pos,
+            "SELECT id, name, email FROM bench_users WHERE 1=1");
+        if (has_name)   pos += snprintf(sql + pos, sizeof(sql) - pos, " AND name LIKE $%d", ++param_count);
+        if (has_score)  pos += snprintf(sql + pos, sizeof(sql) - pos, " AND score > $%d", ++param_count);
+        if (has_active) pos += snprintf(sql + pos, sizeof(sql) - pos, " AND active = $%d", ++param_count);
+        if (has_email)  pos += snprintf(sql + pos, sizeof(sql) - pos, " AND email LIKE $%d", ++param_count);
+        snprintf(sql + pos, sizeof(sql) - pos, " ORDER BY id LIMIT 100");
+
+        /* Execute with the pre-prepared statement (SQL is same each time) */
+        PGresult *res = PQexecPrepared(conn, "dynamic_q", 4, vals, NULL, NULL, 0);
+        int nrows = PQntuples(res);
+        for (int r = 0; r < nrows; r++) {
+            (void)PQgetvalue(res, r, 0);
+            (void)PQgetvalue(res, r, 1);
+            (void)PQgetvalue(res, r, 2);
+        }
+        PQclear(res);
+    }
+    uint64_t elapsed = now_ns() - start;
+    printf("pg_dynamic_4clauses: %llu ns/op  (%d iters)\n",
+           (unsigned long long)(elapsed / iters), iters);
+}
+
 /* ---------- main ---------------------------------------------------------- */
 
 int main(void) {
@@ -353,6 +421,7 @@ int main(void) {
     bench_insert_batch_pipelined(conn);
     bench_join_aggregate(conn);
     bench_subquery(conn);
+    bench_dynamic_query(conn);
 
     PQfinish(conn);
     return 0;

@@ -14,9 +14,10 @@ const ITERATIONS_JOIN: usize = 3000;
 const ITERATIONS_SLOW: usize = 1000;
 const ITERATIONS_SUB: usize = 5000;
 
-fn main() -> Result<(), BsqlError> {
+#[tokio::main]
+async fn main() -> Result<(), BsqlError> {
     let url = std::env::var("BENCH_DATABASE_URL").expect("BENCH_DATABASE_URL");
-    let pool = Pool::connect(&url)?;
+    let pool = Pool::connect(&url).await?;
 
     println!("=== bsql (Rust) PostgreSQL Benchmarks ===\n");
 
@@ -25,12 +26,12 @@ fn main() -> Result<(), BsqlError> {
         let id = 42i32;
         // warm up
         let _ = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
-            .fetch_one(&pool)?;
+            .fetch_one(&pool).await?;
 
         let start = Instant::now();
         for _ in 0..ITERATIONS {
             let _ = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
-                .fetch_one(&pool)?;
+                .fetch_one(&pool).await?;
         }
         let elapsed = start.elapsed();
         println!(
@@ -52,14 +53,14 @@ fn main() -> Result<(), BsqlError> {
         let _ = bsql::query!(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
         )
-        .fetch(&pool)?;
+        .fetch(&pool).await?;
 
         let start = Instant::now();
         for _ in 0..iters {
             let rows = bsql::query!(
                 "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
             )
-            .fetch(&pool)?;
+            .fetch(&pool).await?;
             // Read all columns to match C's PQgetvalue loop (prevent dead-code elimination)
             for row in rows.iter() {
                 let r = row.unwrap();
@@ -83,14 +84,14 @@ fn main() -> Result<(), BsqlError> {
         let _ = bsql::query!(
             "INSERT INTO bench_users (name, email, active, score) VALUES ($name: &str, $email: &str, true, 0.0) RETURNING id"
         )
-        .fetch_one(&pool)?;
+        .fetch_one(&pool).await?;
 
         let start = Instant::now();
         for _ in 0..ITERATIONS {
             let _ = bsql::query!(
                 "INSERT INTO bench_users (name, email, active, score) VALUES ($name: &str, $email: &str, true, 0.0) RETURNING id"
             )
-            .fetch_one(&pool)?;
+            .fetch_one(&pool).await?;
         }
         let elapsed = start.elapsed();
         println!(
@@ -104,16 +105,16 @@ fn main() -> Result<(), BsqlError> {
     {
         let start = Instant::now();
         for _ in 0..ITERATIONS_SLOW {
-            let tx = pool.begin()?;
+            let tx = pool.begin().await?;
             for j in 0..100 {
                 let name = format!("batch_{j}");
                 let email = format!("batch{j}@test.com");
                 bsql::query!(
                     "INSERT INTO bench_users (name, email, active, score) VALUES ($name: String, $email: String, true, 0.0)"
                 )
-                .defer(&tx)?;
+                .defer(&tx).await?;
             }
-            tx.commit()?;
+            tx.commit().await?;
         }
         let elapsed = start.elapsed();
         println!(
@@ -131,7 +132,7 @@ fn main() -> Result<(), BsqlError> {
              FROM bench_users u JOIN bench_orders o ON u.id = o.user_id \
              WHERE u.active = true GROUP BY u.name ORDER BY total_amount DESC LIMIT 10"
         )
-        .fetch(&pool)?;
+        .fetch(&pool).await?;
 
         let start = Instant::now();
         for _ in 0..ITERATIONS_JOIN {
@@ -140,7 +141,7 @@ fn main() -> Result<(), BsqlError> {
                  FROM bench_users u JOIN bench_orders o ON u.id = o.user_id \
                  WHERE u.active = true GROUP BY u.name ORDER BY total_amount DESC LIMIT 10"
             )
-            .fetch(&pool)?;
+            .fetch(&pool).await?;
         }
         let elapsed = start.elapsed();
         println!(
@@ -157,7 +158,7 @@ fn main() -> Result<(), BsqlError> {
             "SELECT id, name, email FROM bench_users \
              WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)"
         )
-        .for_each(&pool, |_row| Ok(()))?;
+        .for_each(&pool, |_row| Ok(())).await?;
 
         let start = Instant::now();
         for _ in 0..ITERATIONS_SUB {
@@ -165,7 +166,7 @@ fn main() -> Result<(), BsqlError> {
                 "SELECT id, name, email FROM bench_users \
                  WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)"
             )
-            .for_each(&pool, |_row| Ok(()))?;
+            .for_each(&pool, |_row| Ok(())).await?;
         }
         let elapsed = start.elapsed();
         println!(
@@ -173,6 +174,71 @@ fn main() -> Result<(), BsqlError> {
             elapsed.as_nanos() / ITERATIONS_SUB as u128,
             ITERATIONS_SUB
         );
+    }
+
+    // === Dynamic query (optional clauses) — runtime SQL dispatch ===
+    // Compares: static query vs dynamic query with 4 optional clauses.
+    // Shows the overhead of runtime string building + hash computation.
+    {
+        // Static: fixed WHERE
+        let active = true;
+        let _ = bsql::query!(
+            "SELECT id, name, email FROM bench_users WHERE active = $active: bool ORDER BY id LIMIT 100"
+        ).fetch(&pool).await?;
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = bsql::query!(
+                "SELECT id, name, email FROM bench_users WHERE active = $active: bool ORDER BY id LIMIT 100"
+            ).fetch(&pool).await?;
+        }
+        let static_elapsed = start.elapsed();
+
+        // Dynamic: 4 optional clauses, all active (worst case for string building)
+        let name_filter: Option<&str> = Some("user_1%");
+        let min_score: Option<f64> = Some(50.0);
+        let active_filter: Option<bool> = Some(true);
+        let email_filter: Option<&str> = Some("%example.com");
+
+        let _ = bsql::query!(
+            "SELECT id, name, email FROM bench_users WHERE 1=1 \
+             [AND name LIKE $name_filter: Option<&str>] \
+             [AND score > $min_score: Option<f64>] \
+             [AND active = $active_filter: Option<bool>] \
+             [AND email LIKE $email_filter: Option<&str>] \
+             ORDER BY id LIMIT 100"
+        ).fetch(&pool).await?;
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            let _ = bsql::query!(
+                "SELECT id, name, email FROM bench_users WHERE 1=1 \
+                 [AND name LIKE $name_filter: Option<&str>] \
+                 [AND score > $min_score: Option<f64>] \
+                 [AND active = $active_filter: Option<bool>] \
+                 [AND email LIKE $email_filter: Option<&str>] \
+                 ORDER BY id LIMIT 100"
+            ).fetch(&pool).await?;
+        }
+        let dynamic_elapsed = start.elapsed();
+
+        println!("\n--- Static vs Dynamic query (4 optional clauses, 100 rows) ---");
+        println!(
+            "static:  {} ns/op  ({ITERATIONS} iters)",
+            static_elapsed.as_nanos() / ITERATIONS as u128
+        );
+        println!(
+            "dynamic: {} ns/op  ({ITERATIONS} iters)",
+            dynamic_elapsed.as_nanos() / ITERATIONS as u128
+        );
+        let overhead = if dynamic_elapsed > static_elapsed {
+            (dynamic_elapsed - static_elapsed).as_nanos() as f64
+                / static_elapsed.as_nanos() as f64
+                * 100.0
+        } else {
+            0.0
+        };
+        println!("dynamic overhead: {overhead:.1}%");
     }
 
     // === fetch (zero-copy) vs fetch_all (owned) on 10K rows ===
@@ -183,7 +249,7 @@ fn main() -> Result<(), BsqlError> {
         let _ = bsql::query!(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
         )
-        .fetch_all(&pool)?;
+        .fetch_all(&pool).await?;
 
         let iters = 200;
 
@@ -192,7 +258,7 @@ fn main() -> Result<(), BsqlError> {
             let rows = bsql::query!(
                 "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
             )
-            .fetch_all(&pool)?;
+            .fetch_all(&pool).await?;
             std::hint::black_box(&rows);
         }
         let fetch_all_elapsed = start.elapsed();
@@ -202,7 +268,7 @@ fn main() -> Result<(), BsqlError> {
             let rows = bsql::query!(
                 "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
             )
-            .fetch(&pool)?;
+            .fetch(&pool).await?;
             std::hint::black_box(&rows);
         }
         let fetch_elapsed = start.elapsed();
