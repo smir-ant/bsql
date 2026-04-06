@@ -2521,3 +2521,256 @@ fn connection_set_read_timeout() {
     // We just verify the timeout fired correctly and let the connection drop.
     // PG will auto-UNLISTEN when the session closes.
 }
+
+// --- COPY protocol tests ---
+
+#[test]
+fn copy_in_basic() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE copy_test (id serial, name text, email text)")
+        .unwrap();
+
+    let rows = vec![
+        "alice\talice@example.com",
+        "bob\tbob@example.com",
+        "charlie\tcharlie@example.com",
+    ];
+
+    let count = conn
+        .copy_in("copy_test", &["name", "email"], rows.iter().map(|s| *s))
+        .unwrap();
+    assert_eq!(count, 3);
+
+    // Verify data was actually inserted
+    let result = conn
+        .simple_query_rows("SELECT name, email FROM copy_test ORDER BY name")
+        .unwrap();
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0][0].as_deref(), Some("alice"));
+    assert_eq!(result[0][1].as_deref(), Some("alice@example.com"));
+    assert_eq!(result[1][0].as_deref(), Some("bob"));
+    assert_eq!(result[2][0].as_deref(), Some("charlie"));
+}
+
+#[test]
+fn copy_in_empty() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE copy_empty_test (name text, email text)")
+        .unwrap();
+
+    let count = conn
+        .copy_in(
+            "copy_empty_test",
+            &["name", "email"],
+            std::iter::empty::<&str>(),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // Connection should still be usable
+    conn.simple_query("SELECT 1").unwrap();
+    assert!(conn.is_idle());
+}
+
+#[test]
+fn copy_out_basic() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    // Create and populate a temp table
+    conn.simple_query("CREATE TEMP TABLE copy_out_test (name text, email text)")
+        .unwrap();
+    conn.simple_query(
+        "INSERT INTO copy_out_test VALUES ('alice', 'alice@example.com'), ('bob', 'bob@example.com'), ('charlie', 'charlie@example.com')",
+    )
+    .unwrap();
+
+    let mut buf = Vec::new();
+    let count = conn
+        .copy_out(
+            "SELECT name, email FROM copy_out_test ORDER BY name",
+            &mut buf,
+        )
+        .unwrap();
+    assert_eq!(count, 3);
+    assert!(!buf.is_empty());
+
+    let text = String::from_utf8(buf).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].contains("alice"));
+    assert!(lines[0].contains('\t'));
+    assert!(lines[1].contains("bob"));
+    assert!(lines[2].contains("charlie"));
+}
+
+#[test]
+fn copy_in_bad_table() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let result = conn.copy_in(
+        "nonexistent_table_12345",
+        &["col1"],
+        vec!["value"].iter().map(|s| *s),
+    );
+    assert!(result.is_err());
+    // Connection should still be usable after error
+    conn.simple_query("SELECT 1").unwrap();
+    assert!(conn.is_idle());
+}
+
+#[test]
+fn copy_in_bad_column() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE copy_badcol_test (name text)")
+        .unwrap();
+
+    let result = conn.copy_in(
+        "copy_badcol_test",
+        &["nonexistent_column"],
+        vec!["value"].iter().map(|s| *s),
+    );
+    assert!(result.is_err());
+    conn.simple_query("SELECT 1").unwrap();
+    assert!(conn.is_idle());
+}
+
+#[test]
+fn copy_out_bad_query() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let mut buf = Vec::new();
+    let result = conn.copy_out("SELECT * FROM nonexistent_table_12345", &mut buf);
+    assert!(result.is_err());
+    // Connection should still be usable after error
+    conn.simple_query("SELECT 1").unwrap();
+    assert!(conn.is_idle());
+}
+
+#[test]
+fn copy_in_special_chars_in_identifiers() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    // Table name with quotes and special chars
+    conn.simple_query(r#"CREATE TEMP TABLE "copy""test" ("col""name" text)"#)
+        .unwrap();
+
+    let count = conn
+        .copy_in(
+            r#"copy"test"#,
+            &[r#"col"name"#],
+            vec!["hello"].iter().map(|s| *s),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let rows = conn
+        .simple_query_rows(r#"SELECT "col""name" FROM "copy""test""#)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_deref(), Some("hello"));
+}
+
+#[test]
+fn copy_roundtrip() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE copy_rt (name text, age text)")
+        .unwrap();
+
+    // Copy in
+    let in_rows = vec!["alice\t30", "bob\t25"];
+    let in_count = conn
+        .copy_in("copy_rt", &["name", "age"], in_rows.iter().map(|s| *s))
+        .unwrap();
+    assert_eq!(in_count, 2);
+
+    // Copy out
+    let mut buf = Vec::new();
+    let out_count = conn
+        .copy_out("SELECT name, age FROM copy_rt ORDER BY name", &mut buf)
+        .unwrap();
+    assert_eq!(out_count, 2);
+
+    let text = String::from_utf8(buf).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "alice\t30");
+    assert_eq!(lines[1], "bob\t25");
+}
+
+#[test]
+fn copy_in_via_pool() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+    let mut conn = pool.acquire().unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE copy_pool_test (name text, val text)")
+        .unwrap();
+
+    let rows = vec!["a\t1", "b\t2"];
+    let count = conn
+        .copy_in("copy_pool_test", &["name", "val"], rows.iter().map(|s| *s))
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn copy_out_via_pool() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+    let mut conn = pool.acquire().unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE copy_pool_out (x text)")
+        .unwrap();
+    conn.simple_query("INSERT INTO copy_pool_out VALUES ('one'), ('two')")
+        .unwrap();
+
+    let mut buf = Vec::new();
+    let count = conn
+        .copy_out("SELECT x FROM copy_pool_out ORDER BY x", &mut buf)
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let text = String::from_utf8(buf).unwrap();
+    assert_eq!(text.lines().count(), 2);
+}
+
+#[test]
+fn copy_in_many_rows() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE copy_many (id text, val text)")
+        .unwrap();
+
+    let rows: Vec<String> = (0..1000).map(|i| format!("{i}\tvalue_{i}")).collect();
+    let count = conn
+        .copy_in("copy_many", &["id", "val"], rows.iter().map(|s| s.as_str()))
+        .unwrap();
+    assert_eq!(count, 1000);
+
+    let result = conn
+        .simple_query_rows("SELECT count(*) FROM copy_many")
+        .unwrap();
+    assert_eq!(result[0][0].as_deref(), Some("1000"));
+}

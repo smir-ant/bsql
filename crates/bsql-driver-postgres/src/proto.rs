@@ -108,6 +108,18 @@ pub enum BackendMessage<'a> {
     },
     EmptyQuery,
     PortalSuspended,
+    CopyInResponse {
+        format: u8,
+        column_formats: Vec<u16>,
+    },
+    CopyOutResponse {
+        format: u8,
+        column_formats: Vec<u16>,
+    },
+    CopyData {
+        data: Vec<u8>,
+    },
+    CopyDone,
 }
 
 // --- Frontend message writers ---
@@ -407,21 +419,15 @@ pub fn parse_backend_message(
         b'I' => Ok(BackendMessage::EmptyQuery),
         b's' => Ok(BackendMessage::PortalSuspended),
 
-        b'G' => Err(DriverError::Protocol(
-            "COPY protocol not supported: server sent CopyInResponse ('G')".into(),
-        )),
-        b'H' => Err(DriverError::Protocol(
-            "COPY protocol not supported: server sent CopyOutResponse ('H')".into(),
-        )),
+        b'G' => parse_copy_in_response(payload),
+        b'H' => parse_copy_out_response(payload),
         b'W' => Err(DriverError::Protocol(
-            "COPY protocol not supported: server sent CopyBothResponse ('W')".into(),
+            "COPY BOTH protocol not supported: server sent CopyBothResponse ('W')".into(),
         )),
-        b'd' => Err(DriverError::Protocol(
-            "COPY protocol not supported: server sent CopyData ('d')".into(),
-        )),
-        b'c' => Err(DriverError::Protocol(
-            "COPY protocol not supported: server sent CopyDone ('c')".into(),
-        )),
+        b'd' => Ok(BackendMessage::CopyData {
+            data: payload.to_vec(),
+        }),
+        b'c' => Ok(BackendMessage::CopyDone),
         _ => Err(DriverError::Protocol(format!(
             "unknown backend message type: '{}' (0x{:02x})",
             msg_type as char, msg_type
@@ -429,7 +435,98 @@ pub fn parse_backend_message(
     }
 }
 
+// --- COPY frontend message writers ---
+
+/// CopyData message — sends a chunk of COPY data to the server.
+///
+/// Format: `'d' [length: i32] [data]`
+pub fn write_copy_data(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.push(b'd');
+    let len = (4 + data.len()) as i32;
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(data);
+}
+
+/// CopyDone message — signals end of COPY data stream.
+///
+/// Format: `'c' [length=4: i32]`
+pub fn write_copy_done(buf: &mut Vec<u8>) {
+    buf.push(b'c');
+    buf.extend_from_slice(&4i32.to_be_bytes());
+}
+
+
 // --- Parse helpers ---
+
+/// Parse a CopyInResponse message.
+///
+/// Format: `[format: u8] [num_columns: i16] [column_format: i16]...`
+fn parse_copy_in_response(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
+    if payload.len() < 3 {
+        return Err(DriverError::Protocol("CopyInResponse too short".into()));
+    }
+    let format = payload[0];
+    let raw_cols = i16::from_be_bytes([payload[1], payload[2]]);
+    if raw_cols < 0 {
+        return Err(DriverError::Protocol(
+            "CopyInResponse: negative column count".into(),
+        ));
+    }
+    let num_cols = raw_cols as usize;
+    let needed = num_cols.checked_mul(2).and_then(|n| n.checked_add(3));
+    match needed {
+        Some(n) if payload.len() >= n => {}
+        _ => {
+            return Err(DriverError::Protocol(
+                "CopyInResponse truncated: not enough column format codes".into(),
+            ));
+        }
+    }
+    let mut column_formats = Vec::with_capacity(num_cols);
+    for i in 0..num_cols {
+        let offset = 3 + i * 2;
+        column_formats.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+    }
+    Ok(BackendMessage::CopyInResponse {
+        format,
+        column_formats,
+    })
+}
+
+/// Parse a CopyOutResponse message.
+///
+/// Format: `[format: u8] [num_columns: i16] [column_format: i16]...`
+fn parse_copy_out_response(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
+    if payload.len() < 3 {
+        return Err(DriverError::Protocol("CopyOutResponse too short".into()));
+    }
+    let format = payload[0];
+    let raw_cols = i16::from_be_bytes([payload[1], payload[2]]);
+    if raw_cols < 0 {
+        return Err(DriverError::Protocol(
+            "CopyOutResponse: negative column count".into(),
+        ));
+    }
+    let num_cols = raw_cols as usize;
+    let needed = num_cols.checked_mul(2).and_then(|n| n.checked_add(3));
+    match needed {
+        Some(n) if payload.len() >= n => {}
+        _ => {
+            return Err(DriverError::Protocol(
+                "CopyOutResponse truncated: not enough column format codes".into(),
+            ));
+        }
+    }
+    let mut column_formats = Vec::with_capacity(num_cols);
+    for i in 0..num_cols {
+        let offset = 3 + i * 2;
+        column_formats.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+    }
+    Ok(BackendMessage::CopyOutResponse {
+        format,
+        column_formats,
+    })
+}
 
 fn parse_auth(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     if payload.len() < 4 {
@@ -806,6 +903,23 @@ pub fn parse_command_tag_bytes(payload: &[u8]) -> u64 {
     n
 }
 
+/// Quote a PostgreSQL identifier with double quotes.
+///
+/// Embedded double quotes are escaped by doubling them (`"` -> `""`).
+/// This prevents SQL injection in table/column names used by COPY.
+pub fn quote_ident(ident: &str) -> String {
+    let mut out = String::with_capacity(ident.len() + 2);
+    out.push('"');
+    for ch in ident.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1159,19 +1273,51 @@ mod tests {
     }
 
     #[test]
-    fn copy_in_response_rejected() {
-        let result = parse_backend_message(b'G', &[]);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("COPY protocol not supported"));
+    fn copy_in_response_parsed() {
+        // Valid CopyInResponse: text format, 2 columns both text
+        let payload = [0u8, 0, 2, 0, 0, 0, 0]; // format=0(text), num_cols=2, col_fmt=0, col_fmt=0
+        let result = parse_backend_message(b'G', &payload);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            BackendMessage::CopyInResponse {
+                format,
+                column_formats,
+            } => {
+                assert_eq!(format, 0);
+                assert_eq!(column_formats, vec![0, 0]);
+            }
+            other => panic!("expected CopyInResponse, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn copy_out_response_rejected() {
+    fn copy_in_response_too_short() {
+        let result = parse_backend_message(b'G', &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn copy_out_response_parsed() {
+        let payload = [0u8, 0, 1, 0, 0]; // format=0, 1 column, text format
+        let result = parse_backend_message(b'H', &payload);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            BackendMessage::CopyOutResponse {
+                format,
+                column_formats,
+            } => {
+                assert_eq!(format, 0);
+                assert_eq!(column_formats, vec![0]);
+            }
+            other => panic!("expected CopyOutResponse, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_out_response_too_short() {
         let result = parse_backend_message(b'H', &[]);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("COPY protocol not supported"));
     }
 
     #[test]
@@ -1179,19 +1325,36 @@ mod tests {
         let result = parse_backend_message(b'W', &[]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("COPY protocol not supported"));
+        assert!(err.to_string().contains("COPY BOTH protocol not supported"));
     }
 
     #[test]
-    fn copy_data_rejected() {
+    fn copy_data_parsed() {
+        let result = parse_backend_message(b'd', b"hello\tworld\n");
+        assert!(result.is_ok());
+        match result.unwrap() {
+            BackendMessage::CopyData { data } => {
+                assert_eq!(data, b"hello\tworld\n");
+            }
+            other => panic!("expected CopyData, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_data_empty() {
         let result = parse_backend_message(b'd', &[]);
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        match result.unwrap() {
+            BackendMessage::CopyData { data } => assert!(data.is_empty()),
+            other => panic!("expected CopyData, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn copy_done_rejected() {
+    fn copy_done_parsed() {
         let result = parse_backend_message(b'c', &[]);
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), BackendMessage::CopyDone));
     }
 
     // --- Audit gap tests ---
@@ -1592,19 +1755,20 @@ mod tests {
         assert!(msg.contains("exceeds maximum"));
     }
 
-    // --- Audit: parse_backend_message rejects COPY protocol ---
+    // --- Audit: parse_backend_message handles COPY protocol ---
 
     #[test]
-    fn backend_message_copy_in_rejected() {
-        let result = parse_backend_message(b'G', &[]);
+    fn backend_message_copy_in_truncated() {
+        // Truncated payload should return error
+        let result = parse_backend_message(b'G', &[0]);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("COPY"));
+        assert!(msg.contains("too short"));
     }
 
     #[test]
-    fn backend_message_copy_out_rejected() {
-        let result = parse_backend_message(b'H', &[]);
+    fn backend_message_copy_out_truncated() {
+        let result = parse_backend_message(b'H', &[0, 0]);
         assert!(result.is_err());
     }
 
@@ -1845,6 +2009,85 @@ mod tests {
         assert_eq!(cols[0].type_oid, 23);
         assert_eq!(&*cols[1].name, "name");
         assert_eq!(cols[1].type_oid, 25);
+    }
+
+    // --- COPY frontend message writer tests ---
+
+    #[test]
+    fn write_copy_data_message() {
+        let mut buf = Vec::new();
+        write_copy_data(&mut buf, b"hello\tworld\n");
+        assert_eq!(buf[0], b'd');
+        let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        assert_eq!(len, 4 + 12); // 4 + "hello\tworld\n".len()
+        assert_eq!(&buf[5..], b"hello\tworld\n");
+    }
+
+    #[test]
+    fn write_copy_data_empty() {
+        let mut buf = Vec::new();
+        write_copy_data(&mut buf, &[]);
+        assert_eq!(buf[0], b'd');
+        let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        assert_eq!(len, 4);
+        assert_eq!(buf.len(), 5);
+    }
+
+    #[test]
+    fn write_copy_done_message() {
+        let mut buf = Vec::new();
+        write_copy_done(&mut buf);
+        assert_eq!(buf, &[b'c', 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn write_copy_fail_message() {
+        let mut buf = Vec::new();
+        write_copy_fail(&mut buf, "abort");
+        assert_eq!(buf[0], b'f');
+        let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+        assert_eq!(len, 4 + 5 + 1); // 4 + "abort".len() + NUL
+        assert_eq!(&buf[5..10], b"abort");
+        assert_eq!(buf[10], 0); // NUL terminator
+    }
+
+    // --- quote_ident tests ---
+
+    #[test]
+    fn quote_ident_simple() {
+        assert_eq!(quote_ident("users"), r#""users""#);
+    }
+
+    #[test]
+    fn quote_ident_with_embedded_quotes() {
+        assert_eq!(quote_ident(r#"my"table"#), r#""my""table""#);
+    }
+
+    #[test]
+    fn quote_ident_empty() {
+        assert_eq!(quote_ident(""), r#""""#);
+    }
+
+    #[test]
+    fn quote_ident_with_spaces() {
+        assert_eq!(quote_ident("my table"), r#""my table""#);
+    }
+
+    #[test]
+    fn copy_in_response_truncated_columns() {
+        // Says 3 columns but only provides data for 1
+        let payload = [0u8, 0, 3, 0, 0];
+        let result = parse_backend_message(b'G', &payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn copy_out_response_truncated_columns() {
+        let payload = [0u8, 0, 3, 0, 0];
+        let result = parse_backend_message(b'H', &payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated"));
     }
 
     mod proptest_fuzz {

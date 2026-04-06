@@ -1887,6 +1887,212 @@ impl Connection {
         }
     }
 
+    // --- COPY protocol ---
+
+    /// Bulk copy data INTO a table from an iterator of text rows.
+    ///
+    /// Each row is a tab-separated string (TSV format, matching PostgreSQL's
+    /// default COPY text format). Returns the number of rows copied.
+    ///
+    /// Table and column names are safely quoted to prevent SQL injection.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), bsql_driver_postgres::DriverError> {
+    /// # let config = bsql_driver_postgres::Config::from_url("postgres://u:p@localhost/db")?;
+    /// # let mut conn = bsql_driver_postgres::Connection::connect(&config)?;
+    /// let rows = vec!["alice\talice@example.com", "bob\tbob@example.com"];
+    /// let count = conn.copy_in("users", &["name", "email"], rows.iter().map(|s| *s))?;
+    /// assert_eq!(count, 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn copy_in<'a, I>(
+        &mut self,
+        table: &str,
+        columns: &[&str],
+        rows: I,
+    ) -> Result<u64, DriverError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        // Build: COPY "table"("col1","col2") FROM STDIN
+        let quoted_table = proto::quote_ident(table);
+        let quoted_cols: Vec<String> = columns.iter().map(|c| proto::quote_ident(c)).collect();
+        let sql = format!(
+            "COPY {}({}) FROM STDIN",
+            quoted_table,
+            quoted_cols.join(",")
+        );
+
+        // Send as simple query
+        self.write_buf.clear();
+        proto::write_simple_query(&mut self.write_buf, &sql);
+        self.flush_write()?;
+
+        // Read CopyInResponse
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::CopyInResponse { .. } => break,
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "expected CopyInResponse, got: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Send CopyData for each row
+        for row in rows {
+            self.write_buf.clear();
+            // Each row must end with \n for COPY text format
+            let mut row_bytes = Vec::with_capacity(row.len() + 1);
+            row_bytes.extend_from_slice(row.as_bytes());
+            row_bytes.push(b'\n');
+            proto::write_copy_data(&mut self.write_buf, &row_bytes);
+            self.flush_write()?;
+        }
+
+        // Send CopyDone
+        self.write_buf.clear();
+        proto::write_copy_done(&mut self.write_buf);
+        self.flush_write()?;
+
+        // Read CommandComplete (extract row count) + ReadyForQuery
+        let mut count: u64 = 0;
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::CommandComplete { tag } => {
+                    count = proto::parse_command_tag(tag);
+                }
+                BackendMessage::ReadyForQuery { status } => {
+                    self.tx_status = status;
+                    return Ok(count);
+                }
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during copy_in completion: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Bulk copy data OUT of a table or query result to a writer.
+    ///
+    /// The query is wrapped in `COPY (...) TO STDOUT` and data is streamed
+    /// in PostgreSQL's text format (tab-separated columns, newline-terminated rows).
+    /// Returns the number of rows copied.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), bsql_driver_postgres::DriverError> {
+    /// # let config = bsql_driver_postgres::Config::from_url("postgres://u:p@localhost/db")?;
+    /// # let mut conn = bsql_driver_postgres::Connection::connect(&config)?;
+    /// let mut buf = Vec::new();
+    /// let count = conn.copy_out("SELECT name, email FROM users", &mut buf)?;
+    /// let text = String::from_utf8(buf).unwrap();
+    /// assert_eq!(text.lines().count(), count as usize);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn copy_out<W: std::io::Write>(
+        &mut self,
+        query: &str,
+        writer: &mut W,
+    ) -> Result<u64, DriverError> {
+        // Build: COPY (query) TO STDOUT
+        let sql = format!("COPY ({query}) TO STDOUT");
+
+        // Send as simple query
+        self.write_buf.clear();
+        proto::write_simple_query(&mut self.write_buf, &sql);
+        self.flush_write()?;
+
+        // Read CopyOutResponse
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::CopyOutResponse { .. } => break,
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "expected CopyOutResponse, got: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Read CopyData messages and write to writer
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::CopyData { data } => {
+                    writer.write_all(&data).map_err(DriverError::Io)?;
+                }
+                BackendMessage::CopyDone => break,
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during copy_out data: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Read CommandComplete + ReadyForQuery
+        let mut count: u64 = 0;
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::CommandComplete { tag } => {
+                    count = proto::parse_command_tag(tag);
+                }
+                BackendMessage::ReadyForQuery { status } => {
+                    self.tx_status = status;
+                    return Ok(count);
+                }
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during copy_out completion: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Prepare a statement without executing it (Parse+Describe+Sync only).
     ///
     /// Returns column and parameter metadata. Uses the unnamed statement `""`

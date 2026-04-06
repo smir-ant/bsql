@@ -672,6 +672,40 @@ impl PoolGuard {
             .streaming_next_chunk(arena, all_col_offsets)
     }
 
+    // --- COPY protocol ---
+
+    /// Bulk copy data INTO a table from an iterator of text rows.
+    ///
+    /// Each row is a tab-separated string (TSV format). Returns the row count.
+    pub fn copy_in<'a, I>(
+        &mut self,
+        table: &str,
+        columns: &[&str],
+        rows: I,
+    ) -> Result<u64, DriverError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
+            .copy_in(table, columns, rows)
+    }
+
+    /// Bulk copy data OUT of a table/query to a writer.
+    ///
+    /// Writes TSV-formatted rows. Returns the row count.
+    pub fn copy_out<W: std::io::Write>(
+        &mut self,
+        query: &str,
+        writer: &mut W,
+    ) -> Result<u64, DriverError> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
+            .copy_out(query, writer)
+    }
+
     /// Whether this guard holds a sync connection (always true now).
     pub fn is_sync(&self) -> bool {
         true

@@ -346,6 +346,51 @@ impl Pool {
         Ok(())
     }
 
+    /// Bulk copy data INTO a table from an iterator of text rows.
+    ///
+    /// Each row is a tab-separated string (TSV format, matching PostgreSQL's
+    /// default COPY text format). Returns the number of rows copied.
+    ///
+    /// This is 10-100x faster than individual INSERTs for bulk data loading.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let rows = vec!["alice\talice@example.com", "bob\tbob@example.com"];
+    /// let count = pool.copy_in("users", &["name", "email"], rows.iter().map(|s| s.as_str())).await?;
+    /// ```
+    pub async fn copy_in<'a, I>(&self, table: &str, columns: &[&str], rows: I) -> BsqlResult<u64>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+        guard
+            .copy_in(table, columns, rows)
+            .map_err(BsqlError::from_driver_query)
+    }
+
+    /// Bulk copy data OUT of a table or query result to a writer.
+    ///
+    /// Data is written in PostgreSQL's text format (tab-separated columns,
+    /// newline-terminated rows). Returns the number of rows copied.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut buf = Vec::new();
+    /// let count = pool.copy_out("SELECT name, email FROM users", &mut buf).await?;
+    /// ```
+    pub async fn copy_out<W: std::io::Write>(
+        &self,
+        query: &str,
+        writer: &mut W,
+    ) -> BsqlResult<u64> {
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+        guard
+            .copy_out(query, writer)
+            .map_err(BsqlError::from_driver_query)
+    }
+
     /// Pool status metrics: idle, active, open, and max_size.
     ///
     /// Returns detailed pool utilization metrics from the driver.
