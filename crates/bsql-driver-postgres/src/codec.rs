@@ -6,7 +6,6 @@
 //! PostgreSQL binary format is big-endian for all numeric types.
 
 use crate::DriverError;
-
 #[cfg(feature = "chrono")]
 use chrono::{Datelike, Timelike};
 

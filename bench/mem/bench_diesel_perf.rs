@@ -177,6 +177,66 @@ fn main() {
         );
     }
 
+    // dynamic query (4 optional clauses via string concatenation)
+    //
+    // Note: diesel's sql_query does not support .filter() on BoxedSqlQuery.
+    // The idiomatic diesel approach for raw SQL with dynamic clauses is
+    // string concatenation — same as C's sprintf approach. This is NOT
+    // compile-time validated (unlike bsql's optional clauses).
+    {
+        let active_filter: Option<bool> = Some(true);
+        let min_score: Option<i16> = Some(5);
+        let name_filter: Option<&str> = None;
+        let email_filter: Option<&str> = None;
+
+        // Warm up
+        {
+            let mut sql =
+                String::from("SELECT id, name, email, active, score FROM bench_users WHERE 1=1");
+            if active_filter.is_some() {
+                sql.push_str(" AND active = true");
+            }
+            if min_score.is_some() {
+                sql.push_str(" AND score > 5");
+            }
+            sql.push_str(" ORDER BY id LIMIT 100");
+            let _ = diesel::sql_query(&sql).load::<User5>(&mut conn).unwrap();
+        }
+
+        let start = Instant::now();
+        for i in 0..ITERATIONS {
+            // Vary parameters each iteration to prevent PG query plan caching
+            // on identical SQL text. This matches real-world usage where
+            // filter values change per request.
+            let mut sql =
+                String::from("SELECT id, name, email, active, score FROM bench_users WHERE 1=1");
+            if active_filter.is_some() {
+                sql.push_str(if i % 2 == 0 {
+                    " AND active = true"
+                } else {
+                    " AND active = false"
+                });
+            }
+            if min_score.is_some() {
+                sql.push_str(&format!(" AND score > {}", (i % 10) as i16));
+            }
+            if name_filter.is_some() {
+                sql.push_str(" AND name LIKE '%bench%'");
+            }
+            if email_filter.is_some() {
+                sql.push_str(" AND email LIKE '%bench%'");
+            }
+            sql.push_str(" ORDER BY id LIMIT 100");
+            let _ = diesel::sql_query(&sql).load::<User5>(&mut conn).unwrap();
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "pg_dynamic_4clauses: {} ns/op  ({} iters)  [string concat, not validated]",
+            elapsed.as_nanos() / ITERATIONS as u128,
+            ITERATIONS
+        );
+    }
+
     // subquery
     {
         let sql = "SELECT id, name, email FROM bench_users \

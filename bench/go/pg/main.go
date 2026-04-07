@@ -55,8 +55,10 @@ func main() {
 	benchFetchMany(ctx, conn, 10000)
 	benchInsertSingle(ctx, conn)
 	benchInsertBatch(ctx, conn)
+	benchInsertBatchPipelined(ctx, conn)
 	benchJoinAggregate(ctx, conn)
 	benchSubquery(ctx, conn)
+	benchDynamic(ctx, conn)
 }
 
 func benchFetchOne(ctx context.Context, conn *pgx.Conn) {
@@ -155,6 +157,30 @@ func benchInsertBatch(ctx context.Context, conn *pgx.Conn) {
 		elapsed.Nanoseconds()/int64(iters), iters)
 }
 
+func benchInsertBatchPipelined(ctx context.Context, conn *pgx.Conn) {
+	sql := "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)"
+	iters := 1000
+
+	// pgx SendBatch: sends all queries in one round-trip
+	start := time.Now()
+	for range iters {
+		batch := &pgx.Batch{}
+		for j := range 100 {
+			name := fmt.Sprintf("batch_%d", j)
+			email := fmt.Sprintf("batch_%d@example.com", j)
+			batch.Queue(sql, name, email)
+		}
+		br := conn.SendBatch(ctx, batch)
+		for range 100 {
+			_, _ = br.Exec()
+		}
+		_ = br.Close()
+	}
+	elapsed := time.Since(start)
+	fmt.Printf("pg_insert_batch_pipelined/100: %d ns/op  (%d iters)\n",
+		elapsed.Nanoseconds()/int64(iters), iters)
+}
+
 func benchJoinAggregate(ctx context.Context, conn *pgx.Conn) {
 	sql := `SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
 		FROM bench_users u
@@ -217,5 +243,63 @@ func benchSubquery(ctx context.Context, conn *pgx.Conn) {
 	}
 	elapsed := time.Since(start)
 	fmt.Printf("pg_subquery:        %d ns/op  (%d iters)\n",
+		elapsed.Nanoseconds()/int64(iters), iters)
+}
+
+func benchDynamic(ctx context.Context, conn *pgx.Conn) {
+	// Dynamic query with 4 optional clauses via string concatenation.
+	// Go has no compile-time SQL validation — this is the standard approach.
+	activeFilter := true
+	minScore := 5
+	_ = activeFilter
+	_ = minScore
+
+	buildSQL := func() string {
+		sql := "SELECT id, name, email, active, score FROM bench_users WHERE 1=1"
+		if activeFilter {
+			sql += " AND active = true"
+		} else {
+			sql += " AND active = false"
+		}
+		if minScore > 0 {
+			sql += fmt.Sprintf(" AND score > %d", minScore)
+		}
+		sql += " ORDER BY id LIMIT 100"
+		return sql
+	}
+
+	// Warm up
+	rows := must(conn.Query(ctx, buildSQL()))
+	for rows.Next() {
+		var id int32
+		var name, email string
+		var active bool
+		var score int16
+		_ = rows.Scan(&id, &name, &email, &active, &score)
+	}
+	rows.Close()
+
+	iters := iterations
+	start := time.Now()
+	for i := range iters {
+		// Vary parameters to prevent PG plan caching on identical SQL text
+		if i%2 == 0 {
+			activeFilter = true
+		} else {
+			activeFilter = false
+		}
+		minScore = i % 10
+		rows, _ := conn.Query(ctx, buildSQL())
+		for rows.Next() {
+			var id int32
+			var name, email string
+			var active bool
+			var score int16
+			_ = rows.Scan(&id, &name, &email, &active, &score)
+		}
+		rows.Close()
+	}
+	elapsed := time.Since(start)
+	fmt.Printf("pg_dynamic_4clauses: %d ns/op  (%d iters)  [string concat]\n",
 		elapsed.Nanoseconds()/int64(iters), iters)
 }

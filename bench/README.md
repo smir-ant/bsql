@@ -17,14 +17,18 @@ All times are mean of N iterations. Microseconds unless noted. Collected 2026-04
 | 10,000 rows | **2.74 ms** <kbd>x1</kbd> | 3.59 ms <kbd>x1.3</kbd> | 5.74 ms <kbd>x2.1</kbd> | 4.39 ms <kbd>x1.6</kbd> | 3.18 ms <kbd>x1.2</kbd> |
 | Insert single | **82.8 us** <kbd>x1</kbd> | 97.5 us <kbd>x1.2</kbd> | 101 us <kbd>x1.2</kbd> | 142 us <kbd>x1.7</kbd> | 134 us <kbd>x1.6</kbd> |
 | Insert batch (100) | **733 us** <kbd>x1</kbd> | 2.42 ms <kbd>x3.3</kbd> | 3.30 ms <kbd>x4.5</kbd> | 2.89 ms <kbd>x3.9</kbd> | 3.78 ms <kbd>x5.2</kbd> |
-| Insert batch pipelined (100) | **733 us** <kbd>x1</kbd> | 1.27 ms <kbd>x1.7</kbd> | — | — | — |
-| JOIN + aggregate | **30.1 ms** <kbd>x1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 32.1 ms <kbd>x1.1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 30.3 ms <kbd>x1.0</kbd> |
-| Subquery | **119 us** <kbd>x1</kbd> | 134 us <kbd>x1.1</kbd> | 182 us <kbd>x1.5</kbd> | 225 us <kbd>x1.9</kbd> | 162 us <kbd>x1.4</kbd> |
-| Dynamic (4 clauses) | **152 us** <kbd>x1</kbd> | 179 us <kbd>x1.2</kbd> | — | — | — |
+| Insert batch pipelined (100) | **733 us** <kbd>x1</kbd> | 1.27 ms <kbd>x1.7</kbd> | — | — | 856 us <kbd>x1.2</kbd> |
+| JOIN + aggregate | **30.1 ms** <kbd>x1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 32.1 ms <kbd>x1.1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 30.9 ms <kbd>x1.0</kbd> |
+| Subquery | **119 us** <kbd>x1</kbd> | 134 us <kbd>x1.1</kbd> | 182 us <kbd>x1.5</kbd> | 225 us <kbd>x1.9</kbd> | 154 us <kbd>x1.3</kbd> |
+| Dynamic (4 clauses)† | **152 us** <kbd>x1</kbd> | 179 us <kbd>x1.2</kbd> | 102 us† | — | 162 us |
 
-bsql is faster than C (libpq) on every operation except JOIN+aggregate (PG engine time dominates). INSERT single: bsql 15% faster than C. Batch pipelined: bsql 42% faster than C's pipeline API. Dynamic query: bsql uses compile-time validated runtime dispatch; C uses manual sprintf (no validation, SQL injection risk).
+bsql is faster than C (libpq) on every operation except JOIN+aggregate (where PostgreSQL engine time dominates — all libraries spend ~30 ms waiting for PG to process the query).
 
-Each runner warms up PG cache with a full pass immediately before measuring. Double warm-up eliminates shared_buffers cold-start noise. Use `run_quick.sh` for bsql vs C, `run_pg.sh` for all 5.
+**† Dynamic query — why diesel is faster here:** diesel uses PostgreSQL's "simple query" protocol, which sends the entire SQL as one message. bsql and C use the "extended query" protocol with prepared statements, which sends 3 messages (Bind + Execute + Sync). The 3-message protocol is safer (type-checked bind parameters, binary results, cached query plans) but has ~50 μs more overhead per query. diesel skips all of this — it concatenates values directly into the SQL string and sends it as plain text. This is faster for lightweight queries but provides no compile-time validation, no type safety, and no SQL injection protection. For heavy queries (JOINs, large result sets), prepared statements win because PG reuses the cached execution plan.
+
+sqlx does not have a dynamic clause mechanism — users build SQL strings manually. It is omitted from the dynamic row because there is no idiomatic equivalent to benchmark.
+
+Each runner warms up PG cache with a full pass immediately before measuring. Double warm-up eliminates shared_buffers cold-start noise. Use `run_bsql_vs_c.sh` for bsql vs C only, `run_pg.sh` for all 5.
 
 All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx).
 
@@ -119,7 +123,9 @@ BSQL_DATABASE_URL="postgres://YOUR_USER@localhost/bench_db?host=/tmp" \
 ./mem/run_all.sh
 ```
 
-`run_pg.sh` handles database reset, cache warm-up, and CHECKPOINT between runs automatically.
+`run_pg.sh` handles database reset, cache warm-up, and CHECKPOINT between runs automatically. `run_bsql_vs_c.sh` runs only bsql and C for quick iteration during development.
+
+**Note on bench workspace**: The `bench/` directory is a separate Cargo workspace (excluded from the main workspace). It pins `time = ">=0.3.36, <0.3.38"` to match bsql's MSRV-compatible range. If diesel or sqlx update their `time` dependency beyond this range, the pin may need adjustment.
 
 ## Machine
 
@@ -158,9 +164,9 @@ INSERT benchmarks grow the database over time. Re-run `setup/pg_setup.sql` or `s
 - **diesel** uses `sql_query` with raw SQL for an apples-to-apples comparison, avoiding diesel's DSL overhead. diesel is fundamentally synchronous; benchmarks run without `to_async()`.
 - **C (libpq)** uses `PQexecPrepared` with prepared statements. Every benchmark reads every column via `PQgetvalue`. Insert batch uses 100 separate `PQexecPrepared` calls in a transaction (no pipelining -- libpq doesn't have built-in pipeline for this pattern).
 
-**Note on batch INSERT**: bsql uses pipeline batching (N Bind+Execute messages in one round-trip). The C benchmark includes both sequential (2.42 ms) and pipelined (1.27 ms) variants. bsql (733 us) is faster than even pipelined C by 42%. The sequential C number represents the most common C usage pattern.
+**Note on batch INSERT**: bsql uses pipeline batching (N Bind+Execute messages in one round-trip). The C benchmark includes both sequential (2.42 ms) and pipelined (1.27 ms) variants. Go (pgx) includes a pipelined variant via `SendBatch` (856 us). diesel and sqlx do not support pipeline protocol — they send each INSERT as a separate round-trip within a transaction.
 - **C (sqlite3)** uses `sqlite3_prepare_v2` with statement reuse. WAL mode enabled. Type-dispatched `sqlite3_column_*` reads every column.
-- **Go (pgx)** uses a direct `pgx.Conn` (not a pool). Queries are automatically prepared on first use.
+- **Go (pgx)** uses a direct `pgx.Conn` (not a pool). Queries are automatically prepared on first use. Batch INSERT includes both sequential (`tx.Exec` loop) and pipelined (`SendBatch`) variants.
 - **Go (go-sqlite3)** uses `database/sql` with prepared statements. WAL mode enabled.
 
 ## Compiler Flags

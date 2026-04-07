@@ -4,3 +4,4 @@ target/
 *.db-wal
 c/pg_bench
 c/sqlite_bench
+bench/go/pg_bench
