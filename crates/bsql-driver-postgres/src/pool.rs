@@ -254,28 +254,39 @@ impl Pool {
     /// to verify the connection is still alive before returning it.
     #[inline]
     fn try_pop_idle(&self) -> Result<Option<PoolGuard>, DriverError> {
-        let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(mut slot) = stack.pop() {
-            let (created_at, idle_dur) = match &slot {
-                PoolSlot::Sync(conn) => (conn.created_at(), conn.idle_duration()),
-                #[cfg(feature = "async")]
-                PoolSlot::Async(conn) => (conn.created_at(), conn.idle_duration()),
-            };
-            if let Some(max_lifetime) = self.inner.max_lifetime {
-                if created_at.elapsed() >= max_lifetime {
-                    self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
-                    continue;
+        // Pop a candidate slot under the lock, performing only non-I/O checks
+        // (lifetime, stale timeout). The health check (network round-trip) happens
+        // AFTER the lock is released so other threads aren't blocked.
+        loop {
+            let (mut slot, needs_health_check) = {
+                let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    let Some(slot) = stack.pop() else {
+                        return Ok(None);
+                    };
+                    let (created_at, idle_dur) = match &slot {
+                        PoolSlot::Sync(conn) => (conn.created_at(), conn.idle_duration()),
+                        #[cfg(feature = "async")]
+                        PoolSlot::Async(conn) => (conn.created_at(), conn.idle_duration()),
+                    };
+                    if let Some(max_lifetime) = self.inner.max_lifetime {
+                        if created_at.elapsed() >= max_lifetime {
+                            self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                            continue;
+                        }
+                    }
+                    if idle_dur >= self.inner.stale_timeout {
+                        // Stale connection — drop it, free the slot
+                        self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                        continue;
+                    }
+                    break (slot, idle_dur > Duration::from_secs(5));
                 }
-            }
-            if idle_dur >= self.inner.stale_timeout {
-                // Stale connection — drop it, free the slot
-                self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
-                continue;
-            }
-            // Health check: verify connection is still alive if idle > 5 seconds.
+            };
+            // Lock is now released — health check happens outside the critical section.
             // Sends an empty query — PG returns EmptyQueryResponse + ReadyForQuery.
             // Fast: one round-trip, ~15us on UDS. Skip for hot connections.
-            if idle_dur > Duration::from_secs(5) {
+            if needs_health_check {
                 let alive = match &mut slot {
                     PoolSlot::Sync(conn) => conn.simple_query("").is_ok(),
                     #[cfg(feature = "async")]
@@ -283,7 +294,7 @@ impl Pool {
                 };
                 if !alive {
                     self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
-                    continue;
+                    continue; // retry — re-acquire lock and pop next slot
                 }
             }
             return Ok(Some(PoolGuard {
@@ -294,7 +305,6 @@ impl Pool {
                 detector: NPlusOneDetector::new(self.inner.n_plus_one_threshold),
             }));
         }
-        Ok(None)
     }
 
     /// Whether this pool uses UDS connections.

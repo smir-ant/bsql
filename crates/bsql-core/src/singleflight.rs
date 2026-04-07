@@ -189,17 +189,23 @@ impl Singleflight {
         use std::hash::{Hash, Hasher};
         let mut hasher = rapidhash::quality::RapidHasher::default();
         sql_hash.hash(&mut hasher);
-        let mut scratch = Vec::with_capacity(64);
-        // Hash each parameter's actual encoded bytes (not just type OID)
-        for param in params {
-            if param.is_null() {
-                hasher.write_u8(0xFF); // NULL marker
-            } else {
-                scratch.clear();
-                param.encode_binary(&mut scratch);
-                hasher.write(&scratch);
-            }
+        // Thread-local scratch buffer avoids heap allocation on every key computation.
+        // encode_binary requires &mut Vec<u8>, so SmallVec won't work here.
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            for param in params {
+                if param.is_null() {
+                    hasher.write_u8(0xFF); // NULL marker
+                } else {
+                    scratch.clear();
+                    param.encode_binary(&mut scratch);
+                    hasher.write(&scratch);
+                }
+            }
+        });
         hasher.finish()
     }
 }

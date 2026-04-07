@@ -450,6 +450,7 @@ pub struct Row<'a> {
 
 impl<'a> Row<'a> {
     /// Get the raw bytes for a column, or `None` if NULL.
+    #[inline]
     pub fn get_raw(&self, idx: usize) -> Option<&'a [u8]> {
         let (offset, len) = self.col_offsets[idx];
         if len < 0 {
@@ -462,68 +463,80 @@ impl<'a> Row<'a> {
     }
 
     /// Whether a column is NULL.
+    #[inline]
     pub fn is_null(&self, idx: usize) -> bool {
         self.col_offsets[idx].1 < 0
     }
 
     /// Number of columns.
+    #[inline]
     pub fn column_count(&self) -> usize {
         self.col_offsets.len()
     }
 
     /// Get a boolean column value. Returns `None` on NULL or decode error.
+    #[inline]
     pub fn get_bool(&self, idx: usize) -> Option<bool> {
         self.get_raw(idx)
             .and_then(|data| crate::codec::decode_bool(data).ok())
     }
 
     /// Get an i16 column value. Returns `None` on NULL or decode error.
+    #[inline]
     pub fn get_i16(&self, idx: usize) -> Option<i16> {
         self.get_raw(idx)
             .and_then(|data| crate::codec::decode_i16(data).ok())
     }
 
     /// Get an i32 column value. Returns `None` on NULL or decode error.
+    #[inline]
     pub fn get_i32(&self, idx: usize) -> Option<i32> {
         self.get_raw(idx)
             .and_then(|data| crate::codec::decode_i32(data).ok())
     }
 
     /// Get an i64 column value. Returns `None` on NULL or decode error.
+    #[inline]
     pub fn get_i64(&self, idx: usize) -> Option<i64> {
         self.get_raw(idx)
             .and_then(|data| crate::codec::decode_i64(data).ok())
     }
 
     /// Get an f32 column value. Returns `None` on NULL or decode error.
+    #[inline]
     pub fn get_f32(&self, idx: usize) -> Option<f32> {
         self.get_raw(idx)
             .and_then(|data| crate::codec::decode_f32(data).ok())
     }
 
     /// Get an f64 column value. Returns `None` on NULL or decode error.
+    #[inline]
     pub fn get_f64(&self, idx: usize) -> Option<f64> {
         self.get_raw(idx)
             .and_then(|data| crate::codec::decode_f64(data).ok())
     }
 
     /// Get a string column value. Returns `None` on NULL or decode error.
+    #[inline]
     pub fn get_str(&self, idx: usize) -> Option<&'a str> {
         self.get_raw(idx)
             .and_then(|data| crate::codec::decode_str(data).ok())
     }
 
     /// Get a byte slice column value.
+    #[inline]
     pub fn get_bytes(&self, idx: usize) -> Option<&'a [u8]> {
         self.get_raw(idx)
     }
 
     /// Get the column name by index.
+    #[inline]
     pub fn column_name(&self, idx: usize) -> &str {
         &self.columns[idx].name
     }
 
     /// Get the column type OID by index.
+    #[inline]
     pub fn column_type_oid(&self, idx: usize) -> u32 {
         self.columns[idx].type_oid
     }

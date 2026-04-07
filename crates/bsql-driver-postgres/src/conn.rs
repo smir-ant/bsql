@@ -1974,13 +1974,26 @@ impl Connection {
         // is broken and cannot be recovered (we cannot send CopyFail on a dead
         // socket). The pool guard's Drop will detect the broken connection and
         // discard it rather than returning it to the pool.
+        //
+        // Batched writes: we accumulate CopyData messages in write_buf and only
+        // flush when the buffer exceeds 64 KB, avoiding N syscalls for N rows.
+        self.write_buf.clear();
         for row in rows {
-            self.write_buf.clear();
-            // Each row must end with \n for COPY text format
-            let mut row_bytes = Vec::with_capacity(row.len() + 1);
-            row_bytes.extend_from_slice(row.as_bytes());
-            row_bytes.push(b'\n');
-            proto::write_copy_data(&mut self.write_buf, &row_bytes);
+            // Write CopyData message directly — no intermediate Vec allocation.
+            let row_data = row.as_bytes();
+            let data_len = (4 + row_data.len() + 1) as i32;
+            self.write_buf.push(b'd');
+            self.write_buf.extend_from_slice(&data_len.to_be_bytes());
+            self.write_buf.extend_from_slice(row_data);
+            self.write_buf.push(b'\n');
+            // Flush when buffer exceeds 64 KB to bound memory usage
+            if self.write_buf.len() > 65536 {
+                self.flush_write()?;
+                self.write_buf.clear();
+            }
+        }
+        // Flush remaining buffered data
+        if !self.write_buf.is_empty() {
             self.flush_write()?;
         }
 

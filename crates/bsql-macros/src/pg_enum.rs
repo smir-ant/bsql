@@ -33,6 +33,7 @@ use quote::quote;
 /// - `TicketStatus` -> `ticket_status`
 /// - `HTTPCode`     -> `http_code`
 /// - `A`            -> `a`
+#[cfg(test)]
 fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     let chars: Vec<char> = s.chars().collect();
@@ -91,7 +92,6 @@ pub fn expand_pg_enum(_attr: TokenStream, item: TokenStream) -> Result<TokenStre
 
     let enum_name = &input.ident;
     let vis = &input.vis;
-    let _pg_type_name = to_snake_case(&enum_name.to_string());
 
     // Preserve any existing attributes except #[sql(...)] on variants
     let enum_attrs: Vec<_> = input.attrs.iter().collect();

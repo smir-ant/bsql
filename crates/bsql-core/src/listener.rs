@@ -164,7 +164,7 @@ impl Listener {
         let config_for_notify = listener_config.clone();
 
         let thread_channels = Arc::clone(&channels);
-        let thread_config = listener_config.clone();
+        let thread_config = listener_config;
         let handle = thread::spawn(move || {
             drive_listener(conn, thread_config, cmd_rx, notif_tx, thread_channels);
         });

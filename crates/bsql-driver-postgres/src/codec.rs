@@ -198,6 +198,16 @@ impl Encode for &str {
     fn type_oid(&self) -> u32 {
         25 // text
     }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        let bytes = self.as_bytes();
+        if bytes.len() != dst.len() {
+            return false;
+        }
+        dst.copy_from_slice(bytes);
+        true
+    }
 }
 
 impl Encode for String {
@@ -209,6 +219,11 @@ impl Encode for String {
     #[inline]
     fn type_oid(&self) -> u32 {
         25 // text
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        self.as_str().encode_at(dst)
     }
 }
 
@@ -222,6 +237,15 @@ impl Encode for &[u8] {
     fn type_oid(&self) -> u32 {
         17 // bytea
     }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if self.len() != dst.len() {
+            return false;
+        }
+        dst.copy_from_slice(self);
+        true
+    }
 }
 
 impl Encode for Vec<u8> {
@@ -233,6 +257,15 @@ impl Encode for Vec<u8> {
     #[inline]
     fn type_oid(&self) -> u32 {
         17 // bytea
+    }
+
+    #[inline]
+    fn encode_at(&self, dst: &mut [u8]) -> bool {
+        if self.len() != dst.len() {
+            return false;
+        }
+        dst.copy_from_slice(self);
+        true
     }
 }
 

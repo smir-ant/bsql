@@ -73,7 +73,7 @@ impl Drop for OwnedResult {
         }
         // Return column offsets buffer to thread-local pool.
         let col_offsets = self.result.take_col_offsets();
-        if !col_offsets.is_empty() || col_offsets.capacity() > 0 {
+        if col_offsets.capacity() > 0 {
             bsql_driver_postgres::release_col_offsets(col_offsets);
         }
     }

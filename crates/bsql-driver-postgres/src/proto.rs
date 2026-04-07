@@ -453,7 +453,11 @@ pub fn parse_backend_message(
 /// CopyData message — sends a chunk of COPY data to the server.
 ///
 /// Format: `'d' [length: i32] [data]`
+///
+/// Note: `copy_in` writes CopyData frames directly to `write_buf` for
+/// batched I/O. This function exists for API completeness and tests.
 #[inline]
+#[cfg(test)]
 pub fn write_copy_data(buf: &mut Vec<u8>, data: &[u8]) {
     buf.push(b'd');
     let len = (4 + data.len()) as i32;

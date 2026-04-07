@@ -82,18 +82,6 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
                 Err(feature_error("NUMERIC", oid, &["decimal"]))
             }
         }
-        // --- JSON / JSONB ---
-        // Returned as String; users parse with serde_json or similar
-        114 => Ok("String"),  // json
-        3802 => Ok("String"), // jsonb
-        // --- INTERVAL ---
-        // Returned as String; PG sends the ISO 8601 text representation
-        1186 => Ok("String"),
-        // --- INET / CIDR / MACADDR ---
-        // Returned as String; PG sends the text representation
-        869 => Ok("String"), // inet
-        650 => Ok("String"), // cidr
-        829 => Ok("String"), // macaddr
         // --- Timestamp/Date/Time arrays ---
         1115 => resolve_array("TIMESTAMP[]", 1114, oid),
         1185 => resolve_array("TIMESTAMPTZ[]", 1184, oid),
@@ -101,9 +89,6 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
         1183 => resolve_array("TIME[]", 1083, oid),
         2951 => resolve_array("UUID[]", 2950, oid),
         1231 => resolve_array("NUMERIC[]", 1700, oid),
-        // --- JSON/JSONB arrays ---
-        199 => Ok("Vec<String>"),  // json[]
-        3807 => Ok("Vec<String>"), // jsonb[]
         // --- Network type arrays ---
         1041 => Ok("Vec<String>"), // inet[]
         651 => Ok("Vec<String>"),  // cidr[]
@@ -225,14 +210,6 @@ pub fn is_param_compatible_extended(rust_type: &str, pg_oid: u32) -> bool {
         ("::rust_decimal::Decimal" | "rust_decimal::Decimal" | "Decimal", 1700) => {
             cfg!(feature = "decimal")
         }
-
-        // --- JSON / JSONB ---
-        // Accept &str and String for json/jsonb params
-        ("&str" | "String", 114 | 3802) => true,
-
-        // --- INTERVAL / INET / CIDR / MACADDR ---
-        // Accept &str and String for text-represented types
-        ("&str" | "String", 1186 | 869 | 650 | 829) => true,
 
         _ => false,
     }
