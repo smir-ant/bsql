@@ -48,26 +48,11 @@ All SQLite benchmarks use NOMUTEX mode (`SQLITE_OPEN_NOMUTEX`). This is applied 
 
 \* **JOIN + aggregate** is the only benchmark where C is marginally faster (2%). This is not driver overhead — bsql's driver overhead on this query is **0 ns** (measured by comparing a raw `sqlite3_step` loop vs bsql's `for_each` in the same process: identical timing). The 2% gap comes from **FFI boundary crossing**: SQLite's JOIN internally executes ~100K `sqlite3_step` calls. Each Rust→C FFI call costs ~2–4 ns for ARM ABI register save/restore. 100K × 3 ns ≈ 300 µs on a 21 ms query. C calls `sqlite3_step` as a native function with zero crossing overhead. This is an inherent cost of using any C library from Rust — every Rust SQLite library (rusqlite, sqlx, diesel) pays it equally. The only way to eliminate it: a pure-Rust SQLite engine (e.g. [Limbo](https://github.com/tursodatabase/limbo)).
 
-## Driver overhead (excluding database engine time)
+## Notes on performance claims
 
-The total query time includes database engine processing (query planning,
-disk I/O, WAL writes) which is identical for all libraries. The driver
-overhead -- message building, wire protocol, response parsing -- is where
-libraries differ:
+Single-row results (bsql 14.6 us vs C 15.4 us) are close — the difference is ~5%, within the range of PG server variance. bsql's advantage is statistically significant on multi-row fetches (10-20% faster) and batch INSERT (2.5x via pipelining).
 
-| Component | bsql | C (libpq) |
-|---|---|---|
-| Message build (Bind+Execute+Sync) | **79 ns** | ~200 ns |
-| Response parse (BindComplete+CommandComplete+ReadyForQuery) | **200 ns** | ~350 ns |
-| **Total driver overhead** | **279 ns** | **~550 ns** |
-
-bsql's driver overhead is **2x smaller than C**. When benchmark results
-show similar totals (e.g., INSERT single: 89.0 us vs 99.7 us), the
-apparent similarity hides a 2x advantage in driver code -- the database
-engine time (~85 us) dominates both measurements equally.
-
-C's overhead was estimated from libpq source code analysis. bsql's
-overhead was measured by instrumenting the send/receive phases separately.
+Both libraries spend ~85 us on PG engine time for INSERT. The remaining ~1-3 us is driver overhead. Measuring driver overhead in isolation requires instrumenting both codebases identically — we have not done this for libpq, so we do not claim a specific driver overhead ratio.
 
 ## Memory (peak RSS)
 
