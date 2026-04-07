@@ -105,7 +105,19 @@ pub enum DriverError {
     Protocol(String),
     /// Server-reported error (invalid SQL, constraint violation, etc.).
     Server {
-        /// Five-byte SQLSTATE code (always ASCII, e.g. `b"42P01"`).
+        /// SQLSTATE error code — always exactly 5 ASCII bytes.
+        ///
+        /// The SQL standard (ISO/IEC 9075) defines SQLSTATE as a 5-character
+        /// code: 2-character class + 3-character subclass. PostgreSQL follows
+        /// this strictly — every error response contains a 5-byte `'C'` field.
+        ///
+        /// Stored as `[u8; 5]` instead of `String` or `Box<str>` because:
+        /// - The length is fixed by the SQL standard (always 5, never more, never less)
+        /// - Eliminates a heap allocation per server error
+        /// - Shrinks `DriverError` by 11 bytes (16-byte Box → 5-byte array)
+        /// - Shrinks every `Result<T, DriverError>` on the stack
+        ///
+        /// Compare with string literals using byte strings: `&err.code == b"23505"`
         code: [u8; 5],
         /// Human-readable error message.
         message: Box<str>,

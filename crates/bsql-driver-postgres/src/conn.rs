@@ -1999,15 +1999,11 @@ impl Connection {
                 self.write_buf.clear();
             }
         }
-        // Flush remaining buffered data
-        if !self.write_buf.is_empty() {
-            self.flush_write()?;
-        }
-
-        // Send CopyDone
-        self.write_buf.clear();
+        // Append CopyDone to any remaining buffered rows and flush once,
+        // saving a syscall vs flushing rows then CopyDone separately.
         proto::write_copy_done(&mut self.write_buf);
         self.flush_write()?;
+        self.write_buf.clear();
 
         // Read CommandComplete (extract row count) + ReadyForQuery
         let mut count: u64 = 0;
