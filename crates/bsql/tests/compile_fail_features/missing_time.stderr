@@ -1,4 +1,5 @@
-error: column "deadline": column type is TIMESTAMPTZ (OID 1184) — enable feature "time" or "chrono" in bsql
+error: query not found in offline cache (hash 543efa4aa1c26892). The SQL may have changed since the cache was last built. Run `cargo build` with a live PostgreSQL connection to update the cache, then rebuild with BSQL_OFFLINE=true.
+         SQL: select id, deadline from tickets where id = $1
  --> tests/compile_fail_features/missing_time.rs:5:13
   |
 5 |     let _ = bsql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32");

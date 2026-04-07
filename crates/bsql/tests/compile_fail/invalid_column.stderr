@@ -1,6 +1,5 @@
-error: PostgreSQL error: column "nonexistent_column_xyz" does not exist (at position 8)
-                SQL: SELECT nonexistent_column_xyz FROM users WHERE id = $1
-                            ^
+error: query not found in offline cache (hash 5ff30c603a52cfa7). The SQL may have changed since the cache was last built. Run `cargo build` with a live PostgreSQL connection to update the cache, then rebuild with BSQL_OFFLINE=true.
+         SQL: select nonexistent_column_xyz from users where id = $1
  --> tests/compile_fail/invalid_column.rs:3:13
   |
 3 |       let _ = bsql::query!(

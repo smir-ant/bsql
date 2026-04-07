@@ -1,7 +1,5 @@
-error: PostgreSQL error: relation "nonexistent_table_xyz" does not exist (at position 16)
-                SQL: SELECT id FROM nonexistent_table_xyz WHERE id = 1
-                                    ^
-         available tables: tickets, users
+error: query not found in offline cache (hash 9c2a00889040f096). The SQL may have changed since the cache was last built. Run `cargo build` with a live PostgreSQL connection to update the cache, then rebuild with BSQL_OFFLINE=true.
+         SQL: select id from nonexistent_table_xyz where id = 1
  --> tests/compile_fail/invalid_table.rs:2:13
   |
 2 |       let _ = bsql::query!(

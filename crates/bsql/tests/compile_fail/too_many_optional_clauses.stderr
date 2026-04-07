@@ -1,4 +1,4 @@
-error: too many optional clauses (11, producing 2048 variants) — maximum is 10 (1024 variants). Consider splitting into multiple queries.
+error: too many optional clauses (11, producing 2048 combinations) — maximum is 10. All 2^N combinations are validated at compile time to guarantee "if it compiles, the SQL is correct". Split into multiple queries if you need more than 10 optional clauses.
   --> tests/compile_fail/too_many_optional_clauses.rs:13:13
    |
 13 |       let _ = bsql::query!(

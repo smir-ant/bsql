@@ -1,4 +1,5 @@
-error: type mismatch for parameter `$id`: declared `i32` but PostgreSQL expects `int2` (OID 21) (expected `i16`)
+error: query not found in offline cache (hash aeeea57421b6a46e). The SQL may have changed since the cache was last built. Run `cargo build` with a live PostgreSQL connection to update the cache, then rebuild with BSQL_OFFLINE=true.
+         SQL: select id from users where score = $1
  --> tests/compile_fail/type_mismatch_i32_for_i64.rs:4:13
   |
 4 |       let _ = bsql::query!(
