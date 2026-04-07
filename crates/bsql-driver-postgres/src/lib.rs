@@ -63,6 +63,7 @@ pub use async_conn::AsyncConnection;
 pub use codec::Encode;
 pub use conn::Connection;
 pub use conn::release_resp_buf;
+pub use conn::release_col_offsets;
 pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 pub use types::{
     ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, Row, SimpleRow,

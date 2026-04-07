@@ -123,7 +123,7 @@ See [examples/](examples/) for more complete, runnable programs.
 - **PostgreSQL driver**: `#![forbid(unsafe_code)]` -- zero unsafe
 - **SQLite driver**: unsafe confined to FFI boundary calls (`ffi.rs`) -- every other file is safe Rust
 - **5 of 6 crates** enforce `#![forbid(unsafe_code)]` at compile time
-- **1,600+ tests** (unit, integration, and compile-fail)
+- **1,800+ tests** (unit, integration, compile-fail, and property-based)
 
 <details>
 <summary>Why does the SQLite driver use unsafe?</summary>
@@ -306,6 +306,133 @@ Each sort variant's SQL is validated at compile time. The enum is exhaustive -- 
 </details>
 
 <details>
+<summary>Connection pool</summary>
+
+Full-featured LIFO connection pool with health checks and configurable behavior.
+
+```rust
+let pool = Pool::builder()
+    .url("postgres://user:pass@localhost/mydb")
+    .max_size(20)                                    // max connections (default: 10)
+    .acquire_timeout(Some(Duration::from_millis(50))) // wait for free connection (default: None = fail-fast)
+    .max_lifetime(Some(Duration::from_secs(1800)))    // recycle connections after 30 min
+    .stale_timeout(Duration::from_secs(30))           // discard idle connections after 30s
+    .min_idle(2)                                      // keep at least 2 idle connections
+    .max_stmt_cache_size(256)                         // prepared statement cache per connection
+    .warmup(&["SELECT 1", "SELECT id FROM users WHERE id = $1"])  // pre-PREPARE on new connections
+    .build()?;
+```
+
+**LIFO ordering** -- most recently returned connection is reused first (warmest PostgreSQL backend caches).
+
+**Fail-fast by default** -- when `acquire_timeout` is `None`, a pool-exhausted condition returns an error immediately. No silent queuing, no unbounded waits. Set `acquire_timeout` when your workload has predictable bursts.
+
+**Health checks** -- connections idle > 5 seconds are health-checked with an empty query before reuse. Stale connections (idle > `stale_timeout`) are silently discarded.
+
+**Statement warmup** -- new connections pre-PREPARE your hot queries. First real execution hits the statement cache instead of doing a Parse+Describe round-trip.
+
+</details>
+
+<details>
+<summary>Read/write splitting</summary>
+
+Route SELECT queries to a read replica, writes to the primary -- transparently.
+
+```rust
+let pool = Pool::builder()
+    .url("postgres://primary/mydb")
+    .replica_url("postgres://replica/mydb")  // optional read replica
+    .replica_max_size(10)                    // replica pool size (default: same as primary)
+    .build()?;
+
+// SELECT queries automatically route to the replica:
+let users = bsql::query!("SELECT id, login FROM users").fetch(&pool).await?;
+
+// INSERT/UPDATE/DELETE always route to the primary:
+bsql::query!("INSERT INTO users (login) VALUES ($login: &str)").run(&pool).await?;
+```
+
+The proc macro knows which queries are read-only (SELECT) at compile time and generates code that routes through `query_raw_readonly`, which the pool sends to the replica. No user code changes needed -- just add `replica_url` to the builder.
+
+</details>
+
+<details>
+<summary>Singleflight (request coalescing)</summary>
+
+When multiple threads issue the same query with the same parameters simultaneously, only one executes against PostgreSQL. The others wait and receive a shared copy of the result.
+
+```rust
+let pool = Pool::builder()
+    .url("postgres://localhost/mydb")
+    .singleflight(true)   // opt-in
+    .build()?;
+```
+
+100 concurrent requests for `SELECT * FROM config WHERE key = 'theme'` become 1 database query. The other 99 threads block on a condvar and receive an `Arc`-shared copy of the result.
+
+- Only coalesces read-only queries (SELECT). Writes are never coalesced.
+- Key = `rapidhash(sql_hash, encoded parameter bytes)` -- same query + same params = same key.
+- 30-second timeout on waiting. If the leader panics, followers get an error (not a deadlock).
+
+</details>
+
+<details>
+<summary>Async and sync modes</summary>
+
+Default: async (`#[tokio::main]` + `.await` on all methods).
+
+```toml
+# Async (default)
+bsql = { version = "0.20" }
+
+# Sync -- removes tokio dependency entirely
+bsql = { version = "0.20", default-features = false }
+```
+
+Same `query!` macro, same zero-copy fetch. Sync mode is pure `fn` -- no async runtime, no `.await`, no tokio in your dependency tree.
+
+Internal I/O is always synchronous (blocking TCP/UDS). The async wrapper uses `tokio::task::block_in_place` to integrate with the tokio scheduler without blocking other tasks. Unix domain socket connections use sync I/O directly (sub-millisecond, acceptable for tokio).
+
+</details>
+
+<details>
+<summary>Offline mode</summary>
+
+Build without a live database. The `.bsql/queries/` directory caches validation results from your last online build.
+
+```bash
+# Online: validate queries and populate cache
+cargo build   # with BSQL_DATABASE_URL set
+
+# Offline: use cached validation
+BSQL_OFFLINE=true cargo build   # no database needed
+```
+
+Auto-fallback: if no `BSQL_DATABASE_URL` is set but `.bsql/` exists, bsql uses the cache automatically.
+
+Cache is version-gated: upgrading bsql invalidates the cache. Commit `.bsql/` to your repo so CI and teammates can build offline.
+
+Format: bitcode-serialized (50x faster than JSON for schema cache loading).
+
+</details>
+
+<details>
+<summary>Zero-copy architecture</summary>
+
+bsql's hot path allocates nothing on the heap for most queries.
+
+- **Binary protocol** -- `i32` is `i32::from_be_bytes()`, not parsed from ASCII text
+- **Pipelined messages** -- Parse+Bind+Execute+Sync in one `write_all()` syscall
+- **Bind templates** -- re-execution patches parameter data in-place, no message rebuild
+- **Thread-local buffer recycling** -- response buffers, column offset vectors, and arenas are recycled via thread-local pools. Second query on the same thread: zero malloc
+- **Zero UTF-8 validation on hot path** -- statement names are `[u8; 18]` passed directly to the wire protocol. No `&str` conversion, no validation overhead
+- **Monolithic execute path** -- entire send+receive inlined in one function for global compiler optimization
+- **SIMD UTF-8 validation** -- `simdutf8` for bulk string validation on result data
+- **Statement cache** -- Vec-based O(n) with u64 hash keys. Faster than HashMap for < 30 entries due to cache locality
+
+</details>
+
+<details>
 <summary>What SQLite settings are used</summary>
 
 bsql automatically configures SQLite for optimal performance:
@@ -350,7 +477,7 @@ Supported transports: TCP, Unix domain sockets, TLS (via rustls).
 
 ## About
 
-Built with [Claude Code](https://claude.ai/code). Seventeen design principles written before the first line of code. Specifications first, then implementation, then multiple rounds of architectural audit. 1,600+ tests proving not just that the code works, but that broken code is rejected.
+Built with [Claude Code](https://claude.ai/code). Seventeen design principles written before the first line of code. Specifications first, then implementation, then multiple rounds of architectural audit. 1,800+ tests proving not just that the code works, but that broken code is rejected.
 
 Don't follow the author's name. Don't assume a library that's been around for 2 years is 12 times better than one that's been around for 2 months. Run the benchmarks yourself, read the tests, check the code.
 

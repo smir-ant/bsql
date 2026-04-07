@@ -348,16 +348,14 @@ impl AsyncConnection {
 
     fn validate_server_params(&self) -> Result<(), DriverError> {
         if let Some(encoding) = self.parameter("server_encoding") {
-            let normalized = encoding.to_uppercase();
-            if normalized != "UTF8" && normalized != "UTF-8" {
+            if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8") {
                 return Err(DriverError::Protocol(format!(
                     "server_encoding is '{encoding}', but bsql requires UTF-8."
                 )));
             }
         }
         if let Some(encoding) = self.parameter("client_encoding") {
-            let normalized = encoding.to_uppercase();
-            if normalized != "UTF8" && normalized != "UTF-8" {
+            if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8") {
                 return Err(DriverError::Protocol(format!(
                     "client_encoding is '{encoding}', but bsql requires UTF-8."
                 )));
@@ -391,7 +389,8 @@ impl AsyncConnection {
             .expect("send_pipeline(need_columns=true) must return Some");
 
         let num_cols = columns.len();
-        let mut all_col_offsets: Vec<(usize, i32)> = Vec::with_capacity(num_cols.max(1) * 8);
+        let mut all_col_offsets = crate::conn::acquire_col_offsets();
+        all_col_offsets.clear();
         let mut affected_rows: u64 = 0;
 
         let mut resp_buf = acquire_resp_buf();
@@ -787,11 +786,11 @@ impl AsyncConnection {
                     has_exec_sync = true;
                 } else {
                     self.write_buf.clear();
-                    proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+                    proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
                     info.bind_template = None;
                 }
             } else {
-                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+                proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
             }
 
             let cols = if need_columns {
@@ -813,12 +812,11 @@ impl AsyncConnection {
         } else {
             // Cache miss: Parse+Describe+Bind+Execute+Sync
             let name = make_stmt_name(sql_hash);
-            let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', name_s);
-            proto::write_bind_params(&mut self.write_buf, "", name_s, params);
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_bind_params(&mut self.write_buf, b"", &name, params);
 
             self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
             self.flush_write().await?;
@@ -876,7 +874,7 @@ impl AsyncConnection {
             && !self.stmts.contains_key(&sql_hash, &info.sql)
         {
             if let Some((_lru_hash, evicted)) = self.stmts.evict_lru() {
-                proto::write_close(&mut self.write_buf, b'S', evicted.name_str());
+                proto::write_close(&mut self.write_buf, b'S', &evicted.name);
             }
         }
         self.stmts.insert(sql_hash, info);

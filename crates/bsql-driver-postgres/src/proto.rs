@@ -117,7 +117,7 @@ pub enum BackendMessage<'a> {
         column_formats: Vec<u16>,
     },
     CopyData {
-        data: Vec<u8>,
+        data: &'a [u8],
     },
     CopyDone,
 }
@@ -137,6 +137,7 @@ pub fn write_message(buf: &mut Vec<u8>, msg_type: u8, payload: &[u8]) {
 }
 
 /// Startup message — no type byte: `[length: i32] [version: i32] [params...] [0x00]`
+#[inline]
 pub fn write_startup(buf: &mut Vec<u8>, user: &str, database: &str) {
     let start = buf.len();
     buf.extend_from_slice(&[0u8; 4]); // placeholder for length
@@ -168,6 +169,7 @@ pub fn write_ssl_request(buf: &mut Vec<u8>) {
 ///
 /// Sent on a NEW TCP connection to cancel a running query.
 /// The connection is closed immediately after sending.
+#[inline]
 pub fn write_cancel_request(buf: &mut Vec<u8>, pid: i32, secret: i32) {
     buf.extend_from_slice(&16i32.to_be_bytes());
     buf.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
@@ -178,7 +180,8 @@ pub fn write_cancel_request(buf: &mut Vec<u8>, pid: i32, secret: i32) {
 /// Parse message — prepare a named statement.
 ///
 /// Format: `'P' [len] [name\0] [sql\0] [num_param_types: i16] [oid: i32]...`
-pub fn write_parse(buf: &mut Vec<u8>, name: &str, sql: &str, param_oids: &[u32]) {
+#[inline]
+pub fn write_parse(buf: &mut Vec<u8>, name: &[u8], sql: &str, param_oids: &[u32]) {
     let payload_len = name.len()
         + 1 // NUL
         + sql.len()
@@ -190,7 +193,7 @@ pub fn write_parse(buf: &mut Vec<u8>, name: &str, sql: &str, param_oids: &[u32])
     let len = (payload_len as i32) + 4;
     buf.extend_from_slice(&len.to_be_bytes());
 
-    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(name);
     buf.push(0);
     buf.extend_from_slice(sql.as_bytes());
     buf.push(0);
@@ -213,10 +216,11 @@ pub fn write_parse(buf: &mut Vec<u8>, name: &str, sql: &str, param_oids: &[u32])
 /// Format: `'B' [len] [portal\0] [stmt\0] [num_fmt_codes: i16] [fmt_code: i16]...
 ///          [num_params: i16] ([param_len: i32] [param_data]...)
 ///          [num_result_fmt_codes: i16] [result_fmt_code: i16]...`
+#[inline]
 pub fn write_bind_params(
     buf: &mut Vec<u8>,
-    portal: &str,
-    statement: &str,
+    portal: &[u8],
+    statement: &[u8],
     params: &[&(dyn crate::codec::Encode + Sync)],
 ) {
     buf.push(MSG_BIND);
@@ -224,11 +228,11 @@ pub fn write_bind_params(
     buf.extend_from_slice(&[0u8; 4]); // placeholder
 
     // Portal name
-    buf.extend_from_slice(portal.as_bytes());
+    buf.extend_from_slice(portal);
     buf.push(0);
 
     // Statement name
-    buf.extend_from_slice(statement.as_bytes());
+    buf.extend_from_slice(statement);
     buf.push(0);
 
     // Parameter format codes: all binary (format code 1)
@@ -269,12 +273,13 @@ pub fn write_bind_params(
 /// Execute message — execute a bound portal.
 ///
 /// `max_rows = 0` means unlimited.
-pub fn write_execute(buf: &mut Vec<u8>, portal: &str, max_rows: i32) {
+#[inline]
+pub fn write_execute(buf: &mut Vec<u8>, portal: &[u8], max_rows: i32) {
     let payload_len = portal.len() + 1 + 4;
     buf.push(MSG_EXECUTE);
     let len = (payload_len as i32) + 4;
     buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(portal.as_bytes());
+    buf.extend_from_slice(portal);
     buf.push(0);
     buf.extend_from_slice(&max_rows.to_be_bytes());
 }
@@ -315,6 +320,7 @@ pub const SYNC_ONLY: &[u8] = &[
 ///
 /// Causes PG to close the implicit transaction (if outside BEGIN) and destroy
 /// all portals (including the unnamed portal). Always sends ReadyForQuery.
+#[inline]
 pub fn write_sync(buf: &mut Vec<u8>) {
     write_message(buf, MSG_SYNC, &[]);
 }
@@ -324,38 +330,43 @@ pub fn write_sync(buf: &mut Vec<u8>) {
 /// Unlike Sync, Flush does NOT close portals or end transactions. This is
 /// essential for streaming: between Execute calls, use Flush to get the
 /// PortalSuspended response without destroying the portal.
+#[inline]
 pub fn write_flush(buf: &mut Vec<u8>) {
     write_message(buf, b'H', &[]);
 }
 
 /// Describe message — request description of a statement ('S') or portal ('P').
-pub fn write_describe(buf: &mut Vec<u8>, kind: u8, name: &str) {
+#[inline]
+pub fn write_describe(buf: &mut Vec<u8>, kind: u8, name: &[u8]) {
     let payload_len = 1 + name.len() + 1;
     buf.push(MSG_DESCRIBE);
     let len = (payload_len as i32) + 4;
     buf.extend_from_slice(&len.to_be_bytes());
     buf.push(kind);
-    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(name);
     buf.push(0);
 }
 
 /// Close message — close a statement ('S') or portal ('P').
-pub fn write_close(buf: &mut Vec<u8>, kind: u8, name: &str) {
+#[inline]
+pub fn write_close(buf: &mut Vec<u8>, kind: u8, name: &[u8]) {
     let payload_len = 1 + name.len() + 1;
     buf.push(MSG_CLOSE);
     let len = (payload_len as i32) + 4;
     buf.extend_from_slice(&len.to_be_bytes());
     buf.push(kind);
-    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(name);
     buf.push(0);
 }
 
 /// Terminate message — close the connection.
+#[inline]
 pub fn write_terminate(buf: &mut Vec<u8>) {
     write_message(buf, MSG_TERMINATE, &[]);
 }
 
 /// Simple query message — for non-prepared SQL (BEGIN, COMMIT, SET, etc.).
+#[inline]
 pub fn write_simple_query(buf: &mut Vec<u8>, sql: &str) {
     let payload_len = sql.len() + 1;
     buf.push(MSG_QUERY);
@@ -366,6 +377,7 @@ pub fn write_simple_query(buf: &mut Vec<u8>, sql: &str) {
 }
 
 /// Password message (MD5 or cleartext).
+#[inline]
 pub fn write_password(buf: &mut Vec<u8>, password: &[u8]) {
     write_message(buf, MSG_PASSWORD, password);
 }
@@ -373,6 +385,7 @@ pub fn write_password(buf: &mut Vec<u8>, password: &[u8]) {
 /// SASLInitialResponse message.
 ///
 /// Format: `'p' [len] [mechanism\0] [data_len: i32] [data]`
+#[inline]
 pub fn write_sasl_initial(buf: &mut Vec<u8>, mechanism: &str, data: &[u8]) {
     buf.push(MSG_PASSWORD);
     let payload_len = mechanism.len() + 1 + 4 + data.len();
@@ -385,6 +398,7 @@ pub fn write_sasl_initial(buf: &mut Vec<u8>, mechanism: &str, data: &[u8]) {
 }
 
 /// SASLResponse message.
+#[inline]
 pub fn write_sasl_response(buf: &mut Vec<u8>, data: &[u8]) {
     write_message(buf, MSG_PASSWORD, data);
 }
@@ -396,6 +410,7 @@ pub fn write_sasl_response(buf: &mut Vec<u8>, data: &[u8]) {
 /// Parse a backend message from its type byte and payload.
 ///
 /// The payload slice must remain valid for the lifetime of the returned message.
+#[inline]
 pub fn parse_backend_message(
     msg_type: u8,
     payload: &[u8],
@@ -425,7 +440,7 @@ pub fn parse_backend_message(
             "COPY BOTH protocol not supported: server sent CopyBothResponse ('W')".into(),
         )),
         b'd' => Ok(BackendMessage::CopyData {
-            data: payload.to_vec(),
+            data: payload,
         }),
         b'c' => Ok(BackendMessage::CopyDone),
         _ => Err(DriverError::Protocol(format!(
@@ -440,6 +455,7 @@ pub fn parse_backend_message(
 /// CopyData message — sends a chunk of COPY data to the server.
 ///
 /// Format: `'d' [length: i32] [data]`
+#[inline]
 pub fn write_copy_data(buf: &mut Vec<u8>, data: &[u8]) {
     buf.push(b'd');
     let len = (4 + data.len()) as i32;
@@ -450,6 +466,7 @@ pub fn write_copy_data(buf: &mut Vec<u8>, data: &[u8]) {
 /// CopyDone message — signals end of COPY data stream.
 ///
 /// Format: `'c' [length=4: i32]`
+#[inline]
 pub fn write_copy_done(buf: &mut Vec<u8>) {
     buf.push(b'c');
     buf.extend_from_slice(&4i32.to_be_bytes());
@@ -460,6 +477,7 @@ pub fn write_copy_done(buf: &mut Vec<u8>) {
 /// Parse a CopyInResponse message.
 ///
 /// Format: `[format: u8] [num_columns: i16] [column_format: i16]...`
+#[inline]
 fn parse_copy_in_response(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     if payload.len() < 3 {
         return Err(DriverError::Protocol("CopyInResponse too short".into()));
@@ -495,6 +513,7 @@ fn parse_copy_in_response(payload: &[u8]) -> Result<BackendMessage<'_>, DriverEr
 /// Parse a CopyOutResponse message.
 ///
 /// Format: `[format: u8] [num_columns: i16] [column_format: i16]...`
+#[inline]
 fn parse_copy_out_response(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     if payload.len() < 3 {
         return Err(DriverError::Protocol("CopyOutResponse too short".into()));
@@ -527,6 +546,7 @@ fn parse_copy_out_response(payload: &[u8]) -> Result<BackendMessage<'_>, DriverE
     })
 }
 
+#[inline]
 fn parse_auth(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     if payload.len() < 4 {
         return Err(DriverError::Protocol("auth message too short".into()));
@@ -564,6 +584,7 @@ fn parse_auth(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     }
 }
 
+#[inline]
 fn parse_parameter_status(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     let name = read_cstring(payload, 0)?;
     let name_end = name.len() + 1;
@@ -571,6 +592,7 @@ fn parse_parameter_status(payload: &[u8]) -> Result<BackendMessage<'_>, DriverEr
     Ok(BackendMessage::ParameterStatus { name, value })
 }
 
+#[inline]
 fn parse_backend_key_data(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     if payload.len() < 8 {
         return Err(DriverError::Protocol(
@@ -582,6 +604,7 @@ fn parse_backend_key_data(payload: &[u8]) -> Result<BackendMessage<'_>, DriverEr
     Ok(BackendMessage::BackendKeyData { pid, secret })
 }
 
+#[inline]
 fn parse_ready_for_query(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     if payload.is_empty() {
         return Err(DriverError::Protocol("ReadyForQuery message empty".into()));
@@ -589,11 +612,13 @@ fn parse_ready_for_query(payload: &[u8]) -> Result<BackendMessage<'_>, DriverErr
     Ok(BackendMessage::ReadyForQuery { status: payload[0] })
 }
 
+#[inline]
 fn parse_command_complete(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     let tag = read_cstring(payload, 0)?;
     Ok(BackendMessage::CommandComplete { tag })
 }
 
+#[inline]
 fn parse_notification(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
     if payload.len() < 4 {
         return Err(DriverError::Protocol("notification too short".into()));
@@ -610,6 +635,7 @@ fn parse_notification(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError>
 }
 
 /// Read a NUL-terminated C string from `data` starting at `offset`.
+#[inline]
 fn read_cstring(data: &[u8], offset: usize) -> Result<&str, DriverError> {
     let remaining = data
         .get(offset..)
@@ -632,6 +658,7 @@ fn read_cstring(data: &[u8], offset: usize) -> Result<&str, DriverError> {
 ///
 /// Format: `[num_fields: i16] ([name\0] [table_oid: i32] [col_attr: i16]
 ///           [type_oid: i32] [type_size: i16] [type_mod: i32] [format: i16])...`
+#[inline]
 pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::types::ColumnDesc>, DriverError> {
     if data.len() < 2 {
         return Err(DriverError::Protocol("RowDescription too short".into()));
@@ -695,6 +722,7 @@ pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::types::ColumnDesc
 /// Parse a ParameterDescription payload into parameter type OIDs.
 ///
 /// Format: `[num_params: i16] [oid: i32]...`
+#[inline]
 pub fn parse_parameter_description(data: &[u8]) -> Result<Vec<u32>, DriverError> {
     if data.len() < 2 {
         return Err(DriverError::Protocol(
@@ -731,6 +759,7 @@ pub fn parse_parameter_description(data: &[u8]) -> Result<Vec<u32>, DriverError>
 /// This is a lightweight helper for compile-time schema introspection queries
 /// only. It processes the raw bytes of multiple DataRow messages that were
 /// collected by the caller.
+#[inline]
 pub fn parse_simple_data_row(data: &[u8]) -> Result<Vec<Option<String>>, DriverError> {
     if data.len() < 2 {
         return Err(DriverError::Protocol("DataRow too short".into()));
@@ -865,6 +894,7 @@ pub fn parse_error_response(data: &[u8]) -> ErrorFields {
 ///
 /// Tags like "INSERT 0 5", "UPDATE 3", "DELETE 12", "SELECT 100" — the last
 /// number is the affected/returned row count.
+#[inline]
 pub fn parse_command_tag(tag: &str) -> u64 {
     tag.rsplit(' ')
         .next()
@@ -906,6 +936,7 @@ pub fn parse_command_tag_bytes(payload: &[u8]) -> u64 {
 ///
 /// Embedded double quotes are escaped by doubling them (`"` -> `""`).
 /// This prevents SQL injection in table/column names used by COPY.
+#[inline]
 pub fn quote_ident(ident: &str) -> String {
     let mut out = String::with_capacity(ident.len() + 2);
     out.push('"');
@@ -1076,7 +1107,7 @@ mod tests {
     #[test]
     fn parse_message_writes_correct_format() {
         let mut buf = Vec::new();
-        write_parse(&mut buf, "s_test", "SELECT 1", &[23]);
+        write_parse(&mut buf, b"s_test", "SELECT 1", &[23]);
 
         assert_eq!(buf[0], b'P');
         // After type byte, next 4 bytes are length
@@ -1089,7 +1120,7 @@ mod tests {
         let mut buf = Vec::new();
         let val = 42i32;
         let params: Vec<&(dyn crate::codec::Encode + Sync)> = vec![&val];
-        write_bind_params(&mut buf, "", "s_test", &params);
+        write_bind_params(&mut buf, b"", b"s_test", &params);
 
         assert_eq!(buf[0], b'B');
         // Verify it contains binary format codes
@@ -1100,21 +1131,21 @@ mod tests {
     fn bind_no_params() {
         let mut buf = Vec::new();
         let params: Vec<&(dyn crate::codec::Encode + Sync)> = vec![];
-        write_bind_params(&mut buf, "", "s_test", &params);
+        write_bind_params(&mut buf, b"", b"s_test", &params);
         assert_eq!(buf[0], b'B');
     }
 
     #[test]
     fn execute_message_format() {
         let mut buf = Vec::new();
-        write_execute(&mut buf, "", 0);
+        write_execute(&mut buf, b"", 0);
         assert_eq!(buf[0], b'E');
     }
 
     #[test]
     fn execute_sync_constant_matches_functions() {
         let mut buf = Vec::new();
-        write_execute(&mut buf, "", 0);
+        write_execute(&mut buf, b"", 0);
         write_sync(&mut buf);
         assert_eq!(buf.as_slice(), EXECUTE_SYNC);
     }
@@ -1122,7 +1153,7 @@ mod tests {
     #[test]
     fn execute_only_matches_execute_without_sync() {
         let mut buf = Vec::new();
-        write_execute(&mut buf, "", 0);
+        write_execute(&mut buf, b"", 0);
         assert_eq!(buf.as_slice(), EXECUTE_ONLY);
     }
 
@@ -1144,7 +1175,7 @@ mod tests {
     #[test]
     fn describe_message_format() {
         let mut buf = Vec::new();
-        write_describe(&mut buf, b'S', "s_test");
+        write_describe(&mut buf, b'S', b"s_test");
         assert_eq!(buf[0], b'D');
         assert_eq!(buf[5], b'S');
     }
@@ -1152,7 +1183,7 @@ mod tests {
     #[test]
     fn close_message_format() {
         let mut buf = Vec::new();
-        write_close(&mut buf, b'S', "s_test");
+        write_close(&mut buf, b'S', b"s_test");
         assert_eq!(buf[0], b'C');
         assert_eq!(buf[5], b'S');
     }
@@ -1220,7 +1251,7 @@ mod tests {
     #[test]
     fn execute_with_max_rows() {
         let mut buf = Vec::new();
-        write_execute(&mut buf, "", 64);
+        write_execute(&mut buf, b"", 64);
         assert_eq!(buf[0], b'E');
         // Portal name "" (1 byte NUL) + max_rows (4 bytes) = 5 bytes payload
         // Message: type(1) + length(4) + portal_NUL(1) + max_rows(4) = 10 bytes
@@ -1558,7 +1589,7 @@ mod tests {
         let mut buf = Vec::new();
         let val: Option<i32> = None;
         let params: Vec<&(dyn crate::codec::Encode + Sync)> = vec![&val];
-        write_bind_params(&mut buf, "", "s_test", &params);
+        write_bind_params(&mut buf, b"", b"s_test", &params);
         assert_eq!(buf[0], b'B');
         // The bind message should contain -1 length for the NULL param
         // We verify the message is well-formed and starts with 'B'

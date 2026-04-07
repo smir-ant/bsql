@@ -55,6 +55,25 @@ pub fn release_resp_buf(buf: Vec<u8>) {
     });
 }
 
+thread_local! {
+    static COL_OFFSETS_POOL: RefCell<Vec<Vec<(usize, i32)>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn acquire_col_offsets() -> Vec<(usize, i32)> {
+    COL_OFFSETS_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default()
+}
+
+pub fn release_col_offsets(buf: Vec<(usize, i32)>) {
+    COL_OFFSETS_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < 4 {
+            pool.push(buf);
+        }
+    });
+}
+
 // --- Connection ---
 
 /// A PostgreSQL connection over TCP, TLS, or Unix domain socket.
@@ -429,16 +448,14 @@ impl Connection {
 
     fn validate_server_params(&self) -> Result<(), DriverError> {
         if let Some(encoding) = self.parameter("server_encoding") {
-            let normalized = encoding.to_uppercase();
-            if normalized != "UTF8" && normalized != "UTF-8" {
+            if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8") {
                 return Err(DriverError::Protocol(format!(
                     "server_encoding is '{encoding}', but bsql requires UTF-8."
                 )));
             }
         }
         if let Some(encoding) = self.parameter("client_encoding") {
-            let normalized = encoding.to_uppercase();
-            if normalized != "UTF8" && normalized != "UTF-8" {
+            if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8") {
                 return Err(DriverError::Protocol(format!(
                     "client_encoding is '{encoding}', but bsql requires UTF-8."
                 )));
@@ -464,10 +481,9 @@ impl Connection {
             return Ok(());
         }
         let name = make_stmt_name(sql_hash);
-        let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
         self.write_buf.clear();
-        proto::write_parse(&mut self.write_buf, name_s, sql, &[]);
-        proto::write_describe(&mut self.write_buf, b'S', name_s);
+        proto::write_parse(&mut self.write_buf, &name, sql, &[]);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
         proto::write_sync(&mut self.write_buf);
         self.flush_write()?;
 
@@ -511,7 +527,8 @@ impl Connection {
             .expect("send_pipeline(need_columns=true) must return Some");
 
         let num_cols = columns.len();
-        let mut all_col_offsets: Vec<(usize, i32)> = Vec::with_capacity(num_cols.max(1) * 8);
+        let mut all_col_offsets = acquire_col_offsets();
+        all_col_offsets.clear();
         let mut affected_rows: u64 = 0;
 
         // Response buffer: DataRow payloads are appended here as raw bytes.
@@ -706,11 +723,11 @@ impl Connection {
                 has_exec_sync = true;
             } else {
                 self.write_buf.clear();
-                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+                proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
                 info.bind_template = None;
             }
         } else {
-            proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+            proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
         }
 
         // Snapshot bind template on first use or after invalidation.
@@ -885,14 +902,13 @@ impl Connection {
         }
 
         let name = make_stmt_name(sql_hash);
-        let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
         let param_oids: smallvec::SmallVec<[u32; 8]> =
             params.iter().map(|p| p.type_oid()).collect();
 
         self.write_buf.clear();
-        proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
-        proto::write_describe(&mut self.write_buf, b'S', name_s);
-        proto::write_bind_params(&mut self.write_buf, "", name_s, params);
+        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_bind_params(&mut self.write_buf, b"", &name, params);
         self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
         self.stream
             .write_all(&self.write_buf)
@@ -1047,7 +1063,6 @@ impl Connection {
         // Ensure statement is prepared.
         if !self.stmts.contains_key(&sql_hash, sql) {
             let name = make_stmt_name(sql_hash);
-            let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
             let first_params = param_sets[0];
             if first_params.len() > i16::MAX as usize {
                 return Err(DriverError::Protocol(format!(
@@ -1058,8 +1073,8 @@ impl Connection {
             }
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 first_params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', name_s);
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
             proto::write_sync(&mut self.write_buf);
             self.flush_write()?;
 
@@ -1087,8 +1102,7 @@ impl Connection {
             .stmts
             .get(&sql_hash, sql)
             .expect("BUG: stmt just cached but not found")
-            .name_str()
-            .to_owned();
+            .name;
         let count = param_sets.len();
 
         for params in param_sets {
@@ -1099,7 +1113,7 @@ impl Connection {
                     i16::MAX
                 )));
             }
-            proto::write_bind_params(&mut self.write_buf, "", &stmt_name, params);
+            proto::write_bind_params(&mut self.write_buf, b"", &stmt_name, params);
             self.write_buf.extend_from_slice(proto::EXECUTE_ONLY);
         }
 
@@ -1159,7 +1173,6 @@ impl Connection {
         }
 
         let name = make_stmt_name(sql_hash);
-        let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
         if params.len() > i16::MAX as usize {
             return Err(DriverError::Protocol(format!(
                 "parameter count {} exceeds maximum {}",
@@ -1171,8 +1184,8 @@ impl Connection {
             params.iter().map(|p| p.type_oid()).collect();
 
         self.write_buf.clear();
-        proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
-        proto::write_describe(&mut self.write_buf, b'S', name_s);
+        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
         proto::write_sync(&mut self.write_buf);
         self.flush_write()?;
 
@@ -1208,8 +1221,8 @@ impl Connection {
             .stmts
             .get(&sql_hash, sql)
             .expect("BUG: stmt just cached but not found")
-            .name_str();
-        proto::write_bind_params(buf, "", stmt_name, params);
+            .name;
+        proto::write_bind_params(buf, b"", &stmt_name, params);
         buf.extend_from_slice(proto::EXECUTE_ONLY);
     }
 
@@ -1454,11 +1467,11 @@ impl Connection {
                 has_exec_sync = true;
             } else {
                 self.write_buf.clear();
-                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+                proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
                 info.bind_template = None;
             }
         } else {
-            proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+            proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
         }
 
         // Snapshot bind template on first use or after invalidation.
@@ -1680,14 +1693,13 @@ impl Connection {
         }
 
         let name = make_stmt_name(sql_hash);
-        let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
         let param_oids: smallvec::SmallVec<[u32; 8]> =
             params.iter().map(|p| p.type_oid()).collect();
 
         self.write_buf.clear();
-        proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
-        proto::write_describe(&mut self.write_buf, b'S', name_s);
-        proto::write_bind_params(&mut self.write_buf, "", name_s, params);
+        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_bind_params(&mut self.write_buf, b"", &name, params);
         self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
         self.stream
             .write_all(&self.write_buf)
@@ -2112,8 +2124,8 @@ impl Connection {
         self.write_buf.clear();
         // Use unnamed statement "" — PG replaces it on every Parse,
         // so there is no cache pollution.
-        proto::write_parse(&mut self.write_buf, "", sql, &[]);
-        proto::write_describe(&mut self.write_buf, b'S', "");
+        proto::write_parse(&mut self.write_buf, b"", sql, &[]);
+        proto::write_describe(&mut self.write_buf, b'S', b"");
         proto::write_sync(&mut self.write_buf);
         self.flush_write()?;
 
@@ -2280,11 +2292,11 @@ impl Connection {
 
                 if !template_ok {
                     self.write_buf.clear();
-                    proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+                    proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
                     info.bind_template = None;
                 }
             } else {
-                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+                proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
             }
 
             let cols = info.columns.clone();
@@ -2293,7 +2305,7 @@ impl Connection {
                 info.bind_template = build_bind_template(&self.write_buf, params.len());
             }
 
-            proto::write_execute(&mut self.write_buf, "", chunk_size);
+            proto::write_execute(&mut self.write_buf, b"", chunk_size);
             // Use Flush (not Sync!) to keep the portal alive between chunks.
             proto::write_flush(&mut self.write_buf);
             self.flush_write()?;
@@ -2302,14 +2314,13 @@ impl Connection {
         } else {
             // Cache miss: Parse+Describe+Bind+Execute+Flush
             let name = make_stmt_name(sql_hash);
-            let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', name_s);
-            proto::write_bind_params(&mut self.write_buf, "", name_s, params);
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_bind_params(&mut self.write_buf, b"", &name, params);
 
-            proto::write_execute(&mut self.write_buf, "", chunk_size);
+            proto::write_execute(&mut self.write_buf, b"", chunk_size);
             proto::write_flush(&mut self.write_buf);
             self.flush_write()?;
 
@@ -2414,7 +2425,7 @@ impl Connection {
     /// Uses Flush (not Sync) to keep the unnamed portal alive.
     pub fn streaming_send_execute(&mut self, chunk_size: i32) -> Result<(), DriverError> {
         self.write_buf.clear();
-        proto::write_execute(&mut self.write_buf, "", chunk_size);
+        proto::write_execute(&mut self.write_buf, b"", chunk_size);
         proto::write_flush(&mut self.write_buf);
         self.flush_write()
     }
@@ -2590,12 +2601,12 @@ impl Connection {
                     has_exec_sync = true; // Template includes EXECUTE_SYNC.
                 } else {
                     self.write_buf.clear();
-                    proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+                    proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
                     // Invalidate stale template so we re-snapshot below.
                     info.bind_template = None;
                 }
             } else {
-                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
+                proto::write_bind_params(&mut self.write_buf, b"", &info.name, params);
             }
 
             let cols = if need_columns {
@@ -2620,12 +2631,11 @@ impl Connection {
         } else {
             // Cache miss: Parse+Describe+Bind+Execute+Sync
             let name = make_stmt_name(sql_hash);
-            let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', name_s);
-            proto::write_bind_params(&mut self.write_buf, "", name_s, params);
+            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_bind_params(&mut self.write_buf, b"", &name, params);
 
             self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
             self.flush_write()?;
@@ -2686,7 +2696,7 @@ impl Connection {
             && !self.stmts.contains_key(&sql_hash, &info.sql)
         {
             if let Some((_lru_hash, evicted)) = self.stmts.evict_lru() {
-                proto::write_close(&mut self.write_buf, b'S', evicted.name_str());
+                proto::write_close(&mut self.write_buf, b'S', &evicted.name);
             }
         }
         self.stmts.insert(sql_hash, info);

@@ -156,9 +156,11 @@ impl StmtInfo {
     /// Return the statement name as a `&str`.
     ///
     /// Safe because name contains only ASCII characters: 's', '_', and hex digits.
+    /// Only used in tests — production code passes `&self.name` ([u8; 18]) directly
+    /// to proto functions, avoiding UTF-8 validation overhead.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn name_str(&self) -> &str {
-        // SAFETY: name is built by make_stmt_name which only writes ASCII bytes.
         std::str::from_utf8(&self.name).expect("stmt name is ASCII")
     }
 }
@@ -465,7 +467,7 @@ mod tests {
     fn build_bind_template_basic() {
         let mut buf = Vec::new();
         let val: i32 = 42;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[&val as &(dyn Encode + Sync)]);
 
         let tmpl = build_bind_template(&buf, 1);
         assert!(tmpl.is_some());
@@ -479,7 +481,7 @@ mod tests {
     fn build_bind_template_null_param() {
         let mut buf = Vec::new();
         let val: Option<i32> = None;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[&val as &(dyn Encode + Sync)]);
 
         let tmpl = build_bind_template(&buf, 1);
         assert!(tmpl.is_some());
@@ -495,8 +497,8 @@ mod tests {
         let name: &str = "alice";
         proto::write_bind_params(
             &mut buf,
-            "",
-            "s_test",
+            b"",
+            b"s_test",
             &[&id as &(dyn Encode + Sync), &name as &(dyn Encode + Sync)],
         );
 
@@ -524,7 +526,7 @@ mod tests {
     fn build_bind_template_param_count_mismatch() {
         let mut buf = Vec::new();
         let val: i32 = 42;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[&val as &(dyn Encode + Sync)]);
 
         // Ask for 2 params but only 1 in the message.
         let tmpl = build_bind_template(&buf, 2);
@@ -540,7 +542,7 @@ mod tests {
     #[test]
     fn build_bind_template_zero_params() {
         let mut buf = Vec::new();
-        proto::write_bind_params(&mut buf, "", "s_test", &[]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[]);
         let tmpl = build_bind_template(&buf, 0);
         assert!(tmpl.is_some());
         let tmpl = tmpl.unwrap();
@@ -551,7 +553,7 @@ mod tests {
     fn build_bind_template_bool_param() {
         let mut buf = Vec::new();
         let val = true;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[&val as &(dyn Encode + Sync)]);
         let tmpl = build_bind_template(&buf, 1);
         assert!(tmpl.is_some());
         let tmpl = tmpl.unwrap();
@@ -563,7 +565,7 @@ mod tests {
     fn build_bind_template_i64_param() {
         let mut buf = Vec::new();
         let val: i64 = 123456789;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[&val as &(dyn Encode + Sync)]);
         let tmpl = build_bind_template(&buf, 1);
         assert!(tmpl.is_some());
         let tmpl = tmpl.unwrap();
@@ -575,7 +577,7 @@ mod tests {
     fn build_bind_template_f64_param() {
         let mut buf = Vec::new();
         let val: f64 = 3.14;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[&val as &(dyn Encode + Sync)]);
         let tmpl = build_bind_template(&buf, 1);
         assert!(tmpl.is_some());
         let tmpl = tmpl.unwrap();
@@ -586,7 +588,7 @@ mod tests {
     fn build_bind_template_str_param() {
         let mut buf = Vec::new();
         let val: &str = "hello world";
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[&val as &(dyn Encode + Sync)]);
         let tmpl = build_bind_template(&buf, 1);
         assert!(tmpl.is_some());
         let tmpl = tmpl.unwrap();
@@ -602,8 +604,8 @@ mod tests {
         let score: f64 = 9.9;
         proto::write_bind_params(
             &mut buf,
-            "",
-            "s_test",
+            b"",
+            b"s_test",
             &[
                 &id as &(dyn Encode + Sync),
                 &name as &(dyn Encode + Sync),
@@ -623,7 +625,7 @@ mod tests {
     fn build_bind_template_preserves_bytes() {
         let mut buf = Vec::new();
         let val: i32 = 42;
-        proto::write_bind_params(&mut buf, "", "s_test", &[&val as &(dyn Encode + Sync)]);
+        proto::write_bind_params(&mut buf, b"", b"s_test", &[&val as &(dyn Encode + Sync)]);
         let bind_len = buf.len();
         let tmpl = build_bind_template(&buf, 1).unwrap();
         // Template bytes = Bind message + EXECUTE_SYNC appended.
