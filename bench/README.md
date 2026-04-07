@@ -54,26 +54,26 @@ Single-row results (bsql 14.6 us vs C 15.4 us) are close — the difference is ~
 
 Both libraries spend ~80-85 us on PG engine time for INSERT. The remaining ~1-15 us is driver overhead. Measuring driver overhead in isolation requires instrumenting both codebases identically — we have not done this for libpq, so we do not claim a specific driver overhead ratio.
 
-## Memory
+## Memory (peak RSS)
 
-Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT queries + 1,000 INSERT queries, then exit. Measured externally via `/usr/bin/time -l` on macOS.
+Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT queries + 1,000 INSERT queries, then exit. Peak resident set size measured externally via `/usr/bin/time -l` on macOS. Built and measured by `mem/run_all.sh`.
 
-**Peak RSS** = total physical memory (includes shared libraries, text segment).
-**Peak footprint** = memory the process itself allocated (heap + stack, excludes shared libs).
+| Library | Peak RSS | vs bsql |
+|---|---|---|
+| **bsql** | **1.61 MB** | <kbd>x1</kbd> |
+| C (libpq) | 6.82 MB | <kbd>x4.2</kbd> |
+| sqlx (Rust) | 6.98 MB | <kbd>x4.3</kbd> |
+| diesel (Rust) | 7.34 MB | <kbd>x4.6</kbd> |
+| Go (pgx) | 17.3 MB | <kbd>x10.7</kbd> |
 
-| Library | Peak RSS | vs bsql | Peak footprint | vs bsql |
-|---|---|---|---|---|
-| **C (libpq)** | **0.90 MB** | <kbd>x0.5</kbd> | **0.74 MB** | <kbd>x0.7</kbd> |
-| **bsql** | **1.72 MB** | <kbd>x1</kbd> | **1.08 MB** | <kbd>x1</kbd> |
-| sqlx (Rust) | 7.00 MB | <kbd>x4.1</kbd> | 1.87 MB | <kbd>x1.7</kbd> |
-| diesel (Rust) | 7.36 MB | <kbd>x4.3</kbd> | 2.08 MB | <kbd>x1.9</kbd> |
-| Go (pgx) | 17.7 MB | <kbd>x10.3</kbd> | 9.52 MB | <kbd>x8.8</kbd> |
+Run the memory benchmarks:
+```bash
+BENCH_DATABASE_URL="host=/tmp dbname=bench_db" \
+BSQL_DATABASE_URL="postgres://YOUR_USER@localhost/bench_db?host=/tmp" \
+./mem/run_all.sh
+```
 
-C uses less memory because it has no Rust runtime overhead (thread-local storage, panic infrastructure, unwinding tables). bsql's RSS includes ~640KB of Rust std/runtime that C programs don't carry. The footprint difference (1.08 vs 0.74 MB) is 340KB — the actual heap overhead of bsql's statement cache, buffer pools, and type metadata.
-
-Among Rust libraries, bsql uses **1.7x less footprint** than sqlx and **1.9x less** than diesel. Go's garbage collector reserves ~10x more memory.
-
-Each binary does identical work: connect, 10K SELECTs by PK, 1K INSERTs, exit. No connection pooling variance -- bsql and sqlx use a pool with 1 connection, diesel and C use a single connection directly.
+Each binary does identical work: connect, 10K SELECTs by PK, 1K INSERTs, exit. bsql uses the driver directly (no pool, no tokio). C uses libpq with prepared statements. All binaries read every column of every row to prevent dead-code elimination.
 
 ## How to reproduce
 
