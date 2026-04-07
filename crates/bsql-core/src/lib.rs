@@ -68,6 +68,57 @@ pub mod driver_sqlite {
     pub const SQLITE_NULL: i32 = 5;
 }
 
+// --- Helper macros for async/sync conditional code generation ---
+//
+// These macros are used by `bsql::query!` generated code to conditionally
+// add/remove `async` and `.await` based on whether the `async` feature is
+// enabled. The cfg check happens here in bsql-core (where the feature is
+// defined), not in the user's crate.
+
+/// Conditionally adds `.await` when the `async` feature is enabled.
+/// In sync mode, passes the expression through unchanged.
+#[cfg(feature = "async")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __bsql_call {
+    ($expr:expr) => {
+        $expr.await
+    };
+}
+
+/// Conditionally adds `.await` when the `async` feature is enabled.
+/// In sync mode, passes the expression through unchanged.
+#[cfg(not(feature = "async"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __bsql_call {
+    ($expr:expr) => {
+        $expr
+    };
+}
+
+/// Conditionally adds `async` keyword to function definitions.
+/// In sync mode, emits a regular `fn`.
+#[cfg(feature = "async")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __bsql_fn {
+    ($(#[$meta:meta])* pub fn $($rest:tt)*) => {
+        $(#[$meta])* pub async fn $($rest)*
+    };
+}
+
+/// Conditionally adds `async` keyword to function definitions.
+/// In sync mode, emits a regular `fn`.
+#[cfg(not(feature = "async"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __bsql_fn {
+    ($(#[$meta:meta])* pub fn $($rest:tt)*) => {
+        $(#[$meta])* pub fn $($rest)*
+    };
+}
+
 pub use error::{BsqlError, BsqlResult};
 pub use executor::{Executor, OwnedResult};
 pub use listener::{Listener, Notification};

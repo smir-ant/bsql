@@ -79,17 +79,51 @@ impl Drop for OwnedResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Executor trait — async (RPITIT) when feature="async", sync otherwise
+// ---------------------------------------------------------------------------
+
 /// Execute a prepared query and return rows.
 ///
 /// The generated code calls `query_raw`, `query_raw_readonly`, and
 /// `execute_raw` on `&Pool`, `&PoolConnection`, or `&Transaction`.
 ///
-/// When the `async` feature is enabled and the pool connects via TCP,
-/// `acquire_async()` returns true async connections that use tokio I/O
-/// instead of blocking the worker thread. UDS connections remain sync
-/// (sub-millisecond, acceptable for tokio).
-pub trait Executor {
+/// When the `async` feature is enabled, methods return `impl Future + Send`
+/// via RPITIT (Return Position Impl Trait In Trait), enabling true async I/O
+/// without `block_in_place`. This requires Rust 1.75+ (MSRV is 1.85).
+///
+/// When the `async` feature is disabled, methods return results directly
+/// as regular synchronous functions. No tokio dependency.
+#[cfg(feature = "async")]
+pub trait Executor: Send + Sync {
     /// Execute a query and return all rows.
+    fn query_raw<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a;
+
+    /// Execute a read-only query. Routes to replicas when configured.
+    fn query_raw_readonly<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a;
+
+    /// Execute a query and return the number of affected rows.
+    fn execute_raw<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'a;
+}
+
+/// Sync variant of the Executor trait. No async runtime required.
+#[cfg(not(feature = "async"))]
+pub trait Executor {
     fn query_raw(
         &self,
         sql: &str,
@@ -97,7 +131,6 @@ pub trait Executor {
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult>;
 
-    /// Execute a read-only query. May route to replicas in the future.
     fn query_raw_readonly(
         &self,
         sql: &str,
@@ -105,7 +138,6 @@ pub trait Executor {
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult>;
 
-    /// Execute a query and return the number of affected rows.
     fn execute_raw(
         &self,
         sql: &str,
@@ -114,73 +146,68 @@ pub trait Executor {
     ) -> BsqlResult<u64>;
 }
 
-/// When async feature is enabled, use `acquire_async()` which auto-detects
-/// UDS vs TCP: UDS gets sync Connection (fast, sub-ms), TCP gets AsyncConnection
-/// (true async I/O via tokio, doesn't block the worker thread).
-///
-/// The `query_async` / `execute_async` methods on PoolGuard dispatch to the
-/// correct backend: sync I/O for UDS connections, async I/O for TCP.
-/// Since we need `.await` inside a sync trait method, we use
-/// `tokio::task::block_in_place` which allows blocking the current worker
-/// while letting other tokio tasks make progress.
+// ---------------------------------------------------------------------------
+// Pool — true async when feature="async", sync otherwise
+// ---------------------------------------------------------------------------
+
+/// True async: `acquire_async().await` + `query_async().await`. No
+/// `block_in_place`, no `Handle::current().block_on()`. The tokio scheduler
+/// can run other tasks while this connection waits for PostgreSQL.
 #[cfg(feature = "async")]
 impl Executor for Pool {
     #[inline]
-    fn query_raw(
-        &self,
-        sql: &str,
+    fn query_raw<'a>(
+        &'a self,
+        sql: &'a str,
         sql_hash: u64,
-        params: &[&(dyn Encode + Sync)],
-    ) -> BsqlResult<OwnedResult> {
-        let mut guard = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.inner.acquire_async())
-        })
-        .map_err(BsqlError::from)?;
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(guard.query_async(sql, sql_hash, params))
-        })
-        .map_err(BsqlError::from_driver_query)?;
-        Ok(OwnedResult::without_arena(result))
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        async move {
+            let mut guard = self.inner.acquire_async().await.map_err(BsqlError::from)?;
+            let result = guard
+                .query_async(sql, sql_hash, params)
+                .await
+                .map_err(BsqlError::from_driver_query)?;
+            Ok(OwnedResult::without_arena(result))
+        }
     }
 
     #[inline]
-    fn query_raw_readonly(
-        &self,
-        sql: &str,
+    fn query_raw_readonly<'a>(
+        &'a self,
+        sql: &'a str,
         sql_hash: u64,
-        params: &[&(dyn Encode + Sync)],
-    ) -> BsqlResult<OwnedResult> {
-        let pool = self.read_pool.as_ref().unwrap_or(&self.inner);
-        let mut guard = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(pool.acquire_async())
-        })
-        .map_err(BsqlError::from)?;
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(guard.query_async(sql, sql_hash, params))
-        })
-        .map_err(BsqlError::from_driver_query)?;
-        Ok(OwnedResult::without_arena(result))
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        async move {
+            let pool = self.read_pool.as_ref().unwrap_or(&self.inner);
+            let mut guard = pool.acquire_async().await.map_err(BsqlError::from)?;
+            let result = guard
+                .query_async(sql, sql_hash, params)
+                .await
+                .map_err(BsqlError::from_driver_query)?;
+            Ok(OwnedResult::without_arena(result))
+        }
     }
 
     #[inline]
-    fn execute_raw(
-        &self,
-        sql: &str,
+    fn execute_raw<'a>(
+        &'a self,
+        sql: &'a str,
         sql_hash: u64,
-        params: &[&(dyn Encode + Sync)],
-    ) -> BsqlResult<u64> {
-        let mut guard = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.inner.acquire_async())
-        })
-        .map_err(BsqlError::from)?;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(guard.execute_async(sql, sql_hash, params))
-        })
-        .map_err(BsqlError::from_driver_query)
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'a {
+        async move {
+            let mut guard = self.inner.acquire_async().await.map_err(BsqlError::from)?;
+            guard
+                .execute_async(sql, sql_hash, params)
+                .await
+                .map_err(BsqlError::from_driver_query)
+        }
     }
 }
 
-/// When async feature is NOT enabled, use plain sync `acquire()` + `query()`.
+/// Sync: plain `acquire()` + `query()`. No tokio.
 #[cfg(not(feature = "async"))]
 impl Executor for Pool {
     #[inline]
@@ -226,6 +253,55 @@ impl Executor for Pool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PoolConnection — always sync internally (mutex lock is instantaneous)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+impl Executor for PoolConnection {
+    #[inline]
+    fn query_raw<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        async move {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let result = guard
+                .query(sql, sql_hash, params)
+                .map_err(BsqlError::from_driver_query)?;
+            Ok(OwnedResult::without_arena(result))
+        }
+    }
+
+    #[inline]
+    fn query_raw_readonly<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        self.query_raw(sql, sql_hash, params)
+    }
+
+    #[inline]
+    fn execute_raw<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'a {
+        async move {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .execute(sql, sql_hash, params)
+                .map_err(BsqlError::from_driver_query)
+        }
+    }
+}
+
+#[cfg(not(feature = "async"))]
 impl Executor for PoolConnection {
     #[inline]
     fn query_raw(
@@ -265,6 +341,43 @@ impl Executor for PoolConnection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Transaction — always sync internally (mutex + driver call)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "async")]
+impl Executor for Transaction {
+    fn query_raw<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        async move { self.query_inner(sql, sql_hash, params) }
+    }
+
+    #[inline]
+    fn query_raw_readonly<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        self.query_raw(sql, sql_hash, params)
+    }
+
+    #[inline]
+    fn execute_raw<'a>(
+        &'a self,
+        sql: &'a str,
+        sql_hash: u64,
+        params: &'a [&'a (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'a {
+        async move { self.execute_inner(sql, sql_hash, params) }
+    }
+}
+
+#[cfg(not(feature = "async"))]
 impl Executor for Transaction {
     fn query_raw(
         &self,
