@@ -3000,6 +3000,258 @@ mod tests {
         assert_eq!(decoded.to_bits(), f64::NAN.to_bits());
     }
 
+    // --- Option<T> roundtrip for all scalar types ---
+
+    #[test]
+    fn option_bool_some_roundtrip() {
+        let val: Option<bool> = Some(true);
+        assert!(!val.is_null());
+        assert_eq!(val.type_oid(), 16);
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(decode_bool(&buf).unwrap());
+    }
+
+    #[test]
+    fn option_bool_none_is_null() {
+        let val: Option<bool> = None;
+        assert!(val.is_null());
+        assert_eq!(val.type_oid(), 0);
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn option_i16_some_roundtrip() {
+        let val: Option<i16> = Some(i16::MIN);
+        assert!(!val.is_null());
+        assert_eq!(val.type_oid(), 21);
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert_eq!(decode_i16(&buf).unwrap(), i16::MIN);
+    }
+
+    #[test]
+    fn option_i16_none_is_null() {
+        let val: Option<i16> = None;
+        assert!(val.is_null());
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn option_i64_some_roundtrip() {
+        let val: Option<i64> = Some(i64::MAX);
+        assert!(!val.is_null());
+        assert_eq!(val.type_oid(), 20);
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert_eq!(decode_i64(&buf).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn option_i64_none_is_null() {
+        let val: Option<i64> = None;
+        assert!(val.is_null());
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn option_f32_some_roundtrip() {
+        let val: Option<f32> = Some(f32::INFINITY);
+        assert!(!val.is_null());
+        assert_eq!(val.type_oid(), 700);
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert_eq!(decode_f32(&buf).unwrap(), f32::INFINITY);
+    }
+
+    #[test]
+    fn option_f32_none_is_null() {
+        let val: Option<f32> = None;
+        assert!(val.is_null());
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn option_f64_some_nan_roundtrip() {
+        let val: Option<f64> = Some(f64::NAN);
+        assert!(!val.is_null());
+        assert_eq!(val.type_oid(), 701);
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(decode_f64(&buf).unwrap().is_nan());
+    }
+
+    #[test]
+    fn option_f64_none_is_null() {
+        let val: Option<f64> = None;
+        assert!(val.is_null());
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn option_string_some_roundtrip() {
+        let val: Option<String> = Some("hello".to_owned());
+        assert!(!val.is_null());
+        assert_eq!(val.type_oid(), 25);
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert_eq!(decode_str(&buf).unwrap(), "hello");
+    }
+
+    #[test]
+    fn option_string_none_is_null() {
+        let val: Option<String> = None;
+        assert!(val.is_null());
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn option_vec_u8_some_roundtrip() {
+        let val: Option<Vec<u8>> = Some(vec![0xDE, 0xAD]);
+        assert!(!val.is_null());
+        assert_eq!(val.type_oid(), 17);
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert_eq!(decode_bytes(&buf), &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn option_vec_u8_none_is_null() {
+        let val: Option<Vec<u8>> = None;
+        assert!(val.is_null());
+        let mut buf = Vec::new();
+        val.encode_binary(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    // --- encode_at for variable-length types ---
+
+    #[test]
+    fn encode_at_vec_u8_same_size() {
+        let v = vec![1u8, 2, 3];
+        let mut dst = [0u8; 3];
+        assert!(v.encode_at(&mut dst));
+        assert_eq!(dst, [1, 2, 3]);
+    }
+
+    #[test]
+    fn encode_at_vec_u8_wrong_size() {
+        let v = vec![1u8, 2, 3];
+        let mut dst = [0u8; 5];
+        assert!(!v.encode_at(&mut dst));
+    }
+
+    #[test]
+    fn encode_at_byte_slice_same_size() {
+        let data: &[u8] = &[0xAA, 0xBB];
+        let mut dst = [0u8; 2];
+        assert!(data.encode_at(&mut dst));
+        assert_eq!(dst, [0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn encode_at_byte_slice_wrong_size() {
+        let data: &[u8] = &[0xAA, 0xBB];
+        let mut dst = [0u8; 4];
+        assert!(!data.encode_at(&mut dst));
+    }
+
+    #[test]
+    fn encode_at_string_same_size() {
+        let s = String::from("hi");
+        let mut dst = [0u8; 2];
+        assert!(s.encode_at(&mut dst));
+        assert_eq!(&dst, b"hi");
+    }
+
+    #[test]
+    fn encode_at_string_wrong_size() {
+        let s = String::from("hi");
+        let mut dst = [0u8; 5];
+        assert!(!s.encode_at(&mut dst));
+    }
+
+    // --- encode_param with NULL ---
+
+    #[test]
+    fn encode_param_null_option() {
+        // When param is_null(), wire protocol should NOT call encode_binary.
+        // encode_param writes length + data, but for NULL, the caller handles
+        // it differently (writes -1 length). encode_param just writes 0-length.
+        let val: Option<i32> = None;
+        let mut buf = Vec::new();
+        encode_param(&mut buf, &val);
+        // encode_param writes 4-byte length prefix + 0 bytes of data (since
+        // encode_binary is a no-op for None). Length = 0.
+        assert_eq!(buf.len(), 4);
+        let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(len, 0);
+    }
+
+    // --- decode_array with negative element count ---
+
+    #[test]
+    fn decode_array_negative_element_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_be_bytes()); // ndim=1
+        data.extend_from_slice(&0i32.to_be_bytes()); // has_null
+        data.extend_from_slice(&23i32.to_be_bytes()); // elem OID
+        data.extend_from_slice(&(-1i32).to_be_bytes()); // n_elements=-1 (negative!)
+        data.extend_from_slice(&1i32.to_be_bytes()); // lower_bound
+        let result = decode_array_i32(&data);
+        assert!(result.is_err(), "negative element count should error");
+        assert!(result.unwrap_err().to_string().contains("negative"));
+    }
+
+    // --- decode_array with excessive element count ---
+
+    #[test]
+    fn decode_array_excessive_element_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_be_bytes()); // ndim=1
+        data.extend_from_slice(&0i32.to_be_bytes()); // has_null
+        data.extend_from_slice(&23i32.to_be_bytes()); // elem OID
+        data.extend_from_slice(&20_000_000i32.to_be_bytes()); // way over 10M limit
+        data.extend_from_slice(&1i32.to_be_bytes()); // lower_bound
+        let result = decode_array_i32(&data);
+        assert!(result.is_err(), "excessive element count should error");
+        assert!(result.unwrap_err().to_string().contains("exceeds limit"));
+    }
+
+    // --- decode_array header too short ---
+
+    #[test]
+    fn decode_array_header_too_short() {
+        let data = [0u8; 8]; // less than 12 bytes minimum
+        let result = decode_array_i32(&data);
+        assert!(result.is_err(), "header too short should error");
+    }
+
+    // --- decode_array truncated dimension header ---
+
+    #[test]
+    fn decode_array_truncated_dimension_header() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_be_bytes()); // ndim=1
+        data.extend_from_slice(&0i32.to_be_bytes()); // has_null
+        data.extend_from_slice(&23i32.to_be_bytes()); // elem OID
+        // Missing n_elements and lower_bound (only 12 bytes, need 20)
+        let result = decode_array_i32(&data);
+        assert!(result.is_err(), "truncated dimension header should error");
+    }
+
     mod proptest_fuzz {
         use super::*;
         use proptest::prelude::*;

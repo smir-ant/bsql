@@ -511,6 +511,68 @@ mod tests {
         assert_eq!(k1, k2);
     }
 
+    // --- Gap: compute_key with bool params ---
+
+    #[test]
+    fn compute_key_bool_params() {
+        let t = true;
+        let f = false;
+        let k1 = Singleflight::compute_key(100, &[&t]);
+        let k2 = Singleflight::compute_key(100, &[&f]);
+        assert_ne!(k1, k2, "true and false should produce different keys");
+    }
+
+    #[test]
+    fn compute_key_bool_same_value_same_key() {
+        let a = true;
+        let b = true;
+        let k1 = Singleflight::compute_key(100, &[&a]);
+        let k2 = Singleflight::compute_key(100, &[&b]);
+        assert_eq!(k1, k2);
+    }
+
+    // --- Gap: compute_key with mixed types ---
+
+    #[test]
+    fn compute_key_mixed_types() {
+        let i = 42i32;
+        let s = "hello";
+        let b = true;
+        let k1 = Singleflight::compute_key(100, &[&i, &s, &b]);
+        let k2 = Singleflight::compute_key(100, &[&i, &s, &b]);
+        assert_eq!(k1, k2, "same mixed params should produce same key");
+    }
+
+    #[test]
+    fn compute_key_mixed_types_different_values() {
+        let i1 = 42i32;
+        let i2 = 43i32;
+        let s = "hello";
+        let k1 = Singleflight::compute_key(100, &[&i1, &s]);
+        let k2 = Singleflight::compute_key(100, &[&i2, &s]);
+        assert_ne!(k1, k2, "different int values should produce different keys");
+    }
+
+    // --- Gap: compute_key with f64 params ---
+
+    #[test]
+    fn compute_key_f64_params() {
+        let a = 3.14f64;
+        let b = 3.14f64;
+        let k1 = Singleflight::compute_key(100, &[&a]);
+        let k2 = Singleflight::compute_key(100, &[&b]);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn compute_key_f64_different_values() {
+        let a = 3.14f64;
+        let b = 2.71f64;
+        let k1 = Singleflight::compute_key(100, &[&a]);
+        let k2 = Singleflight::compute_key(100, &[&b]);
+        assert_ne!(k1, k2);
+    }
+
     // --- Leader complete with no followers ---
 
     #[test]

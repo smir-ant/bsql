@@ -1528,4 +1528,50 @@ mod tests {
         let arena = Arena::empty();
         assert_eq!(arena.get(0, 0), &[]);
     }
+
+    // --- Gap: get_str with unicode multi-byte ---
+
+    #[test]
+    fn get_str_unicode_multibyte() {
+        let mut arena = Arena::new();
+        let text = "\u{1F600}\u{00E9}";
+        let offset = arena.alloc_copy(text.as_bytes());
+        assert_eq!(arena.get_str(offset, text.len()), Some(text));
+    }
+
+    // --- Gap: release_arena of Arena::empty() does not panic ---
+
+    #[test]
+    fn release_arena_empty_does_not_panic() {
+        let arena = Arena::empty();
+        release_arena(arena); // Should not panic even though no chunks
+    }
+
+    // --- Gap: ValidatedRows blob_slice ---
+
+    #[test]
+    fn validated_rows_blob_slice_roundtrip() {
+        let mut arena = Arena::new();
+        let offset = arena.alloc_copy(&[0xDE, 0xAD]);
+        let rows: ValidatedRows<u32> =
+            ValidatedRows::new(vec![offset as u32], String::new(), arena);
+        let blob = rows.blob_slice(offset as u32, 2);
+        assert_eq!(blob, &[0xDE, 0xAD]);
+    }
+
+    // --- Gap: ValidatedRows deref and into_iter ---
+
+    #[test]
+    fn validated_rows_deref_and_for_loop() {
+        let arena = Arena::new();
+        let rows: ValidatedRows<i32> = ValidatedRows::new(vec![1, 2, 3], String::new(), arena);
+        let slice: &[i32] = &rows;
+        assert_eq!(slice, &[1, 2, 3]);
+
+        let mut sum = 0;
+        for &v in &rows {
+            sum += v;
+        }
+        assert_eq!(sum, 6);
+    }
 }

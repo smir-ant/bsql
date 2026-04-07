@@ -1702,6 +1702,37 @@ mod tests {
         assert_eq!(pool.inner.max_stmt_cache_size, 0);
     }
 
+    // --- Gap: stale_timeout builder config ---
+
+    #[test]
+    fn pool_builder_stale_timeout_default() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.stale_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn pool_builder_stale_timeout_custom() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .stale_timeout(Duration::from_secs(60))
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.stale_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn pool_builder_stale_timeout_zero() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .stale_timeout(Duration::from_secs(0))
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.stale_timeout, Duration::from_secs(0));
+    }
+
     // ===============================================================
     // PoolStatus
     // ===============================================================

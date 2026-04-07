@@ -2146,6 +2146,119 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("truncated"));
     }
 
+    // --- Gap: write_startup with multiple extra params ---
+
+    #[test]
+    fn startup_message_with_multiple_extra_params() {
+        let mut buf = Vec::new();
+        write_startup(
+            &mut buf,
+            "testuser",
+            "testdb",
+            &[
+                ("statement_timeout", "30s"),
+                ("application_name", "bsql_test"),
+            ],
+        );
+
+        let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(len as usize, buf.len());
+
+        let payload = &buf[8..];
+        let payload_str = String::from_utf8_lossy(payload);
+        assert!(
+            payload_str.contains("statement_timeout"),
+            "should contain statement_timeout"
+        );
+        assert!(payload_str.contains("30s"), "should contain timeout value");
+        assert!(
+            payload_str.contains("application_name"),
+            "should contain application_name"
+        );
+        assert!(
+            payload_str.contains("bsql_test"),
+            "should contain app name value"
+        );
+        assert_eq!(*buf.last().unwrap(), 0); // trailing NUL
+    }
+
+    // --- Gap: parse_simple_data_row with zero columns ---
+
+    #[test]
+    fn simple_data_row_zero_columns() {
+        let data = 0i16.to_be_bytes();
+        let row = parse_simple_data_row(&data).unwrap();
+        assert!(row.is_empty());
+    }
+
+    // --- Gap: parse_simple_data_row with multiple columns ---
+
+    #[test]
+    fn simple_data_row_multiple_columns() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&3i16.to_be_bytes()); // 3 columns
+        // col 0: "foo"
+        data.extend_from_slice(&3i32.to_be_bytes());
+        data.extend_from_slice(b"foo");
+        // col 1: NULL
+        data.extend_from_slice(&(-1i32).to_be_bytes());
+        // col 2: "bar"
+        data.extend_from_slice(&3i32.to_be_bytes());
+        data.extend_from_slice(b"bar");
+
+        let row = parse_simple_data_row(&data).unwrap();
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0], Some("foo".to_owned()));
+        assert_eq!(row[1], None);
+        assert_eq!(row[2], Some("bar".to_owned()));
+    }
+
+    // --- Gap: parse_simple_data_row truncated column header ---
+
+    #[test]
+    fn simple_data_row_truncated_column_header() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2i16.to_be_bytes()); // 2 columns
+        data.extend_from_slice(&3i32.to_be_bytes());
+        data.extend_from_slice(b"foo");
+        // Second column: missing length bytes
+        data.push(0); // only 1 byte, need 4
+        let result = parse_simple_data_row(&data);
+        assert!(result.is_err());
+    }
+
+    // --- Gap: parse_simple_data_row too short ---
+
+    #[test]
+    fn simple_data_row_too_short() {
+        let result = parse_simple_data_row(&[0]);
+        assert!(result.is_err());
+    }
+
+    // --- Gap: CopyInResponse with negative column count ---
+
+    #[test]
+    fn copy_in_response_negative_col_count() {
+        let mut payload = Vec::new();
+        payload.push(0); // format
+        payload.extend_from_slice(&(-1i16).to_be_bytes()); // negative column count
+        let result = parse_backend_message(b'G', &payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("negative"));
+    }
+
+    // --- Gap: CopyOutResponse with negative column count ---
+
+    #[test]
+    fn copy_out_response_negative_col_count() {
+        let mut payload = Vec::new();
+        payload.push(0); // format
+        payload.extend_from_slice(&(-1i16).to_be_bytes()); // negative column count
+        let result = parse_backend_message(b'H', &payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("negative"));
+    }
+
     mod proptest_fuzz {
         use super::*;
         use proptest::prelude::*;
