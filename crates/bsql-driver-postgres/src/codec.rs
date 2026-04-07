@@ -7,6 +7,26 @@
 
 use crate::DriverError;
 
+#[cfg(feature = "chrono")]
+use chrono::{Datelike, Timelike};
+
+// --- PG epoch constants ---
+//
+// PostgreSQL stores timestamps/dates relative to its own epoch: 2000-01-01 00:00:00 UTC.
+// These constants allow const arithmetic instead of constructing epoch objects at runtime.
+
+/// Seconds from Unix epoch (1970-01-01) to PG epoch (2000-01-01).
+#[cfg(any(feature = "time", feature = "chrono"))]
+const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
+
+/// Microseconds from Unix epoch to PG epoch.
+#[cfg(any(feature = "time", feature = "chrono"))]
+const PG_EPOCH_UNIX_MICROS: i64 = PG_EPOCH_UNIX_SECS * 1_000_000;
+
+/// Julian day number of 2000-01-01 (the PG epoch).
+#[cfg(feature = "time")]
+const PG_EPOCH_JULIAN_DAY: i32 = 2_451_545;
+
 // --- Encode trait ---
 
 /// Encode a Rust value into PostgreSQL binary format.
@@ -375,17 +395,11 @@ trait OffsetDateTimeExt {
 impl OffsetDateTimeExt for time::OffsetDateTime {
     #[inline]
     fn encode_pg_micros(&self) -> i64 {
-        // PG epoch: 2000-01-01 00:00:00 UTC
-        // PG stores timestamptz as i64 microseconds since PG epoch
-        let pg_epoch =
-            time::OffsetDateTime::from_unix_timestamp(946_684_800).expect("PG epoch is valid");
-        let diff = *self - pg_epoch;
-        let micros_128 = diff.whole_microseconds();
-        if micros_128 >= i64::MIN as i128 && micros_128 <= i64::MAX as i128 {
-            micros_128 as i64
-        } else {
-            if micros_128 < 0 { i64::MIN } else { i64::MAX }
-        }
+        // PG stores timestamptz as i64 microseconds since PG epoch (2000-01-01).
+        // Use const arithmetic instead of constructing an epoch OffsetDateTime.
+        let unix_nanos = self.unix_timestamp_nanos();
+        let unix_micros = (unix_nanos / 1000) as i64;
+        unix_micros.saturating_sub(PG_EPOCH_UNIX_MICROS)
     }
 }
 
@@ -420,11 +434,9 @@ trait DateExt {
 impl DateExt for time::Date {
     #[inline]
     fn encode_pg_days(&self) -> i32 {
-        // PG stores date as i32 days since 2000-01-01
-        let pg_epoch = time::Date::from_calendar_date(2000, time::Month::January, 1)
-            .expect("PG epoch date is valid");
-        let days_i64 = (*self - pg_epoch).whole_days();
-        i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX })
+        // PG stores date as i32 days since 2000-01-01.
+        // Use Julian day arithmetic instead of constructing an epoch Date.
+        self.to_julian_day() - PG_EPOCH_JULIAN_DAY
     }
 }
 
@@ -498,17 +510,11 @@ impl PrimitiveDateTimeExt for time::PrimitiveDateTime {
     #[inline]
     fn encode_pg_micros(&self) -> i64 {
         // TIMESTAMP (without tz) has the same binary format as TIMESTAMPTZ:
-        // i64 microseconds since PG epoch (2000-01-01 00:00:00)
-        let pg_epoch =
-            time::OffsetDateTime::from_unix_timestamp(946_684_800).expect("PG epoch is valid");
-        let as_utc = self.assume_utc();
-        let diff = as_utc - pg_epoch;
-        let micros_128 = diff.whole_microseconds();
-        if micros_128 >= i64::MIN as i128 && micros_128 <= i64::MAX as i128 {
-            micros_128 as i64
-        } else {
-            if micros_128 < 0 { i64::MIN } else { i64::MAX }
-        }
+        // i64 microseconds since PG epoch (2000-01-01 00:00:00).
+        // Use const arithmetic instead of constructing an epoch OffsetDateTime.
+        let unix_nanos = self.assume_utc().unix_timestamp_nanos();
+        let unix_micros = (unix_nanos / 1000) as i64;
+        unix_micros.saturating_sub(PG_EPOCH_UNIX_MICROS)
     }
 }
 
@@ -544,9 +550,8 @@ impl NaiveDateTimeExt for chrono::NaiveDateTime {
     #[inline]
     fn encode_pg_micros(&self) -> i64 {
         // TIMESTAMP has same binary format: i64 microseconds since PG epoch
-        let pg_epoch_unix_micros: i64 = 946_684_800 * 1_000_000;
         let unix_micros = self.and_utc().timestamp_micros();
-        unix_micros.saturating_sub(pg_epoch_unix_micros)
+        unix_micros.saturating_sub(PG_EPOCH_UNIX_MICROS)
     }
 }
 
@@ -582,9 +587,8 @@ impl ChronoDateTimeUtcExt for chrono::DateTime<chrono::Utc> {
     #[inline]
     fn encode_pg_micros(&self) -> i64 {
         // PG epoch: 2000-01-01 00:00:00 UTC = Unix timestamp 946684800
-        let pg_epoch_unix_micros: i64 = 946_684_800 * 1_000_000;
         let unix_micros = self.timestamp_micros();
-        unix_micros.saturating_sub(pg_epoch_unix_micros)
+        unix_micros.saturating_sub(PG_EPOCH_UNIX_MICROS)
     }
 }
 
@@ -619,8 +623,11 @@ trait ChronoNaiveDateExt {
 impl ChronoNaiveDateExt for chrono::NaiveDate {
     #[inline]
     fn encode_pg_days(&self) -> i32 {
-        let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("PG epoch date valid");
-        let days_i64 = (*self - pg_epoch).num_days();
+        // Use const days offset instead of constructing an epoch NaiveDate.
+        // chrono NaiveDate doesn't have to_julian_day, but num_days_from_ce() works:
+        // PG epoch (2000-01-01) num_days_from_ce = 730120
+        const PG_EPOCH_CE_DAYS: i32 = 730_120;
+        let days_i64 = (self.num_days_from_ce() - PG_EPOCH_CE_DAYS) as i64;
         i32::try_from(days_i64).unwrap_or(if days_i64 < 0 { i32::MIN } else { i32::MAX })
     }
 }
@@ -656,12 +663,11 @@ trait ChronoNaiveTimeExt {
 impl ChronoNaiveTimeExt for chrono::NaiveTime {
     #[inline]
     fn encode_pg_micros(&self) -> i64 {
-        // Midnight (00:00:00) is infallibly valid -- this .expect() can never fail.
-        let midnight = chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is always valid");
-        let diff = *self - midnight;
-        // Panic on None instead of silently encoding midnight (0).
-        diff.num_microseconds()
-            .expect("time-of-day difference always fits i64")
+        // Use num_seconds_from_midnight() to avoid constructing a midnight object.
+        let secs = self.num_seconds_from_midnight() as i64;
+        let nanos = self.nanosecond() % 1_000_000_000; // strip leap-second flag
+        let micros_in_sec = (nanos / 1000) as i64;
+        secs * 1_000_000 + micros_in_sec
     }
 }
 
@@ -698,52 +704,60 @@ impl Encode for rust_decimal::Decimal {
         let abs = self.abs();
         let mut mantissa = abs.mantissa().unsigned_abs();
 
-        // Collect decimal digits (max ~39 for u128, SmallVec caps at 32 inline)
-        let mut decimal_digits: smallvec::SmallVec<[i16; 32]> = smallvec::SmallVec::new();
-        while mantissa > 0 {
-            decimal_digits.push((mantissa % 10) as i16);
-            mantissa /= 10;
-        }
-        decimal_digits.reverse();
-
-        // decimal_digits now has the full unscaled number.
-        // The decimal point is `scale` digits from the right.
-        // Integer part length:
-        let total_digits = decimal_digits.len();
+        // Count decimal digits in mantissa to determine integer/fractional split.
+        let total_digits = if mantissa == 0 {
+            1
+        } else {
+            // ceil(log10(mantissa+1)) — exact for u128
+            let mut n = 0usize;
+            let mut tmp = mantissa;
+            while tmp > 0 {
+                tmp /= 10;
+                n += 1;
+            }
+            n
+        };
         let int_len = total_digits.saturating_sub(scale as usize);
+        let frac_len = total_digits - int_len;
 
-        // Pad integer part on the left so its length is a multiple of 4
+        // Pad the fractional part to a multiple of 4 digits on the right by
+        // multiplying the mantissa. This aligns the base-10000 boundary with
+        // the decimal point so divide-by-10000 produces correctly aligned groups.
+        let frac_pad = (4 - (frac_len % 4)) % 4;
+        for _ in 0..frac_pad {
+            mantissa *= 10;
+        }
+
+        // Pad the integer part to a multiple of 4 digits on the left.
+        // We don't need to multiply — we just need to track the padding for weight.
         let int_pad = if int_len > 0 {
             (4 - (int_len % 4)) % 4
         } else {
             0
         };
-        // Pad fractional part on the right so total is a multiple of 4
-        let frac_len = total_digits - int_len;
-        let frac_pad = (4 - (frac_len % 4)) % 4;
 
-        let mut padded: smallvec::SmallVec<[i16; 32]> = smallvec::SmallVec::new();
-        padded.extend(std::iter::repeat_n(0i16, int_pad));
-        padded.extend_from_slice(&decimal_digits);
-        padded.extend(std::iter::repeat_n(0i16, frac_pad));
-
-        // Group into base-10000 digits
+        // Extract base-10000 digits directly (~4x fewer u128 divisions than /10).
         let mut pg_digits: smallvec::SmallVec<[i16; 12]> = smallvec::SmallVec::new();
-        for chunk in padded.chunks(4) {
-            let d = chunk[0] * 1000 + chunk[1] * 100 + chunk[2] * 10 + chunk[3];
-            pg_digits.push(d);
+        while mantissa > 0 {
+            pg_digits.push((mantissa % 10000) as i16);
+            mantissa /= 10000;
         }
+        pg_digits.reverse();
 
-        // Strip trailing zero groups from the fractional part
-        let int_groups = (int_len + int_pad) / 4;
+        // Strip trailing zero groups from the fractional part.
+        let int_groups = if int_len > 0 {
+            (int_len + int_pad) / 4
+        } else {
+            0
+        };
         while pg_digits.len() > int_groups && pg_digits.last().copied() == Some(0) {
             pg_digits.pop();
         }
 
         let ndigits = pg_digits.len() as i16;
 
+        // Weight = exponent of the first base-10000 digit.
         // For large scales, cast to i16 only at the end with saturation.
-        // Both branches clamp to i16 range since PG weight is i16 on the wire.
         let weight: i16 = if int_len > 0 {
             let w = ((int_len + int_pad) / 4 - 1) as i32;
             w.clamp(i16::MIN as i32, i16::MAX as i32) as i16
@@ -751,7 +765,6 @@ impl Encode for rust_decimal::Decimal {
             // Pure fractional: weight is negative
             // E.g., 0.0001 has weight -1 (first group is 10^-4)
             let w = -((scale as usize - frac_len + frac_pad) as i32 / 4 + 1);
-            // Clamp to i16 range (PG weight is i16 on the wire)
             w.clamp(i16::MIN as i32, i16::MAX as i32) as i16
         };
 
@@ -920,9 +933,11 @@ fn encode_array_header(buf: &mut Vec<u8>, n_elements: usize, elem_oid: u32) {
 impl Encode for [bool] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 16);
+        // Pre-allocate: 4 (len prefix) + 1 (data) = 5 bytes per element
+        buf.reserve(self.len() * 5);
         for val in self {
-            buf.extend_from_slice(&1i32.to_be_bytes()); // elem_len = 1
-            buf.push(if *val { 1 } else { 0 });
+            let tmp = [0u8, 0, 0, 1, if *val { 1 } else { 0 }];
+            buf.extend_from_slice(&tmp);
         }
     }
 
@@ -959,9 +974,13 @@ impl Encode for Vec<bool> {
 impl Encode for [i16] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 21);
+        // Pre-allocate: 4 (len prefix) + 2 (data) = 6 bytes per element
+        buf.reserve(self.len() * 6);
         for val in self {
-            buf.extend_from_slice(&2i32.to_be_bytes()); // elem_len = 2
-            buf.extend_from_slice(&val.to_be_bytes());
+            let mut tmp = [0u8; 6];
+            tmp[0..4].copy_from_slice(&2i32.to_be_bytes());
+            tmp[4..6].copy_from_slice(&val.to_be_bytes());
+            buf.extend_from_slice(&tmp);
         }
     }
 
@@ -998,9 +1017,13 @@ impl Encode for Vec<i16> {
 impl Encode for [i32] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 23);
+        // Pre-allocate: 4 (len prefix) + 4 (data) = 8 bytes per element
+        buf.reserve(self.len() * 8);
         for val in self {
-            buf.extend_from_slice(&4i32.to_be_bytes()); // elem_len = 4
-            buf.extend_from_slice(&val.to_be_bytes());
+            let mut tmp = [0u8; 8];
+            tmp[0..4].copy_from_slice(&4i32.to_be_bytes());
+            tmp[4..8].copy_from_slice(&val.to_be_bytes());
+            buf.extend_from_slice(&tmp);
         }
     }
 
@@ -1037,9 +1060,13 @@ impl Encode for Vec<i32> {
 impl Encode for [i64] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 20);
+        // Pre-allocate: 4 (len prefix) + 8 (data) = 12 bytes per element
+        buf.reserve(self.len() * 12);
         for val in self {
-            buf.extend_from_slice(&8i32.to_be_bytes()); // elem_len = 8
-            buf.extend_from_slice(&val.to_be_bytes());
+            let mut tmp = [0u8; 12];
+            tmp[0..4].copy_from_slice(&8i32.to_be_bytes());
+            tmp[4..12].copy_from_slice(&val.to_be_bytes());
+            buf.extend_from_slice(&tmp);
         }
     }
 
@@ -1076,9 +1103,13 @@ impl Encode for Vec<i64> {
 impl Encode for [f32] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 700);
+        // Pre-allocate: 4 (len prefix) + 4 (data) = 8 bytes per element
+        buf.reserve(self.len() * 8);
         for val in self {
-            buf.extend_from_slice(&4i32.to_be_bytes()); // elem_len = 4
-            buf.extend_from_slice(&val.to_be_bytes());
+            let mut tmp = [0u8; 8];
+            tmp[0..4].copy_from_slice(&4i32.to_be_bytes());
+            tmp[4..8].copy_from_slice(&val.to_be_bytes());
+            buf.extend_from_slice(&tmp);
         }
     }
 
@@ -1115,9 +1146,13 @@ impl Encode for Vec<f32> {
 impl Encode for [f64] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 701);
+        // Pre-allocate: 4 (len prefix) + 8 (data) = 12 bytes per element
+        buf.reserve(self.len() * 12);
         for val in self {
-            buf.extend_from_slice(&8i32.to_be_bytes()); // elem_len = 8
-            buf.extend_from_slice(&val.to_be_bytes());
+            let mut tmp = [0u8; 12];
+            tmp[0..4].copy_from_slice(&8i32.to_be_bytes());
+            tmp[4..12].copy_from_slice(&val.to_be_bytes());
+            buf.extend_from_slice(&tmp);
         }
     }
 
@@ -1426,11 +1461,15 @@ pub fn decode_timestamptz_time(data: &[u8]) -> Result<time::OffsetDateTime, Driv
 #[inline]
 pub fn decode_date_time(data: &[u8]) -> Result<time::Date, DriverError> {
     let days = decode_i32(data)?;
-    let pg_epoch = time::Date::from_calendar_date(2000, time::Month::January, 1)
-        .expect("PG epoch date is valid");
-    pg_epoch
-        .checked_add(time::Duration::days(days as i64))
-        .ok_or_else(|| DriverError::Protocol(format!("date out of range: {days} days")))
+    // Use Julian day arithmetic instead of constructing an epoch Date.
+    let julian_day = PG_EPOCH_JULIAN_DAY as i64 + days as i64;
+    if julian_day < i32::MIN as i64 || julian_day > i32::MAX as i64 {
+        return Err(DriverError::Protocol(format!(
+            "date out of range: {days} days"
+        )));
+    }
+    time::Date::from_julian_day(julian_day as i32)
+        .map_err(|_| DriverError::Protocol(format!("date out of range: {days} days")))
 }
 
 /// Decode PG time (i64 microseconds since midnight) to `time::Time`.
@@ -1474,15 +1513,16 @@ pub fn decode_timestamptz_chrono(
 #[inline]
 pub fn decode_date_chrono(data: &[u8]) -> Result<chrono::NaiveDate, DriverError> {
     let days = decode_i32(data)?;
-    let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).expect("PG epoch valid");
-
-    // silently mapped ALL dates before 2000-01-01 to epoch. Check sign first.
-    let result = if days >= 0 {
-        pg_epoch.checked_add_days(chrono::Days::new(days as u64))
-    } else {
-        pg_epoch.checked_sub_days(chrono::Days::new(days.unsigned_abs() as u64))
-    };
-    result.ok_or_else(|| DriverError::Protocol(format!("date out of range: {days} days")))
+    // Use const CE-day arithmetic instead of constructing an epoch NaiveDate.
+    const PG_EPOCH_CE_DAYS: i32 = 730_120;
+    let ce_days = PG_EPOCH_CE_DAYS as i64 + days as i64;
+    if ce_days < i32::MIN as i64 || ce_days > i32::MAX as i64 {
+        return Err(DriverError::Protocol(format!(
+            "date out of range: {days} days"
+        )));
+    }
+    chrono::NaiveDate::from_num_days_from_ce_opt(ce_days as i32)
+        .ok_or_else(|| DriverError::Protocol(format!("date out of range: {days} days")))
 }
 
 /// Decode PG time to `chrono::NaiveTime`.

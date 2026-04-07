@@ -180,7 +180,8 @@ pub(crate) struct BindTemplate {
     /// For each parameter: `(data_offset, data_len)` within `bytes`.
     /// `data_offset` points to the first byte of param data (after the i32 length).
     /// `data_len` is the length of the param data. -1 means NULL.
-    pub(crate) param_slots: Vec<(usize, i32)>,
+    /// SmallVec avoids heap allocation for queries with <= 8 parameters (the common case).
+    pub(crate) param_slots: smallvec::SmallVec<[(usize, i32); 8]>,
 }
 
 // --- Bind template builder ---
@@ -231,7 +232,7 @@ pub(crate) fn build_bind_template(write_buf: &[u8], param_count: usize) -> Optio
         return None;
     }
 
-    let mut param_slots = Vec::with_capacity(param_count);
+    let mut param_slots = smallvec::SmallVec::with_capacity(param_count);
     for _ in 0..param_count {
         if pos + 4 > write_buf.len() {
             return None;

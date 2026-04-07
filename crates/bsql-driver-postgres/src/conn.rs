@@ -103,23 +103,26 @@ pub fn release_col_offsets(buf: Vec<(usize, i32)>) {
 /// # }
 /// ```
 pub struct Connection {
-    stream: Stream,
-    read_buf: Vec<u8>,
-    stream_buf: Vec<u8>,
+    // Hot path (first 64 bytes — first cache line)
     stream_buf_pos: usize,
     stream_buf_end: usize,
-    write_buf: Vec<u8>,
-    stmts: StmtCache,
-    params: Vec<(Box<str>, Box<str>)>,
+    query_counter: u64,
+    tx_status: u8,
+    streaming_active: bool,
     pid: i32,
     secret: i32,
-    tx_status: u8,
+    max_stmt_cache_size: usize,
+    // Second cache line: buffers
+    stream: Stream,
+    write_buf: Vec<u8>,
+    stream_buf: Vec<u8>,
+    stmts: StmtCache,
+    // Cold fields
+    read_buf: Vec<u8>,
+    params: Vec<(Box<str>, Box<str>)>,
     last_used: std::time::Instant,
-    streaming_active: bool,
     created_at: std::time::Instant,
     pending_notifications: Vec<Notification>,
-    max_stmt_cache_size: usize,
-    query_counter: u64,
     /// The config used to connect — stored for cancel() which needs host:port.
     /// Wrapped in Arc to avoid cloning 5 Strings per connection open.
     connect_config: Arc<Config>,
@@ -239,24 +242,28 @@ impl Connection {
             }
         };
 
+        let now = std::time::Instant::now();
         let mut conn = Self {
-            stream,
-            read_buf: Vec::with_capacity(8192),
-            stream_buf: vec![0u8; 65536],
+            // Hot path
             stream_buf_pos: 0,
             stream_buf_end: 0,
-            write_buf: Vec::with_capacity(4096),
-            stmts: StmtCache::default(),
-            params: Vec::new(),
+            query_counter: 0,
+            tx_status: b'I',
+            streaming_active: false,
             pid: 0,
             secret: 0,
-            tx_status: b'I',
-            last_used: std::time::Instant::now(),
-            streaming_active: false,
-            created_at: std::time::Instant::now(),
-            pending_notifications: Vec::new(),
             max_stmt_cache_size: 256,
-            query_counter: 0,
+            // Buffers
+            stream,
+            write_buf: Vec::with_capacity(4096),
+            stream_buf: vec![0u8; 65536],
+            stmts: StmtCache::default(),
+            // Cold
+            read_buf: Vec::with_capacity(8192),
+            params: Vec::new(),
+            last_used: now,
+            created_at: now,
+            pending_notifications: Vec::new(),
             connect_config: config.clone(),
             tls_server_cert_hash: tls_cert_hash,
         };
