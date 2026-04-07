@@ -557,8 +557,8 @@ mod tests {
 
     #[test]
     fn compute_key_f64_params() {
-        let a = 3.14f64;
-        let b = 3.14f64;
+        let a = 1.23f64;
+        let b = 1.23f64;
         let k1 = Singleflight::compute_key(100, &[&a]);
         let k2 = Singleflight::compute_key(100, &[&b]);
         assert_eq!(k1, k2);
@@ -566,8 +566,8 @@ mod tests {
 
     #[test]
     fn compute_key_f64_different_values() {
-        let a = 3.14f64;
-        let b = 2.71f64;
+        let a = 1.23f64;
+        let b = 4.56f64;
         let k1 = Singleflight::compute_key(100, &[&a]);
         let k2 = Singleflight::compute_key(100, &[&b]);
         assert_ne!(k1, k2);
