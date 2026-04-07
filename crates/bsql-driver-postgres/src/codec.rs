@@ -704,67 +704,90 @@ impl Encode for rust_decimal::Decimal {
         let abs = self.abs();
         let mut mantissa = abs.mantissa().unsigned_abs();
 
-        // Count decimal digits in mantissa to determine integer/fractional split.
-        let total_digits = if mantissa == 0 {
-            1
-        } else {
-            // ceil(log10(mantissa+1)) — exact for u128
-            let mut n = 0usize;
-            let mut tmp = mantissa;
-            while tmp > 0 {
-                tmp /= 10;
-                n += 1;
-            }
-            n
-        };
-        let int_len = total_digits.saturating_sub(scale as usize);
-        let frac_len = total_digits - int_len;
-
-        // Pad the fractional part to a multiple of 4 digits on the right by
-        // multiplying the mantissa. This aligns the base-10000 boundary with
-        // the decimal point so divide-by-10000 produces correctly aligned groups.
-        let frac_pad = (4 - (frac_len % 4)) % 4;
-        for _ in 0..frac_pad {
-            mantissa *= 10;
+        // Collect decimal digits of mantissa (max ~39 for u128)
+        let mut decimal_digits: smallvec::SmallVec<[i16; 32]> = smallvec::SmallVec::new();
+        while mantissa > 0 {
+            decimal_digits.push((mantissa % 10) as i16);
+            mantissa /= 10;
         }
+        decimal_digits.reverse();
 
-        // Pad the integer part to a multiple of 4 digits on the left.
-        // We don't need to multiply — we just need to track the padding for weight.
+        // The mantissa digits represent the unscaled number. The decimal
+        // point sits `scale` positions from the right. For 0.001 (mantissa=1,
+        // scale=3), decimal_digits=[1] and the value is 1 × 10^-3.
+        let total_digits = decimal_digits.len();
+        let scale_usize = scale as usize;
+        let int_len = total_digits.saturating_sub(scale_usize);
+        let sig_frac_len = total_digits - int_len; // significant fractional digits
+
+        // Build padded digit sequence aligned to base-10000 boundaries:
+        //   [int_pad zeros][integer digits][implicit frac zeros][significant frac digits][frac_pad zeros]
+        let mut padded: smallvec::SmallVec<[i16; 32]> = smallvec::SmallVec::new();
+
+        // Integer part: pad left to multiple of 4
         let int_pad = if int_len > 0 {
             (4 - (int_len % 4)) % 4
         } else {
             0
         };
+        padded.extend(std::iter::repeat_n(0i16, int_pad));
+        padded.extend_from_slice(&decimal_digits[..int_len]);
 
-        // Extract base-10000 digits directly (~4x fewer u128 divisions than /10).
+        // Fractional part: implicit leading zeros (scale - sig_frac_len)
+        // then significant digits, then pad right to multiple of 4.
+        // E.g., 0.001: scale=3, sig_frac_len=1 → 2 implicit zeros → [0,0,1]
+        let implicit_zeros = scale_usize.saturating_sub(sig_frac_len);
+        padded.extend(std::iter::repeat_n(0i16, implicit_zeros));
+        padded.extend_from_slice(&decimal_digits[int_len..]);
+        let frac_total = implicit_zeros + sig_frac_len; // = scale_usize
+        let frac_pad = (4 - (frac_total % 4)) % 4;
+        padded.extend(std::iter::repeat_n(0i16, frac_pad));
+
+        // Group into base-10000 digits
         let mut pg_digits: smallvec::SmallVec<[i16; 12]> = smallvec::SmallVec::new();
-        while mantissa > 0 {
-            pg_digits.push((mantissa % 10000) as i16);
-            mantissa /= 10000;
+        for chunk in padded.chunks(4) {
+            let d = chunk[0] * 1000 + chunk[1] * 100 + chunk[2] * 10 + chunk[3];
+            pg_digits.push(d);
         }
-        pg_digits.reverse();
 
-        // Strip trailing zero groups from the fractional part.
+        // Integer group count (for weight and stripping)
         let int_groups = if int_len > 0 {
             (int_len + int_pad) / 4
         } else {
             0
         };
-        while pg_digits.len() > int_groups && pg_digits.last().copied() == Some(0) {
+
+        // Strip leading zero groups from fractional part (adjust weight)
+        let mut leading_frac_zeros = 0usize;
+        for i in int_groups..pg_digits.len() {
+            if pg_digits[i] == 0 {
+                leading_frac_zeros += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Strip trailing zero groups from fractional part
+        while pg_digits.len() > int_groups + leading_frac_zeros
+            && pg_digits.last().copied() == Some(0)
+        {
             pg_digits.pop();
+        }
+
+        // Remove leading fractional zeros (they affect weight, not digit values)
+        if leading_frac_zeros > 0 {
+            pg_digits.drain(int_groups..int_groups + leading_frac_zeros);
         }
 
         let ndigits = pg_digits.len() as i16;
 
-        // Weight = exponent of the first base-10000 digit.
-        // For large scales, cast to i16 only at the end with saturation.
-        let weight: i16 = if int_len > 0 {
-            let w = ((int_len + int_pad) / 4 - 1) as i32;
+        // Weight = exponent of the first base-10000 digit group.
+        let weight: i16 = if int_groups > 0 {
+            let w = (int_groups - 1) as i32;
             w.clamp(i16::MIN as i32, i16::MAX as i32) as i16
         } else {
-            // Pure fractional: weight is negative
-            // E.g., 0.0001 has weight -1 (first group is 10^-4)
-            let w = -((scale as usize - frac_len + frac_pad) as i32 / 4 + 1);
+            // Pure fractional: negative weight based on leading zero groups skipped
+            let w = -(leading_frac_zeros as i32 + 1);
             w.clamp(i16::MIN as i32, i16::MAX as i32) as i16
         };
 
@@ -2125,6 +2148,99 @@ mod tests {
         // rust_decimal preserves trailing zeros from dscale, normalize to compare value
         let dec_normalized = dec.normalize();
         assert_eq!(dec_normalized.to_string(), "0.001");
+    }
+
+    // --- Decimal encode round-trip tests ---
+    // These verify that encode → decode produces the original value.
+    // Critical for catching regressions in the PG NUMERIC encoder.
+
+    #[cfg(feature = "decimal")]
+    fn decimal_encode_roundtrip(s: &str) {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        let original = Decimal::from_str(s).unwrap();
+        let mut buf = Vec::new();
+        original.encode_binary(&mut buf);
+        let decoded = decode_numeric_decimal(&buf).unwrap();
+        assert_eq!(
+            decoded.normalize().to_string(),
+            original.normalize().to_string(),
+            "round-trip failed for {s}: encoded {} bytes",
+            buf.len()
+        );
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_zero() {
+        decimal_encode_roundtrip("0");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_one() {
+        decimal_encode_roundtrip("1");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_negative() {
+        decimal_encode_roundtrip("-42.5");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_large_integer() {
+        decimal_encode_roundtrip("123456789");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_pure_fractional_0001() {
+        decimal_encode_roundtrip("0.001");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_pure_fractional_00001() {
+        decimal_encode_roundtrip("0.0001");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_pure_fractional_000001() {
+        decimal_encode_roundtrip("0.00001");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_mixed() {
+        decimal_encode_roundtrip("12345.6789");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_trailing_zeros() {
+        decimal_encode_roundtrip("100.00");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_small_negative_fraction() {
+        decimal_encode_roundtrip("-0.007");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_high_scale() {
+        // rust_decimal max scale is 28
+        decimal_encode_roundtrip("0.0000000000000000000000000001");
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn decimal_roundtrip_large_with_fraction() {
+        decimal_encode_roundtrip("999999999999999999.999999999999");
     }
 
     // #18: decode_array_elements empty (ndim=0)

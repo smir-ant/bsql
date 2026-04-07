@@ -392,7 +392,7 @@ bsql = { version = "0.20", default-features = false }
 
 Same `query!` macro, same zero-copy fetch. Sync mode is pure `fn` -- no async runtime, no `.await`, no tokio in your dependency tree.
 
-Internal I/O is always synchronous (blocking TCP/UDS). The async wrapper uses `tokio::task::block_in_place` to integrate with the tokio scheduler without blocking other tasks. Unix domain socket connections use sync I/O directly (sub-millisecond, acceptable for tokio).
+When async is enabled, TCP connections use true async I/O via tokio — the scheduler can run other tasks while waiting for PostgreSQL. Unix domain socket connections use sync I/O (sub-millisecond, no benefit from async). No `block_in_place`, no `Handle::current().block_on()` — the Executor trait uses RPITIT (`-> impl Future + Send`) for genuine cooperative scheduling.
 
 </details>
 
