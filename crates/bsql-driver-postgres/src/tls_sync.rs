@@ -8,13 +8,15 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::proto;
 use crate::DriverError;
 
 /// Cached TLS client config. Built once, reused for all connections.
-static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
+static TLS_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+
+fn init_tls_config() -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     Arc::new(
@@ -22,7 +24,7 @@ static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
             .with_root_certificates(root_store)
             .with_no_client_auth(),
     )
-});
+}
 
 /// Result of a successful TLS upgrade, carrying both the encrypted stream
 /// and the SHA-256 hash of the server's end-entity certificate (for SCRAM
@@ -70,8 +72,11 @@ pub fn try_upgrade(
                     DriverError::Protocol(format!("invalid TLS server name '{host}': {e}"))
                 })?;
 
-            let tls_conn = rustls::ClientConnection::new(TLS_CONFIG.clone(), server_name)
-                .map_err(|e| DriverError::Io(std::io::Error::other(e)))?;
+            let tls_conn = rustls::ClientConnection::new(
+                TLS_CONFIG.get_or_init(init_tls_config).clone(),
+                server_name,
+            )
+            .map_err(|e| DriverError::Io(std::io::Error::other(e)))?;
 
             let stream = rustls::StreamOwned::new(tls_conn, tcp);
 
@@ -118,9 +123,9 @@ mod tests {
 
     #[test]
     fn tls_sync_config_cached() {
-        // Verify the LazyLock TLS config is accessible and reusable
-        let c1 = TLS_CONFIG.clone();
-        let c2 = TLS_CONFIG.clone();
+        // Verify the OnceLock TLS config is accessible and reusable
+        let c1 = TLS_CONFIG.get_or_init(init_tls_config).clone();
+        let c2 = TLS_CONFIG.get_or_init(init_tls_config).clone();
         assert!(Arc::ptr_eq(&c1, &c2));
     }
 }

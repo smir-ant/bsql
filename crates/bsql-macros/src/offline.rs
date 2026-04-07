@@ -9,7 +9,7 @@
 //! needed and incremental compilation works naturally.
 
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use bitcode::{Decode, Encode};
 
@@ -96,8 +96,10 @@ pub struct CachedColumn {
 /// initial online build, and makes cloned repos with committed `.bsql/`
 /// build out of the box.
 ///
-/// Evaluated once per compilation via `LazyLock`.
-static IS_OFFLINE: LazyLock<bool> = LazyLock::new(|| {
+/// Evaluated once per compilation via `OnceLock`.
+static IS_OFFLINE: OnceLock<bool> = OnceLock::new();
+
+fn compute_is_offline() -> bool {
     // Explicit opt-in
     if std::env::var("BSQL_OFFLINE")
         .map(|v| v == "true" || v == "1")
@@ -123,10 +125,10 @@ static IS_OFFLINE: LazyLock<bool> = LazyLock::new(|| {
     }
 
     false
-});
+}
 
 pub fn is_offline() -> bool {
-    *IS_OFFLINE
+    *IS_OFFLINE.get_or_init(compute_is_offline)
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +139,7 @@ pub fn is_offline() -> bool {
 /// to find an existing `.bsql/` (or creating it next to the workspace root).
 ///
 /// Cached once per compilation.
-static CACHE_DIR: LazyLock<Result<PathBuf, String>> = LazyLock::new(resolve_cache_dir);
+static CACHE_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 fn resolve_cache_dir() -> Result<PathBuf, String> {
     let manifest_dir =
@@ -164,7 +166,10 @@ fn resolve_cache_dir() -> Result<PathBuf, String> {
 }
 
 fn cache_dir() -> Result<&'static PathBuf, String> {
-    CACHE_DIR.as_ref().map_err(|e| e.clone())
+    CACHE_DIR
+        .get_or_init(resolve_cache_dir)
+        .as_ref()
+        .map_err(|e| e.clone())
 }
 
 // ---------------------------------------------------------------------------

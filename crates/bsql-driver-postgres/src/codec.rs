@@ -730,18 +730,18 @@ impl Encode for rust_decimal::Decimal {
         } else {
             0
         };
-        padded.extend(std::iter::repeat_n(0i16, int_pad));
+        padded.extend(std::iter::repeat(0i16).take(int_pad));
         padded.extend_from_slice(&decimal_digits[..int_len]);
 
         // Fractional part: implicit leading zeros (scale - sig_frac_len)
         // then significant digits, then pad right to multiple of 4.
         // E.g., 0.001: scale=3, sig_frac_len=1 → 2 implicit zeros → [0,0,1]
         let implicit_zeros = scale_usize.saturating_sub(sig_frac_len);
-        padded.extend(std::iter::repeat_n(0i16, implicit_zeros));
+        padded.extend(std::iter::repeat(0i16).take(implicit_zeros));
         padded.extend_from_slice(&decimal_digits[int_len..]);
         let frac_total = implicit_zeros + sig_frac_len; // = scale_usize
         let frac_pad = (4 - (frac_total % 4)) % 4;
-        padded.extend(std::iter::repeat_n(0i16, frac_pad));
+        padded.extend(std::iter::repeat(0i16).take(frac_pad));
 
         // Group into base-10000 digits
         let mut pg_digits: smallvec::SmallVec<[i16; 12]> = smallvec::SmallVec::new();

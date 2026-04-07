@@ -1,6 +1,6 @@
 //! Shared compile-time database connection for proc macro validation.
 //!
-//! Uses `LazyLock` to maintain a single connection across all `query!`
+//! Uses `OnceLock` to maintain a single connection across all `query!`
 //! invocations within one `cargo build`. The first invocation pays ~5ms
 //! for the connection. Subsequent invocations reuse it at ~0 cost.
 //!
@@ -26,7 +26,7 @@
 //! Without the `tls` feature, connections use `NoTls` and `sslmode=require`
 //! will fail with a connection error.
 
-use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 use bsql_driver_postgres::Connection;
 
@@ -79,7 +79,9 @@ struct MacroConnection {
 }
 
 /// The global shared PG connection. Initialized on first access.
-static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| {
+static MACRO_CONN: OnceLock<Result<MacroConnection, String>> = OnceLock::new();
+
+fn init_macro_conn() -> Result<MacroConnection, String> {
     let database_url = std::env::var("BSQL_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
         .map_err(|_| {
@@ -114,7 +116,7 @@ static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| 
     Ok(MacroConnection {
         conn: std::sync::Mutex::new(conn),
     })
-});
+}
 
 /// Run a synchronous operation on the shared compile-time PG connection.
 ///
@@ -124,6 +126,7 @@ where
     F: FnOnce(&mut Connection) -> Result<T, String>,
 {
     let mc = MACRO_CONN
+        .get_or_init(init_macro_conn)
         .as_ref()
         .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
     let mut conn = mc.conn.lock().unwrap_or_else(|e| e.into_inner());

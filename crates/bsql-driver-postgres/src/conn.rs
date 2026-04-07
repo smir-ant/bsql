@@ -1198,11 +1198,7 @@ impl Connection {
         let mut results = Vec::with_capacity(count);
 
         'outer: loop {
-            loop {
-                let Some((msg_type, start, end, total)) = self.peek_stream_msg()? else {
-                    break; // need more data
-                };
-
+            while let Some((msg_type, start, end, total)) = self.peek_stream_msg()? {
                 if msg_type == b'2' {
                     // BindComplete — skip.
                 } else if msg_type == b'C' {
@@ -1347,11 +1343,7 @@ impl Connection {
         let mut results = Vec::with_capacity(count);
 
         'outer: loop {
-            loop {
-                let Some((msg_type, start, end, total)) = self.peek_stream_msg()? else {
-                    break; // need more data
-                };
-
+            while let Some((msg_type, start, end, total)) = self.peek_stream_msg()? {
                 if msg_type == b'2' {
                     // BindComplete — skip.
                 } else if msg_type == b'C' {
