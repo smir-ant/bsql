@@ -29,18 +29,21 @@ pub fn check_migration(
         Config::from_url(database_url).map_err(|e| format!("invalid database URL: {e}"))?;
     let mut conn = Connection::connect(&config).map_err(|e| format!("connection failed: {e}"))?;
 
+    // Use a unique shadow schema name per invocation to avoid races
+    // when tests run in parallel against the same database.
+    let shadow = format!("__bsql_shadow_{}", std::process::id());
+
     // 1. Drop any leftover shadow schema, then create fresh.
-    //    Use CREATE OR REPLACE (PG 14+) or DROP+CREATE for older versions.
-    conn.simple_query("DROP SCHEMA IF EXISTS __bsql_shadow CASCADE")
+    conn.simple_query(&format!("DROP SCHEMA IF EXISTS {shadow} CASCADE"))
         .map_err(|e| format!("failed to drop stale shadow schema: {e}"))?;
-    conn.simple_query("CREATE SCHEMA IF NOT EXISTS __bsql_shadow")
+    conn.simple_query(&format!("CREATE SCHEMA {shadow}"))
         .map_err(|e| format!("failed to create shadow schema: {e}"))?;
 
     // 3. Clone the current public schema structure into the shadow.
     let tables = get_public_tables(&mut conn)?;
     for table in &tables {
         let sql = format!(
-            "CREATE TABLE __bsql_shadow.\"{}\" (LIKE public.\"{}\" INCLUDING ALL)",
+            "CREATE TABLE {shadow}.\"{}\" (LIKE public.\"{}\" INCLUDING ALL)",
             table, table
         );
         if let Err(e) = conn.simple_query(&sql) {
@@ -55,11 +58,11 @@ pub fn check_migration(
         // The stored definition uses unqualified table names, so we
         // rely on search_path to resolve them.
         let sql = format!(
-            "CREATE OR REPLACE VIEW __bsql_shadow.\"{}\" AS {}",
+            "CREATE OR REPLACE VIEW {shadow}.\"{}\" AS {}",
             view_name, view_def
         );
         // Set search_path temporarily so the view body resolves to shadow tables.
-        let _ = conn.simple_query("SET search_path TO __bsql_shadow, public");
+        let _ = conn.simple_query(&format!("SET search_path TO {shadow}, public"));
         if let Err(e) = conn.simple_query(&sql) {
             eprintln!("  warning: could not clone view {}: {}", view_name, e);
         }
@@ -67,7 +70,7 @@ pub fn check_migration(
     }
 
     // 4. Apply the migration to the shadow schema.
-    conn.simple_query("SET search_path TO __bsql_shadow, public")
+    conn.simple_query(&format!("SET search_path TO {shadow}, public"))
         .map_err(|e| format!("failed to set search_path: {e}"))?;
     conn.simple_query(migration_sql)
         .map_err(|e| format!("migration failed: {e}"))?;
@@ -112,7 +115,7 @@ pub fn check_migration(
     // 6. Cleanup.
     conn.simple_query("SET search_path TO public")
         .map_err(|e| format!("failed to reset search_path: {e}"))?;
-    conn.simple_query("DROP SCHEMA IF EXISTS __bsql_shadow CASCADE")
+    conn.simple_query(&format!("DROP SCHEMA IF EXISTS {shadow} CASCADE"))
         .map_err(|e| format!("failed to drop shadow schema: {e}"))?;
 
     Ok(result)
@@ -313,13 +316,13 @@ mod tests {
         let Some(url) = pg_url() else { return };
         check_migration(&url, "", &[]).unwrap();
 
-        // Verify shadow schema was dropped
+        // Verify shadow schema was dropped (name includes PID)
         let config = Config::from_url(&url).unwrap();
         let mut conn = Connection::connect(&config).unwrap();
         let rows = conn
             .simple_query_rows(
                 "SELECT 1 FROM information_schema.schemata \
-                 WHERE schema_name = '__bsql_shadow'",
+                 WHERE schema_name LIKE '__bsql_shadow_%'",
             )
             .unwrap();
         assert!(rows.is_empty(), "shadow schema should be cleaned up");
