@@ -30,8 +30,14 @@ pub fn check_migration(
     let mut conn = Connection::connect(&config).map_err(|e| format!("connection failed: {e}"))?;
 
     // Use a unique shadow schema name per invocation to avoid races
-    // when tests run in parallel against the same database.
-    let shadow = format!("__bsql_shadow_{}", std::process::id());
+    // when tests run in parallel (same PID, different threads).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let shadow = format!(
+        "__bsql_shadow_{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
 
     // 1. Drop any leftover shadow schema, then create fresh.
     conn.simple_query(&format!("DROP SCHEMA IF EXISTS {shadow} CASCADE"))
