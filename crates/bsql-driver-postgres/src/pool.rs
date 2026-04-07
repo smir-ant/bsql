@@ -16,6 +16,24 @@ use crate::codec::Encode;
 use crate::conn::Connection;
 use crate::types::{Config, PgDataRow, QueryResult, SimpleRow};
 
+#[cfg(feature = "async")]
+use crate::async_conn::AsyncConnection;
+
+// --- PoolSlot ---
+
+/// A connection slot — either sync (UDS/TCP) or async (TCP only).
+///
+/// The pool auto-detects: UDS hosts get sync `Connection`, TCP hosts get
+/// `AsyncConnection` (when the `async` feature is enabled). When `async`
+/// is disabled, all connections are sync.
+pub(crate) enum PoolSlot {
+    /// Sync connection (UDS or TCP without async feature).
+    Sync(Connection),
+    /// Async TCP connection (requires async feature + tokio runtime).
+    #[cfg(feature = "async")]
+    Async(AsyncConnection),
+}
+
 // --- Pool ---
 
 /// A connection pool with LIFO ordering and fail-fast semantics.
@@ -39,7 +57,7 @@ struct PoolInner {
     /// Idle connections. Uses std::sync::Mutex because the critical section is
     /// trivial (push/pop — no I/O). This lets PoolGuard::Drop return connections
     /// synchronously.
-    stack: std::sync::Mutex<Vec<Connection>>,
+    stack: std::sync::Mutex<Vec<PoolSlot>>,
     max_size: usize,
     open_count: AtomicUsize,
     config: Arc<Config>,
@@ -139,7 +157,7 @@ impl Pool {
                 self.warmup_conn(&mut conn);
 
                 Ok(PoolGuard {
-                    conn: Some(conn),
+                    conn: Some(PoolSlot::Sync(conn)),
                     pool: self.inner.clone(),
                     discard: false,
                 })
@@ -156,16 +174,21 @@ impl Pool {
     #[inline]
     fn try_pop_idle(&self) -> Result<Option<PoolGuard>, DriverError> {
         let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(conn) = stack.pop() {
+        while let Some(slot) = stack.pop() {
+            let (created_at, idle_dur) = match &slot {
+                PoolSlot::Sync(conn) => (conn.created_at(), conn.idle_duration()),
+                #[cfg(feature = "async")]
+                PoolSlot::Async(conn) => (conn.created_at(), conn.idle_duration()),
+            };
             if let Some(max_lifetime) = self.inner.max_lifetime {
-                if conn.created_at().elapsed() >= max_lifetime {
+                if created_at.elapsed() >= max_lifetime {
                     self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
                     continue;
                 }
             }
-            if conn.idle_duration() < Duration::from_secs(30) {
+            if idle_dur < Duration::from_secs(30) {
                 return Ok(Some(PoolGuard {
-                    conn: Some(conn),
+                    conn: Some(slot),
                     pool: self.inner.clone(),
                     discard: false,
                 }));
@@ -292,13 +315,22 @@ impl Pool {
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
         // Drain and close all idle connections
-        let conns: Vec<Connection> = {
+        let slots: Vec<PoolSlot> = {
             let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *stack)
         };
-        for conn in conns {
+        for slot in slots {
             self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
-            let _ = conn.close();
+            match slot {
+                PoolSlot::Sync(conn) => {
+                    let _ = conn.close();
+                }
+                #[cfg(feature = "async")]
+                PoolSlot::Async(_conn) => {
+                    // AsyncConnection::close() is async — we can't await in sync close().
+                    // Drop will close the TCP socket, PG auto-cleans up.
+                }
+            }
         }
         // Notify any waiters so they get the "pool is closed" error
         let (_, cvar) = &self.inner.release_pair;
@@ -308,6 +340,99 @@ impl Pool {
     /// Whether the pool has been closed.
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
+    }
+
+    /// Acquire a connection from the pool (async).
+    ///
+    /// Auto-detects transport: UDS hosts get a sync `Connection`, TCP hosts
+    /// get an `AsyncConnection`. If the `async` feature is disabled, always
+    /// creates sync connections.
+    ///
+    /// Returns immediately with the most recently used idle connection (LIFO).
+    /// If no idle connections are available and the pool is below max_size, a new
+    /// connection is created.
+    #[cfg(feature = "async")]
+    pub async fn acquire_async(&self) -> Result<PoolGuard, DriverError> {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(DriverError::Pool("pool is closed".into()));
+        }
+
+        // Try to pop an idle connection (fast path).
+        if let Some(guard) = self.try_pop_idle()? {
+            return Ok(guard);
+        }
+
+        // No idle connections — try to claim a slot with a proper CAS loop.
+        loop {
+            let current = self.inner.open_count.load(Ordering::Acquire);
+            if current >= self.inner.max_size {
+                if let Some(timeout) = self.inner.acquire_timeout {
+                    let (lock, cvar) = &self.inner.release_pair;
+                    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let (_guard, result) = cvar
+                        .wait_timeout(guard, timeout)
+                        .unwrap_or_else(|e| e.into_inner());
+                    if result.timed_out() {
+                        return Err(DriverError::Pool(
+                            "pool exhausted: acquire timeout expired".into(),
+                        ));
+                    }
+                    if let Some(guard) = self.try_pop_idle()? {
+                        return Ok(guard);
+                    }
+                    continue;
+                }
+                return Err(DriverError::Pool(
+                    "pool exhausted: all connections in use".into(),
+                ));
+            }
+            if self
+                .inner
+                .open_count
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        // Open a new connection — auto-detect UDS vs TCP
+        if self.inner.config.host_is_uds() {
+            // UDS — use sync Connection
+            let conn_result = Connection::connect_arc(self.inner.config.clone());
+            match conn_result {
+                Ok(mut conn) => {
+                    conn.set_max_stmt_cache_size(self.inner.max_stmt_cache_size);
+                    self.warmup_conn(&mut conn);
+                    Ok(PoolGuard {
+                        conn: Some(PoolSlot::Sync(conn)),
+                        pool: self.inner.clone(),
+                        discard: false,
+                    })
+                }
+                Err(e) => {
+                    self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                    Err(e)
+                }
+            }
+        } else {
+            // TCP — use AsyncConnection
+            let conn_result = AsyncConnection::connect_arc(self.inner.config.clone()).await;
+            match conn_result {
+                Ok(mut conn) => {
+                    conn.set_max_stmt_cache_size(self.inner.max_stmt_cache_size);
+                    Ok(PoolGuard {
+                        conn: Some(PoolSlot::Async(conn)),
+                        pool: self.inner.clone(),
+                        discard: false,
+                    })
+                }
+                Err(e) => {
+                    self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -469,7 +594,7 @@ fn maintain_min_idle(inner: Arc<PoolInner>) {
             match Connection::connect_arc(inner.config.clone()) {
                 Ok(conn) => {
                     let mut stack = inner.stack.lock().unwrap_or_else(|e| e.into_inner());
-                    stack.push(conn);
+                    stack.push(PoolSlot::Sync(conn));
                     let (_, cvar) = &inner.release_pair;
                     cvar.notify_one();
                 }
@@ -492,13 +617,40 @@ fn maintain_min_idle(inner: Arc<PoolInner>) {
 /// If the connection is in a failed transaction state, broken, or marked for
 /// discard, it is dropped (decrements open_count) instead of returned.
 pub struct PoolGuard {
-    conn: Option<Connection>,
+    conn: Option<PoolSlot>,
     pool: Arc<PoolInner>,
     /// When true, the connection is dropped instead of returned to the pool.
     discard: bool,
 }
 
 impl PoolGuard {
+    /// Get a reference to the inner sync connection. Panics if the slot
+    /// holds an async connection.
+    #[inline]
+    fn sync_conn(&self) -> Result<&Connection, DriverError> {
+        match self.conn.as_ref() {
+            Some(PoolSlot::Sync(conn)) => Ok(conn),
+            #[cfg(feature = "async")]
+            Some(PoolSlot::Async(_)) => Err(DriverError::Pool(
+                "expected sync connection, got async; use async methods".into(),
+            )),
+            None => Err(DriverError::Pool("connection already taken".into())),
+        }
+    }
+
+    /// Get a mutable reference to the inner sync connection.
+    #[inline]
+    fn sync_conn_mut(&mut self) -> Result<&mut Connection, DriverError> {
+        match self.conn.as_mut() {
+            Some(PoolSlot::Sync(conn)) => Ok(conn),
+            #[cfg(feature = "async")]
+            Some(PoolSlot::Async(_)) => Err(DriverError::Pool(
+                "expected sync connection, got async; use async methods".into(),
+            )),
+            None => Err(DriverError::Pool("connection already taken".into())),
+        }
+    }
+
     /// Mark this connection for discard — it will NOT be returned to the pool
     /// on drop. The open_count is decremented and the TCP connection is closed.
     pub fn mark_discard(&mut self) {
@@ -510,34 +662,39 @@ impl PoolGuard {
     /// Opens a new TCP connection and sends a CancelRequest to PG.
     /// The cancel connection is closed immediately after.
     pub fn cancel(&self) -> Result<(), DriverError> {
-        let conn = self
-            .conn
-            .as_ref()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
-        conn.cancel()
+        self.sync_conn()?.cancel()
     }
 
     // --- Introspection dispatch methods ---
 
     /// Get the backend process ID for this connection.
     pub fn pid(&self) -> i32 {
-        self.conn.as_ref().expect("connection taken").pid()
+        match self.conn.as_ref().expect("connection taken") {
+            PoolSlot::Sync(conn) => conn.pid(),
+            #[cfg(feature = "async")]
+            PoolSlot::Async(conn) => conn.pid(),
+        }
     }
 
     /// Whether the connection is idle (not in a transaction).
     pub fn is_idle(&self) -> bool {
-        self.conn.as_ref().expect("connection taken").is_idle()
+        match self.conn.as_ref().expect("connection taken") {
+            PoolSlot::Sync(conn) => conn.is_idle(),
+            #[cfg(feature = "async")]
+            PoolSlot::Async(conn) => conn.is_idle(),
+        }
     }
 
     /// Whether the connection is inside a transaction.
     pub fn is_in_transaction(&self) -> bool {
-        self.conn
-            .as_ref()
-            .expect("connection taken")
-            .is_in_transaction()
+        match self.conn.as_ref().expect("connection taken") {
+            PoolSlot::Sync(conn) => conn.is_in_transaction(),
+            #[cfg(feature = "async")]
+            PoolSlot::Async(conn) => conn.is_in_transaction(),
+        }
     }
 
-    // --- Query dispatch methods ---
+    // --- Sync query dispatch methods ---
 
     /// Execute a prepared query and return rows.
     #[inline]
@@ -547,10 +704,7 @@ impl PoolGuard {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<QueryResult, DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .query(sql, sql_hash, params)
+        self.sync_conn_mut()?.query(sql, sql_hash, params)
     }
 
     /// Execute a query without result rows (INSERT/UPDATE/DELETE).
@@ -561,10 +715,7 @@ impl PoolGuard {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .execute(sql, sql_hash, params)
+        self.sync_conn_mut()?.execute(sql, sql_hash, params)
     }
 
     /// Execute the same statement N times with different params in one pipeline.
@@ -577,28 +728,20 @@ impl PoolGuard {
         sql_hash: u64,
         param_sets: &[&[&(dyn Encode + Sync)]],
     ) -> Result<Vec<u64>, DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
+        self.sync_conn_mut()?
             .execute_pipeline(sql, sql_hash, param_sets)
     }
 
     /// Execute a simple (unprepared) query.
     pub fn simple_query(&mut self, sql: &str) -> Result<(), DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .simple_query(sql)
+        self.sync_conn_mut()?.simple_query(sql)
     }
 
     /// Execute a simple query and return rows as text.
     ///
     /// Uses PostgreSQL's simple query protocol — all values are strings.
     pub fn simple_query_rows(&mut self, sql: &str) -> Result<Vec<SimpleRow>, DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .simple_query_rows(sql)
+        self.sync_conn_mut()?.simple_query_rows(sql)
     }
 
     /// Process each row via a closure with zero-copy `PgDataRow`.
@@ -612,10 +755,7 @@ impl PoolGuard {
     where
         F: FnMut(PgDataRow<'_>) -> Result<(), DriverError>,
     {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .for_each(sql, sql_hash, params, f)
+        self.sync_conn_mut()?.for_each(sql, sql_hash, params, f)
     }
 
     /// Process each DataRow as raw bytes — fastest path.
@@ -629,10 +769,7 @@ impl PoolGuard {
     where
         F: FnMut(&[u8]) -> Result<(), DriverError>,
     {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .for_each_raw(sql, sql_hash, params, f)
+        self.sync_conn_mut()?.for_each_raw(sql, sql_hash, params, f)
     }
 
     // --- Streaming ---
@@ -645,18 +782,13 @@ impl PoolGuard {
         params: &[&(dyn Encode + Sync)],
         chunk_size: i32,
     ) -> Result<(std::sync::Arc<[crate::types::ColumnDesc]>, bool), DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
+        self.sync_conn_mut()?
             .query_streaming_start(sql, sql_hash, params, chunk_size)
     }
 
     /// Send Execute+Flush for a streaming query (2nd+ chunks).
     pub fn streaming_send_execute(&mut self, chunk_size: i32) -> Result<(), DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .streaming_send_execute(chunk_size)
+        self.sync_conn_mut()?.streaming_send_execute(chunk_size)
     }
 
     /// Read the next chunk of rows from an in-progress streaming query.
@@ -665,9 +797,7 @@ impl PoolGuard {
         arena: &mut Arena,
         all_col_offsets: &mut Vec<(usize, i32)>,
     ) -> Result<bool, DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
+        self.sync_conn_mut()?
             .streaming_next_chunk(arena, all_col_offsets)
     }
 
@@ -685,10 +815,7 @@ impl PoolGuard {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .copy_in(table, columns, rows)
+        self.sync_conn_mut()?.copy_in(table, columns, rows)
     }
 
     /// Bulk copy data OUT of a table/query to a writer.
@@ -699,15 +826,64 @@ impl PoolGuard {
         query: &str,
         writer: &mut W,
     ) -> Result<u64, DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .copy_out(query, writer)
+        self.sync_conn_mut()?.copy_out(query, writer)
     }
 
-    /// Whether this guard holds a sync connection (always true now).
+    /// Whether this guard holds a sync connection.
     pub fn is_sync(&self) -> bool {
-        true
+        matches!(self.conn.as_ref(), Some(PoolSlot::Sync(_)))
+    }
+
+    /// Whether this guard holds an async connection.
+    #[cfg(feature = "async")]
+    pub fn is_async(&self) -> bool {
+        matches!(self.conn.as_ref(), Some(PoolSlot::Async(_)))
+    }
+
+    // --- Async query dispatch methods ---
+
+    /// Execute a prepared query and return rows (async).
+    ///
+    /// Auto-dispatches: sync connections use blocking I/O, async connections
+    /// use tokio I/O. Returns an error if the guard holds a sync connection
+    /// and this method is called.
+    #[cfg(feature = "async")]
+    pub async fn query_async(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<QueryResult, DriverError> {
+        match self.conn.as_mut() {
+            Some(PoolSlot::Sync(conn)) => conn.query(sql, sql_hash, params),
+            Some(PoolSlot::Async(conn)) => conn.query(sql, sql_hash, params).await,
+            None => Err(DriverError::Pool("connection already taken".into())),
+        }
+    }
+
+    /// Execute without result rows (async).
+    #[cfg(feature = "async")]
+    pub async fn execute_async(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<u64, DriverError> {
+        match self.conn.as_mut() {
+            Some(PoolSlot::Sync(conn)) => conn.execute(sql, sql_hash, params),
+            Some(PoolSlot::Async(conn)) => conn.execute(sql, sql_hash, params).await,
+            None => Err(DriverError::Pool("connection already taken".into())),
+        }
+    }
+
+    /// Execute a simple query (async).
+    #[cfg(feature = "async")]
+    pub async fn simple_query_async(&mut self, sql: &str) -> Result<(), DriverError> {
+        match self.conn.as_mut() {
+            Some(PoolSlot::Sync(conn)) => conn.simple_query(sql),
+            Some(PoolSlot::Async(conn)) => conn.simple_query(sql).await,
+            None => Err(DriverError::Pool("connection already taken".into())),
+        }
     }
 
     // --- Deferred pipeline support ---
@@ -719,9 +895,7 @@ impl PoolGuard {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<[u8; 18], DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
+        self.sync_conn_mut()?
             .ensure_stmt_prepared(sql, sql_hash, params)
     }
 
@@ -732,7 +906,9 @@ impl PoolGuard {
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
     ) {
-        let conn = self.conn.as_ref().expect("connection taken");
+        let conn = self
+            .sync_conn()
+            .expect("sync_conn failed in write_deferred");
         conn.write_deferred_bind_execute(sql_hash, params, buf);
     }
 
@@ -742,47 +918,57 @@ impl PoolGuard {
         buf: &mut Vec<u8>,
         count: usize,
     ) -> Result<Vec<u64>, DriverError> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
-            .flush_deferred_pipeline(buf, count)
+        self.sync_conn_mut()?.flush_deferred_pipeline(buf, count)
     }
 }
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            // Discard if:
-            //   - explicitly marked for discard
-            //   - in a failed transaction (tx_status == 'E')
-            //   - in an active transaction (tx_status == 'T') — uncommitted tx
-            //   - streaming query in progress — connection in indeterminate state
-            //   - pool is closed
-            if self.discard
-                || conn.is_in_failed_transaction()
-                || conn.is_in_transaction()
-                || conn.is_streaming()
+        if let Some(slot) = self.conn.take() {
+            // Check discard conditions based on slot type.
+            let should_discard = self.discard
                 || self.pool.closed.load(Ordering::Acquire)
-            {
+                || match &slot {
+                    PoolSlot::Sync(conn) => {
+                        conn.is_in_failed_transaction()
+                            || conn.is_in_transaction()
+                            || conn.is_streaming()
+                    }
+                    #[cfg(feature = "async")]
+                    PoolSlot::Async(conn) => {
+                        conn.is_in_failed_transaction() || conn.is_in_transaction()
+                    }
+                };
+
+            if should_discard {
                 self.pool.open_count.fetch_sub(1, Ordering::AcqRel);
                 return;
             }
 
             // Stamp last-used time for idle connection tracking.
             // Amortized: only call Instant::now() every 64 returns.
-            // Max error: 64 queries × ~15us = ~1ms on a 30s idle threshold.
-            if conn.query_counter() & 63 == 0 {
-                conn.touch();
+            let mut slot = slot;
+            match &mut slot {
+                PoolSlot::Sync(conn) => {
+                    if conn.query_counter() & 63 == 0 {
+                        conn.touch();
+                    }
+                }
+                #[cfg(feature = "async")]
+                PoolSlot::Async(conn) => {
+                    if conn.query_counter() & 63 == 0 {
+                        conn.touch();
+                    }
+                }
             }
 
             // Return to pool
             {
                 let mut stack = self.pool.stack.lock().unwrap_or_else(|e| e.into_inner());
-                stack.push(conn);
+                stack.push(slot);
             }
 
             // Notify waiters only if pool was exhausted (someone might be waiting).
-            // Skip notify when pool has spare capacity — saves ~20ns per release.
             if self.pool.open_count.load(Ordering::Relaxed) >= self.pool.max_size {
                 let (_, cvar) = &self.pool.release_pair;
                 cvar.notify_one();
@@ -997,7 +1183,7 @@ impl Drop for Transaction {
         if !self.committed {
             // Connection is in an uncommitted transaction — discard it from the pool.
             // Take the connection out of the guard and drop it, decrementing open_count.
-            if let Some(_conn) = self.guard.conn.take() {
+            if let Some(_slot) = self.guard.conn.take() {
                 self.guard.pool.open_count.fetch_sub(1, Ordering::AcqRel);
                 // Connection dropped — PG server will auto-rollback when it sees disconnect
             }

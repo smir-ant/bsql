@@ -39,7 +39,7 @@ thread_local! {
     static RESP_BUF_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
-fn acquire_resp_buf() -> Vec<u8> {
+pub(crate) fn acquire_resp_buf() -> Vec<u8> {
     RESP_BUF_POOL
         .with(|pool| pool.borrow_mut().pop())
         .unwrap_or_default()
@@ -3024,7 +3024,7 @@ fn sync_buffered_read_exact(
 /// Cost per row: one bounds check + walk column headers (no memcpy per column,
 /// one extend_from_slice per row for all non-NULL column data).
 #[inline(always)]
-fn parse_data_row_into_buf(
+pub(crate) fn parse_data_row_into_buf(
     data: &[u8],
     buf: &mut Vec<u8>,
     out: &mut Vec<(usize, i32)>,

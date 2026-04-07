@@ -10,7 +10,8 @@ description = "PostgreSQL wire protocol driver for bsql — binary protocol, are
 
 [features]
 default = []
-tls = ["dep:rustls", "dep:webpki-roots"]
+tls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls"]
+async = ["dep:tokio"]
 time = ["dep:time"]
 chrono = ["dep:chrono"]
 uuid = ["dep:uuid"]
@@ -38,6 +39,10 @@ rand = { version = "0.9", default-features = false, features = ["std", "os_rng"]
 # TLS (optional)
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+
+# Async runtime (optional)
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync"], optional = true }
 
 # Feature-gated type support (optional)
 time = { workspace = true, optional = true }

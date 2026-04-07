@@ -6,6 +6,8 @@ All times are mean of N iterations. Microseconds unless noted. Collected 2026-04
 
 ## PostgreSQL
 
+> **Note on async:** bsql and diesel are benchmarked in sync mode (no async runtime overhead). sqlx is benchmarked through tokio runtime. All libraries use Unix domain sockets (UDS) to PostgreSQL. For TCP benchmarks, see methodology section.
+
 | Operation | bsql | C (libpq) | diesel (Rust) | sqlx (Rust) | Go (pgx) |
 |---|---|---|---|---|---|
 | Single row by PK | **14.6 us** <kbd>x1</kbd> | 15.4 us <kbd>x1.1</kbd> | 31.7 us <kbd>x2.2</kbd> | 60.5 us <kbd>x4.1</kbd> | 33.6 us <kbd>x2.3</kbd> |

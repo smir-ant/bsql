@@ -52,7 +52,14 @@ mod sync_io;
 #[cfg(feature = "tls")]
 mod tls_sync;
 
+#[cfg(feature = "async")]
+pub mod async_conn;
+#[cfg(feature = "async")]
+mod async_io;
+
 pub use arena::Arena;
+#[cfg(feature = "async")]
+pub use async_conn::AsyncConnection;
 pub use codec::Encode;
 pub use conn::Connection;
 pub use conn::release_resp_buf;
