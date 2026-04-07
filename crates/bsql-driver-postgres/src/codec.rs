@@ -2262,7 +2262,7 @@ mod tests {
         data.extend_from_slice(&2i32.to_be_bytes()); // ndim=2
         data.extend_from_slice(&0i32.to_be_bytes()); // has_null
         data.extend_from_slice(&23i32.to_be_bytes()); // element OID
-        // Add enough fake dimension data
+                                                      // Add enough fake dimension data
         data.extend_from_slice(&0i32.to_be_bytes());
         data.extend_from_slice(&0i32.to_be_bytes());
         data.extend_from_slice(&0i32.to_be_bytes());
@@ -2281,7 +2281,7 @@ mod tests {
         data.extend_from_slice(&23i32.to_be_bytes()); // elem OID
         data.extend_from_slice(&1i32.to_be_bytes()); // n_elements=1
         data.extend_from_slice(&1i32.to_be_bytes()); // lower_bound
-        // Missing element data
+                                                     // Missing element data
         let result = decode_array_i32(&data);
         assert!(result.is_err(), "truncated array should error");
     }
@@ -3247,7 +3247,7 @@ mod tests {
         data.extend_from_slice(&1i32.to_be_bytes()); // ndim=1
         data.extend_from_slice(&0i32.to_be_bytes()); // has_null
         data.extend_from_slice(&23i32.to_be_bytes()); // elem OID
-        // Missing n_elements and lower_bound (only 12 bytes, need 20)
+                                                      // Missing n_elements and lower_bound (only 12 bytes, need 20)
         let result = decode_array_i32(&data);
         assert!(result.is_err(), "truncated dimension header should error");
     }

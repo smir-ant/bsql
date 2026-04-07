@@ -30,13 +30,13 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use bsql_arena::{Arena, acquire_arena};
+use bsql_arena::{acquire_arena, Arena};
 use smallvec::SmallVec;
 
-use crate::SqliteError;
 use crate::codec::SqliteEncode;
-use crate::conn::{QueryResult, SqliteConnection, StreamingQuery, hash_sql};
+use crate::conn::{hash_sql, QueryResult, SqliteConnection, StreamingQuery};
 use crate::ffi::StmtHandle;
+use crate::SqliteError;
 
 /// Validate a savepoint name to prevent SQL injection.
 ///

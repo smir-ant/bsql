@@ -2197,7 +2197,7 @@ mod tests {
     fn simple_data_row_multiple_columns() {
         let mut data = Vec::new();
         data.extend_from_slice(&3i16.to_be_bytes()); // 3 columns
-        // col 0: "foo"
+                                                     // col 0: "foo"
         data.extend_from_slice(&3i32.to_be_bytes());
         data.extend_from_slice(b"foo");
         // col 1: NULL

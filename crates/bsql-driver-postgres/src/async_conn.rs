@@ -13,14 +13,14 @@
 
 use std::sync::Arc;
 
-use crate::DriverError;
 use crate::async_io::AsyncStream;
 use crate::auth;
 use crate::codec::Encode;
 use crate::conn::{acquire_resp_buf, parse_data_row_into_buf};
 use crate::proto::{self, BackendMessage};
-use crate::stmt_cache::{StmtCache, StmtInfo, build_bind_template, make_stmt_name};
+use crate::stmt_cache::{build_bind_template, make_stmt_name, StmtCache, StmtInfo};
 use crate::types::{ColumnDesc, Config, Notification, QueryResult, SslMode, StartupAction};
+use crate::DriverError;
 
 /// An async PostgreSQL connection over TCP or TLS.
 ///
@@ -847,7 +847,11 @@ impl AsyncConnection {
                     bind_template: None,
                 },
             );
-            if need_columns { Some(columns) } else { None }
+            if need_columns {
+                Some(columns)
+            } else {
+                None
+            }
         };
 
         Ok(columns)

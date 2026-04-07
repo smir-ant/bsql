@@ -17,8 +17,8 @@
 //! - `BLOB`: raw bytes
 //! - `NULL`: nothing (indicated by length == -1 in the offset array)
 
-use crate::SqliteError;
 use crate::ffi::StmtHandle;
+use crate::SqliteError;
 
 // --- SqliteEncode trait ---
 

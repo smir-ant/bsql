@@ -5,8 +5,8 @@ exclude = ["bench", "examples", "crates/bsql-driver-postgres/fuzz"]
 
 [workspace.package]
 version = "0.20.1"
-edition = "2024"
-rust-version = "1.85"
+edition = "2021"
+rust-version = "1.75"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/smir-ant/bsql"
 
@@ -28,9 +28,9 @@ webpki-roots = { version = "1.0.6", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 # Feature-gated type support
-time = { version = "0.3", default-features = false, features = ["std"] }
+time = { version = ">=0.3.36, <0.3.38", default-features = false, features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-uuid = { version = "1", default-features = false }
+uuid = { version = ">=1.8, <1.22", default-features = false }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
 # Logging

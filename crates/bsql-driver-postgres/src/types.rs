@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use rapidhash::quality::RapidHasher;
 
-use crate::DriverError;
 use crate::arena::Arena;
+use crate::DriverError;
 
 // ---------------------------------------------------------------------------
 // Config

@@ -6,7 +6,7 @@
 //! available, SCRAM-SHA-256-PLUS with `tls-server-end-point` channel binding
 //! (RFC 5929) is preferred.
 
-use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use sha2::{Digest, Sha256};

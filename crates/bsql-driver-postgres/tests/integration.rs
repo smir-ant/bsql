@@ -9,7 +9,7 @@
 //!
 //! Tests are skipped (not failed) if the environment variable is not set.
 
-use bsql_driver_postgres::{Arena, Config, Connection, DriverError, Pool, hash_sql};
+use bsql_driver_postgres::{hash_sql, Arena, Config, Connection, DriverError, Pool};
 
 fn db_url() -> Option<String> {
     std::env::var("BSQL_DATABASE_URL").ok()

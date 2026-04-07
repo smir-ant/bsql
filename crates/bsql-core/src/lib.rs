@@ -53,15 +53,15 @@ pub mod driver {
 /// Re-export bsql_driver_sqlite types used by generated SQLite code.
 #[cfg(feature = "sqlite")]
 pub mod driver_sqlite {
-    pub use bsql_driver_sqlite::SqliteError;
     pub use bsql_driver_sqlite::codec::SqliteEncode;
     pub use bsql_driver_sqlite::conn::SqliteConnection;
     pub use bsql_driver_sqlite::ffi::{StepResult, StmtHandle};
     pub use bsql_driver_sqlite::pool::ParamValue;
-    pub use smallvec::{SmallVec, smallvec};
+    pub use bsql_driver_sqlite::SqliteError;
+    pub use smallvec::{smallvec, SmallVec};
 
     // Arena types for arena-backed fetch_all
-    pub use bsql_arena::{Arena, ArenaRows, ValidatedRows, acquire_arena};
+    pub use bsql_arena::{acquire_arena, Arena, ArenaRows, ValidatedRows};
 
     /// SQLite NULL type indicator (matches `SQLITE_NULL` = 5).
     /// Re-exported here so generated code does not need a direct libsqlite3-sys dep.

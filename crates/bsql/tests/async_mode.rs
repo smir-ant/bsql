@@ -8,8 +8,8 @@
 //! Set BSQL_DATABASE_URL=postgres://bsql:bsql@localhost/bsql_test
 
 use bsql::{Listener, Pool};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const DB_URL: &str = "postgres://bsql:bsql@localhost/bsql_test";
 

@@ -6,15 +6,15 @@
 //! up to `acquire_timeout` (default: 5 seconds). Set `acquire_timeout` to
 //! `None` for fail-fast behavior (immediate error when exhausted).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::DriverError;
 use crate::arena::Arena;
 use crate::codec::Encode;
 use crate::conn::Connection;
 use crate::types::{Config, PgDataRow, QueryResult, SimpleRow};
+use crate::DriverError;
 
 #[cfg(feature = "async")]
 use crate::async_conn::AsyncConnection;
@@ -2075,7 +2075,7 @@ mod n_plus_one_tests {
         d.track(10);
         d.track(10);
         d.track(10); // count=3 > 2
-        // Switch hash — this internally calls emit_warning for hash=10
+                     // Switch hash — this internally calls emit_warning for hash=10
         d.track(20);
         // Now tracking hash=20, count=1
         assert_eq!(d.last_query_hash, 20);
@@ -2233,7 +2233,7 @@ mod n_plus_one_tests {
         // Simulate: fetch users, then for each user fetch orders (N+1)
         let mut d = NPlusOneDetector::new(5);
         d.track(100); // SELECT * FROM users
-        // N+1 pattern: same query per user
+                      // N+1 pattern: same query per user
         for _ in 0..20 {
             d.track(200); // SELECT * FROM orders WHERE user_id = ?
         }

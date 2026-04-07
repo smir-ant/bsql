@@ -16,9 +16,9 @@ use bsql_arena::Arena;
 use libsqlite3_sys as raw;
 use rapidhash::quality::RapidHasher;
 
-use crate::SqliteError;
 use crate::codec::SqliteEncode;
 use crate::ffi::{DbHandle, StmtHandle};
+use crate::SqliteError;
 
 // --- Vec-based statement cache ---
 //

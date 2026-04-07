@@ -14,17 +14,17 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use crate::DriverError;
 use crate::arena::Arena;
 use crate::auth;
 use crate::codec::Encode;
 use crate::proto::{self, BackendMessage};
-use crate::stmt_cache::{StmtCache, StmtInfo, build_bind_template, make_stmt_name};
+use crate::stmt_cache::{build_bind_template, make_stmt_name, StmtCache, StmtInfo};
 use crate::sync_io::Stream;
 use crate::types::{
     ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, SimpleRow, SslMode,
     StartupAction,
 };
+use crate::DriverError;
 
 // --- Thread-local response buffer pool ---
 //
@@ -2785,7 +2785,11 @@ impl Connection {
                     bind_template: None,
                 },
             );
-            if need_columns { Some(columns) } else { None }
+            if need_columns {
+                Some(columns)
+            } else {
+                None
+            }
         };
 
         if !skip_bind_complete {

@@ -10,8 +10,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, LazyLock};
 
-use crate::DriverError;
 use crate::proto;
+use crate::DriverError;
 
 /// Cached TLS client config. Built once, reused for all connections.
 static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {

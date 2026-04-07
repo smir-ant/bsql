@@ -9,6 +9,7 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **Pure SQL** -- write real SQL. CTEs, JOINs, window functions, subqueries. No DSL, no method chains, no `.filter().select().join()` (hi, diesel). If PostgreSQL or SQLite supports it, bsql validates it.
 - **C-level performance** -- matches raw C (libpq) on single-row queries, 10-20% faster on multi-row fetches, 42% faster on pipelined batch INSERT. See [benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md).
 - **Minimal footprint** -- 1.61 MB peak memory — 4.2x less than C (libpq), 4.3x less than sqlx, 10.7x less than Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
+- **Async and sync — both first-class** -- same `query!` macro, same performance, same features. Async uses true cooperative scheduling (RPITIT, no `block_in_place` hacks). Sync removes tokio entirely — pure `fn`, zero async runtime overhead. Switch by changing one line in `Cargo.toml`. Most Rust SQL libraries are async-first with sync as an afterthought, or sync-only. bsql is both, equally.
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
 - **Things nobody else does** -- [automatic N+1 detection](#n1-query-detection), [compile-time query plan analysis](#compile-time-query-plan-analysis), [migration safety checking](#migration-safety-check), [request coalescing](#singleflight-request-coalescing). Details below.
 

@@ -186,11 +186,9 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let result = read_cache_file(&path);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("unsupported cache format version 99")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("unsupported cache format version 99"));
     }
 
     #[test]
@@ -277,11 +275,9 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let result = read_cache_file(&path);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("failed to decode cached query")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("failed to decode cached query"));
     }
 
     #[test]
@@ -296,11 +292,9 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let result = read_cache_file(&path);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("failed to decode v1 cached query")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("failed to decode v1 cached query"));
     }
 
     #[test]

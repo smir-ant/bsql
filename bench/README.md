@@ -79,7 +79,7 @@ Each binary does identical work: connect, 10K SELECTs by PK, 1K INSERTs, exit. b
 
 ### Prerequisites
 - PostgreSQL (any version 15-18)
-- Rust stable (1.85+)
+- Rust stable (1.75+)
 - Go 1.22+
 - C compiler (clang or gcc)
 - SQLite 3.37+ (system or bundled)
