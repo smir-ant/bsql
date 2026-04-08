@@ -203,7 +203,7 @@ No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variant
 | ----------------- | ------------ | ---------------------- |
 | `.fetch(&pool).await` | `Vec<Row>` | SELECT queries         |
 | `.run(&pool).await`   | `u64`      | INSERT, UPDATE, DELETE |
-| `.defer(&tx).await`   | `()`       | Buffer in transaction  |
+| `.defer(&mut tx).await`   | `()`       | Buffer in transaction  |
 
 Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also available.
 
@@ -213,13 +213,13 @@ Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also avai
 <summary>Transactions and batching</summary>
 
 ```rust
-let tx = pool.begin().await?;
+let mut tx = pool.begin().await?;
 
 // .defer() buffers writes -- nothing hits the network yet
 bsql::query!("INSERT INTO audit_log (msg) VALUES ($msg: &str)")
-    .defer(&tx).await?;
+    .defer(&mut tx).await?;
 bsql::query!("UPDATE accounts SET balance = balance - $amt: i32 WHERE id = $id: i32")
-    .defer(&tx).await?;
+    .defer(&mut tx).await?;
 
 // commit() flushes all deferred operations in a single pipeline, then commits
 tx.commit().await?;
@@ -393,7 +393,7 @@ bsql = { version = "0.21", default-features = false }
 
 Same `query!` macro, same zero-copy fetch. Sync mode is pure `fn` -- no async runtime, no `.await`, no tokio in your dependency tree.
 
-When async is enabled, TCP connections use true async I/O via tokio — the scheduler can run other tasks while waiting for PostgreSQL. Unix domain socket connections use sync I/O (sub-millisecond, no benefit from async). No `block_in_place`, no `Handle::current().block_on()` — the Executor trait uses RPITIT (`-> impl Future + Send`) for genuine cooperative scheduling.
+When async is enabled, TCP connections use true async I/O via tokio — the scheduler can run other tasks while waiting for PostgreSQL. Unix domain socket connections use sync I/O (sub-millisecond, no benefit from async). No `block_in_place`, no `Handle::current().block_on()` — the `QueryTarget` enum dispatch uses genuine cooperative scheduling.
 
 </details>
 

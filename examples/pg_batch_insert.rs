@@ -36,12 +36,12 @@ async fn main() -> Result<(), BsqlError> {
     // ---------------------------------------------------------------
     // Batch INSERT with .defer() — one round-trip for N inserts
     // ---------------------------------------------------------------
-    let tx = pool.begin().await?;
+    let mut tx = pool.begin().await?;
 
     // .defer() buffers each INSERT — no network I/O yet.
     for (name, email) in &users {
         bsql::query!("INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)")
-            .defer(&tx).await?;
+            .defer(&mut tx).await?;
     }
 
     // commit() sends ALL buffered INSERTs in one pipeline round-trip.

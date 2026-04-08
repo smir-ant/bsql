@@ -65,7 +65,7 @@ pub use bsql_macros::sort;
 pub use bsql_core::error::{self, BsqlError, BsqlResult};
 // Used by generated code from `bsql::query!`. Not part of the user-facing API.
 #[doc(hidden)]
-pub use bsql_core::executor::{Executor, OwnedResult};
+pub use bsql_core::executor::{OwnedResult, QueryTarget};
 pub use bsql_core::listener::{Listener, Notification};
 pub use bsql_core::pool::{Pool, PoolBuilder, PoolStatus, RawRow};
 

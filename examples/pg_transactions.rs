@@ -2,8 +2,8 @@
 //!
 //! Demonstrates:
 //!   - `pool.begin()` to start a transaction
-//!   - `.defer(&tx)` to buffer writes (no network I/O until commit)
-//!   - `.run(&tx)` for immediate writes within a transaction
+//!   - `.defer(&mut tx)` to buffer writes (no network I/O until commit)
+//!   - `.run(&mut tx)` for immediate writes within a transaction
 //!   - `tx.commit()` to flush deferred operations and commit
 //!   - Savepoints for partial rollback within a transaction
 //!   - Isolation levels for serializable reads
@@ -46,7 +46,7 @@ async fn main() -> Result<(), BsqlError> {
     // ---------------------------------------------------------------
     // Transfer with .defer() — all writes batched into one pipeline
     // ---------------------------------------------------------------
-    let tx = pool.begin().await?;
+    let mut tx = pool.begin().await?;
 
     let from_id = 1i32;
     let to_id = 2i32;
@@ -56,12 +56,12 @@ async fn main() -> Result<(), BsqlError> {
     bsql::query!(
         "UPDATE accounts SET balance = balance - $amount: i32 WHERE id = $from_id: i32"
     )
-    .defer(&tx).await?;
+    .defer(&mut tx).await?;
 
     bsql::query!(
         "UPDATE accounts SET balance = balance + $amount: i32 WHERE id = $to_id: i32"
     )
-    .defer(&tx).await?;
+    .defer(&mut tx).await?;
 
     // Log the transfer in the audit table — also deferred.
     let note = "transfer between accounts";
@@ -70,13 +70,13 @@ async fn main() -> Result<(), BsqlError> {
         "INSERT INTO audit_log (account_id, delta, note)
          VALUES ($from_id: i32, $neg_amount: i32, $note: &str)"
     )
-    .defer(&tx).await?;
+    .defer(&mut tx).await?;
 
     bsql::query!(
         "INSERT INTO audit_log (account_id, delta, note)
          VALUES ($to_id: i32, $amount: i32, $note: &str)"
     )
-    .defer(&tx).await?;
+    .defer(&mut tx).await?;
 
     // commit() flushes all 4 deferred operations in a single TCP write, then commits.
     tx.commit().await?;
@@ -85,7 +85,7 @@ async fn main() -> Result<(), BsqlError> {
     // ---------------------------------------------------------------
     // Savepoints — partial rollback within a transaction
     // ---------------------------------------------------------------
-    let tx = pool.begin().await?;
+    let mut tx = pool.begin().await?;
 
     // Debit the source account (immediate write, not deferred).
     let account_id = 1i32;
@@ -93,7 +93,7 @@ async fn main() -> Result<(), BsqlError> {
     bsql::query!(
         "UPDATE accounts SET balance = balance + $debit: i32 WHERE id = $account_id: i32"
     )
-    .run(&tx).await?;
+    .run(&mut tx).await?;
 
     // Create a savepoint before a risky operation.
     tx.savepoint("before_audit").await?;
@@ -105,7 +105,7 @@ async fn main() -> Result<(), BsqlError> {
         "INSERT INTO audit_log (account_id, delta, note)
          VALUES ($account_id: i32, $debit: i32, $note: &str)"
     )
-    .run(&tx).await;
+    .run(&mut tx).await;
 
     match audit_result {
         Ok(_) => println!("Audit log inserted."),
@@ -121,7 +121,7 @@ async fn main() -> Result<(), BsqlError> {
     // ---------------------------------------------------------------
     // Isolation levels — serializable reads
     // ---------------------------------------------------------------
-    let tx = pool.begin().await?;
+    let mut tx = pool.begin().await?;
 
     // Set isolation before the first query in the transaction.
     tx.set_isolation(IsolationLevel::Serializable).await?;
@@ -130,7 +130,7 @@ async fn main() -> Result<(), BsqlError> {
     let accounts = bsql::query!(
         "SELECT id, name, balance FROM accounts WHERE id = $account_id: i32"
     )
-    .fetch(&tx).await?;
+    .fetch(&mut tx).await?;
     let account = &accounts[0];
     println!(
         "Serializable read: account {} has balance {}",

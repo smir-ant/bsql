@@ -91,10 +91,10 @@ async fn delete_uses_primary() {
 async fn transaction_uses_primary() {
     let pool = pool().await;
 
-    let txn = pool.begin().await.unwrap();
+    let mut txn = pool.begin().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&txn)
+        .fetch_all(&mut txn)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -106,10 +106,10 @@ async fn transaction_uses_primary() {
 #[tokio::test]
 async fn pool_connection_uses_primary() {
     let pool = pool().await;
-    let conn = pool.acquire().await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&conn)
+        .fetch_all(&mut conn)
         .await
         .unwrap();
     assert!(users.len() >= 2);

@@ -119,7 +119,7 @@ async fn async_transaction_commit_await() {
     let pool = pool().await;
 
     // Begin a transaction.
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     // Insert a row via defer (the recommended async pattern).
     let title = "async_commit_test";
@@ -129,7 +129,7 @@ async fn async_transaction_commit_await() {
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
     let ticket_id = ticket.id;
@@ -163,7 +163,7 @@ async fn async_transaction_commit_await() {
 async fn async_transaction_rollback_await() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let title = "async_rollback_test";
     let uid = 1i32;
@@ -172,7 +172,7 @@ async fn async_transaction_rollback_await() {
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
     let ticket_id = ticket.id;

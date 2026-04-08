@@ -41,9 +41,9 @@ fn main() -> Result<(), BsqlError> {
     println!("Inserted user: {login}");
 
     // Transaction
-    let tx = pool.begin()?;
+    let mut tx = pool.begin()?;
     bsql::query!("DELETE FROM users WHERE login = $login: &str")
-        .defer(&tx)?;
+        .defer(&mut tx)?;
     tx.commit()?;
     println!("Deleted user: {login}");
 

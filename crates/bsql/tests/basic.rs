@@ -184,10 +184,8 @@ async fn select_count_expression() {
         .await
         .unwrap();
     let r = result.get().unwrap();
-    // COUNT(*) never returns NULL (returns 0 for empty sets)
-    // but our system defaults computed columns to nullable -> Option<i64>
-    assert!(r.cnt.is_some());
-    assert!(r.cnt.unwrap() >= 2);
+    // COUNT(*) is correctly inferred as NOT NULL — returns i64, not Option<i64>
+    assert!(r.cnt >= 2);
 }
 
 #[tokio::test]
@@ -440,11 +438,11 @@ async fn pool_builder_max_size_and_status() {
 #[tokio::test]
 async fn pool_acquire_and_use() {
     let pool = pool().await;
-    let conn = pool.acquire().await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
 
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
-        .fetch_one(&conn)
+        .fetch_one(&mut conn)
         .await
         .unwrap();
     let r = user.get().unwrap();
@@ -496,10 +494,10 @@ async fn warmup_prepares_statements() {
     // Acquire forces warmup on the new connection -- the statement is prepared
     // via Parse+Describe+Sync (no Bind+Execute). Subsequent queries using the
     // same SQL skip the Parse round-trip because the statement is already cached.
-    let conn = pool.acquire().await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
-        .fetch_one(&conn)
+        .fetch_one(&mut conn)
         .await
         .unwrap();
     let r = user.get().unwrap();

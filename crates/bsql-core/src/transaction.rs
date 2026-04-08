@@ -12,7 +12,6 @@
 //! is emitted via `log::warn!` to help detect forgotten commits during development.
 
 use std::fmt;
-use std::sync::Mutex;
 
 use bsql_driver_postgres::codec::Encode;
 
@@ -52,8 +51,8 @@ impl fmt::Display for IsolationLevel {
 /// committed via [`commit()`](Transaction::commit). If dropped without
 /// `commit()`, the connection is discarded from the pool and a warning is logged.
 ///
-/// Use `.defer(&tx)` on queries to buffer writes, then `tx.commit()` to flush
-/// them all in a single pipeline. Use `.run(&tx)` or `.fetch(&tx)` for immediate
+/// Use `.defer(&mut tx)` on queries to buffer writes, then `tx.commit()` to flush
+/// them all in a single pipeline. Use `.run(&mut tx)` or `.fetch(&mut tx)` for immediate
 /// execution within the transaction.
 ///
 /// # Example
@@ -66,17 +65,17 @@ impl fmt::Display for IsolationLevel {
 ///
 /// // Buffer writes with .defer() — nothing hits the network yet
 /// bsql::query!("INSERT INTO log (msg) VALUES ($msg: &str)")
-///     .defer(&tx)?;
+///     .defer(&mut tx)?;
 ///
 /// // Or execute immediately within the transaction
 /// bsql::query!("UPDATE accounts SET balance = 0 WHERE id = $id: i32")
-///     .run(&tx)?;
+///     .run(&mut tx)?;
 ///
 /// // commit() flushes all deferred operations, then commits
 /// tx.commit()?;
 /// ```
 pub struct Transaction {
-    inner: Mutex<Option<bsql_driver_postgres::Transaction>>,
+    inner: Option<bsql_driver_postgres::Transaction>,
     /// Set to true when commit() or rollback() is called.
     finished: bool,
 }
@@ -85,7 +84,7 @@ impl Transaction {
     /// Wrap a driver-level transaction.
     pub(crate) fn from_driver(tx: bsql_driver_postgres::Transaction) -> Self {
         Self {
-            inner: Mutex::new(Some(tx)),
+            inner: Some(tx),
             finished: false,
         }
     }
@@ -104,12 +103,7 @@ impl Transaction {
     /// Consumes `self` — the transaction cannot be used after commit.
     pub async fn commit(mut self) -> BsqlResult<()> {
         self.finished = true;
-        let tx = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.take().ok_or_else(Self::consumed_error)?;
         tx.commit().map_err(BsqlError::from)
     }
 
@@ -118,12 +112,7 @@ impl Transaction {
     /// Consumes `self` — the transaction cannot be used after rollback.
     pub async fn rollback(mut self) -> BsqlResult<()> {
         self.finished = true;
-        let tx = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.take().ok_or_else(Self::consumed_error)?;
         tx.rollback().map_err(BsqlError::from)
     }
 
@@ -131,33 +120,30 @@ impl Transaction {
     ///
     /// The `name` must be a valid SQL identifier: ASCII alphanumeric and
     /// underscores only, starting with a letter or underscore. Maximum 63 characters.
-    pub async fn savepoint(&self, name: &str) -> BsqlResult<()> {
+    pub async fn savepoint(&mut self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("SAVEPOINT {name}");
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
 
     /// Release (destroy) a savepoint, keeping its effects.
     ///
     /// The `name` must match a previously created savepoint.
-    pub async fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
+    pub async fn release_savepoint(&mut self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("RELEASE SAVEPOINT {name}");
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
 
     /// Roll back to a savepoint, undoing changes made after it was created.
     ///
     /// The savepoint remains valid after this call (can be rolled back to again).
-    pub async fn rollback_to(&self, name: &str) -> BsqlResult<()> {
+    pub async fn rollback_to(&mut self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("ROLLBACK TO SAVEPOINT {name}");
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
 
@@ -166,37 +152,34 @@ impl Transaction {
     /// Must be called before the first query in the transaction (immediately
     /// after `begin()`). PostgreSQL rejects `SET TRANSACTION` after any
     /// data-modifying statement.
-    pub async fn set_isolation(&self, level: IsolationLevel) -> BsqlResult<()> {
+    pub async fn set_isolation(&mut self, level: IsolationLevel) -> BsqlResult<()> {
         let sql = format!("SET TRANSACTION ISOLATION LEVEL {}", level.as_sql());
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
 
-    /// Execute a query within the transaction (used by Executor impl).
+    /// Execute a query within the transaction (used by QueryTarget dispatch).
     pub(crate) fn query_inner(
-        &self,
+        &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         let result = tx
             .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::without_arena(result))
     }
 
-    /// Execute without result rows within the transaction (used by Executor impl).
+    /// Execute without result rows within the transaction (used by QueryTarget dispatch).
     pub(crate) fn execute_inner(
-        &self,
+        &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         tx.execute(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)
     }
@@ -207,13 +190,12 @@ impl Transaction {
     /// N operations within the transaction. Returns the affected row count
     /// for each parameter set.
     pub async fn execute_pipeline(
-        &self,
+        &mut self,
         sql: &str,
         sql_hash: u64,
         param_sets: &[&[&(dyn Encode + Sync)]],
     ) -> BsqlResult<Vec<u64>> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         tx.execute_pipeline(sql, sql_hash, param_sets)
             .map_err(BsqlError::from_driver_query)
     }
@@ -236,13 +218,12 @@ impl Transaction {
     /// read-your-writes consistency.
     #[doc(hidden)]
     pub async fn defer_execute(
-        &self,
+        &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<()> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         tx.defer_execute(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)
     }
@@ -252,9 +233,8 @@ impl Transaction {
     /// Sends all buffered Bind+Execute messages + one Sync in a single TCP write.
     /// Returns the affected row count for each deferred operation.
     #[doc(hidden)]
-    pub async fn flush_deferred(&self) -> BsqlResult<Vec<u64>> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+    pub async fn flush_deferred(&mut self) -> BsqlResult<Vec<u64>> {
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         tx.flush_deferred().map_err(BsqlError::from_driver_query)
     }
 
@@ -265,8 +245,7 @@ impl Transaction {
     /// on commit or before any read.
     #[doc(hidden)]
     pub fn deferred_count(&self) -> usize {
-        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
+        match self.inner.as_ref() {
             Some(tx) => tx.deferred_count(),
             None => 0,
         }
@@ -277,7 +256,7 @@ impl Transaction {
     /// Zero arena allocation — the closure receives a `PgDataRow` that reads
     /// columns directly from the DataRow message bytes.
     pub async fn for_each_raw<F>(
-        &self,
+        &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -286,8 +265,7 @@ impl Transaction {
     where
         F: FnMut(bsql_driver_postgres::PgDataRow<'_>) -> BsqlResult<()>,
     {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         let mut user_err: Option<BsqlError> = None;
         let driver_result = tx.for_each(sql, sql_hash, params, |row| match f(row) {
             Ok(()) => Ok(()),
@@ -310,7 +288,7 @@ impl Transaction {
     /// to the closure — no `PgDataRow` construction, no SmallVec pre-scan.
     #[doc(hidden)]
     pub async fn __for_each_raw_bytes<F>(
-        &self,
+        &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -319,8 +297,7 @@ impl Transaction {
     where
         F: FnMut(&[u8]) -> BsqlResult<()>,
     {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         let mut user_err: Option<BsqlError> = None;
         let driver_result = tx.for_each_raw(sql, sql_hash, params, |data| match f(data) {
             Ok(()) => Ok(()),
@@ -465,7 +442,6 @@ mod tests {
     // --- Send + Sync assertions ---
 
     fn _assert_send<T: Send>() {}
-    fn _assert_sync<T: Sync>() {}
 
     #[test]
     fn transaction_is_send() {
@@ -473,14 +449,8 @@ mod tests {
     }
 
     #[test]
-    fn transaction_is_sync() {
-        _assert_sync::<Transaction>();
-    }
-
-    #[test]
-    fn isolation_level_is_send_and_sync() {
+    fn isolation_level_is_send() {
         _assert_send::<IsolationLevel>();
-        _assert_sync::<IsolationLevel>();
     }
 
     // --- IsolationLevel as_sql covers all variants ---

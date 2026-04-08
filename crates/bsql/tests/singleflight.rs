@@ -100,10 +100,10 @@ async fn parameterized_query_works_with_singleflight() {
 #[tokio::test]
 async fn transaction_queries_are_not_coalesced() {
     let pool = pool().await;
-    let txn = pool.begin().await.unwrap();
+    let mut txn = pool.begin().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&txn)
+        .fetch_all(&mut txn)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -115,10 +115,10 @@ async fn transaction_queries_are_not_coalesced() {
 #[tokio::test]
 async fn pool_connection_queries_not_coalesced() {
     let pool = pool().await;
-    let conn = pool.acquire().await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&conn)
+        .fetch_all(&mut conn)
         .await
         .unwrap();
     assert!(users.len() >= 2);
