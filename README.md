@@ -125,7 +125,18 @@ See [examples/](examples/) for more complete, runnable programs.
 - **PostgreSQL driver**: `#![forbid(unsafe_code)]` -- zero unsafe
 - **SQLite driver**: unsafe confined to FFI boundary calls (`ffi.rs`) -- every other file is safe Rust
 - **5 of 6 crates** enforce `#![forbid(unsafe_code)]` at compile time
-- **1,800+ tests** (unit, integration, compile-fail, and property-based)
+- **1,900+ tests** (unit, integration, compile-fail, and property-based)
+
+<details>
+<summary>Requirements</summary>
+
+**Rust 1.75+** (MSRV). Required for RPITIT — `impl Future + Send` in trait return position. This is how bsql provides true async without `block_in_place` or `BoxFuture`. Rust 1.75 was released December 2023.
+
+**PostgreSQL 12+**. bsql uses: prepared statements with binary protocol (PG 7.4+), `pg_catalog` introspection (PG 7.x+), `CREATE SCHEMA` for test isolation (PG 7.3+), SCRAM-SHA-256 authentication (PG 10+). The realistic minimum is PG 10 (SCRAM), but PG 12+ is recommended and CI-tested. PG 15-18 are tested in CI matrix.
+
+**SQLite 3.37+** (for STRICT tables). bsql uses WAL mode, mmap, foreign keys, and STRICT tables by default. SQLite 3.37 (2021) added STRICT.
+
+</details>
 
 <details>
 <summary>Why does the SQLite driver use unsafe?</summary>
