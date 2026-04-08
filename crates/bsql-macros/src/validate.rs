@@ -177,11 +177,9 @@ fn parse_select_expressions(sql: &str) -> Vec<String> {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth -= 1,
-            b' ' if depth == 0 && i + 6 <= bytes.len() => {
-                if &select_lower[i..i + 6] == " from " {
-                    from_pos = Some(i);
-                    break;
-                }
+            b' ' if depth == 0 && i + 6 <= bytes.len() && &select_lower[i..i + 6] == " from " => {
+                from_pos = Some(i);
+                break;
             }
             _ => {}
         }

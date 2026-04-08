@@ -727,8 +727,8 @@ mod tests {
     /// logic directly: Rust labels must be a subset of PG labels.
     #[test]
     fn validate_labels_matching_subset() {
-        let rust_labels = vec!["new", "active", "closed"];
-        let pg_labels = vec!["new", "active", "closed"];
+        let rust_labels = ["new", "active", "closed"];
+        let pg_labels = ["new", "active", "closed"];
         // Every Rust label exists in PG — should pass
         for rl in &rust_labels {
             assert!(
@@ -740,21 +740,21 @@ mod tests {
 
     #[test]
     fn validate_labels_mismatched_label() {
-        let rust_labels = vec!["new", "active", "archived"];
-        let pg_labels = vec!["new", "active", "closed"];
+        let rust_labels = ["new", "active", "archived"];
+        let pg_labels = ["new", "active", "closed"];
         // "archived" not in PG — should be detected
         let mismatched: Vec<_> = rust_labels
             .iter()
             .filter(|rl| !pg_labels.contains(rl))
             .collect();
-        assert_eq!(mismatched, vec![&"archived"]);
+        assert_eq!(mismatched, [&"archived"]);
     }
 
     #[test]
     fn validate_labels_extra_pg_label_ok() {
         // PG can have more labels than Rust enum — that's fine
-        let rust_labels = vec!["new", "closed"];
-        let pg_labels = vec!["new", "active", "closed", "archived"];
+        let rust_labels = ["new", "closed"];
+        let pg_labels = ["new", "active", "closed", "archived"];
         for rl in &rust_labels {
             assert!(
                 pg_labels.contains(rl),
