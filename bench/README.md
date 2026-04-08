@@ -60,15 +60,19 @@ Both libraries spend ~80-85 us on PG engine time for INSERT. The remaining ~1-15
 
 ## Memory (peak RSS)
 
-Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT queries + 1,000 INSERT queries, then exit. Peak resident set size measured externally via `/usr/bin/time -l` on macOS. Built and measured by `mem/run_all.sh`.
+Standalone **minimal** binaries (`mem/` directory) that each connect to PostgreSQL via a single direct connection (no pool, no async runtime) and run 10,000 SELECT queries + 1,000 INSERT queries, then exit. This isolates library memory overhead from pool/runtime overhead.
+
+Peak resident set size measured externally via `/usr/bin/time -l` on macOS. Built and measured by `mem/run_all.sh` (which compiles all 5 binaries fresh before measuring).
+
+**Important:** Do not confuse `mem_bsql_pg` (minimal, ~1.6 MB) with `bench_bsql_perf` (full benchmark with Pool + tokio, ~1.7 MB). The memory table uses the minimal binary for fair comparison — all libraries use a single direct connection, no pooling.
 
 | Library | Peak RSS | vs bsql |
 |---|---|---|
-| **bsql** | **1.61 MB** | <kbd>x1</kbd> |
-| C (libpq) | 6.82 MB | <kbd>x4.2</kbd> |
-| sqlx (Rust) | 6.98 MB | <kbd>x4.3</kbd> |
+| **bsql** | **1.59 MB** | <kbd>x1</kbd> |
+| C (libpq) | 6.82 MB | <kbd>x4.3</kbd> |
+| sqlx (Rust) | 6.95 MB | <kbd>x4.4</kbd> |
 | diesel (Rust) | 7.34 MB | <kbd>x4.6</kbd> |
-| Go (pgx) | 17.3 MB | <kbd>x10.7</kbd> |
+| Go (pgx) | 17.3 MB | <kbd>x10.9</kbd> |
 
 Run the memory benchmarks:
 ```bash
@@ -142,6 +146,9 @@ All 5 runners (bsql, C, Go, diesel, sqlx) use **identical methodology**: N itera
 - All 5 runners warm up PG shared buffers before any measurement
 - UDS connections eliminate TCP stack noise
 - JOIN + aggregate uses 3,000 iterations (other operations: 10,000) for lower variance
+- Each runner warms up PG cache with a full pass before measuring (double warm-up)
+
+**Variance note:** Individual operations can vary ±10-15% between runs due to PostgreSQL server state (shared_buffers, WAL position, autovacuum timing). The published numbers are from a representative run after warm-up. For critical comparisons, run 3-5 times and take the median.
 
 **Iteration counts:**
 - fetch_one, fetch_many (10/100/1000), INSERT single: 10,000 iterations
