@@ -6,7 +6,7 @@
 //! - Remote PostgreSQL over TCP (not localhost UDS)
 //!
 //! Cargo.toml:
-//!   bsql = { version = "0.19", features = ["async"] }
+//!   bsql = { version = "0.22", features = ["async"] }
 //!   tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 //!
 //! Run: cargo run --example pg_async

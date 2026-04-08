@@ -6,7 +6,7 @@
 //! - You don't need concurrent connections
 //!
 //! Cargo.toml:
-//!   bsql = { version = "0.19", default-features = false, features = ["sync"] }
+//!   bsql = { version = "0.22", default-features = false, features = ["sync"] }
 //!
 //! Run: cargo run --example pg_sync
 

@@ -12,12 +12,22 @@ publish = false
 #   BSQL_DATABASE_URL=postgres://user:pass@localhost/mydb cargo run --bin pg_basic
 
 [dependencies]
-bsql = { path = "../crates/bsql", version = "0.18", features = ["time", "uuid", "sqlite-bundled"] }
+bsql = { path = "../crates/bsql", version = "0.22", features = ["time", "uuid", "sqlite-bundled", "detect-n-plus-one"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+# --- PostgreSQL examples ---
 
 [[bin]]
 name = "pg_basic"
 path = "pg_basic.rs"
+
+[[bin]]
+name = "pg_async"
+path = "pg_async.rs"
+
+[[bin]]
+name = "pg_sync"
+path = "pg_sync.rs"
 
 [[bin]]
 name = "pg_dynamic"
@@ -40,9 +50,35 @@ name = "pg_batch_insert"
 path = "pg_batch_insert.rs"
 
 [[bin]]
+name = "pg_query_as"
+path = "pg_query_as.rs"
+
+[[bin]]
+name = "pg_testing"
+path = "pg_testing.rs"
+
+[[bin]]
+name = "pg_n_plus_one"
+path = "pg_n_plus_one.rs"
+
+[[bin]]
+name = "pg_sort_enum"
+path = "pg_sort_enum.rs"
+
+[[bin]]
+name = "pg_singleflight"
+path = "pg_singleflight.rs"
+
+# --- SQLite examples ---
+
+[[bin]]
 name = "sqlite_basic"
 path = "sqlite_basic.rs"
 
 [[bin]]
 name = "sqlite_dynamic"
 path = "sqlite_dynamic.rs"
+
+[[bin]]
+name = "sqlite_query_as"
+path = "sqlite_query_as.rs"

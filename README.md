@@ -11,7 +11,7 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **Minimal footprint** -- 1.59 MB peak memory — 4.3x less than C (libpq), 4.4x less than sqlx, 10.9x less than Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
 - **Async and sync — both first-class** -- same `query!` macro, same performance, same features. Async uses true cooperative scheduling (RPITIT, no `block_in_place` hacks). Sync removes tokio entirely — pure `fn`, zero async runtime overhead. Switch by changing one line in `Cargo.toml`. Most Rust SQL libraries are async-first with sync as an afterthought, or sync-only. bsql is both, equally.
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
-- **Test isolation in 2ms** -- `#[bsql::test]` gives each test its own PostgreSQL schema. Fixtures applied at compile time. 25x faster than sqlx's per-database approach. [Details below](#test-isolation).
+- **Test isolation in 2ms, not 50** -- `#[bsql::test]` creates a schema per test, not a database. 1,000 tests: ~2 seconds overhead vs ~50 seconds with sqlx. [Details below](#test-isolation).
 - **Things nobody else does** -- [automatic N+1 detection](#n1-query-detection), [compile-time query plan analysis](#compile-time-query-plan-analysis), [migration safety checking](#migration-safety-check), [request coalescing](#singleflight-request-coalescing), [SQLite parameter type checking](#sqlite-parameter-type-checking), [smart NULL inference](#smart-null-inference). Details below.
 
 ```rust
