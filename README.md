@@ -100,7 +100,7 @@ use bsql::SqlitePool;
 
 #[tokio::main]
 async fn main() -> Result<(), bsql::BsqlError> {
-    let pool = SqlitePool::open("./myapp.db").await?;
+    let pool = SqlitePool::open("./myapp.db")?;
 
     let id = 1i64;
     let users = bsql::query!(

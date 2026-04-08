@@ -111,6 +111,69 @@ pub async fn setup_test_schema(fixtures_sql: &[&str]) -> Result<TestContext, Bsq
     })
 }
 
+// ===========================================================================
+// SQLite test support
+// ===========================================================================
+
+/// SQLite test context — isolated temporary database file.
+///
+/// Created by [`setup_sqlite_test`]. The temporary file (plus WAL/SHM) is
+/// automatically deleted when the context is dropped.
+#[cfg(feature = "sqlite")]
+pub struct SqliteTestContext {
+    /// The SQLite connection pool for the test.
+    pub pool: crate::sqlite_pool::SqlitePool,
+    /// Path to the temporary database file (public for tests to inspect).
+    pub db_path: std::path::PathBuf,
+}
+
+#[cfg(feature = "sqlite")]
+impl Drop for SqliteTestContext {
+    fn drop(&mut self) {
+        // Close pool first to release the file lock.
+        self.pool.close();
+        // Delete the temp database file and any WAL/SHM sidecar files.
+        let _ = std::fs::remove_file(&self.db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", self.db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", self.db_path.display()));
+    }
+}
+
+/// Set up an isolated SQLite test database with fixtures.
+///
+/// Called by generated `#[bsql::test]` code for SQLite tests.
+/// Not intended for direct use.
+///
+/// Each call creates a unique temporary file (PID + atomic counter).
+/// `fixtures_sql` contains compile-time embedded SQL strings from fixture files.
+#[cfg(feature = "sqlite")]
+pub fn setup_sqlite_test(
+    fixtures_sql: &[&str],
+) -> Result<SqliteTestContext, crate::error::BsqlError> {
+    use crate::error::ConnectError;
+
+    // Generate a unique temp file path.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let db_path = std::env::temp_dir().join(format!(
+        "bsql_test_{}_{}.db",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
+
+    // Create pool (SqlitePool::connect is sync — no async runtime required).
+    let pool = crate::sqlite_pool::SqlitePool::connect(db_path.to_str().unwrap_or("bsql_test.db"))?;
+
+    // Apply fixtures in order.
+    for fixture_sql in fixtures_sql {
+        if !fixture_sql.trim().is_empty() {
+            pool.simple_exec(fixture_sql)
+                .map_err(|e| ConnectError::create(format!("SQLite fixture failed: {e}")))?;
+        }
+    }
+
+    Ok(SqliteTestContext { pool, db_path })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +675,138 @@ mod tests {
         }
         if let Some(v) = orig_db {
             std::env::set_var("DATABASE_URL", v);
+        }
+    }
+
+    // ===================================================================
+    // SQLite test support
+    // ===================================================================
+
+    #[cfg(feature = "sqlite")]
+    mod sqlite_tests {
+        use super::super::*;
+
+        #[test]
+        fn sqlite_test_context_creates_file() {
+            let ctx = setup_sqlite_test(&["CREATE TABLE t (id INTEGER PRIMARY KEY)"]).unwrap();
+            assert!(ctx.db_path.exists());
+        }
+
+        #[test]
+        fn sqlite_test_context_drop_removes_file() {
+            let path;
+            {
+                let ctx = setup_sqlite_test(&[]).unwrap();
+                path = ctx.db_path.clone();
+                assert!(path.exists());
+            }
+            // After drop
+            assert!(!path.exists(), "temp db should be deleted on drop");
+        }
+
+        #[test]
+        fn sqlite_fixtures_applied() {
+            let ctx = setup_sqlite_test(&[
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                "INSERT INTO users (name) VALUES ('Alice')",
+            ])
+            .unwrap();
+            // Verify via simple_exec + query
+            let sql = "SELECT name FROM users";
+            let hash = crate::rapid_hash_str(sql);
+            let (result, arena) = ctx
+                .pool
+                .query_readonly(sql, hash, smallvec::SmallVec::new())
+                .unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result.get_str(0, 0, &arena), Some("Alice"));
+        }
+
+        #[test]
+        fn sqlite_unique_paths() {
+            let ctx1 = setup_sqlite_test(&[]).unwrap();
+            let ctx2 = setup_sqlite_test(&[]).unwrap();
+            assert_ne!(ctx1.db_path, ctx2.db_path);
+        }
+
+        #[test]
+        fn sqlite_empty_fixture_works() {
+            let ctx = setup_sqlite_test(&[""]).unwrap();
+            assert!(ctx.db_path.exists());
+        }
+
+        #[test]
+        fn sqlite_multiple_fixtures_order() {
+            let ctx = setup_sqlite_test(&[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)",
+                "INSERT INTO t (val) VALUES ('first')",
+                "INSERT INTO t (val) VALUES ('second')",
+            ])
+            .unwrap();
+            let sql = "SELECT val FROM t ORDER BY id";
+            let hash = crate::rapid_hash_str(sql);
+            let (result, arena) = ctx
+                .pool
+                .query_readonly(sql, hash, smallvec::SmallVec::new())
+                .unwrap();
+            assert_eq!(result.len(), 2);
+            assert_eq!(result.get_str(0, 0, &arena), Some("first"));
+            assert_eq!(result.get_str(1, 0, &arena), Some("second"));
+        }
+
+        #[test]
+        fn sqlite_fixture_error_propagates() {
+            let result = setup_sqlite_test(&["NOT VALID SQL AT ALL !@#"]);
+            assert!(result.is_err(), "bad SQL should propagate as Err");
+        }
+
+        #[test]
+        fn sqlite_wal_shm_cleaned() {
+            let path;
+            {
+                let ctx = setup_sqlite_test(&[
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+                    "INSERT INTO t VALUES (1)",
+                ])
+                .unwrap();
+                path = ctx.db_path.clone();
+            }
+            // WAL and SHM files should be cleaned up too
+            assert!(
+                !std::path::Path::new(&format!("{}-wal", path.display())).exists(),
+                "WAL file should be removed"
+            );
+            assert!(
+                !std::path::Path::new(&format!("{}-shm", path.display())).exists(),
+                "SHM file should be removed"
+            );
+        }
+
+        #[test]
+        fn sqlite_whitespace_only_fixture_skipped() {
+            // Whitespace-only fixture should not error
+            let ctx = setup_sqlite_test(&["  \n\t  "]).unwrap();
+            assert!(ctx.db_path.exists());
+        }
+
+        #[test]
+        fn sqlite_path_contains_pid() {
+            let ctx = setup_sqlite_test(&[]).unwrap();
+            let path_str = ctx.db_path.to_string_lossy().to_string();
+            assert!(
+                path_str.contains(&std::process::id().to_string()),
+                "path should contain PID: {path_str}"
+            );
+        }
+
+        #[test]
+        fn sqlite_path_has_db_extension() {
+            let ctx = setup_sqlite_test(&[]).unwrap();
+            let path_str = ctx.db_path.to_string_lossy().to_string();
+            assert!(
+                path_str.ends_with(".db"),
+                "path should end with .db: {path_str}"
+            );
         }
     }
 }

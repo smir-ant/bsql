@@ -30,7 +30,7 @@ use bsql::{BsqlError, SqlitePool};
 async fn main() -> Result<(), BsqlError> {
     // SqlitePool::open() opens a pool with 1 writer + 4 reader connections.
     // WAL mode, mmap, and page cache are configured automatically.
-    let pool = SqlitePool::open("./myapp.db").await?;
+    let pool = SqlitePool::open("./myapp.db")?;
 
     // ---------------------------------------------------------------
     // INSERT — .run() returns affected row count, same as PostgreSQL

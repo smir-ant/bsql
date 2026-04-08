@@ -56,7 +56,7 @@ impl SqlitePoolBuilder {
     }
 
     /// Build and open the pool.
-    pub async fn build(self) -> BsqlResult<SqlitePool> {
+    pub fn build(self) -> BsqlResult<SqlitePool> {
         let path = self.path.ok_or_else(|| {
             BsqlError::Connect(crate::error::ConnectError {
                 message: "SQLite pool builder requires a path".into(),
@@ -91,7 +91,7 @@ impl SqlitePool {
     /// Open a SQLite pool with default settings (4 reader connections).
     ///
     /// Alias: [`open`](Self::open) — same behavior, friendlier name for file-backed databases.
-    pub async fn connect(path: &str) -> BsqlResult<Self> {
+    pub fn connect(path: &str) -> BsqlResult<Self> {
         let inner =
             bsql_driver_sqlite::pool::SqlitePool::connect(path).map_err(BsqlError::from_sqlite)?;
         Ok(SqlitePool {
@@ -107,8 +107,8 @@ impl SqlitePool {
     /// ```rust,ignore
     /// let pool = SqlitePool::open("./data.db")?;
     /// ```
-    pub async fn open(path: &str) -> BsqlResult<Self> {
-        Self::connect(path).await
+    pub fn open(path: &str) -> BsqlResult<Self> {
+        Self::connect(path)
     }
 
     /// Create a pool builder for custom configuration.
@@ -320,7 +320,7 @@ impl SqlitePool {
     ///
     /// Returns a `SqliteTransaction` that must be committed or rolled back.
     /// If dropped without committing, the transaction is automatically rolled back.
-    pub async fn begin(&self) -> BsqlResult<SqliteTransaction> {
+    pub fn begin(&self) -> BsqlResult<SqliteTransaction> {
         self.inner
             .begin_transaction()
             .map_err(BsqlError::from_sqlite)?;
@@ -411,7 +411,7 @@ pub struct SqliteTransaction {
 
 impl SqliteTransaction {
     /// Commit the transaction.
-    pub async fn commit(mut self) -> BsqlResult<()> {
+    pub fn commit(mut self) -> BsqlResult<()> {
         self.finished = true;
         self.pool
             .commit_transaction()
@@ -419,7 +419,7 @@ impl SqliteTransaction {
     }
 
     /// Explicitly roll back the transaction.
-    pub async fn rollback(mut self) -> BsqlResult<()> {
+    pub fn rollback(mut self) -> BsqlResult<()> {
         self.finished = true;
         self.pool
             .rollback_transaction()
@@ -427,13 +427,13 @@ impl SqliteTransaction {
     }
 
     /// Create a savepoint within the transaction.
-    pub async fn savepoint(&self, name: &str) -> BsqlResult<()> {
+    pub fn savepoint(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         self.pool.savepoint(name).map_err(BsqlError::from_sqlite)
     }
 
     /// Release (destroy) a savepoint, keeping its effects.
-    pub async fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
+    pub fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         self.pool
             .release_savepoint(name)
@@ -441,7 +441,7 @@ impl SqliteTransaction {
     }
 
     /// Roll back to a savepoint.
-    pub async fn rollback_to(&self, name: &str) -> BsqlResult<()> {
+    pub fn rollback_to(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         self.pool.rollback_to(name).map_err(BsqlError::from_sqlite)
     }

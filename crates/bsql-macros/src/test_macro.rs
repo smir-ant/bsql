@@ -95,7 +95,22 @@ fn resolve_fixture_path(name: &str, manifest_dir: &str) -> Result<String, String
     }
 }
 
-/// Expand `#[bsql::test]` into a `#[tokio::test]` wrapper with schema isolation.
+/// Check whether a parameter type path ends with `SqlitePool`.
+///
+/// Handles both `SqlitePool` and `bsql::SqlitePool` (or any longer path).
+fn is_sqlite_pool_type(pat_type: &syn::PatType) -> bool {
+    if let syn::Type::Path(type_path) = pat_type.ty.as_ref() {
+        if let Some(last_seg) = type_path.path.segments.last() {
+            return last_seg.ident == "SqlitePool";
+        }
+    }
+    false
+}
+
+/// Expand `#[bsql::test]` into a test wrapper with database isolation.
+///
+/// - `pool: Pool` or `pool: bsql::Pool` → PostgreSQL (async, `#[tokio::test]`)
+/// - `pool: SqlitePool` or `pool: bsql::SqlitePool` → SQLite (sync, `#[test]`)
 pub fn expand_test(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Error> {
     let args: TestArgs = syn::parse2(attr)?;
     let input_fn: ItemFn = syn::parse2(item)?;
@@ -105,23 +120,15 @@ pub fn expand_test(attr: TokenStream, item: TokenStream) -> Result<TokenStream, 
     let fn_attrs = &input_fn.attrs;
     let fn_block = &input_fn.block;
 
-    // Validate: must be async
-    if input_fn.sig.asyncness.is_none() {
-        return Err(syn::Error::new_spanned(
-            &input_fn.sig.fn_token,
-            "#[bsql::test] functions must be async",
-        ));
-    }
-
-    // Validate: must take exactly one argument of type Pool (or bsql::Pool)
+    // Validate: must take exactly one argument (Pool or SqlitePool)
     if input_fn.sig.inputs.len() != 1 {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.inputs,
-            "#[bsql::test] function must take exactly one argument: pool: bsql::Pool",
+            "#[bsql::test] function must take exactly one argument: pool: bsql::Pool or pool: bsql::SqlitePool",
         ));
     }
 
-    // Extract the pool parameter name
+    // Extract the pool parameter name and detect type
     let pool_param = match input_fn.sig.inputs.first().unwrap() {
         syn::FnArg::Typed(pat_type) => pat_type,
         syn::FnArg::Receiver(_) => {
@@ -132,6 +139,23 @@ pub fn expand_test(attr: TokenStream, item: TokenStream) -> Result<TokenStream, 
         }
     };
     let pool_pat = &pool_param.pat;
+    let is_sqlite = is_sqlite_pool_type(pool_param);
+
+    // For SQLite tests, the function must be sync (fn, not async fn).
+    // For PostgreSQL tests, the function must be async.
+    if is_sqlite {
+        if input_fn.sig.asyncness.is_some() {
+            return Err(syn::Error::new_spanned(
+                &input_fn.sig.fn_token,
+                "#[bsql::test] SQLite tests must be sync (fn, not async fn)",
+            ));
+        }
+    } else if input_fn.sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            &input_fn.sig.fn_token,
+            "#[bsql::test] PostgreSQL tests must be async",
+        ));
+    }
 
     // Resolve fixture paths at macro expansion time (compile time)
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
@@ -151,24 +175,47 @@ pub fn expand_test(attr: TokenStream, item: TokenStream) -> Result<TokenStream, 
         quote! { &[ #( #fixture_includes ),* ] }
     };
 
-    Ok(quote! {
-        #( #fn_attrs )*
-        #[::tokio::test]
-        #fn_vis async fn #fn_name() {
-            let __bsql_ctx = ::bsql::__test_support::setup_test_schema(
-                #fixtures_array
-            ).await.expect("bsql::test setup failed");
+    if is_sqlite {
+        // SQLite: sync test, no tokio
+        Ok(quote! {
+            #( #fn_attrs )*
+            #[::core::prelude::v1::test]
+            #fn_vis fn #fn_name() {
+                let __bsql_ctx = ::bsql::__test_support::setup_sqlite_test(
+                    #fixtures_array
+                ).expect("bsql::test SQLite setup failed");
 
-            let #pool_pat = __bsql_ctx.pool.clone();
+                let #pool_pat = __bsql_ctx.pool.clone();
 
-            // Run the user's test body
-            async {
-                #fn_block
-            }.await;
+                // Run the user's test body
+                {
+                    #fn_block
+                }
 
-            // __bsql_ctx drops here, cleaning up the schema
-        }
-    })
+                // __bsql_ctx drops here, cleaning up the temp file
+            }
+        })
+    } else {
+        // PostgreSQL: async test with tokio
+        Ok(quote! {
+            #( #fn_attrs )*
+            #[::tokio::test]
+            #fn_vis async fn #fn_name() {
+                let __bsql_ctx = ::bsql::__test_support::setup_test_schema(
+                    #fixtures_array
+                ).await.expect("bsql::test setup failed");
+
+                let #pool_pat = __bsql_ctx.pool.clone();
+
+                // Run the user's test body
+                async {
+                    #fn_block
+                }.await;
+
+                // __bsql_ctx drops here, cleaning up the schema
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -289,7 +336,7 @@ mod tests {
     // ===============================================================
 
     #[test]
-    fn expand_rejects_sync_fn() {
+    fn expand_rejects_sync_fn_for_pg() {
         let attr: TokenStream = "".parse().unwrap();
         let item: TokenStream = "fn test_sync(pool: Pool) {}".parse().unwrap();
         let result = expand_test(attr, item);
@@ -302,6 +349,16 @@ mod tests {
     fn expand_rejects_no_args() {
         let attr: TokenStream = "".parse().unwrap();
         let item: TokenStream = "async fn test_no_args() {}".parse().unwrap();
+        let result = expand_test(attr, item);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("exactly one argument"), "got: {msg}");
+    }
+
+    #[test]
+    fn expand_rejects_no_args_sync() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_no_args() {}".parse().unwrap();
         let result = expand_test(attr, item);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -1005,5 +1062,219 @@ mod tests {
             output.contains("async fn test_sig ()"),
             "generated fn should have no params: {output}"
         );
+    }
+
+    // ===============================================================
+    // SQLite type detection
+    // ===============================================================
+
+    #[test]
+    fn is_sqlite_pool_detects_bare_sqlite_pool() {
+        let item: ItemFn = syn::parse_str("fn test(pool: SqlitePool) {}").unwrap();
+        if let syn::FnArg::Typed(pat_type) = item.sig.inputs.first().unwrap() {
+            assert!(is_sqlite_pool_type(pat_type));
+        } else {
+            panic!("expected typed arg");
+        }
+    }
+
+    #[test]
+    fn is_sqlite_pool_detects_bsql_sqlite_pool() {
+        let item: ItemFn = syn::parse_str("fn test(pool: bsql::SqlitePool) {}").unwrap();
+        if let syn::FnArg::Typed(pat_type) = item.sig.inputs.first().unwrap() {
+            assert!(is_sqlite_pool_type(pat_type));
+        } else {
+            panic!("expected typed arg");
+        }
+    }
+
+    #[test]
+    fn is_sqlite_pool_rejects_bare_pool() {
+        let item: ItemFn = syn::parse_str("fn test(pool: Pool) {}").unwrap();
+        if let syn::FnArg::Typed(pat_type) = item.sig.inputs.first().unwrap() {
+            assert!(!is_sqlite_pool_type(pat_type));
+        } else {
+            panic!("expected typed arg");
+        }
+    }
+
+    #[test]
+    fn is_sqlite_pool_rejects_bsql_pool() {
+        let item: ItemFn = syn::parse_str("fn test(pool: bsql::Pool) {}").unwrap();
+        if let syn::FnArg::Typed(pat_type) = item.sig.inputs.first().unwrap() {
+            assert!(!is_sqlite_pool_type(pat_type));
+        } else {
+            panic!("expected typed arg");
+        }
+    }
+
+    // ===============================================================
+    // SQLite test expansion
+    // ===============================================================
+
+    #[test]
+    fn expand_sqlite_generates_sync_test() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_sqlite(pool: SqlitePool) {}".parse().unwrap();
+        let result = expand_test(attr, item);
+        assert!(
+            result.is_ok(),
+            "SQLite test should expand: {:?}",
+            result.unwrap_err()
+        );
+        let output = result.unwrap().to_string();
+        // Should NOT have tokio::test
+        assert!(
+            !output.contains("tokio"),
+            "SQLite test should not use tokio: {output}"
+        );
+        // Should have #[test] (core::prelude::v1::test)
+        assert!(
+            output.contains("test"),
+            "SQLite test should have #[test]: {output}"
+        );
+        // Should NOT be async
+        assert!(
+            !output.contains("async fn"),
+            "SQLite test should be sync: {output}"
+        );
+    }
+
+    #[test]
+    fn expand_sqlite_generates_setup_sqlite_test() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_sqlite(pool: SqlitePool) {}".parse().unwrap();
+        let result = expand_test(attr, item).unwrap();
+        let output = result.to_string();
+        assert!(
+            output.contains("setup_sqlite_test"),
+            "SQLite test should call setup_sqlite_test: {output}"
+        );
+        assert!(
+            !output.contains("setup_test_schema"),
+            "SQLite test should NOT call setup_test_schema: {output}"
+        );
+    }
+
+    #[test]
+    fn expand_sqlite_no_await() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_sqlite(pool: SqlitePool) {}".parse().unwrap();
+        let result = expand_test(attr, item).unwrap();
+        let output = result.to_string();
+        assert!(
+            !output.contains(".await"),
+            "SQLite test should not have .await: {output}"
+        );
+    }
+
+    #[test]
+    fn expand_sqlite_preserves_fn_name() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn my_sqlite_test(pool: SqlitePool) {}".parse().unwrap();
+        let result = expand_test(attr, item).unwrap();
+        let output = result.to_string();
+        assert!(
+            output.contains("my_sqlite_test"),
+            "function name must be preserved: {output}"
+        );
+    }
+
+    #[test]
+    fn expand_sqlite_preserves_body() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_body(pool: SqlitePool) { let x = 99; assert_eq!(x, 99); }"
+            .parse()
+            .unwrap();
+        let result = expand_test(attr, item).unwrap();
+        let output = result.to_string();
+        assert!(output.contains("99"), "body must be preserved: {output}");
+    }
+
+    #[test]
+    fn expand_sqlite_pool_clone_from_context() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_clone(pool: SqlitePool) {}".parse().unwrap();
+        let result = expand_test(attr, item).unwrap();
+        let output = result.to_string();
+        assert!(output.contains("clone"), "pool should be cloned: {output}");
+    }
+
+    #[test]
+    fn expand_sqlite_rejects_async_fn() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "async fn test_bad(pool: SqlitePool) {}".parse().unwrap();
+        let result = expand_test(attr, item);
+        assert!(result.is_err(), "async SQLite test should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("must be sync"),
+            "error should mention sync, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn expand_sqlite_with_bsql_prefix() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_prefixed(pool: bsql::SqlitePool) {}"
+            .parse()
+            .unwrap();
+        let result = expand_test(attr, item);
+        assert!(
+            result.is_ok(),
+            "bsql::SqlitePool should work: {:?}",
+            result.unwrap_err()
+        );
+        let output = result.unwrap().to_string();
+        assert!(output.contains("setup_sqlite_test"));
+    }
+
+    #[test]
+    fn expand_sqlite_generated_fn_is_sync_and_no_args() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_sig(pool: SqlitePool) {}".parse().unwrap();
+        let result = expand_test(attr, item).unwrap();
+        let output = result.to_string();
+        assert!(
+            output.contains("fn test_sig ()"),
+            "generated fn should be sync with no params: {output}"
+        );
+    }
+
+    #[test]
+    fn expand_sqlite_with_fixtures() {
+        let attr: TokenStream = "fixtures(\"test_schema\")".parse().unwrap();
+        let item: TokenStream = "fn test_fix(pool: SqlitePool) {}".parse().unwrap();
+        let result = expand_test(attr, item);
+        assert!(
+            result.is_ok(),
+            "SQLite + fixtures should work: {:?}",
+            result.unwrap_err()
+        );
+        let output = result.unwrap().to_string();
+        assert!(
+            output.contains("include_str"),
+            "fixtures should produce include_str: {output}"
+        );
+        assert!(
+            output.contains("setup_sqlite_test"),
+            "should use SQLite setup: {output}"
+        );
+    }
+
+    #[test]
+    fn expand_sqlite_accepts_any_param_name() {
+        let attr: TokenStream = "".parse().unwrap();
+        let item: TokenStream = "fn test_name(db: SqlitePool) { let _ = db; }"
+            .parse()
+            .unwrap();
+        let result = expand_test(attr, item);
+        assert!(
+            result.is_ok(),
+            "any param name should work: {:?}",
+            result.unwrap_err()
+        );
+        let output = result.unwrap().to_string();
+        assert!(output.contains("db"), "should preserve param name 'db'");
     }
 }
