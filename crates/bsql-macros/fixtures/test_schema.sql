@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS test_items (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL
+);
