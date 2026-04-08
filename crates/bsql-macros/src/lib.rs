@@ -20,6 +20,7 @@ mod sort_enum;
 mod sql_norm;
 mod stmt_name;
 mod suggest;
+mod test_macro;
 pub(crate) mod types;
 #[cfg(feature = "sqlite")]
 mod types_sqlite;
@@ -564,9 +565,52 @@ pub fn sort(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Attribute macro for database integration tests with schema isolation.
+///
+/// Creates an isolated PostgreSQL schema per test, applies SQL fixtures,
+/// passes a connected `Pool` to the test function, and drops the schema
+/// after the test completes (even on panic).
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// #[bsql::test]
+/// async fn test_basic(pool: bsql::Pool) {
+///     pool.raw_execute("SELECT 1").await.unwrap();
+/// }
+///
+/// #[bsql::test(fixtures("schema", "seed"))]
+/// async fn test_with_fixtures(pool: bsql::Pool) {
+///     let user = bsql::query!("SELECT name FROM users WHERE id = $id: i32")
+///         .fetch_one(&pool).await.unwrap();
+///     assert_eq!(user.name, "Alice");
+/// }
+/// ```
+///
+/// # Fixtures
+///
+/// Fixture names are resolved to SQL files at compile time from:
+/// - `{CARGO_MANIFEST_DIR}/fixtures/{name}.sql`
+/// - `{CARGO_MANIFEST_DIR}/tests/fixtures/{name}.sql`
+///
+/// Fixtures are applied in order after the isolated schema is created.
+///
+/// # Environment
+///
+/// Requires `BSQL_DATABASE_URL` or `DATABASE_URL` to be set at runtime.
+#[proc_macro_attribute]
+pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr2: proc_macro2::TokenStream = attr.into();
+    let item2: proc_macro2::TokenStream = item.into();
+    match test_macro::expand_test(attr2, item2) {
+        Ok(output) => output.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{extract_type_and_sql, QueryAsArgs};
 
     #[test]
     fn parse_query_as_args() {

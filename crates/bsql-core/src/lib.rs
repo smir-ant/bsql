@@ -15,6 +15,7 @@ pub mod singleflight;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_pool;
 pub mod stream;
+pub mod test_support;
 pub mod transaction;
 pub mod types;
 pub mod util;

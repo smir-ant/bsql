@@ -60,6 +60,7 @@ pub use bsql_macros::pg_enum;
 pub use bsql_macros::query;
 pub use bsql_macros::query_as;
 pub use bsql_macros::sort;
+pub use bsql_macros::test;
 
 // Re-export all runtime types
 pub use bsql_core::error::{self, BsqlError, BsqlResult};
@@ -83,6 +84,12 @@ pub use bsql_core::transaction::{IsolationLevel, Transaction};
 // SQLite pool, transaction, and streaming
 #[cfg(feature = "sqlite")]
 pub use bsql_core::{SqlitePool, SqliteStreamingQuery, SqliteTransaction};
+
+// Re-export test support types used by generated `#[bsql::test]` code
+#[doc(hidden)]
+pub mod __test_support {
+    pub use bsql_core::test_support::*;
+}
 
 // Re-export driver types used by generated code
 #[doc(hidden)]
