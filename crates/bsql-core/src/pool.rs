@@ -3,7 +3,6 @@
 //! Delegates all connection management, fail-fast semantics, and LIFO ordering
 //! to the driver. This layer adds only the bsql error type conversions.
 
-use std::sync::Mutex;
 use std::time::Duration;
 
 use bsql_driver_postgres::arena::acquire_arena;
@@ -281,9 +280,7 @@ impl Pool {
     /// are available (unless `acquire_timeout` is configured).
     pub async fn acquire(&self) -> BsqlResult<PoolConnection> {
         let guard = self.inner.acquire().map_err(BsqlError::from)?;
-        Ok(PoolConnection {
-            inner: Mutex::new(guard),
-        })
+        Ok(PoolConnection { inner: guard })
     }
 
     /// Begin a new transaction.
@@ -568,14 +565,13 @@ impl std::fmt::Debug for Pool {
 
 /// A connection borrowed from the pool.
 ///
-/// Uses `std::sync::Mutex` for interior mutability because the driver's
-/// `PoolGuard` requires `&mut self` for queries, but the `Executor` trait
-/// takes `&self`. The mutex is uncontended in practice — a single connection
-/// is used by one caller at a time, never shared between concurrent callers.
+/// The `Executor` trait is implemented for `&mut PoolConnection`, so callers
+/// pass `&mut conn` to query methods. No interior mutability needed — the
+/// borrow checker enforces exclusive access at compile time.
 ///
 /// Returned to the pool when dropped.
 pub struct PoolConnection {
-    pub(crate) inner: Mutex<bsql_driver_postgres::PoolGuard>,
+    pub(crate) inner: bsql_driver_postgres::PoolGuard,
 }
 
 impl std::fmt::Debug for PoolConnection {
@@ -807,9 +803,8 @@ mod tests {
     }
 
     #[test]
-    fn pool_connection_is_send_and_sync() {
+    fn pool_connection_is_send() {
         _assert_send::<PoolConnection>();
-        _assert_sync::<PoolConnection>();
     }
 
     #[test]

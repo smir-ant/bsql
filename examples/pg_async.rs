@@ -43,9 +43,9 @@ async fn main() -> Result<(), BsqlError> {
     println!("Inserted user: {login}");
 
     // Transaction
-    let tx = pool.begin().await?;
+    let mut tx = pool.begin().await?;
     bsql::query!("DELETE FROM users WHERE login = $login: &str")
-        .defer(&tx).await?;
+        .defer(&mut tx).await?;
     tx.commit().await?;
     println!("Deleted user: {login}");
 

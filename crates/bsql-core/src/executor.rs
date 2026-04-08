@@ -95,51 +95,57 @@ impl Drop for OwnedResult {
 /// When the `async` feature is disabled, methods return results directly
 /// as regular synchronous functions. No tokio dependency.
 #[cfg(feature = "async")]
-pub trait Executor: Send + Sync {
+pub trait Executor: Send {
     /// Execute a query and return all rows.
-    fn query_raw<'a>(
-        &'a self,
-        sql: &'a str,
+    fn query_raw<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a;
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'q
+    where
+        Self: 'q;
 
     /// Execute a read-only query. Routes to replicas when configured.
-    fn query_raw_readonly<'a>(
-        &'a self,
-        sql: &'a str,
+    fn query_raw_readonly<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a;
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'q
+    where
+        Self: 'q;
 
     /// Execute a query and return the number of affected rows.
-    fn execute_raw<'a>(
-        &'a self,
-        sql: &'a str,
+    fn execute_raw<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'a;
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'q
+    where
+        Self: 'q;
 }
 
 /// Sync variant of the Executor trait. No async runtime required.
 #[cfg(not(feature = "async"))]
 pub trait Executor {
     fn query_raw(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult>;
 
     fn query_raw_readonly(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult>;
 
     fn execute_raw(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -155,14 +161,17 @@ pub trait Executor {
 /// can run other tasks while this connection waits for PostgreSQL.
 #[cfg(feature = "async")]
 #[allow(clippy::manual_async_fn)] // Intentional: RPITIT gives us + Send bound that async fn doesn't
-impl Executor for Pool {
+impl Executor for &Pool {
     #[inline]
-    fn query_raw<'a>(
-        &'a self,
-        sql: &'a str,
+    fn query_raw<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'q
+    where
+        Self: 'q,
+    {
         async move {
             let mut guard = self.inner.acquire_async().await.map_err(BsqlError::from)?;
             let result = guard
@@ -174,12 +183,15 @@ impl Executor for Pool {
     }
 
     #[inline]
-    fn query_raw_readonly<'a>(
-        &'a self,
-        sql: &'a str,
+    fn query_raw_readonly<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'q
+    where
+        Self: 'q,
+    {
         async move {
             let pool = self.read_pool.as_ref().unwrap_or(&self.inner);
             let mut guard = pool.acquire_async().await.map_err(BsqlError::from)?;
@@ -192,12 +204,15 @@ impl Executor for Pool {
     }
 
     #[inline]
-    fn execute_raw<'a>(
-        &'a self,
-        sql: &'a str,
+    fn execute_raw<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'q
+    where
+        Self: 'q,
+    {
         async move {
             let mut guard = self.inner.acquire_async().await.map_err(BsqlError::from)?;
             guard
@@ -210,10 +225,10 @@ impl Executor for Pool {
 
 /// Sync: plain `acquire()` + `query()`. No tokio.
 #[cfg(not(feature = "async"))]
-impl Executor for Pool {
+impl Executor for &Pool {
     #[inline]
     fn query_raw(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -227,7 +242,7 @@ impl Executor for Pool {
 
     #[inline]
     fn query_raw_readonly(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -242,7 +257,7 @@ impl Executor for Pool {
 
     #[inline]
     fn execute_raw(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -260,17 +275,20 @@ impl Executor for Pool {
 
 #[cfg(feature = "async")]
 #[allow(clippy::manual_async_fn)]
-impl Executor for PoolConnection {
+impl Executor for &mut PoolConnection {
     #[inline]
-    fn query_raw<'a>(
-        &'a self,
-        sql: &'a str,
+    fn query_raw<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'q
+    where
+        Self: 'q,
+    {
         async move {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let result = guard
+            let result = self
+                .inner
                 .query(sql, sql_hash, params)
                 .map_err(BsqlError::from_driver_query)?;
             Ok(OwnedResult::without_arena(result))
@@ -278,25 +296,30 @@ impl Executor for PoolConnection {
     }
 
     #[inline]
-    fn query_raw_readonly<'a>(
-        &'a self,
-        sql: &'a str,
+    fn query_raw_readonly<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'q
+    where
+        Self: 'q,
+    {
         self.query_raw(sql, sql_hash, params)
     }
 
     #[inline]
-    fn execute_raw<'a>(
-        &'a self,
-        sql: &'a str,
+    fn execute_raw<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'q
+    where
+        Self: 'q,
+    {
         async move {
-            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            guard
+            self.inner
                 .execute(sql, sql_hash, params)
                 .map_err(BsqlError::from_driver_query)
         }
@@ -304,16 +327,16 @@ impl Executor for PoolConnection {
 }
 
 #[cfg(not(feature = "async"))]
-impl Executor for PoolConnection {
+impl Executor for &mut PoolConnection {
     #[inline]
     fn query_raw(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let result = guard
+        let result = self
+            .inner
             .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::without_arena(result))
@@ -321,7 +344,7 @@ impl Executor for PoolConnection {
 
     #[inline]
     fn query_raw_readonly(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -331,13 +354,12 @@ impl Executor for PoolConnection {
 
     #[inline]
     fn execute_raw(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard
+        self.inner
             .execute(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)
     }
@@ -349,41 +371,50 @@ impl Executor for PoolConnection {
 
 #[cfg(feature = "async")]
 #[allow(clippy::manual_async_fn)]
-impl Executor for Transaction {
-    fn query_raw<'a>(
-        &'a self,
-        sql: &'a str,
+impl Executor for &mut Transaction {
+    fn query_raw<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'q
+    where
+        Self: 'q,
+    {
         async move { self.query_inner(sql, sql_hash, params) }
     }
 
     #[inline]
-    fn query_raw_readonly<'a>(
-        &'a self,
-        sql: &'a str,
+    fn query_raw_readonly<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send + 'q
+    where
+        Self: 'q,
+    {
         self.query_raw(sql, sql_hash, params)
     }
 
     #[inline]
-    fn execute_raw<'a>(
-        &'a self,
-        sql: &'a str,
+    fn execute_raw<'q>(
+        self,
+        sql: &'q str,
         sql_hash: u64,
-        params: &'a [&'a (dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'a {
+        params: &'q [&'q (dyn Encode + Sync)],
+    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send + 'q
+    where
+        Self: 'q,
+    {
         async move { self.execute_inner(sql, sql_hash, params) }
     }
 }
 
 #[cfg(not(feature = "async"))]
-impl Executor for Transaction {
+impl Executor for &mut Transaction {
     fn query_raw(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -393,7 +424,7 @@ impl Executor for Transaction {
 
     #[inline]
     fn query_raw_readonly(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -403,7 +434,7 @@ impl Executor for Transaction {
 
     #[inline]
     fn execute_raw(
-        &self,
+        self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
@@ -593,19 +624,15 @@ mod tests {
     }
 
     #[test]
-    fn pool_connection_is_send_and_sync() {
+    fn pool_connection_is_send() {
         fn _assert_send<T: Send>() {}
-        fn _assert_sync<T: Sync>() {}
         _assert_send::<crate::pool::PoolConnection>();
-        _assert_sync::<crate::pool::PoolConnection>();
     }
 
     #[test]
-    fn transaction_is_send_and_sync() {
+    fn transaction_is_send() {
         fn _assert_send<T: Send>() {}
-        fn _assert_sync<T: Sync>() {}
         _assert_send::<crate::transaction::Transaction>();
-        _assert_sync::<crate::transaction::Transaction>();
     }
 
     #[test]
@@ -618,12 +645,12 @@ mod tests {
 
     #[cfg(feature = "async")]
     #[test]
-    fn executor_trait_requires_send_sync() {
-        // Verify that the async Executor trait has Send + Sync bounds.
+    fn executor_trait_requires_send() {
+        // Verify that the async Executor trait has Send bound.
         // This is a compile-time test: if it compiles, the constraint holds.
         fn _check_executor_bounds<E: Executor>() {
-            fn _assert_send_sync<T: Send + Sync>() {}
-            _assert_send_sync::<E>();
+            fn _assert_send<T: Send>() {}
+            _assert_send::<E>();
         }
     }
 }

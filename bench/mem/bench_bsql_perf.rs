@@ -105,14 +105,14 @@ async fn main() -> Result<(), BsqlError> {
     {
         let start = Instant::now();
         for _ in 0..ITERATIONS_SLOW {
-            let tx = pool.begin().await?;
+            let mut tx = pool.begin().await?;
             for j in 0..100 {
                 let name = format!("batch_{j}");
                 let email = format!("batch{j}@test.com");
                 bsql::query!(
                     "INSERT INTO bench_users (name, email, active, score) VALUES ($name: String, $email: String, true, 0.0)"
                 )
-                .defer(&tx).await?;
+                .defer(&mut tx).await?;
             }
             tx.commit().await?;
         }

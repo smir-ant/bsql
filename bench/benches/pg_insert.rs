@@ -106,14 +106,14 @@ fn bench_pg_insert_batch(c: &mut Criterion) {
     // -- bsql: 100 INSERTs in a transaction (sync) --
     group.bench_function("bsql", |b| {
         b.iter(|| {
-            let tx = bsql_pool.begin().unwrap();
+            let mut tx = bsql_pool.begin().unwrap();
             for i in 0..100i32 {
                 let name = format!("batch_{i}");
                 let email = format!("batch_{i}@example.com");
                 bsql::query!(
                     "INSERT INTO bench_users (name, email, active, score) VALUES ($name: String, $email: String, true, 0.0)"
                 )
-                .execute(&tx)
+                .execute(&mut tx)
                 .unwrap();
             }
             tx.commit().unwrap();

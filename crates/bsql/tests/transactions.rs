@@ -23,13 +23,13 @@ async fn transaction_commit_persists() {
     let uid = 1i32;
 
     // Insert inside a transaction, then commit.
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
     let ticket = bsql::query!(
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
     let ticket_id = ticket.id;
@@ -60,13 +60,13 @@ async fn transaction_rollback_discards() {
     let title = "tx_rollback_test";
     let uid = 1i32;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
     let ticket = bsql::query!(
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
     let ticket_id = ticket.id;
@@ -93,13 +93,13 @@ async fn transaction_drop_without_commit_discards() {
         let title = "tx_drop_test";
         let uid = 1i32;
 
-        let tx = pool.begin().await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
         let ticket = bsql::query!(
             "INSERT INTO tickets (title, status, created_by_user_id)
              VALUES ($title: &str, 'new', $uid: i32)
              RETURNING id"
         )
-        .fetch_one(&tx)
+        .fetch_one(&mut tx)
         .await
         .unwrap();
         ticket_id = ticket.id;
@@ -122,7 +122,7 @@ async fn transaction_drop_without_commit_discards() {
 async fn transaction_multiple_queries() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     // Insert two tickets in the same transaction.
     let title1 = "tx_multi_1";
@@ -134,7 +134,7 @@ async fn transaction_multiple_queries() {
          VALUES ($title1: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
 
@@ -143,7 +143,7 @@ async fn transaction_multiple_queries() {
          VALUES ($title2: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
 
@@ -182,7 +182,7 @@ async fn transaction_multiple_queries() {
 async fn transaction_error_rolls_back() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     // Insert a valid row.
     let title = "tx_error_test";
@@ -192,7 +192,7 @@ async fn transaction_error_rolls_back() {
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
     let ticket_id = ticket.id;
@@ -205,7 +205,7 @@ async fn transaction_error_rolls_back() {
          VALUES ($bad_title: &str, 'new', $bad_uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await;
     assert!(result.is_err());
 
@@ -229,7 +229,7 @@ async fn transaction_error_rolls_back() {
 async fn transaction_read_your_writes() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let title = "tx_read_write_test";
     let uid = 1i32;
@@ -238,14 +238,14 @@ async fn transaction_read_your_writes() {
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
     let ticket_id = ticket.id;
 
     // Read the row back within the same transaction.
     let found = bsql::query!("SELECT id, title FROM tickets WHERE id = $ticket_id: i32")
-        .fetch_one(&tx)
+        .fetch_one(&mut tx)
         .await
         .unwrap();
     let r = found.get().unwrap();
@@ -289,8 +289,8 @@ async fn begin_on_exhausted_pool_fails_fast() {
 async fn independent_transactions_are_isolated() {
     let pool = pool().await;
 
-    let tx1 = pool.begin().await.unwrap();
-    let tx2 = pool.begin().await.unwrap();
+    let mut tx1 = pool.begin().await.unwrap();
+    let mut tx2 = pool.begin().await.unwrap();
 
     // Insert in tx1 only.
     let title = "tx_isolated_test";
@@ -299,14 +299,14 @@ async fn independent_transactions_are_isolated() {
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title: &str, 'new', $uid: i32)"
     )
-    .execute(&tx1)
+    .execute(&mut tx1)
     .await
     .unwrap();
 
     // tx2 should NOT see the uncommitted row (default READ COMMITTED isolation).
     let search = "tx_isolated_test";
     let seen = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&tx2)
+        .fetch_all(&mut tx2)
         .await
         .unwrap();
     assert!(seen.is_empty(), "tx2 should not see tx1's uncommitted row");
@@ -333,7 +333,7 @@ async fn transaction_commit_without_queries_is_noop() {
 
     // Begin and immediately commit -- no queries executed.
     // Lazy BEGIN means no BEGIN/COMMIT round-trips sent.
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
     tx.commit().await.unwrap();
 
     // The single connection should be back in the pool, usable.
@@ -355,7 +355,7 @@ async fn transaction_rollback_without_queries_is_noop() {
         .await
         .unwrap();
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
     tx.rollback().await.unwrap();
 
     // Connection should be clean and returned to pool.
@@ -398,12 +398,12 @@ async fn transaction_drop_without_queries_returns_connection_clean() {
 #[tokio::test]
 async fn transaction_lazy_begin_first_query_triggers_begin() {
     let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     // First query inside tx triggers lazy BEGIN, then runs the query.
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
-        .fetch_one(&tx)
+        .fetch_one(&mut tx)
         .await
         .unwrap();
     let r = user.get().unwrap();
@@ -420,7 +420,7 @@ async fn transaction_lazy_begin_first_query_triggers_begin() {
 #[tokio::test]
 async fn transaction_debug_format() {
     let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let debug = format!("{:?}", tx);
     assert!(debug.contains("Transaction"), "debug: {debug}");
@@ -435,12 +435,12 @@ async fn transaction_debug_format() {
 #[tokio::test]
 async fn transaction_execute_returns_affected_rows() {
     let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let desc = "tx_execute_test";
     let id = 1i32;
     let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
-        .execute(&tx)
+        .execute(&mut tx)
         .await
         .unwrap();
     assert_eq!(affected, 1);
@@ -456,7 +456,7 @@ async fn transaction_execute_returns_affected_rows() {
 async fn transaction_defer_execute_commit() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let title = "defer_commit_bsql";
     let uid = 1i32;
@@ -492,7 +492,7 @@ async fn transaction_defer_execute_commit() {
 async fn transaction_defer_execute_flush_returns_counts() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let title = "defer_flush_bsql";
     let uid = 1i32;
@@ -516,7 +516,7 @@ async fn transaction_defer_execute_flush_returns_counts() {
 async fn transaction_defer_execute_auto_flushes_before_read() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let title = "defer_autoflush_bsql";
     let uid = 1i32;
@@ -530,7 +530,7 @@ async fn transaction_defer_execute_auto_flushes_before_read() {
     // SELECT triggers auto-flush, so we can read-your-writes
     let search = "defer_autoflush_bsql";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -543,7 +543,7 @@ async fn transaction_defer_execute_auto_flushes_before_read() {
 async fn transaction_defer_execute_rollback_discards() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let title = "defer_rollback_bsql";
     let uid = 1i32;
@@ -567,7 +567,7 @@ async fn transaction_defer_execute_rollback_discards() {
 async fn transaction_defer_execute_empty_flush_is_noop() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
     let results = tx.flush_deferred().await.unwrap();
     assert!(results.is_empty());
     assert_eq!(tx.deferred_count(), 0);
@@ -582,7 +582,7 @@ async fn transaction_defer_execute_empty_flush_is_noop() {
 async fn savepoint_and_release() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     tx.savepoint("sp1").await.unwrap();
 
@@ -593,7 +593,7 @@ async fn savepoint_and_release() {
          VALUES ($title: &str, 'new', $uid: i32)
          RETURNING id"
     )
-    .fetch_one(&tx)
+    .fetch_one(&mut tx)
     .await
     .unwrap();
     let ticket_id = ticket.id;
@@ -622,7 +622,7 @@ async fn savepoint_and_release() {
 async fn savepoint_and_rollback_to() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     tx.savepoint("sp_rb").await.unwrap();
 
@@ -632,7 +632,7 @@ async fn savepoint_and_rollback_to() {
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title: &str, 'new', $uid: i32)"
     )
-    .execute(&tx)
+    .execute(&mut tx)
     .await
     .unwrap();
 
@@ -642,7 +642,7 @@ async fn savepoint_and_rollback_to() {
     // Verify the row does NOT exist within the transaction.
     let search = "sp_rollback_test";
     let found = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert!(
@@ -667,7 +667,7 @@ async fn savepoint_and_rollback_to() {
 async fn nested_savepoints() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     // Savepoint A: insert row A.
     tx.savepoint("sp_a").await.unwrap();
@@ -677,7 +677,7 @@ async fn nested_savepoints() {
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title_a: &str, 'new', $uid: i32)"
     )
-    .execute(&tx)
+    .execute(&mut tx)
     .await
     .unwrap();
 
@@ -688,7 +688,7 @@ async fn nested_savepoints() {
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title_b: &str, 'new', $uid: i32)"
     )
-    .execute(&tx)
+    .execute(&mut tx)
     .await
     .unwrap();
 
@@ -698,7 +698,7 @@ async fn nested_savepoints() {
     // A's insert should still be visible.
     let search_a = "nested_sp_a";
     let found_a = bsql::query!("SELECT id FROM tickets WHERE title = $search_a: &str")
-        .fetch_all(&tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert_eq!(
@@ -710,7 +710,7 @@ async fn nested_savepoints() {
     // B's insert should be gone.
     let search_b = "nested_sp_b";
     let found_b = bsql::query!("SELECT id FROM tickets WHERE title = $search_b: &str")
-        .fetch_all(&tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert!(
@@ -724,12 +724,12 @@ async fn nested_savepoints() {
 #[tokio::test]
 async fn rollback_to_nonexistent_savepoint_errors() {
     let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     // Force the transaction to be active (lazy BEGIN) with a harmless query.
     let id = 1i32;
     let _ = bsql::query!("SELECT id FROM users WHERE id = $id: i32")
-        .fetch_one(&tx)
+        .fetch_one(&mut tx)
         .await
         .unwrap();
 
@@ -746,7 +746,7 @@ async fn rollback_to_nonexistent_savepoint_errors() {
 #[tokio::test]
 async fn savepoint_invalid_name_rejected() {
     let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     // Empty name.
     let result = tx.savepoint("").await;
@@ -775,7 +775,7 @@ async fn savepoint_invalid_name_rejected() {
 #[tokio::test]
 async fn set_isolation_serializable() {
     let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     tx.set_isolation(bsql::IsolationLevel::Serializable)
         .await
@@ -784,7 +784,7 @@ async fn set_isolation_serializable() {
     // Run a query to prove the transaction works with SERIALIZABLE.
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
-        .fetch_one(&tx)
+        .fetch_one(&mut tx)
         .await
         .unwrap();
     let r = user.get().unwrap();
@@ -796,7 +796,7 @@ async fn set_isolation_serializable() {
 #[tokio::test]
 async fn set_isolation_read_committed() {
     let pool = pool().await;
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     tx.set_isolation(bsql::IsolationLevel::ReadCommitted)
         .await
@@ -804,7 +804,7 @@ async fn set_isolation_read_committed() {
 
     let id = 1i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
-        .fetch_one(&tx)
+        .fetch_one(&mut tx)
         .await
         .unwrap();
     let r = user.get().unwrap();
@@ -821,12 +821,12 @@ async fn set_isolation_read_committed() {
 async fn flush_empty_deferred_queue() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     // Force the transaction active with a read.
     let id = 1i32;
     let _ = bsql::query!("SELECT id FROM users WHERE id = $id: i32")
-        .fetch_one(&tx)
+        .fetch_one(&mut tx)
         .await
         .unwrap();
 
@@ -842,7 +842,7 @@ async fn flush_empty_deferred_queue() {
 async fn multiple_flush_calls() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let title = "multi_flush_test";
     let uid = 1i32;
@@ -873,7 +873,7 @@ async fn multiple_flush_calls() {
     // All 6 rows should exist.
     let search = "multi_flush_test";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert_eq!(rows.len(), 6);
@@ -885,7 +885,7 @@ async fn multiple_flush_calls() {
 async fn deferred_count_tracks_correctly() {
     let pool = pool().await;
 
-    let tx = pool.begin().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
 
     let title = "defer_count_test";
     let uid = 1i32;
