@@ -1,0 +1,3 @@
+t.updated_at DESC, t.id DESC
+t.deadline ASC NULLS LAST, t.id ASC
+t.id DESC

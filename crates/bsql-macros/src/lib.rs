@@ -280,13 +280,7 @@ fn query_impl_sort(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStrea
     let sort_placeholder = parsed.sort_placeholder.as_ref().unwrap();
     let sort_enum_name = &sort_placeholder.enum_name;
 
-    // We can't validate sort variants at proc-macro time because we don't have
-    // the enum definition. Instead, generate code that does runtime SQL dispatch.
-    // The `{SORT}` in positional_sql will be a sentinel that codegen handles.
-
-    // For validation, we need at least the base query structure. Use a dummy
-    // ORDER BY to validate the query shape (columns, params) — replace {SORT}
-    // with "1" (which is always valid in ORDER BY).
+    // Validate the base query shape with a dummy ORDER BY 1.
     let dummy_sql = parsed.positional_sql.replace("{SORT}", "1");
 
     // Create a temporary ParsedQuery with the dummy SQL for validation
@@ -307,6 +301,28 @@ fn query_impl_sort(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStrea
         let result = connection::with_connection(|conn| {
             validate::validate_query_with_suggestions(&dummy_parsed, conn)
         })?;
+
+        // Validate each sort fragment by PREPARE'ing the full query with it spliced in.
+        // Read fragments from .bsql/sorts/{EnumName}.txt (written by #[bsql::sort]).
+        let sorts_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .map(|d| std::path::PathBuf::from(d).join(".bsql").join("sorts"))
+            .ok();
+        if let Some(sorts_dir) = sorts_dir {
+            let path = sorts_dir.join(format!("{}.txt", sort_enum_name));
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                connection::with_connection(|conn| {
+                    for fragment in content.lines().filter(|l| !l.is_empty()) {
+                        let test_sql = parsed.positional_sql.replace("{SORT}", fragment);
+                        let prepare = format!("PREPARE __bsql_sort_check AS {}", test_sql);
+                        if let Err(e) = conn.simple_query(&prepare) {
+                            return Err(format!("sort fragment '{}' is invalid: {}", fragment, e));
+                        }
+                        let _ = conn.simple_query("DEALLOCATE __bsql_sort_check");
+                    }
+                    Ok(())
+                })?;
+            }
+        }
 
         offline::write_cache(&parsed, &result);
         result

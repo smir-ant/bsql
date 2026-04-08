@@ -66,6 +66,23 @@ pub fn expand_sort_enum(_attr: TokenStream, item: TokenStream) -> Result<TokenSt
 
     let variants = parse_sort_variants(&input)?;
 
+    // Write sort fragments to .bsql/sorts/{EnumName}.txt for query! to validate.
+    // Each line is one SQL fragment. Errors silently ignored (offline mode etc).
+    {
+        let cache_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .map(|d| std::path::PathBuf::from(d).join(".bsql").join("sorts"))
+            .or_else(|_| std::env::current_dir().map(|d| d.join(".bsql").join("sorts")));
+        if let Ok(sorts_dir) = cache_dir {
+            let _ = std::fs::create_dir_all(&sorts_dir);
+            let content: String = variants
+                .iter()
+                .map(|v| v.sql_fragment.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let _ = std::fs::write(sorts_dir.join(format!("{}.txt", input.ident)), &content);
+        }
+    }
+
     let enum_name = &input.ident;
     let vis = &input.vis;
 
