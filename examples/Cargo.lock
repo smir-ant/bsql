@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "bsql-core",
  "bsql-driver-sqlite",
@@ -59,14 +59,14 @@ dependencies = [
 
 [[package]]
 name = "bsql-arena"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "simdutf8",
 ]
 
 [[package]]
 name = "bsql-core"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "bsql-arena",
  "bsql-driver-postgres",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-driver-postgres"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "base64",
  "bsql-arena",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-driver-sqlite"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "bsql-arena",
  "libsqlite3-sys",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-macros"
-version = "0.22.1"
+version = "0.22.2"
 dependencies = [
  "bitcode",
  "bsql-core",
