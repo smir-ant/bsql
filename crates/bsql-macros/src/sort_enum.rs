@@ -27,10 +27,10 @@
 //! the query string at compile time, and the runtime selects between
 //! pre-validated SQL strings via a `match`.
 //!
-//! **Note:** Sort SQL fragments are NOT individually validated at compile time.
-//! The query structure is validated but individual ORDER BY expressions are
-//! verified only at runtime. Ensure your `#[sql("...")]` fragments reference
-//! valid columns.
+//! **Compile-time validation:** Sort SQL fragments are validated via a two-phase
+//! registry approach. `#[bsql::sort]` writes each fragment to `.bsql/sorts/`,
+//! then `query!` reads the registry and PREPAREs each fragment in the full query
+//! context against PostgreSQL. Column typos in sort fragments are compile errors.
 
 use proc_macro2::TokenStream;
 use quote::quote;
