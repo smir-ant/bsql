@@ -229,6 +229,7 @@ pub fn generate_sort_query_code(
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
         let row_decode = gen_row_decode(validation);
+        let column_check = gen_column_count_check(validation);
         let r_rows_name = rows_struct_name(parsed);
         let r_single_name = single_ref_struct_name(parsed);
 
@@ -303,6 +304,7 @@ pub fn generate_sort_query_code(
                             ));
                         }
                         let row = owned.row(0);
+                        #column_check
                         Ok(#result_name { #row_decode })
                     }
                 }
@@ -318,6 +320,7 @@ pub fn generate_sort_query_code(
                             0 => Ok(None),
                             1 => {
                                 let row = owned.row(0);
+                                #column_check
                                 Ok(Some(#result_name { #row_decode }))
                             }
                             n => Err(::bsql_core::error::QueryError::row_count(
@@ -341,13 +344,17 @@ pub fn generate_sort_query_code(
                 ::bsql_core::__bsql_fn! {
                     pub fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                         if let Some(row) = self.inner.next_row() {
+                            #column_check
                             return Ok(Some(#result_name { #row_decode }));
                         }
                         if !::bsql_core::__bsql_call!(self.inner.fetch_next_chunk())? {
                             return Ok(None);
                         }
                         match self.inner.next_row() {
-                            Some(row) => Ok(Some(#result_name { #row_decode })),
+                            Some(row) => {
+                                #column_check
+                                Ok(Some(#result_name { #row_decode }))
+                            },
                             None => Ok(None),
                         }
                     }
@@ -369,7 +376,10 @@ pub fn generate_sort_query_code(
                     ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                         #build_sql
                         let owned = ::bsql_core::__bsql_call!(executor.#qm(sql, sql_hash, #params_slice))?;
-                        owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
+                        owned.iter().map(|row| {
+                            #column_check
+                            Ok(#result_name { #row_decode })
+                        }).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                     }
                 }
 
@@ -602,6 +612,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
+    // Column-count bounds check — inserted before every row decode (Fix-5)
+    let column_check = gen_column_count_check(validation);
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
@@ -626,6 +639,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                             ));
                         }
                         let row = owned.row(0);
+                        #column_check
                         Ok(#result_name { #row_decode })
                     }
                 }
@@ -640,6 +654,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                             0 => Ok(None),
                             1 => {
                                 let row = owned.row(0);
+                                #column_check
                                 Ok(Some(#result_name { #row_decode }))
                             }
                             n => Err(::bsql_core::error::QueryError::row_count(
@@ -661,7 +676,10 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     let owned = ::bsql_core::__bsql_call!(executor.#query_method(#sql_lit, #sql_hash_val, #params_slice))?;
-                    owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
+                    owned.iter().map(|row| {
+                        #column_check
+                        Ok(#result_name { #row_decode })
+                    }).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
             }
 
@@ -687,7 +705,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     let stream_struct = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
-        gen_stream_struct(&result_name, &stream_name, &row_decode)
+        gen_stream_struct(&result_name, &stream_name, &row_decode, &column_check)
     } else {
         TokenStream::new()
     };
@@ -734,6 +752,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         // constructs a minimal single-column wrapper only for those columns.
         let (fe_raw_stmts, fe_raw_inits) = gen_pg_for_each_raw_decode(validation);
         let (fe_raw_stmts2, fe_raw_inits2) = gen_pg_for_each_raw_decode(validation);
+        let raw_column_check = gen_raw_column_count_check(validation);
 
         quote! {
             /// Process each row directly from the wire buffer via a closure.
@@ -755,6 +774,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                         #params_slice,
                         true,
                         |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                            #raw_column_check
                             #fe_raw_stmts
                             let _bsql_typed = #fe_row_name { #fe_raw_inits };
                             f(_bsql_typed)
@@ -780,6 +800,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                         #params_slice,
                         true,
                         |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                            #raw_column_check
                             #fe_raw_stmts2
                             let _bsql_typed = #fe_row_name { #fe_raw_inits2 };
                             _bsql_results.push(f(_bsql_typed));
@@ -942,6 +963,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         TokenStream::new()
     };
 
+    // Column-count bounds check — inserted before every row decode (Fix-5)
+    let column_check = gen_column_count_check(validation);
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
@@ -968,6 +992,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                         ));
                     }
                     let row = owned.row(0);
+                    #column_check
                     Ok(#result_name { #row_decode })
                 }
             });
@@ -979,6 +1004,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                         0 => Ok(None),
                         1 => {
                             let row = owned.row(0);
+                            #column_check
                             Ok(Some(#result_name { #row_decode }))
                         }
                         n => Err(::bsql_core::error::QueryError::row_count(
@@ -1013,7 +1039,10 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         let fetch_all_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
             quote! {
                 let owned = ::bsql_core::__bsql_call!(executor.#qm(&_bsql_sql, _bsql_hash, &_bsql_params[..]))?;
-                owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
+                owned.iter().map(|row| {
+                    #column_check
+                    Ok(#result_name { #row_decode })
+                }).collect::<::bsql_core::BsqlResult<Vec<_>>>()
             }
         });
 
@@ -1057,7 +1086,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
     let stream_struct = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
-        gen_stream_struct(&result_name, &stream_name, &row_decode)
+        gen_stream_struct(&result_name, &stream_name, &row_decode, &column_check)
     } else {
         TokenStream::new()
     };
@@ -1106,6 +1135,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         let fe_row_name = pg_for_each_row_struct_name(parsed);
         let (fe_raw_stmts, fe_raw_inits) = gen_pg_for_each_raw_decode(validation);
         let (fe_raw_stmts2, fe_raw_inits2) = gen_pg_for_each_raw_decode(validation);
+        let raw_column_check = gen_raw_column_count_check(validation);
 
         let for_each_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
             quote! {
@@ -1115,6 +1145,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     &_bsql_params[..],
                     true,
                     |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                        #raw_column_check
                         #fe_raw_stmts
                         let _bsql_typed = #fe_row_name { #fe_raw_inits };
                         f(_bsql_typed)
@@ -1131,6 +1162,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     &_bsql_params[..],
                     true,
                     |_bsql_data: &[u8]| -> ::bsql_core::BsqlResult<()> {
+                        #raw_column_check
                         #fe_raw_stmts2
                         let _bsql_typed = #fe_row_name { #fe_raw_inits2 };
                         _bsql_results.push(f(_bsql_typed));
@@ -1552,6 +1584,7 @@ fn gen_stream_struct(
     result_name: &proc_macro2::Ident,
     stream_name: &proc_macro2::Ident,
     row_decode: &TokenStream,
+    column_check: &TokenStream,
 ) -> TokenStream {
     quote! {
         #[allow(non_camel_case_types)]
@@ -1568,13 +1601,17 @@ fn gen_stream_struct(
             ::bsql_core::__bsql_fn! {
                 pub fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                     if let Some(row) = self.inner.next_row() {
+                        #column_check
                         return Ok(Some(#result_name { #row_decode }));
                     }
                     if !::bsql_core::__bsql_call!(self.inner.fetch_next_chunk())? {
                         return Ok(None);
                     }
                     match self.inner.next_row() {
-                        Some(row) => Ok(Some(#result_name { #row_decode })),
+                        Some(row) => {
+                            #column_check
+                            Ok(Some(#result_name { #row_decode }))
+                        },
                         None => Ok(None),
                     }
                 }
@@ -2201,6 +2238,50 @@ fn gen_pg_raw_nullable_feature_decode(
     }
 }
 
+/// Generate a runtime column-count bounds check for `Row`-based decode paths.
+///
+/// If the row has fewer columns than expected (e.g., schema drift between
+/// compile-time and runtime), returns `Err(DecodeError::column_count(...))`
+/// instead of panicking with an index-out-of-bounds.
+///
+/// The variable `row` must be in scope when the generated code runs.
+fn gen_column_count_check(validation: &ValidationResult) -> TokenStream {
+    let expected = validation.columns.len();
+    if expected == 0 {
+        return TokenStream::new();
+    }
+    quote! {
+        if row.column_count() < #expected {
+            return Err(::bsql_core::error::DecodeError::column_count(
+                #expected,
+                row.column_count(),
+            ));
+        }
+    }
+}
+
+/// Generate a runtime column-count bounds check for the raw-bytes (`_bsql_data`) path.
+///
+/// Reads the i16 num_cols from the DataRow header and checks it against the
+/// expected column count. Returns `Err` on mismatch instead of panicking.
+fn gen_raw_column_count_check(validation: &ValidationResult) -> TokenStream {
+    let expected = validation.columns.len() as i16;
+    if expected == 0 {
+        return TokenStream::new();
+    }
+    quote! {
+        {
+            let _bsql_num_cols = i16::from_be_bytes([_bsql_data[0], _bsql_data[1]]);
+            if _bsql_num_cols < #expected {
+                return Err(::bsql_core::error::DecodeError::column_count(
+                    #expected as usize,
+                    _bsql_num_cols as usize,
+                ));
+            }
+        }
+    }
+}
+
 /// Generate row field decoding using typed getters from bsql_driver_postgres::Row.
 ///
 /// For each column, generates the appropriate getter call based on the Rust type:
@@ -2696,6 +2777,7 @@ fn gen_rows_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Token
     let single_ref_name = single_ref_struct_name(parsed);
     let fe_row_name = pg_for_each_row_struct_name(parsed);
     let borrowed_decode = gen_borrowed_row_decode(validation);
+    let column_check = gen_column_count_check(validation);
 
     // Check if the for_each struct needs a phantom marker
     let needs_lifetime = validation.columns.iter().any(|col| {
@@ -2729,6 +2811,7 @@ fn gen_rows_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Token
             /// Get a borrowed row by index.
             pub fn get(&self, idx: usize) -> ::bsql_core::BsqlResult<#fe_row_name<'_>> {
                 let row = self.owned.row(idx);
+                #column_check
                 Ok(#fe_row_name { #borrowed_decode #phantom_init })
             }
 
@@ -2750,6 +2833,7 @@ fn gen_rows_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Token
             /// Get the borrowed row.
             pub fn get(&self) -> ::bsql_core::BsqlResult<#fe_row_name<'_>> {
                 let row = self.owned.row(0);
+                #column_check
                 Ok(#fe_row_name { #borrowed_decode #phantom_init })
             }
         }
@@ -3406,6 +3490,55 @@ mod tests {
         assert!(
             !rows_section.contains("to_vec"),
             "nullable BsqlRows decode should NOT use to_vec: {rows_section}"
+        );
+    }
+
+    // --- Fix-5: column count bounds check ---
+
+    #[test]
+    fn generated_code_includes_column_count_check() {
+        let parsed = parse_query("SELECT id, name FROM t WHERE 1 = $a: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32"), col("name", "String")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // The generated code must contain column_count checks before decode
+        assert!(
+            code_str.contains("column_count"),
+            "generated code should include column_count bounds check: {code_str}"
+        );
+        // Must reference DecodeError::column_count
+        assert!(
+            code_str.contains("DecodeError"),
+            "generated code should reference DecodeError for column mismatch: {code_str}"
+        );
+    }
+
+    #[test]
+    fn column_count_check_uses_correct_count() {
+        let parsed = parse_query("SELECT a, b, c FROM t WHERE 1 = $x: i32").unwrap();
+        let validation = make_validation(vec![col("a", "i32"), col("b", "i32"), col("c", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // 3 columns — the check must reference 3usize
+        assert!(
+            code_str.contains("3usize") || code_str.contains("3 usize"),
+            "column_count check should use expected=3: {code_str}"
+        );
+    }
+
+    #[test]
+    fn no_column_count_check_for_execute_only() {
+        // An UPDATE with no RETURNING has no columns — no check needed
+        let parsed = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            !code_str.contains("column_count"),
+            "execute-only query should NOT have column_count check: {code_str}"
         );
     }
 }

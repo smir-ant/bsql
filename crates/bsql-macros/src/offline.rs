@@ -21,7 +21,7 @@ use crate::validate::{ColumnInfo, ValidationResult};
 // ---------------------------------------------------------------------------
 
 /// Current cache format version. Bump when `CachedQuery` fields change.
-const CACHE_FORMAT_VERSION: u8 = 2;
+const CACHE_FORMAT_VERSION: u8 = 3;
 
 /// The bsql crate version at build time. Stored in each cache entry so that
 /// a bsql version upgrade invalidates stale caches rather than producing
@@ -51,6 +51,18 @@ struct CachedQueryV1 {
     pub param_is_pg_enum: Vec<bool>,
 }
 
+/// Legacy v2 cache format (without `param_rust_types` field).
+/// Used for backwards-compatible reading of v2 cache entries.
+#[derive(Debug, Clone, Encode, Decode)]
+struct CachedQueryV2 {
+    pub sql_hash: u64,
+    pub normalized_sql: String,
+    pub columns: Vec<CachedColumn>,
+    pub param_pg_oids: Vec<u32>,
+    pub param_is_pg_enum: Vec<bool>,
+    pub bsql_version: String,
+}
+
 /// A single cached query validation result, persisted as bitcode.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CachedQuery {
@@ -67,6 +79,10 @@ pub struct CachedQuery {
     /// The bsql version that generated this cache entry. Used to invalidate
     /// cache on bsql upgrades that change type mappings or codegen.
     pub bsql_version: String,
+    /// User-declared Rust type strings for each parameter position.
+    /// Empty for cache entries migrated from v2 (param type checking is
+    /// skipped for those entries).
+    pub param_rust_types: Vec<String>,
 }
 
 /// A single result column, cached.
@@ -217,9 +233,9 @@ pub fn lookup_cached_validation(parsed: &ParsedQuery) -> Result<ValidationResult
         )
     })?;
 
-    // Decode the inner CachedQuery, handling v1 -> v2 migration
+    // Decode the inner CachedQuery, handling v1 -> v2 -> v3 migration
     let cached: CachedQuery = if envelope.version == 1 {
-        // v1 format: CachedQuery without bsql_version field
+        // v1 format: CachedQuery without bsql_version or param_rust_types
         let v1: CachedQueryV1 = bitcode::decode(&envelope.data).map_err(|e| {
             format!(
                 "failed to decode v1 cached query in {} (file may be corrupted \
@@ -235,6 +251,26 @@ pub fn lookup_cached_validation(parsed: &ParsedQuery) -> Result<ValidationResult
             param_pg_oids: v1.param_pg_oids,
             param_is_pg_enum: v1.param_is_pg_enum,
             bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec![],
+        }
+    } else if envelope.version == 2 {
+        // v2 format: CachedQuery without param_rust_types
+        let v2: CachedQueryV2 = bitcode::decode(&envelope.data).map_err(|e| {
+            format!(
+                "failed to decode v2 cached query in {} (file may be corrupted \
+                 — run `cargo build` with a live PostgreSQL connection to \
+                 regenerate): {e}",
+                path.display()
+            )
+        })?;
+        CachedQuery {
+            sql_hash: v2.sql_hash,
+            normalized_sql: v2.normalized_sql,
+            columns: v2.columns,
+            param_pg_oids: v2.param_pg_oids,
+            param_is_pg_enum: v2.param_is_pg_enum,
+            bsql_version: v2.bsql_version,
+            param_rust_types: vec![],
         }
     } else if envelope.version == CACHE_FORMAT_VERSION {
         let cached: CachedQuery = bitcode::decode(&envelope.data).map_err(|e| {
@@ -264,6 +300,33 @@ pub fn lookup_cached_validation(parsed: &ParsedQuery) -> Result<ValidationResult
             envelope.version, CACHE_FORMAT_VERSION
         ));
     };
+
+    // Verify parameter Rust types match — catches changes like $id: i32 → $id: &str
+    // that would not be detected until runtime without this check.
+    // Skipped for migrated v2 cache entries (param_rust_types is empty).
+    if !cached.param_rust_types.is_empty() {
+        for (i, cached_type) in cached.param_rust_types.iter().enumerate() {
+            if i < parsed.params.len() {
+                let current_type = &parsed.params[i].rust_type;
+                if current_type != cached_type {
+                    return Err(format!(
+                        "parameter type mismatch: ${} was '{}' when cache was built, \
+                         now declared as '{}'. Rebuild with a live database connection \
+                         to update the cache.",
+                        parsed.params[i].name, cached_type, current_type
+                    ));
+                }
+            }
+        }
+        if parsed.params.len() != cached.param_rust_types.len() {
+            return Err(format!(
+                "parameter count changed: cache has {} params, query now has {}. \
+                 Rebuild with a live database connection.",
+                cached.param_rust_types.len(),
+                parsed.params.len()
+            ));
+        }
+    }
 
     // Verify the normalized SQL matches (guards against hash collisions,
     // which are astronomically unlikely but worth defending against)
@@ -396,6 +459,7 @@ fn validation_to_cached(
         param_pg_oids: validation.param_pg_oids.to_vec(),
         param_is_pg_enum: validation.param_is_pg_enum.to_vec(),
         bsql_version: BSQL_VERSION.to_owned(),
+        param_rust_types: parsed.params.iter().map(|p| p.rust_type.clone()).collect(),
     }
 }
 
@@ -485,6 +549,7 @@ mod tests {
             param_pg_oids: vec![23],
             param_is_pg_enum: vec![false],
             bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec!["i32".into()],
         }
     }
 
@@ -597,6 +662,7 @@ mod tests {
         assert_eq!(cached.columns[0].pg_oid, 20);
         assert_eq!(cached.columns[0].rust_type, "i64");
         assert_eq!(cached.param_pg_oids, vec![25, 23]);
+        assert_eq!(cached.param_rust_types, vec!["&str", "i32"]);
     }
 
     #[test]
@@ -676,6 +742,7 @@ mod tests {
             param_pg_oids: vec![23],
             param_is_pg_enum: vec![false],
             bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec!["i32".into()],
         };
 
         let bytes = encode_enveloped(&cached);
@@ -699,6 +766,7 @@ mod tests {
             param_pg_oids: vec![99999],
             param_is_pg_enum: vec![true],
             bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec!["String".into()],
         };
 
         let bytes = encode_enveloped(&cached);
@@ -922,11 +990,97 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec![],
         };
         let other_sql = "select b from t";
         assert_ne!(cached.normalized_sql, other_sql);
         // The guard in lookup_cached_validation compares cached.normalized_sql
         // against parsed.normalized_sql — here we just verify the strings differ
         // and that the error path would fire.
+    }
+
+    // --- v3 param_rust_types tests ---
+
+    #[test]
+    fn cache_v3_roundtrip_with_param_types() {
+        let query = CachedQuery {
+            sql_hash: 42,
+            normalized_sql: "SELECT id FROM users WHERE id = $1".to_owned(),
+            columns: vec![],
+            param_pg_oids: vec![23],
+            param_is_pg_enum: vec![false],
+            bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec!["i32".to_owned()],
+        };
+        let bytes = encode_enveloped(&query);
+        let decoded = decode_enveloped(&bytes).unwrap();
+        assert_eq!(decoded.param_rust_types, vec!["i32"]);
+    }
+
+    #[test]
+    fn cache_v2_migration_has_empty_param_types() {
+        // Write a v2 cache entry (without param_rust_types)
+        let v2 = CachedQueryV2 {
+            sql_hash: 77,
+            normalized_sql: "SELECT 1".to_owned(),
+            columns: vec![],
+            param_pg_oids: vec![23],
+            param_is_pg_enum: vec![false],
+            bsql_version: BSQL_VERSION.to_owned(),
+        };
+        let inner_bytes = bitcode::encode(&v2);
+        let envelope = CacheEnvelope {
+            version: 2,
+            data: inner_bytes,
+        };
+        let bytes = bitcode::encode(&envelope);
+
+        // Decode through the v1/v2/v3 migration path used by lookup
+        let env: CacheEnvelope = bitcode::decode(&bytes).unwrap();
+        assert_eq!(env.version, 2);
+        let decoded_v2: CachedQueryV2 = bitcode::decode(&env.data).unwrap();
+        let migrated = CachedQuery {
+            sql_hash: decoded_v2.sql_hash,
+            normalized_sql: decoded_v2.normalized_sql,
+            columns: decoded_v2.columns,
+            param_pg_oids: decoded_v2.param_pg_oids,
+            param_is_pg_enum: decoded_v2.param_is_pg_enum,
+            bsql_version: decoded_v2.bsql_version,
+            param_rust_types: vec![],
+        };
+        assert!(migrated.param_rust_types.is_empty());
+        assert_eq!(migrated.sql_hash, 77);
+    }
+
+    #[test]
+    fn cache_v3_multiple_param_types_roundtrip() {
+        let query = CachedQuery {
+            sql_hash: 100,
+            normalized_sql: "SELECT 1 FROM t WHERE a = $1 AND b = $2".to_owned(),
+            columns: vec![],
+            param_pg_oids: vec![23, 25],
+            param_is_pg_enum: vec![false, false],
+            bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec!["i32".to_owned(), "&str".to_owned()],
+        };
+        let bytes = encode_enveloped(&query);
+        let decoded = decode_enveloped(&bytes).unwrap();
+        assert_eq!(decoded.param_rust_types, vec!["i32", "&str"]);
+    }
+
+    #[test]
+    fn cache_v3_empty_param_types_roundtrip() {
+        let query = CachedQuery {
+            sql_hash: 200,
+            normalized_sql: "SELECT 1".to_owned(),
+            columns: vec![],
+            param_pg_oids: vec![],
+            param_is_pg_enum: vec![],
+            bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec![],
+        };
+        let bytes = encode_enveloped(&query);
+        let decoded = decode_enveloped(&bytes).unwrap();
+        assert!(decoded.param_rust_types.is_empty());
     }
 }

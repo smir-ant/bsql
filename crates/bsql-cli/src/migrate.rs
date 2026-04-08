@@ -205,6 +205,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
         let result = check_migration(&url, "", &queries).unwrap();
         assert_eq!(result.total_queries, 1);
@@ -233,6 +234,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
 
         // Migration drops the column — shadow copy loses 'name', PREPARE fails
@@ -270,6 +272,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
 
         let result = check_migration(
@@ -301,6 +304,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
 
         // Adding a column should not break existing queries
@@ -347,6 +351,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
         let result = check_migration(&url, "", &queries).unwrap();
         assert_eq!(result.failed.len(), 1);
@@ -367,6 +372,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
         // This will fail on connection — the semicolon check only fires
         // inside check_migration after successful connection. So this test
@@ -389,6 +395,7 @@ mod tests {
                 param_pg_oids: vec![],
                 param_is_pg_enum: vec![],
                 bsql_version: "0.20.1".to_owned(),
+                param_rust_types: vec![],
             },
             crate::cache::CachedQuery {
                 sql_hash: 2,
@@ -397,6 +404,7 @@ mod tests {
                 param_pg_oids: vec![],
                 param_is_pg_enum: vec![],
                 bsql_version: "0.20.1".to_owned(),
+                param_rust_types: vec![],
             },
             crate::cache::CachedQuery {
                 sql_hash: 3,
@@ -405,6 +413,7 @@ mod tests {
                 param_pg_oids: vec![],
                 param_is_pg_enum: vec![],
                 bsql_version: "0.20.1".to_owned(),
+                param_rust_types: vec![],
             },
         ];
         let result = check_migration(&url, "", &queries).unwrap();
@@ -423,6 +432,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
         // Migration SQL with multiple statements is fine -- it's trusted input
         // The SEMICOLON check is on CACHED QUERIES, not on migration SQL
@@ -441,6 +451,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
         let result = check_migration(&url, "", &queries).unwrap();
         // Empty SQL will fail PREPARE -- that's expected
@@ -457,6 +468,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
         let result = check_migration(&url, "", &queries).unwrap();
         assert_eq!(result.passed, 1);
@@ -475,6 +487,7 @@ mod tests {
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
+            param_rust_types: vec![],
         }];
         let result = check_migration(&url, "", &queries).unwrap();
         assert_eq!(result.passed, 1);
@@ -491,6 +504,7 @@ mod tests {
                 param_pg_oids: vec![],
                 param_is_pg_enum: vec![],
                 bsql_version: "0.20.1".to_owned(),
+                param_rust_types: vec![],
             })
             .collect();
         let result = check_migration(&url, "", &queries).unwrap();

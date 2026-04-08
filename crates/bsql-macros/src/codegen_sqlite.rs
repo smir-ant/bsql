@@ -394,6 +394,25 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 
 // --- Executor impl ---
 
+/// Generate a runtime column-count bounds check for SQLite decode paths.
+///
+/// Checks `_bsql_stmt.column_count()` against the expected number of columns.
+/// Returns `Err(BsqlError::Decode(...))` on mismatch instead of panicking.
+fn gen_sqlite_column_count_check(validation: &ValidationResult) -> TokenStream {
+    let expected = validation.columns.len() as i32;
+    if expected == 0 {
+        return TokenStream::new();
+    }
+    quote! {
+        if _bsql_stmt.column_count() < #expected {
+            return Err(::bsql_core::error::DecodeError::column_count(
+                #expected as usize,
+                _bsql_stmt.column_count() as usize,
+            ));
+        }
+    }
+}
+
 /// Wrap a decode expression that may `return Err(SqliteError)` so it converts
 /// to `BsqlError`. The decode code was written for closures that return
 /// `Result<T, SqliteError>`, but inline code returns `BsqlResult<T>`.
@@ -529,6 +548,9 @@ fn gen_executor_impls(
         TokenStream::new()
     };
 
+    // Column-count bounds check for SQLite — inserted before every decode (Fix-5)
+    let sqlite_column_check = gen_sqlite_column_count_check(validation);
+
     let inline_bind = gen_inline_param_bind();
 
     let fetch_methods = if has_columns {
@@ -549,6 +571,7 @@ fn gen_executor_impls(
                     let _bsql_stmt = _bsql_conn.__get_or_prepare(#limited_sql_lit, #limited_sql_hash_val)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #inline_bind
+                    #sqlite_column_check
                     match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
                         ::bsql_core::driver_sqlite::StepResult::Row => {
                             let _bsql_result = #decode_one_inner;
@@ -597,6 +620,7 @@ fn gen_executor_impls(
                     let _bsql_stmt = _bsql_conn.__get_or_prepare(#limited_sql_lit, #limited_sql_hash_val)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #inline_bind
+                    #sqlite_column_check
                     match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
                         ::bsql_core::driver_sqlite::StepResult::Row => {
                             let _bsql_result = #decode_opt_inner;
@@ -630,6 +654,7 @@ fn gen_executor_impls(
                     let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #inline_bind
+                    #sqlite_column_check
                     let mut _bsql_text_buf: Vec<u8> = Vec::new();
                     let mut _bsql_blob_arena = ::bsql_core::driver_sqlite::acquire_arena();
                     let mut _bsql_rows = Vec::new();
@@ -671,6 +696,7 @@ fn gen_executor_impls(
                     let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #inline_bind
+                    #sqlite_column_check
                     let mut _bsql_rows = Vec::new();
                     loop {
                         match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
@@ -730,6 +756,7 @@ fn gen_executor_impls(
                 let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
                     .map_err(::bsql_core::BsqlError::from_sqlite)?;
                 #inline_bind
+                #sqlite_column_check
                 loop {
                     match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
                         ::bsql_core::driver_sqlite::StepResult::Row => {
@@ -759,6 +786,7 @@ fn gen_executor_impls(
                 let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
                     .map_err(::bsql_core::BsqlError::from_sqlite)?;
                 #inline_bind
+                #sqlite_column_check
                 let mut _bsql_rows = Vec::new();
                 loop {
                     match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
@@ -1558,6 +1586,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         TokenStream::new()
     };
 
+    // Column-count bounds check for SQLite dynamic queries (Fix-5)
+    let sqlite_column_check = gen_sqlite_column_count_check(validation);
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let needs_limit = has_columns && is_select && !parsed.normalized_sql.contains(" limit ");
@@ -1571,6 +1602,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #bind
+                    #sqlite_column_check
                     match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
                         ::bsql_core::driver_sqlite::StepResult::Row => {
                             let _bsql_result = #decode_one;
@@ -1612,6 +1644,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #bind
+                    #sqlite_column_check
                     match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
                         ::bsql_core::driver_sqlite::StepResult::Row => {
                             let _bsql_result = #decode_opt;
@@ -1640,6 +1673,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                         let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                             .map_err(::bsql_core::BsqlError::from_sqlite)?;
                         #bind
+                        #sqlite_column_check
                         let mut _bsql_text_buf: Vec<u8> = Vec::new();
                         let mut _bsql_blob_arena = ::bsql_core::driver_sqlite::acquire_arena();
                         let mut _bsql_rows = Vec::new();
@@ -1683,6 +1717,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                         let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                             .map_err(::bsql_core::BsqlError::from_sqlite)?;
                         #bind
+                        #sqlite_column_check
                         let mut _bsql_rows = Vec::new();
                         loop {
                             match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
@@ -1739,6 +1774,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                 let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                     .map_err(::bsql_core::BsqlError::from_sqlite)?;
                 #bind
+                #sqlite_column_check
                 loop {
                     match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
                         ::bsql_core::driver_sqlite::StepResult::Row => {
@@ -1762,6 +1798,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #bind
+                    #sqlite_column_check
                     let mut _bsql_rows = Vec::new();
                     loop {
                         match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {

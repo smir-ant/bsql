@@ -401,6 +401,22 @@ impl DecodeError {
             source: Some(Box::new(source)),
         })
     }
+
+    /// Create a decode error for a column count mismatch.
+    ///
+    /// Used by generated code to detect schema drift between compile-time
+    /// and runtime (e.g. a column was added/removed after the binary was built).
+    pub fn column_count(expected: usize, actual: usize) -> BsqlError {
+        BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("*"),
+            expected: "matching column count",
+            actual: Cow::Owned(format!(
+                "expected {} columns but row has {}",
+                expected, actual
+            )),
+            source: None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1130,5 +1146,20 @@ mod tests {
             "should include msg: {display}"
         );
         assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn decode_error_column_count_mismatch() {
+        // DecodeError::column_count returns a BsqlError::Decode
+        let e: BsqlError = DecodeError::column_count(3, 2);
+        let display = e.to_string();
+        assert!(
+            display.contains("expected 3 columns but row has 2"),
+            "should describe column count mismatch: {display}"
+        );
+        // Should be a Decode variant
+        assert!(matches!(e, BsqlError::Decode(_)));
+        // No source
+        assert!(e.source().is_none());
     }
 }

@@ -63,7 +63,7 @@ pub fn validate_query(
     // Detect PG enums by querying pg_type.typtype for each parameter OID.
     let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids);
 
-    let columns = build_columns(conn, &result.columns)?;
+    let columns = build_columns(conn, &result.columns, &parsed.positional_sql)?;
 
     Ok(ValidationResult {
         columns,
@@ -75,11 +75,33 @@ pub fn validate_query(
 }
 
 /// Resolve column metadata (name, type, nullability) from a prepared statement.
+///
+/// `sql` is the normalized SQL string, used to infer NOT NULL for computed
+/// columns via `is_known_not_null`.
 fn build_columns(
     conn: &mut Connection,
     pg_columns: &[ColumnDesc],
+    sql: &str,
 ) -> Result<Vec<ColumnInfo>, String> {
-    let nullable_flags = resolve_nullability_batch(conn, pg_columns);
+    let mut nullable_flags = resolve_nullability_batch(conn, pg_columns);
+
+    // Second pass: override known-NOT-NULL computed columns (Fix-6).
+    // Parse the SELECT list and check each computed column (table_oid == 0)
+    // against known NOT NULL expression patterns.
+    let select_exprs = parse_select_expressions(sql);
+    for (i, col) in pg_columns.iter().enumerate() {
+        if col.table_oid == 0 && nullable_flags[i] {
+            // Computed column — check if the expression is known NOT NULL.
+            let expr = if i < select_exprs.len() {
+                &select_exprs[i]
+            } else {
+                ""
+            };
+            if is_known_not_null(&col.name, expr) {
+                nullable_flags[i] = false;
+            }
+        }
+    }
 
     // Detect which columns are PG enum types (for the enum error message).
     let enum_flags = detect_column_enums(conn, pg_columns);
@@ -118,6 +140,169 @@ fn build_columns(
         });
     }
     Ok(columns)
+}
+
+/// Parse the SELECT clause of a SQL statement and extract individual expressions.
+///
+/// Handles nested parentheses (e.g., `COALESCE(a, 'x')`, `SUM(CASE ... END)`)
+/// by tracking parenthesis depth. Strips trailing `AS alias` from each expression.
+///
+/// Returns an empty `Vec` if the SQL cannot be parsed (e.g., no SELECT/FROM).
+fn parse_select_expressions(sql: &str) -> Vec<String> {
+    let lower = sql.to_lowercase();
+
+    // Find "SELECT " (case insensitive)
+    let select_start = match lower.find("select ") {
+        Some(pos) => pos + 7, // skip "select "
+        None => return Vec::new(),
+    };
+
+    // Handle SELECT DISTINCT
+    let after_select = lower[select_start..].trim_start();
+    let offset = if after_select.starts_with("distinct ") {
+        select_start + (lower[select_start..].len() - after_select.len()) + 9
+    } else {
+        select_start
+    };
+
+    // Find " FROM " — end of select list.
+    // Must find the FROM at depth 0 (not inside subqueries).
+    let select_region = &sql[offset..];
+    let mut from_pos = None;
+    let mut depth: i32 = 0;
+    let select_lower = &lower[offset..];
+    let bytes = select_lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b' ' if depth == 0 && i + 6 <= bytes.len() => {
+                if &select_lower[i..i + 6] == " from " {
+                    from_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let select_list = match from_pos {
+        Some(pos) => &select_region[..pos],
+        // No FROM clause (e.g., "SELECT 1") — entire remaining string is the select list
+        None => select_region.trim_end_matches(';').trim(),
+    };
+
+    // Split by commas, respecting parenthesis depth.
+    let mut exprs = Vec::new();
+    let mut current_start = 0;
+    depth = 0;
+    let list_bytes = select_list.as_bytes();
+    for j in 0..list_bytes.len() {
+        match list_bytes[j] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                let raw = select_list[current_start..j].trim();
+                exprs.push(strip_alias(raw));
+                current_start = j + 1;
+            }
+            _ => {}
+        }
+    }
+    // Last expression
+    let raw = select_list[current_start..].trim();
+    if !raw.is_empty() {
+        exprs.push(strip_alias(raw));
+    }
+
+    exprs
+}
+
+/// Strip a trailing `AS alias` from a SELECT expression.
+///
+/// Handles both `expr AS alias` and `expr alias` (implicit alias).
+/// Only strips at depth 0 to avoid stripping `AS` inside subqueries.
+fn strip_alias(expr: &str) -> String {
+    let lower = expr.to_lowercase();
+
+    // Look for " as " (case insensitive) at depth 0, from right to left.
+    if let Some(as_pos) = lower.rfind(" as ") {
+        // Verify it's at depth 0
+        let depth: i32 = expr[..as_pos]
+            .bytes()
+            .map(|b| match b {
+                b'(' => 1,
+                b')' => -1,
+                _ => 0,
+            })
+            .sum();
+        if depth == 0 {
+            return expr[..as_pos].trim().to_owned();
+        }
+    }
+
+    expr.trim().to_owned()
+}
+
+/// Check if a SQL expression in the SELECT list is known to produce NOT NULL results.
+///
+/// Analyzes the expression text for patterns that the SQL standard guarantees
+/// will never return NULL. Uses both the column name (from `pg_catalog`) and
+/// the parsed expression text for maximum coverage.
+fn is_known_not_null(col_name: &str, select_expr: &str) -> bool {
+    // If the SELECT expression is empty (parsing failed), fall back to the
+    // column name reported by PostgreSQL. Bare aggregates like COUNT(*)
+    // produce a column name "count".
+    let expr_lower = if select_expr.trim().is_empty() {
+        col_name.to_lowercase()
+    } else {
+        select_expr.trim().to_lowercase()
+    };
+
+    // COUNT(*) and COUNT(expr) — SQL standard guarantees NOT NULL
+    if expr_lower.starts_with("count(") || expr_lower == "count" {
+        return true;
+    }
+
+    // COALESCE with a literal last argument — guaranteed NOT NULL
+    if expr_lower.starts_with("coalesce(") {
+        // Check if the last argument before ')' is a literal
+        // This is a heuristic — covers COALESCE(col, 'default') patterns
+        if let Some(last_arg) = expr_lower.rsplit(',').next() {
+            let trimmed = last_arg.trim().trim_end_matches(')').trim();
+            if trimmed.starts_with('\'')
+                || trimmed.parse::<f64>().is_ok()
+                || trimmed == "true"
+                || trimmed == "false"
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // EXISTS(...) — always returns boolean, never NULL
+    if expr_lower.starts_with("exists(") {
+        return true;
+    }
+
+    // Numeric/string/boolean literals
+    if expr_lower.parse::<f64>().is_ok() {
+        return true;
+    }
+    if expr_lower.starts_with('\'') && expr_lower.ends_with('\'') {
+        return true;
+    }
+    if expr_lower == "true" || expr_lower == "false" {
+        return true;
+    }
+    if expr_lower.starts_with("current_") {
+        return true;
+    } // CURRENT_DATE, CURRENT_TIMESTAMP, etc.
+
+    false
 }
 
 /// Fetch EXPLAIN output for a query (only when `explain` feature is enabled).
@@ -415,7 +600,7 @@ fn validate_variant(
     let param_pg_oids: SmallVec<[u32; 8]> = result.param_oids.iter().copied().collect();
     let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids);
 
-    let columns = build_columns(conn, &result.columns)?;
+    let columns = build_columns(conn, &result.columns, &variant.sql)?;
 
     Ok(ValidationResult {
         columns,
@@ -921,5 +1106,85 @@ mod tests {
             result.is_err(),
             "Option<&str> stripped to &str should not match int4"
         );
+    }
+
+    // --- is_known_not_null ---
+
+    #[test]
+    fn is_known_not_null_count() {
+        assert!(is_known_not_null("count", "count(*)"));
+        assert!(is_known_not_null("count", "COUNT(id)"));
+        assert!(is_known_not_null("total", "count(*)"));
+    }
+
+    #[test]
+    fn is_known_not_null_coalesce_with_literal() {
+        assert!(is_known_not_null("x", "coalesce(name, 'unknown')"));
+        assert!(is_known_not_null("x", "COALESCE(a, b, 0)"));
+    }
+
+    #[test]
+    fn is_known_not_null_coalesce_without_literal() {
+        assert!(!is_known_not_null("x", "coalesce(a, b)"));
+    }
+
+    #[test]
+    fn is_known_not_null_exists() {
+        assert!(is_known_not_null("x", "exists(select 1 from t)"));
+    }
+
+    #[test]
+    fn is_known_not_null_literals() {
+        assert!(is_known_not_null("x", "1"));
+        assert!(is_known_not_null("x", "'hello'"));
+        assert!(is_known_not_null("x", "true"));
+        assert!(is_known_not_null("x", "42.5"));
+    }
+
+    #[test]
+    fn is_known_not_null_current() {
+        assert!(is_known_not_null("x", "current_timestamp"));
+        assert!(is_known_not_null("x", "current_date"));
+    }
+
+    #[test]
+    fn is_known_not_null_regular_column() {
+        assert!(!is_known_not_null("name", "name"));
+        assert!(!is_known_not_null("x", "some_function(a)"));
+    }
+
+    // --- parse_select_expressions ---
+
+    #[test]
+    fn parse_select_list_simple() {
+        let exprs = parse_select_expressions("select id, name from users");
+        assert_eq!(exprs, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn parse_select_list_with_functions() {
+        let exprs =
+            parse_select_expressions("select count(*), coalesce(name, 'x') as n from users");
+        assert_eq!(exprs, vec!["count(*)", "coalesce(name, 'x')"]);
+    }
+
+    #[test]
+    fn parse_select_list_nested_parens() {
+        let exprs =
+            parse_select_expressions("select id, sum(case when x > 0 then 1 else 0 end) from t");
+        assert_eq!(exprs, vec!["id", "sum(case when x > 0 then 1 else 0 end)"]);
+    }
+
+    #[test]
+    fn parse_select_list_no_from() {
+        // "SELECT 1" has no FROM clause
+        let exprs = parse_select_expressions("SELECT 1");
+        assert_eq!(exprs, vec!["1"]);
+    }
+
+    #[test]
+    fn parse_select_list_distinct() {
+        let exprs = parse_select_expressions("SELECT DISTINCT id, name FROM t");
+        assert_eq!(exprs, vec!["id", "name"]);
     }
 }
