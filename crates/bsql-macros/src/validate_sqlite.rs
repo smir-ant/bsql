@@ -530,4 +530,253 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    // --- pg_to_sqlite_params: edge cases for WHERE/JOIN/DELETE etc ---
+
+    #[test]
+    fn convert_where_with_or() {
+        assert_eq!(
+            pg_to_sqlite_params("SELECT * FROM t WHERE id = $1 OR name = $2"),
+            "SELECT * FROM t WHERE id = ?1 OR name = ?2"
+        );
+    }
+
+    #[test]
+    fn convert_where_with_and() {
+        assert_eq!(
+            pg_to_sqlite_params("SELECT * FROM t WHERE id = $1 AND name = $2"),
+            "SELECT * FROM t WHERE id = ?1 AND name = ?2"
+        );
+    }
+
+    #[test]
+    fn convert_where_with_parentheses() {
+        assert_eq!(
+            pg_to_sqlite_params("SELECT * FROM t WHERE (id = $1)"),
+            "SELECT * FROM t WHERE (id = ?1)"
+        );
+    }
+
+    #[test]
+    fn convert_subquery() {
+        assert_eq!(
+            pg_to_sqlite_params(
+                "SELECT * FROM t WHERE id IN (SELECT user_id FROM orders WHERE amount > $1)"
+            ),
+            "SELECT * FROM t WHERE id IN (SELECT user_id FROM orders WHERE amount > ?1)"
+        );
+    }
+
+    #[test]
+    fn convert_between() {
+        assert_eq!(
+            pg_to_sqlite_params("SELECT * FROM t WHERE id BETWEEN $1 AND $2"),
+            "SELECT * FROM t WHERE id BETWEEN ?1 AND ?2"
+        );
+    }
+
+    #[test]
+    fn convert_join() {
+        assert_eq!(
+            pg_to_sqlite_params(
+                "SELECT u.id FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = $1"
+            ),
+            "SELECT u.id FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = ?1"
+        );
+    }
+
+    #[test]
+    fn convert_delete() {
+        assert_eq!(
+            pg_to_sqlite_params("DELETE FROM users WHERE id = $1"),
+            "DELETE FROM users WHERE id = ?1"
+        );
+    }
+
+    #[test]
+    fn convert_quoted_table() {
+        assert_eq!(
+            pg_to_sqlite_params("SELECT * FROM \"my_table\" WHERE id = $1"),
+            "SELECT * FROM \"my_table\" WHERE id = ?1"
+        );
+    }
+
+    #[test]
+    fn convert_param_used_multiple_times() {
+        assert_eq!(
+            pg_to_sqlite_params("SELECT * FROM t WHERE id > $1 AND id < $1"),
+            "SELECT * FROM t WHERE id > ?1 AND id < ?1"
+        );
+    }
+
+    #[test]
+    fn convert_empty_sql() {
+        assert_eq!(pg_to_sqlite_params(""), "");
+    }
+
+    #[test]
+    fn convert_whitespace_only() {
+        assert_eq!(pg_to_sqlite_params("   "), "   ");
+    }
+
+    #[test]
+    fn convert_insert_with_default_no_params() {
+        // INSERT with DEFAULT VALUES — no $N params, no conversion needed
+        assert_eq!(
+            pg_to_sqlite_params("INSERT INTO t DEFAULT VALUES"),
+            "INSERT INTO t DEFAULT VALUES"
+        );
+    }
+
+    #[test]
+    fn convert_update_with_expression() {
+        assert_eq!(
+            pg_to_sqlite_params("UPDATE t SET score = score + $1 WHERE id = $2"),
+            "UPDATE t SET score = score + ?1 WHERE id = ?2"
+        );
+    }
+
+    // --- validate_query_sqlite: additional edge cases ---
+
+    #[test]
+    fn validate_where_or() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT id, name FROM t WHERE id = $id: i64 OR name = $name: &str",
+        )
+        .unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 2);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_where_and() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT id, name FROM t WHERE id = $id: i64 AND name = $name: &str",
+        )
+        .unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 2);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_subquery_in_where() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE users (id INTEGER NOT NULL, name TEXT)")
+            .unwrap();
+        conn.exec("CREATE TABLE orders (user_id INTEGER NOT NULL, amount REAL)")
+            .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > $min: f64)",
+        )
+        .unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "id");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_between() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL)").unwrap();
+
+        let parsed =
+            crate::parse::parse_query("SELECT id FROM t WHERE id BETWEEN $lo: i64 AND $hi: i64")
+                .unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_join() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE users (id INTEGER NOT NULL, name TEXT)")
+            .unwrap();
+        conn.exec("CREATE TABLE orders (id INTEGER NOT NULL, user_id INTEGER NOT NULL)")
+            .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT u.id FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = $id: i64",
+        )
+        .unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_delete() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE users (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let parsed = crate::parse::parse_query("DELETE FROM users WHERE id = $id: i64").unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert!(result.columns.is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_update_with_expression() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL, score INTEGER NOT NULL)")
+            .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "UPDATE t SET score = score + $delta: i64 WHERE id = $id: i64",
+        )
+        .unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert!(result.columns.is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_quoted_table_name() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE \"my_table\" (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let parsed =
+            crate::parse::parse_query("SELECT id FROM \"my_table\" WHERE id = $id: i64").unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
 }

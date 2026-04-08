@@ -3541,4 +3541,55 @@ mod tests {
             "execute-only query should NOT have column_count check: {code_str}"
         );
     }
+
+    // --- gen_column_count_check unit tests ---
+
+    #[test]
+    fn gen_column_count_check_zero_columns_returns_empty() {
+        let validation = make_validation(vec![]);
+        let check = gen_column_count_check(&validation);
+        assert!(
+            check.is_empty(),
+            "0 columns should produce empty check: {}",
+            check
+        );
+    }
+
+    #[test]
+    fn gen_column_count_check_one_column() {
+        let validation = make_validation(vec![col("id", "i32")]);
+        let check = gen_column_count_check(&validation);
+        let code = check.to_string();
+        assert!(
+            code.contains("column_count"),
+            "1 column should produce a check: {code}"
+        );
+        assert!(
+            code.contains("1usize") || code.contains("1 usize"),
+            "should check for 1 column: {code}"
+        );
+    }
+
+    #[test]
+    fn gen_column_count_check_ten_columns() {
+        let cols: Vec<ColumnInfo> = (0..10).map(|i| col(&format!("c{i}"), "i32")).collect();
+        let validation = make_validation(cols);
+        let check = gen_column_count_check(&validation);
+        let code = check.to_string();
+        assert!(
+            code.contains("10usize") || code.contains("10 usize"),
+            "should check for 10 columns: {code}"
+        );
+    }
+
+    #[test]
+    fn gen_column_count_check_references_decode_error() {
+        let validation = make_validation(vec![col("a", "i32"), col("b", "String")]);
+        let check = gen_column_count_check(&validation);
+        let code = check.to_string();
+        assert!(
+            code.contains("DecodeError :: column_count"),
+            "should reference DecodeError::column_count: {code}"
+        );
+    }
 }

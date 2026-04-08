@@ -1162,4 +1162,35 @@ mod tests {
         // No source
         assert!(e.source().is_none());
     }
+
+    #[test]
+    fn decode_error_column_count_5_vs_3() {
+        let e: BsqlError = DecodeError::column_count(5, 3);
+        let display = e.to_string();
+        assert!(
+            display.contains("expected 5 columns but row has 3"),
+            "should describe 5 vs 3 mismatch: {display}"
+        );
+        // Verify the column field is "*" (wildcard — not a specific column)
+        match &e {
+            BsqlError::Decode(d) => {
+                assert_eq!(d.column, "*", "column_count should use '*' for column");
+                assert_eq!(d.expected, "matching column count");
+            }
+            other => panic!("expected Decode, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_error_column_count_zero_zero() {
+        // Edge case: both expected and actual are 0
+        let e: BsqlError = DecodeError::column_count(0, 0);
+        let display = e.to_string();
+        assert!(
+            display.contains("expected 0 columns but row has 0"),
+            "should handle 0/0 edge case: {display}"
+        );
+        assert!(matches!(e, BsqlError::Decode(_)));
+        assert!(e.source().is_none());
+    }
 }

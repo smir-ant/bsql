@@ -1187,4 +1187,150 @@ mod tests {
         let exprs = parse_select_expressions("SELECT DISTINCT id, name FROM t");
         assert_eq!(exprs, vec!["id", "name"]);
     }
+
+    // --- is_known_not_null: aggregate functions that remain nullable ---
+
+    #[test]
+    fn sum_remains_nullable() {
+        // SUM on an empty group returns NULL
+        assert!(!is_known_not_null("total", "sum(col)"));
+        assert!(!is_known_not_null("total", "SUM(amount)"));
+    }
+
+    #[test]
+    fn avg_remains_nullable() {
+        assert!(!is_known_not_null("avg", "avg(col)"));
+        assert!(!is_known_not_null("average", "AVG(score)"));
+    }
+
+    #[test]
+    fn max_remains_nullable() {
+        assert!(!is_known_not_null("mx", "max(col)"));
+        assert!(!is_known_not_null("mx", "MAX(created_at)"));
+    }
+
+    #[test]
+    fn min_remains_nullable() {
+        assert!(!is_known_not_null("mn", "min(col)"));
+        assert!(!is_known_not_null("mn", "MIN(id)"));
+    }
+
+    #[test]
+    fn coalesce_without_literal_remains_nullable() {
+        // COALESCE(a, b) where both args are columns — still nullable
+        assert!(!is_known_not_null("x", "coalesce(a, b)"));
+        assert!(!is_known_not_null("x", "COALESCE(col1, col2)"));
+    }
+
+    #[test]
+    fn count_distinct_is_not_null() {
+        assert!(is_known_not_null("cnt", "count(distinct col)"));
+        assert!(is_known_not_null("cnt", "COUNT(DISTINCT id)"));
+    }
+
+    #[test]
+    fn arithmetic_expression_remains_nullable() {
+        // `1 + 1` is an expression, not a single literal — the parser
+        // sees "1 + 1" as a whole, which does not match a bare numeric literal
+        assert!(!is_known_not_null("x", "1 + 1"));
+    }
+
+    #[test]
+    fn cast_remains_nullable() {
+        assert!(!is_known_not_null("x", "cast(col as integer)"));
+        assert!(!is_known_not_null("x", "CAST(name AS TEXT)"));
+    }
+
+    #[test]
+    fn nested_coalesce_count_is_not_null() {
+        // COALESCE(COUNT(*), 0) — COUNT is NOT NULL, plus COALESCE with literal
+        // But is_known_not_null checks the outermost expression.
+        // It sees "coalesce(count(*), 0)" — COALESCE with literal 0 => NOT NULL
+        assert!(is_known_not_null("x", "coalesce(count(*), 0)"));
+    }
+
+    #[test]
+    fn count_star_not_null() {
+        // Redundant but explicit: COUNT(*) is always NOT NULL
+        assert!(is_known_not_null("count", "COUNT(*)"));
+        assert!(is_known_not_null("x", "count(*)"));
+    }
+
+    #[test]
+    fn coalesce_with_string_literal_not_null() {
+        assert!(is_known_not_null("x", "coalesce(name, 'N/A')"));
+    }
+
+    #[test]
+    fn coalesce_with_numeric_literal_not_null() {
+        assert!(is_known_not_null("x", "coalesce(val, 0)"));
+    }
+
+    #[test]
+    fn coalesce_with_boolean_literal_not_null() {
+        assert!(is_known_not_null("x", "coalesce(flag, false)"));
+    }
+
+    // --- parse_select_expressions: more edge cases ---
+
+    #[test]
+    fn parse_select_empty_string() {
+        let exprs = parse_select_expressions("");
+        assert!(exprs.is_empty());
+    }
+
+    #[test]
+    fn parse_select_star() {
+        // SELECT * FROM t — * is the single expression
+        let exprs = parse_select_expressions("SELECT * FROM t");
+        assert_eq!(exprs, vec!["*"]);
+    }
+
+    #[test]
+    fn parse_select_subquery_in_from() {
+        // SELECT x FROM (SELECT 1 AS x) sub
+        // The parser looks for " FROM " at depth 0. The subquery in FROM
+        // changes depth, but the outer FROM is at depth 0.
+        let exprs = parse_select_expressions("SELECT x FROM (SELECT 1 AS x) sub");
+        assert_eq!(exprs, vec!["x"]);
+    }
+
+    #[test]
+    fn parse_select_case_when() {
+        let exprs = parse_select_expressions(
+            "SELECT CASE WHEN status = 1 THEN 'active' ELSE 'inactive' END AS label FROM t",
+        );
+        assert_eq!(
+            exprs,
+            vec!["CASE WHEN status = 1 THEN 'active' ELSE 'inactive' END"]
+        );
+    }
+
+    #[test]
+    fn parse_select_mixed_columns_and_aggregates() {
+        let exprs =
+            parse_select_expressions("SELECT id, COUNT(*), name FROM users GROUP BY id, name");
+        assert_eq!(exprs, vec!["id", "COUNT(*)", "name"]);
+    }
+
+    #[test]
+    fn parse_select_no_select_keyword() {
+        // Garbage input — should return empty
+        let exprs = parse_select_expressions("INSERT INTO t VALUES (1)");
+        assert!(exprs.is_empty());
+    }
+
+    // --- is_known_not_null: column name fallback ---
+
+    #[test]
+    fn is_known_not_null_column_name_count_fallback() {
+        // When select_expr is empty, falls back to col_name
+        assert!(is_known_not_null("count", ""));
+    }
+
+    #[test]
+    fn is_known_not_null_empty_both() {
+        // Empty column name and empty expression — not known NOT NULL
+        assert!(!is_known_not_null("", ""));
+    }
 }

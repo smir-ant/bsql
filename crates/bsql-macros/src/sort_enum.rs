@@ -634,4 +634,110 @@ mod tests {
             "deleted_at should be accepted (DELETE is substring, not standalone word)"
         );
     }
+
+    // --- Sort registry / resolve tests ---
+
+    #[test]
+    fn sort_fragment_special_chars_valid_sql_accepted() {
+        // Valid ORDER BY with NULLS LAST — no dangerous keywords
+        let input = quote! {
+            enum Sort {
+                #[sql("created_at DESC NULLS LAST")]
+                CreatedAtDesc,
+                #[sql("t.priority ASC NULLS FIRST, t.id ASC")]
+                Priority,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "complex valid fragments should be accepted");
+        let code = result.unwrap().to_string();
+        assert!(
+            code.contains("created_at DESC NULLS LAST"),
+            "should contain first fragment: {code}"
+        );
+        assert!(
+            code.contains("t.priority ASC NULLS FIRST"),
+            "should contain second fragment: {code}"
+        );
+    }
+
+    #[test]
+    fn sort_enum_generates_all_match_arms() {
+        // Verify that generated sql() method contains all arms
+        let input = quote! {
+            enum Sort {
+                #[sql("a ASC")]
+                A,
+                #[sql("b DESC")]
+                B,
+                #[sql("c ASC NULLS LAST")]
+                C,
+            }
+        };
+        let output = parse_sort(input);
+        let code = output.to_string();
+        assert!(code.contains("a ASC"), "missing arm A: {code}");
+        assert!(code.contains("b DESC"), "missing arm B: {code}");
+        assert!(code.contains("c ASC NULLS LAST"), "missing arm C: {code}");
+    }
+
+    #[test]
+    fn sort_enum_recompile_overwrites_output() {
+        // Two successive calls to expand_sort_enum produce fresh output
+        let input1 = quote! {
+            enum Sort {
+                #[sql("a ASC")]
+                A,
+            }
+        };
+        let input2 = quote! {
+            enum Sort {
+                #[sql("b DESC")]
+                B,
+            }
+        };
+        let out1 = expand_sort_enum(TokenStream::new(), input1)
+            .unwrap()
+            .to_string();
+        let out2 = expand_sort_enum(TokenStream::new(), input2)
+            .unwrap()
+            .to_string();
+        assert!(out1.contains("a ASC") && !out1.contains("b DESC"));
+        assert!(out2.contains("b DESC") && !out2.contains("a ASC"));
+    }
+
+    #[test]
+    fn sort_enum_multiple_commas_in_fragment() {
+        let input = quote! {
+            enum Sort {
+                #[sql("t.a ASC, t.b DESC, t.c ASC")]
+                Multi,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "multi-comma fragment should be accepted");
+        let code = result.unwrap().to_string();
+        assert!(
+            code.contains("t.a ASC, t.b DESC, t.c ASC"),
+            "fragment should be preserved verbatim: {code}"
+        );
+    }
+
+    #[test]
+    fn sort_enum_doc_comments_preserved() {
+        let input = quote! {
+            /// This is a doc comment
+            enum Sort {
+                #[sql("id ASC")]
+                Id,
+            }
+        };
+        let output = parse_sort(input);
+        let code = output.to_string();
+        // Doc comments become #[doc = "..."] attributes
+        assert!(
+            code.contains("doc"),
+            "doc comment should be preserved: {code}"
+        );
+    }
 }

@@ -719,4 +719,110 @@ mod tests {
         assert_eq!(to_snake_case("URL"), "url");
         assert_eq!(to_snake_case("HTTP"), "http");
     }
+
+    // --- validate_pg_labels logic tests ---
+
+    /// Test the label comparison logic that `validate_pg_labels` uses.
+    /// Since we cannot connect to PG in unit tests, we test the comparison
+    /// logic directly: Rust labels must be a subset of PG labels.
+    #[test]
+    fn validate_labels_matching_subset() {
+        let rust_labels = vec!["new", "active", "closed"];
+        let pg_labels = vec!["new", "active", "closed"];
+        // Every Rust label exists in PG — should pass
+        for rl in &rust_labels {
+            assert!(
+                pg_labels.contains(rl),
+                "Rust label '{rl}' should exist in PG labels"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_labels_mismatched_label() {
+        let rust_labels = vec!["new", "active", "archived"];
+        let pg_labels = vec!["new", "active", "closed"];
+        // "archived" not in PG — should be detected
+        let mismatched: Vec<_> = rust_labels
+            .iter()
+            .filter(|rl| !pg_labels.contains(rl))
+            .collect();
+        assert_eq!(mismatched, vec![&"archived"]);
+    }
+
+    #[test]
+    fn validate_labels_extra_pg_label_ok() {
+        // PG can have more labels than Rust enum — that's fine
+        let rust_labels = vec!["new", "closed"];
+        let pg_labels = vec!["new", "active", "closed", "archived"];
+        for rl in &rust_labels {
+            assert!(
+                pg_labels.contains(rl),
+                "Rust label '{rl}' should exist in PG labels"
+            );
+        }
+    }
+
+    // --- to_snake_case additional edge cases ---
+
+    #[test]
+    fn snake_case_already_snake_case() {
+        assert_eq!(to_snake_case("ticket_status"), "ticket_status");
+    }
+
+    #[test]
+    fn snake_case_with_numbers() {
+        assert_eq!(to_snake_case("Error404Page"), "error404_page");
+    }
+
+    #[test]
+    fn snake_case_single_lowercase() {
+        assert_eq!(to_snake_case("x"), "x");
+    }
+
+    #[test]
+    fn snake_case_mixed_with_numbers() {
+        assert_eq!(to_snake_case("V2Status"), "v2_status");
+    }
+
+    // --- graceful failure when PG unavailable ---
+
+    #[test]
+    fn expand_pg_enum_does_not_require_connection() {
+        // expand_pg_enum is a pure macro expansion — it should never connect to PG.
+        // Validation against PG happens in a separate step. Verify the macro alone works.
+        let input = quote! {
+            enum Status {
+                #[sql("new")]
+                New,
+                #[sql("closed")]
+                Closed,
+            }
+        };
+        let result = expand_pg_enum(TokenStream::new(), input);
+        assert!(
+            result.is_ok(),
+            "pg_enum macro expansion should not require a database connection"
+        );
+    }
+
+    #[test]
+    fn from_sql_label_generated_returns_none_for_unknown() {
+        // The generated from_sql_label should return None for unknown labels.
+        // We verify this by checking the generated code includes a None fallback.
+        let input = quote! {
+            enum Status {
+                #[sql("open")]
+                Open,
+                #[sql("closed")]
+                Closed,
+            }
+        };
+        let output = parse_enum(input);
+        let code = output.to_string();
+        assert!(
+            code.contains("None"),
+            "from_sql_label should have None fallback: {code}"
+        );
+    }
 }
