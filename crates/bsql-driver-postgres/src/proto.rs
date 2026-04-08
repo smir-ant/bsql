@@ -110,11 +110,11 @@ pub enum BackendMessage<'a> {
     PortalSuspended,
     CopyInResponse {
         format: u8,
-        column_formats: Vec<u16>,
+        column_formats: smallvec::SmallVec<[u16; 16]>,
     },
     CopyOutResponse {
         format: u8,
-        column_formats: Vec<u16>,
+        column_formats: smallvec::SmallVec<[u16; 16]>,
     },
     CopyData {
         data: &'a [u8],
@@ -512,7 +512,7 @@ fn parse_copy_in_response(payload: &[u8]) -> Result<BackendMessage<'_>, DriverEr
             ));
         }
     }
-    let mut column_formats = Vec::with_capacity(num_cols);
+    let mut column_formats = smallvec::SmallVec::with_capacity(num_cols);
     for i in 0..num_cols {
         let offset = 3 + i * 2;
         column_formats.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
@@ -548,7 +548,7 @@ fn parse_copy_out_response(payload: &[u8]) -> Result<BackendMessage<'_>, DriverE
             ));
         }
     }
-    let mut column_formats = Vec::with_capacity(num_cols);
+    let mut column_formats = smallvec::SmallVec::with_capacity(num_cols);
     for i in 0..num_cols {
         let offset = 3 + i * 2;
         column_formats.push(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
@@ -1355,7 +1355,7 @@ mod tests {
                 column_formats,
             } => {
                 assert_eq!(format, 0);
-                assert_eq!(column_formats, vec![0, 0]);
+                assert_eq!(column_formats.as_slice(), &[0u16, 0]);
             }
             other => panic!("expected CopyInResponse, got: {other:?}"),
         }
@@ -1379,7 +1379,7 @@ mod tests {
                 column_formats,
             } => {
                 assert_eq!(format, 0);
-                assert_eq!(column_formats, vec![0]);
+                assert_eq!(column_formats.as_slice(), &[0u16]);
             }
             other => panic!("expected CopyOutResponse, got: {other:?}"),
         }

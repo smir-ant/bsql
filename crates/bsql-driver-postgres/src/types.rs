@@ -254,10 +254,10 @@ pub struct ColumnDesc {
     pub name: Box<str>,
     /// PostgreSQL type OID.
     pub type_oid: u32,
-    /// Type size in bytes (-1 for variable-length).
-    pub type_size: i16,
     /// OID of the source table (0 if not a table column, e.g. computed).
     pub table_oid: u32,
+    /// Type size in bytes (-1 for variable-length).
+    pub type_size: i16,
     /// Column number within the source table (0 if not a table column).
     pub column_id: i16,
 }

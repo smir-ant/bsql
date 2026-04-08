@@ -212,13 +212,17 @@ impl Arena {
 
     /// Total bytes allocated in this arena (across all chunks).
     pub fn allocated(&self) -> usize {
-        let mut total = 0;
-        for (i, chunk) in self.chunks.iter().enumerate() {
-            if i < self.current {
-                total += chunk.len();
-            } else if i == self.current {
-                total += self.offset;
-            }
+        if self.chunks.is_empty() {
+            return 0;
+        }
+        // Fast path: single chunk (common case — most queries fit in 8KB).
+        if self.current == 0 {
+            return self.offset;
+        }
+        // Multi-chunk: sum filled chunks + current offset.
+        let mut total = self.offset;
+        for chunk in &self.chunks[..self.current] {
+            total += chunk.len();
         }
         total
     }
