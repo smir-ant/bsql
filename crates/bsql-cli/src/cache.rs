@@ -3,7 +3,7 @@ use std::path::Path;
 
 /// Current cache format version. Must match `CACHE_FORMAT_VERSION` in
 /// `bsql-macros/src/offline.rs`.
-const CACHE_FORMAT_VERSION: u8 = 3;
+const CACHE_FORMAT_VERSION: u8 = 4;
 
 /// Versioned envelope wrapping the serialized [`CachedQuery`].
 ///
@@ -36,27 +36,33 @@ struct CachedQueryV2 {
     pub bsql_version: String,
 }
 
+/// Legacy v3 cache format (without `rewritten_sql` field).
+#[derive(Debug, Clone, Encode, Decode)]
+struct CachedQueryV3 {
+    pub sql_hash: u64,
+    pub normalized_sql: String,
+    pub columns: Vec<CachedColumn>,
+    pub param_pg_oids: Vec<u32>,
+    pub param_is_pg_enum: Vec<bool>,
+    pub bsql_version: String,
+    pub param_rust_types: Vec<String>,
+}
+
 /// A single cached query validation result, persisted as bitcode.
 ///
 /// Field names and order MUST match `bsql-macros/src/offline.rs` exactly —
 /// bitcode serialization is positional.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CachedQuery {
-    /// rapidhash of the normalized SQL (the filename / lookup key).
     pub sql_hash: u64,
-    /// The normalized SQL text.
     pub normalized_sql: String,
-    /// Result columns (empty for non-SELECT / non-RETURNING queries).
     pub columns: Vec<CachedColumn>,
-    /// PostgreSQL OIDs of the expected parameter types.
     pub param_pg_oids: Vec<u32>,
-    /// Whether each parameter position is a PG enum type.
     pub param_is_pg_enum: Vec<bool>,
-    /// The bsql version that generated this cache entry.
     pub bsql_version: String,
-    /// User-declared Rust type strings for each parameter position.
-    /// Empty for cache entries migrated from v2.
     pub param_rust_types: Vec<String>,
+    /// SQL with auto-casts added (e.g. `$1::jsonb`). None if no rewrite needed.
+    pub rewritten_sql: Option<String>,
 }
 
 /// A single result column, cached.
@@ -121,6 +127,7 @@ pub fn read_cache_file(path: &Path) -> Result<CachedQuery, String> {
             param_is_pg_enum: v1.param_is_pg_enum,
             bsql_version: String::new(),
             param_rust_types: vec![],
+            rewritten_sql: None,
         })
     } else if envelope.version == 2 {
         let v2: CachedQueryV2 = bitcode::decode(&envelope.data).map_err(|e| {
@@ -137,6 +144,24 @@ pub fn read_cache_file(path: &Path) -> Result<CachedQuery, String> {
             param_is_pg_enum: v2.param_is_pg_enum,
             bsql_version: v2.bsql_version,
             param_rust_types: vec![],
+            rewritten_sql: None,
+        })
+    } else if envelope.version == 3 {
+        let v3: CachedQueryV3 = bitcode::decode(&envelope.data).map_err(|e| {
+            format!(
+                "failed to decode v3 cached query in {}: {e}",
+                path.display()
+            )
+        })?;
+        Ok(CachedQuery {
+            sql_hash: v3.sql_hash,
+            normalized_sql: v3.normalized_sql,
+            columns: v3.columns,
+            param_pg_oids: v3.param_pg_oids,
+            param_is_pg_enum: v3.param_is_pg_enum,
+            bsql_version: v3.bsql_version,
+            param_rust_types: v3.param_rust_types,
+            rewritten_sql: None,
         })
     } else if envelope.version == CACHE_FORMAT_VERSION {
         bitcode::decode(&envelope.data)
@@ -238,6 +263,7 @@ mod tests {
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
             param_rust_types: vec!["i32".to_owned()],
+            rewritten_sql: None,
         };
 
         let inner_bytes = bitcode::encode(&query);
@@ -379,6 +405,7 @@ mod tests {
             param_is_pg_enum: vec![],
             bsql_version: "0.20.1".to_owned(),
             param_rust_types: vec![],
+            rewritten_sql: None,
         };
         let inner_bytes = bitcode::encode(&query);
         let envelope = CacheEnvelope {

@@ -99,6 +99,7 @@ mod tests {
             param_is_pg_enum: vec![],
             bsql_version: "0.23.0".to_owned(),
             param_rust_types: vec![],
+            rewritten_sql: None,
         }];
 
         // Can't call verify_cache without a DB, but we can verify the semicolon
