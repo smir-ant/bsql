@@ -984,3 +984,72 @@ async fn array_param_with_any() {
     assert_eq!(rows[0].login, "alice");
     assert_eq!(rows[1].login, "bob");
 }
+
+// ---------------------------------------------------------------------------
+// JSON (not JSONB) — same transparent auto-cast, same tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn json_insert_and_select() {
+    let pool = pool().await;
+
+    let notes = r#"{"note": "hello"}"#;
+    let data = r#"{"x": 1}"#;
+    let row = bsql::query!(
+        "INSERT INTO test_jsonb (data, notes) VALUES ($data: &str, $notes: &str) RETURNING id"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.id > 0);
+
+    let id = row.id;
+    let row = bsql::query!("SELECT notes FROM test_jsonb WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // notes is JSON (nullable) → Option<String>
+    assert!(row.notes.is_some());
+    assert!(row.notes.unwrap().contains("hello"));
+
+    bsql::query!("DELETE FROM test_jsonb WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn json_null_column() {
+    let pool = pool().await;
+
+    let data = r#"{"x": 1}"#;
+    let row = bsql::query!(
+        "INSERT INTO test_jsonb (data) VALUES ($data: &str) RETURNING id, notes"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert!(row.notes.is_none());
+
+    let id = row.id;
+    bsql::query!("DELETE FROM test_jsonb WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn json_invalid_returns_error() {
+    let pool = pool().await;
+
+    let data = r#"{"valid": true}"#;
+    let notes = "not json!!!";
+    let result = bsql::query!(
+        "INSERT INTO test_jsonb (data, notes) VALUES ($data: &str, $notes: &str) RETURNING id"
+    )
+    .fetch_one(&pool)
+    .await;
+
+    assert!(result.is_err(), "invalid JSON in json column should fail");
+}
