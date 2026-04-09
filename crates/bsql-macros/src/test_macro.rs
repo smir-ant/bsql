@@ -146,13 +146,13 @@ pub fn expand_test(attr: TokenStream, item: TokenStream) -> Result<TokenStream, 
     if is_sqlite {
         if input_fn.sig.asyncness.is_some() {
             return Err(syn::Error::new_spanned(
-                &input_fn.sig.fn_token,
+                input_fn.sig.fn_token,
                 "#[bsql::test] SQLite tests must be sync (fn, not async fn)",
             ));
         }
     } else if input_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
-            &input_fn.sig.fn_token,
+            input_fn.sig.fn_token,
             "#[bsql::test] PostgreSQL tests must be async",
         ));
     }

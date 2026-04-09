@@ -45,7 +45,7 @@ let user = &users[0];
 
 ```toml
 [dependencies]
-bsql = { version = "0.22", features = ["time", "uuid"] }
+bsql = { version = "0.23", features = ["time", "uuid"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -82,7 +82,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 
 ```toml
 [dependencies]
-bsql = { version = "0.22", features = ["sqlite"] }
+bsql = { version = "0.23", features = ["sqlite"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -175,7 +175,7 @@ When a pure-Rust SQLite engine like [Limbo](https://github.com/penberg/limbo) re
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. Enable features for specialized types:
 
 ```toml
-bsql = { version = "0.22", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.23", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature     | PostgreSQL types                   | Rust types                                   |
@@ -282,7 +282,7 @@ Real-time notifications for cache invalidation, job queues, live updates.
 <summary>Compile-time EXPLAIN plans</summary>
 
 ```toml
-bsql = { version = "0.22", features = ["explain"] }
+bsql = { version = "0.23", features = ["explain"] }
 ```
 
 Runs `EXPLAIN` on every query during compilation. The plan is embedded as a doc comment (hover in your IDE to see it), and bsql actively warns about sequential scans and missing indexes. See [compile-time query plan analysis](#compile-time-query-plan-analysis) for details. Development-only -- disable in CI and release builds.
@@ -397,10 +397,10 @@ Default: async (`#[tokio::main]` + `.await` on all methods).
 
 ```toml
 # Async (default)
-bsql = { version = "0.22" }
+bsql = { version = "0.23" }
 
 # Sync -- removes tokio dependency entirely
-bsql = { version = "0.22", default-features = false }
+bsql = { version = "0.23", default-features = false }
 ```
 
 Same `query!` macro, same compile-time safety. Sync mode is pure `fn` -- no async runtime, no `.await`, no tokio in your dependency tree.
@@ -498,7 +498,7 @@ These are features that no other Rust SQL library offers. They exist because bsq
 The most common database performance bug: your code fetches a list, then queries once per item. 100 users = 100 queries instead of 1. Frameworks like Rails have third-party gems to detect this. bsql detects it at the driver level -- no middleware, no configuration, no code changes.
 
 ```toml
-bsql = { version = "0.22", features = ["detect-n-plus-one"] }
+bsql = { version = "0.23", features = ["detect-n-plus-one"] }
 ```
 
 When the same query fires more than 10 times in a row on a single connection, bsql logs a warning with the query hash. The threshold is configurable via `Pool::builder().n_plus_one_threshold(5)`. When the feature is disabled, zero code exists in the binary -- full compile-time exclusion.

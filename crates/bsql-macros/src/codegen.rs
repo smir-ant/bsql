@@ -2577,7 +2577,6 @@ fn gen_nullable_decode(idx: usize, inner_type: &str) -> TokenStream {
     }
 }
 
-
 /// Generate the constructor expression that captures variables from scope.
 fn gen_constructor(parsed: &ParsedQuery) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
@@ -2677,7 +2676,6 @@ fn executor_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
 fn stream_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
     format_ident!("BsqlStream_{}", &parsed.statement_name)
 }
-
 
 /// Rust keywords (2024 edition) that cannot be used as bare identifiers.
 const RUST_KEYWORDS: &[&str] = &[
@@ -3166,7 +3164,6 @@ mod tests {
             "execute-only should NOT have BsqlRows: {code_str}"
         );
     }
-
 
     // --- Fix-5: column count bounds check ---
 

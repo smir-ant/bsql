@@ -1857,39 +1857,38 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
             let arena_name = arena_result_struct_name(parsed);
             let bind = gen_inline_param_bind();
             let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
-            let fetch_dispatcher =
-                gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
-                    quote! {
-                        let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
-                            .map_err(::bsql_core::BsqlError::from_sqlite)?;
-                        #bind
-                        #sqlite_column_check
-                        let mut _bsql_text_buf: Vec<u8> = Vec::new();
-                        let mut _bsql_blob_arena = ::bsql_core::driver_sqlite::acquire_arena();
-                        let mut _bsql_rows = Vec::new();
-                        loop {
-                            match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
-                                ::bsql_core::driver_sqlite::StepResult::Row => {
-                                    _bsql_rows.push(#decode_arena);
-                                }
-                                ::bsql_core::driver_sqlite::StepResult::Done => break,
+            let fetch_dispatcher = gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
+                quote! {
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #bind
+                    #sqlite_column_check
+                    let mut _bsql_text_buf: Vec<u8> = Vec::new();
+                    let mut _bsql_blob_arena = ::bsql_core::driver_sqlite::acquire_arena();
+                    let mut _bsql_rows = Vec::new();
+                    loop {
+                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                            ::bsql_core::driver_sqlite::StepResult::Row => {
+                                _bsql_rows.push(#decode_arena);
                             }
+                            ::bsql_core::driver_sqlite::StepResult::Done => break,
                         }
-                        _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                        drop(_bsql_conn);
-                        let _bsql_text = String::from_utf8(_bsql_text_buf)
-                            .map_err(|e| ::bsql_core::BsqlError::from_sqlite(
-                                ::bsql_core::driver_sqlite::SqliteError::Internal(
-                                    format!("invalid UTF-8 in query result: {e}"),
-                                ),
-                            ))?;
-                        return Ok(::bsql_core::driver_sqlite::ValidatedRows::new(
-                            _bsql_rows,
-                            _bsql_text,
-                            _bsql_blob_arena,
-                        ));
                     }
-                });
+                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    drop(_bsql_conn);
+                    let _bsql_text = String::from_utf8(_bsql_text_buf)
+                        .map_err(|e| ::bsql_core::BsqlError::from_sqlite(
+                            ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                format!("invalid UTF-8 in query result: {e}"),
+                            ),
+                        ))?;
+                    return Ok(::bsql_core::driver_sqlite::ValidatedRows::new(
+                        _bsql_rows,
+                        _bsql_text,
+                        _bsql_blob_arena,
+                    ));
+                }
+            });
             quote! {
                 pub fn fetch_all(
                     self,
@@ -1901,27 +1900,26 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         } else {
             let bind = gen_inline_param_bind();
             let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
-            let fetch_dispatcher =
-                gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
-                    quote! {
-                        let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
-                            .map_err(::bsql_core::BsqlError::from_sqlite)?;
-                        #bind
-                        #sqlite_column_check
-                        let mut _bsql_rows = Vec::new();
-                        loop {
-                            match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
-                                ::bsql_core::driver_sqlite::StepResult::Row => {
-                                    _bsql_rows.push(#decode_all);
-                                }
-                                ::bsql_core::driver_sqlite::StepResult::Done => break,
+            let fetch_dispatcher = gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
+                quote! {
+                    let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
+                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    #bind
+                    #sqlite_column_check
+                    let mut _bsql_rows = Vec::new();
+                    loop {
+                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                            ::bsql_core::driver_sqlite::StepResult::Row => {
+                                _bsql_rows.push(#decode_all);
                             }
+                            ::bsql_core::driver_sqlite::StepResult::Done => break,
                         }
-                        _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                        drop(_bsql_conn);
-                        return Ok(_bsql_rows);
                     }
-                });
+                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                    drop(_bsql_conn);
+                    return Ok(_bsql_rows);
+                }
+            });
             quote! {
                 pub fn fetch_all(
                     self,

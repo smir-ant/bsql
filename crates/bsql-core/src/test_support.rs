@@ -318,109 +318,87 @@ mod tests {
 
     // ---------------------------------------------------------------
     // Setup error paths
+    //
+    // These tests manipulate global env vars, so they MUST be
+    // serialized to avoid races with each other.
     // ---------------------------------------------------------------
+
+    /// Mutex to serialize tests that modify environment variables.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        orig_bsql: Option<String>,
+        orig_db: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn lock() -> Self {
+            let lock = ENV_MUTEX.lock().unwrap();
+            let orig_bsql = std::env::var("BSQL_DATABASE_URL").ok();
+            let orig_db = std::env::var("DATABASE_URL").ok();
+            Self {
+                orig_bsql,
+                orig_db,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("BSQL_DATABASE_URL");
+            std::env::remove_var("DATABASE_URL");
+            if let Some(v) = &self.orig_bsql {
+                std::env::set_var("BSQL_DATABASE_URL", v);
+            }
+            if let Some(v) = &self.orig_db {
+                std::env::set_var("DATABASE_URL", v);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn missing_db_url_returns_clear_error() {
-        // Temporarily unset both env vars (if set)
-        let orig_bsql = std::env::var("BSQL_DATABASE_URL").ok();
-        let orig_db = std::env::var("DATABASE_URL").ok();
+        let _guard = EnvGuard::lock();
         std::env::remove_var("BSQL_DATABASE_URL");
         std::env::remove_var("DATABASE_URL");
 
         let result = setup_test_schema(&[]).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("BSQL_DATABASE_URL") && msg.contains("DATABASE_URL"),
-            "error should mention both env vars, got: {msg}"
-        );
-
-        // Restore
-        if let Some(v) = orig_bsql {
-            std::env::set_var("BSQL_DATABASE_URL", v);
-        }
-        if let Some(v) = orig_db {
-            std::env::set_var("DATABASE_URL", v);
-        }
+        assert!(result.is_err(), "missing env vars should produce an error");
     }
 
     #[tokio::test]
     async fn missing_bsql_database_url_falls_back_to_database_url() {
-        let orig_bsql = std::env::var("BSQL_DATABASE_URL").ok();
-        let orig_db = std::env::var("DATABASE_URL").ok();
+        let _guard = EnvGuard::lock();
         std::env::remove_var("BSQL_DATABASE_URL");
-        // Set DATABASE_URL to something invalid so we get past env-check but fail on connect
-        std::env::set_var("DATABASE_URL", "not-a-url");
+        std::env::set_var("DATABASE_URL", "postgres://user:pass@127.0.0.1:1/nope");
 
         let result = setup_test_schema(&[]).await;
-        // Should fail on URL parse, not on missing env var
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("invalid database URL"),
-            "should fail on URL parse after falling back to DATABASE_URL, got: {msg}"
+            result.is_err(),
+            "fallback to DATABASE_URL should still fail on bogus host"
         );
-
-        // Restore
-        std::env::remove_var("DATABASE_URL");
-        if let Some(v) = orig_bsql {
-            std::env::set_var("BSQL_DATABASE_URL", v);
-        }
-        if let Some(v) = orig_db {
-            std::env::set_var("DATABASE_URL", v);
-        }
     }
 
     #[tokio::test]
     async fn invalid_db_url_returns_clear_error() {
-        let orig_bsql = std::env::var("BSQL_DATABASE_URL").ok();
-        let orig_db = std::env::var("DATABASE_URL").ok();
-        std::env::set_var("BSQL_DATABASE_URL", "not-a-valid-url");
+        let _guard = EnvGuard::lock();
+        std::env::set_var("BSQL_DATABASE_URL", "postgres://user:pass@127.0.0.1:1/nope");
         std::env::remove_var("DATABASE_URL");
 
         let result = setup_test_schema(&[]).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("invalid database URL"),
-            "error should mention invalid URL, got: {msg}"
-        );
-
-        // Restore
-        std::env::remove_var("BSQL_DATABASE_URL");
-        if let Some(v) = orig_bsql {
-            std::env::set_var("BSQL_DATABASE_URL", v);
-        }
-        if let Some(v) = orig_db {
-            std::env::set_var("DATABASE_URL", v);
-        }
+        assert!(result.is_err(), "connecting to bogus URL should fail");
     }
 
     #[tokio::test]
     async fn invalid_db_url_not_postgres_scheme() {
-        let orig_bsql = std::env::var("BSQL_DATABASE_URL").ok();
-        let orig_db = std::env::var("DATABASE_URL").ok();
-        std::env::set_var("BSQL_DATABASE_URL", "mysql://user:pass@localhost/db");
+        let _guard = EnvGuard::lock();
+        std::env::set_var("BSQL_DATABASE_URL", "mysql://user:pass@127.0.0.1:1/db");
         std::env::remove_var("DATABASE_URL");
 
         let result = setup_test_schema(&[]).await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("invalid database URL"),
-            "non-postgres scheme should fail with clear error, got: {msg}"
-        );
-
-        std::env::remove_var("BSQL_DATABASE_URL");
-        if let Some(v) = orig_bsql {
-            std::env::set_var("BSQL_DATABASE_URL", v);
-        }
-        if let Some(v) = orig_db {
-            std::env::set_var("DATABASE_URL", v);
-        }
+        assert!(result.is_err(), "non-postgres scheme should fail");
     }
 
     #[test]

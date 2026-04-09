@@ -445,11 +445,10 @@ async fn pool_acquire_execute() {
 
     let desc = "via conn";
     let id = 1i32;
-    let affected =
-        bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
-            .execute(&mut conn)
-            .await
-            .unwrap();
+    let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
+        .execute(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(affected, 1);
 }
 
@@ -513,12 +512,11 @@ async fn execute_update_multiple_rows() {
 
     // UPDATE all three at once
     let title2 = "batch_multi_test";
-    let affected = bsql::query!(
-        "UPDATE tickets SET description = 'batched' WHERE title = $title2: &str"
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let affected =
+        bsql::query!("UPDATE tickets SET description = 'batched' WHERE title = $title2: &str")
+            .execute(&pool)
+            .await
+            .unwrap();
     assert_eq!(affected, 3);
 
     // DELETE all three at once
@@ -549,7 +547,10 @@ async fn execute_unique_constraint_violation() {
 
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.is_unique_violation(), "expected unique violation, got: {err:?}");
+    assert!(
+        err.is_unique_violation(),
+        "expected unique violation, got: {err:?}"
+    );
 }
 
 #[tokio::test]

@@ -854,7 +854,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
 
         // Write
-        let fragments = vec!["name ASC", "id DESC"];
+        let fragments = ["name ASC", "id DESC"];
         let content = fragments.join("\n");
         std::fs::write(dir.join("UserSort.txt"), &content).unwrap();
 
