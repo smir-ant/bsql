@@ -1540,3 +1540,225 @@ async fn extreme_value_empty_string() {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Encoding edge cases — boundary values
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn boundary_i16_max() {
+    let pool = pool().await;
+    let score = i16::MAX;
+    let affected = bsql::query!("UPDATE users SET score = $score: i16 WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(affected, 1);
+    let user = bsql::query!("SELECT score FROM users WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.score, i16::MAX);
+    // Restore
+    let score = 42i16;
+    bsql::query!("UPDATE users SET score = $score: i16 WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn boundary_f64_nan() {
+    let pool = pool().await;
+    let rating = f64::NAN;
+    bsql::query!("UPDATE users SET balance = $rating: f64 WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let user = bsql::query!("SELECT balance FROM users WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(user.balance.is_nan());
+    // Restore
+    let rating = 100.50f64;
+    bsql::query!("UPDATE users SET balance = $rating: f64 WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn boundary_f64_infinity() {
+    let pool = pool().await;
+    let val = f64::INFINITY;
+    bsql::query!("UPDATE users SET balance = $val: f64 WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let user = bsql::query!("SELECT balance FROM users WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(user.balance.is_infinite() && user.balance.is_sign_positive());
+    // Restore
+    let val = 100.50f64;
+    bsql::query!("UPDATE users SET balance = $val: f64 WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn unicode_text_roundtrip() {
+    let pool = pool().await;
+    let desc: Option<&str> = Some("Привет мир 🎉 中文 العربية");
+    let id = 1i32;
+    bsql::query!("UPDATE tickets SET description = $desc: Option<&str> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ticket = bsql::query!("SELECT description FROM tickets WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ticket.description.as_deref(),
+        Some("Привет мир 🎉 中文 العربية")
+    );
+    // Restore
+    let desc: Option<&str> = None;
+    bsql::query!("UPDATE tickets SET description = $desc: Option<&str> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn empty_bytea_not_null() {
+    let pool = pool().await;
+    let avatar: Option<&[u8]> = Some(&[]);
+    let id = 1i32;
+    bsql::query!("UPDATE users SET avatar = $avatar: Option<&[u8]> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let user = bsql::query!("SELECT avatar FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Empty bytea is Some(vec![]), not None
+    assert_eq!(user.avatar, Some(vec![]));
+    // Restore
+    let avatar: Option<&[u8]> = None;
+    bsql::query!("UPDATE users SET avatar = $avatar: Option<&[u8]> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Security tests — credential leak prevention
+// ---------------------------------------------------------------------------
+
+#[test]
+fn password_not_in_config_debug() {
+    let config =
+        bsql::driver::Config::from_url("postgres://user:supersecret@localhost/db").unwrap();
+    let debug = format!("{:?}", config);
+    assert!(
+        !debug.contains("supersecret"),
+        "password must not appear in Debug: {debug}"
+    );
+}
+
+#[tokio::test]
+async fn password_not_in_connection_error() {
+    // Pool creation is lazy — the error surfaces on acquire/query, not connect.
+    let pool = bsql::PgPool::connect("postgres://user:supersecret@127.0.0.1:1/db")
+        .await
+        .unwrap();
+    let id = 1i32;
+    let result = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await;
+    // Connection to port 1 should fail
+    assert!(result.is_err(), "connection to port 1 should fail");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(!msg.contains("supersecret"), "password in error: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// Additional SQL construct tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sql_like_with_param() {
+    let pool = pool().await;
+    let pattern = "%ali%";
+    let rows = bsql::query!("SELECT id, login FROM users WHERE login LIKE $pattern: &str")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].login, "alice");
+}
+
+#[tokio::test]
+async fn sql_between_with_params() {
+    let pool = pool().await;
+    let low = 1i32;
+    let high = 2i32;
+    let rows =
+        bsql::query!("SELECT id FROM users WHERE id BETWEEN $low: i32 AND $high: i32 ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+async fn sql_is_null_in_where() {
+    let pool = pool().await;
+    let rows = bsql::query!("SELECT id FROM tickets WHERE description IS NULL")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(!rows.is_empty());
+}
+
+#[tokio::test]
+async fn sql_is_not_null_in_where() {
+    let pool = pool().await;
+    let rows = bsql::query!("SELECT id FROM users WHERE middle_name IS NOT NULL")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    // All seed users have NULL middle_name
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn sql_coalesce_in_select() {
+    let pool = pool().await;
+    let rows =
+        bsql::query!("SELECT id, COALESCE(middle_name, 'N/A') AS middle FROM users ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].middle, "N/A");
+}
+
+#[tokio::test]
+async fn sql_case_when_in_select() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT id, CASE WHEN active THEN 'yes' ELSE 'no' END AS status FROM users ORDER BY id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].status, "yes");
+}

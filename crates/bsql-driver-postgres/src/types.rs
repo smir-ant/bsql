@@ -16,7 +16,7 @@ use crate::DriverError;
 
 /// Implements Drop to zeroize the password field, minimizing the
 /// window where plaintext credentials live in memory.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -49,6 +49,26 @@ impl Drop for Config {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.password.zeroize();
+    }
+}
+
+/// Redact the password field in Debug output to prevent credential leaks
+/// in logs, error messages, and `{:?}` formatting.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"[REDACTED]")
+            .field("database", &self.database)
+            .field("ssl", &self.ssl)
+            .field("statement_timeout_secs", &self.statement_timeout_secs)
+            .field("statement_cache_mode", &self.statement_cache_mode)
+            .field("ssl_root_cert", &self.ssl_root_cert)
+            .field("ssl_cert", &self.ssl_cert)
+            .field("ssl_key", &self.ssl_key)
+            .finish()
     }
 }
 

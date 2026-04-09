@@ -3329,3 +3329,163 @@ fn connection_recovers_after_statement_timeout() {
     conn.simple_query("SELECT 1").unwrap();
     assert!(conn.is_idle(), "connection should be idle after recovery");
 }
+
+// ===============================================================
+// Error handling gaps
+// ===============================================================
+
+#[test]
+fn not_null_constraint_violation() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    // tickets.title is NOT NULL — insert without it should fail
+    let result = conn.simple_query("INSERT INTO tickets (created_by_user_id) VALUES (1)");
+    assert!(result.is_err());
+    match result {
+        Err(DriverError::Server { code, .. }) => {
+            // PG error code 23502 = not_null_violation
+            assert_eq!(&code, b"23502");
+        }
+        Err(e) => panic!("expected Server error with code 23502, got: {e}"),
+        Ok(_) => unreachable!(),
+    }
+}
+
+#[test]
+fn division_by_zero_error() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let result = conn.simple_query("SELECT 1/0");
+    assert!(result.is_err());
+    match result {
+        Err(DriverError::Server { code, .. }) => {
+            // PG error code 22012 = division_by_zero
+            assert_eq!(&code, b"22012");
+        }
+        Err(e) => panic!("expected Server error with code 22012, got: {e}"),
+        Ok(_) => unreachable!(),
+    }
+}
+
+// ===============================================================
+// Pool URL parsing edge cases
+// ===============================================================
+
+#[test]
+fn url_without_password() {
+    let config = Config::from_url("postgres://user@localhost/db").unwrap();
+    assert_eq!(config.user, "user");
+    assert_eq!(config.password, "");
+}
+
+#[test]
+fn url_without_port_defaults_5432() {
+    let config = Config::from_url("postgres://user:pass@localhost/db").unwrap();
+    assert_eq!(config.port, 5432);
+}
+
+#[test]
+fn url_with_percent_encoded_password() {
+    let config = Config::from_url("postgres://user:p%40ss%23word@localhost/db").unwrap();
+    assert_eq!(config.password, "p@ss#word");
+}
+
+#[test]
+fn url_invalid_scheme() {
+    let result = Config::from_url("mysql://user:pass@localhost/db");
+    assert!(result.is_err());
+}
+
+#[test]
+fn url_missing_at_sign() {
+    let result = Config::from_url("postgres://localhost/db");
+    assert!(result.is_err());
+}
+
+// ===============================================================
+// Pool idempotency
+// ===============================================================
+
+#[test]
+fn pool_close_is_idempotent() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(1).build().unwrap();
+
+    // Acquire + release a connection so the pool has one idle connection.
+    {
+        let mut conn = pool.acquire().unwrap();
+        conn.simple_query("SELECT 1").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    pool.close();
+    pool.close(); // second close must not panic
+
+    let status = pool.status();
+    assert_eq!(status.idle, 0);
+    assert!(pool.is_closed());
+
+    // Acquiring after close should fail.
+    let result = pool.acquire();
+    assert!(result.is_err());
+}
+
+// ===============================================================
+// Statement cache edge cases
+// ===============================================================
+
+#[test]
+fn stmt_cache_size_zero_evicts_aggressively() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+    let arena = Arena::new();
+
+    conn.set_max_stmt_cache_size(0);
+
+    // With max_stmt_cache_size=0, the cache evicts before inserting a new
+    // statement, keeping at most 1 entry. Two *different* queries demonstrate
+    // that the cache never grows beyond 1.
+    let sql1 = "SELECT 1 AS n";
+    let hash1 = hash_sql(sql1);
+    let sql2 = "SELECT 2 AS m";
+    let hash2 = hash_sql(sql2);
+
+    let r1 = conn.query(sql1, hash1, &[]).unwrap();
+    assert_eq!(r1.len(), 1);
+    assert_eq!(r1.row(0, &arena).get_i32(0), Some(1));
+    assert!(conn.stmt_cache_len() <= 1);
+
+    let r2 = conn.query(sql2, hash2, &[]).unwrap();
+    assert_eq!(r2.len(), 1);
+    assert_eq!(r2.row(0, &arena).get_i32(0), Some(2));
+    // Cache should still be at most 1 due to aggressive eviction
+    assert!(conn.stmt_cache_len() <= 1);
+}
+
+#[test]
+fn stmt_cache_disabled_mode_always_reparses() {
+    let url = require_db!();
+    let mut config = Config::from_url(&url).unwrap();
+    config.statement_cache_mode = bsql_driver_postgres::StatementCacheMode::Disabled;
+    let mut conn = Connection::connect(&config).unwrap();
+    let arena = Arena::new();
+
+    // With Disabled mode, every query uses the unnamed statement — no caching.
+    let sql = "SELECT 1 AS n";
+    let hash = hash_sql(sql);
+
+    let r1 = conn.query(sql, hash, &[]).unwrap();
+    assert_eq!(r1.len(), 1);
+    assert_eq!(r1.row(0, &arena).get_i32(0), Some(1));
+
+    let r2 = conn.query(sql, hash, &[]).unwrap();
+    assert_eq!(r2.len(), 1);
+    assert_eq!(r2.row(0, &arena).get_i32(0), Some(1));
+
+    assert_eq!(conn.stmt_cache_len(), 0);
+}
