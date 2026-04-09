@@ -1217,3 +1217,108 @@ async fn slice_of_string_as_param() {
     assert_eq!(rows[0].login, "alice");
     assert_eq!(rows[1].login, "bob");
 }
+
+// ---------------------------------------------------------------------------
+// Option<i32> on integer nullable column
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn option_i32_none_sets_null_on_integer_column() {
+    let pool = pool().await;
+    let dept: Option<i32> = None;
+    let id = 1i32;
+    bsql::query!("UPDATE tickets SET department_id = $dept: Option<i32> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let ticket = bsql::query!("SELECT department_id FROM tickets WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(ticket.department_id.is_none());
+}
+
+#[tokio::test]
+async fn option_i32_some_sets_value_on_integer_column() {
+    let pool = pool().await;
+    let dept: Option<i32> = Some(42);
+    let id = 1i32;
+    bsql::query!("UPDATE tickets SET department_id = $dept: Option<i32> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let ticket = bsql::query!("SELECT department_id FROM tickets WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ticket.department_id, Some(42));
+
+    // Clean up — reset to NULL
+    let dept: Option<i32> = None;
+    bsql::query!("UPDATE tickets SET department_id = $dept: Option<i32> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// raw_query_params edge cases
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn raw_query_params_insert_and_delete() {
+    let pool = pool().await;
+    pool.raw_query_params(
+        "INSERT INTO test_jsonb (data) VALUES ($1::jsonb)",
+        &[&r#"{"raw": true}"# as &(dyn bsql::driver::Encode + Sync)],
+    )
+    .await
+    .unwrap();
+
+    let rows = pool
+        .raw_query_params(
+            "SELECT data FROM test_jsonb WHERE data->>'raw' = $1",
+            &[&"true" as &(dyn bsql::driver::Encode + Sync)],
+        )
+        .await
+        .unwrap();
+    assert!(!rows.is_empty());
+
+    pool.raw_query_params(
+        "DELETE FROM test_jsonb WHERE data->>'raw' = $1",
+        &[&"true" as &(dyn bsql::driver::Encode + Sync)],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn raw_query_params_invalid_sql_returns_error() {
+    let pool = pool().await;
+    let result = pool
+        .raw_query_params(
+            "SELECT FROM nonexistent_xyz WHERE id = $1",
+            &[&1i32 as &(dyn bsql::driver::Encode + Sync)],
+        )
+        .await;
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// &[String] edge case: empty array
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_string_array_param() {
+    let pool = pool().await;
+    let logins: Vec<String> = vec![];
+    let rows = bsql::query!(
+        "SELECT id, login FROM users WHERE login = ANY($logins: &[String]) ORDER BY id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(rows.is_empty(), "empty array should match no rows");
+}
