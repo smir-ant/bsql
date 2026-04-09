@@ -1381,7 +1381,7 @@ fn query_error_constructable_from_user_code() {
 #[test]
 fn query_error_with_source() {
     use std::borrow::Cow;
-    let io_err = std::io::Error::new(std::io::ErrorKind::Other, "underlying");
+    let io_err = std::io::Error::other("underlying");
     let err = BsqlError::Query(bsql::error::QueryError {
         message: Cow::Borrowed("wrapper"),
         pg_code: None,
