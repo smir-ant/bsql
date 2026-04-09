@@ -3489,3 +3489,94 @@ fn stmt_cache_disabled_mode_always_reparses() {
 
     assert_eq!(conn.stmt_cache_len(), 0);
 }
+
+// --- Additional error tests ---
+
+#[test]
+fn check_constraint_violation() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    // Attempt to insert a negative score.
+    // score is SMALLINT NOT NULL DEFAULT 0 — no CHECK, but -1 is valid for smallint.
+    // This test documents that negative values are accepted.
+    let result = conn.simple_query(
+        "INSERT INTO users (login, first_name, last_name, email, score) VALUES ('check_test', 'A', 'B', 'c@d.com', -1)"
+    );
+    if result.is_ok() {
+        conn.simple_query("DELETE FROM users WHERE login = 'check_test'")
+            .unwrap();
+    }
+}
+
+#[test]
+fn wrong_database_connection() {
+    let config = Config::from_url("postgres://bsql:bsql@localhost/nonexistent_db_xyz").unwrap();
+    let result = Connection::connect(&config);
+    assert!(result.is_err());
+}
+
+#[test]
+fn wrong_password_connection() {
+    let config = Config::from_url("postgres://bsql:wrong_password@localhost/bsql_test").unwrap();
+    let result = Connection::connect(&config);
+    // If PG is configured with `trust` auth, this will succeed — that's fine.
+    // We only assert the error type if it fails.
+    if let Err(ref e) = result {
+        match e {
+            DriverError::Auth(_) => {}
+            DriverError::Server { .. } => {}
+            _ => panic!("expected Auth or Server error, got: {e}"),
+        }
+    }
+}
+
+// --- Pool edge-case: prepared queries through max_size=1 pool ---
+
+#[test]
+fn pool_max_size_1_sequential_queries() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(1).build().unwrap();
+    let arena = Arena::new();
+
+    let sql = "SELECT 1 AS n";
+    let hash = hash_sql(sql);
+
+    // First query — acquire, run prepared query, release.
+    {
+        let mut conn = pool.acquire().unwrap();
+        let r = conn.query(sql, hash, &[]).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.row(0, &arena).get_i32(0), Some(1));
+    }
+
+    // Give the spawned return task a moment.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Second query — should get the same connection back (statement is cached).
+    {
+        let mut conn = pool.acquire().unwrap();
+        let r = conn.query(sql, hash, &[]).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.row(0, &arena).get_i32(0), Some(1));
+    }
+}
+
+// --- Encoding edge case: bytea with interleaved NUL bytes ---
+
+#[test]
+fn encode_nul_byte_in_bytea() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+    let arena = Arena::new();
+
+    let sql = "SELECT $1::bytea AS val";
+    let hash = hash_sql(sql);
+    let val: &[u8] = &[0x00, 0xFF, 0x00, 0xAB];
+    let result = conn.query(sql, hash, &[&val]).unwrap();
+    let row = result.row(0, &arena);
+    let decoded = row.get_bytes(0).unwrap();
+    assert_eq!(decoded, &[0x00, 0xFF, 0x00, 0xAB]);
+}

@@ -1762,3 +1762,185 @@ async fn sql_case_when_in_select() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].status, "yes");
 }
+
+// ---------------------------------------------------------------------------
+// SQL construct coverage
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sql_right_join() {
+    let pool = pool().await;
+    // RIGHT JOIN: left side nullable
+    let rows = bsql::query!(
+        "SELECT u.id, t.title FROM tickets t RIGHT JOIN users u ON u.id = t.created_by_user_id ORDER BY u.id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(rows.len() >= 2);
+}
+
+#[tokio::test]
+async fn sql_cross_join() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT u.login, t.title FROM users u CROSS JOIN tickets t ORDER BY u.id, t.id LIMIT 4"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 4);
+}
+
+#[tokio::test]
+async fn sql_self_join() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT a.login AS login_a, b.login AS login_b FROM users a JOIN users b ON a.id != b.id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2); // alice-bob and bob-alice
+}
+
+#[tokio::test]
+async fn sql_multiple_joins() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT t.id, t.title, u.login
+         FROM tickets t
+         JOIN users u ON u.id = t.created_by_user_id
+         ORDER BY t.id LIMIT 2"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+async fn sql_exists_subquery() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT id, login FROM users WHERE EXISTS (SELECT 1 FROM tickets WHERE created_by_user_id = users.id)"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(rows.len() >= 2);
+}
+
+#[tokio::test]
+async fn sql_in_subquery() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT id, login FROM users WHERE id IN (SELECT created_by_user_id FROM tickets)"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(rows.len() >= 2);
+}
+
+#[tokio::test]
+async fn sql_group_by_having() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT created_by_user_id, COUNT(*) AS cnt FROM tickets GROUP BY created_by_user_id HAVING COUNT(*) >= 1"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!rows.is_empty());
+}
+
+#[tokio::test]
+async fn sql_count_distinct() {
+    let pool = pool().await;
+    let row =
+        bsql::query!("SELECT COUNT(DISTINCT created_by_user_id) AS unique_creators FROM tickets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(row.unique_creators >= 2);
+}
+
+#[tokio::test]
+async fn sql_offset() {
+    let pool = pool().await;
+    let rows = bsql::query!("SELECT id, login FROM users ORDER BY id LIMIT 1 OFFSET 1")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].login, "bob");
+}
+
+#[tokio::test]
+async fn sql_string_concatenation() {
+    let pool = pool().await;
+    let row =
+        bsql::query!("SELECT first_name || ' ' || last_name AS full_name FROM users WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // PG marks concatenation expressions as nullable (no column-level NOT NULL info)
+    assert!(row.full_name.is_some());
+    assert_eq!(row.full_name.unwrap(), "Alice Smith");
+}
+
+#[tokio::test]
+async fn sql_arithmetic_expression() {
+    let pool = pool().await;
+    let row = bsql::query!("SELECT id, score * 2 AS double_score FROM users WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.id, 1);
+}
+
+#[tokio::test]
+async fn sql_insert_on_conflict_do_nothing() {
+    let pool = pool().await;
+    // alice already exists — no params variant
+    let affected = bsql::query!(
+        "INSERT INTO users (login, first_name, last_name, email) VALUES ('alice', 'A', 'A', 'a@a.com') ON CONFLICT (login) DO NOTHING"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(affected, 0);
+}
+
+#[tokio::test]
+async fn sql_with_comments() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT id, login -- this is a comment
+         FROM users
+         /* multi-line
+            comment */
+         ORDER BY id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Query execution edge cases
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn same_param_used_twice() {
+    let pool = pool().await;
+    let name = "alice";
+    let rows =
+        bsql::query!("SELECT id FROM users WHERE login = $name: &str OR first_name = $name: &str")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(!rows.is_empty());
+}

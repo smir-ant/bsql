@@ -977,3 +977,104 @@ async fn transaction_error_aborts_state() {
 
     tx.rollback().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// transaction edge cases
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transaction_read_your_writes_by_title() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+
+    let title = "read_your_writes_test";
+    let uid = 1i32;
+    bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($title: &str, 'new', $uid: i32)"
+    ).execute(&mut tx).await.unwrap();
+
+    // Should see the insert within the same transaction
+    let search = "read_your_writes_test";
+    let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
+        .fetch_all(&mut tx)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_begin_commit_empty() {
+    let pool = pool().await;
+    let tx = pool.begin().await.unwrap();
+    // Empty transaction — no operations
+    tx.commit().await.unwrap();
+    // Pool should work fine after empty commit
+    let rows = bsql::query!("SELECT 1 AS n")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn transaction_begin_rollback_empty() {
+    let pool = pool().await;
+    let tx = pool.begin().await.unwrap();
+    tx.rollback().await.unwrap();
+    // Pool works after empty rollback
+    let rows = bsql::query!("SELECT 1 AS n")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn transaction_new_tx_after_rollback() {
+    let pool = pool().await;
+
+    // First transaction — rollback
+    let mut tx1 = pool.begin().await.unwrap();
+    let title = "tx_after_rollback";
+    let uid = 1i32;
+    bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($title: &str, 'new', $uid: i32)"
+    ).execute(&mut tx1).await.unwrap();
+    tx1.rollback().await.unwrap();
+
+    // Second transaction — should work normally
+    let mut tx2 = pool.begin().await.unwrap();
+    let title2 = "tx_after_rollback_2";
+    bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($title2: &str, 'new', $uid: i32)"
+    ).execute(&mut tx2).await.unwrap();
+    tx2.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_fetch_one_inside_tx() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let uid = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $uid: i32")
+        .fetch_one(&mut tx)
+        .await
+        .unwrap();
+    assert_eq!(user.login, "alice");
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_fetch_optional_inside_tx() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let uid = 999i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $uid: i32")
+        .fetch_optional(&mut tx)
+        .await
+        .unwrap();
+    assert!(user.is_none());
+    tx.rollback().await.unwrap();
+}

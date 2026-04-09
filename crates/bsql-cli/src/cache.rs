@@ -290,6 +290,7 @@ mod tests {
         assert!(decoded.param_is_pg_enum.is_empty());
         assert_eq!(decoded.bsql_version, "0.20.1");
         assert_eq!(decoded.param_rust_types, vec!["i32"]);
+        assert!(decoded.rewritten_sql.is_none());
     }
 
     #[test]
@@ -324,6 +325,7 @@ mod tests {
         assert_eq!(decoded.sql_hash, 42);
         assert_eq!(decoded.bsql_version, "0.20.0");
         assert!(decoded.param_rust_types.is_empty());
+        assert!(decoded.rewritten_sql.is_none()); // v2 has no rewritten_sql
     }
 
     #[test]
@@ -355,6 +357,7 @@ mod tests {
         assert_eq!(decoded.param_is_pg_enum, vec![false]);
         assert_eq!(decoded.bsql_version, ""); // v1 has no version
         assert!(decoded.param_rust_types.is_empty()); // v1 has no param types
+        assert!(decoded.rewritten_sql.is_none()); // v1 has no rewritten_sql
     }
 
     #[test]
@@ -452,5 +455,80 @@ mod tests {
         // Empty file should fail to decode, be skipped
         let queries = read_cache_dir(dir.path()).unwrap();
         assert!(queries.is_empty());
+    }
+
+    #[test]
+    fn read_file_valid_v3_migration() {
+        let v3 = CachedQueryV3 {
+            sql_hash: 77,
+            normalized_sql: "SELECT $1::int4".to_owned(),
+            columns: vec![CachedColumn {
+                name: "int4".to_owned(),
+                pg_oid: 23,
+                pg_type_name: "int4".to_owned(),
+                is_nullable: false,
+                rust_type: "i32".to_owned(),
+            }],
+            param_pg_oids: vec![23],
+            param_is_pg_enum: vec![false],
+            bsql_version: "0.19.0".to_owned(),
+            param_rust_types: vec!["i32".to_owned()],
+        };
+
+        let inner_bytes = bitcode::encode(&v3);
+        let envelope = CacheEnvelope {
+            version: 3,
+            data: inner_bytes,
+        };
+        let bytes = bitcode::encode(&envelope);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3_migration.bitcode");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let decoded = read_cache_file(&path).unwrap();
+        assert_eq!(decoded.sql_hash, 77);
+        assert_eq!(decoded.normalized_sql, "SELECT $1::int4");
+        assert_eq!(decoded.columns.len(), 1);
+        assert_eq!(decoded.columns[0].name, "int4");
+        assert_eq!(decoded.bsql_version, "0.19.0");
+        assert_eq!(decoded.param_rust_types, vec!["i32"]);
+        assert_eq!(decoded.param_pg_oids, vec![23]);
+        assert_eq!(decoded.param_is_pg_enum, vec![false]);
+        assert!(decoded.rewritten_sql.is_none()); // v3 has no rewritten_sql
+    }
+
+    #[test]
+    fn read_file_v3_corrupt_inner_data() {
+        let envelope = CacheEnvelope {
+            version: 3,
+            data: vec![0xFF, 0xFE, 0xFD],
+        };
+        let bytes = bitcode::encode(&envelope);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_v3.bitcode");
+        std::fs::write(&path, &bytes).unwrap();
+        let result = read_cache_file(&path);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("failed to decode v3 cached query"));
+    }
+
+    #[test]
+    fn read_file_v2_corrupt_inner_data_v2() {
+        let envelope = CacheEnvelope {
+            version: 2,
+            data: vec![0xFF, 0xFE, 0xFD],
+        };
+        let bytes = bitcode::encode(&envelope);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_v2.bitcode");
+        std::fs::write(&path, &bytes).unwrap();
+        let result = read_cache_file(&path);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("failed to decode v2 cached query"));
     }
 }
