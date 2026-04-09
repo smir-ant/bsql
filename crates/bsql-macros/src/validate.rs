@@ -958,20 +958,55 @@ fn validate_variant(
     parsed: &ParsedQuery,
     variant_index: usize,
 ) -> Result<ValidationResult, String> {
-    let result = conn
-        .prepare_describe(&variant.sql)
-        .map_err(|e| format_variant_driver_error(&e, variant, parsed, variant_index))?;
+    // Build Rust-type OIDs for this variant's parameters (same as Phase 1
+    // in validate_query). Without these, PG cannot determine the type of
+    // parameters used in patterns like `$9 IS NULL OR id > $9`.
+    let rust_oids: SmallVec<[u32; 8]> = variant
+        .params
+        .iter()
+        .map(|p| bsql_core::types::default_pg_oid_for_rust_type(&p.rust_type))
+        .collect();
+
+    // Phase 1: PREPARE with Rust-type OIDs
+    let (result, rewritten_sql) = match conn.prepare_describe_with_oids(&variant.sql, &rust_oids) {
+        Ok(mut r) => {
+            // Try empty-OID PREPARE to get PG's true inferred types
+            if let Ok(inferred) = conn.prepare_describe(&variant.sql) {
+                r.param_oids = inferred.param_oids;
+            }
+            (r, None)
+        }
+        Err(_phase1_err) => {
+            // Phase 2: Retry with empty OIDs (PG infers from context)
+            let result = conn
+                .prepare_describe(&variant.sql)
+                .map_err(|e| format_variant_driver_error(&e, variant, parsed, variant_index))?;
+
+            // Check for OID mismatches and rewrite SQL with casts
+            let rewritten = rewrite_sql_with_casts(&variant.sql, &rust_oids, &result.param_oids);
+
+            if rewritten != variant.sql {
+                let result2 = conn
+                    .prepare_describe_with_oids(&rewritten, &rust_oids)
+                    .map_err(|e| format_variant_driver_error(&e, variant, parsed, variant_index))?;
+                (result2, Some(rewritten))
+            } else {
+                (result, None)
+            }
+        }
+    };
 
     let param_pg_oids: SmallVec<[u32; 8]> = result.param_oids.iter().copied().collect();
     let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids);
 
-    let columns = build_columns(conn, &result.columns, &variant.sql)?;
+    let final_sql = rewritten_sql.as_deref().unwrap_or(&variant.sql);
+    let columns = build_columns(conn, &result.columns, final_sql)?;
 
     Ok(ValidationResult {
         columns,
         param_pg_oids,
         param_is_pg_enum,
-        rewritten_sql: None,
+        rewritten_sql,
         #[cfg(feature = "explain")]
         explain_plan: None,
     })
