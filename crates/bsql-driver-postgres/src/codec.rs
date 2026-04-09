@@ -92,9 +92,15 @@ pub trait Encode {
 
 // --- Encode implementations ---
 
+/// Delegate to the single-source OID mapping.
+#[inline]
+fn oid(ty: &str) -> u32 {
+    crate::oid_map::default_pg_oid_for_rust_type(ty)
+}
+
 impl Encode for bool {
     fn pg_type_oid() -> u32 {
-        16
+        oid("bool")
     }
 
     #[inline]
@@ -104,7 +110,7 @@ impl Encode for bool {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        16 // bool
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -119,7 +125,7 @@ impl Encode for bool {
 
 impl Encode for i16 {
     fn pg_type_oid() -> u32 {
-        21
+        oid("i16")
     }
 
     #[inline]
@@ -129,7 +135,7 @@ impl Encode for i16 {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        21 // int2
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -144,7 +150,7 @@ impl Encode for i16 {
 
 impl Encode for i32 {
     fn pg_type_oid() -> u32 {
-        23
+        oid("i32")
     }
 
     #[inline]
@@ -154,7 +160,7 @@ impl Encode for i32 {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        23 // int4
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -169,7 +175,7 @@ impl Encode for i32 {
 
 impl Encode for i64 {
     fn pg_type_oid() -> u32 {
-        20
+        oid("i64")
     }
 
     #[inline]
@@ -179,7 +185,7 @@ impl Encode for i64 {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        20 // int8
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -194,7 +200,7 @@ impl Encode for i64 {
 
 impl Encode for f32 {
     fn pg_type_oid() -> u32 {
-        700
+        oid("f32")
     }
 
     #[inline]
@@ -204,7 +210,7 @@ impl Encode for f32 {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        700 // float4
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -219,7 +225,7 @@ impl Encode for f32 {
 
 impl Encode for f64 {
     fn pg_type_oid() -> u32 {
-        701
+        oid("f64")
     }
 
     #[inline]
@@ -229,7 +235,7 @@ impl Encode for f64 {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        701 // float8
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -244,7 +250,7 @@ impl Encode for f64 {
 
 impl Encode for &str {
     fn pg_type_oid() -> u32 {
-        25
+        oid("&str")
     }
 
     #[inline]
@@ -254,7 +260,7 @@ impl Encode for &str {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        25 // text
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -270,7 +276,7 @@ impl Encode for &str {
 
 impl Encode for String {
     fn pg_type_oid() -> u32 {
-        25
+        oid("String")
     }
 
     #[inline]
@@ -280,7 +286,7 @@ impl Encode for String {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        25 // text
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -291,7 +297,7 @@ impl Encode for String {
 
 impl Encode for &[u8] {
     fn pg_type_oid() -> u32 {
-        17
+        oid("&[u8]")
     }
 
     #[inline]
@@ -301,7 +307,7 @@ impl Encode for &[u8] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        17 // bytea
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -316,7 +322,7 @@ impl Encode for &[u8] {
 
 impl Encode for Vec<u8> {
     fn pg_type_oid() -> u32 {
-        17
+        oid("Vec<u8>")
     }
 
     #[inline]
@@ -326,7 +332,7 @@ impl Encode for Vec<u8> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        17 // bytea
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -341,7 +347,7 @@ impl Encode for Vec<u8> {
 
 impl Encode for u32 {
     fn pg_type_oid() -> u32 {
-        26
+        oid("u32")
     }
 
     #[inline]
@@ -351,7 +357,7 @@ impl Encode for u32 {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        26 // oid
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -399,7 +405,7 @@ impl<T: Encode> Encode for Option<T> {
 #[cfg(feature = "uuid")]
 impl Encode for uuid::Uuid {
     fn pg_type_oid() -> u32 {
-        2950
+        oid("uuid::Uuid")
     }
 
     #[inline]
@@ -409,7 +415,7 @@ impl Encode for uuid::Uuid {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        2950 // uuid
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -425,7 +431,7 @@ impl Encode for uuid::Uuid {
 #[cfg(feature = "time")]
 impl Encode for time::OffsetDateTime {
     fn pg_type_oid() -> u32 {
-        1184
+        oid("time::OffsetDateTime")
     }
 
     #[inline]
@@ -435,7 +441,7 @@ impl Encode for time::OffsetDateTime {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1184 // timestamptz
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -468,7 +474,7 @@ impl OffsetDateTimeExt for time::OffsetDateTime {
 #[cfg(feature = "time")]
 impl Encode for time::Date {
     fn pg_type_oid() -> u32 {
-        1082
+        oid("time::Date")
     }
 
     #[inline]
@@ -478,7 +484,7 @@ impl Encode for time::Date {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1082 // date
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -509,7 +515,7 @@ impl DateExt for time::Date {
 #[cfg(feature = "time")]
 impl Encode for time::Time {
     fn pg_type_oid() -> u32 {
-        1083
+        oid("time::Time")
     }
 
     #[inline]
@@ -519,7 +525,7 @@ impl Encode for time::Time {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1083 // time
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -551,7 +557,7 @@ impl TimeExt for time::Time {
 #[cfg(feature = "time")]
 impl Encode for time::PrimitiveDateTime {
     fn pg_type_oid() -> u32 {
-        1114
+        oid("time::PrimitiveDateTime")
     }
 
     #[inline]
@@ -561,7 +567,7 @@ impl Encode for time::PrimitiveDateTime {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1114 // timestamp (without timezone)
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -595,7 +601,7 @@ impl PrimitiveDateTimeExt for time::PrimitiveDateTime {
 #[cfg(feature = "chrono")]
 impl Encode for chrono::NaiveDateTime {
     fn pg_type_oid() -> u32 {
-        1114
+        oid("chrono::NaiveDateTime")
     }
 
     #[inline]
@@ -605,7 +611,7 @@ impl Encode for chrono::NaiveDateTime {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1114 // timestamp (without timezone)
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -636,7 +642,7 @@ impl NaiveDateTimeExt for chrono::NaiveDateTime {
 #[cfg(feature = "chrono")]
 impl Encode for chrono::DateTime<chrono::Utc> {
     fn pg_type_oid() -> u32 {
-        1184
+        oid("chrono::DateTime<chrono::Utc>")
     }
 
     #[inline]
@@ -646,7 +652,7 @@ impl Encode for chrono::DateTime<chrono::Utc> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1184 // timestamptz
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -677,7 +683,7 @@ impl ChronoDateTimeUtcExt for chrono::DateTime<chrono::Utc> {
 #[cfg(feature = "chrono")]
 impl Encode for chrono::NaiveDate {
     fn pg_type_oid() -> u32 {
-        1082
+        oid("chrono::NaiveDate")
     }
 
     #[inline]
@@ -687,7 +693,7 @@ impl Encode for chrono::NaiveDate {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1082 // date
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -721,7 +727,7 @@ impl ChronoNaiveDateExt for chrono::NaiveDate {
 #[cfg(feature = "chrono")]
 impl Encode for chrono::NaiveTime {
     fn pg_type_oid() -> u32 {
-        1083
+        oid("chrono::NaiveTime")
     }
 
     #[inline]
@@ -731,7 +737,7 @@ impl Encode for chrono::NaiveTime {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1083 // time
+        Self::pg_type_oid()
     }
 
     #[inline]
@@ -764,7 +770,7 @@ impl ChronoNaiveTimeExt for chrono::NaiveTime {
 #[cfg(feature = "decimal")]
 impl Encode for rust_decimal::Decimal {
     fn pg_type_oid() -> u32 {
-        1700
+        oid("rust_decimal::Decimal")
     }
 
     fn encode_binary(&self, buf: &mut Vec<u8>) {
@@ -897,7 +903,7 @@ impl Encode for rust_decimal::Decimal {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1700 // numeric
+        Self::pg_type_oid()
     }
 }
 
@@ -1049,7 +1055,7 @@ fn encode_array_header(buf: &mut Vec<u8>, n_elements: usize, elem_oid: u32) {
 
 impl Encode for [bool] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 16);
+        encode_array_header(buf, self.len(), oid("bool"));
         // Pre-allocate: 4 (len prefix) + 1 (data) = 5 bytes per element
         buf.reserve(self.len() * 5);
         for val in self {
@@ -1060,13 +1066,13 @@ impl Encode for [bool] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1000 // bool[]
+        oid("Vec<bool>")
     }
 }
 
 impl Encode for &[bool] {
     fn pg_type_oid() -> u32 {
-        1000
+        oid("&[bool]")
     }
 
     #[inline]
@@ -1076,13 +1082,13 @@ impl Encode for &[bool] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1000
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for Vec<bool> {
     fn pg_type_oid() -> u32 {
-        1000
+        oid("Vec<bool>")
     }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
@@ -1091,13 +1097,13 @@ impl Encode for Vec<bool> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1000
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [i16] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 21);
+        encode_array_header(buf, self.len(), oid("i16"));
         // Pre-allocate: 4 (len prefix) + 2 (data) = 6 bytes per element
         buf.reserve(self.len() * 6);
         for val in self {
@@ -1110,13 +1116,13 @@ impl Encode for [i16] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1005 // int2[]
+        oid("Vec<i16>")
     }
 }
 
 impl Encode for &[i16] {
     fn pg_type_oid() -> u32 {
-        1005
+        oid("&[i16]")
     }
 
     #[inline]
@@ -1126,13 +1132,13 @@ impl Encode for &[i16] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1005
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for Vec<i16> {
     fn pg_type_oid() -> u32 {
-        1005
+        oid("Vec<i16>")
     }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
@@ -1141,13 +1147,13 @@ impl Encode for Vec<i16> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1005
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [i32] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 23);
+        encode_array_header(buf, self.len(), oid("i32"));
         // Pre-allocate: 4 (len prefix) + 4 (data) = 8 bytes per element
         buf.reserve(self.len() * 8);
         for val in self {
@@ -1160,13 +1166,13 @@ impl Encode for [i32] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1007 // int4[]
+        oid("Vec<i32>")
     }
 }
 
 impl Encode for &[i32] {
     fn pg_type_oid() -> u32 {
-        1007
+        oid("&[i32]")
     }
 
     #[inline]
@@ -1176,13 +1182,13 @@ impl Encode for &[i32] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1007
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for Vec<i32> {
     fn pg_type_oid() -> u32 {
-        1007
+        oid("Vec<i32>")
     }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
@@ -1191,13 +1197,13 @@ impl Encode for Vec<i32> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1007
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [i64] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 20);
+        encode_array_header(buf, self.len(), oid("i64"));
         // Pre-allocate: 4 (len prefix) + 8 (data) = 12 bytes per element
         buf.reserve(self.len() * 12);
         for val in self {
@@ -1210,13 +1216,13 @@ impl Encode for [i64] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1016 // int8[]
+        oid("Vec<i64>")
     }
 }
 
 impl Encode for &[i64] {
     fn pg_type_oid() -> u32 {
-        1016
+        oid("&[i64]")
     }
 
     #[inline]
@@ -1226,13 +1232,13 @@ impl Encode for &[i64] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1016
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for Vec<i64> {
     fn pg_type_oid() -> u32 {
-        1016
+        oid("Vec<i64>")
     }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
@@ -1241,13 +1247,13 @@ impl Encode for Vec<i64> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1016
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [f32] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 700);
+        encode_array_header(buf, self.len(), oid("f32"));
         // Pre-allocate: 4 (len prefix) + 4 (data) = 8 bytes per element
         buf.reserve(self.len() * 8);
         for val in self {
@@ -1260,13 +1266,13 @@ impl Encode for [f32] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1021 // float4[]
+        oid("Vec<f32>")
     }
 }
 
 impl Encode for &[f32] {
     fn pg_type_oid() -> u32 {
-        1021
+        oid("&[f32]")
     }
 
     #[inline]
@@ -1276,13 +1282,13 @@ impl Encode for &[f32] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1021
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for Vec<f32> {
     fn pg_type_oid() -> u32 {
-        1021
+        oid("Vec<f32>")
     }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
@@ -1291,13 +1297,13 @@ impl Encode for Vec<f32> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1021
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [f64] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 701);
+        encode_array_header(buf, self.len(), oid("f64"));
         // Pre-allocate: 4 (len prefix) + 8 (data) = 12 bytes per element
         buf.reserve(self.len() * 12);
         for val in self {
@@ -1310,13 +1316,13 @@ impl Encode for [f64] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1022 // float8[]
+        oid("Vec<f64>")
     }
 }
 
 impl Encode for &[f64] {
     fn pg_type_oid() -> u32 {
-        1022
+        oid("&[f64]")
     }
 
     #[inline]
@@ -1326,13 +1332,13 @@ impl Encode for &[f64] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1022
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for Vec<f64> {
     fn pg_type_oid() -> u32 {
-        1022
+        oid("Vec<f64>")
     }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
@@ -1341,13 +1347,13 @@ impl Encode for Vec<f64> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1022
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [&str] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 25);
+        encode_array_header(buf, self.len(), oid("String"));
         for val in self {
             let bytes = val.as_bytes();
             buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
@@ -1357,13 +1363,13 @@ impl Encode for [&str] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1009 // text[]
+        oid("Vec<String>")
     }
 }
 
 impl Encode for &[&str] {
     fn pg_type_oid() -> u32 {
-        1009
+        oid("&[&str]")
     }
 
     #[inline]
@@ -1373,16 +1379,16 @@ impl Encode for &[&str] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1009
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for Vec<String> {
     fn pg_type_oid() -> u32 {
-        1009
+        oid("Vec<String>")
     }
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 25);
+        encode_array_header(buf, self.len(), oid("String"));
         for val in self {
             let bytes = val.as_bytes();
             buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
@@ -1392,13 +1398,13 @@ impl Encode for Vec<String> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1009 // text[]
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [String] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 25); // 25 = text OID
+        encode_array_header(buf, self.len(), oid("String"));
         for val in self {
             let bytes = val.as_bytes();
             buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
@@ -1408,13 +1414,13 @@ impl Encode for [String] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1009
+        oid("Vec<String>")
     }
 }
 
 impl Encode for &[String] {
     fn pg_type_oid() -> u32 {
-        1009
+        oid("&[String]")
     }
 
     #[inline]
@@ -1424,13 +1430,13 @@ impl Encode for &[String] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1009
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [&[u8]] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 17);
+        encode_array_header(buf, self.len(), oid("Vec<u8>"));
         for val in self {
             buf.extend_from_slice(&(val.len() as i32).to_be_bytes());
             buf.extend_from_slice(val);
@@ -1439,13 +1445,13 @@ impl Encode for [&[u8]] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1001 // bytea[]
+        oid("Vec<Vec<u8>>")
     }
 }
 
 impl Encode for &[&[u8]] {
     fn pg_type_oid() -> u32 {
-        1001
+        oid("&[&[u8]]")
     }
 
     #[inline]
@@ -1455,13 +1461,13 @@ impl Encode for &[&[u8]] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1001
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for [Vec<u8>] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
-        encode_array_header(buf, self.len(), 17);
+        encode_array_header(buf, self.len(), oid("Vec<u8>"));
         for val in self {
             buf.extend_from_slice(&(val.len() as i32).to_be_bytes());
             buf.extend_from_slice(val);
@@ -1470,13 +1476,13 @@ impl Encode for [Vec<u8>] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1001 // bytea[]
+        oid("Vec<Vec<u8>>")
     }
 }
 
 impl Encode for &[Vec<u8>] {
     fn pg_type_oid() -> u32 {
-        1001
+        oid("Vec<Vec<u8>>")
     }
 
     #[inline]
@@ -1486,13 +1492,13 @@ impl Encode for &[Vec<u8>] {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1001
+        Self::pg_type_oid()
     }
 }
 
 impl Encode for Vec<Vec<u8>> {
     fn pg_type_oid() -> u32 {
-        1001
+        oid("Vec<Vec<u8>>")
     }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
@@ -1501,7 +1507,7 @@ impl Encode for Vec<Vec<u8>> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        1001 // bytea[]
+        Self::pg_type_oid()
     }
 }
 

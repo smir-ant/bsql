@@ -337,32 +337,16 @@ pub fn pg_name_for_oid(oid: u32) -> Option<&'static str> {
 /// Returns the OID that a Rust type would naturally correspond to in PG.
 /// Returns 0 for unknown types (let PG infer from context).
 ///
-/// Used by the two-phase PREPARE mechanism: Phase 1 sends these OIDs so PG
-/// can resolve overloaded functions like `unnest`.
+/// Delegates to `bsql_driver_postgres::oid_map::default_pg_oid_for_rust_type`,
+/// which is the single source of truth for this mapping.
+///
+/// Used by:
+/// - The proc macro's two-phase PREPARE (Phase 1 sends these OIDs)
+/// - `Encode::pg_type_oid()` and `Encode::type_oid()` (runtime delegation)
+///
+/// Every OID value in the codebase should originate from this function.
 pub fn default_pg_oid_for_rust_type(rust_type: &str) -> u32 {
-    // Strip Option<> wrapper — Option<T> is nullable T, same PG type as T.
-    let ty = strip_option_wrapper(rust_type);
-    match ty {
-        "bool" => 16,
-        "i16" => 21,
-        "i32" => 23,
-        "i64" => 20,
-        "f32" => 700,
-        "f64" => 701,
-        "&str" | "String" => 25,
-        "u32" => 26,
-        "&[u8]" | "Vec<u8>" => 17,
-        // Arrays
-        "&[bool]" | "Vec<bool>" => 1000,
-        "&[i16]" | "Vec<i16>" => 1005,
-        "&[i32]" | "Vec<i32>" => 1007,
-        "&[i64]" | "Vec<i64>" => 1016,
-        "&[f32]" | "Vec<f32>" => 1021,
-        "&[f64]" | "Vec<f64>" => 1022,
-        "&[&str]" | "Vec<String>" | "&[String]" => 1009,
-        "&[&[u8]]" | "Vec<Vec<u8>>" => 1001,
-        _ => 0, // unknown → let PG infer
-    }
+    bsql_driver_postgres::oid_map::default_pg_oid_for_rust_type(rust_type)
 }
 
 /// Strip `Option<...>` wrapper from a type string, returning the inner type.

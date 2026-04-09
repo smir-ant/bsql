@@ -41,6 +41,7 @@
 
 pub mod arena;
 pub mod codec;
+pub mod oid_map;
 pub mod pool;
 pub(crate) mod types;
 
