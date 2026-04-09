@@ -1389,3 +1389,154 @@ fn query_error_with_source() {
     });
     assert!(!err.is_unique_violation());
 }
+
+// ---------------------------------------------------------------------------
+// for_each — zero-alloc iteration
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn for_each_iterates_all_rows() {
+    let pool = pool().await;
+    let mut count = 0u32;
+    bsql::query!("SELECT id, login FROM users ORDER BY id")
+        .for_each(&pool, |row| {
+            count += 1;
+            assert!(!row.login.is_empty());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn for_each_map_collects_results() {
+    let pool = pool().await;
+    let logins: Vec<String> = bsql::query!("SELECT login FROM users ORDER BY id")
+        .for_each_map(&pool, |row| row.login.to_owned())
+        .await
+        .unwrap();
+    assert_eq!(logins, vec!["alice", "bob"]);
+}
+
+#[tokio::test]
+async fn for_each_empty_result() {
+    let pool = pool().await;
+    let mut count = 0u32;
+    let name = "nonexistent_xyz";
+    bsql::query!("SELECT id FROM users WHERE login = $name: &str")
+        .for_each(&pool, |_row| {
+            count += 1;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// window functions — NOT NULL inference
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn window_function_row_number() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT id, login, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM users ORDER BY id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    // rn should be i64, NOT Option<i64> — ROW_NUMBER is always NOT NULL
+    assert_eq!(rows[0].rn, 1i64);
+    assert_eq!(rows[1].rn, 2i64);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP BY + aggregates
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn group_by_with_count() {
+    let pool = pool().await;
+    let rows =
+        bsql::query!("SELECT active, COUNT(*) AS cnt FROM users GROUP BY active ORDER BY active")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(!rows.is_empty());
+    // cnt: i64 (COUNT is NOT NULL)
+    assert!(rows[0].cnt > 0);
+}
+
+#[tokio::test]
+async fn aggregate_sum_is_nullable() {
+    let pool = pool().await;
+    // SUM on empty group returns NULL — must be Option
+    let row = bsql::query!("SELECT SUM(score) AS total FROM users WHERE login = 'nonexistent'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(row.total.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// subquery
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn subquery_in_from() {
+    let pool = pool().await;
+    let rows =
+        bsql::query!("SELECT sub.id, sub.login FROM (SELECT id, login FROM users ORDER BY id) sub")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// UNION
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn union_all_query() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT login AS name FROM users WHERE id = 1
+         UNION ALL
+         SELECT title AS name FROM tickets WHERE id = 1"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// extreme values — empty string vs NULL
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn extreme_value_empty_string() {
+    let pool = pool().await;
+    let desc: Option<&str> = Some("");
+    let id = 1i32;
+    bsql::query!("UPDATE tickets SET description = $desc: Option<&str> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ticket = bsql::query!("SELECT description FROM tickets WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Empty string is NOT NULL — should be Some("")
+    assert_eq!(ticket.description, Some(String::new()));
+    // Restore
+    let desc: Option<&str> = None;
+    bsql::query!("UPDATE tickets SET description = $desc: Option<&str> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}

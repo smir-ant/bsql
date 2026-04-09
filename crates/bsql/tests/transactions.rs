@@ -936,3 +936,44 @@ async fn deferred_count_tracks_correctly() {
 
     tx.rollback().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// transaction error recovery — aborted state
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transaction_error_aborts_state() {
+    // After a PG error inside a transaction, the tx is in aborted state.
+    // All subsequent queries should fail until rollback.
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+
+    // This should succeed
+    let uid = 1i32;
+    bsql::query!("SELECT id FROM users WHERE id = $uid: i32")
+        .fetch_one(&mut tx)
+        .await
+        .unwrap();
+
+    // This should fail (FK violation: user 999999 doesn't exist)
+    let bad_title = "tx_aborted_state_test";
+    let bad_uid = 999999i32;
+    let result = bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id)
+         VALUES ($bad_title: &str, 'new', $bad_uid: i32)
+         RETURNING id"
+    )
+    .fetch_one(&mut tx)
+    .await;
+    assert!(result.is_err());
+
+    // After error, further queries should also fail (aborted state)
+    let uid2 = 1i32;
+    let result2 = bsql::query!("SELECT id FROM users WHERE id = $uid2: i32")
+        .fetch_one(&mut tx)
+        .await;
+    // PG returns "current transaction is aborted"
+    assert!(result2.is_err());
+
+    tx.rollback().await.unwrap();
+}
