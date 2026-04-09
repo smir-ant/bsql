@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn semicolon_injection_detected() {
         // Simulate a tampered cache entry with semicolons.
-        let queries = vec![CachedQuery {
+        let queries = [CachedQuery {
             sql_hash: 1,
             normalized_sql: "SELECT 1; DROP TABLE users".to_owned(),
             columns: vec![],

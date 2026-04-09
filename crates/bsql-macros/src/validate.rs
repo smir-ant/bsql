@@ -281,7 +281,8 @@ fn is_known_not_null(col_name: &str, select_expr: &str) -> bool {
     }
 
     // CASE WHEN ... THEN literal ELSE literal END — not null if both branches are literals
-    if expr_lower.starts_with("case ") && expr_lower.ends_with(" end")
+    if expr_lower.starts_with("case ")
+        && expr_lower.ends_with(" end")
         && is_case_all_literal_branches(&expr_lower)
     {
         return true;
