@@ -174,11 +174,13 @@ fn resolve_array(pg_name: &str, element_oid: u32, array_oid: u32) -> Result<&'st
 ///
 /// Extends `bsql_core::types::is_param_compatible` with feature-gated types.
 pub fn is_param_compatible_extended(rust_type: &str, pg_oid: u32) -> bool {
-    // Base types first
+    // Base types first (is_param_compatible strips Option<> internally)
     if bsql_core::types::is_param_compatible(rust_type, pg_oid) {
         return true;
     }
 
+    // Strip Option<> wrapper — Option<T> is nullable T, same PG type as T.
+    let rust_type = strip_option(rust_type);
     match (rust_type, pg_oid) {
         // --- time crate types ---
         ("::time::OffsetDateTime" | "time::OffsetDateTime" | "OffsetDateTime", 1184) => {
@@ -219,6 +221,17 @@ pub fn is_param_compatible_extended(rust_type: &str, pg_oid: u32) -> bool {
 
         _ => false,
     }
+}
+
+/// Strip `Option<...>` wrapper from a type string, returning the inner type.
+/// If the type is not `Option<T>`, returns it unchanged.
+fn strip_option(ty: &str) -> &str {
+    if let Some(inner) = ty.strip_prefix("Option<") {
+        if let Some(inner) = inner.strip_suffix('>') {
+            return inner;
+        }
+    }
+    ty
 }
 
 /// Build a clear error message for a type that requires an unabled feature.

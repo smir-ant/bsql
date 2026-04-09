@@ -55,7 +55,7 @@ pub struct QueryError {
     pub message: Cow<'static, str>,
     /// The five-character SQLSTATE code (e.g. `"23505"` for unique violation).
     pub pg_code: Option<Box<str>>,
-    pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Row/column decoding failure.

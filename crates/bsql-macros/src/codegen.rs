@@ -392,10 +392,12 @@ pub fn generate_sort_query_code(
     let for_each_row_struct = gen_pg_for_each_row_struct(parsed, validation);
 
     // Constructor: captures params + sort from scope
+    let coercions = gen_ref_coercions(&parsed.params);
     let field_inits: Vec<proc_macro2::Ident> =
         parsed.params.iter().map(|p| param_ident(&p.name)).collect();
 
     let constructor = quote! {
+        #coercions
         #executor_name {
             #(#field_inits,)*
             sort,
@@ -1442,23 +1444,32 @@ where
 fn gen_dynamic_constructor(parsed: &ParsedQuery) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
 
+    let mut all_params: Vec<crate::parse::Param> = Vec::new();
     let mut field_names: Vec<proc_macro2::Ident> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for p in &parsed.params {
         field_names.push(param_ident(&p.name));
-        seen.insert(p.name.clone());
+        if seen.insert(p.name.clone()) {
+            all_params.push(p.clone());
+        }
     }
 
     for clause in &parsed.optional_clauses {
         for p in &clause.params {
             if seen.insert(p.name.clone()) {
                 field_names.push(param_ident(&p.name));
+                all_params.push(p.clone());
             }
         }
     }
 
-    quote! { #executor_name { #(#field_names,)* _marker: ::std::marker::PhantomData } }
+    let coercions = gen_ref_coercions(&all_params);
+
+    quote! {
+        #coercions
+        #executor_name { #(#field_names,)* _marker: ::std::marker::PhantomData }
+    }
 }
 
 /// Generate the stream struct and its `next()` / `remaining()` methods.
@@ -2592,14 +2603,41 @@ fn gen_nullable_decode(idx: usize, inner_type: &str) -> TokenStream {
 }
 
 /// Generate the constructor expression that captures variables from scope.
+///
+/// For reference-typed parameters (`&str`, `&[i32]`, etc.) we emit a
+/// `let name: &T = &name;` rebinding so that owned types like `String`
+/// and `Vec<T>` auto-deref into the expected reference.
 fn gen_constructor(parsed: &ParsedQuery) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
+    let coercions = gen_ref_coercions(&parsed.params);
     let field_inits = parsed.params.iter().map(|p| {
         let name = param_ident(&p.name);
         quote! { #name }
     });
 
-    quote! { #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData } }
+    quote! {
+        #coercions
+        #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData }
+    }
+}
+
+/// Generate `let name: &T = &name;` coercions for every reference-typed param.
+///
+/// This allows callers to pass `String` where `&str` is expected, or
+/// `Vec<i32>` where `&[i32]` is expected — the rebinding triggers Rust's
+/// auto-deref coercion.
+fn gen_ref_coercions(params: &[crate::parse::Param]) -> TokenStream {
+    let stmts: Vec<TokenStream> = params
+        .iter()
+        .filter(|p| p.rust_type.starts_with('&'))
+        .map(|p| {
+            let name = param_ident(&p.name);
+            let ty: syn::Type = syn::parse_str(&p.rust_type)
+                .unwrap_or_else(|_| panic!("cannot parse type `{}`", p.rust_type));
+            quote! { let #name: #ty = &#name; }
+        })
+        .collect();
+    quote! { #(#stmts)* }
 }
 
 /// Parse a Rust type string and inject `'_bsql` lifetime on bare references.
@@ -3010,6 +3048,30 @@ mod tests {
         assert!(!s.contains("'_bsql"), "i32 should have no lifetime: {s}");
     }
 
+    // --- Option<T> lifetime injection ---
+
+    #[test]
+    fn inject_lifetime_option_str() {
+        let ts = inject_lifetime("Option<&str>");
+        let s = ts.to_string();
+        assert!(
+            s.contains("'_bsql"),
+            "Option<&str> inner ref needs lifetime: {s}"
+        );
+        assert!(s.contains("Option"), "should still be Option: {s}");
+    }
+
+    #[test]
+    fn inject_lifetime_option_i32_no_lifetime() {
+        let ts = inject_lifetime("Option<i32>");
+        let s = ts.to_string();
+        assert!(
+            !s.contains("'_bsql"),
+            "Option<i32> should have no lifetime: {s}"
+        );
+        assert!(s.contains("Option"), "should still be Option: {s}");
+    }
+
     // --- column dedup ---
 
     #[test]
@@ -3414,5 +3476,96 @@ mod tests {
             code_str.contains("LIMIT 2"),
             "missing LIMIT 2 in query_as fetch_one: {code_str}"
         );
+    }
+
+    // --- auto-deref coercion tests ---
+
+    #[test]
+    fn constructor_coerces_ref_str_param() {
+        let parsed = parse_query("SELECT id FROM t WHERE name = $name: &str").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // Should contain `let name : & str = & name ;`
+        assert!(
+            code_str.contains("let name : & str = & name"),
+            "missing auto-deref coercion for &str: {code_str}"
+        );
+    }
+
+    #[test]
+    fn constructor_coerces_ref_slice_param() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = ANY($ids: &[i32])").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // Should contain `let ids : & [i32] = & ids ;`
+        assert!(
+            code_str.contains("let ids : & [i32] = & ids"),
+            "missing auto-deref coercion for &[i32]: {code_str}"
+        );
+    }
+
+    #[test]
+    fn constructor_no_coercion_for_owned_types() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // Should NOT contain a let coercion for i32
+        assert!(
+            !code_str.contains("let id : i32 = & id"),
+            "should not coerce owned type i32: {code_str}"
+        );
+    }
+
+    #[test]
+    fn gen_ref_coercions_empty_for_no_refs() {
+        let params = vec![crate::parse::Param {
+            name: "id".into(),
+            rust_type: "i32".into(),
+            position: 1,
+        }];
+        let coercions = gen_ref_coercions(&params);
+        assert!(
+            coercions.is_empty(),
+            "no coercions expected for i32: {}",
+            coercions
+        );
+    }
+
+    #[test]
+    fn gen_ref_coercions_str_and_slice() {
+        let params = vec![
+            crate::parse::Param {
+                name: "name".into(),
+                rust_type: "&str".into(),
+                position: 1,
+            },
+            crate::parse::Param {
+                name: "ids".into(),
+                rust_type: "&[i32]".into(),
+                position: 2,
+            },
+            crate::parse::Param {
+                name: "age".into(),
+                rust_type: "i32".into(),
+                position: 3,
+            },
+        ];
+        let coercions = gen_ref_coercions(&params);
+        let code = coercions.to_string();
+        assert!(
+            code.contains("let name : & str = & name"),
+            "missing &str coercion: {code}"
+        );
+        assert!(
+            code.contains("let ids : & [i32] = & ids"),
+            "missing &[i32] coercion: {code}"
+        );
+        assert!(!code.contains("let age"), "should not coerce i32: {code}");
     }
 }

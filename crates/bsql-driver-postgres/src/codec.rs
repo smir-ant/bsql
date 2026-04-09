@@ -1252,6 +1252,34 @@ impl Encode for Vec<String> {
     }
 }
 
+impl Encode for [String] {
+    fn encode_binary(&self, buf: &mut Vec<u8>) {
+        encode_array_header(buf, self.len(), 25); // 25 = text OID
+        for val in self {
+            let bytes = val.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            buf.extend_from_slice(bytes);
+        }
+    }
+
+    #[inline]
+    fn type_oid(&self) -> u32 {
+        1009
+    }
+}
+
+impl Encode for &[String] {
+    #[inline]
+    fn encode_binary(&self, buf: &mut Vec<u8>) {
+        (**self).encode_binary(buf);
+    }
+
+    #[inline]
+    fn type_oid(&self) -> u32 {
+        1009
+    }
+}
+
 impl Encode for [&[u8]] {
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 17);
@@ -2677,6 +2705,38 @@ mod tests {
         let decoded = decode_array_str(&buf).unwrap();
         assert_eq!(decoded, vec!["foo".to_string(), "bar".to_string()]);
         assert_eq!(v.type_oid(), 1009);
+    }
+
+    #[test]
+    fn encode_array_slice_string() {
+        let v = vec!["foo".to_string(), "bar".to_string()];
+        let slice: &[String] = &v;
+        let mut buf = Vec::new();
+        slice.encode_binary(&mut buf);
+        let decoded = decode_array_str(&buf).unwrap();
+        assert_eq!(decoded, vec!["foo".to_string(), "bar".to_string()]);
+        assert_eq!(slice.type_oid(), 1009);
+    }
+
+    #[test]
+    fn encode_array_slice_string_empty() {
+        let v: Vec<String> = vec![];
+        let slice: &[String] = &v;
+        let mut buf = Vec::new();
+        slice.encode_binary(&mut buf);
+        let decoded = decode_array_str(&buf).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn encode_array_ref_slice_string() {
+        let v = vec!["alpha".to_string(), "beta".to_string()];
+        let r: &&[String] = &&v[..];
+        let mut buf = Vec::new();
+        r.encode_binary(&mut buf);
+        let decoded = decode_array_str(&buf).unwrap();
+        assert_eq!(decoded, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(r.type_oid(), 1009);
     }
 
     #[test]

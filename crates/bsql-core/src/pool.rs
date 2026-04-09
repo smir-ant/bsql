@@ -41,6 +41,66 @@ impl RawRow {
     }
 }
 
+/// Convert a binary-encoded column value to its text representation.
+///
+/// Uses the column type OID to dispatch to the correct decoder. For types
+/// not explicitly handled, falls back to hex-encoded raw bytes.
+fn binary_col_to_text(row: &bsql_driver_postgres::Row<'_>, idx: usize, type_oid: u32) -> String {
+    match type_oid {
+        16 => row // bool
+            .get_bool(idx)
+            .map(|v| if v { "t" } else { "f" })
+            .unwrap_or("")
+            .to_owned(),
+        21 => row.get_i16(idx).map(|v| v.to_string()).unwrap_or_default(), // int2
+        23 => row.get_i32(idx).map(|v| v.to_string()).unwrap_or_default(), // int4
+        20 => row.get_i64(idx).map(|v| v.to_string()).unwrap_or_default(), // int8
+        26 => row
+            .get_i32(idx)
+            .map(|v| (v as u32).to_string())
+            .unwrap_or_default(), // oid
+        700 => row.get_f32(idx).map(|v| v.to_string()).unwrap_or_default(), // float4
+        701 => row.get_f64(idx).map(|v| v.to_string()).unwrap_or_default(), // float8
+        25 | 1042 | 1043 | 114 | 142 | 3802 => {
+            // text, char, varchar, json, xml, jsonb — all UTF-8 text
+            row.get_str(idx).unwrap_or("").to_owned()
+        }
+        17 => {
+            // bytea — hex-encode with \x prefix (PG default hex output)
+            match row.get_bytes(idx) {
+                Some(bytes) => {
+                    let mut s = String::with_capacity(2 + bytes.len() * 2);
+                    s.push_str("\\x");
+                    for b in bytes {
+                        use std::fmt::Write;
+                        let _ = write!(s, "{b:02x}");
+                    }
+                    s
+                }
+                None => String::new(),
+            }
+        }
+        _ => {
+            // Fallback: try UTF-8 text decode first (handles many PG types
+            // like inet, uuid, timestamps that are text-representable),
+            // then fall back to hex-encoded raw bytes.
+            if let Some(s) = row.get_str(idx) {
+                s.to_owned()
+            } else if let Some(bytes) = row.get_bytes(idx) {
+                let mut s = String::with_capacity(2 + bytes.len() * 2);
+                s.push_str("\\x");
+                for b in bytes {
+                    use std::fmt::Write;
+                    let _ = write!(s, "{b:02x}");
+                }
+                s
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
 /// A PostgreSQL connection pool.
 ///
 /// Created via [`Pool::connect`] or [`Pool::builder`]. The pool manages a set
@@ -369,6 +429,56 @@ impl Pool {
             .simple_query(sql)
             .map_err(BsqlError::from_driver_query)?;
         Ok(())
+    }
+
+    /// Execute parameterized SQL and return text rows.
+    ///
+    /// Uses PostgreSQL's extended query protocol (Parse+Bind+Execute) with
+    /// positional `$1, $2, ...` parameter placeholders. Results are converted
+    /// from binary format to text strings.
+    ///
+    /// This is the parameterized equivalent of [`raw_query`](Self::raw_query).
+    /// Use when you need parameter binding but don't want compile-time
+    /// validation via `query!`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let rows = pool.raw_query_params(
+    ///     "SELECT $1::int4 + $2::int4 AS sum",
+    ///     &[&1i32, &2i32],
+    /// ).await?;
+    /// assert_eq!(rows[0].get(0), Some("3"));
+    /// ```
+    pub async fn raw_query_params(
+        &self,
+        sql: &str,
+        params: &[&(dyn Encode + Sync)],
+    ) -> BsqlResult<Vec<RawRow>> {
+        let sql_hash = crate::rapid_hash_str(sql);
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+        let result = guard
+            .query(sql, sql_hash, params)
+            .map_err(BsqlError::from_driver_query)?;
+        let arena = bsql_driver_postgres::Arena::empty();
+        let columns = result.columns();
+        let num_rows = result.len();
+        let mut rows = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let row = result.row(i, &arena);
+            let num_cols = row.column_count();
+            let mut values = Vec::with_capacity(num_cols);
+            for (c, col) in columns.iter().enumerate().take(num_cols) {
+                if row.is_null(c) {
+                    values.push(None);
+                } else {
+                    let text = binary_col_to_text(&row, c, col.type_oid);
+                    values.push(Some(text));
+                }
+            }
+            rows.push(RawRow(values));
+        }
+        Ok(rows)
     }
 
     /// Bulk copy data INTO a table from an iterator of text rows.
@@ -1107,5 +1217,24 @@ mod tests {
         assert_eq!(b.stale_timeout, Some(Duration::from_secs(30)));
         assert_eq!(b.max_stmt_cache_size, Some(128));
         assert_eq!(b.replica_max_size, Some(16));
+    }
+
+    // --- RawRow construction ---
+
+    #[test]
+    fn raw_row_with_nulls() {
+        let row = RawRow(vec![Some("hello".into()), None, Some("world".into())]);
+        assert_eq!(row.len(), 3);
+        assert_eq!(row.get(0), Some("hello"));
+        assert_eq!(row.get(1), None);
+        assert_eq!(row.get(2), Some("world"));
+    }
+
+    #[test]
+    fn raw_row_all_nulls() {
+        let row = RawRow(vec![None, None]);
+        assert_eq!(row.len(), 2);
+        assert_eq!(row.get(0), None);
+        assert_eq!(row.get(1), None);
     }
 }

@@ -12,12 +12,16 @@ fn main() {
         Some("check") if args.get(2).map(|s| s.as_str()) == Some("--verify-cache") => {
             cmd_verify_cache(&args);
         }
+        Some("clean") => {
+            cmd_clean(&args);
+        }
         _ => {
             eprintln!("Usage:");
             eprintln!(
                 "  bsql migrate --check <migration.sql> [--database-url URL] [--cache-dir DIR]"
             );
             eprintln!("  bsql check --verify-cache [--database-url URL] [--cache-dir DIR]");
+            eprintln!("  bsql clean [--cache-dir DIR]");
             std::process::exit(2);
         }
     }
@@ -149,6 +153,24 @@ fn cmd_verify_cache(args: &[String]) {
     }
 }
 
+fn cmd_clean(args: &[String]) {
+    let cache_dir = get_cache_dir(args);
+    let mut count = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|e| e == "bitcode")
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                count += 1;
+            }
+        }
+    }
+    println!(
+        "Removed {count} cached queries from {}",
+        cache_dir.display()
+    );
+}
+
 /// Parse a `--flag value` pair from the argument list.
 pub fn parse_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
@@ -249,5 +271,80 @@ mod tests {
             "second".into(),
         ];
         assert_eq!(parse_flag(&args, "--database-url"), Some("first".into()));
+    }
+
+    #[test]
+    fn cmd_clean_removes_bitcode_files() {
+        let dir = std::env::temp_dir().join("bsql_clean_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create some .bitcode files and a non-bitcode file
+        std::fs::write(dir.join("query1.bitcode"), b"data1").unwrap();
+        std::fs::write(dir.join("query2.bitcode"), b"data2").unwrap();
+        std::fs::write(dir.join("keep_me.txt"), b"keep").unwrap();
+
+        let args = vec![
+            "bsql".into(),
+            "clean".into(),
+            "--cache-dir".into(),
+            dir.to_str().unwrap().into(),
+        ];
+        let cache_dir = get_cache_dir(&args);
+        let mut count = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().is_some_and(|e| e == "bitcode") {
+                    if std::fs::remove_file(entry.path()).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(count, 2, "should remove exactly 2 .bitcode files");
+        assert!(
+            dir.join("keep_me.txt").exists(),
+            "non-bitcode file should be preserved"
+        );
+        assert!(
+            !dir.join("query1.bitcode").exists(),
+            "bitcode file should be removed"
+        );
+        assert!(
+            !dir.join("query2.bitcode").exists(),
+            "bitcode file should be removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cmd_clean_empty_directory() {
+        let dir = std::env::temp_dir().join("bsql_clean_empty_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let args = vec![
+            "bsql".into(),
+            "clean".into(),
+            "--cache-dir".into(),
+            dir.to_str().unwrap().into(),
+        ];
+        let cache_dir = get_cache_dir(&args);
+        let mut count = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().is_some_and(|e| e == "bitcode") {
+                    if std::fs::remove_file(entry.path()).is_ok() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(count, 0, "should remove 0 files from empty dir");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

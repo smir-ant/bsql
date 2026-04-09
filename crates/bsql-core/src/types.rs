@@ -340,7 +340,9 @@ pub fn pg_name_for_oid(oid: u32) -> Option<&'static str> {
 /// Used by the two-phase PREPARE mechanism: Phase 1 sends these OIDs so PG
 /// can resolve overloaded functions like `unnest`.
 pub fn default_pg_oid_for_rust_type(rust_type: &str) -> u32 {
-    match rust_type {
+    // Strip Option<> wrapper — Option<T> is nullable T, same PG type as T.
+    let ty = strip_option_wrapper(rust_type);
+    match ty {
         "bool" => 16,
         "i16" => 21,
         "i32" => 23,
@@ -363,12 +365,25 @@ pub fn default_pg_oid_for_rust_type(rust_type: &str) -> u32 {
     }
 }
 
+/// Strip `Option<...>` wrapper from a type string, returning the inner type.
+/// If the type is not `Option<T>`, returns it unchanged.
+fn strip_option_wrapper(ty: &str) -> &str {
+    if let Some(inner) = ty.strip_prefix("Option<") {
+        if let Some(inner) = inner.strip_suffix('>') {
+            return inner;
+        }
+    }
+    ty
+}
+
 /// Check whether a user-declared Rust parameter type is compatible with a PG OID.
 ///
 /// This is used by the proc macro to verify that `$id: i32` matches the column
 /// type PostgreSQL expects. The check is intentionally strict — no implicit
 /// widening (i32 does not match int8).
 pub fn is_param_compatible(rust_type: &str, pg_oid: u32) -> bool {
+    // Strip Option<> wrapper — Option<T> is nullable T, same PG type as T.
+    let rust_type = strip_option_wrapper(rust_type);
     matches!(
         (rust_type, pg_oid),
         // Exact matches
@@ -477,8 +492,15 @@ mod tests {
     #[test]
     fn default_pg_oid_unknown_returns_zero() {
         assert_eq!(default_pg_oid_for_rust_type("MyCustomType"), 0);
-        assert_eq!(default_pg_oid_for_rust_type("Option<i32>"), 0);
         assert_eq!(default_pg_oid_for_rust_type(""), 0);
+    }
+
+    #[test]
+    fn default_pg_oid_option_strips_wrapper() {
+        // Option<T> is nullable T — same PG type as T.
+        assert_eq!(default_pg_oid_for_rust_type("Option<i32>"), 23);
+        assert_eq!(default_pg_oid_for_rust_type("Option<&str>"), 25);
+        assert_eq!(default_pg_oid_for_rust_type("Option<bool>"), 16);
     }
 
     #[test]
@@ -574,6 +596,28 @@ mod tests {
     #[test]
     fn param_compatible_unknown_oid() {
         assert!(!is_param_compatible("i32", 99999));
+    }
+
+    #[test]
+    fn param_compatible_option_types() {
+        // Option<T> should be compatible with the same OIDs as T
+        assert!(is_param_compatible("Option<i32>", 23));
+        assert!(is_param_compatible("Option<i64>", 20));
+        assert!(is_param_compatible("Option<bool>", 16));
+        assert!(is_param_compatible("Option<f32>", 700));
+        assert!(is_param_compatible("Option<f64>", 701));
+        assert!(is_param_compatible("Option<&str>", 25));
+        assert!(is_param_compatible("Option<String>", 25));
+        assert!(is_param_compatible("Option<i16>", 21));
+        assert!(is_param_compatible("Option<u32>", 26));
+    }
+
+    #[test]
+    fn param_compatible_option_mismatch() {
+        // Option<T> should NOT match wrong OIDs
+        assert!(!is_param_compatible("Option<i32>", 20)); // int4 vs int8
+        assert!(!is_param_compatible("Option<&str>", 23)); // text vs int4
+        assert!(!is_param_compatible("Option<bool>", 23)); // bool vs int4
     }
 
     #[test]

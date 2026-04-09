@@ -991,7 +991,7 @@ fn check_params_against_pg(
     params: &[crate::parse::Param],
     pg_oids: &[u32],
     pg_enum_flags: &[bool],
-    strip_option_wrapper: bool,
+    _strip_option_wrapper: bool,
     context: &str,
 ) -> Result<(), String> {
     if params.len() != pg_oids.len() {
@@ -1011,11 +1011,12 @@ fn check_params_against_pg(
     for (i, (param, &pg_oid)) in params.iter().zip(pg_oids).enumerate() {
         let is_pg_enum = pg_enum_flags.get(i).copied().unwrap_or(false);
 
-        let check_type = if strip_option_wrapper {
-            strip_option(&param.rust_type)
-        } else {
-            &param.rust_type
-        };
+        // Always strip Option<> wrapper — Option<T> is "nullable T" and the
+        // underlying PG type is identical to T. The `strip_option_wrapper` flag
+        // remains for backwards compat but we now strip unconditionally so that
+        // both static queries (`$parent_id: Option<i32>`) and dynamic variants
+        // work correctly.
+        let check_type = strip_option(&param.rust_type);
 
         if is_pg_enum {
             if matches!(check_type, "&str" | "String") {
@@ -1460,6 +1461,143 @@ mod tests {
         assert!(
             result.is_err(),
             "Option<&str> stripped to &str should not match int4"
+        );
+    }
+
+    // --- Option<T> in static (non-variant) queries ---
+
+    #[test]
+    fn check_params_option_i32_static_query_ok() {
+        // Option<i32> should be accepted for int4 even without strip_option_wrapper
+        let params = vec![Param {
+            name: "parent_id".into(),
+            rust_type: "Option<i32>".into(),
+            position: 1,
+        }];
+        let pg_oids = [23u32]; // int4
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(
+            result.is_ok(),
+            "Option<i32> should match int4 in static query: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn check_params_option_str_static_query_ok() {
+        let params = vec![Param {
+            name: "name".into(),
+            rust_type: "Option<&str>".into(),
+            position: 1,
+        }];
+        let pg_oids = [25u32]; // text
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(
+            result.is_ok(),
+            "Option<&str> should match text in static query: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn check_params_option_string_static_query_ok() {
+        let params = vec![Param {
+            name: "name".into(),
+            rust_type: "Option<String>".into(),
+            position: 1,
+        }];
+        let pg_oids = [25u32]; // text
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(
+            result.is_ok(),
+            "Option<String> should match text in static query: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn check_params_option_i64_static_query_ok() {
+        let params = vec![Param {
+            name: "big_id".into(),
+            rust_type: "Option<i64>".into(),
+            position: 1,
+        }];
+        let pg_oids = [20u32]; // int8
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(
+            result.is_ok(),
+            "Option<i64> should match int8 in static query: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn check_params_option_mismatch_static_query() {
+        // Option<&str> should NOT match int4 even after stripping
+        let params = vec![Param {
+            name: "id".into(),
+            rust_type: "Option<&str>".into(),
+            position: 1,
+        }];
+        let pg_oids = [23u32]; // int4
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_err(), "Option<&str> should not match int4");
+    }
+
+    #[test]
+    fn check_params_option_bool_static_query_ok() {
+        let params = vec![Param {
+            name: "active".into(),
+            rust_type: "Option<bool>".into(),
+            position: 1,
+        }];
+        let pg_oids = [16u32]; // bool
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(
+            result.is_ok(),
+            "Option<bool> should match bool in static query: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn check_params_option_f64_static_query_ok() {
+        let params = vec![Param {
+            name: "score".into(),
+            rust_type: "Option<f64>".into(),
+            position: 1,
+        }];
+        let pg_oids = [701u32]; // float8
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(
+            result.is_ok(),
+            "Option<f64> should match float8 in static query: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn check_params_option_enum_str_static_query_ok() {
+        // Option<&str> should be accepted for PG enum columns
+        let params = vec![Param {
+            name: "status".into(),
+            rust_type: "Option<&str>".into(),
+            position: 1,
+        }];
+        let pg_oids = [99999u32]; // custom enum OID
+        let pg_enum = [true];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(
+            result.is_ok(),
+            "Option<&str> should be accepted for PG enum: {:?}",
+            result.err()
         );
     }
 

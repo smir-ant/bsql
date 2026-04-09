@@ -1553,11 +1553,30 @@ fn param_value_conversion(val_expr: TokenStream, rust_type: &str) -> TokenStream
 
 fn gen_constructor(parsed: &ParsedQuery) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
+    let coercions = gen_ref_coercions(&parsed.params);
     let field_inits = parsed.params.iter().map(|p| {
         let name = param_ident(&p.name);
         quote! { #name }
     });
-    quote! { #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData } }
+    quote! {
+        #coercions
+        #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData }
+    }
+}
+
+/// Generate `let name: &T = &name;` coercions for every reference-typed param.
+fn gen_ref_coercions(params: &[crate::parse::Param]) -> TokenStream {
+    let stmts: Vec<TokenStream> = params
+        .iter()
+        .filter(|p| p.rust_type.starts_with('&'))
+        .map(|p| {
+            let name = param_ident(&p.name);
+            let ty: syn::Type = syn::parse_str(&p.rust_type)
+                .unwrap_or_else(|_| panic!("cannot parse type `{}`", p.rust_type));
+            quote! { let #name: #ty = &#name; }
+        })
+        .collect();
+    quote! { #(#stmts)* }
 }
 
 // --- Shared helpers (mirrored from codegen.rs) ---
@@ -2273,23 +2292,32 @@ where
 fn gen_dynamic_constructor(parsed: &ParsedQuery) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
 
+    let mut all_params: Vec<crate::parse::Param> = Vec::new();
     let mut field_names: Vec<proc_macro2::Ident> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for p in &parsed.params {
         field_names.push(param_ident(&p.name));
-        seen.insert(p.name.clone());
+        if seen.insert(p.name.clone()) {
+            all_params.push(p.clone());
+        }
     }
 
     for clause in &parsed.optional_clauses {
         for p in &clause.params {
             if seen.insert(p.name.clone()) {
                 field_names.push(param_ident(&p.name));
+                all_params.push(p.clone());
             }
         }
     }
 
-    quote! { #executor_name { #(#field_names,)* _marker: ::std::marker::PhantomData } }
+    let coercions = gen_ref_coercions(&all_params);
+
+    quote! {
+        #coercions
+        #executor_name { #(#field_names,)* _marker: ::std::marker::PhantomData }
+    }
 }
 
 // ===========================================================================
@@ -2524,10 +2552,12 @@ pub fn generate_sort_sqlite_query_code(
     };
 
     // Constructor captures params + sort from scope
+    let coercions = gen_ref_coercions(&parsed.params);
     let field_inits: Vec<proc_macro2::Ident> =
         parsed.params.iter().map(|p| param_ident(&p.name)).collect();
 
     let constructor = quote! {
+        #coercions
         #executor_name {
             #(#field_inits,)*
             sort,
