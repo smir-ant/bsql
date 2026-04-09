@@ -30,7 +30,7 @@ rustls-pemfile = { version = "2", default-features = false, features = ["std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 
 # Feature-gated type support
-time = { version = ">=0.3.36, <0.3.38", default-features = false, features = ["std"] }
+time = { version = "0.3.36", default-features = false, features = ["std"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 uuid = { version = ">=1.8, <1.22", default-features = false }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
