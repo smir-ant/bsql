@@ -443,3 +443,288 @@ fn sqlite_unicode_roundtrip() {
         .execute(&pool)
         .unwrap();
 }
+
+// ===========================================================================
+// Query execution edge cases
+// ===========================================================================
+
+#[test]
+fn sqlite_fetch_one_multiple_rows_errors() {
+    let pool = pool();
+    // users has 2 rows — fetch_one should error
+    let result = bsql::query!("SELECT id, name FROM users").fetch_one(&pool);
+    assert!(result.is_err());
+}
+
+#[test]
+fn sqlite_fetch_optional_multiple_rows_returns_first() {
+    let pool = pool();
+    // SQLite fetch_optional uses LIMIT internally — returns first row, no error
+    let result = bsql::query!("SELECT id, name FROM users ORDER BY id").fetch_optional(&pool);
+    assert!(result.is_ok());
+    let row = result.unwrap().unwrap();
+    assert_eq!(row.name, "alice");
+}
+
+#[test]
+fn sqlite_for_each_map_collects() {
+    let pool = pool();
+    let names: Vec<String> = bsql::query!("SELECT name FROM users ORDER BY id")
+        .for_each_map(&pool, |row| row.name.to_owned())
+        .unwrap();
+    assert_eq!(names, vec!["alice", "bob"]);
+}
+
+// ===========================================================================
+// Parameters — more edge cases
+// ===========================================================================
+
+#[test]
+fn sqlite_same_param_twice() {
+    let pool = pool();
+    let name = "alice";
+    let rows =
+        bsql::query!("SELECT id FROM users WHERE name = $name: &str OR email LIKE $name: &str")
+            .fetch_all(&pool)
+            .unwrap();
+    // alice matches name='alice', email doesn't match 'alice' exactly
+    assert!(!rows.is_empty());
+}
+
+// ===========================================================================
+// SQL constructs — remaining gaps
+// ===========================================================================
+
+#[test]
+fn sqlite_self_join() {
+    let pool = pool();
+    let rows = bsql::query!(
+        "SELECT a.name AS name_a, b.name AS name_b FROM users a JOIN users b ON a.id != b.id"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    assert_eq!(rows.len(), 2); // alice-bob and bob-alice
+}
+
+#[test]
+fn sqlite_exists_subquery() {
+    let pool = pool();
+    let rows = bsql::query!(
+        "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM items WHERE owner_id = users.id)"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn sqlite_group_by_having() {
+    let pool = pool();
+    let rows = bsql::query!(
+        "SELECT owner_id, COUNT(*) AS cnt FROM items GROUP BY owner_id HAVING COUNT(*) >= 1"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    assert!(!rows.is_empty());
+}
+
+#[test]
+fn sqlite_count_distinct() {
+    let pool = pool();
+    let row = bsql::query!("SELECT COUNT(DISTINCT owner_id) AS cnt FROM items")
+        .fetch_one(&pool)
+        .unwrap();
+    // cnt is Option<i64> in SQLite
+    assert!(row.cnt.is_some());
+}
+
+#[test]
+fn sqlite_intersect() {
+    let pool = pool();
+    let rows = bsql::query!(
+        "SELECT id FROM users WHERE active = 1
+         INTERSECT
+         SELECT owner_id AS id FROM items"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    assert!(!rows.is_empty());
+}
+
+#[test]
+fn sqlite_except() {
+    let pool = pool();
+    let rows = bsql::query!(
+        "SELECT id FROM users
+         EXCEPT
+         SELECT owner_id AS id FROM items"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    // Both users own items
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn sqlite_recursive_cte() {
+    let pool = pool();
+    let rows = bsql::query!(
+        "WITH RECURSIVE nums AS (
+            SELECT 1 AS n
+            UNION ALL
+            SELECT n + 1 FROM nums WHERE n < 5
+        )
+        SELECT n FROM nums ORDER BY n"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    assert_eq!(rows.len(), 5);
+}
+
+#[test]
+fn sqlite_on_conflict() {
+    let pool = pool();
+    // Insert with existing id=1 — ON CONFLICT ignore
+    let affected = bsql::query!("INSERT OR IGNORE INTO users (id, name) VALUES (1, 'duplicate')")
+        .execute(&pool)
+        .unwrap();
+    assert_eq!(affected, 0);
+}
+
+#[test]
+fn sqlite_arithmetic() {
+    let pool = pool();
+    let row = bsql::query!("SELECT 1 + 2 AS result")
+        .fetch_one(&pool)
+        .unwrap();
+    // result is Option<String> in SQLite (expression columns)
+    assert_eq!(row.result, Some("3".to_owned()));
+}
+
+#[test]
+fn sqlite_string_concat() {
+    let pool = pool();
+    let row = bsql::query!("SELECT name || '@test' AS combined FROM users WHERE id = 1")
+        .fetch_one(&pool)
+        .unwrap();
+    // combined is Option<String> in SQLite
+    assert_eq!(row.combined, Some("alice@test".to_owned()));
+}
+
+#[test]
+fn sqlite_comments_in_sql() {
+    let pool = pool();
+    let rows = bsql::query!(
+        "SELECT id, name -- line comment
+         FROM users
+         /* block comment */
+         ORDER BY id"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+// ===========================================================================
+// Error handling
+// ===========================================================================
+
+#[test]
+fn sqlite_fk_violation() {
+    let pool = pool();
+    // Enable FK enforcement
+    pool.simple_exec("PRAGMA foreign_keys = ON").unwrap();
+    // owner_id 999 doesn't exist
+    let result =
+        bsql::query!("INSERT INTO items (title, owner_id) VALUES ('fk_test', 999)").execute(&pool);
+    assert!(result.is_err());
+    pool.simple_exec("PRAGMA foreign_keys = OFF").unwrap();
+}
+
+#[test]
+fn sqlite_fetch_one_error_message_clear() {
+    let pool = pool();
+    let id = 999i64;
+    let result = bsql::query!("SELECT name FROM users WHERE id = $id: i64").fetch_one(&pool);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("1 row") || msg.contains("exactly"),
+        "error should mention row count: {msg}"
+    );
+}
+
+// ===========================================================================
+// Edge cases
+// ===========================================================================
+
+#[test]
+fn sqlite_boundary_i64_max() {
+    let pool = pool();
+    let big = i64::MAX;
+    bsql::query!("INSERT INTO users (name, score) VALUES ('big', $big: i64)")
+        .execute(&pool)
+        .unwrap();
+    let row = bsql::query!("SELECT score FROM users WHERE name = 'big'")
+        .fetch_one(&pool)
+        .unwrap();
+    assert_eq!(row.score, Some(i64::MAX));
+    bsql::query!("DELETE FROM users WHERE name = 'big'")
+        .execute(&pool)
+        .unwrap();
+}
+
+#[test]
+fn sqlite_concurrent_reads() {
+    let pool = pool();
+    // Multiple sequential reads should not deadlock
+    for _ in 0..20 {
+        let rows = bsql::query!("SELECT id FROM users")
+            .fetch_all(&pool)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+}
+
+// ===========================================================================
+// Stress tests
+// ===========================================================================
+
+#[test]
+#[ignore] // stress: ~2 seconds
+fn sqlite_stress_insert_delete_100() {
+    let pool = pool();
+    for i in 0..100 {
+        let name = format!("stress_{i}");
+        bsql::query!("INSERT INTO users (name) VALUES ($name: &str)")
+            .execute(&pool)
+            .unwrap();
+    }
+    let affected = bsql::query!("DELETE FROM users WHERE name LIKE 'stress_%'")
+        .execute(&pool)
+        .unwrap();
+    assert_eq!(affected, 100);
+}
+
+#[test]
+#[ignore] // stress: for_each on many rows
+fn sqlite_stress_for_each_100() {
+    let pool = pool();
+    for i in 0..100 {
+        let name = format!("fe_stress_{i}");
+        bsql::query!("INSERT INTO users (name) VALUES ($name: &str)")
+            .execute(&pool)
+            .unwrap();
+    }
+    let mut count = 0u32;
+    bsql::query!("SELECT id, name FROM users WHERE name LIKE 'fe_stress_%'")
+        .for_each(&pool, |_row| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(count, 100);
+    bsql::query!("DELETE FROM users WHERE name LIKE 'fe_stress_%'")
+        .execute(&pool)
+        .unwrap();
+}
