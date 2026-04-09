@@ -426,6 +426,8 @@ Auto-fallback: if no `BSQL_DATABASE_URL` is set but `.bsql/` exists, bsql uses t
 
 Cache is version-gated: upgrading bsql invalidates the cache. Commit `.bsql/` to your repo so CI and teammates can build offline.
 
+**Auto-cleanup**: stale cache files are removed automatically on every build. When you change or remove a `query!()` call, the old `.bitcode` file is cleaned up — no manual intervention, no accumulation of dead files. (sqlx does not do this — stale `.sqlx` files pile up over time.)
+
 Format: bitcode-serialized (50x faster than JSON for schema cache loading).
 
 </details>
