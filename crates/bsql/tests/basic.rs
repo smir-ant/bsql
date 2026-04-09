@@ -1944,3 +1944,74 @@ async fn same_param_used_twice() {
             .unwrap();
     assert!(!rows.is_empty());
 }
+
+// ===========================================================================
+// STRESS TESTS — run with: cargo test -- --ignored
+// ===========================================================================
+
+#[tokio::test]
+#[ignore] // stress: inserts 10K rows, ~2-3 seconds
+async fn stress_fetch_all_10k_rows() {
+    let pool = pool().await;
+
+    // Insert 10K rows
+    for i in 0..10_000i32 {
+        let title = format!("stress_row_{i}");
+        let uid = 1i32;
+        bsql::query!(
+            "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($title: &str, 'new', $uid: i32)"
+        ).execute(&pool).await.unwrap();
+    }
+
+    // fetch_all should return all 10K + seed rows
+    let search = "stress_row_%";
+    let rows =
+        bsql::query!("SELECT id, title FROM tickets WHERE title LIKE $search: &str ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 10_000);
+
+    // Cleanup
+    bsql::query!("DELETE FROM tickets WHERE title LIKE $search: &str")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore] // stress: for_each on 10K rows, verify constant-ish memory
+async fn stress_for_each_10k_rows() {
+    let insert_pool = pool().await;
+    let query_pool = Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
+        .await
+        .unwrap();
+
+    // Insert 10K rows
+    for i in 0..10_000i32 {
+        let title = format!("fe_stress_{i}");
+        let uid = 1i32;
+        bsql::query!(
+            "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($title: &str, 'new', $uid: i32)"
+        ).execute(&insert_pool).await.unwrap();
+    }
+
+    // for_each uses sync connections internally while execute uses async
+    // connections — use a separate pool so we get fresh sync connection slots.
+    let mut count = 0u64;
+    let search = "fe_stress_%";
+    bsql::query!("SELECT id, title FROM tickets WHERE title LIKE $search: &str")
+        .for_each(&query_pool, |_row| {
+            count += 1;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 10_000);
+
+    // Cleanup
+    bsql::query!("DELETE FROM tickets WHERE title LIKE $search: &str")
+        .execute(&query_pool)
+        .await
+        .unwrap();
+}

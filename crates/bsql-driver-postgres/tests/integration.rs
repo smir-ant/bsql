@@ -3580,3 +3580,113 @@ fn encode_nul_byte_in_bytea() {
     let decoded = row.get_bytes(0).unwrap();
     assert_eq!(decoded, &[0x00, 0xFF, 0x00, 0xAB]);
 }
+
+// ===========================================================================
+// STRESS TESTS — run with: cargo test -- --ignored
+// ===========================================================================
+
+#[test]
+#[ignore] // stress: 16 threads x 100 queries
+fn stress_concurrent_pool_queries() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(4).build().unwrap();
+
+    let pool = std::sync::Arc::new(pool);
+    let mut handles = vec![];
+
+    for thread_id in 0..16u32 {
+        let pool = pool.clone();
+        handles.push(std::thread::spawn(move || {
+            for query_id in 0..100u32 {
+                let sql = "SELECT id, login FROM users ORDER BY id";
+                let hash = hash_sql(sql);
+                let mut conn = pool.acquire().unwrap();
+                let result = conn.query(sql, hash, &[]).unwrap();
+                assert_eq!(result.len(), 2, "thread {thread_id} query {query_id}");
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let status = pool.status();
+    assert!(status.idle + status.active <= 4, "pool size exceeded max");
+}
+
+#[test]
+#[ignore] // stress: singleflight under contention
+fn stress_singleflight_contention() {
+    use std::sync::Arc;
+
+    let url = require_db!();
+    let pool = Arc::new(Pool::builder().url(&url).max_size(4).build().unwrap());
+
+    let mut handles = vec![];
+
+    // 20 threads all doing the exact same query simultaneously
+    for _ in 0..20 {
+        let pool = pool.clone();
+        handles.push(std::thread::spawn(move || {
+            let sql = "SELECT id, login FROM users ORDER BY id";
+            let hash = hash_sql(sql);
+            let mut conn = pool.acquire().unwrap();
+            let result = conn.query(sql, hash, &[]).unwrap();
+            assert_eq!(result.len(), 2);
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+#[test]
+#[ignore] // stress: rapid acquire/release cycles
+fn stress_pool_acquire_release_cycles() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(2).build().unwrap();
+
+    // 1000 rapid acquire/release cycles
+    for _ in 0..1000 {
+        let mut conn = pool.acquire().unwrap();
+        conn.simple_query("SELECT 1").unwrap();
+        // conn dropped here, returned to pool
+    }
+
+    let status = pool.status();
+    assert!(status.idle > 0);
+    assert_eq!(status.active, 0);
+}
+
+#[test]
+#[ignore] // stress: deferred pipeline with 1000 operations
+fn stress_deferred_pipeline_1000() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().unwrap();
+
+    // Defer 1000 inserts
+    for i in 0..1000i32 {
+        let login = format!("deferred_stress_{i}");
+        let first_name = format!("first_stress_{i}");
+        let last_name = "test".to_string();
+        let email = format!("deferred_stress_{i}@test.com");
+        tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
+            .unwrap();
+    }
+
+    // Flush all at once
+    let results = tx.flush_deferred().unwrap();
+    assert_eq!(results.len(), 1000);
+    for &affected in &results {
+        assert_eq!(affected, 1);
+    }
+
+    tx.rollback().unwrap();
+}
