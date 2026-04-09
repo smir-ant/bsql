@@ -3601,7 +3601,7 @@ fn streaming_query_interrupted_by_backend_kill() {
 
     let stream_result = conn.query_streaming_start(sql, hash, &[], 64);
 
-    if let Ok(_) = stream_result {
+    if stream_result.is_ok() {
         // Kill the backend from another connection
         let mut killer = pool.acquire().unwrap();
         let _ = killer.simple_query(&format!("SELECT pg_terminate_backend({pid})"));
@@ -3839,6 +3839,7 @@ fn stress_deferred_pipeline_1000() {
 
 #[cfg(unix)]
 #[test]
+#[ignore] // requires local PG with Unix domain socket (not available in Docker/CI)
 fn unix_socket_connection() {
     let _url = require_db!(); // skip if no DB configured
 
@@ -3859,8 +3860,12 @@ fn unix_socket_connection() {
             break;
         }
     }
-    // At least one socket path should work on Unix
-    assert!(connected, "UDS connection should work on at least one path");
+    assert!(
+        connected,
+        "UDS connection failed on all paths (/tmp, /var/run/postgresql). \
+         If running in Docker/CI where PG uses TCP only, this test should be \
+         skipped with --skip unix_socket"
+    );
 }
 
 #[cfg(windows)]

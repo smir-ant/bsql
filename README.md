@@ -410,7 +410,7 @@ When async is enabled, TCP connections use true async I/O via tokio — the sche
 </details>
 
 <details>
-<summary>Offline mode</summary>
+<summary>Offline mode & auto-cleanup cache</summary>
 
 Build without a live database. The `.bsql/queries/` directory caches validation results from your last online build.
 

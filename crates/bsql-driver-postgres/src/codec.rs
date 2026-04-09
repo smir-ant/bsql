@@ -2730,7 +2730,7 @@ mod tests {
 
     #[test]
     fn encode_array_ref_slice_string() {
-        let v = vec!["alpha".to_string(), "beta".to_string()];
+        let v = ["alpha".to_string(), "beta".to_string()];
         let r: &&[String] = &&v[..];
         let mut buf = Vec::new();
         r.encode_binary(&mut buf);
