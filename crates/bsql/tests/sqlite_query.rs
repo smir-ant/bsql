@@ -133,7 +133,6 @@ fn sqlite_fetch_all_empty() {
 fn sqlite_fetch_one_empty_errors() {
     let pool = pool();
     let id = 999i64;
-    let result = bsql::query!("SELECT id, name FROM users WHERE id = $id: i64")
-        .fetch_one(&pool);
+    let result = bsql::query!("SELECT id, name FROM users WHERE id = $id: i64").fetch_one(&pool);
     assert!(result.is_err());
 }

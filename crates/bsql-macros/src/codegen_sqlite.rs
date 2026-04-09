@@ -662,6 +662,9 @@ fn wrap_decode_as_bsql(struct_name: &proc_macro2::Ident, decode: &TokenStream) -
 }
 
 /// Wrap a validated-rows decode expression (arena path with text_buf + blob_arena).
+/// Currently unused — fetch_all always uses the direct (owned) path. Kept for
+/// potential future use by arena-based batch APIs.
+#[allow(dead_code)]
 fn wrap_validated_decode(struct_name: &proc_macro2::Ident, decode: &TokenStream) -> TokenStream {
     quote! {
         (|| -> Result<#struct_name, ::bsql_core::driver_sqlite::SqliteError> {
@@ -776,14 +779,6 @@ fn gen_executor_impls(
         TokenStream::new()
     };
 
-    let use_arena = has_columns && has_arena_columns(validation);
-
-    let arena_decode = if use_arena {
-        gen_sqlite_arena_decode(validation)
-    } else {
-        TokenStream::new()
-    };
-
     // Column-count bounds check for SQLite — inserted before every decode (Fix-5)
     let sqlite_column_check = gen_sqlite_column_count_check(validation);
 
@@ -875,50 +870,10 @@ fn gen_executor_impls(
         };
 
         // --- Inline fetch ---
-        let fetch_method = if use_arena {
-            let arena_name = arena_result_struct_name(parsed);
-            let inline_acquire_all = gen_inline_acquire(is_write);
-            let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
-            quote! {
-                /// Fetch all rows. Batch-validated text, zero unsafe.
-                pub fn fetch_all(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
-                    #direct_params_build
-                    let mut _bsql_conn = #inline_acquire_all;
-                    let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
-                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
-                    #inline_bind
-                    #sqlite_column_check
-                    let mut _bsql_text_buf: Vec<u8> = Vec::new();
-                    let mut _bsql_blob_arena = ::bsql_core::driver_sqlite::acquire_arena();
-                    let mut _bsql_rows = Vec::new();
-                    loop {
-                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
-                            ::bsql_core::driver_sqlite::StepResult::Row => {
-                                _bsql_rows.push(#decode_arena);
-                            }
-                            ::bsql_core::driver_sqlite::StepResult::Done => break,
-                        }
-                    }
-                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                    drop(_bsql_conn);
-                    // Batch-validate ALL text in one SIMD-accelerated pass
-                    let _bsql_text = String::from_utf8(_bsql_text_buf)
-                        .map_err(|e| ::bsql_core::BsqlError::from_sqlite(
-                            ::bsql_core::driver_sqlite::SqliteError::Internal(
-                                format!("invalid UTF-8 in query result: {e}"),
-                            ),
-                        ))?;
-                    Ok(::bsql_core::driver_sqlite::ValidatedRows::new(
-                        _bsql_rows,
-                        _bsql_text,
-                        _bsql_blob_arena,
-                    ))
-                }
-            }
-        } else {
+        // Always use the direct (owned) decode path for fetch_all so that TEXT
+        // columns return owned `String` instead of arena `(u32, u32)` offsets.
+        // The arena path is reserved for for_each / for_each_map (zero-alloc hot path).
+        let fetch_method = {
             let inline_acquire_all = gen_inline_acquire(is_write);
             let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
             quote! {
@@ -1401,6 +1356,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
 // After the step loop, `String::from_utf8(_bsql_text_buf)` validates ALL text
 // in one SIMD-accelerated pass. No from_utf8_unchecked. No transmute. No unsafe.
 
+#[allow(dead_code)]
 fn gen_sqlite_arena_decode(validation: &ValidationResult) -> TokenStream {
     let deduped_names = deduplicate_column_names(&validation.columns);
     let fields = deduped_names.iter().enumerate().map(|(i, name)| {
@@ -1414,6 +1370,7 @@ fn gen_sqlite_arena_decode(validation: &ValidationResult) -> TokenStream {
     quote! { #(#fields),* }
 }
 
+#[allow(dead_code)]
 fn gen_sqlite_arena_column_decode(idx: i32, rust_type: &str) -> TokenStream {
     if let Some(inner) = rust_type
         .strip_prefix("Option<")
@@ -1425,6 +1382,7 @@ fn gen_sqlite_arena_column_decode(idx: i32, rust_type: &str) -> TokenStream {
     }
 }
 
+#[allow(dead_code)]
 fn gen_sqlite_arena_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
     let col_idx_str = idx.to_string();
     match rust_type {
@@ -1461,6 +1419,7 @@ fn gen_sqlite_arena_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
     }
 }
 
+#[allow(dead_code)]
 fn gen_sqlite_arena_nullable_decode(idx: i32, inner_type: &str) -> TokenStream {
     match inner_type {
         // Option<String> -> Option<(u32, u32)> text range
@@ -1787,14 +1746,6 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         TokenStream::new()
     };
 
-    let use_arena = has_columns && has_arena_columns(validation);
-
-    let arena_decode = if use_arena {
-        gen_sqlite_arena_decode(validation)
-    } else {
-        TokenStream::new()
-    };
-
     // Column-count bounds check for SQLite dynamic queries (Fix-5)
     let sqlite_column_check = gen_sqlite_column_count_check(validation);
 
@@ -1872,51 +1823,10 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         };
 
         // --- Inline fetch ---
-        let fetch_method = if use_arena {
-            let arena_name = arena_result_struct_name(parsed);
-            let bind = gen_inline_param_bind();
-            let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
-            let fetch_dispatcher = gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
-                quote! {
-                    let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
-                        .map_err(::bsql_core::BsqlError::from_sqlite)?;
-                    #bind
-                    #sqlite_column_check
-                    let mut _bsql_text_buf: Vec<u8> = Vec::new();
-                    let mut _bsql_blob_arena = ::bsql_core::driver_sqlite::acquire_arena();
-                    let mut _bsql_rows = Vec::new();
-                    loop {
-                        match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
-                            ::bsql_core::driver_sqlite::StepResult::Row => {
-                                _bsql_rows.push(#decode_arena);
-                            }
-                            ::bsql_core::driver_sqlite::StepResult::Done => break,
-                        }
-                    }
-                    _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
-                    drop(_bsql_conn);
-                    let _bsql_text = String::from_utf8(_bsql_text_buf)
-                        .map_err(|e| ::bsql_core::BsqlError::from_sqlite(
-                            ::bsql_core::driver_sqlite::SqliteError::Internal(
-                                format!("invalid UTF-8 in query result: {e}"),
-                            ),
-                        ))?;
-                    return Ok(::bsql_core::driver_sqlite::ValidatedRows::new(
-                        _bsql_rows,
-                        _bsql_text,
-                        _bsql_blob_arena,
-                    ));
-                }
-            });
-            quote! {
-                pub fn fetch_all(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
-                    #fetch_dispatcher
-                }
-            }
-        } else {
+        // Always use the direct (owned) decode path for fetch_all so that TEXT
+        // columns return owned `String` instead of arena `(u32, u32)` offsets.
+        // The arena path is reserved for for_each / for_each_map (zero-alloc hot path).
+        let fetch_method = {
             let bind = gen_inline_param_bind();
             let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
             let fetch_dispatcher = gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
