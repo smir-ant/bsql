@@ -294,10 +294,10 @@ mod tests {
         let mut count = 0u64;
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
-                if entry.path().extension().is_some_and(|e| e == "bitcode") {
-                    if std::fs::remove_file(entry.path()).is_ok() {
-                        count += 1;
-                    }
+                if entry.path().extension().is_some_and(|e| e == "bitcode")
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    count += 1;
                 }
             }
         }
@@ -335,10 +335,10 @@ mod tests {
         let mut count = 0u64;
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
-                if entry.path().extension().is_some_and(|e| e == "bitcode") {
-                    if std::fs::remove_file(entry.path()).is_ok() {
-                        count += 1;
-                    }
+                if entry.path().extension().is_some_and(|e| e == "bitcode")
+                    && std::fs::remove_file(entry.path()).is_ok()
+                {
+                    count += 1;
                 }
             }
         }

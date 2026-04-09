@@ -1612,23 +1612,22 @@ async fn boundary_f64_infinity() {
 #[tokio::test]
 async fn unicode_text_roundtrip() {
     let pool = pool().await;
-    let desc: Option<&str> = Some("Привет мир 🎉 中文 العربية");
-    let id = 1i32;
-    bsql::query!("UPDATE tickets SET description = $desc: Option<&str> WHERE id = $id: i32")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let ticket = bsql::query!("SELECT description FROM tickets WHERE id = $id: i32")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let title = "unicode_test_row";
+    let uid = 1i32;
+    let row = bsql::query!(
+        "INSERT INTO tickets (title, description, status, created_by_user_id)
+         VALUES ($title: &str, 'Привет мир 🎉 中文 العربية', 'new', $uid: i32)
+         RETURNING id, description"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        ticket.description.as_deref(),
+        row.description.as_deref(),
         Some("Привет мир 🎉 中文 العربية")
     );
-    // Restore
-    let desc: Option<&str> = None;
-    bsql::query!("UPDATE tickets SET description = $desc: Option<&str> WHERE id = $id: i32")
+    let id = row.id;
+    bsql::query!("DELETE FROM tickets WHERE id = $id: i32")
         .execute(&pool)
         .await
         .unwrap();
