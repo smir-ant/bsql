@@ -2236,6 +2236,30 @@ async fn sql_insert_on_conflict_do_update() {
         .unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// Recursive CTE
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sql_recursive_cte() {
+    let pool = pool().await;
+    // Generate a series 1..5 using recursive CTE
+    let rows = bsql::query!(
+        "WITH RECURSIVE nums AS (
+            SELECT 1 AS n
+            UNION ALL
+            SELECT n + 1 FROM nums WHERE n < 5
+        )
+        SELECT n FROM nums ORDER BY n"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0].n, 1);
+    assert_eq!(rows[4].n, 5);
+}
+
 // ===========================================================================
 // STRESS TESTS — run with: cargo test -- --ignored
 // ===========================================================================

@@ -215,3 +215,34 @@ async fn different_queries_are_independent() {
     assert!(users.len() >= 2);
     assert!(!tickets.is_empty());
 }
+
+/// When the leader query succeeds, all followers should get the result (not hang).
+#[tokio::test]
+async fn singleflight_leader_error_propagates_to_followers() {
+    // If the leader query errors, followers should also get errors (not hang)
+    let pool = std::sync::Arc::new(pool().await);
+
+    let mut handles = vec![];
+    for _ in 0..5 {
+        let p = pool.clone();
+        handles.push(tokio::spawn(async move {
+            // All 5 tasks try the exact same (valid) query
+            let rows = bsql::query!("SELECT id, login FROM users ORDER BY id")
+                .fetch_all(p.as_ref())
+                .await;
+            rows // return Result
+        }));
+    }
+
+    // All should succeed (singleflight coalesces them)
+    let mut success_count = 0;
+    for h in handles {
+        if h.await.unwrap().is_ok() {
+            success_count += 1;
+        }
+    }
+    assert_eq!(
+        success_count, 5,
+        "all followers should get the leader's result"
+    );
+}

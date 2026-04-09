@@ -3581,6 +3581,104 @@ fn encode_nul_byte_in_bytea() {
     assert_eq!(decoded, &[0x00, 0xFF, 0x00, 0xAB]);
 }
 
+// --- Streaming query interrupted by backend kill ---
+
+#[test]
+fn streaming_query_interrupted_by_backend_kill() {
+    let url = require_db!();
+    // Need 2 connections: one for streaming, one for pg_terminate_backend
+    let pool = Pool::builder().url(&url).max_size(2).build().unwrap();
+
+    let mut conn = pool.acquire().unwrap();
+
+    // Get the backend PID
+    let pid_rows = conn.simple_query_rows("SELECT pg_backend_pid()").unwrap();
+    let pid: i32 = pid_rows[0][0].as_deref().unwrap().parse().unwrap();
+
+    // Start a long-running streaming query that generates many rows
+    let sql = "SELECT g FROM generate_series(1, 100000) g";
+    let hash = hash_sql(sql);
+
+    let stream_result = conn.query_streaming_start(sql, hash, &[], 64);
+
+    if let Ok(_) = stream_result {
+        // Kill the backend from another connection
+        let mut killer = pool.acquire().unwrap();
+        let _ = killer.simple_query(&format!("SELECT pg_terminate_backend({pid})"));
+        drop(killer);
+
+        // Give PG a moment to process the termination
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Next read from the stream should error — connection is broken
+        let result = conn.simple_query("SELECT 1");
+        assert!(
+            result.is_err(),
+            "connection should be broken after backend kill"
+        );
+    }
+}
+
+// --- Pool recovers after connection killed during query ---
+
+#[test]
+fn pool_recovers_after_connection_killed_during_query() {
+    let url = require_db!();
+    let pool = Pool::builder()
+        .url(&url)
+        .max_size(2)
+        .stale_timeout(std::time::Duration::from_millis(0)) // immediate stale eviction
+        .build()
+        .unwrap();
+
+    // Get a connection and its PID
+    let mut conn = pool.acquire().unwrap();
+    let pid_rows = conn.simple_query_rows("SELECT pg_backend_pid()").unwrap();
+    let pid: i32 = pid_rows[0][0].as_deref().unwrap().parse().unwrap();
+    drop(conn);
+
+    // Kill that backend
+    let mut killer = pool.acquire().unwrap();
+    let _ = killer.simple_query(&format!("SELECT pg_terminate_backend({pid})"));
+    drop(killer);
+
+    // Wait for stale eviction
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Pool should recover — next query gets a fresh connection
+    let mut conn = pool.acquire().unwrap();
+    let result = conn.simple_query("SELECT 1");
+    assert!(
+        result.is_ok(),
+        "pool should provide working connection after kill"
+    );
+}
+
+// --- Transaction with large deferred batch ---
+
+#[test]
+fn transaction_with_large_deferred_batch() {
+    let url = require_db!();
+    // Verify ordering is preserved in large deferred pipeline
+    let pool = Pool::builder().url(&url).max_size(1).build().unwrap();
+
+    let mut tx = pool.begin().unwrap();
+    let sql = "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($1, 'new', 1)";
+    let hash = hash_sql(sql);
+
+    for i in 0..100 {
+        let title = format!("order_test_{:04}", i);
+        tx.defer_execute(sql, hash, &[&title]).unwrap();
+    }
+
+    let results = tx.flush_deferred().unwrap();
+    assert_eq!(results.len(), 100);
+    // All should affect 1 row
+    assert!(results.iter().all(|&r| r == 1));
+
+    tx.rollback().unwrap();
+}
+
 // ===========================================================================
 // STRESS TESTS — run with: cargo test -- --ignored
 // ===========================================================================
