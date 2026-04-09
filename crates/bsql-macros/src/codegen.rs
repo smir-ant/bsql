@@ -490,10 +490,10 @@ fn gen_query_as_executor_impls(
     let limited_sql_lit = &limited_sql;
     let limited_sql_hash_val = bsql_core::rapid_hash_str(&limited_sql);
 
-    let row_decode = if has_columns {
-        gen_row_decode(validation)
+    let (decode_bindings, field_names) = if has_columns {
+        gen_query_as_decode_bindings(validation)
     } else {
-        TokenStream::new()
+        (TokenStream::new(), TokenStream::new())
     };
 
     let column_check = gen_column_count_check(validation);
@@ -516,7 +516,8 @@ fn gen_query_as_executor_impls(
                     }
                     let row = owned.row(0);
                     #column_check
-                    Ok(#target_type { #row_decode })
+                    #decode_bindings
+                    Ok(#target_type { #field_names })
                 }
             }
 
@@ -528,7 +529,8 @@ fn gen_query_as_executor_impls(
                     let executor = executor.into(); let owned = ::bsql_core::__bsql_call!(executor.#qm(#sql_lit, #sql_hash_val, #params_slice))?;
                     owned.iter().map(|row| {
                         #column_check
-                        Ok(#target_type { #row_decode })
+                        #decode_bindings
+                        Ok(#target_type { #field_names })
                     }).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
             }
@@ -544,7 +546,8 @@ fn gen_query_as_executor_impls(
                         1 => {
                             let row = owned.row(0);
                             #column_check
-                            Ok(Some(#target_type { #row_decode }))
+                            #decode_bindings
+                            Ok(Some(#target_type { #field_names }))
                         }
                         n => Err(::bsql_core::error::QueryError::row_count(
                             "0 or 1 rows",
@@ -2194,6 +2197,38 @@ fn gen_row_decode(validation: &ValidationResult) -> TokenStream {
     });
 
     quote! { #(#fields),* }
+}
+
+/// Like `gen_row_decode` but for query_as! — decodes into named bindings first,
+/// then returns field names for struct construction. This produces clearer rustc
+/// error messages when nullable columns don't match struct field types.
+///
+/// Generated code:
+/// ```ignore
+/// let title: Option<String> = ...; // bsql: nullable column
+/// let id: i32 = ...;
+/// Ok(MyStruct { id, title })       // rustc error here is clearer
+/// ```
+fn gen_query_as_decode_bindings(validation: &ValidationResult) -> (TokenStream, TokenStream) {
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let mut bindings = Vec::new();
+    let mut field_names = Vec::new();
+
+    for (i, name) in deduped_names.iter().enumerate() {
+        let field_name = format_ident!("{}", name);
+        let col = &validation.columns[i];
+        let decode_expr = gen_column_decode(i, &col.rust_type);
+        let rust_type = parse_result_type(&col.rust_type);
+
+        bindings.push(quote! {
+            let #field_name: #rust_type = #decode_expr;
+        });
+        field_names.push(quote! { #field_name });
+    }
+
+    let bindings_ts = quote! { #(#bindings)* };
+    let fields_ts = quote! { #(#field_names),* };
+    (bindings_ts, fields_ts)
 }
 
 /// Generate the decode expression for a single column based on its Rust type.
