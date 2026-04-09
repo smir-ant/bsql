@@ -20,7 +20,7 @@ async fn select_works_without_replicas() {
     let pool = pool().await;
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&pool)
+        .fetch(&pool)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -94,7 +94,7 @@ async fn transaction_uses_primary() {
     let mut txn = pool.begin().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&mut txn)
+        .fetch(&mut txn)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -109,7 +109,7 @@ async fn pool_connection_uses_primary() {
     let mut conn = pool.acquire().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&mut conn)
+        .fetch(&mut conn)
         .await
         .unwrap();
     assert!(users.len() >= 2);

@@ -23,7 +23,7 @@ async fn one_optional_clause_some() {
          [AND department_id = $dept: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -46,7 +46,7 @@ async fn one_optional_clause_none() {
          [AND department_id = $dept: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -72,7 +72,7 @@ async fn two_optional_clauses_none_none() {
          [AND assignee_id = $assignee: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -95,7 +95,7 @@ async fn two_optional_clauses_some_none() {
          [AND assignee_id = $assignee: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -118,7 +118,7 @@ async fn two_optional_clauses_none_some() {
          [AND assignee_id = $assignee: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -141,7 +141,7 @@ async fn two_optional_clauses_some_some() {
          [AND assignee_id = $assignee: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -165,7 +165,7 @@ async fn optional_clause_with_base_params() {
          [AND department_id = $dept: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -184,7 +184,7 @@ async fn optional_clause_with_base_params_filtered() {
          [AND department_id = $dept: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -213,7 +213,7 @@ async fn optional_clause_fetch_optional_found() {
     .unwrap();
 
     assert!(result.is_some());
-    assert_eq!(result.unwrap().get().unwrap().login, "alice");
+    assert_eq!(result.unwrap().login, "alice");
 }
 
 #[tokio::test]
@@ -306,7 +306,7 @@ async fn three_optional_clauses() {
          [AND created_by_user_id = $creator: Option<i32>]
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -326,7 +326,7 @@ async fn optional_clause_ilike_pattern() {
          [AND title ILIKE '%' || $search: Option<String> || '%']
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 
@@ -347,7 +347,7 @@ async fn optional_clause_ilike_pattern_none() {
          [AND title ILIKE '%' || $search: Option<String> || '%']
          ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
 

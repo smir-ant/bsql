@@ -248,9 +248,8 @@ async fn transaction_read_your_writes() {
         .fetch_one(&mut tx)
         .await
         .unwrap();
-    let r = found.get().unwrap();
-    assert_eq!(r.id, ticket_id);
-    assert_eq!(r.title, "tx_read_write_test");
+    assert_eq!(found.id, ticket_id);
+    assert_eq!(found.title, "tx_read_write_test");
 
     tx.rollback().await.unwrap();
 }
@@ -306,7 +305,7 @@ async fn independent_transactions_are_isolated() {
     // tx2 should NOT see the uncommitted row (default READ COMMITTED isolation).
     let search = "tx_isolated_test";
     let seen = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&mut tx2)
+        .fetch(&mut tx2)
         .await
         .unwrap();
     assert!(seen.is_empty(), "tx2 should not see tx1's uncommitted row");
@@ -342,8 +341,7 @@ async fn transaction_commit_without_queries_is_noop() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 }
 
 #[tokio::test]
@@ -364,8 +362,7 @@ async fn transaction_rollback_without_queries_is_noop() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 }
 
 #[tokio::test]
@@ -391,8 +388,7 @@ async fn transaction_drop_without_queries_returns_connection_clean() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1, "connection should be clean and reusable");
+    assert_eq!(user.id, 1, "connection should be clean and reusable");
 }
 
 #[tokio::test]
@@ -406,9 +402,8 @@ async fn transaction_lazy_begin_first_query_triggers_begin() {
         .fetch_one(&mut tx)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert_eq!(r.login, "alice");
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
 
     tx.commit().await.unwrap();
 }
@@ -514,7 +509,7 @@ async fn transaction_defer_execute_commit() {
     // Verify rows were inserted (use existing cached query by id pattern)
     let search = "defer_commit_bsql";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&pool)
+        .fetch(&pool)
         .await
         .unwrap();
     assert_eq!(rows.len(), 2);
@@ -571,7 +566,7 @@ async fn transaction_defer_execute_auto_flushes_before_read() {
     // SELECT triggers auto-flush, so we can read-your-writes
     let search = "defer_autoflush_bsql";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&mut tx)
+        .fetch(&mut tx)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -683,7 +678,7 @@ async fn savepoint_and_rollback_to() {
     // Verify the row does NOT exist within the transaction.
     let search = "sp_rollback_test";
     let found = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&mut tx)
+        .fetch(&mut tx)
         .await
         .unwrap();
     assert!(
@@ -739,7 +734,7 @@ async fn nested_savepoints() {
     // A's insert should still be visible.
     let search_a = "nested_sp_a";
     let found_a = bsql::query!("SELECT id FROM tickets WHERE title = $search_a: &str")
-        .fetch_all(&mut tx)
+        .fetch(&mut tx)
         .await
         .unwrap();
     assert_eq!(
@@ -751,7 +746,7 @@ async fn nested_savepoints() {
     // B's insert should be gone.
     let search_b = "nested_sp_b";
     let found_b = bsql::query!("SELECT id FROM tickets WHERE title = $search_b: &str")
-        .fetch_all(&mut tx)
+        .fetch(&mut tx)
         .await
         .unwrap();
     assert!(
@@ -828,8 +823,7 @@ async fn set_isolation_serializable() {
         .fetch_one(&mut tx)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 
     tx.commit().await.unwrap();
 }
@@ -848,8 +842,7 @@ async fn set_isolation_read_committed() {
         .fetch_one(&mut tx)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 
     tx.commit().await.unwrap();
 }
@@ -914,7 +907,7 @@ async fn multiple_flush_calls() {
     // All 6 rows should exist.
     let search = "multi_flush_test";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch_all(&mut tx)
+        .fetch(&mut tx)
         .await
         .unwrap();
     assert_eq!(rows.len(), 6);

@@ -403,7 +403,7 @@ bsql = { version = "0.22" }
 bsql = { version = "0.22", default-features = false }
 ```
 
-Same `query!` macro, same zero-copy fetch. Sync mode is pure `fn` -- no async runtime, no `.await`, no tokio in your dependency tree.
+Same `query!` macro, same compile-time safety. Sync mode is pure `fn` -- no async runtime, no `.await`, no tokio in your dependency tree.
 
 When async is enabled, TCP connections use true async I/O via tokio — the scheduler can run other tasks while waiting for PostgreSQL. Unix domain socket connections use sync I/O (sub-millisecond, no benefit from async). No `block_in_place`, no `Handle::current().block_on()` — the `QueryTarget` enum dispatch uses genuine cooperative scheduling.
 

@@ -48,9 +48,8 @@ async fn async_pool_connect() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert_eq!(r.login, "alice");
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
 }
 
 // ---------------------------------------------------------------------------
@@ -75,10 +74,9 @@ async fn async_concurrent_queries() {
 
                 match user {
                     Ok(user) => {
-                        let r = user.get().unwrap();
-                        assert_eq!(r.id, 1, "task {task_id} query {query_idx}: id mismatch");
+                        assert_eq!(user.id, 1, "task {task_id} query {query_idx}: id mismatch");
                         assert_eq!(
-                            r.login, "alice",
+                            user.login, "alice",
                             "task {task_id} query {query_idx}: login mismatch"
                         );
                     }
@@ -105,9 +103,8 @@ async fn async_concurrent_queries() {
         .fetch_one(pool.as_ref())
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 2);
-    assert_eq!(r.login, "bob");
+    assert_eq!(user.id, 2);
+    assert_eq!(user.login, "bob");
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +143,7 @@ async fn async_transaction_commit_await() {
         found.is_some(),
         "committed row should persist after tx.commit().await"
     );
-    assert_eq!(found.unwrap().get().unwrap().title, "async_commit_test");
+    assert_eq!(found.unwrap().title, "async_commit_test");
 
     // Clean up.
     bsql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")

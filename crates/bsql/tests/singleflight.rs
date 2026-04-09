@@ -25,9 +25,8 @@ async fn singleflight_fetch_one_works() {
         .await
         .unwrap();
 
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert_eq!(r.login, "alice");
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
 }
 
 /// Basic: singleflight is transparent for fetch_all.
@@ -35,7 +34,7 @@ async fn singleflight_fetch_one_works() {
 async fn singleflight_fetch_all_works() {
     let pool = pool().await;
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&pool)
+        .fetch(&pool)
         .await
         .unwrap();
 
@@ -62,7 +61,7 @@ async fn concurrent_identical_queries_all_succeed() {
         let pool = Arc::clone(&pool);
         handles.push(tokio::spawn(async move {
             bsql::query!("SELECT id, login FROM users ORDER BY id")
-                .fetch_all(pool.as_ref())
+                .fetch(pool.as_ref())
                 .await
         }));
     }
@@ -86,14 +85,14 @@ async fn parameterized_query_works_with_singleflight() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(user.get().unwrap().id, 1);
+    assert_eq!(user.id, 1);
 
     let id = 2i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(user.get().unwrap().id, 2);
+    assert_eq!(user.id, 2);
 }
 
 /// Singleflight does NOT apply to transactions (snapshot isolation).
@@ -103,7 +102,7 @@ async fn transaction_queries_are_not_coalesced() {
     let mut txn = pool.begin().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&mut txn)
+        .fetch(&mut txn)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -118,7 +117,7 @@ async fn pool_connection_queries_not_coalesced() {
     let mut conn = pool.acquire().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&mut conn)
+        .fetch(&mut conn)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -153,7 +152,7 @@ async fn queries_work_after_concurrent_burst() {
         let pool = Arc::clone(&pool);
         handles.push(tokio::spawn(async move {
             bsql::query!("SELECT id, login FROM users ORDER BY id")
-                .fetch_all(pool.as_ref())
+                .fetch(pool.as_ref())
                 .await
         }));
     }
@@ -172,9 +171,8 @@ async fn queries_work_after_concurrent_burst() {
         .fetch_one(pool.as_ref())
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert_eq!(r.login, "alice");
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
 }
 
 /// fetch_optional through singleflight path works.
@@ -187,7 +185,7 @@ async fn singleflight_fetch_optional_works() {
         .await
         .unwrap();
     assert!(user.is_some());
-    assert_eq!(user.unwrap().get().unwrap().login, "alice");
+    assert_eq!(user.unwrap().login, "alice");
 }
 
 /// Different SQL texts are independently handled by singleflight.
@@ -200,14 +198,14 @@ async fn different_queries_are_independent() {
     let pool1 = Arc::clone(&pool);
     let h1 = tokio::spawn(async move {
         bsql::query!("SELECT id, login FROM users ORDER BY id")
-            .fetch_all(pool1.as_ref())
+            .fetch(pool1.as_ref())
             .await
     });
 
     let pool2 = Arc::clone(&pool);
     let h2 = tokio::spawn(async move {
         bsql::query!("SELECT id FROM tickets ORDER BY id")
-            .fetch_all(pool2.as_ref())
+            .fetch(pool2.as_ref())
             .await
     });
 

@@ -61,7 +61,7 @@ pub mod driver_sqlite {
     pub use bsql_driver_sqlite::SqliteError;
     pub use smallvec::{smallvec, SmallVec};
 
-    // Arena types for arena-backed fetch_all
+    // Arena types for arena-backed fetch
     pub use bsql_arena::{acquire_arena, Arena, ArenaRows, ValidatedRows};
 
     /// SQLite NULL type indicator (matches `SQLITE_NULL` = 5).

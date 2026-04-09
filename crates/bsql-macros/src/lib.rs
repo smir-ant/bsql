@@ -50,8 +50,8 @@ use proc_macro::TokenStream;
 /// # Execution methods
 ///
 /// The macro returns an executor with these methods:
+/// - `.fetch(executor)` — returns all rows as `Vec<T>`
 /// - `.fetch_one(executor)` — returns exactly one row (errors on 0 or 2+)
-/// - `.fetch_all(executor)` — returns all rows as `Vec<T>`
 /// - `.fetch_optional(executor)` — returns `Option<T>` (errors on 2+)
 /// - `.execute(executor)` — returns affected row count (`u64`)
 ///
@@ -357,7 +357,7 @@ fn query_impl_sort(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStrea
 ///
 /// # Execution methods
 ///
-/// Same as `query!`: `.fetch_one(executor)`, `.fetch_all(executor)`,
+/// Same as `query!`: `.fetch(executor)`, `.fetch_one(executor)`,
 /// `.fetch_optional(executor)`, `.execute(executor)`, `.defer(tx)`.
 #[proc_macro]
 pub fn query_as(input: TokenStream) -> TokenStream {
@@ -544,7 +544,7 @@ pub fn pg_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```rust,ignore
 /// let tickets = bsql::query!(
 ///     "SELECT id, title FROM tickets ORDER BY $[sort: TicketSort] LIMIT $limit: i64"
-/// ).fetch_all(&pool)?;
+/// ).fetch(&pool)?;
 /// ```
 ///
 /// Each variant must have a `#[sql("...")]` attribute mapping it to the

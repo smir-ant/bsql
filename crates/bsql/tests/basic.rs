@@ -21,18 +21,17 @@ async fn select_fetch_one() {
             .await
             .unwrap();
 
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert_eq!(r.login, "alice");
-    assert_eq!(r.first_name, "Alice");
-    assert_eq!(r.last_name, "Smith");
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
+    assert_eq!(user.first_name, "Alice");
+    assert_eq!(user.last_name, "Smith");
 }
 
 #[tokio::test]
 async fn select_fetch_all() {
     let pool = pool().await;
     let users = bsql::query!("SELECT id, login FROM users WHERE active = true ORDER BY id")
-        .fetch_all(&pool)
+        .fetch(&pool)
         .await
         .unwrap();
 
@@ -51,7 +50,7 @@ async fn select_fetch_optional_found() {
         .unwrap();
 
     assert!(user.is_some());
-    assert_eq!(user.unwrap().get().unwrap().login, "alice");
+    assert_eq!(user.unwrap().login, "alice");
 }
 
 #[tokio::test]
@@ -75,9 +74,8 @@ async fn select_nullable_column() {
         .await
         .unwrap();
 
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert!(r.middle_name.is_none());
+    assert_eq!(user.id, 1);
+    assert!(user.middle_name.is_none());
 }
 
 #[tokio::test]
@@ -166,13 +164,12 @@ async fn select_multiple_types() {
     .await
     .unwrap();
 
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1i32);
-    assert_eq!(r.login, "alice");
-    assert!(r.active);
-    assert_eq!(r.score, 42i16);
-    assert!((r.rating - 4.5f32).abs() < f32::EPSILON);
-    assert!((r.balance - 100.50f64).abs() < f64::EPSILON);
+    assert_eq!(user.id, 1i32);
+    assert_eq!(user.login, "alice");
+    assert!(user.active);
+    assert_eq!(user.score, 42i16);
+    assert!((user.rating - 4.5f32).abs() < f32::EPSILON);
+    assert!((user.balance - 100.50f64).abs() < f64::EPSILON);
 }
 
 #[tokio::test]
@@ -183,9 +180,8 @@ async fn select_count_expression() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = result.get().unwrap();
     // COUNT(*) is correctly inferred as NOT NULL — returns i64, not Option<i64>
-    assert!(r.cnt >= 2);
+    assert!(result.cnt >= 2);
 }
 
 #[tokio::test]
@@ -201,10 +197,9 @@ async fn select_with_join_and_aliases() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    let r = result.get().unwrap();
-    assert_eq!(r.ticket_id, 1);
-    assert_eq!(r.title, "Fix login bug");
-    assert_eq!(r.creator, "alice");
+    assert_eq!(result.ticket_id, 1);
+    assert_eq!(result.title, "Fix login bug");
+    assert_eq!(result.creator, "alice");
 }
 
 #[tokio::test]
@@ -216,7 +211,7 @@ async fn select_with_cte() {
         )
         SELECT id, login FROM active_users ORDER BY id"
     )
-    .fetch_all(&pool)
+    .fetch(&pool)
     .await
     .unwrap();
     assert_eq!(results.len(), 2);
@@ -228,7 +223,7 @@ async fn fetch_all_empty_result() {
     let pool = pool().await;
     let login = "absolutely_nobody_has_this_login";
     let results = bsql::query!("SELECT id, login FROM users WHERE login = $login: &str")
-        .fetch_all(&pool)
+        .fetch(&pool)
         .await
         .unwrap();
     assert!(results.is_empty());
@@ -241,9 +236,8 @@ async fn select_expression_arithmetic() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = result.get().unwrap();
     // Computed expression -> nullable by default
-    assert_eq!(r.sum_val, Some(2i32));
+    assert_eq!(result.sum_val, Some(2i32));
 }
 
 #[tokio::test]
@@ -281,7 +275,7 @@ async fn delete_returning() {
 
     let id = ticket.id;
     let deleted = bsql::query!("DELETE FROM tickets WHERE id = $id: i32 RETURNING id, title")
-        .fetch_all(&pool)
+        .fetch(&pool)
         .await
         .unwrap();
     assert_eq!(deleted.len(), 1);
@@ -296,8 +290,7 @@ async fn param_reuse_in_real_query() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 }
 
 #[tokio::test]
@@ -338,9 +331,8 @@ async fn bytea_column_round_trip() {
         .await
         .unwrap();
 
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert_eq!(r.avatar, Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+    assert_eq!(user.id, 1);
+    assert_eq!(user.avatar, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
 }
 
 #[tokio::test]
@@ -352,9 +344,8 @@ async fn array_column_type() {
         .await
         .unwrap();
 
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert!(r.tag_ids.is_empty()); // default '{}'
+    assert_eq!(user.id, 1);
+    assert!(user.tag_ids.is_empty()); // default '{}'
 }
 
 #[tokio::test]
@@ -371,8 +362,7 @@ async fn select_star() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 }
 
 #[tokio::test]
@@ -392,7 +382,7 @@ async fn pool_builder_url_method() {
         .unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch_all(&pool)
+        .fetch(&pool)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -445,8 +435,7 @@ async fn pool_acquire_and_use() {
         .fetch_one(&mut conn)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 }
 
 #[tokio::test]
@@ -635,9 +624,8 @@ async fn warmup_prepares_statements() {
         .fetch_one(&mut conn)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
-    assert_eq!(r.login, "alice");
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
 }
 
 // ---------------------------------------------------------------------------
@@ -710,8 +698,7 @@ async fn fetch_stream_drop_mid_iteration() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -738,8 +725,7 @@ async fn fetch_stream_fully_consumed() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let r = user.get().unwrap();
-    assert_eq!(r.id, 1);
+    assert_eq!(user.id, 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -200,9 +200,9 @@ fn gen_query_as_executor_impls(
             }
         };
 
-        let fetch_all_method = quote! {
+        let fetch_method = quote! {
             /// Fetch all rows, mapped into the target struct.
-            pub fn fetch_all(
+            pub fn fetch(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
@@ -229,16 +229,8 @@ fn gen_query_as_executor_impls(
 
         quote! {
             #fetch_one_method
-            #fetch_all_method
+            #fetch_method
             #fetch_optional_method
-
-            /// Fetch all rows as a Vec (alias for fetch_all).
-            pub fn fetch(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
-                self.fetch_all(pool)
-            }
         }
     } else {
         TokenStream::new()
@@ -882,14 +874,14 @@ fn gen_executor_impls(
             }
         };
 
-        // --- Inline fetch_all ---
-        let fetch_all_method = if use_arena {
+        // --- Inline fetch ---
+        let fetch_method = if use_arena {
             let arena_name = arena_result_struct_name(parsed);
             let inline_acquire_all = gen_inline_acquire(is_write);
             let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
             quote! {
                 /// Fetch all rows. Batch-validated text, zero unsafe.
-                pub fn fetch_all(
+                pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
@@ -931,7 +923,7 @@ fn gen_executor_impls(
             let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
             quote! {
                 /// Fetch all rows. Inline step loop — no cross-crate call overhead.
-                pub fn fetch_all(
+                pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
@@ -959,7 +951,7 @@ fn gen_executor_impls(
 
         quote! {
             #fetch_one_method
-            #fetch_all_method
+            #fetch_method
             #fetch_optional_method
 
             /// Stream rows in chunks.
@@ -1073,47 +1065,12 @@ fn gen_executor_impls(
         }
     };
 
-    // --- Simple API (fetch) ---
-    let simple_api_fetch = if has_columns {
-        let result_name = result_struct_name(parsed);
-
-        let fetch_method = if use_arena {
-            let arena_name = arena_result_struct_name(parsed);
-            quote! {
-                /// Fetch all rows as a Vec.
-                pub fn fetch(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
-                    self.fetch_all(pool)
-                }
-            }
-        } else {
-            quote! {
-                /// Fetch all rows as a Vec.
-                pub fn fetch(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    self.fetch_all(pool)
-                }
-            }
-        };
-
-        quote! {
-            #fetch_method
-        }
-    } else {
-        TokenStream::new()
-    };
-
     quote! {
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
             #for_each_methods
             #execute_method
-            #simple_api_fetch
         }
     }
 }
@@ -1895,12 +1852,12 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
             })
         };
 
-        // --- Inline fetch_all ---
-        let fetch_all_method = if use_arena {
+        // --- Inline fetch ---
+        let fetch_method = if use_arena {
             let arena_name = arena_result_struct_name(parsed);
             let bind = gen_inline_param_bind();
             let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
-            let fetch_all_dispatcher =
+            let fetch_dispatcher =
                 gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
                     quote! {
                         let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
@@ -1934,17 +1891,17 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     }
                 });
             quote! {
-                pub fn fetch_all(
+                pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
-                    #fetch_all_dispatcher
+                    #fetch_dispatcher
                 }
             }
         } else {
             let bind = gen_inline_param_bind();
             let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
-            let fetch_all_dispatcher =
+            let fetch_dispatcher =
                 gen_sqlite_runtime_dispatcher(parsed, false, is_write, |_| {
                     quote! {
                         let _bsql_stmt = _bsql_conn.__get_or_prepare(&_bsql_sql, _bsql_hash)
@@ -1966,11 +1923,11 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     }
                 });
             quote! {
-                pub fn fetch_all(
+                pub fn fetch(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    #fetch_all_dispatcher
+                    #fetch_dispatcher
                 }
             }
         };
@@ -1983,7 +1940,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                 #fetch_one_dispatcher
             }
 
-            #fetch_all_method
+            #fetch_method
 
             pub fn fetch_optional(
                 self,
@@ -2099,47 +2056,12 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         }
     };
 
-    // --- Simple API (fetch) ---
-    let simple_api_fetch = if has_columns {
-        let result_name = result_struct_name(parsed);
-
-        let fetch_method = if use_arena {
-            let arena_name = arena_result_struct_name(parsed);
-            quote! {
-                /// Fetch all rows as a Vec.
-                pub fn fetch(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
-                    self.fetch_all(pool)
-                }
-            }
-        } else {
-            quote! {
-                /// Fetch all rows as a Vec.
-                pub fn fetch(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    self.fetch_all(pool)
-                }
-            }
-        };
-
-        quote! {
-            #fetch_method
-        }
-    } else {
-        TokenStream::new()
-    };
-
     quote! {
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
             #for_each_methods
             #execute_method
-            #simple_api_fetch
         }
     }
 }
@@ -2518,8 +2440,8 @@ pub fn generate_sort_sqlite_query_code(
 
         // Sort queries always use the direct decode path (safe from_utf8,
         // owned strings) since they go through pool indirection anyway.
-        let fetch_all_method = quote! {
-            pub fn fetch_all(
+        let fetch_method = quote! {
+            pub fn fetch(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
@@ -2557,7 +2479,7 @@ pub fn generate_sort_sqlite_query_code(
                     )
                 }
 
-                #fetch_all_method
+                #fetch_method
 
                 pub fn fetch_optional(
                     self,
@@ -2583,16 +2505,6 @@ pub fn generate_sort_sqlite_query_code(
                     #direct_params_build
                     #build_sql
                     pool.execute_direct(&sql, sql_hash, _bsql_params)
-                }
-
-                // --- Simple API ---
-
-                /// Fetch all rows as a Vec.
-                pub fn fetch(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    self.fetch_all(pool)
                 }
             }
         }

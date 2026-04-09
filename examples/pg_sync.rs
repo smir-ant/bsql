@@ -19,14 +19,12 @@ fn main() -> Result<(), BsqlError> {
     let id = 1i32;
     let user = bsql::query!("SELECT id, login, first_name FROM users WHERE id = $id: i32")
         .fetch_one(&pool)?;
-    let r = user.get()?;
-    println!("User: {} ({})", r.first_name, r.login);
+    println!("User: {} ({})", user.first_name, user.login);
 
     // Multiple rows
     let users = bsql::query!("SELECT id, login FROM users WHERE active = true ORDER BY id LIMIT 10")
         .fetch(&pool)?;
-    for row in users.iter() {
-        let r = row?;
+    for r in &users {
         println!("  {} — {}", r.id, r.login);
     }
 
