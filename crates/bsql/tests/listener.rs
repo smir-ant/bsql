@@ -573,3 +573,45 @@ async fn listener_unlisten_all_then_listen_new() {
     assert_eq!(notification.channel(), ch2);
     assert_eq!(notification.payload(), "after_unlisten_all");
 }
+
+// ---------------------------------------------------------------------------
+// Notification burst: send 100 notifications rapidly, verify none are lost
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn listener_notification_burst() {
+    let ch = unique_channel("burst_test");
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+    listener.listen(&ch).await.unwrap();
+
+    // Send 100 notifications in rapid succession from a separate connection
+    let sender = Listener::connect(DB_URL).await.unwrap();
+    for i in 0..100u32 {
+        sender.notify(&ch, &i.to_string()).await.unwrap();
+    }
+
+    // Receive all 100 with a deadline
+    let mut received = 0u32;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while received < 100 {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        // try_recv to avoid blocking forever; if nothing yet, yield and retry
+        match listener.try_recv().await {
+            Ok(Some(notif)) => {
+                assert_eq!(notif.channel(), ch);
+                received += 1;
+            }
+            Ok(None) => {
+                // No notification ready yet — brief yield then retry
+                tokio::task::yield_now().await;
+            }
+            Err(e) => panic!("recv error: {e}"),
+        }
+    }
+    assert_eq!(
+        received, 100,
+        "all 100 notifications should be received, got {received}"
+    );
+}

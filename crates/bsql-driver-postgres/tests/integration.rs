@@ -3834,3 +3834,97 @@ fn stress_deferred_pipeline_1000() {
 
     tx.rollback().unwrap();
 }
+
+// --- Unix domain socket connection ---
+
+#[cfg(unix)]
+#[test]
+fn unix_socket_connection() {
+    let _url = require_db!(); // skip if no DB configured
+
+    // Connect via Unix domain socket (default PG socket path).
+    // Try /tmp first (macOS default), then /var/run/postgresql (Linux).
+    let urls = [
+        "postgres://bsql:bsql@localhost/bsql_test?host=/tmp",
+        "postgres://bsql:bsql@localhost/bsql_test?host=/var/run/postgresql",
+    ];
+
+    let mut connected = false;
+    for url in &urls {
+        let config = Config::from_url(url).unwrap();
+        if let Ok(mut conn) = Connection::connect(&config) {
+            let result = conn.simple_query("SELECT 1");
+            assert!(result.is_ok());
+            connected = true;
+            break;
+        }
+    }
+    // At least one socket path should work on Unix
+    assert!(connected, "UDS connection should work on at least one path");
+}
+
+#[cfg(windows)]
+#[test]
+fn unix_socket_rejected_on_windows() {
+    let config = Config::from_url("postgres://bsql:bsql@localhost/bsql_test?host=/tmp").unwrap();
+    let result = Connection::connect(&config);
+    assert!(result.is_err(), "UDS should fail on Windows");
+}
+
+// --- TLS prefer fallback ---
+
+#[test]
+fn tls_prefer_fallback_to_plain() {
+    let _url = require_db!(); // skip if no DB configured
+
+    // sslmode=prefer should try TLS, fall back to plain if server doesn't support it.
+    // Most test PG instances don't have TLS, so this tests the fallback path.
+    let config =
+        Config::from_url("postgres://bsql:bsql@localhost/bsql_test?sslmode=prefer").unwrap();
+    let result = Connection::connect(&config);
+    // Should succeed (falls back to plain) or succeed with TLS
+    assert!(
+        result.is_ok(),
+        "sslmode=prefer should connect (with or without TLS): {:?}",
+        result.err()
+    );
+}
+
+// --- Tokio cancellation mid-stream ---
+
+#[tokio::test]
+async fn tokio_cancel_during_query() {
+    let _url = require_db!(); // skip if no DB configured
+
+    // Start a long query, cancel the task, verify pool is not poisoned.
+    let pool = std::sync::Arc::new(
+        Pool::builder()
+            .url("postgres://bsql:bsql@localhost/bsql_test")
+            .max_size(1)
+            .acquire_timeout(Some(std::time::Duration::from_secs(5)))
+            .build()
+            .unwrap(),
+    );
+
+    let p = pool.clone();
+    let handle = tokio::spawn(async move {
+        let mut conn = p.acquire().unwrap();
+        let sql = "SELECT pg_sleep(10)"; // 10 second sleep
+        let hash = hash_sql(sql);
+        // This will block for 10 seconds
+        let _ = conn.query(sql, hash, &[]);
+    });
+
+    // Cancel after 100ms
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    handle.abort();
+    let _ = handle.await; // JoinError from abort
+
+    // Wait for connection to be returned/discarded
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Pool should still work — get a new connection
+    let mut conn = pool.acquire().unwrap();
+    let result = conn.simple_query("SELECT 1");
+    assert!(result.is_ok(), "pool should work after cancelled task");
+}
