@@ -95,6 +95,12 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
         1040 => Ok("Vec<String>"), // macaddr[]
         // --- Interval array ---
         1187 => Ok("Vec<String>"), // interval[]
+        705 => Err(
+            "PostgreSQL could not determine the type of this expression (OID 705 = unknown). \
+             This usually happens with untyped parameters inside functions like unnest(). \
+             Add an explicit cast: unnest($param::int[]), unnest($param::text[]), etc."
+                .into(),
+        ),
         _ => {
             let name = bsql_core::types::pg_name_for_oid(oid).unwrap_or("unknown");
             Err(format!(

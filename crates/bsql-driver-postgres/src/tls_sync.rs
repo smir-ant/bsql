@@ -308,8 +308,7 @@ mod tests {
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
         // Generate a client cert signed by the CA
-        let mut client_params =
-            rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut client_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         client_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "bsql-test-client");

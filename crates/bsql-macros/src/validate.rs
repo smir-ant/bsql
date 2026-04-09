@@ -266,15 +266,9 @@ fn is_known_not_null(col_name: &str, select_expr: &str) -> bool {
 
     // COALESCE with a literal last argument — guaranteed NOT NULL
     if expr_lower.starts_with("coalesce(") {
-        // Check if the last argument before ')' is a literal
-        // This is a heuristic — covers COALESCE(col, 'default') patterns
         if let Some(last_arg) = expr_lower.rsplit(',').next() {
             let trimmed = last_arg.trim().trim_end_matches(')').trim();
-            if trimmed.starts_with('\'')
-                || trimmed.parse::<f64>().is_ok()
-                || trimmed == "true"
-                || trimmed == "false"
-            {
+            if is_literal(trimmed) {
                 return true;
             }
         }
@@ -286,21 +280,149 @@ fn is_known_not_null(col_name: &str, select_expr: &str) -> bool {
         return true;
     }
 
-    // Numeric/string/boolean literals
-    if expr_lower.parse::<f64>().is_ok() {
+    // CASE WHEN ... THEN literal ELSE literal END — not null if both branches are literals
+    if expr_lower.starts_with("case ") && expr_lower.ends_with(" end")
+        && is_case_all_literal_branches(&expr_lower)
+    {
         return true;
     }
-    if expr_lower.starts_with('\'') && expr_lower.ends_with('\'') {
+
+    // Window functions that always return NOT NULL
+    if is_not_null_window_function(&expr_lower) {
         return true;
     }
-    if expr_lower == "true" || expr_lower == "false" {
+
+    // Date/time functions that always return NOT NULL
+    if is_not_null_datetime_function(&expr_lower) {
         return true;
     }
+
+    // String/array functions that return NOT NULL (given NOT NULL input assumed)
+    if is_not_null_scalar_function(&expr_lower) {
+        return true;
+    }
+
+    // Literals: numeric, string, boolean
+    if is_literal(&expr_lower) {
+        return true;
+    }
+
+    // CURRENT_DATE, CURRENT_TIMESTAMP, CURRENT_USER, etc.
     if expr_lower.starts_with("current_") {
         return true;
-    } // CURRENT_DATE, CURRENT_TIMESTAMP, etc.
+    }
 
     false
+}
+
+/// Check if an expression is a literal value (numeric, string, or boolean).
+fn is_literal(expr: &str) -> bool {
+    let s = expr.trim();
+    s.parse::<f64>().is_ok()
+        || (s.starts_with('\'') && s.ends_with('\''))
+        || s == "true"
+        || s == "false"
+}
+
+/// Check if a CASE expression has only literal THEN/ELSE branches.
+///
+/// Matches: `case when ... then 1 else 0 end`, `case when ... then 'a' else 'b' end`
+/// Does NOT match if any branch is a column reference or function call.
+fn is_case_all_literal_branches(expr: &str) -> bool {
+    // Extract all THEN and ELSE values
+    let mut rest = expr;
+    while let Some(idx) = rest.find(" then ") {
+        let after = &rest[idx + 6..];
+        // Value runs until next WHEN, ELSE, or END
+        let end = after
+            .find(" when ")
+            .or_else(|| after.find(" else "))
+            .or_else(|| after.find(" end"))
+            .unwrap_or(after.len());
+        let val = after[..end].trim();
+        if !is_literal(val) {
+            return false;
+        }
+        rest = &after[end..];
+    }
+    // Check ELSE
+    if let Some(idx) = expr.rfind(" else ") {
+        let after = &expr[idx + 6..];
+        let end = after.find(" end").unwrap_or(after.len());
+        let val = after[..end].trim();
+        if !is_literal(val) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Window functions that are guaranteed to return NOT NULL.
+fn is_not_null_window_function(expr: &str) -> bool {
+    expr.starts_with("row_number(")
+        || expr.starts_with("rank(")
+        || expr.starts_with("dense_rank(")
+        || expr.starts_with("ntile(")
+        || expr.starts_with("cume_dist(")
+        || expr.starts_with("percent_rank(")
+}
+
+/// Date/time functions guaranteed NOT NULL.
+fn is_not_null_datetime_function(expr: &str) -> bool {
+    expr.starts_with("now(")
+        || expr.starts_with("clock_timestamp(")
+        || expr.starts_with("statement_timestamp(")
+        || expr.starts_with("transaction_timestamp(")
+        || expr == "localtime"
+        || expr == "localtimestamp"
+        || expr.starts_with("extract(")
+        || expr.starts_with("date_part(")
+        || expr.starts_with("age(")
+        || expr.starts_with("date_trunc(")
+}
+
+/// Scalar functions that return NOT NULL given non-NULL arguments.
+/// We assume the input is non-NULL here (conservative: only for common patterns).
+fn is_not_null_scalar_function(expr: &str) -> bool {
+    expr.starts_with("length(")
+        || expr.starts_with("char_length(")
+        || expr.starts_with("octet_length(")
+        || expr.starts_with("lower(")
+        || expr.starts_with("upper(")
+        || expr.starts_with("trim(")
+        || expr.starts_with("ltrim(")
+        || expr.starts_with("rtrim(")
+        || expr.starts_with("concat(")
+        || expr.starts_with("replace(")
+        || expr.starts_with("substring(")
+        || expr.starts_with("left(")
+        || expr.starts_with("right(")
+        || expr.starts_with("md5(")
+        || expr.starts_with("sha256(")
+        || expr.starts_with("encode(")
+        || expr.starts_with("decode(")
+        || expr.starts_with("abs(")
+        || expr.starts_with("ceil(")
+        || expr.starts_with("floor(")
+        || expr.starts_with("round(")
+        || expr.starts_with("trunc(")
+        || expr.starts_with("sign(")
+        || expr.starts_with("mod(")
+        || expr.starts_with("power(")
+        || expr.starts_with("sqrt(")
+        || expr.starts_with("greatest(")
+        || expr.starts_with("least(")
+        || expr.starts_with("array_length(")
+        || expr.starts_with("cardinality(")
+        || expr.starts_with("jsonb_build_object(")
+        || expr.starts_with("jsonb_build_array(")
+        || expr.starts_with("json_build_object(")
+        || expr.starts_with("json_build_array(")
+        || expr.starts_with("to_char(")
+        || expr.starts_with("to_number(")
+        || expr.starts_with("to_date(")
+        || expr.starts_with("to_timestamp(")
+        || expr.starts_with("gen_random_uuid(")
 }
 
 /// Fetch EXPLAIN output for a query (only when `explain` feature is enabled).
@@ -1498,5 +1620,98 @@ mod tests {
     fn is_known_not_null_negative_number() {
         // "-1" as an expression — parse::<f64>() returns Ok
         assert!(is_known_not_null("x", "-1"));
+    }
+
+    // --- is_known_not_null: new patterns ---
+
+    #[test]
+    fn case_with_literal_branches_not_null() {
+        assert!(is_known_not_null("x", "CASE WHEN a > 0 THEN 1 ELSE 0 END"));
+        assert!(is_known_not_null(
+            "x",
+            "CASE WHEN active THEN 'yes' ELSE 'no' END"
+        ));
+    }
+
+    #[test]
+    fn case_with_column_branch_remains_nullable() {
+        assert!(!is_known_not_null(
+            "x",
+            "CASE WHEN a > 0 THEN name ELSE 'unknown' END"
+        ));
+    }
+
+    #[test]
+    fn row_number_is_not_null() {
+        assert!(is_known_not_null("x", "row_number()"));
+        assert!(is_known_not_null("x", "rank()"));
+        assert!(is_known_not_null("x", "dense_rank()"));
+        assert!(is_known_not_null("x", "ntile(4)"));
+    }
+
+    #[test]
+    fn now_and_datetime_functions_not_null() {
+        assert!(is_known_not_null("x", "now()"));
+        assert!(is_known_not_null("x", "clock_timestamp()"));
+        assert!(is_known_not_null("x", "extract(year from created_at)"));
+        assert!(is_known_not_null("x", "date_part('year', created_at)"));
+        assert!(is_known_not_null("x", "date_trunc('month', created_at)"));
+    }
+
+    #[test]
+    fn string_functions_not_null() {
+        assert!(is_known_not_null("x", "length(name)"));
+        assert!(is_known_not_null("x", "lower(name)"));
+        assert!(is_known_not_null("x", "upper(name)"));
+        assert!(is_known_not_null("x", "trim(name)"));
+        assert!(is_known_not_null("x", "concat(first_name, ' ', last_name)"));
+        assert!(is_known_not_null("x", "replace(name, 'old', 'new')"));
+    }
+
+    #[test]
+    fn math_functions_not_null() {
+        assert!(is_known_not_null("x", "abs(amount)"));
+        assert!(is_known_not_null("x", "ceil(rating)"));
+        assert!(is_known_not_null("x", "floor(rating)"));
+        assert!(is_known_not_null("x", "round(price, 2)"));
+        assert!(is_known_not_null("x", "greatest(a, b, 0)"));
+        assert!(is_known_not_null("x", "least(a, b, 100)"));
+    }
+
+    #[test]
+    fn array_functions_not_null() {
+        assert!(is_known_not_null("x", "array_length(tags, 1)"));
+        assert!(is_known_not_null("x", "cardinality(tags)"));
+    }
+
+    #[test]
+    fn json_build_functions_not_null() {
+        assert!(is_known_not_null("x", "jsonb_build_object('key', value)"));
+        assert!(is_known_not_null("x", "json_build_array(1, 2, 3)"));
+    }
+
+    #[test]
+    fn gen_random_uuid_not_null() {
+        assert!(is_known_not_null("x", "gen_random_uuid()"));
+    }
+
+    #[test]
+    fn to_char_and_conversion_functions_not_null() {
+        assert!(is_known_not_null("x", "to_char(created_at, 'YYYY-MM-DD')"));
+        assert!(is_known_not_null("x", "to_timestamp(epoch_secs)"));
+    }
+
+    #[test]
+    fn sum_avg_still_nullable() {
+        // SUM/AVG return NULL for empty groups — must stay Option
+        assert!(!is_known_not_null("x", "sum(amount)"));
+        assert!(!is_known_not_null("x", "avg(score)"));
+        assert!(!is_known_not_null("x", "max(created_at)"));
+        assert!(!is_known_not_null("x", "min(created_at)"));
+    }
+
+    #[test]
+    fn unknown_function_remains_nullable() {
+        assert!(!is_known_not_null("x", "my_custom_func(col)"));
     }
 }
