@@ -465,6 +465,43 @@ async fn pool_acquire_execute() {
 }
 
 #[tokio::test]
+async fn conn_execute_insert_and_delete() {
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    let title = "conn_insert_test";
+    let uid = 1i32;
+    let inserted = bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id)
+         VALUES ($title: &str, 'new', $uid: i32)"
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(inserted, 1);
+
+    let title2 = "conn_insert_test";
+    let deleted = bsql::query!("DELETE FROM tickets WHERE title = $title2: &str")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+}
+
+#[tokio::test]
+async fn conn_execute_returns_zero_for_no_match() {
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    let id = 999999i32;
+    let affected = bsql::query!("UPDATE tickets SET description = 'x' WHERE id = $id: i32")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
+}
+
+#[tokio::test]
 async fn pool_builder_bad_url_errors() {
     let result = Pool::builder().url("not_a_url").build().await;
     assert!(result.is_err());

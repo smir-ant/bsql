@@ -448,6 +448,47 @@ async fn transaction_execute_returns_affected_rows() {
     tx.rollback().await.unwrap();
 }
 
+#[tokio::test]
+async fn transaction_execute_insert_and_delete() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+
+    let title = "tx_insert_delete";
+    let uid = 1i32;
+    let inserted = bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id)
+         VALUES ($title: &str, 'new', $uid: i32)"
+    )
+    .execute(&mut tx)
+    .await
+    .unwrap();
+    assert_eq!(inserted, 1);
+
+    let title2 = "tx_insert_delete";
+    let deleted = bsql::query!("DELETE FROM tickets WHERE title = $title2: &str")
+        .execute(&mut tx)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_execute_returns_zero_for_no_match() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+
+    let id = 999999i32;
+    let affected = bsql::query!("UPDATE tickets SET description = 'x' WHERE id = $id: i32")
+        .execute(&mut tx)
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
+
+    tx.rollback().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // deferred pipeline (defer_execute / flush_deferred / auto-flush)
 // ---------------------------------------------------------------------------
