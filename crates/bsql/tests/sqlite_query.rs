@@ -858,3 +858,143 @@ fn sqlite_error_display_format() {
     let msg = err.to_string();
     assert!(!msg.is_empty(), "error display should not be empty");
 }
+
+// ===========================================================================
+// query_as!
+// ===========================================================================
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct UserRow {
+    id: Option<i64>,
+    name: String,
+    email: Option<String>,
+}
+
+#[test]
+fn sqlite_query_as_fetch_one() {
+    let pool = pool();
+    let id = 1i64;
+    let user = bsql::query_as!(
+        UserRow,
+        "SELECT id, name, email FROM users WHERE id = $id: i64"
+    )
+    .fetch_one(&pool)
+    .unwrap();
+    assert_eq!(user.name, "alice");
+    assert_eq!(user.email, Some("a@test.com".to_owned()));
+}
+
+#[test]
+fn sqlite_query_as_fetch_all() {
+    let pool = pool();
+    let rows = bsql::query_as!(UserRow, "SELECT id, name, email FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].name, "alice");
+    assert_eq!(rows[1].name, "bob");
+}
+
+#[test]
+fn sqlite_query_as_fetch_optional_found() {
+    let pool = pool();
+    let id = 1i64;
+    let user = bsql::query_as!(
+        UserRow,
+        "SELECT id, name, email FROM users WHERE id = $id: i64"
+    )
+    .fetch_optional(&pool)
+    .unwrap();
+    assert!(user.is_some());
+    assert_eq!(user.unwrap().name, "alice");
+}
+
+#[test]
+fn sqlite_query_as_fetch_optional_not_found() {
+    let pool = pool();
+    let id = 999i64;
+    let user = bsql::query_as!(
+        UserRow,
+        "SELECT id, name, email FROM users WHERE id = $id: i64"
+    )
+    .fetch_optional(&pool)
+    .unwrap();
+    assert!(user.is_none());
+}
+
+#[test]
+fn sqlite_query_as_nullable_field() {
+    let pool = pool();
+    let id = 2i64; // bob has NULL email
+    let user = bsql::query_as!(
+        UserRow,
+        "SELECT id, name, email FROM users WHERE id = $id: i64"
+    )
+    .fetch_one(&pool)
+    .unwrap();
+    assert_eq!(user.name, "bob");
+    assert!(user.email.is_none());
+}
+
+// ===========================================================================
+// SQL constructs — remaining gaps
+// ===========================================================================
+
+#[test]
+fn sqlite_subquery_in_from() {
+    let pool = pool();
+    let rows = bsql::query!("SELECT sub.name FROM (SELECT id, name FROM users ORDER BY id) sub")
+        .fetch_all(&pool)
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn sqlite_window_function() {
+    let pool = pool();
+    let rows =
+        bsql::query!("SELECT name, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM users ORDER BY id")
+            .fetch_all(&pool)
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    // rn is Option<i64> in SQLite (no NOT NULL inference for window functions)
+}
+
+#[test]
+fn sqlite_union_deduplicated() {
+    let pool = pool();
+    // UNION (not ALL) removes duplicates
+    let rows = bsql::query!("SELECT name FROM users UNION SELECT name FROM users")
+        .fetch_all(&pool)
+        .unwrap();
+    assert_eq!(rows.len(), 2); // deduplicated
+}
+
+#[test]
+fn sqlite_multiple_ctes() {
+    let pool = pool();
+    let rows = bsql::query!(
+        "WITH u AS (SELECT id, name FROM users WHERE active = 1),
+              i AS (SELECT owner_id, COUNT(*) AS cnt FROM items GROUP BY owner_id)
+         SELECT u.name FROM u JOIN i ON u.id = i.owner_id ORDER BY u.name"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    assert!(!rows.is_empty());
+}
+
+#[test]
+fn sqlite_multiple_joins() {
+    let pool = pool();
+    // Join users with items
+    let rows = bsql::query!(
+        "SELECT i.title, u.name
+         FROM items i
+         JOIN users u ON u.id = i.owner_id
+         ORDER BY i.id"
+    )
+    .fetch_all(&pool)
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+}

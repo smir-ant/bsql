@@ -148,3 +148,59 @@ fn sqlite_open_nonexistent_readonly_fails() {
     let result = SqlitePool::open("/nonexistent/path/to/db.sqlite");
     assert!(result.is_err());
 }
+
+#[test]
+fn sqlite_concurrent_writes_wal() {
+    // WAL mode allows concurrent readers + 1 writer
+    let pool = setup_db();
+    pool.simple_exec("PRAGMA journal_mode=WAL").unwrap();
+
+    // Sequential writes should work
+    for i in 0..10 {
+        let sql = format!("INSERT INTO users (name) VALUES ('wal_test_{i}')");
+        pool.simple_exec(&sql).unwrap();
+    }
+
+    let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
+    let counts = pool
+        .fetch_all_direct("SELECT COUNT(*) FROM users", hash, &[], true, |stmt| {
+            Ok(stmt.column_int64(0))
+        })
+        .unwrap();
+    assert_eq!(counts, vec![12]); // 2 seed + 10 new
+}
+
+#[test]
+fn sqlite_execute_batch_multiple_statements() {
+    let pool = setup_db();
+    pool.simple_exec("INSERT INTO users (name) VALUES ('batch1')")
+        .unwrap();
+    pool.simple_exec("INSERT INTO users (name) VALUES ('batch2')")
+        .unwrap();
+    pool.simple_exec("INSERT INTO users (name) VALUES ('batch3')")
+        .unwrap();
+
+    let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
+    let counts = pool
+        .fetch_all_direct("SELECT COUNT(*) FROM users", hash, &[], true, |stmt| {
+            Ok(stmt.column_int64(0))
+        })
+        .unwrap();
+    assert_eq!(counts, vec![5]); // 2 seed + 3 batch
+}
+
+#[test]
+fn sqlite_large_insert_batch() {
+    let pool = setup_db();
+    for i in 0..500 {
+        let sql = format!("INSERT INTO users (name) VALUES ('large_{i}')");
+        pool.simple_exec(&sql).unwrap();
+    }
+    let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
+    let counts = pool
+        .fetch_all_direct("SELECT COUNT(*) FROM users", hash, &[], true, |stmt| {
+            Ok(stmt.column_int64(0))
+        })
+        .unwrap();
+    assert_eq!(counts, vec![502]); // 2 seed + 500
+}
