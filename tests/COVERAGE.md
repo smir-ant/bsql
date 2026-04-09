@@ -1,7 +1,8 @@
 # Test Coverage Specification
 
 Every item is a scenario that must have a passing test.
-Serves as test instruction for any backend (PG, SQLite, future MySQL).
+Serves as test instruction for any backend (PG, SQLite, future drivers).
+Living document — grows with each bug report and edge case discovery.
 
 ---
 
@@ -10,8 +11,8 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 ### Happy path
 - 0 rows → empty Vec
 - 1 row → Vec with 1 element
-- 2 rows → correct order preserved
-- 100+ rows → all returned
+- 2+ rows → correct order preserved
+- 100+ rows → all returned, no truncation
 - Multiple column types in one query (int + text + bool + nullable)
 - Same query executed twice → same results (idempotent)
 
@@ -24,10 +25,12 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - All rows have NULL in nullable column
 - Mix of NULL and non-NULL in same column
 - Column name with underscore, digit
-- Duplicate column names (SELECT a.id, b.id)
+- Duplicate column names (SELECT a.id, b.id → id, id_1)
 - Very long TEXT value (10KB+)
 - Empty string vs NULL in same result set
-- Unicode / emoji in text values (🎉, кириллица, 中文)
+- Unicode / emoji in text values (кириллица, 中文, 🎉)
+- ASCII control characters in text
+- Column named with SQL reserved word (type, select, from)
 
 ---
 
@@ -38,13 +41,13 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - Row with all field types populated
 
 ### Bad path
-- 0 rows → Err with clear message
-- 2+ rows → Err with clear message
-- Wrong column type in struct (query_as!) → compile error
+- 0 rows → Err with "exactly 1 row, got 0" message
+- 2+ rows → Err with "exactly 1 row, got N" message
+- Error message distinguishable from fetch_optional error
 
 ### Edge cases
-- fetch_one on a table with millions of rows + WHERE on PK (must use index, not scan)
 - fetch_one with NULL in every nullable column
+- fetch_one on table with millions of rows + WHERE on PK (index usage)
 
 ---
 
@@ -58,8 +61,8 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - 2+ rows → Err (not silently returns first)
 
 ### Edge cases
-- fetch_optional on empty table → None
-- fetch_optional with WHERE that sometimes matches, sometimes doesn't
+- Empty table → None
+- WHERE that sometimes matches, sometimes doesn't (data-dependent)
 
 ---
 
@@ -77,20 +80,20 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 ### Via different targets
 - execute via Pool
 - execute via Transaction
-- execute via PoolConnection (PG)
+- execute via PoolConnection
 
 ### Bad path
-- INSERT violating UNIQUE → Err
-- INSERT violating FK → Err
+- INSERT violating UNIQUE → Err + is_unique_violation()
+- INSERT violating FK → Err + is_foreign_key_violation()
 - INSERT violating NOT NULL → Err
 - INSERT violating CHECK constraint → Err
 - UPDATE with invalid value → Err
-- DELETE on nonexistent table → compile error
 
 ### Edge cases
-- execute on SELECT (what happens?)
-- INSERT with RETURNING (should use fetch_one, not execute)
+- execute on SELECT (returns 0 affected? or error?)
 - Batch INSERT of 100+ rows via loop
+- INSERT ... ON CONFLICT DO NOTHING → affected = 0
+- INSERT ... ON CONFLICT DO UPDATE → affected = 1
 
 ---
 
@@ -107,9 +110,10 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - Empty result → closure never called
 
 ### Edge cases
-- for_each on 10,000 rows (memory should stay constant)
+- for_each on 10,000+ rows (memory stays constant)
 - for_each with NULL values in borrowed fields
-- Nested for_each (query inside for_each closure)
+- Nested query inside for_each closure (acquires second connection)
+- for_each inside a transaction (deferred auto-flush before read)
 
 ---
 
@@ -122,13 +126,16 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - Fully consumed → connection returned to pool
 
 ### Bad path
-- Drop stream mid-iteration → connection discarded (not returned)
+- Drop stream mid-iteration → connection discarded (not returned to pool)
 - Server error mid-stream → Err on next()
+- Statement timeout fires during streaming after N chunks consumed
 
 ### Edge cases
 - Stream 0 rows → first next() returns None
 - Stream 1 row → one Some, then None
 - Stream 100,000 rows → constant memory
+- Drop after first advance() but before any next_row()
+- tokio task cancellation during streaming
 
 ---
 
@@ -140,23 +147,22 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - Struct with all common types (i32, String, bool, Option<T>)
 
 ### Bad path
-- Struct field type doesn't match column → compile error
+- Struct field type doesn't match column → clear compile error
+- Nullable column but struct field is non-Option → compile error with hint
 - Struct missing a field → compile error
 - Struct has extra field → compile error
-- Nullable column but struct field is non-Option → compile error (clear message)
 
 ### Edge cases
 - Struct with Option<String> for nullable column
 - Struct with renamed fields (AS alias in SQL)
+- Struct in different module (path resolution)
 
 ---
 
 ## 8. Parameters — Scalar Types
 
 ### Happy path
-- i32, i64, i16
-- f32, f64
-- bool
+- i16, i32, i64, f32, f64, bool
 - &str, String
 - u32 (OID)
 - &[u8], Vec<u8> (bytea)
@@ -167,14 +173,19 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - &str for int4 column → compile error
 
 ### Edge cases
-- i32::MAX, i32::MIN
-- i64::MAX, i64::MIN
-- f64::INFINITY, f64::NEG_INFINITY, f64::NAN
-- Empty string ""
+- i16::MIN, i16::MAX
+- i32::MIN, i32::MAX
+- i64::MIN, i64::MAX
+- f32::NAN, f32::INFINITY, f32::NEG_INFINITY
+- f64::NAN, f64::INFINITY, f64::NEG_INFINITY
+- Empty string "" (not NULL)
 - Very long string (100KB)
 - Empty bytea (zero bytes)
 - Large bytea (1MB)
+- NUL byte (\0) inside bytea
 - bool true and false explicitly
+- Same parameter used twice in SQL ($x in WHERE and SET)
+- Parameter in subquery context
 
 ---
 
@@ -186,9 +197,8 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - Vec<String> variable → &[String] param
 
 ### Edge cases
-- &String (double reference) → &str
-- Box<str> → &str (if Deref chain works)
-- Cow<str> → &str
+- &String (double reference)
+- Cow<str> if applicable
 
 ---
 
@@ -202,13 +212,10 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - Option<bool> = None / Some
 - Option<f64> = None / Some
 
-### Bad path
-- Option<i32> on NOT NULL column → should this work? (PG accepts, inserts NULL → constraint error at runtime)
-
 ### Edge cases
 - Option<String> = Some("".to_owned()) → empty string, not NULL
 - Repeated None/Some in same query
-- Option param used twice in same SQL ($x: Option<i32> in WHERE and SET)
+- Option param used twice in same SQL
 
 ---
 
@@ -220,15 +227,13 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - &[&str] in ANY()
 - Vec<i64>, Vec<bool>, Vec<f32>, Vec<f64>
 
-### Bad path
-- Wrong element type → compile error
-
 ### Edge cases
 - Empty array → 0 matches
 - Array with 1 element
 - Array with 1000 elements
 - Array with duplicate values
 - Array of empty strings
+- Array with NULL elements (Vec<Option<i32>>)
 
 ---
 
@@ -248,7 +253,7 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - JSON with unicode
 - JSON with very long string values
 - JSON null literal ("null") vs SQL NULL
-- JSONB operators in WHERE (->>, @>)
+- JSONB operators in WHERE (->>, @>, ?)
 
 ---
 
@@ -261,7 +266,6 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 
 ### Edge cases
 - unnest empty array → 0 rows
-- unnest with NULL elements in array
 
 ---
 
@@ -285,45 +289,40 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 
 ## 15. Nullability — NOT NULL inference for expressions
 
-### Happy path
-- COUNT(*) → i64
-- COUNT(column) → i64
-- ROW_NUMBER() OVER → i64
-- RANK(), DENSE_RANK(), NTILE() → not null
-- NOW(), CURRENT_TIMESTAMP → not null
-- COALESCE(nullable, literal) → not null
-- EXISTS(subquery) → bool
-- Literal values (42, 'text', true) → not null
-- CASE WHEN ... THEN literal ELSE literal END → not null
+### Happy path (must be NOT NULL)
+- COUNT(*), COUNT(column)
+- ROW_NUMBER(), RANK(), DENSE_RANK(), NTILE()
+- NOW(), CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_USER
+- COALESCE(nullable, literal)
+- EXISTS(subquery)
+- Literal values (42, 'text', true, false)
+- CASE WHEN ... THEN literal ELSE literal END
+- LENGTH(), LOWER(), UPPER(), TRIM(), CONCAT()
+- ABS(), CEIL(), FLOOR(), ROUND()
+- GEN_RANDOM_UUID()
+- TO_CHAR(), TO_TIMESTAMP()
 
 ### Correctly nullable (must stay Option)
-- SUM() → Option (empty group returns NULL)
-- AVG() → Option
-- MAX() → Option
-- MIN() → Option
-- COALESCE(nullable, nullable) → Option (no literal fallback)
-- LAG(), LEAD() → Option
-- Function with unknown nullability → Option
-
-### Edge cases
-- Nested COALESCE
-- CASE with mixed nullable/literal branches
-- Arithmetic on NOT NULL columns (a + b) → should be not null but currently nullable
-- String concatenation (a || b)
+- SUM(), AVG(), MAX(), MIN() on empty group
+- COALESCE(nullable, nullable) without literal
+- LAG(), LEAD()
+- Unknown/custom functions
+- Arithmetic on nullable columns
 
 ---
 
 ## 16. Nullability — Cast inference
 
 ### Happy path
-- column::text on NOT NULL column → String (not Option)
+- column::text on NOT NULL column → String
 - CAST(column AS integer) on NOT NULL column → i32
 
 ### Safety
-- column::text on nullable column → Option<String>
-- Ambiguous column name (two tables, same name) → stays Option
-- Schema-qualified name (public.col::text) → stays Option (not matched)
-- Complex expression cast (lower(name)::text) → not matched, stays Option
+- Cast on nullable column → Option
+- Ambiguous column name → stays Option
+- Schema-qualified name → not matched, stays Option
+- Complex expression cast → not matched, stays Option
+- Only whitelisted safe casts: text→jsonb/json/xml
 
 ---
 
@@ -356,14 +355,15 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 ### Joins
 - INNER JOIN
 - LEFT JOIN
-- RIGHT JOIN (PG)
+- RIGHT JOIN
 - CROSS JOIN
 - Multiple JOINs in one query
 - Self-join
 
 ### Subqueries & CTEs
 - Subquery in FROM
-- Subquery in WHERE (EXISTS, IN)
+- Subquery in WHERE (EXISTS)
+- Subquery in WHERE (IN)
 - CTE (WITH clause)
 - Multiple CTEs
 - Recursive CTE (PG)
@@ -393,16 +393,18 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - CASE WHEN in SELECT
 - String concatenation (||)
 - Arithmetic expressions in SELECT
+- SQL with comments (-- and /* */)
+- SQL with dollar-quoted strings ($$...$$)
 
 ### Dynamic queries (PG)
-- 1 optional clause (Some)
-- 1 optional clause (None)
-- 2 optional clauses (all combinations)
+- 1 optional clause (Some / None)
+- 2 optional clauses (all 4 combinations)
 - 3 optional clauses
 - Optional clause with ILIKE
 - Optional clause + base required params
 - Dynamic query via Transaction
 - Dynamic query via PoolConnection
+- Dynamic query + sort enum combined
 
 ---
 
@@ -411,44 +413,50 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 ### Lifecycle
 - Begin + commit → data persists
 - Begin + rollback → data discarded
-- Drop without commit → auto-rollback
+- Drop without commit → auto-rollback (no panic)
 - Begin + no operations + commit → noop
 - Begin + no operations + rollback → noop
+- New transaction after rollback → works normally
 
 ### Operations in transaction
 - execute → returns affected count
 - fetch_one inside tx
 - fetch_all inside tx
+- fetch_optional inside tx
 - Multiple operations in same tx
+- Read your own writes within tx
 
 ### Error recovery
 - Error inside tx → aborted state
 - Query after error → "current transaction is aborted"
 - Rollback after error → succeeds, connection usable
-- New transaction after rollback → works
+- Pool.close() while transaction active → connection discarded
 
 ### Isolation
 - Two concurrent transactions don't see each other's uncommitted data
-- Read your own writes within tx
+- Serializable isolation detects conflicts
 
 ### Savepoints (PG)
 - Savepoint + release
 - Savepoint + rollback_to
 - Nested savepoints (A inside B)
-- Rollback to inner savepoint preserves outer changes
+- Rollback to inner preserves outer changes
+- Invalid savepoint name rejected
 
 ### Deferred pipeline (PG)
 - Defer 1 operation + commit → flushed
-- Defer N operations + commit → all flushed
-- Defer + explicit flush → returns counts
+- Defer N operations + commit → all flushed in order
+- Defer + explicit flush → returns counts in order
 - Defer + rollback → discarded
 - Deferred count tracking
 - Auto-flush before read
+- Deferred pipeline with 10,000 operations
 
 ### Isolation levels (PG)
 - READ COMMITTED (default)
 - SERIALIZABLE
 - REPEATABLE READ
+- Set isolation after first query → Err
 
 ---
 
@@ -456,15 +464,15 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 
 - Invalid table name → error with "available tables" hint
 - Invalid column name → error
-- Type mismatch: &str for int4 → error
-- Type mismatch: i32 for int8 → error
-- Type mismatch: i32 for text → error
-- Type mismatch: bool for text → error
-- Type mismatch: i64 for int4 → error
-- Type mismatch: &str for int column → error
-- Parameter missing type (bare $name) → error
-- Parameter empty type ($name:) → error
-- Parameter conflicting types ($x: i32 used with $x: &str) → error
+- Type mismatch: &str for int4
+- Type mismatch: i32 for int8
+- Type mismatch: i32 for text
+- Type mismatch: bool for text
+- Type mismatch: i64 for int4
+- Type mismatch: &str for int column
+- Parameter missing type (bare $name)
+- Parameter empty type ($name:)
+- Parameter conflicting types ($x: i32 and $x: &str)
 - DDL: CREATE TABLE → rejected
 - DDL: DROP TABLE → rejected
 - DDL: ALTER TABLE → rejected
@@ -483,6 +491,7 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - Nested brackets in optional clause → error
 - Unclosed bracket in optional clause → error
 - Missing feature flag for time/uuid/decimal → error with hint
+- unnest(unknown) → error with cast suggestion
 
 ---
 
@@ -512,55 +521,76 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 ### Error API
 - QueryError constructable from user code (pub fields)
 - QueryError with source (pub source)
-- is_unique_violation() true/false
-- is_foreign_key_violation() true/false
-- pg_code() returns correct code
-- Display format includes message
+- is_unique_violation() true for 23505, false for others
+- is_foreign_key_violation() true for 23503, false for others
+- pg_code() returns correct code / None for non-PG errors
+- Display format includes message and pg_code
 - Debug format includes all fields
+- Error messages distinguish pool exhausted / pool closed / timeout
 
 ---
 
 ## 22. Pool & Connection
 
 ### Lifecycle
-- Pool::connect / SqlitePool::open → success
+- Pool connect / open → success
 - Pool with invalid URL → Err
 - Pool acquire → PoolConnection
 - PoolConnection query → works
 - PoolConnection drop → returned to pool
+- Pool close → all connections dropped
 
 ### Limits
 - max_size: acquire up to max → success
 - max_size: acquire beyond max → blocks/timeout
-- acquire_timeout: fires when pool exhausted
-- max_lifetime: old connections replaced
+- max_size=0 → all acquires fail immediately
+- max_size=1 + concurrent query and transaction → blocks correctly
+- acquire_timeout fires when pool exhausted
+- max_lifetime: old connections replaced with new
 - stale_timeout: idle connections evicted
-- min_idle: pool pre-warms connections
+- stale_timeout=0 → every connection evicted immediately
 
 ### Status
 - status.max_size correct
 - status.idle + status.active = status.open
-- status under concurrent load maintains invariants
+- Status under concurrent load maintains invariants
 
 ### Recovery
 - Backend killed → next query errors
 - Pool creates new connection after kill
 - Connection usable after statement timeout (outside tx)
+- Pool recovers after all connections killed
 
 ### Concurrency
-- 8 threads × 50 queries → no panic, no deadlock
+- 8+ threads × 50+ queries → no panic, no deadlock
 - Concurrent acquire/release cycles → pool stable
 - Pool close while connections checked out → graceful
+- Pool close then close again (double close) → idempotent
+- Pool close then status() → all zeros
 
 ### Configuration
 - Builder: all options at once
-- Builder: minimal options
+- Builder: minimal options (just URL)
 - URL parsing: host, port, user, password, database
 - URL parsing: sslmode=disable/prefer/require
 - URL parsing: statement_timeout
 - URL parsing: statement_cache=disabled (PG)
 - URL parsing: sslrootcert, sslcert, sslkey (PG)
 - URL parsing: host=/tmp (Unix socket, PG)
+- URL with percent-encoded characters
+- URL without password
+- URL without port (default 5432)
+
+### Statement cache (PG)
+- Cache hit → no Parse roundtrip
+- Cache miss → Parse+Describe+Bind
+- Cache eviction at max_stmt_cache_size
+- max_stmt_cache_size=0 → always re-prepare
+- Unnamed statements (pgbouncer mode) → cache empty after queries
+
+### Connection states
+- Connection returned in transaction state → discarded (not pooled)
+- Connection with streaming_active → new query errors or auto-closes
 
 ---
 
@@ -568,16 +598,19 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 
 ### LISTEN/NOTIFY
 - Listen on channel → receive notification
-- Multiple channels
-- Notification payload
-- Large payload
+- Multiple channels simultaneously
+- Notification with payload
+- Large payload (8000 bytes)
 - Listener drop → cleanup
+- Notification burst (1000+ rapid notifications)
+- unlisten then re-listen same channel
 
 ### Singleflight
 - Identical concurrent queries → single roundtrip
 - Different queries → separate roundtrips
-- Singleflight via PoolConnection → not coalesced
-- Singleflight via Transaction → not coalesced
+- Via PoolConnection → not coalesced
+- Via Transaction → not coalesced
+- Leader panics → followers get None
 
 ### Read/write split
 - SELECT → routes to replica (when configured)
@@ -589,24 +622,26 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 - COPY OUT (bulk export)
 - COPY IN empty → noop
 - COPY IN invalid data → error
+- COPY inside transaction
 
 ### pgbouncer compatibility
 - Unnamed statements (statement_cache=disabled)
 - Statement cache empty after queries
 - Same SQL twice without cache → both succeed
 - URL parsing statement_cache param
+- Warmup SQLs with pgbouncer mode → skipped or adapted
 
 ### TLS
-- Connect with sslmode=require
 - Custom CA certificate
 - Client certificate (mTLS)
-- Connect to non-TLS server with sslmode=prefer → fallback
+- sslmode=prefer → fallback to non-TLS
 
 ### Dynamic SQL
 - raw_query_params: SELECT with params → rows
-- raw_query_params: INSERT with params → affected
+- raw_query_params: INSERT with params
 - raw_query_params: invalid SQL → error
 - raw_query_params: no params → works
+- raw_query_params: NULL in results
 
 ---
 
@@ -614,16 +649,17 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 
 ### Isolation
 - In-memory DBs are isolated (separate pools)
-- WAL mode readers don't block writer
+- Two pools on same file → WAL handles concurrent access
+- Database file deleted during pool operation → error
 
 ### Transactions
 - BEGIN/COMMIT via simple_exec
 - BEGIN/ROLLBACK via simple_exec
-- Nested BEGIN (savepoints)
+- Busy timeout under concurrent write contention
 
 ### Schema
 - CREATE TABLE + INSERT + SELECT roundtrip
-- execute_batch (multiple statements)
+- execute_batch (multiple statements at once)
 
 ---
 
@@ -631,19 +667,21 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 
 ### migrate --check
 - Valid migration → all queries pass
-- Breaking migration → reports failed queries
+- Breaking migration → reports failed queries with SQL hash
 - Unreachable host → timeout error
 - No cache directory → error
 - Empty cache → nothing to check
+- Semicolon in cached SQL → rejected (tampering defense)
 
 ### check --verify-cache
 - Fresh cache → all pass
 - Stale cache (schema changed) → reports drift
-- Semicolon in cached SQL → rejected (tampering)
+- No database URL → error with env var hint
 
 ### bsql clean
 - Removes all .bitcode files
 - Empty directory → prints 0 removed
+- Does NOT remove non-.bitcode files
 - Non-existent directory → error
 
 ---
@@ -651,7 +689,7 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 ## 26. Macros
 
 ### #[bsql::pg_enum]
-- Derives correct FromSql/ToSql
+- Derives FromSql/ToSql
 - Label validation against pg_catalog
 - Display, Debug, Clone, Copy, PartialEq, Eq, Hash
 
@@ -670,19 +708,81 @@ Serves as test instruction for any backend (PG, SQLite, future MySQL).
 
 ## 27. Encoding / Decoding Edge Cases
 
-- UTF-8 text with multibyte characters (кириллица, 中文, 🎉)
+- UTF-8 multibyte characters round-trip (кириллица, 中文, 🎉)
 - ASCII control characters in text
-- NUL byte in bytea
-- Very large row (many columns)
-- Column with reserved SQL keyword name
-- Table with reserved SQL keyword name
-- Schema-qualified table name
-- Timestamp at epoch (1970-01-01)
+- NUL byte (\0) in bytea
+- Empty bytea (0 bytes, not NULL)
+- Very large row (50+ columns)
+- Column with SQL reserved keyword name
+- Timestamp at PG epoch (2000-01-01)
+- Timestamp at Unix epoch (1970-01-01)
 - Timestamp far in future (year 9999)
-- Date before epoch
-- Negative interval
-- Numeric with many decimal places
+- Date before Unix epoch
+- Numeric with many decimal places (0.000000001)
 - Numeric zero, negative zero
 - Array with NULL elements
-- Empty array
-- Nested arrays (PG multidimensional)
+- Empty array (not NULL)
+- f64 NaN round-trip
+- f64 Infinity round-trip
+- i32::MAX, i32::MIN boundary values
+- Option<Vec<u8>> Some(vec![]) vs None (empty bytea vs NULL)
+
+---
+
+## 28. Security
+
+- Savepoint name injection attempt → rejected by validation
+- COPY table/column name with special characters → properly quoted
+- LISTEN channel name with injection attempt → properly quoted
+- NOTIFY payload with quotes/backslashes → properly escaped
+- Password NOT in error messages
+- Password NOT in Debug output of Config/Pool
+- Cache tampering (semicolons in cached SQL) → rejected
+
+---
+
+## 29. Concurrency & Race Conditions
+
+- Two threads acquire() when 1 slot remains → one succeeds, one waits
+- Rapid acquire/release cycles → pool stable, no leak
+- Pool close races with in-progress acquire → no hang
+- Singleflight leader panics → followers get clean error
+- Listener notification burst exceeding buffer → no crash
+- Transaction commit concurrent with pool close → clean error
+- PoolGuard Drop on different thread than acquire → buffer returned to correct TL pool
+- Statement cache eviction during active streaming query → no crash
+- Connection returned while condvar wait times out → no lost wakeup
+
+---
+
+## 30. Resource Exhaustion
+
+- fetch_all on 1M rows → completes (may be slow, but no OOM on 8GB)
+- for_each on 1M rows → constant memory
+- copy_in with 10M rows → steady memory
+- Statement cache at max → eviction works, no unbounded growth
+- Thread-local buffer pools → capped, excess dropped
+- Deferred pipeline with 10,000 operations → flush works
+- Notification buffer full → logged, not crashed, resumes after drain
+
+---
+
+## 31. Partial Failures
+
+- Network drop after Parse sent but before Execute response → connection discarded
+- TCP RST mid-DataRow → no panic from bounds check
+- Server killed mid-streaming → error on next advance(), connection discarded
+- SQLite file becomes read-only mid-write → error
+- SQLite disk full during INSERT → error
+- Partial cache write (process killed) → next read detects corruption
+- TLS renegotiation failure mid-query → error
+
+---
+
+## 32. Backward Compatibility
+
+- Cache v1 file (no bsql_version) → readable with migration
+- Cache v2 file (no param_rust_types) → readable
+- Cache v3 file (no rewritten_sql) → readable
+- Cache v5 (future, unknown) → clear "upgrade bsql" error
+- URL param unknown value (sslmode=verify-full) → clear error
