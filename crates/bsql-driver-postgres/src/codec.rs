@@ -49,6 +49,17 @@ pub trait Encode {
     /// The PostgreSQL OID for this type.
     fn type_oid(&self) -> u32;
 
+    /// Static version of [`type_oid`] — available without an instance.
+    ///
+    /// Used by `Option<T>` to report the correct OID when the value is `None`.
+    /// The `Self: Sized` bound keeps `Encode` dyn-compatible.
+    fn pg_type_oid() -> u32
+    where
+        Self: Sized,
+    {
+        0
+    }
+
     /// Whether this value represents SQL NULL.
     ///
     /// When true, the wire protocol sends length -1 with no data bytes.
@@ -82,6 +93,10 @@ pub trait Encode {
 // --- Encode implementations ---
 
 impl Encode for bool {
+    fn pg_type_oid() -> u32 {
+        16
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.push(if *self { 1 } else { 0 });
@@ -103,6 +118,10 @@ impl Encode for bool {
 }
 
 impl Encode for i16 {
+    fn pg_type_oid() -> u32 {
+        21
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.to_be_bytes());
@@ -124,6 +143,10 @@ impl Encode for i16 {
 }
 
 impl Encode for i32 {
+    fn pg_type_oid() -> u32 {
+        23
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.to_be_bytes());
@@ -145,6 +168,10 @@ impl Encode for i32 {
 }
 
 impl Encode for i64 {
+    fn pg_type_oid() -> u32 {
+        20
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.to_be_bytes());
@@ -166,6 +193,10 @@ impl Encode for i64 {
 }
 
 impl Encode for f32 {
+    fn pg_type_oid() -> u32 {
+        700
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.to_be_bytes());
@@ -187,6 +218,10 @@ impl Encode for f32 {
 }
 
 impl Encode for f64 {
+    fn pg_type_oid() -> u32 {
+        701
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.to_be_bytes());
@@ -208,6 +243,10 @@ impl Encode for f64 {
 }
 
 impl Encode for &str {
+    fn pg_type_oid() -> u32 {
+        25
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(self.as_bytes());
@@ -230,6 +269,10 @@ impl Encode for &str {
 }
 
 impl Encode for String {
+    fn pg_type_oid() -> u32 {
+        25
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(self.as_bytes());
@@ -247,6 +290,10 @@ impl Encode for String {
 }
 
 impl Encode for &[u8] {
+    fn pg_type_oid() -> u32 {
+        17
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(self);
@@ -268,6 +315,10 @@ impl Encode for &[u8] {
 }
 
 impl Encode for Vec<u8> {
+    fn pg_type_oid() -> u32 {
+        17
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(self);
@@ -289,6 +340,10 @@ impl Encode for Vec<u8> {
 }
 
 impl Encode for u32 {
+    fn pg_type_oid() -> u32 {
+        26
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.to_be_bytes());
@@ -312,6 +367,10 @@ impl Encode for u32 {
 // --- Option<T> Encode — NULL parameter support ---
 
 impl<T: Encode> Encode for Option<T> {
+    fn pg_type_oid() -> u32 {
+        T::pg_type_oid()
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         if let Some(val) = self {
@@ -323,13 +382,9 @@ impl<T: Encode> Encode for Option<T> {
 
     #[inline]
     fn type_oid(&self) -> u32 {
-        // For NULL, we return 0 (unspecified). This is safe because the Parse
-        // message's param_oids array always gets explicit, concrete type OIDs
-        // from codegen — the Encode::type_oid for Option is only used in the
-        // fallback path and PG infers the type from context when it sees 0.
         match self {
             Some(val) => val.type_oid(),
-            None => 0,
+            None => T::pg_type_oid(),
         }
     }
 
@@ -343,6 +398,10 @@ impl<T: Encode> Encode for Option<T> {
 
 #[cfg(feature = "uuid")]
 impl Encode for uuid::Uuid {
+    fn pg_type_oid() -> u32 {
+        2950
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(self.as_bytes());
@@ -365,6 +424,10 @@ impl Encode for uuid::Uuid {
 
 #[cfg(feature = "time")]
 impl Encode for time::OffsetDateTime {
+    fn pg_type_oid() -> u32 {
+        1184
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
@@ -404,6 +467,10 @@ impl OffsetDateTimeExt for time::OffsetDateTime {
 
 #[cfg(feature = "time")]
 impl Encode for time::Date {
+    fn pg_type_oid() -> u32 {
+        1082
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.encode_pg_days().to_be_bytes());
@@ -441,6 +508,10 @@ impl DateExt for time::Date {
 
 #[cfg(feature = "time")]
 impl Encode for time::Time {
+    fn pg_type_oid() -> u32 {
+        1083
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
@@ -479,6 +550,10 @@ impl TimeExt for time::Time {
 
 #[cfg(feature = "time")]
 impl Encode for time::PrimitiveDateTime {
+    fn pg_type_oid() -> u32 {
+        1114
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
@@ -519,6 +594,10 @@ impl PrimitiveDateTimeExt for time::PrimitiveDateTime {
 
 #[cfg(feature = "chrono")]
 impl Encode for chrono::NaiveDateTime {
+    fn pg_type_oid() -> u32 {
+        1114
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
@@ -556,6 +635,10 @@ impl NaiveDateTimeExt for chrono::NaiveDateTime {
 
 #[cfg(feature = "chrono")]
 impl Encode for chrono::DateTime<chrono::Utc> {
+    fn pg_type_oid() -> u32 {
+        1184
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
@@ -593,6 +676,10 @@ impl ChronoDateTimeUtcExt for chrono::DateTime<chrono::Utc> {
 
 #[cfg(feature = "chrono")]
 impl Encode for chrono::NaiveDate {
+    fn pg_type_oid() -> u32 {
+        1082
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.encode_pg_days().to_be_bytes());
@@ -633,6 +720,10 @@ impl ChronoNaiveDateExt for chrono::NaiveDate {
 
 #[cfg(feature = "chrono")]
 impl Encode for chrono::NaiveTime {
+    fn pg_type_oid() -> u32 {
+        1083
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.encode_pg_micros().to_be_bytes());
@@ -672,6 +763,10 @@ impl ChronoNaiveTimeExt for chrono::NaiveTime {
 
 #[cfg(feature = "decimal")]
 impl Encode for rust_decimal::Decimal {
+    fn pg_type_oid() -> u32 {
+        1700
+    }
+
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         // PG NUMERIC binary format:
         //   i16 ndigits  — number of base-10000 digit groups
@@ -970,6 +1065,10 @@ impl Encode for [bool] {
 }
 
 impl Encode for &[bool] {
+    fn pg_type_oid() -> u32 {
+        1000
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -982,6 +1081,9 @@ impl Encode for &[bool] {
 }
 
 impl Encode for Vec<bool> {
+    fn pg_type_oid() -> u32 {
+        1000
+    }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         self.as_slice().encode_binary(buf);
@@ -1013,6 +1115,10 @@ impl Encode for [i16] {
 }
 
 impl Encode for &[i16] {
+    fn pg_type_oid() -> u32 {
+        1005
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1025,6 +1131,9 @@ impl Encode for &[i16] {
 }
 
 impl Encode for Vec<i16> {
+    fn pg_type_oid() -> u32 {
+        1005
+    }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         self.as_slice().encode_binary(buf);
@@ -1056,6 +1165,10 @@ impl Encode for [i32] {
 }
 
 impl Encode for &[i32] {
+    fn pg_type_oid() -> u32 {
+        1007
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1068,6 +1181,9 @@ impl Encode for &[i32] {
 }
 
 impl Encode for Vec<i32> {
+    fn pg_type_oid() -> u32 {
+        1007
+    }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         self.as_slice().encode_binary(buf);
@@ -1099,6 +1215,10 @@ impl Encode for [i64] {
 }
 
 impl Encode for &[i64] {
+    fn pg_type_oid() -> u32 {
+        1016
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1111,6 +1231,9 @@ impl Encode for &[i64] {
 }
 
 impl Encode for Vec<i64> {
+    fn pg_type_oid() -> u32 {
+        1016
+    }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         self.as_slice().encode_binary(buf);
@@ -1142,6 +1265,10 @@ impl Encode for [f32] {
 }
 
 impl Encode for &[f32] {
+    fn pg_type_oid() -> u32 {
+        1021
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1154,6 +1281,9 @@ impl Encode for &[f32] {
 }
 
 impl Encode for Vec<f32> {
+    fn pg_type_oid() -> u32 {
+        1021
+    }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         self.as_slice().encode_binary(buf);
@@ -1185,6 +1315,10 @@ impl Encode for [f64] {
 }
 
 impl Encode for &[f64] {
+    fn pg_type_oid() -> u32 {
+        1022
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1197,6 +1331,9 @@ impl Encode for &[f64] {
 }
 
 impl Encode for Vec<f64> {
+    fn pg_type_oid() -> u32 {
+        1022
+    }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         self.as_slice().encode_binary(buf);
@@ -1225,6 +1362,10 @@ impl Encode for [&str] {
 }
 
 impl Encode for &[&str] {
+    fn pg_type_oid() -> u32 {
+        1009
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1237,6 +1378,9 @@ impl Encode for &[&str] {
 }
 
 impl Encode for Vec<String> {
+    fn pg_type_oid() -> u32 {
+        1009
+    }
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         encode_array_header(buf, self.len(), 25);
         for val in self {
@@ -1269,6 +1413,10 @@ impl Encode for [String] {
 }
 
 impl Encode for &[String] {
+    fn pg_type_oid() -> u32 {
+        1009
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1296,6 +1444,10 @@ impl Encode for [&[u8]] {
 }
 
 impl Encode for &[&[u8]] {
+    fn pg_type_oid() -> u32 {
+        1001
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1323,6 +1475,10 @@ impl Encode for [Vec<u8>] {
 }
 
 impl Encode for &[Vec<u8>] {
+    fn pg_type_oid() -> u32 {
+        1001
+    }
+
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         (**self).encode_binary(buf);
@@ -1335,6 +1491,9 @@ impl Encode for &[Vec<u8>] {
 }
 
 impl Encode for Vec<Vec<u8>> {
+    fn pg_type_oid() -> u32 {
+        1001
+    }
     #[inline]
     fn encode_binary(&self, buf: &mut Vec<u8>) {
         self.as_slice().encode_binary(buf);
@@ -1911,7 +2070,7 @@ mod tests {
     fn option_none_is_null() {
         let val: Option<i32> = None;
         assert!(val.is_null());
-        assert_eq!(val.type_oid(), 0);
+        assert_eq!(val.type_oid(), 23); // reports i32 OID even for None
     }
 
     #[test]
@@ -2328,6 +2487,7 @@ mod tests {
     fn option_none_i32_is_null() {
         let val: Option<i32> = None;
         assert!(val.is_null());
+        assert_eq!(val.type_oid(), 23);
         let mut buf = Vec::new();
         val.encode_binary(&mut buf);
         assert!(buf.is_empty());
@@ -3075,7 +3235,7 @@ mod tests {
     fn option_bool_none_is_null() {
         let val: Option<bool> = None;
         assert!(val.is_null());
-        assert_eq!(val.type_oid(), 0);
+        assert_eq!(val.type_oid(), 16); // reports bool OID even for None
         let mut buf = Vec::new();
         val.encode_binary(&mut buf);
         assert!(buf.is_empty());
@@ -3095,6 +3255,7 @@ mod tests {
     fn option_i16_none_is_null() {
         let val: Option<i16> = None;
         assert!(val.is_null());
+        assert_eq!(val.type_oid(), 21);
         let mut buf = Vec::new();
         val.encode_binary(&mut buf);
         assert!(buf.is_empty());
@@ -3114,6 +3275,7 @@ mod tests {
     fn option_i64_none_is_null() {
         let val: Option<i64> = None;
         assert!(val.is_null());
+        assert_eq!(val.type_oid(), 20);
         let mut buf = Vec::new();
         val.encode_binary(&mut buf);
         assert!(buf.is_empty());
@@ -3133,6 +3295,7 @@ mod tests {
     fn option_f32_none_is_null() {
         let val: Option<f32> = None;
         assert!(val.is_null());
+        assert_eq!(val.type_oid(), 700);
         let mut buf = Vec::new();
         val.encode_binary(&mut buf);
         assert!(buf.is_empty());
@@ -3152,6 +3315,7 @@ mod tests {
     fn option_f64_none_is_null() {
         let val: Option<f64> = None;
         assert!(val.is_null());
+        assert_eq!(val.type_oid(), 701);
         let mut buf = Vec::new();
         val.encode_binary(&mut buf);
         assert!(buf.is_empty());
@@ -3171,6 +3335,7 @@ mod tests {
     fn option_string_none_is_null() {
         let val: Option<String> = None;
         assert!(val.is_null());
+        assert_eq!(val.type_oid(), 25);
         let mut buf = Vec::new();
         val.encode_binary(&mut buf);
         assert!(buf.is_empty());
@@ -3190,6 +3355,7 @@ mod tests {
     fn option_vec_u8_none_is_null() {
         let val: Option<Vec<u8>> = None;
         assert!(val.is_null());
+        assert_eq!(val.type_oid(), 17);
         let mut buf = Vec::new();
         val.encode_binary(&mut buf);
         assert!(buf.is_empty());
@@ -3390,5 +3556,128 @@ mod tests {
                 let _ = decode_str(&data);
             }
         }
+    }
+
+    // --- pg_type_oid: Option<T> reports correct OID for None ---
+
+    // --- pg_type_oid: Option<T> reports correct OID for None — every type ---
+
+    #[test]
+    fn option_none_type_oid_scalars() {
+        // Every scalar type: None must report the same OID as Some
+        assert_eq!(None::<bool>.type_oid(), 16);
+        assert_eq!(None::<i16>.type_oid(), 21);
+        assert_eq!(None::<i32>.type_oid(), 23);
+        assert_eq!(None::<i64>.type_oid(), 20);
+        assert_eq!(None::<f32>.type_oid(), 700);
+        assert_eq!(None::<f64>.type_oid(), 701);
+        assert_eq!(None::<String>.type_oid(), 25);
+        assert_eq!(None::<Vec<u8>>.type_oid(), 17);
+        assert_eq!(None::<u32>.type_oid(), 26);
+
+        // Some must also match
+        assert_eq!(Some(true).type_oid(), 16);
+        assert_eq!(Some(0i16).type_oid(), 21);
+        assert_eq!(Some(0i32).type_oid(), 23);
+        assert_eq!(Some(0i64).type_oid(), 20);
+        assert_eq!(Some(0f32).type_oid(), 700);
+        assert_eq!(Some(0f64).type_oid(), 701);
+        assert_eq!(Some(String::new()).type_oid(), 25);
+        assert_eq!(Some(Vec::<u8>::new()).type_oid(), 17);
+        assert_eq!(Some(0u32).type_oid(), 26);
+    }
+
+    #[test]
+    fn option_none_type_oid_arrays() {
+        assert_eq!(None::<Vec<bool>>.type_oid(), 1000);
+        assert_eq!(None::<Vec<i16>>.type_oid(), 1005);
+        assert_eq!(None::<Vec<i32>>.type_oid(), 1007);
+        assert_eq!(None::<Vec<i64>>.type_oid(), 1016);
+        assert_eq!(None::<Vec<f32>>.type_oid(), 1021);
+        assert_eq!(None::<Vec<f64>>.type_oid(), 1022);
+        assert_eq!(None::<Vec<String>>.type_oid(), 1009);
+        assert_eq!(None::<Vec<Vec<u8>>>.type_oid(), 1001);
+    }
+
+    #[test]
+    fn option_none_type_oid_nested_option() {
+        // Option<Option<T>> — the inner Option's pg_type_oid forwards to T
+        assert_eq!(None::<Option<i32>>.type_oid(), 23);
+        assert_eq!(Some(None::<i32>).type_oid(), 23);
+        assert_eq!(Some(Some(42i32)).type_oid(), 23);
+    }
+
+    #[cfg(feature = "uuid")]
+    #[test]
+    fn option_none_type_oid_uuid() {
+        assert_eq!(None::<uuid::Uuid>.type_oid(), 2950);
+    }
+
+    #[cfg(feature = "time")]
+    #[test]
+    fn option_none_type_oid_time() {
+        assert_eq!(None::<time::OffsetDateTime>.type_oid(), 1184);
+        assert_eq!(None::<time::Date>.type_oid(), 1082);
+        assert_eq!(None::<time::Time>.type_oid(), 1083);
+        assert_eq!(None::<time::PrimitiveDateTime>.type_oid(), 1114);
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn option_none_type_oid_chrono() {
+        assert_eq!(None::<chrono::NaiveDateTime>.type_oid(), 1114);
+        assert_eq!(None::<chrono::DateTime<chrono::Utc>>.type_oid(), 1184);
+        assert_eq!(None::<chrono::NaiveDate>.type_oid(), 1082);
+        assert_eq!(None::<chrono::NaiveTime>.type_oid(), 1083);
+    }
+
+    #[cfg(feature = "decimal")]
+    #[test]
+    fn option_none_type_oid_decimal() {
+        assert_eq!(None::<rust_decimal::Decimal>.type_oid(), 1700);
+    }
+
+    #[test]
+    fn pg_type_oid_static_all_types() {
+        // Scalars
+        assert_eq!(bool::pg_type_oid(), 16);
+        assert_eq!(i16::pg_type_oid(), 21);
+        assert_eq!(i32::pg_type_oid(), 23);
+        assert_eq!(i64::pg_type_oid(), 20);
+        assert_eq!(f32::pg_type_oid(), 700);
+        assert_eq!(f64::pg_type_oid(), 701);
+        assert_eq!(<&str>::pg_type_oid(), 25);
+        assert_eq!(String::pg_type_oid(), 25);
+        assert_eq!(<&[u8]>::pg_type_oid(), 17);
+        assert_eq!(Vec::<u8>::pg_type_oid(), 17);
+        assert_eq!(u32::pg_type_oid(), 26);
+
+        // Option forwards to inner
+        assert_eq!(<Option<i32>>::pg_type_oid(), 23);
+        assert_eq!(<Option<String>>::pg_type_oid(), 25);
+        assert_eq!(<Option<bool>>::pg_type_oid(), 16);
+        assert_eq!(<Option<i64>>::pg_type_oid(), 20);
+        assert_eq!(<Option<f64>>::pg_type_oid(), 701);
+        assert_eq!(<Option<Vec<u8>>>::pg_type_oid(), 17);
+
+        // Arrays
+        assert_eq!(<&[bool]>::pg_type_oid(), 1000);
+        assert_eq!(Vec::<bool>::pg_type_oid(), 1000);
+        assert_eq!(<&[i16]>::pg_type_oid(), 1005);
+        assert_eq!(Vec::<i16>::pg_type_oid(), 1005);
+        assert_eq!(<&[i32]>::pg_type_oid(), 1007);
+        assert_eq!(Vec::<i32>::pg_type_oid(), 1007);
+        assert_eq!(<&[i64]>::pg_type_oid(), 1016);
+        assert_eq!(Vec::<i64>::pg_type_oid(), 1016);
+        assert_eq!(<&[f32]>::pg_type_oid(), 1021);
+        assert_eq!(Vec::<f32>::pg_type_oid(), 1021);
+        assert_eq!(<&[f64]>::pg_type_oid(), 1022);
+        assert_eq!(Vec::<f64>::pg_type_oid(), 1022);
+        assert_eq!(<&[&str]>::pg_type_oid(), 1009);
+        assert_eq!(Vec::<String>::pg_type_oid(), 1009);
+        assert_eq!(<&[String]>::pg_type_oid(), 1009);
+        assert_eq!(<&[&[u8]]>::pg_type_oid(), 1001);
+        assert_eq!(<&[Vec<u8>]>::pg_type_oid(), 1001);
+        assert_eq!(Vec::<Vec<u8>>::pg_type_oid(), 1001);
     }
 }

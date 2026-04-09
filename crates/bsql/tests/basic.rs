@@ -2329,3 +2329,36 @@ async fn stress_for_each_10k_rows() {
         .await
         .unwrap();
 }
+
+// --- Option<T> type_oid for None (keyset pagination pattern) ---
+
+#[tokio::test]
+async fn option_param_is_null_or_pattern() {
+    let pool = pool().await;
+
+    // First page: seek_id is None → "$1 IS NULL" is true → returns all rows
+    let seek_id: Option<i32> = None;
+    let rows = bsql::query!(
+        "SELECT id, login FROM users WHERE $seek_id: Option<i32> IS NULL OR id > $seek_id: Option<i32> ORDER BY id LIMIT 2"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!rows.is_empty(), "should return rows when seek_id is None");
+    let first_page_last = rows.last().unwrap().id;
+
+    // Second page: seek_id is Some → "$1 IS NULL" is false → filters by id > seek_id
+    let seek_id: Option<i32> = Some(first_page_last);
+    let rows2 = bsql::query!(
+        "SELECT id, login FROM users WHERE $seek_id: Option<i32> IS NULL OR id > $seek_id: Option<i32> ORDER BY id LIMIT 2"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for row in &rows2 {
+        assert!(
+            row.id > first_page_last,
+            "second page ids must be > seek_id"
+        );
+    }
+}
