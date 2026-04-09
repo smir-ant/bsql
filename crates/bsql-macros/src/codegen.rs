@@ -12,6 +12,17 @@ use quote::{format_ident, quote};
 use crate::parse::ParsedQuery;
 use crate::validate::ValidationResult;
 
+/// Return the effective SQL for code generation.
+///
+/// If the two-phase PREPARE mechanism rewrote the SQL (e.g. added `::jsonb`
+/// casts), use the rewritten version. Otherwise use `parsed.positional_sql`.
+fn effective_sql<'a>(parsed: &'a ParsedQuery, validation: &'a ValidationResult) -> &'a str {
+    validation
+        .rewritten_sql
+        .as_deref()
+        .unwrap_or(&parsed.positional_sql)
+}
+
 /// Generate the complete Rust code for a `query!` invocation.
 pub fn generate_query_code(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     // Static queries (no optional clauses): original codegen path
@@ -129,7 +140,8 @@ pub fn generate_sort_query_code(
         quote! { query_raw }
     };
 
-    let sql_template = &parsed.positional_sql;
+    let eff_sql_sort = effective_sql(parsed, validation);
+    let sql_template = eff_sql_sort;
     let has_columns = !validation.columns.is_empty();
 
     // Split the SQL template at {SORT} to enable zero-allocation concatenation.
@@ -433,7 +445,8 @@ fn gen_query_as_executor_impls(
     target_type: &syn::Path,
 ) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
-    let sql_lit = &parsed.positional_sql;
+    let eff_sql = effective_sql(parsed, validation);
+    let sql_lit = eff_sql;
 
     let is_select = parsed.kind == crate::parse::QueryKind::Select;
     let query_method = if is_select {
@@ -458,7 +471,7 @@ fn gen_query_as_executor_impls(
         quote! { &[#(#param_refs),*] }
     };
 
-    let sql_hash_val = bsql_core::rapid_hash_str(&parsed.positional_sql);
+    let sql_hash_val = bsql_core::rapid_hash_str(eff_sql);
 
     let has_columns = !validation.columns.is_empty();
 
@@ -468,9 +481,9 @@ fn gen_query_as_executor_impls(
         && !parsed.normalized_sql.contains(" limit ")
         && !parsed.normalized_sql.contains(" for ");
     let limited_sql = if needs_limit {
-        format!("{} LIMIT 2", parsed.positional_sql)
+        format!("{} LIMIT 2", eff_sql)
     } else {
-        parsed.positional_sql.clone()
+        eff_sql.to_owned()
     };
     let limited_sql_lit = &limited_sql;
     let limited_sql_hash_val = bsql_core::rapid_hash_str(&limited_sql);
@@ -643,7 +656,8 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 /// Generate `fetch_one`, `fetch_all`, `fetch_optional`, `execute` methods.
 fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
-    let sql_lit = &parsed.positional_sql;
+    let eff_sql = effective_sql(parsed, validation);
+    let sql_lit = eff_sql;
 
     // SELECT -> query_raw_readonly (replica-aware), writes -> query_raw (primary)
     let is_select = parsed.kind == crate::parse::QueryKind::Select;
@@ -670,7 +684,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     };
 
     // Compute sql_hash at compile time
-    let sql_hash_val = bsql_core::rapid_hash_str(&parsed.positional_sql);
+    let sql_hash_val = bsql_core::rapid_hash_str(eff_sql);
 
     let has_columns = !validation.columns.is_empty();
 
@@ -680,9 +694,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         && !parsed.normalized_sql.contains(" limit ")
         && !parsed.normalized_sql.contains(" for ");
     let limited_sql = if needs_limit {
-        format!("{} LIMIT 2", parsed.positional_sql)
+        format!("{} LIMIT 2", eff_sql)
     } else {
-        parsed.positional_sql.clone()
+        eff_sql.to_owned()
     };
     let limited_sql_lit = &limited_sql;
     let limited_sql_hash_val = bsql_core::rapid_hash_str(&limited_sql);
@@ -2740,6 +2754,7 @@ mod tests {
             columns,
             param_pg_oids: smallvec::smallvec![],
             param_is_pg_enum: smallvec::smallvec![],
+            rewritten_sql: None,
             #[cfg(feature = "explain")]
             explain_plan: None,
         }

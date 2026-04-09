@@ -44,6 +44,7 @@ SQL
 | [pg_listener.rs](pg_listener.rs) | Real-time LISTEN/NOTIFY with `listener.recv()` |
 | [pg_query_as.rs](pg_query_as.rs) | `query_as!` — map results to your own structs with compile-time safety |
 | [pg_sort_enum.rs](pg_sort_enum.rs) | Sort enums — type-safe ORDER BY with `#[bsql::sort]` |
+| [pg_jsonb.rs](pg_jsonb.rs) | JSONB columns + array unnest — transparent type handling, no wrappers |
 | [pg_testing.rs](pg_testing.rs) | `#[bsql::test]` — schema-isolated tests with fixtures |
 | [pg_n_plus_one.rs](pg_n_plus_one.rs) | Automatic N+1 query detection with `detect-n-plus-one` feature |
 | [pg_singleflight.rs](pg_singleflight.rs) | Singleflight — deduplicate identical concurrent queries |

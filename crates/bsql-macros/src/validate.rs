@@ -37,6 +37,10 @@ pub struct ValidationResult {
     /// When true, `&str`/`String` params are accepted in addition to
     /// any `#[bsql::pg_enum]`-annotated Rust enum.
     pub param_is_pg_enum: SmallVec<[bool; 8]>,
+    /// Rewritten SQL if casts were added during two-phase PREPARE.
+    /// `Some(sql)` when the SQL was rewritten (e.g. `$1` -> `$1::jsonb`).
+    /// `None` when the original SQL was used unchanged.
+    pub rewritten_sql: Option<String>,
     /// EXPLAIN plan summary (only populated when `explain` feature is enabled).
     #[cfg(feature = "explain")]
     pub explain_plan: Option<String>,
@@ -44,18 +48,60 @@ pub struct ValidationResult {
 
 /// Validate a parsed query against a live PostgreSQL instance.
 ///
-/// Uses `conn.prepare_describe()` which:
-/// 1. Validates SQL syntax
-/// 2. Validates table/column existence
-/// 3. Returns column metadata and parameter types
+/// Uses a two-phase PREPARE mechanism:
+///
+/// **Phase 1**: PREPARE with Rust-type OIDs. This resolves overloaded functions
+/// like `unnest($1)` where PG needs to know the parameter type to pick the
+/// right function overload.
+///
+/// **Phase 2** (on Phase 1 failure): Retry with empty OIDs (PG infers from
+/// context). Then check for OID mismatches (e.g. text→jsonb) and rewrite
+/// the SQL with explicit casts (`$1::jsonb`). Re-PREPARE to validate.
 pub fn validate_query(
     parsed: &ParsedQuery,
     conn: &mut Connection,
 ) -> Result<ValidationResult, String> {
-    // Prepare the query — this validates syntax, tables, columns, types.
-    let result = conn
-        .prepare_describe(&parsed.positional_sql)
-        .map_err(|e| format_driver_error(&e, parsed))?;
+    // Build Rust-type OIDs for Phase 1
+    let rust_oids: Vec<u32> = parsed
+        .params
+        .iter()
+        .map(|p| bsql_core::types::default_pg_oid_for_rust_type(&p.rust_type))
+        .collect();
+
+    // Phase 1: PREPARE with Rust-type OIDs (resolves unnest, most queries)
+    let (result, rewritten_sql) =
+        match conn.prepare_describe_with_oids(&parsed.positional_sql, &rust_oids) {
+            Ok(mut r) => {
+                // PG returns the OIDs we sent, not the column types.
+                // Try an empty-OID PREPARE to get PG's true inferred types
+                // for accurate param compatibility checking. If it fails
+                // (e.g. unnest), keep the Phase 1 OIDs — they're what PG accepted.
+                if let Ok(inferred) = conn.prepare_describe(&parsed.positional_sql) {
+                    r.param_oids = inferred.param_oids;
+                }
+                (r, None)
+            }
+            Err(_phase1_err) => {
+                // Phase 2: Retry with empty OIDs (PG infers from context)
+                let result = conn
+                    .prepare_describe(&parsed.positional_sql)
+                    .map_err(|e| format_driver_error(&e, parsed))?;
+
+                // Check for OID mismatches and rewrite SQL with casts
+                let rewritten =
+                    rewrite_sql_with_casts(&parsed.positional_sql, &rust_oids, &result.param_oids);
+
+                if rewritten != parsed.positional_sql {
+                    // Re-PREPARE with the rewritten SQL to validate it
+                    let result2 = conn
+                        .prepare_describe_with_oids(&rewritten, &rust_oids)
+                        .map_err(|e| format_driver_error(&e, parsed))?;
+                    (result2, Some(rewritten))
+                } else {
+                    (result, None)
+                }
+            }
+        };
 
     // Extract parameter type OIDs
     let param_pg_oids: SmallVec<[u32; 8]> = result.param_oids.iter().copied().collect();
@@ -63,15 +109,112 @@ pub fn validate_query(
     // Detect PG enums by querying pg_type.typtype for each parameter OID.
     let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids);
 
-    let columns = build_columns(conn, &result.columns, &parsed.positional_sql)?;
+    let final_sql = rewritten_sql.as_deref().unwrap_or(&parsed.positional_sql);
+    let columns = build_columns(conn, &result.columns, final_sql)?;
 
     Ok(ValidationResult {
         columns,
         param_pg_oids,
         param_is_pg_enum,
+        rewritten_sql,
         #[cfg(feature = "explain")]
         explain_plan: fetch_explain_plan(conn, parsed),
     })
+}
+
+/// For each parameter where the Rust-type OID differs from PG-inferred OID,
+/// add an explicit cast `$N::typename` in the SQL.
+///
+/// Careful to:
+/// - Not match `$1` inside `$10`, `$11`, etc. (word-boundary aware)
+/// - Not double-cast already-cast params (`$1::jsonb` stays as-is)
+/// - Process in reverse order so positions don't shift
+fn rewrite_sql_with_casts(sql: &str, rust_oids: &[u32], pg_oids: &[u32]) -> String {
+    let mut result = sql.to_owned();
+    // Process in reverse order so earlier replacements don't shift later positions
+    for i in (0..rust_oids.len().min(pg_oids.len())).rev() {
+        if rust_oids[i] != 0 && pg_oids[i] != 0 && rust_oids[i] != pg_oids[i] {
+            // SAFETY: only auto-cast for known-safe conversions.
+            // text → jsonb/json/xml is safe (the content is text-representable).
+            // All other mismatches should remain compile errors.
+            if !is_safe_auto_cast(rust_oids[i], pg_oids[i]) {
+                continue;
+            }
+            let pg_name = bsql_core::types::pg_name_for_oid(pg_oids[i]);
+            if let Some(name) = pg_name {
+                let param = format!("${}", i + 1);
+                let cast = format!("${}::{}", i + 1, name);
+                result = replace_param_with_cast(&result, &param, &cast);
+            }
+        }
+    }
+    result
+}
+
+/// Returns true if auto-casting from `from_oid` to `to_oid` is safe.
+///
+/// Only whitelisted conversions are allowed. Everything else must remain
+/// a compile error so the user fixes their type declaration.
+fn is_safe_auto_cast(from_oid: u32, to_oid: u32) -> bool {
+    matches!(
+        (from_oid, to_oid),
+        // text/varchar → jsonb: JSON is text-representable
+        (25, 3802) | (1043, 3802) |
+        // text/varchar → json: same
+        (25, 114) | (1043, 114) |
+        // text/varchar → xml
+        (25, 142) | (1043, 142)
+    )
+}
+
+/// Replace `$N` with `$N::type` in SQL, respecting word boundaries.
+///
+/// Only replaces `$N` when it is NOT followed by another digit (to avoid
+/// `$1` matching inside `$10`) and NOT already followed by `::`.
+fn replace_param_with_cast(sql: &str, param: &str, cast: &str) -> String {
+    let mut result = String::with_capacity(sql.len() + 16);
+    let bytes = sql.as_bytes();
+    let param_bytes = param.as_bytes();
+    let param_len = param_bytes.len();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if i + param_len <= bytes.len() && &bytes[i..i + param_len] == param_bytes {
+            // Check what follows: must NOT be a digit (avoid $1 matching $10)
+            let after = if i + param_len < bytes.len() {
+                bytes[i + param_len]
+            } else {
+                b' ' // end of string — safe to replace
+            };
+
+            if after.is_ascii_digit() {
+                // This is part of a longer parameter like $10, $11 — skip
+                result.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+
+            // Check if already cast (followed by `::`)
+            if i + param_len + 1 < bytes.len()
+                && bytes[i + param_len] == b':'
+                && bytes[i + param_len + 1] == b':'
+            {
+                // Already cast — don't double-cast
+                result.push_str(param);
+                i += param_len;
+                continue;
+            }
+
+            // Safe to replace
+            result.push_str(cast);
+            i += param_len;
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+
+    result
 }
 
 /// Resolve column metadata (name, type, nullability) from a prepared statement.
@@ -817,6 +960,7 @@ fn validate_variant(
         columns,
         param_pg_oids,
         param_is_pg_enum,
+        rewritten_sql: None,
         #[cfg(feature = "explain")]
         explain_plan: None,
     })
@@ -1924,5 +2068,134 @@ mod tests {
     fn has_outer_join_case_insensitive() {
         assert!(has_outer_join("select * from a left join b on true"));
         assert!(has_outer_join("SELECT * FROM a LEFT JOIN b ON TRUE"));
+    }
+
+    // --- rewrite_sql_with_casts ---
+
+    #[test]
+    fn rewrite_sql_with_casts_jsonb() {
+        // text OID (25) from Rust &str, but PG expects jsonb (3802) → add ::jsonb
+        let sql = "INSERT INTO t (data) VALUES ($1)";
+        let rust_oids = [25]; // text
+        let pg_oids = [3802]; // jsonb
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, "INSERT INTO t (data) VALUES ($1::jsonb)");
+    }
+
+    #[test]
+    fn rewrite_sql_with_casts_no_change() {
+        // Matching OIDs → no rewrite
+        let sql = "SELECT * FROM t WHERE id = $1";
+        let rust_oids = [23]; // int4
+        let pg_oids = [23]; // int4
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, sql);
+    }
+
+    #[test]
+    fn rewrite_sql_with_casts_multiple() {
+        // Only param 2 (0-indexed 1) has a mismatch
+        let sql = "INSERT INTO t (id, data) VALUES ($1, $2)";
+        let rust_oids = [23, 25]; // int4, text
+        let pg_oids = [23, 3802]; // int4, jsonb
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, "INSERT INTO t (id, data) VALUES ($1, $2::jsonb)");
+    }
+
+    #[test]
+    fn rewrite_sql_with_casts_already_cast() {
+        // $1 already has a cast → don't double-cast
+        let sql = "INSERT INTO t (data) VALUES ($1::jsonb)";
+        let rust_oids = [25]; // text
+        let pg_oids = [3802]; // jsonb
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, sql, "should not double-cast");
+    }
+
+    #[test]
+    fn rewrite_sql_does_not_match_longer_param() {
+        // $1 must not match inside $10
+        let sql = "SELECT * FROM t WHERE a = $1 AND b = $10";
+        let rust_oids = [25]; // text (only 1 param in rust_oids)
+        let pg_oids = [3802]; // jsonb
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        // $1 should be cast, $10 should remain untouched
+        assert_eq!(result, "SELECT * FROM t WHERE a = $1::jsonb AND b = $10");
+    }
+
+    #[test]
+    fn rewrite_sql_param_at_end_of_string() {
+        let sql = "INSERT INTO t (data) VALUES ($1)";
+        let rust_oids = [25];
+        let pg_oids = [3802];
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, "INSERT INTO t (data) VALUES ($1::jsonb)");
+    }
+
+    #[test]
+    fn rewrite_sql_unknown_rust_oid_skipped() {
+        // rust_oid = 0 → unknown, skip
+        let sql = "SELECT * FROM t WHERE data = $1";
+        let rust_oids = [0]; // unknown
+        let pg_oids = [3802]; // jsonb
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, sql, "unknown rust OID should not trigger rewrite");
+    }
+
+    #[test]
+    fn rewrite_sql_unknown_pg_oid_skipped() {
+        // pg_oid = 0 → PG couldn't infer, skip
+        let sql = "SELECT * FROM t WHERE data = $1";
+        let rust_oids = [25]; // text
+        let pg_oids = [0]; // unknown
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, sql, "unknown PG OID should not trigger rewrite");
+    }
+
+    #[test]
+    fn rewrite_sql_empty_params() {
+        let sql = "SELECT 1";
+        let rust_oids: [u32; 0] = [];
+        let pg_oids: [u32; 0] = [];
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, sql);
+    }
+
+    // --- replace_param_with_cast ---
+
+    #[test]
+    fn replace_param_basic() {
+        let result = replace_param_with_cast("VALUES ($1)", "$1", "$1::jsonb");
+        assert_eq!(result, "VALUES ($1::jsonb)");
+    }
+
+    #[test]
+    fn replace_param_does_not_match_longer() {
+        let result = replace_param_with_cast("$1 $10 $11", "$1", "$1::jsonb");
+        assert_eq!(result, "$1::jsonb $10 $11");
+    }
+
+    #[test]
+    fn replace_param_already_cast() {
+        let result = replace_param_with_cast("$1::text", "$1", "$1::jsonb");
+        assert_eq!(result, "$1::text", "already cast should not be replaced");
+    }
+
+    #[test]
+    fn replace_param_multiple_occurrences() {
+        let result = replace_param_with_cast("$1 AND $1", "$1", "$1::jsonb");
+        assert_eq!(result, "$1::jsonb AND $1::jsonb");
+    }
+
+    #[test]
+    fn replace_param_at_end_of_string() {
+        let result = replace_param_with_cast("WHERE x = $1", "$1", "$1::jsonb");
+        assert_eq!(result, "WHERE x = $1::jsonb");
+    }
+
+    #[test]
+    fn replace_param_no_match() {
+        let result = replace_param_with_cast("WHERE x = $2", "$1", "$1::jsonb");
+        assert_eq!(result, "WHERE x = $2");
     }
 }

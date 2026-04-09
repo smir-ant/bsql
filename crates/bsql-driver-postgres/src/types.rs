@@ -88,6 +88,29 @@ impl Config {
     ///
     /// Format: `postgres://user:password@host:port/database?sslmode=prefer`
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bsql_driver_postgres::Config;
+    ///
+    /// let config = Config::from_url("postgres://alice:secret@db.example.com:5432/myapp").unwrap();
+    /// assert_eq!(config.user, "alice");
+    /// assert_eq!(config.host, "db.example.com");
+    /// assert_eq!(config.port, 5432);
+    /// assert_eq!(config.database, "myapp");
+    /// ```
+    ///
+    /// pgbouncer-compatible connection:
+    ///
+    /// ```
+    /// use bsql_driver_postgres::{Config, StatementCacheMode};
+    ///
+    /// let config = Config::from_url(
+    ///     "postgres://user:pass@pgbouncer:6432/mydb?statement_cache=disabled"
+    /// ).unwrap();
+    /// assert_eq!(config.statement_cache_mode, StatementCacheMode::Disabled);
+    /// ```
+    ///
     /// # Unix domain sockets
     ///
     /// Use the `host` query parameter to specify a UDS directory (libpq convention):
@@ -737,6 +760,15 @@ impl<'a> PgDataRow<'a> {
 /// Compute a rapidhash of a SQL string.
 ///
 /// Uses `str::hash()` via the `Hash` trait, matching `bsql_core::rapid_hash_str`.
+///
+/// ```
+/// let hash = bsql_driver_postgres::hash_sql("SELECT 1");
+/// assert_ne!(hash, 0);
+/// // Same SQL always produces the same hash
+/// assert_eq!(hash, bsql_driver_postgres::hash_sql("SELECT 1"));
+/// // Different SQL produces different hash
+/// assert_ne!(hash, bsql_driver_postgres::hash_sql("SELECT 2"));
+/// ```
 pub fn hash_sql(sql: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = RapidHasher::default();

@@ -62,6 +62,10 @@ name = "pg_n_plus_one"
 path = "pg_n_plus_one.rs"
 
 [[bin]]
+name = "pg_jsonb"
+path = "pg_jsonb.rs"
+
+[[bin]]
 name = "pg_sort_enum"
 path = "pg_sort_enum.rs"
 

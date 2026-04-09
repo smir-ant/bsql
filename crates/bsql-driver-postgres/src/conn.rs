@@ -2626,10 +2626,20 @@ impl Connection {
     /// Returns column and parameter metadata. Uses the unnamed statement `""`
     /// so there is no cache pollution.
     pub fn prepare_describe(&mut self, sql: &str) -> Result<PrepareResult, DriverError> {
+        self.prepare_describe_with_oids(sql, &[])
+    }
+
+    /// Like `prepare_describe` but sends explicit parameter OIDs in the Parse
+    /// message. PG uses these to resolve overloaded functions (e.g. `unnest`).
+    pub fn prepare_describe_with_oids(
+        &mut self,
+        sql: &str,
+        param_oids: &[u32],
+    ) -> Result<PrepareResult, DriverError> {
         self.write_buf.clear();
         // Use unnamed statement "" — PG replaces it on every Parse,
         // so there is no cache pollution.
-        proto::write_parse(&mut self.write_buf, b"", sql, &[]);
+        proto::write_parse(&mut self.write_buf, b"", sql, param_oids);
         proto::write_describe(&mut self.write_buf, b'S', b"");
         proto::write_sync(&mut self.write_buf);
         self.flush_write()?;

@@ -332,6 +332,37 @@ pub fn pg_name_for_oid(oid: u32) -> Option<&'static str> {
         .map(|m| m.pg_name)
 }
 
+/// Map a Rust type string to the default PostgreSQL OID for that type.
+///
+/// Returns the OID that a Rust type would naturally correspond to in PG.
+/// Returns 0 for unknown types (let PG infer from context).
+///
+/// Used by the two-phase PREPARE mechanism: Phase 1 sends these OIDs so PG
+/// can resolve overloaded functions like `unnest`.
+pub fn default_pg_oid_for_rust_type(rust_type: &str) -> u32 {
+    match rust_type {
+        "bool" => 16,
+        "i16" => 21,
+        "i32" => 23,
+        "i64" => 20,
+        "f32" => 700,
+        "f64" => 701,
+        "&str" | "String" => 25,
+        "u32" => 26,
+        "&[u8]" | "Vec<u8>" => 17,
+        // Arrays
+        "&[bool]" | "Vec<bool>" => 1000,
+        "&[i16]" | "Vec<i16>" => 1005,
+        "&[i32]" | "Vec<i32>" => 1007,
+        "&[i64]" | "Vec<i64>" => 1016,
+        "&[f32]" | "Vec<f32>" => 1021,
+        "&[f64]" | "Vec<f64>" => 1022,
+        "&[&str]" | "Vec<String>" | "&[String]" => 1009,
+        "&[&[u8]]" | "Vec<Vec<u8>>" => 1001,
+        _ => 0, // unknown → let PG infer
+    }
+}
+
 /// Check whether a user-declared Rust parameter type is compatible with a PG OID.
 ///
 /// This is used by the proc macro to verify that `$id: i32` matches the column
@@ -404,6 +435,51 @@ pub fn is_param_compatible(rust_type: &str, pg_oid: u32) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // --- default_pg_oid_for_rust_type ---
+
+    #[test]
+    fn default_pg_oid_scalars() {
+        assert_eq!(default_pg_oid_for_rust_type("bool"), 16);
+        assert_eq!(default_pg_oid_for_rust_type("i16"), 21);
+        assert_eq!(default_pg_oid_for_rust_type("i32"), 23);
+        assert_eq!(default_pg_oid_for_rust_type("i64"), 20);
+        assert_eq!(default_pg_oid_for_rust_type("f32"), 700);
+        assert_eq!(default_pg_oid_for_rust_type("f64"), 701);
+        assert_eq!(default_pg_oid_for_rust_type("&str"), 25);
+        assert_eq!(default_pg_oid_for_rust_type("String"), 25);
+        assert_eq!(default_pg_oid_for_rust_type("u32"), 26);
+        assert_eq!(default_pg_oid_for_rust_type("&[u8]"), 17);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<u8>"), 17);
+    }
+
+    #[test]
+    fn default_pg_oid_arrays() {
+        assert_eq!(default_pg_oid_for_rust_type("&[bool]"), 1000);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<bool>"), 1000);
+        assert_eq!(default_pg_oid_for_rust_type("&[i16]"), 1005);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<i16>"), 1005);
+        assert_eq!(default_pg_oid_for_rust_type("&[i32]"), 1007);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<i32>"), 1007);
+        assert_eq!(default_pg_oid_for_rust_type("&[i64]"), 1016);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<i64>"), 1016);
+        assert_eq!(default_pg_oid_for_rust_type("&[f32]"), 1021);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<f32>"), 1021);
+        assert_eq!(default_pg_oid_for_rust_type("&[f64]"), 1022);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<f64>"), 1022);
+        assert_eq!(default_pg_oid_for_rust_type("&[&str]"), 1009);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<String>"), 1009);
+        assert_eq!(default_pg_oid_for_rust_type("&[String]"), 1009);
+        assert_eq!(default_pg_oid_for_rust_type("&[&[u8]]"), 1001);
+        assert_eq!(default_pg_oid_for_rust_type("Vec<Vec<u8>>"), 1001);
+    }
+
+    #[test]
+    fn default_pg_oid_unknown_returns_zero() {
+        assert_eq!(default_pg_oid_for_rust_type("MyCustomType"), 0);
+        assert_eq!(default_pg_oid_for_rust_type("Option<i32>"), 0);
+        assert_eq!(default_pg_oid_for_rust_type(""), 0);
+    }
 
     #[test]
     fn all_oids_are_unique() {

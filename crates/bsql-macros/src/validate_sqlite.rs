@@ -93,6 +93,7 @@ pub fn validate_query_sqlite(
         columns,
         param_pg_oids: SmallVec::new(), // SQLite doesn't type params
         param_is_pg_enum: SmallVec::new(), // No PG enums in SQLite
+        rewritten_sql: None,
         #[cfg(feature = "explain")]
         explain_plan: None,
     })
@@ -165,6 +166,7 @@ pub fn validate_variants_sqlite(
                 columns,
                 param_pg_oids: SmallVec::new(),
                 param_is_pg_enum: SmallVec::new(),
+                rewritten_sql: None,
                 #[cfg(feature = "explain")]
                 explain_plan: None,
             });

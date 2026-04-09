@@ -21,7 +21,7 @@ use crate::validate::{ColumnInfo, ValidationResult};
 // ---------------------------------------------------------------------------
 
 /// Current cache format version. Bump when `CachedQuery` fields change.
-const CACHE_FORMAT_VERSION: u8 = 3;
+const CACHE_FORMAT_VERSION: u8 = 4;
 
 /// The bsql crate version at build time. Stored in each cache entry so that
 /// a bsql version upgrade invalidates stale caches rather than producing
@@ -63,6 +63,19 @@ struct CachedQueryV2 {
     pub bsql_version: String,
 }
 
+/// Legacy v3 cache format (without `rewritten_sql` field).
+/// Used for backwards-compatible reading of v3 cache entries.
+#[derive(Debug, Clone, Encode, Decode)]
+struct CachedQueryV3 {
+    pub sql_hash: u64,
+    pub normalized_sql: String,
+    pub columns: Vec<CachedColumn>,
+    pub param_pg_oids: Vec<u32>,
+    pub param_is_pg_enum: Vec<bool>,
+    pub bsql_version: String,
+    pub param_rust_types: Vec<String>,
+}
+
 /// A single cached query validation result, persisted as bitcode.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct CachedQuery {
@@ -83,6 +96,9 @@ pub struct CachedQuery {
     /// Empty for cache entries migrated from v2 (param type checking is
     /// skipped for those entries).
     pub param_rust_types: Vec<String>,
+    /// Rewritten SQL with explicit casts (e.g. `$1::jsonb`), if the
+    /// two-phase PREPARE mechanism rewrote the query. `None` if unchanged.
+    pub rewritten_sql: Option<String>,
 }
 
 /// A single result column, cached.
@@ -252,6 +268,7 @@ pub fn lookup_cached_validation(parsed: &ParsedQuery) -> Result<ValidationResult
             param_is_pg_enum: v1.param_is_pg_enum,
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec![],
+            rewritten_sql: None,
         }
     } else if envelope.version == 2 {
         // v2 format: CachedQuery without param_rust_types
@@ -271,6 +288,27 @@ pub fn lookup_cached_validation(parsed: &ParsedQuery) -> Result<ValidationResult
             param_is_pg_enum: v2.param_is_pg_enum,
             bsql_version: v2.bsql_version,
             param_rust_types: vec![],
+            rewritten_sql: None,
+        }
+    } else if envelope.version == 3 {
+        // v3 format: CachedQuery without rewritten_sql
+        let v3: CachedQueryV3 = bitcode::decode(&envelope.data).map_err(|e| {
+            format!(
+                "failed to decode v3 cached query in {} (file may be corrupted \
+                 — run `cargo build` with a live PostgreSQL connection to \
+                 regenerate): {e}",
+                path.display()
+            )
+        })?;
+        CachedQuery {
+            sql_hash: v3.sql_hash,
+            normalized_sql: v3.normalized_sql,
+            columns: v3.columns,
+            param_pg_oids: v3.param_pg_oids,
+            param_is_pg_enum: v3.param_is_pg_enum,
+            bsql_version: v3.bsql_version,
+            param_rust_types: v3.param_rust_types,
+            rewritten_sql: None,
         }
     } else if envelope.version == CACHE_FORMAT_VERSION {
         let cached: CachedQuery = bitcode::decode(&envelope.data).map_err(|e| {
@@ -366,6 +404,7 @@ fn cached_to_validation(cached: &CachedQuery) -> ValidationResult {
         columns,
         param_pg_oids: cached.param_pg_oids.iter().copied().collect(),
         param_is_pg_enum: cached.param_is_pg_enum.iter().copied().collect(),
+        rewritten_sql: cached.rewritten_sql.clone(),
         #[cfg(feature = "explain")]
         explain_plan: None,
     }
@@ -460,6 +499,7 @@ fn validation_to_cached(
         param_is_pg_enum: validation.param_is_pg_enum.to_vec(),
         bsql_version: BSQL_VERSION.to_owned(),
         param_rust_types: parsed.params.iter().map(|p| p.rust_type.clone()).collect(),
+        rewritten_sql: validation.rewritten_sql.clone(),
     }
 }
 
@@ -550,6 +590,7 @@ mod tests {
             param_is_pg_enum: vec![false],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec!["i32".into()],
+            rewritten_sql: None,
         }
     }
 
@@ -643,6 +684,7 @@ mod tests {
             }],
             param_pg_oids: smallvec::smallvec![25, 23],
             param_is_pg_enum: smallvec::smallvec![false, false],
+            rewritten_sql: None,
             #[cfg(feature = "explain")]
             explain_plan: None,
         };
@@ -743,6 +785,7 @@ mod tests {
             param_is_pg_enum: vec![false],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec!["i32".into()],
+            rewritten_sql: None,
         };
 
         let bytes = encode_enveloped(&cached);
@@ -767,6 +810,7 @@ mod tests {
             param_is_pg_enum: vec![true],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec!["String".into()],
+            rewritten_sql: None,
         };
 
         let bytes = encode_enveloped(&cached);
@@ -991,6 +1035,7 @@ mod tests {
             param_is_pg_enum: vec![],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec![],
+            rewritten_sql: None,
         };
         let other_sql = "select b from t";
         assert_ne!(cached.normalized_sql, other_sql);
@@ -1011,6 +1056,7 @@ mod tests {
             param_is_pg_enum: vec![false],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec!["i32".to_owned()],
+            rewritten_sql: None,
         };
         let bytes = encode_enveloped(&query);
         let decoded = decode_enveloped(&bytes).unwrap();
@@ -1047,6 +1093,7 @@ mod tests {
             param_is_pg_enum: decoded_v2.param_is_pg_enum,
             bsql_version: decoded_v2.bsql_version,
             param_rust_types: vec![],
+            rewritten_sql: None,
         };
         assert!(migrated.param_rust_types.is_empty());
         assert_eq!(migrated.sql_hash, 77);
@@ -1062,6 +1109,7 @@ mod tests {
             param_is_pg_enum: vec![false, false],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec!["i32".to_owned(), "&str".to_owned()],
+            rewritten_sql: None,
         };
         let bytes = encode_enveloped(&query);
         let decoded = decode_enveloped(&bytes).unwrap();
@@ -1078,6 +1126,7 @@ mod tests {
             param_is_pg_enum: vec![],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec![],
+            rewritten_sql: None,
         };
         let bytes = encode_enveloped(&query);
         let decoded = decode_enveloped(&bytes).unwrap();
@@ -1111,6 +1160,7 @@ mod tests {
             param_is_pg_enum: vec![false],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec!["i32".to_owned()],
+            rewritten_sql: None,
         };
         let bytes = encode_enveloped(&cached);
         let path = queries_dir.join(format!("{hash:016x}.bitcode"));
@@ -1138,6 +1188,7 @@ mod tests {
             param_is_pg_enum: vec![false, false],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec!["i32".to_owned(), "&str".to_owned()],
+            rewritten_sql: None,
         };
 
         // Simulate having 3 params in the current query
@@ -1181,6 +1232,7 @@ mod tests {
             param_is_pg_enum: v1_param_is_pg_enum,
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec![],
+            rewritten_sql: None,
         };
 
         // Verify data survived migration
@@ -1231,6 +1283,7 @@ mod tests {
             param_is_pg_enum: decoded_v2.param_is_pg_enum,
             bsql_version: decoded_v2.bsql_version,
             param_rust_types: vec![],
+            rewritten_sql: None,
         };
 
         // param_rust_types is empty — the type check in lookup should be skipped
@@ -1329,6 +1382,7 @@ mod tests {
             param_is_pg_enum: vec![false, false],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec!["i32".into(), "&str".into()],
+            rewritten_sql: None,
         };
 
         let bytes = encode_enveloped(&cached);
@@ -1352,6 +1406,7 @@ mod tests {
             param_is_pg_enum: vec![],
             bsql_version: BSQL_VERSION.to_owned(),
             param_rust_types: vec![],
+            rewritten_sql: None,
         };
         let bytes = encode_enveloped(&cached);
         let decoded = decode_enveloped(&bytes).unwrap();
