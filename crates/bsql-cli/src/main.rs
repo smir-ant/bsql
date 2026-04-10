@@ -1,4 +1,5 @@
 mod cache;
+mod integrity;
 mod migrate;
 mod verify;
 
@@ -12,6 +13,9 @@ fn main() {
         Some("check") if args.get(2).map(|s| s.as_str()) == Some("--verify-cache") => {
             cmd_verify_cache(&args);
         }
+        Some("verify") => {
+            cmd_verify_integrity(&args);
+        }
         Some("clean") => {
             cmd_clean(&args);
         }
@@ -21,6 +25,9 @@ fn main() {
                 "  bsql migrate --check <migration.sql> [--database-url URL] [--cache-dir DIR]"
             );
             eprintln!("  bsql check --verify-cache [--database-url URL] [--cache-dir DIR]");
+            eprintln!("  bsql verify [--cache-dir DIR]");
+            eprintln!("      Check local cache integrity (no database required).");
+            eprintln!("      Exits 1 if cache is broken — suitable for pre-commit hooks.");
             eprintln!("  bsql clean [--cache-dir DIR]");
             std::process::exit(2);
         }
@@ -153,22 +160,101 @@ fn cmd_verify_cache(args: &[String]) {
     }
 }
 
+fn cmd_verify_integrity(args: &[String]) {
+    let cache_dir = get_cache_dir(args);
+
+    let report = integrity::check(&cache_dir).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+
+    println!(
+        "Cache at {}: {} bitcode files, {} manifested",
+        cache_dir.display(),
+        report.total_bitcode,
+        report.total_manifested
+    );
+
+    if !report.missing_bitcode.is_empty() {
+        println!(
+            "\nERROR: {} manifest entries have no bitcode file on disk:",
+            report.missing_bitcode.len()
+        );
+        for h in report.missing_bitcode.iter().take(10) {
+            println!("  {h}.bitcode");
+        }
+        if report.missing_bitcode.len() > 10 {
+            println!("  ... and {} more", report.missing_bitcode.len() - 10);
+        }
+        println!(
+            "\nThis is the most common cause of 'query not found in offline cache'.\n\
+             Usually it means `.bitcode` files were not committed to git.\n\
+             Fix: rebuild with a live database, then `git add .bsql/queries/`."
+        );
+    }
+
+    if !report.corrupt_files.is_empty() {
+        println!(
+            "\nERROR: {} bitcode files failed to decode:",
+            report.corrupt_files.len()
+        );
+        for (path, err) in report.corrupt_files.iter().take(10) {
+            println!("  {path}: {err}");
+        }
+    }
+
+    if !report.filename_mismatch.is_empty() {
+        println!(
+            "\nERROR: {} bitcode files have a filename that does not match their hash:",
+            report.filename_mismatch.len()
+        );
+        for f in report.filename_mismatch.iter().take(10) {
+            println!("  {f}");
+        }
+    }
+
+    if !report.orphan_bitcode.is_empty() {
+        println!(
+            "\nWarning: {} bitcode files are not referenced by any manifest \
+             (run `bsql clean` to remove):",
+            report.orphan_bitcode.len()
+        );
+        for h in report.orphan_bitcode.iter().take(5) {
+            println!("  {h}.bitcode");
+        }
+        if report.orphan_bitcode.len() > 5 {
+            println!("  ... and {} more", report.orphan_bitcode.len() - 5);
+        }
+    }
+
+    if report.is_ok() {
+        println!("\nCache is consistent.");
+        std::process::exit(0);
+    } else {
+        std::process::exit(1);
+    }
+}
+
 fn cmd_clean(args: &[String]) {
     let cache_dir = get_cache_dir(args);
     let mut count = 0u64;
     if let Ok(entries) = std::fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|e| e == "bitcode")
-                && std::fs::remove_file(entry.path()).is_ok()
-            {
+            let path = entry.path();
+            // Clean ALL cache state — bitcode AND metadata — so the next
+            // build starts from a known-empty state. Leaving `.manifest` with
+            // stale hashes while deleting `.bitcode` is the exact bug that
+            // motivated this tool.
+            let should_remove = path.extension().is_some_and(|e| e == "bitcode")
+                || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    matches!(n, ".manifest" | ".manifest.canonical" | ".generation")
+                });
+            if should_remove && std::fs::remove_file(&path).is_ok() {
                 count += 1;
             }
         }
     }
-    println!(
-        "Removed {count} cached queries from {}",
-        cache_dir.display()
-    );
+    println!("Removed {count} cache entries from {}", cache_dir.display());
 }
 
 /// Parse a `--flag value` pair from the argument list.
@@ -274,14 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn cmd_clean_removes_bitcode_files() {
-        let dir = std::env::temp_dir().join("bsql_clean_test");
+    fn cmd_clean_removes_bitcode_and_metadata() {
+        let dir = std::env::temp_dir().join("bsql_clean_full_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Create some .bitcode files and a non-bitcode file
         std::fs::write(dir.join("query1.bitcode"), b"data1").unwrap();
         std::fs::write(dir.join("query2.bitcode"), b"data2").unwrap();
+        std::fs::write(dir.join(".manifest"), b"deadbeef\n").unwrap();
+        std::fs::write(dir.join(".manifest.canonical"), b"deadbeef\n").unwrap();
+        std::fs::write(dir.join(".generation"), b"123_456").unwrap();
         std::fs::write(dir.join("keep_me.txt"), b"keep").unwrap();
 
         let args = vec![
@@ -290,31 +378,18 @@ mod tests {
             "--cache-dir".into(),
             dir.to_str().unwrap().into(),
         ];
-        let cache_dir = get_cache_dir(&args);
-        let mut count = 0u64;
-        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                if entry.path().extension().is_some_and(|e| e == "bitcode")
-                    && std::fs::remove_file(entry.path()).is_ok()
-                {
-                    count += 1;
-                }
-            }
-        }
+        cmd_clean(&args);
 
-        assert_eq!(count, 2, "should remove exactly 2 .bitcode files");
+        assert!(dir.join("keep_me.txt").exists(), "non-cache file preserved");
+        assert!(!dir.join("query1.bitcode").exists());
+        assert!(!dir.join("query2.bitcode").exists());
         assert!(
-            dir.join("keep_me.txt").exists(),
-            "non-bitcode file should be preserved"
+            !dir.join(".manifest").exists(),
+            ".manifest must also be cleaned, otherwise a subsequent build \
+             in offline mode fails with 'query not in cache'"
         );
-        assert!(
-            !dir.join("query1.bitcode").exists(),
-            "bitcode file should be removed"
-        );
-        assert!(
-            !dir.join("query2.bitcode").exists(),
-            "bitcode file should be removed"
-        );
+        assert!(!dir.join(".manifest.canonical").exists());
+        assert!(!dir.join(".generation").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

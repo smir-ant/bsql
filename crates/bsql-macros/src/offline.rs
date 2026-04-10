@@ -14,8 +14,23 @@ use std::sync::{Mutex, OnceLock};
 use bitcode::{Decode, Encode};
 
 // ---------------------------------------------------------------------------
-// Stale cache auto-cleanup
+// Stale cache auto-cleanup (canonical manifest)
 // ---------------------------------------------------------------------------
+//
+// Two files track cache membership:
+//
+//   `.manifest`           — hashes written during the current cargo build
+//   `.manifest.canonical` — union of every `.manifest` ever observed as
+//                           "at least as complete as the previous one"
+//
+// At build start we truncate `.manifest` so it can be repopulated as
+// `query!()` sites fire. But the CLEANUP decision uses the canonical set,
+// not the (possibly partial) last-build manifest. This is the guard against
+// the footgun where a `cargo check -p some-crate` that compiles zero query!()
+// sites would otherwise tell the next build's cleanup to delete everything.
+//
+// Canonical is only ever expanded — never shrunk by the macro. To shrink it,
+// run `bsql clean` (which rewrites canonical from the current manifest).
 
 /// Build state tracker. Uses a generation file (.generation) with PID+timestamp
 /// to detect new cargo build invocations, even when the proc macro DLL stays
@@ -26,24 +41,50 @@ struct BuildState {
     seen_hashes: std::collections::HashSet<u64>,
 }
 
-/// Ensure stale cleanup has run for this build, and record the hash as active.
+/// How close together two proc-macro DLL loads have to be to count as
+/// belonging to the same `cargo build` invocation (rather than two separate
+/// builds). Cargo fans out rustc invocations across crates in parallel; they
+/// run within seconds of each other. A threshold of 60 seconds is generous
+/// enough to cover slow sequential builds while still distinguishing a new
+/// `cargo build` run minutes later.
+const SAME_BUILD_WINDOW_NANOS: u128 = 60 * 1_000_000_000;
+
+/// Ensure canonical-based cleanup has run for this build, and record `hash`
+/// as active in the current manifest.
+///
+/// "This build" means this cargo invocation, which may span multiple rustc
+/// processes (one per crate). We detect continuation via the `.generation`
+/// file's timestamp: if it was written recently, we're still in the same
+/// build and append to `.manifest` without truncating; otherwise this is a
+/// new build and we truncate + refresh canonical + run stale cleanup.
 fn track_and_cleanup(dir: &std::path::Path, hash: u64) {
     let state = BUILD_STATE.get_or_init(|| {
-        // First query! in this DLL load — check if this is a new build
         let gen_path = dir.join(".generation");
-        let my_gen = format!("{}_{}", std::process::id(), timestamp_nanos());
+        let now = timestamp_nanos();
+        let my_gen = format!("{}_{}", std::process::id(), now);
 
         let prev_gen = std::fs::read_to_string(&gen_path).unwrap_or_default();
-        let prev_gen = prev_gen.trim();
+        let is_same_build = prev_gen
+            .trim()
+            .split('_')
+            .nth(1)
+            .and_then(|ts| ts.parse::<u128>().ok())
+            .is_some_and(|prev_ts| now.saturating_sub(prev_ts) < SAME_BUILD_WINDOW_NANOS);
 
-        // Always treat as new build on first DLL load (OnceLock fires once)
-        if !prev_gen.is_empty() {
+        if !prev_gen.trim().is_empty() && !is_same_build {
+            // This is a new cargo build (previous generation is old enough).
+            // Fold the previous build's final manifest into canonical and run
+            // stale cleanup.
+            refresh_canonical(dir);
             cleanup_stale_files(dir);
+            // Start a fresh manifest for the new build
+            let _ = std::fs::write(dir.join(".manifest"), "");
         }
+        // On is_same_build=true, leave the manifest alone — other rustc
+        // processes from the same cargo invocation may have already appended
+        // hashes. We'll append our own below.
 
-        // Write new generation + truncate manifest
         let _ = std::fs::write(&gen_path, &my_gen);
-        let _ = std::fs::write(dir.join(".manifest"), "");
 
         Mutex::new(BuildState {
             seen_hashes: std::collections::HashSet::new(),
@@ -59,6 +100,10 @@ fn track_and_cleanup(dir: &std::path::Path, hash: u64) {
                 .append(true)
                 .open(&manifest)
                 .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+            // Canonical is only updated at build start via `refresh_canonical`,
+            // not per-query. That keeps the canonical file dedup-clean across
+            // many builds (a per-query append would accumulate duplicates until
+            // the next refresh rewrote the file from a set).
         }
     }
 }
@@ -70,17 +115,59 @@ fn timestamp_nanos() -> u128 {
         .as_nanos()
 }
 
-/// Delete .bitcode files not listed in the previous build's manifest.
-fn cleanup_stale_files(dir: &std::path::Path) {
-    let manifest_path = dir.join(".manifest");
-    let active: std::collections::HashSet<String> = std::fs::read_to_string(&manifest_path)
+/// Read newline-separated hash lines from a file into a set.
+fn read_hash_set(path: &std::path::Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
+        .map(|l| l.trim())
         .filter(|l| !l.is_empty())
-        .map(|l| l.trim().to_owned())
-        .collect();
+        .map(|l| l.to_owned())
+        .collect()
+}
 
-    if active.is_empty() {
+/// Write a hash set as newline-separated lines, sorted for stable diffs.
+fn write_hash_set(path: &std::path::Path, set: &std::collections::HashSet<String>) {
+    let mut lines: Vec<&String> = set.iter().collect();
+    lines.sort();
+    let mut out = String::with_capacity(lines.len() * 17);
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let _ = std::fs::write(path, out);
+}
+
+/// Union the previous build's `.manifest` into `.manifest.canonical`.
+///
+/// Canonical grows monotonically with the set of query hashes the macro
+/// has observed. This runs once per cargo build, before cleanup decides
+/// which files to delete.
+fn refresh_canonical(dir: &std::path::Path) {
+    let manifest = read_hash_set(&dir.join(".manifest"));
+    if manifest.is_empty() {
+        // Previous build wrote nothing — nothing to fold in.
+        return;
+    }
+    let canonical_path = dir.join(".manifest.canonical");
+    let mut canonical = read_hash_set(&canonical_path);
+    let before = canonical.len();
+    canonical.extend(manifest);
+    if canonical.len() != before {
+        write_hash_set(&canonical_path, &canonical);
+    }
+}
+
+/// Delete .bitcode files whose hash is not in `.manifest.canonical`.
+///
+/// Never consults the last-build manifest directly — that file can be
+/// partial (e.g. when `cargo check -p some-crate` compiled zero `query!()`
+/// sites) and using it would delete files that are still in the source.
+fn cleanup_stale_files(dir: &std::path::Path) {
+    let canonical = read_hash_set(&dir.join(".manifest.canonical"));
+    if canonical.is_empty() {
+        // No canonical yet (fresh checkout or first build) — don't delete
+        // anything. The next build will populate canonical.
         return;
     }
 
@@ -89,12 +176,58 @@ fn cleanup_stale_files(dir: &std::path::Path) {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "bitcode") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if !active.contains(stem) {
+                    if !canonical.contains(stem) {
                         let _ = std::fs::remove_file(&path);
                     }
                 }
             }
         }
+    }
+}
+
+/// Produce a one-line human-readable diagnosis of the cache state, used to
+/// frame the "query not in cache" error so users understand whether the
+/// problem is a stale single entry or a structurally broken cache.
+fn diagnose_cache_state(dir: &std::path::Path) -> String {
+    let manifest_set = read_hash_set(&dir.join(".manifest"));
+    let canonical_set = read_hash_set(&dir.join(".manifest.canonical"));
+    let active_set: std::collections::HashSet<&String> =
+        manifest_set.union(&canonical_set).collect();
+
+    let bitcode_count = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "bitcode"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    let manifest_count = active_set.len();
+
+    if manifest_count == 0 && bitcode_count == 0 {
+        "The cache directory is empty. \
+         This is expected on a fresh clone — populate it by building with a \
+         live database."
+            .to_owned()
+    } else if manifest_count > 0 && bitcode_count == 0 {
+        format!(
+            "Cache is STRUCTURALLY BROKEN: .manifest references {manifest_count} \
+             queries but 0 .bitcode files exist on disk. \
+             The bitcode files were probably not committed to git — only the \
+             manifest was. This is the most common cause of this error."
+        )
+    } else if manifest_count > 0 && bitcode_count < manifest_count {
+        format!(
+            "Cache is INCOMPLETE: .manifest references {manifest_count} queries \
+             but only {bitcode_count} .bitcode files exist on disk. \
+             Missing bitcode files suggest a partial commit to git."
+        )
+    } else {
+        format!(
+            "Cache has {bitcode_count} .bitcode files but this query's hash is \
+             not among them — the SQL has likely changed since the cache was built."
+        )
     }
 }
 
@@ -216,28 +349,51 @@ pub struct CachedColumn {
 /// Evaluated once per compilation via `OnceLock`.
 static IS_OFFLINE: OnceLock<bool> = OnceLock::new();
 
+/// Pure parser for the `BSQL_OFFLINE` env var. Factored out so tests can
+/// exercise every branch without touching global env state (which is `unsafe`
+/// in Rust 2024 due to thread-safety).
+///
+/// Returns `Some(true/false)` for an explicit opt-in/out, or `None` for
+/// "unset or unrecognized — caller should fall through to auto-detect".
+pub(crate) fn parse_bsql_offline_env(value: Option<&str>) -> Option<bool> {
+    let v = value?.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        "" => None,
+        _ => {
+            eprintln!(
+                "warning: bsql: ignoring BSQL_OFFLINE={v:?} \
+                 (expected true/false/1/0)"
+            );
+            None
+        }
+    }
+}
+
 fn compute_is_offline() -> bool {
-    // Explicit opt-in
-    if std::env::var("BSQL_OFFLINE")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false)
-    {
-        return true;
+    if let Some(explicit) = parse_bsql_offline_env(std::env::var("BSQL_OFFLINE").ok().as_deref()) {
+        return explicit;
     }
 
-    // Auto-fallback: no database URL, but cache exists
+    // Auto-detect: prefer live mode when a database URL is present, otherwise
+    // fall back to offline if a cache exists. Users can force either mode
+    // explicitly via BSQL_OFFLINE.
     let has_url =
         std::env::var("BSQL_DATABASE_URL").is_ok() || std::env::var("DATABASE_URL").is_ok();
-    if !has_url {
-        // Check if .bsql/ cache directory exists with at least one entry
-        if let Ok(dir) = resolve_cache_dir() {
-            if dir.is_dir()
-                && std::fs::read_dir(&dir)
-                    .map(|mut d| d.next().is_some())
-                    .unwrap_or(false)
-            {
-                return true;
-            }
+    if has_url {
+        return false;
+    }
+
+    // No URL — check if .bsql/queries/ cache directory exists with at least one
+    // entry (including .manifest). If yes, use offline mode as a convenience.
+    if let Ok(dir) = resolve_cache_dir() {
+        if dir.is_dir()
+            && std::fs::read_dir(&dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        {
+            return true;
         }
     }
 
@@ -309,19 +465,35 @@ pub fn lookup_cached_validation(parsed: &ParsedQuery) -> Result<ValidationResult
     let hash = sql_hash(&parsed.normalized_sql);
     let dir = cache_dir()?;
 
-    // Track this hash as active (for stale cleanup on next build)
-    track_and_cleanup(dir, hash);
+    // Offline mode is strictly read-only — do NOT call track_and_cleanup here.
+    // Otherwise rust-analyzer (which runs rustc for diagnostics without a DB
+    // and therefore lands in offline mode) would truncate `.manifest` and run
+    // cleanup on every keystroke, destroying the committed cache state.
 
     let path = dir.join(format!("{hash:016x}.bitcode"));
 
     if !path.exists() {
+        // Distinguish the two common causes so the error points at the right fix:
+        //   A) cache is structurally broken (manifest references bitcode files
+        //      that were never committed, or got deleted locally) — user needs
+        //      to regenerate and git-add the full `.bsql/queries/` directory
+        //   B) this specific query is new/changed and the cache is simply stale
+        //      for this entry — same fix but the framing is different
+        let diagnosis = diagnose_cache_state(dir);
         return Err(format!(
-            "query not found in offline cache (hash {hash:016x}). \
-             The SQL may have changed since the cache was last built. \
-             Run `cargo build` with a live PostgreSQL connection to update \
-             the cache, then rebuild with BSQL_OFFLINE=true.\n  \
-             SQL: {}",
-            parsed.normalized_sql
+            "bsql: query not found in offline cache (hash {hash:016x})\n  \
+             SQL: {sql}\n\n  \
+             {diagnosis}\n\n  \
+             To fix:\n  \
+             1) Set DATABASE_URL (or BSQL_DATABASE_URL) to a live PostgreSQL\n     \
+                and run `cargo build`. This regenerates the cache.\n  \
+             2) Commit the entire `.bsql/queries/` directory to git:\n     \
+                `git add .bsql/queries/ && git commit`\n     \
+                Make sure ALL `.bitcode` files are staged, not just `.manifest`.\n  \
+             3) On CI / prod, set `BSQL_OFFLINE=true` and build — no DB needed.\n  \
+             4) Run `bsql verify` locally to confirm the cache is self-consistent\n     \
+                before pushing.",
+            sql = parsed.normalized_sql,
         ));
     }
 
@@ -1584,5 +1756,223 @@ mod tests {
         let h1 = sql_hash("SELECT 1");
         let h2 = sql_hash("SELECT  1");
         assert_ne!(h1, h2, "whitespace should produce different hashes");
+    }
+
+    // --- Canonical manifest: safe cleanup across partial builds ---
+
+    fn touch_bitcode(dir: &std::path::Path, hash: &str) {
+        std::fs::write(dir.join(format!("{hash}.bitcode")), b"stub").unwrap();
+    }
+
+    #[test]
+    fn read_hash_set_dedupes_and_trims() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("m");
+        std::fs::write(&path, "  aaa  \nbbb\n\naaa\n").unwrap();
+        let set = read_hash_set(&path);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("aaa"));
+        assert!(set.contains("bbb"));
+    }
+
+    #[test]
+    fn write_hash_set_roundtrips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("m");
+        let mut set = std::collections::HashSet::new();
+        set.insert("bbb".to_owned());
+        set.insert("aaa".to_owned());
+        write_hash_set(&path, &set);
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Sorted for stable diffs
+        assert_eq!(content, "aaa\nbbb\n");
+    }
+
+    #[test]
+    fn refresh_canonical_unions_into_canonical() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".manifest"), "h1\nh2\n").unwrap();
+        std::fs::write(dir.path().join(".manifest.canonical"), "h2\nh3\n").unwrap();
+
+        refresh_canonical(dir.path());
+
+        let canonical = read_hash_set(&dir.path().join(".manifest.canonical"));
+        assert_eq!(canonical.len(), 3);
+        assert!(canonical.contains("h1"));
+        assert!(canonical.contains("h2"));
+        assert!(canonical.contains("h3"));
+    }
+
+    #[test]
+    fn refresh_canonical_noop_when_manifest_empty() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".manifest"), "").unwrap();
+        std::fs::write(dir.path().join(".manifest.canonical"), "h1\nh2\n").unwrap();
+
+        refresh_canonical(dir.path());
+
+        let canonical = read_hash_set(&dir.path().join(".manifest.canonical"));
+        assert_eq!(canonical.len(), 2);
+        assert!(canonical.contains("h1"));
+        assert!(canonical.contains("h2"));
+    }
+
+    #[test]
+    fn cleanup_stale_files_keeps_canonical_entries() {
+        let dir = TempDir::new().unwrap();
+        touch_bitcode(dir.path(), "aa");
+        touch_bitcode(dir.path(), "bb");
+        touch_bitcode(dir.path(), "cc");
+        std::fs::write(dir.path().join(".manifest.canonical"), "aa\nbb\n").unwrap();
+
+        cleanup_stale_files(dir.path());
+
+        assert!(dir.path().join("aa.bitcode").exists());
+        assert!(dir.path().join("bb.bitcode").exists());
+        assert!(
+            !dir.path().join("cc.bitcode").exists(),
+            "cc is not in canonical → must be deleted"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_files_noop_when_canonical_empty() {
+        let dir = TempDir::new().unwrap();
+        touch_bitcode(dir.path(), "aa");
+        touch_bitcode(dir.path(), "bb");
+        // Empty canonical — the "first build" state; never delete.
+        std::fs::write(dir.path().join(".manifest.canonical"), "").unwrap();
+
+        cleanup_stale_files(dir.path());
+
+        assert!(dir.path().join("aa.bitcode").exists());
+        assert!(dir.path().join("bb.bitcode").exists());
+    }
+
+    #[test]
+    fn cleanup_stale_files_ignores_non_bitcode() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), b"hi").unwrap();
+        std::fs::write(dir.path().join(".manifest.canonical"), "aa\n").unwrap();
+
+        cleanup_stale_files(dir.path());
+
+        assert!(dir.path().join("keep.txt").exists());
+    }
+
+    /// The regression test for the footgun: a partial build (that doesn't
+    /// fire all `query!()` sites) must not cause the cleanup to delete files
+    /// that are still needed.
+    #[test]
+    fn partial_build_does_not_delete_full_build_files() {
+        let dir = TempDir::new().unwrap();
+        // Simulate a previous full build: manifest had h1..h3, bitcode files present.
+        touch_bitcode(dir.path(), "h1");
+        touch_bitcode(dir.path(), "h2");
+        touch_bitcode(dir.path(), "h3");
+        std::fs::write(dir.path().join(".manifest"), "h1\nh2\nh3\n").unwrap();
+        // A partial build already ran (e.g. `cargo check -p some-crate`) and
+        // wrote only h1 into .manifest. Before the fix this would cause the
+        // next build to delete h2 and h3. With canonical-based cleanup, the
+        // full build's manifest is first folded into canonical.
+        refresh_canonical(dir.path());
+        // Now simulate the partial build's manifest state.
+        std::fs::write(dir.path().join(".manifest"), "h1\n").unwrap();
+
+        // Next build starts → cleanup based on canonical (has h1..h3)
+        cleanup_stale_files(dir.path());
+
+        assert!(dir.path().join("h1.bitcode").exists());
+        assert!(
+            dir.path().join("h2.bitcode").exists(),
+            "h2 must survive — it was in canonical from the full build"
+        );
+        assert!(
+            dir.path().join("h3.bitcode").exists(),
+            "h3 must survive — it was in canonical from the full build"
+        );
+    }
+
+    // --- diagnose_cache_state: reports the three failure shapes ---
+
+    #[test]
+    fn diagnose_empty_cache() {
+        let dir = TempDir::new().unwrap();
+        let msg = diagnose_cache_state(dir.path());
+        assert!(msg.contains("empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn diagnose_structurally_broken_cache() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".manifest"), "deadbeef\nbadf00d\n").unwrap();
+        // No bitcode files on disk — the exact prod bug
+        let msg = diagnose_cache_state(dir.path());
+        assert!(
+            msg.contains("STRUCTURALLY BROKEN"),
+            "should flag structural break, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn diagnose_incomplete_cache() {
+        let dir = TempDir::new().unwrap();
+        touch_bitcode(dir.path(), "deadbeef");
+        std::fs::write(
+            dir.path().join(".manifest"),
+            "deadbeef\nbadf00d\nc0ffee00\n",
+        )
+        .unwrap();
+        let msg = diagnose_cache_state(dir.path());
+        assert!(msg.contains("INCOMPLETE"), "got: {msg}");
+    }
+
+    #[test]
+    fn diagnose_stale_single_entry() {
+        let dir = TempDir::new().unwrap();
+        touch_bitcode(dir.path(), "aa");
+        touch_bitcode(dir.path(), "bb");
+        std::fs::write(dir.path().join(".manifest"), "aa\nbb\n").unwrap();
+        let msg = diagnose_cache_state(dir.path());
+        assert!(msg.contains("SQL has likely changed"), "got: {msg}");
+    }
+
+    // --- parse_bsql_offline_env: pure parser, every branch ---
+
+    #[test]
+    fn parse_bsql_offline_true_variants() {
+        for val in ["true", "1", "yes", "on", "TRUE", "Yes", "ON", " true "] {
+            assert_eq!(
+                parse_bsql_offline_env(Some(val)),
+                Some(true),
+                "BSQL_OFFLINE={val:?} must parse as true"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bsql_offline_false_variants() {
+        for val in ["false", "0", "no", "off", "FALSE", "No", "OFF", " false "] {
+            assert_eq!(
+                parse_bsql_offline_env(Some(val)),
+                Some(false),
+                "BSQL_OFFLINE={val:?} must parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_bsql_offline_unset_is_none() {
+        assert_eq!(parse_bsql_offline_env(None), None);
+        assert_eq!(parse_bsql_offline_env(Some("")), None);
+        assert_eq!(parse_bsql_offline_env(Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_bsql_offline_garbage_is_none_with_warning() {
+        // Unrecognized values fall through to auto-detect, not silently truthy.
+        assert_eq!(parse_bsql_offline_env(Some("nope")), None);
+        assert_eq!(parse_bsql_offline_env(Some("maybe")), None);
+        assert_eq!(parse_bsql_offline_env(Some("2")), None);
     }
 }
