@@ -1307,6 +1307,99 @@ async fn raw_query_params_invalid_sql_returns_error() {
 }
 
 // ---------------------------------------------------------------------------
+// raw_execute: SET commands
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn raw_execute_set_search_path() {
+    let pool = pool().await;
+    // SET is a session-level command, not a query. raw_execute handles it.
+    pool.raw_execute("SET search_path TO public").await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// raw_query_params: NULL parameter
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn raw_query_params_with_null_param() {
+    let pool = pool().await;
+    // Pass NULL as a parameter — the driver should send -1 length, PG should
+    // handle it as NULL. Use Option<i32> = None via the Encode trait.
+    let null_id: Option<i32> = None;
+    let rows = pool
+        .raw_query_params(
+            "SELECT $1::int4 IS NULL AS is_null",
+            &[&null_id as &(dyn bsql::driver::Encode + Sync)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("t")); // PG returns "t" for true in text protocol
+}
+
+// ---------------------------------------------------------------------------
+// raw_execute: full schema isolation pattern (the test-infrastructure pattern)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn raw_execute_schema_isolation_lifecycle() {
+    let pool = pool().await;
+    let schema = format!("bsql_test_iso_{}", std::process::id());
+
+    // 1. Create isolated schema
+    pool.raw_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .unwrap();
+
+    // 2. Set search path to the new schema
+    pool.raw_execute(&format!("SET search_path TO \"{schema}\", public"))
+        .await
+        .unwrap();
+
+    // 3. Create a table inside the isolated schema
+    pool.raw_execute(&format!(
+        "CREATE TABLE \"{schema}\".iso_test (id int PRIMARY KEY, val text)"
+    ))
+    .await
+    .unwrap();
+
+    // 4. Insert data through the schema
+    pool.raw_execute(&format!(
+        "INSERT INTO \"{schema}\".iso_test (id, val) VALUES (1, 'hello')"
+    ))
+    .await
+    .unwrap();
+
+    // 5. Query back — verify the table is accessible
+    let rows = pool
+        .raw_query(&format!(
+            "SELECT val FROM \"{schema}\".iso_test WHERE id = 1"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("hello"));
+
+    // 6. Drop schema cascade — clean up everything in one shot
+    pool.raw_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .await
+        .unwrap();
+
+    // 7. Verify schema is gone — querying it should fail
+    let result = pool
+        .raw_query(&format!("SELECT 1 FROM \"{schema}\".iso_test"))
+        .await;
+    assert!(
+        result.is_err(),
+        "schema should be dropped, query should fail"
+    );
+
+    // Reset search path to default
+    pool.raw_execute("SET search_path TO public").await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // &[String] edge case: empty array
 // ---------------------------------------------------------------------------
 

@@ -12,7 +12,11 @@ publish = false
 #   BSQL_DATABASE_URL=postgres://user:pass@localhost/mydb cargo run --bin pg_basic
 
 [dependencies]
-bsql = { path = "../crates/bsql", version = "0.22", features = ["time", "uuid", "sqlite-bundled", "detect-n-plus-one"] }
+bsql = { path = "../crates/bsql", version = "0.27", features = ["time", "uuid", "sqlite-bundled", "detect-n-plus-one"] }
+# The query! macro expands to absolute `::bsql_core::*` paths, so users of the macro
+# need bsql-core as a direct dependency. This is transitive through bsql but cargo
+# doesn't bring transitive deps into scope by name — it has to be declared explicitly.
+bsql-core = { path = "../crates/bsql-core", version = "0.27", features = ["sqlite"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 # --- PostgreSQL examples ---
@@ -73,6 +77,10 @@ path = "pg_sort_enum.rs"
 name = "pg_singleflight"
 path = "pg_singleflight.rs"
 
+[[bin]]
+name = "pg_keyset_pagination"
+path = "pg_keyset_pagination.rs"
+
 # --- SQLite examples ---
 
 [[bin]]
@@ -86,3 +94,7 @@ path = "sqlite_dynamic.rs"
 [[bin]]
 name = "sqlite_query_as"
 path = "sqlite_query_as.rs"
+
+[[bin]]
+name = "sqlite_keyset_pagination"
+path = "sqlite_keyset_pagination.rs"

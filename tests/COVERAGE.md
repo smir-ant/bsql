@@ -663,12 +663,33 @@ Living document — grows with each bug report and edge case discovery.
   TLS config in the process is constructed with the pinned `ring`
   provider via exactly one codepath.
 
-### Dynamic SQL
-- raw_query_params: SELECT with params → rows
-- raw_query_params: INSERT with params
-- raw_query_params: invalid SQL → error
-- raw_query_params: no params → works
-- raw_query_params: NULL in results
+### Dynamic SQL / runtime escape hatch
+
+**`raw_execute`** (DDL, SET, DML without result rows)
+- CREATE TEMP TABLE → succeeds
+- SET search_path TO → succeeds (session-level command)
+- ALTER TABLE (via schema isolation lifecycle)
+- DROP SCHEMA CASCADE (via schema isolation lifecycle)
+- Invalid SQL → error
+
+**`raw_query`** (SELECT returning text-encoded rows)
+- SELECT returning rows → Vec<RawRow> with values
+- SELECT returning empty result → empty Vec
+- Invalid SQL → error
+
+**`raw_query_params`** (parameterized runtime SQL via extended protocol)
+- SELECT with typed params ($1: i32) → correct rows
+- SELECT with multiple params → correct filtering
+- SELECT with empty params array → works
+- INSERT + DELETE with params → rows affected
+- NULL parameter (Option<i32> = None) → PG handles correctly
+- Invalid SQL → error
+
+**Schema isolation lifecycle** (the `#[bsql::test]` pattern, exercised end-to-end)
+- CREATE SCHEMA → SET search_path → CREATE TABLE inside schema →
+  INSERT → SELECT back → DROP SCHEMA CASCADE → verify schema is gone →
+  reset search_path. Full round-trip proving the test-infrastructure
+  pattern works through `raw_execute` + `raw_query`.
 
 ---
 

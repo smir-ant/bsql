@@ -19,4 +19,10 @@ bench.db
 # Regenerated on every build — not source-controlled.
 .bsql/sorts/
 
+# Examples crate has its own standalone cache that gets regenerated
+# whenever someone runs `cargo run --bin <example>` locally. Not worth
+# committing — the examples each validate against whatever DB the user
+# has BSQL_DATABASE_URL pointed at.
+examples/.bsql/
+
 TODO

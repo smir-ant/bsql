@@ -11,8 +11,8 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **Minimal footprint** -- 1.59 MB peak memory — 4.3x less than C (libpq), 4.4x less than sqlx, 10.9x less than Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
 - **Async and sync — both first-class** -- same `query!` macro, same performance, same features. Async uses true cooperative scheduling (RPITIT, no `block_in_place` hacks). Sync removes tokio entirely — pure `fn`, zero async runtime overhead. Switch by changing one line in `Cargo.toml`. Most Rust SQL libraries are async-first with sync as an afterthought, or sync-only. bsql is both, equally.
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
-- **Test isolation in 2ms, not 50** -- `#[bsql::test]` creates a schema per test, not a database. 1,000 tests: ~2 seconds overhead vs ~50 seconds with sqlx. [Details below](#test-isolation).
-- **Things nobody else does** -- [automatic N+1 detection](#n1-query-detection), [compile-time query plan analysis](#compile-time-query-plan-analysis), [migration safety checking](#migration-safety-check), [request coalescing](#singleflight-request-coalescing), [SQLite parameter type checking](#sqlite-parameter-type-checking), [smart NULL inference](#smart-null-inference). Details below.
+- **Test isolation in sub-millisecond** -- `#[bsql::test]` creates a schema per test, not a database. Raw schema create+drop cycle is ~300μs on a local PG; a full test with fixtures typically runs 1-3ms total. Orders of magnitude faster than DB-per-test approaches.
+- **Things nobody else does** -- automatic N+1 detection, compile-time query plan analysis, migration safety checking, request coalescing, SQLite parameter type checking, smart NULL inference. See [**One more thing**](#one-more-thing) below.
 
 ```rust
 let id = 42i32;
@@ -45,7 +45,7 @@ let user = &users[0];
 
 ```toml
 [dependencies]
-bsql = { version = "0.26", features = ["time", "uuid"] }
+bsql = { version = "0.27", features = ["time", "uuid"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -82,7 +82,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 
 ```toml
 [dependencies]
-bsql = { version = "0.26", features = ["sqlite"] }
+bsql = { version = "0.27", features = ["sqlite"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -117,7 +117,7 @@ URL formats: `sqlite:./relative/path`, `sqlite:///absolute/path`, `sqlite::memor
 
 </details>
 
-See [examples/](examples/) for more complete, runnable programs.
+See [examples/](examples/) for more complete, runnable programs — including [keyset pagination](examples/pg_keyset_pagination.rs) (the correct way to paginate large result sets; works identically in [PostgreSQL](examples/pg_keyset_pagination.rs) and [SQLite](examples/sqlite_keyset_pagination.rs)).
 
 ---
 
@@ -126,7 +126,7 @@ See [examples/](examples/) for more complete, runnable programs.
 - **PostgreSQL driver**: `#![forbid(unsafe_code)]` -- zero unsafe
 - **SQLite driver**: unsafe confined to FFI boundary calls (`ffi.rs`) -- every other file is safe Rust
 - **5 of 6 crates** enforce `#![forbid(unsafe_code)]` at compile time
-- **2,550+ tests** (unit, integration, compile-fail, property-based, and stress)
+- **2,300+ tests** (unit, integration, compile-fail, property-based, and stress)
 
 <details>
 <summary>Requirements</summary>
@@ -175,7 +175,7 @@ When a pure-Rust SQLite engine like [Limbo](https://github.com/penberg/limbo) re
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. Enable features for specialized types:
 
 ```toml
-bsql = { version = "0.26", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.27", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature     | PostgreSQL types                   | Rust types                                   |
@@ -282,10 +282,10 @@ Real-time notifications for cache invalidation, job queues, live updates.
 <summary>Compile-time EXPLAIN plans</summary>
 
 ```toml
-bsql = { version = "0.26", features = ["explain"] }
+bsql = { version = "0.27", features = ["explain"] }
 ```
 
-Runs `EXPLAIN` on every query during compilation. The plan is embedded as a doc comment (hover in your IDE to see it), and bsql actively warns about sequential scans and missing indexes. See [compile-time query plan analysis](#compile-time-query-plan-analysis) for details. Development-only -- disable in CI and release builds.
+Runs `EXPLAIN` on every query during compilation. The plan is embedded as a doc comment (hover in your IDE to see it), and bsql actively warns about sequential scans and missing indexes. See the **Compile-time query plan analysis** section in [One more thing](#one-more-thing) for details. Development-only -- disable in CI and release builds.
 
 </details>
 
@@ -373,20 +373,14 @@ The proc macro knows which queries are read-only (SELECT) at compile time and ge
 <details>
 <summary>Singleflight (request coalescing)</summary>
 
-When multiple threads issue the same query with the same parameters simultaneously, only one executes against PostgreSQL. The others wait and receive a shared copy of the result.
+Opt-in feature — when 100 threads fire the same read-only query at the same time, bsql executes it once and shares the result. See [Singleflight](#one-more-thing) below for the full description.
 
 ```rust
 let pool = Pool::builder()
     .url("postgres://localhost/mydb")
-    .singleflight(true)   // opt-in
+    .singleflight(true)
     .build()?;
 ```
-
-100 concurrent requests for `SELECT * FROM config WHERE key = 'theme'` become 1 database query. The other 99 threads block on a condvar and receive an `Arc`-shared copy of the result.
-
-- Only coalesces read-only queries (SELECT). Writes are never coalesced.
-- Key = `rapidhash(sql_hash, encoded parameter bytes)` -- same query + same params = same key.
-- 30-second timeout on waiting. If the leader panics, followers get an error (not a deadlock).
 
 </details>
 
@@ -397,10 +391,10 @@ Default: async (`#[tokio::main]` + `.await` on all methods).
 
 ```toml
 # Async (default)
-bsql = { version = "0.26" }
+bsql = { version = "0.27" }
 
 # Sync -- removes tokio dependency entirely
-bsql = { version = "0.26", default-features = false }
+bsql = { version = "0.27", default-features = false }
 ```
 
 Same `query!` macro, same compile-time safety. Sync mode is pure `fn` -- no async runtime, no `.await`, no tokio in your dependency tree.
@@ -410,41 +404,130 @@ When async is enabled, TCP connections use true async I/O via tokio — the sche
 </details>
 
 <details>
-<summary>Offline mode & auto-cleanup cache</summary>
+<summary>Offline mode (build without a database)</summary>
 
-Build without a live database. The `.bsql/queries/` directory caches validation results from your last online build.
+`.bsql/queries/` holds a bitcode-serialized snapshot of every query's validation result — column types, parameter types, nullability, the whole PostgreSQL view of the query. Commit it to git and your CI and teammates can build without touching a database.
 
 ```bash
-# Online: validate queries and populate cache
-cargo build   # with BSQL_DATABASE_URL set
+# Local dev: validate against a live DB, cache everything as a side-effect
+cargo build                     # with BSQL_DATABASE_URL set
 
-# Offline: use cached validation
-BSQL_OFFLINE=true cargo build   # no database needed
+# CI / prod: use the committed cache, no database needed
+BSQL_OFFLINE=true cargo build
 ```
 
-Auto-fallback: if no `BSQL_DATABASE_URL` is set but `.bsql/` exists, bsql uses the cache automatically.
+**How mode selection works**
 
-Cache is version-gated: upgrading bsql invalidates the cache. Commit `.bsql/` to your repo so CI and teammates can build offline.
+- `BSQL_OFFLINE=true` → strict offline. Fail-fast on cache misses.
+- `BSQL_OFFLINE=false` → strict live. Require `BSQL_DATABASE_URL`.
+- Neither set + `DATABASE_URL` present → live mode.
+- Neither set + no DB + cache exists → offline mode as a convenience (local dev shortcut).
 
-**Auto-cleanup**: stale cache files are removed automatically on every build. When you change or remove a `query!()` call, the old `.bitcode` file is cleaned up — no manual intervention, no accumulation of dead files. (sqlx does not do this — stale `.sqlx` files pile up over time.)
+**How the cache stays consistent**
 
-Format: bitcode-serialized (50x faster than JSON for schema cache loading).
+Each `query!()` invocation appends its hash to `.manifest` under an exclusive file lock ([`fs2::FileExt::lock_exclusive`](https://docs.rs/fs2/latest/fs2/trait.FileExt.html#tymethod.lock_exclusive)) after the bitcode file has been fsynced to disk. Append is atomic even with parallel `rustc` processes from `cargo build --workspace`, so hashes never get lost to races. Cache keys include parameter Rust types, so two `query!()` sites with the same SQL but different declared types don't collide on the same file.
+
+**What the cache does NOT do**
+
+Auto-clean stale entries. If you remove or rename a query, its old `.bitcode` file stays on disk. This is a deliberate tradeoff — detecting "build finished" reliably from inside a proc macro isn't possible (cargo fans out rustc processes per crate), and past attempts at auto-cleanup corrupted the cache on real production builds. The overhead is small: each bitcode file is ~100-500 bytes, and a mature project typically accumulates tens of stale entries per year.
+
+**Housekeeping**
+
+```bash
+bsql verify       # check cache integrity (use as a pre-commit hook)
+bsql clean        # wipe the cache clean — a fresh cargo build repopulates it
+```
+
+`bsql verify` catches two kinds of breakage: manifest entries without a bitcode file (the "I forgot to git-add the bitcode files" mistake), and bitcode files that don't decode (corruption). Exit code 1 on broken state.
+
+Format: [bitcode](https://docs.rs/bitcode/) — 50x faster than JSON for schema cache loading, binary-compact, versioned envelope so upgrading bsql rejects stale entries with a clear message instead of crashing.
+
+</details>
+
+<details>
+<summary>Testing</summary>
+
+bsql was built assuming tests are a first-class part of your codebase. The macros, the pool, the schema-per-test harness, the fixtures — all of it is designed so that writing a test looks almost exactly like writing production code.
+
+### The 95% path: `#[bsql::test]`
+
+```rust
+#[bsql::test(fixtures("schema", "seed"))]
+async fn get_user_returns_alice(pool: bsql::Pool) {
+    let user = bsql::query!(
+        "SELECT name FROM users WHERE id = $id: i32"
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(user.name, "Alice");
+}
+```
+
+What happens per test:
+
+1. `CREATE SCHEMA test_<uuid>` — isolated namespace
+2. Apply fixtures — each listed file (`fixtures/schema.sql`, `fixtures/seed.sql`) is embedded at compile time via `include_str!` and executed
+3. Run your test body
+4. `DROP SCHEMA test_<uuid> CASCADE` — cleanup (runs even on panic via Drop guard)
+
+The same `query!()` macro you use in production works inside tests with full compile-time validation. Assertions, fixtures, inserts, updates, complex joins — all go through the normal path. No mocks, no fakes, no separate test-only API.
+
+> `#[bsql::test]` is the fastest test isolation in Rust that supports **full DDL, real nested transactions, and parallel execution** without caveats. Transaction-wrapping approaches (diesel's `test_transaction`, Go's `go-txdb`) can be ~2x faster but can't test DDL changes, treat nested transactions as savepoints, and serialize tests on one connection. sqlx creates a full database per test — correct but an order of magnitude slower.
+
+### The 5% path: runtime SQL for DDL with dynamic identifiers
+
+Sometimes you genuinely need SQL that isn't known at compile time. The canonical case is manual schema isolation — you're writing your own test harness and need `CREATE SCHEMA "test_${runtime_id}"`. The schema name is a runtime string, so `query!()` (which validates SQL against a real database at compile time) can't help.
+
+bsql exposes three runtime methods on `PgPool` for exactly this:
+
+```rust
+// DDL, SET, ALTER, DROP — anything with no result rows
+pool.raw_execute("CREATE SCHEMA \"test_xyz\"").await?;
+
+// SELECT returning text-encoded rows (values come back as strings)
+let rows = pool.raw_query("SELECT id, name FROM users").await?;
+
+// Parameterized runtime SQL via extended protocol (Parse + Bind + Execute)
+let rows = pool.raw_query_params(
+    "SELECT id FROM users WHERE login = $1",
+    &[&"alice"]
+).await?;
+```
+
+Manual schema isolation (if you want something custom, not `#[bsql::test]`):
+
+```rust
+let schema = format!("test_{}", uuid::Uuid::new_v4());
+pool.raw_execute(&format!("CREATE SCHEMA \"{schema}\"")).await?;
+pool.raw_execute(&format!("SET search_path TO \"{schema}\"")).await?;
+// ... your test ...
+pool.raw_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await?;
+```
+
+For SQLite, `SqlitePool::simple_exec(sql)` serves the same role (SQLite has no runtime parameters for DDL).
+
+### Why runtime SQL isn't hidden behind a test-only feature
+
+Because runtime SQL is legitimate in production too. Migrations, admin scripts, maintenance tasks, runtime diagnostic dumps — all of these need SQL that isn't known until a user runs the program. Hiding `raw_execute` behind a `#[cfg(test)]`-gated feature would break real users, so bsql doesn't do that. The escape hatch is documented as what it is: "use when compile-time validation can't express what you need". If you find yourself reaching for it inside a normal `SELECT` or `INSERT`, that's a signal to rewrite as `query!()` instead.
+
+### Parallelism
+
+Cargo's default test parallelism works unchanged. Each test gets its own schema, so they don't see each other's data. Extensions stay global and shared (if you need an extension, install it once in a migration, not per test). The pool is shared across tests — each test acquires a connection, runs, returns it.
+
+### Fixtures
+
+Fixtures are plain SQL files under a directory you choose. `fixtures("schema", "seed")` looks for `fixtures/schema.sql` and `fixtures/seed.sql` relative to the crate root, reads them at compile time with `include_str!`, and executes them sequentially inside the fresh schema before your test body runs. Zero runtime file I/O, zero risk of "file not found" surprises in CI.
 
 </details>
 
 <details>
 <summary>Zero-copy architecture</summary>
 
-bsql's hot path allocates nothing on the heap for most queries.
+The hot path — prepare → bind → execute → decode — allocates nothing on the heap after the second query on a given thread. A few of the mechanics:
 
-- **Binary protocol** -- `i32` is `i32::from_be_bytes()`, not parsed from ASCII text
-- **Pipelined messages** -- Parse+Bind+Execute+Sync in one `write_all()` syscall
-- **Bind templates** -- re-execution patches parameter data in-place, no message rebuild
-- **Thread-local buffer recycling** -- response buffers, column offset vectors, and arenas are recycled via thread-local pools. Second query on the same thread: zero malloc
-- **Zero UTF-8 validation on hot path** -- statement names are `[u8; 18]` passed directly to the wire protocol. No `&str` conversion, no validation overhead
-- **Monolithic execute path** -- entire send+receive inlined in one function for global compiler optimization
-- **SIMD UTF-8 validation** -- `simdutf8` for bulk string validation on result data
-- **Statement cache** -- Vec-based O(n) with u64 hash keys. Faster than HashMap for < 30 entries due to cache locality
+- **Binary wire protocol**. Integers come in as `i32::from_be_bytes()`, not parsed from ASCII. Strings are SIMD-validated via `simdutf8` then handed out as `&str` slices pointing into a shared arena.
+- **Pipelined messages**. Parse + Bind + Execute + Sync all go out in one `write_all()` syscall, then we read the entire response burst.
+- **Bind templates**. When you re-execute the same prepared statement with different parameters, bsql patches the parameter bytes in place inside a cached message template instead of rebuilding the whole Bind message.
+- **Thread-local recycling**. Response buffers, column offset vectors, decoding arenas — all pooled per thread. Second query on the same thread hits zero `malloc`.
+- **Statement cache** — small Vec with u64 hash keys. For < 30 cached statements this beats `HashMap` because it fits in one cache line per probe and branches are predictable.
 
 </details>
 
@@ -470,7 +553,7 @@ The pool uses a single writer + N reader connections (default 4) behind `Mutex`,
 - **Not an ORM.** You write SQL, not method chains.
 - **Not a query builder.** No `.filter()`, `.select()`, `.join()`.
 - **Not database-agnostic.** PostgreSQL and SQLite only. No MySQL, no MSSQL.
-- **Not a migration tool.** Use dbmate, sqitch, refinery, or whatever you prefer. bsql can [validate your migrations](#migration-safety-check) before you deploy them, but it does not write or apply them.
+- **Not a migration tool.** Use dbmate, sqitch, refinery, or whatever you prefer. bsql can validate your migrations before you deploy them (see **Migration safety check** in [One more thing](#one-more-thing)), but it does not write or apply them.
 
 </details>
 
@@ -495,29 +578,36 @@ Supported transports: TCP, Unix domain sockets, TLS (via rustls).
 
 ## One more thing
 
-These are features that no other Rust SQL library offers. They exist because bsql sees every query at compile time and every query execution at runtime -- that visibility makes things possible that are architecturally impossible in other libraries.
+bsql sees every query at compile time and every query execution at runtime. That end-to-end visibility makes a set of features possible that are architecturally out of reach for libraries that only see one half of the picture.
 
-### N+1 query detection
+<details>
+<summary>N+1 query detection</summary>
 
-The most common database performance bug: your code fetches a list, then queries once per item. 100 users = 100 queries instead of 1. Frameworks like Rails have third-party gems to detect this. bsql detects it at the driver level -- no middleware, no configuration, no code changes.
+The most common database performance bug: your code fetches a list, then queries once per item. 100 users = 100 queries instead of 1. Frameworks like Rails have third-party gems for this. bsql detects it at the driver level — no middleware, no config, no code changes.
 
 ```toml
-bsql = { version = "0.26", features = ["detect-n-plus-one"] }
+bsql = { version = "0.27", features = ["detect-n-plus-one"] }
 ```
 
-When the same query fires more than 10 times in a row on a single connection, bsql logs a warning with the query hash. The threshold is configurable via `Pool::builder().n_plus_one_threshold(5)`. When the feature is disabled, zero code exists in the binary -- full compile-time exclusion.
+When the same query fires more than 10 times in a row on a single connection, bsql logs a warning with the query hash. The threshold is configurable via `Pool::builder().n_plus_one_threshold(5)`. When the feature is disabled, zero code exists in the binary — full compile-time exclusion.
 
-### Compile-time query plan analysis
+</details>
 
-When you enable the `explain` feature, bsql runs `EXPLAIN` on every query during `cargo build` and analyzes the result. If PostgreSQL would use a sequential scan on a table with more than 1,000 rows, you get a compile-time warning:
+<details>
+<summary>Compile-time query plan analysis</summary>
+
+With the `explain` feature, bsql runs `EXPLAIN` on every query during `cargo build` and analyzes the result. If PostgreSQL would use a sequential scan on a table with more than 1,000 rows, you get a compile-time warning:
 
 ```
 warning: [bsql] Seq Scan on "orders" (est. 50000 rows) — consider adding an index
 ```
 
-This catches missing indexes before your code reaches production. The threshold is configurable via the `BSQL_EXPLAIN_THRESHOLD` environment variable. When the `explain` feature is disabled, this analysis does not run.
+Catches missing indexes before your code reaches production. Threshold is configurable via `BSQL_EXPLAIN_THRESHOLD`. Development-only — disable in CI and release builds.
 
-### Migration safety check
+</details>
+
+<details>
+<summary>Migration safety check</summary>
 
 You write a migration. Will it break any of your existing queries? Find out before deploying:
 
@@ -525,13 +615,16 @@ You write a migration. Will it break any of your existing queries? Find out befo
 bsql migrate --check add_column.sql
 ```
 
-bsql reads every validated query from its compile-time cache, creates a temporary copy of your schema, applies the migration, and tests each query against the new schema. If any query would break, it tells you which ones and why -- before the migration touches production.
+bsql reads every validated query from its compile-time cache, creates a shadow copy of your schema, applies the migration, and tests each query against the post-migration schema. If any query would break, it tells you which ones and why — before the migration touches production.
 
-This works because bsql's offline cache (`.bsql/queries/`) contains every SQL statement your application uses. No other library has this cache, so no other library can offer this check.
+This works because `.bsql/queries/` contains every SQL statement your application uses. No other library has this cache, so no other library can offer this check.
 
-### Singleflight (request coalescing)
+</details>
 
-When 100 requests hit the same endpoint at the same time and each one runs the same query with the same parameters, bsql can execute it once and share the result. The other 99 requests wait (not poll) and receive a shared copy.
+<details>
+<summary>Singleflight (request coalescing)</summary>
+
+When 100 requests hit the same endpoint at the same time and each one runs the same query with the same parameters, bsql executes it once and shares the result. The other 99 requests wait (not poll) and receive a shared copy.
 
 ```rust
 let pool = Pool::builder()
@@ -540,11 +633,18 @@ let pool = Pool::builder()
     .build()?;
 ```
 
-Only read queries are coalesced. Writes always execute independently. The deduplication key is the query hash combined with the encoded parameter bytes -- same query + same parameters = one database round-trip.
+- Only read-only queries (SELECT). Writes never coalesced.
+- Key = `rapidhash(sql_hash, encoded parameter bytes)` — same query + same params = same key.
+- 30-second timeout on waiting. If the leader panics, followers get an error, not a deadlock.
 
-### SQLite parameter type checking
+100 concurrent requests for `SELECT * FROM config WHERE key = 'theme'` become one database round-trip.
 
-Every Rust SQLite library checks parameter types at runtime — pass a string where an integer is expected, and you get a runtime error. bsql checks at compile time.
+</details>
+
+<details>
+<summary>SQLite parameter type checking (compile time)</summary>
+
+Every other Rust SQLite library checks parameter types at runtime — pass a string where an integer is expected, and you get a runtime error. bsql checks at compile time.
 
 ```rust
 // Column "id" is INTEGER in the schema.
@@ -555,11 +655,12 @@ bsql::query!("SELECT name FROM users WHERE id = $id: &str")
 
 bsql parses the SQL, finds which column each parameter is compared against, looks up the column's declared type via `PRAGMA table_info`, and verifies compatibility. Works for `WHERE`, `INSERT VALUES`, `UPDATE SET`, and comparison operators (`=`, `>`, `<`, `LIKE`, `IN`, etc.). No other Rust SQL library does this for SQLite.
 
-### Smart NULL inference
+</details>
 
-Most SQL libraries treat all computed expressions as nullable. `SELECT COUNT(*) as cnt` returns `Option<i64>` — even though `COUNT(*)` can never be NULL. You end up writing `.unwrap()` everywhere for values that are guaranteed to exist.
+<details>
+<summary>Smart NULL inference (50+ SQL patterns)</summary>
 
-bsql analyzes the SQL and infers NOT NULL for expressions that are guaranteed by the SQL standard:
+Most SQL libraries treat every computed expression as nullable. `SELECT COUNT(*) as cnt` returns `Option<i64>` — even though `COUNT(*)` can never be NULL. You end up writing `.unwrap()` everywhere for values that are guaranteed to exist. bsql analyzes the SQL and infers NOT NULL for expressions the SQL standard already guarantees:
 
 | Expression | Other libraries | bsql |
 |---|---|---|
@@ -574,11 +675,14 @@ bsql analyzes the SQL and infers NOT NULL for expressions that are guaranteed by
 | `CASE WHEN ... THEN 1 ELSE 0 END` | `Option<i32>` | `i32` |
 | `LEFT JOIN` columns | varies | `Option<T>` (always) |
 
-50+ SQL patterns recognized. No `!` override syntax, no user hints, no runtime panics. If the macro can prove NOT NULL -- you get the bare type. If it can't -- you get `Option<T>`.
+50+ patterns recognized. No `!` override syntax, no user hints, no runtime panics. If bsql can prove NOT NULL — you get the bare type. If it can't — you get `Option<T>`.
 
 > **Safety philosophy: when in doubt, `Option<T>`.** A redundant `.unwrap()` is better than a runtime crash. bsql will never mark a column as NOT NULL unless it can prove it at compile time. LEFT/RIGHT/FULL JOIN columns are always `Option<T>` regardless of table constraints, because the join itself can produce NULLs that `pg_attribute` doesn't report.
 
-### Test isolation
+</details>
+
+<details>
+<summary>Schema-per-test isolation</summary>
 
 Every test gets its own PostgreSQL schema. No shared state, no flaky tests, full parallelism.
 
@@ -591,15 +695,19 @@ async fn test_get_user(pool: bsql::Pool) {
 }
 ```
 
-Each test: `CREATE SCHEMA` (~1-2ms) → apply fixtures → run test → `DROP SCHEMA CASCADE`. Fixtures are SQL files embedded at compile time via `include_str!` — zero runtime file I/O. Cleanup runs even on panic (Drop guard). Extensions are database-global and shared across schemas.
+Each test: `CREATE SCHEMA` → apply fixtures → run → `DROP SCHEMA CASCADE`. Fixtures are embedded at compile time via `include_str!`. Cleanup runs even on panic (Drop guard).
 
-sqlx creates a temporary DATABASE per test (~50ms). bsql creates a SCHEMA (~2ms). Same isolation for tables, data, indexes, views — 25x faster setup.
+> `#[bsql::test]` is the fastest test isolation in Rust that supports **full DDL, real nested transactions, and parallel execution** without caveats. Transaction-wrapping approaches (diesel's `test_transaction`, Go's `go-txdb`) can be ~2x faster but can't test DDL changes, treat nested transactions as savepoints, and serialize tests on one connection. sqlx creates a full database per test — correct but an order of magnitude slower.
+
+See the **Testing** section in [Features](#features) above for runtime SQL escape hatches and manual schema isolation.
+
+</details>
 
 ---
 
 ## About
 
-Built with [Claude Code](https://claude.ai/code). Seventeen design principles written before the first line of code. Specifications first, then implementation, then multiple rounds of architectural audit. 1,900+ tests proving not just that the code works, but that broken code is rejected.
+Built with [Claude Code](https://claude.ai/code). Design first, implementation second, architectural review third. 2,300+ tests across the workspace — unit, integration, compile-fail, property-based, and a handful of stress tests for the pool and the wire protocol. Not just tests that the code works, but tests that broken code is rejected at compile time.
 
 Don't follow the author's name. Don't assume a library that's been around for 2 years is 12 times better than one that's been around for 2 months. Run the benchmarks yourself, read the tests, check the code.
 
