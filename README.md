@@ -449,9 +449,9 @@ Format: [bitcode](https://docs.rs/bitcode/) — 50x faster than JSON for schema 
 <details>
 <summary>Testing</summary>
 
-bsql was built assuming tests are a first-class part of your codebase. The macros, the pool, the schema-per-test harness, the fixtures — all of it is designed so that writing a test looks almost exactly like writing production code.
+bsql validates every `query!()` at compile time. That means your tests use the same `query!()` macro as your production code — no mocks, no fakes, same compile-time guarantees. The question is only: how do you isolate test data so parallel tests don't step on each other?
 
-### The 95% path: `#[bsql::test]`
+### Schema-per-test: `#[bsql::test]`
 
 ```rust
 #[bsql::test(fixtures("schema", "seed"))]
@@ -463,60 +463,46 @@ async fn get_user_returns_alice(pool: bsql::Pool) {
 }
 ```
 
-What happens per test:
+Each test runs in its own PostgreSQL schema:
 
-1. `CREATE SCHEMA test_<uuid>` — isolated namespace
-2. Apply fixtures — each listed file (`fixtures/schema.sql`, `fixtures/seed.sql`) is embedded at compile time via `include_str!` and executed
-3. Run your test body
-4. `DROP SCHEMA test_<uuid> CASCADE` — cleanup (runs even on panic via Drop guard)
+1. `CREATE SCHEMA test_<uuid>` — fresh, isolated namespace (~300μs)
+2. Apply fixtures (`fixtures/schema.sql`, `fixtures/seed.sql`) — embedded at compile time via `include_str!`, zero file I/O at runtime
+3. Run the test body — same `query!()`, same compile-time validation as production
+4. `DROP SCHEMA test_<uuid> CASCADE` — cleanup runs even on panic (Drop guard)
 
-The same `query!()` macro you use in production works inside tests with full compile-time validation. Assertions, fixtures, inserts, updates, complex joins — all go through the normal path. No mocks, no fakes, no separate test-only API.
+Cargo's default parallelism works without changes. Each test has its own schema, so they never see each other's data. No `#[serial]`, no mutexes on the database. The pool is shared — each test acquires a connection, runs, returns it.
 
 > `#[bsql::test]` is the fastest test isolation in Rust that supports **full DDL, real nested transactions, and parallel execution** without caveats. Transaction-wrapping approaches (diesel's `test_transaction`, Go's `go-txdb`) can be ~2x faster but can't test DDL changes, treat nested transactions as savepoints, and serialize tests on one connection. sqlx creates a full database per test — correct but an order of magnitude slower.
 
-### The 5% path: runtime SQL for DDL with dynamic identifiers
+### When compile-time validation can't help
 
-Sometimes you genuinely need SQL that isn't known at compile time. The canonical case is manual schema isolation — you're writing your own test harness and need `CREATE SCHEMA "test_${runtime_id}"`. The schema name is a runtime string, so `query!()` (which validates SQL against a real database at compile time) can't help.
+`query!()` validates SQL at compile time against a real database. This works for everything where the SQL text is known before the program runs — which is almost all application code: SELECTs, INSERTs, UPDATEs, DELETEs, assertions, fixtures, seed data.
 
-bsql exposes three runtime methods on `PgPool` for exactly this:
-
-```rust
-// DDL, SET, ALTER, DROP — anything with no result rows
-pool.raw_execute("CREATE SCHEMA \"test_xyz\"").await?;
-
-// SELECT returning text-encoded rows (values come back as strings)
-let rows = pool.raw_query("SELECT id, name FROM users").await?;
-
-// Parameterized runtime SQL via extended protocol (Parse + Bind + Execute)
-let rows = pool.raw_query_params(
-    "SELECT id FROM users WHERE login = $1",
-    &[&"alice"]
-).await?;
-```
-
-Manual schema isolation (if you want something custom, not `#[bsql::test]`):
+The one case it **can't** cover: SQL where an **identifier** (not a value) is computed at runtime. The canonical example is building your own test harness with dynamic schema names:
 
 ```rust
 let schema = format!("test_{}", uuid::Uuid::new_v4());
-pool.raw_execute(&format!("CREATE SCHEMA \"{schema}\"")).await?;
-pool.raw_execute(&format!("SET search_path TO \"{schema}\"")).await?;
-// ... your test ...
-pool.raw_execute(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await?;
+// "CREATE SCHEMA "test_a1b2c3..." — the schema NAME is a runtime string,
+// not a parameter. query!() can't validate this because the identifier
+// doesn't exist yet when cargo build runs.
 ```
 
-For SQLite, `SqlitePool::simple_exec(sql)` serves the same role (SQLite has no runtime parameters for DDL).
+Note the difference: a **value** (`WHERE id = $id`) can be a `query!()` parameter. An **identifier** (`CREATE SCHEMA "test_xyz"`) cannot — SQL doesn't allow parameterized identifiers. This is a SQL language constraint, not a bsql limitation.
 
-### Why runtime SQL isn't hidden behind a test-only feature
+For this narrow case, bsql exposes three methods directly on `PgPool`:
 
-Because runtime SQL is legitimate in production too. Migrations, admin scripts, maintenance tasks, runtime diagnostic dumps — all of these need SQL that isn't known until a user runs the program. Hiding `raw_execute` behind a `#[cfg(test)]`-gated feature would break real users, so bsql doesn't do that. The escape hatch is documented as what it is: "use when compile-time validation can't express what you need". If you find yourself reaching for it inside a normal `SELECT` or `INSERT`, that's a signal to rewrite as `query!()` instead.
+```rust
+pool.raw_execute("CREATE SCHEMA \"test_xyz\"").await?;          // DDL, SET — no result rows
+pool.raw_query("SELECT id, name FROM users").await?;            // SELECT → Vec<RawRow> (text values)
+pool.raw_query_params("SELECT id FROM users WHERE id = $1",
+    &[&1i32 as &(dyn Encode + Sync)]).await?;                   // parameterized runtime SQL
+```
 
-### Parallelism
+These bypass compile-time validation entirely. They're the escape hatch for runtime-computed identifiers, `SET` commands (connection-level session config like `SET search_path`, `SET timezone`), and the rare edge case where `query!()` genuinely can't express what you need.
 
-Cargo's default test parallelism works unchanged. Each test gets its own schema, so they don't see each other's data. Extensions stay global and shared (if you need an extension, install it once in a migration, not per test). The pool is shared across tests — each test acquires a connection, runs, returns it.
+For SQLite, `SqlitePool::simple_exec(sql)` fills the same role.
 
-### Fixtures
-
-Fixtures are plain SQL files under a directory you choose. `fixtures("schema", "seed")` looks for `fixtures/schema.sql` and `fixtures/seed.sql` relative to the crate root, reads them at compile time with `include_str!`, and executes them sequentially inside the fresh schema before your test body runs. Zero runtime file I/O, zero risk of "file not found" surprises in CI.
+**If you're using `raw_execute` for a normal SELECT or INSERT** — that's a signal to rewrite it as `query!()`. The escape hatch exists for identifiers and DDL, not for skipping validation on regular queries.
 
 </details>
 
