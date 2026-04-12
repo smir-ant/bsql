@@ -701,8 +701,8 @@ Living document — grows with each bug report and edge case discovery.
 - Database file deleted during pool operation → error
 
 ### Transactions
-- BEGIN/COMMIT via simple_exec
-- BEGIN/ROLLBACK via simple_exec
+- BEGIN/COMMIT via raw_execute
+- BEGIN/ROLLBACK via raw_execute
 - Busy timeout under concurrent write contention
 
 ### Schema

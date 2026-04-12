@@ -321,14 +321,9 @@ impl SqlitePool {
     /// Named with the `raw_` prefix to make it visually obvious that
     /// you're leaving the compile-time-safe zone.
     pub fn raw_execute(&self, sql: &str) -> BsqlResult<()> {
-        self.inner.simple_exec(sql).map_err(BsqlError::from_sqlite)
+        self.inner.raw_execute(sql).map_err(BsqlError::from_sqlite)
     }
 
-    /// Deprecated alias for [`raw_execute`]. Use `raw_execute` instead.
-    #[deprecated(since = "0.27.0", note = "renamed to `raw_execute` for API consistency with PgPool")]
-    pub fn simple_exec(&self, sql: &str) -> BsqlResult<()> {
-        self.raw_execute(sql)
-    }
 
     /// Begin a transaction on the writer connection.
     ///
@@ -650,7 +645,7 @@ mod tests {
     fn open_is_alias_for_connect() {
         let path = temp_db_path();
         let pool = SqlitePool::open(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
         // Verify the pool is usable
         assert_eq!(pool.reader_count(), 4);
@@ -664,7 +659,7 @@ mod tests {
     fn transaction_commit() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let tx = pool.begin().unwrap();
@@ -699,7 +694,7 @@ mod tests {
     fn transaction_rollback() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let tx = pool.begin().unwrap();
@@ -726,7 +721,7 @@ mod tests {
     fn transaction_savepoint() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let tx = pool.begin().unwrap();
@@ -764,7 +759,7 @@ mod tests {
     fn transaction_drop_auto_rollback() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         {
@@ -796,10 +791,10 @@ mod tests {
     fn streaming_query() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
         for i in 0..10 {
-            pool.simple_exec(&format!("INSERT INTO t VALUES ({i})"))
+            pool.raw_execute(&format!("INSERT INTO t VALUES ({i})"))
                 .unwrap();
         }
 
@@ -952,7 +947,7 @@ mod tests {
     fn execute_batch_multiple() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let sql = "INSERT INTO t VALUES (?1)";
@@ -987,7 +982,7 @@ mod tests {
     fn execute_direct_insert() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let sql = "INSERT INTO t VALUES (?1)";
@@ -1027,7 +1022,7 @@ mod tests {
     fn transaction_nested_savepoints_three_levels() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let tx = pool.begin().unwrap();
@@ -1090,7 +1085,7 @@ mod tests {
     fn transaction_savepoint_same_name_twice() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let tx = pool.begin().unwrap();
@@ -1141,7 +1136,7 @@ mod tests {
     fn transaction_release_savepoint() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let tx = pool.begin().unwrap();
@@ -1174,7 +1169,7 @@ mod tests {
     fn sqlite_pool_warmup() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         // Warmup should not panic even with valid SQL
@@ -1190,11 +1185,11 @@ mod tests {
     fn sqlite_pool_for_each() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (2)").unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (3)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (1)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (2)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (3)").unwrap();
 
         let sql = "SELECT id FROM t ORDER BY id";
         let hash = crate::rapid_hash_str(sql);
@@ -1218,10 +1213,10 @@ mod tests {
     fn sqlite_pool_for_each_collect() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (10)").unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (20)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (10)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (20)").unwrap();
 
         let sql = "SELECT id FROM t ORDER BY id";
         let hash = crate::rapid_hash_str(sql);
@@ -1241,9 +1236,9 @@ mod tests {
     fn sqlite_pool_fetch_one_direct() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (42)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (42)").unwrap();
 
         let sql = "SELECT id FROM t LIMIT 1";
         let hash = crate::rapid_hash_str(sql);
@@ -1263,9 +1258,9 @@ mod tests {
     fn sqlite_pool_fetch_optional_direct_some() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (7)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (7)").unwrap();
 
         let sql = "SELECT id FROM t LIMIT 1";
         let hash = crate::rapid_hash_str(sql);
@@ -1283,7 +1278,7 @@ mod tests {
     fn sqlite_pool_fetch_optional_direct_none() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let sql = "SELECT id FROM t LIMIT 1";
@@ -1304,10 +1299,10 @@ mod tests {
     fn sqlite_pool_fetch_all_direct() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
-        pool.simple_exec("INSERT INTO t VALUES (2)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (1)").unwrap();
+        pool.raw_execute("INSERT INTO t VALUES (2)").unwrap();
 
         let sql = "SELECT id FROM t ORDER BY id";
         let hash = crate::rapid_hash_str(sql);
@@ -1325,7 +1320,7 @@ mod tests {
     fn sqlite_pool_fetch_all_direct_empty() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let sql = "SELECT id FROM t";
@@ -1346,7 +1341,7 @@ mod tests {
     fn transaction_read_own_writes() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let tx = pool.begin().unwrap();
@@ -1380,7 +1375,7 @@ mod tests {
     fn transaction_execute_batch() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
-        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
             .unwrap();
 
         let tx = pool.begin().unwrap();

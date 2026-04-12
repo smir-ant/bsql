@@ -8,7 +8,7 @@ use bsql::SqlitePool;
 
 fn setup_db() -> SqlitePool {
     let pool = SqlitePool::open(":memory:").unwrap();
-    pool.simple_exec(
+    pool.raw_execute(
         "CREATE TABLE users (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -17,9 +17,9 @@ fn setup_db() -> SqlitePool {
         )",
     )
     .unwrap();
-    pool.simple_exec("INSERT INTO users (name, email, score) VALUES ('alice', 'a@test.com', 42)")
+    pool.raw_execute("INSERT INTO users (name, email, score) VALUES ('alice', 'a@test.com', 42)")
         .unwrap();
-    pool.simple_exec("INSERT INTO users (name, email, score) VALUES ('bob', NULL, NULL)")
+    pool.raw_execute("INSERT INTO users (name, email, score) VALUES ('bob', NULL, NULL)")
         .unwrap();
     pool
 }
@@ -30,7 +30,7 @@ fn sqlite_open_memory() {
 }
 
 #[test]
-fn sqlite_simple_exec_create_and_insert() {
+fn sqlite_raw_execute_create_and_insert() {
     let pool = setup_db();
     // Verify data exists via fetch_all_direct
     let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
@@ -66,21 +66,21 @@ fn sqlite_in_memory_isolation() {
     let pool2 = SqlitePool::open(":memory:").unwrap();
 
     pool1
-        .simple_exec("CREATE TABLE isolated (id INTEGER)")
+        .raw_execute("CREATE TABLE isolated (id INTEGER)")
         .unwrap();
 
     // pool2 should NOT see pool1's table
-    let result = pool2.simple_exec("INSERT INTO isolated VALUES (1)");
+    let result = pool2.raw_execute("INSERT INTO isolated VALUES (1)");
     assert!(result.is_err(), "in-memory DBs should be isolated");
 }
 
 #[test]
 fn sqlite_transaction_commit() {
     let pool = setup_db();
-    pool.simple_exec("BEGIN").unwrap();
-    pool.simple_exec("INSERT INTO users (name) VALUES ('charlie')")
+    pool.raw_execute("BEGIN").unwrap();
+    pool.raw_execute("INSERT INTO users (name) VALUES ('charlie')")
         .unwrap();
-    pool.simple_exec("COMMIT").unwrap();
+    pool.raw_execute("COMMIT").unwrap();
 
     let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
     let counts = pool
@@ -94,10 +94,10 @@ fn sqlite_transaction_commit() {
 #[test]
 fn sqlite_transaction_rollback() {
     let pool = setup_db();
-    pool.simple_exec("BEGIN").unwrap();
-    pool.simple_exec("INSERT INTO users (name) VALUES ('dave')")
+    pool.raw_execute("BEGIN").unwrap();
+    pool.raw_execute("INSERT INTO users (name) VALUES ('dave')")
         .unwrap();
-    pool.simple_exec("ROLLBACK").unwrap();
+    pool.raw_execute("ROLLBACK").unwrap();
 
     let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
     let counts = pool
@@ -111,7 +111,7 @@ fn sqlite_transaction_rollback() {
 #[test]
 fn sqlite_error_bad_sql() {
     let pool = setup_db();
-    let result = pool.simple_exec("NOT VALID SQL");
+    let result = pool.raw_execute("NOT VALID SQL");
     assert!(result.is_err());
 }
 
@@ -153,12 +153,12 @@ fn sqlite_open_nonexistent_readonly_fails() {
 fn sqlite_concurrent_writes_wal() {
     // WAL mode allows concurrent readers + 1 writer
     let pool = setup_db();
-    pool.simple_exec("PRAGMA journal_mode=WAL").unwrap();
+    pool.raw_execute("PRAGMA journal_mode=WAL").unwrap();
 
     // Sequential writes should work
     for i in 0..10 {
         let sql = format!("INSERT INTO users (name) VALUES ('wal_test_{i}')");
-        pool.simple_exec(&sql).unwrap();
+        pool.raw_execute(&sql).unwrap();
     }
 
     let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
@@ -173,11 +173,11 @@ fn sqlite_concurrent_writes_wal() {
 #[test]
 fn sqlite_execute_batch_multiple_statements() {
     let pool = setup_db();
-    pool.simple_exec("INSERT INTO users (name) VALUES ('batch1')")
+    pool.raw_execute("INSERT INTO users (name) VALUES ('batch1')")
         .unwrap();
-    pool.simple_exec("INSERT INTO users (name) VALUES ('batch2')")
+    pool.raw_execute("INSERT INTO users (name) VALUES ('batch2')")
         .unwrap();
-    pool.simple_exec("INSERT INTO users (name) VALUES ('batch3')")
+    pool.raw_execute("INSERT INTO users (name) VALUES ('batch3')")
         .unwrap();
 
     let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
@@ -194,7 +194,7 @@ fn sqlite_large_insert_batch() {
     let pool = setup_db();
     for i in 0..500 {
         let sql = format!("INSERT INTO users (name) VALUES ('large_{i}')");
-        pool.simple_exec(&sql).unwrap();
+        pool.raw_execute(&sql).unwrap();
     }
     let hash = bsql::driver::hash_sql("SELECT COUNT(*) FROM users");
     let counts = pool

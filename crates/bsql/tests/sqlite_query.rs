@@ -633,12 +633,12 @@ fn sqlite_comments_in_sql() {
 fn sqlite_fk_violation() {
     let pool = pool();
     // Enable FK enforcement
-    pool.simple_exec("PRAGMA foreign_keys = ON").unwrap();
+    pool.raw_execute("PRAGMA foreign_keys = ON").unwrap();
     // owner_id 999 doesn't exist
     let result =
         bsql::query!("INSERT INTO items (title, owner_id) VALUES ('fk_test', 999)").execute(&pool);
     assert!(result.is_err());
-    pool.simple_exec("PRAGMA foreign_keys = OFF").unwrap();
+    pool.raw_execute("PRAGMA foreign_keys = OFF").unwrap();
 }
 
 #[test]

@@ -69,7 +69,7 @@ mod tests {
     //
     // #[bsql::test]
     // fn test_create_own_table(pool: bsql::SqlitePool) {
-    //     pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+    //     pool.raw_execute("CREATE TABLE t (id INTEGER)").unwrap();
     //     // Table exists only in this test's temp DB
     // }
 }

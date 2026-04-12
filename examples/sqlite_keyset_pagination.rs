@@ -29,7 +29,7 @@ fn main() -> Result<(), BsqlError> {
     let pool = SqlitePool::open(":memory:")?;
 
     // Schema + seed data. DDL and multi-row inserts go through
-    // `simple_exec` — runtime SQL, no compile-time validation,
+    // `raw_execute` — runtime SQL, no compile-time validation,
     // which is the right fit for one-shot setup statements.
     pool.raw_execute(
         "CREATE TABLE users (

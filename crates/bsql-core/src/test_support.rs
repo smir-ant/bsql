@@ -740,7 +740,7 @@ mod tests {
                 "INSERT INTO users (name) VALUES ('Alice')",
             ])
             .unwrap();
-            // Verify via simple_exec + query
+            // Verify via raw_execute + query
             let sql = "SELECT name FROM users";
             let hash = crate::rapid_hash_str(sql);
             let (result, arena) = ctx
