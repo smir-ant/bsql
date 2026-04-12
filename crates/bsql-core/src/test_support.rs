@@ -166,7 +166,7 @@ pub fn setup_sqlite_test(
     // Apply fixtures in order.
     for fixture_sql in fixtures_sql {
         if !fixture_sql.trim().is_empty() {
-            pool.simple_exec(fixture_sql)
+            pool.raw_execute(fixture_sql)
                 .map_err(|e| ConnectError::create(format!("SQLite fixture failed: {e}")))?;
         }
     }

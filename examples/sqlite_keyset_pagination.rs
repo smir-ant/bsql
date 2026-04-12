@@ -31,14 +31,14 @@ fn main() -> Result<(), BsqlError> {
     // Schema + seed data. DDL and multi-row inserts go through
     // `simple_exec` — runtime SQL, no compile-time validation,
     // which is the right fit for one-shot setup statements.
-    pool.simple_exec(
+    pool.raw_execute(
         "CREATE TABLE users (
             id    INTEGER PRIMARY KEY AUTOINCREMENT,
             login TEXT NOT NULL
         ) STRICT",
     )?;
 
-    pool.simple_exec(
+    pool.raw_execute(
         "INSERT INTO users (login) VALUES
             ('alice'), ('bob'), ('carol'), ('dave'), ('eve'),
             ('frank'), ('grace'), ('heidi'), ('ivan'), ('judy')",

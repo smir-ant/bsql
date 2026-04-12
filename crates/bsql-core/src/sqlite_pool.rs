@@ -311,9 +311,23 @@ impl SqlitePool {
             .map_err(BsqlError::from_sqlite)
     }
 
-    /// Execute a simple SQL statement on the writer (PRAGMA, DDL).
-    pub fn simple_exec(&self, sql: &str) -> BsqlResult<()> {
+    /// Execute arbitrary runtime SQL on the writer connection (DDL, PRAGMA, SET).
+    ///
+    /// This bypasses bsql's compile-time SQL validation entirely.
+    /// Use for DDL with runtime-computed identifiers (schema names, table
+    /// names) and connection-level session commands. For normal queries,
+    /// always prefer `query!()`.
+    ///
+    /// Named with the `raw_` prefix to make it visually obvious that
+    /// you're leaving the compile-time-safe zone.
+    pub fn raw_execute(&self, sql: &str) -> BsqlResult<()> {
         self.inner.simple_exec(sql).map_err(BsqlError::from_sqlite)
+    }
+
+    /// Deprecated alias for [`raw_execute`]. Use `raw_execute` instead.
+    #[deprecated(since = "0.27.0", note = "renamed to `raw_execute` for API consistency with PgPool")]
+    pub fn simple_exec(&self, sql: &str) -> BsqlResult<()> {
+        self.raw_execute(sql)
     }
 
     /// Begin a transaction on the writer connection.

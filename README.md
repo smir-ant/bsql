@@ -500,7 +500,7 @@ pool.raw_query_params("SELECT id FROM users WHERE id = $1",
 
 These bypass compile-time validation entirely. They're the escape hatch for runtime-computed identifiers, `SET` commands (connection-level session config like `SET search_path`, `SET timezone`), and the rare edge case where `query!()` genuinely can't express what you need.
 
-For SQLite, `SqlitePool::simple_exec(sql)` fills the same role.
+For SQLite, `SqlitePool::raw_execute(sql)` fills the same role.
 
 **If you're using `raw_execute` for a normal SELECT or INSERT** — that's a signal to rewrite it as `query!()`. The escape hatch exists for identifiers and DDL, not for skipping validation on regular queries.
 

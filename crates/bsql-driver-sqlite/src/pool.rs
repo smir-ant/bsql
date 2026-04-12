@@ -233,10 +233,19 @@ impl SqlitePool {
         conn.execute(sql, sql_hash, &param_refs)
     }
 
-    /// Execute a simple SQL statement on the writer (PRAGMA, DDL).
-    pub fn simple_exec(&self, sql: &str) -> Result<(), SqliteError> {
+    /// Execute arbitrary runtime SQL on the writer (DDL, PRAGMA).
+    ///
+    /// Bypasses compile-time validation. Named `raw_execute` for API
+    /// consistency with `PgPool::raw_execute`.
+    pub fn raw_execute(&self, sql: &str) -> Result<(), SqliteError> {
         let conn = self.acquire_writer()?;
         conn.exec(sql)
+    }
+
+    /// Deprecated alias for [`raw_execute`].
+    #[deprecated(since = "0.27.0", note = "renamed to `raw_execute` for API consistency")]
+    pub fn simple_exec(&self, sql: &str) -> Result<(), SqliteError> {
+        self.raw_execute(sql)
     }
 
     /// Fetch exactly one row via direct decode — zero arena overhead.
