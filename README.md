@@ -11,7 +11,7 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **Minimal footprint** -- 1.59 MB peak memory — 4.3x less than C (libpq), 4.4x less than sqlx, 10.9x less than Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
 - **Async and sync — both first-class** -- same `query!` macro, same performance, same features. Async uses true cooperative scheduling (RPITIT, no `block_in_place` hacks). Sync removes tokio entirely — pure `fn`, zero async runtime overhead. Switch by changing one line in `Cargo.toml`. Most Rust SQL libraries are async-first with sync as an afterthought, or sync-only. bsql is both, equally.
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
-- **Test isolation in sub-millisecond** -- `#[bsql::test]` creates a schema per test, not a database. Raw schema create+drop cycle is ~300μs on a local PG; a full test with fixtures typically runs 1-3ms total. Orders of magnitude faster than DB-per-test approaches.
+- **Test isolation in sub-millisecond** -- `#[bsql::test]` creates a schema per test, not a database. Raw schema create+drop cycle is ~300μs on a local PG; a full test with fixtures typically runs 1-3ms total. Orders of magnitude faster than DB-per-test approaches. For DDL with runtime identifiers (custom schema names, ad-hoc setup), `pool.raw_execute()` is the escape hatch — see **Testing** in [Features](#features).
 - **Things nobody else does** -- automatic N+1 detection, compile-time query plan analysis, migration safety checking, request coalescing, SQLite parameter type checking, smart NULL inference. See [**One more thing**](#one-more-thing) below.
 
 ```rust
@@ -117,7 +117,9 @@ URL formats: `sqlite:./relative/path`, `sqlite:///absolute/path`, `sqlite::memor
 
 </details>
 
-See [examples/](examples/) for more complete, runnable programs — including [keyset pagination](examples/pg_keyset_pagination.rs) (the correct way to paginate large result sets; works identically in [PostgreSQL](examples/pg_keyset_pagination.rs) and [SQLite](examples/sqlite_keyset_pagination.rs)).
+See [examples/](examples/) for more complete, runnable programs — including [keyset pagination](examples/pg_keyset_pagination.rs) (works identically in [PostgreSQL](examples/pg_keyset_pagination.rs) and [SQLite](examples/sqlite_keyset_pagination.rs)).
+
+**Writing tests?** See the **Testing** section in [Features](#features) — covers `#[bsql::test]`, schema isolation, runtime SQL escape hatches (`raw_execute`, `raw_query`), and when to use what.
 
 ---
 
