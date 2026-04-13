@@ -84,6 +84,60 @@ impl Drop for OwnedResult {
 }
 
 // ---------------------------------------------------------------------------
+// PgQuerySpec — trait describing a compile-time validated query
+// ---------------------------------------------------------------------------
+
+/// Trait implemented by generated query structs from `bsql::query!`.
+///
+/// Separates the query description (SQL, params, decoding) from the
+/// execution backend (Pool, Connection, Transaction). This keeps the
+/// pool and QueryTarget types clean — they have generic execution methods
+/// (`fetch_all<Q>`, `execute_query<Q>`) instead of internal low-level
+/// methods that generated code would call directly.
+///
+/// # Not meant for manual implementation
+///
+/// This trait is `#[doc(hidden)]` and implemented exclusively by the
+/// `bsql::query!` proc macro. Its shape may change between bsql
+/// versions without notice.
+#[doc(hidden)]
+pub trait PgQuerySpec: Sized {
+    /// The decoded row type (generated struct with typed fields).
+    type Row;
+
+    /// The SQL text, embedded as a `&'static str` at compile time.
+    const SQL: &'static str;
+
+    /// Pre-computed hash of the SQL (for statement cache lookup).
+    const SQL_HASH: u64;
+
+    /// SQL with ` LIMIT 2` appended, used by `fetch_one`/`fetch_optional`
+    /// to avoid fetching thousands of rows when only 0-1 are expected.
+    /// Equal to `SQL` if the original query already contains LIMIT or FOR.
+    const SQL_LIMITED: &'static str;
+
+    /// Hash of `SQL_LIMITED`.
+    const SQL_LIMITED_HASH: u64;
+
+    /// Whether this is a read-only query (SELECT). When true,
+    /// `QueryTarget::Pool` routes to the read replica if configured.
+    const READONLY: bool;
+
+    /// Whether this query returns columns (SELECT, RETURNING). When
+    /// false, only `execute_query` makes sense (returns affected rows).
+    const HAS_COLUMNS: bool;
+
+    /// Build the parameter list from `self`'s fields.
+    ///
+    /// One small Vec allocation per query execution (typically 3-8
+    /// pointers). Negligible compared to the network round-trip.
+    fn params(&self) -> Vec<&(dyn Encode + Sync)>;
+
+    /// Decode a single row from the query result.
+    fn decode_row(row: bsql_driver_postgres::Row<'_>) -> BsqlResult<Self::Row>;
+}
+
+// ---------------------------------------------------------------------------
 // QueryTarget — enum dispatch for Pool / PoolConnection / Transaction
 // ---------------------------------------------------------------------------
 
@@ -123,7 +177,134 @@ impl<'a> From<&'a mut Transaction> for QueryTarget<'a> {
     }
 }
 
-// --- Async QueryTarget methods ---
+// --- Generic query execution (used by generated code via PgQuerySpec) ---
+
+#[cfg(feature = "async")]
+impl<'a> QueryTarget<'a> {
+    /// Fetch all rows for a compile-time validated query.
+    #[doc(hidden)]
+    pub async fn fetch_all<Q: PgQuerySpec>(self, query: &Q) -> BsqlResult<Vec<Q::Row>> {
+        let params = query.params();
+        let owned = if Q::READONLY {
+            self.query_raw_readonly(Q::SQL, Q::SQL_HASH, &params)
+                .await?
+        } else {
+            self.query_raw(Q::SQL, Q::SQL_HASH, &params).await?
+        };
+        owned
+            .iter()
+            .map(|row| Q::decode_row(row))
+            .collect::<BsqlResult<Vec<_>>>()
+    }
+
+    /// Fetch exactly one row. Returns error if 0 or 2+ rows.
+    /// Uses `SQL_LIMITED` (with LIMIT 2) to avoid over-fetching.
+    #[doc(hidden)]
+    pub async fn fetch_one<Q: PgQuerySpec>(self, query: &Q) -> BsqlResult<Q::Row> {
+        let params = query.params();
+        let owned = if Q::READONLY {
+            self.query_raw_readonly(Q::SQL_LIMITED, Q::SQL_LIMITED_HASH, &params)
+                .await?
+        } else {
+            self.query_raw(Q::SQL_LIMITED, Q::SQL_LIMITED_HASH, &params)
+                .await?
+        };
+        if owned.len() != 1 {
+            return Err(crate::error::QueryError::row_count(
+                "exactly 1 row",
+                owned.len() as u64,
+            ));
+        }
+        Q::decode_row(owned.row(0))
+    }
+
+    /// Fetch zero or one row. Returns error if 2+ rows.
+    /// Uses `SQL_LIMITED` (with LIMIT 2) to avoid over-fetching.
+    #[doc(hidden)]
+    pub async fn fetch_optional<Q: PgQuerySpec>(self, query: &Q) -> BsqlResult<Option<Q::Row>> {
+        let params = query.params();
+        let owned = if Q::READONLY {
+            self.query_raw_readonly(Q::SQL_LIMITED, Q::SQL_LIMITED_HASH, &params)
+                .await?
+        } else {
+            self.query_raw(Q::SQL_LIMITED, Q::SQL_LIMITED_HASH, &params)
+                .await?
+        };
+        match owned.len() {
+            0 => Ok(None),
+            1 => Ok(Some(Q::decode_row(owned.row(0))?)),
+            n => Err(crate::error::QueryError::row_count("0 or 1 rows", n as u64)),
+        }
+    }
+
+    /// Execute a write query, return affected row count.
+    #[doc(hidden)]
+    pub async fn execute_query<Q: PgQuerySpec>(self, query: &Q) -> BsqlResult<u64> {
+        let params = query.params();
+        self.execute_raw(Q::SQL, Q::SQL_HASH, &params).await
+    }
+}
+
+#[cfg(not(feature = "async"))]
+impl<'a> QueryTarget<'a> {
+    /// Fetch all rows for a compile-time validated query.
+    #[doc(hidden)]
+    pub fn fetch_all<Q: PgQuerySpec>(self, query: &Q) -> BsqlResult<Vec<Q::Row>> {
+        let params = query.params();
+        let owned = if Q::READONLY {
+            self.query_raw_readonly(Q::SQL, Q::SQL_HASH, &params)?
+        } else {
+            self.query_raw(Q::SQL, Q::SQL_HASH, &params)?
+        };
+        owned
+            .iter()
+            .map(|row| Q::decode_row(row))
+            .collect::<BsqlResult<Vec<_>>>()
+    }
+
+    /// Fetch exactly one row. Returns error if 0 or 2+ rows.
+    #[doc(hidden)]
+    pub fn fetch_one<Q: PgQuerySpec>(self, query: &Q) -> BsqlResult<Q::Row> {
+        let params = query.params();
+        let owned = if Q::READONLY {
+            self.query_raw_readonly(Q::SQL, Q::SQL_HASH, &params)?
+        } else {
+            self.query_raw(Q::SQL, Q::SQL_HASH, &params)?
+        };
+        if owned.len() != 1 {
+            return Err(crate::error::QueryError::row_count(
+                "exactly 1 row",
+                owned.len() as u64,
+            ));
+        }
+        Q::decode_row(owned.row(0))
+    }
+
+    /// Fetch zero or one row. Returns error if 2+ rows.
+    #[doc(hidden)]
+    pub fn fetch_optional<Q: PgQuerySpec>(self, query: &Q) -> BsqlResult<Option<Q::Row>> {
+        let params = query.params();
+        let owned = if Q::READONLY {
+            self.query_raw_readonly(Q::SQL, Q::SQL_HASH, &params)?
+        } else {
+            self.query_raw(Q::SQL, Q::SQL_HASH, &params)?
+        };
+        match owned.len() {
+            0 => Ok(None),
+            1 => Ok(Some(Q::decode_row(owned.row(0))?)),
+            n => Err(crate::error::QueryError::row_count("0 or 1 rows", n as u64)),
+        }
+    }
+
+    /// Execute a write query, return affected row count.
+    #[doc(hidden)]
+    pub fn execute_query<Q: PgQuerySpec>(self, query: &Q) -> BsqlResult<u64> {
+        let params = query.params();
+        self.execute_raw(Q::SQL, Q::SQL_HASH, &params)
+    }
+}
+
+// --- Low-level QueryTarget methods (used by generic methods above) ---
 
 #[cfg(feature = "async")]
 impl<'a> QueryTarget<'a> {
