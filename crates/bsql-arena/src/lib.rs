@@ -1582,6 +1582,60 @@ mod tests {
         assert_eq!(blob, &[0xDE, 0xAD]);
     }
 
+    // --- Arena::empty() + global_offset() ---
+
+    #[test]
+    fn empty_arena_global_offset_is_zero() {
+        let arena = Arena::empty();
+        assert_eq!(arena.global_offset(), 0);
+    }
+
+    #[test]
+    fn empty_arena_has_no_chunks() {
+        let arena = Arena::empty();
+        assert!(arena.chunks.is_empty());
+        assert!(arena.prefix_sums.is_empty());
+    }
+
+    #[test]
+    fn empty_arena_zero_capacity() {
+        let arena = Arena::empty();
+        assert_eq!(arena.capacity(), 0);
+    }
+
+    #[test]
+    fn empty_arena_zero_allocated() {
+        let arena = Arena::empty();
+        assert_eq!(arena.allocated(), 0);
+    }
+
+    #[test]
+    fn empty_arena_alloc_triggers_first_chunk() {
+        let mut arena = Arena::empty();
+        let offset = arena.alloc_copy(b"hello");
+        assert_eq!(arena.get(offset, 5), b"hello");
+        assert!(!arena.chunks.is_empty(), "alloc on empty arena must create a chunk");
+    }
+
+    #[test]
+    fn global_offset_advances_after_alloc() {
+        let mut arena = Arena::new();
+        assert_eq!(arena.global_offset(), 0);
+        arena.alloc_copy(b"abc");
+        assert_eq!(arena.global_offset(), 3);
+        arena.alloc_copy(b"de");
+        assert_eq!(arena.global_offset(), 5);
+    }
+
+    #[test]
+    fn global_offset_reset_returns_to_zero() {
+        let mut arena = Arena::new();
+        arena.alloc_copy(b"data");
+        assert_eq!(arena.global_offset(), 4);
+        arena.reset();
+        assert_eq!(arena.global_offset(), 0);
+    }
+
     // --- Gap: ValidatedRows deref and into_iter ---
 
     #[test]

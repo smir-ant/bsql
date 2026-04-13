@@ -3997,4 +3997,65 @@ mod tests {
         assert!(hex.contains("00000019"), "must contain OID 25 (text)");
         assert!(hex.contains("00000010"), "must contain OID 16 (bool)");
     }
+
+    // --- pg_wire_size tests ---
+
+    #[test]
+    fn pg_wire_size_bool() {
+        assert_eq!(pg_wire_size("bool"), Some(1));
+    }
+
+    #[test]
+    fn pg_wire_size_i16() {
+        assert_eq!(pg_wire_size("i16"), Some(2));
+    }
+
+    #[test]
+    fn pg_wire_size_i32() {
+        assert_eq!(pg_wire_size("i32"), Some(4));
+    }
+
+    #[test]
+    fn pg_wire_size_f32() {
+        assert_eq!(pg_wire_size("f32"), Some(4));
+    }
+
+    #[test]
+    fn pg_wire_size_u32() {
+        assert_eq!(pg_wire_size("u32"), Some(4));
+    }
+
+    #[test]
+    fn pg_wire_size_i64() {
+        assert_eq!(pg_wire_size("i64"), Some(8));
+    }
+
+    #[test]
+    fn pg_wire_size_f64() {
+        assert_eq!(pg_wire_size("f64"), Some(8));
+    }
+
+    #[test]
+    fn pg_wire_size_unknown_returns_none() {
+        assert_eq!(pg_wire_size("String"), None);
+        assert_eq!(pg_wire_size("Vec<u8>"), None);
+        assert_eq!(pg_wire_size("Option<i32>"), None);
+        assert_eq!(pg_wire_size("uuid::Uuid"), None);
+        assert_eq!(pg_wire_size(""), None);
+    }
+
+    #[test]
+    fn pg_wire_size_all_4byte_types_equal() {
+        // i32, f32, u32 all occupy 4 bytes on the wire
+        let four_byte = pg_wire_size("i32").unwrap();
+        assert_eq!(pg_wire_size("f32").unwrap(), four_byte);
+        assert_eq!(pg_wire_size("u32").unwrap(), four_byte);
+    }
+
+    #[test]
+    fn pg_wire_size_all_8byte_types_equal() {
+        // i64 and f64 both occupy 8 bytes on the wire
+        let eight_byte = pg_wire_size("i64").unwrap();
+        assert_eq!(pg_wire_size("f64").unwrap(), eight_byte);
+    }
 }

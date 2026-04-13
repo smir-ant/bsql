@@ -2666,3 +2666,162 @@ async fn copy_in_binary_large_batch() {
         .unwrap();
     assert_eq!(result[0].get(0), Some("10000"));
 }
+
+// ---------------------------------------------------------------------------
+// for_each — fixed-offset decode optimisation paths
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn for_each_all_fixed_columns() {
+    // All columns are fixed-size NOT NULL → compile-time column offset path.
+    let pool = pool().await;
+    let mut count = 0u32;
+    bsql::query!("SELECT id, active, score, balance FROM users ORDER BY id")
+        .for_each(&pool, |row| {
+            count += 1;
+            match count {
+                1 => {
+                    assert_eq!(row.id, 1);
+                    assert_eq!(row.active, true);
+                    assert_eq!(row.score, 42i16);
+                    assert!((row.balance - 100.50).abs() < f64::EPSILON);
+                }
+                2 => {
+                    assert_eq!(row.id, 2);
+                    assert_eq!(row.active, true);
+                    assert_eq!(row.score, 7i16);
+                    assert!((row.balance - 0.0).abs() < f64::EPSILON);
+                }
+                _ => panic!("unexpected row count {count}"),
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn for_each_mixed_fixed_and_variable() {
+    // id (i32 NOT NULL) gets fixed-offset decode; login (text NOT NULL) and
+    // active (bool NOT NULL) fall back to sequential decode.
+    let pool = pool().await;
+    let mut count = 0u32;
+    bsql::query!("SELECT id, login, active FROM users ORDER BY id")
+        .for_each(&pool, |row| {
+            count += 1;
+            match count {
+                1 => {
+                    assert_eq!(row.id, 1);
+                    assert_eq!(row.login, "alice");
+                    assert_eq!(row.active, true);
+                }
+                2 => {
+                    assert_eq!(row.id, 2);
+                    assert_eq!(row.login, "bob");
+                    assert_eq!(row.active, true);
+                }
+                _ => panic!("unexpected row count {count}"),
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn for_each_no_fixed_prefix_nullable_first() {
+    // First column is nullable text → no fixed-offset optimisation applies,
+    // all columns decoded sequentially.
+    let pool = pool().await;
+    let mut count = 0u32;
+    bsql::query!("SELECT middle_name, id FROM users ORDER BY id")
+        .for_each(&pool, |row| {
+            count += 1;
+            match count {
+                1 => {
+                    assert!(row.middle_name.is_none());
+                    assert_eq!(row.id, 1);
+                }
+                2 => {
+                    assert!(row.middle_name.is_none());
+                    assert_eq!(row.id, 2);
+                }
+                _ => panic!("unexpected row count {count}"),
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn large_text_column_exceeds_stream_buffer() {
+    // INSERT a 20KB text value, then SELECT it back via for_each.
+    // Verifies the reduced 16KB stream_buf handles oversized messages.
+    //
+    // for_each uses sync connections while fetch_one/execute use async, so we
+    // need a separate pool for the for_each call (same pattern as stress test).
+    let insert_pool = pool().await;
+    let query_pool = Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
+        .await
+        .unwrap();
+
+    let large_desc = "x".repeat(20_000); // 20KB text
+    let title = "large_text_test";
+    let uid = 1i32;
+
+    // Insert a ticket with the large description.
+    let ticket = bsql::query!(
+        "INSERT INTO tickets (title, description, status, created_by_user_id)
+         VALUES ($title: &str, $large_desc: &str, 'new', $uid: i32)
+         RETURNING id"
+    )
+    .fetch_one(&insert_pool)
+    .await
+    .unwrap();
+
+    let ticket_id = ticket.id;
+
+    // Read it back through for_each to exercise the streaming path.
+    let mut found = false;
+    bsql::query!("SELECT id, description FROM tickets WHERE id = $ticket_id: i32")
+        .for_each(&query_pool, |row| {
+            assert_eq!(row.id, ticket_id);
+            let desc = row.description.expect("description should not be NULL");
+            assert_eq!(desc.len(), 20_000, "full 20KB text must round-trip");
+            assert!(desc.chars().all(|c| c == 'x'));
+            found = true;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(found, "for_each must visit the inserted row");
+
+    // Clean up.
+    bsql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
+        .execute(&insert_pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn for_each_int_array_column() {
+    // tag_ids is INTEGER[] NOT NULL on the users table.
+    // for_each should decode it as Vec<i32> (borrowed path).
+    let pool = pool().await;
+    let mut count = 0u32;
+    bsql::query!("SELECT id, tag_ids FROM users ORDER BY id")
+        .for_each(&pool, |row| {
+            count += 1;
+            // Both seeded users have the default empty array.
+            assert_eq!(row.id, count as i32);
+            assert!(row.tag_ids.is_empty(), "default tag_ids should be empty");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}

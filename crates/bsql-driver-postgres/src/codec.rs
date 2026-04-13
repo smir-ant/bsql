@@ -3504,6 +3504,193 @@ mod tests {
         assert!(result.is_err(), "truncated dimension header should error");
     }
 
+    // --- decode_array_str_borrowed tests ---
+
+    /// Helper: build a PG binary 1D text array wire payload.
+    /// `elements` contains Some(bytes) for present elements, None for NULL.
+    fn build_text_array_wire(elements: &[Option<&[u8]>]) -> Vec<u8> {
+        let has_null = elements.iter().any(|e| e.is_none());
+        let mut buf = Vec::new();
+        if elements.is_empty() {
+            // ndim=0 means empty array
+            buf.extend_from_slice(&0i32.to_be_bytes()); // ndim
+            buf.extend_from_slice(&0i32.to_be_bytes()); // has_null
+            buf.extend_from_slice(&25i32.to_be_bytes()); // elem OID (text)
+            return buf;
+        }
+        buf.extend_from_slice(&1i32.to_be_bytes()); // ndim=1
+        buf.extend_from_slice(&(has_null as i32).to_be_bytes()); // has_null flag
+        buf.extend_from_slice(&25i32.to_be_bytes()); // elem OID (text=25)
+        buf.extend_from_slice(&(elements.len() as i32).to_be_bytes()); // n_elements
+        buf.extend_from_slice(&1i32.to_be_bytes()); // lower_bound=1
+        for elem in elements {
+            match elem {
+                Some(data) => {
+                    buf.extend_from_slice(&(data.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(data);
+                }
+                None => {
+                    buf.extend_from_slice(&(-1i32).to_be_bytes()); // NULL marker
+                }
+            }
+        }
+        buf
+    }
+
+    /// Helper: build a PG binary 1D bytea array wire payload.
+    fn build_bytea_array_wire(elements: &[Option<&[u8]>]) -> Vec<u8> {
+        let has_null = elements.iter().any(|e| e.is_none());
+        let mut buf = Vec::new();
+        if elements.is_empty() {
+            buf.extend_from_slice(&0i32.to_be_bytes()); // ndim=0
+            buf.extend_from_slice(&0i32.to_be_bytes()); // has_null
+            buf.extend_from_slice(&17i32.to_be_bytes()); // elem OID (bytea=17)
+            return buf;
+        }
+        buf.extend_from_slice(&1i32.to_be_bytes()); // ndim=1
+        buf.extend_from_slice(&(has_null as i32).to_be_bytes());
+        buf.extend_from_slice(&17i32.to_be_bytes()); // elem OID (bytea=17)
+        buf.extend_from_slice(&(elements.len() as i32).to_be_bytes());
+        buf.extend_from_slice(&1i32.to_be_bytes()); // lower_bound=1
+        for elem in elements {
+            match elem {
+                Some(data) => {
+                    buf.extend_from_slice(&(data.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(data);
+                }
+                None => {
+                    buf.extend_from_slice(&(-1i32).to_be_bytes());
+                }
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn decode_array_str_borrowed_single() {
+        let wire = build_text_array_wire(&[Some(b"hello")]);
+        let result = decode_array_str_borrowed(&wire).unwrap();
+        assert_eq!(result, vec!["hello"]);
+    }
+
+    #[test]
+    fn decode_array_str_borrowed_multi() {
+        let wire = build_text_array_wire(&[Some(b"hello"), Some(b""), Some(b"world")]);
+        let result = decode_array_str_borrowed(&wire).unwrap();
+        assert_eq!(result, vec!["hello", "", "world"]);
+    }
+
+    #[test]
+    fn decode_array_str_borrowed_empty_array() {
+        let wire = build_text_array_wire(&[]);
+        let result = decode_array_str_borrowed(&wire).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decode_array_str_borrowed_null_elements_skipped() {
+        // NULL elements are skipped by decode_array_elements (continue on elem_len < 0)
+        let wire = build_text_array_wire(&[Some(b"a"), None, Some(b"b")]);
+        let result = decode_array_str_borrowed(&wire).unwrap();
+        // NULL elements are dropped, only non-NULL remain
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn decode_array_str_borrowed_all_nulls() {
+        let wire = build_text_array_wire(&[None, None]);
+        let result = decode_array_str_borrowed(&wire).unwrap();
+        assert!(result.is_empty(), "all-NULL array should decode to empty vec");
+    }
+
+    #[test]
+    fn decode_array_str_borrowed_invalid_utf8() {
+        let wire = build_text_array_wire(&[Some(&[0xFF, 0xFE])]);
+        let result = decode_array_str_borrowed(&wire);
+        assert!(result.is_err(), "invalid UTF-8 should error");
+    }
+
+    #[test]
+    fn decode_array_str_borrowed_unicode() {
+        let emoji = "\u{1F600}".as_bytes();
+        let accent = "\u{00E9}".as_bytes();
+        let wire = build_text_array_wire(&[Some(emoji), Some(accent)]);
+        let result = decode_array_str_borrowed(&wire).unwrap();
+        assert_eq!(result, vec!["\u{1F600}", "\u{00E9}"]);
+    }
+
+    #[test]
+    fn decode_array_str_borrowed_borrows_from_input() {
+        // Verify zero-copy: returned &str slices point into the original wire buffer
+        let wire = build_text_array_wire(&[Some(b"test")]);
+        let result = decode_array_str_borrowed(&wire).unwrap();
+        let wire_range = wire.as_ptr_range();
+        let s_ptr = result[0].as_ptr();
+        assert!(
+            wire_range.contains(&s_ptr),
+            "borrowed str should point into original wire data"
+        );
+    }
+
+    // --- decode_array_bytea_borrowed tests ---
+
+    #[test]
+    fn decode_array_bytea_borrowed_single() {
+        let wire = build_bytea_array_wire(&[Some(&[0xDE, 0xAD])]);
+        let result = decode_array_bytea_borrowed(&wire).unwrap();
+        assert_eq!(result, vec![&[0xDE, 0xAD][..]]);
+    }
+
+    #[test]
+    fn decode_array_bytea_borrowed_multi() {
+        let wire = build_bytea_array_wire(&[Some(&[1, 2, 3]), Some(&[]), Some(&[0xFF])]);
+        let result = decode_array_bytea_borrowed(&wire).unwrap();
+        assert_eq!(result, vec![&[1u8, 2, 3][..], &[][..], &[0xFF][..]]);
+    }
+
+    #[test]
+    fn decode_array_bytea_borrowed_empty_array() {
+        let wire = build_bytea_array_wire(&[]);
+        let result = decode_array_bytea_borrowed(&wire).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decode_array_bytea_borrowed_null_elements_skipped() {
+        let wire = build_bytea_array_wire(&[Some(&[0xAA]), None, Some(&[0xBB])]);
+        let result = decode_array_bytea_borrowed(&wire).unwrap();
+        assert_eq!(result, vec![&[0xAA][..], &[0xBB][..]]);
+    }
+
+    #[test]
+    fn decode_array_bytea_borrowed_all_nulls() {
+        let wire = build_bytea_array_wire(&[None, None, None]);
+        let result = decode_array_bytea_borrowed(&wire).unwrap();
+        assert!(result.is_empty(), "all-NULL bytea array should decode to empty vec");
+    }
+
+    #[test]
+    fn decode_array_bytea_borrowed_borrows_from_input() {
+        let wire = build_bytea_array_wire(&[Some(&[0x42, 0x43])]);
+        let result = decode_array_bytea_borrowed(&wire).unwrap();
+        let wire_range = wire.as_ptr_range();
+        let slice_ptr = result[0].as_ptr();
+        assert!(
+            wire_range.contains(&slice_ptr),
+            "borrowed bytes should point into original wire data"
+        );
+    }
+
+    #[test]
+    fn decode_array_bytea_borrowed_large_element() {
+        let big = vec![0xEE; 4096];
+        let wire = build_bytea_array_wire(&[Some(&big)]);
+        let result = decode_array_bytea_borrowed(&wire).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 4096);
+        assert!(result[0].iter().all(|&b| b == 0xEE));
+    }
+
     mod proptest_fuzz {
         use super::*;
         use proptest::prelude::*;
