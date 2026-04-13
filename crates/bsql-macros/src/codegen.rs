@@ -244,10 +244,9 @@ pub fn generate_sort_query_code(
         // Cache: maps sort fragment &'static str pointer -> (Arc<str>, hash)
         static SORT_SQL_CACHE: ::std::sync::LazyLock<::std::sync::Mutex<Vec<(usize, ::std::sync::Arc<str>, u64)>>> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(Vec::new()));
         let sort_fragment: &'static str = self.sort.sql();
-        let cache = &*SORT_SQL_CACHE;
         let key = sort_fragment.as_ptr() as usize;
         let (sql_arc, sql_hash) = {
-            let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = SORT_SQL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.iter().find(|e| e.0 == key) {
                 (entry.1.clone(), entry.2)
             } else {
@@ -255,7 +254,7 @@ pub fn generate_sort_query_code(
                 let built = format!("{}{}{}", #sql_prefix, sort_fragment, #sql_suffix);
                 let hash = ::bsql_core::driver::hash_sql(&built);
                 let arc: ::std::sync::Arc<str> = ::std::sync::Arc::from(built);
-                let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = SORT_SQL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
                 // Double-check after re-acquiring lock
                 if let Some(entry) = guard.iter().find(|e| e.0 == key) {
                     (entry.1.clone(), entry.2)
@@ -273,10 +272,9 @@ pub fn generate_sort_query_code(
             // Cache: maps sort fragment &'static str pointer -> (Arc<str>, hash)
             static SORT_LIMITED_SQL_CACHE: ::std::sync::LazyLock<::std::sync::Mutex<Vec<(usize, ::std::sync::Arc<str>, u64)>>> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(Vec::new()));
             let sort_fragment: &'static str = self.sort.sql();
-            let cache = &*SORT_LIMITED_SQL_CACHE;
             let key = sort_fragment.as_ptr() as usize;
             let (sql_arc, sql_hash) = {
-                let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                let guard = SORT_LIMITED_SQL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(entry) = guard.iter().find(|e| e.0 == key) {
                     (entry.1.clone(), entry.2)
                 } else {
@@ -284,7 +282,7 @@ pub fn generate_sort_query_code(
                     let built = format!("{}{}{}", #sql_prefix, sort_fragment, #limited_suffix_lit);
                     let hash = ::bsql_core::driver::hash_sql(&built);
                     let arc: ::std::sync::Arc<str> = ::std::sync::Arc::from(built);
-                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut guard = SORT_LIMITED_SQL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = guard.iter().find(|e| e.0 == key) {
                         (entry.1.clone(), entry.2)
                     } else {

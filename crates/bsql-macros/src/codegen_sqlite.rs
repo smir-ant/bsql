@@ -2316,17 +2316,16 @@ pub fn generate_sort_sqlite_query_code(
     let build_sql = quote! {
         static SORT_SQL_CACHE: ::std::sync::LazyLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(Vec::new()));
         let sort_fragment: &'static str = self.sort.sql();
-        let cache = &*SORT_SQL_CACHE;
         let key = sort_fragment.as_ptr() as usize;
         let (sql, sql_hash) = {
-            let guard = cache.lock().unwrap();
+            let guard = SORT_SQL_CACHE.lock().unwrap();
             if let Some(entry) = guard.iter().find(|e| e.0 == key) {
                 (entry.1.clone(), entry.2)
             } else {
                 drop(guard);
                 let built = format!("{}{}{}", #sql_prefix, sort_fragment, #sql_suffix);
                 let hash = ::bsql_core::rapid_hash_str(&built);
-                let mut guard = cache.lock().unwrap();
+                let mut guard = SORT_SQL_CACHE.lock().unwrap();
                 if let Some(entry) = guard.iter().find(|e| e.0 == key) {
                     (entry.1.clone(), entry.2)
                 } else {
@@ -2341,17 +2340,16 @@ pub fn generate_sort_sqlite_query_code(
         quote! {
             static SORT_LIMITED_SQL_CACHE: ::std::sync::LazyLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(Vec::new()));
             let sort_fragment: &'static str = self.sort.sql();
-            let cache = &*SORT_LIMITED_SQL_CACHE;
             let key = sort_fragment.as_ptr() as usize;
             let (sql, sql_hash) = {
-                let guard = cache.lock().unwrap();
+                let guard = SORT_LIMITED_SQL_CACHE.lock().unwrap();
                 if let Some(entry) = guard.iter().find(|e| e.0 == key) {
                     (entry.1.clone(), entry.2)
                 } else {
                     drop(guard);
                     let built = format!("{}{}{}", #sql_prefix, sort_fragment, #limited_suffix_lit);
                     let hash = ::bsql_core::rapid_hash_str(&built);
-                    let mut guard = cache.lock().unwrap();
+                    let mut guard = SORT_LIMITED_SQL_CACHE.lock().unwrap();
                     if let Some(entry) = guard.iter().find(|e| e.0 == key) {
                         (entry.1.clone(), entry.2)
                     } else {
