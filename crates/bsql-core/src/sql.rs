@@ -36,6 +36,10 @@ pub struct Sql<'a> {
     text: &'a str,
     hash: u64,
     readonly: bool,
+    /// Pre-built Parse+Describe wire protocol bytes (compile-time generated).
+    /// When present, the driver uses these directly on cache miss instead
+    /// of building the Parse message at runtime (~200ns saved per first-execution).
+    parse_msg: Option<&'a [u8]>,
 }
 
 impl<'a> Sql<'a> {
@@ -43,12 +47,27 @@ impl<'a> Sql<'a> {
     ///
     /// Used by generated code — all arguments are compile-time constants.
     /// Zero runtime cost: two integers and a pointer, all in the binary.
+    /// No pre-built Parse message — the driver builds it at runtime on cache miss.
     #[inline]
     pub const fn precomputed(text: &'a str, hash: u64, readonly: bool) -> Self {
         Sql {
             text,
             hash,
             readonly,
+            parse_msg: None,
+        }
+    }
+
+    /// Create with precomputed hash, routing flag, AND pre-built Parse+Describe
+    /// wire protocol bytes. The driver sends these directly on cache miss — zero
+    /// runtime message construction.
+    #[inline]
+    pub const fn with_parse(text: &'a str, hash: u64, readonly: bool, parse_msg: &'a [u8]) -> Self {
+        Sql {
+            text,
+            hash,
+            readonly,
+            parse_msg: Some(parse_msg),
         }
     }
 
@@ -60,6 +79,7 @@ impl<'a> Sql<'a> {
             text,
             hash: crate::rapid_hash_str(text),
             readonly: false,
+            parse_msg: None,
         }
     }
 
@@ -73,6 +93,12 @@ impl<'a> Sql<'a> {
     #[inline]
     pub fn hash(&self) -> u64 {
         self.hash
+    }
+
+    /// Pre-built Parse+Describe wire bytes, if available.
+    #[inline]
+    pub fn parse_msg(&self) -> Option<&[u8]> {
+        self.parse_msg
     }
 
     /// Whether this query is read-only (determines connection routing).

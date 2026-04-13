@@ -9,6 +9,73 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+// ---------------------------------------------------------------------------
+// Compile-time wire protocol generation
+// ---------------------------------------------------------------------------
+
+/// Build the PostgreSQL Parse + Describe message bytes at compile time.
+///
+/// Produces the exact wire bytes that the driver would build at runtime
+/// on a statement cache miss. When these bytes are available, the driver
+/// can `write_all(bytes)` directly instead of constructing Parse/Describe
+/// from scratch — saving ~200ns on first execution of each query.
+///
+/// Wire format:
+/// ```text
+/// 'P' [i32 BE length] [stmt_name\0] [sql\0] [i16 BE param_count] [i32 BE oid]...
+/// 'D' [i32 BE length] 'S' [stmt_name\0]
+/// ```
+fn gen_parse_describe_bytes(sql: &str, sql_hash: u64, param_oids: &[u32]) -> Vec<u8> {
+    let stmt_name = make_stmt_name_bytes(sql_hash);
+    let mut buf = Vec::new();
+
+    // --- Parse message ---
+    buf.push(b'P');
+    let parse_payload = stmt_name.len()
+        + 1  // NUL after name
+        + sql.len()
+        + 1  // NUL after SQL
+        + 2  // i16 param count
+        + param_oids.len() * 4; // i32 per OID
+    let parse_len = (parse_payload as i32) + 4;
+    buf.extend_from_slice(&parse_len.to_be_bytes());
+    buf.extend_from_slice(&stmt_name);
+    buf.push(0);
+    buf.extend_from_slice(sql.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&(param_oids.len() as i16).to_be_bytes());
+    for &oid in param_oids {
+        buf.extend_from_slice(&(oid as i32).to_be_bytes());
+    }
+
+    // --- Describe message (Statement) ---
+    buf.push(b'D');
+    let describe_payload = 1 + stmt_name.len() + 1; // 'S' + name + NUL
+    let describe_len = (describe_payload as i32) + 4;
+    buf.extend_from_slice(&describe_len.to_be_bytes());
+    buf.push(b'S');
+    buf.extend_from_slice(&stmt_name);
+    buf.push(0);
+
+    buf
+}
+
+/// Generate the statement name bytes from a sql_hash.
+/// Format: `s_{hash:016x}` — exactly 18 bytes.
+/// Must match `bsql-driver-postgres::stmt_cache::make_stmt_name`.
+fn make_stmt_name_bytes(hash: u64) -> [u8; 18] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    buf[0] = b's';
+    buf[1] = b'_';
+    let bytes = hash.to_be_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        buf[2 + i * 2] = HEX[(b >> 4) as usize];
+        buf[2 + i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    buf
+}
+
 use crate::parse::ParsedQuery;
 use crate::validate::ValidationResult;
 
@@ -708,10 +775,32 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     // Column-count bounds check — inserted before every row decode (Fix-5)
     let column_check = gen_column_count_check(validation);
 
-    // Sql::precomputed values for generated code (zero-cost: compile-time consts)
+    // Compile-time Parse+Describe wire bytes for zero-cost first-execution
+    let param_oids: Vec<u32> = validation.param_pg_oids.iter().copied().collect();
+    let parse_bytes = gen_parse_describe_bytes(eff_sql, sql_hash_val, &param_oids);
+    let parse_bytes_tokens: Vec<TokenStream> = parse_bytes.iter().map(|b| quote! { #b }).collect();
+    let parse_bytes_len = parse_bytes.len();
+
+    // Limited SQL variant (fetch_one/fetch_optional with LIMIT 2) — also gets its own Parse bytes
+    let limited_parse_bytes =
+        gen_parse_describe_bytes(&limited_sql, limited_sql_hash_val, &param_oids);
+    let limited_parse_tokens: Vec<TokenStream> =
+        limited_parse_bytes.iter().map(|b| quote! { #b }).collect();
+    let limited_parse_len = limited_parse_bytes.len();
+
     let readonly_val = is_select;
-    let sql_ctor = quote! { ::bsql_core::Sql::precomputed(#sql_lit, #sql_hash_val, #readonly_val) };
-    let limited_sql_ctor = quote! { ::bsql_core::Sql::precomputed(#limited_sql_lit, #limited_sql_hash_val, #readonly_val) };
+    let sql_ctor = quote! {
+        {
+            static _BSQL_PARSE: [u8; #parse_bytes_len] = [#(#parse_bytes_tokens),*];
+            ::bsql_core::Sql::with_parse(#sql_lit, #sql_hash_val, #readonly_val, &_BSQL_PARSE)
+        }
+    };
+    let limited_sql_ctor = quote! {
+        {
+            static _BSQL_PARSE_LIM: [u8; #limited_parse_len] = [#(#limited_parse_tokens),*];
+            ::bsql_core::Sql::with_parse(#limited_sql_lit, #limited_sql_hash_val, #readonly_val, &_BSQL_PARSE_LIM)
+        }
+    };
 
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
