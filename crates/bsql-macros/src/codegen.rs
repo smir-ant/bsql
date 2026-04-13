@@ -238,13 +238,13 @@ pub fn generate_sort_query_code(
     // calls clone the Arc (cheap ref-count bump) and borrow from the local clone.
     //
     // No Box::leak — the Arc<str> is owned by the cache Vec (which lives in a static
-    // OnceLock) and by the local clone (which lives for the duration of the function).
+    // LazyLock) and by the local clone (which lives for the duration of the function).
     // Total memory is bounded: one Arc<str> per unique sort variant (typically 3-10).
     let build_sql = quote! {
         // Cache: maps sort fragment &'static str pointer -> (Arc<str>, hash)
-        static SORT_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, ::std::sync::Arc<str>, u64)>>> = ::std::sync::OnceLock::new();
+        static SORT_SQL_CACHE: ::std::sync::LazyLock<::std::sync::Mutex<Vec<(usize, ::std::sync::Arc<str>, u64)>>> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(Vec::new()));
         let sort_fragment: &'static str = self.sort.sql();
-        let cache = SORT_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
+        let cache = &*SORT_SQL_CACHE;
         let key = sort_fragment.as_ptr() as usize;
         let (sql_arc, sql_hash) = {
             let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -271,9 +271,9 @@ pub fn generate_sort_query_code(
     let build_limited_sql = if needs_limit {
         quote! {
             // Cache: maps sort fragment &'static str pointer -> (Arc<str>, hash)
-            static SORT_LIMITED_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, ::std::sync::Arc<str>, u64)>>> = ::std::sync::OnceLock::new();
+            static SORT_LIMITED_SQL_CACHE: ::std::sync::LazyLock<::std::sync::Mutex<Vec<(usize, ::std::sync::Arc<str>, u64)>>> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(Vec::new()));
             let sort_fragment: &'static str = self.sort.sql();
-            let cache = SORT_LIMITED_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
+            let cache = &*SORT_LIMITED_SQL_CACHE;
             let key = sort_fragment.as_ptr() as usize;
             let (sql_arc, sql_hash) = {
                 let guard = cache.lock().unwrap_or_else(|e| e.into_inner());

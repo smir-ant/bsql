@@ -2237,7 +2237,7 @@ fn gen_dynamic_constructor(parsed: &ParsedQuery) -> TokenStream {
 /// Generate Rust code for a SQLite query with `$[sort: EnumType]`.
 ///
 /// The sort fragment is spliced into SQL at runtime. Each variant gets its
-/// own sql_hash. Uses OnceLock cache same as the PG sort codegen.
+/// own sql_hash. Uses LazyLock cache same as the PG sort codegen.
 pub fn generate_sort_sqlite_query_code(
     parsed: &ParsedQuery,
     validation: &ValidationResult,
@@ -2314,9 +2314,9 @@ pub fn generate_sort_sqlite_query_code(
 
     // Sort SQL cache: builds the final SQL from prefix + sort_fragment + suffix
     let build_sql = quote! {
-        static SORT_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::OnceLock::new();
+        static SORT_SQL_CACHE: ::std::sync::LazyLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(Vec::new()));
         let sort_fragment: &'static str = self.sort.sql();
-        let cache = SORT_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
+        let cache = &*SORT_SQL_CACHE;
         let key = sort_fragment.as_ptr() as usize;
         let (sql, sql_hash) = {
             let guard = cache.lock().unwrap();
@@ -2339,9 +2339,9 @@ pub fn generate_sort_sqlite_query_code(
 
     let build_limited_sql = if needs_limit {
         quote! {
-            static SORT_LIMITED_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::OnceLock::new();
+            static SORT_LIMITED_SQL_CACHE: ::std::sync::LazyLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::LazyLock::new(|| ::std::sync::Mutex::new(Vec::new()));
             let sort_fragment: &'static str = self.sort.sql();
-            let cache = SORT_LIMITED_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
+            let cache = &*SORT_LIMITED_SQL_CACHE;
             let key = sort_fragment.as_ptr() as usize;
             let (sql, sql_hash) = {
                 let guard = cache.lock().unwrap();

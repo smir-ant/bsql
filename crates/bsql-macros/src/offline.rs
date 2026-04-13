@@ -9,7 +9,7 @@
 //! needed and incremental compilation works naturally.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use bitcode::{Decode, Encode};
 
@@ -41,7 +41,8 @@ use bitcode::{Decode, Encode};
 /// Per-rustc dedup state: avoid writing the same line multiple times when
 /// one `query!()` site appears in several generic instantiations. This is
 /// a pure optimization — correctness does not depend on it.
-static SEEN_HASHES: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+static SEEN_HASHES: LazyLock<Mutex<std::collections::HashSet<u64>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 /// Append a hash to `.manifest`. Called from the online (write-cache) path
 /// immediately AFTER the bitcode file has been fsynced to disk.
@@ -67,7 +68,7 @@ static SEEN_HASHES: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::
 /// holds for the duration of a single `write(2)` of ~17 bytes.
 fn append_to_manifest(dir: &std::path::Path, hash: u64) {
     // Per-process dedup — a pure optimization, independent of correctness.
-    let seen = SEEN_HASHES.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let seen = &*SEEN_HASHES;
     if let Ok(mut s) = seen.lock() {
         if !s.insert(hash) {
             return;
@@ -314,8 +315,8 @@ pub struct CachedColumn {
 /// initial online build, and makes cloned repos with committed `.bsql/`
 /// build out of the box.
 ///
-/// Evaluated once per compilation via `OnceLock`.
-static IS_OFFLINE: OnceLock<bool> = OnceLock::new();
+/// Evaluated once per compilation via `LazyLock`.
+static IS_OFFLINE: LazyLock<bool> = LazyLock::new(compute_is_offline);
 
 /// Pure parser for the `BSQL_OFFLINE` env var. Factored out so tests can
 /// exercise every branch without touching global env state (which is `unsafe`
@@ -369,7 +370,7 @@ fn compute_is_offline() -> bool {
 }
 
 pub fn is_offline() -> bool {
-    *IS_OFFLINE.get_or_init(compute_is_offline)
+    *IS_OFFLINE
 }
 
 // ---------------------------------------------------------------------------
@@ -380,7 +381,7 @@ pub fn is_offline() -> bool {
 /// to find an existing `.bsql/` (or creating it next to the workspace root).
 ///
 /// Cached once per compilation.
-static CACHE_DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+static CACHE_DIR: LazyLock<Result<PathBuf, String>> = LazyLock::new(resolve_cache_dir);
 
 fn resolve_cache_dir() -> Result<PathBuf, String> {
     let manifest_dir =
@@ -407,10 +408,7 @@ fn resolve_cache_dir() -> Result<PathBuf, String> {
 }
 
 fn cache_dir() -> Result<&'static PathBuf, String> {
-    CACHE_DIR
-        .get_or_init(resolve_cache_dir)
-        .as_ref()
-        .map_err(|e| e.clone())
+    CACHE_DIR.as_ref().map_err(|e| e.clone())
 }
 
 // ---------------------------------------------------------------------------

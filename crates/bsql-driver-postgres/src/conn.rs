@@ -260,8 +260,8 @@ impl Connection {
             statement_cache_mode: config.statement_cache_mode,
             // Buffers
             stream,
-            write_buf: Vec::with_capacity(4096),
-            stream_buf: vec![0u8; 65536],
+            write_buf: Vec::with_capacity(16384),
+            stream_buf: vec![0u8; 16384],
             stmts: StmtCache::default(),
             // Cold
             read_buf: Vec::with_capacity(8192),
