@@ -318,6 +318,7 @@ impl<'a> QueryTarget<'a> {
 impl<'a> QueryTarget<'a> {
     /// Execute a query and return all rows.
     #[inline]
+    #[doc(hidden)]
     pub async fn query_raw(
         self,
         sql: &str,
@@ -346,6 +347,7 @@ impl<'a> QueryTarget<'a> {
 
     /// Execute a read-only query. Routes to replicas for Pool when configured.
     #[inline]
+    #[doc(hidden)]
     pub async fn query_raw_readonly(
         self,
         sql: &str,
@@ -376,6 +378,7 @@ impl<'a> QueryTarget<'a> {
 
     /// Execute a query and return the number of affected rows.
     #[inline]
+    #[doc(hidden)]
     pub async fn execute_raw(
         self,
         sql: &str,
@@ -405,6 +408,7 @@ impl<'a> QueryTarget<'a> {
 impl<'a> QueryTarget<'a> {
     /// Execute a query and return all rows.
     #[inline]
+    #[doc(hidden)]
     pub fn query_raw(
         self,
         sql: &str,
@@ -432,6 +436,7 @@ impl<'a> QueryTarget<'a> {
 
     /// Execute a read-only query. Routes to replicas for Pool when configured.
     #[inline]
+    #[doc(hidden)]
     pub fn query_raw_readonly(
         self,
         sql: &str,
@@ -460,6 +465,7 @@ impl<'a> QueryTarget<'a> {
 
     /// Execute a query and return the number of affected rows.
     #[inline]
+    #[doc(hidden)]
     pub fn execute_raw(
         self,
         sql: &str,
