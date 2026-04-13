@@ -243,6 +243,14 @@ impl<'a> QueryTarget<'a> {
         let params = query.params();
         self.execute_raw(Q::SQL, Q::SQL_HASH, &params).await
     }
+
+    // NOTE: for_each stays on the direct codegen path (not PgQuerySpec).
+    // Reason: for_each returns BORROWED rows ({ name: &str }) while
+    // decode_row returns OWNED rows ({ name: String }). Routing for_each
+    // through decode_row would allocate a String per text column per row —
+    // defeating the entire purpose of the zero-alloc streaming path.
+    // The two row types (owned vs borrowed) are fundamentally different
+    // and can't share one decode function.
 }
 
 #[cfg(not(feature = "async"))]

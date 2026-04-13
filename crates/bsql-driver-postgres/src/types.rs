@@ -549,6 +549,28 @@ pub struct Row<'a> {
 }
 
 impl<'a> Row<'a> {
+    /// Create a Row view from raw data bytes and pre-parsed column offsets.
+    ///
+    /// Used to bridge PgDataRow (streaming path) → Row (decode path) so
+    /// that PgQuerySpec::decode_row works for both batch and streaming
+    /// execution without duplication.
+    ///
+    /// The `arena` and `columns` fields are set to empty — `get_raw()`
+    /// always reads from `data` when it's `Some`, so the arena is never
+    /// accessed. Column metadata (name, type_oid) is unavailable through
+    /// this constructor, but `decode_row` doesn't need it.
+    #[doc(hidden)]
+    #[inline]
+    pub fn from_raw_data(data: &'a [u8], offsets: &'a [(usize, i32)], arena: &'a Arena) -> Self {
+        static EMPTY_COLS: [ColumnDesc; 0] = [];
+        Row {
+            data: Some(data),
+            arena,
+            col_offsets: offsets,
+            columns: &EMPTY_COLS,
+        }
+    }
+
     /// Get the raw bytes for a column, or `None` if NULL.
     #[inline]
     pub fn get_raw(&self, idx: usize) -> Option<&'a [u8]> {
@@ -662,6 +684,21 @@ pub struct PgDataRow<'a> {
 }
 
 impl<'a> PgDataRow<'a> {
+    /// The underlying wire data bytes.
+    #[doc(hidden)]
+    #[inline]
+    pub fn data_bytes(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// The pre-parsed column offsets `(byte_offset, wire_len)`.
+    /// Wire_len = -1 means NULL.
+    #[doc(hidden)]
+    #[inline]
+    pub fn column_offsets(&self) -> &[(usize, i32)] {
+        &self.offsets
+    }
+
     /// Parse column boundaries from a raw DataRow payload.
     ///
     /// `data` is the DataRow message payload (after the 'D' type byte and
