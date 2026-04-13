@@ -1623,6 +1623,8 @@ fn pg_for_each_result_type(type_str: &str) -> TokenStream {
     match type_str {
         "String" => quote! { &'a str },
         "Vec<u8>" => quote! { &'a [u8] },
+        "Vec<String>" => quote! { Vec<&'a str> },
+        "Vec<Vec<u8>>" => quote! { Vec<&'a [u8]> },
         _ => {
             if let Some(inner) = type_str
                 .strip_prefix("Option<")
@@ -1657,7 +1659,7 @@ fn gen_pg_for_each_row_struct(parsed: &ParsedQuery, validation: &ValidationResul
     // Check if any column actually uses the 'a lifetime.
     let needs_lifetime = validation.columns.iter().any(|col| {
         let rt = &col.rust_type;
-        matches!(rt.as_str(), "String" | "Vec<u8>")
+        matches!(rt.as_str(), "String" | "Vec<u8>" | "Vec<String>" | "Vec<Vec<u8>>")
             || rt.starts_with("Option<String>")
             || rt.starts_with("Option<Vec<u8>>")
     });
@@ -1786,7 +1788,7 @@ fn gen_pg_for_each_raw_decode(validation: &ValidationResult) -> (TokenStream, To
 
     let needs_lifetime = validation.columns.iter().any(|col| {
         let rt = &col.rust_type;
-        matches!(rt.as_str(), "String" | "Vec<u8>")
+        matches!(rt.as_str(), "String" | "Vec<u8>" | "Vec<String>" | "Vec<Vec<u8>>")
             || rt.starts_with("Option<String>")
             || rt.starts_with("Option<Vec<u8>>")
     });
@@ -2080,6 +2082,49 @@ fn gen_pg_raw_not_null_decode(field_name: &proc_macro2::Ident, rust_type: &str) 
             _bsql_pos += 4;
             if _bsql_len > 0 { _bsql_pos += _bsql_len as usize; }
             let #field_name = ();
+        },
+        // Zero-copy array decode: borrow &str / &[u8] from wire buffer
+        "Vec<String>" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "text[]", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL text[]")),
+                ));
+            } else {
+                let _end = _bsql_pos + _bsql_len as usize;
+                let _v = ::bsql_core::driver::decode_array_str_borrowed(&_bsql_data[_bsql_pos.._end])
+                    .map_err(|e| ::bsql_core::error::DecodeError::with_source(
+                        #field_str, "text[]", "invalid array data", e,
+                    ))?;
+                _bsql_pos = _end;
+                _v
+            };
+        },
+        "Vec<Vec<u8>>" => quote! {
+            let _bsql_len = i32::from_be_bytes([
+                _bsql_data[_bsql_pos], _bsql_data[_bsql_pos + 1],
+                _bsql_data[_bsql_pos + 2], _bsql_data[_bsql_pos + 3],
+            ]);
+            _bsql_pos += 4;
+            let #field_name = if _bsql_len < 0 {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, "bytea[]", "NULL or invalid data",
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL bytea[]")),
+                ));
+            } else {
+                let _end = _bsql_pos + _bsql_len as usize;
+                let _v = ::bsql_core::driver::decode_array_bytea_borrowed(&_bsql_data[_bsql_pos.._end])
+                    .map_err(|e| ::bsql_core::error::DecodeError::with_source(
+                        #field_str, "bytea[]", "invalid array data", e,
+                    ))?;
+                _bsql_pos = _end;
+                _v
+            };
         },
         // Feature-gated types: extract raw column slice and delegate to codec functions
         _ => gen_pg_raw_feature_decode(field_name, rust_type),

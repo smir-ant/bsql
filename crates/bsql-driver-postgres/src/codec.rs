@@ -1642,12 +1642,31 @@ pub fn decode_array_str(data: &[u8]) -> Result<Vec<String>, DriverError> {
         .collect()
 }
 
+/// Zero-copy: decode a PG binary array of text values as borrowed `&str`.
+///
+/// Each element borrows directly from `data` — no per-element heap allocation.
+/// Used by the `for_each` raw-bytes path where the wire buffer outlives the
+/// callback.
+pub fn decode_array_str_borrowed(data: &[u8]) -> Result<Vec<&str>, DriverError> {
+    decode_array_elements(data)?
+        .into_iter()
+        .map(|d| decode_str(d))
+        .collect()
+}
+
 /// Decode a PG binary array of bytea values.
 pub fn decode_array_bytea(data: &[u8]) -> Result<Vec<Vec<u8>>, DriverError> {
     Ok(decode_array_elements(data)?
         .into_iter()
         .map(|d| d.to_vec())
         .collect())
+}
+
+/// Zero-copy: decode a PG binary array of bytea values as borrowed `&[u8]`.
+///
+/// Each element borrows directly from `data` — no per-element heap allocation.
+pub fn decode_array_bytea_borrowed(data: &[u8]) -> Result<Vec<&[u8]>, DriverError> {
+    decode_array_elements(data)
 }
 
 // --- Feature-gated decode functions ---

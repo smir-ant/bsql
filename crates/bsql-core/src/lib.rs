@@ -32,8 +32,9 @@ pub mod driver {
 
     // Array decode functions for generated code
     pub use bsql_driver_postgres::codec::{
-        decode_array_bool, decode_array_bytea, decode_array_f32, decode_array_f64,
-        decode_array_i16, decode_array_i32, decode_array_i64, decode_array_str,
+        decode_array_bool, decode_array_bytea, decode_array_bytea_borrowed, decode_array_f32,
+        decode_array_f64, decode_array_i16, decode_array_i32, decode_array_i64,
+        decode_array_str, decode_array_str_borrowed,
     };
 
     // Feature-gated decode functions for generated code
