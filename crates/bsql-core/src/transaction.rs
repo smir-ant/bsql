@@ -202,23 +202,9 @@ impl Transaction {
 
     // --- Deferred pipeline API ---
 
-    /// Defer a compile-time validated query for pipeline flush on commit.
-    ///
-    /// Uses PgQuerySpec to extract SQL, hash, and params from the query struct.
-    /// Generated code delegates here via a one-line wrapper.
-    #[doc(hidden)]
-    pub async fn defer_typed<Q: crate::executor::PgQuerySpec>(
-        &mut self,
-        query: &Q,
-    ) -> BsqlResult<()> {
-        let params = query.params();
-        self.defer_execute(Q::SQL, Q::SQL_HASH, &params).await
-    }
-
     /// Buffer an execute for deferred pipeline flush (low-level).
     ///
-    /// Prefer `defer_typed` for generated code. This method is used by
-    /// dynamic queries and other paths that don't implement PgQuerySpec.
+    /// Used by generated code and dynamic queries for deferred execution.
     #[doc(hidden)]
     pub async fn defer_execute(
         &mut self,

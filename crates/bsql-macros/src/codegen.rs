@@ -134,11 +134,7 @@ pub fn generate_sort_query_code(
     };
 
     let is_select = parsed.kind == crate::parse::QueryKind::Select;
-    let query_method = if is_select {
-        quote! { query_raw_readonly }
-    } else {
-        quote! { query_raw }
-    };
+    let readonly_val = is_select;
 
     let eff_sql_sort = effective_sql(parsed, validation);
     let sql_template = eff_sql_sort;
@@ -241,7 +237,6 @@ pub fn generate_sort_query_code(
         let stream_name = stream_struct_name(parsed);
         let row_decode = gen_row_decode(validation);
         let column_check = gen_column_count_check(validation);
-        let qm = &query_method;
 
         quote! {
             #[allow(non_camel_case_types)]
@@ -283,7 +278,7 @@ pub fn generate_sort_query_code(
                         executor: impl Into<::bsql_core::QueryTarget<'_>>,
                     ) -> ::bsql_core::BsqlResult<#result_name> {
                         #build_limited_sql
-                        let executor = executor.into(); let owned = ::bsql_core::__bsql_call!(executor.#qm(sql, sql_hash, #params_slice))?;
+                        let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice))?;
                         if owned.len() != 1 {
                             return Err(::bsql_core::error::QueryError::row_count(
                                 "exactly 1 row",
@@ -302,7 +297,7 @@ pub fn generate_sort_query_code(
                         executor: impl Into<::bsql_core::QueryTarget<'_>>,
                     ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                         #build_limited_sql
-                        let executor = executor.into(); let owned = ::bsql_core::__bsql_call!(executor.#qm(sql, sql_hash, #params_slice))?;
+                        let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice))?;
                         match owned.len() {
                             0 => Ok(None),
                             1 => {
@@ -324,7 +319,7 @@ pub fn generate_sort_query_code(
                         executor: impl Into<::bsql_core::QueryTarget<'_>>,
                     ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                         #build_sql
-                        let executor = executor.into(); let owned = ::bsql_core::__bsql_call!(executor.#qm(sql, sql_hash, #params_slice))?;
+                        let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice))?;
                         owned.iter().map(|row| {
                             #column_check
                             Ok(#result_name { #row_decode })
@@ -349,7 +344,7 @@ pub fn generate_sort_query_code(
                         executor: impl Into<::bsql_core::QueryTarget<'_>>,
                     ) -> ::bsql_core::BsqlResult<u64> {
                         #build_sql
-                        let executor = executor.into(); ::bsql_core::__bsql_call!(executor.execute_raw(sql, sql_hash, #params_slice))
+                        let mut target = executor.into(); ::bsql_core::__bsql_call!(target.execute(::bsql_core::Sql::precomputed(sql, sql_hash, false), #params_slice))
                     }
                 }
 
@@ -374,7 +369,7 @@ pub fn generate_sort_query_code(
                         executor: impl Into<::bsql_core::QueryTarget<'_>>,
                     ) -> ::bsql_core::BsqlResult<u64> {
                         #build_sql
-                        let executor = executor.into(); ::bsql_core::__bsql_call!(executor.execute_raw(sql, sql_hash, #params_slice))
+                        let mut target = executor.into(); ::bsql_core::__bsql_call!(target.execute(::bsql_core::Sql::precomputed(sql, sql_hash, false), #params_slice))
                     }
                 }
 
@@ -488,55 +483,17 @@ fn gen_query_as_executor_impls(
 
     let column_check = gen_column_count_check(validation);
 
-    // --- PgQuerySpec trait impl ---
-    let readonly_val = is_select;
-    let trait_impl = if has_columns {
-        quote! {
-            #[allow(non_camel_case_types)]
-            impl<'_bsql> ::bsql_core::PgQuerySpec for #executor_name<'_bsql> {
-                type Row = #target_type;
-                const SQL: &'static str = #sql_lit;
-                const SQL_HASH: u64 = #sql_hash_val;
-                const SQL_LIMITED: &'static str = #limited_sql_lit;
-                const SQL_LIMITED_HASH: u64 = #limited_sql_hash_val;
-                const READONLY: bool = #readonly_val;
-                const HAS_COLUMNS: bool = true;
-
-                fn params(&self) -> Vec<&(dyn ::bsql_core::driver::Encode + Sync)> {
-                    vec![#(#param_refs),*]
-                }
-
-                fn decode_row(row: ::bsql_core::driver::Row<'_>) -> ::bsql_core::BsqlResult<#target_type> {
-                    #column_check
-                    #decode_bindings
-                    Ok(#target_type { #field_names })
-                }
-            }
-        }
+    let params_slice = if param_refs.is_empty() {
+        quote! { &[] }
     } else {
-        quote! {
-            #[allow(non_camel_case_types)]
-            impl<'_bsql> ::bsql_core::PgQuerySpec for #executor_name<'_bsql> {
-                type Row = ();
-                const SQL: &'static str = #sql_lit;
-                const SQL_HASH: u64 = #sql_hash_val;
-                const SQL_LIMITED: &'static str = #sql_lit;
-                const SQL_LIMITED_HASH: u64 = #sql_hash_val;
-                const READONLY: bool = false;
-                const HAS_COLUMNS: bool = false;
-
-                fn params(&self) -> Vec<&(dyn ::bsql_core::driver::Encode + Sync)> {
-                    vec![#(#param_refs),*]
-                }
-
-                fn decode_row(_row: ::bsql_core::driver::Row<'_>) -> ::bsql_core::BsqlResult<()> {
-                    Ok(())
-                }
-            }
-        }
+        quote! { &[#(#param_refs),*] }
     };
 
-    // --- Thin wrapper methods ---
+    // Sql::precomputed values (zero-cost: compile-time consts)
+    let readonly_val = is_select;
+    let sql_ctor = quote! { ::bsql_core::Sql::precomputed(#sql_lit, #sql_hash_val, #readonly_val) };
+    let limited_sql_ctor = quote! { ::bsql_core::Sql::precomputed(#limited_sql_lit, #limited_sql_hash_val, #readonly_val) };
+
     let fetch_methods = if has_columns {
         quote! {
             ::bsql_core::__bsql_fn! {
@@ -544,7 +501,18 @@ fn gen_query_as_executor_impls(
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<#target_type> {
-                    ::bsql_core::__bsql_call!(executor.into().fetch_one(&self))
+                    let mut target = executor.into();
+                    let owned = ::bsql_core::__bsql_call!(target.query(#limited_sql_ctor, #params_slice))?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
+                    }
+                    let row = owned.row(0);
+                    #column_check
+                    #decode_bindings
+                    Ok(#target_type { #field_names })
                 }
             }
 
@@ -553,7 +521,13 @@ fn gen_query_as_executor_impls(
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
-                    ::bsql_core::__bsql_call!(executor.into().fetch_all(&self))
+                    let mut target = executor.into();
+                    let owned = ::bsql_core::__bsql_call!(target.query(#sql_ctor, #params_slice))?;
+                    owned.iter().map(|row| {
+                        #column_check
+                        #decode_bindings
+                        Ok(#target_type { #field_names })
+                    }).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
             }
 
@@ -562,7 +536,21 @@ fn gen_query_as_executor_impls(
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<Option<#target_type>> {
-                    ::bsql_core::__bsql_call!(executor.into().fetch_optional(&self))
+                    let mut target = executor.into();
+                    let owned = ::bsql_core::__bsql_call!(target.query(#limited_sql_ctor, #params_slice))?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => {
+                            let row = owned.row(0);
+                            #column_check
+                            #decode_bindings
+                            Ok(Some(#target_type { #field_names }))
+                        }
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
                 }
             }
         }
@@ -576,7 +564,8 @@ fn gen_query_as_executor_impls(
                 self,
                 executor: impl Into<::bsql_core::QueryTarget<'_>>,
             ) -> ::bsql_core::BsqlResult<u64> {
-                ::bsql_core::__bsql_call!(executor.into().execute_query(&self))
+                let mut target = executor.into();
+                ::bsql_core::__bsql_call!(target.execute(#sql_ctor, #params_slice))
             }
         }
     };
@@ -585,13 +574,12 @@ fn gen_query_as_executor_impls(
         /// Buffer this operation in a transaction for pipeline flush on commit.
         ::bsql_core::__bsql_fn! {
             pub fn defer(self, tx: &mut ::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
-                ::bsql_core::__bsql_call!(tx.defer_typed(&self))
+                ::bsql_core::__bsql_call!(tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice))
             }
         }
     };
 
     quote! {
-        #trait_impl
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
@@ -720,57 +708,11 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     // Column-count bounds check — inserted before every row decode (Fix-5)
     let column_check = gen_column_count_check(validation);
 
-    // --- PgQuerySpec trait impl (contains SQL, hash, params, decode) ---
-    let trait_impl = if has_columns {
-        let result_name = result_struct_name(parsed);
-        let readonly_val = is_select;
+    // Sql::precomputed values for generated code (zero-cost: compile-time consts)
+    let readonly_val = is_select;
+    let sql_ctor = quote! { ::bsql_core::Sql::precomputed(#sql_lit, #sql_hash_val, #readonly_val) };
+    let limited_sql_ctor = quote! { ::bsql_core::Sql::precomputed(#limited_sql_lit, #limited_sql_hash_val, #readonly_val) };
 
-        quote! {
-            #[allow(non_camel_case_types)]
-            impl<'_bsql> ::bsql_core::PgQuerySpec for #executor_name<'_bsql> {
-                type Row = #result_name;
-                const SQL: &'static str = #sql_lit;
-                const SQL_HASH: u64 = #sql_hash_val;
-                const SQL_LIMITED: &'static str = #limited_sql_lit;
-                const SQL_LIMITED_HASH: u64 = #limited_sql_hash_val;
-                const READONLY: bool = #readonly_val;
-                const HAS_COLUMNS: bool = true;
-
-                fn params(&self) -> Vec<&(dyn ::bsql_core::driver::Encode + Sync)> {
-                    vec![#(#param_refs),*]
-                }
-
-                fn decode_row(row: ::bsql_core::driver::Row<'_>) -> ::bsql_core::BsqlResult<#result_name> {
-                    #column_check
-                    Ok(#result_name { #row_decode })
-                }
-            }
-        }
-    } else {
-        // Execute-only queries (INSERT/UPDATE/DELETE without RETURNING)
-        quote! {
-            #[allow(non_camel_case_types)]
-            impl<'_bsql> ::bsql_core::PgQuerySpec for #executor_name<'_bsql> {
-                type Row = ();
-                const SQL: &'static str = #sql_lit;
-                const SQL_HASH: u64 = #sql_hash_val;
-                const SQL_LIMITED: &'static str = #sql_lit;
-                const SQL_LIMITED_HASH: u64 = #sql_hash_val;
-                const READONLY: bool = false;
-                const HAS_COLUMNS: bool = false;
-
-                fn params(&self) -> Vec<&(dyn ::bsql_core::driver::Encode + Sync)> {
-                    vec![#(#param_refs),*]
-                }
-
-                fn decode_row(_row: ::bsql_core::driver::Row<'_>) -> ::bsql_core::BsqlResult<()> {
-                    Ok(())
-                }
-            }
-        }
-    };
-
-    // --- Thin wrapper methods that delegate to QueryTarget generic methods ---
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
@@ -781,7 +723,17 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<#result_name> {
-                    ::bsql_core::__bsql_call!(executor.into().fetch_one(&self))
+                    let mut target = executor.into();
+                    let owned = ::bsql_core::__bsql_call!(target.query(#limited_sql_ctor, #params_slice))?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
+                    }
+                    let row = owned.row(0);
+                    #column_check
+                    Ok(#result_name { #row_decode })
                 }
             }
 
@@ -790,7 +742,20 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                    ::bsql_core::__bsql_call!(executor.into().fetch_optional(&self))
+                    let mut target = executor.into();
+                    let owned = ::bsql_core::__bsql_call!(target.query(#limited_sql_ctor, #params_slice))?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => {
+                            let row = owned.row(0);
+                            #column_check
+                            Ok(Some(#result_name { #row_decode }))
+                        }
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
                 }
             }
 
@@ -799,11 +764,15 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    ::bsql_core::__bsql_call!(executor.into().fetch_all(&self))
+                    let mut target = executor.into();
+                    let owned = ::bsql_core::__bsql_call!(target.query(#sql_ctor, #params_slice))?;
+                    owned.iter().map(|row| {
+                        #column_check
+                        Ok(#result_name { #row_decode })
+                    }).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
             }
 
-            // fetch_stream stays on the old path (uses pool.query_stream, not PgQuerySpec)
             ::bsql_core::__bsql_fn! {
                 pub fn fetch_stream(
                     self,
@@ -833,7 +802,8 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 self,
                 executor: impl Into<::bsql_core::QueryTarget<'_>>,
             ) -> ::bsql_core::BsqlResult<u64> {
-                ::bsql_core::__bsql_call!(executor.into().execute_query(&self))
+                let mut target = executor.into();
+                ::bsql_core::__bsql_call!(target.execute(#sql_ctor, #params_slice))
             }
         }
     };
@@ -842,13 +812,12 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         /// Buffer this operation in a transaction for pipeline flush on commit.
         ::bsql_core::__bsql_fn! {
             pub fn defer(self, tx: &mut ::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
-                ::bsql_core::__bsql_call!(tx.defer_typed(&self))
+                ::bsql_core::__bsql_call!(tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice))
             }
         }
     };
 
-    // --- PG for_each (stays on direct path — different execution model,
-    //     zero-alloc streaming from raw wire bytes) ---
+    // --- PG for_each (streaming from raw wire bytes — zero-alloc) ---
     let for_each_row_struct = if has_columns {
         gen_pg_for_each_row_struct(parsed, validation)
     } else {
@@ -927,7 +896,6 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     };
 
     quote! {
-        #trait_impl
         #stream_struct
         #for_each_row_struct
 
@@ -983,11 +951,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
     let has_columns = !validation.columns.is_empty();
 
     let is_select = parsed.kind == crate::parse::QueryKind::Select;
-    let query_method = if is_select {
-        quote! { query_raw_readonly }
-    } else {
-        quote! { query_raw }
-    };
+    let readonly_val = is_select;
 
     // Cache row decode once, reuse for fetch methods + stream struct (F-27)
     let row_decode = if has_columns {
@@ -1008,12 +972,10 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
             && !parsed.normalized_sql.contains(" limit ")
             && !parsed.normalized_sql.contains(" for ");
 
-        let qm = &query_method;
-
         let owned_fetch_one_optional = {
             let fetch_one_dispatcher = gen_runtime_dispatcher(parsed, needs_limit, |_| {
                 quote! {
-                    let executor = executor.into(); let owned = ::bsql_core::__bsql_call!(executor.#qm(&_bsql_sql, _bsql_hash, &_bsql_params[..]))?;
+                    let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]))?;
                     if owned.len() != 1 {
                         return Err(::bsql_core::error::QueryError::row_count(
                             "exactly 1 row",
@@ -1028,7 +990,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
 
             let fetch_optional_dispatcher = gen_runtime_dispatcher(parsed, needs_limit, |_| {
                 quote! {
-                    let executor = executor.into(); let owned = ::bsql_core::__bsql_call!(executor.#qm(&_bsql_sql, _bsql_hash, &_bsql_params[..]))?;
+                    let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]))?;
                     match owned.len() {
                         0 => Ok(None),
                         1 => {
@@ -1067,7 +1029,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
 
         let fetch_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
             quote! {
-                let executor = executor.into(); let owned = ::bsql_core::__bsql_call!(executor.#qm(&_bsql_sql, _bsql_hash, &_bsql_params[..]))?;
+                let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]))?;
                 owned.iter().map(|row| {
                     #column_check
                     Ok(#result_name { #row_decode })
@@ -1118,7 +1080,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
 
     let execute_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
         quote! {
-            let executor = executor.into(); ::bsql_core::__bsql_call!(executor.execute_raw(&_bsql_sql, _bsql_hash, &_bsql_params[..]))
+            let mut target = executor.into(); ::bsql_core::__bsql_call!(target.execute(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, false), &_bsql_params[..]))
         }
     });
 
@@ -3025,32 +2987,36 @@ mod tests {
     }
 
     #[test]
-    fn select_uses_query_raw_readonly() {
+    fn select_uses_sql_precomputed_readonly() {
         let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
         let validation = make_validation(vec![col("id", "i32")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
         assert!(
-            code_str.contains("query_raw_readonly"),
-            "SELECT should use query_raw_readonly: {code_str}"
+            code_str.contains("Sql :: precomputed"),
+            "SELECT should use Sql::precomputed: {code_str}"
+        );
+        assert!(
+            code_str.contains(". query"),
+            "SELECT should use .query(): {code_str}"
         );
     }
 
     #[test]
-    fn insert_uses_query_raw_not_readonly() {
+    fn insert_uses_execute_not_readonly() {
         let parsed = parse_query("INSERT INTO t (a) VALUES ($a: i32) RETURNING id").unwrap();
         let validation = make_validation(vec![col("id", "i32")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
         assert!(
-            !code_str.contains("query_raw_readonly"),
-            "INSERT should NOT use query_raw_readonly: {code_str}"
+            code_str.contains("Sql :: precomputed"),
+            "INSERT RETURNING should use Sql::precomputed: {code_str}"
         );
         assert!(
-            code_str.contains("query_raw"),
-            "INSERT RETURNING should use query_raw: {code_str}"
+            !code_str.contains("query_raw"),
+            "INSERT RETURNING should NOT use query_raw: {code_str}"
         );
     }
 

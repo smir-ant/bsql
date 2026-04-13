@@ -120,10 +120,13 @@ macro_rules! __bsql_fn {
     };
 }
 
+mod sql;
+
 pub use error::{BsqlError, BsqlResult};
-pub use executor::{OwnedResult, PgQuerySpec, QueryTarget};
+pub use executor::{OwnedResult, QueryTarget};
 pub use listener::{Listener, Notification};
 pub use pool::{PgPool, Pool, PoolBuilder, PoolConnection, PoolStatus};
+pub use sql::Sql;
 #[cfg(feature = "sqlite")]
 pub use sqlite_pool::{SqlitePool, SqliteStreamingQuery, SqliteTransaction};
 pub use stream::QueryStream;
