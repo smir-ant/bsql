@@ -2544,3 +2544,125 @@ async fn copy_in_binary_with_text() {
     assert_eq!(result[0].get(0), Some("alice"));
     assert_eq!(result[1].get(0), Some("bob"));
 }
+
+#[tokio::test]
+async fn copy_in_binary_with_nulls() {
+    let pool = pool().await;
+
+    pool.raw_execute("CREATE TEMP TABLE _copy_bin_nulls (id int4 NOT NULL, note text)")
+        .await
+        .unwrap();
+
+    let note1: Option<&str> = Some("hello");
+    let note2: Option<&str> = None; // NULL
+    let rows: Vec<Vec<&(dyn bsql::driver::Encode + Sync)>> = vec![
+        vec![&1i32 as &(dyn bsql::driver::Encode + Sync), &note1],
+        vec![&2i32, &note2], // second row has NULL note
+    ];
+    let row_refs: Vec<&[&(dyn bsql::driver::Encode + Sync)]> =
+        rows.iter().map(|r| r.as_slice()).collect();
+
+    let count = pool
+        .copy_in_binary("_copy_bin_nulls", &["id", "note"], &row_refs)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let result = pool
+        .raw_query("SELECT id, note FROM _copy_bin_nulls ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(result[0].get(1), Some("hello"));
+    assert_eq!(result[1].get(1), None); // NULL
+}
+
+#[tokio::test]
+async fn copy_in_binary_multiple_types() {
+    let pool = pool().await;
+
+    pool.raw_execute(
+        "CREATE TEMP TABLE _copy_bin_types (a bool NOT NULL, b int8 NOT NULL, c float8 NOT NULL)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<Vec<&(dyn bsql::driver::Encode + Sync)>> = vec![
+        vec![
+            &true as &(dyn bsql::driver::Encode + Sync),
+            &42i64,
+            &3.14f64,
+        ],
+        vec![&false, &(-1i64), &0.0f64],
+    ];
+    let row_refs: Vec<&[&(dyn bsql::driver::Encode + Sync)]> =
+        rows.iter().map(|r| r.as_slice()).collect();
+
+    let count = pool
+        .copy_in_binary("_copy_bin_types", &["a", "b", "c"], &row_refs)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let result = pool
+        .raw_query("SELECT a, b, c FROM _copy_bin_types ORDER BY b")
+        .await
+        .unwrap();
+    assert_eq!(result[0].get(0), Some("f")); // false
+    assert_eq!(result[0].get(1), Some("-1"));
+    assert_eq!(result[1].get(0), Some("t")); // true
+    assert_eq!(result[1].get(1), Some("42"));
+}
+
+#[tokio::test]
+async fn copy_in_binary_column_count_mismatch() {
+    let pool = pool().await;
+
+    pool.raw_execute("CREATE TEMP TABLE _copy_bin_mismatch (id int4 NOT NULL, name text NOT NULL)")
+        .await
+        .unwrap();
+
+    // Row has 1 column but table expects 2
+    let rows: Vec<Vec<&(dyn bsql::driver::Encode + Sync)>> =
+        vec![vec![&1i32 as &(dyn bsql::driver::Encode + Sync)]];
+    let row_refs: Vec<&[&(dyn bsql::driver::Encode + Sync)]> =
+        rows.iter().map(|r| r.as_slice()).collect();
+
+    let result = pool
+        .copy_in_binary("_copy_bin_mismatch", &["id", "name"], &row_refs)
+        .await;
+    assert!(
+        result.is_err(),
+        "column count mismatch should produce an error"
+    );
+}
+
+#[tokio::test]
+async fn copy_in_binary_large_batch() {
+    let pool = pool().await;
+
+    pool.raw_execute("CREATE TEMP TABLE _copy_bin_large (id int4 NOT NULL, val int4 NOT NULL)")
+        .await
+        .unwrap();
+
+    // 10,000 rows — exceeds 64KB buffer, tests flush mid-stream
+    let data: Vec<(i32, i32)> = (0..10_000).map(|i| (i, i * 10)).collect();
+    let rows: Vec<Vec<&(dyn bsql::driver::Encode + Sync)>> = data
+        .iter()
+        .map(|(id, val)| vec![id as &(dyn bsql::driver::Encode + Sync), val as &_])
+        .collect();
+    let row_refs: Vec<&[&(dyn bsql::driver::Encode + Sync)]> =
+        rows.iter().map(|r| r.as_slice()).collect();
+
+    let count = pool
+        .copy_in_binary("_copy_bin_large", &["id", "val"], &row_refs)
+        .await
+        .unwrap();
+    assert_eq!(count, 10_000);
+
+    // Spot check
+    let result = pool
+        .raw_query("SELECT COUNT(*) FROM _copy_bin_large")
+        .await
+        .unwrap();
+    assert_eq!(result[0].get(0), Some("10000"));
+}

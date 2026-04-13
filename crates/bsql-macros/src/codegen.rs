@@ -3691,4 +3691,107 @@ mod tests {
         );
         assert!(!code.contains("let age"), "should not coerce i32: {code}");
     }
+
+    // --- Compile-time Parse+Describe bytes ---
+
+    #[test]
+    fn make_stmt_name_bytes_format() {
+        let name = make_stmt_name_bytes(0xDEADBEEF12345678);
+        assert_eq!(&name[0..2], b"s_");
+        assert_eq!(&name[2..], b"deadbeef12345678");
+        assert_eq!(name.len(), 18);
+    }
+
+    #[test]
+    fn make_stmt_name_bytes_zero() {
+        let name = make_stmt_name_bytes(0);
+        assert_eq!(&name, b"s_0000000000000000");
+    }
+
+    #[test]
+    fn make_stmt_name_bytes_max() {
+        let name = make_stmt_name_bytes(u64::MAX);
+        assert_eq!(&name, b"s_ffffffffffffffff");
+    }
+
+    #[test]
+    fn gen_parse_describe_bytes_structure() {
+        let sql = "SELECT id FROM users WHERE id = $1";
+        let hash = bsql_core::rapid_hash_str(sql);
+        let param_oids = vec![23u32]; // int4
+
+        let bytes = gen_parse_describe_bytes(sql, hash, &param_oids);
+
+        // Parse message starts with 'P'
+        assert_eq!(bytes[0], b'P', "first byte must be Parse type 'P'");
+
+        // Find NUL after statement name
+        let name_end = bytes[5..].iter().position(|&b| b == 0).unwrap() + 5;
+        let stmt_name = &bytes[5..name_end];
+        assert_eq!(stmt_name.len(), 18, "statement name must be 18 bytes");
+        assert_eq!(&stmt_name[0..2], b"s_", "statement name must start with s_");
+
+        // SQL text follows after NUL
+        let sql_start = name_end + 1;
+        let sql_end = bytes[sql_start..].iter().position(|&b| b == 0).unwrap() + sql_start;
+        let embedded_sql = std::str::from_utf8(&bytes[sql_start..sql_end]).unwrap();
+        assert_eq!(embedded_sql, sql, "embedded SQL must match input");
+
+        // Param count and OID
+        let param_count_pos = sql_end + 1;
+        let param_count = i16::from_be_bytes([bytes[param_count_pos], bytes[param_count_pos + 1]]);
+        assert_eq!(param_count, 1, "must have 1 parameter");
+
+        let oid_pos = param_count_pos + 2;
+        let oid = i32::from_be_bytes([
+            bytes[oid_pos],
+            bytes[oid_pos + 1],
+            bytes[oid_pos + 2],
+            bytes[oid_pos + 3],
+        ]);
+        assert_eq!(oid, 23, "OID must be 23 (int4)");
+
+        // Describe message follows
+        let describe_start = oid_pos + 4;
+        assert_eq!(bytes[describe_start], b'D', "Describe must follow Parse");
+
+        // Describe contains 'S' (statement) + same name
+        let describe_body_start = describe_start + 5; // type + length
+        assert_eq!(
+            bytes[describe_body_start], b'S',
+            "Describe must be for Statement"
+        );
+    }
+
+    #[test]
+    fn gen_parse_describe_bytes_no_params() {
+        let sql = "SELECT 1";
+        let hash = bsql_core::rapid_hash_str(sql);
+        let bytes = gen_parse_describe_bytes(sql, hash, &[]);
+
+        assert_eq!(bytes[0], b'P');
+        // Find param count (after SQL NUL)
+        let sql_end = bytes[5..].iter().position(|&b| b == 0).unwrap() + 5;
+        let sql_text_end = bytes[sql_end + 1..].iter().position(|&b| b == 0).unwrap() + sql_end + 1;
+        let param_count_pos = sql_text_end + 1;
+        let param_count = i16::from_be_bytes([bytes[param_count_pos], bytes[param_count_pos + 1]]);
+        assert_eq!(param_count, 0, "no params");
+    }
+
+    #[test]
+    fn gen_parse_describe_bytes_multiple_params() {
+        let sql = "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)";
+        let hash = bsql_core::rapid_hash_str(sql);
+        let oids = vec![23u32, 25u32, 16u32]; // int4, text, bool
+        let bytes = gen_parse_describe_bytes(sql, hash, &oids);
+
+        assert_eq!(bytes[0], b'P');
+        // Verify it contains all 3 OIDs somewhere in the bytes
+        // OID 23 = 0x00000017, OID 25 = 0x00000019, OID 16 = 0x00000010
+        let bytes_str: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = bytes_str.join("");
+        assert!(hex.contains("00000017"), "must contain OID 23 (int4)");
+        assert!(hex.contains("00000019"), "must contain OID 25 (text)");
+        assert!(hex.contains("00000010"), "must contain OID 16 (bool)");
+    }
 }
