@@ -78,7 +78,9 @@ pub trait Encode {
     /// types (i32, i64, etc.) override this to write directly — eliminating the
     /// scratch buffer double-copy on the bind-template hot path.
     fn encode_at(&self, dst: &mut [u8]) -> bool {
-        // Fallback: encode to a stack buffer, check size, copy.
+        // Fallback: encode into a temporary buffer, check size, copy.
+        // All built-in types override this with direct writes — this
+        // path only runs for user-defined Encode implementations.
         let mut tmp = Vec::with_capacity(dst.len());
         self.encode_binary(&mut tmp);
         if tmp.len() == dst.len() {

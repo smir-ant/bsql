@@ -123,28 +123,30 @@ impl Arena {
 
         // Fast path: data fits in current chunk's remaining capacity.
         // No function calls, no branches — just memcpy and bump.
-        let chunk = &mut self.chunks[self.current];
-        let remaining = chunk.capacity() - self.offset;
-        if remaining >= len {
-            let start = self.offset;
-            // Append directly — extend_from_slice is the fastest way to
-            // copy data into a Vec when we know capacity is sufficient.
-            // It compiles to a single memcpy + length update.
-            if start == chunk.len() {
-                chunk.extend_from_slice(data);
-            } else {
-                let new_len = start + len;
-                if new_len > chunk.len() {
-                    chunk.resize(new_len, 0);
+        // Guard: empty arena (lazy init) falls through to slow path.
+        if let Some(chunk) = self.chunks.get_mut(self.current) {
+            let remaining = chunk.capacity() - self.offset;
+            if remaining >= len {
+                let start = self.offset;
+                // Append directly — extend_from_slice is the fastest way to
+                // copy data into a Vec when we know capacity is sufficient.
+                // It compiles to a single memcpy + length update.
+                if start == chunk.len() {
+                    chunk.extend_from_slice(data);
+                } else {
+                    let new_len = start + len;
+                    if new_len > chunk.len() {
+                        chunk.resize(new_len, 0);
+                    }
+                    chunk[start..start + len].copy_from_slice(data);
                 }
-                chunk[start..start + len].copy_from_slice(data);
+                let global = self.prefix_sums[self.current] + start;
+                self.offset = start + len;
+                return global;
             }
-            let global = self.prefix_sums[self.current] + start;
-            self.offset = start + len;
-            return global;
         }
 
-        // Slow path: need a new chunk.
+        // Slow path: need a new chunk (or first allocation for lazy arena).
         self.alloc_copy_slow(data)
     }
 
@@ -236,6 +238,16 @@ impl Arena {
 
     /// Ensure the current chunk has room for `len` bytes. If not, allocate a new chunk.
     fn ensure_capacity(&mut self, len: usize) {
+        // Lazy arena: first allocation creates the initial chunk.
+        if self.chunks.is_empty() {
+            let cap = INITIAL_CHUNK_SIZE.max(len);
+            self.chunks.push(Vec::with_capacity(cap));
+            self.prefix_sums.push(0);
+            self.current = 0;
+            self.offset = 0;
+            return;
+        }
+
         let chunk = &self.chunks[self.current];
         let remaining = chunk.capacity().saturating_sub(self.offset);
 
@@ -287,6 +299,9 @@ impl Arena {
 
     /// Compute the global offset for the current position.
     pub fn global_offset(&self) -> usize {
+        if self.chunks.is_empty() {
+            return 0;
+        }
         self.global_offset_at(self.current, self.offset)
     }
 
@@ -326,8 +341,10 @@ impl Arena {
 }
 
 impl Default for Arena {
+    /// Default creates a lazy arena (zero upfront allocation).
+    /// The first `alloc_copy` call allocates the initial 8KB chunk.
     fn default() -> Self {
-        Self::new()
+        Self::empty()
     }
 }
 
@@ -1315,11 +1332,10 @@ mod tests {
     }
 
     #[test]
-    fn arena_default_is_new() {
-        let a1 = Arena::new();
-        let a2 = Arena::default();
-        assert_eq!(a1.allocated(), a2.allocated());
-        assert_eq!(a1.capacity(), a2.capacity());
+    fn arena_default_is_empty() {
+        let a = Arena::default();
+        assert_eq!(a.allocated(), 0);
+        assert_eq!(a.capacity(), 0);
     }
 
     // ===============================================================
@@ -1450,20 +1466,23 @@ mod tests {
     // an empty chunks vec. Call reset() first to initialize a chunk.
 
     #[test]
-    #[should_panic]
-    fn arena_empty_alloc_copy_panics_without_reset() {
+    fn arena_empty_lazy_init_alloc_copy() {
         let mut arena = Arena::empty();
         assert_eq!(arena.chunks.len(), 0);
-        // alloc_copy on empty arena panics -- must call reset() first
-        let _ = arena.alloc_copy(b"boom");
+        // Lazy init: first alloc_copy creates the initial chunk.
+        let offset = arena.alloc_copy(b"lazy");
+        assert_eq!(arena.chunks.len(), 1);
+        assert_eq!(arena.get(offset, 4), b"lazy");
     }
 
     #[test]
-    #[should_panic]
-    fn arena_empty_alloc_panics_without_reset() {
+    fn arena_empty_lazy_init_alloc() {
         let mut arena = Arena::empty();
-        // alloc on empty arena panics -- must call reset() first
-        let _ = arena.alloc(8);
+        assert_eq!(arena.chunks.len(), 0);
+        // Lazy init: first alloc creates the initial chunk.
+        let slice = arena.alloc(8);
+        assert_eq!(slice.len(), 8);
+        assert_eq!(arena.chunks.len(), 1);
     }
 
     #[test]
