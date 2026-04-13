@@ -46,10 +46,13 @@ pub(crate) fn acquire_resp_buf() -> Vec<u8> {
 }
 
 /// Return a response buffer to the thread-local pool for reuse.
+///
+/// Pool capped at 16 buffers — matches typical connection pool size per
+/// thread. Excess buffers are dropped, returning memory to the allocator.
 pub fn release_resp_buf(buf: Vec<u8>) {
     RESP_BUF_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.len() < 4 {
+        if pool.len() < 16 {
             pool.push(buf);
         }
     });
@@ -68,7 +71,7 @@ pub(crate) fn acquire_col_offsets() -> Vec<(usize, i32)> {
 pub fn release_col_offsets(buf: Vec<(usize, i32)>) {
     COL_OFFSETS_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.len() < 4 {
+        if pool.len() < 16 {
             pool.push(buf);
         }
     });
@@ -782,18 +785,13 @@ impl Connection {
         };
 
         // Build Bind+Execute+Sync message — inline bind template logic.
-        let can_use_template = info
-            .bind_template
-            .as_ref()
-            .is_some_and(|t| t.param_slots.len() == params.len());
-
         let mut has_exec_sync = false;
 
-        if can_use_template {
-            // can_use_template is true only when bind_template.is_some()
-            let tmpl = info.bind_template.as_ref().ok_or_else(|| {
-                DriverError::Protocol("bind_template missing despite can_use_template".into())
-            })?;
+        if let Some(tmpl) = info
+            .bind_template
+            .as_ref()
+            .filter(|t| t.param_slots.len() == params.len())
+        {
             self.write_buf.extend_from_slice(&tmpl.bytes);
 
             let mut template_ok = true;
@@ -1929,18 +1927,13 @@ impl Connection {
         };
 
         // Build Bind+Execute+Sync message — inline bind template logic.
-        let can_use_template = info
-            .bind_template
-            .as_ref()
-            .is_some_and(|t| t.param_slots.len() == params.len());
-
         let mut has_exec_sync = false;
 
-        if can_use_template {
-            // can_use_template is true only when bind_template.is_some()
-            let tmpl = info.bind_template.as_ref().ok_or_else(|| {
-                DriverError::Protocol("bind_template missing despite can_use_template".into())
-            })?;
+        if let Some(tmpl) = info
+            .bind_template
+            .as_ref()
+            .filter(|t| t.param_slots.len() == params.len())
+        {
             self.write_buf.extend_from_slice(&tmpl.bytes);
 
             let mut template_ok = true;
@@ -3434,21 +3427,16 @@ impl Connection {
             self.query_counter += 1;
             info.last_used = self.query_counter;
 
-            let can_use_template = info
-                .bind_template
-                .as_ref()
-                .is_some_and(|t| t.param_slots.len() == params.len());
-
             // Tracks whether write_buf already contains EXECUTE_SYNC (from template).
             let mut has_exec_sync = false;
 
-            if can_use_template {
+            if let Some(tmpl) = info
+                .bind_template
+                .as_ref()
+                .filter(|t| t.param_slots.len() == params.len())
+            {
                 // Fast path: copy template (includes EXECUTE_SYNC) and patch params
                 // directly via encode_at — no scratch buffer, no double-copy.
-                // can_use_template is true only when bind_template.is_some()
-                let tmpl = info.bind_template.as_ref().ok_or_else(|| {
-                    DriverError::Protocol("bind_template missing despite can_use_template".into())
-                })?;
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
@@ -3509,20 +3497,22 @@ impl Connection {
             // Cache miss: Parse+Describe+Bind+Execute+Sync
             let name = make_stmt_name(sql_hash);
             if let Some(prebuilt) = prebuilt_parse {
-                // Compile-time generated Parse+Describe bytes — zero runtime
-                // message construction. Just memcpy static data.
-                self.write_buf.extend_from_slice(prebuilt);
+                // Compile-time generated Parse+Describe bytes — vectored write
+                // sends [prebuilt | Bind+Execute+Sync] without copying prebuilt
+                // into write_buf. Single writev syscall.
+                proto::write_bind_params(&mut self.write_buf, b"", &name, params);
+                self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+                self.flush_write_with_prefix(prebuilt)?;
             } else {
                 // Runtime construction (for dynamic SQL, user raw_query, etc.)
                 let param_oids: smallvec::SmallVec<[u32; 8]> =
                     params.iter().map(|p| p.type_oid()).collect();
                 proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
                 proto::write_describe(&mut self.write_buf, b'S', &name);
+                proto::write_bind_params(&mut self.write_buf, b"", &name, params);
+                self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+                self.flush_write()?;
             }
-            proto::write_bind_params(&mut self.write_buf, b"", &name, params);
-
-            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
-            self.flush_write()?;
 
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
             let columns = self.read_column_description()?;
@@ -3867,6 +3857,32 @@ impl Connection {
             .map_err(DriverError::Io)
     }
 
+    /// Flush `[prefix, write_buf]` via vectored I/O — single `writev` syscall,
+    /// no memcpy of `prefix` into `write_buf`.
+    ///
+    /// Used on the cold path (statement cache miss) to send prebuilt
+    /// Parse+Describe bytes alongside the dynamically-built Bind+Execute+Sync
+    /// without copying the prebuilt bytes into the write buffer.
+    fn flush_write_with_prefix(&mut self, prefix: &[u8]) -> Result<(), DriverError> {
+        use std::io::IoSlice;
+        let mut bufs: &mut [IoSlice<'_>] =
+            &mut [IoSlice::new(prefix), IoSlice::new(&self.write_buf)];
+        while !bufs.is_empty() {
+            match self.stream.write_vectored(bufs) {
+                Ok(0) => {
+                    return Err(DriverError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "write_vectored returned 0 bytes",
+                    )));
+                }
+                Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(DriverError::Io(e)),
+            }
+        }
+        Ok(())
+    }
+
     /// Read one complete backend message. Blocking.
     ///
     /// Returns `(msg_type, payload_len)`. Payload is stored in `self.read_buf`.
@@ -4007,16 +4023,19 @@ pub(crate) fn parse_data_row_into_buf(
     // On 64-bit platforms, 128 MB + 128 MB << usize::MAX, so overflow is
     // impossible. On 32-bit this is still safe: 256 MB < 4 GB.
     let col_data = &data[2..];
+
+    // Upfront minimum: each column has at least a 4-byte length prefix.
+    // This proves all length reads in the loop are in-bounds.
+    if col_data.len() < num_cols * 4 {
+        return Err(DriverError::Protocol("DataRow truncated".into()));
+    }
+
     let base = buf.len();
     buf.extend_from_slice(col_data);
 
     // Walk columns within the buffer — no copying, just record offsets.
     let mut pos: usize = 0;
     for _ in 0..num_cols {
-        if pos + 4 > col_data.len() {
-            return Err(DriverError::Protocol("DataRow truncated".into()));
-        }
-
         let col_len = i32::from_be_bytes([
             col_data[pos],
             col_data[pos + 1],

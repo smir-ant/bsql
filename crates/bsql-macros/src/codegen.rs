@@ -1680,26 +1680,99 @@ fn gen_pg_for_each_row_struct(parsed: &ParsedQuery, validation: &ValidationResul
 
 // ---- PG for_each RAW BYTES inline decode (no PgDataRow, no SmallVec) ----
 
+/// PostgreSQL binary wire size for fixed-size types.
+///
+/// Returns `Some(n)` when the type has a known, constant wire representation
+/// size in PostgreSQL binary format. Returns `None` for variable-length types.
+fn pg_wire_size(rust_type: &str) -> Option<usize> {
+    match rust_type {
+        "bool" => Some(1),
+        "i16" => Some(2),
+        "i32" | "f32" | "u32" => Some(4),
+        "i64" | "f64" => Some(8),
+        _ => None,
+    }
+}
+
 /// Generate inline sequential decode for PG for_each raw-bytes path.
 ///
 /// Instead of constructing a `PgDataRow` and calling `.get_i32(idx)` etc.,
 /// this generates code that advances `_bsql_pos` through `_bsql_data` sequentially,
 /// reading each column's 4-byte length prefix followed by the column bytes.
 ///
+/// **Compile-time column offsets**: when leading columns are fixed-size NOT NULL
+/// (bool, i16, i32, i64, f32, f64, u32), their byte offsets within the DataRow
+/// payload are known at compile time. The generated code reads them via literal
+/// array indices — no length prefix read, no NULL branch, no position tracking.
+/// A single bounds check at the start enables the compiler to elide all per-column
+/// bounds checks for the fixed prefix.
+///
 /// For basic types (bool, i16, i32, i64, f32, f64, str, bytes): direct inline decode.
 /// For feature-gated types (uuid, time, chrono, decimal, arrays): extracts the raw
 /// column slice and calls the same `::bsql_core::driver::decode_*` functions.
 fn gen_pg_for_each_raw_decode(validation: &ValidationResult) -> (TokenStream, TokenStream) {
     let deduped_names = deduplicate_column_names(&validation.columns);
-    let decode_stmts: Vec<TokenStream> = deduped_names
+
+    // Determine the fixed-size NOT NULL prefix: the longest leading run of columns
+    // whose wire size is known at compile time and that are NOT NULL.
+    let fixed_prefix_len = validation
+        .columns
         .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let field_name = format_ident!("{}", name);
-            let col = &validation.columns[i];
-            gen_pg_raw_column_decode(&field_name, &col.rust_type)
+        .take_while(|col| {
+            !col.rust_type.starts_with("Option<") && pg_wire_size(&col.rust_type).is_some()
         })
-        .collect();
+        .count();
+
+    // Compute byte offsets for the fixed prefix.
+    // DataRow payload: [2 bytes col_count] ([4 bytes len] [data bytes])*
+    let mut fixed_offsets: Vec<(usize, usize)> = Vec::new(); // (data_offset, wire_size)
+    let mut cursor: usize = 2; // skip i16 col_count
+    for col in &validation.columns[..fixed_prefix_len] {
+        let ws = pg_wire_size(&col.rust_type).unwrap();
+        cursor += 4; // skip length prefix (present in wire but we don't read it)
+        fixed_offsets.push((cursor, ws));
+        cursor += ws;
+    }
+    let fixed_end = cursor; // _bsql_pos starts here for remaining columns
+
+    // Generate decode statements.
+    let mut decode_stmts: Vec<TokenStream> = Vec::new();
+
+    // --- Fixed-prefix columns: compile-time offsets, direct access ---
+    if fixed_prefix_len > 0 {
+        let min_size = fixed_end;
+        decode_stmts.push(quote! {
+            if _bsql_data.len() < #min_size {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    "row", "fixed-layout", "truncated DataRow payload",
+                    ::std::io::Error::new(
+                        ::std::io::ErrorKind::UnexpectedEof,
+                        "row too short for fixed-offset decode",
+                    ),
+                ));
+            }
+        });
+
+        for (i, (data_offset, _ws)) in fixed_offsets.iter().enumerate() {
+            let field_name = format_ident!("{}", deduped_names[i]);
+            let col = &validation.columns[i];
+            decode_stmts.push(gen_pg_raw_fixed_decode(&field_name, &col.rust_type, *data_offset));
+        }
+    }
+
+    // --- Remaining columns: sequential decode with _bsql_pos ---
+    let remaining_start = fixed_prefix_len;
+    if remaining_start < validation.columns.len() {
+        let init_pos = fixed_end;
+        decode_stmts.push(quote! {
+            let mut _bsql_pos: usize = #init_pos;
+        });
+
+        for (name, col) in deduped_names[remaining_start..].iter().zip(&validation.columns[remaining_start..]) {
+            let field_name = format_ident!("{}", name);
+            decode_stmts.push(gen_pg_raw_column_decode(&field_name, &col.rust_type));
+        }
+    }
 
     let field_inits: Vec<TokenStream> = deduped_names
         .iter()
@@ -1725,13 +1798,79 @@ fn gen_pg_for_each_raw_decode(validation: &ValidationResult) -> (TokenStream, To
     };
 
     let stmts = quote! {
-        let mut _bsql_pos: usize = 2; // skip i16 num_cols
         #(#decode_stmts)*
     };
     let inits = quote! {
         #(#field_inits),* #phantom_init
     };
     (stmts, inits)
+}
+
+/// Generate direct-access decode for a fixed-size NOT NULL column at a
+/// compile-time-known byte offset within the DataRow payload.
+///
+/// Emits code that reads directly via literal indices — no length prefix
+/// read, no NULL check, no `_bsql_pos` tracking.
+fn gen_pg_raw_fixed_decode(
+    field_name: &proc_macro2::Ident,
+    rust_type: &str,
+    data_offset: usize,
+) -> TokenStream {
+    match rust_type {
+        "bool" => {
+            let o = data_offset;
+            quote! { let #field_name = _bsql_data[#o] != 0; }
+        }
+        "i16" => {
+            let o0 = data_offset;
+            let o1 = data_offset + 1;
+            quote! { let #field_name = i16::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1]]); }
+        }
+        "i32" => {
+            let o0 = data_offset;
+            let o1 = data_offset + 1;
+            let o2 = data_offset + 2;
+            let o3 = data_offset + 3;
+            quote! { let #field_name = i32::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3]]); }
+        }
+        "i64" => {
+            let o0 = data_offset;
+            let o1 = data_offset + 1;
+            let o2 = data_offset + 2;
+            let o3 = data_offset + 3;
+            let o4 = data_offset + 4;
+            let o5 = data_offset + 5;
+            let o6 = data_offset + 6;
+            let o7 = data_offset + 7;
+            quote! { let #field_name = i64::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3], _bsql_data[#o4], _bsql_data[#o5], _bsql_data[#o6], _bsql_data[#o7]]); }
+        }
+        "f32" => {
+            let o0 = data_offset;
+            let o1 = data_offset + 1;
+            let o2 = data_offset + 2;
+            let o3 = data_offset + 3;
+            quote! { let #field_name = f32::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3]]); }
+        }
+        "f64" => {
+            let o0 = data_offset;
+            let o1 = data_offset + 1;
+            let o2 = data_offset + 2;
+            let o3 = data_offset + 3;
+            let o4 = data_offset + 4;
+            let o5 = data_offset + 5;
+            let o6 = data_offset + 6;
+            let o7 = data_offset + 7;
+            quote! { let #field_name = f64::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3], _bsql_data[#o4], _bsql_data[#o5], _bsql_data[#o6], _bsql_data[#o7]]); }
+        }
+        "u32" => {
+            let o0 = data_offset;
+            let o1 = data_offset + 1;
+            let o2 = data_offset + 2;
+            let o3 = data_offset + 3;
+            quote! { let #field_name = i32::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3]]) as u32; }
+        }
+        _ => unreachable!("gen_pg_raw_fixed_decode called with non-fixed type: {rust_type}"),
+    }
 }
 
 /// Generate the inline decode for a single column in the raw-bytes path.
@@ -3083,8 +3222,8 @@ mod tests {
         let code_str = code.to_string();
 
         assert!(
-            code_str.contains("Sql :: precomputed"),
-            "SELECT should use Sql::precomputed: {code_str}"
+            code_str.contains("Sql :: with_parse"),
+            "SELECT should use Sql::with_parse: {code_str}"
         );
         assert!(
             code_str.contains(". query"),
@@ -3100,8 +3239,8 @@ mod tests {
         let code_str = code.to_string();
 
         assert!(
-            code_str.contains("Sql :: precomputed"),
-            "INSERT RETURNING should use Sql::precomputed: {code_str}"
+            code_str.contains("Sql :: with_parse"),
+            "INSERT RETURNING should use Sql::with_parse: {code_str}"
         );
         assert!(
             !code_str.contains("query_raw"),

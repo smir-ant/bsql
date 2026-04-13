@@ -817,18 +817,13 @@ impl AsyncConnection {
             self.query_counter += 1;
             info.last_used = self.query_counter;
 
-            let can_use_template = info
-                .bind_template
-                .as_ref()
-                .is_some_and(|t| t.param_slots.len() == params.len());
-
             let mut has_exec_sync = false;
 
-            if can_use_template {
-                // can_use_template is true only when bind_template.is_some()
-                let tmpl = info.bind_template.as_ref().ok_or_else(|| {
-                    DriverError::Protocol("bind_template missing despite can_use_template".into())
-                })?;
+            if let Some(tmpl) = info
+                .bind_template
+                .as_ref()
+                .filter(|t| t.param_slots.len() == params.len())
+            {
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;

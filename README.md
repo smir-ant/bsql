@@ -187,7 +187,7 @@ See [examples/](examples/) for more complete, runnable programs — including [k
 <details>
 <summary>Requirements</summary>
 
-**Rust 1.75+** (MSRV). Required for RPITIT — `impl Future + Send` in trait return position. This is how bsql provides true async without `block_in_place` or `BoxFuture`. Rust 1.75 was released December 2023.
+**Rust 1.81+** (MSRV). Required for `IoSlice::advance_slices` — vectored I/O that sends Parse+Describe and Bind+Execute+Sync in a single `writev` syscall without copying prebuilt bytes into the write buffer. Also enables `LazyLock` for lock-free lazy initialization and `#[expect(lint)]` for precise lint control. Rust 1.81 was released September 2024.
 
 **PostgreSQL 10+**. bsql uses prepared statements with binary protocol, `pg_catalog` introspection, SCRAM-SHA-256 authentication (PG 10+), and `CREATE SCHEMA` for test isolation. PG 15-18 are tested in CI matrix.
 

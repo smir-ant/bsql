@@ -703,6 +703,10 @@ impl<'a> PgDataRow<'a> {
     ///
     /// `data` is the DataRow message payload (after the 'D' type byte and
     /// 4-byte length prefix have been stripped by the framing layer).
+    ///
+    /// Validates the minimum required size upfront (`2 + num_cols * 4`) so the
+    /// per-column loop runs without bounds checks on the length prefix reads.
+    #[inline]
     pub fn new(data: &'a [u8]) -> Result<Self, DriverError> {
         if data.len() < 2 {
             return Err(DriverError::Protocol("DataRow too short".into()));
@@ -714,9 +718,20 @@ impl<'a> PgDataRow<'a> {
             ));
         }
         let num_cols = num_cols as usize;
+
+        // Upfront minimum size: 2-byte header + 4-byte length prefix per column.
+        // This proves all length-prefix reads are in-bounds, eliminating per-column
+        // bounds checks in the loop below.
+        let min_size = 2 + num_cols * 4;
+        if data.len() < min_size {
+            return Err(DriverError::Protocol("DataRow truncated".into()));
+        }
+
         let mut offsets = smallvec::SmallVec::<[(usize, i32); 16]>::with_capacity(num_cols);
         let mut pos = 2usize;
         for _ in 0..num_cols {
+            // The upfront min_size check guarantees the first iteration is in-bounds.
+            // For subsequent iterations, col_data may have pushed pos forward.
             if pos + 4 > data.len() {
                 return Err(DriverError::Protocol("DataRow truncated".into()));
             }

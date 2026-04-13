@@ -71,6 +71,21 @@ impl Write for Stream {
         }
     }
 
+    /// Vectored write — single `writev` syscall for multiple buffers.
+    ///
+    /// Dispatches once to the inner stream; the default `Write::write_vectored`
+    /// would go through `write()` per slice via the fallback.
+    #[inline(always)]
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.write_vectored(bufs),
+            #[cfg(unix)]
+            Stream::Unix(s) => s.write_vectored(bufs),
+            #[cfg(feature = "tls")]
+            Stream::Tls(s) => s.write_vectored(bufs),
+        }
+    }
+
     #[inline(always)]
     fn flush(&mut self) -> io::Result<()> {
         match self {

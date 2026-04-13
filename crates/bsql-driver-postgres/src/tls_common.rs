@@ -38,52 +38,48 @@
 //! - **Custom `ClientConfig`** (`ssl_root_cert`/`ssl_cert`/`ssl_key`):
 //!   built once per pool that requests it, reuses the shared provider.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 
 use crate::DriverError;
 
-/// Process-wide `ring` crypto provider, cached on first use.
+/// Process-wide `ring` crypto provider, initialized on first access.
 ///
 /// Returns a cloned `Arc` so callers own a refcounted handle without
-/// having to worry about static lifetimes. Since the inner `Arc` is
-/// cached in a `OnceLock`, the allocation happens exactly once for the
-/// lifetime of the process; every subsequent call is a pointer read
-/// plus an atomic refcount increment.
+/// having to worry about static lifetimes. The `LazyLock` guarantees
+/// exactly one allocation for the process lifetime; every subsequent
+/// call is a pointer read plus an atomic refcount increment.
 pub(crate) fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
-    PROVIDER
-        .get_or_init(|| Arc::new(rustls::crypto::ring::default_provider()))
-        .clone()
+    static PROVIDER: LazyLock<Arc<rustls::crypto::CryptoProvider>> =
+        LazyLock::new(|| Arc::new(rustls::crypto::ring::default_provider()));
+    PROVIDER.clone()
 }
 
 /// Process-wide default [`rustls::ClientConfig`] — webpki roots, no
 /// client authentication.
 ///
-/// Shared between the sync and async TLS paths. Built on first use from
-/// [`ring_provider`] and `webpki_roots::TLS_SERVER_ROOTS`; every
+/// Shared between the sync and async TLS paths. Built on first access
+/// from [`ring_provider`] and `webpki_roots::TLS_SERVER_ROOTS`; every
 /// subsequent call returns the cached `Arc`.
 ///
 /// Custom-CA or mTLS configurations bypass this cache and go through
 /// [`build_client_config`] directly to get their own `ClientConfig`.
 pub(crate) fn default_client_config() -> Arc<rustls::ClientConfig> {
-    static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            // The default config is built from a hardcoded trust anchor
-            // and the pinned `ring` provider. It is infallible by
-            // construction — any failure here is a bsql/rustls bug and
-            // not something a user can fix at runtime, so panic with a
-            // clear diagnostic rather than returning a Result up the
-            // call chain and polluting every TLS-unrelated code path.
-            let config = build_client_config(root_store, None).expect(
-                "bsql: default rustls ClientConfig must build with webpki roots \
-                 and the ring provider — this is a programmer error",
-            );
-            Arc::new(config)
-        })
-        .clone()
+    static CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // The default config is built from a hardcoded trust anchor
+        // and the pinned `ring` provider. It is infallible by
+        // construction — any failure here is a bsql/rustls bug and
+        // not something a user can fix at runtime, so panic with a
+        // clear diagnostic rather than returning a Result up the
+        // call chain and polluting every TLS-unrelated code path.
+        let config = build_client_config(root_store, None).expect(
+            "bsql: default rustls ClientConfig must build with webpki roots \
+             and the ring provider — this is a programmer error",
+        );
+        Arc::new(config)
+    });
+    CONFIG.clone()
 }
 
 /// Build a [`rustls::ClientConfig`] with the given root store and
@@ -137,9 +133,9 @@ mod tests {
         assert!(
             Arc::ptr_eq(&a, &b),
             "ring_provider() must return the same Arc across calls — \
-             OnceLock caching is the whole point"
+             LazyLock caching is the whole point"
         );
-        // At least two references (a and b) plus the one held by OnceLock.
+        // At least two references (a and b) plus the one held by LazyLock.
         assert!(Arc::strong_count(&a) >= 3);
     }
 

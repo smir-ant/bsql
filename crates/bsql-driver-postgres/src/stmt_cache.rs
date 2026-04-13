@@ -39,7 +39,7 @@ impl StmtCache {
     pub(crate) fn get_mut(&mut self, hash: &u64, sql: &str) -> Option<&mut StmtInfo> {
         self.entries
             .iter_mut()
-            .find(|(h, info)| h == hash && info.sql.len() == sql.len() && &*info.sql == sql)
+            .find(|(h, info)| h == hash && &*info.sql == sql)
             .map(|(_, info)| info)
     }
 
@@ -47,7 +47,7 @@ impl StmtCache {
     pub(crate) fn get(&self, hash: &u64, sql: &str) -> Option<&StmtInfo> {
         self.entries
             .iter()
-            .find(|(h, info)| h == hash && info.sql.len() == sql.len() && &*info.sql == sql)
+            .find(|(h, info)| h == hash && &*info.sql == sql)
             .map(|(_, info)| info)
     }
 
@@ -55,13 +55,13 @@ impl StmtCache {
     pub(crate) fn contains_key(&self, hash: &u64, sql: &str) -> bool {
         self.entries
             .iter()
-            .any(|(h, info)| h == hash && info.sql.len() == sql.len() && &*info.sql == sql)
+            .any(|(h, info)| h == hash && &*info.sql == sql)
     }
 
     #[inline]
     pub(crate) fn insert(&mut self, hash: u64, info: StmtInfo) {
         if let Some(entry) = self.entries.iter_mut().find(|(h, existing)| {
-            *h == hash && existing.sql.len() == info.sql.len() && existing.sql == info.sql
+            *h == hash && existing.sql == info.sql
         }) {
             entry.1 = info;
         } else {
