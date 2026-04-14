@@ -1,17 +1,6 @@
-error: bsql: query not found in offline cache (hash fffb761d7447997e)
-         SQL: select nonexistent_column_xyz from users where id = $1
-
-         Cache has 161 .bitcode files but this query's hash is not among them — the SQL has likely changed since the cache was built.
-
-         To fix:
-         1) Set DATABASE_URL (or BSQL_DATABASE_URL) to a live PostgreSQL
-            and run `cargo build`. This regenerates the cache.
-         2) Commit the entire `.bsql/queries/` directory to git:
-            `git add .bsql/queries/ && git commit`
-            Make sure ALL `.bitcode` files are staged, not just `.manifest`.
-         3) On CI / prod, set `BSQL_OFFLINE=true` and build — no DB needed.
-         4) Run `bsql verify` locally to confirm the cache is self-consistent
-            before pushing.
+error: PostgreSQL error: column "nonexistent_column_xyz" does not exist (at position 8)
+                SQL: SELECT nonexistent_column_xyz FROM users WHERE id = $1
+                            ^
  --> tests/compile_fail/invalid_column.rs:3:13
   |
 3 |       let _ = bsql::query!(

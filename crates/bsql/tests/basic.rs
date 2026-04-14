@@ -2590,7 +2590,7 @@ async fn copy_in_binary_multiple_types() {
         vec![
             &true as &(dyn bsql::driver::Encode + Sync),
             &42i64,
-            &3.14f64,
+            &std::f64::consts::PI,
         ],
         vec![&false, &(-1i64), &0.0f64],
     ];
@@ -2682,13 +2682,13 @@ async fn for_each_all_fixed_columns() {
             match count {
                 1 => {
                     assert_eq!(row.id, 1);
-                    assert_eq!(row.active, true);
+                    assert!(row.active);
                     assert_eq!(row.score, 42i16);
                     assert!((row.balance - 100.50).abs() < f64::EPSILON);
                 }
                 2 => {
                     assert_eq!(row.id, 2);
-                    assert_eq!(row.active, true);
+                    assert!(row.active);
                     assert_eq!(row.score, 7i16);
                     assert!((row.balance - 0.0).abs() < f64::EPSILON);
                 }
@@ -2714,12 +2714,12 @@ async fn for_each_mixed_fixed_and_variable() {
                 1 => {
                     assert_eq!(row.id, 1);
                     assert_eq!(row.login, "alice");
-                    assert_eq!(row.active, true);
+                    assert!(row.active);
                 }
                 2 => {
                     assert_eq!(row.id, 2);
                     assert_eq!(row.login, "bob");
-                    assert_eq!(row.active, true);
+                    assert!(row.active);
                 }
                 _ => panic!("unexpected row count {count}"),
             }

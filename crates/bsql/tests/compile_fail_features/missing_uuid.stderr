@@ -1,14 +1,7 @@
-error[E0425]: cannot find function `decode_uuid_type` in module `::bsql_core::driver`
+error: column "ticket_uuid": column type is UUID (OID 2950) — enable feature "uuid" in bsql
  --> tests/compile_fail_features/missing_uuid.rs:5:13
   |
 5 |     let _ = bsql::query!("SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32");
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `::bsql_core::driver`
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
-note: found an item that was configured out
- --> $WORKSPACE/crates/bsql-core/src/lib.rs
-  |
-  |     #[cfg(feature = "uuid")]
-  |           ---------------- the item is gated behind the `uuid` feature
-  |     pub use bsql_driver_postgres::codec::decode_uuid_type;
-  |                                          ^^^^^^^^^^^^^^^^
   = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

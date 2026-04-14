@@ -1,17 +1,7 @@
-error: bsql: query not found in offline cache (hash c7ec0227274c83fe)
-         SQL: select id from nonexistent_table_xyz where id = 1
-
-         Cache has 161 .bitcode files but this query's hash is not among them — the SQL has likely changed since the cache was built.
-
-         To fix:
-         1) Set DATABASE_URL (or BSQL_DATABASE_URL) to a live PostgreSQL
-            and run `cargo build`. This regenerates the cache.
-         2) Commit the entire `.bsql/queries/` directory to git:
-            `git add .bsql/queries/ && git commit`
-            Make sure ALL `.bitcode` files are staged, not just `.manifest`.
-         3) On CI / prod, set `BSQL_OFFLINE=true` and build — no DB needed.
-         4) Run `bsql verify` locally to confirm the cache is self-consistent
-            before pushing.
+error: PostgreSQL error: relation "nonexistent_table_xyz" does not exist (at position 16)
+                SQL: SELECT id FROM nonexistent_table_xyz WHERE id = 1
+                                    ^
+         available tables: test_jsonb, tickets, users
  --> tests/compile_fail/invalid_table.rs:2:13
   |
 2 |       let _ = bsql::query!(
