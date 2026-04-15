@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = []
+
+[workspace.package]
+version = "1.0.0-alpha.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/smir-ant/bsql"
+
+# Crates listed here will be re-added one-by-one as Phase 1..6 of
+# reforge.md roll out. The workspace begins empty by design —
+# nothing compiles until the first crate (`bsql-pg-proto`) lands
+# in Phase 1.
+
+[workspace.dependencies]
+# Deps will be added alongside their first consumer crate.
+# Every addition must include:
+#   - Why we can't write it ourselves in < 200 LoC.
+#   - default-features = false (minimum surface).
+#   - A pinned version, not `*`.
+# See reforge.md Part XI for the policy.
+
+# --- Build profiles ---
+#
+# Consumer profiles apply when bsql is used as a library. These
+# workspace profiles only affect in-repo builds (tests, benches).
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
