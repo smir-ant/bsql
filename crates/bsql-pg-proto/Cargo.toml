@@ -1,0 +1,24 @@
+[package]
+name = "bsql-pg-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL wire-protocol state machine — pure sync, no_std, no alloc. Sans-I/O core for bsql."
+keywords = ["postgres", "postgresql", "wire", "protocol", "sans-io"]
+categories = ["database", "no-std", "parser-implementations"]
+
+# `bsql-pg-proto` is the sans-I/O kernel: pure synchronous state
+# machine, zero I/O, zero allocator, zero async runtime. It runs
+# inside an async wrapper (`bsql-driver-postgres`, ships in 1e),
+# inside the proc-macro online client (Phase 2), or inside a
+# blocking ad-hoc test — identically. See reforge.md §7.1, §13.
+
+[dependencies]
+heapless = { workspace = true }
+
+# `panic = "abort"` is set at the workspace level for `release` so
+# unwinding cannot occur in production. The forbid-bundle in
+# `lib.rs` rules out panic-able expressions at compile time, so
+# the abort path is unreachable by construction.

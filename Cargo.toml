@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = []
+members = [
+    "crates/bsql-pg-proto",
+]
 
 [workspace.package]
 version = "1.0.0-alpha.0"
@@ -9,18 +11,25 @@ rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/smir-ant/bsql"
 
-# Crates listed here will be re-added one-by-one as Phase 1..6 of
-# reforge.md roll out. The workspace begins empty by design —
-# nothing compiles until the first crate (`bsql-pg-proto`) lands
-# in Phase 1.
+# Crates are added one-by-one as Phase 1..6 of reforge.md roll out.
+# The workspace landed in Phase 1a with `bsql-pg-proto` (sans-I/O
+# wire-protocol state machine, Ping flow only).
 
 [workspace.dependencies]
-# Deps will be added alongside their first consumer crate.
-# Every addition must include:
+# Every addition is justified inline:
 #   - Why we can't write it ourselves in < 200 LoC.
-#   - default-features = false (minimum surface).
-#   - A pinned version, not `*`.
-# See reforge.md Part XI for the policy.
+#   - `default-features = false` to minimise surface.
+#   - Pinned version, never `*`.
+# See reforge.md §4.4 / Part XI for the policy.
+
+# `heapless` — bounded, stack-allocated `Vec<T, N>` / `String<N>` /
+# `FnvIndexMap<K, V, N>`. `bsql-pg-proto` is `no_std` and forbids
+# `alloc`; the only way to build a runtime-sized buffer (the read
+# buffer that absorbs incoming wire bytes) is `heapless::Vec`.
+# Writing a 250-LoC bounded ringbuffer ourselves duplicates a
+# 6-year-stable upstream that ships zero transitive deps with
+# `default-features = false`.
+heapless = { version = "0.9.2", default-features = false }
 
 # --- Build profiles ---
 #

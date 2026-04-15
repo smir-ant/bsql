@@ -1,0 +1,365 @@
+//! Phase 1a — end-to-end Ping flow + bad-path coverage.
+//!
+//! Every test here names the invariant it defends. Per architect.txt
+//! Part III, a test exists *only* for:
+//!
+//! - **(A) Spec conformance** — the observable API behaviour on legal
+//!   input matches the PostgreSQL wire spec.
+//! - **(B) Tier-3 invariants** — properties the compiler / architecture
+//!   cannot verify (parsers on arbitrary bytes, concurrent interleavings).
+//! - **(C) Compile-time invariant docs** — `compile_fail` doctests.
+//!
+//! Tests covering tier-1 or tier-2 invariants have no place here.
+//!
+//! This file is pure-sync — no tokio, no async. It pushes commands and
+//! feeds bytes into the state machine directly and pattern-matches on
+//! the returned [`OutActions`]. That is exactly what the async wrapper
+//! (`bsql-driver-postgres`, Phase 1e) does internally; covering it
+//! here without a runtime keeps the testbed maximally minimal.
+
+#![forbid(unsafe_code)]
+#![forbid(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::mem_forget,
+    clippy::as_conversions,
+    clippy::arithmetic_side_effects,
+    clippy::float_arithmetic,
+    clippy::integer_division
+)]
+// Tests *must* be able to fail fast on unexpected match arms — that is
+// the whole point of a test. `panic!` / `unreachable!` in test code
+// models "this branch is a spec violation by the code under test";
+// allowing them is how we surface failure. Note production code carries
+// the full forbid bundle — no exceptions there.
+#![deny(unused_must_use, unused_lifetimes)]
+
+use bsql_pg_proto::{
+    Action, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply, ReplyId, SendBuf,
+    wire::{SYNC_WIRE_BYTES, TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
+};
+use core::num::NonZeroU64;
+
+/// Build a legal `ReadyForQuery` frame: tag `'Z'`, length 5 (self + 1
+/// payload byte), one byte of tx-status.
+fn rfq_frame(tx_status: u8) -> [u8; 6] {
+    // Length field value is 5 (4 bytes of length + 1 payload byte).
+    [TAG_READY_FOR_QUERY, 0, 0, 0, 5, tx_status]
+}
+
+/// Build an `ErrorResponse` frame with a minimal payload. The frame
+/// parser does not inspect the payload; we use `b'\0'` as a single
+/// terminator byte so the length is the minimum 5.
+fn error_frame() -> [u8; 6] {
+    [TAG_ERROR_RESPONSE, 0, 0, 0, 5, b'\0']
+}
+
+/// A distinguishable `ReplyId` for a single-command test.
+fn id(raw: u64) -> ReplyId {
+    // `NonZeroU64::new` returns None only for 0; the tests pass 1..
+    match NonZeroU64::new(raw) {
+        Some(v) => ReplyId::from_raw(v),
+        None => ReplyId::from_raw(NonZeroU64::MIN),
+    }
+}
+
+/// Push a Ping command and assert the single expected emission
+/// (`SendBytes(Static(Sync))`). Used to set up tests whose interesting
+/// behaviour is on the response half of the round-trip.
+///
+/// Using this helper instead of `let _ = proto.push_command(...)`
+/// verifies the setup is well-formed on every call site — any
+/// regression in the push path is surfaced at the top of the test,
+/// not masked.
+fn ping_setup(proto: &mut PgProtocol, reply: ReplyId) {
+    let out = proto.push_command(PgCommand::Ping { reply });
+    assert_eq!(out.len(), 1, "Ping setup: push emits exactly 1 action");
+    assert!(
+        matches!(out.as_slice(), [Action::SendBytes(SendBuf::Static(_))]),
+        "Ping setup: must emit SendBytes(Static), got {out:?}",
+    );
+}
+
+// ------------------------------------------------------------------
+// (A) Spec conformance — legal input → correct protocol output.
+// ------------------------------------------------------------------
+
+/// Invariant (spec): pushing a Ping from `Idle` emits exactly one
+/// action — `SendBytes(SendBuf::Static(SYNC_WIRE_BYTES))`. The state
+/// transitions to `AwaitingPingReply`.
+///
+/// This corresponds to reforge.md §13 / §19's wire-layer contract:
+/// a Ping maps 1:1 to a `Sync` frame on the wire.
+#[test]
+fn ping_from_idle_emits_sync_bytes() {
+    let mut proto = PgProtocol::new();
+    assert_eq!(proto.state(), &ProtoState::Idle);
+
+    let out = proto.push_command(PgCommand::Ping { reply: id(1) });
+
+    assert_eq!(out.len(), 1, "Phase 1a budget: push_command emits exactly 1 action");
+    match out.as_slice() {
+        [Action::SendBytes(SendBuf::Static(bytes))] => {
+            assert_eq!(
+                *bytes, &SYNC_WIRE_BYTES,
+                "must send the const Sync wire bytes, not a rebuilt copy",
+            );
+        }
+        _ => panic!("unexpected action shape: {out:?}"),
+    }
+    assert_eq!(proto.state(), &ProtoState::AwaitingPingReply(id(1)));
+}
+
+/// Invariant (spec): feeding a complete `ReadyForQuery` frame while
+/// awaiting a ping reply emits `DeliverReply { value: Pong { tx_status } }`,
+/// carries the correct status byte, returns state to `Idle`, and leaves
+/// no bytes in the read buffer.
+#[test]
+fn rfq_delivers_pong_and_returns_to_idle() {
+    let mut proto = PgProtocol::new();
+    let ping_id = id(42);
+    ping_setup(&mut proto, ping_id.clone());
+
+    let out = proto.feed_bytes(&rfq_frame(b'I'));
+
+    assert_eq!(out.len(), 1, "Phase 1a budget: feed_bytes(RFQ) emits exactly 1 action");
+    match out.as_slice() {
+        [Action::DeliverReply { id: delivered_id, value }] => {
+            assert_eq!(delivered_id, &ping_id, "reply correlator round-trips unchanged");
+            match value {
+                Reply::Pong { tx_status } => assert_eq!(
+                    *tx_status, b'I',
+                    "Pong must surface the RFQ payload byte (tx-status) unchanged",
+                ),
+                other => panic!("only Reply::Pong defined in Phase 1a; got {other:?}"),
+            }
+        }
+        other => panic!("unexpected action shape: {other:?}"),
+    }
+    assert_eq!(proto.state(), &ProtoState::Idle);
+    assert_eq!(proto.unread().len(), 0, "frame fully consumed");
+}
+
+/// Invariant (spec): the three legal tx-status bytes (`I`, `T`, `E`)
+/// all surface through the `Pong` payload unchanged. This pins the
+/// Phase 1a contract that Ping is an *opaque* surface — we do not
+/// interpret the byte at this layer.
+#[test]
+fn pong_carries_all_legal_tx_status_bytes() {
+    for status in [b'I', b'T', b'E'] {
+        let mut proto = PgProtocol::new();
+        ping_setup(&mut proto, id(1));
+        let out = proto.feed_bytes(&rfq_frame(status));
+        match out.as_slice() {
+            [Action::DeliverReply { value: Reply::Pong { tx_status }, .. }] => {
+                assert_eq!(
+                    *tx_status, status,
+                    "tx-status byte {status:?} must round-trip through Pong unchanged",
+                );
+            }
+            _ => panic!("unexpected action shape for status {status:?}: {out:?}"),
+        }
+    }
+}
+
+/// Invariant (spec): a frame arriving byte-by-byte (partial feeds) is
+/// buffered until complete. Each partial feed emits zero actions; the
+/// final feed emits the delivery.
+///
+/// This exercises `feed_bytes`'s loop bailout on `HeaderParse::Incomplete`
+/// — the parser must never act on a half-read frame.
+#[test]
+fn partial_rfq_feeds_are_buffered_until_complete() {
+    let mut proto = PgProtocol::new();
+    ping_setup(&mut proto, id(7));
+    let frame = rfq_frame(b'I');
+
+    // Feed the header one byte at a time, then the payload.
+    for (i, byte) in frame.iter().enumerate().take(5) {
+        let out = proto.feed_bytes(core::slice::from_ref(byte));
+        assert_eq!(
+            out.len(),
+            0,
+            "no actions until frame is complete (after feeding byte {i})",
+        );
+        assert!(
+            matches!(proto.state(), ProtoState::AwaitingPingReply(_)),
+            "state stays in AwaitingPingReply while buffering",
+        );
+    }
+    // Final byte completes the frame. `frame: [u8; 6]` — slice [5..]
+    // is always `[frame[5]]`, compile-time known.
+    let last_slice: &[u8] = match frame.last() {
+        Some(b) => core::slice::from_ref(b),
+        None => panic!("frame has 6 bytes; .last() must be Some"),
+    };
+    let out = proto.feed_bytes(last_slice);
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out.as_slice(), [Action::DeliverReply { .. }]));
+    assert_eq!(proto.state(), &ProtoState::Idle);
+}
+
+// ------------------------------------------------------------------
+// (A) Bad-path coverage — user-feedback: "100% coverage of all
+//     failure modes, not just happy paths."
+// ------------------------------------------------------------------
+
+/// Invariant (spec): an unsolicited `ReadyForQuery` arriving in
+/// `Idle` (we never sent anything) is out-of-spec. The protocol
+/// classifies it as `UnexpectedFrame` and closes the socket. No
+/// `DeliverReply` — there is no in-flight ReplyId to deliver to.
+#[test]
+fn rfq_in_idle_is_unexpected_frame() {
+    let mut proto = PgProtocol::new();
+    let out = proto.feed_bytes(&rfq_frame(b'I'));
+
+    // Expect exactly one action: CloseSocket. No FailReply because
+    // nothing was in-flight.
+    assert_eq!(out.len(), 1, "unexpected frame with no in-flight reply emits CloseSocket only");
+    assert!(matches!(out.as_slice(), [Action::CloseSocket]));
+}
+
+/// Invariant (spec): `ErrorResponse` arriving while awaiting a Ping
+/// reply is classified as `ServerError`. Both FailReply (to notify the
+/// caller) and CloseSocket (the connection is desynced) are emitted.
+#[test]
+fn error_response_fails_the_in_flight_ping() {
+    let mut proto = PgProtocol::new();
+    let ping_id = id(5);
+    ping_setup(&mut proto, ping_id.clone());
+
+    let out = proto.feed_bytes(&error_frame());
+
+    assert_eq!(
+        out.len(),
+        2,
+        "Phase 1a budget: server-error during ping → FailReply + CloseSocket",
+    );
+    match out.as_slice() {
+        [
+            Action::FailReply { id: failed_id, cause },
+            Action::CloseSocket,
+        ] => {
+            assert_eq!(failed_id, &ping_id);
+            assert_eq!(*cause, ProtocolError::ServerError);
+        }
+        _ => panic!("unexpected action sequence: {out:?}"),
+    }
+}
+
+/// Invariant (spec): a frame with a malformed length-field (< 4) is
+/// classified and tears the connection down.
+#[test]
+fn malformed_length_fails_and_closes() {
+    let mut proto = PgProtocol::new();
+    let ping_id = id(9);
+    ping_setup(&mut proto, ping_id.clone());
+
+    // Tag 'Z', length field = 3 (illegal: min is 4).
+    let frame = [TAG_READY_FOR_QUERY, 0, 0, 0, 3, b'I'];
+    let out = proto.feed_bytes(&frame);
+
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [
+            Action::FailReply { id: failed_id, cause },
+            Action::CloseSocket,
+        ] => {
+            assert_eq!(failed_id, &ping_id);
+            assert!(matches!(
+                cause,
+                ProtocolError::MalformedFrameLength { declared: 3 },
+            ));
+        }
+        _ => panic!("unexpected action sequence: {out:?}"),
+    }
+}
+
+/// Invariant (spec): a frame declaring a length that exceeds
+/// `MAX_FRAME_LEN_FIELD` (structural DoS guard) is rejected without
+/// the body ever being buffered. `FrameTooLarge` is emitted and the
+/// connection is closed.
+///
+/// This defends reforge.md §53's "Frame length amplification DoS =
+/// STRUCTURALLY UNREACHABLE": the cap is checked before any allocation
+/// is made toward the body.
+#[test]
+fn frame_too_large_is_rejected_pre_buffer() {
+    let mut proto = PgProtocol::new();
+    let ping_id = id(11);
+    ping_setup(&mut proto, ping_id.clone());
+
+    // Tag 'Z', length field = u32::MAX (obviously > MAX_FRAME_LEN_FIELD).
+    // Only the 5-byte header is fed; the body is never sent.
+    let frame = [TAG_READY_FOR_QUERY, 0xFF, 0xFF, 0xFF, 0xFF];
+    let out = proto.feed_bytes(&frame);
+
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [
+            Action::FailReply { id: failed_id, cause },
+            Action::CloseSocket,
+        ] => {
+            assert_eq!(failed_id, &ping_id);
+            assert!(matches!(
+                cause,
+                ProtocolError::FrameTooLarge { declared: 0xFFFF_FFFF },
+            ));
+        }
+        _ => panic!("unexpected action sequence: {out:?}"),
+    }
+}
+
+/// Invariant (spec): a second Ping pushed while one is already in
+/// flight is refused without disturbing the first. The new command's
+/// reply gets `FailReply(UnexpectedFrame)`; the original in-flight
+/// Ping continues to wait for its RFQ.
+#[test]
+fn pipelined_ping_is_refused_without_disturbing_first() {
+    let mut proto = PgProtocol::new();
+    let first_id = id(1);
+    let second_id = id(2);
+    ping_setup(&mut proto, first_id.clone());
+
+    let out = proto.push_command(PgCommand::Ping { reply: second_id.clone() });
+
+    assert_eq!(out.len(), 1);
+    match out.as_slice() {
+        [Action::FailReply { id: failed_id, cause: _ }] => {
+            assert_eq!(failed_id, &second_id, "second Ping's reply id fails, not the first");
+        }
+        _ => panic!("unexpected action sequence: {out:?}"),
+    }
+    assert_eq!(proto.state(), &ProtoState::AwaitingPingReply(first_id));
+}
+
+/// Invariant (spec): an RFQ with a zero-byte payload (length field
+/// exactly 4) is rejected — the PG spec demands a 1-byte tx-status.
+#[test]
+fn rfq_with_empty_payload_is_rejected() {
+    let mut proto = PgProtocol::new();
+    let ping_id = id(4);
+    ping_setup(&mut proto, ping_id.clone());
+
+    // Tag 'Z', length = 4 (legal at the framing level, but RFQ demands 1 payload byte).
+    let frame = [TAG_READY_FOR_QUERY, 0, 0, 0, 4];
+    let out = proto.feed_bytes(&frame);
+
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [
+            Action::FailReply { id: failed_id, cause },
+            Action::CloseSocket,
+        ] => {
+            assert_eq!(failed_id, &ping_id);
+            assert!(matches!(
+                cause,
+                ProtocolError::MalformedReadyForQuery { payload_len: 0 },
+            ));
+        }
+        _ => panic!("unexpected action sequence: {out:?}"),
+    }
+}
