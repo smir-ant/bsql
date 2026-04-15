@@ -13,9 +13,21 @@ macros ethos, verification strategy, and roadmap live in one place:
 
 **[`reforge.md`](reforge.md)** — the master architectural document.
 
-Nothing else at the top level is prescriptive right now. `Cargo.toml`
-is an empty workspace; crates appear as Phase 1..6 of reforge.md
-land.
+## Current state
+
+Phase 1a has landed: `bsql-pg-proto` crate with the sans-I/O
+PostgreSQL wire-protocol state machine (Ping flow only). See
+[`crates/bsql-pg-proto/`](crates/bsql-pg-proto/).
+
+The crate is `no_std`, forbids `unsafe`, runs the full clippy forbid
+bundle, and passes a hand-rolled 100 000-iteration randomized fuzz of
+the frame-header parser. `cargo test -p bsql-pg-proto` runs 19 tests
+in < 50 ms.
+
+Remaining Phase 1 sub-phases (1b–1f) land
+`bsql-backend`, SCRAM-SHA-256, the full command set, streaming,
+COPY / LISTEN / NOTIFY, and the async `run_io` wrapper — in that
+order.
 
 ## One-line goal
 
