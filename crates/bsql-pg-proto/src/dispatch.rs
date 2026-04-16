@@ -74,7 +74,7 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
             [tx_status] => DispatchOutcome::Advanced {
                 new_state: ProtoState::Idle,
                 action: Some(Action::DeliverReply {
-                    id,
+                    id: id.consume(),
                     value: Reply::Pong {
                         tx_status: *tx_status,
                     },

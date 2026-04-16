@@ -18,7 +18,7 @@
 
 use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
-use crate::reply_id::ReplyId;
+use core::num::NonZeroU64;
 use heapless::Vec;
 
 /// Bounded list of actions emitted by a single protocol entry-point
@@ -53,10 +53,17 @@ pub enum Action {
     /// The wrapper looks up its `oneshot::Sender` by `id` and forwards
     /// `value`. The protocol does not keep any record after emitting
     /// this action.
+    ///
+    /// The `id` here is the raw `NonZeroU64` the command's `ReplyId`
+    /// was built from — the protocol state machine called
+    /// [`crate::ReplyId::consume`] on the handle to produce this value,
+    /// which marks the reply as delivered (see the Drop-guard on
+    /// `ReplyId`). The wrapper only needs the raw value to route;
+    /// the consume-tracking handle is an internal protocol concept.
     DeliverReply {
         /// The correlator the user originally supplied with their
         /// command.
-        id: ReplyId,
+        id: NonZeroU64,
         /// The typed payload.
         value: Reply,
     },
@@ -68,7 +75,7 @@ pub enum Action {
     FailReply {
         /// The correlator the user originally supplied with their
         /// command.
-        id: ReplyId,
+        id: NonZeroU64,
         /// Why the protocol failed the in-flight command.
         cause: ProtocolError,
     },

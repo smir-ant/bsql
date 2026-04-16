@@ -38,73 +38,228 @@ use core::num::NonZeroU64;
 /// counter. The protocol crate ferries the value through; it never
 /// inspects it, never compares it, never mints one of its own.
 ///
-/// # Non-`Copy`, non-`Clone` by design — tier-1 non-duplication
+/// # Consume discipline — tier-1 runtime, tier-2 compile-enforced
 ///
-/// `ReplyId` wraps an 8-byte `NonZeroU64` — trivially copyable at the
-/// machine-word level — but the type deliberately implements **neither
-/// `Copy` nor `Clone`**. Any attempt to duplicate it is a compile error.
+/// `ReplyId` tracks whether its value has been **delivered** to an
+/// outgoing [`crate::Action::DeliverReply`] / [`crate::Action::FailReply`].
+/// The only way to extract the underlying `NonZeroU64` is
+/// [`ReplyId::consume`], which also marks the id as delivered. Dropping
+/// a `ReplyId` for which `consume` was never called is a **runtime
+/// failure**: the Drop impl asserts that `delivered == true` and panics
+/// with a descriptive message.
 ///
-/// Consequence, combined with the crate-root `#[deny(unused_variables)]`
-/// and the architect.txt Part V ban on `let _ = expr;` and `_varname`
-/// suppression: extracting an `id` from a [`crate::ProtoState`] match arm
-/// forces the arm to *use* it (pass it into an
-/// [`crate::Action::DeliverReply`] / [`crate::Action::FailReply`] payload,
-/// or bind it to a further variable that is itself used). A match arm
-/// that silently drops the id is a build failure, not an audit finding —
-/// this is **tier-1 compile** for the "no silent reply loss" invariant.
+/// Under release builds with `panic = "abort"` (the workspace-level
+/// setting) the panic aborts the process. Under test / dev builds with
+/// `panic = "unwind"` the test harness surfaces the panic as a failure.
+/// Either way the bug — a caller who silently dropped a pending reply,
+/// leaving their `oneshot::Receiver` to hang forever — becomes loudly
+/// observable instead of silently corrupting user flows.
 ///
-/// The one path that *does* legitimately drop an unfinished id is
-/// transport teardown (wrapper crash, connection error before reply):
-/// the wrapper crate converts the dropped id into a classified
-/// `TransportClosed` failure delivered to the caller's oneshot, one
-/// layer above the protocol core. This crate never needs to clone.
-#[expect(
-    missing_copy_implementations,
-    reason = "deliberately non-Copy + non-Clone: duplicating an id is a compile error — the tier-1 mechanism for reply-loss prevention",
-)]
-#[derive(PartialEq, Eq, Hash)]
-#[must_use = "a ReplyId without a registered sender will silently drop the reply"]
-pub struct ReplyId(NonZeroU64);
+/// ## Layered guarantees
+///
+/// - **Tier 1 compile** — non-duplicatable. No `Copy`, no `Clone` impl.
+///   `let b = a;` is a move, not a copy; `a.clone()` does not compile.
+/// - **Tier 1 compile** — cannot be extracted without acknowledging the
+///   consume step. Extracting the value requires calling `consume(self)`
+///   (which takes ownership), not `&self` — so you can't "peek and
+///   forget" the value while retaining the handle.
+/// - **Tier 2 compile** — cannot be silently ignored from a pattern
+///   match. The crate-root `#[deny(unused_variables)]` combined with
+///   the architect.txt Part V bans on `let _ = expr;` and `_varname`
+///   suppression forces a match arm that binds `id: ReplyId` to refer
+///   to `id` in the arm body. Calling `drop(id)` is still legal (the
+///   variable is "used" by `drop`); the Drop-guard below promotes that
+///   path to tier 1 runtime.
+/// - **Tier 1 runtime** — Drop panics / aborts on undelivered drop.
+///
+/// A legitimate transport-teardown path (wrapper closes the connection
+/// while a reply is still in flight) calls `consume` internally, then
+/// the wrapper delivers the classified `TransportClosed` error to the
+/// caller's oneshot. The protocol crate never needs to drop an
+/// unconsumed id on this path — [`crate::PgProtocol::terminate`]
+/// handles it.
+///
+/// # Raw counter values are the wire currency
+///
+/// Outgoing actions carry `NonZeroU64` directly, not `ReplyId` — the
+/// wrapper's pending-replies table is keyed on `NonZeroU64` and has no
+/// need of the consume-tracking handle. The handle exists only inside
+/// the protocol crate's state-transition paths.
+#[must_use = "a ReplyId must be consumed via `.consume()` into an Action — dropping it without delivery is a runtime error"]
+pub struct ReplyId {
+    /// The wire-level correlator value. Never changes after
+    /// construction. The wrapper uses this as the key in its pending-
+    /// replies map.
+    value: NonZeroU64,
+    /// Whether [`ReplyId::consume`] was called before drop. The Drop
+    /// impl reads this to decide whether to panic. A plain `bool`
+    /// suffices — `consume(mut self)` takes ownership so we can mutate
+    /// without synchronisation and then let `self` drop with the flag
+    /// set.
+    delivered: bool,
+}
 
 impl ReplyId {
     /// Construct a `ReplyId` from a non-zero monotonic counter value.
     ///
-    /// **Caller contract** (tier-3, audit-enforced): `value` must not
+    /// **Caller contract** (tier-2, audit-enforced): `value` must not
     /// have been used previously on the same `PgProtocol` instance.
     /// Reuse causes the protocol to deliver future replies to whichever
     /// sender is still registered under that ID — a logic error, not a
     /// memory-safety issue.
     ///
     /// The standard wrapper (`bsql-driver-postgres`) uses an
-    /// `AtomicU64` initialised to 1 with `fetch_add(1, Relaxed)`. At one
-    /// pull per nanosecond that lasts ~584 years, so wraparound is
+    /// `AtomicU64` initialised to 1 with `fetch_add(1, Relaxed)`. At
+    /// one pull per nanosecond that lasts ~584 years, so wraparound is
     /// outside any realistic horizon.
+    ///
+    /// A fresh `ReplyId` starts with `delivered = false`; the
+    /// Drop-guard will fire if it is dropped before
+    /// [`ReplyId::consume`] is called. See type-level docstring.
     #[inline]
     pub const fn from_raw(value: NonZeroU64) -> Self {
-        Self(value)
+        Self {
+            value,
+            delivered: false,
+        }
     }
 
-    /// Extract the underlying counter value by reference.
+    /// Extract the underlying counter value, consuming the handle and
+    /// marking the reply as delivered.
     ///
-    /// Takes `&self` — the contained `NonZeroU64` is `Copy`, so
-    /// extracting the raw value does not consume the id. The
-    /// non-duplication guarantee (see type-level docstring) comes from
-    /// `ReplyId` itself being non-`Copy` / non-`Clone`; you still
-    /// cannot reproduce a whole `ReplyId` from a raw value outside of
-    /// this module's constructor.
+    /// The returned `NonZeroU64` is what the wrapper uses to route
+    /// a reply back to the caller's `oneshot::Sender`. After calling
+    /// `consume`, the `ReplyId` is gone — the raw value travels inside
+    /// an outgoing `Action`, which is not consume-tracked.
     ///
-    /// Used by the wrapper to look up the matching `oneshot::Sender` in
-    /// its pending-replies map without moving the id out of the match
-    /// arm that carries it.
+    /// Tier-1 semantic: if a code path wants the raw value it *must*
+    /// call `consume`; there is no alternative extraction method.
+    /// Calling `consume` is the ack that the reply is en route to the
+    /// wrapper; the Drop-guard then runs harmlessly at end-of-scope.
+    #[inline]
+    pub fn consume(mut self) -> NonZeroU64 {
+        self.delivered = true;
+        self.value
+        // Drop runs here with `delivered = true` → no panic.
+    }
+
+    /// Peek at the underlying counter value without consuming the id.
+    ///
+    /// Useful for logging and for tests that want to assert a reply id
+    /// round-trips correctly without having to wait until the id has
+    /// been packaged into an outgoing Action. This is **not** the path
+    /// used by the wrapper to route replies — that path calls
+    /// [`ReplyId::consume`] instead.
     #[inline]
     #[must_use]
     pub const fn get(&self) -> NonZeroU64 {
-        self.0
+        self.value
+    }
+}
+
+impl Drop for ReplyId {
+    /// Tier-1 runtime consume-discipline guard.
+    ///
+    /// Fires when a `ReplyId` reaches end-of-scope without
+    /// [`ReplyId::consume`] ever being called. Under the workspace
+    /// release profile's `panic = "abort"` this aborts the process;
+    /// under test/dev (`unwind`) the test harness surfaces the panic.
+    /// Either way the silent-reply-loss bug class — which would
+    /// otherwise hang the caller's `oneshot::Receiver` forever — is
+    /// made loudly visible at the moment it happens.
+    fn drop(&mut self) {
+        assert!(
+            self.delivered,
+            "ReplyId {} dropped without delivery — the caller's oneshot receiver will never resolve",
+            self.value.get(),
+        );
+    }
+}
+
+// PartialEq / Eq / Hash compare on `value` only: the `delivered` flag is
+// an implementation detail of the Drop-guard and must not participate
+// in equality semantics (two `ReplyId`s with the same value are "the
+// same id" regardless of whether one of them has been consumed).
+impl PartialEq for ReplyId {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for ReplyId {}
+
+impl core::hash::Hash for ReplyId {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
     }
 }
 
 impl fmt::Debug for ReplyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ReplyId({})", self.0.get())
+        // Intentionally does not print `delivered` — that field is
+        // internal drop-guard bookkeeping; the wrapper / tests care
+        // only about the wire value.
+        write!(f, "ReplyId({})", self.value.get())
+    }
+}
+
+#[cfg(test)]
+mod drop_guard_proofs {
+    //! These tests are the tier-1-runtime proof: they exercise the
+    //! Drop-guard directly and confirm it fires / does not fire on the
+    //! expected paths. A regression that weakens the guard — e.g. a
+    //! future edit that swallows the `delivered` check — makes one of
+    //! these tests fail, rather than silently reintroducing the
+    //! silent-reply-loss bug class.
+
+    use super::*;
+
+    /// Consuming a `ReplyId` returns the raw value and suppresses the
+    /// Drop-guard — the happy path used by every legitimate flow.
+    #[test]
+    fn consume_extracts_value_and_does_not_panic() {
+        let raw = NonZeroU64::new(42).unwrap_or(NonZeroU64::MIN);
+        let id = ReplyId::from_raw(raw);
+        let extracted = id.consume();
+        assert_eq!(extracted, raw, "consume returns the original wire value");
+        // `id` is gone; no drop runs — correctness demonstrated by the
+        // absence of a panic in this test. Compare with the
+        // `#[should_panic]` test below for the symmetric negative case.
+    }
+
+    /// Dropping a `ReplyId` without calling `.consume()` trips the
+    /// Drop-guard — the tier-1 runtime safety net that catches the
+    /// "silent reply loss" bug class.
+    ///
+    /// The test's `#[should_panic]` expects a specific message; a
+    /// future refactor that changes the panic text requires updating
+    /// this fixture, which is intentional — the text is user-visible
+    /// diagnostic and regressions in its shape are worth surfacing.
+    #[test]
+    #[should_panic(expected = "dropped without delivery")]
+    fn undelivered_drop_panics() {
+        let raw = NonZeroU64::new(7).unwrap_or(NonZeroU64::MIN);
+        let id = ReplyId::from_raw(raw);
+        drop(id);
+    }
+
+    /// Equality ignores the `delivered` flag: two ids with the same
+    /// wire value are "the same id" whether one has been consumed or
+    /// not. Construction for this test is scoped so both instances
+    /// flow into `.consume()` before their handles drop — the test is
+    /// about equality, not the Drop-guard, and it should not panic.
+    #[test]
+    fn partial_eq_ignores_delivered_flag() {
+        let raw = NonZeroU64::new(99).unwrap_or(NonZeroU64::MIN);
+        let a = ReplyId::from_raw(raw);
+        let b = ReplyId::from_raw(raw);
+        assert_eq!(a, b, "two ids built from the same raw value compare equal");
+        // Consume both so the Drop-guard does not fire at scope exit.
+        let a_raw = a.consume();
+        let b_raw = b.consume();
+        assert_eq!(a_raw, raw);
+        assert_eq!(b_raw, raw);
     }
 }

@@ -241,7 +241,14 @@ impl PgProtocol {
                             // The Err branch is dead but the Result is
                             // surfaced so the compiler knows we saw it.
                             if let Some(id) = reply_id
-                                && push_action(&mut out, Action::FailReply { id, cause }).is_err()
+                                && push_action(
+                                    &mut out,
+                                    Action::FailReply {
+                                        id: id.consume(),
+                                        cause,
+                                    },
+                                )
+                                .is_err()
                             {
                                 break;
                             }
@@ -289,12 +296,14 @@ impl PgProtocol {
             ProtoState::AwaitingPingReply(prev_reply) => {
                 // Pipelining a Ping while one is already in flight is
                 // not supported in Phase 1a. Restore the previous
-                // state and fail the new request.
+                // state (with its *un-consumed* correlator still inside;
+                // it waits for its own RFQ) and fail the *new* request's
+                // correlator.
                 self.state = ProtoState::AwaitingPingReply(prev_reply);
                 let Ok(()) = push_action(
                     out,
                     Action::FailReply {
-                        id: reply,
+                        id: reply.consume(),
                         cause: ProtocolError::UnexpectedFrame { tag: b'P' },
                     },
                 ) else {
@@ -313,7 +322,7 @@ impl PgProtocol {
                 let Ok(()) = push_action(
                     out,
                     Action::FailReply {
-                        id: reply,
+                        id: reply.consume(),
                         cause: original,
                     },
                 ) else {
@@ -351,7 +360,13 @@ impl PgProtocol {
             ProtoState::AwaitingPingReply(id) => {
                 self.state = ProtoState::Errored(cause);
                 self.read_buf.clear();
-                let Ok(()) = push_action(out, Action::FailReply { id, cause }) else {
+                let Ok(()) = push_action(
+                    out,
+                    Action::FailReply {
+                        id: id.consume(),
+                        cause,
+                    },
+                ) else {
                     return;
                 };
                 let Ok(()) = push_action(out, Action::CloseSocket) else {

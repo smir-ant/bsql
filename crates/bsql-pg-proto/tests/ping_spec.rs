@@ -76,6 +76,51 @@ fn id(value: NonZeroU64) -> ReplyId {
     ReplyId::from_raw(value)
 }
 
+/// Assert the state is `AwaitingPingReply` carrying the given raw value.
+///
+/// Does **not** construct a temporary `ReplyId` for comparison —
+/// constructing one just to feed PartialEq would be an undelivered
+/// drop and trip the consume-discipline Drop-guard at end-of-expression.
+/// Instead we pattern-match and extract the inner `value` directly.
+#[track_caller]
+fn expect_awaiting_ping_reply(state: &ProtoState, expected: NonZeroU64) {
+    match state {
+        ProtoState::AwaitingPingReply(id) => assert_eq!(
+            id.get(),
+            expected,
+            "state is AwaitingPingReply but carrier id does not match",
+        ),
+        other => panic!("expected AwaitingPingReply({expected}), got {other:?}"),
+    }
+}
+
+/// Drain an in-flight ping reply via synthetic `ReadyForQuery`.
+///
+/// Required at the end of any test that leaves the state in
+/// `AwaitingPingReply` — because the `ReplyId` inside that variant
+/// would otherwise be dropped without delivery when the protocol
+/// goes out of scope, tripping its tier-1 runtime Drop-guard and
+/// aborting the test process.
+///
+/// This is not ceremony; it is the architectural reality that production
+/// code must also respect. Every in-flight `ReplyId` must be consumed,
+/// either by a genuine RFQ (this helper) or by
+/// [`crate::PgProtocol::terminate`] (not shipped yet; lands with the
+/// async wrapper in 1e).
+#[track_caller]
+fn drain_pending_ping(proto: &mut PgProtocol) {
+    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    assert_eq!(
+        out.len(),
+        1,
+        "drain: RFQ must emit exactly one Action (DeliverReply)",
+    );
+    assert!(
+        matches!(out.as_slice(), [Action::DeliverReply { .. }]),
+        "drain: expected DeliverReply, got {out:?}",
+    );
+}
+
 /// Push a Ping command and assert the single expected emission
 /// (`SendBytes(Static(Sync))`). Used to set up tests whose interesting
 /// behaviour is on the response half of the round-trip.
@@ -121,7 +166,11 @@ fn ping_from_idle_emits_sync_bytes() {
         }
         _ => panic!("unexpected action shape: {out:?}"),
     }
-    assert_eq!(proto.state(), &ProtoState::AwaitingPingReply(id(ping_raw)));
+    expect_awaiting_ping_reply(proto.state(), ping_raw);
+
+    // Tier-1 runtime consume-discipline: drain the in-flight reply
+    // before the protocol drops. See [`drain_pending_ping`].
+    drain_pending_ping(&mut proto);
 }
 
 /// Invariant (spec): feeding a complete `ReadyForQuery` frame while
@@ -140,8 +189,8 @@ fn rfq_delivers_pong_and_returns_to_idle() {
     match out.as_slice() {
         [Action::DeliverReply { id: delivered_id, value }] => {
             assert_eq!(
-                delivered_id.get(),
-                ping_raw,
+                delivered_id,
+                &ping_raw,
                 "reply correlator round-trips unchanged",
             );
             match value {
@@ -258,7 +307,7 @@ fn error_response_fails_the_in_flight_ping() {
             Action::FailReply { id: failed_id, cause },
             Action::CloseSocket,
         ] => {
-            assert_eq!(failed_id.get(), ping_raw);
+            assert_eq!(failed_id, &ping_raw);
             assert_eq!(*cause, ProtocolError::ServerError);
         }
         _ => panic!("unexpected action sequence: {out:?}"),
@@ -283,7 +332,7 @@ fn malformed_length_fails_and_closes() {
             Action::FailReply { id: failed_id, cause },
             Action::CloseSocket,
         ] => {
-            assert_eq!(failed_id.get(), ping_raw);
+            assert_eq!(failed_id, &ping_raw);
             assert!(matches!(
                 cause,
                 ProtocolError::MalformedFrameLength { declared: 3 },
@@ -318,7 +367,7 @@ fn frame_too_large_is_rejected_pre_buffer() {
             Action::FailReply { id: failed_id, cause },
             Action::CloseSocket,
         ] => {
-            assert_eq!(failed_id.get(), ping_raw);
+            assert_eq!(failed_id, &ping_raw);
             assert!(matches!(
                 cause,
                 ProtocolError::FrameTooLarge { declared: 0xFFFF_FFFF },
@@ -345,14 +394,18 @@ fn pipelined_ping_is_refused_without_disturbing_first() {
     match out.as_slice() {
         [Action::FailReply { id: failed_id, cause: _ }] => {
             assert_eq!(
-                failed_id.get(),
-                second_raw,
+                failed_id,
+                &second_raw,
                 "second Ping's reply id fails, not the first",
             );
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
-    assert_eq!(proto.state(), &ProtoState::AwaitingPingReply(id(first_raw)));
+    expect_awaiting_ping_reply(proto.state(), first_raw);
+
+    // Drain the still-pending first-ping reply so its ReplyId is
+    // consumed before the protocol drops. See [`drain_pending_ping`].
+    drain_pending_ping(&mut proto);
 }
 
 /// Invariant (spec): an RFQ with a zero-byte payload (length field
@@ -373,7 +426,7 @@ fn rfq_with_empty_payload_is_rejected() {
             Action::FailReply { id: failed_id, cause },
             Action::CloseSocket,
         ] => {
-            assert_eq!(failed_id.get(), ping_raw);
+            assert_eq!(failed_id, &ping_raw);
             assert!(matches!(
                 cause,
                 ProtocolError::MalformedReadyForQuery { payload_len: 0 },
