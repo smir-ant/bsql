@@ -18,7 +18,7 @@ use crate::buf::{ReadBuf, ReadBufFull};
 use crate::command::PgCommand;
 use crate::dispatch::{DispatchOutcome, dispatch};
 use crate::error::ProtocolError;
-use crate::frame::{HeaderParse, parse_header};
+use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
 use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
 use crate::wire::SYNC_WIRE_BYTES;
@@ -178,21 +178,21 @@ impl PgProtocol {
                         // Body not yet fully buffered.
                         break;
                     }
-                    // Slice the payload (bytes after the 5-byte header).
-                    // `total_len >= 5` is guaranteed by `parse_header`
-                    // (it rejects declared_len < 4, so total_len =
-                    // declared_len + 1 >= 5). `unread().len() >=
-                    // total_len` was verified just above. Therefore
-                    // `get(5..total_len)` is always `Some`; the empty-
-                    // slice fallback is defensive against a future
-                    // refactor that breaks either invariant — the
-                    // dispatcher's payload-shape patterns classify
-                    // such inputs as `Malformed…` rather than
-                    // accepting them silently.
+                    // Slice the payload (bytes after the header).
+                    // `total_len >= HEADER_LEN` is guaranteed by
+                    // `parse_header` (it rejects declared_len < 4, so
+                    // total_len = declared_len + 1 >= 5 = HEADER_LEN).
+                    // `unread().len() >= total_len` was verified just
+                    // above. Therefore `get(HEADER_LEN..total_len)` is
+                    // always `Some`; the empty-slice fallback is
+                    // defensive against a future refactor that breaks
+                    // either invariant — the dispatcher's payload-
+                    // shape patterns classify such inputs as
+                    // `Malformed…` rather than accepting them silently.
                     let payload = self
                         .read_buf
                         .unread()
-                        .get(5..total_len)
+                        .get(HEADER_LEN..total_len)
                         .unwrap_or(&[]);
                     // Take ownership of state for the dispatcher.
                     let prev = core::mem::take(&mut self.state);

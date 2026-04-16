@@ -167,6 +167,27 @@ impl Drop for ReplyId {
     /// Either way the silent-reply-loss bug class — which would
     /// otherwise hang the caller's `oneshot::Receiver` forever — is
     /// made loudly visible at the moment it happens.
+    ///
+    /// # Known diagnostic-masking limitation (tracked as DEF-052)
+    ///
+    /// Under `panic = "unwind"` (the test profile), a test that
+    /// panics for an unrelated reason while a non-delivered `ReplyId`
+    /// is alive runs this Drop during unwinding; the assert below
+    /// trips a double-panic that translates to `SIGABRT` before the
+    /// harness prints the original panic message. **The safety
+    /// property is not weakened** (the guard still catches the
+    /// undelivered-drop bug class), but the test-time diagnostic
+    /// for an *unrelated* panic can be masked.
+    ///
+    /// Mitigation today: tests that leave an in-flight `ReplyId` must
+    /// drive the state to a consuming arm via
+    /// `PgProtocol::feed_bytes` (see `drain_pending_ping` in the
+    /// integration tests). A future `PgProtocol::terminate(self,
+    /// cause) -> OutActions` shipping with the async wrapper (Phase
+    /// 1e) will be the canonical teardown path. Deeper fix —
+    /// `std::thread::panicking()` guard — requires a feature flag to
+    /// avoid pulling `std` into `no_std` downstream consumers; see
+    /// DEF-052.
     fn drop(&mut self) {
         assert!(
             self.delivered,

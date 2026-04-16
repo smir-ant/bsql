@@ -45,6 +45,20 @@ pub const READ_BUF_CAP: usize = 4096;
 /// the build fails until both are in sync.
 pub const MAX_FRAME_LEN_FIELD: u32 = 4095;
 
+/// Fixed wire-header length in bytes: 1 byte (tag) + 4 bytes (big-
+/// endian length field).
+///
+/// Named here so that every consumer (parser, dispatcher, buffer slice
+/// sites) references a single named constant rather than the magic `5`.
+/// A future refactor that changes the wire-header layout (unlikely for
+/// PG but possible for a multiplexed wrapper) has exactly one symbol to
+/// find and update. The parser's `total_len = declared + 1` formula
+/// still uses the literal `1` (that is the tag-byte component of the
+/// header, not the whole header), which is a separate spec commitment
+/// pinned by [`total_len_equals_one_plus_declared_len`] in
+/// `tests/frame_parse.rs`.
+pub const HEADER_LEN: usize = 5;
+
 // Tier-1 drift guard: `MAX_FRAME_LEN_FIELD` (u32) must correspond to
 // `READ_BUF_CAP - 1` (usize). A change to either without updating the
 // other fails the build here, because the arithmetic identity below
@@ -60,6 +74,7 @@ pub const MAX_FRAME_LEN_FIELD: u32 = 4095;
 const _: () = assert!(READ_BUF_CAP == 4096);
 const _: () = assert!(MAX_FRAME_LEN_FIELD == 4095);
 const _: () = assert!(MAX_FRAME_LEN_FIELD.saturating_add(1) == 4096);
+const _: () = assert!(HEADER_LEN == 5, "wire header = 1 byte tag + 4 bytes BE length field");
 
 // READ_BUF_CAP must be large enough to hold the smallest legal complete
 // frame (5 bytes: 1 tag + 4 length-field). Below that the protocol

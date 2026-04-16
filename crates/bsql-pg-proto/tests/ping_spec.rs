@@ -386,30 +386,175 @@ fn pipelined_ping_is_refused_without_disturbing_first() {
     drain_pending_ping(&mut proto);
 }
 
-/// Invariant (spec): an RFQ with a zero-byte payload (length field
-/// exactly 4) is rejected — the PG spec demands a 1-byte tx-status.
+/// Build a `ReadyForQuery` frame with a custom payload length. Payload
+/// bytes are all `b'X'` — only the length matters for the
+/// malformed-length classification, not the byte values.
+fn build_rfq_frame_with_payload_len(payload_len: usize) -> Vec<u8> {
+    // declared = self-inclusive length = 4 (length-field) + payload_len.
+    let declared_usize = payload_len.saturating_add(4);
+    let declared = u32::try_from(declared_usize).unwrap_or(u32::MAX);
+    let len_bytes = declared.to_be_bytes();
+    let mut frame = Vec::with_capacity(5_usize.saturating_add(payload_len));
+    frame.push(TAG_READY_FOR_QUERY);
+    frame.extend_from_slice(&len_bytes);
+    frame.extend(std::iter::repeat_n(b'X', payload_len));
+    frame
+}
+
+/// Invariant (spec): an RFQ whose payload is not exactly 1 byte is
+/// rejected with a `MalformedReadyForQuery` classification carrying
+/// the **observed** `payload_len` — the PG spec demands exactly one
+/// transaction-status byte.
+///
+/// Sweeps payload lengths 0, 2, 3, 10. This pins (a) the
+/// `[tx_status]` slice pattern in the dispatcher rejecting *any*
+/// non-single-element shape (not just empty), (b) the classification
+/// variant carrying the actual length for wrapper diagnostics — not a
+/// placeholder.
+///
+/// Closes seam class §4.11.1 / 4 (arm-body access beyond pattern):
+/// without multi-byte coverage a future edit replacing `[tx_status] =>`
+/// with `[tx_status, ..] =>` (accepting any non-empty prefix) would
+/// compile and silently accept bogus RFQ frames. Any input in this
+/// sweep catches that regression.
 #[test]
-fn rfq_with_empty_payload_is_rejected() {
+fn rfq_with_non_single_byte_payload_is_rejected() {
+    for payload_len in [0_usize, 2, 3, 10] {
+        let mut proto = PgProtocol::new();
+        let ping_raw = raw(100);
+        ping_setup(&mut proto, id(ping_raw));
+
+        let frame = build_rfq_frame_with_payload_len(payload_len);
+        let out = proto.feed_bytes(&frame);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "payload_len={payload_len}: expected FailReply + CloseSocket",
+        );
+        match out.as_slice() {
+            [
+                Action::FailReply { id: failed_id, cause },
+                Action::CloseSocket,
+            ] => {
+                assert_eq!(failed_id, &ping_raw);
+                assert!(
+                    matches!(
+                        cause,
+                        ProtocolError::MalformedReadyForQuery { payload_len: actual }
+                            if *actual == payload_len,
+                    ),
+                    "payload_len={payload_len}: unexpected cause {cause:?}",
+                );
+            }
+            other => panic!("payload_len={payload_len}: unexpected actions {other:?}"),
+        }
+    }
+}
+
+/// Invariant (spec): once `ProtoState::Errored(cause)` is entered, the
+/// state machine stays terminal — subsequent `feed_bytes` calls drop
+/// the incoming frames silently (zero actions emitted) and do **not**
+/// overwrite the original cause.
+///
+/// This pins the dispatcher's `(ProtoState::Errored(original), _) =>
+/// Advanced { new_state: Errored(original), action: None }` arm in
+/// `dispatch.rs`. Without this test, a future edit could replace
+/// `action: None` with `Some(Action::CloseSocket)` (or worse, a
+/// DeliverReply with a spoofed id) and the regression would compile
+/// with no downstream indication.
+///
+/// Closes seam classes §4.11.1 / 2 (arm return swap) and 11 (action-
+/// ordering / action-presence assumption).
+#[test]
+fn errored_state_is_terminal_and_drops_subsequent_frames() {
     let mut proto = PgProtocol::new();
-    let ping_raw = raw(4);
+    let ping_raw = raw(100);
     ping_setup(&mut proto, id(ping_raw));
 
-    // Tag 'Z', length = 4 (legal at the framing level, but RFQ demands 1 payload byte).
-    let frame = [TAG_READY_FOR_QUERY, 0, 0, 0, 4];
-    let out = proto.feed_bytes(&frame);
+    // Drive into Errored via an ErrorResponse — `ServerError` cause.
+    let err_out = proto.feed_bytes(&error_frame());
+    assert_eq!(err_out.len(), 2, "entering Errored emits FailReply + CloseSocket");
+    assert!(matches!(
+        proto.state(),
+        ProtoState::Errored(ProtocolError::ServerError),
+    ));
 
-    assert_eq!(out.len(), 2);
+    // First post-terminal frame: a well-formed RFQ. Expect zero actions
+    // (the terminal sink silently drops it) and the original cause
+    // preserved.
+    let post_out_1 = proto.feed_bytes(&rfq_frame(b'I'));
+    assert_eq!(
+        post_out_1.len(),
+        0,
+        "post-terminal RFQ must emit zero actions, got {post_out_1:?}",
+    );
+    assert!(matches!(
+        proto.state(),
+        ProtoState::Errored(ProtocolError::ServerError),
+    ));
+
+    // Second post-terminal frame: an ErrorResponse that would *normally*
+    // classify as a separate ServerError. The original cause must still
+    // win — the terminal sink does not overwrite.
+    let post_out_2 = proto.feed_bytes(&error_frame());
+    assert_eq!(
+        post_out_2.len(),
+        0,
+        "post-terminal ErrorResponse must emit zero actions, got {post_out_2:?}",
+    );
+    assert!(matches!(
+        proto.state(),
+        ProtoState::Errored(ProtocolError::ServerError),
+    ));
+}
+
+/// Invariant (spec): `push_command` on a protocol that has already
+/// reached `Errored` fails the new command with the **stored** cause
+/// — no new wire actions, no state transition, and the caller's
+/// `oneshot` is never left hanging.
+///
+/// Pins the `handle_push_ping`'s `ProtoState::Errored(original) =>
+/// FailReply` arm. A future edit that (a) drops the arm (compile
+/// error via exhaustive match — good) or (b) replaces the cause with
+/// something else (e.g. `UnexpectedFrame { tag: b'P' }`) would
+/// silently shadow the root cause the wrapper is trying to diagnose.
+#[test]
+fn push_command_on_errored_state_fails_with_stored_cause() {
+    let mut proto = PgProtocol::new();
+    let first_raw = raw(50);
+    ping_setup(&mut proto, id(first_raw));
+
+    // Drive into Errored via ErrorResponse.
+    let err_out = proto.feed_bytes(&error_frame());
+    assert_eq!(err_out.len(), 2);
+
+    // Push a new Ping while Errored. The command's reply correlator
+    // must fail with the stored cause (ServerError), not with a fresh
+    // UnexpectedFrame classification.
+    let second_raw = raw(51);
+    let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) });
+
+    assert_eq!(
+        out.len(),
+        1,
+        "post-terminal push_command emits exactly one FailReply, got {out:?}",
+    );
     match out.as_slice() {
-        [
-            Action::FailReply { id: failed_id, cause },
-            Action::CloseSocket,
-        ] => {
-            assert_eq!(failed_id, &ping_raw);
-            assert!(matches!(
-                cause,
-                ProtocolError::MalformedReadyForQuery { payload_len: 0 },
-            ));
+        [Action::FailReply { id: failed_id, cause }] => {
+            assert_eq!(failed_id, &second_raw, "fail correlates to the new command");
+            assert_eq!(
+                *cause,
+                ProtocolError::ServerError,
+                "cause is the STORED terminal cause, not a fresh classification",
+            );
         }
-        _ => panic!("unexpected action sequence: {out:?}"),
+        other => panic!("unexpected action shape: {other:?}"),
     }
+
+    // State unchanged — original cause preserved.
+    assert!(matches!(
+        proto.state(),
+        ProtoState::Errored(ProtocolError::ServerError),
+    ));
 }
