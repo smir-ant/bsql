@@ -1,23 +1,36 @@
-//! Phase 1a — frame-header parser spec + tier-3 randomized fuzz.
+//! Phase 1a — frame-header parser spec conformance.
 //!
-//! Two categories of tests, each category named by the invariant it
-//! defends (per architect.txt Part III):
+//! Per architect.txt Part III, a test exists only for:
 //!
-//! - **(A) Spec conformance** — `parse_header` on specific inputs
-//!   returns the spec-dictated [`HeaderParse`] variant. Pins the
-//!   externally observable behaviour.
-//! - **(B) Tier-3 invariant** — `parse_header` never panics on
-//!   arbitrary bytes. The forbid-bundle in the crate root makes
-//!   `panic!` / `unwrap` / indexing compile errors; this test gives
-//!   empirical confidence by running 100 000 pseudo-random inputs
-//!   through the parser and observing that every call returns a
-//!   classified result. When Phase 1 verification infrastructure lands
-//!   (§111), this loop is replaced by `proptest` and its corpus is
-//!   cargo-fuzz managed.
+//! - **(A) Spec conformance** — the observable API behaviour on legal
+//!   input matches the PostgreSQL wire spec.
+//! - **(B) Tier-3 invariants** — properties the compiler / architecture
+//!   cannot verify (parsers on arbitrary bytes, concurrent interleavings).
+//! - **(C) Compile-time invariant docs** — `compile_fail` doctests.
 //!
-//! No runtime dep on `proptest` / `quickcheck` in Phase 1a — a
-//! hand-rolled SplitMix-style PRNG gives us deterministic coverage
-//! with zero additional build cost.
+//! Tests covering tier-1 or tier-2 invariants have no place here.
+//!
+//! **Tier-1 closures** (invariants covered by architecture, NOT by a
+//! test in this file):
+//!
+//! - *Parser never panics on arbitrary input.* Every panic-able
+//!   expression in [`bsql_pg_proto::parse_header`] is a compile error
+//!   under the crate's forbid-bundle (`clippy::unwrap_used`,
+//!   `clippy::indexing_slicing`, `clippy::arithmetic_side_effects`, …).
+//!   Slice patterns (`[tag, l0, l1, l2, l3, ..]`) carry compiler-
+//!   enforced bounds; `u32::from_be_bytes` on `[u8; 4]` is total;
+//!   `usize::try_from` returns `Result`; `saturating_add` cannot
+//!   overflow; `NonZeroU32::new` returns `Option`. The previous
+//!   randomized 100 000-iteration fuzz loop (SplitMix64-driven) was
+//!   **overspec** — it exercised no path the forbid-bundle does not
+//!   already close at compile time. Removed; DEF-018 closed.
+//! - *`total_len ≤ READ_BUF_CAP` for every `HeaderParse::Ok`.* Pinned
+//!   by `const _: () = assert!(READ_BUF_CAP == MAX_FRAME_LEN_FIELD + 1);`
+//!   in `src/frame.rs` plus the saturating arithmetic above: any
+//!   declared length within the cap is ≤ cap-1, so `declared + 1 ≤
+//!   cap`. The previous fuzz sweep was overspec; the spec-conformance
+//!   case (`total_len == declared + 1` for known declared values)
+//!   remains covered by [`total_len_equals_one_plus_declared_len`].
 
 #![forbid(unsafe_code)]
 #![forbid(
@@ -32,13 +45,9 @@
     clippy::float_arithmetic,
     clippy::integer_division
 )]
-#![deny(unused_must_use, unused_lifetimes)]
+#![deny(unused_must_use, unused_lifetimes, unused_variables)]
 
 use bsql_pg_proto::{HeaderParse, MAX_FRAME_LEN_FIELD, parse_header};
-
-// ------------------------------------------------------------------
-// (A) Spec conformance.
-// ------------------------------------------------------------------
 
 /// Invariant (spec): empty input yields `Empty`.
 ///
@@ -168,113 +177,6 @@ fn total_len_equals_one_plus_declared_len() {
                 assert_eq!(total_len, expected);
             }
             other => panic!("declared={declared}: expected Ok, got {other:?}"),
-        }
-    }
-}
-
-// ------------------------------------------------------------------
-// (B) Tier-3 invariant: parser never panics on arbitrary input.
-// ------------------------------------------------------------------
-
-/// A tiny SplitMix64-style PRNG. Deterministic, seed-driven, zero-dep.
-/// Quality is sufficient for byte-level fuzz; not cryptographic.
-struct Rng(u64);
-
-impl Rng {
-    const fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        // SplitMix64 — https://xoshiro.di.unimi.it/splitmix64.c
-        let mut z = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        self.0 = z;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn next_u8(&mut self) -> u8 {
-        // Take the low byte of the u64 stream.
-        (self.next_u64() & 0xFF)
-            .try_into()
-            .unwrap_or_else(|_| panic!("0..=0xFF always fits u8 — unreachable"))
-    }
-}
-
-/// Invariant (tier 3): `parse_header` never panics, regardless of the
-/// byte content or length of the input. Any classification is
-/// acceptable; the invariant is merely "returns".
-///
-/// Strategy: 100 000 iterations × pseudo-random slices of length
-/// uniformly distributed in 0..=32 bytes. The Phase 1a parser's only
-/// length-sensitive branches are the slice patterns for 0/1/2/3/4
-/// bytes and the fall-through ≥ 5 bytes; iterations spend enough
-/// time in each. Every `declared_len` value from the fuzzed u32
-/// range hits both the `MalformedLength` (< 4) and `FrameTooLarge`
-/// (> cap) boundaries.
-///
-/// When Phase 1 verification infrastructure (§111) lands, this loop is
-/// rewritten as `proptest!` with `100_000` configured per-case and a
-/// cargo-fuzz harness added as a separate target.
-#[test]
-fn parse_header_never_panics_on_random_bytes() {
-    const ITERATIONS: u32 = 100_000;
-    let mut rng = Rng::new(0x_DEAD_BEEF_CAFE_F00D);
-
-    for _iter in 0..ITERATIONS {
-        // Length uniformly in 0..=32. We cap at 32 because the parser
-        // only inspects the first 5 bytes; longer inputs exercise
-        // no new paths. `checked_rem` avoids the arithmetic-side-effects
-        // forbid on a bare `%`.
-        let len = usize::from(rng.next_u8())
-            .checked_rem(33)
-            .unwrap_or(0);
-        let mut buf = [0_u8; 32];
-        let slice = match buf.get_mut(..len) {
-            Some(s) => s,
-            None => panic!("len <= 32 and buf has 32 bytes — unreachable"),
-        };
-        for byte in slice.iter_mut() {
-            *byte = rng.next_u8();
-        }
-        // Parse. We do not inspect the output — the test is only
-        // "the call returns without panicking".
-        match parse_header(slice) {
-            HeaderParse::Empty
-            | HeaderParse::Incomplete
-            | HeaderParse::MalformedLength { .. }
-            | HeaderParse::FrameTooLarge { .. }
-            | HeaderParse::Ok { .. } => {}
-        }
-    }
-}
-
-/// Invariant (tier 3): `parse_header` preserves `total_len <= buffer
-/// capacity` for every `Ok` return. This is the critical safety
-/// property the dispatcher relies on when calling `advance(total_len)`.
-///
-/// Randomized check: 100 000 pseudo-random headers (fixed 5-byte slice
-/// length, random tag, random length-field). Every `Ok` return must
-/// have `total_len <= READ_BUF_CAP`.
-#[test]
-fn parse_ok_always_yields_total_len_within_cap() {
-    const ITERATIONS: u32 = 100_000;
-    const READ_BUF_CAP: usize = bsql_pg_proto::frame::READ_BUF_CAP;
-    let mut rng = Rng::new(0x_0123_4567_89AB_CDEF);
-
-    for _iter in 0..ITERATIONS {
-        let tag = rng.next_u8();
-        let l0 = rng.next_u8();
-        let l1 = rng.next_u8();
-        let l2 = rng.next_u8();
-        let l3 = rng.next_u8();
-        let header = [tag, l0, l1, l2, l3];
-        if let HeaderParse::Ok { total_len, .. } = parse_header(&header) {
-            assert!(
-                total_len <= READ_BUF_CAP,
-                "total_len {total_len} exceeds READ_BUF_CAP {READ_BUF_CAP} for header {header:?}",
-            );
         }
     }
 }
