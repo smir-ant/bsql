@@ -228,8 +228,11 @@ impl PgProtocol {
                         DispatchOutcome::Errored { reply_id, cause } => {
                             // State already taken (we called mem::take
                             // above). Do NOT advance the buffer — the
-                            // connection is about to be closed.
-                            self.state = ProtoState::Idle;
+                            // connection is about to be closed. Store
+                            // the cause as the root classification so
+                            // post-close frames drop silently rather
+                            // than misreading `Idle` as "ready".
+                            self.state = ProtoState::Errored(cause);
                             // Push FailReply + CloseSocket if there
                             // was an in-flight reply; otherwise just
                             // CloseSocket. Per-method budget: at most
@@ -264,12 +267,15 @@ impl PgProtocol {
     /// we surface it via `if .is_err() { return }` — the compiler sees
     /// we did not discard a `Result`.
     fn handle_push_ping(&mut self, reply: ReplyId, out: &mut OutActions) {
-        // State-as-data move: take Idle out (safe — Default = Idle),
-        // transition to AwaitingPingReply carrying the correlator.
+        // State-as-data move: take the previous state out, inspect it,
+        // and write back the correct next state (same or new). `take`
+        // replaces with `Default = Idle`; every arm that does not want
+        // to end in `Idle` restores its own state explicitly.
+        //
         // If any push fails (architecturally unreachable — budget
         // audit above proves each site fits the const cap), the
-        // short-circuit `?`-like `let Ok(()) = ...` pattern returns
-        // early without discarding the Result.
+        // `let Ok(()) = ...` pattern returns early without discarding
+        // the Result.
         match core::mem::take(&mut self.state) {
             ProtoState::Idle => {
                 self.state = ProtoState::AwaitingPingReply(reply);
@@ -295,37 +301,68 @@ impl PgProtocol {
                     return;
                 };
             }
+            ProtoState::Errored(original) => {
+                // Connection is already classified terminal; reject
+                // the new command with the stored cause. The wrapper
+                // has already been told (via an earlier `CloseSocket`)
+                // that the transport is gone, but nothing stops a
+                // caller from pushing another command while it drops
+                // the protocol — fail those commands rather than let
+                // them hang.
+                self.state = ProtoState::Errored(original);
+                let Ok(()) = push_action(
+                    out,
+                    Action::FailReply {
+                        id: reply,
+                        cause: original,
+                    },
+                ) else {
+                    return;
+                };
+            }
         }
     }
 
-    /// Helper: fail any in-flight reply with `cause` and emit
-    /// `CloseSocket`. State is set to `Idle` (the connection is about
-    /// to be torn down; the wrapper will drop the protocol entirely).
+    /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
+    /// and transition the state to [`ProtoState::Errored`].
     ///
     /// Per-method push budget: **≤ 2** (FailReply + CloseSocket).
     /// `MAX_ACTIONS_PER_CALL >= 2` (const-asserted) guarantees both
     /// pushes succeed.
+    ///
+    /// If the previous state is already `Errored`, the original cause
+    /// is preserved and no new actions are emitted — the wrapper was
+    /// already told to close on the first classification; a duplicate
+    /// `CloseSocket` would only confuse it.
     fn fail_inflight_and_close(
         &mut self,
         cause: ProtocolError,
         out: &mut OutActions,
     ) {
         let prev = core::mem::take(&mut self.state);
-        self.state = ProtoState::Idle;
-        self.read_buf.clear();
         match prev {
             ProtoState::Idle => {
+                self.state = ProtoState::Errored(cause);
+                self.read_buf.clear();
                 let Ok(()) = push_action(out, Action::CloseSocket) else {
                     return;
                 };
             }
             ProtoState::AwaitingPingReply(id) => {
+                self.state = ProtoState::Errored(cause);
+                self.read_buf.clear();
                 let Ok(()) = push_action(out, Action::FailReply { id, cause }) else {
                     return;
                 };
                 let Ok(()) = push_action(out, Action::CloseSocket) else {
                     return;
                 };
+            }
+            ProtoState::Errored(original) => {
+                // Already torn down. Preserve the original cause; the
+                // wrapper has already acted on the first `CloseSocket`,
+                // so we do not duplicate the emission.
+                self.state = ProtoState::Errored(original);
             }
         }
     }

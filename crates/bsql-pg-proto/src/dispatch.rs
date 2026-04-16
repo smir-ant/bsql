@@ -105,5 +105,19 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
             reply_id: None,
             cause: ProtocolError::UnexpectedFrame { tag: other },
         },
+        // Already classified as terminal: the wrapper has been told to
+        // close the socket (the earlier `fail_inflight_and_close` or
+        // `DispatchOutcome::Errored` emitted `CloseSocket`). A frame
+        // arriving here is either a genuine post-close flush on the
+        // wire or a wrapper that hasn't dropped us yet. Either way the
+        // protocol stays passive: no new actions, no change of state,
+        // and the caller advances past the frame's bytes so the read
+        // buffer does not fill up in the meantime. The stored cause
+        // stays the *original* classification — not overwritten by
+        // subsequent noise.
+        (ProtoState::Errored(original), _) => DispatchOutcome::Advanced {
+            new_state: ProtoState::Errored(original),
+            action: None,
+        },
     }
 }
