@@ -206,36 +206,56 @@ impl fmt::Debug for ReplyId {
 }
 
 #[cfg(test)]
-mod drop_guard_proof {
-    //! Tier-1 runtime proof that the Drop-guard fires on the
-    //! undelivered-drop path. This is the **only** invariant in
-    //! `reply_id.rs` that cannot be lifted to tier-1 compile on stable
-    //! Rust (no linear types, no field-level `#[must_use]`), so the
-    //! runtime panic is the load-bearing mechanism — and a runtime
-    //! mechanism is only trustworthy once it has been observed to
-    //! fire. That is this test's sole job.
-    //!
-    //! The happy path (consume suppresses the guard, equality ignores
-    //! the internal flag) is held tier-2 by one-line inspection of
-    //! `consume` / `PartialEq` bodies and is exercised implicitly by
-    //! every ping-flow test that completes a round-trip.
+mod reply_id_semantics {
+    //! Per reforge.md §4.11, tests cover category (1) functional
+    //! spec-conformance or (2) tier-3 invariants only. Every test in
+    //! this module is labelled with its category in the docstring.
 
     use super::*;
 
-    /// Dropping a `ReplyId` without calling `.consume()` trips the
-    /// Drop-guard — the tier-1 runtime safety net that catches the
-    /// "silent reply loss" bug class.
+    /// Category (2) — tier-3 runtime invariant.
     ///
-    /// The test's `#[should_panic]` expects a specific message
-    /// substring; a future refactor that changes the panic text
-    /// requires updating this fixture, which is intentional — the
-    /// text is user-visible diagnostic and a silent regression in its
-    /// shape is worth surfacing.
+    /// Dropping a `ReplyId` without calling `.consume()` trips the
+    /// Drop-guard. This is the load-bearing mechanism against the
+    /// "silent reply loss" bug class: on stable Rust we cannot lift
+    /// this to tier-1 compile (no linear types, no field-level
+    /// `#[must_use]`), so the runtime panic is how we close the hole.
+    /// A runtime mechanism is only trustworthy once observed to fire;
+    /// that is this test's sole job.
+    ///
+    /// The `#[should_panic]` expects a specific message substring —
+    /// the text is user-visible diagnostic and a silent change in its
+    /// shape is worth surfacing as a test update.
     #[test]
     #[should_panic(expected = "dropped without delivery")]
     fn undelivered_drop_panics() {
         let raw = NonZeroU64::new(7).unwrap_or(NonZeroU64::MIN);
         let id = ReplyId::from_raw(raw);
         drop(id);
+    }
+
+    /// Category (1) — `PartialEq` semantic pin.
+    ///
+    /// Invariant (spec): two `ReplyId`s with the same wire value
+    /// compare equal, regardless of their internal `delivered` flag.
+    ///
+    /// The `PartialEq` body is one line (`self.value == other.value`);
+    /// a future edit could add `&& self.delivered == other.delivered`
+    /// and compile. No production path in Phase 1a compares ReplyIds
+    /// directly, but `ProtoState` derives `PartialEq` transitively
+    /// through `ReplyId`, and any future code (Loom harness, internal
+    /// state comparison, etc.) that compares `ProtoState` values would
+    /// rely on this semantic. Test pins it.
+    #[test]
+    fn partial_eq_ignores_delivered_flag() {
+        let raw = NonZeroU64::new(99).unwrap_or(NonZeroU64::MIN);
+        let a = ReplyId::from_raw(raw);
+        let b = ReplyId::from_raw(raw);
+        assert_eq!(a, b, "two ids built from the same raw value compare equal");
+        // Consume both so the Drop-guard does not fire at scope exit.
+        let a_raw = a.consume();
+        let b_raw = b.consume();
+        assert_eq!(a_raw, raw);
+        assert_eq!(b_raw, raw);
     }
 }

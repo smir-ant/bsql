@@ -1,42 +1,35 @@
 //! Phase 1a — frame-header parser spec-conformance.
 //!
-//! Per architect.txt Part III, a test exists only for:
+//! Per reforge.md §4.11, a test exists only if it pins:
 //!
-//! - **(A) Spec conformance** — externally observable API behaviour on
-//!   valid or invalid input matches spec.
-//! - **(B) Tier-3 invariant** — property the compiler / architecture
-//!   cannot express; verified by harness (proptest, fuzz, Loom).
-//! - **(C) Compile-time documentation** — `compile_fail` / trybuild.
+//! - **(1) Functional spec-conformance** — externally observable API
+//!   behaviour on valid or invalid input matches the contract.
+//! - **(2) Tier-3 verification** — property the compiler / architecture
+//!   cannot express (verified by proptest / fuzz / Loom).
+//! - **(3) Compile-time invariant documentation** — `assert_send::<T>()`
+//!   style, `compile_fail` doctests, trybuild.
 //!
-//! Tests covering tier-1 or tier-2 invariants have no place here.
+//! Tier-1 or tier-2 invariants have no place here.
 //!
 //! # Tier-1 closures (no test required)
 //!
-//! The following invariants are held **architecturally** by the parser
-//! source — a test would be duplicate verification of what the compiler
-//! or a const-assert already enforces:
+//! The following invariants are held architecturally and a test would
+//! be duplicate verification:
 //!
 //! - *Parser never panics on arbitrary input.* Every panic-able
 //!   expression in [`bsql_pg_proto::parse_header`] is a build error
 //!   under the crate's forbid-bundle (`unwrap_used`, `indexing_slicing`,
-//!   `arithmetic_side_effects`, …). Slice patterns carry compiler-
-//!   enforced bounds; `u32::from_be_bytes([u8; 4])` is total;
-//!   `usize::try_from` returns `Result`; `saturating_add` cannot
-//!   overflow; `NonZeroU32::new` returns `Option`.
-//! - *`parse_header(&[])` → `Empty`*, *1..=4 bytes → `Incomplete`*,
-//!   *≥ 5 bytes with trailing bytes unchanged → same classification*.
-//!   Held by one-line slice patterns `[] => HeaderParse::Empty`,
-//!   `[_] | [_, _] | [_, _, _] | [_, _, _, _] => HeaderParse::Incomplete`,
-//!   `[tag, l0, l1, l2, l3, ..] => …` — the rest-pattern `..` is the
-//!   "ignore trailing bytes" contract.
-//! - *`Ok.total_len == declared + 1` for in-range `declared`.* Pinned
-//!   by `total_len = n.saturating_add(1)` plus the `READ_BUF_CAP ==
-//!   MAX_FRAME_LEN_FIELD + 1` const-assert: saturation cannot occur for
-//!   any accepted declared length, so the formula is exact.
+//!   `arithmetic_side_effects`, …). Slice patterns bound every byte
+//!   access; `u32::from_be_bytes([u8; 4])` is total; `usize::try_from`
+//!   returns `Result`; `saturating_add` cannot overflow; `NonZeroU32::new`
+//!   returns `Option`.
 //!
-//! Tests below pin **classification boundaries** and **full-frame
-//! happy-path composition** — the values that the compiler cannot see
-//! are load-bearing for external callers.
+//! All tests below are category (1): they pin **classification
+//! boundaries**, **literal formula constants**, and **happy-path
+//! composition** — the parts of the parser's behaviour that the source
+//! expresses as literals or arm-body code (not as structural patterns).
+//! Regressing any of them requires editing code that the compiler will
+//! accept; only these tests will catch the shift.
 
 #![forbid(unsafe_code)]
 #![forbid(
@@ -55,14 +48,57 @@
 
 use bsql_pg_proto::{HeaderParse, MAX_FRAME_LEN_FIELD, parse_header};
 
+/// Category (1) — classification pin.
+///
+/// Invariant (spec): `parse_header(&[])` returns `HeaderParse::Empty`,
+/// distinct from `HeaderParse::Incomplete`.
+///
+/// The source is `[] => HeaderParse::Empty` — a one-line slice pattern.
+/// The compiler enforces that an empty slice matches this arm, but a
+/// future edit could swap the returned variant (`[] =>
+/// HeaderParse::Incomplete`) and still compile. Today the feed-bytes
+/// caller treats `Empty | Incomplete` as one arm, so the regression is
+/// informational only; `HeaderParse` is `pub`, though, and external
+/// consumers may legitimately distinguish "no data" from "partial
+/// header" for diagnostics. Test catches the swap.
+#[test]
+fn empty_input_yields_empty() {
+    assert_eq!(parse_header(&[]), HeaderParse::Empty);
+}
+
+/// Category (1) — classification pin.
+///
+/// Invariant (spec): slices of length 1..=4 return `HeaderParse::Incomplete`.
+///
+/// Held today by the slice patterns `[_] | [_, _] | [_, _, _] | [_, _,
+/// _, _] => HeaderParse::Incomplete`. A future edit could swap any of
+/// those return values for `Empty` or for `MalformedLength`. Compiler
+/// does not catch; this test does.
+#[test]
+fn one_to_four_bytes_yield_incomplete() {
+    for n in 1_usize..=4 {
+        let buf = [0xAA_u8; 4];
+        let slice = match buf.get(..n) {
+            Some(s) => s,
+            None => panic!("buf has 4 bytes; .get(..{n}) must be Some"),
+        };
+        assert_eq!(
+            parse_header(slice),
+            HeaderParse::Incomplete,
+            "input of {n} byte(s) must be Incomplete",
+        );
+    }
+}
+
+/// Category (1) — full-frame happy-path composition.
+///
 /// Invariant (spec): a well-formed header with `declared = 4` (header-
 /// only frame, empty payload) parses as `Ok` with `total_len = 5`,
-/// `tag` round-tripped, and `declared_len` packaged into `NonZeroU32`.
+/// `tag` round-tripped, `declared_len` packaged into `NonZeroU32`.
 ///
-/// This is the **full-frame happy path** composition: BE decode +
-/// `NonZeroU32::new` + the declared→total formula. None of those
-/// compose at the type level; their behaviour is only observable via
-/// the returned variant's fields.
+/// Ties together BE decode + `NonZeroU32::new` + the declared→total
+/// formula. None of those compose at the type level; their aggregate
+/// behaviour is only observable via the returned variant's fields.
 #[test]
 fn minimal_legal_header_parses_ok() {
     let header = [b'X', 0, 0, 0, 4];
@@ -80,12 +116,14 @@ fn minimal_legal_header_parses_ok() {
     }
 }
 
-/// Invariant (spec): `declared < 4` is the `MalformedLength` boundary.
+/// Category (1) — boundary pin.
 ///
-/// The `4` is a spec choice encoded as a literal comparison
-/// (`if declared < 4`). Nothing structural pins `4` as the correct
-/// value — a bug that set it to `3` or `5` would compile and silently
-/// shift the boundary. This test catches such a drift.
+/// Invariant (spec): `declared < 4` is the `MalformedLength` cut-off.
+///
+/// Held by the literal comparison `if declared < 4`. Nothing structural
+/// pins `4` as the correct threshold — a bug setting it to `3` or `5`
+/// would compile and silently shift the boundary. This test fails on
+/// such drift.
 #[test]
 fn length_below_minimum_is_malformed() {
     for declared in 0_u8..=3 {
@@ -101,13 +139,16 @@ fn length_below_minimum_is_malformed() {
     }
 }
 
-/// Invariant (spec): `declared > MAX_FRAME_LEN_FIELD` → `FrameTooLarge`.
+/// Category (1) — DoS cap pin.
 ///
-/// This is the structural DoS cap from reforge.md §53 (length-
-/// amplification rejected before the buffer grows). The cap value is a
-/// wire-level commitment that must round-trip exactly in the reported
-/// error; a regression that clamped `declared` to the cap, for
-/// instance, would hide attacker-chosen values from the wrapper.
+/// Invariant (spec): `declared > MAX_FRAME_LEN_FIELD` → `FrameTooLarge`,
+/// with the attacker-chosen value round-tripped unchanged in the error.
+///
+/// This is the structural DoS defence from reforge.md §53 (length-
+/// amplification rejected before the buffer grows). The cap value is
+/// a wire-level commitment; a regression that clamped `declared` to
+/// the cap inside the error would hide attacker values from the
+/// wrapper's logs.
 #[test]
 fn length_above_max_is_frame_too_large() {
     // One above the cap.
@@ -128,4 +169,59 @@ fn length_above_max_is_frame_too_large() {
             declared: u32::MAX,
         },
     );
+}
+
+/// Category (1) — output-stability pin.
+///
+/// Invariant (spec): the parser's return value depends only on the
+/// first 5 bytes of `unread`; any trailing bytes do not affect it.
+///
+/// The slice pattern `[tag, l0, l1, l2, l3, ..]` binds only the first
+/// five bytes, but the arm body still sees the original `unread` slice
+/// in scope. A future refactor could add code inside that arm reading
+/// `unread.get(5)` or later, and return a different `HeaderParse`
+/// variant based on those bytes — it would compile. Today's behaviour
+/// is "trailing bytes do not reach the parser's output"; this test
+/// pins that by comparing outputs from two slices with identical 5-byte
+/// prefixes and different tails.
+#[test]
+fn trailing_bytes_do_not_affect_header_parse() {
+    let header_a = [b'Z', 0, 0, 0, 5, 0xAA, 0xBB];
+    let header_b = [b'Z', 0, 0, 0, 5, 0xCC, 0xDD, 0xEE, 0xFF];
+    assert_eq!(parse_header(&header_a), parse_header(&header_b));
+}
+
+/// Category (1) — algebraic-formula pin.
+///
+/// Invariant (spec): `total_len == declared + 1` for every successful
+/// parse (the `+1` accounts for the tag byte, which the declared length
+/// excludes per the PG protocol).
+///
+/// Held by `n.saturating_add(1)` in the parser body. The `1` is a
+/// literal; a regression that changed it to `0`, `2`, or any
+/// non-literal formula would compile. The `READ_BUF_CAP ==
+/// MAX_FRAME_LEN_FIELD + 1` const-assert pins consistency between two
+/// *constants*, not the arithmetic in `parse_header`. Only this test
+/// catches the formula drift.
+#[test]
+fn total_len_equals_one_plus_declared_len() {
+    for declared in [4_u32, 5, 6, 100, 1024, MAX_FRAME_LEN_FIELD] {
+        let bytes = declared.to_be_bytes();
+        let header = [b'X', bytes[0], bytes[1], bytes[2], bytes[3]];
+        match parse_header(&header) {
+            HeaderParse::Ok {
+                declared_len,
+                total_len,
+                ..
+            } => {
+                assert_eq!(declared_len.get(), declared);
+                let expected = usize::try_from(declared)
+                    .ok()
+                    .and_then(|n| n.checked_add(1))
+                    .unwrap_or(0);
+                assert_eq!(total_len, expected);
+            }
+            other => panic!("declared={declared}: expected Ok, got {other:?}"),
+        }
+    }
 }
