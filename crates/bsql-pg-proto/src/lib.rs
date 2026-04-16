@@ -76,6 +76,7 @@
 #![deny(
     unused_must_use,
     unused_lifetimes,
+    unused_variables,
     missing_docs,
     rust_2024_incompatible_pat
 )]
