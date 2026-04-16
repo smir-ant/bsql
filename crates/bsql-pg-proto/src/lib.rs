@@ -104,3 +104,28 @@ pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use protocol::{MAX_ACTIONS_PER_CALL, PgProtocol};
 pub use reply_id::ReplyId;
 pub use state::ProtoState;
+
+// ---------------------------------------------------------------------
+// Tier-1 compile gates on Send — every type that crosses a task
+// boundary in the wrapper (`bsql-driver-postgres`) must be `Send`.
+// A future refactor that introduces a non-Send field (`Rc<T>`, raw
+// pointer, `MutexGuard`) into any of these types becomes a build
+// error here rather than a silent regression downstream.
+//
+// `PgProtocol: !Sync` is structural via `PhantomData<Cell<()>>` on the
+// struct itself (see `protocol.rs`); it is *not* asserted here because
+// `assert_not_sync` has no stable stdlib form and would require a
+// dependency. Covered by review.
+// ---------------------------------------------------------------------
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<action::Action>();
+    assert_send::<action::OutActions>();
+    assert_send::<action::Reply>();
+    assert_send::<action::SendBuf>();
+    assert_send::<command::PgCommand>();
+    assert_send::<error::ProtocolError>();
+    assert_send::<protocol::PgProtocol>();
+    assert_send::<reply_id::ReplyId>();
+    assert_send::<state::ProtoState>();
+};
