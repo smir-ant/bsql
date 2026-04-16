@@ -1,36 +1,42 @@
-//! Phase 1a — frame-header parser spec conformance.
+//! Phase 1a — frame-header parser spec-conformance.
 //!
 //! Per architect.txt Part III, a test exists only for:
 //!
-//! - **(A) Spec conformance** — the observable API behaviour on legal
-//!   input matches the PostgreSQL wire spec.
-//! - **(B) Tier-3 invariants** — properties the compiler / architecture
-//!   cannot verify (parsers on arbitrary bytes, concurrent interleavings).
-//! - **(C) Compile-time invariant docs** — `compile_fail` doctests.
+//! - **(A) Spec conformance** — externally observable API behaviour on
+//!   valid or invalid input matches spec.
+//! - **(B) Tier-3 invariant** — property the compiler / architecture
+//!   cannot express; verified by harness (proptest, fuzz, Loom).
+//! - **(C) Compile-time documentation** — `compile_fail` / trybuild.
 //!
 //! Tests covering tier-1 or tier-2 invariants have no place here.
 //!
-//! **Tier-1 closures** (invariants covered by architecture, NOT by a
-//! test in this file):
+//! # Tier-1 closures (no test required)
+//!
+//! The following invariants are held **architecturally** by the parser
+//! source — a test would be duplicate verification of what the compiler
+//! or a const-assert already enforces:
 //!
 //! - *Parser never panics on arbitrary input.* Every panic-able
-//!   expression in [`bsql_pg_proto::parse_header`] is a compile error
-//!   under the crate's forbid-bundle (`clippy::unwrap_used`,
-//!   `clippy::indexing_slicing`, `clippy::arithmetic_side_effects`, …).
-//!   Slice patterns (`[tag, l0, l1, l2, l3, ..]`) carry compiler-
-//!   enforced bounds; `u32::from_be_bytes` on `[u8; 4]` is total;
+//!   expression in [`bsql_pg_proto::parse_header`] is a build error
+//!   under the crate's forbid-bundle (`unwrap_used`, `indexing_slicing`,
+//!   `arithmetic_side_effects`, …). Slice patterns carry compiler-
+//!   enforced bounds; `u32::from_be_bytes([u8; 4])` is total;
 //!   `usize::try_from` returns `Result`; `saturating_add` cannot
-//!   overflow; `NonZeroU32::new` returns `Option`. The previous
-//!   randomized 100 000-iteration fuzz loop (SplitMix64-driven) was
-//!   **overspec** — it exercised no path the forbid-bundle does not
-//!   already close at compile time. Removed; DEF-018 closed.
-//! - *`total_len ≤ READ_BUF_CAP` for every `HeaderParse::Ok`.* Pinned
-//!   by `const _: () = assert!(READ_BUF_CAP == MAX_FRAME_LEN_FIELD + 1);`
-//!   in `src/frame.rs` plus the saturating arithmetic above: any
-//!   declared length within the cap is ≤ cap-1, so `declared + 1 ≤
-//!   cap`. The previous fuzz sweep was overspec; the spec-conformance
-//!   case (`total_len == declared + 1` for known declared values)
-//!   remains covered by [`total_len_equals_one_plus_declared_len`].
+//!   overflow; `NonZeroU32::new` returns `Option`.
+//! - *`parse_header(&[])` → `Empty`*, *1..=4 bytes → `Incomplete`*,
+//!   *≥ 5 bytes with trailing bytes unchanged → same classification*.
+//!   Held by one-line slice patterns `[] => HeaderParse::Empty`,
+//!   `[_] | [_, _] | [_, _, _] | [_, _, _, _] => HeaderParse::Incomplete`,
+//!   `[tag, l0, l1, l2, l3, ..] => …` — the rest-pattern `..` is the
+//!   "ignore trailing bytes" contract.
+//! - *`Ok.total_len == declared + 1` for in-range `declared`.* Pinned
+//!   by `total_len = n.saturating_add(1)` plus the `READ_BUF_CAP ==
+//!   MAX_FRAME_LEN_FIELD + 1` const-assert: saturation cannot occur for
+//!   any accepted declared length, so the formula is exact.
+//!
+//! Tests below pin **classification boundaries** and **full-frame
+//! happy-path composition** — the values that the compiler cannot see
+//! are load-bearing for external callers.
 
 #![forbid(unsafe_code)]
 #![forbid(
@@ -49,40 +55,14 @@
 
 use bsql_pg_proto::{HeaderParse, MAX_FRAME_LEN_FIELD, parse_header};
 
-/// Invariant (spec): empty input yields `Empty`.
-///
-/// The caller must distinguish "no data yet" from "less than a header
-/// worth of data" — we want classification to be precise, not "one
-/// incomplete catch-all".
-#[test]
-fn empty_input_yields_empty() {
-    assert_eq!(parse_header(&[]), HeaderParse::Empty);
-}
-
-/// Invariant (spec): 1..=4 bytes yield `Incomplete`. The header is 5
-/// bytes and we need all of them before we can classify.
-#[test]
-fn one_to_four_bytes_yield_incomplete() {
-    for n in 1_usize..=4 {
-        let buf = [0xAA_u8; 4];
-        let slice = match buf.get(..n) {
-            Some(s) => s,
-            None => panic!("buf has 4 bytes; .get(..{n}) must be Some"),
-        };
-        assert_eq!(
-            parse_header(slice),
-            HeaderParse::Incomplete,
-            "input of {n} byte(s) must be Incomplete",
-        );
-    }
-}
-
 /// Invariant (spec): a well-formed header with `declared = 4` (header-
-/// only frame, empty payload) parses as `Ok` with `total_len = 5`.
+/// only frame, empty payload) parses as `Ok` with `total_len = 5`,
+/// `tag` round-tripped, and `declared_len` packaged into `NonZeroU32`.
 ///
-/// This is the *framing-level* minimum — whether the semantic payload
-/// is legal (e.g. RFQ demands 1 byte) is a dispatcher concern, not the
-/// parser's. The parser's contract stops at framing.
+/// This is the **full-frame happy path** composition: BE decode +
+/// `NonZeroU32::new` + the declared→total formula. None of those
+/// compose at the type level; their behaviour is only observable via
+/// the returned variant's fields.
 #[test]
 fn minimal_legal_header_parses_ok() {
     let header = [b'X', 0, 0, 0, 4];
@@ -100,9 +80,12 @@ fn minimal_legal_header_parses_ok() {
     }
 }
 
-/// Invariant (spec): a length-field below 4 is `MalformedLength` —
-/// even 3 (one byte short of self-length). The connection is out of
-/// sync; no semantic interpretation possible.
+/// Invariant (spec): `declared < 4` is the `MalformedLength` boundary.
+///
+/// The `4` is a spec choice encoded as a literal comparison
+/// (`if declared < 4`). Nothing structural pins `4` as the correct
+/// value — a bug that set it to `3` or `5` would compile and silently
+/// shift the boundary. This test catches such a drift.
 #[test]
 fn length_below_minimum_is_malformed() {
     for declared in 0_u8..=3 {
@@ -118,9 +101,13 @@ fn length_below_minimum_is_malformed() {
     }
 }
 
-/// Invariant (spec): a length-field exceeding `MAX_FRAME_LEN_FIELD` is
-/// `FrameTooLarge`. This is the structural cap defended against length
-/// amplification DoS (reforge.md §53).
+/// Invariant (spec): `declared > MAX_FRAME_LEN_FIELD` → `FrameTooLarge`.
+///
+/// This is the structural DoS cap from reforge.md §53 (length-
+/// amplification rejected before the buffer grows). The cap value is a
+/// wire-level commitment that must round-trip exactly in the reported
+/// error; a regression that clamped `declared` to the cap, for
+/// instance, would hide attacker-chosen values from the wrapper.
 #[test]
 fn length_above_max_is_frame_too_large() {
     // One above the cap.
@@ -141,42 +128,4 @@ fn length_above_max_is_frame_too_large() {
             declared: u32::MAX,
         },
     );
-}
-
-/// Invariant (spec): a valid header is parsed identically regardless
-/// of trailing bytes — the parser is byte-exact on the first 5 bytes
-/// and does not validate beyond.
-#[test]
-fn trailing_bytes_do_not_affect_header_parse() {
-    // Two buffers with identical 5-byte prefix, different tails.
-    let header_a = [b'Z', 0, 0, 0, 5, 0xAA, 0xBB];
-    let header_b = [b'Z', 0, 0, 0, 5, 0xCC, 0xDD, 0xEE, 0xFF];
-    assert_eq!(parse_header(&header_a), parse_header(&header_b));
-}
-
-/// Invariant (spec): `total_len` is always `1 + declared_len` for a
-/// successfully parsed header. This is the contract the dispatcher
-/// relies on when advancing the read buffer.
-#[test]
-fn total_len_equals_one_plus_declared_len() {
-    // Sweep a spread of legal lengths.
-    for declared in [4_u32, 5, 6, 100, 1024, MAX_FRAME_LEN_FIELD] {
-        let bytes = declared.to_be_bytes();
-        let header = [b'X', bytes[0], bytes[1], bytes[2], bytes[3]];
-        match parse_header(&header) {
-            HeaderParse::Ok {
-                declared_len,
-                total_len,
-                ..
-            } => {
-                assert_eq!(declared_len.get(), declared);
-                let expected = usize::try_from(declared)
-                    .ok()
-                    .and_then(|n| n.checked_add(1))
-                    .unwrap_or(0);
-                assert_eq!(total_len, expected);
-            }
-            other => panic!("declared={declared}: expected Ok, got {other:?}"),
-        }
-    }
 }

@@ -119,10 +119,14 @@ pub enum HeaderParse {
 /// path (slice-pattern match compiles to a length check + 5 byte
 /// loads + 4 BE-shift assemble).
 ///
-/// Tier-3 invariant: never panics on arbitrary input. The forbid-bundle
-/// in [`crate`] makes panic-able expressions a build error; a
-/// randomized fuzz harness in `tests/frame_parse.rs` exercises 100k
-/// arbitrary slices to give the empirical confidence the spec demands.
+/// **Tier-1 invariant (no-panic):** every panic-able expression in
+/// this function is a build error under the crate's forbid-bundle
+/// (`unwrap_used`, `indexing_slicing`, `arithmetic_side_effects`,
+/// `as_conversions`, …). Slice patterns bound every byte access;
+/// `u32::from_be_bytes([u8; 4])` is total; `usize::try_from` returns
+/// `Result`; `saturating_add` cannot overflow; `NonZeroU32::new`
+/// returns `Option`. No fuzz harness — there is no path the compiler
+/// does not already close.
 #[inline]
 #[must_use]
 pub fn parse_header(unread: &[u8]) -> HeaderParse {

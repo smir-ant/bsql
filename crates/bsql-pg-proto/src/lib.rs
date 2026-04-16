@@ -42,9 +42,9 @@
 //!
 //! - [`buf`] — sealed, bounded read buffer. Methods that could panic
 //!   (`insert`, `resize`, indexing, etc.) physically absent from the API.
-//! - [`frame`] — pure-function frame-header parser. Tested in isolation;
-//!   never panics on arbitrary bytes (tier-3, verified by randomized
-//!   fuzz harness).
+//! - [`frame`] — pure-function frame-header parser. Never panics on
+//!   arbitrary bytes — tier-1 by forbid-bundle + slice patterns +
+//!   checked arithmetic. See its docstring for the mechanism audit.
 //! - [`wire`] — protocol byte constants, including the precomputed `Sync`
 //!   message body.
 //! - [`reply_id`] — opaque correlator for in-flight commands.

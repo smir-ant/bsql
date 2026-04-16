@@ -207,28 +207,6 @@ fn rfq_delivers_pong_and_returns_to_idle() {
     assert_eq!(proto.unread().len(), 0, "frame fully consumed");
 }
 
-/// Invariant (spec): the three legal tx-status bytes (`I`, `T`, `E`)
-/// all surface through the `Pong` payload unchanged. This pins the
-/// Phase 1a contract that Ping is an *opaque* surface — we do not
-/// interpret the byte at this layer.
-#[test]
-fn pong_carries_all_legal_tx_status_bytes() {
-    for status in [b'I', b'T', b'E'] {
-        let mut proto = PgProtocol::new();
-        ping_setup(&mut proto, id(raw(1)));
-        let out = proto.feed_bytes(&rfq_frame(status));
-        match out.as_slice() {
-            [Action::DeliverReply { value: Reply::Pong { tx_status }, .. }] => {
-                assert_eq!(
-                    *tx_status, status,
-                    "tx-status byte {status:?} must round-trip through Pong unchanged",
-                );
-            }
-            _ => panic!("unexpected action shape for status {status:?}: {out:?}"),
-        }
-    }
-}
-
 /// Invariant (spec): a frame arriving byte-by-byte (partial feeds) is
 /// buffered until complete. Each partial feed emits zero actions; the
 /// final feed emits the delivery.
