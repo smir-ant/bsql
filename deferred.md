@@ -163,7 +163,57 @@ this file, or `architect.txt` appears to conflict with a meta-policy,
 |---|---|---|
 | DEF-META-01 | **Never hand-roll expert-domain code, never ship facades over it.** This covers cryptography (SHA, HMAC, PBKDF2, AES, ChaCha20, RSA, ECDSA, Ed25519), TLS (use `rustls`), encoding formats (base64, hex, base32, base58 — use `base64` / `base64ct` / `hex`), random number generation (use `getrandom`), regex (use `regex`), compression (`zstd`, `flate2`, etc.), large-format parsers (JSON/YAML/TOML/protobuf — use maintained crates per perf policy), OS primitives, and CPU-architecture specifics. Always depend on maintained, audited crates (RustCrypto organisation, `rustls`, etc.). Thin facade wrappers over trusted crates are also banned — they add maintenance surface for zero value. | Lesson from Phase 1b round 1: the agent, reading architect.txt Part II policy 8 ("write it yourself if < 200 LoC"), hand-rolled HMAC-SHA-256 (~130 LoC), PBKDF2 (~114 LoC), and RFC-4648 base64 (~498 LoC), and also wrote a 94-LoC facade over `sha2::Sha256`. All four passed their RFC test vectors — **but unit tests cannot catch timing side-channels, constant-time-compare regressions, or subtle edge cases that expert adversaries exploit**. We are not crypto auditors. The "<200 LoC" heuristic was misapplied to a domain where the asymmetry is "afternoon of reading" vs "weeks of expertise plus third-party audit". DEF-META-01 is the non-negotiable carve-out; architect.txt Part II policy 9 and Part XI bans codify it in the agent's operating instructions. Any future proposal to hand-roll in these domains is rejected at review without discussion. |
 
-## 9. Closed
+## 9. Phase-1a architectural hardening (2026-04-17)
+
+Following the "no tests where architecture can speak" review, Phase 1a
+was tightened before Phase 1b expansion lands. Every upgrade below
+moves an invariant from tier-3 (test-verified), tier-4 (happens-not-to-
+fail), or implicit audit-enforced tier-2 up to a tier-1 or honest
+tier-2 structural form — the foundation that Phase 1b's much larger
+state surface will inherit.
+
+### Closed
+
+| ID | Status | What closed it |
+|---|---|---|
+| DEF-018 | Closed — overspec | Hand-rolled SplitMix64 fuzz test for `parse_header_never_panics_on_random_bytes` deleted (49849b9). Invariant is tier-1 by forbid-bundle + slice patterns + checked arithmetic — every panic-able expression is a compile error. The companion `parse_ok_always_yields_total_len_within_cap` fuzz test is also gone: `total_len ≤ READ_BUF_CAP` is structurally pinned by the `READ_BUF_CAP == MAX_FRAME_LEN_FIELD + 1` const-assert plus saturating arithmetic. No verification harness replaces these — none is needed. |
+| DEF-015 (partial, Phase 1a scope) | Closed for every Phase 1a path | `ReplyId`/`PgCommand` stripped of `Clone` (396d9e0) + `deny(unused_variables)` at crate root (e9ec81c) + architect.txt ban on `let _ = expr;` and `_varname` suppression. Combined, these make it a compile error to extract a `ReplyId` from a state variant and silently drop it: the arm must use the id, the id cannot be duplicated, and discarding bindings is forbidden. Phase 1b inherits the discipline automatically for every new `ConnectingStartup { reply, … }`-style variant. |
+| DEF-019 (Phase 1a scope) | Closed | The `push_action` budget-overflow runtime branch in Phase 1a's error paths is now observably classified — overflow leads to `ProtoState::Errored(cause)` (52fd13e) and all subsequent bytes/commands land on the dedicated dispatcher arm. No silent hang. |
+
+### Registered upgrades (post-hardening, before Phase 1b)
+
+| ID | Change | Tier before | Tier after |
+|---|---|---|---|
+| DEF-028 (partial) | `ReplyId`: non-`Copy` + non-`Clone`, `pub` ctor (tier-2 — the cross-crate seal of "only the wrapper mints" is not expressible until a sealed `Backend` trait lands in 1e). Drop-guard still pending; the combination of non-duplication + compile-enforced consumption is already enough for Phase 1a's flows. | — | 1 (non-duplication); 1 (consume discipline via unused_variables); 2 (minting provenance audit-enforced) |
+| DEF-030 (Phase 1a scope) | Send const-asserts at crate root for `Action`, `OutActions`, `Reply`, `SendBuf`, `PgCommand`, `ProtocolError`, `PgProtocol`, `ReplyId`, `ProtoState` (52c8704). Future non-`Send` regressions fail compile. | — | 1 |
+| DEF-META-02 | `DispatchOutcome::Advanced` no longer echoes the `by` the caller just handed in. Slice patterns in the dispatcher body replace `unread.get(5)` / `saturating_sub(5)` / "unreachable in practice; classify" patterns (f178160). Payload shape is verified by the compiler, not by review. | 4 (happens not to fail) / 2 (audit) | 1 (slice pattern exhaustive) / 2 (buffer-advance local invariant) |
+| DEF-META-03 | `ProtoState::Errored(ProtocolError)` terminal variant replaces the `state = Idle` after-close tier-4 pattern (52fd13e). Post-classify frames flow through a dedicated dispatcher arm, post-classify commands get a typed `FailReply` with the stored cause. | 4 | 2 (structural terminal-sink, no re-open path) |
+
+### Phase 1b+ binding commitments (open, to-be-implemented in their phase)
+
+These inherit the Phase 1a discipline and lock the tier ambitions for
+new mechanisms. Each is **mandatory at tier-1** unless the cell says
+otherwise — "tier-2" here means "genuinely unreachable at tier-1 on
+stable Rust without adding synthetic types or nightly, and the tier-2
+mechanism fully closes the observable behaviour".
+
+| ID | Commitment | Phase | Target tier |
+|---|---|---|---|
+| DEF-039 | `SecretDigest` newtype: byte-array wrapper for SCRAM signature / proof / server-signature that deliberately does **not** implement `PartialEq` / `Eq`. Only exposes `ct_eq(&self, other: &Self) -> subtle::Choice`. Any future attempt to compare two secret-derived digests via `==` is a compile error. | 1b | 1 |
+| DEF-040 | `CappedServerNonce<const CAP: usize>`: phantom wrapper around `&[u8]` / `HString`. Constructible only via `try_from_raw` which enforces the cap. Downstream builders of `client-final-message` accept only this type. A server nonce of any length that doesn't fit is rejected at construction, not at assembly. | 1b | 1 |
+| DEF-041 | `Ident` / `ApplicationName` / `DatabaseName`: newtype with `try_from_str` constructor that rejects embedded NUL and enforces a length cap. Downstream StartupMessage builder accepts only these types — a NUL-containing string cannot reach the wire. | 1b | 1 |
+| DEF-042 | `SessionParams`: fixed struct with named optional fields for the known-useful PG `ParameterStatus` keys (`server_version`, `server_encoding`, `client_encoding`, `application_name`, `is_superuser`, `session_authorization`, `date_style`, `integer_datetimes`, `time_zone`). Unknown keys are parsed and dropped — no `heapless::Map` with an overflow class to classify, no silent drop class. | 1b | 1 (no overflow class exists) |
+| DEF-043 | `NoticeResponse` (tag `N`) pre-dispatch filter: any state, any frame, a single filter at the top of `feed_bytes` extracts the notice and emits `Action::EmitNotice(…)` without touching state. Dispatcher arms do not need to handle `N` separately. | 1c (first Query flow; Phase 1b's Startup flow does not need it) | 1 (single site, structural) |
+| DEF-044 | `NegotiateProtocolVersion` (tag `v`) during startup: handled by a dedicated dispatcher arm; the resulting `UnsupportedProtocolOption` variant of `ProtocolError` carries the option names the server rejected. Outside `ConnectingStartup`, treated as `UnexpectedFrame`. | 1b | 1 structural (exhaustive match) |
+| DEF-045 | `emit_actions!` macro — compile-time per-site action budget. Any future contributor who adds a push without declaring its budget gets a build error; exceeding the declared budget is also a build error. Global `MAX_ACTIONS_PER_CALL` becomes an upper bound checked against the sum of declared budgets. | 1a+ (applicable the moment Phase 1b adds more push sites; deferred until then to avoid refactoring-for-nothing) | 1 |
+| DEF-046 | `ReplyId` counter wraparound: wrapper crate's counter uses `checked_add(1)` + classified `IdPoolExhausted` error. 2⁶⁴ IDs on 1-ns cadence is 584 years; the guard is there for the "24/7 pool over a long-running service" edge only. | 1e | 1 |
+| DEF-047 | Wrapper-level typestate for connection lifecycle: `IdleConnection<B>` / `ActiveConnection<B, R>` / `DeadConnection<B>`. Typed handles enforce "no command on dead connection" and "no second command while first in flight" at compile time — the equivalent runtime rejects in `bsql-pg-proto` become the safety-net of last resort, not the primary guard. | 1e | 1 (at the wrapper API; protocol-crate-level stays tier-2 via `Errored` arm) |
+| DEF-048 | `Sensitive<T>` + `!Debug` audit: every type that contains a `Sensitive<T>` field gets either a manual `Debug` that redacts the field, or no `Debug` at all. No Rust stable negative trait bound; enforced by naming convention (`Credentials`, `Secret*`) + reviewer discipline — honest tier-2, not tier-1. | 1b onward | 2 |
+| DEF-049 | `ReadBuf` capacity sizing study: confirm that `READ_BUF_CAP = 4 KiB` is above the largest frame Phase 1-4 will emit. If not (e.g. COPY rows), bump — always at compile time, never at runtime. | 1c–1d | 1 |
+| DEF-050 | SASLPrep for unicode passwords: `stringprep` crate integration, opt-in. ASCII passwords are the common case; non-ASCII without SASLPrep can fail interop with PG servers that normalize. Tier-3 best-effort without the dep; tier-2 structural with it. | 1b (optional) or later | 2-3 (design decision) |
+| DEF-051 | Empty-password policy: `Password::try_from_str` returns `Err(PasswordEmpty)` on zero-length input. Rare path, but a tier-1 compile-visible choice (via the `Result`) rather than a silent weak-KDF. | 1b | 1 |
+
+## 10. Closed
 
 Move entries here when a deferral is genuinely resolved — not just
 "implemented one phase later", but actively shipped with the invariant
