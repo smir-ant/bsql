@@ -57,13 +57,23 @@ fn error_frame() -> [u8; 6] {
     [TAG_ERROR_RESPONSE, 0, 0, 0, 5, b'\0']
 }
 
-/// A distinguishable `ReplyId` for a single-command test.
-fn id(raw: u64) -> ReplyId {
-    // `NonZeroU64::new` returns None only for 0; the tests pass 1..
-    match NonZeroU64::new(raw) {
-        Some(v) => ReplyId::from_raw(v),
-        None => ReplyId::from_raw(NonZeroU64::MIN),
-    }
+/// Non-zero correlator value — the raw counter the wrapper would mint.
+///
+/// Tests keep the raw `NonZeroU64` on the side and compare against it
+/// via [`ReplyId::get`]; the `ReplyId` itself is move-only by design
+/// (non-`Copy`, non-`Clone` — see [`ReplyId`] docstring), so a test
+/// cannot hold a reference to it *and* pass it into a command at the
+/// same time.
+fn raw(value: u64) -> NonZeroU64 {
+    // Tests pass 1..= never 0; fall-through is defensive only.
+    NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
+}
+
+/// A distinguishable `ReplyId` for a single-command test, minted from a
+/// raw counter value. Consumes the raw so the caller also remembers the
+/// value on the side if they need to assert the round-trip.
+fn id(value: NonZeroU64) -> ReplyId {
+    ReplyId::from_raw(value)
 }
 
 /// Push a Ping command and assert the single expected emission
@@ -98,7 +108,8 @@ fn ping_from_idle_emits_sync_bytes() {
     let mut proto = PgProtocol::new();
     assert_eq!(proto.state(), &ProtoState::Idle);
 
-    let out = proto.push_command(PgCommand::Ping { reply: id(1) });
+    let ping_raw = raw(1);
+    let out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) });
 
     assert_eq!(out.len(), 1, "Phase 1a budget: push_command emits exactly 1 action");
     match out.as_slice() {
@@ -110,7 +121,7 @@ fn ping_from_idle_emits_sync_bytes() {
         }
         _ => panic!("unexpected action shape: {out:?}"),
     }
-    assert_eq!(proto.state(), &ProtoState::AwaitingPingReply(id(1)));
+    assert_eq!(proto.state(), &ProtoState::AwaitingPingReply(id(ping_raw)));
 }
 
 /// Invariant (spec): feeding a complete `ReadyForQuery` frame while
@@ -120,15 +131,19 @@ fn ping_from_idle_emits_sync_bytes() {
 #[test]
 fn rfq_delivers_pong_and_returns_to_idle() {
     let mut proto = PgProtocol::new();
-    let ping_id = id(42);
-    ping_setup(&mut proto, ping_id.clone());
+    let ping_raw = raw(42);
+    ping_setup(&mut proto, id(ping_raw));
 
     let out = proto.feed_bytes(&rfq_frame(b'I'));
 
     assert_eq!(out.len(), 1, "Phase 1a budget: feed_bytes(RFQ) emits exactly 1 action");
     match out.as_slice() {
         [Action::DeliverReply { id: delivered_id, value }] => {
-            assert_eq!(delivered_id, &ping_id, "reply correlator round-trips unchanged");
+            assert_eq!(
+                delivered_id.get(),
+                ping_raw,
+                "reply correlator round-trips unchanged",
+            );
             match value {
                 Reply::Pong { tx_status } => assert_eq!(
                     *tx_status, b'I',
@@ -151,7 +166,7 @@ fn rfq_delivers_pong_and_returns_to_idle() {
 fn pong_carries_all_legal_tx_status_bytes() {
     for status in [b'I', b'T', b'E'] {
         let mut proto = PgProtocol::new();
-        ping_setup(&mut proto, id(1));
+        ping_setup(&mut proto, id(raw(1)));
         let out = proto.feed_bytes(&rfq_frame(status));
         match out.as_slice() {
             [Action::DeliverReply { value: Reply::Pong { tx_status }, .. }] => {
@@ -174,7 +189,7 @@ fn pong_carries_all_legal_tx_status_bytes() {
 #[test]
 fn partial_rfq_feeds_are_buffered_until_complete() {
     let mut proto = PgProtocol::new();
-    ping_setup(&mut proto, id(7));
+    ping_setup(&mut proto, id(raw(7)));
     let frame = rfq_frame(b'I');
 
     // Feed the header one byte at a time, then the payload.
@@ -228,8 +243,8 @@ fn rfq_in_idle_is_unexpected_frame() {
 #[test]
 fn error_response_fails_the_in_flight_ping() {
     let mut proto = PgProtocol::new();
-    let ping_id = id(5);
-    ping_setup(&mut proto, ping_id.clone());
+    let ping_raw = raw(5);
+    ping_setup(&mut proto, id(ping_raw));
 
     let out = proto.feed_bytes(&error_frame());
 
@@ -243,7 +258,7 @@ fn error_response_fails_the_in_flight_ping() {
             Action::FailReply { id: failed_id, cause },
             Action::CloseSocket,
         ] => {
-            assert_eq!(failed_id, &ping_id);
+            assert_eq!(failed_id.get(), ping_raw);
             assert_eq!(*cause, ProtocolError::ServerError);
         }
         _ => panic!("unexpected action sequence: {out:?}"),
@@ -255,8 +270,8 @@ fn error_response_fails_the_in_flight_ping() {
 #[test]
 fn malformed_length_fails_and_closes() {
     let mut proto = PgProtocol::new();
-    let ping_id = id(9);
-    ping_setup(&mut proto, ping_id.clone());
+    let ping_raw = raw(9);
+    ping_setup(&mut proto, id(ping_raw));
 
     // Tag 'Z', length field = 3 (illegal: min is 4).
     let frame = [TAG_READY_FOR_QUERY, 0, 0, 0, 3, b'I'];
@@ -268,7 +283,7 @@ fn malformed_length_fails_and_closes() {
             Action::FailReply { id: failed_id, cause },
             Action::CloseSocket,
         ] => {
-            assert_eq!(failed_id, &ping_id);
+            assert_eq!(failed_id.get(), ping_raw);
             assert!(matches!(
                 cause,
                 ProtocolError::MalformedFrameLength { declared: 3 },
@@ -289,8 +304,8 @@ fn malformed_length_fails_and_closes() {
 #[test]
 fn frame_too_large_is_rejected_pre_buffer() {
     let mut proto = PgProtocol::new();
-    let ping_id = id(11);
-    ping_setup(&mut proto, ping_id.clone());
+    let ping_raw = raw(11);
+    ping_setup(&mut proto, id(ping_raw));
 
     // Tag 'Z', length field = u32::MAX (obviously > MAX_FRAME_LEN_FIELD).
     // Only the 5-byte header is fed; the body is never sent.
@@ -303,7 +318,7 @@ fn frame_too_large_is_rejected_pre_buffer() {
             Action::FailReply { id: failed_id, cause },
             Action::CloseSocket,
         ] => {
-            assert_eq!(failed_id, &ping_id);
+            assert_eq!(failed_id.get(), ping_raw);
             assert!(matches!(
                 cause,
                 ProtocolError::FrameTooLarge { declared: 0xFFFF_FFFF },
@@ -320,20 +335,24 @@ fn frame_too_large_is_rejected_pre_buffer() {
 #[test]
 fn pipelined_ping_is_refused_without_disturbing_first() {
     let mut proto = PgProtocol::new();
-    let first_id = id(1);
-    let second_id = id(2);
-    ping_setup(&mut proto, first_id.clone());
+    let first_raw = raw(1);
+    let second_raw = raw(2);
+    ping_setup(&mut proto, id(first_raw));
 
-    let out = proto.push_command(PgCommand::Ping { reply: second_id.clone() });
+    let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) });
 
     assert_eq!(out.len(), 1);
     match out.as_slice() {
         [Action::FailReply { id: failed_id, cause: _ }] => {
-            assert_eq!(failed_id, &second_id, "second Ping's reply id fails, not the first");
+            assert_eq!(
+                failed_id.get(),
+                second_raw,
+                "second Ping's reply id fails, not the first",
+            );
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
-    assert_eq!(proto.state(), &ProtoState::AwaitingPingReply(first_id));
+    assert_eq!(proto.state(), &ProtoState::AwaitingPingReply(id(first_raw)));
 }
 
 /// Invariant (spec): an RFQ with a zero-byte payload (length field
@@ -341,8 +360,8 @@ fn pipelined_ping_is_refused_without_disturbing_first() {
 #[test]
 fn rfq_with_empty_payload_is_rejected() {
     let mut proto = PgProtocol::new();
-    let ping_id = id(4);
-    ping_setup(&mut proto, ping_id.clone());
+    let ping_raw = raw(4);
+    ping_setup(&mut proto, id(ping_raw));
 
     // Tag 'Z', length = 4 (legal at the framing level, but RFQ demands 1 payload byte).
     let frame = [TAG_READY_FOR_QUERY, 0, 0, 0, 4];
@@ -354,7 +373,7 @@ fn rfq_with_empty_payload_is_rejected() {
             Action::FailReply { id: failed_id, cause },
             Action::CloseSocket,
         ] => {
-            assert_eq!(failed_id, &ping_id);
+            assert_eq!(failed_id.get(), ping_raw);
             assert!(matches!(
                 cause,
                 ProtocolError::MalformedReadyForQuery { payload_len: 0 },

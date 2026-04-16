@@ -38,33 +38,31 @@ use core::num::NonZeroU64;
 /// counter. The protocol crate ferries the value through; it never
 /// inspects it, never compares it, never mints one of its own.
 ///
-/// # Non-`Copy` by design
+/// # Non-`Copy`, non-`Clone` by design — tier-1 non-duplication
 ///
 /// `ReplyId` wraps an 8-byte `NonZeroU64` — trivially copyable at the
-/// machine-word level — but the type is deliberately *not* `Copy`.
-/// Marking it `Copy` would make `match prev { AwaitingPingReply(id) =>
-/// { /* forget id */ } }` a silent bit-copy; non-`Copy` downgrades
-/// that misuse to a move-out-of-match, which an unused binding still
-/// passes through but makes reviewer-visible.
+/// machine-word level — but the type deliberately implements **neither
+/// `Copy` nor `Clone`**. Any attempt to duplicate it is a compile error.
 ///
-/// Honest tier classification of the state-as-data invariant: moving
-/// out of [`crate::ProtoState::AwaitingPingReply`] naming the `id` is
-/// forced by the pattern, but the compiler does not enforce that the
-/// named id flows into a [`crate::Action::DeliverReply`] /
-/// [`crate::Action::FailReply`]. That step is **tier-2** — enforced by
-/// the dispatcher's documented match arms and by review, not by the
-/// type system. Making `ReplyId` non-`Copy` just keeps the reviewer
-/// honest (a discarded move-out is visually apparent).
+/// Consequence, combined with the crate-root `#[deny(unused_variables)]`
+/// and the architect.txt Part V ban on `let _ = expr;` and `_varname`
+/// suppression: extracting an `id` from a [`crate::ProtoState`] match arm
+/// forces the arm to *use* it (pass it into an
+/// [`crate::Action::DeliverReply`] / [`crate::Action::FailReply`] payload,
+/// or bind it to a further variable that is itself used). A match arm
+/// that silently drops the id is a build failure, not an audit finding —
+/// this is **tier-1 compile** for the "no silent reply loss" invariant.
 ///
-/// `Clone` is implemented because legitimate protocol paths in later
-/// sub-phases occasionally echo an id back while retaining it (e.g.
-/// error recovery that both reports failure and restores the pending
-/// state). Phase 1a does not call `.clone()`.
+/// The one path that *does* legitimately drop an unfinished id is
+/// transport teardown (wrapper crash, connection error before reply):
+/// the wrapper crate converts the dropped id into a classified
+/// `TransportClosed` failure delivered to the caller's oneshot, one
+/// layer above the protocol core. This crate never needs to clone.
 #[expect(
     missing_copy_implementations,
-    reason = "deliberately non-Copy to keep move-out-of-state-variant reviewer-visible; see docstring",
+    reason = "deliberately non-Copy + non-Clone: duplicating an id is a compile error — the tier-1 mechanism for reply-loss prevention",
 )]
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash)]
 #[must_use = "a ReplyId without a registered sender will silently drop the reply"]
 pub struct ReplyId(NonZeroU64);
 
@@ -86,13 +84,21 @@ impl ReplyId {
         Self(value)
     }
 
-    /// Extract the underlying counter value.
+    /// Extract the underlying counter value by reference.
+    ///
+    /// Takes `&self` — the contained `NonZeroU64` is `Copy`, so
+    /// extracting the raw value does not consume the id. The
+    /// non-duplication guarantee (see type-level docstring) comes from
+    /// `ReplyId` itself being non-`Copy` / non-`Clone`; you still
+    /// cannot reproduce a whole `ReplyId` from a raw value outside of
+    /// this module's constructor.
     ///
     /// Used by the wrapper to look up the matching `oneshot::Sender` in
-    /// its pending-replies map.
+    /// its pending-replies map without moving the id out of the match
+    /// arm that carries it.
     #[inline]
     #[must_use]
-    pub const fn get(self) -> NonZeroU64 {
+    pub const fn get(&self) -> NonZeroU64 {
         self.0
     }
 }

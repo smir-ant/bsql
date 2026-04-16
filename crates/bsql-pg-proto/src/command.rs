@@ -20,7 +20,15 @@ use crate::reply_id::ReplyId;
 /// `#[must_use]` because constructing a command without pushing it
 /// into [`crate::PgProtocol::push_command`] cannot deliver a reply —
 /// the user's `oneshot::Receiver` would block forever.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # No `Clone`
+///
+/// `PgCommand` owns a [`ReplyId`] which is deliberately non-duplicable
+/// (see [`ReplyId`] docstring). A cloneable `PgCommand` would imply a
+/// cloneable id, which would break the tier-1 "no silent reply loss"
+/// invariant. If a caller needs multiple commands they mint multiple
+/// ids from the wrapper's monotonic counter and build multiple commands.
+#[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "a PgCommand has no effect until pushed via PgProtocol::push_command"]
 pub enum PgCommand {
