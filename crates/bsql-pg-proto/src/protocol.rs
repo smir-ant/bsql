@@ -178,30 +178,42 @@ impl PgProtocol {
                         // Body not yet fully buffered.
                         break;
                     }
+                    // Slice the payload (bytes after the 5-byte header).
+                    // `total_len >= 5` is guaranteed by `parse_header`
+                    // (it rejects declared_len < 4, so total_len =
+                    // declared_len + 1 >= 5). `unread().len() >=
+                    // total_len` was verified just above. Therefore
+                    // `get(5..total_len)` is always `Some`; the empty-
+                    // slice fallback is defensive against a future
+                    // refactor that breaks either invariant — the
+                    // dispatcher's payload-shape patterns classify
+                    // such inputs as `Malformed…` rather than
+                    // accepting them silently.
+                    let payload = self
+                        .read_buf
+                        .unread()
+                        .get(5..total_len)
+                        .unwrap_or(&[]);
                     // Take ownership of state for the dispatcher.
                     let prev = core::mem::take(&mut self.state);
-                    let outcome = dispatch(prev, tag, self.read_buf.unread(), total_len);
+                    let outcome = dispatch(prev, tag, payload);
                     match outcome {
-                        DispatchOutcome::Advanced { new_state, by, action } => {
+                        DispatchOutcome::Advanced { new_state, action } => {
                             self.state = new_state;
-                            // Advance is provably in-bounds (we just
-                            // checked unread().len() >= total_len, and
-                            // dispatch returned `by <= total_len`).
-                            // The Err branch is dead but kept honest.
-                            if self.read_buf.advance(by).is_err() {
-                                // This is unreachable in current code
-                                // paths, but rather than panic we
-                                // classify and exit. Should this ever
-                                // fire it is a logic bug worth
-                                // surfacing as a protocol error.
+                            // `advance(total_len)` was proved in-bounds
+                            // above (`unread().len() >= total_len`).
+                            // The Result surface is kept honest via
+                            // `let-else`; a future refactor that
+                            // breaks that local invariant classifies as
+                            // a typed protocol error rather than
+                            // silently corrupting the read cursor.
+                            let Ok(()) = self.read_buf.advance(total_len) else {
                                 self.fail_inflight_and_close(
-                                    ProtocolError::MalformedFrameLength {
-                                        declared: 0,
-                                    },
+                                    ProtocolError::ProtocolInvariantBroken,
                                     &mut out,
                                 );
                                 break;
-                            }
+                            };
                             if let Some(act) = action
                                 && push_action(&mut out, act).is_err()
                             {

@@ -6,11 +6,24 @@
 //! adding a new state or tag is a build error until it is wired into
 //! the matcher.
 //!
-//! Two outcomes:
+//! # Payload contract — tier-1 via slice patterns
 //!
-//! - [`DispatchOutcome::Advanced`] — frame consumed cleanly. Caller
-//!   advances the read buffer by `by` bytes, replaces state with
-//!   `new_state`, and pushes `action` (if `Some`).
+//! The caller has already parsed the header (5 bytes: tag + 4-byte BE
+//! length) and verified that the full frame is buffered. It passes the
+//! dispatcher the **payload** — the bytes *after* the header, of length
+//! `total_len - 5`. Every arm that needs to inspect bytes uses a slice
+//! pattern (`[b0]`, `[b0, b1, ..]`, etc.) so the compiler enforces the
+//! length / presence check. There is no `slice.get(i)` `Option` dance
+//! in here and no "unreachable but classify" branch: any payload shape
+//! the pattern does not match falls through to a typed
+//! `ProtocolError::Malformed…` classification.
+//!
+//! # Outcomes
+//!
+//! - [`DispatchOutcome::Advanced`] — frame consumed cleanly. The caller
+//!   replaces state with `new_state`, pushes `action` (if `Some`), and
+//!   advances the read buffer by `total_len` (which the caller already
+//!   holds — no reason to echo it back through this enum).
 //! - [`DispatchOutcome::Errored`] — protocol violation. Caller must
 //!   tear the connection down. The state has already been moved out by
 //!   the caller (it called `mem::take`); this outcome surfaces the
@@ -25,12 +38,11 @@ use crate::wire::{TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY};
 /// What to do after dispatching a single frame.
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
-    /// Frame consumed; transition to `new_state`. Caller must advance
-    /// the read buffer by exactly `by` bytes (= the frame's
-    /// `total_len`) and push `action` if present.
+    /// Frame consumed; transition to `new_state`. Caller advances the
+    /// read buffer by the `total_len` it already holds from the
+    /// preceding `parse_header` and pushes `action` if present.
     Advanced {
         new_state: ProtoState,
-        by: usize,
         action: Option<Action>,
     },
     /// Frame rejected; connection irrecoverable. Caller must tear the
@@ -43,64 +55,43 @@ pub(crate) enum DispatchOutcome {
 
 /// Dispatch a single frame.
 ///
-/// `prev` was just `mem::take`'d from `PgProtocol::state`; it is now
-/// owned. `tag` and `total_len` come from a successful `parse_header`;
-/// `unread` is the buffer slice starting with the frame's tag (the
-/// caller has already verified `unread.len() >= total_len`).
-pub(crate) fn dispatch(
-    prev: ProtoState,
-    tag: u8,
-    unread: &[u8],
-    total_len: usize,
-) -> DispatchOutcome {
+/// - `prev` was just `mem::take`'d from `PgProtocol::state`; it is
+///   now owned by the dispatcher.
+/// - `tag` is the first byte of the frame.
+/// - `payload` is the body after the 5-byte `(tag + length)` header —
+///   its length equals `total_len - 5`, which the caller computed and
+///   verified before invoking us.
+pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOutcome {
     match (prev, tag) {
         // Successful Ping reply: RFQ in `AwaitingPingReply`.
-        (ProtoState::AwaitingPingReply(id), TAG_READY_FOR_QUERY) => {
-            // RFQ payload must be exactly 1 byte (the tx-status).
-            // total_len = 1 (tag) + 4 (len) + payload_len = 5 + payload_len.
-            // total_len = 6 ⇒ payload = 1 (legal). Anything else is
-            // out-of-spec.
-            //
-            // checked_sub: total_len is at least 5 (smallest legal
-            // header). If somehow it were below 5 we'd never have
-            // gotten here (parse_header would have returned
-            // MalformedLength).
-            let payload_len = total_len.saturating_sub(5);
-            if payload_len != 1 {
-                return DispatchOutcome::Errored {
-                    reply_id: Some(id),
-                    cause: ProtocolError::MalformedReadyForQuery { payload_len },
-                };
-            }
-            // Read the single payload byte. `unread.get(5)` is in-
-            // bounds because the caller verified `unread.len() >= total_len`
-            // and `total_len == 6`.
-            let tx_status = match unread.get(5) {
-                Some(b) => *b,
-                None => {
-                    // Unreachable in practice; classify rather than panic.
-                    return DispatchOutcome::Errored {
-                        reply_id: Some(id),
-                        cause: ProtocolError::MalformedReadyForQuery { payload_len },
-                    };
-                }
-            };
-            DispatchOutcome::Advanced {
+        //
+        // RFQ's payload is spec'd at exactly 1 byte (the tx-status —
+        // one of `I`, `T`, `E`). The slice pattern `[tx_status]`
+        // matches only when that length holds; any other shape falls
+        // through to `MalformedReadyForQuery` carrying the observed
+        // length for diagnostic.
+        (ProtoState::AwaitingPingReply(id), TAG_READY_FOR_QUERY) => match payload {
+            [tx_status] => DispatchOutcome::Advanced {
                 new_state: ProtoState::Idle,
-                by: total_len,
                 action: Some(Action::DeliverReply {
                     id,
-                    value: Reply::Pong { tx_status },
+                    value: Reply::Pong {
+                        tx_status: *tx_status,
+                    },
                 }),
-            }
-        }
-        // Server emitted ErrorResponse where we expected RFQ.
-        (ProtoState::AwaitingPingReply(id), TAG_ERROR_RESPONSE) => {
-            DispatchOutcome::Errored {
+            },
+            other => DispatchOutcome::Errored {
                 reply_id: Some(id),
-                cause: ProtocolError::ServerError,
-            }
-        }
+                cause: ProtocolError::MalformedReadyForQuery {
+                    payload_len: other.len(),
+                },
+            },
+        },
+        // Server emitted ErrorResponse where we expected RFQ.
+        (ProtoState::AwaitingPingReply(id), TAG_ERROR_RESPONSE) => DispatchOutcome::Errored {
+            reply_id: Some(id),
+            cause: ProtocolError::ServerError,
+        },
         // Anything else in `AwaitingPingReply` is out-of-spec for the
         // Ping flow. Phase 1a does not understand auth/notice/etc.
         // mid-Ping; the connection is desynced.

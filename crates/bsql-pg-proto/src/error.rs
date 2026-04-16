@@ -84,6 +84,22 @@ pub enum ProtocolError {
         /// How much headroom was available.
         available: usize,
     },
+
+    /// A local protocol-crate invariant was violated.
+    ///
+    /// Classified rather than silent: in Phase 1a the only emission site
+    /// is the "advance-past-unread" branch in [`crate::PgProtocol::feed_bytes`]
+    /// that a future refactor could reach if someone broke the local
+    /// `unread().len() >= total_len` check that precedes the advance. The
+    /// branch is currently unreachable by audit of the single function
+    /// that guards it; surfacing it as a classified error rather than
+    /// leaving it mislabelled as `MalformedFrameLength` makes any future
+    /// regression loud (the wrapper sees a distinct error code and the
+    /// connection is torn down cleanly).
+    ///
+    /// If this error ever appears at runtime it is a logic bug in
+    /// `bsql-pg-proto` itself, not wire-level input — triage accordingly.
+    ProtocolInvariantBroken,
 }
 
 impl fmt::Display for ProtocolError {
@@ -119,6 +135,9 @@ impl fmt::Display for ProtocolError {
                 f,
                 "read buffer full: tried to append {attempted} bytes, only {available} available",
             ),
+            Self::ProtocolInvariantBroken => {
+                f.write_str("protocol invariant violated — internal bsql-pg-proto logic bug")
+            }
         }
     }
 }
