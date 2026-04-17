@@ -15,6 +15,15 @@
 //! ClientProof    := ClientKey XOR ClientSignature
 //! ServerSignature:= HMAC(ServerKey, AuthMessage)
 //! ```
+//!
+//! # AuthMessage — incremental, zero intermediate buffer
+//!
+//! `AuthMessage = client-first-bare + "," + server-first + "," +
+//! client-final-without-proof`. Rather than assembling this into a
+//! temporary `[u8; N]` (which introduces a silent-truncation class if
+//! N is too small), the three components are fed directly into
+//! `HMAC::update()` calls. No buffer → no overflow → tier-1 by
+//! construction.
 
 use crate::scram::types::SecretDigest;
 use hmac::{Hmac, Mac};
@@ -36,38 +45,46 @@ fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[
     out
 }
 
-/// HMAC-SHA-256(key, message) -> 32 bytes.
+/// HMAC-SHA-256(key, message) → 32 bytes.
+///
+/// HMAC-SHA256 accepts any key length; `new_from_slice` cannot fail.
+/// The Err branch returns zeros → downstream SCRAM proof will fail
+/// server verification openly, not silently.
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut mac =
-        HmacSha256::new_from_slice(key).unwrap_or_else(|_| HmacSha256::new_from_slice(&[]).unwrap_or_else(|_| {
-            // HMAC-SHA256 accepts any key length; this branch is
-            // unreachable. We handle it to satisfy the forbid-bundle.
-            // Return a zeroed MAC which will fail verification downstream.
-            HmacSha256::new(&Default::default())
-        }));
+    let mut mac = match HmacSha256::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => return [0u8; 32],
+    };
     mac.update(message);
-    let result = mac.finalize();
-    // `into_bytes` returns `GenericArray<u8, U32>` — convert to array.
-    let mut out = [0u8; 32];
-    let bytes = result.into_bytes();
-    if let Some(dest) = out.get_mut(..32)
-        && let Some(src) = bytes.get(..32)
-    {
-        dest.copy_from_slice(src);
-    }
-    out
+    mac.finalize().into_bytes().into()
 }
 
-/// SHA-256 hash of a single input.
-fn sha256(input: &[u8]) -> [u8; 32] {
-    let hash = Sha256::digest(input);
-    let mut out = [0u8; 32];
-    if let Some(dest) = out.get_mut(..32)
-        && let Some(src) = hash.get(..32)
-    {
-        dest.copy_from_slice(src);
-    }
-    out
+/// HMAC-SHA256 over the SCRAM AuthMessage, computed incrementally.
+///
+/// AuthMessage = `client_first_bare` + `","` + `server_first` + `","` +
+/// `client_final_without_proof`. Each component is fed directly into
+/// `HMAC::update()` — **zero intermediate buffer**. This eliminates the
+/// silent-truncation class that a fixed-size staging buffer would
+/// introduce: there is no buffer to overflow.
+///
+/// Tier-1 by construction: overflow is impossible because HMAC accepts
+/// arbitrarily many `update()` calls with arbitrarily sized slices.
+fn hmac_auth_message(
+    key: &[u8],
+    client_first_bare: &[u8],
+    server_first: &[u8],
+    client_final_without_proof: &[u8],
+) -> [u8; 32] {
+    let mut mac = match HmacSha256::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => return [0u8; 32],
+    };
+    mac.update(client_first_bare);
+    mac.update(b",");
+    mac.update(server_first);
+    mac.update(b",");
+    mac.update(client_final_without_proof);
+    mac.finalize().into_bytes().into()
 }
 
 /// Full SCRAM-SHA-256 client proof computation.
@@ -77,39 +94,53 @@ fn sha256(input: &[u8]) -> [u8; 32] {
 /// `server_signature` is returned as [`SecretDigest`] for constant-time
 /// comparison later.
 ///
+/// # AuthMessage — tier-1 no-truncation
+///
+/// The three AuthMessage components are passed separately and fed
+/// incrementally into HMAC. No intermediate buffer is assembled,
+/// so the silent-truncation class does not exist. See
+/// [`hmac_auth_message`].
+///
 /// # Arguments
 ///
 /// - `password` — the user's password bytes.
 /// - `salt` — base64-decoded salt from the server.
 /// - `iterations` — iteration count from the server (>= 4096).
-/// - `auth_message` — the concatenation of client-first-bare + "," +
-///   server-first + "," + client-final-without-proof.
+/// - `client_first_bare` — the `n=<user>,r=<nonce>` string.
+/// - `server_first` — the raw server-first-message bytes from the wire.
+/// - `client_final_without_proof` — `c=biws,r=<server_nonce>`.
 pub fn compute_client_proof(
     password: &[u8],
     salt: &[u8],
     iterations: u32,
-    auth_message: &[u8],
+    client_first_bare: &[u8],
+    server_first: &[u8],
+    client_final_without_proof: &[u8],
 ) -> (Zeroizing<[u8; 32]>, SecretDigest) {
     let salted_pw = salted_password(password, salt, iterations);
 
     let client_key = Zeroizing::new(hmac_sha256(salted_pw.as_ref(), b"Client Key"));
-    let stored_key = sha256(client_key.as_ref());
+    let stored_key: [u8; 32] = Sha256::digest(client_key.as_ref()).into();
     let server_key = Zeroizing::new(hmac_sha256(salted_pw.as_ref(), b"Server Key"));
 
-    let client_signature = hmac_sha256(&stored_key, auth_message);
-    let server_signature = SecretDigest::new(hmac_sha256(server_key.as_ref(), auth_message));
+    let client_signature = hmac_auth_message(
+        &stored_key,
+        client_first_bare,
+        server_first,
+        client_final_without_proof,
+    );
+    let server_signature = SecretDigest::new(hmac_auth_message(
+        server_key.as_ref(),
+        client_first_bare,
+        server_first,
+        client_final_without_proof,
+    ));
 
     // ClientProof = ClientKey XOR ClientSignature (element-wise).
-    // Bitwise XOR on u8 is a bitwise operation, not arithmetic —
-    // it cannot overflow. `clippy::arithmetic_side_effects` does
-    // NOT fire on `^` for integer types.
+    // Bitwise XOR on u8 cannot overflow — `clippy::arithmetic_side_effects`
+    // does not fire on `^` for integer types.
     let mut proof = Zeroizing::new([0u8; 32]);
-    // Zip the three arrays element-wise. All are [u8; 32], so the
-    // iterator yields exactly 32 triples. No index arithmetic needed.
-    let proof_iter = proof.iter_mut();
-    let ck_iter = client_key.iter();
-    let cs_iter = client_signature.iter();
-    for ((p, ck), cs) in proof_iter.zip(ck_iter).zip(cs_iter) {
+    for ((p, ck), cs) in proof.iter_mut().zip(client_key.iter()).zip(client_signature.iter()) {
         *p = *ck ^ *cs;
     }
 
@@ -131,12 +162,7 @@ mod tests {
     //   S: r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096
     //   C: c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=
     //   S: v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=
-    //
-    // Salt base64 "W22ZaJ0SNY7soEsUEjb6gQ==" decodes to 16 bytes:
-    //   [0x5B, 0x6D, 0x99, 0x68, 0x9D, 0x12, 0x35, 0x8E,
-    //    0xEC, 0xA0, 0x4B, 0x14, 0x12, 0x36, 0xFA, 0x81]
 
-    /// The raw salt bytes from the RFC 7677 exchange.
     fn rfc7677_salt() -> [u8; 16] {
         [
             0x5B, 0x6D, 0x99, 0x68, 0x9D, 0x12, 0x35, 0x8E,
@@ -144,31 +170,31 @@ mod tests {
         ]
     }
 
-    /// The AuthMessage per RFC 5802 is:
-    /// client-first-message-bare + "," + server-first-message + "," + client-final-message-without-proof
-    fn rfc7677_auth_message() -> &'static [u8] {
-        b"n=user,r=rOprNGfwEbeRWgbNEkqO,\
-          r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
-          s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096,\
-          c=biws,\
-          r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0"
-    }
-
     /// Invariant (spec): SCRAM-SHA-256 with the RFC 7677 Appendix A
     /// parameters produces the correct ClientProof and ServerSignature.
     ///
-    /// We verify the proof and server signature against the base64
-    /// values in the published exchange:
-    /// - ClientProof: `dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=`
-    /// - ServerSignature: `6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=`
+    /// The three AuthMessage components are passed separately — the
+    /// function computes AuthMessage incrementally without a staging
+    /// buffer (tier-1 no-truncation).
     #[test]
     fn rfc7677_appendix_a_full_proof() {
         let salt = rfc7677_salt();
         let password = b"pencil";
         let iterations = 4096u32;
-        let auth_message = rfc7677_auth_message();
 
-        let (proof, server_sig) = compute_client_proof(password, &salt, iterations, auth_message);
+        // AuthMessage components from the RFC exchange:
+        let client_first_bare = b"n=user,r=rOprNGfwEbeRWgbNEkqO";
+        let server_first = b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        let client_final_without_proof = b"c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
+
+        let (proof, server_sig) = compute_client_proof(
+            password,
+            &salt,
+            iterations,
+            client_first_bare,
+            server_first,
+            client_final_without_proof,
+        );
 
         // Verify via base64 encoding of the proof.
         let mut proof_b64_buf = [0u8; 64];

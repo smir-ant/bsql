@@ -727,20 +727,18 @@ fn scram_sha256_handshake_end_to_end() {
     ));
 
     // Step 6: Compute the expected server signature.
-    // Build the AuthMessage the same way the protocol did.
+    // Pass AuthMessage components separately — compute_client_proof
+    // feeds them incrementally into HMAC (no staging buffer).
+    let client_first_bare_str = std::str::from_utf8(&client_first_bare).unwrap_or("");
     let client_final_without_proof = format!("c=biws,r={server_nonce_str}");
-    let auth_message = format!(
-        "{},{},{}",
-        std::str::from_utf8(&client_first_bare).unwrap_or(""),
-        server_first,
-        client_final_without_proof,
-    );
 
     let (_proof, expected_server_sig) = compute_client_proof(
         password.as_bytes(),
         &salt_raw,
         iterations,
-        auth_message.as_bytes(),
+        client_first_bare_str.as_bytes(),
+        server_first.as_bytes(),
+        client_final_without_proof.as_bytes(),
     );
 
     // Base64 encode the server signature.
@@ -895,4 +893,67 @@ fn scram_nonce_prefix_mismatch_is_rejected() {
         }
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+// =================================================================
+// Sensitive<T> Debug redaction — seam class §4.11.1 / 3
+// =================================================================
+
+/// Category (1) spec-conformance — `Sensitive<T>` Debug pin.
+///
+/// Invariant: `Sensitive<T>` Debug prints `"<REDACTED>"` and does NOT
+/// leak the inner value. A one-line impl drift (`f.write_str("<REDACTED>")`
+/// → `f.debug_struct("Sensitive").field("inner", &self.inner).finish()`)
+/// compiles and would silently expose secrets in logs / error messages.
+/// This test catches such a drift.
+#[test]
+fn sensitive_debug_does_not_leak_inner_value() {
+    let secret = bsql_pg_proto::Sensitive::new([42u8; 4]);
+    let debug_output = format!("{secret:?}");
+    assert!(
+        debug_output.contains("REDACTED"),
+        "Sensitive Debug must contain REDACTED, got: {debug_output}",
+    );
+    assert!(
+        !debug_output.contains("42"),
+        "Sensitive Debug must NOT leak inner value, got: {debug_output}",
+    );
+}
+
+/// Category (1) spec-conformance — `Password` Debug pin.
+///
+/// Same seam as `Sensitive`: a `Password` Debug must never reveal
+/// the password bytes.
+#[test]
+fn password_debug_does_not_leak_bytes() {
+    let pw = bsql_pg_proto::Password::try_from_bytes(b"hunter2").unwrap_or_else(|_| {
+        panic!("valid password must construct")
+    });
+    let debug_output = format!("{pw:?}");
+    assert!(
+        debug_output.contains("REDACTED"),
+        "Password Debug must contain REDACTED, got: {debug_output}",
+    );
+    assert!(
+        !debug_output.contains("hunter2"),
+        "Password Debug must NOT leak password text, got: {debug_output}",
+    );
+}
+
+/// Category (1) spec-conformance — `Credentials::ScramPassword` Debug pin.
+#[test]
+fn credentials_debug_does_not_leak_password() {
+    let pw = bsql_pg_proto::Password::try_from_bytes(b"s3cret").unwrap_or_else(|_| {
+        panic!("valid password must construct")
+    });
+    let cred = bsql_pg_proto::Credentials::ScramPassword(bsql_pg_proto::Sensitive::new(pw));
+    let debug_output = format!("{cred:?}");
+    assert!(
+        debug_output.contains("REDACTED"),
+        "Credentials Debug must contain REDACTED, got: {debug_output}",
+    );
+    assert!(
+        !debug_output.contains("s3cret"),
+        "Credentials Debug must NOT leak password, got: {debug_output}",
+    );
 }

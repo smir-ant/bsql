@@ -539,31 +539,20 @@ fn dispatch_auth_sasl_continue(
             }
         };
 
-    // Build AuthMessage = client-first-bare + "," + server-first + "," +
-    // client-final-without-proof.
-    let mut auth_msg_buf = [0u8; 1024];
-    let auth_msg_len = build_auth_message(
-        &client_first_bare,
-        rest,
-        &client_final_without_proof,
-        &mut auth_msg_buf,
-    );
-    let auth_message = match auth_msg_buf.get(..auth_msg_len) {
-        Some(s) => s,
-        None => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply),
-                cause: scram_buf_err(),
-            }
-        }
-    };
-
     // Compute proof and expected server signature.
+    //
+    // AuthMessage = client-first-bare + "," + server-first + "," +
+    // client-final-without-proof. The three components are passed
+    // separately — compute_client_proof feeds them incrementally into
+    // HMAC::update(), with zero intermediate buffer. No staging
+    // buffer → no silent-truncation class → tier-1 by construction.
     let (proof, expected_server_sig) = crate::scram::crypto::compute_client_proof(
         password_bytes,
         &server_first.salt,
         server_first.iterations,
-        auth_message,
+        &client_first_bare,
+        rest,
+        &client_final_without_proof,
     );
 
     // Base64-encode proof.
@@ -798,34 +787,6 @@ fn parse_backend_key_data(payload: &[u8]) -> Result<(i32, i32), ProtocolError> {
             payload_len: other.len(),
         }),
     }
-}
-
-// -----------------------------------------------------------------
-// Helper: build AuthMessage for SCRAM
-// -----------------------------------------------------------------
-
-/// Build AuthMessage = client-first-bare + "," + server-first + "," +
-/// client-final-without-proof. Returns the length written into `out`.
-fn build_auth_message(
-    client_first_bare: &[u8],
-    server_first: &[u8],
-    client_final_without_proof: &[u8],
-    out: &mut [u8],
-) -> usize {
-    let mut pos: usize = 0;
-    for chunk in &[
-        client_first_bare,
-        b",".as_slice(),
-        server_first,
-        b",".as_slice(),
-        client_final_without_proof,
-    ] {
-        if let Some(dest) = out.get_mut(pos..pos.saturating_add(chunk.len())) {
-            dest.copy_from_slice(chunk);
-            pos = pos.saturating_add(chunk.len());
-        }
-    }
-    pos
 }
 
 /// Convenience: SCRAM buffer overflow error.
