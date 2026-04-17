@@ -108,6 +108,7 @@
 - «Это маловероятный случай» / «in practice X не случается» — input space bounded; всё в bounds должно быть covered. Если что-то outside bounds — это задокументированное ограничение модуля.
 - «Эффект не окупается / bottleneck в другом месте» — §3 не торгуется против performance. Zero-cost и absolute safety — ортогональные цели в Rust.
 - «Это сложно / долго» — не аргумент.
+- **«Tier-1 runtime»** — несуществующая категория. Tier 1 = IMPOSSIBLE-BY-COMPILE. Runtime check (panic, abort, assert) — это **не** tier 1, каким бы loud'ом ни был failure. Runtime check который abort'ит процесс — это tier 2 (structural: bug surfaces loudly, but code with the bug **compiles**). Называть runtime assertion'ы «tier-1» запрещено: это маскирует реальный tier-2 gap за красивым ярлыком.
 
 ### 3.5. Применение
 
@@ -305,7 +306,7 @@ Tier-1 щит — не монолит. У него есть **узкие швы*
 
 ## §5. Language-level choices
 
-### §5.1. MSRV: 1.94 stable
+### §5.1. MSRV: 1.95 stable
 
 Фиксируется в `Cargo.toml` через `rust-version`, в CI через `rust-toolchain.toml`.
 
@@ -381,9 +382,9 @@ Workspace release profile использует `panic = "abort"` вместо `u
 - Каждая pub функция возвращающая `Result` / `Option` / stateful тип — `#[must_use]`. Молчаливый `let result = fn();` warn'ится в user-коде.
 - Каждая pub doc'ирована (`#![deny(missing_docs)]`).
 
-### §5.6. Rust 1.94+ features — явный leverage list
+### §5.6. Rust 1.95+ features — явный leverage list
 
-Features stable в MSRV 1.94 (или earlier) которые bsql активно использует. Каждый выбран потому что **closes a CREDO §0 gap** или **даёт zero-cost выигрыш**.
+Features stable в MSRV 1.95 (или earlier) которые bsql активно использует. Каждый выбран потому что **closes a CREDO §0 gap** или **даёт zero-cost выигрыш**.
 
 | Feature | Stable с | Применение в bsql |
 |---|---|---|
@@ -402,6 +403,7 @@ Features stable в MSRV 1.94 (или earlier) которые bsql активно
 | **Disjoint capture fields в closures** | 2024 edition | Fewer `.clone()` в closure captures. Zero-cost ergonomics. |
 | **`Cell::update`** | 1.80 | Atomic-ish field update в `RefCell<State>` paths. |
 | **Edition 2024 patterns** | edition 2024 | `impl Trait` in type aliases в stable forms, extended `Result`/`Option` methods. |
+| **`cfg_select!` macro** | 1.95 | Compile-time conditional branching, заменяет `cfg-if` crate. Используется для conditional compilation `#[cfg(test)]` vs `#[cfg(not(test))]` блоков, в частности для DEF-052 (ReplyId Drop-guard diagnostic masking). Zero dep, zero runtime. |
 
 **MSRV bump policy:** поднимается **сразу** когда stable Rust release дает feature, которая closes a tier-1 gap или снимает workaround в codebase. Не consensus-driven, не «wait for ecosystem» — CREDO §0 takes priority over backward compatibility breadth.
 
@@ -504,7 +506,7 @@ members = [
 [workspace.package]
 version = "1.0.0-alpha.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 ```
 
 На старте v1.0 `members = []`. Крейт добавляется в members только когда его минимальный API landс и проходит базовую проверку.

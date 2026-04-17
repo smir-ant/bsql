@@ -99,7 +99,7 @@ fn expect_awaiting_ping_reply(state: &ProtoState, expected: NonZeroU64) {
 /// Required at the end of any test that leaves the state in
 /// `AwaitingPingReply` — because the `ReplyId` inside that variant
 /// would otherwise be dropped without delivery when the protocol
-/// goes out of scope, tripping its tier-1 runtime Drop-guard and
+/// goes out of scope, tripping its tier-2 structural Drop-guard and
 /// aborting the test process.
 ///
 /// This is not ceremony; it is the architectural reality that production
@@ -168,7 +168,7 @@ fn ping_from_idle_emits_sync_bytes() {
     }
     expect_awaiting_ping_reply(proto.state(), ping_raw);
 
-    // Tier-1 runtime consume-discipline: drain the in-flight reply
+    // Tier-2 structural consume-discipline: drain the in-flight reply
     // before the protocol drops. See [`drain_pending_ping`].
     drain_pending_ping(&mut proto);
 }

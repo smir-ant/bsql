@@ -38,7 +38,7 @@ use core::num::NonZeroU64;
 /// counter. The protocol crate ferries the value through; it never
 /// inspects it, never compares it, never mints one of its own.
 ///
-/// # Consume discipline — tier-1 runtime, tier-2 compile-enforced
+/// # Consume discipline — tier-1 compile + tier-2 structural
 ///
 /// `ReplyId` tracks whether its value has been **delivered** to an
 /// outgoing [`crate::Action::DeliverReply`] / [`crate::Action::FailReply`].
@@ -63,14 +63,21 @@ use core::num::NonZeroU64;
 ///   consume step. Extracting the value requires calling `consume(self)`
 ///   (which takes ownership), not `&self` — so you can't "peek and
 ///   forget" the value while retaining the handle.
-/// - **Tier 2 compile** — cannot be silently ignored from a pattern
+/// - **Tier 2 structural** — cannot be silently ignored from a pattern
 ///   match. The crate-root `#[deny(unused_variables)]` combined with
 ///   the architect.txt Part V bans on `let _ = expr;` and `_varname`
 ///   suppression forces a match arm that binds `id: ReplyId` to refer
 ///   to `id` in the arm body. Calling `drop(id)` is still legal (the
-///   variable is "used" by `drop`); the Drop-guard below promotes that
-///   path to tier 1 runtime.
-/// - **Tier 1 runtime** — Drop panics / aborts on undelivered drop.
+///   variable is "used" by `drop`) — the code **compiles**. This is
+///   NOT tier 1. No path in our code calls `drop(id)` (tier 2 by
+///   structural audit), and the Drop-guard below surfaces the bug
+///   loudly at runtime if someone adds one.
+/// - **Tier 2 structural (runtime safety net)** — Drop asserts
+///   `self.delivered` and panics on undelivered drop. Under
+///   `panic = "abort"` (release) this aborts the process. This is
+///   a **runtime** check, not a compile check — per CREDO §3.4,
+///   it is NOT tier 1. It is tier 2: the guard makes the bug
+///   immediately observable, but the buggy code still compiles.
 ///
 /// A legitimate transport-teardown path (wrapper closes the connection
 /// while a reply is still in flight) calls `consume` internally, then
@@ -158,7 +165,7 @@ impl ReplyId {
 }
 
 impl Drop for ReplyId {
-    /// Tier-1 runtime consume-discipline guard.
+    /// Tier-2 structural consume-discipline guard (runtime safety net).
     ///
     /// Fires when a `ReplyId` reaches end-of-scope without
     /// [`ReplyId::consume`] ever being called. Under the workspace
