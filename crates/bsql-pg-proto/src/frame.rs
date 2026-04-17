@@ -25,6 +25,15 @@ use core::num::NonZeroU32;
 /// matches one OS page on aarch64-Apple, x86\_64-Linux, and most other
 /// targets bsql ships on. Tunable per-connection in a later phase via
 /// const generic; the const here is the Phase 1a constant.
+///
+/// **Internal sizing choice, NOT a PostgreSQL spec commitment.**
+/// PostgreSQL does not limit frame sizes; the value here is our memory
+/// budget for the bounded read buffer. Bumping to 8192 (or higher) in
+/// a future phase is a legitimate change — tests that pin the absolute
+/// value would falsely block such a bump. The pair-consistency between
+/// `READ_BUF_CAP` and [`MAX_FRAME_LEN_FIELD`] is what must hold (and
+/// is const-asserted below); the absolute number itself is ours to
+/// choose.
 pub const READ_BUF_CAP: usize = 4096;
 
 /// Maximum legal value of a frame's length-field.

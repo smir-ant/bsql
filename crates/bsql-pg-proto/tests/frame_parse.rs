@@ -191,7 +191,7 @@ fn trailing_bytes_do_not_affect_header_parse() {
     assert_eq!(parse_header(&header_a), parse_header(&header_b));
 }
 
-/// Category (1) — algebraic-formula pin.
+/// Category (1) — algebraic-formula pin + inclusive-boundary pin.
 ///
 /// Invariant (spec): `total_len == declared + 1` for every successful
 /// parse (the `+1` accounts for the tag byte, which the declared length
@@ -203,6 +203,15 @@ fn trailing_bytes_do_not_affect_header_parse() {
 /// MAX_FRAME_LEN_FIELD + 1` const-assert pins consistency between two
 /// *constants*, not the arithmetic in `parse_header`. Only this test
 /// catches the formula drift.
+///
+/// **Bonus: `>` vs `>=` boundary pin.** The sweep includes
+/// `MAX_FRAME_LEN_FIELD` as the last input and expects `Ok`. If the
+/// parser's comparison `declared > MAX_FRAME_LEN_FIELD` were changed
+/// to `declared >= MAX_FRAME_LEN_FIELD`, this input would return
+/// `FrameTooLarge` instead of `Ok` and this test would fail on the
+/// last iteration. So the inclusive nature of the cap boundary is
+/// pinned here too — not only by `length_above_max_is_frame_too_large`
+/// (which tests strictly-above values).
 #[test]
 fn total_len_equals_one_plus_declared_len() {
     for declared in [4_u32, 5, 6, 100, 1024, MAX_FRAME_LEN_FIELD] {
