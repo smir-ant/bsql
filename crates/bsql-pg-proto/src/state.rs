@@ -20,7 +20,9 @@
 //! become true no-ops instead of silent mis-advances).
 
 use crate::error::ProtocolError;
+use crate::password::Credentials;
 use crate::reply_id::ReplyId;
+use crate::scram::types::SecretDigest;
 
 /// Where the protocol is right now.
 ///
@@ -42,15 +44,9 @@ use crate::reply_id::ReplyId;
 // the non-Copy `ReplyId` field, so the `missing_copy_implementations`
 // lint does not fire here (there is no "could be Copy" suggestion to
 // suppress).
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ProtoState {
     /// Connection established and idle. Accepts new commands.
-    ///
-    /// **Note (Phase 1a):** the protocol *starts* in `Idle`.
-    ///
-    /// The startup + auth handshake that legitimately produces this
-    /// state lives upstream and lands in 1b/1e. Until then, the test
-    /// harness just constructs `PgProtocol::new()` and pushes commands.
     #[default]
     Idle,
 
@@ -64,6 +60,69 @@ pub enum ProtoState {
     /// impossible to write.
     AwaitingPingReply(ReplyId),
 
+    // ---------------------------------------------------------------
+    // Phase 1b: startup + auth handshake states (DEF-001..DEF-004)
+    // ---------------------------------------------------------------
+
+    /// A `StartupMessage` was sent; awaiting the server's authentication
+    /// response. DEF-001.
+    ///
+    /// The carried `credentials` determine what authentication we can
+    /// perform: `Trust` expects immediate `AuthenticationOk`;
+    /// `ScramPassword` expects `AuthenticationSASL` offering
+    /// `SCRAM-SHA-256`.
+    ConnectingStartup {
+        /// Correlator for the Startup command.
+        reply: ReplyId,
+        /// Credentials supplied by the user.
+        credentials: Credentials,
+    },
+
+    /// SCRAM step 1 complete (client-first sent); awaiting
+    /// `AuthenticationSASLContinue` (server-first-message). DEF-002.
+    ConnectingScramAwaitServerFirst {
+        /// Correlator for the Startup command.
+        reply: ReplyId,
+        /// Credentials for deriving the SCRAM proof.
+        credentials: Credentials,
+        /// The `client-first-message-bare` (saved for AuthMessage).
+        client_first_bare: heapless::Vec<u8, 128>,
+        /// The client nonce (base64-encoded, for prefix validation).
+        client_nonce_b64: heapless::Vec<u8, 48>,
+    },
+
+    /// SCRAM step 2 complete (client-final sent); awaiting
+    /// `AuthenticationSASLFinal` (server-final-message). DEF-002.
+    ConnectingScramAwaitServerFinal {
+        /// Correlator for the Startup command.
+        reply: ReplyId,
+        /// Expected server signature for constant-time comparison.
+        expected_server_sig: SecretDigest,
+    },
+
+    /// SCRAM step 3 complete (server signature verified); awaiting
+    /// `AuthenticationOk`. DEF-002.
+    ConnectingScramAwaitAuthOk(ReplyId),
+
+    /// Authentication succeeded; waiting for `BackendKeyData`. DEF-003.
+    ///
+    /// `ParameterStatus` messages received in this state are recorded
+    /// on [`crate::PgProtocol::session_params`] by the `feed_bytes`
+    /// loop. `BackendKeyData` transitions to `ConnectingPostAuthHaveKey`.
+    ConnectingPostAuthWaitKey(ReplyId),
+
+    /// `BackendKeyData` received; waiting for `ReadyForQuery`. DEF-004.
+    ///
+    /// Additional `ParameterStatus` messages may arrive before RFQ.
+    ConnectingPostAuthHaveKey {
+        /// Correlator for the Startup command.
+        reply: ReplyId,
+        /// The backend process ID.
+        pid: i32,
+        /// The backend secret key (for cancel requests).
+        secret_key: i32,
+    },
+
     /// Terminal: the connection has been classified as unrecoverable.
     ///
     /// Entered by any path that calls `fail_inflight_and_close` or
@@ -72,15 +131,40 @@ pub enum ProtoState {
     /// so by the time the state is observable as `Errored` the wrapper
     /// has already been told to tear the transport down.
     ///
-    /// Never left: no arm of `dispatch` or `handle_push_*` transitions
-    /// out of `Errored`. New bytes arriving at `feed_bytes` after the
-    /// transition are dropped silently (the TCP segment that provoked
-    /// the transition may still have been in flight on a later reader
-    /// call). New commands pushed via `push_command` are failed with
-    /// the cached cause.
-    ///
-    /// The carried [`ProtocolError`] is the **root** cause — the
-    /// first failure classified, not the most recent. Later failures
-    /// on an already-errored state do not overwrite it.
+    /// Never left. The carried [`ProtocolError`] is the **root** cause.
     Errored(ProtocolError),
+}
+
+impl core::fmt::Debug for ProtoState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("Idle"),
+            Self::AwaitingPingReply(id) => write!(f, "AwaitingPingReply({id:?})"),
+            Self::ConnectingStartup { reply, credentials } => f
+                .debug_struct("ConnectingStartup")
+                .field("reply", reply)
+                .field("credentials", credentials)
+                .finish(),
+            Self::ConnectingScramAwaitServerFirst { reply, .. } => f
+                .debug_struct("ConnectingScramAwaitServerFirst")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::ConnectingScramAwaitServerFinal { reply, .. } => f
+                .debug_struct("ConnectingScramAwaitServerFinal")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::ConnectingScramAwaitAuthOk(id) => {
+                write!(f, "ConnectingScramAwaitAuthOk({id:?})")
+            }
+            Self::ConnectingPostAuthWaitKey(id) => {
+                write!(f, "ConnectingPostAuthWaitKey({id:?})")
+            }
+            Self::ConnectingPostAuthHaveKey { reply, pid, .. } => f
+                .debug_struct("ConnectingPostAuthHaveKey")
+                .field("reply", reply)
+                .field("pid", pid)
+                .finish_non_exhaustive(),
+            Self::Errored(cause) => write!(f, "Errored({cause:?})"),
+        }
+    }
 }

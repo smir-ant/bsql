@@ -18,6 +18,7 @@
 
 use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
+use crate::write_buf::MAX_OWNED_SEND_LEN;
 use core::num::NonZeroU64;
 use heapless::Vec;
 
@@ -40,6 +41,7 @@ pub type OutActions = Vec<Action, MAX_ACTIONS_PER_CALL>;
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; Action is moved once per frame, not per row — the stack cost is amortised")]
 pub enum Action {
     /// Send these bytes verbatim to the server.
     ///
@@ -104,21 +106,30 @@ pub enum Action {
 /// [`Owned`]: # "lands in 1b/1c"
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; SendBuf::Owned carries a bounded stack buffer by design")]
 pub enum SendBuf {
     /// A compile-time const wire payload (`&'static [u8]`).
     ///
     /// Zero alloc, zero copy. The bytes live in the binary's read-only
     /// section.
     Static(&'static [u8]),
+
+    /// A runtime-built wire payload in a bounded stack buffer.
+    ///
+    /// Used for StartupMessage, SASLInitialResponse, SASLResponse —
+    /// messages whose content depends on user-supplied parameters.
+    /// DEF-013.
+    Owned(heapless::Vec<u8, MAX_OWNED_SEND_LEN>),
 }
 
 impl SendBuf {
     /// Borrow the underlying wire bytes.
     #[inline]
     #[must_use]
-    pub const fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Static(bytes) => bytes,
+            Self::Owned(vec) => vec,
         }
     }
 }
@@ -140,6 +151,21 @@ pub enum Reply {
     /// [transaction-status indicator]: https://www.postgresql.org/docs/current/protocol-message-formats.html
     Pong {
         /// The single payload byte — `'I'`, `'T'`, or `'E'`.
+        tx_status: u8,
+    },
+
+    /// The startup handshake completed successfully.
+    ///
+    /// The connection is now in [`crate::ProtoState::Idle`] and ready
+    /// for queries. Carries the backend process ID and secret key
+    /// (for cancel requests) and the transaction status byte from the
+    /// final `ReadyForQuery`.
+    StartupComplete {
+        /// Backend process ID from `BackendKeyData`.
+        pid: i32,
+        /// Backend secret key from `BackendKeyData` (cancel key).
+        secret_key: i32,
+        /// Transaction status from `ReadyForQuery` (`'I'`, `'T'`, `'E'`).
         tx_status: u8,
     },
 }

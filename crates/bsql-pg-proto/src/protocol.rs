@@ -19,9 +19,13 @@ use crate::command::PgCommand;
 use crate::dispatch::{DispatchOutcome, dispatch};
 use crate::error::ProtocolError;
 use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
+use crate::ident::{ApplicationName, DatabaseName, Ident};
+use crate::password::Credentials;
 use crate::reply_id::ReplyId;
+use crate::session_params::SessionParams;
 use crate::state::ProtoState;
 use crate::wire::SYNC_WIRE_BYTES;
+use crate::write_buf::WriteBuf;
 use core::cell::Cell;
 use core::marker::PhantomData;
 
@@ -73,10 +77,11 @@ const _: () = assert!(MAX_ACTIONS_PER_CALL >= 2);
 pub struct PgProtocol {
     state: ProtoState,
     read_buf: ReadBuf,
-    /// `!Sync` marker. PG protocol cannot be driven from multiple
-    /// threads; the borrow checker blocks shared `&mut`, but a future
-    /// `&self` introspection method would otherwise become a Sync hole.
-    /// Tier-1 belt-and-braces.
+    /// Session parameters from the post-auth handshake. Populated
+    /// during startup from ParameterStatus messages. Read-only after
+    /// startup completes (accessible via `session_params()`).
+    session_params: SessionParams,
+    /// `!Sync` marker.
     _not_sync: PhantomData<Cell<()>>,
 }
 
@@ -92,6 +97,7 @@ impl PgProtocol {
         Self {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
+            session_params: SessionParams::new(),
             _not_sync: PhantomData,
         }
     }
@@ -101,6 +107,16 @@ impl PgProtocol {
     #[must_use]
     pub const fn state(&self) -> &ProtoState {
         &self.state
+    }
+
+    /// Borrow the accumulated session parameters.
+    ///
+    /// Populated during the startup handshake from `ParameterStatus`
+    /// messages. Empty until startup completes.
+    #[inline]
+    #[must_use]
+    pub const fn session_params(&self) -> &SessionParams {
+        &self.session_params
     }
 
     /// Borrow the current unread bytes in the read buffer.
@@ -121,6 +137,13 @@ impl PgProtocol {
         let mut out = OutActions::new();
         match cmd {
             PgCommand::Ping { reply } => self.handle_push_ping(reply, &mut out),
+            PgCommand::Startup {
+                user,
+                database,
+                app_name,
+                credentials,
+                reply,
+            } => self.handle_push_startup(user, database, app_name, credentials, reply, &mut out),
         }
         out
     }
@@ -194,6 +217,19 @@ impl PgProtocol {
                         .unread()
                         .get(HEADER_LEN..total_len)
                         .unwrap_or(&[]);
+                    // If this is a ParameterStatus frame during a
+                    // post-auth state, record the parameter before
+                    // dispatching. Params live on PgProtocol, not in
+                    // the state variant.
+                    // If this is a ParameterStatus frame during a
+                    // post-auth state, record the parameter. Params
+                    // live on PgProtocol, not in the state variant.
+                    if tag == crate::wire::TAG_PARAMETER_STATUS
+                        && is_post_auth_state(&self.state)
+                    {
+                        record_param_status(&mut self.session_params, payload);
+                    }
+
                     // Take ownership of state for the dispatcher.
                     let prev = core::mem::take(&mut self.state);
                     let outcome = dispatch(prev, tag, payload);
@@ -232,7 +268,12 @@ impl PgProtocol {
                             // the cause as the root classification so
                             // post-close frames drop silently rather
                             // than misreading `Idle` as "ready".
-                            self.state = ProtoState::Errored(cause);
+                            //
+                            // Clone: the cause goes both into the state
+                            // (for post-terminal diagnostics) AND into
+                            // the FailReply action. Error path only —
+                            // zero hot-path impact.
+                            self.state = ProtoState::Errored(cause.clone());
                             // Push FailReply + CloseSocket if there
                             // was an in-flight reply; otherwise just
                             // CloseSocket. Per-method budget: at most
@@ -274,15 +315,6 @@ impl PgProtocol {
     /// we surface it via `if .is_err() { return }` — the compiler sees
     /// we did not discard a `Result`.
     fn handle_push_ping(&mut self, reply: ReplyId, out: &mut OutActions) {
-        // State-as-data move: take the previous state out, inspect it,
-        // and write back the correct next state (same or new). `take`
-        // replaces with `Default = Idle`; every arm that does not want
-        // to end in `Idle` restores its own state explicitly.
-        //
-        // If any push fails (architecturally unreachable — budget
-        // audit above proves each site fits the const cap), the
-        // `let Ok(()) = ...` pattern returns early without discarding
-        // the Result.
         match core::mem::take(&mut self.state) {
             ProtoState::Idle => {
                 self.state = ProtoState::AwaitingPingReply(reply);
@@ -294,11 +326,6 @@ impl PgProtocol {
                 };
             }
             ProtoState::AwaitingPingReply(prev_reply) => {
-                // Pipelining a Ping while one is already in flight is
-                // not supported in Phase 1a. Restore the previous
-                // state (with its *un-consumed* correlator still inside;
-                // it waits for its own RFQ) and fail the *new* request's
-                // correlator.
                 self.state = ProtoState::AwaitingPingReply(prev_reply);
                 let Ok(()) = push_action(
                     out,
@@ -310,20 +337,112 @@ impl PgProtocol {
                     return;
                 };
             }
+            // Any connecting state: reject the Ping — startup is in progress.
+            other @ (ProtoState::ConnectingStartup { .. }
+            | ProtoState::ConnectingScramAwaitServerFirst { .. }
+            | ProtoState::ConnectingScramAwaitServerFinal { .. }
+            | ProtoState::ConnectingScramAwaitAuthOk(_)
+            | ProtoState::ConnectingPostAuthWaitKey(_)
+            | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+                self.state = other;
+                let Ok(()) = push_action(
+                    out,
+                    Action::FailReply {
+                        id: reply.consume(),
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    },
+                ) else {
+                    return;
+                };
+            }
             ProtoState::Errored(original) => {
-                // Connection is already classified terminal; reject
-                // the new command with the stored cause. The wrapper
-                // has already been told (via an earlier `CloseSocket`)
-                // that the transport is gone, but nothing stops a
-                // caller from pushing another command while it drops
-                // the protocol — fail those commands rather than let
-                // them hang.
+                let fail_cause = original.clone();
                 self.state = ProtoState::Errored(original);
                 let Ok(()) = push_action(
                     out,
                     Action::FailReply {
                         id: reply.consume(),
-                        cause: original,
+                        cause: fail_cause,
+                    },
+                ) else {
+                    return;
+                };
+            }
+        }
+    }
+
+    /// Handle `PgCommand::Startup` — build and emit a StartupMessage.
+    ///
+    /// Per-method push budget: **1** (SendBytes with the StartupMessage).
+    fn handle_push_startup(
+        &mut self,
+        user: Ident,
+        database: Option<DatabaseName>,
+        app_name: Option<ApplicationName>,
+        credentials: Credentials,
+        reply: ReplyId,
+        out: &mut OutActions,
+    ) {
+        match core::mem::take(&mut self.state) {
+            ProtoState::Idle => {
+                // Build the StartupMessage frame.
+                match build_startup_message(&user, database.as_ref(), app_name.as_ref()) {
+                    Ok(send_buf) => {
+                        self.state = ProtoState::ConnectingStartup {
+                            reply,
+                            credentials,
+                        };
+                        let Ok(()) = push_action(out, Action::SendBytes(send_buf)) else {
+                            return;
+                        };
+                    }
+                    Err(_) => {
+                        // WriteBuf overflow building StartupMessage.
+                        self.state = ProtoState::Idle;
+                        let Ok(()) = push_action(
+                            out,
+                            Action::FailReply {
+                                id: reply.consume(),
+                                cause: ProtocolError::ScramError {
+                                    detail: heapless::String::try_from(
+                                        "StartupMessage too large for send buffer",
+                                    )
+                                    .unwrap_or_default(),
+                                },
+                            },
+                        ) else {
+                            return;
+                        };
+                    }
+                }
+            }
+            // Already connecting or awaiting — reject.
+            other @ (ProtoState::AwaitingPingReply(_)
+            | ProtoState::ConnectingStartup { .. }
+            | ProtoState::ConnectingScramAwaitServerFirst { .. }
+            | ProtoState::ConnectingScramAwaitServerFinal { .. }
+            | ProtoState::ConnectingScramAwaitAuthOk(_)
+            | ProtoState::ConnectingPostAuthWaitKey(_)
+            | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+                self.state = other;
+                let Ok(()) = push_action(
+                    out,
+                    Action::FailReply {
+                        id: reply.consume(),
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    },
+                ) else {
+                    return;
+                };
+            }
+            ProtoState::Errored(original) => {
+                let fail_cause = original.clone();
+                self.state = ProtoState::Errored(original);
+                let Ok(()) = push_action(
+                    out,
+                    Action::FailReply {
+                        id: reply.consume(),
+                        cause: fail_cause,
                     },
                 ) else {
                     return;
@@ -357,8 +476,15 @@ impl PgProtocol {
                     return;
                 };
             }
-            ProtoState::AwaitingPingReply(id) => {
-                self.state = ProtoState::Errored(cause);
+            // All states carrying an in-flight ReplyId.
+            ProtoState::AwaitingPingReply(id)
+            | ProtoState::ConnectingStartup { reply: id, .. }
+            | ProtoState::ConnectingScramAwaitServerFirst { reply: id, .. }
+            | ProtoState::ConnectingScramAwaitServerFinal { reply: id, .. }
+            | ProtoState::ConnectingScramAwaitAuthOk(id)
+            | ProtoState::ConnectingPostAuthWaitKey(id)
+            | ProtoState::ConnectingPostAuthHaveKey { reply: id, .. } => {
+                self.state = ProtoState::Errored(cause.clone());
                 self.read_buf.clear();
                 let Ok(()) = push_action(
                     out,
@@ -374,13 +500,84 @@ impl PgProtocol {
                 };
             }
             ProtoState::Errored(original) => {
-                // Already torn down. Preserve the original cause; the
-                // wrapper has already acted on the first `CloseSocket`,
-                // so we do not duplicate the emission.
                 self.state = ProtoState::Errored(original);
             }
         }
     }
+
+}
+
+/// Check if a state is a post-auth connecting state where
+/// ParameterStatus should be recorded.
+fn is_post_auth_state(state: &ProtoState) -> bool {
+    matches!(
+        state,
+        ProtoState::ConnectingPostAuthWaitKey(_)
+            | ProtoState::ConnectingPostAuthHaveKey { .. }
+    )
+}
+
+/// Parse a ParameterStatus payload and record it in session_params.
+fn record_param_status(params: &mut SessionParams, payload: &[u8]) {
+    let nul_pos = match payload.iter().position(|b| *b == 0) {
+        Some(p) => p,
+        None => return,
+    };
+    let key = match payload.get(..nul_pos) {
+        Some(k) => k,
+        None => return,
+    };
+    let value_start = match nul_pos.checked_add(1) {
+        Some(s) => s,
+        None => return,
+    };
+    let value_region = match payload.get(value_start..) {
+        Some(v) => v,
+        None => return,
+    };
+    let value = match value_region.strip_suffix(&[0]) {
+        Some(v) => v,
+        None => value_region,
+    };
+    params.set(key, value);
+}
+
+/// Build a PostgreSQL StartupMessage frame.
+///
+/// StartupMessage format (no tag byte):
+/// - 4 bytes: length (includes self)
+/// - 4 bytes: protocol version (196608 = 3.0)
+/// - key-value pairs, each NUL-terminated
+/// - trailing empty key NUL
+fn build_startup_message(
+    user: &Ident,
+    database: Option<&DatabaseName>,
+    app_name: Option<&ApplicationName>,
+) -> Result<SendBuf, crate::write_buf::WriteBufFull> {
+    use crate::write_buf::WriteBufFull;
+
+    let mut wb = WriteBuf::new();
+    wb.with_length_prefix(|w| {
+        // Protocol version 3.0 = 196608
+        w.push_u32_be(crate::wire::PROTOCOL_VERSION_3_0)?;
+        // user=<username>\0
+        w.push_nul_terminated(b"user")?;
+        w.push_nul_terminated(user.as_bytes())?;
+        // database=<dbname>\0 (optional)
+        if let Some(db) = database {
+            w.push_nul_terminated(b"database")?;
+            w.push_nul_terminated(db.as_bytes())?;
+        }
+        // application_name=<name>\0 (optional)
+        if let Some(name) = app_name {
+            w.push_nul_terminated(b"application_name")?;
+            w.push_nul_terminated(name.as_bytes())?;
+        }
+        // Trailing empty key NUL
+        w.push_u8(0).map_err(|_| WriteBufFull)?;
+        Ok(())
+    })?;
+    Ok(SendBuf::Owned(wb.into_inner()))
 }
 
 impl Default for PgProtocol {
@@ -394,6 +591,7 @@ impl core::fmt::Debug for PgProtocol {
         f.debug_struct("PgProtocol")
             .field("state", &self.state)
             .field("read_buf", &self.read_buf)
+            .field("session_params", &self.session_params)
             .finish_non_exhaustive()
     }
 }
@@ -405,6 +603,7 @@ impl core::fmt::Debug for PgProtocol {
 /// proved safe by the `MAX_ACTIONS_PER_CALL` const_assert and the
 /// per-method audit in the docstring; the Err branch is dead.
 #[inline]
+#[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; Action is returned on overflow which is architecturally unreachable")]
 fn push_action(out: &mut OutActions, action: Action) -> Result<(), Action> {
     out.push(action)
 }

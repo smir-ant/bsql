@@ -18,8 +18,9 @@ use core::fmt;
 /// async wrapper, not user-visible types — the wrapper translates them
 /// into its public `BackendError` (Phase 1e). Variants are kept narrow
 /// and self-describing; the wrapper never has to invent error context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; ProtocolError is constructed on error paths only, never hot path")]
 pub enum ProtocolError {
     /// The header's length-field is below the legal minimum (4).
     ///
@@ -85,6 +86,64 @@ pub enum ProtocolError {
         available: usize,
     },
 
+    /// Server sent an `ErrorResponse` (tag `'E'`) during the startup
+    /// handshake. Phase 1b parses the typed-field body to extract
+    /// severity, code, message, detail, hint for diagnostic quality.
+    ServerErrorResponse {
+        /// Severity level string (e.g. "ERROR", "FATAL").
+        severity: heapless::String<32>,
+        /// SQLSTATE error code (e.g. "28P01" for auth failure).
+        code: heapless::String<8>,
+        /// Primary human-readable error message.
+        message: heapless::String<256>,
+        /// Optional detail string.
+        detail: heapless::String<256>,
+        /// Optional hint string.
+        hint: heapless::String<256>,
+    },
+
+    /// Server sent an authentication method we do not support.
+    ///
+    /// PG's Authentication message (tag `'R'`) carries a sub-code for
+    /// the method. Phase 1b supports only sub-code 0 (Ok), 10 (SASL),
+    /// 11 (SASLContinue), 12 (SASLFinal). Anything else lands here.
+    UnsupportedAuthMethod {
+        /// The sub-code the server requested.
+        sub_code: u32,
+    },
+
+    /// Server sent `NegotiateProtocolVersion` (tag `'v'`) during
+    /// startup, indicating it does not support a protocol option we
+    /// requested. DEF-044.
+    UnsupportedProtocolOption,
+
+    /// SCRAM authentication error — wraps the specific SCRAM failure.
+    ScramError {
+        /// Descriptive SCRAM error message.
+        detail: heapless::String<128>,
+    },
+
+    /// Server's `BackendKeyData` payload has wrong size (expected 8).
+    MalformedBackendKeyData {
+        /// Actual payload byte count.
+        payload_len: usize,
+    },
+
+    /// Server's `ParameterStatus` payload is malformed (missing NUL
+    /// separator between key and value, or other structural issue).
+    MalformedParameterStatus,
+
+    /// Server's `Authentication*` message payload is too short to
+    /// contain the 4-byte sub-code.
+    MalformedAuthentication {
+        /// Actual payload byte count.
+        payload_len: usize,
+    },
+
+    /// Attempted to start a second Startup handshake while one is
+    /// already in progress.
+    StartupAlreadyInProgress,
+
     /// A local protocol-crate invariant was violated.
     ///
     /// Classified rather than silent: in Phase 1a the only emission site
@@ -135,6 +194,33 @@ impl fmt::Display for ProtocolError {
                 f,
                 "read buffer full: tried to append {attempted} bytes, only {available} available",
             ),
+            Self::ServerErrorResponse {
+                severity,
+                code,
+                message,
+                ..
+            } => write!(f, "server error: {severity} ({code}): {message}"),
+            Self::UnsupportedAuthMethod { sub_code } => {
+                write!(f, "unsupported authentication method (sub-code {sub_code})")
+            }
+            Self::UnsupportedProtocolOption => {
+                f.write_str("server does not support requested protocol option")
+            }
+            Self::ScramError { detail } => write!(f, "SCRAM authentication failed: {detail}"),
+            Self::MalformedBackendKeyData { payload_len } => write!(
+                f,
+                "BackendKeyData payload length {payload_len} (expected 8)",
+            ),
+            Self::MalformedParameterStatus => {
+                f.write_str("malformed ParameterStatus (missing NUL separator)")
+            }
+            Self::MalformedAuthentication { payload_len } => write!(
+                f,
+                "Authentication message payload too short: {payload_len} bytes (need >= 4)",
+            ),
+            Self::StartupAlreadyInProgress => {
+                f.write_str("startup handshake already in progress")
+            }
             Self::ProtocolInvariantBroken => {
                 f.write_str("protocol invariant violated — internal bsql-pg-proto logic bug")
             }

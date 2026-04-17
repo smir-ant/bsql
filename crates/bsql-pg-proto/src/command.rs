@@ -9,6 +9,8 @@
 //! variants (`Query`, `Execute`, `Begin`, …) land with their drivers
 //! per reforge.md §3.5.
 
+use crate::ident::{ApplicationName, DatabaseName, Ident};
+use crate::password::Credentials;
 use crate::reply_id::ReplyId;
 
 /// A command pushed by the wrapper into the protocol state machine.
@@ -28,9 +30,10 @@ use crate::reply_id::ReplyId;
 /// cloneable id, which would break the tier-1 "no silent reply loss"
 /// invariant. If a caller needs multiple commands they mint multiple
 /// ids from the wrapper's monotonic counter and build multiple commands.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 #[must_use = "a PgCommand has no effect until pushed via PgProtocol::push_command"]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; PgCommand is constructed once per user request, not per row")]
 pub enum PgCommand {
     /// Cheap server liveness probe.
     ///
@@ -45,6 +48,26 @@ pub enum PgCommand {
     Ping {
         /// Correlator the wrapper will use to route the matching
         /// [`crate::Reply::Pong`] back to the caller.
+        reply: ReplyId,
+    },
+
+    /// Initiate the PostgreSQL startup handshake.
+    ///
+    /// Builds and sends a `StartupMessage` frame. The protocol then
+    /// navigates the authentication exchange (trust or SCRAM-SHA-256)
+    /// followed by the post-auth chain (ParameterStatus, BackendKeyData,
+    /// ReadyForQuery) before transitioning to [`crate::ProtoState::Idle`]
+    /// and emitting [`crate::Reply::StartupComplete`].
+    Startup {
+        /// The PostgreSQL user to authenticate as.
+        user: Ident,
+        /// Optional database name (defaults to user name on the server).
+        database: Option<DatabaseName>,
+        /// Optional application name for `application_name` parameter.
+        app_name: Option<ApplicationName>,
+        /// Authentication credentials.
+        credentials: Credentials,
+        /// Correlator for the Startup command.
         reply: ReplyId,
     },
 }

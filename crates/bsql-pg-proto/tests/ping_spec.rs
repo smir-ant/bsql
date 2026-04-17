@@ -151,7 +151,7 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId) {
 #[test]
 fn ping_from_idle_emits_sync_bytes() {
     let mut proto = PgProtocol::new();
-    assert_eq!(proto.state(), &ProtoState::Idle);
+    assert!(matches!(proto.state(), ProtoState::Idle));
 
     let ping_raw = raw(1);
     let out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) });
@@ -203,7 +203,7 @@ fn rfq_delivers_pong_and_returns_to_idle() {
         }
         other => panic!("unexpected action shape: {other:?}"),
     }
-    assert_eq!(proto.state(), &ProtoState::Idle);
+    assert!(matches!(proto.state(), ProtoState::Idle));
     assert_eq!(proto.unread().len(), 0, "frame fully consumed");
 }
 
@@ -241,7 +241,7 @@ fn partial_rfq_feeds_are_buffered_until_complete() {
     let out = proto.feed_bytes(last_slice);
     assert_eq!(out.len(), 1);
     assert!(matches!(out.as_slice(), [Action::DeliverReply { .. }]));
-    assert_eq!(proto.state(), &ProtoState::Idle);
+    assert!(matches!(proto.state(), ProtoState::Idle));
 }
 
 // ------------------------------------------------------------------
@@ -286,7 +286,10 @@ fn error_response_fails_the_in_flight_ping() {
             Action::CloseSocket,
         ] => {
             assert_eq!(failed_id, &ping_raw);
-            assert_eq!(*cause, ProtocolError::ServerError);
+            assert!(
+                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+                "expected ServerErrorResponse, got {cause:?}",
+            );
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
@@ -477,7 +480,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     assert_eq!(err_out.len(), 2, "entering Errored emits FailReply + CloseSocket");
     assert!(matches!(
         proto.state(),
-        ProtoState::Errored(ProtocolError::ServerError),
+        ProtoState::Errored(ProtocolError::ServerErrorResponse { .. }),
     ));
 
     // First post-terminal frame: a well-formed RFQ. Expect zero actions
@@ -491,7 +494,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     );
     assert!(matches!(
         proto.state(),
-        ProtoState::Errored(ProtocolError::ServerError),
+        ProtoState::Errored(ProtocolError::ServerErrorResponse { .. }),
     ));
 
     // Second post-terminal frame: an ErrorResponse that would *normally*
@@ -505,7 +508,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     );
     assert!(matches!(
         proto.state(),
-        ProtoState::Errored(ProtocolError::ServerError),
+        ProtoState::Errored(ProtocolError::ServerErrorResponse { .. }),
     ));
 }
 
@@ -543,10 +546,9 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
     match out.as_slice() {
         [Action::FailReply { id: failed_id, cause }] => {
             assert_eq!(failed_id, &second_raw, "fail correlates to the new command");
-            assert_eq!(
-                *cause,
-                ProtocolError::ServerError,
-                "cause is the STORED terminal cause, not a fresh classification",
+            assert!(
+                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+                "cause must be the STORED terminal cause (ServerErrorResponse), got {cause:?}",
             );
         }
         other => panic!("unexpected action shape: {other:?}"),
@@ -555,6 +557,6 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
     // State unchanged — original cause preserved.
     assert!(matches!(
         proto.state(),
-        ProtoState::Errored(ProtocolError::ServerError),
+        ProtoState::Errored(ProtocolError::ServerErrorResponse { .. }),
     ));
 }

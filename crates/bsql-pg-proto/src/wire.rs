@@ -45,6 +45,64 @@ pub const TAG_ERROR_RESPONSE: u8 = b'E';
 /// zero copy.
 pub const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC, 0, 0, 0, 4];
 
+// ---------------------------------------------------------------
+// Phase 1b tags
+// ---------------------------------------------------------------
+
+/// Backend `Authentication*` message tag (`'R'`).
+///
+/// Carries a 4-byte sub-code indicating the authentication method:
+/// 0 = Ok, 10 = SASL, 11 = SASLContinue, 12 = SASLFinal.
+pub const TAG_AUTHENTICATION: u8 = b'R';
+
+/// Backend `ParameterStatus` message tag (`'S'`).
+///
+/// Carries a key=NUL + value=NUL pair for a session parameter.
+/// Reused for both inbound ParameterStatus and outbound Sync
+/// (the outbound Sync uses `TAG_SYNC` = `b'S'` = same byte;
+/// disambiguation is by direction — we only parse inbound `S`
+/// as ParameterStatus during connecting states).
+pub const TAG_PARAMETER_STATUS: u8 = b'S';
+
+/// Backend `BackendKeyData` message tag (`'K'`).
+///
+/// Carries 8 bytes: pid (i32 BE) + secret_key (i32 BE).
+pub const TAG_BACKEND_KEY_DATA: u8 = b'K';
+
+/// Backend `NegotiateProtocolVersion` message tag (`'v'`).
+///
+/// Sent when the server does not support a requested protocol option.
+/// DEF-044.
+pub const TAG_NEGOTIATE_PROTOCOL_VERSION: u8 = b'v';
+
+/// Frontend `SASLInitialResponse` / `SASLResponse` message tag (`'p'`).
+///
+/// Used for both the initial SASL response (mechanism + client-first)
+/// and the subsequent SASL response (client-final).
+pub const TAG_SASL_RESPONSE: u8 = b'p';
+
+// ---------------------------------------------------------------
+// Authentication sub-codes (first 4 bytes of 'R' payload)
+// ---------------------------------------------------------------
+
+/// `AuthenticationOk` — sub-code 0.
+pub const AUTH_OK: u32 = 0;
+
+/// `AuthenticationSASL` — sub-code 10. Mechanism list follows.
+pub const AUTH_SASL: u32 = 10;
+
+/// `AuthenticationSASLContinue` — sub-code 11. Server-first-message follows.
+pub const AUTH_SASL_CONTINUE: u32 = 11;
+
+/// `AuthenticationSASLFinal` — sub-code 12. Server-final-message follows.
+pub const AUTH_SASL_FINAL: u32 = 12;
+
+/// The SCRAM-SHA-256 mechanism name as bytes.
+pub const SCRAM_SHA_256_MECHANISM: &[u8] = b"SCRAM-SHA-256";
+
+/// PG protocol version 3.0 = 196608 (0x00030000).
+pub const PROTOCOL_VERSION_3_0: u32 = 196608;
+
 /// Compile-time check: `Sync` body length matches the spec.
 ///
 /// Tier-1 against typo-induced wire breaks. If this assert fires, the
