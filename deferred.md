@@ -22,14 +22,14 @@ entry path and its exit path. Phase 1a ships `Idle` and
 
 | ID | Variant | Arrives in | Lands with |
 |---|---|---|---|
-| DEF-001 | `ConnectingStartup(ReplyId)` | 1b | StartupMessage flow |
-| DEF-002 | `ConnectingScram { nonce, step, … }` | 1b | SCRAM-SHA-256 auth |
-| DEF-003 | `ConnectingPostAuthWaitKey(ReplyId)` | 1b | Post-auth handshake |
-| DEF-004 | `ConnectingPostAuthHaveKey { pid, secret_key, … }` | 1b | BackendKeyData receipt |
+| DEF-001 | `ConnectingStartup { reply, credentials }` | 1b | **CLOSED** — landed with entry+exit in Phase 1b (6382cdc) |
+| DEF-002 | `ConnectingScramAwaitServerFirst/Final/AuthOk` | 1b | **CLOSED** — three SCRAM variants landed with full SCRAM flow (6382cdc) |
+| DEF-003 | `ConnectingPostAuthWaitKey(ReplyId)` | 1b | **CLOSED** — landed with post-auth chain (6382cdc) |
+| DEF-004 | `ConnectingPostAuthHaveKey { reply, pid, secret_key }` | 1b | **CLOSED** — landed with BackendKeyData + RFQ (6382cdc) |
 | DEF-005 | `AwaitingQueryReply { reply, hash, columns }` | 1c | Query / Execute flow |
 | DEF-006 | `StreamingRows { stream, hash, columns }` | 1d | QueryStream |
 | DEF-007 | `InTransaction { level, depth }` | 1c | Begin/Commit/Rollback |
-| DEF-008 | `Errored(ProtocolError)` | every flow | Added when its first legitimate entry path lands |
+| DEF-008 | `Errored(ProtocolError)` | every flow | **CLOSED** — entry from all Phase 1a+1b states verified (6382cdc) |
 | DEF-009 | `Closed` | 1e | Terminate flow / async wrapper shutdown |
 
 **Verification hook:** before closing any ID, confirm the commit that
@@ -49,9 +49,9 @@ proof.
 |---|---|---|---|---|---|
 | DEF-010 | `MAX_ACTIONS_PER_CALL` | 4 | 2 (FailReply + CloseSocket on malformed frame) | Single global `const _: () = assert!(MAX >= 2)` | 2 (global assert, not per-site) |
 | DEF-011 | `READ_BUF_CAP` | 4096 (4 KiB) | frame up to 4095 bytes | Drift-detection `const _: () = assert!(cap == MAX_FRAME_LEN_FIELD + 1)` | 1 (compile error on drift) |
-| DEF-012 | `MAX_OWNED_SEND_LEN` | not yet shipped | — | — | — (lands with SendBuf::Owned, DEF-013) |
-| DEF-013 | `SendBuf::Owned` variant | not yet shipped | — | — | Lands with StartupMessage (1b) |
-| DEF-014 | `WriteBuf` newtype | not yet shipped | — | — | Lands with runtime-built outbound frames (1b) |
+| DEF-012 | `MAX_OWNED_SEND_LEN` | 1b | 512 bytes | **CLOSED** — sized for worst-case StartupMessage (690e30e) | 1 (const_assert >= 297) |
+| DEF-013 | `SendBuf::Owned` variant | 1b | StartupMessage + SASL frames | **CLOSED** — landed (6382cdc) | 1 (exhaustive match) |
+| DEF-014 | `WriteBuf` newtype | 1b | runtime-built outbound frames | **CLOSED** — landed (690e30e) | 2 (sealed API surface) |
 
 **Verification hook for DEF-010:** before merging any PR that adds a
 new `push_action` call site, confirm (a) the per-method-budget
@@ -199,19 +199,20 @@ mechanism fully closes the observable behaviour".
 
 | ID | Commitment | Phase | Target tier |
 |---|---|---|---|
-| DEF-039 | `SecretDigest` newtype: byte-array wrapper for SCRAM signature / proof / server-signature that deliberately does **not** implement `PartialEq` / `Eq`. Only exposes `ct_eq(&self, other: &Self) -> subtle::Choice`. Any future attempt to compare two secret-derived digests via `==` is a compile error. | 1b | 1 |
-| DEF-040 | `CappedServerNonce<const CAP: usize>`: phantom wrapper around `&[u8]` / `HString`. Constructible only via `try_from_raw` which enforces the cap. Downstream builders of `client-final-message` accept only this type. A server nonce of any length that doesn't fit is rejected at construction, not at assembly. | 1b | 1 |
-| DEF-041 | `Ident` / `ApplicationName` / `DatabaseName`: newtype with `try_from_str` constructor that rejects embedded NUL and enforces a length cap. Downstream StartupMessage builder accepts only these types — a NUL-containing string cannot reach the wire. | 1b | 1 |
-| DEF-042 | `SessionParams`: fixed struct with named optional fields for the known-useful PG `ParameterStatus` keys (`server_version`, `server_encoding`, `client_encoding`, `application_name`, `is_superuser`, `session_authorization`, `date_style`, `integer_datetimes`, `time_zone`). Unknown keys are parsed and dropped — no `heapless::Map` with an overflow class to classify, no silent drop class. | 1b | 1 (no overflow class exists) |
+| DEF-039 | `SecretDigest` newtype — no `PartialEq`, only `ct_eq`. | 1b | **CLOSED** — landed (690e30e). tier-1: `==` on SecretDigest is a compile error. |
+| DEF-040 | `CappedServerNonce` — bounded server nonce buffer. | 1b | **CLOSED** — landed (690e30e). tier-1 by constructor rejection. |
+| DEF-041 | `Ident` / `ApplicationName` / `DatabaseName` — NUL-free newtypes. | 1b | **CLOSED** — landed (690e30e). tier-1: NUL bytes rejected at construction. |
+| DEF-042 | `SessionParams` — fixed struct, no map, no overflow class. | 1b | **CLOSED** — landed (690e30e). tier-1 by absence of growable container. |
 | DEF-043 | `NoticeResponse` (tag `N`) pre-dispatch filter: any state, any frame, a single filter at the top of `feed_bytes` extracts the notice and emits `Action::EmitNotice(…)` without touching state. Dispatcher arms do not need to handle `N` separately. | 1c (first Query flow; Phase 1b's Startup flow does not need it) | 1 (single site, structural) |
-| DEF-044 | `NegotiateProtocolVersion` (tag `v`) during startup: handled by a dedicated dispatcher arm; the resulting `UnsupportedProtocolOption` variant of `ProtocolError` carries the option names the server rejected. Outside `ConnectingStartup`, treated as `UnexpectedFrame`. | 1b | 1 structural (exhaustive match) |
+| DEF-044 | `NegotiateProtocolVersion` during startup → `UnsupportedProtocolOption`. | 1b | **CLOSED** — landed (6382cdc). tier-1 by exhaustive match. |
 | DEF-045 | `emit_actions!` macro — compile-time per-site action budget. Any future contributor who adds a push without declaring its budget gets a build error; exceeding the declared budget is also a build error. Global `MAX_ACTIONS_PER_CALL` becomes an upper bound checked against the sum of declared budgets. | 1a+ (applicable the moment Phase 1b adds more push sites; deferred until then to avoid refactoring-for-nothing) | 1 |
 | DEF-046 | `ReplyId` counter wraparound: wrapper crate's counter uses `checked_add(1)` + classified `IdPoolExhausted` error. 2⁶⁴ IDs on 1-ns cadence is 584 years; the guard is there for the "24/7 pool over a long-running service" edge only. | 1e | 1 |
 | DEF-047 | Wrapper-level typestate for connection lifecycle: `IdleConnection<B>` / `ActiveConnection<B, R>` / `DeadConnection<B>`. Typed handles enforce "no command on dead connection" and "no second command while first in flight" at compile time — the equivalent runtime rejects in `bsql-pg-proto` become the safety-net of last resort, not the primary guard. | 1e | 1 (at the wrapper API; protocol-crate-level stays tier-2 via `Errored` arm) |
 | DEF-048 | `Sensitive<T>` + `!Debug` audit: every type that contains a `Sensitive<T>` field gets either a manual `Debug` that redacts the field, or no `Debug` at all. No Rust stable negative trait bound; enforced by naming convention (`Credentials`, `Secret*`) + reviewer discipline — honest tier-2, not tier-1. | 1b onward | 2 |
 | DEF-049 | `ReadBuf` capacity sizing study: confirm that `READ_BUF_CAP = 4 KiB` is above the largest frame Phase 1-4 will emit. If not (e.g. COPY rows), bump — always at compile time, never at runtime. | 1c–1d | 1 |
 | DEF-050 | SASLPrep for unicode passwords: `stringprep` crate integration, opt-in. ASCII passwords are the common case; non-ASCII without SASLPrep can fail interop with PG servers that normalize. Tier-3 best-effort without the dep; tier-2 structural with it. | 1b (optional) or later | 2-3 (design decision) |
-| DEF-051 | Empty-password policy: `Password::try_from_str` returns `Err(PasswordEmpty)` on zero-length input. Rare path, but a tier-1 compile-visible choice (via the `Result`) rather than a silent weak-KDF. | 1b | 1 |
+| DEF-051 | Empty-password rejection: `Password::try_from_str` → `Err(PasswordError::Empty)`. | 1b | **CLOSED** — landed (690e30e). tier-1 via Result return. |
+| DEF-053 | Channel binding (SCRAM-SHA-256-PLUS): Phase 1b uses `n,,` GS2 header and `biws` cbind data (no channel binding). Requires TLS channel binding data from the transport layer, which does not exist until the async wrapper lands in Phase 1e. GS2 header always `n,,`, cbind always `biws`. | 1e (with TLS) | 2 (structural — requires transport-layer data not yet available) |
 | DEF-052 | `ReplyId::drop` diagnostic-masking under `panic = "unwind"`. When a test panics for an unrelated reason while a non-delivered `ReplyId` is alive, the Drop-guard's `assert!` fires during unwinding → double-panic → `SIGABRT` → original panic message is masked. Safety property is NOT weakened (the guard still catches undelivered-drop); only test-time diagnostic quality degrades. Fix direction: `if std::thread::panicking() { return; }` early-out inside `Drop`, gated so the `std::` reference does not break `no_std` downstream builds. Candidate gates: a dedicated `__drop_guard_std` feature enabled by dev-dependencies, or a `#[cfg(all(debug_assertions, not(target_os = "none")))]` heuristic. Mitigation today: tests that leave an in-flight ReplyId call `drain_pending_ping` (integration tests) or complete the flow to `Idle`/`Errored` (library internal tests). The permanent `PgProtocol::terminate(self, cause) -> OutActions` lands with the async wrapper in Phase 1e and subsumes this concern for wrapper-driven teardown. | 1e (with wrapper) or sooner with a feature-flag design pass | 2 (diagnostic-quality, not safety) |
 
 ## 10. Closed
