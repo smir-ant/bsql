@@ -29,6 +29,72 @@ use crate::write_buf::WriteBuf;
 use core::cell::Cell;
 use core::marker::PhantomData;
 
+// -----------------------------------------------------------------
+// emit_actions! — tier-1 per-site action-budget enforcement (DEF-045)
+// -----------------------------------------------------------------
+
+/// Count the number of expression arguments in a `macro_rules!` call.
+/// Used by [`emit_actions!`] to verify at compile time that the
+/// declared budget matches the number of actions actually pushed.
+///
+/// Returns a `usize` literal. Implementation avoids the `1 + rec`
+/// pattern that triggers `clippy::int_plus_one` when the result is
+/// compared via `>=` in the caller.
+macro_rules! count_exprs {
+    () => { 0_usize };
+    ($one:expr) => { 1_usize };
+    ($one:expr, $two:expr) => { 2_usize };
+    ($one:expr, $two:expr, $three:expr) => { 3_usize };
+    ($one:expr, $two:expr, $three:expr, $four:expr) => { 4_usize };
+}
+
+/// Push 1..=N actions into `out`, with compile-time enforcement of
+/// both the per-site budget and the global `MAX_ACTIONS_PER_CALL` cap.
+///
+/// ```text
+/// emit_actions!(out, budget: 2, on_overflow: return, [
+///     Action::FailReply { id: id.consume(), cause },
+///     Action::CloseSocket,
+/// ]);
+/// ```
+///
+/// Compile-time checks (both are `const _: () = assert!(…)` — failure
+/// is a build error, not a runtime branch):
+///
+/// 1. `MAX_ACTIONS_PER_CALL >= budget` — the site's declared budget
+///    fits within the global cap.
+/// 2. `budget >= count(actions)` — the site does not push more actions
+///    than it declared.
+///
+/// Runtime: each action is pushed via `heapless::Vec::push`. The Err
+/// branch (capacity exhausted) takes the `on_overflow` path — typically
+/// `return` or `break`. Under the compile-time proofs above, this
+/// branch is dead (the budget fits the cap and the count fits the
+/// budget), but it is surfaced honestly so the compiler sees every
+/// `Result` handled. DEF-045.
+macro_rules! emit_actions {
+    (
+        $out:expr, budget: $budget:literal, on_overflow: $bail:tt,
+        [$($action:expr),+ $(,)?]
+    ) => {{
+        const _: () = assert!(
+            $crate::protocol::MAX_ACTIONS_PER_CALL >= $budget,
+            "emit_actions! per-site budget exceeds MAX_ACTIONS_PER_CALL",
+        );
+        const _: () = assert!(
+            $budget >= count_exprs!($($action),+),
+            "emit_actions! site pushes more actions than its declared budget",
+        );
+        $(
+            #[allow(clippy::needless_return)]
+            match $out.push($action) {
+                Ok(()) => {}
+                Err(_) => $bail,
+            }
+        )+
+    }};
+}
+
 /// Maximum number of [`Action`]s a single entry-point call may emit.
 ///
 /// **Phase 1a budget audit** (each entry-point bounded above):
@@ -172,8 +238,9 @@ impl PgProtocol {
         }
 
         // Drain as many complete frames as possible. Bounded by
-        // (a) `MAX_ACTIONS_PER_CALL` (push_action returns false when
-        // full; we stop) and (b) the buffer being drained empty.
+        // (a) `MAX_ACTIONS_PER_CALL` (emit_actions! budget overflow
+        // bails with `break`; we stop) and (b) the buffer being
+        // drained empty.
         loop {
             let header = parse_header(self.read_buf.unread());
             match header {
@@ -250,51 +317,29 @@ impl PgProtocol {
                                 );
                                 break;
                             };
-                            if let Some(act) = action
-                                && push_action(&mut out, act).is_err()
-                            {
-                                // Action buffer exhausted before we
-                                // could emit. Phase 1a budget (4) is
-                                // comfortably above the worst case (2);
-                                // this branch is currently dead but the
-                                // loop bails cleanly if it ever fires.
-                                break;
+                            if let Some(act) = action {
+                                emit_actions!(&mut out, budget: 1, on_overflow: break, [
+                                    act,
+                                ]);
                             }
                         }
                         DispatchOutcome::Errored { reply_id, cause } => {
-                            // State already taken (we called mem::take
-                            // above). Do NOT advance the buffer — the
-                            // connection is about to be closed. Store
-                            // the cause as the root classification so
-                            // post-close frames drop silently rather
-                            // than misreading `Idle` as "ready".
-                            //
-                            // Clone: the cause goes both into the state
-                            // (for post-terminal diagnostics) AND into
-                            // the FailReply action. Error path only —
-                            // zero hot-path impact.
                             self.state = ProtoState::Errored(cause.clone());
-                            // Push FailReply + CloseSocket if there
-                            // was an in-flight reply; otherwise just
-                            // CloseSocket. Per-method budget: at most
-                            // 2 actions; `MAX_ACTIONS_PER_CALL >= 2`
-                            // (asserted const) guarantees push success.
-                            // The Err branch is dead but the Result is
-                            // surfaced so the compiler knows we saw it.
-                            if let Some(id) = reply_id
-                                && push_action(
-                                    &mut out,
-                                    Action::FailReply {
-                                        id: id.consume(),
-                                        cause,
-                                    },
-                                )
-                                .is_err()
-                            {
-                                break;
-                            }
-                            if push_action(&mut out, Action::CloseSocket).is_err() {
-                                break;
+                            match reply_id {
+                                Some(id) => {
+                                    emit_actions!(&mut out, budget: 2, on_overflow: break, [
+                                        Action::FailReply {
+                                            id: id.consume(),
+                                            cause,
+                                        },
+                                        Action::CloseSocket,
+                                    ]);
+                                }
+                                None => {
+                                    emit_actions!(&mut out, budget: 1, on_overflow: break, [
+                                        Action::CloseSocket,
+                                    ]);
+                                }
                             }
                             break;
                         }
@@ -318,26 +363,19 @@ impl PgProtocol {
         match core::mem::take(&mut self.state) {
             ProtoState::Idle => {
                 self.state = ProtoState::AwaitingPingReply(reply);
-                let Ok(()) = push_action(
-                    out,
+                emit_actions!(out, budget: 1, on_overflow: return, [
                     Action::SendBytes(SendBuf::Static(&SYNC_WIRE_BYTES)),
-                ) else {
-                    return;
-                };
+                ]);
             }
             ProtoState::AwaitingPingReply(prev_reply) => {
                 self.state = ProtoState::AwaitingPingReply(prev_reply);
-                let Ok(()) = push_action(
-                    out,
+                emit_actions!(out, budget: 1, on_overflow: return, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: ProtocolError::UnexpectedFrame { tag: b'P' },
                     },
-                ) else {
-                    return;
-                };
+                ]);
             }
-            // Any connecting state: reject the Ping — startup is in progress.
             other @ (ProtoState::ConnectingStartup { .. }
             | ProtoState::ConnectingScramAwaitServerFirst { .. }
             | ProtoState::ConnectingScramAwaitServerFinal { .. }
@@ -345,28 +383,22 @@ impl PgProtocol {
             | ProtoState::ConnectingPostAuthWaitKey(_)
             | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
                 self.state = other;
-                let Ok(()) = push_action(
-                    out,
+                emit_actions!(out, budget: 1, on_overflow: return, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: ProtocolError::StartupAlreadyInProgress,
                     },
-                ) else {
-                    return;
-                };
+                ]);
             }
             ProtoState::Errored(original) => {
                 let fail_cause = original.clone();
                 self.state = ProtoState::Errored(original);
-                let Ok(()) = push_action(
-                    out,
+                emit_actions!(out, budget: 1, on_overflow: return, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: fail_cause,
                     },
-                ) else {
-                    return;
-                };
+                ]);
             }
         }
     }
@@ -385,22 +417,19 @@ impl PgProtocol {
     ) {
         match core::mem::take(&mut self.state) {
             ProtoState::Idle => {
-                // Build the StartupMessage frame.
                 match build_startup_message(&user, database.as_ref(), app_name.as_ref()) {
                     Ok(send_buf) => {
                         self.state = ProtoState::ConnectingStartup {
                             reply,
                             credentials,
                         };
-                        let Ok(()) = push_action(out, Action::SendBytes(send_buf)) else {
-                            return;
-                        };
+                        emit_actions!(out, budget: 1, on_overflow: return, [
+                            Action::SendBytes(send_buf),
+                        ]);
                     }
                     Err(_) => {
-                        // WriteBuf overflow building StartupMessage.
                         self.state = ProtoState::Idle;
-                        let Ok(()) = push_action(
-                            out,
+                        emit_actions!(out, budget: 1, on_overflow: return, [
                             Action::FailReply {
                                 id: reply.consume(),
                                 cause: ProtocolError::ScramError {
@@ -410,13 +439,10 @@ impl PgProtocol {
                                     .unwrap_or_default(),
                                 },
                             },
-                        ) else {
-                            return;
-                        };
+                        ]);
                     }
                 }
             }
-            // Already connecting or awaiting — reject.
             other @ (ProtoState::AwaitingPingReply(_)
             | ProtoState::ConnectingStartup { .. }
             | ProtoState::ConnectingScramAwaitServerFirst { .. }
@@ -425,28 +451,22 @@ impl PgProtocol {
             | ProtoState::ConnectingPostAuthWaitKey(_)
             | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
                 self.state = other;
-                let Ok(()) = push_action(
-                    out,
+                emit_actions!(out, budget: 1, on_overflow: return, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: ProtocolError::StartupAlreadyInProgress,
                     },
-                ) else {
-                    return;
-                };
+                ]);
             }
             ProtoState::Errored(original) => {
                 let fail_cause = original.clone();
                 self.state = ProtoState::Errored(original);
-                let Ok(()) = push_action(
-                    out,
+                emit_actions!(out, budget: 1, on_overflow: return, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: fail_cause,
                     },
-                ) else {
-                    return;
-                };
+                ]);
             }
         }
     }
@@ -472,11 +492,10 @@ impl PgProtocol {
             ProtoState::Idle => {
                 self.state = ProtoState::Errored(cause);
                 self.read_buf.clear();
-                let Ok(()) = push_action(out, Action::CloseSocket) else {
-                    return;
-                };
+                emit_actions!(out, budget: 1, on_overflow: return, [
+                    Action::CloseSocket,
+                ]);
             }
-            // All states carrying an in-flight ReplyId.
             ProtoState::AwaitingPingReply(id)
             | ProtoState::ConnectingStartup { reply: id, .. }
             | ProtoState::ConnectingScramAwaitServerFirst { reply: id, .. }
@@ -486,18 +505,13 @@ impl PgProtocol {
             | ProtoState::ConnectingPostAuthHaveKey { reply: id, .. } => {
                 self.state = ProtoState::Errored(cause.clone());
                 self.read_buf.clear();
-                let Ok(()) = push_action(
-                    out,
+                emit_actions!(out, budget: 2, on_overflow: return, [
                     Action::FailReply {
                         id: id.consume(),
                         cause,
                     },
-                ) else {
-                    return;
-                };
-                let Ok(()) = push_action(out, Action::CloseSocket) else {
-                    return;
-                };
+                    Action::CloseSocket,
+                ]);
             }
             ProtoState::Errored(original) => {
                 self.state = ProtoState::Errored(original);
@@ -596,14 +610,7 @@ impl core::fmt::Debug for PgProtocol {
     }
 }
 
-/// Push an action into the bounded out-list.
-///
-/// Returns `Err(action)` if the buffer is full — the caller decides
-/// how to surface the budget breach. In Phase 1a all call sites are
-/// proved safe by the `MAX_ACTIONS_PER_CALL` const_assert and the
-/// per-method audit in the docstring; the Err branch is dead.
-#[inline]
-#[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; Action is returned on overflow which is architecturally unreachable")]
-fn push_action(out: &mut OutActions, action: Action) -> Result<(), Action> {
-    out.push(action)
-}
+// `push_action` helper removed — all push sites now go through
+// `emit_actions!` which provides compile-time per-site budget
+// enforcement (DEF-045). The old helper's Result handling is
+// subsumed by the macro's `on_overflow` parameter.
