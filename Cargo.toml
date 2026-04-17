@@ -31,6 +31,43 @@ repository = "https://github.com/smir-ant/bsql"
 # `default-features = false`.
 heapless = { version = "0.9.2", default-features = false }
 
+# `sha2` — SHA-256 hash used by SCRAM-SHA-256 authentication (RFC 5802).
+# Expert-domain cryptography: DEF-META-01 mandates we never hand-roll
+# this. RustCrypto org, audited. `default-features = false` for no_std.
+sha2 = { version = "0.10", default-features = false }
+
+# `hmac` — HMAC-SHA-256 used by SCRAM to derive keys and signatures.
+# Same rationale as `sha2`: expert-domain, DEF-META-01 binding.
+hmac = { version = "0.12", default-features = false }
+
+# `pbkdf2` — PBKDF2-HMAC-SHA-256 key derivation for SCRAM salted
+# passwords (RFC 7677). Timing-safe implementation from RustCrypto.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+
+# `base64` — RFC 4648 encoding/decoding for SCRAM wire messages.
+# Alphabet confusion and padding semantics are non-trivial;
+# DEF-META-01 covers encoding formats. `default-features = false`
+# drops std but keeps the core engine; we only need `no_std` + alloc
+# for the Engine trait. Note: base64 0.22 requires `alloc` feature
+# for most operations, but we only need stack-based encode/decode
+# via `engine::general_purpose::STANDARD` with pre-sized buffers.
+base64 = { version = "0.22", default-features = false }
+
+# `subtle` — constant-time comparison for SCRAM server-signature
+# verification. Prevents timing side-channels on secret-derived
+# digests. DEF-META-01 scope (cryptographic primitive).
+subtle = { version = "2", default-features = false }
+
+# `zeroize` — secure memory scrubbing on drop for password and key
+# buffers. The `zeroize_derive` feature provides `#[derive(Zeroize,
+# ZeroizeOnDrop)]` for struct fields. DEF-META-01 scope.
+zeroize = { version = "1", default-features = false, features = ["zeroize_derive"] }
+
+# `getrandom` — cryptographically secure random bytes for SCRAM
+# client nonce. OS-provided entropy; never hand-rolled, never
+# SystemTime-seeded. DEF-META-01 scope.
+getrandom = { version = "0.2", default-features = false }
+
 # --- Build profiles ---
 #
 # Consumer profiles apply when bsql is used as a library. These

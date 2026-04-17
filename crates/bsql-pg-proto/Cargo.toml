@@ -17,6 +17,18 @@ categories = ["database", "no-std", "parser-implementations"]
 
 [dependencies]
 heapless = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
+base64 = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+
+# `getrandom` is a dev/test dependency for deterministic nonce
+# injection in tests. Production nonce generation uses it too, but
+# behind a cfg — the no_std, no_alloc contract is preserved because
+# getrandom provides OS entropy via a thin syscall wrapper.
+getrandom = { workspace = true }
 
 # `panic = "abort"` is set at the workspace level for `release` so
 # unwinding cannot occur in production. The forbid-bundle in

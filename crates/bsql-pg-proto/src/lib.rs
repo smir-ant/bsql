@@ -91,19 +91,30 @@ pub mod command;
 mod dispatch;
 pub mod error;
 pub mod frame;
+pub mod ident;
+pub mod password;
 pub mod protocol;
 pub mod reply_id;
+pub mod scram;
+pub mod sensitive;
+pub mod session_params;
 pub mod state;
 pub mod wire;
+pub mod write_buf;
 
 pub use action::{Action, OutActions, Reply, SendBuf};
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::PgCommand;
 pub use error::ProtocolError;
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
+pub use ident::{ApplicationName, DatabaseName, Ident, IdentError};
+pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{MAX_ACTIONS_PER_CALL, PgProtocol};
 pub use reply_id::ReplyId;
+pub use sensitive::Sensitive;
+pub use session_params::SessionParams;
 pub use state::ProtoState;
+pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------
 // Tier-1 compile gates on Send — every type that crosses a task
@@ -119,6 +130,7 @@ pub use state::ProtoState;
 // ---------------------------------------------------------------------
 const _: fn() = || {
     fn assert_send<T: Send>() {}
+    // Phase 1a types
     assert_send::<action::Action>();
     assert_send::<action::OutActions>();
     assert_send::<action::Reply>();
@@ -128,4 +140,14 @@ const _: fn() = || {
     assert_send::<protocol::PgProtocol>();
     assert_send::<reply_id::ReplyId>();
     assert_send::<state::ProtoState>();
+    // Phase 1b types
+    assert_send::<ident::Ident>();
+    assert_send::<ident::DatabaseName>();
+    assert_send::<ident::ApplicationName>();
+    assert_send::<password::Password>();
+    assert_send::<password::Credentials>();
+    assert_send::<session_params::SessionParams>();
+    assert_send::<write_buf::WriteBuf>();
+    assert_send::<scram::types::SecretDigest>();
+    assert_send::<scram::types::CappedServerNonce>();
 };
