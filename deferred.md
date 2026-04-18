@@ -215,6 +215,72 @@ mechanism fully closes the observable behaviour".
 | DEF-053 | Channel binding (SCRAM-SHA-256-PLUS): Phase 1b uses `n,,` GS2 header and `biws` cbind data (no channel binding). Requires TLS channel binding data from the transport layer, which does not exist until the async wrapper lands in Phase 1e. GS2 header always `n,,`, cbind always `biws`. | 1e (with TLS) | 2 (structural — requires transport-layer data not yet available) |
 | DEF-052 | `ReplyId::drop` diagnostic-masking under `panic = "unwind"`. When a test panics for an unrelated reason while a non-delivered `ReplyId` is alive, the Drop-guard's `assert!` fires during unwinding → double-panic → `SIGABRT` → original panic message is masked. Safety property is NOT weakened (the guard still catches undelivered-drop); only test-time diagnostic quality degrades. Fix direction: use `cfg_select!` (stable since Rust 1.95, now our MSRV) to conditionally compile `if std::thread::panicking() { return; }` in debug/test builds without pulling `std` into release or `no_std` downstream builds. `cfg_select!` replaces the previously-considered `cfg-if` dep or manual `#[cfg]` stacking. Mitigation today: tests that leave an in-flight ReplyId call `drain_pending_ping` (integration tests) or complete the flow to `Idle`/`Errored` (library internal tests). The permanent `PgProtocol::terminate(self, cause) -> OutActions` lands with the async wrapper in Phase 1e and subsumes this concern for wrapper-driven teardown. | 1e (with wrapper) or sooner with cfg_select! | 2 (diagnostic-quality, not safety) |
 
+## 11. Phase-1b hardening (2026-04-18)
+
+Second paranoid audit pass before Phase 1c begins. Found one latent
+Phase-1c bug, one Part-V discipline violation, one manufactured-variant
+leak, and two classes of regression brittleness ("glass architecture"
+where changing a literal constant silently breaks invariants). All
+resolved in this commit; future Phase-1c commitments registered as
+open items below.
+
+### Closed in this pass
+
+| ID | Status | What closed it |
+|---|---|---|
+| DEF-054 | Closed | `is_post_auth_state` renamed to `allows_unsolicited_param_status` with exhaustive `match` over every `ProtoState` variant. `Idle` and `AwaitingPingReply` now accept unsolicited `ParameterStatus` (per PG spec: server emits PS after `SET`, `ALTER SYSTEM`, session-parameter updates). Pre-filter in `feed_bytes` records and skips dispatch; dispatcher PS arms removed. Adding a new state variant without explicitly deciding its PS policy now fails the build here. **Latent Phase-1c bug fixed preemptively**: before this, any runtime `SET` command's PS would have triggered `UnexpectedFrame` → `CloseSocket`. Three regression tests added (`unsolicited_param_status_in_idle_is_recorded_and_skipped`, `unsolicited_param_status_in_awaiting_ping_reply_is_recorded`, `param_status_during_pre_auth_is_unexpected`). |
+| DEF-055 | Closed | `emit_actions!` split into two forms: `on_overflow: break` (loop callers, bails out of the enclosing loop) and no-bail (non-loop callers where the `const _ = assert!(MAX >= budget)` proves the push cannot fail on a fresh `OutActions`). Previous Part-V violation (`#[allow(clippy::needless_return)]` without `reason`) removed entirely. |
+| DEF-056 | Closed | `ProtocolError::MalformedParameterStatus` variant removed. It was manufactured (never emitted anywhere; classification path has never existed). Violation of §4.6 manufactured-variant ban. Phase 1c can re-introduce with a real emit path if `record_param_status`'s silent-drop policy changes. |
+| DEF-057 | Closed | `max_startup_message_size()` (`write_buf.rs`) and `sasl_initial_response_frame_size()` / `sasl_response_frame_size()` / `expected_client_first_bare_size()` / `expected_client_first_msg_size()` / `expected_client_final_msg_size()` (`scram/wire.rs`) as `const fn` over the underlying inputs (`MAX_IDENT_LEN`, `MAX_APP_NAME_LEN`, `MAX_CLIENT_NONCE_B64_LEN`, `MAX_SERVER_NONCE_LEN`). All `const _ = assert!(...)` drift-guards link `MAX_OWNED_SEND_LEN` / SCRAM buffer caps to the computed worst case. Bumping any contributing input without growing the cap now fails the build. Tier 2 → 1 on regression resilience. |
+| DEF-058 | Closed | `ReadBuf::append` lazy-compacts — attempts `extend_from_slice` first (fast path when tail has room, no memmove) and only reclaims the consumed prefix when the tail is insufficient. `heapless::Vec::extend_from_slice` is all-or-nothing on overflow so the retry is safe. `ReadBuf::append`, `ReadBuf::advance` gained `#[inline]` for per-I/O-cycle hot path. Saves one memmove per read-heavy append call on typical workload. |
+
+### Phase-1c binding commitments (open)
+
+All items below are **mandatory at tier-1** unless the cell says
+otherwise. Each must land in Phase 1c's sub-phases before that phase
+closes.
+
+| ID | Commitment | Phase | Target tier |
+|---|---|---|---|
+| DEF-059 | `compute_push_action(cmd: PgCommand, state: ProtoState) -> PushAction` + `apply_push_action(&mut self, action: PushAction) -> OutActions` — pure-compute / mutate split. The pure half is testable without constructing `PgProtocol`; side effects are isolated in one place. DX improvement, lowers cognitive overhead of push paths as commands proliferate in 1c/1d. | 1c | — (DX + test surface) |
+| DEF-060 | Typed SCRAM / wire error enums replacing `ProtocolError::ScramError { detail: heapless::String<128> }` and all `heapless::String::try_from("…").unwrap_or_default()` sites. Replace with sub-enums of discrete failure kinds (`ScramFailure::NoMechanism`, `::NoncePrefixMismatch`, etc.) + `Display` over `&'static str`. Kills the silent-truncation class from cold path entirely. Tier 3 → 1. | 1c | 1 |
+| DEF-061 | `ProtoState::Errored(ErrorKind)` instead of `ProtoState::Errored(ProtocolError)`. First fatal emits the full `ProtocolError` in the `FailReply` action; subsequent pushes into `Errored` see `ErrorKind` (u8-size discriminant) and emit a classified "connection closed, see earlier error" reply. Eliminates ~1.3 KB per-push stack clone on the cold path while preserving diagnostic quality (full error goes out once on the first fatal). | 1c | — (perf + simplification) |
+| DEF-062 | `NoticeResponse` (tag `'N'`) pre-dispatch filter — extracts the notice from any state, emits `Action::EmitNotice(...)`, skips the dispatcher. Matches the DEF-054 pattern for ParameterStatus. Supersedes DEF-043 with concrete shape. | 1c | 1 (single-site, structural) |
+| DEF-063 | Handshake-flow typestate extraction. The linear chain `Idle → ConnectingStartup → ConnectingScram* → ConnectingPostAuth* → Idle` becomes a dedicated `handshake` module with typestate transitions: each step is `fn step(PrevState, ...) -> Result<(NextState, Action), ProtocolError>`. Reactive states (AwaitingQueryReply, StreamingRows, InTransaction) remain in the enum — typestate doesn't apply to them because server events can drive multiple outcomes. Tier 2 → 1 on "invalid handshake-step call from wrong state". | 1c | 1 on handshake path |
+| DEF-064 | `parse_error_response` bounded-iterations loop — replace unbounded `loop { pos += 1; ... }` with `for _ in 0..MAX_ERROR_FIELDS (=16) { ... }`. Closes a potential DoS vector on malformed `ErrorResponse` with adversarially-crafted fields. | 1c | 2 (structural bound) |
+| DEF-065 | SCRAM message assembly writes directly into `WriteBuf` — remove `build_client_first_bare` / `build_client_first_message` intermediate `heapless::Vec` buffers (currently 128 + 136 = 264 bytes stack + 2 memcpy per SCRAM init). Save state `client_first_bare` only (the one input needed later for HMAC). | 1c | — (perf + simplification) |
+
+### Phase-1e+ binding commitments (open)
+
+| ID | Commitment | Phase | Target tier |
+|---|---|---|---|
+| DEF-066 | `ReplyId` layout optimisation: pack `delivered: bool` into the LSB of `value: NonZeroU64` (or equivalent niche). Saves 8 bytes per in-flight reply. Adopt iff bench on the Phase-1e wrapper shows meaningful impact (pool with `heapless::FnvIndexMap<ReplyId, Sender, N>` or slotted `Box<[Option<Sender>]>` — DEF-034). | 1e | — (perf, measured) |
+
+### Measurement milestones (verification, not code)
+
+| ID | Milestone | Phase |
+|---|---|---|
+| DEF-067 | `cargo rustc -p bsql-pg-proto --release -- --emit asm` on `parse_header` and `dispatch`. Verify: (a) `parse_header` compiles to ≤ 12 instructions on happy path, branchless BE-load; (b) `dispatch`'s big `match (ProtoState, u8)` generates a jump table or tree of comparisons (not a linear chain). Results committed to `docs/asm/phase-1c.md`. Guards against silent perf regression when state surface expands. | end of 1c |
+| DEF-068 | `base64-simd` vs `base64` benchmark on large payloads (bytea decode, JSONB text). Small-payload SCRAM paths (nonce 24 chars, proof 44 chars) are too small for SIMD overhead to amortise; the benchmark is for the forthcoming binary codec in 1c. Adopt iff ≥ 2× gain on target arch (x86_64 AVX2, aarch64 NEON). Fallback preserved on unsupported targets. | 1c codec |
+| DEF-069 | Allocation-profile harness + baseline (`benchmarks/alloc_profile.md`) per `reforge.md §80.10`. Counting global allocator in benches crate, comparative workload vs sqlx / tokio-postgres / diesel / libpq. | 6 |
+
+### Research track (Phase 5+ / v1.x+)
+
+| ID | Idea | Phase | Rationale |
+|---|---|---|---|
+| DEF-070 | Proc-macro `state_machine!` DSL — declarative state + transition syntax, auto-generates `ProtoState` enum + dispatcher + GraphViz diagram for docs. Revisit when the machine exceeds ~15 states (query + stream + copy + listen + cancel + terminate + transaction + savepoints + ...). DX / documentation win; no tier change (same enum + exhaustive match under the hood). | 5+ | Declarative form becomes more readable than hand-written match when state count grows. Not urgent until Phase 3. |
+| DEF-071 | Session-types POC — compile-time wire sequencing via type-level encoding. Would give tier-1 on "send/recv in correct order" instead of today's tier-2-via-exhaustive-match. Rust session-type crates are pre-production; error messages are notoriously opaque. Revisit if a production-ready library emerges, or as a standalone research crate without public API exposure. Related to §80.20 proof-carrying tokens. | v1.x+ | Current design covers ~95% of the session-type guarantees via exhaustive match + state-as-data. Adopting session types would trade DX for a marginal tier upgrade. |
+
+### Architectural commitment: sync-driver path
+
+The sans-I/O core (`bsql-pg-proto`) has no dependence on tokio. This
+was always the plan (§7.1), but the **sibling sync-driver crates**
+that take full advantage of it need explicit registration.
+
+| ID | Commitment | Phase |
+|---|---|---|
+| DEF-072 | `bsql-driver-postgres-sync` and `bsql-driver-sqlite-sync` sibling crates — pure-sync implementations of `Backend` using `std::net::TcpStream` (blocking) + `std::sync::mpsc` / `crossbeam-channel` instead of tokio primitives. `bsql-pg-proto` is shared byte-for-byte; the driver layer is the only difference. Users feature-select async or sync (or both, for heterogeneous pools). Benefit: apps without tokio (CLI tools, embedded, sync libraries) never transitively pull tokio. | 3 (async lands 1e; sync sibling in 3 with pool) |
+
 ## 10. Closed
 
 Move entries here when a deferral is genuinely resolved — not just

@@ -8,37 +8,69 @@
 //!
 //! DEF-012/013/014: `MAX_OWNED_SEND_LEN`, `SendBuf::Owned`, `WriteBuf`.
 //!
-//! # `MAX_OWNED_SEND_LEN` sizing
+//! # `MAX_OWNED_SEND_LEN` sizing — const fn derivation (DEF-057)
 //!
-//! Worst-case Phase 1b outbound frame: `StartupMessage` with maximum-
-//! length user (63), database (63), application_name (128), plus fixed
-//! keys and separators:
+//! The cap is not a hardcoded magic number. [`max_startup_message_size`]
+//! computes the worst-case `StartupMessage` byte length from its
+//! components — the underlying `MAX_IDENT_LEN`, `MAX_APP_NAME_LEN`, and
+//! fixed key names. The `const _` assert below ties the buffer cap to
+//! those inputs: bumping `MAX_IDENT_LEN` or adding a StartupMessage
+//! parameter without growing the cap fails the build.
 //!
-//! ```text
-//! 4 bytes (length prefix)
-//! 4 bytes (protocol version 196608 = 3.0)
-//! "user\0" + user(63) + "\0"     =  5 + 63 + 1 =  69
-//! "database\0" + db(63) + "\0"   =  9 + 63 + 1 =  73
-//! "application_name\0" + app(128) + "\0" = 17 + 128 + 1 = 146
-//! "\0" (terminator)              =  1
-//! Total = 4 + 4 + 69 + 73 + 146 + 1 = 297
-//! ```
-//!
-//! SASL messages are smaller (~200 bytes). We round up to 512 for
-//! headroom against future startup parameters.
+//! SASL frame sizes have analogous drift-guards in `scram::wire`.
 
 use core::fmt;
 
 /// Maximum byte capacity for an owned outbound frame.
 ///
-/// See module-level sizing math. 512 bytes covers worst-case Phase 1b
-/// StartupMessage + SASLInitialResponse + SASLResponse with generous
-/// margin.
+/// Derived from the worst case across StartupMessage, SASLInitialResponse,
+/// and SASLResponse — see [`max_startup_message_size`] and the
+/// `scram::wire::sasl_*_frame_size` counterparts. 512 bytes provides
+/// comfortable headroom above the ~389-byte worst-case SASLResponse.
 pub const MAX_OWNED_SEND_LEN: usize = 512;
 
-// Compile-time: the owned send buffer must hold at least the largest
-// Phase 1b frame (297 bytes for a maxed StartupMessage).
-const _: () = assert!(MAX_OWNED_SEND_LEN >= 297);
+/// Worst-case byte size of a PostgreSQL `StartupMessage` frame.
+///
+/// `StartupMessage` has no tag byte; the 4-byte length prefix includes
+/// itself per PG spec. The body is a fixed 4-byte protocol version
+/// followed by NUL-terminated key/value pairs, ending in a single NUL
+/// terminator.
+///
+/// # Drift-guarded inputs
+///
+/// - `user` (key `"user"`, 4 bytes): value up to [`crate::ident::MAX_IDENT_LEN`].
+/// - `database` (key `"database"`, 8 bytes): value up to [`crate::ident::MAX_IDENT_LEN`].
+/// - `application_name` (key `"application_name"`, 16 bytes): value
+///   up to [`crate::ident::MAX_APP_NAME_LEN`].
+///
+/// Changing any of the inputs without growing [`MAX_OWNED_SEND_LEN`]
+/// fails the `const _` assert below.
+pub const fn max_startup_message_size() -> usize {
+    // `saturating_add` keeps the const body clean of `+` operators;
+    // the crate-root forbid-bundle bans `arithmetic_side_effects` even
+    // in const context, and saturating arithmetic is the accepted form
+    // across the rest of the crate.
+    4usize // length prefix
+        .saturating_add(4) // protocol version
+        .saturating_add(4) // "user"
+        .saturating_add(1) // NUL
+        .saturating_add(crate::ident::MAX_IDENT_LEN)
+        .saturating_add(1) // NUL
+        .saturating_add(8) // "database"
+        .saturating_add(1) // NUL
+        .saturating_add(crate::ident::MAX_IDENT_LEN)
+        .saturating_add(1) // NUL
+        .saturating_add(16) // "application_name"
+        .saturating_add(1) // NUL
+        .saturating_add(crate::ident::MAX_APP_NAME_LEN)
+        .saturating_add(1) // NUL
+        .saturating_add(1) // trailing empty-key NUL
+}
+
+// DEF-057 drift guard. Bumping any contributing constant (MAX_IDENT_LEN,
+// MAX_APP_NAME_LEN) or adding a StartupMessage parameter without
+// growing MAX_OWNED_SEND_LEN fails the build here.
+const _: () = assert!(MAX_OWNED_SEND_LEN >= max_startup_message_size());
 
 /// Bounded outbound frame buffer with PG wire builders.
 ///

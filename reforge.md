@@ -441,16 +441,25 @@ Features stable в MSRV 1.95 (или earlier) которые bsql активно
 PG path:
   bsql-pg-proto  (sans-I/O, no_std, pure sync state machine)
        │
-       ▼
-  bsql-driver-postgres  (async run_io + auth + TLS + codec + PgBackend impl)
+       ├────────────────────────────────┐
+       ▼                                ▼
+  bsql-driver-postgres              bsql-driver-postgres-sync
+  (async run_io via tokio,          (sync run_io via
+   TLS, SCRAM, codec)                std::net, no tokio)
+                                    DEF-072; Phase 3+
 
 SQLite path:
-  bsql-driver-sqlite  (FFI + SqliteBackend + spawn_blocking shim)
-  (no *-proto split — no wire protocol to abstract)
+  bsql-driver-sqlite                bsql-driver-sqlite-sync
+  (FFI + SqliteBackend              (FFI + direct-blocking,
+   + spawn_blocking shim)            no runtime)
+  (no *-proto split —               DEF-072; Phase 3+
+   no wire protocol to abstract)
 
 Shared utilities:
   bsql-arena  (bump allocator for row data; internal helper, не exposed в bsql facade)
 ```
+
+**Async и sync — оба first-class.** Sans-I/O (`§7.1`) делает возможным написать две параллельные driver-обёртки вокруг одного и того же `bsql-pg-proto`. Приложения без tokio (CLI, embedded, sync backends) выбирают `*-sync` крейты и получают те же tier-гарантии. Детали commitment'а — DEF-072.
 
 ### §6.2. Per-crate responsibilities
 
@@ -529,6 +538,7 @@ Protocol-логика отделяется от I/O-транспорта физ�
 1. Cancellation-safety by construction. User future держит `oneshot::Receiver`. Drop future → drop receiver. Background task видит закрытый channel, **продолжает** драйвить state-machine до RFQ (чистое состояние), выбрасывает reply (никому не нужен), готов к next command.
 2. Verifiability. Sync code — proptest 10⁵, Loom harness на ~100 LoC async wrapper, typestate — всё применимо. Async-mixed code всё это теряет.
 3. Reuse. Тот же `PgProtocol` используется и sync и async wrapper'ами. v0.27 имел 5K LoC sync + 1.5K LoC async с дубликатом логики. v1.0: 1 state machine, 2 тонкие оболочки.
+4. **Sync-без-tokio.** Пользователь, который не хочет async runtime (CLI, embedded, блокирующий бэкенд), добавляет `bsql-driver-postgres-sync` вместо async-варианта. Внутри — `std::net::TcpStream` + `std::sync::mpsc`. Никаких транзитивных tokio-зависимостей. Тот же `bsql-pg-proto` байт-в-байт; отличается только слой I/O. Это конкретный win от sans-I/O, а не декоративный — DEF-072.
 
 **Прецедент в Rust ecosystem:** `rustls`, `quiche`, `h2` используют этот паттерн. Ни один Rust SQL-драйвер до bsql этого не делал.
 
@@ -1041,6 +1051,8 @@ pub enum ProtoState {
 
 **Variants добавляются** когда их путь реализуется. Manufactured-future variants (без кода входа/выхода) — запрещены §4.6.
 
+**Phase 1c split-plan (DEF-063):** handshake-флоу (`ConnectingStartup → ConnectingScram* → ConnectingPostAuth* → Idle`) — **линейная цепочка**, где typestate даёт реальный tier-1 выигрыш: нельзя вызвать шаг 3 handshake'а минуя шаг 2. Phase 1c выделяет handshake в отдельный `handshake` модуль с typestate-transitions (`fn step_n(PrevState, ...) -> Result<(NextState, Action), ProtocolError>`). **Реактивные состояния** (`AwaitingQueryReply`, `StreamingRows`, `InTransaction`) остаются в enum — typestate там не работает, потому что один и тот же server-event (`'N'`, `'Z'`, `'E'`, ...) может вести в несколько исходов, sum-type неизбежен. Это гибрид: чистая tier-1 форма для линейных участков, enum для реактивных. См. DEF-063.
+
 ## §18. Command enum
 
 `PgCommand` — см. §13. Each variant:
@@ -1103,6 +1115,13 @@ enum DispatchOutcome {
 Pattern match `(prev, header.tag)` exhaustive over ALL (state, tag) combinations. Unlisted = compile error.
 
 Каждый arm либо `Advanced` либо `Errored`. Separation means outer feed_bytes loop can't accidentally advance on errored path — no silent corruption.
+
+**Pre-dispatch filters (DEF-054 / DEF-062).** Некоторые inbound frame'ы обрабатываются **до** dispatcher'а, потому что они могут прилететь в любом post-startup state и не должны засорять state-специфичные arm'ы:
+
+- `ParameterStatus` (tag `'S'`): перехватывается pre-dispatch если `allows_unsolicited_param_status(state)`; записывается в `SessionParams`, кадр проscipает ahead, dispatch не вызывается. Exhaustive match по state-variants гарантирует, что новый state не забудется (DEF-054). Ship'нуто в Phase 1b hardening.
+- `NoticeResponse` (tag `'N'`): аналогично — эмиттится `Action::EmitNotice(...)`, dispatcher не видит (DEF-062, Phase 1c).
+
+**Phase 1c compute/apply split (DEF-059).** `push_command` сейчас смешивает чистую логику «что делать с командой в этом state» и мутацию state + emit actions. Split на `compute_push_action(cmd, state) -> PushAction` (pure) и `apply_push_action(&mut self, action) -> OutActions` (mutate) даёт testability pure-части без construction'а `PgProtocol` и изолирует side-effects. Без изменения tier — улучшение DX / testability.
 
 ## §22. run_io (~100-200 LoC async wrapper)
 
@@ -3289,11 +3308,12 @@ Acceptance:
 - Loom harness on run_io passes.
 
 **Sub-phases:**
-- 1a — bsql-pg-proto skeleton + Ping flow.
-- 1b — SCRAM-SHA-256 в pure-sync (hardest — ~300 LoC HMAC-SHA256 + PBKDF2 + base64 + nonce generation).
-- 1c — Query / Execute / post-auth chain / basic codec.
+- 1a — bsql-pg-proto skeleton + Ping flow. ✅
+- 1b — SCRAM-SHA-256 в pure-sync (hardest — ~300 LoC HMAC-SHA256 + PBKDF2 + base64 + nonce generation). ✅
+- **1b hardening (2026-04-18)** — latent Phase-1c bug fix + regression-brittleness lockdown before 1c begins. Closed: DEF-054 (exhaustive `allows_unsolicited_param_status`, unsolicited PS works in Idle), DEF-055 (`emit_actions!` two-form split, no `#[allow]` left), DEF-056 (`MalformedParameterStatus` manufactured variant removed), DEF-057 (`const fn` size math ties `MAX_OWNED_SEND_LEN` / SCRAM bounds to `MAX_IDENT_LEN`/`MAX_APP_NAME_LEN`/`MAX_SERVER_NONCE_LEN`), DEF-058 (`ReadBuf` lazy-compact + inline hints). ✅
+- 1c — Query / Execute / post-auth chain / basic codec. Binding commitments from the 1b-hardening audit: **DEF-059** compute/apply split in `PgProtocol`, **DEF-060** typed error enums replacing `heapless::String<N>` in cold-path errors (kills silent-truncation class), **DEF-061** `Errored(ErrorKind)` instead of `Errored(ProtocolError)` (zero-clone on subsequent pushes), **DEF-062** `NoticeResponse` pre-dispatch filter, **DEF-063** handshake-flow typestate extraction (tier-2→1 on "invalid handshake call from wrong state"), **DEF-064** bounded-iterations loop in `parse_error_response`, **DEF-065** SCRAM message assembly direct-to-`WriteBuf`. Measurement milestone **DEF-067** (`cargo asm` verification) and **DEF-068** (base64-simd benchmark decision) land at the end of 1c.
 - 1d — Streaming, COPY, LISTEN/NOTIFY.
-- 1e — bsql-backend + PgBackend + run_io + live ping integration.
+- 1e — bsql-backend + PgBackend + run_io + live ping integration. Binding: **DEF-027** sealed-token pattern, **DEF-047** wrapper typestate (`Client<Idle>` / `Transaction<Active>` / `QueryStream<Open>`), **DEF-031** `JoinHandle` owned inside `Client`, **DEF-035** semaphore-gated `max_inflight`, **DEF-052** `cfg_select!` for `ReplyId::drop` diagnostic under `panic = "unwind"`, **DEF-053** SCRAM channel binding (requires TLS), **DEF-066** `ReplyId` bit-packing (if measured benefit warrants).
 - 1f — full query integration test (real SELECT against live PG, using raw codec; NO macro yet).
 
 ## §107. Phase 2 — Macros + compile-time validation
@@ -3327,6 +3347,7 @@ Acceptance:
 - Schema fingerprint runtime check.
 - `bsql` facade crate with type aliases.
 - End-to-end: full-stack query through macro → pool → driver → live PG.
+- **Sync driver sibling lands here**: `bsql-driver-postgres-sync` крейт — pure-sync `Backend` impl на `std::net::TcpStream` + `std::sync::mpsc`/`crossbeam-channel`. `bsql-core::Pool<B>` работает и с `PgBackend` (async tokio) и с `PgBackendSync` (sync std); пользователь выбирает через feature flag на `bsql` фасаде. Тот же `bsql-pg-proto` обслуживает оба. DEF-072.
 
 ## §109. Phase 4 — SQLite backend
 
@@ -3338,6 +3359,8 @@ Acceptance:
 - SQLite-specific features (WAL, mmap, STRICT tables, foreign keys).
 - SQLite param type checking в macro (§77).
 - Parity test suite (where semantically applicable) against PG path.
+
+**Sync sibling:** `bsql-driver-sqlite-sync` — прямые FFI вызовы без `spawn_blocking`. Для приложений без async runtime. Тот же FFI-модуль (`ffi.rs`) с его `unsafe` + SAFETY-аудитом, только без tokio-адаптера. DEF-072.
 
 ## §110. Phase 5 — Killer features
 

@@ -23,7 +23,7 @@ use crate::state::ProtoState;
 use crate::wire::{
     AUTH_OK, AUTH_SASL, AUTH_SASL_CONTINUE, AUTH_SASL_FINAL, SCRAM_SHA_256_MECHANISM,
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_ERROR_RESPONSE, TAG_NEGOTIATE_PROTOCOL_VERSION,
-    TAG_PARAMETER_STATUS, TAG_READY_FOR_QUERY,
+    TAG_READY_FOR_QUERY,
 };
 
 /// What to do after dispatching a single frame.
@@ -174,16 +174,11 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
 
         // =============================================================
         // Post-auth: waiting for BackendKeyData
+        //
+        // `ParameterStatus` (tag 'S') is filtered pre-dispatch in
+        // `feed_bytes` via `allows_unsolicited_param_status`; the
+        // dispatcher never sees it for these states. DEF-054.
         // =============================================================
-        (ProtoState::ConnectingPostAuthWaitKey(reply), TAG_PARAMETER_STATUS) => {
-            // ParameterStatus recording is handled by the feed_bytes
-            // loop on PgProtocol (params live on the protocol, not
-            // in the state variant). We just stay in the same state.
-            DispatchOutcome::Advanced {
-                new_state: ProtoState::ConnectingPostAuthWaitKey(reply),
-                action: None,
-            }
-        }
         (ProtoState::ConnectingPostAuthWaitKey(reply), TAG_BACKEND_KEY_DATA) => {
             match parse_backend_key_data(payload) {
                 Ok((pid, secret_key)) => DispatchOutcome::Advanced {
@@ -214,25 +209,11 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
 
         // =============================================================
         // Post-auth: have BackendKeyData, waiting for ReadyForQuery
+        //
+        // `ParameterStatus` (tag 'S') is filtered pre-dispatch in
+        // `feed_bytes` via `allows_unsolicited_param_status`; the
+        // dispatcher never sees it for these states. DEF-054.
         // =============================================================
-        (
-            ProtoState::ConnectingPostAuthHaveKey {
-                reply,
-                pid,
-                secret_key,
-            },
-            TAG_PARAMETER_STATUS,
-        ) => {
-            // ParameterStatus recording handled by feed_bytes loop.
-            DispatchOutcome::Advanced {
-                new_state: ProtoState::ConnectingPostAuthHaveKey {
-                    reply,
-                    pid,
-                    secret_key,
-                },
-                action: None,
-            }
-        }
         (
             ProtoState::ConnectingPostAuthHaveKey {
                 reply,

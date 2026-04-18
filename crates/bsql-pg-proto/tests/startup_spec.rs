@@ -957,3 +957,139 @@ fn credentials_debug_does_not_leak_password() {
         "Credentials Debug must NOT leak password, got: {debug_output}",
     );
 }
+
+// =================================================================
+// (A) Spec conformance — unsolicited ParameterStatus after startup.
+// DEF-054 regression guard.
+// =================================================================
+
+/// Invariant (spec): once the handshake completes and the state is
+/// `Idle`, the server may emit `ParameterStatus` at any time (commonly
+/// after a session `SET` command or `ALTER SYSTEM`). The protocol must
+/// accept such frames silently — recording the new value in
+/// [`PgProtocol::session_params`] and returning no actions — rather
+/// than classifying as `UnexpectedFrame` and closing the connection.
+///
+/// This pins the `allows_unsolicited_param_status` exhaustive match in
+/// `protocol.rs`: adding a new state variant without explicitly
+/// deciding how it handles unsolicited PS fails the build there, and
+/// flipping `Idle` from `true` to `false` in that match would compile
+/// but would break the invariant this test asserts.
+#[test]
+fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
+    let mut proto = PgProtocol::new();
+    let startup_raw = raw(100);
+    startup_trust(&mut proto, "testuser", None, startup_raw);
+
+    // Complete startup: AuthOk → BackendKeyData → RFQ → Idle.
+    let _ = proto.feed_bytes(&auth_ok_frame());
+    let _ = proto.feed_bytes(&backend_key_data_frame(1, 1));
+    let _ = proto.feed_bytes(&rfq_frame(b'I'));
+    assert!(
+        matches!(proto.state(), ProtoState::Idle),
+        "handshake should land in Idle, got {:?}",
+        proto.state(),
+    );
+
+    // Now simulate PG sending ParameterStatus in idle (e.g. after a
+    // SET command finishes). Before DEF-054 this would trigger
+    // UnexpectedFrame → CloseSocket. After DEF-054 it is recorded
+    // silently.
+    let out = proto.feed_bytes(&param_status_frame("TimeZone", "America/New_York"));
+    assert_eq!(out.len(), 0, "unsolicited PS in Idle emits no actions");
+    assert!(
+        matches!(proto.state(), ProtoState::Idle),
+        "state must remain Idle after unsolicited PS, got {:?}",
+        proto.state(),
+    );
+    assert_eq!(
+        proto.session_params().time_zone.as_deref(),
+        Some("America/New_York"),
+        "PS must update session_params",
+    );
+}
+
+/// Invariant (spec): ParameterStatus arriving while the protocol is
+/// in `AwaitingPingReply` (or any other post-auth flight state) is
+/// similarly recorded without disturbing the state. PG can emit PS
+/// during query execution if `ALTER SYSTEM` runs server-side.
+///
+/// Before DEF-054 this would corrupt the in-flight ping (the PS would
+/// be misclassified as an unexpected frame, failing the Ping reply).
+/// After DEF-054 the PS is recorded pre-dispatch and the Ping remains
+/// in flight.
+#[test]
+fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
+    use bsql_pg_proto::{PgCommand, SendBuf};
+
+    let mut proto = PgProtocol::new();
+    let startup_raw = raw(200);
+    startup_trust(&mut proto, "testuser", None, startup_raw);
+    let _ = proto.feed_bytes(&auth_ok_frame());
+    let _ = proto.feed_bytes(&backend_key_data_frame(1, 1));
+    let _ = proto.feed_bytes(&rfq_frame(b'I'));
+
+    // Send a ping. State → AwaitingPingReply.
+    let ping_raw = raw(201);
+    let push_out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) });
+    assert!(matches!(
+        push_out.as_slice(),
+        [Action::SendBytes(SendBuf::Static(_))]
+    ));
+    assert!(matches!(proto.state(), ProtoState::AwaitingPingReply(_)));
+
+    // Server emits ParameterStatus before RFQ (e.g. an ALTER SYSTEM
+    // committed during our ping's round-trip).
+    let out = proto.feed_bytes(&param_status_frame("client_encoding", "LATIN1"));
+    assert_eq!(out.len(), 0, "PS during flight emits no actions");
+    assert!(
+        matches!(proto.state(), ProtoState::AwaitingPingReply(_)),
+        "PS must not disturb the AwaitingPingReply state",
+    );
+    assert_eq!(
+        proto.session_params().client_encoding.as_deref(),
+        Some("LATIN1"),
+    );
+
+    // Now feed RFQ — ping completes normally.
+    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    assert_eq!(out.len(), 1, "RFQ completes ping with DeliverReply");
+    match out.as_slice() {
+        [Action::DeliverReply { id: delivered, .. }] => {
+            assert_eq!(delivered, &ping_raw);
+        }
+        other => panic!("expected DeliverReply, got {other:?}"),
+    }
+    assert!(matches!(proto.state(), ProtoState::Idle));
+}
+
+/// Invariant (spec): ParameterStatus arriving in a pre-auth state
+/// (before AuthOk) is out-of-spec and must be classified as
+/// UnexpectedFrame — `allows_unsolicited_param_status` returns false
+/// for Connecting* pre-auth states.
+///
+/// This pins the other side of the DEF-054 boundary: flipping a
+/// Connecting* state from `false` to `true` in the exhaustive match
+/// would compile and silently accept server frames that contravene
+/// the auth handshake.
+#[test]
+fn param_status_during_pre_auth_is_unexpected() {
+    let mut proto = PgProtocol::new();
+    let startup_raw = raw(300);
+    startup_trust(&mut proto, "testuser", None, startup_raw);
+    // State is now ConnectingStartup. Server should send
+    // AuthenticationOk / SASL / ErrorResponse — not ParameterStatus.
+    let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"));
+    assert_eq!(out.len(), 2, "pre-auth PS → FailReply + CloseSocket");
+    match out.as_slice() {
+        [Action::FailReply { id: failed, cause }, Action::CloseSocket] => {
+            assert_eq!(failed, &startup_raw);
+            assert!(
+                matches!(cause, ProtocolError::UnexpectedFrame { tag: b'S' }),
+                "expected UnexpectedFrame('S'), got {cause:?}",
+            );
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+}

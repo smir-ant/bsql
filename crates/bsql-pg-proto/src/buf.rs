@@ -64,22 +64,25 @@ impl ReadBuf {
     /// Append `bytes` to the unread region.
     ///
     /// Returns [`ReadBufFull`] if the resulting length would exceed
-    /// [`READ_BUF_CAP`]. Before writing, the buffer auto-compacts —
-    /// reclaims the space `[0..cursor)` already consumed — so the cap
-    /// applies to the *unread* region, not historical data.
+    /// [`READ_BUF_CAP`] even after reclaiming the consumed prefix.
     ///
-    /// Compact-on-write is a deliberate choice over compact-on-read:
-    /// the hot path is "read 8 KiB chunk → parse zero or more frames",
-    /// where compaction once per chunk dominates compaction once per
-    /// frame.
+    /// **Lazy compaction (DEF-058).** We try to fit the incoming bytes
+    /// into the tail first — `heapless::Vec::extend_from_slice` checks
+    /// capacity before copying and returns `Err` without mutation, so
+    /// we can safely retry after compacting. On the typical workload
+    /// (8 KiB chunks on a 4 KiB buffer where previous frames have been
+    /// consumed) this saves one `memmove` per `append` call whenever
+    /// the tail already has room. Only when the tail is insufficient
+    /// do we reclaim `[0..cursor)` and try again.
+    #[inline]
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
+        // Fast path: tail has room, no need to compact.
+        if self.inner.extend_from_slice(bytes).is_ok() {
+            return Ok(());
+        }
+        // Slow path: reclaim the consumed prefix and retry. If it
+        // still does not fit, classify as a fatal buffer-full error.
         self.compact();
-        // After compact, `inner.len() == self.unread_len()`. Capacity
-        // headroom = READ_BUF_CAP - inner.len().
-        // `extend_from_slice` returns Err(()) on overflow, no panic.
-        // `extend_from_slice` returns `Err(CapacityError)` on overflow;
-        // we carry no additional detail from the typed error (heapless
-        // ships it as a marker). Reclassify as our bounded-full error.
         self.inner
             .extend_from_slice(bytes)
             .map_err(|CapacityError { .. }| ReadBufFull {
@@ -114,6 +117,7 @@ impl ReadBuf {
     /// In the dispatcher this Err is dead (we only advance after
     /// `parse_header` confirmed the bytes are present); exposing it
     /// publicly is a tier-1 belt-and-braces.
+    #[inline]
     pub fn advance(&mut self, n: usize) -> Result<(), AdvancePastEnd> {
         let available = self.unread_len();
         if n > available {

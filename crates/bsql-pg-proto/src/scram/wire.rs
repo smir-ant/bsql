@@ -47,6 +47,103 @@ pub const MIN_SCRAM_ITERATIONS: u32 = 4096;
 /// Maximum base64-decoded salt length.
 pub const MAX_SALT_LEN: usize = 64;
 
+/// Base64-encoded length (with RFC 4648 padding) of a SHA-256 digest.
+///
+/// SHA-256 produces 32 bytes. Base64 encoding with padding is
+/// `ceil(N / 3) * 4`; for `N = 32` that is `ceil(32/3) * 4 = 11 * 4 = 44`.
+///
+/// Named as a constant rather than computed via a `const fn`, because
+/// the crate's forbid-bundle bans `clippy::integer_division` even in
+/// const context — and `forbid` cannot be downgraded by `#[expect]`.
+/// The value is verified by the base64 crate's runtime encoding on the
+/// actual proof bytes in the RFC 7677 test vector (see
+/// `scram::crypto::tests`), which fails if the padding length drifts.
+const SHA256_PROOF_B64_LEN: usize = 44;
+
+/// Byte size of a SASL `Initial Response` frame sent by the client.
+///
+/// Wire format: tag `'p'` (1) + length field (4) + mechanism name +
+/// NUL (1) + body-length field (4) + client-first-message body.
+///
+/// The result is used in a drift-guard against
+/// [`crate::write_buf::MAX_OWNED_SEND_LEN`] — if the worst-case SASL
+/// initial response outgrows the outbound buffer, build fails.
+pub const fn sasl_initial_response_frame_size() -> usize {
+    1usize // tag 'p'
+        .saturating_add(4) // length field
+        .saturating_add(crate::wire::SCRAM_SHA_256_MECHANISM.len())
+        .saturating_add(1) // mechanism NUL terminator
+        .saturating_add(4) // body-length field
+        .saturating_add(MAX_CLIENT_FIRST_MSG_LEN)
+}
+
+/// Byte size of a SASL `Response` frame sent by the client (step 2).
+///
+/// Wire format: tag `'p'` (1) + length field (4) + client-final-message
+/// body.
+pub const fn sasl_response_frame_size() -> usize {
+    1usize // tag 'p'
+        .saturating_add(4) // length field
+        .saturating_add(MAX_CLIENT_FINAL_MSG_LEN)
+}
+
+// -------------------------------------------------------------------
+// Drift guards (DEF-057)
+//
+// Each expected-size const fn below computes a worst-case size from
+// the underlying inputs (`MAX_IDENT_LEN`, `MAX_SERVER_NONCE_LEN`, ...).
+// The accompanying `const _` assert ties the declared bound to its
+// computed worst case. Bump any input without growing the bound →
+// build fails here. This converts a class of silent-runtime-truncation
+// regressions (tier 2) into compile errors (tier 1).
+// -------------------------------------------------------------------
+
+/// Worst-case `client-first-message-bare`: `n=<user>,r=<nonce_b64>`.
+const fn expected_client_first_bare_size() -> usize {
+    2usize // "n="
+        .saturating_add(crate::ident::MAX_IDENT_LEN)
+        .saturating_add(3) // ",r="
+        .saturating_add(MAX_CLIENT_NONCE_B64_LEN)
+}
+const _: () = assert!(
+    MAX_CLIENT_FIRST_BARE_LEN >= expected_client_first_bare_size(),
+    "MAX_CLIENT_FIRST_BARE_LEN below worst-case n=<user>,r=<nonce>",
+);
+
+/// Worst-case full `client-first-message`: GS2 header + bare.
+const fn expected_client_first_msg_size() -> usize {
+    3usize // GS2 header "n,,"
+        .saturating_add(MAX_CLIENT_FIRST_BARE_LEN)
+}
+const _: () = assert!(
+    MAX_CLIENT_FIRST_MSG_LEN >= expected_client_first_msg_size(),
+    "MAX_CLIENT_FIRST_MSG_LEN below GS2 header + client-first-bare",
+);
+
+/// Worst-case `client-final-message`: `c=biws,r=<server_nonce>,p=<proof_b64>`.
+const fn expected_client_final_msg_size() -> usize {
+    2usize // "c="
+        .saturating_add(4) // "biws" (base64 of GS2 "n,,")
+        .saturating_add(3) // ",r="
+        .saturating_add(crate::scram::types::MAX_SERVER_NONCE_LEN)
+        .saturating_add(3) // ",p="
+        .saturating_add(SHA256_PROOF_B64_LEN)
+}
+const _: () = assert!(
+    MAX_CLIENT_FINAL_MSG_LEN >= expected_client_final_msg_size(),
+    "MAX_CLIENT_FINAL_MSG_LEN below worst-case c=biws,r=<nonce>,p=<proof>",
+);
+
+// SASL frames must fit inside the shared outbound buffer.
+const _: () = assert!(
+    crate::write_buf::MAX_OWNED_SEND_LEN >= sasl_initial_response_frame_size(),
+    "MAX_OWNED_SEND_LEN below SASLInitialResponse frame size",
+);
+const _: () = assert!(
+    crate::write_buf::MAX_OWNED_SEND_LEN >= sasl_response_frame_size(),
+    "MAX_OWNED_SEND_LEN below SASLResponse frame size",
+);
+
 /// Errors from SCRAM wire message construction or parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScramError {

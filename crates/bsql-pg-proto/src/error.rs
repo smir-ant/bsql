@@ -129,10 +129,6 @@ pub enum ProtocolError {
         payload_len: usize,
     },
 
-    /// Server's `ParameterStatus` payload is malformed (missing NUL
-    /// separator between key and value, or other structural issue).
-    MalformedParameterStatus,
-
     /// Server's `Authentication*` message payload is too short to
     /// contain the 4-byte sub-code.
     MalformedAuthentication {
@@ -211,9 +207,6 @@ impl fmt::Display for ProtocolError {
                 f,
                 "BackendKeyData payload length {payload_len} (expected 8)",
             ),
-            Self::MalformedParameterStatus => {
-                f.write_str("malformed ParameterStatus (missing NUL separator)")
-            }
             Self::MalformedAuthentication { payload_len } => write!(
                 f,
                 "Authentication message payload too short: {payload_len} bytes (need >= 4)",

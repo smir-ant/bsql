@@ -51,10 +51,28 @@ macro_rules! count_exprs {
 /// Push 1..=N actions into `out`, with compile-time enforcement of
 /// both the per-site budget and the global `MAX_ACTIONS_PER_CALL` cap.
 ///
+/// Two forms:
+///
+/// - **Loop form** (`on_overflow: break`) — for callers inside a loop
+///   who must bail out of the loop if the vector fills. Used by the
+///   `feed_bytes` drain loop.
+/// - **No-bail form** (no `on_overflow:` argument) — for callers where
+///   the compile-time `const _: () = assert!(...)` already proves the
+///   push cannot fail (the vector starts empty and the budget fits).
+///   Used by `push_command` handlers and `fail_inflight_and_close`.
+///   The Err arm is dead under the assert but explicit so the
+///   compiler sees every `Result` handled.
+///
 /// ```text
-/// emit_actions!(out, budget: 2, on_overflow: return, [
+/// // Loop caller:
+/// emit_actions!(out, budget: 2, on_overflow: break, [
 ///     Action::FailReply { id: id.consume(), cause },
 ///     Action::CloseSocket,
+/// ]);
+///
+/// // Non-loop caller:
+/// emit_actions!(out, budget: 1, [
+///     Action::SendBytes(SendBuf::Static(&SYNC_WIRE_BYTES)),
 /// ]);
 /// ```
 ///
@@ -66,15 +84,11 @@ macro_rules! count_exprs {
 /// 2. `budget >= count(actions)` — the site does not push more actions
 ///    than it declared.
 ///
-/// Runtime: each action is pushed via `heapless::Vec::push`. The Err
-/// branch (capacity exhausted) takes the `on_overflow` path — typically
-/// `return` or `break`. Under the compile-time proofs above, this
-/// branch is dead (the budget fits the cap and the count fits the
-/// budget), but it is surfaced honestly so the compiler sees every
-/// `Result` handled. DEF-045.
+/// DEF-045. Form split: DEF-055.
 macro_rules! emit_actions {
+    // Loop form: bails out of the enclosing loop on overflow.
     (
-        $out:expr, budget: $budget:literal, on_overflow: $bail:tt,
+        $out:expr, budget: $budget:literal, on_overflow: break,
         [$($action:expr),+ $(,)?]
     ) => {{
         const _: () = assert!(
@@ -86,10 +100,30 @@ macro_rules! emit_actions {
             "emit_actions! site pushes more actions than its declared budget",
         );
         $(
-            #[allow(clippy::needless_return)]
+            if $out.push($action).is_err() {
+                break;
+            }
+        )+
+    }};
+
+    // No-bail form: const_assert guarantees the push fits; Err arm is
+    // dead but explicit to honor `heapless::Vec::push`'s must-use.
+    (
+        $out:expr, budget: $budget:literal,
+        [$($action:expr),+ $(,)?]
+    ) => {{
+        const _: () = assert!(
+            $crate::protocol::MAX_ACTIONS_PER_CALL >= $budget,
+            "emit_actions! per-site budget exceeds MAX_ACTIONS_PER_CALL",
+        );
+        const _: () = assert!(
+            $budget >= count_exprs!($($action),+),
+            "emit_actions! site pushes more actions than its declared budget",
+        );
+        $(
             match $out.push($action) {
                 Ok(()) => {}
-                Err(_) => $bail,
+                Err(_) => {}
             }
         )+
     }};
@@ -284,17 +318,25 @@ impl PgProtocol {
                         .unread()
                         .get(HEADER_LEN..total_len)
                         .unwrap_or(&[]);
-                    // If this is a ParameterStatus frame during a
-                    // post-auth state, record the parameter before
-                    // dispatching. Params live on PgProtocol, not in
-                    // the state variant.
-                    // If this is a ParameterStatus frame during a
-                    // post-auth state, record the parameter. Params
-                    // live on PgProtocol, not in the state variant.
+                    // ParameterStatus pre-dispatch filter: if the
+                    // current state accepts unsolicited parameter
+                    // updates, record the param and skip the
+                    // dispatcher entirely. PostgreSQL emits PS during
+                    // the post-auth handshake, after session `SET`
+                    // commands, and on `ALTER SYSTEM` — all reachable
+                    // from `Idle` and post-startup states. DEF-054.
                     if tag == crate::wire::TAG_PARAMETER_STATUS
-                        && is_post_auth_state(&self.state)
+                        && allows_unsolicited_param_status(&self.state)
                     {
                         record_param_status(&mut self.session_params, payload);
+                        let Ok(()) = self.read_buf.advance(total_len) else {
+                            self.fail_inflight_and_close(
+                                ProtocolError::ProtocolInvariantBroken,
+                                &mut out,
+                            );
+                            break;
+                        };
+                        continue;
                     }
 
                     // Take ownership of state for the dispatcher.
@@ -363,13 +405,13 @@ impl PgProtocol {
         match core::mem::take(&mut self.state) {
             ProtoState::Idle => {
                 self.state = ProtoState::AwaitingPingReply(reply);
-                emit_actions!(out, budget: 1, on_overflow: return, [
+                emit_actions!(out, budget: 1, [
                     Action::SendBytes(SendBuf::Static(&SYNC_WIRE_BYTES)),
                 ]);
             }
             ProtoState::AwaitingPingReply(prev_reply) => {
                 self.state = ProtoState::AwaitingPingReply(prev_reply);
-                emit_actions!(out, budget: 1, on_overflow: return, [
+                emit_actions!(out, budget: 1, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: ProtocolError::UnexpectedFrame { tag: b'P' },
@@ -383,7 +425,7 @@ impl PgProtocol {
             | ProtoState::ConnectingPostAuthWaitKey(_)
             | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
                 self.state = other;
-                emit_actions!(out, budget: 1, on_overflow: return, [
+                emit_actions!(out, budget: 1, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: ProtocolError::StartupAlreadyInProgress,
@@ -393,7 +435,7 @@ impl PgProtocol {
             ProtoState::Errored(original) => {
                 let fail_cause = original.clone();
                 self.state = ProtoState::Errored(original);
-                emit_actions!(out, budget: 1, on_overflow: return, [
+                emit_actions!(out, budget: 1, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: fail_cause,
@@ -423,13 +465,13 @@ impl PgProtocol {
                             reply,
                             credentials,
                         };
-                        emit_actions!(out, budget: 1, on_overflow: return, [
+                        emit_actions!(out, budget: 1, [
                             Action::SendBytes(send_buf),
                         ]);
                     }
                     Err(_) => {
                         self.state = ProtoState::Idle;
-                        emit_actions!(out, budget: 1, on_overflow: return, [
+                        emit_actions!(out, budget: 1, [
                             Action::FailReply {
                                 id: reply.consume(),
                                 cause: ProtocolError::ScramError {
@@ -451,7 +493,7 @@ impl PgProtocol {
             | ProtoState::ConnectingPostAuthWaitKey(_)
             | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
                 self.state = other;
-                emit_actions!(out, budget: 1, on_overflow: return, [
+                emit_actions!(out, budget: 1, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: ProtocolError::StartupAlreadyInProgress,
@@ -461,7 +503,7 @@ impl PgProtocol {
             ProtoState::Errored(original) => {
                 let fail_cause = original.clone();
                 self.state = ProtoState::Errored(original);
-                emit_actions!(out, budget: 1, on_overflow: return, [
+                emit_actions!(out, budget: 1, [
                     Action::FailReply {
                         id: reply.consume(),
                         cause: fail_cause,
@@ -492,7 +534,7 @@ impl PgProtocol {
             ProtoState::Idle => {
                 self.state = ProtoState::Errored(cause);
                 self.read_buf.clear();
-                emit_actions!(out, budget: 1, on_overflow: return, [
+                emit_actions!(out, budget: 1, [
                     Action::CloseSocket,
                 ]);
             }
@@ -505,7 +547,7 @@ impl PgProtocol {
             | ProtoState::ConnectingPostAuthHaveKey { reply: id, .. } => {
                 self.state = ProtoState::Errored(cause.clone());
                 self.read_buf.clear();
-                emit_actions!(out, budget: 2, on_overflow: return, [
+                emit_actions!(out, budget: 2, [
                     Action::FailReply {
                         id: id.consume(),
                         cause,
@@ -521,14 +563,43 @@ impl PgProtocol {
 
 }
 
-/// Check if a state is a post-auth connecting state where
-/// ParameterStatus should be recorded.
-fn is_post_auth_state(state: &ProtoState) -> bool {
-    matches!(
-        state,
-        ProtoState::ConnectingPostAuthWaitKey(_)
-            | ProtoState::ConnectingPostAuthHaveKey { .. }
-    )
+/// Whether the current protocol state accepts unsolicited
+/// `ParameterStatus` frames from the server.
+///
+/// PostgreSQL emits `ParameterStatus` (tag `'S'`, shared with
+/// outbound `Sync` — disambiguated by direction) in three situations:
+///
+/// - During the post-authentication handshake (the initial burst of
+///   server-settings the client needs to know).
+/// - In [`ProtoState::Idle`], any time after a session `SET` command
+///   commits.
+/// - In a flight state (awaiting reply / streaming) if `ALTER SYSTEM`
+///   runs on the server while a query is in progress.
+///
+/// Pre-auth states ([`ProtoState::ConnectingStartup`] and the SCRAM
+/// exchange) and [`ProtoState::Errored`] must not see unsolicited PS;
+/// the dispatcher classifies those as `UnexpectedFrame` and tears the
+/// connection down.
+///
+/// # Tier-1 regression guard
+///
+/// The match is exhaustive: adding a new [`ProtoState`] variant fails
+/// the build here until the contributor decides how the new state
+/// should handle unsolicited PS. This forecloses the latent-bug class
+/// where a newly-added state "forgot" to be included and silently
+/// tore the connection down on the first runtime PS. DEF-054.
+fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
+    match state {
+        ProtoState::Idle
+        | ProtoState::AwaitingPingReply(_)
+        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. } => true,
+        ProtoState::ConnectingStartup { .. }
+        | ProtoState::ConnectingScramAwaitServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitAuthOk(_)
+        | ProtoState::Errored(_) => false,
+    }
 }
 
 /// Parse a ParameterStatus payload and record it in session_params.
