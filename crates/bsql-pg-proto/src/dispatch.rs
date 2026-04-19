@@ -644,8 +644,11 @@ fn dispatch_auth_sasl_final(
 
 /// Dispatch AuthenticationOk after SCRAM verification.
 fn dispatch_auth_ok_after_scram(reply: ReplyId, payload: &[u8]) -> DispatchOutcome {
-    let (code, _rest) = match auth_sub_code(payload) {
-        Ok(pair) => pair,
+    // AuthOk has no trailing data; destructure with anonymous `_`
+    // pattern (pattern-discard, not a `_`-prefixed identifier —
+    // allowed by the `no underscore vars` discipline).
+    let code = match auth_sub_code(payload) {
+        Ok((code, _)) => code,
         Err(cause) => {
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),

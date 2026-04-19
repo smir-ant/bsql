@@ -189,8 +189,12 @@ pub struct PgProtocol {
     /// during startup from ParameterStatus messages. Read-only after
     /// startup completes (accessible via `session_params()`).
     session_params: SessionParams,
-    /// `!Sync` marker.
-    _not_sync: PhantomData<Cell<()>>,
+    /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
+    /// Load-bearing: the crate-root ambiguous-impl gate verifies that
+    /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
+    /// `_not_sync` (leading-underscore convention for structurally-used
+    /// fields is forbidden per user-feedback memory).
+    sync_marker: PhantomData<Cell<()>>,
 }
 
 impl PgProtocol {
@@ -206,7 +210,7 @@ impl PgProtocol {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
-            _not_sync: PhantomData,
+            sync_marker: PhantomData,
         }
     }
 

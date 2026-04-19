@@ -145,6 +145,19 @@ const _: fn() = || {
     assert_send::<write_buf::WriteBuf>();
     assert_send::<scram::types::SecretDigest>();
     assert_send::<scram::types::CappedServerNonce>();
+    // Typestate wrappers (audit round 2 D1).
+    assert_send::<scram::session::ScramSession>();
+    assert_send::<sensitive::Sensitive<password::Password>>();
+    // Error sentinels — small Copy-like types that must stay Send so
+    // that Result<T, E> returned across a task boundary compiles.
+    assert_send::<buf::AdvancePastEnd>();
+    assert_send::<buf::ReadBufFull>();
+    assert_send::<write_buf::WriteBufFull>();
+    assert_send::<action::SendBufFull>();
+    assert_send::<scram::types::ServerNonceTooLong>();
+    assert_send::<ident::IdentError>();
+    assert_send::<password::PasswordError>();
+    assert_send::<frame::HeaderParse>();
 };
 
 // ---------------------------------------------------------------------
@@ -296,4 +309,39 @@ const _: () = assert!(
 const _: () = assert!(
     !core::mem::needs_drop::<password::PasswordError>(),
     "PasswordError must stay drop-free — enum of Copy variants",
+);
+// Audit round 2 E1 — expanded coverage. Positives: types carrying
+// secrets / resources that MUST self-scrub. Negatives: small value
+// types that MUST stay Copy-friendly / drop-free.
+const _: () = assert!(
+    core::mem::needs_drop::<scram::session::ScramSession>(),
+    "ScramSession owns Sensitive<Password> — must Drop so the inner zeroize fires",
+);
+const _: () = assert!(
+    core::mem::needs_drop::<sensitive::Sensitive<password::Password>>(),
+    "Sensitive<Password> must Drop to trigger ZeroizeOnDrop on the inner",
+);
+// Note — Ident/DatabaseName/ApplicationName wrap heapless::Vec<u8, N>,
+// which carries a blanket `Drop` impl (even for `T: Copy`) and thus
+// trips `needs_drop`. No negative assert here — the ambient Drop has
+// an empty body for `u8`, so there is no scrub contract to pin.
+const _: () = assert!(
+    !core::mem::needs_drop::<buf::ReadBufFull>(),
+    "ReadBufFull must stay drop-free — error sentinel, Copy value",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<buf::AdvancePastEnd>(),
+    "AdvancePastEnd must stay drop-free — ZST-like error sentinel",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<write_buf::WriteBufFull>(),
+    "WriteBufFull must stay drop-free — error sentinel",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<action::SendBufFull>(),
+    "SendBufFull must stay drop-free — error sentinel",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<scram::types::ServerNonceTooLong>(),
+    "ServerNonceTooLong must stay drop-free — error sentinel",
 );
