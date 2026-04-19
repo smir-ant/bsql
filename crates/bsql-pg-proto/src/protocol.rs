@@ -240,20 +240,29 @@ impl PgProtocol {
     ///
     /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].
     /// Caller must execute every action in order.
+    ///
+    /// # Compute / apply split (DEF-059)
+    ///
+    /// The body is a three-line delegate: move the current state out,
+    /// hand it (with `cmd`) to the pure [`compute_push`] free function,
+    /// put the returned new state back. All push-path decision logic
+    /// — per-command match, per-state transitions, action emission —
+    /// lives in [`compute_push`] and its per-command helpers. Those
+    /// helpers are free functions taking [`ProtoState`] by value; they
+    /// are testable directly, with no `PgProtocol` construction needed
+    /// (see `compute_push_tests` at the bottom of this file).
+    ///
+    /// The `core::mem::take` here momentarily leaves `self.state` in
+    /// its `Default` (`Idle`) value for the duration of `compute_push`.
+    /// `PgProtocol` is `!Sync` (tier-1 compile, via the `PhantomData<Cell<()>>`
+    /// field) so no observer can witness the window; the split is
+    /// safe even though the intermediate is not the terminal state.
     #[must_use = "the returned actions carry side-effects that must be executed"]
     pub fn push_command(&mut self, cmd: PgCommand) -> OutActions {
-        let mut out = OutActions::new();
-        match cmd {
-            PgCommand::Ping { reply } => self.handle_push_ping(reply, &mut out),
-            PgCommand::Startup {
-                user,
-                database,
-                app_name,
-                credentials,
-                reply,
-            } => self.handle_push_startup(user, database, app_name, credentials, reply, &mut out),
-        }
-        out
+        let prev = core::mem::take(&mut self.state);
+        let (new_state, actions) = compute_push(cmd, prev);
+        self.state = new_state;
+        actions
     }
 
     /// Feed inbound wire bytes.
@@ -401,156 +410,6 @@ impl PgProtocol {
         out
     }
 
-    /// Helper: emit a Sync command on the wire and transition to
-    /// `AwaitingPingReply`.
-    ///
-    /// Per-method push budget: **1**. `MAX_ACTIONS_PER_CALL >= 1`
-    /// (const-asserted) guarantees the push succeeds; the Err branch
-    /// is architecturally unreachable but returned by `heapless`, so
-    /// we surface it via `if .is_err() { return }` — the compiler sees
-    /// we did not discard a `Result`.
-    ///
-    /// **Errored pre-check** (DEF-093): when the protocol is already
-    /// in `Errored`, we handle before `core::mem::take` — this avoids
-    /// the transient `Idle` window that `take` introduces (state goes
-    /// Errored → Idle → Errored-with-same-cause). Pre-check reads
-    /// `&self.state`, clones the cause, emits `FailReply`. The Errored
-    /// state is never momentarily lost.
-    fn handle_push_ping(&mut self, reply: ReplyId, out: &mut OutActions) {
-        if let ProtoState::Errored(cause) = &self.state {
-            let fail_cause = cause.clone();
-            emit_actions!(out, budget: 1, [
-                Action::FailReply {
-                    id: reply.consume(),
-                    cause: fail_cause,
-                },
-            ]);
-            return;
-        }
-        match core::mem::take(&mut self.state) {
-            ProtoState::Idle => {
-                // DEF-089: SendBuf is a single-shape newtype — no Static /
-                // Owned enum arms to swap. `from_slice` copies 5 bytes into
-                // the stack-bounded buffer. Err branch is dead (SYNC is 5
-                // bytes, fits 512-byte cap) but surfaced honestly via
-                // let-else → classified ProtocolInvariantBroken.
-                let Ok(sync_buf) = SendBuf::from_slice(&SYNC_WIRE_BYTES) else {
-                    self.state =
-                        ProtoState::Errored(ProtocolError::ProtocolInvariantBroken);
-                    reply.consume();
-                    emit_actions!(out, budget: 1, [Action::CloseSocket]);
-                    return;
-                };
-                self.state = ProtoState::AwaitingPingReply(reply);
-                emit_actions!(out, budget: 1, [Action::SendBytes(sync_buf)]);
-            }
-            ProtoState::AwaitingPingReply(prev_reply) => {
-                self.state = ProtoState::AwaitingPingReply(prev_reply);
-                emit_actions!(out, budget: 1, [
-                    Action::FailReply {
-                        id: reply.consume(),
-                        cause: ProtocolError::UnexpectedFrame { tag: b'P' },
-                    },
-                ]);
-            }
-            other @ (ProtoState::ConnectingStartup { .. }
-            | ProtoState::ConnectingScramAwaitServerFirst { .. }
-            | ProtoState::ConnectingScramAwaitServerFinal { .. }
-            | ProtoState::ConnectingScramAwaitAuthOk(_)
-            | ProtoState::ConnectingPostAuthWaitKey(_)
-            | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
-                self.state = other;
-                emit_actions!(out, budget: 1, [
-                    Action::FailReply {
-                        id: reply.consume(),
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    },
-                ]);
-            }
-            ProtoState::Errored(_) => {
-                // Unreachable: pre-check above handled Errored before
-                // `core::mem::take` could run. Match arm present for
-                // exhaustiveness; empty body is safe because the
-                // pre-check guarantees state is non-Errored here.
-            }
-        }
-    }
-
-    /// Handle `PgCommand::Startup` — build and emit a StartupMessage.
-    ///
-    /// Per-method push budget: **1** (SendBytes with the StartupMessage).
-    /// Uses the same Errored pre-check pattern as [`handle_push_ping`]
-    /// (DEF-093): check `&self.state` before `core::mem::take` to
-    /// avoid transient `Idle` window when state is already Errored.
-    fn handle_push_startup(
-        &mut self,
-        user: Ident,
-        database: Option<DatabaseName>,
-        app_name: Option<ApplicationName>,
-        credentials: Credentials,
-        reply: ReplyId,
-        out: &mut OutActions,
-    ) {
-        if let ProtoState::Errored(cause) = &self.state {
-            let fail_cause = cause.clone();
-            emit_actions!(out, budget: 1, [
-                Action::FailReply {
-                    id: reply.consume(),
-                    cause: fail_cause,
-                },
-            ]);
-            return;
-        }
-        match core::mem::take(&mut self.state) {
-            ProtoState::Idle => {
-                match build_startup_message(&user, database.as_ref(), app_name.as_ref()) {
-                    Ok(send_buf) => {
-                        self.state = ProtoState::ConnectingStartup {
-                            reply,
-                            credentials,
-                        };
-                        emit_actions!(out, budget: 1, [
-                            Action::SendBytes(send_buf),
-                        ]);
-                    }
-                    Err(_) => {
-                        self.state = ProtoState::Idle;
-                        emit_actions!(out, budget: 1, [
-                            Action::FailReply {
-                                id: reply.consume(),
-                                cause: ProtocolError::ScramError {
-                                    detail: heapless::String::try_from(
-                                        "StartupMessage too large for send buffer",
-                                    )
-                                    .unwrap_or_default(),
-                                },
-                            },
-                        ]);
-                    }
-                }
-            }
-            other @ (ProtoState::AwaitingPingReply(_)
-            | ProtoState::ConnectingStartup { .. }
-            | ProtoState::ConnectingScramAwaitServerFirst { .. }
-            | ProtoState::ConnectingScramAwaitServerFinal { .. }
-            | ProtoState::ConnectingScramAwaitAuthOk(_)
-            | ProtoState::ConnectingPostAuthWaitKey(_)
-            | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
-                self.state = other;
-                emit_actions!(out, budget: 1, [
-                    Action::FailReply {
-                        id: reply.consume(),
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    },
-                ]);
-            }
-            ProtoState::Errored(_) => {
-                // Unreachable: pre-check at fn entry handled Errored.
-                // Match arm present for exhaustiveness.
-            }
-        }
-    }
-
     /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
     /// and transition the state to [`ProtoState::Errored`].
     ///
@@ -606,6 +465,199 @@ impl PgProtocol {
         }
     }
 
+}
+
+/// Compute the state transition and actions for a command push.
+///
+/// # Pure compute / apply split (DEF-059)
+///
+/// This free function owns the entire push-path decision: given the
+/// command and current [`ProtoState`] *by value*, it produces the new
+/// state and a bounded [`OutActions`] list. No `&mut PgProtocol` — the
+/// only mutation the caller needs is the single `self.state = new_state`
+/// assignment in [`PgProtocol::push_command`].
+///
+/// Why pure:
+/// - **Testability.** Unit tests call `compute_push` directly with a
+///   synthesised `(cmd, state)` pair and inspect the returned tuple.
+///   No `PgProtocol` construction, no `&mut self` dance.
+/// - **Single locus of mutation.** All `self.state = ...` statements
+///   in the crate are restricted to `push_command` and `feed_bytes`.
+///   Adding a new command variant grows the match here, not the
+///   mutable surface of `PgProtocol`.
+/// - **Errored pre-check dissolves.** The DEF-093 workaround (reading
+///   `&self.state` *before* `core::mem::take` to avoid a transient
+///   `Idle` window) is no longer needed. `ProtoState::Errored` is a
+///   first-class arm: it preserves the cause (returns
+///   `ProtoState::Errored(cause)` unchanged) and emits the
+///   `FailReply`. No intermediate-value peek, no empty unreachable arm.
+///
+/// Per-command semantics live in dedicated helpers
+/// ([`compute_push_ping`], [`compute_push_startup`]); `compute_push`
+/// dispatches on the command variant. Adding a new `PgCommand` variant
+/// fails the build here until a matching helper is wired up.
+fn compute_push(cmd: PgCommand, state: ProtoState) -> (ProtoState, OutActions) {
+    let mut out = OutActions::new();
+    let new_state = match cmd {
+        PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut out),
+        PgCommand::Startup {
+            user,
+            database,
+            app_name,
+            credentials,
+            reply,
+        } => compute_push_startup(state, user, database, app_name, credentials, reply, &mut out),
+    };
+    (new_state, out)
+}
+
+/// Compute the transition for [`PgCommand::Ping`] against the current
+/// [`ProtoState`]. Pure; see [`compute_push`] for framing.
+///
+/// Exhaustive match over every `ProtoState` variant — adding a new
+/// variant fails the build until the push-from-that-state policy is
+/// declared here. The decision table:
+///
+/// | current state              | action                 | new state                 |
+/// |----------------------------|------------------------|---------------------------|
+/// | `Idle`                     | `SendBytes(SYNC)`      | `AwaitingPingReply(reply)`|
+/// | `Errored(cause)`           | `FailReply(cause)`     | `Errored(cause)` preserved|
+/// | `AwaitingPingReply(prev)`  | `FailReply(UnexpFr)`   | `AwaitingPingReply(prev)` |
+/// | any `Connecting*` variant  | `FailReply(InProgr.)`  | same state preserved      |
+///
+/// The `compute_push_tests` module below pins this table via a
+/// per-variant assertion, closing the structural seam where two arm
+/// bodies could be swapped without a compile error.
+fn compute_push_ping(
+    state: ProtoState,
+    reply: ReplyId,
+    out: &mut OutActions,
+) -> ProtoState {
+    match state {
+        ProtoState::Idle => {
+            // DEF-089: SendBuf is a single-shape newtype — no Static /
+            // Owned enum arms to swap. `from_slice` copies 5 bytes into
+            // the stack-bounded buffer. Err branch is dead (SYNC is 5
+            // bytes, fits 512-byte cap) but surfaced honestly via
+            // let-else → classified ProtocolInvariantBroken.
+            let Ok(sync_buf) = SendBuf::from_slice(&SYNC_WIRE_BYTES) else {
+                reply.consume();
+                emit_actions!(out, budget: 1, [Action::CloseSocket]);
+                return ProtoState::Errored(ProtocolError::ProtocolInvariantBroken);
+            };
+            emit_actions!(out, budget: 1, [Action::SendBytes(sync_buf)]);
+            ProtoState::AwaitingPingReply(reply)
+        }
+        ProtoState::Errored(cause) => {
+            let fail_cause = cause.clone();
+            emit_actions!(out, budget: 1, [
+                Action::FailReply {
+                    id: reply.consume(),
+                    cause: fail_cause,
+                },
+            ]);
+            ProtoState::Errored(cause)
+        }
+        ProtoState::AwaitingPingReply(prev_reply) => {
+            emit_actions!(out, budget: 1, [
+                Action::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::UnexpectedFrame { tag: b'P' },
+                },
+            ]);
+            ProtoState::AwaitingPingReply(prev_reply)
+        }
+        other @ (ProtoState::ConnectingStartup { .. }
+        | ProtoState::ConnectingScramAwaitServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitAuthOk(_)
+        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+            emit_actions!(out, budget: 1, [
+                Action::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::StartupAlreadyInProgress,
+                },
+            ]);
+            other
+        }
+    }
+}
+
+/// Compute the transition for [`PgCommand::Startup`] against the current
+/// [`ProtoState`]. Pure; see [`compute_push`] for framing.
+///
+/// Exhaustive match over every `ProtoState` variant. Decision table:
+///
+/// | current state          | action                       | new state                   |
+/// |------------------------|------------------------------|-----------------------------|
+/// | `Idle` (build OK)      | `SendBytes(StartupMessage)`  | `ConnectingStartup { ... }` |
+/// | `Idle` (build Err)     | `FailReply(ScramError)`      | `Idle` (unchanged)          |
+/// | `Errored(cause)`       | `FailReply(cause)`           | `Errored(cause)` preserved  |
+/// | any non-`Idle` other   | `FailReply(InProgress)`      | same state preserved        |
+///
+/// The `Idle` build-failure arm is architecturally unreachable in
+/// normal operation (startup fits 512-byte cap) but surfaced honestly
+/// — a future refactor that breaks the const drift-guard on
+/// `MAX_OWNED_SEND_LEN` classifies as a typed reply failure instead of
+/// silent truncation.
+fn compute_push_startup(
+    state: ProtoState,
+    user: Ident,
+    database: Option<DatabaseName>,
+    app_name: Option<ApplicationName>,
+    credentials: Credentials,
+    reply: ReplyId,
+    out: &mut OutActions,
+) -> ProtoState {
+    match state {
+        ProtoState::Idle => match build_startup_message(&user, database.as_ref(), app_name.as_ref())
+        {
+            Ok(send_buf) => {
+                emit_actions!(out, budget: 1, [Action::SendBytes(send_buf)]);
+                ProtoState::ConnectingStartup { reply, credentials }
+            }
+            Err(_) => {
+                emit_actions!(out, budget: 1, [
+                    Action::FailReply {
+                        id: reply.consume(),
+                        cause: ProtocolError::ScramError {
+                            detail: heapless::String::try_from(
+                                "StartupMessage too large for send buffer",
+                            )
+                            .unwrap_or_default(),
+                        },
+                    },
+                ]);
+                ProtoState::Idle
+            }
+        },
+        ProtoState::Errored(cause) => {
+            let fail_cause = cause.clone();
+            emit_actions!(out, budget: 1, [
+                Action::FailReply {
+                    id: reply.consume(),
+                    cause: fail_cause,
+                },
+            ]);
+            ProtoState::Errored(cause)
+        }
+        other @ (ProtoState::AwaitingPingReply(_)
+        | ProtoState::ConnectingStartup { .. }
+        | ProtoState::ConnectingScramAwaitServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitAuthOk(_)
+        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+            emit_actions!(out, budget: 1, [
+                Action::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::StartupAlreadyInProgress,
+                },
+            ]);
+            other
+        }
+    }
 }
 
 /// Whether the current protocol state accepts unsolicited
@@ -844,5 +896,600 @@ mod allows_unsolicited_param_status_tests {
         let errored = ProtoState::Errored(ProtocolError::UnexpectedFrame { tag: b'X' });
         assert!(!allows_unsolicited_param_status(&errored));
         consume_state(errored);
+    }
+}
+
+#[cfg(test)]
+mod compute_push_tests {
+    //! DEF-059 — seam-closing tests for the pure push-compute split.
+    //!
+    //! The push-path decision table is enumerated per `(cmd, state)`
+    //! pair; every arm of [`compute_push_ping`] and
+    //! [`compute_push_startup`] is exercised and its `(new_state,
+    //! actions)` output is pinned. Swapping any two arm bodies would
+    //! compile (identical return shape `ProtoState`, identical
+    //! `emit_actions!` budget), so the only shield for the policy
+    //! table is this enumeration.
+    //!
+    //! Category (1) per reforge.md §4.11 — exhaustive-match policy
+    //! table. Companion to `allows_unsolicited_param_status_tests`
+    //! above (same test style, same helpers).
+    //!
+    //! These tests also stand as the DEF-059 proof that the pure
+    //! half is testable without constructing [`PgProtocol`]: every
+    //! test calls [`compute_push`] directly on a synthesised
+    //! `(cmd, state)` pair.
+    use super::*;
+    use crate::password::{Credentials, Password};
+    use crate::reply_id::ReplyId;
+    use crate::scram::types::SecretDigest;
+    use crate::sensitive::Sensitive;
+    use core::num::NonZeroU64;
+
+    fn nz(n: u64) -> NonZeroU64 {
+        NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
+    }
+
+    /// Consume any ReplyId carried by `state` so its Drop-guard does
+    /// not trip when the state drops at end of scope. Copy of the
+    /// helper in `allows_unsolicited_param_status_tests` — test
+    /// modules are siblings; Rust module privacy forbids re-use
+    /// without cross-module `pub(super)` exposure, and a 20-line
+    /// match is cheaper than the coupling.
+    fn consume_state(state: ProtoState) {
+        match state {
+            ProtoState::Idle | ProtoState::Errored(_) => {}
+            ProtoState::AwaitingPingReply(id)
+            | ProtoState::ConnectingScramAwaitAuthOk(id)
+            | ProtoState::ConnectingPostAuthWaitKey(id) => {
+                id.consume();
+            }
+            ProtoState::ConnectingStartup { reply, .. }
+            | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
+            | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
+            | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
+                reply.consume();
+            }
+        }
+    }
+
+    /// If `new_state` is `AwaitingPingReply`, consume the inner reply
+    /// and return its raw value. Otherwise drain any carried reply
+    /// and return `None`. Used to express the assertion "new state
+    /// is AwaitingPingReply(expected_raw)" as a single `assert_eq!`
+    /// without the forbid-bundle incompatibility of `panic!` in an
+    /// else branch.
+    fn take_awaiting_ping_raw(new_state: ProtoState) -> Option<NonZeroU64> {
+        match new_state {
+            ProtoState::AwaitingPingReply(r) => Some(r.consume()),
+            other => {
+                consume_state(other);
+                None
+            }
+        }
+    }
+
+    /// Like [`take_awaiting_ping_raw`] but for `ConnectingStartup`.
+    fn take_connecting_startup_raw(new_state: ProtoState) -> Option<NonZeroU64> {
+        match new_state {
+            ProtoState::ConnectingStartup { reply, .. } => Some(reply.consume()),
+            other => {
+                consume_state(other);
+                None
+            }
+        }
+    }
+
+    /// Build a minimal valid `Ident` for tests. `"u"` is 1 byte, well
+    /// within MAX_IDENT_LEN; the Err branch is architecturally dead
+    /// but surfaced via `.ok()?` so the forbid-bundle is honoured.
+    fn mk_user() -> Option<Ident> {
+        Ident::try_from_str("u").ok()
+    }
+
+    // -----------------------------------------------------------------
+    // Ping — per-variant policy table
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ping_from_idle_emits_sync_and_awaits() {
+        let raw_id = nz(101);
+        let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_id) };
+        let (new_state, out) = compute_push(cmd, ProtoState::Idle);
+
+        // Action: exactly one SendBytes whose payload is SYNC_WIRE_BYTES.
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(
+                out.first(),
+                Some(Action::SendBytes(sb)) if sb.as_bytes() == SYNC_WIRE_BYTES.as_slice()
+            ),
+            "expected SendBytes(SYNC)",
+        );
+
+        // State: AwaitingPingReply(raw_id).
+        assert_eq!(take_awaiting_ping_raw(new_state), Some(raw_id));
+    }
+
+    #[test]
+    fn ping_from_errored_preserves_errored_and_fails_with_cause() {
+        let raw_id = nz(102);
+        let original_cause = ProtocolError::UnexpectedFrame { tag: b'X' };
+        let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_id) };
+        let (new_state, out) = compute_push(
+            cmd,
+            ProtoState::Errored(original_cause.clone()),
+        );
+
+        // Action: FailReply carrying the ORIGINAL cause (not a synthetic one).
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(
+                out.first(),
+                Some(Action::FailReply { id, cause }) if *id == raw_id && *cause == original_cause
+            ),
+            "expected FailReply(original cause)",
+        );
+
+        // State: Errored preserved with the same cause.
+        assert!(
+            matches!(&new_state, ProtoState::Errored(cause) if *cause == original_cause),
+            "expected Errored(cause) preserved",
+        );
+        consume_state(new_state);
+    }
+
+    #[test]
+    fn ping_from_awaiting_ping_reply_fails_with_unexpected_frame_and_preserves_state() {
+        let raw_prev = nz(103);
+        let raw_new = nz(104);
+        let prev_state = ProtoState::AwaitingPingReply(ReplyId::from_raw(raw_prev));
+        let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+        let (new_state, out) = compute_push(cmd, prev_state);
+
+        // Action: FailReply(UnexpectedFrame { tag: b'P' }) for the NEW reply.
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(
+                out.first(),
+                Some(Action::FailReply {
+                    id,
+                    cause: ProtocolError::UnexpectedFrame { tag: b'P' },
+                }) if *id == raw_new
+            ),
+            "expected FailReply(UnexpectedFrame{{tag: b'P'}}) for new reply",
+        );
+
+        // State: AwaitingPingReply(raw_prev) — the original prev_reply
+        // is preserved, not replaced by the new one.
+        assert_eq!(take_awaiting_ping_raw(new_state), Some(raw_prev));
+    }
+
+    /// Construct every `Connecting*` variant and assert that pushing
+    /// `Ping` against it yields `FailReply(StartupAlreadyInProgress)`
+    /// with the state preserved unchanged. Closes the seam where one
+    /// variant could be pulled out of the `other @ (…)` or-pattern
+    /// into a different arm with different semantics — compile stays
+    /// green (exhaustive match still satisfied), runtime drifts.
+    #[test]
+    fn ping_from_any_connecting_state_fails_with_startup_in_progress() {
+        // ConnectingStartup — Trust credentials (no Password needed).
+        {
+            let raw_prev = nz(201);
+            let raw_new = nz(202);
+            let prev = ProtoState::ConnectingStartup {
+                reply: ReplyId::from_raw(raw_prev),
+                credentials: Credentials::Trust,
+            };
+            let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+            let (new_state, out) = compute_push(cmd, prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ConnectingStartup → expected FailReply(StartupAlreadyInProgress)",
+            );
+            assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
+        }
+
+        // ConnectingScramAwaitServerFirst — needs a Password.
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let raw_prev = nz(203);
+            let raw_new = nz(204);
+            let prev = ProtoState::ConnectingScramAwaitServerFirst {
+                reply: ReplyId::from_raw(raw_prev),
+                credentials: Credentials::ScramPassword(Sensitive::new(pw)),
+                client_first_bare: heapless::Vec::new(),
+                client_nonce_b64: heapless::Vec::new(),
+            };
+            let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+            let (new_state, out) = compute_push(cmd, prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ScramAwaitServerFirst → expected FailReply(StartupAlreadyInProgress)",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingScramAwaitServerFirst { .. }
+            ));
+            consume_state(new_state);
+        }
+
+        // ConnectingScramAwaitServerFinal.
+        {
+            let raw_prev = nz(205);
+            let raw_new = nz(206);
+            let prev = ProtoState::ConnectingScramAwaitServerFinal {
+                reply: ReplyId::from_raw(raw_prev),
+                expected_server_sig: SecretDigest::new([0u8; 32]),
+            };
+            let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+            let (new_state, out) = compute_push(cmd, prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ScramAwaitServerFinal → expected FailReply(StartupAlreadyInProgress)",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingScramAwaitServerFinal { .. }
+            ));
+            consume_state(new_state);
+        }
+
+        // ConnectingScramAwaitAuthOk.
+        {
+            let raw_prev = nz(207);
+            let raw_new = nz(208);
+            let prev = ProtoState::ConnectingScramAwaitAuthOk(ReplyId::from_raw(raw_prev));
+            let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+            let (new_state, out) = compute_push(cmd, prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ScramAwaitAuthOk → expected FailReply(StartupAlreadyInProgress)",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingScramAwaitAuthOk(_)
+            ));
+            consume_state(new_state);
+        }
+
+        // ConnectingPostAuthWaitKey.
+        {
+            let raw_prev = nz(209);
+            let raw_new = nz(210);
+            let prev = ProtoState::ConnectingPostAuthWaitKey(ReplyId::from_raw(raw_prev));
+            let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+            let (new_state, out) = compute_push(cmd, prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "PostAuthWaitKey → expected FailReply(StartupAlreadyInProgress)",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingPostAuthWaitKey(_)
+            ));
+            consume_state(new_state);
+        }
+
+        // ConnectingPostAuthHaveKey.
+        {
+            let raw_prev = nz(211);
+            let raw_new = nz(212);
+            let prev = ProtoState::ConnectingPostAuthHaveKey {
+                reply: ReplyId::from_raw(raw_prev),
+                pid: 42,
+                secret_key: 1337,
+            };
+            let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+            let (new_state, out) = compute_push(cmd, prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "PostAuthHaveKey → expected FailReply(StartupAlreadyInProgress)",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingPostAuthHaveKey { .. }
+            ));
+            consume_state(new_state);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Startup — per-variant policy table
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn startup_from_idle_transitions_and_emits_startup_message() {
+        let Some(user) = mk_user() else { return };
+        let raw_id = nz(301);
+        let cmd = PgCommand::Startup {
+            user,
+            database: None,
+            app_name: None,
+            credentials: Credentials::Trust,
+            reply: ReplyId::from_raw(raw_id),
+        };
+        let (new_state, out) = compute_push(cmd, ProtoState::Idle);
+
+        // Action: SendBytes with non-empty payload (startup frame, no tag).
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(
+                out.first(),
+                Some(Action::SendBytes(sb)) if !sb.as_bytes().is_empty()
+            ),
+            "expected non-empty SendBytes(StartupMessage)",
+        );
+
+        // State: ConnectingStartup with the pushed reply id.
+        assert_eq!(take_connecting_startup_raw(new_state), Some(raw_id));
+    }
+
+    #[test]
+    fn startup_from_errored_preserves_errored_and_fails_with_cause() {
+        let Some(user) = mk_user() else { return };
+        let raw_id = nz(302);
+        let original_cause = ProtocolError::MalformedFrameLength { declared: 0 };
+        let cmd = PgCommand::Startup {
+            user,
+            database: None,
+            app_name: None,
+            credentials: Credentials::Trust,
+            reply: ReplyId::from_raw(raw_id),
+        };
+        let (new_state, out) = compute_push(
+            cmd,
+            ProtoState::Errored(original_cause.clone()),
+        );
+
+        // Action: FailReply carrying the ORIGINAL cause intact.
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(
+                out.first(),
+                Some(Action::FailReply { id, cause }) if *id == raw_id && *cause == original_cause
+            ),
+            "expected FailReply(original cause) for Errored",
+        );
+
+        // State: Errored preserved.
+        assert!(
+            matches!(&new_state, ProtoState::Errored(cause) if *cause == original_cause),
+            "expected Errored preserved",
+        );
+        consume_state(new_state);
+    }
+
+    /// Every non-`Idle`/non-`Errored` state rejects Startup with
+    /// `StartupAlreadyInProgress` and preserves its state. Closes the
+    /// same or-pattern seam as the ping counterpart.
+    #[test]
+    fn startup_from_non_idle_non_errored_fails_with_startup_in_progress() {
+        // Factory to build a Startup command consuming a fresh
+        // `user` per sub-case. Each Startup consumes its `user`, so
+        // we cannot share one across iterations.
+        let make_startup_cmd = |user: Ident, raw: NonZeroU64| PgCommand::Startup {
+            user,
+            database: None,
+            app_name: None,
+            credentials: Credentials::Trust,
+            reply: ReplyId::from_raw(raw),
+        };
+
+        // AwaitingPingReply.
+        if let Some(user) = mk_user() {
+            let raw_prev = nz(401);
+            let raw_new = nz(402);
+            let prev = ProtoState::AwaitingPingReply(ReplyId::from_raw(raw_prev));
+            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "AwaitingPingReply → expected StartupAlreadyInProgress",
+            );
+            assert_eq!(take_awaiting_ping_raw(new_state), Some(raw_prev));
+        }
+
+        // ConnectingStartup.
+        if let Some(user) = mk_user() {
+            let raw_prev = nz(403);
+            let raw_new = nz(404);
+            let prev = ProtoState::ConnectingStartup {
+                reply: ReplyId::from_raw(raw_prev),
+                credentials: Credentials::Trust,
+            };
+            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ConnectingStartup → expected StartupAlreadyInProgress",
+            );
+            assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
+        }
+
+        // ConnectingScramAwaitServerFirst.
+        if let (Some(user), Ok(pw)) = (mk_user(), Password::try_from_bytes(b"pw")) {
+            let raw_prev = nz(405);
+            let raw_new = nz(406);
+            let prev = ProtoState::ConnectingScramAwaitServerFirst {
+                reply: ReplyId::from_raw(raw_prev),
+                credentials: Credentials::ScramPassword(Sensitive::new(pw)),
+                client_first_bare: heapless::Vec::new(),
+                client_nonce_b64: heapless::Vec::new(),
+            };
+            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ScramAwaitServerFirst → expected StartupAlreadyInProgress",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingScramAwaitServerFirst { .. }
+            ));
+            consume_state(new_state);
+        }
+
+        // ConnectingScramAwaitServerFinal.
+        if let Some(user) = mk_user() {
+            let raw_prev = nz(407);
+            let raw_new = nz(408);
+            let prev = ProtoState::ConnectingScramAwaitServerFinal {
+                reply: ReplyId::from_raw(raw_prev),
+                expected_server_sig: SecretDigest::new([0u8; 32]),
+            };
+            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ScramAwaitServerFinal → expected StartupAlreadyInProgress",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingScramAwaitServerFinal { .. }
+            ));
+            consume_state(new_state);
+        }
+
+        // ConnectingScramAwaitAuthOk.
+        if let Some(user) = mk_user() {
+            let raw_prev = nz(409);
+            let raw_new = nz(410);
+            let prev = ProtoState::ConnectingScramAwaitAuthOk(ReplyId::from_raw(raw_prev));
+            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ScramAwaitAuthOk → expected StartupAlreadyInProgress",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingScramAwaitAuthOk(_)
+            ));
+            consume_state(new_state);
+        }
+
+        // ConnectingPostAuthWaitKey.
+        if let Some(user) = mk_user() {
+            let raw_prev = nz(411);
+            let raw_new = nz(412);
+            let prev = ProtoState::ConnectingPostAuthWaitKey(ReplyId::from_raw(raw_prev));
+            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "PostAuthWaitKey → expected StartupAlreadyInProgress",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingPostAuthWaitKey(_)
+            ));
+            consume_state(new_state);
+        }
+
+        // ConnectingPostAuthHaveKey.
+        if let Some(user) = mk_user() {
+            let raw_prev = nz(413);
+            let raw_new = nz(414);
+            let prev = ProtoState::ConnectingPostAuthHaveKey {
+                reply: ReplyId::from_raw(raw_prev),
+                pid: 1,
+                secret_key: 2,
+            };
+            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(out.len(), 1);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(Action::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "PostAuthHaveKey → expected StartupAlreadyInProgress",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingPostAuthHaveKey { .. }
+            ));
+            consume_state(new_state);
+        }
     }
 }
