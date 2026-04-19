@@ -72,7 +72,7 @@ macro_rules! count_exprs {
 ///
 /// // Non-loop caller:
 /// emit_actions!(out, budget: 1, [
-///     Action::SendBytes(SendBuf::Static(&SYNC_WIRE_BYTES)),
+///     Action::SendBytes(SendBuf::from_slice(&SYNC_WIRE_BYTES)?),
 /// ]);
 /// ```
 ///
@@ -409,13 +409,40 @@ impl PgProtocol {
     /// is architecturally unreachable but returned by `heapless`, so
     /// we surface it via `if .is_err() { return }` — the compiler sees
     /// we did not discard a `Result`.
+    ///
+    /// **Errored pre-check** (DEF-093): when the protocol is already
+    /// in `Errored`, we handle before `core::mem::take` — this avoids
+    /// the transient `Idle` window that `take` introduces (state goes
+    /// Errored → Idle → Errored-with-same-cause). Pre-check reads
+    /// `&self.state`, clones the cause, emits `FailReply`. The Errored
+    /// state is never momentarily lost.
     fn handle_push_ping(&mut self, reply: ReplyId, out: &mut OutActions) {
+        if let ProtoState::Errored(cause) = &self.state {
+            let fail_cause = cause.clone();
+            emit_actions!(out, budget: 1, [
+                Action::FailReply {
+                    id: reply.consume(),
+                    cause: fail_cause,
+                },
+            ]);
+            return;
+        }
         match core::mem::take(&mut self.state) {
             ProtoState::Idle => {
+                // DEF-089: SendBuf is a single-shape newtype — no Static /
+                // Owned enum arms to swap. `from_slice` copies 5 bytes into
+                // the stack-bounded buffer. Err branch is dead (SYNC is 5
+                // bytes, fits 512-byte cap) but surfaced honestly via
+                // let-else → classified ProtocolInvariantBroken.
+                let Ok(sync_buf) = SendBuf::from_slice(&SYNC_WIRE_BYTES) else {
+                    self.state =
+                        ProtoState::Errored(ProtocolError::ProtocolInvariantBroken);
+                    reply.consume();
+                    emit_actions!(out, budget: 1, [Action::CloseSocket]);
+                    return;
+                };
                 self.state = ProtoState::AwaitingPingReply(reply);
-                emit_actions!(out, budget: 1, [
-                    Action::SendBytes(SendBuf::Static(&SYNC_WIRE_BYTES)),
-                ]);
+                emit_actions!(out, budget: 1, [Action::SendBytes(sync_buf)]);
             }
             ProtoState::AwaitingPingReply(prev_reply) => {
                 self.state = ProtoState::AwaitingPingReply(prev_reply);
@@ -440,15 +467,11 @@ impl PgProtocol {
                     },
                 ]);
             }
-            ProtoState::Errored(original) => {
-                let fail_cause = original.clone();
-                self.state = ProtoState::Errored(original);
-                emit_actions!(out, budget: 1, [
-                    Action::FailReply {
-                        id: reply.consume(),
-                        cause: fail_cause,
-                    },
-                ]);
+            ProtoState::Errored(_) => {
+                // Unreachable: pre-check above handled Errored before
+                // `core::mem::take` could run. Match arm present for
+                // exhaustiveness; empty body is safe because the
+                // pre-check guarantees state is non-Errored here.
             }
         }
     }
@@ -456,6 +479,9 @@ impl PgProtocol {
     /// Handle `PgCommand::Startup` — build and emit a StartupMessage.
     ///
     /// Per-method push budget: **1** (SendBytes with the StartupMessage).
+    /// Uses the same Errored pre-check pattern as [`handle_push_ping`]
+    /// (DEF-093): check `&self.state` before `core::mem::take` to
+    /// avoid transient `Idle` window when state is already Errored.
     fn handle_push_startup(
         &mut self,
         user: Ident,
@@ -465,6 +491,16 @@ impl PgProtocol {
         reply: ReplyId,
         out: &mut OutActions,
     ) {
+        if let ProtoState::Errored(cause) = &self.state {
+            let fail_cause = cause.clone();
+            emit_actions!(out, budget: 1, [
+                Action::FailReply {
+                    id: reply.consume(),
+                    cause: fail_cause,
+                },
+            ]);
+            return;
+        }
         match core::mem::take(&mut self.state) {
             ProtoState::Idle => {
                 match build_startup_message(&user, database.as_ref(), app_name.as_ref()) {
@@ -508,15 +544,9 @@ impl PgProtocol {
                     },
                 ]);
             }
-            ProtoState::Errored(original) => {
-                let fail_cause = original.clone();
-                self.state = ProtoState::Errored(original);
-                emit_actions!(out, budget: 1, [
-                    Action::FailReply {
-                        id: reply.consume(),
-                        cause: fail_cause,
-                    },
-                ]);
+            ProtoState::Errored(_) => {
+                // Unreachable: pre-check at fn entry handled Errored.
+                // Match arm present for exhaustiveness.
             }
         }
     }
@@ -677,7 +707,7 @@ fn build_startup_message(
         w.push_u8(0).map_err(|_| WriteBufFull)?;
         Ok(())
     })?;
-    Ok(SendBuf::Owned(wb.into_inner()))
+    Ok(SendBuf::from_owned(wb.into_inner()))
 }
 
 impl Default for PgProtocol {

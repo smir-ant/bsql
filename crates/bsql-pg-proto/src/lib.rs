@@ -102,7 +102,7 @@ pub mod state;
 pub mod wire;
 pub mod write_buf;
 
-pub use action::{Action, OutActions, Reply, SendBuf};
+pub use action::{Action, OutActions, Reply, SendBuf, SendBufFull};
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::PgCommand;
 pub use error::ProtocolError;
@@ -252,4 +252,48 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::size_of::<action::OutActions>() <= 4096,
     "OutActions size regression — MAX_ACTIONS_PER_CALL * sizeof(Action)?",
+);
+
+// ---------------------------------------------------------------------
+// Tier-1 compile gates on Drop semantics (DEF-093).
+//
+// `core::mem::needs_drop::<T>()` is a const fn that returns true iff
+// T (or any of its fields transitively) has a non-trivial Drop impl.
+// We assert this at compile time to pin invariants:
+//
+// - Types that carry secrets MUST have Drop (for zeroize-on-drop).
+// - Types that are safety-net runtime guards MUST have Drop.
+// - Small value types SHOULD NOT have Drop (Copy-able / move-friendly
+//   / no hidden runtime cost on scope exit).
+//
+// A regression that removed Zeroize impls from Password or added a
+// Drop to Reply would fail the build here. Zero runtime cost.
+// ---------------------------------------------------------------------
+const _: () = assert!(
+    core::mem::needs_drop::<password::Password>(),
+    "Password must have Drop for zeroize-on-drop (DEF-051 / secret scrub)",
+);
+const _: () = assert!(
+    core::mem::needs_drop::<scram::types::SecretDigest>(),
+    "SecretDigest must have Drop for zeroize-on-drop",
+);
+const _: () = assert!(
+    core::mem::needs_drop::<reply_id::ReplyId>(),
+    "ReplyId must have Drop for the consume-discipline guard (DEF-028)",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<action::Reply>(),
+    "Reply must stay drop-free — all variants are Copy-like (small value type)",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<frame::HeaderParse>(),
+    "HeaderParse must stay drop-free — pure value type",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<ident::IdentError>(),
+    "IdentError must stay drop-free — enum of Copy variants",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<password::PasswordError>(),
+    "PasswordError must stay drop-free — enum of Copy variants",
 );

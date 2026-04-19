@@ -24,7 +24,7 @@
 
 use bsql_pg_proto::{
     Action, Credentials, Ident, PgCommand, PgProtocol, Password, ProtoState, ProtocolError,
-    Reply, ReplyId, SendBuf, Sensitive,
+    Reply, ReplyId, Sensitive,
 };
 use core::num::NonZeroU64;
 
@@ -190,7 +190,8 @@ fn trust_auth_handshake_end_to_end() {
     let out = startup_trust(&mut proto, "testuser", Some("testdb"), startup_raw);
     assert_eq!(out.len(), 1, "Startup emits exactly 1 action (SendBytes)");
     match out.as_slice() {
-        [Action::SendBytes(SendBuf::Owned(bytes))] => {
+        [Action::SendBytes(send_buf)] => {
+            let bytes = send_buf.as_bytes();
             // Verify the StartupMessage wire format.
             // First 4 bytes: length (includes self).
             // Next 4 bytes: protocol version 196608.
@@ -495,7 +496,8 @@ fn startup_message_wire_format() {
     let out = startup_trust(&mut proto, "alice", Some("mydb"), startup_raw);
 
     match out.as_slice() {
-        [Action::SendBytes(SendBuf::Owned(bytes))] => {
+        [Action::SendBytes(send_buf)] => {
+            let bytes = send_buf.as_bytes();
             // Parse the length prefix.
             let len_bytes = bytes.get(..4).unwrap_or(&[]);
             let declared = u32::from_be_bytes([
@@ -670,7 +672,7 @@ fn scram_sha256_handshake_end_to_end() {
     // Step 1: Push Startup with SCRAM password.
     let out = startup_scram(&mut proto, "user", password, startup_raw);
     assert_eq!(out.len(), 1);
-    assert!(matches!(out.as_slice(), [Action::SendBytes(SendBuf::Owned(_))]));
+    assert!(matches!(out.as_slice(), [Action::SendBytes(_)]));
     assert!(matches!(proto.state(), ProtoState::ConnectingStartup { .. }));
 
     // Step 2: Server sends AuthenticationSASL with SCRAM-SHA-256.
@@ -678,7 +680,7 @@ fn scram_sha256_handshake_end_to_end() {
     // This should produce a SASLInitialResponse.
     assert_eq!(out.len(), 1, "AuthSASL → SendBytes(SASLInitialResponse)");
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
-        [Action::SendBytes(SendBuf::Owned(bytes))] => bytes.to_vec(),
+        [Action::SendBytes(send_buf)] => send_buf.as_bytes().to_vec(),
         other => panic!("expected SendBytes(Owned), got {other:?}"),
     };
     assert!(matches!(
@@ -718,7 +720,7 @@ fn scram_sha256_handshake_end_to_end() {
     // This should produce a SASLResponse (client-final-message).
     assert_eq!(out.len(), 1, "SASLContinue → SendBytes(SASLResponse)");
     let _sasl_response_bytes: Vec<u8> = match out.as_slice() {
-        [Action::SendBytes(SendBuf::Owned(bytes))] => bytes.to_vec(),
+        [Action::SendBytes(send_buf)] => send_buf.as_bytes().to_vec(),
         other => panic!("expected SendBytes(Owned), got {other:?}"),
     };
     assert!(matches!(
@@ -794,7 +796,7 @@ fn scram_signature_mismatch_is_rejected() {
     startup_scram(&mut proto, "user", "pencil", startup_raw);
     let out = proto.feed_bytes(&auth_sasl_frame());
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
-        [Action::SendBytes(SendBuf::Owned(bytes))] => bytes.to_vec(),
+        [Action::SendBytes(send_buf)] => send_buf.as_bytes().to_vec(),
         other => panic!("expected SendBytes, got {other:?}"),
     };
 
@@ -841,7 +843,7 @@ fn scram_iterations_too_low_is_rejected() {
     startup_scram(&mut proto, "user", "pencil", startup_raw);
     let out = proto.feed_bytes(&auth_sasl_frame());
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
-        [Action::SendBytes(SendBuf::Owned(bytes))] => bytes.to_vec(),
+        [Action::SendBytes(send_buf)] => send_buf.as_bytes().to_vec(),
         other => panic!("expected SendBytes, got {other:?}"),
     };
 
@@ -1020,7 +1022,7 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
 /// in flight.
 #[test]
 fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
-    use bsql_pg_proto::{PgCommand, SendBuf};
+    use bsql_pg_proto::PgCommand;
 
     let mut proto = PgProtocol::new();
     let startup_raw = raw(200);
@@ -1034,7 +1036,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     let push_out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) });
     assert!(matches!(
         push_out.as_slice(),
-        [Action::SendBytes(SendBuf::Static(_))]
+        [Action::SendBytes(_)]
     ));
     assert!(matches!(proto.state(), ProtoState::AwaitingPingReply(_)));
 

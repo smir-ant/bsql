@@ -40,8 +40,10 @@ pub const TAG_ERROR_RESPONSE: u8 = b'E';
 /// the tag).
 ///
 /// This is a `&'static [u8]` because the message is parameter-free; we
-/// ship it via [`crate::action::SendBuf::Static`] with zero alloc and
-/// zero copy.
+/// ship it via [`crate::action::SendBuf`] with a 5-byte memcpy into
+/// the bounded stack buffer (DEF-089 collapsed the Static/Owned enum
+/// to a single-shape newtype; zero-copy recovery waits for the
+/// lifetime-parametrised `Action<'buf>` redesign in Phase 1c).
 pub const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC, 0, 0, 0, 4];
 
 // ---------------------------------------------------------------

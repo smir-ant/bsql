@@ -448,7 +448,7 @@ fn build_sasl_initial_response(
     .map_err(|_| scram_buf_err())?;
 
     Ok((
-        SendBuf::Owned(wb.into_inner()),
+        SendBuf::from_owned(wb.into_inner()),
         client_first_bare,
         client_nonce_b64,
     ))
@@ -592,7 +592,7 @@ fn dispatch_auth_sasl_continue(
             reply,
             expected_server_sig,
         },
-        action: Some(Action::SendBytes(SendBuf::Owned(wb.into_inner()))),
+        action: Some(Action::SendBytes(SendBuf::from_owned(wb.into_inner()))),
     }
 }
 

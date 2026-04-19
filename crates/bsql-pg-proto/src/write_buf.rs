@@ -6,7 +6,7 @@
 //! "length includes itself but excludes tag" convention. Every mutator
 //! returns `Result<(), WriteBufFull>` — no panic, no silent truncation.
 //!
-//! DEF-012/013/014: `MAX_OWNED_SEND_LEN`, `SendBuf::Owned`, `WriteBuf`.
+//! DEF-012/013/014: `MAX_OWNED_SEND_LEN`, `SendBuf`, `WriteBuf`.
 //!
 //! # `MAX_OWNED_SEND_LEN` sizing — const fn derivation (DEF-057)
 //!

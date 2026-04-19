@@ -26,7 +26,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// A value that is scrubbed on drop and redacted in debug output.
 ///
 /// See [module-level documentation](self) for design rationale.
+///
+/// `#[repr(transparent)]` (DEF-093) — formal zero-cost ABI layout
+/// identical to the inner `T`. `Sensitive<T>` is a compile-time-only
+/// wrapper; at runtime the memory is literally a `T`.
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[repr(transparent)]
 pub struct Sensitive<T: Zeroize> {
     inner: T,
 }

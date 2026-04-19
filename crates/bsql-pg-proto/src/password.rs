@@ -17,7 +17,7 @@
 
 use crate::sensitive::Sensitive;
 use core::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Maximum password length in bytes.
 ///
@@ -33,21 +33,18 @@ pub const MAX_PASSWORD_LEN: usize = 1024;
 /// (DEF-051) and over-length inputs. NUL bytes are allowed.
 ///
 /// The inner storage is a fixed-size array with a length field,
-/// avoiding heap allocation. On drop, [`Zeroize`] scrubs the full
-/// array (not just the used portion).
+/// avoiding heap allocation. `#[derive(Zeroize, ZeroizeOnDrop)]`
+/// scrubs the full array (not just the used portion) on drop —
+/// self-zeroizing regardless of wrapper context (DEF-093). A
+/// compile-time `const _: () = assert!(needs_drop::<Password>())`
+/// in `lib.rs` enforces this invariant structurally.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Password {
     /// Fixed-size backing store. The full array is zeroed on drop,
     /// not just `[..len]`.
     buf: [u8; MAX_PASSWORD_LEN],
     /// Number of valid bytes in `buf[..len]`.
     len: usize,
-}
-
-impl Zeroize for Password {
-    fn zeroize(&mut self) {
-        self.buf.zeroize();
-        self.len.zeroize();
-    }
 }
 
 /// Errors from [`Password`] construction.

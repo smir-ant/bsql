@@ -38,7 +38,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply, ReplyId, SendBuf,
+    Action, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply, ReplyId,
     wire::{SYNC_WIRE_BYTES, TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
 };
 use core::num::NonZeroU64;
@@ -133,7 +133,7 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId) {
     let out = proto.push_command(PgCommand::Ping { reply });
     assert_eq!(out.len(), 1, "Ping setup: push emits exactly 1 action");
     assert!(
-        matches!(out.as_slice(), [Action::SendBytes(SendBuf::Static(_))]),
+        matches!(out.as_slice(), [Action::SendBytes(_)]),
         "Ping setup: must emit SendBytes(Static), got {out:?}",
     );
 }
@@ -143,8 +143,8 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId) {
 // ------------------------------------------------------------------
 
 /// Invariant (spec): pushing a Ping from `Idle` emits exactly one
-/// action — `SendBytes(SendBuf::Static(SYNC_WIRE_BYTES))`. The state
-/// transitions to `AwaitingPingReply`.
+/// action — `SendBytes(send_buf)` carrying the `SYNC_WIRE_BYTES`
+/// payload. The state transitions to `AwaitingPingReply`.
 ///
 /// This corresponds to reforge.md §13 / §19's wire-layer contract:
 /// a Ping maps 1:1 to a `Sync` frame on the wire.
@@ -158,10 +158,11 @@ fn ping_from_idle_emits_sync_bytes() {
 
     assert_eq!(out.len(), 1, "Phase 1a budget: push_command emits exactly 1 action");
     match out.as_slice() {
-        [Action::SendBytes(SendBuf::Static(bytes))] => {
+        [Action::SendBytes(send_buf)] => {
             assert_eq!(
-                *bytes, &SYNC_WIRE_BYTES,
-                "must send the const Sync wire bytes, not a rebuilt copy",
+                send_buf.as_bytes(),
+                &SYNC_WIRE_BYTES,
+                "must send the const Sync wire bytes",
             );
         }
         _ => panic!("unexpected action shape: {out:?}"),

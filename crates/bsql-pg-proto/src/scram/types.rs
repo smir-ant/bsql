@@ -17,8 +17,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// only comparison path is [`SecretDigest::ct_eq`], which uses
 /// [`subtle::ConstantTimeEq`] to prevent timing side-channels. DEF-039.
 ///
-/// Scrubbed on drop via [`ZeroizeOnDrop`].
+/// Scrubbed on drop via [`ZeroizeOnDrop`]. DEF-093: `#[repr(transparent)]`
+/// for formal zero-cost ABI layout over `[u8; 32]`.
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[repr(transparent)]
 pub struct SecretDigest {
     bytes: [u8; 32],
 }
@@ -70,8 +72,9 @@ pub const MAX_SERVER_NONCE_LEN: usize = 256;
 /// Constructible only via [`CappedServerNonce::try_from_bytes`], which
 /// enforces the capacity bound. Downstream builders of
 /// `client-final-message` accept only this type — an unbounded nonce
-/// cannot reach the wire.
+/// cannot reach the wire. DEF-093: `#[repr(transparent)]`.
 #[derive(Clone)]
+#[repr(transparent)]
 pub struct CappedServerNonce {
     buf: heapless::Vec<u8, MAX_SERVER_NONCE_LEN>,
 }

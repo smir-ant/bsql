@@ -8,13 +8,13 @@
 //! neither.
 //!
 //! Phase 1a ships only the actions the Ping flow produces:
-//! [`Action::SendBytes`] (carrying [`SendBuf::Static`]) and
+//! [`Action::SendBytes`] (carrying a [`SendBuf`]) and
 //! [`Action::DeliverReply`] / [`Action::FailReply`] (carrying
 //! [`Reply::Pong`]). [`Action::CloseSocket`] is also shipped because
 //! protocol-error paths in 1a require it.
 //!
-//! Other actions (`StreamRow`, `SendBuf::Owned`, additional `Reply`
-//! variants) land with their drivers — reforge.md §3.5.
+//! Other actions (`StreamRow`, additional `Reply` variants) land
+//! with their drivers — reforge.md §3.5.
 
 use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
@@ -93,44 +93,99 @@ pub enum Action {
 
 /// A wire-bytes buffer for [`Action::SendBytes`].
 ///
-/// Phase 1a ships only the [`Static`] variant because the only
-/// outbound message in scope (`Sync`) is a const 5-byte payload.
-/// [`Owned`] (a bounded `heapless::Vec`) lands with the first
-/// runtime-built outbound message — startup, parse, bind. See
-/// reforge.md §7.10 for the rationale of the enum shape.
+/// Newtype wrapper around `heapless::Vec<u8, MAX_OWNED_SEND_LEN>`.
+/// All outbound frames — whether 5-byte `Sync` or runtime-built
+/// `StartupMessage` / SASL messages — flow through the same bounded
+/// stack buffer. This is DEF-089: the previous two-arm enum
+/// (`Static(&'static [u8])` / `Owned(heapless::Vec<u8, N>)`) had a
+/// **tier-3 shield seam** in `as_bytes` — a silent swap of the two
+/// match arms would compile and cross-wire every outbound message.
+/// The collapsed single-path design eliminates the seam at tier-1
+/// structural (no enum, no match, no swap).
 ///
-/// `#[non_exhaustive]` lets us add `Owned` without breaking user
-/// `match`es.
+/// Cost: a 5-byte `memcpy` for the const `Sync` message on every
+/// ping (before: zero-copy via `&'static [u8]`). Negligible — Ping is
+/// rare, 5 bytes fit in one cache line. Full zero-copy via
+/// lifetime-bound `&'buf [u8]` references is the DEF-059 / Phase 1c
+/// work where compute/apply split naturally threads the lifetime.
 ///
-/// [`Static`]: SendBuf::Static
-/// [`Owned`]: # "lands in 1b/1c"
-#[derive(Debug, PartialEq, Eq)]
+/// `#[non_exhaustive]` prevents external crates from constructing
+/// `SendBuf(inner)` directly — construction must go through the
+/// public `from_slice` constructor (which validates capacity) or the
+/// `pub(crate)` `from_owned` (used when we already built a `WriteBuf`
+/// and move its inner Vec).
+///
+/// `#[repr(transparent)]` guarantees ABI-identical layout with the
+/// inner `heapless::Vec<u8, N>` — formal zero-cost abstraction.
+#[derive(Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; SendBuf::Owned carries a bounded stack buffer by design")]
-pub enum SendBuf {
-    /// A compile-time const wire payload (`&'static [u8]`).
-    ///
-    /// Zero alloc, zero copy. The bytes live in the binary's read-only
-    /// section.
-    Static(&'static [u8]),
+#[repr(transparent)]
+pub struct SendBuf(heapless::Vec<u8, MAX_OWNED_SEND_LEN>);
 
-    /// A runtime-built wire payload in a bounded stack buffer.
-    ///
-    /// Used for StartupMessage, SASLInitialResponse, SASLResponse —
-    /// messages whose content depends on user-supplied parameters.
-    /// DEF-013.
-    Owned(heapless::Vec<u8, MAX_OWNED_SEND_LEN>),
+/// Returned when a slice passed to [`SendBuf::from_slice`] exceeds
+/// the bounded capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendBufFull {
+    /// Actual byte length of the rejected input.
+    pub attempted: usize,
+}
+
+impl core::fmt::Display for SendBufFull {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "send buffer full: tried to store {} bytes (max {})",
+            self.attempted, MAX_OWNED_SEND_LEN,
+        )
+    }
 }
 
 impl SendBuf {
+    /// Construct from a byte slice. Fails if the slice exceeds
+    /// [`MAX_OWNED_SEND_LEN`].
+    ///
+    /// Error classification is the caller's responsibility — in
+    /// protocol-internal call sites where input is compile-time-known
+    /// to fit (e.g. the 5-byte `SYNC_WIRE_BYTES`), the Err branch is
+    /// dead but surfaced honestly via `let-else` → `ProtocolError::ProtocolInvariantBroken`.
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, SendBufFull> {
+        let mut inner = heapless::Vec::new();
+        inner
+            .extend_from_slice(bytes)
+            .map_err(|_| SendBufFull {
+                attempted: bytes.len(),
+            })?;
+        Ok(Self(inner))
+    }
+
+    /// Construct from an already-owned bounded buffer. `pub(crate)`
+    /// because the normal path through external callers is
+    /// [`SendBuf::from_slice`]; this exists for internal use when
+    /// `WriteBuf::into_inner()` has already produced the buffer.
+    #[inline]
+    pub(crate) const fn from_owned(inner: heapless::Vec<u8, MAX_OWNED_SEND_LEN>) -> Self {
+        Self(inner)
+    }
+
     /// Borrow the underlying wire bytes.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            Self::Static(bytes) => bytes,
-            Self::Owned(vec) => vec,
-        }
+        &self.0
+    }
+
+    /// Length of the buffered bytes.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the buffer is empty.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 

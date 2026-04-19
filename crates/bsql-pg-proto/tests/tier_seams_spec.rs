@@ -6,9 +6,6 @@
 //! seams that §4.11.1 requires us to close via test.
 //!
 //! Seams covered (from the 2026-04-18 second-pass audit):
-//! - **S2** `SendBuf::as_bytes` — two-arm match (`Static` / `Owned`)
-//!   where both arms return `&[u8]`; swapping them compiles and
-//!   silently cross-wires every outbound message.
 //! - **S3** `SessionParams::set` — nine `b"key" => &mut self.field`
 //!   arms; any swap compiles and the user observes one param in
 //!   another's slot.
@@ -42,7 +39,7 @@
 
 use bsql_pg_proto::{
     Action, ApplicationName, Credentials, DatabaseName, Ident, IdentError, PgCommand, PgProtocol,
-    ProtoState, ProtocolError, ReplyId, SendBuf, SessionParams,
+    ProtoState, ProtocolError, ReplyId, SessionParams,
 };
 use core::num::NonZeroU64;
 
@@ -55,29 +52,15 @@ fn id(value: NonZeroU64) -> ReplyId {
 }
 
 // =================================================================
-// S2. SendBuf::as_bytes — Static vs Owned fidelity
+// S2 — DELETED (DEF-089). The seam no longer exists: `SendBuf` is a
+// single-shape newtype, not an enum. There is no `as_bytes` match
+// body to swap. The former test `send_buf_as_bytes_static_and_owned_round_trip`
+// was removed in the same commit that collapsed the enum — surface
+// that could drift no longer exists, so no test is needed.
+//
+// This is the §4.11 ideal: when architecture moves a tier-3 test
+// up to tier-1 structural, the test disappears alongside the surface.
 // =================================================================
-
-/// Invariant (spec): `SendBuf::Static(bytes).as_bytes()` returns the
-/// inner `&'static [u8]` exactly; `SendBuf::Owned(vec).as_bytes()`
-/// returns the inner `heapless::Vec` contents exactly.
-///
-/// Pins the two-arm match body. A regression that swapped the arms
-/// (`Static(_) => vec`, `Owned(_) => bytes`) would not compile
-/// because the types differ in one interpretation — but a subtler
-/// swap (e.g. both arms returning the same branch via copy-paste bug)
-/// would compile and silently cross-wire outbound data.
-#[test]
-fn send_buf_as_bytes_static_and_owned_round_trip() {
-    static STATIC_BYTES: &[u8] = b"\x53\x00\x00\x00\x04"; // mock Sync frame
-    let static_sb = SendBuf::Static(STATIC_BYTES);
-    assert_eq!(static_sb.as_bytes(), STATIC_BYTES);
-
-    let owned_vec: heapless::Vec<u8, { bsql_pg_proto::MAX_OWNED_SEND_LEN }> =
-        heapless::Vec::from_slice(b"\x70\x00\x00\x00\x10some-body").unwrap_or_default();
-    let owned_sb = SendBuf::Owned(owned_vec);
-    assert_eq!(owned_sb.as_bytes(), b"\x70\x00\x00\x00\x10some-body");
-}
 
 // =================================================================
 // S3. SessionParams::set — key → field routing table

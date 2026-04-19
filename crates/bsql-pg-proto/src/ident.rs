@@ -33,7 +33,11 @@ pub const MAX_APP_NAME_LEN: usize = 128;
 ///
 /// Guaranteed: non-empty, no embedded NUL, at most [`MAX_IDENT_LEN`]
 /// bytes. These properties are tier-1 by constructor rejection.
+///
+/// `#[repr(transparent)]` — formal zero-cost-newtype ABI guarantee
+/// (DEF-093). Same in-memory layout as inner `heapless::Vec`.
 #[derive(Clone, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct Ident {
     buf: heapless::Vec<u8, MAX_IDENT_LEN>,
 }
@@ -42,8 +46,9 @@ pub struct Ident {
 ///
 /// Same invariants and capacity as [`Ident`]; separate type for
 /// call-site clarity (you cannot accidentally pass a user name where
-/// a database name is expected).
+/// a database name is expected). DEF-093: `#[repr(transparent)]`.
 #[derive(Clone, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct DatabaseName {
     buf: heapless::Vec<u8, MAX_IDENT_LEN>,
 }
@@ -51,8 +56,9 @@ pub struct DatabaseName {
 /// A PostgreSQL `application_name` parameter.
 ///
 /// Guaranteed: no embedded NUL, at most [`MAX_APP_NAME_LEN`] bytes.
-/// May be empty (PG allows it).
+/// May be empty (PG allows it). DEF-093: `#[repr(transparent)]`.
 #[derive(Clone, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct ApplicationName {
     buf: heapless::Vec<u8, MAX_APP_NAME_LEN>,
 }
