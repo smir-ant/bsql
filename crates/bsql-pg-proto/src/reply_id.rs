@@ -204,25 +204,28 @@ impl Drop for ReplyId {
     }
 }
 
-// PartialEq / Eq / Hash compare on `value` only: the `delivered` flag is
-// an implementation detail of the Drop-guard and must not participate
-// in equality semantics (two `ReplyId`s with the same value are "the
-// same id" regardless of whether one of them has been consumed).
-impl PartialEq for ReplyId {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-    }
-}
-
-impl Eq for ReplyId {}
-
-impl core::hash::Hash for ReplyId {
-    #[inline]
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.value.hash(state);
-    }
-}
+// `PartialEq`, `Eq`, `Hash` are **deliberately NOT implemented** on
+// `ReplyId` (DEF-088 tier raise).
+//
+// Background: a previous version had hand-rolled impls that compared
+// only on `value`, ignoring `delivered`. That was a tier-3 seam — a
+// one-line body swap (`... && self.delivered == other.delivered`)
+// compiles cleanly and silently shifts equality semantics. Closed at
+// tier-1 compile by **removing** the impls entirely: callers who
+// genuinely need to compare ids use `.get()` to extract the wire-level
+// `NonZeroU64` (which has its own correct-by-construction equality)
+// and compare those. The wrapper's pending-replies map is keyed on
+// `NonZeroU64` (the `Action::DeliverReply { id: NonZeroU64, .. }`
+// shape), not on `ReplyId`. No production / test code requires
+// `ReplyId == ReplyId` or `HashMap<ReplyId, _>`.
+//
+// If a future consumer needs semantic equality on `ReplyId`, they
+// must either (a) compare `a.get() == b.get()` explicitly — which
+// makes the comparison site greppable and auditable — or (b) propose
+// a derive on a refactored `ReplyId` that carries only `value`
+// (the `delivered` flag would move to an internal wrapper type,
+// similar to DEF-077's `NonErroredState` split). Until either happens,
+// the absence of the impl is the structural guarantee.
 
 impl fmt::Debug for ReplyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -262,28 +265,4 @@ mod reply_id_semantics {
         drop(id);
     }
 
-    /// Category (1) — `PartialEq` semantic pin.
-    ///
-    /// Invariant (spec): two `ReplyId`s with the same wire value
-    /// compare equal, regardless of their internal `delivered` flag.
-    ///
-    /// The `PartialEq` body is one line (`self.value == other.value`);
-    /// a future edit could add `&& self.delivered == other.delivered`
-    /// and compile. No production path in Phase 1a compares ReplyIds
-    /// directly, but `ProtoState` derives `PartialEq` transitively
-    /// through `ReplyId`, and any future code (Loom harness, internal
-    /// state comparison, etc.) that compares `ProtoState` values would
-    /// rely on this semantic. Test pins it.
-    #[test]
-    fn partial_eq_ignores_delivered_flag() {
-        let raw = NonZeroU64::new(99).unwrap_or(NonZeroU64::MIN);
-        let a = ReplyId::from_raw(raw);
-        let b = ReplyId::from_raw(raw);
-        assert_eq!(a, b, "two ids built from the same raw value compare equal");
-        // Consume both so the Drop-guard does not fire at scope exit.
-        let a_raw = a.consume();
-        let b_raw = b.consume();
-        assert_eq!(a_raw, raw);
-        assert_eq!(b_raw, raw);
-    }
 }
