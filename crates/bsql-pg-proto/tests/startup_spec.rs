@@ -1063,6 +1063,55 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     assert!(matches!(proto.state(), ProtoState::Idle));
 }
 
+/// Invariant (spec): ParameterStatus arriving during the SCRAM
+/// handshake (ConnectingScramAwaitServerFirst) is out-of-spec — PG
+/// does not emit PS between SASLInitialResponse and
+/// AuthenticationSASLContinue. Policy (`allows_unsolicited_param_status`)
+/// returns false for all ConnectingScram* states; dispatcher fallback
+/// classifies any tag-in-state pair not explicitly handled as
+/// UnexpectedFrame. This E2E test pins the wiring: unit-level
+/// `policy_per_variant` verifies policy correctness; this test
+/// verifies filter + dispatch composition produces the expected
+/// FailReply + CloseSocket sequence.
+///
+/// The other two ConnectingScram* states (ServerFinal, AuthOk) use
+/// the same policy function and the same dispatcher fallback — a
+/// single E2E test here is sufficient because the code path is
+/// structurally identical. Flipping any ConnectingScram* variant to
+/// the `true` branch in `allows_unsolicited_param_status` would
+/// compile and silently accept server PS frames mid-handshake;
+/// `policy_per_variant` would catch that. Flipping the dispatcher's
+/// catch-all arm would be caught by `connecting_states_become_errored_on_bad_frame`.
+/// This test is the integration-level guard.
+#[test]
+fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
+    let mut proto = PgProtocol::new();
+    let startup_raw = raw(901);
+    startup_scram(&mut proto, "user", "pencil", startup_raw);
+    // Server offers SASL → we emit SASLInitialResponse → state is now
+    // ConnectingScramAwaitServerFirst.
+    let _ = proto.feed_bytes(&auth_sasl_frame());
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingScramAwaitServerFirst { .. },
+    ));
+
+    // Unsolicited ParameterStatus during SCRAM — must be classified.
+    let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"));
+    assert_eq!(out.len(), 2, "PS during SCRAM → FailReply + CloseSocket");
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &startup_raw);
+            assert!(
+                matches!(cause, ProtocolError::UnexpectedFrame { tag: b'S' }),
+                "expected UnexpectedFrame('S'), got {cause:?}",
+            );
+        }
+        other => panic!("unexpected action sequence: {other:?}"),
+    }
+    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+}
+
 /// Invariant (spec): ParameterStatus arriving in a pre-auth state
 /// (before AuthOk) is out-of-spec and must be classified as
 /// UnexpectedFrame — `allows_unsolicited_param_status` returns false

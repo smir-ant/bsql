@@ -183,3 +183,73 @@ const _: fn() = || {
     // resolution — this line fails to compile.
     <protocol::PgProtocol as AmbiguousIfSync<_>>::assert_not_sync();
 };
+
+// ---------------------------------------------------------------------
+// Tier-1 compile gates on enum / struct **size** (DEF-087).
+//
+// Background: an enum's `size_of` is governed by its largest variant.
+// The `no_alloc` constraint forces variants to carry bounded inline
+// buffers (heapless::Vec, heapless::String). A well-intentioned
+// contributor could silently balloon an enum by bumping a
+// `heapless::String<N>` capacity or adding a variant carrying a large
+// inline buffer — the code compiles, but every call allocating that
+// enum on stack now pays the bloated cost, and every move is a larger
+// memcpy.
+//
+// Size bounds are **documentation in the type system**: they pin the
+// current envelope and catch regressions. A legitimate size growth
+// (e.g., adding a new state variant with its own bounded buffers) is
+// normal — the bound adjusts in the same commit, making the memory
+// cost part of the review surface instead of drifting silently.
+//
+// All bounds are generous — set slightly above current observed size
+// to leave room for ordinary evolution, tight enough to catch obvious
+// regression (2×, 4× blowups).
+//
+// Measurement baseline (x86_64 Linux, 2026-04-20):
+//   ProtocolError:   856  (five heapless::String<N>, N<=256)
+//   Action:          864  (SendBuf::Owned contains 512-byte vec)
+//   SendBuf:         528
+//   Reply:            12
+//   ReplyId:          16
+//   ProtoState:     1248  (ConnectingScramAwaitServerFirst is dominant)
+//   PgCommand:      1352  (Startup carries Credentials + names)
+//   PgProtocol:     6656  (ReadBuf 4096 + state 1248 + session_params ~ 1200)
+//   OutActions:     3464  (4 * Action)
+// ---------------------------------------------------------------------
+const _: () = assert!(
+    core::mem::size_of::<error::ProtocolError>() <= 1024,
+    "ProtocolError size regression — did a variant add a large inline buffer?",
+);
+const _: () = assert!(
+    core::mem::size_of::<action::Action>() <= 1024,
+    "Action size regression — did SendBuf::Owned or a Reply variant grow?",
+);
+const _: () = assert!(
+    core::mem::size_of::<action::SendBuf>() <= 768,
+    "SendBuf size regression — MAX_OWNED_SEND_LEN growth?",
+);
+const _: () = assert!(
+    core::mem::size_of::<action::Reply>() <= 64,
+    "Reply size regression — did a variant add a large field?",
+);
+const _: () = assert!(
+    core::mem::size_of::<reply_id::ReplyId>() <= 24,
+    "ReplyId size regression — did a bookkeeping field get added?",
+);
+const _: () = assert!(
+    core::mem::size_of::<state::ProtoState>() <= 2048,
+    "ProtoState size regression — did a state variant add a large buffer?",
+);
+const _: () = assert!(
+    core::mem::size_of::<command::PgCommand>() <= 2048,
+    "PgCommand size regression — did a command variant grow?",
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::PgProtocol>() <= 8192,
+    "PgProtocol size regression — ReadBuf growth or state bloat?",
+);
+const _: () = assert!(
+    core::mem::size_of::<action::OutActions>() <= 4096,
+    "OutActions size regression — MAX_ACTIONS_PER_CALL * sizeof(Action)?",
+);

@@ -323,6 +323,83 @@ fn malformed_length_fails_and_closes() {
     }
 }
 
+/// Invariant (spec): a chunk of bytes exceeding the `ReadBuf`
+/// capacity triggers `ReadBufferFull` classification at `append` time
+/// (before any parsing), which propagates through `feed_bytes` as
+/// `FailReply(ReadBufferFull { attempted, available })` + `CloseSocket`,
+/// and the state transitions to `Errored(ReadBufferFull{...})` with the
+/// exact overflow dimensions preserved.
+///
+/// This E2E test pins the full propagation chain:
+/// - `ReadBuf::append` returns `ReadBufFull { attempted, available }`
+///   with the exact input size and the actual headroom.
+/// - `feed_bytes`'s early-return on ReadBufFull invokes
+///   `fail_inflight_and_close(ProtocolError::ReadBufferFull{...})`.
+/// - `fail_inflight_and_close` from AwaitingPingReply emits
+///   FailReply(ping_id) + CloseSocket.
+/// - State becomes `Errored(ReadBufferFull{...})` with matching
+///   `attempted`/`available` fields preserved byte-for-byte.
+///
+/// Complements `bounded_buffers_spec::append_overflow_is_classified_and_fail_atomic`
+/// (which pins the ReadBuf API contract). Neither alone covers the
+/// full chain — that's what this E2E test closes.
+#[test]
+fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
+    use bsql_pg_proto::READ_BUF_CAP;
+
+    let mut proto = PgProtocol::new();
+    let ping_raw = raw(333);
+    ping_setup(&mut proto, id(ping_raw));
+
+    // Feed a chunk one byte larger than READ_BUF_CAP. `append` rejects
+    // with `ReadBufFull { attempted: CAP+1, available: CAP }`.
+    let overflow_len = READ_BUF_CAP.saturating_add(1);
+    let chunk = vec![0xAA_u8; overflow_len];
+    let out = proto.feed_bytes(&chunk);
+
+    assert_eq!(
+        out.len(),
+        2,
+        "ReadBufferFull during AwaitingPingReply → FailReply + CloseSocket",
+    );
+    match out.as_slice() {
+        [
+            Action::FailReply { id: failed_id, cause },
+            Action::CloseSocket,
+        ] => {
+            assert_eq!(failed_id, &ping_raw);
+            match cause {
+                ProtocolError::ReadBufferFull {
+                    attempted,
+                    available,
+                } => {
+                    assert_eq!(*attempted, overflow_len);
+                    assert_eq!(*available, READ_BUF_CAP);
+                }
+                other => panic!(
+                    "expected ReadBufferFull {{ attempted: {overflow_len}, available: {READ_BUF_CAP} }}, got {other:?}",
+                ),
+            }
+        }
+        other => panic!("unexpected action sequence: {other:?}"),
+    }
+
+    // State preservation: the Errored variant carries the exact same
+    // cause value, not a generic-fallback or a truncated copy.
+    match proto.state() {
+        ProtoState::Errored(ProtocolError::ReadBufferFull {
+            attempted,
+            available,
+        }) => {
+            assert_eq!(*attempted, overflow_len);
+            assert_eq!(*available, READ_BUF_CAP);
+        }
+        other => panic!(
+            "state must be Errored(ReadBufferFull{{..}}), got {other:?}",
+        ),
+    }
+}
+
 /// Invariant (spec): a frame declaring a length that exceeds
 /// `MAX_FRAME_LEN_FIELD` (structural DoS guard) is rejected without
 /// the body ever being buffered. `FrameTooLarge` is emitted and the
