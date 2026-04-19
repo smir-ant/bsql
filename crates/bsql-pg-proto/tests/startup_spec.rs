@@ -850,7 +850,7 @@ fn scram_signature_mismatch_is_rejected() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             assert!(
-                matches!(cause, ProtocolError::ScramError { .. }),
+                matches!(cause, ProtocolError::Scram(_)),
                 "expected ScramError, got {cause:?}",
             );
         }
@@ -887,7 +887,7 @@ fn scram_iterations_too_low_is_rejected() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             assert!(
-                matches!(cause, ProtocolError::ScramError { .. }),
+                matches!(cause, ProtocolError::Scram(_)),
                 "expected ScramError for low iterations, got {cause:?}",
             );
         }
@@ -913,7 +913,7 @@ fn scram_nonce_prefix_mismatch_is_rejected() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             assert!(
-                matches!(cause, ProtocolError::ScramError { .. }),
+                matches!(cause, ProtocolError::Scram(_)),
                 "expected ScramError for nonce mismatch, got {cause:?}",
             );
         }

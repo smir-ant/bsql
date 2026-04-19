@@ -350,10 +350,7 @@ fn dispatch_auth_in_startup(
             if !mechanism_list_contains_scram(rest) {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: ProtocolError::ScramError {
-                        detail: heapless::String::try_from("no supported mechanism")
-                            .unwrap_or_default(),
-                    },
+                    cause: scram_err(crate::scram::wire::ScramError::NoSupportedMechanism),
                 };
             }
 
@@ -428,19 +425,19 @@ fn build_sasl_initial_response(
     // an empty "n=" field is accepted per RFC 5802.
     let user_bytes: &[u8] = b"";
 
-    let client_nonce_b64 = wire::generate_client_nonce().map_err(scram_err_from)?;
+    let client_nonce_b64 = wire::generate_client_nonce().map_err(scram_err)?;
 
     let client_first_bare =
-        wire::build_client_first_bare(user_bytes, &client_nonce_b64).map_err(scram_err_from)?;
+        wire::build_client_first_bare(user_bytes, &client_nonce_b64).map_err(scram_err)?;
 
     let client_first_msg =
-        wire::build_client_first_message(user_bytes, &client_nonce_b64).map_err(scram_err_from)?;
+        wire::build_client_first_message(user_bytes, &client_nonce_b64).map_err(scram_err)?;
 
     // Build SASLInitialResponse frame:
     // tag 'p', length-prefix, mechanism-name NUL, i32 body-length, body
     let mut wb = WriteBuf::new();
     wb.push_u8(crate::wire::TAG_SASL_RESPONSE)
-        .map_err(|_| scram_buf_err())?;
+        .map_err(|_| scram_err(crate::scram::wire::ScramError::BufferOverflow))?;
     wb.with_length_prefix(|w| {
         // Mechanism name NUL-terminated
         w.push_bytes(SCRAM_SHA_256_MECHANISM)
@@ -456,7 +453,7 @@ fn build_sasl_initial_response(
             .map_err(|_| crate::write_buf::WriteBufFull)?;
         Ok(())
     })
-    .map_err(|_| scram_buf_err())?;
+    .map_err(|_| scram_err(crate::scram::wire::ScramError::BufferOverflow))?;
 
     Ok((
         SendBuf::from_owned(wb.into_inner()),
@@ -508,7 +505,7 @@ fn dispatch_auth_sasl_continue(
             Err(e) => {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: scram_err_from(e),
+                    cause: scram_err(e),
                 };
             }
         };
@@ -526,7 +523,7 @@ fn dispatch_auth_sasl_continue(
             Err(e) => {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: scram_err_from(e),
+                    cause: scram_err(e),
                 };
             }
         };
@@ -555,7 +552,7 @@ fn dispatch_auth_sasl_continue(
             Err(_) => {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: scram_buf_err(),
+                    cause: scram_err(crate::scram::wire::ScramError::BufferOverflow),
                 }
             }
         };
@@ -564,7 +561,7 @@ fn dispatch_auth_sasl_continue(
         None => {
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),
-                cause: scram_buf_err(),
+                cause: scram_err(crate::scram::wire::ScramError::BufferOverflow),
             }
         }
     };
@@ -578,7 +575,7 @@ fn dispatch_auth_sasl_continue(
         Err(e) => {
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),
-                cause: scram_err_from(e),
+                cause: scram_err(e),
             };
         }
     };
@@ -592,7 +589,7 @@ fn dispatch_auth_sasl_continue(
     {
         return DispatchOutcome::Errored {
             reply_id: Some(reply),
-            cause: scram_buf_err(),
+            cause: scram_err(crate::scram::wire::ScramError::BufferOverflow),
         };
     }
 
@@ -634,7 +631,7 @@ fn dispatch_auth_sasl_final(
         Err(e) => {
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),
-                cause: scram_err_from(e),
+                cause: scram_err(e),
             };
         }
     };
@@ -643,10 +640,7 @@ fn dispatch_auth_sasl_final(
     if !bool::from(expected_server_sig.ct_eq(&received_sig)) {
         return DispatchOutcome::Errored {
             reply_id: Some(reply),
-            cause: ProtocolError::ScramError {
-                detail: heapless::String::try_from("server signature mismatch")
-                    .unwrap_or_default(),
-            },
+            cause: scram_err(crate::scram::wire::ScramError::SignatureMismatch),
         };
     }
 
@@ -787,59 +781,22 @@ fn parse_backend_key_data(payload: &[u8]) -> Result<(i32, i32), ProtocolError> {
     }
 }
 
-/// Convenience: SCRAM buffer overflow error.
-fn scram_buf_err() -> ProtocolError {
-    ProtocolError::ScramError {
-        detail: heapless::String::try_from("buffer overflow").unwrap_or_default(),
-    }
-}
-
-/// Build a [`ProtocolError::ScramError`] from any [`Display`] source,
-/// handling the `heapless::String` cap-exhaustion case explicitly.
+/// Wrap a [`scram::wire::ScramError`] into the protocol's typed
+/// [`ProtocolError::Scram`] variant. The helper exists so the call
+/// sites can write `.map_err(scram_err)` instead of
+/// `.map_err(ProtocolError::Scram)` — more discoverable by name and
+/// one place to hook diagnostics in the future.
 ///
-/// Call sites previously wrote this inline as
-/// `let _ = Write::write_fmt(...)` — banned pattern (memory
-/// `feedback_no_underscore_vars`) *and* tier-3 silent-truncation
-/// class: `write_fmt` returns `Err(fmt::Error)` iff the formatter
-/// exhausted capacity, after possibly writing partial content. The
-/// inline form discarded that signal, so oversized detail messages
-/// silently surfaced as partial strings to the caller.
+/// DEF-060: this replaces the earlier `scram_err<E: Display>`
+/// which formatted the source into a `heapless::String<128>` — the
+/// tier-3 silent-truncation class (oversized messages collapsed to
+/// empty via `unwrap_or_default`). Typed variants eliminate the
+/// class entirely.
 ///
-/// This helper replaces the inline pattern with an explicit
-/// `is_err()` branch: on cap exhaustion the partial content is
-/// cleared and a static sentinel (`"scram error (detail
-/// truncated)"`, 30 bytes — fits 128-byte cap) takes its place.
-/// The fallback's `try_from` Err branch is architecturally dead (the
-/// sentinel fits) but surfaced honestly via `if let Ok` — if a
-/// future refactor tightens the cap below 30 bytes, `detail` stays
-/// empty rather than carrying garbage.
-///
-/// Cold path: every SCRAM error classification routes through here;
-/// the happy path never constructs one. `#[cold]` moves the
-/// monomorphised code out of the hot instruction-cache neighbourhood.
-///
-/// Superseded by DEF-060 (typed SCRAM error sub-enums eliminate the
-/// `heapless::String<128>` detail field entirely); until DEF-060
-/// ships, this helper is the canonical construction path.
-///
-/// [`Display`]: core::fmt::Display
+/// [`scram::wire::ScramError`]: crate::scram::wire::ScramError
 #[cold]
-fn scram_err_from<E: core::fmt::Display>(source: E) -> ProtocolError {
-    use core::fmt::Write;
-    let mut detail = heapless::String::<128>::new();
-    if detail.write_fmt(format_args!("{source}")).is_err() {
-        // Partial content may have been appended before the capacity
-        // hit. Drop it — the caller would otherwise receive a
-        // truncated message with no indication of the truncation.
-        detail.clear();
-        if let Ok(sentinel) = heapless::String::try_from("scram error (detail truncated)") {
-            detail = sentinel;
-        }
-        // Dead `else`: sentinel (30 bytes) fits the 128-byte cap —
-        // a future cap reduction would surface as empty `detail`,
-        // which is still non-silent.
-    }
-    ProtocolError::ScramError { detail }
+fn scram_err(failure: crate::scram::wire::ScramError) -> ProtocolError {
+    ProtocolError::Scram(failure)
 }
 
 #[cfg(test)]

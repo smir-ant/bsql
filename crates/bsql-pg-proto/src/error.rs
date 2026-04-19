@@ -108,11 +108,19 @@ pub enum ProtocolError {
     /// requested. DEF-044.
     UnsupportedProtocolOption,
 
-    /// SCRAM authentication error — wraps the specific SCRAM failure.
-    ScramError {
-        /// Descriptive SCRAM error message.
-        detail: heapless::String<128>,
-    },
+    /// SCRAM authentication failure.
+    ///
+    /// DEF-060: typed variant carrying the discrete [`scram::wire::ScramError`]
+    /// classification directly. The previous shape
+    /// `ScramError { detail: heapless::String<128> }` was a tier-3
+    /// silent-truncation seam (`.unwrap_or_default()` on
+    /// `heapless::String::try_from`) — formatted strings larger than
+    /// 128 bytes silently collapsed to empty. Now the cause is a
+    /// discrete enum; `Display` is computed from the variant, no
+    /// intermediate buffer, no truncation class.
+    ///
+    /// [`scram::wire::ScramError`]: crate::scram::wire::ScramError
+    Scram(crate::scram::wire::ScramError),
 
     /// Server's `BackendKeyData` payload has wrong size (expected 8).
     MalformedBackendKeyData {
@@ -246,7 +254,7 @@ impl ProtocolError {
             Self::ServerErrorResponse { .. } => ErrorKind::ServerError,
             Self::UnsupportedAuthMethod { .. }
             | Self::UnsupportedProtocolOption
-            | Self::ScramError { .. }
+            | Self::Scram(_)
             | Self::StartupAlreadyInProgress => ErrorKind::Auth,
             Self::ProtocolInvariantBroken => ErrorKind::Internal,
             Self::ConnectionAlreadyClosed { .. } => ErrorKind::AlreadyClosed,
@@ -298,7 +306,7 @@ impl fmt::Display for ProtocolError {
             Self::UnsupportedProtocolOption => {
                 f.write_str("server does not support requested protocol option")
             }
-            Self::ScramError { detail } => write!(f, "SCRAM authentication failed: {detail}"),
+            Self::Scram(failure) => write!(f, "SCRAM authentication failed: {failure}"),
             Self::MalformedBackendKeyData { payload_len } => write!(
                 f,
                 "BackendKeyData payload length {payload_len} (expected 8)",

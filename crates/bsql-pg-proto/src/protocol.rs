@@ -651,15 +651,19 @@ fn compute_push_startup(
                 ProtoState::ConnectingStartup { reply, credentials }
             }
             Err(_) => {
+                // Architecturally unreachable: the const drift-guard
+                // `MAX_OWNED_SEND_LEN >= max_startup_message_size()`
+                // (write_buf.rs) proves StartupMessage fits the cap.
+                // Classify as `ProtocolInvariantBroken` — if this
+                // branch ever fires at runtime, it is a logic bug
+                // in this crate (drift-guard removed without cap
+                // growth). Previously mis-classified as ScramError
+                // with a 128-byte string (tier-4 silent-truncation);
+                // DEF-060 replaces the string with the typed kind.
                 emit_actions!(out, budget: 1, [
                     Action::FailReply {
                         id: reply.consume(),
-                        cause: ProtocolError::ScramError {
-                            detail: heapless::String::try_from(
-                                "StartupMessage too large for send buffer",
-                            )
-                            .unwrap_or_default(),
-                        },
+                        cause: ProtocolError::ProtocolInvariantBroken,
                     },
                 ]);
                 ProtoState::Idle
