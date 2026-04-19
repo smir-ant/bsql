@@ -392,7 +392,7 @@ Features stable в MSRV 1.95 (или earlier) которые bsql активно
 | **`core::mem::offset_of!`** | 1.77 | Const-eval offset of field в struct. Macro-generated row decoders используют для fixed-offset decode без sizeof-gymnastics. |
 | **Precise capturing `impl Trait + use<…>`** | 1.87 | Tight lifetime bounds в RPITIT (`async fn` in traits). Backend's `run_io` signature становится чище + fewer unnecessary lifetime pollution up the call stack. |
 | **`async fn` in traits** (stable evolution) | 1.75-1.94 | `Backend` trait пишется native async без `async-trait` dep. Zero Box-dyn-Future overhead. |
-| **`core::hint::cold_path()`** | 1.83 | Inline cold-branch hint без extract'а в отдельную `#[cold]` function. Branch prediction уточнение. |
+| **`core::hint::cold_path()`** | 1.95 | Inline cold-branch hint без extract'а в отдельную `#[cold]` function. Branch prediction уточнение. Применён в `parse_header` (MalformedLength / FrameTooLarge / NonZero None arms), `#[cold]` на `parse_error_response` / `parse_backend_key_data` / `fail_inflight_and_close` — см. Phase 1b hardening 2026-04-18. |
 | **`const_refs_to_static`** | 1.83 | `const TABLE: &[u8] = &STATIC_BYTES;` — const references в static tables. LUT'ы из §89.5. |
 | **`LazyLock` / `OnceLock`** | 1.80 / 1.70 | Ленивая инициализация static lookup tables (OID→decoder fn-ptr, tag→handler) без `lazy_static!` / `once_cell` deps. Minus one dep. |
 | **`#[diagnostic::do_not_recommend]`** | 1.85 | На `raw_query` и `BsqlError::Other` — compiler не suggest'ит их в error messages как «возможно ты хотел это». Guides user toward correct APIs. |

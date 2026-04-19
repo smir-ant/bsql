@@ -27,11 +27,10 @@ pub const TAG_READY_FOR_QUERY: u8 = b'Z';
 
 /// Backend `ErrorResponse` message tag (`'E'`).
 ///
-/// A server-side error. Variable-length payload of typed fields. Phase
-/// 1a does not parse the field set — it classifies the entire message
-/// as a single [`ProtocolError::ServerError`] and drops it.
-///
-/// [`ProtocolError::ServerError`]: crate::error::ProtocolError::ServerError
+/// A server-side error. Variable-length payload of typed fields. The
+/// dispatcher's [`parse_error_response`][crate::error::ProtocolError::ServerErrorResponse]
+/// extracts severity / code / message / detail / hint into a typed
+/// `ServerErrorResponse` classification.
 pub const TAG_ERROR_RESPONSE: u8 = b'E';
 
 /// The complete `Sync` frame on the wire.

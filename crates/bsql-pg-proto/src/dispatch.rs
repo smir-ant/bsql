@@ -684,6 +684,11 @@ fn dispatch_auth_ok_after_scram(reply: ReplyId, payload: &[u8]) -> DispatchOutco
 /// PG ErrorResponse body: series of typed fields, each = type-byte +
 /// NUL-terminated string. Terminated by a bare NUL (0x00). We extract
 /// 'S' (severity), 'C' (code), 'M' (message), 'D' (detail), 'H' (hint).
+///
+/// Cold path: called only when the server emits an `ErrorResponse`
+/// frame (`'E'` tag). The `#[cold]` attribute tells LLVM to keep the
+/// body out of hot-path inlining scope.
+#[cold]
 fn parse_error_response(payload: &[u8]) -> ProtocolError {
     let mut severity = heapless::String::new();
     let mut code = heapless::String::new();
@@ -756,6 +761,10 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 // -----------------------------------------------------------------
 
 /// Parse BackendKeyData payload: 8 bytes = pid(i32 BE) + secret_key(i32 BE).
+///
+/// Cold path: called once per connection at end of startup handshake.
+/// Not on any per-frame or per-query hot path.
+#[cold]
 #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
 fn parse_backend_key_data(payload: &[u8]) -> Result<(i32, i32), ProtocolError> {
     match payload {
@@ -774,5 +783,161 @@ fn parse_backend_key_data(payload: &[u8]) -> Result<(i32, i32), ProtocolError> {
 fn scram_buf_err() -> ProtocolError {
     ProtocolError::ScramError {
         detail: heapless::String::try_from("buffer overflow").unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod parse_error_response_tests {
+    //! Seam-closing tests for `parse_error_response` (S4 / B1 from the
+    //! 2026-04-18 second-pass audit).
+    //!
+    //! The function has nine field-type arms (`b'S'`, `b'V'`, `b'C'`,
+    //! `b'M'`, `b'D'`, `b'H'`, unknown) mapping to five
+    //! `ServerErrorResponse` fields. Swapping any two arms compiles
+    //! cleanly — the lint-level type checker cannot see that `b'M'`
+    //! should land in `message` and `b'D'` should land in `detail`.
+    //! Tests below set each field explicitly and assert the full
+    //! `ProtocolError` value for byte-exact mapping.
+    //!
+    //! Also covers pathological inputs:
+    //! - Empty payload (just the terminator).
+    //! - Field type with no NUL-terminated value (unterminated).
+    //! - Duplicate severity (S / V) — first wins (`if severity.is_empty()`).
+    //!
+    //! Category (1) per reforge.md §4.11. Uses `assert_eq!` on the
+    //! full `ProtocolError` variant because `panic!` is crate-root
+    //! forbidden even in unit tests.
+
+    extern crate alloc;
+
+    use super::*;
+
+    /// Build a well-formed ErrorResponse body: a sequence of
+    /// `type_byte + NUL-terminated-value` entries, followed by a
+    /// single trailing `\0` terminator.
+    fn build_error_body(fields: &[(u8, &[u8])]) -> alloc::vec::Vec<u8> {
+        let mut body = alloc::vec::Vec::new();
+        for (type_byte, value) in fields {
+            body.push(*type_byte);
+            body.extend_from_slice(value);
+            body.push(0);
+        }
+        body.push(0); // Terminator.
+        body
+    }
+
+    fn mk_err(
+        severity: &str,
+        code: &str,
+        message: &str,
+        detail: &str,
+        hint: &str,
+    ) -> ProtocolError {
+        ProtocolError::ServerErrorResponse {
+            severity: heapless::String::try_from(severity).unwrap_or_default(),
+            code: heapless::String::try_from(code).unwrap_or_default(),
+            message: heapless::String::try_from(message).unwrap_or_default(),
+            detail: heapless::String::try_from(detail).unwrap_or_default(),
+            hint: heapless::String::try_from(hint).unwrap_or_default(),
+        }
+    }
+
+    /// Invariant (spec): each known field type routes to its dedicated
+    /// `ServerErrorResponse` field. A one-arm swap in `parse_error_response`
+    /// compiles silently; this table catches it via full-value equality.
+    #[test]
+    fn field_type_routes_to_correct_output_field() {
+        let body = build_error_body(&[
+            (b'S', b"FATAL"),
+            (b'C', b"28P01"),
+            (b'M', b"authentication failed"),
+            (b'D', b"user does not exist"),
+            (b'H', b"check pg_hba.conf"),
+        ]);
+        let actual = parse_error_response(&body);
+        let expected = mk_err(
+            "FATAL",
+            "28P01",
+            "authentication failed",
+            "user does not exist",
+            "check pg_hba.conf",
+        );
+        assert_eq!(actual, expected);
+    }
+
+    /// Invariant (spec): `b'V'` is an alternate for `b'S'` (non-localised
+    /// severity). When only `V` arrives, it populates `severity`.
+    #[test]
+    fn severity_v_used_when_s_absent() {
+        let body = build_error_body(&[(b'V', b"ERROR")]);
+        let actual = parse_error_response(&body);
+        let expected = mk_err("ERROR", "", "", "", "");
+        assert_eq!(actual, expected);
+    }
+
+    /// Invariant (spec): first severity (`S` or `V`) wins — the
+    /// `if severity.is_empty()` guard in the S/V arms blocks overwrite.
+    #[test]
+    fn severity_s_wins_over_later_v() {
+        let body = build_error_body(&[(b'S', b"FATAL"), (b'V', b"ERROR")]);
+        let actual = parse_error_response(&body);
+        let expected = mk_err("FATAL", "", "", "", "");
+        assert_eq!(actual, expected);
+    }
+
+    /// Invariant (spec): unknown field types are silently dropped;
+    /// other fields still parse.
+    #[test]
+    fn unknown_field_types_are_silently_skipped() {
+        let body = build_error_body(&[
+            (b'Z', b"irrelevant"),
+            (b'M', b"real message"),
+            (b'Q', b"also irrelevant"),
+        ]);
+        let actual = parse_error_response(&body);
+        let expected = mk_err("", "", "real message", "", "");
+        assert_eq!(actual, expected);
+    }
+
+    /// Invariant (spec): empty payload (just the terminator NUL)
+    /// yields an all-empty `ServerErrorResponse`, not a parse failure
+    /// or panic.
+    #[test]
+    fn empty_payload_yields_empty_fields() {
+        let body: alloc::vec::Vec<u8> = alloc::vec![0];
+        let actual = parse_error_response(&body);
+        let expected = mk_err("", "", "", "", "");
+        assert_eq!(actual, expected);
+    }
+
+    /// Invariant (spec): a field-type byte with no NUL-terminated
+    /// value (adversarial input: payload ends mid-field) does not
+    /// loop forever and does not panic. Pins that the
+    /// `while let Some(b) = payload.get(pos)` inner loop terminates
+    /// on end-of-buffer. A regression using unchecked indexing would
+    /// loop / panic; this test verifies graceful termination.
+    #[test]
+    fn unterminated_final_field_does_not_panic() {
+        // [S, 'A', 'B'] — no NUL after 'B', no terminator.
+        let body: alloc::vec::Vec<u8> = alloc::vec![b'S', b'A', b'B'];
+        let actual = parse_error_response(&body);
+        // Whatever the parser recovered: must be a bounded string and
+        // must not panic. Exact value of severity is an implementation
+        // detail (parser reads to EOF as the value).
+        let expected = mk_err("AB", "", "", "", "");
+        assert_eq!(actual, expected);
+    }
+
+    /// Invariant (spec): duplicate non-severity fields — second
+    /// overwrites first. Pins that the unguarded assignments for
+    /// `C`, `M`, `D`, `H` arms hold. A regression that added `if
+    /// .is_empty()` guards would silently change the semantics
+    /// (first-wins vs last-wins).
+    #[test]
+    fn duplicate_code_second_wins() {
+        let body = build_error_body(&[(b'C', b"FIRST"), (b'C', b"SECOND")]);
+        let actual = parse_error_response(&body);
+        let expected = mk_err("", "SECOND", "", "", "");
+        assert_eq!(actual, expected);
     }
 }

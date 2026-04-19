@@ -42,15 +42,6 @@ pub enum ProtocolError {
         declared: u32,
     },
 
-    /// Server emitted an `ErrorResponse` (tag `'E'`) where the protocol
-    /// expected a successful reply.
-    ///
-    /// Phase 1a does not parse the typed-field body of the response;
-    /// the wrapper layer can read the underlying bytes via a future API
-    /// extension. For the Ping flow we only need to know "the server
-    /// said no".
-    ServerError,
-
     /// Received a server frame whose tag is not legal in the current
     /// state.
     ///
@@ -168,7 +159,6 @@ impl fmt::Display for ProtocolError {
                 f,
                 "frame too large: declared length {declared} exceeds buffer cap",
             ),
-            Self::ServerError => f.write_str("server emitted ErrorResponse"),
             Self::UnexpectedFrame { tag } => {
                 // Print the tag as a character if it is in the printable
                 // ASCII range; otherwise hex. PG message tags are all in

@@ -122,11 +122,6 @@ pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 // A future refactor that introduces a non-Send field (`Rc<T>`, raw
 // pointer, `MutexGuard`) into any of these types becomes a build
 // error here rather than a silent regression downstream.
-//
-// `PgProtocol: !Sync` is structural via `PhantomData<Cell<()>>` on the
-// struct itself (see `protocol.rs`); it is *not* asserted here because
-// `assert_not_sync` has no stable stdlib form and would require a
-// dependency. Covered by review.
 // ---------------------------------------------------------------------
 const _: fn() = || {
     fn assert_send<T: Send>() {}
@@ -150,4 +145,41 @@ const _: fn() = || {
     assert_send::<write_buf::WriteBuf>();
     assert_send::<scram::types::SecretDigest>();
     assert_send::<scram::types::CappedServerNonce>();
+};
+
+// ---------------------------------------------------------------------
+// Tier-1 compile gate on `!Sync` for `PgProtocol` (DEF-073).
+//
+// `PgProtocol` must be `!Sync` by construction so that concurrent
+// `&mut PgProtocol` access is architecturally unreachable — only one
+// task at a time holds the exclusive borrow (see reforge.md §16). The
+// marker that achieves this today is the `PhantomData<Cell<()>>` field
+// on the struct; since `Cell<T>` is `!Sync`, the struct inherits it.
+//
+// **Without this assertion**, removing the marker field compiles
+// silently and `PgProtocol` becomes `Sync`. The downstream wrapper
+// then would accept `&PgProtocol` across threads — a soundness break
+// the compiler would no longer catch.
+//
+// # The ambiguous-impl trick
+//
+// We define a private trait with two overlapping blanket impls: one
+// for every `T: ?Sized`, one for every `T: ?Sized + Sync`. For
+// `T: Sync`, both impls match — method resolution is ambiguous and
+// the build fails. For `T: !Sync`, only the first impl matches — the
+// build succeeds. Calling `assert_not_sync::<PgProtocol>()` thus
+// compiles iff `PgProtocol` is `!Sync`.
+//
+// No dev-dep on `static_assertions`; stable Rust, zero runtime cost
+// (the const block resolves at typeck time and emits no code).
+const _: fn() = || {
+    trait AmbiguousIfSync<A> {
+        fn assert_not_sync() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T {}
+
+    // If `PgProtocol: Sync`, the two impls above collide on method
+    // resolution — this line fails to compile.
+    <protocol::PgProtocol as AmbiguousIfSync<_>>::assert_not_sync();
 };

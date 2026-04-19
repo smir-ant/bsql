@@ -281,6 +281,65 @@ that take full advantage of it need explicit registration.
 |---|---|---|
 | DEF-072 | `bsql-driver-postgres-sync` and `bsql-driver-sqlite-sync` sibling crates — pure-sync implementations of `Backend` using `std::net::TcpStream` (blocking) + `std::sync::mpsc` / `crossbeam-channel` instead of tokio primitives. `bsql-pg-proto` is shared byte-for-byte; the driver layer is the only difference. Users feature-select async or sync (or both, for heterogeneous pools). Benefit: apps without tokio (CLI tools, embedded, sync libraries) never transitively pull tokio. | 3 (async lands 1e; sync sibling in 3 with pool) |
 
+## 12. Phase-1b second paranoid pass (2026-04-18 — same day)
+
+User requested a third-order paranoid audit of the Phase-1b hardening
+commit (`08ee095`): "are we certain nothing's glass architecture,
+really tier-N as claimed, no missing tests". An independent audit
+pass by the architect sub-agent found:
+
+- **T1: real manufactured variant** (`ProtocolError::ServerError`
+  declared, never emitted) — direct §4.6 violation, missed in round 1.
+- **T2: tier-honesty drift** (`MAX_ACTIONS_PER_CALL` aggregate claim
+  was loose).
+- **S1–S4: seams without tests** (literal-swap-in-arm-body paths
+  where the compiler does not pin `{input → output}` mapping).
+- **U1: tier upgrade available** (`PgProtocol: !Sync` was tier-2
+  structural via `PhantomData<Cell<()>>`; compile-time assert via
+  "ambiguous-impl" trait trick raises it to tier-1).
+- **U2: Errored-loss hazard** (`core::mem::take` pattern is tier-2
+  by audit; a `take_unless_errored() -> Option<ProtoState>` helper
+  raises to tier-1 via NonErroredState sum-type).
+
+### Closed in this pass
+
+| ID | Status | What closed it |
+|---|---|---|
+| DEF-073 | Closed | `ProtocolError::ServerError` variant stricken — was manufactured (declared at `error.rs:52`, zero emit sites — `parse_error_response` only emits `ServerErrorResponse`). §3.5/§4.6 violation caught by independent architect pass; missed in round 1. Doc reference in `wire.rs` updated to point at `ServerErrorResponse`. |
+| DEF-074 | Closed | `PgProtocol: !Sync` raised from tier-2 structural to **tier-1 compile** via the ambiguous-impl trait trick in `lib.rs`. A private trait `AmbiguousIfSync<A>` has two overlapping blanket impls: `impl<T: ?Sized> AmbiguousIfSync<()> for T` and `impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for T`. For `T: Sync` both match and method resolution is ambiguous (build fail); for `T: !Sync` only the first matches (build succeeds). Removing the `_not_sync: PhantomData<Cell<()>>` field now fails the build — the structural defence became a compile-time proof. Zero dep, zero runtime cost. |
+| DEF-075 | Closed | Tier-1 shield seams pinned by tests (second-pass audit categories S1/S2/S3/S4/U3 + direct bounded-buffer / newtype / BackendKeyData coverage): <br>• `tests/bounded_buffers_spec.rs` (15 tests): `ReadBuf` append/advance/clear/overflow/lazy-compact; `WriteBuf` push methods + length-prefix + overflow; `CappedServerNonce` bound classification.<br>• `tests/tier_seams_spec.rs` (9 tests): `SendBuf::as_bytes` Static/Owned fidelity (S2); `SessionParams::set` key→field mapping table (S3) + unknown-key drop + non-UTF8 skip + overwrite semantics; `Errored` cause preservation in state AND reply (U3) with distinguishable `FrameTooLarge{declared:0xDEAD}`; `DatabaseName` validation + `ApplicationName` allow-empty; `BackendKeyData` malformed-size classification.<br>• In-module tests in `protocol.rs` (1 test): `allows_unsolicited_param_status` policy table over all 9 `ProtoState` variants (S1).<br>• In-module tests in `dispatch.rs` (7 tests): `parse_error_response` field-type → field mapping (S4), severity S/V precedence, unknown-field skip, empty/unterminated payload graceful handling (B1 partial), duplicate-code last-wins.<br>Test count: 41 → 73 tests. Each test maps to a reforge.md §4.11.1 seam class (literal swap, arm return swap, arm-body access, classification boundary, one-line impl drift). |
+| DEF-076 | Closed | `MAX_ACTIONS_PER_CALL` docstring in `protocol.rs` rewrote the tier claim honestly: **per-site budget** is tier-1 compile (via `emit_actions!` const_asserts, DEF-045); **aggregate across loop iterations** is tier-2 structural (bounded container + `on_overflow: break` bail, not compile-proven in frame count). The previous `"tier-1"` summary label was loose. §3.4 ban on "tier-1 runtime" labels honored. |
+
+### Carried open (architect second-pass findings not closed yet)
+
+| ID | Commitment | Phase | Rationale / note |
+|---|---|---|---|
+| DEF-077 | **`NonErroredState` refactor** — extract non-Errored variants into a separate enum; `take_state_or_read_errored_cause()` helper returns either `NonErroredState` (moved out) or `&ProtocolError` (borrowed from Errored). Forgetting to restore Errored becomes compile-impossible (you literally never get the cause out to lose). Currently tier-2 by audit; refactor raises to tier-1. **Deferred to Phase 1c** because it touches every state-handling function and naturally bundles with DEF-059 (compute/apply split). Not urgent because all current `mem::take` sites correctly restore `Errored` (pinned by U3 test `errored_cause_is_preserved_in_state_and_reply`). | 1c | Architect second pass U2. |
+| DEF-078 | `parse_server_first` accepts RFC 5802 extension fields (`m=required` prefix) — currently `splitn(3, ',')` may silently ignore extra comma-separated fields. Bumping split cap + classifying unexpected `m=` prefix per RFC. | 1c (with query flow) | Architect second pass B3. Real-world PG servers don't send extensions, but strict spec-conformance for future interop. |
+| DEF-079 | `record_param_status` edge-shape coverage — tests for empty key (leading NUL), missing trailing NUL, missing value-NUL. All handled by current code (`strip_suffix(&[0])` falls back to region, `checked_add` bounds the walk), but no spec-conformance test pins the behaviour. Low-risk, worth documenting. | 1c | Architect second pass B2. |
+| DEF-080 | `buf::compact` proptest — random sequences of `append → partial advance → append` exercise the `copy_within` overlap cases. `heapless::Vec::copy_within` is safe per std semantics, but DEF-058 changed the code; a property test formalizes the invariant. | 6 (verification infra) | Architect second pass B4. Falls into the proptest bundle (DEF-026). |
+
+### Rust 1.95 features — future applications
+
+Audit of every 1.95-stabilised feature against our current code produced one
+immediate application (`#[cold]` / `core::hint::cold_path()` added in
+Phase 1b hardening, see DEF-081 below). The rest are registered here for
+phases where they naturally fit.
+
+| ID | Feature | Target phase | Use-case |
+|---|---|---|---|
+| DEF-082 | `bool: TryFrom<{integer}>` | 1c codec | PG binary `bool` type (OID 16) encodes as exactly `0` or `1`. Using `bool::try_from(byte)` instead of `byte != 0` rejects any other byte value as a decode error — tier-1 against server-protocol violation. Today unused because no binary codec yet. |
+| DEF-083 | `AtomicBool::update` / `AtomicPtr::update` / `Atomic{Isize,Usize}::update` | 1e wrapper | `Client<B>::is_connected: AtomicBool` — lock-free state flip on transport close. Pending-replies slot updates if DEF-034 slotted map uses atomics. Cleaner than `compare_exchange` loops. |
+| DEF-084 | `if let` guards on match arms | Not applicable today | Audited every parse-then-dispatch site; slice patterns + match-over-Result already cover our use cases. An Err branch always needs the concrete error value, which `if let` guards hide. Keep in mind if Phase 1c / 2 produces new "pattern + optional validation" shapes. |
+| DEF-085 | `core::range::RangeInclusive` + `Iter` | Not applicable today | The new `core::range` mod provides inclusive-range iteration in no_std. No current use but potentially useful for test fixtures or future bounded counters. Register for visibility. |
+| DEF-086 | `fmt::from_fn` (now const) | Not applicable after DEF-060 | Could replace Display impls with const-builders. Made irrelevant by DEF-060's move to `&'static str` discrete error enums (no runtime formatting needed on cold path). |
+
+### Closed in this sub-pass (cold-path application)
+
+| ID | Status | What closed it |
+|---|---|---|
+| DEF-081 | Closed | `core::hint::cold_path()` (stable 1.95) applied inside `parse_header` at MalformedLength / FrameTooLarge / NonZero-None arms — keeps the happy path contiguous in I-cache. `#[cold]` attribute applied to `parse_error_response`, `parse_backend_key_data`, and `PgProtocol::fail_inflight_and_close` — whole-function cold markers so LLVM places their bodies out of hot-path instruction-cache neighborhoods. No safety impact (hints only); perf gain measured later via DEF-067 `cargo asm` milestone. reforge.md §5.6 corrected: cold_path stabilised 1.95, not 1.83. |
+
 ## 10. Closed
 
 Move entries here when a deferral is genuinely resolved — not just

@@ -161,9 +161,16 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
         [tag, l0, l1, l2, l3, ..] => {
             let declared = u32::from_be_bytes([*l0, *l1, *l2, *l3]);
             if declared < 4 {
+                // Cold branch — malformed frames are the adversarial /
+                // server-bug case, not the common path. `cold_path()`
+                // hints LLVM to push this block to the end of the
+                // generated body so the happy path stays contiguous
+                // in I-cache. Stable since Rust 1.95.
+                core::hint::cold_path();
                 return HeaderParse::MalformedLength { declared };
             }
             if declared > MAX_FRAME_LEN_FIELD {
+                core::hint::cold_path();
                 return HeaderParse::FrameTooLarge { declared };
             }
             // declared >= 4 and declared <= MAX_FRAME_LEN_FIELD <= READ_BUF_CAP - 1;
@@ -174,7 +181,10 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
             // path is dead).
             let total_len = match usize::try_from(declared) {
                 Ok(n) => n.saturating_add(1),
-                Err(_) => return HeaderParse::FrameTooLarge { declared },
+                Err(_) => {
+                    core::hint::cold_path();
+                    return HeaderParse::FrameTooLarge { declared };
+                }
             };
             // declared >= 4 ⇒ NonZeroU32::new is Some.
             match NonZeroU32::new(declared) {
@@ -183,7 +193,10 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
                     declared_len: nz,
                     total_len,
                 },
-                None => HeaderParse::MalformedLength { declared },
+                None => {
+                    core::hint::cold_path();
+                    HeaderParse::MalformedLength { declared }
+                }
             }
         }
     }

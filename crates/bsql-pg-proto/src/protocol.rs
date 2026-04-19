@@ -131,34 +131,42 @@ macro_rules! emit_actions {
 
 /// Maximum number of [`Action`]s a single entry-point call may emit.
 ///
-/// **Phase 1a budget audit** (each entry-point bounded above):
+/// # Two-level guarantee
+///
+/// - **Per emission site — tier 1 compile (DEF-045).** Each call to
+///   `emit_actions!` carries a `budget: N` literal and a `const _: () =
+///   assert!(MAX_ACTIONS_PER_CALL >= N)` inside the macro expansion.
+///   A site that declares a budget it cannot fit is a build error.
+///   A site that pushes more actions than its declared budget is a
+///   build error. Both checks are pure compile-time.
+/// - **Aggregate across one entry-point call — tier 2 structural.**
+///   `feed_bytes` can loop over multiple frames, each potentially
+///   emitting up to its site's budget. The aggregate is bounded by
+///   `OutActions`'s capacity (`MAX_ACTIONS_PER_CALL`) — overflow
+///   causes the `emit_actions!(..., on_overflow: break, ...)` form
+///   to bail out of the loop, not silently drop. The aggregate cap is
+///   **structural** (bounded container), not compile-proven in terms
+///   of frame count. Honest tier: not tier-1, per §3.4's ban on
+///   "tier-1 runtime" labels for runtime-checked bounds.
+///
+/// # Phase 1a + 1b budget audit
 ///
 /// - `push_command(Ping)` from `Idle` → 1 action (`SendBytes`).
-/// - `push_command(Ping)` from any non-`Idle` state → not yet
-///   reachable (only `AwaitingPingReply` exists, and §54 of the PG
-///   protocol does not let us pipeline a second Ping concurrently —
-///   the dispatcher refuses with `FailReply` + `CloseSocket`, **2
-///   actions**).
-/// - `feed_bytes(rfq)` from `AwaitingPingReply` → 1 action
-///   (`DeliverReply`).
-/// - `feed_bytes(error_response)` from `AwaitingPingReply` → 2
-///   actions (`FailReply` + `CloseSocket`).
-/// - `feed_bytes(malformed)` from any state → 2 actions
-///   (`FailReply` + `CloseSocket`); if no in-flight reply, **1**
-///   action (`CloseSocket` only).
-/// - `feed_bytes(multiple frames in one chunk)` is a future concern.
-///   Phase 1a's only inbound frame is RFQ (6 wire bytes); the read
-///   buffer can hold up to `READ_BUF_CAP / 6 ≈ 682` of them, but only
-///   one is meaningful at a time. The dispatcher runs one frame per
-///   loop iteration; the loop bounds itself on `OutActions::push`
-///   returning `Err` (the loop exits when the action vector is full).
+/// - `push_command(Ping)` from non-`Idle` → 1 action (`FailReply`).
+/// - `push_command(Startup)` → 1 action (`SendBytes` or `FailReply`).
+/// - `feed_bytes(rfq)` from `AwaitingPingReply` → 1 action.
+/// - `feed_bytes(error_response)` from any flight state → 2 actions
+///   (`FailReply` + `CloseSocket`).
+/// - `feed_bytes(malformed)` → 2 actions (or 1 if no in-flight reply).
+/// - `feed_bytes(multiple frames in one chunk)` — the drain loop in
+///   `feed_bytes` bails on `OutActions` full via `on_overflow: break`.
 ///
-/// Therefore the Phase 1a worst case is **2** actions per call. We
-/// use **4** here to give the dispatcher loop one frame's slack so it
-/// can advance and emit on the same call without being forced into a
-/// second feed cycle. Bumping happens in 1c with the first multi-action
-/// path and is enforced via per-call-site `const _: () = assert!(…)`
-/// that lives next to the emission.
+/// The worst-case single-site emission in Phase 1a/1b is **2** actions.
+/// `MAX_ACTIONS_PER_CALL = 4` gives the dispatcher loop one frame's
+/// slack (two actions absorbed, room for one more iteration's emission
+/// before the bail-break fires). Bumping happens in 1c with the first
+/// multi-action path (compute/apply split — DEF-059 — may surface new
+/// emission sites).
 pub const MAX_ACTIONS_PER_CALL: usize = 4;
 
 // Sanity assert — the budget audit above demands at least 2.
@@ -524,6 +532,13 @@ impl PgProtocol {
     /// is preserved and no new actions are emitted — the wrapper was
     /// already told to close on the first classification; a duplicate
     /// `CloseSocket` would only confuse it.
+    ///
+    /// Cold path: called only from fatal classifications in
+    /// `feed_bytes` (buffer-full, malformed frame, oversized frame,
+    /// broken invariant). `#[cold]` hints LLVM to lay out the caller's
+    /// hot path contiguously — this body is reachable only on the
+    /// protocol-error branch.
+    #[cold]
     fn fail_inflight_and_close(
         &mut self,
         cause: ProtocolError,
@@ -685,3 +700,119 @@ impl core::fmt::Debug for PgProtocol {
 // `emit_actions!` which provides compile-time per-site budget
 // enforcement (DEF-045). The old helper's Result handling is
 // subsumed by the macro's `on_overflow` parameter.
+
+#[cfg(test)]
+mod allows_unsolicited_param_status_tests {
+    //! Seam-closing table for `allows_unsolicited_param_status`
+    //! (S1 / DEF-054). The function's exhaustive match returns `true`
+    //! for four variants and `false` for five. Swapping any variant
+    //! between arms compiles (both arms return `bool`); only a test
+    //! enumerating every variant against its expected policy value
+    //! can catch the drift.
+    //!
+    //! Category (1) per reforge.md §4.11.
+
+    use super::*;
+    use crate::password::{Credentials, Password};
+    use crate::reply_id::ReplyId;
+    use crate::scram::types::SecretDigest;
+    use crate::sensitive::Sensitive;
+    use core::num::NonZeroU64;
+
+    fn nz(n: u64) -> NonZeroU64 {
+        NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
+    }
+
+    /// Consume any ReplyId carried by a state so the Drop-guard does
+    /// not trip at end-of-scope.
+    fn consume_state(state: ProtoState) {
+        match state {
+            ProtoState::Idle | ProtoState::Errored(_) => {}
+            ProtoState::AwaitingPingReply(id)
+            | ProtoState::ConnectingScramAwaitAuthOk(id)
+            | ProtoState::ConnectingPostAuthWaitKey(id) => {
+                // `.consume()` marks the ReplyId as delivered so the
+                // Drop-guard does not fire. The returned `NonZeroU64`
+                // is discarded as a statement — no `drop()` call
+                // (NonZeroU64 is not Drop; clippy's `drop_non_drop`
+                // fires on such calls) and no `let _` (banned).
+                id.consume();
+            }
+            ProtoState::ConnectingStartup { reply, .. }
+            | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
+            | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
+            | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
+                reply.consume();
+            }
+        }
+    }
+
+    /// Each variant is constructed and its policy verified. Adding a
+    /// new `ProtoState` variant WITHOUT adding it here causes the
+    /// exhaustive-match inside `allows_unsolicited_param_status` to
+    /// build-fail; adding it with the wrong arm compiles but fails
+    /// THIS test.
+    #[test]
+    fn policy_per_variant() {
+        // --- Accepting states (policy = true) ---
+        let idle = ProtoState::Idle;
+        assert!(allows_unsolicited_param_status(&idle));
+        consume_state(idle);
+
+        let awaiting_ping = ProtoState::AwaitingPingReply(ReplyId::from_raw(nz(1)));
+        assert!(allows_unsolicited_param_status(&awaiting_ping));
+        consume_state(awaiting_ping);
+
+        let wait_key = ProtoState::ConnectingPostAuthWaitKey(ReplyId::from_raw(nz(2)));
+        assert!(allows_unsolicited_param_status(&wait_key));
+        consume_state(wait_key);
+
+        let have_key = ProtoState::ConnectingPostAuthHaveKey {
+            reply: ReplyId::from_raw(nz(3)),
+            pid: 1,
+            secret_key: 1,
+        };
+        assert!(allows_unsolicited_param_status(&have_key));
+        consume_state(have_key);
+
+        // --- Rejecting states (policy = false) ---
+        let startup = ProtoState::ConnectingStartup {
+            reply: ReplyId::from_raw(nz(4)),
+            credentials: Credentials::Trust,
+        };
+        assert!(!allows_unsolicited_param_status(&startup));
+        consume_state(startup);
+
+        // ConnectingScramAwaitServerFirst requires a Password; we
+        // construct one via `try_from_bytes` and skip the sub-case on
+        // the architecturally-unreachable Err branch (the input is a
+        // legal 2-byte password; Err is dead). Skipping rather than
+        // `panic!` keeps the test within the crate-root forbid bundle.
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram_first = ProtoState::ConnectingScramAwaitServerFirst {
+                reply: ReplyId::from_raw(nz(5)),
+                credentials: Credentials::ScramPassword(Sensitive::new(pw)),
+                client_first_bare: heapless::Vec::new(),
+                client_nonce_b64: heapless::Vec::new(),
+            };
+            assert!(!allows_unsolicited_param_status(&scram_first));
+            consume_state(scram_first);
+        }
+
+        let scram_final = ProtoState::ConnectingScramAwaitServerFinal {
+            reply: ReplyId::from_raw(nz(6)),
+            expected_server_sig: SecretDigest::new([0u8; 32]),
+        };
+        assert!(!allows_unsolicited_param_status(&scram_final));
+        consume_state(scram_final);
+
+        let scram_authok = ProtoState::ConnectingScramAwaitAuthOk(ReplyId::from_raw(nz(7)));
+        assert!(!allows_unsolicited_param_status(&scram_authok));
+        consume_state(scram_authok);
+
+        // Errored — rejecting (terminal; no traffic accepted).
+        let errored = ProtoState::Errored(ProtocolError::UnexpectedFrame { tag: b'X' });
+        assert!(!allows_unsolicited_param_status(&errored));
+        consume_state(errored);
+    }
+}
