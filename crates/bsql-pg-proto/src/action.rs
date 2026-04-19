@@ -41,7 +41,6 @@ pub type OutActions = Vec<Action, MAX_ACTIONS_PER_CALL>;
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; Action is moved once per frame, not per row — the stack cost is amortised")]
 pub enum Action {
     /// Send these bytes verbatim to the server.
     ///

@@ -231,12 +231,16 @@ const _: fn() = || {
 //   OutActions:     3464  (4 * Action)
 // ---------------------------------------------------------------------
 const _: () = assert!(
-    core::mem::size_of::<error::ProtocolError>() <= 1024,
-    "ProtocolError size regression — did a variant add a large inline buffer?",
+    core::mem::size_of::<error::ProtocolError>() <= 320,
+    "ProtocolError size regression — post-DEF-060/061 budget is 320 bytes. \
+     Did ServerErrorResponse.message/detail/hint bounds grow, or did a \
+     variant add a large inline buffer?",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Action>() <= 1024,
-    "Action size regression — did SendBuf::Owned or a Reply variant grow?",
+    "Action size regression — dominated by SendBuf::Owned (512-byte inline) \
+     and FailReply.cause (ProtocolError). DEF-094 will replace SendBuf \
+     with &'buf [u8] (16 bytes), shrinking Action to ~300 bytes.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::SendBuf>() <= 768,

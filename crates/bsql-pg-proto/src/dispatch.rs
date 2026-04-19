@@ -692,11 +692,17 @@ fn dispatch_auth_ok_after_scram(reply: ReplyId, payload: &[u8]) -> DispatchOutco
 /// body out of hot-path inlining scope.
 #[cold]
 fn parse_error_response(payload: &[u8]) -> ProtocolError {
-    let mut severity = heapless::String::new();
-    let mut code = heapless::String::new();
-    let mut message = heapless::String::new();
-    let mut detail = heapless::String::new();
-    let mut hint = heapless::String::new();
+    use crate::error::{BoundedStr, Severity, SqlStateCode};
+    // DEF-060 part 2: typed fields. Severity → enum (1 byte);
+    // code → SqlStateCode ([u8;5]); message/detail/hint →
+    // BoundedStr<N> with explicit truncation marker (no
+    // `.unwrap_or_default()` silent-truncation).
+    let mut severity = Severity::Unknown;
+    let mut severity_set = false;
+    let mut code = SqlStateCode::from_bytes(b"");
+    let mut message: BoundedStr<128> = BoundedStr::default();
+    let mut detail: BoundedStr<96> = BoundedStr::default();
+    let mut hint: BoundedStr<64> = BoundedStr::default();
 
     let mut pos: usize = 0;
     loop {
@@ -730,20 +736,23 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
         };
 
         match field_type {
-            b'S' | b'V' if severity.is_empty() => {
-                severity = heapless::String::try_from(value_str).unwrap_or_default();
+            // `S` (localised) takes precedence; `V` (non-localised,
+            // PG 9.6+) fills in if `S` didn't.
+            b'S' | b'V' if !severity_set => {
+                severity = Severity::from_bytes(value_bytes);
+                severity_set = true;
             }
             b'C' => {
-                code = heapless::String::try_from(value_str).unwrap_or_default();
+                code = SqlStateCode::from_bytes(value_bytes);
             }
             b'M' => {
-                message = heapless::String::try_from(value_str).unwrap_or_default();
+                message = BoundedStr::from_str_truncating(value_str);
             }
             b'D' => {
-                detail = heapless::String::try_from(value_str).unwrap_or_default();
+                detail = BoundedStr::from_str_truncating(value_str);
             }
             b'H' => {
-                hint = heapless::String::try_from(value_str).unwrap_or_default();
+                hint = BoundedStr::from_str_truncating(value_str);
             }
             _ => {} // Unknown field type — skip.
         }
@@ -846,12 +855,13 @@ mod parse_error_response_tests {
         detail: &str,
         hint: &str,
     ) -> ProtocolError {
+        use crate::error::{BoundedStr, Severity, SqlStateCode};
         ProtocolError::ServerErrorResponse {
-            severity: heapless::String::try_from(severity).unwrap_or_default(),
-            code: heapless::String::try_from(code).unwrap_or_default(),
-            message: heapless::String::try_from(message).unwrap_or_default(),
-            detail: heapless::String::try_from(detail).unwrap_or_default(),
-            hint: heapless::String::try_from(hint).unwrap_or_default(),
+            severity: Severity::from_bytes(severity.as_bytes()),
+            code: SqlStateCode::from_bytes(code.as_bytes()),
+            message: BoundedStr::from_str_truncating(message),
+            detail: BoundedStr::from_str_truncating(detail),
+            hint: BoundedStr::from_str_truncating(hint),
         }
     }
 

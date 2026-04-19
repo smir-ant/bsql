@@ -12,6 +12,228 @@
 
 use core::fmt;
 
+// -----------------------------------------------------------------
+// DEF-060 part 2 — typed fields for ServerErrorResponse
+// -----------------------------------------------------------------
+
+/// Server-error severity classification. DEF-060 part 2.
+///
+/// Replaces the earlier `heapless::String<32>` with a 1-byte enum.
+/// Parsed from the PG "S" (localised) / "V" (non-localised) field
+/// at receive time; unrecognised strings map to
+/// [`Severity::Unknown`] rather than silently dropping the field.
+///
+/// # Discriminant layout
+///
+/// `#[repr(u8)]` — 1 byte. The niche `Severity::Unknown = 0` is
+/// deliberately the first variant so that `unsafe` zero-init (not
+/// used in this crate but is in caller crates) land on `Unknown`
+/// rather than a specific level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Severity {
+    /// Unrecognised server severity. Fall-through for forward-compat.
+    Unknown = 0,
+    /// Diagnostic log output — non-error informational traffic.
+    Log,
+    /// Info — server informational message.
+    Info,
+    /// Debug — server debug-level traffic.
+    Debug,
+    /// Notice — server noteworthy condition (not an error).
+    Notice,
+    /// Warning — potentially problematic but non-fatal.
+    Warning,
+    /// Standard error — query failed, server stays connected.
+    Error,
+    /// Fatal — connection terminated by server.
+    Fatal,
+    /// Panic — server is aborting, process exit imminent.
+    Panic,
+}
+
+impl Severity {
+    /// Parse a server-provided severity byte slice into the enum.
+    ///
+    /// Matches the PG-standard uppercase names. Case-sensitive (PG
+    /// emits uppercase). Falls through to [`Severity::Unknown`] for
+    /// anything else — never panics, never rejects.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        match bytes {
+            b"ERROR" => Self::Error,
+            b"FATAL" => Self::Fatal,
+            b"PANIC" => Self::Panic,
+            b"WARNING" => Self::Warning,
+            b"NOTICE" => Self::Notice,
+            b"DEBUG" => Self::Debug,
+            b"INFO" => Self::Info,
+            b"LOG" => Self::Log,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Uppercase name for `Display`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::Log => "LOG",
+            Self::Info => "INFO",
+            Self::Debug => "DEBUG",
+            Self::Notice => "NOTICE",
+            Self::Warning => "WARNING",
+            Self::Error => "ERROR",
+            Self::Fatal => "FATAL",
+            Self::Panic => "PANIC",
+        }
+    }
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// PostgreSQL SQLSTATE code — always exactly 5 ASCII chars (per spec).
+///
+/// Packed as `[u8; 5]` newtype: 5 bytes, `Copy`, no allocation. If
+/// the server sends a shorter code (shouldn't — SQLSTATE is always
+/// 5 chars), the remainder is space-padded (`0x20`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct SqlStateCode {
+    /// The 5 ASCII chars. Non-ASCII input is coerced to `?` at
+    /// construction (never panics).
+    bytes: [u8; 5],
+}
+
+impl SqlStateCode {
+    /// Construct from a byte slice. Non-ASCII chars become `?`,
+    /// short inputs are space-padded, over-5-char inputs take the
+    /// first 5 bytes. Never fails, never allocates.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut out = [b' '; 5];
+        let mut i = 0;
+        while i < 5 && i < bytes.len() {
+            let b = bytes.get(i).copied().unwrap_or(b'?');
+            let safe = if b.is_ascii() { b } else { b'?' };
+            match out.get_mut(i) {
+                Some(slot) => *slot = safe,
+                None => break,
+            }
+            i = i.saturating_add(1);
+        }
+        Self { bytes: out }
+    }
+
+    /// The 5 bytes (may include trailing spaces for short codes).
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 5] {
+        &self.bytes
+    }
+
+    /// The code as `&str` — guaranteed ASCII by construction.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // SAFETY note — we would need unsafe to avoid the utf8 check,
+        // but the forbid-bundle bans unsafe. The check is O(5) —
+        // negligible on a cold error path.
+        core::str::from_utf8(&self.bytes).unwrap_or("?????")
+    }
+}
+
+impl fmt::Display for SqlStateCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Bounded string with explicit truncation on overflow. DEF-060 part 2.
+///
+/// Replaces `heapless::String::try_from(s).unwrap_or_default()` — a
+/// tier-4 silent-truncation pattern where oversized input silently
+/// became empty. On overflow this type truncates at a UTF-8-safe
+/// boundary and appends an explicit `"…"` marker, so the caller
+/// never receives silently-lost content.
+///
+/// `N` is the inclusive byte budget (marker included in the budget).
+/// Messages of length ≤ N-3 fit verbatim; longer messages become
+/// `&input[..max_fit] + "…"`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct BoundedStr<const N: usize> {
+    inner: heapless::String<N>,
+}
+
+impl<const N: usize> BoundedStr<N> {
+    /// Construct from a `&str`, truncating with `"…"` on overflow.
+    /// Never panics, never silently drops.
+    #[must_use]
+    pub fn from_str_truncating(source: &str) -> Self {
+        if let Ok(inner) = heapless::String::try_from(source) {
+            return Self { inner };
+        }
+        // Source too long. UTF-8-ellipsis marker is 3 bytes.
+        // `…` — precomputed constant.
+        const MARKER: &str = "…";
+        const MARKER_LEN: usize = MARKER.len();
+        // Largest byte-budget for the prefix that leaves room for
+        // the marker. `saturating_sub` avoids underflow when
+        // N < MARKER_LEN (pathologically small N).
+        let budget = N.saturating_sub(MARKER_LEN);
+        // Walk char boundaries to find the largest prefix ≤ budget.
+        let mut fit_end = 0usize;
+        for (i, _) in source.char_indices() {
+            if i > budget {
+                break;
+            }
+            fit_end = i;
+        }
+        let prefix = source.get(..fit_end).unwrap_or("");
+        let mut out = heapless::String::<N>::new();
+        // Both pushes are infallible given the construction above;
+        // the `.is_err()` guards surface a regression honestly rather
+        // than via `let _`.
+        if out.push_str(prefix).is_err() {
+            return Self { inner: heapless::String::new() };
+        }
+        if out.push_str(MARKER).is_err() {
+            return Self { inner: out };
+        }
+        Self { inner: out }
+    }
+
+    /// Borrow the string content.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+
+    /// Whether the string is empty (never-assigned absent field).
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl<const N: usize> fmt::Display for BoundedStr<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// -----------------------------------------------------------------
+// ProtocolError (below)
+// -----------------------------------------------------------------
+
+
 /// A classified failure on the wire protocol.
 ///
 /// Errors are *transport-level* signals from the state machine to the
@@ -78,19 +300,32 @@ pub enum ProtocolError {
     },
 
     /// Server sent an `ErrorResponse` (tag `'E'`) during the startup
-    /// handshake. Phase 1b parses the typed-field body to extract
-    /// severity, code, message, detail, hint for diagnostic quality.
+    /// handshake or mid-query. DEF-060 part 2: typed
+    /// [`Severity`] + [`SqlStateCode`] (5-byte SQLSTATE) + bounded
+    /// strings with explicit truncation via `BoundedStr`.
+    ///
+    /// Size: ~280 bytes (down from ~848 in the pre-DEF-060 form with
+    /// 5 × `heapless::String<256>`). The shrink landed alongside the
+    /// silent-truncation fix — previous code used
+    /// `heapless::String::try_from(s).unwrap_or_default()` which
+    /// silently collapsed oversized server messages to empty
+    /// (tier-4); now overflow appends an explicit `"…"` marker
+    /// (tier-2 structural — bounded, explicit).
     ServerErrorResponse {
-        /// Severity level string (e.g. "ERROR", "FATAL").
-        severity: heapless::String<32>,
-        /// SQLSTATE error code (e.g. "28P01" for auth failure).
-        code: heapless::String<8>,
-        /// Primary human-readable error message.
-        message: heapless::String<256>,
-        /// Optional detail string.
-        detail: heapless::String<256>,
-        /// Optional hint string.
-        hint: heapless::String<256>,
+        /// Severity classification (enum, 1 byte). Unknown server
+        /// severities map to [`Severity::Unknown`] rather than silently
+        /// dropping the field.
+        severity: Severity,
+        /// SQLSTATE code — always exactly 5 ASCII chars, packed as
+        /// a `[u8; 5]` newtype. Space-padded if shorter; never empty.
+        code: SqlStateCode,
+        /// Primary human-readable error message (up to 128 bytes,
+        /// explicit truncation marker on overflow).
+        message: BoundedStr<128>,
+        /// Optional detail string (up to 96 bytes).
+        detail: BoundedStr<96>,
+        /// Optional hint string (up to 64 bytes).
+        hint: BoundedStr<64>,
     },
 
     /// Server sent an authentication method we do not support.
@@ -300,6 +535,8 @@ impl fmt::Display for ProtocolError {
                 message,
                 ..
             } => write!(f, "server error: {severity} ({code}): {message}"),
+            // Typed Severity + SqlStateCode + BoundedStr all impl
+            // Display — no extra plumbing needed.
             Self::UnsupportedAuthMethod { sub_code } => {
                 write!(f, "unsupported authentication method (sub-code {sub_code})")
             }
