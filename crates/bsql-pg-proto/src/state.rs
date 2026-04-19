@@ -19,7 +19,7 @@
 //! (no action, no state change — post-`CloseSocket` packet flushes
 //! become true no-ops instead of silent mis-advances).
 
-use crate::error::ProtocolError;
+use crate::error::ErrorKind;
 use crate::password::Credentials;
 use crate::reply_id::ReplyId;
 use crate::scram::session::ScramSession;
@@ -130,12 +130,16 @@ pub enum ProtoState {
     ///
     /// Entered by any path that calls `fail_inflight_and_close` or
     /// returns `DispatchOutcome::Errored` — these paths also emit the
-    /// matching `FailReply` + `CloseSocket` actions in the same call,
-    /// so by the time the state is observable as `Errored` the wrapper
-    /// has already been told to tear the transport down.
+    /// matching `FailReply` (full cause) + `CloseSocket` actions in the
+    /// same call, so by the time the state is observable as `Errored`
+    /// the wrapper has already received the diagnostic.
     ///
-    /// Never left. The carried [`ProtocolError`] is the **root** cause.
-    Errored(ProtocolError),
+    /// Never left. DEF-061: carries [`ErrorKind`] (1 byte) not the full
+    /// [`ProtocolError`]. The full cause went out once in the first
+    /// `FailReply`; subsequent pushes get a compact
+    /// [`crate::error::ProtocolError::ConnectionAlreadyClosed`]
+    /// carrying the `prior_kind` for diagnostic context.
+    Errored(ErrorKind),
 }
 
 impl core::fmt::Debug for ProtoState {
@@ -167,7 +171,7 @@ impl core::fmt::Debug for ProtoState {
                 .field("reply", reply)
                 .field("pid", pid)
                 .finish_non_exhaustive(),
-            Self::Errored(cause) => write!(f, "Errored({cause:?})"),
+            Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }
 }

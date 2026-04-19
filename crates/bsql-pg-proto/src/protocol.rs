@@ -395,7 +395,10 @@ impl PgProtocol {
                             ]);
                         }
                         DispatchOutcome::Errored { reply_id, cause } => {
-                            self.state = ProtoState::Errored(cause.clone());
+                            // DEF-061: store the compact 1-byte kind in
+                            // state; the full cause goes out in the
+                            // `FailReply` below, exactly once.
+                            self.state = ProtoState::Errored(cause.kind());
                             match reply_id {
                                 Some(id) => {
                                     emit_actions!(&mut out, budget: 2, on_overflow: break, [
@@ -445,10 +448,18 @@ impl PgProtocol {
         cause: ProtocolError,
         out: &mut OutActions,
     ) {
+        // DEF-061: compute kind before `cause` is moved into the
+        // FailReply action. Stored in state as 1-byte ErrorKind;
+        // full cause goes out in the one FailReply emitted below.
+        let kind = cause.kind();
         let prev = core::mem::take(&mut self.state);
         match prev {
             ProtoState::Idle => {
-                self.state = ProtoState::Errored(cause);
+                // No in-flight correlator — only CloseSocket. The
+                // full `cause` goes out of scope at the end of this
+                // arm and drops normally (wrapper reads terminal
+                // state via `.state()`).
+                self.state = ProtoState::Errored(kind);
                 self.read_buf.clear();
                 emit_actions!(out, budget: 1, [
                     Action::CloseSocket,
@@ -461,7 +472,7 @@ impl PgProtocol {
             | ProtoState::ConnectingScramAwaitAuthOk(id)
             | ProtoState::ConnectingPostAuthWaitKey(id)
             | ProtoState::ConnectingPostAuthHaveKey { reply: id, .. } => {
-                self.state = ProtoState::Errored(cause.clone());
+                self.state = ProtoState::Errored(kind);
                 self.read_buf.clear();
                 emit_actions!(out, budget: 2, [
                     Action::FailReply {
@@ -471,8 +482,13 @@ impl PgProtocol {
                     Action::CloseSocket,
                 ]);
             }
-            ProtoState::Errored(original) => {
-                self.state = ProtoState::Errored(original);
+            ProtoState::Errored(original_kind) => {
+                // Already Errored — preserve the original kind. Do not
+                // emit another FailReply / CloseSocket; the wrapper
+                // already saw them on the first fatal. The fresh
+                // `cause` is the redundant classification of the same
+                // root cause; drops normally at end of arm.
+                self.state = ProtoState::Errored(original_kind);
             }
         }
     }
@@ -555,20 +571,25 @@ fn compute_push_ping(
             let Ok(sync_buf) = SendBuf::from_slice(&SYNC_WIRE_BYTES) else {
                 reply.consume();
                 emit_actions!(out, budget: 1, [Action::CloseSocket]);
-                return ProtoState::Errored(ProtocolError::ProtocolInvariantBroken);
+                // DEF-061: state carries ErrorKind, not the full
+                // ProtocolError. The dead-branch classification is
+                // `Internal` (ProtocolInvariantBroken).
+                return ProtoState::Errored(crate::error::ErrorKind::Internal);
             };
             emit_actions!(out, budget: 1, [Action::SendBytes(sync_buf)]);
             ProtoState::AwaitingPingReply(reply)
         }
-        ProtoState::Errored(cause) => {
-            let fail_cause = cause.clone();
+        ProtoState::Errored(prior_kind) => {
+            // DEF-061: state carries ErrorKind (1-byte Copy); no clone.
+            // Emit `ConnectionAlreadyClosed { prior_kind }` — carries
+            // the earlier classification for diagnostic context.
             emit_actions!(out, budget: 1, [
                 Action::FailReply {
                     id: reply.consume(),
-                    cause: fail_cause,
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(cause)
+            ProtoState::Errored(prior_kind)
         }
         ProtoState::AwaitingPingReply(prev_reply) => {
             emit_actions!(out, budget: 1, [
@@ -644,15 +665,16 @@ fn compute_push_startup(
                 ProtoState::Idle
             }
         },
-        ProtoState::Errored(cause) => {
-            let fail_cause = cause.clone();
+        ProtoState::Errored(prior_kind) => {
+            // Same DEF-061 pattern as compute_push_ping — emit
+            // ConnectionAlreadyClosed, preserve kind (Copy).
             emit_actions!(out, budget: 1, [
                 Action::FailReply {
                     id: reply.consume(),
-                    cause: fail_cause,
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(cause)
+            ProtoState::Errored(prior_kind)
         }
         other @ (ProtoState::AwaitingPingReply(_)
         | ProtoState::ConnectingStartup { .. }
@@ -908,7 +930,9 @@ mod allows_unsolicited_param_status_tests {
         consume_state(scram_authok);
 
         // Errored — rejecting (terminal; no traffic accepted).
-        let errored = ProtoState::Errored(ProtocolError::UnexpectedFrame { tag: b'X' });
+        // DEF-061: Errored carries ErrorKind (1 byte), not the full
+        // ProtocolError.
+        let errored = ProtoState::Errored(crate::error::ErrorKind::Framing);
         assert!(!allows_unsolicited_param_status(&errored));
         consume_state(errored);
     }
@@ -1027,29 +1051,35 @@ mod compute_push_tests {
     }
 
     #[test]
-    fn ping_from_errored_preserves_errored_and_fails_with_cause() {
+    fn ping_from_errored_preserves_kind_and_fails_with_connection_already_closed() {
+        // DEF-061 semantic: on push against Errored, we emit a
+        // `ConnectionAlreadyClosed { prior_kind }` — the full original
+        // cause was surfaced in the earlier FailReply (when the
+        // connection was first torn down). The state retains only the
+        // kind (1-byte Copy).
+        use crate::error::ErrorKind;
         let raw_id = nz(102);
-        let original_cause = ProtocolError::UnexpectedFrame { tag: b'X' };
+        let prior_kind = ErrorKind::Framing;
         let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_id) };
-        let (new_state, out) = compute_push(
-            cmd,
-            ProtoState::Errored(original_cause.clone()),
-        );
+        let (new_state, out) = compute_push(cmd, ProtoState::Errored(prior_kind));
 
-        // Action: FailReply carrying the ORIGINAL cause (not a synthetic one).
+        // Action: FailReply(ConnectionAlreadyClosed{prior_kind}).
         assert_eq!(out.len(), 1);
         assert!(
             matches!(
                 out.first(),
-                Some(Action::FailReply { id, cause }) if *id == raw_id && *cause == original_cause
+                Some(Action::FailReply {
+                    id,
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
+                }) if *id == raw_id && *pk == prior_kind
             ),
-            "expected FailReply(original cause)",
+            "expected FailReply(ConnectionAlreadyClosed{{prior_kind={prior_kind:?}}})",
         );
 
-        // State: Errored preserved with the same cause.
+        // State: Errored(prior_kind) preserved unchanged.
         assert!(
-            matches!(&new_state, ProtoState::Errored(cause) if *cause == original_cause),
-            "expected Errored(cause) preserved",
+            matches!(&new_state, ProtoState::Errored(k) if *k == prior_kind),
+            "expected Errored(prior_kind) preserved",
         );
         consume_state(new_state);
     }
@@ -1287,10 +1317,13 @@ mod compute_push_tests {
     }
 
     #[test]
-    fn startup_from_errored_preserves_errored_and_fails_with_cause() {
+    fn startup_from_errored_preserves_kind_and_fails_with_connection_already_closed() {
+        // DEF-061 semantic — same shape as
+        // `ping_from_errored_preserves_kind_and_fails_with_connection_already_closed`.
+        use crate::error::ErrorKind;
         let Some(user) = mk_user() else { return };
         let raw_id = nz(302);
-        let original_cause = ProtocolError::MalformedFrameLength { declared: 0 };
+        let prior_kind = ErrorKind::Framing;
         let cmd = PgCommand::Startup {
             user,
             database: None,
@@ -1298,24 +1331,24 @@ mod compute_push_tests {
             credentials: Credentials::Trust,
             reply: ReplyId::from_raw(raw_id),
         };
-        let (new_state, out) = compute_push(
-            cmd,
-            ProtoState::Errored(original_cause.clone()),
-        );
+        let (new_state, out) = compute_push(cmd, ProtoState::Errored(prior_kind));
 
-        // Action: FailReply carrying the ORIGINAL cause intact.
+        // Action: FailReply(ConnectionAlreadyClosed{prior_kind}).
         assert_eq!(out.len(), 1);
         assert!(
             matches!(
                 out.first(),
-                Some(Action::FailReply { id, cause }) if *id == raw_id && *cause == original_cause
+                Some(Action::FailReply {
+                    id,
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
+                }) if *id == raw_id && *pk == prior_kind
             ),
-            "expected FailReply(original cause) for Errored",
+            "expected FailReply(ConnectionAlreadyClosed{{prior_kind={prior_kind:?}}})",
         );
 
-        // State: Errored preserved.
+        // State: Errored(prior_kind) preserved.
         assert!(
-            matches!(&new_state, ProtoState::Errored(cause) if *cause == original_cause),
+            matches!(&new_state, ProtoState::Errored(k) if *k == prior_kind),
             "expected Errored preserved",
         );
         consume_state(new_state);

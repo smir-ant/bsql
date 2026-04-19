@@ -422,10 +422,20 @@ fn startup_on_errored_state_fails_with_stored_cause() {
     assert_eq!(out.len(), 1);
     match out.as_slice() {
         [Action::FailReply { id: failed_id, cause }] => {
+            use bsql_pg_proto::error::ErrorKind;
             assert_eq!(failed_id, &second_raw);
+            // DEF-061: on push against Errored, cause is
+            // ConnectionAlreadyClosed{prior_kind: ServerError} —
+            // the wrapper keeps the full original diagnostic from
+            // the first FailReply at transition-to-Errored.
             assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "cause must be the STORED terminal cause, got {cause:?}",
+                matches!(
+                    cause,
+                    ProtocolError::ConnectionAlreadyClosed {
+                        prior_kind: ErrorKind::ServerError,
+                    }
+                ),
+                "cause must be ConnectionAlreadyClosed{{ServerError}}, got {cause:?}",
             );
         }
         other => panic!("unexpected: {other:?}"),

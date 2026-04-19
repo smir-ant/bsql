@@ -146,6 +146,112 @@ pub enum ProtocolError {
     /// If this error ever appears at runtime it is a logic bug in
     /// `bsql-pg-proto` itself, not wire-level input — triage accordingly.
     ProtocolInvariantBroken,
+
+    /// A user command arrived on a connection that had already been
+    /// torn down by a prior fatal. The wrapper translates this into
+    /// the public error "connection closed, see earlier error" with
+    /// the `prior_kind` as diagnostic context.
+    ///
+    /// Introduced by DEF-061 — see [`ErrorKind`] for the ship-order
+    /// rationale. Before DEF-061, the full 856-byte `ProtocolError`
+    /// was cloned into every `FailReply` on an Errored connection;
+    /// now the prior cause is surfaced **once** in the first
+    /// `FailReply`, and subsequent pushes get a compact
+    /// `ConnectionAlreadyClosed { prior_kind }` (17 bytes incl.
+    /// discriminant + padding).
+    ConnectionAlreadyClosed {
+        /// Classification of the earlier fatal that closed the
+        /// connection. The full cause was emitted exactly once in
+        /// the first `FailReply` action; the wrapper is expected to
+        /// have preserved it.
+        prior_kind: ErrorKind,
+    },
+}
+
+/// Compact 1-byte classification of a [`ProtocolError`], stored in
+/// [`crate::state::ProtoState::Errored`].
+///
+/// # DEF-061 rationale
+///
+/// Before DEF-061, the state carried the full `ProtocolError`
+/// (~856 bytes dominated by `ServerErrorResponse`'s five
+/// `heapless::String<N>` fields). Every `push_command` on an Errored
+/// connection cloned the whole thing into a new `FailReply` —
+/// ~1.3 KB of stack churn per push on the cold path.
+///
+/// Now `ProtoState::Errored(ErrorKind)` is 2 bytes (1 for the
+/// discriminant + 1 for the outer variant tag). The full
+/// `ProtocolError` is emitted in `FailReply` **exactly once** (the
+/// first fatal); subsequent pushes emit
+/// [`ProtocolError::ConnectionAlreadyClosed { prior_kind }`] — a
+/// compact typed echo.
+///
+/// # Tier
+///
+/// - **Tier-1 compile** on "every `ProtocolError` variant maps to
+///   exactly one `ErrorKind`": the `ProtocolError::kind` match is
+///   exhaustive; adding a new `ProtocolError` variant without
+///   classifying it is a build error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ErrorKind {
+    /// Wire framing: length field below minimum, over cap, or tag
+    /// mismatch. [`ProtocolError::MalformedFrameLength`] +
+    /// [`ProtocolError::FrameTooLarge`] + [`ProtocolError::UnexpectedFrame`] +
+    /// [`ProtocolError::MalformedReadyForQuery`] +
+    /// [`ProtocolError::MalformedBackendKeyData`] +
+    /// [`ProtocolError::MalformedAuthentication`].
+    Framing = 0,
+    /// Read buffer overflow — local transport classification.
+    /// [`ProtocolError::ReadBufferFull`].
+    Transport = 1,
+    /// Server-side error response arrived mid-handshake or mid-query.
+    /// [`ProtocolError::ServerErrorResponse`].
+    ServerError = 2,
+    /// Authentication negotiation failed — unsupported method or
+    /// SCRAM exchange error. [`ProtocolError::UnsupportedAuthMethod`] +
+    /// [`ProtocolError::ScramError`] +
+    /// [`ProtocolError::UnsupportedProtocolOption`] +
+    /// [`ProtocolError::StartupAlreadyInProgress`].
+    Auth = 3,
+    /// Internal invariant broken — bug in this crate.
+    /// [`ProtocolError::ProtocolInvariantBroken`].
+    Internal = 4,
+    /// Pseudo-kind for a `ConnectionAlreadyClosed` meta-error. Only
+    /// ever appears in `FailReply` replies, never in state (the state
+    /// retains the real prior kind).
+    AlreadyClosed = 5,
+}
+
+impl ProtocolError {
+    /// Compact kind classification for this error.
+    ///
+    /// Used by [`crate::state::ProtoState::Errored(ErrorKind)`] to
+    /// store the terminal state cheaply — 1 byte instead of 856.
+    /// The full cause is emitted in `FailReply` exactly once (the
+    /// first fatal); the state retains only the kind.
+    ///
+    /// Exhaustive match — adding a `ProtocolError` variant without
+    /// classifying it is a build error. Tier-1 compile.
+    #[must_use]
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::MalformedFrameLength { .. }
+            | Self::FrameTooLarge { .. }
+            | Self::UnexpectedFrame { .. }
+            | Self::MalformedReadyForQuery { .. }
+            | Self::MalformedBackendKeyData { .. }
+            | Self::MalformedAuthentication { .. } => ErrorKind::Framing,
+            Self::ReadBufferFull { .. } => ErrorKind::Transport,
+            Self::ServerErrorResponse { .. } => ErrorKind::ServerError,
+            Self::UnsupportedAuthMethod { .. }
+            | Self::UnsupportedProtocolOption
+            | Self::ScramError { .. }
+            | Self::StartupAlreadyInProgress => ErrorKind::Auth,
+            Self::ProtocolInvariantBroken => ErrorKind::Internal,
+            Self::ConnectionAlreadyClosed { .. } => ErrorKind::AlreadyClosed,
+        }
+    }
 }
 
 impl fmt::Display for ProtocolError {
@@ -206,6 +312,12 @@ impl fmt::Display for ProtocolError {
             }
             Self::ProtocolInvariantBroken => {
                 f.write_str("protocol invariant violated — internal bsql-pg-proto logic bug")
+            }
+            Self::ConnectionAlreadyClosed { prior_kind } => {
+                write!(
+                    f,
+                    "connection already closed (prior fatal kind: {prior_kind:?})",
+                )
             }
         }
     }

@@ -163,46 +163,58 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     let frame = [b'Z', 0x00, 0x00, 0xDE, 0xAD];
     let out = proto.feed_bytes(&frame);
     assert_eq!(out.len(), 2);
-    // State is now Errored(FrameTooLarge { declared: 0xDEAD }).
-    match proto.state() {
-        ProtoState::Errored(ProtocolError::FrameTooLarge { declared }) => {
-            assert_eq!(*declared, 0xDEAD);
-        }
-        other => panic!("expected Errored(FrameTooLarge 0xDEAD), got {other:?}"),
-    }
 
-    // Push a new Ping — must FailReply with the exact same cause AND
-    // state must STILL be Errored(FrameTooLarge { declared: 0xDEAD }).
+    // First fatal: FailReply carries the FULL ProtocolError
+    // (FrameTooLarge{declared: 0xDEAD}) and state transitions to
+    // Errored(ErrorKind::Framing) — DEF-061: state retains only the
+    // 1-byte kind classification, not the full cause.
+    use bsql_pg_proto::error::ErrorKind;
+    match out.as_slice() {
+        [
+            Action::FailReply {
+                cause: ProtocolError::FrameTooLarge { declared },
+                ..
+            },
+            Action::CloseSocket,
+        ] => {
+            assert_eq!(*declared, 0xDEAD, "first FailReply carries full cause");
+        }
+        other => panic!("expected [FailReply(FrameTooLarge 0xDEAD), CloseSocket], got {other:?}"),
+    }
+    assert!(
+        matches!(proto.state(), ProtoState::Errored(ErrorKind::Framing)),
+        "state after first fatal must be Errored(Framing), got {:?}",
+        proto.state(),
+    );
+
+    // Push a new Ping — DEF-061: state is compact-Errored(Framing),
+    // so the second FailReply is ConnectionAlreadyClosed{prior_kind:
+    // Framing}, NOT a duplicate of the original FrameTooLarge. The
+    // wrapper preserved the original diagnostic from the first
+    // FailReply; this reply just classifies "already closed".
     let second_raw = raw(7778);
     let out = proto.push_command(PgCommand::Ping {
         reply: id(second_raw),
     });
     assert_eq!(out.len(), 1);
     match out.as_slice() {
-        [Action::FailReply { cause, .. }] => match cause {
-            ProtocolError::FrameTooLarge { declared } => {
-                assert_eq!(
-                    *declared, 0xDEAD,
-                    "FailReply cause must carry the stored Errored cause exactly",
-                );
-            }
-            other => panic!("expected FrameTooLarge, got {other:?}"),
-        },
-        other => panic!("expected FailReply, got {other:?}"),
-    }
-    // State preservation: the Errored variant must still hold the
-    // ORIGINAL cause (not reset, not replaced).
-    match proto.state() {
-        ProtoState::Errored(ProtocolError::FrameTooLarge { declared }) => {
-            assert_eq!(
-                *declared, 0xDEAD,
-                "Errored state must still carry the original cause after push",
-            );
+        [Action::FailReply {
+            cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
+            ..
+        }] => {
+            assert_eq!(*prior_kind, ErrorKind::Framing,
+                "ConnectionAlreadyClosed must carry the prior_kind classification");
         }
         other => panic!(
-            "expected Errored(FrameTooLarge 0xDEAD) after push, got {other:?}",
+            "expected FailReply(ConnectionAlreadyClosed{{Framing}}), got {other:?}",
         ),
     }
+    // State preservation: still Errored(Framing) after the push.
+    assert!(
+        matches!(proto.state(), ProtoState::Errored(ErrorKind::Framing)),
+        "state must stay Errored(Framing) after push, got {:?}",
+        proto.state(),
+    );
 }
 
 // =================================================================

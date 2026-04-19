@@ -396,18 +396,15 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
         other => panic!("unexpected action sequence: {other:?}"),
     }
 
-    // State preservation: the Errored variant carries the exact same
-    // cause value, not a generic-fallback or a truncated copy.
+    // DEF-061: state carries only ErrorKind (the `Transport` kind
+    // classifies ReadBufferFull). The full ReadBufferFull diagnostic
+    // (with exact `attempted`/`available` bytes) went out in the
+    // FailReply action above, which the test already pins.
+    use bsql_pg_proto::error::ErrorKind;
     match proto.state() {
-        ProtoState::Errored(ProtocolError::ReadBufferFull {
-            attempted,
-            available,
-        }) => {
-            assert_eq!(*attempted, overflow_len);
-            assert_eq!(*available, READ_BUF_CAP);
-        }
+        ProtoState::Errored(ErrorKind::Transport) => {}
         other => panic!(
-            "state must be Errored(ReadBufferFull{{..}}), got {other:?}",
+            "state must be Errored(Transport), got {other:?}",
         ),
     }
 }
@@ -567,14 +564,16 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     // Drive into Errored via an ErrorResponse — `ServerError` cause.
     let err_out = proto.feed_bytes(&error_frame());
     assert_eq!(err_out.len(), 2, "entering Errored emits FailReply + CloseSocket");
+    // DEF-061: state carries ErrorKind::ServerError (1 byte), the
+    // full diagnostic cause went out in the FailReply above.
+    use bsql_pg_proto::error::ErrorKind;
     assert!(matches!(
         proto.state(),
-        ProtoState::Errored(ProtocolError::ServerErrorResponse { .. }),
+        ProtoState::Errored(ErrorKind::ServerError),
     ));
 
     // First post-terminal frame: a well-formed RFQ. Expect zero actions
-    // (the terminal sink silently drops it) and the original cause
-    // preserved.
+    // (the terminal sink silently drops it) and the kind preserved.
     let post_out_1 = proto.feed_bytes(&rfq_frame(b'I'));
     assert_eq!(
         post_out_1.len(),
@@ -583,11 +582,11 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     );
     assert!(matches!(
         proto.state(),
-        ProtoState::Errored(ProtocolError::ServerErrorResponse { .. }),
+        ProtoState::Errored(ErrorKind::ServerError),
     ));
 
     // Second post-terminal frame: an ErrorResponse that would *normally*
-    // classify as a separate ServerError. The original cause must still
+    // classify as a separate ServerError. The original kind must still
     // win — the terminal sink does not overwrite.
     let post_out_2 = proto.feed_bytes(&error_frame());
     assert_eq!(
@@ -597,7 +596,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     );
     assert!(matches!(
         proto.state(),
-        ProtoState::Errored(ProtocolError::ServerErrorResponse { .. }),
+        ProtoState::Errored(ErrorKind::ServerError),
     ));
 }
 
@@ -621,9 +620,11 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
     let err_out = proto.feed_bytes(&error_frame());
     assert_eq!(err_out.len(), 2);
 
-    // Push a new Ping while Errored. The command's reply correlator
-    // must fail with the stored cause (ServerError), not with a fresh
-    // UnexpectedFrame classification.
+    // Push a new Ping while Errored. DEF-061: the FailReply carries
+    // ConnectionAlreadyClosed{prior_kind: ServerError}; the full
+    // original diagnostic was surfaced in the first FailReply at
+    // transition-to-Errored (the wrapper has preserved it).
+    use bsql_pg_proto::error::ErrorKind;
     let second_raw = raw(51);
     let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) });
 
@@ -636,16 +637,21 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
         [Action::FailReply { id: failed_id, cause }] => {
             assert_eq!(failed_id, &second_raw, "fail correlates to the new command");
             assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "cause must be the STORED terminal cause (ServerErrorResponse), got {cause:?}",
+                matches!(
+                    cause,
+                    ProtocolError::ConnectionAlreadyClosed {
+                        prior_kind: ErrorKind::ServerError,
+                    }
+                ),
+                "cause must be ConnectionAlreadyClosed{{ServerError}}, got {cause:?}",
             );
         }
         other => panic!("unexpected action shape: {other:?}"),
     }
 
-    // State unchanged — original cause preserved.
+    // State unchanged — kind preserved.
     assert!(matches!(
         proto.state(),
-        ProtoState::Errored(ProtocolError::ServerErrorResponse { .. }),
+        ProtoState::Errored(ErrorKind::ServerError),
     ));
 }
