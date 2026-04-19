@@ -672,7 +672,20 @@ fn scram_sha256_handshake_end_to_end() {
     // Step 1: Push Startup with SCRAM password.
     let out = startup_scram(&mut proto, "user", password, startup_raw);
     assert_eq!(out.len(), 1);
-    assert!(matches!(out.as_slice(), [Action::SendBytes(_)]));
+    // StartupMessage has no tag byte; protocol version 3.0 (196608 =
+    // 0x00030000) occupies bytes [4..8] after the 4-byte length prefix.
+    match out.as_slice() {
+        [Action::SendBytes(send_buf)] => {
+            let bytes = send_buf.as_bytes();
+            assert!(bytes.len() >= 8, "StartupMessage must be >= 8 bytes");
+            assert_eq!(
+                bytes.get(4..8),
+                Some([0, 3, 0, 0].as_slice()),
+                "StartupMessage protocol version must be 3.0 (196608)",
+            );
+        }
+        other => panic!("expected SendBytes(StartupMessage), got {other:?}"),
+    }
     assert!(matches!(proto.state(), ProtoState::ConnectingStartup { .. }));
 
     // Step 2: Server sends AuthenticationSASL with SCRAM-SHA-256.
@@ -1034,10 +1047,16 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     // Send a ping. State → AwaitingPingReply.
     let ping_raw = raw(201);
     let push_out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) });
-    assert!(matches!(
-        push_out.as_slice(),
-        [Action::SendBytes(_)]
-    ));
+    match push_out.as_slice() {
+        [Action::SendBytes(send_buf)] => {
+            assert_eq!(
+                send_buf.as_bytes(),
+                &bsql_pg_proto::wire::SYNC_WIRE_BYTES,
+                "Ping must emit the 5-byte const Sync wire payload",
+            );
+        }
+        other => panic!("expected SendBytes(SYNC), got {other:?}"),
+    }
     assert!(matches!(proto.state(), ProtoState::AwaitingPingReply(_)));
 
     // Server emits ParameterStatus before RFQ (e.g. an ALTER SYSTEM

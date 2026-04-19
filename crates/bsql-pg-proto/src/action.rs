@@ -120,7 +120,15 @@ pub enum Action {
 #[derive(Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 #[repr(transparent)]
-pub struct SendBuf(heapless::Vec<u8, MAX_OWNED_SEND_LEN>);
+pub struct SendBuf {
+    /// Backing storage. Named field (not tuple-struct positional `.0`)
+    /// for consistency with every other newtype in the crate
+    /// (`Ident.buf`, `DatabaseName.buf`, `ApplicationName.buf`,
+    /// `SecretDigest.bytes`, `CappedServerNonce.buf`,
+    /// `Sensitive.inner`). `#[repr(transparent)]` holds with one
+    /// named field same as with a positional one.
+    inner: heapless::Vec<u8, MAX_OWNED_SEND_LEN>,
+}
 
 /// Returned when a slice passed to [`SendBuf::from_slice`] exceeds
 /// the bounded capacity.
@@ -155,7 +163,7 @@ impl SendBuf {
             .map_err(|_| SendBufFull {
                 attempted: bytes.len(),
             })?;
-        Ok(Self(inner))
+        Ok(Self { inner })
     }
 
     /// Construct from an already-owned bounded buffer. `pub(crate)`
@@ -164,28 +172,28 @@ impl SendBuf {
     /// `WriteBuf::into_inner()` has already produced the buffer.
     #[inline]
     pub(crate) const fn from_owned(inner: heapless::Vec<u8, MAX_OWNED_SEND_LEN>) -> Self {
-        Self(inner)
+        Self { inner }
     }
 
     /// Borrow the underlying wire bytes.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.inner
     }
 
     /// Length of the buffered bytes.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.inner.len()
     }
 
     /// Whether the buffer is empty.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.inner.is_empty()
     }
 }
 

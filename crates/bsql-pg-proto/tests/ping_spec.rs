@@ -121,21 +121,32 @@ fn drain_pending_ping(proto: &mut PgProtocol) {
     );
 }
 
-/// Push a Ping command and assert the single expected emission
-/// (`SendBytes(Static(Sync))`). Used to set up tests whose interesting
-/// behaviour is on the response half of the round-trip.
+/// Push a Ping command and assert the single expected emission —
+/// one `SendBytes` action carrying the const `SYNC_WIRE_BYTES`.
 ///
 /// Using this helper instead of `let _ = proto.push_command(...)`
 /// verifies the setup is well-formed on every call site — any
-/// regression in the push path is surfaced at the top of the test,
-/// not masked.
+/// regression in the push path (wrong number of actions, wrong
+/// action kind, wrong bytes) is surfaced at the top of the test,
+/// not masked. Every test that uses `ping_setup` implicitly
+/// validates push-content for free, without duplicating the
+/// content assertion in each test's body.
+#[track_caller]
 fn ping_setup(proto: &mut PgProtocol, reply: ReplyId) {
     let out = proto.push_command(PgCommand::Ping { reply });
     assert_eq!(out.len(), 1, "Ping setup: push emits exactly 1 action");
-    assert!(
-        matches!(out.as_slice(), [Action::SendBytes(_)]),
-        "Ping setup: must emit SendBytes(Static), got {out:?}",
-    );
+    match out.as_slice() {
+        [Action::SendBytes(send_buf)] => {
+            assert_eq!(
+                send_buf.as_bytes(),
+                &SYNC_WIRE_BYTES,
+                "Ping setup: SendBytes must carry the 5-byte const Sync wire payload",
+            );
+        }
+        other => panic!(
+            "Ping setup: expected a single Action::SendBytes, got {other:?}",
+        ),
+    }
 }
 
 // ------------------------------------------------------------------
