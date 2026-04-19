@@ -68,7 +68,7 @@ const SHA256_PROOF_B64_LEN: usize = 44;
 /// The result is used in a drift-guard against
 /// [`crate::write_buf::MAX_OWNED_SEND_LEN`] — if the worst-case SASL
 /// initial response outgrows the outbound buffer, build fails.
-pub const fn sasl_initial_response_frame_size() -> usize {
+pub(crate) const fn sasl_initial_response_frame_size() -> usize {
     1usize // tag 'p'
         .saturating_add(4) // length field
         .saturating_add(crate::wire::SCRAM_SHA_256_MECHANISM.len())
@@ -81,7 +81,7 @@ pub const fn sasl_initial_response_frame_size() -> usize {
 ///
 /// Wire format: tag `'p'` (1) + length field (4) + client-final-message
 /// body.
-pub const fn sasl_response_frame_size() -> usize {
+pub(crate) const fn sasl_response_frame_size() -> usize {
     1usize // tag 'p'
         .saturating_add(4) // length field
         .saturating_add(MAX_CLIENT_FINAL_MSG_LEN)

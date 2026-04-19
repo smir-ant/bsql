@@ -405,25 +405,13 @@ fn build_sasl_initial_response(
         }
     };
 
-    let client_nonce_b64 = wire::generate_client_nonce().map_err(|e| {
-        let mut detail = heapless::String::new();
-        let _ = core::fmt::Write::write_fmt(&mut detail, format_args!("{e}"));
-        ProtocolError::ScramError { detail }
-    })?;
+    let client_nonce_b64 = wire::generate_client_nonce().map_err(scram_err_from)?;
 
     let client_first_bare =
-        wire::build_client_first_bare(user_bytes, &client_nonce_b64).map_err(|e| {
-            let mut detail = heapless::String::new();
-            let _ = core::fmt::Write::write_fmt(&mut detail, format_args!("{e}"));
-            ProtocolError::ScramError { detail }
-        })?;
+        wire::build_client_first_bare(user_bytes, &client_nonce_b64).map_err(scram_err_from)?;
 
     let client_first_msg =
-        wire::build_client_first_message(user_bytes, &client_nonce_b64).map_err(|e| {
-            let mut detail = heapless::String::new();
-            let _ = core::fmt::Write::write_fmt(&mut detail, format_args!("{e}"));
-            ProtocolError::ScramError { detail }
-        })?;
+        wire::build_client_first_message(user_bytes, &client_nonce_b64).map_err(scram_err_from)?;
 
     // Build SASLInitialResponse frame:
     // tag 'p', length-prefix, mechanism-name NUL, i32 body-length, body
@@ -484,11 +472,9 @@ fn dispatch_auth_sasl_continue(
         match crate::scram::wire::parse_server_first(rest, &client_nonce_b64) {
             Ok(sf) => sf,
             Err(e) => {
-                let mut detail = heapless::String::new();
-                let _ = core::fmt::Write::write_fmt(&mut detail, format_args!("{e}"));
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: ProtocolError::ScramError { detail },
+                    cause: scram_err_from(e),
                 };
             }
         };
@@ -511,11 +497,9 @@ fn dispatch_auth_sasl_continue(
         ) {
             Ok(v) => v,
             Err(e) => {
-                let mut detail = heapless::String::new();
-                let _ = core::fmt::Write::write_fmt(&mut detail, format_args!("{e}"));
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: ProtocolError::ScramError { detail },
+                    cause: scram_err_from(e),
                 };
             }
         };
@@ -565,11 +549,9 @@ fn dispatch_auth_sasl_continue(
     ) {
         Ok(v) => v,
         Err(e) => {
-            let mut detail = heapless::String::new();
-            let _ = core::fmt::Write::write_fmt(&mut detail, format_args!("{e}"));
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),
-                cause: ProtocolError::ScramError { detail },
+                cause: scram_err_from(e),
             };
         }
     };
@@ -623,11 +605,9 @@ fn dispatch_auth_sasl_final(
     let received_sig = match crate::scram::wire::parse_server_final(rest) {
         Ok(sig) => sig,
         Err(e) => {
-            let mut detail = heapless::String::new();
-            let _ = core::fmt::Write::write_fmt(&mut detail, format_args!("{e}"));
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),
-                cause: ProtocolError::ScramError { detail },
+                cause: scram_err_from(e),
             };
         }
     };
@@ -784,6 +764,54 @@ fn scram_buf_err() -> ProtocolError {
     ProtocolError::ScramError {
         detail: heapless::String::try_from("buffer overflow").unwrap_or_default(),
     }
+}
+
+/// Build a [`ProtocolError::ScramError`] from any [`Display`] source,
+/// handling the `heapless::String` cap-exhaustion case explicitly.
+///
+/// Call sites previously wrote this inline as
+/// `let _ = Write::write_fmt(...)` — banned pattern (memory
+/// `feedback_no_underscore_vars`) *and* tier-3 silent-truncation
+/// class: `write_fmt` returns `Err(fmt::Error)` iff the formatter
+/// exhausted capacity, after possibly writing partial content. The
+/// inline form discarded that signal, so oversized detail messages
+/// silently surfaced as partial strings to the caller.
+///
+/// This helper replaces the inline pattern with an explicit
+/// `is_err()` branch: on cap exhaustion the partial content is
+/// cleared and a static sentinel (`"scram error (detail
+/// truncated)"`, 30 bytes — fits 128-byte cap) takes its place.
+/// The fallback's `try_from` Err branch is architecturally dead (the
+/// sentinel fits) but surfaced honestly via `if let Ok` — if a
+/// future refactor tightens the cap below 30 bytes, `detail` stays
+/// empty rather than carrying garbage.
+///
+/// Cold path: every SCRAM error classification routes through here;
+/// the happy path never constructs one. `#[cold]` moves the
+/// monomorphised code out of the hot instruction-cache neighbourhood.
+///
+/// Superseded by DEF-060 (typed SCRAM error sub-enums eliminate the
+/// `heapless::String<128>` detail field entirely); until DEF-060
+/// ships, this helper is the canonical construction path.
+///
+/// [`Display`]: core::fmt::Display
+#[cold]
+fn scram_err_from<E: core::fmt::Display>(source: E) -> ProtocolError {
+    use core::fmt::Write;
+    let mut detail = heapless::String::<128>::new();
+    if detail.write_fmt(format_args!("{source}")).is_err() {
+        // Partial content may have been appended before the capacity
+        // hit. Drop it — the caller would otherwise receive a
+        // truncated message with no indication of the truncation.
+        detail.clear();
+        if let Ok(sentinel) = heapless::String::try_from("scram error (detail truncated)") {
+            detail = sentinel;
+        }
+        // Dead `else`: sentinel (30 bytes) fits the 128-byte cap —
+        // a future cap reduction would surface as empty `detail`,
+        // which is still non-silent.
+    }
+    ProtocolError::ScramError { detail }
 }
 
 #[cfg(test)]

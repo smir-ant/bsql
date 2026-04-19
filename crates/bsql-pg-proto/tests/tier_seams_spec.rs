@@ -154,10 +154,11 @@ fn session_params_set_second_value_overwrites() {
 fn errored_cause_is_preserved_in_state_and_reply() {
     let mut proto = PgProtocol::new();
     let ping_raw = raw(7777);
-    // Push ping and feed a FrameTooLarge frame.
-    let _ = proto.push_command(PgCommand::Ping {
+    // Push ping and feed a FrameTooLarge frame. Setup-action list
+    // discarded explicitly (`let _ = ...` is banned by user feedback).
+    drop(proto.push_command(PgCommand::Ping {
         reply: id(ping_raw),
-    });
+    }));
     // Declared length = 0xDEAD (way above MAX_FRAME_LEN_FIELD=4095).
     let frame = [b'Z', 0x00, 0x00, 0xDE, 0xAD];
     let out = proto.feed_bytes(&frame);
@@ -288,16 +289,18 @@ fn backend_key_data_wrong_payload_size_is_classified() {
     // Set up: drive to ConnectingPostAuthWaitKey.
     let mut proto = PgProtocol::new();
     let startup_raw = raw(9000);
-    let _ = proto.push_command(PgCommand::Startup {
+    // Setup: push Startup, feed AuthOk. Action lists are discarded
+    // explicitly via `drop(...)` — `let _ = ...` is banned.
+    drop(proto.push_command(PgCommand::Startup {
         user: Ident::try_from_str("u").unwrap_or_else(|_| panic!("valid ident")),
         database: None,
         app_name: None,
         credentials: Credentials::Trust,
         reply: id(startup_raw),
-    });
+    }));
     // Feed AuthOk — now ConnectingPostAuthWaitKey.
     let auth_ok_frame: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
-    let _ = proto.feed_bytes(&auth_ok_frame);
+    drop(proto.feed_bytes(&auth_ok_frame));
     assert!(matches!(
         proto.state(),
         ProtoState::ConnectingPostAuthWaitKey(_),

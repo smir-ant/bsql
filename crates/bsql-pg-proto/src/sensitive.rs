@@ -51,12 +51,6 @@ impl<T: Zeroize> Sensitive<T> {
     pub fn get(&self) -> &T {
         &self.inner
     }
-
-    /// Mutably borrow the inner value.
-    #[inline]
-    pub fn get_mut(&mut self) -> &mut T {
-        &mut self.inner
-    }
 }
 
 impl<T: Zeroize> fmt::Debug for Sensitive<T> {

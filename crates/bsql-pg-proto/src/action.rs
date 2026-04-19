@@ -181,20 +181,6 @@ impl SendBuf {
     pub fn as_bytes(&self) -> &[u8] {
         &self.inner
     }
-
-    /// Length of the buffered bytes.
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Whether the buffer is empty.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
 }
 
 /// A typed protocol reply payload.
