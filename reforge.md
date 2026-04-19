@@ -1013,39 +1013,71 @@ pub type OutActions = heapless::Vec<Action, MAX_ACTIONS_PER_CALL>;
 
 ## §16. PgProtocol shape
 
+**Phase 1b shape (what actually ships today):**
+
 ```rust
 pub struct PgProtocol {
     state: ProtoState,
     read_buf: ReadBuf,
-    write_buf: WriteBuf,
-    stmt_cache: StmtCache,  // prepared statement LRU
-    session_params: SessionParams,  // from ParameterStatus (server_version, ...)
-    schema_fingerprint: Option<[u8; 32]>,
-    _not_sync: PhantomData<Cell<()>>,  // !Sync by construction
+    session_params: SessionParams,          // from ParameterStatus (server_version, ...)
+    sync_marker: PhantomData<Cell<()>>,     // !Sync by construction
+}
+```
+
+**Full target shape** (lands across 1c/1d/1e; DEF-IDs annotated):
+
+```rust
+pub struct PgProtocol {
+    state: ProtoState,
+    read_buf: ReadBuf,
+    write_buf: WriteBuf,               // DEF-094 caller-owned in current plan; field status TBD
+    stmt_cache: StmtCache,             // DEF-035 prepared statement LRU (Phase 1c)
+    session_params: SessionParams,
+    schema_fingerprint: Option<[u8; 32]>,  // Phase 1c/2 schema-aware decoder
+    sync_marker: PhantomData<Cell<()>>,
 }
 ```
 
 **ReadBuf / WriteBuf** — newtype-sealed `heapless::Vec<u8, CAP>`. API exposes ONLY: `append()`, `unread()`, `clear()`, `advance()`. Methods panic-on-misuse (`insert`, `resize`, `drain`, indexing `[i]`) physically absent.
 
-**`!Sync`** via `PhantomData<Cell<()>>`. Concurrent race на protocol state — STRUCTURALLY UNREACHABLE: only one task can own `&mut PgProtocol` at a time, compiler enforces.
+**`!Sync`** via `PhantomData<Cell<()>>`. Concurrent race на protocol state — STRUCTURALLY UNREACHABLE: only one task can own `&mut PgProtocol` at a time, compiler enforces. The `sync_marker` field (formerly `_not_sync`; renamed in AUDIT-C1 to avoid the `_`-prefixed convention which signals "unused in purpose" — the field is load-bearing).
 
 ## §17. State enum (state-as-data)
+
+**Phase 1b shape (what actually ships today):**
 
 ```rust
 pub enum ProtoState {
     Idle,
-    ConnectingStartup(ReplyId),          // sent StartupMessage, awaiting auth
-    ConnectingScram { reply: ReplyId, step: ScramStep, client_nonce: Sensitive<[u8; 24]>, server_data: Option<ScramServerFirst> },
-    ConnectingPostAuthWaitKey(ReplyId),  // AuthOk received, awaiting BackendKeyData
-    ConnectingPostAuthHaveKey { reply: ReplyId, pid: i32, secret_key: i32 },
     AwaitingPingReply(ReplyId),
-    AwaitingQueryReply { reply: ReplyId, hash: u64, columns: ColumnMeta },
-    StreamingRows { stream: StreamHandle, hash: u64, columns: ColumnMeta },
-    InTransaction { level: IsolationLevel, depth: u8 /* savepoint stack */ },
-    Errored(ProtocolError),
-    Closed,
+    ConnectingStartup { reply: ReplyId, credentials: Credentials },
+    ConnectingScramAwaitServerFirst {
+        reply: ReplyId,
+        scram: ScramSession,              // AUDIT-A2 typestate — no `Trust` variant
+        client_first_bare: heapless::Vec<u8, 128>,
+        client_nonce_b64: heapless::Vec<u8, 48>,
+    },
+    ConnectingScramAwaitServerFinal { reply: ReplyId, expected_server_sig: SecretDigest },
+    ConnectingScramAwaitAuthOk(ReplyId),
+    ConnectingPostAuthWaitKey(ReplyId),
+    ConnectingPostAuthHaveKey { reply: ReplyId, pid: i32, secret_key: i32 },
+    Errored(ProtocolError),                 // → Errored(ErrorKind) after DEF-061
 }
 ```
+
+**Full target shape** (lands across 1c/1d/1e; variants added per DEF-ID as each flow's code ships):
+
+```rust
+pub enum ProtoState {
+    // Phase 1a-1b variants as above ...
+    AwaitingQueryReply { reply: ReplyId, hash: u64, columns: ColumnMeta },  // Phase 1c
+    StreamingRows { stream: StreamHandle, hash: u64, columns: ColumnMeta }, // Phase 1c
+    InTransaction { level: IsolationLevel, depth: u8 },                      // Phase 1c
+    // ... Closed / Terminated on transport teardown (Phase 1e)
+}
+```
+
+**SCRAM split rationale (DEF-002).** Originally one `ConnectingScram { step: ScramStep }` variant was sketched; implementation split into three typestate variants (`AwaitServerFirst`, `AwaitServerFinal`, `AwaitAuthOk`) so that each transition's per-step data is carried only in the state that needs it (e.g., `client_first_bare` is only in `AwaitServerFirst`; `expected_server_sig` is only in `AwaitServerFinal`). DEF-063 will re-extract the handshake chain into a dedicated `handshake` module with typestate transitions.
 
 **Каждый variant** inline carries correlators. Transition requires `match prev { Variant(data) => consume(data); self.state = next }`. Compiler enforces — бага «lost correlator» не существует.
 
@@ -1063,24 +1095,43 @@ pub enum ProtoState {
 
 ## §19. Action enum
 
+**Phase 1b shape:**
+
 ```rust
 pub enum Action {
     SendBytes(SendBuf),
-    DeliverReply { id: ReplyId, value: Reply },
-    FailReply { id: ReplyId, cause: ProtocolError },
-    StreamRow { stream: StreamHandle, row: OwnedRow },
+    DeliverReply { id: NonZeroU64, value: Reply },
+    FailReply { id: NonZeroU64, cause: ProtocolError },
     CloseSocket,
 }
-pub enum SendBuf {
-    Static(&'static [u8]),                        // compile-time const
-    Owned(heapless::Vec<u8, MAX_OWNED_SEND_LEN>), // runtime-built
+
+// Single-shape newtype (DEF-089 — was a two-arm enum `Static(&'static [u8]) | Owned(...)`;
+// the enum had a tier-3 arm-swap seam in `as_bytes`, now gone).
+#[repr(transparent)]
+pub struct SendBuf {
+    inner: heapless::Vec<u8, MAX_OWNED_SEND_LEN>,
 }
+
 pub type OutActions = heapless::Vec<Action, MAX_ACTIONS_PER_CALL>;
 ```
 
+**DEF-094 target shape** (lands after DEF-061 shrinks `ProtocolError`; see deferred.md §14 for the ship-order analysis):
+
+```rust
+pub enum Action<'buf> {
+    SendBytes(&'buf [u8]),                 // zero-copy — ref into caller-owned WriteBuf
+    DeliverReply { id: NonZeroU64, value: Reply },
+    FailReply { id: NonZeroU64, cause: ProtocolError },
+    CloseSocket,
+}
+pub type OutActions<'buf> = heapless::Vec<Action<'buf>, MAX_ACTIONS_PER_CALL>;
+```
+
+The 1e `StreamRow { stream: StreamHandle, row: OwnedRow }` variant lands with the streaming-query flow.
+
 **Per-method push budget** — const per operation + `const _ : () = assert!(MAX >= MAX_PUSHED_BY_…)`. Overflow push — impossible at compile.
 
-**SendBuf rationale** см. §7.10. `large_enum_variant` clippy → `#[expect(...)]` с reason.
+**`large_enum_variant` clippy → `#[expect(...)]`** with reason: `FailReply.cause: ProtocolError` (~856 bytes) dominates the enum until DEF-060/061 shrinks it.
 
 ## §20. Frame parsing (pure function)
 
@@ -1090,18 +1141,33 @@ fn parse_header(unread: &[u8]) -> HeaderParse {
         [] => HeaderParse::Empty,
         [_] | [_, _] | [_, _, _] | [_, _, _, _] => HeaderParse::Incomplete,
         [tag, l0, l1, l2, l3, ..] => {
-            let declared = u32::from_be_bytes([*l0, *l1, *l2, *l3]);
-            if declared < 4 { return HeaderParse::MalformedLength { declared }; }
-            if usize::try_from(declared).ok().is_none_or(|n| n > MAX_FRAME_LEN) {
-                return HeaderParse::FrameTooLarge { declared };
+            let declared_raw = u32::from_be_bytes([*l0, *l1, *l2, *l3]);
+            let Some(declared) = NonZeroU32::new(declared_raw) else {
+                // declared_raw == 0 — structurally invalid (PG length
+                // includes itself, must be >= 4).
+                return HeaderParse::MalformedLength { declared: declared_raw };
+            };
+            if declared.get() < 4 || declared.get() > MAX_FRAME_LEN_FIELD {
+                return if declared.get() < 4 {
+                    HeaderParse::MalformedLength { declared: declared.get() }
+                } else {
+                    HeaderParse::FrameTooLarge { declared: declared.get() }
+                };
             }
-            HeaderParse::Ok { tag: *tag, declared_len: declared, total_len: declared as usize + 1 }
+            // `as` casts are forbidden (forbid(clippy::as_conversions)).
+            // `usize::try_from` is the accepted form — on 16-bit targets
+            // the try can fail; surface that honestly as FrameTooLarge.
+            let total_len = match usize::try_from(declared.get()) {
+                Ok(n) => n.saturating_add(1),
+                Err(_) => return HeaderParse::FrameTooLarge { declared: declared.get() },
+            };
+            HeaderParse::Ok { tag: *tag, declared_len: declared, total_len }
         }
     }
 }
 ```
 
-Pure function — no state mutation, no I/O. Testable in isolation. Early-reject `FrameTooLarge` (declared_len > READ_BUF_CAP) — DoS via length amplification STRUCTURALLY UNREACHABLE.
+Pure function — no state mutation, no I/O. Testable in isolation. Early-reject `FrameTooLarge` (declared_len > `MAX_FRAME_LEN_FIELD`) — DoS via length amplification STRUCTURALLY UNREACHABLE. `declared_len` is `NonZeroU32` so `MalformedLength { declared: 0 }` is a separate variant; the `Option<NonZeroU32>` niche keeps the struct packed.
 
 ## §21. Dispatch (typed outcome)
 
