@@ -364,7 +364,7 @@ impl PgProtocol {
                     let prev = core::mem::take(&mut self.state);
                     let outcome = dispatch(prev, tag, payload);
                     match outcome {
-                        DispatchOutcome::Advanced { new_state, action } => {
+                        DispatchOutcome::AdvancedSilent { new_state } => {
                             self.state = new_state;
                             // `advance(total_len)` was proved in-bounds
                             // above (`unread().len() >= total_len`).
@@ -380,11 +380,19 @@ impl PgProtocol {
                                 );
                                 break;
                             };
-                            if let Some(act) = action {
-                                emit_actions!(&mut out, budget: 1, on_overflow: break, [
-                                    act,
-                                ]);
-                            }
+                        }
+                        DispatchOutcome::AdvancedWithAction { new_state, action } => {
+                            self.state = new_state;
+                            let Ok(()) = self.read_buf.advance(total_len) else {
+                                self.fail_inflight_and_close(
+                                    ProtocolError::ProtocolInvariantBroken,
+                                    &mut out,
+                                );
+                                break;
+                            };
+                            emit_actions!(&mut out, budget: 1, on_overflow: break, [
+                                action,
+                            ]);
                         }
                         DispatchOutcome::Errored { reply_id, cause } => {
                             self.state = ProtoState::Errored(cause.clone());

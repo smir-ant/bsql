@@ -27,14 +27,32 @@ use crate::wire::{
 };
 
 /// What to do after dispatching a single frame.
+///
+/// Three variants to keep the "emit zero actions" and "emit one
+/// action" cases structurally distinct (audit round 2 A4). The
+/// earlier two-variant form used `Advanced { action: Option<Action> }`
+/// and an arm-body drift that flipped `Some(act)` into `None`
+/// compiled silently — now such a drift is a compile error
+/// (`AdvancedWithAction` requires the field, `AdvancedSilent` does not).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant, reason = "no_alloc: Box unavailable; DispatchOutcome is a one-shot return, not stored")]
 pub(crate) enum DispatchOutcome {
-    /// Frame consumed; transition to `new_state`. Caller advances the
-    /// read buffer and pushes `action` if present.
-    Advanced {
+    /// Frame consumed; transition to `new_state`. No action emitted.
+    /// Used by ParameterStatus, BackendKeyData, AuthenticationOk,
+    /// SASLFinal — frames that advance state without user-visible
+    /// side effects.
+    AdvancedSilent {
+        /// The state to transition to.
         new_state: ProtoState,
-        action: Option<Action>,
+    },
+    /// Frame consumed; transition to `new_state` **and** emit one
+    /// action. Used by ReadyForQuery → DeliverReply and by
+    /// SASL intermediate replies that produce an outbound frame.
+    AdvancedWithAction {
+        /// The state to transition to.
+        new_state: ProtoState,
+        /// The single side-effect to push into `out`.
+        action: Action,
     },
     /// Frame rejected; connection irrecoverable. Caller tears down.
     Errored {
@@ -50,14 +68,14 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
         // Ping flow (Phase 1a, carried forward)
         // =============================================================
         (ProtoState::AwaitingPingReply(id), TAG_READY_FOR_QUERY) => match payload {
-            [tx_status] => DispatchOutcome::Advanced {
+            [tx_status] => DispatchOutcome::AdvancedWithAction {
                 new_state: ProtoState::Idle,
-                action: Some(Action::DeliverReply {
+                action: Action::DeliverReply {
                     id: id.consume(),
                     value: Reply::Pong {
                         tx_status: *tx_status,
                     },
-                }),
+                },
             },
             other => DispatchOutcome::Errored {
                 reply_id: Some(id),
@@ -181,13 +199,12 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
         // =============================================================
         (ProtoState::ConnectingPostAuthWaitKey(reply), TAG_BACKEND_KEY_DATA) => {
             match parse_backend_key_data(payload) {
-                Ok((pid, secret_key)) => DispatchOutcome::Advanced {
+                Ok((pid, secret_key)) => DispatchOutcome::AdvancedSilent {
                     new_state: ProtoState::ConnectingPostAuthHaveKey {
                         reply,
                         pid,
                         secret_key,
                     },
-                    action: None,
                 },
                 Err(cause) => DispatchOutcome::Errored {
                     reply_id: Some(reply),
@@ -222,16 +239,16 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
             },
             TAG_READY_FOR_QUERY,
         ) => match payload {
-            [tx_status] => DispatchOutcome::Advanced {
+            [tx_status] => DispatchOutcome::AdvancedWithAction {
                 new_state: ProtoState::Idle,
-                action: Some(Action::DeliverReply {
+                action: Action::DeliverReply {
                     id: reply.consume(),
                     value: Reply::StartupComplete {
                         pid,
                         secret_key,
                         tx_status: *tx_status,
                     },
-                }),
+                },
             },
             other => DispatchOutcome::Errored {
                 reply_id: Some(reply),
@@ -265,9 +282,8 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
         // =============================================================
         // Errored — terminal sink (Phase 1a pattern carried forward)
         // =============================================================
-        (ProtoState::Errored(original), _) => DispatchOutcome::Advanced {
+        (ProtoState::Errored(original), _) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::Errored(original),
-            action: None,
         },
     }
 }
@@ -309,9 +325,8 @@ fn dispatch_auth_in_startup(
     match code {
         AUTH_OK => {
             // Trust auth succeeded. Move to post-auth chain.
-            DispatchOutcome::Advanced {
+            DispatchOutcome::AdvancedSilent {
                 new_state: ProtoState::ConnectingPostAuthWaitKey(reply),
-                action: None,
             }
         }
         AUTH_SASL => {
@@ -345,14 +360,14 @@ fn dispatch_auth_in_startup(
             // Build client-first-message and SASLInitialResponse.
             match build_sasl_initial_response(&scram) {
                 Ok((send_buf, client_first_bare, client_nonce_b64)) => {
-                    DispatchOutcome::Advanced {
+                    DispatchOutcome::AdvancedWithAction {
                         new_state: ProtoState::ConnectingScramAwaitServerFirst {
                             reply,
                             scram,
                             client_first_bare,
                             client_nonce_b64,
                         },
-                        action: Some(Action::SendBytes(send_buf)),
+                        action: Action::SendBytes(send_buf),
                     }
                 }
                 Err(cause) => DispatchOutcome::Errored {
@@ -581,12 +596,12 @@ fn dispatch_auth_sasl_continue(
         };
     }
 
-    DispatchOutcome::Advanced {
+    DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::ConnectingScramAwaitServerFinal {
             reply,
             expected_server_sig,
         },
-        action: Some(Action::SendBytes(SendBuf::from_owned(wb.into_inner()))),
+        action: Action::SendBytes(SendBuf::from_owned(wb.into_inner())),
     }
 }
 
@@ -636,9 +651,8 @@ fn dispatch_auth_sasl_final(
     }
 
     // Signature matches. Await AuthenticationOk.
-    DispatchOutcome::Advanced {
+    DispatchOutcome::AdvancedSilent {
         new_state: ProtoState::ConnectingScramAwaitAuthOk(reply),
-        action: None,
     }
 }
 
@@ -664,9 +678,8 @@ fn dispatch_auth_ok_after_scram(reply: ReplyId, payload: &[u8]) -> DispatchOutco
         };
     }
 
-    DispatchOutcome::Advanced {
+    DispatchOutcome::AdvancedSilent {
         new_state: ProtoState::ConnectingPostAuthWaitKey(reply),
-        action: None,
     }
 }
 
