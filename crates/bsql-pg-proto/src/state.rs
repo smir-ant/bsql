@@ -22,6 +22,7 @@
 use crate::error::ProtocolError;
 use crate::password::Credentials;
 use crate::reply_id::ReplyId;
+use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
 
 /// Where the protocol is right now.
@@ -83,8 +84,10 @@ pub enum ProtoState {
     ConnectingScramAwaitServerFirst {
         /// Correlator for the Startup command.
         reply: ReplyId,
-        /// Credentials for deriving the SCRAM proof.
-        credentials: Credentials,
+        /// SCRAM session (password bundle). Tier-1 typestate via
+        /// [`ScramSession`] — the `Credentials::Trust` variant
+        /// cannot appear here by construction (audit A2).
+        scram: ScramSession,
         /// The `client-first-message-bare` (saved for AuthMessage).
         client_first_bare: heapless::Vec<u8, 128>,
         /// The client nonce (base64-encoded, for prefix validation).

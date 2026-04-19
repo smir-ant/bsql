@@ -108,13 +108,13 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
         (
             ProtoState::ConnectingScramAwaitServerFirst {
                 reply,
-                credentials,
+                scram,
                 client_first_bare,
                 client_nonce_b64,
             },
             TAG_AUTHENTICATION,
         ) => {
-            dispatch_auth_sasl_continue(reply, credentials, client_first_bare, client_nonce_b64, payload)
+            dispatch_auth_sasl_continue(reply, scram, client_first_bare, client_nonce_b64, payload)
         }
         (ProtoState::ConnectingScramAwaitServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
@@ -315,19 +315,22 @@ fn dispatch_auth_in_startup(
             }
         }
         AUTH_SASL => {
-            // Server wants SASL. Parse the mechanism list and check for
-            // SCRAM-SHA-256. The mechanism names are NUL-separated with
-            // an extra NUL terminator.
-            match credentials {
-                Credentials::Trust => {
-                    // Server wants auth but we have no password.
+            // Server wants SASL. Tier-1 boundary (audit A2): the
+            // `Trust`-vs-`ScramPassword` discrimination happens here,
+            // exactly once. Every downstream site takes `ScramSession`
+            // by value or reference; the `Trust` variant cannot drift
+            // into them.
+            let scram = match crate::scram::session::ScramSession::try_from_credentials(
+                credentials,
+            ) {
+                Ok(s) => s,
+                Err(()) => {
                     return DispatchOutcome::Errored {
                         reply_id: Some(reply),
                         cause: ProtocolError::UnsupportedAuthMethod { sub_code: code },
                     };
                 }
-                Credentials::ScramPassword(_) => {}
-            }
+            };
 
             if !mechanism_list_contains_scram(rest) {
                 return DispatchOutcome::Errored {
@@ -340,12 +343,12 @@ fn dispatch_auth_in_startup(
             }
 
             // Build client-first-message and SASLInitialResponse.
-            match build_sasl_initial_response(&credentials) {
+            match build_sasl_initial_response(&scram) {
                 Ok((send_buf, client_first_bare, client_nonce_b64)) => {
                     DispatchOutcome::Advanced {
                         new_state: ProtoState::ConnectingScramAwaitServerFirst {
                             reply,
-                            credentials,
+                            scram,
                             client_first_bare,
                             client_nonce_b64,
                         },
@@ -378,9 +381,22 @@ fn mechanism_list_contains_scram(data: &[u8]) -> bool {
 }
 
 /// Build the SASLInitialResponse frame for SCRAM-SHA-256.
+///
+/// Takes a [`ScramSession`] by shared reference. The parameter is
+/// not dereferenced — the password is not needed until the
+/// SASL-continue step — but the signature makes the call-site
+/// typestate explicit: calling this function without constructing a
+/// `ScramSession` first is a compile error. The
+/// `Credentials`-vs-`ScramPassword` split happens exactly once at
+/// [`ScramSession::try_from_credentials`] (audit A2). The `_` in
+/// `_: &ScramSession` uses Rust's anonymous-parameter syntax — the
+/// parameter shape is load-bearing, its binding is not.
+///
+/// [`ScramSession`]: crate::scram::session::ScramSession
+/// [`ScramSession::try_from_credentials`]: crate::scram::session::ScramSession::try_from_credentials
 #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
 fn build_sasl_initial_response(
-    credentials: &Credentials,
+    _: &crate::scram::session::ScramSession,
 ) -> Result<
     (
         SendBuf,
@@ -395,15 +411,7 @@ fn build_sasl_initial_response(
     // SCRAM client-first uses the username in "n=<user>".
     // PostgreSQL already has the username from the StartupMessage;
     // an empty "n=" field is accepted per RFC 5802.
-    let user_bytes: &[u8] = match credentials {
-        Credentials::ScramPassword(_) => b"",
-        Credentials::Trust => {
-            return Err(ProtocolError::ScramError {
-                detail: heapless::String::try_from("trust auth cannot do SCRAM")
-                    .unwrap_or_default(),
-            });
-        }
-    };
+    let user_bytes: &[u8] = b"";
 
     let client_nonce_b64 = wire::generate_client_nonce().map_err(scram_err_from)?;
 
@@ -443,9 +451,20 @@ fn build_sasl_initial_response(
 }
 
 /// Dispatch AuthenticationSASLContinue (server-first-message).
+///
+/// Takes a [`ScramSession`] by value — the `Trust`-vs-`ScramPassword`
+/// discrimination was consumed at
+/// [`ScramSession::try_from_credentials`] in the parent dispatch
+/// call; this function cannot be reached with `Trust` credentials
+/// because the state variant it destructures from
+/// ([`ProtoState::ConnectingScramAwaitServerFirst`]) carries
+/// `ScramSession`, not `Credentials`. Audit A2.
+///
+/// [`ScramSession`]: crate::scram::session::ScramSession
+/// [`ScramSession::try_from_credentials`]: crate::scram::session::ScramSession::try_from_credentials
 fn dispatch_auth_sasl_continue(
     reply: ReplyId,
-    credentials: Credentials,
+    scram: crate::scram::session::ScramSession,
     client_first_bare: heapless::Vec<u8, 128>,
     client_nonce_b64: heapless::Vec<u8, 48>,
     payload: &[u8],
@@ -479,16 +498,9 @@ fn dispatch_auth_sasl_continue(
             }
         };
 
-    // Get password bytes from credentials.
-    let password_bytes = match &credentials {
-        Credentials::ScramPassword(sensitive) => sensitive.get().as_bytes(),
-        Credentials::Trust => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply),
-                cause: scram_buf_err(),
-            }
-        }
-    };
+    // Password bytes come from the typed SCRAM session — no
+    // Trust-vs-ScramPassword discrimination here (audit A2).
+    let password_bytes = scram.password_bytes();
 
     // Build client-final-without-proof.
     let client_final_without_proof =
