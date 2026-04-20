@@ -273,6 +273,262 @@ pub(crate) fn parse_row_description(
     })
 }
 
+// ════════════════════════════════════════════════════════════════════
+// 1c-2b — DataRow parser + ColumnsIter
+// ════════════════════════════════════════════════════════════════════
+
+/// Decode-time errors — classify malformed row bodies independently
+/// of wire-level [`crate::ProtocolError`].
+///
+/// A [`DecodeError`] means the caller tried to parse an individual row
+/// or column and the bytes don't match the PG DataRow shape. These
+/// are per-row diagnostic errors: the protocol state machine already
+/// accepted the frame as well-formed at the framing layer (the D
+/// tag + length were intact); the body's internal structure is the
+/// issue.
+///
+/// **Why separate from `ProtocolError`**: `ProtocolError` tears down
+/// the connection. `DecodeError` surfaces to the row consumer who
+/// can choose to skip the row, fail the application query, or
+/// classify as a driver bug (the server sent a malformed row body)
+/// — the connection itself is still healthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DecodeError {
+    /// DataRow body too short to contain the 2-byte column count
+    /// header. Malformed frame.
+    TruncatedRow,
+    /// A column's 4-byte length prefix is missing (fewer bytes
+    /// remain than expected). `column_idx` is 0-based.
+    TruncatedColumnLen {
+        /// Zero-based column index where the truncation was detected.
+        column_idx: usize,
+    },
+    /// A column's declared length prefix is negative and is not the
+    /// sentinel `-1` (which encodes SQL `NULL`). Other negative
+    /// values are wire-level invalid.
+    NegativeColumnLength {
+        /// Zero-based column index.
+        column_idx: usize,
+        /// The offending length value.
+        length: i32,
+    },
+    /// A column's data region is shorter than the declared length
+    /// prefix (partial row).
+    TruncatedColumnData {
+        /// Zero-based column index.
+        column_idx: usize,
+        /// Length declared by the prefix.
+        declared_len: usize,
+        /// Bytes actually remaining in the row body.
+        remaining: usize,
+    },
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TruncatedRow => f.write_str("DataRow body too short for column count header"),
+            Self::TruncatedColumnLen { column_idx } => {
+                write!(f, "column {column_idx}: length prefix truncated")
+            }
+            Self::NegativeColumnLength { column_idx, length } => write!(
+                f,
+                "column {column_idx}: invalid negative length {length} (only -1 = SQL NULL is valid)",
+            ),
+            Self::TruncatedColumnData {
+                column_idx,
+                declared_len,
+                remaining,
+            } => write!(
+                f,
+                "column {column_idx}: data truncated — declared {declared_len} bytes, only {remaining} remain",
+            ),
+        }
+    }
+}
+
+/// Zero-copy reference to a `DataRow` frame body.
+///
+/// Wraps the body bytes (everything after the 5-byte frame header)
+/// and parses the 2-byte column count header eagerly. Per-column
+/// data is lazily iterated via [`DataRowRef::columns`].
+///
+/// # Lifetimes
+///
+/// `'a` borrows the body bytes. Typically obtained from
+/// [`crate::Action::StreamRow::row_bytes`], in which case `'a` is
+/// the `'r` lifetime of the owning [`crate::OutActions`]. The
+/// iterator yields column slices that share this borrow — no
+/// copying, no allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct DataRowRef<'a> {
+    /// Full body, including the 2-byte count header.
+    body: &'a [u8],
+    /// Parsed column count.
+    n_columns: u16,
+}
+
+impl<'a> DataRowRef<'a> {
+    /// Parse a `DataRow` frame body. Returns the declared column count
+    /// without walking the column payloads — that happens in
+    /// [`Self::columns`].
+    ///
+    /// # Errors
+    ///
+    /// - [`DecodeError::TruncatedRow`] — body is shorter than 2 bytes,
+    ///   or the count header decodes to a negative `i16` (invalid).
+    #[inline]
+    pub fn parse(body: &'a [u8]) -> Result<Self, DecodeError> {
+        let (count_bytes, _) = body.split_first_chunk::<2>().ok_or(DecodeError::TruncatedRow)?;
+        let n_columns_i16 = i16::from_be_bytes(*count_bytes);
+        if n_columns_i16 < 0 {
+            return Err(DecodeError::TruncatedRow);
+        }
+        // `n_columns_i16 >= 0` ⟹ `try_from` infallible; the
+        // `unwrap_or(0)` fallback is architecturally dead but
+        // honours the forbid-bundle ban on `unwrap()`.
+        let n_columns = u16::try_from(n_columns_i16).unwrap_or(0);
+        Ok(Self { body, n_columns })
+    }
+
+    /// Declared column count.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::from(self.n_columns)
+    }
+
+    /// Whether the row carries zero columns (unusual — typically DML
+    /// responses have no DataRow; a 0-column DataRow is exotic).
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.n_columns == 0
+    }
+
+    /// Iterator over columns in declaration order.
+    ///
+    /// Each item is `Result<Option<&'a [u8]>, DecodeError>`:
+    /// - `Ok(Some(bytes))` — non-NULL column; `bytes` is the raw
+    ///   payload (length-prefix stripped).
+    /// - `Ok(None)` — SQL `NULL` (wire-level length prefix = `-1`).
+    /// - `Err(DecodeError)` — malformed row body; iteration should
+    ///   stop.
+    ///
+    /// Body bytes are advanced by `4 + data_len` per column; the
+    /// iterator stops after `n_columns` items or on the first error.
+    #[inline]
+    #[must_use]
+    pub fn columns(&self) -> ColumnsIter<'a> {
+        let remaining = self.body.get(2..).unwrap_or(&[]);
+        ColumnsIter {
+            remaining,
+            columns_left: self.n_columns,
+            column_idx: 0,
+        }
+    }
+}
+
+/// Lazy iterator over a [`DataRowRef`]'s columns.
+///
+/// Produced by [`DataRowRef::columns`]. Each call to [`Iterator::next`]
+/// reads one `(length, data)` pair from the remaining body bytes.
+///
+/// # Iterator semantics
+///
+/// - Yields exactly `n_columns` items on a well-formed row (then
+///   returns `None`).
+/// - On the first [`DecodeError`], that error is yielded; subsequent
+///   `.next()` calls yield `None` (fused after error via the
+///   `columns_left` counter saturating-decrement — further iteration
+///   stops cleanly).
+#[derive(Debug, Clone)]
+pub struct ColumnsIter<'a> {
+    remaining: &'a [u8],
+    columns_left: u16,
+    column_idx: usize,
+}
+
+impl<'a> Iterator for ColumnsIter<'a> {
+    type Item = Result<Option<&'a [u8]>, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.columns_left == 0 {
+            return None;
+        }
+        let idx = self.column_idx;
+        self.column_idx = idx.saturating_add(1);
+        self.columns_left = self.columns_left.saturating_sub(1);
+
+        // 4-byte length prefix.
+        let (len_bytes, after_len) = match self.remaining.split_first_chunk::<4>() {
+            Some(pair) => pair,
+            None => {
+                // Fuse: drop remaining bytes so subsequent `next` is None.
+                self.remaining = &[];
+                self.columns_left = 0;
+                return Some(Err(DecodeError::TruncatedColumnLen { column_idx: idx }));
+            }
+        };
+        let len = i32::from_be_bytes(*len_bytes);
+
+        if len == -1 {
+            // SQL NULL — no data bytes to consume.
+            self.remaining = after_len;
+            return Some(Ok(None));
+        }
+
+        if len < 0 {
+            self.remaining = &[];
+            self.columns_left = 0;
+            return Some(Err(DecodeError::NegativeColumnLength {
+                column_idx: idx,
+                length: len,
+            }));
+        }
+
+        // `len >= 0` ⟹ `try_from` infallible; defensive fallback.
+        let len_usize = match usize::try_from(len) {
+            Ok(v) => v,
+            Err(_) => {
+                self.remaining = &[];
+                self.columns_left = 0;
+                return Some(Err(DecodeError::NegativeColumnLength {
+                    column_idx: idx,
+                    length: len,
+                }));
+            }
+        };
+
+        match after_len.split_at_checked(len_usize) {
+            Some((data, next)) => {
+                self.remaining = next;
+                Some(Ok(Some(data)))
+            }
+            None => {
+                let remaining = after_len.len();
+                self.remaining = &[];
+                self.columns_left = 0;
+                Some(Err(DecodeError::TruncatedColumnData {
+                    column_idx: idx,
+                    declared_len: len_usize,
+                    remaining,
+                }))
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = usize::from(self.columns_left);
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for ColumnsIter<'_> {}
+impl core::iter::FusedIterator for ColumnsIter<'_> {}
+
 #[cfg(test)]
 mod parse_tests {
     //! `parse_row_description` conformance per PG §55.7 + bad-path
@@ -477,5 +733,238 @@ mod parse_tests {
             matches!(&result, Ok(desc) if desc.len() == MAX_ROW_COLUMNS),
             "expected MAX_ROW_COLUMNS parse, got {result:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod data_row_tests {
+    //! `DataRowRef` + `ColumnsIter` spec-conformance per PG §55.7
+    //! `DataRow` shape + bad-path classification.
+    //!
+    //! Body layout: i16 column-count + per-column `(i32 length,
+    //! data-bytes)`. `length = -1` encodes SQL NULL.
+
+    extern crate alloc;
+    use super::*;
+
+    /// Build a DataRow body: 2-byte count + per-column payloads.
+    /// `None` = NULL, `Some(bytes)` = data.
+    fn build(columns: &[Option<&[u8]>]) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::new();
+        let count = i16::try_from(columns.len()).unwrap_or(0);
+        out.extend_from_slice(&count.to_be_bytes());
+        for col in columns {
+            match col {
+                Some(data) => {
+                    let len = i32::try_from(data.len()).unwrap_or(0);
+                    out.extend_from_slice(&len.to_be_bytes());
+                    out.extend_from_slice(data);
+                }
+                None => {
+                    out.extend_from_slice(&(-1i32).to_be_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Parse a body and return the row — with `assert` fail path
+    /// that avoids the forbid-bundle's bans on `panic!`, `.unwrap()`,
+    /// `.expect()`, `unreachable!()`, and `assert!(false)`.
+    ///
+    /// The `assert!(matches!(...))` ensures Ok on well-formed input;
+    /// if it fires, the test fails before reaching the `else` branch,
+    /// so the `return` is defensive dead code satisfying
+    /// borrow-checker exhaustiveness on the post-assert decomposition.
+    fn must_parse(body: &[u8]) -> DataRowRef<'_> {
+        let result = DataRowRef::parse(body);
+        assert!(
+            result.is_ok(),
+            "fixture parse should succeed, got {result:?}",
+        );
+        result.unwrap_or(DataRowRef {
+            body: &[],
+            n_columns: 0,
+        })
+    }
+
+    /// Invariant (spec): a well-formed 2-column row yields both
+    /// values in order; length + data round-trip verbatim.
+    #[test]
+    fn two_column_row_roundtrip() {
+        let body = build(&[Some(b"hello"), Some(b"world")]);
+        let row = must_parse(&body);
+        assert_eq!(row.len(), 2);
+        let items: alloc::vec::Vec<_> = row.columns().collect();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items.first(), Some(Ok(Some(b"hello")))));
+        assert!(matches!(items.get(1), Some(Ok(Some(b"world")))));
+    }
+
+    /// Invariant (spec): `length = -1` encodes SQL NULL, surfaced as
+    /// `Ok(None)` — distinct from empty bytes `Ok(Some(b""))`.
+    #[test]
+    fn null_column_is_none() {
+        let body = build(&[Some(b"x"), None, Some(b"y")]);
+        let row = must_parse(&body);
+        let items: alloc::vec::Vec<_> = row.columns().collect();
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items.first(), Some(Ok(Some(b"x")))));
+        assert!(matches!(items.get(1), Some(Ok(None))));
+        assert!(matches!(items.get(2), Some(Ok(Some(b"y")))));
+    }
+
+    /// Invariant: empty column (`length = 0`) surfaces as
+    /// `Ok(Some(&[]))` — distinct from NULL.
+    #[test]
+    fn empty_column_is_not_null() {
+        let body = build(&[Some(b""), Some(b"nonempty")]);
+        let row = must_parse(&body);
+        let items: alloc::vec::Vec<_> = row.columns().collect();
+        assert!(
+            matches!(items.first(), Some(Ok(Some(s))) if s.is_empty()),
+            "expected Ok(Some(empty)), got {:?}", items.first(),
+        );
+        assert!(matches!(items.get(1), Some(Ok(Some(b"nonempty")))));
+    }
+
+    /// Invariant: 0-column row parses — valid edge case.
+    #[test]
+    fn zero_column_row_parses() {
+        let body = build(&[]);
+        let row = must_parse(&body);
+        assert!(row.is_empty());
+        assert_eq!(row.columns().count(), 0);
+    }
+
+    /// Invariant: body shorter than the 2-byte count header is
+    /// classified as `TruncatedRow`.
+    #[test]
+    fn truncated_count_header() {
+        for buf in [&[][..], &[0][..]] {
+            let result = DataRowRef::parse(buf);
+            assert!(
+                matches!(result, Err(DecodeError::TruncatedRow)),
+                "expected TruncatedRow, got {result:?}",
+            );
+        }
+    }
+
+    /// Invariant: negative column count (i.e. count header decodes to
+    /// a negative `i16`) is classified as `TruncatedRow`.
+    #[test]
+    fn negative_column_count() {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&(-3i16).to_be_bytes());
+        let result = DataRowRef::parse(&body);
+        assert!(
+            matches!(result, Err(DecodeError::TruncatedRow)),
+            "negative count: expected TruncatedRow, got {result:?}",
+        );
+    }
+
+    /// Invariant: missing column length prefix surfaces as
+    /// `TruncatedColumnLen`.
+    #[test]
+    fn missing_column_length_prefix() {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&2i16.to_be_bytes()); // claim 2 columns
+        body.extend_from_slice(&1i32.to_be_bytes());
+        body.extend_from_slice(b"a"); // first column fine
+        body.extend_from_slice(&[0, 0]); // partial length prefix for second
+        let row = must_parse(&body);
+        let items: alloc::vec::Vec<_> = row.columns().collect();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items.first(), Some(Ok(Some(b"a")))));
+        assert!(
+            matches!(
+                items.get(1),
+                Some(Err(DecodeError::TruncatedColumnLen { column_idx: 1 })),
+            ),
+            "expected TruncatedColumnLen, got {:?}", items.get(1),
+        );
+    }
+
+    /// Invariant: negative length that isn't `-1` classifies as
+    /// `NegativeColumnLength`.
+    #[test]
+    fn negative_column_length_not_null_sentinel() {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&1i16.to_be_bytes());
+        body.extend_from_slice(&(-7i32).to_be_bytes());
+        let row = must_parse(&body);
+        let items: alloc::vec::Vec<_> = row.columns().collect();
+        assert!(matches!(
+            items.first(),
+            Some(Err(DecodeError::NegativeColumnLength {
+                column_idx: 0,
+                length: -7,
+            })),
+        ));
+    }
+
+    /// Invariant: data region shorter than declared length classifies
+    /// as `TruncatedColumnData` and identifies the shortage.
+    #[test]
+    fn truncated_column_data() {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&1i16.to_be_bytes());
+        body.extend_from_slice(&10i32.to_be_bytes()); // claim 10 bytes
+        body.extend_from_slice(b"short"); // only 5 provided
+        let row = must_parse(&body);
+        let items: alloc::vec::Vec<_> = row.columns().collect();
+        assert!(
+            matches!(
+                items.first(),
+                Some(Err(DecodeError::TruncatedColumnData {
+                    column_idx: 0,
+                    declared_len: 10,
+                    remaining: 5,
+                })),
+            ),
+            "expected TruncatedColumnData, got {:?}", items.first(),
+        );
+    }
+
+    /// Invariant: iterator is fused after an error — subsequent
+    /// `.next()` calls return `None`, not re-yielding the error or
+    /// advancing past broken bytes. Protects against infinite-loop
+    /// consumers and double-processing.
+    #[test]
+    fn iterator_fuses_after_error() {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&3i16.to_be_bytes()); // 3 columns claimed
+        body.extend_from_slice(&(-99i32).to_be_bytes()); // invalid first col
+        let row = must_parse(&body);
+        let mut iter = row.columns();
+        // First next: the error.
+        assert!(matches!(iter.next(), Some(Err(_))));
+        // Second next: fused None (not another error, not a stale value).
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    /// Invariant: `ExactSizeIterator::len()` reflects the declared
+    /// column count pre-iteration and decrements with each `.next()`.
+    #[test]
+    fn exact_size_hint() {
+        let body = build(&[Some(b"a"), Some(b"b"), Some(b"c")]);
+        let row = must_parse(&body);
+        let mut iter = row.columns();
+        assert_eq!(iter.size_hint(), (3, Some(3)));
+        // Consume three items. Iterator yields Result; drop the
+        // yielded Result via explicit match — no `let _ = next()`
+        // per crate convention.
+        match iter.next() {
+            Some(_) | None => {}
+        }
+        assert_eq!(iter.size_hint(), (2, Some(2)));
+        match iter.next() {
+            Some(_) | None => {}
+        }
+        match iter.next() {
+            Some(_) | None => {}
+        }
+        assert_eq!(iter.size_hint(), (0, Some(0)));
     }
 }

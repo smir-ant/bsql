@@ -109,7 +109,9 @@ pub use action::{
 };
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::PgCommand;
-pub use decode::{ColumnDesc, FormatCode, MAX_ROW_COLUMNS, RowDesc};
+pub use decode::{
+    ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, MAX_ROW_COLUMNS, RowDesc,
+};
 pub use error::ProtocolError;
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use ident::{

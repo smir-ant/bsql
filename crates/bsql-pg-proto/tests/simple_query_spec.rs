@@ -29,8 +29,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, FormatCode, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply,
-    ReplyId, RowDesc, Sql, WriteBuf,
+    Action, DataRowRef, FormatCode, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind,
+    Reply, ReplyId, RowDesc, Sql, WriteBuf,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
         TAG_QUERY, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
@@ -738,6 +738,67 @@ fn overflow_backpressure_preserves_delivery_across_calls() {
     }
     assert_eq!(total_rows, row_count, "every row delivered exactly once");
     assert!(matches!(proto.state(), ProtoState::Idle));
+}
+
+/// Invariant (1c-2b): `DataRowRef::parse` + `columns()` decode the
+/// raw `Action::StreamRow::row_bytes` the protocol emitted — the
+/// full round-trip from wire bytes to per-column `&[u8]`, including
+/// SQL NULL handling (`length = -1` → `Ok(None)`).
+#[test]
+fn stream_row_bytes_decode_via_data_row_ref() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(400);
+    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+
+    // Feed: T (2 cols) + D (val1, NULL) + C + Z.
+    let mut bytes = std::vec::Vec::new();
+    bytes.extend_from_slice(&row_description_frame(2));
+    // DataRow with 2 columns: "answer" and NULL.
+    let mut row_body = std::vec::Vec::new();
+    row_body.extend_from_slice(&2i16.to_be_bytes());
+    // col 0: "answer" (non-null)
+    let col0 = b"answer";
+    let Ok(col0_len) = i32::try_from(col0.len()) else { unreachable!() };
+    row_body.extend_from_slice(&col0_len.to_be_bytes());
+    row_body.extend_from_slice(col0);
+    // col 1: NULL
+    row_body.extend_from_slice(&(-1i32).to_be_bytes());
+    bytes.push(TAG_DATA_ROW);
+    let Ok(row_framelen) = u32::try_from(row_body.len().saturating_add(4)) else {
+        unreachable!()
+    };
+    bytes.extend_from_slice(&row_framelen.to_be_bytes());
+    bytes.extend_from_slice(&row_body);
+    bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
+    bytes.extend_from_slice(&rfq_frame(b'I'));
+
+    let out = proto.feed_bytes(&bytes, &mut wb);
+    let mut saw_stream = false;
+    for a in out.as_slice() {
+        if let Action::StreamRow { row_bytes, .. } = a {
+            saw_stream = true;
+            // Round-trip: DataRowRef::parse + columns() yields
+            // Ok(Some(b"answer")) then Ok(None) for the NULL.
+            let Ok(row) = DataRowRef::parse(row_bytes) else {
+                panic!("DataRowRef::parse on StreamRow row_bytes should succeed");
+            };
+            assert_eq!(row.len(), 2);
+            let items: std::vec::Vec<_> = row.columns().collect();
+            assert_eq!(items.len(), 2);
+            assert!(
+                matches!(items.first(), Some(Ok(Some(b"answer")))),
+                "col 0 should decode to b\"answer\", got {:?}",
+                items.first(),
+            );
+            assert!(
+                matches!(items.get(1), Some(Ok(None))),
+                "col 1 should decode as SQL NULL, got {:?}",
+                items.get(1),
+            );
+        }
+    }
+    assert!(saw_stream, "test fixture must produce a StreamRow");
 }
 
 /// Invariant (1c-2a): a DML query following a SELECT must receive
