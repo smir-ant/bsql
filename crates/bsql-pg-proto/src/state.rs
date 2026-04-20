@@ -89,9 +89,13 @@ pub enum ProtoState {
         /// cannot appear here by construction (audit A2).
         scram: ScramSession,
         /// The `client-first-message-bare` (saved for AuthMessage).
-        client_first_bare: heapless::Vec<u8, 128>,
+        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN`]
+        /// so a bump in one place fails to compile in the other (DEF-095).
+        client_first_bare: heapless::Vec<u8, { crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
         /// The client nonce (base64-encoded, for prefix validation).
-        client_nonce_b64: heapless::Vec<u8, 48>,
+        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN`]
+        /// (DEF-095 drift guard).
+        client_nonce_b64: heapless::Vec<u8, { crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     },
 
     /// SCRAM step 2 complete (client-final sent); awaiting

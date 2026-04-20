@@ -27,6 +27,15 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// while keeping the stack footprint bounded.
 pub const MAX_PASSWORD_LEN: usize = 1024;
 
+/// Compile-time drift guard: `MAX_PASSWORD_LEN` must fit the `u16`
+/// length field on [`Password`]. `65_535` is hard-coded instead of
+/// `u16::MAX as usize` because `as` casts are banned by the crate
+/// forbid-bundle.
+const _: () = assert!(
+    MAX_PASSWORD_LEN <= 65_535,
+    "MAX_PASSWORD_LEN must fit Password::len (u16)",
+);
+
 /// A bounded, zeroize-on-drop password buffer.
 ///
 /// Constructed via [`Password::try_from_bytes`]. Rejects empty
@@ -38,13 +47,19 @@ pub const MAX_PASSWORD_LEN: usize = 1024;
 /// self-zeroizing regardless of wrapper context (DEF-093). A
 /// compile-time `const _: () = assert!(needs_drop::<Password>())`
 /// in `lib.rs` enforces this invariant structurally.
+///
+/// `len` is a `u16` (not `usize`) because `MAX_PASSWORD_LEN`
+/// (1024) trivially fits; the narrower type saves 6 bytes per
+/// `Password` instance which compounds through `Sensitive<Password>` →
+/// `Credentials::ScramPassword` → `PgCommand::Startup` →
+/// `ProtoState::ConnectingStartup`. (DEF-095)
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Password {
     /// Fixed-size backing store. The full array is zeroed on drop,
     /// not just `[..len]`.
     buf: [u8; MAX_PASSWORD_LEN],
     /// Number of valid bytes in `buf[..len]`.
-    len: usize,
+    len: u16,
 }
 
 /// Errors from [`Password`] construction.
@@ -83,17 +98,18 @@ impl Password {
         if input.len() > MAX_PASSWORD_LEN {
             return Err(PasswordError::TooLong { len: input.len() });
         }
+        // `input.len() <= MAX_PASSWORD_LEN <= 65_535` (const-asserted),
+        // so the narrowing is infallible in practice. `try_from` +
+        // `map_err` keeps the forbid-bundle happy without `as`.
+        let len = u16::try_from(input.len())
+            .map_err(|_| PasswordError::TooLong { len: input.len() })?;
         let mut buf = [0u8; MAX_PASSWORD_LEN];
-        // Copy input into the fixed buffer. Length is bounded above.
         let dest = match buf.get_mut(..input.len()) {
             Some(s) => s,
             None => return Err(PasswordError::TooLong { len: input.len() }),
         };
         dest.copy_from_slice(input);
-        Ok(Self {
-            buf,
-            len: input.len(),
-        })
+        Ok(Self { buf, len })
     }
 
     /// Construct from a UTF-8 string.
@@ -108,7 +124,8 @@ impl Password {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         // `self.len <= MAX_PASSWORD_LEN` by constructor invariant.
-        self.buf.get(..self.len).unwrap_or(&[])
+        // `usize::from(u16)` is the forbid-bundle-safe widening.
+        self.buf.get(..usize::from(self.len)).unwrap_or(&[])
     }
 }
 

@@ -724,27 +724,17 @@ fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
 }
 
 /// Parse a ParameterStatus payload and record it in session_params.
+///
+/// Payload format: `key\0value\0`. Compressed with `let-else` to
+/// five short lines (DEF-095). `[T]::split_once` with a predicate
+/// is still unstable (#112811); the `iter().position` idiom is the
+/// stable-library equivalent.
 fn record_param_status(params: &mut SessionParams, payload: &[u8]) {
-    let nul_pos = match payload.iter().position(|b| *b == 0) {
-        Some(p) => p,
-        None => return,
-    };
-    let key = match payload.get(..nul_pos) {
-        Some(k) => k,
-        None => return,
-    };
-    let value_start = match nul_pos.checked_add(1) {
-        Some(s) => s,
-        None => return,
-    };
-    let value_region = match payload.get(value_start..) {
-        Some(v) => v,
-        None => return,
-    };
-    let value = match value_region.strip_suffix(&[0]) {
-        Some(v) => v,
-        None => value_region,
-    };
+    let Some(nul_pos) = payload.iter().position(|b| *b == 0) else { return; };
+    let Some(key) = payload.get(..nul_pos) else { return; };
+    let Some(value_start) = nul_pos.checked_add(1) else { return; };
+    let Some(value_region) = payload.get(value_start..) else { return; };
+    let value = value_region.strip_suffix(b"\0").unwrap_or(value_region);
     params.set(key, value);
 }
 
