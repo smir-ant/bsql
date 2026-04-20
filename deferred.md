@@ -762,8 +762,8 @@ Will ship in **1c-5** (pipelining sub-phase).
 | sub-phase | status | findings landed | scope |
 |---|---|---|---|
 | **1c-0 / 1c-1** | ✅ done | #2 typed newtypes (Sql/StmtName/PortalName); #3 CommandTag as BoundedStr<32> (typed-struct upgrade deferred to 1c-6) | SimpleQuery end-to-end, Action::StreamRow, DEF-121 gate |
-| **1c-2** | 🚧 in progress | #5 text-format rejection (scheduled with decoder) | RowDesc parse, column iter, FromPgText primitives |
-| **1c-3** | ⏳ pending | #6 ParamsWriter zero-copy | Parse/Bind/Describe/Execute/Close extended-query flow |
+| **1c-2** | ✅ done | #5 text-format rejection (UnexpectedFormatCode classification at parse) | RowDesc parse, DataRowRef + ColumnsIter, FromPgText primitives, oids module |
+| **1c-3** | ⏳ pending | #6 ParamsWriter zero-copy | Parse/Bind/Describe/Execute/Close extended-query flow + FromPgBinary parallel trait |
 | **1c-4** | ⏳ pending | — | BEGIN/COMMIT/ROLLBACK + tx_status tracking + SAVEPOINT |
 | **1c-5** | ⏳ pending | #1 InFlightSlot sum enum; #4 Flush/Sync guard; #7 RowDescRef arena; **DEF-119 witness-guard** | Pipelining — biggest tier-lift of Phase 1c |
 | **1c-6** | ⏳ pending | #3 typed CommandTag upgrade; DEF-109/110 cargo-asm validation | Hardening + fuzzing + proptest before 1d |
@@ -781,6 +781,18 @@ Will ship in **1c-5** (pipelining sub-phase).
 Finding 3 (typed CommandTag) — partially shipped: `QueryCompletePayload::command_tag: BoundedStr<32>` carries the raw PG tag verbatim. Upgrade to typed `CommandTag { kind: CommandKind, rows_affected: Option<u64>, insert_oid: Option<u32> }` deferred to 1c-6 hardening — the parse lives at the ingest boundary in `dispatch::parse_command_tag` so the upgrade is a local refactor.
 
 Test count: 83 → 96 (+12 simple-query spec + DEF-121 regression).
+
+### 1c-2 landed (2026-04-20)
+
+| commit | scope |
+|---|---|
+| `8d3c5df` | 1c-2a — `decode` module, `RowDesc` + `ColumnDesc` + `FormatCode`, `parse_row_description`, `PgProtocol.row_desc` slot, `Action::StreamRow.desc: &'r RowDesc`, `Reply::QueryComplete.row_desc: Option<RowDesc>`, clear-on-new-push discipline, new error variants (`MalformedRowDescription`, `TooManyColumns`, `UnexpectedFormatCode` — round-4 #5 shipped), `Reply` size assert 64→320. 10 parse tests + `dml_after_select_clears_row_desc` regression. |
+| `7513a09` | 1c-2b — `DataRowRef` + `ColumnsIter` zero-copy row-body parser with SQL NULL handling (`length = -1` → `Ok(None)`), `DecodeError` classification (`TruncatedRow` / `TruncatedColumnLen` / `NegativeColumnLength` / `TruncatedColumnData`), fused post-error semantics, `ExactSizeIterator` + `FusedIterator` impls. 11 unit tests + `stream_row_bytes_decode_via_data_row_ref` integration. |
+| `3c3c0b2` | 1c-2c — `FromPgText<'a>` trait + impls for `i16`/`i32`/`i64`/`u32`/`bool`/`&str`, PG-strict bool (`"t"` / `"f"` only), UTF-8 + integer-parse validation, `DecodeError` `NonUtf8` / `IntParse` / `BoolParse` additions, `oids` module with catalog-pinned constants. 10 unit tests + `end_to_end_decode_typed_row` integration (full user pipeline push→schema→row→typed Rust values). |
+
+Test count: 96 → 131 (+35 across all 1c-2 commits).
+
+**Round-4 finding #5 closed** — text-format rejection ships as `ProtocolError::UnexpectedFormatCode { code }` in `parse_row_description`: format codes outside `{0, 1}` tear the connection down. 1c-3 will layer `FromPgBinary` on top of the same infrastructure (Extended Query selects binary per-column via Bind; decoder dispatch uses `ColumnDesc::format_code`).
 
 ### DEF-121 — silent reply loss on `feed_bytes` loop overflow
 
