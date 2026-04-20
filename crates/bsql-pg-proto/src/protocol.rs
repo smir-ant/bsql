@@ -442,13 +442,22 @@ impl PgProtocol {
         // below. `staged` is the phase-1 accumulator; entry-point
         // materialises into `OutActions<'buf>`.
         let kind = cause.kind();
-        let prev = core::mem::take(&mut self.state);
-        // DEF-112: each ReplyId-carrying variant now has its own
-        // typed kind (`PingKind` vs `StartupKind`). An or-pattern
-        // binding `id` across variants would require all arms to
-        // share the same type — they don't anymore. Extract the
-        // raw `NonZeroU64` per-arm via `.consume()`; from there on
-        // the teardown path is kind-agnostic.
+        // DEF-117: `core::mem::replace` directly installs the
+        // terminal `Errored(kind)` state, eliminating the
+        // transient `Idle`-window that `core::mem::take` would
+        // create. Consequence: the "Default-on-ProtoState-is-Idle
+        // is load-bearing for transient-window safety" invariant
+        // becomes architecturally unneeded here. Even if a future
+        // refactor grew this function body with `&self` reads
+        // between the state swap and the write-back, there is no
+        // intermediate `Idle` to misread — the state is already
+        // `Errored(kind)` from the first instruction.
+        //
+        // DEF-112: typed `ReplyId<K>` variants have distinct
+        // types; or-pattern `id` bindings are type-incompatible,
+        // so per-variant `.consume()` produces the raw
+        // `NonZeroU64` individually.
+        let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
         let raw_id: Option<core::num::NonZeroU64> = match prev {
             ProtoState::Idle => None,
             ProtoState::AwaitingPingReply(id) => Some(id.consume()),
@@ -460,14 +469,14 @@ impl PgProtocol {
             | ProtoState::ConnectingPostAuthWaitKey(reply)
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
             ProtoState::Errored(original_kind) => {
-                // Already Errored — preserve the original kind. Do
-                // not emit another FailReply / CloseSocket; the
+                // Already Errored — preserve the ORIGINAL kind
+                // (the `replace` above wrote the new one; revert).
+                // Do not emit another FailReply / CloseSocket; the
                 // wrapper already saw them on the first fatal.
                 self.state = ProtoState::Errored(original_kind);
                 return;
             }
         };
-        self.state = ProtoState::Errored(kind);
         self.read_buf.clear();
         match raw_id {
             Some(id) => {

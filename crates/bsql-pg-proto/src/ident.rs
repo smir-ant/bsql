@@ -58,12 +58,41 @@ pub const MAX_IDENT_LEN: usize = 63;
 /// like `myapp-worker-pod-abc123def456`.
 pub const MAX_APP_NAME_LEN: usize = 128;
 
+/// Sealing module for [`FixedStrKind`] and [`Validated`]. Private
+/// to this module so external crates cannot impl the sealed
+/// supertrait — and thus cannot impl the public traits either.
+/// DEF-115 (escalation of DEF-096).
+///
+/// Without sealing, a downstream crate could introduce its own tag:
+///
+/// ```rust,ignore
+/// pub enum MyTag {}
+/// impl bsql_pg_proto::ident::FixedStrKind for MyTag { … }
+/// impl bsql_pg_proto::ident::Validated for MyTag {}
+/// ```
+///
+/// and call the generic `try_from_str` with it. The set of tags was
+/// tier-4 in practice ("users happen not to") rather than tier-1
+/// compile. The sealed supertrait closes this hole: only types
+/// defined inside `bsql-pg-proto` can ever be valid tags.
+mod sealed {
+    /// Supertrait seal for [`super::FixedStrKind`]. Can only be
+    /// impl'd from within the `ident` module.
+    pub trait FixedStrKindSealed {}
+    /// Supertrait seal for [`super::Validated`].
+    pub trait ValidatedSealed {}
+}
+
 /// Tag trait supplying the per-kind debug name. Every
 /// `FixedStr<_, Tag>` uses this to render its own type name in
 /// `Debug`.
 ///
+/// **Sealed** (DEF-115): external crates cannot introduce new tags.
+/// The sealed supertrait [`sealed::FixedStrKindSealed`] is
+/// module-private, so no downstream impl compiles.
+///
 /// `ALLOW_EMPTY` is consulted by validated-constructor impls.
-pub trait FixedStrKind {
+pub trait FixedStrKind: sealed::FixedStrKindSealed {
     /// Human-readable type name used by `Debug`.
     const DEBUG_NAME: &'static str;
     /// Whether construction accepts empty input.
@@ -79,7 +108,10 @@ pub trait FixedStrKind {
 /// rejects empty iff `ALLOW_EMPTY = false`). `BoundedStrTag` does
 /// *not* implement this trait — its truncating constructor lives on
 /// a separate impl block.
-pub trait Validated: FixedStrKind {}
+///
+/// **Sealed** (DEF-115): only the crate's own tags can be
+/// `Validated`.
+pub trait Validated: FixedStrKind + sealed::ValidatedSealed {}
 
 /// Tag for [`Ident`] — non-empty, no NUL, max 63 bytes.
 ///
@@ -88,6 +120,8 @@ pub trait Validated: FixedStrKind {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentTag {}
 
+impl sealed::FixedStrKindSealed for IdentTag {}
+impl sealed::ValidatedSealed for IdentTag {}
 impl FixedStrKind for IdentTag {
     const DEBUG_NAME: &'static str = "Ident";
     const ALLOW_EMPTY: bool = false;
@@ -99,6 +133,8 @@ impl Validated for IdentTag {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseNameTag {}
 
+impl sealed::FixedStrKindSealed for DatabaseNameTag {}
+impl sealed::ValidatedSealed for DatabaseNameTag {}
 impl FixedStrKind for DatabaseNameTag {
     const DEBUG_NAME: &'static str = "DatabaseName";
     const ALLOW_EMPTY: bool = false;
@@ -109,6 +145,8 @@ impl Validated for DatabaseNameTag {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationNameTag {}
 
+impl sealed::FixedStrKindSealed for ApplicationNameTag {}
+impl sealed::ValidatedSealed for ApplicationNameTag {}
 impl FixedStrKind for ApplicationNameTag {
     const DEBUG_NAME: &'static str = "ApplicationName";
     const ALLOW_EMPTY: bool = true;
@@ -121,12 +159,16 @@ impl Validated for ApplicationNameTag {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundedStrTag {}
 
+impl sealed::FixedStrKindSealed for BoundedStrTag {}
 impl FixedStrKind for BoundedStrTag {
     const DEBUG_NAME: &'static str = "BoundedStr";
     const ALLOW_EMPTY: bool = true;
 }
 // Deliberately *not* `impl Validated for BoundedStrTag` — its
-// constructor is `from_str_truncating`, not `try_from_str`.
+// constructor is `from_str_truncating`, not `try_from_str`. Also
+// deliberately *not* `impl sealed::ValidatedSealed` — the sealed
+// supertrait makes this impossible externally anyway, but the
+// explicit omission documents the intent.
 
 /// POD fixed-capacity byte string with a phantom `Tag` for nominal
 /// typing.

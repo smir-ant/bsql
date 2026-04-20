@@ -143,10 +143,24 @@ const _: () = assert!(
 
 /// **Inbound** (backend → frontend) tag-distinctness assertions.
 ///
-/// If PG ships a new inbound tag and we add a const above, add it
-/// to the chain below. A miss would not fire this assert; that's
-/// accepted — the goal is "no two constants sharing one byte",
-/// not "every byte is a known tag".
+/// DEF-111 / DEF-116 history: the round-3 audit proposed replacing
+/// the hand-unrolled N² form below with a `const fn` that iterates
+/// a `&[u8]` array via `<[T]>::get(i)`. That would auto-scale to
+/// every future tag: adding a const would just require extending
+/// the input array. **Blocked on MSRV 1.95**:
+/// [`<[T]>::get`](core::slice) is not yet const-stable
+/// (rust-lang/rust#143874). `assert!(arr[i] != arr[j])` is banned
+/// by `forbid(clippy::indexing_slicing)` and `forbid` cannot be
+/// downgraded by `#[expect]`. When `<[T]>::get` stabilises in
+/// const context, fold the N² form below into a
+/// `const fn assert_distinct_pairwise` helper; until then, new
+/// inbound tags MUST be added to both (a) this conjunction and
+/// (b) the `INBOUND_TAGS` list — tracked as DEF-116.
+///
+/// Tier today: tier-1 compile for the tags currently listed;
+/// tier-3 audit on "remember to extend the chain when a new tag
+/// is added". The tier of the invariant itself is tier-1; the
+/// maintenance discipline around adding tags is tier-3.
 const _: () = assert!(
     TAG_READY_FOR_QUERY != TAG_ERROR_RESPONSE
         && TAG_READY_FOR_QUERY != TAG_AUTHENTICATION
@@ -167,12 +181,28 @@ const _: () = assert!(
      If this assert fires, someone duplicated a const in wire.rs.",
 );
 
+/// Parallel list used by the runtime drift-guard test at the
+/// bottom of this file. If you add a new inbound tag const above,
+/// add it here AND in the conjunction above.
+#[cfg(test)]
+const INBOUND_TAGS_FOR_RUNTIME_CHECK: &[u8] = &[
+    TAG_READY_FOR_QUERY,
+    TAG_ERROR_RESPONSE,
+    TAG_AUTHENTICATION,
+    TAG_PARAMETER_STATUS,
+    TAG_BACKEND_KEY_DATA,
+    TAG_NEGOTIATE_PROTOCOL_VERSION,
+];
+
 /// **Outbound** (frontend → backend) tag-distinctness assertions.
 const _: () = assert!(
     TAG_SYNC != TAG_SASL_RESPONSE,
     "Two outbound PG wire tags share a byte — frame construction will \
      silently target the wrong message type.",
 );
+
+#[cfg(test)]
+const OUTBOUND_TAGS_FOR_RUNTIME_CHECK: &[u8] = &[TAG_SYNC, TAG_SASL_RESPONSE];
 
 /// **Authentication sub-codes** distinctness. The sub-code is the
 /// first four bytes of an `AUTHENTICATION` payload; a collision
@@ -187,3 +217,61 @@ const _: () = assert!(
     "Two SCRAM auth sub-codes share a value — dispatcher arms will \
      collide on AUTH_* matching.",
 );
+
+#[cfg(test)]
+const AUTH_SUBCODES_FOR_RUNTIME_CHECK: &[u32] =
+    &[AUTH_OK, AUTH_SASL, AUTH_SASL_CONTINUE, AUTH_SASL_FINAL];
+
+#[cfg(test)]
+mod collision_drift_guard {
+    //! DEF-116 runtime drift-guard (Category 2 — tier-3 invariant).
+    //!
+    //! The const assertions above already catch collisions at
+    //! build time for the tags currently listed. The risk the
+    //! const form does NOT catch: adding a new tag to
+    //! `wire.rs` **without** also widening the conjunction.
+    //! That's a maintenance miss, not a build break.
+    //!
+    //! These runtime tests walk the `*_FOR_RUNTIME_CHECK`
+    //! parallel arrays pairwise and assert distinctness. If a
+    //! contributor adds a tag to the array but forgets the
+    //! conjunction, this test catches it at CI time (one tier up
+    //! from pure audit, one below compile-error).
+    //!
+    //! When `<[T]>::get` stabilises in const context, fold these
+    //! runtime tests into a `const fn` helper and collapse the
+    //! two-list form into one — see DEF-116 note.
+
+    use super::*;
+
+    fn assert_distinct_u8(arr: &[u8], scope: &str) {
+        for (i, &a) in arr.iter().enumerate() {
+            for &b in arr.iter().skip(i.saturating_add(1)) {
+                assert_ne!(a, b, "tag collision in {scope}: 0x{a:02x}");
+            }
+        }
+    }
+
+    fn assert_distinct_u32(arr: &[u32], scope: &str) {
+        for (i, &a) in arr.iter().enumerate() {
+            for &b in arr.iter().skip(i.saturating_add(1)) {
+                assert_ne!(a, b, "sub-code collision in {scope}: {a}");
+            }
+        }
+    }
+
+    #[test]
+    fn inbound_tags_pairwise_distinct() {
+        assert_distinct_u8(INBOUND_TAGS_FOR_RUNTIME_CHECK, "INBOUND_TAGS");
+    }
+
+    #[test]
+    fn outbound_tags_pairwise_distinct() {
+        assert_distinct_u8(OUTBOUND_TAGS_FOR_RUNTIME_CHECK, "OUTBOUND_TAGS");
+    }
+
+    #[test]
+    fn auth_subcodes_pairwise_distinct() {
+        assert_distinct_u32(AUTH_SUBCODES_FOR_RUNTIME_CHECK, "AUTH_SUBCODES");
+    }
+}
