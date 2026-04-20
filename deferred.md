@@ -768,6 +768,19 @@ Will ship in **1c-5** (pipelining sub-phase).
 - **1c-5:** findings 1, 4, 7, **DEF-119 via guards** —
   pipelining sub-phase, all queue/phase work together.
 
+### 1c-1 landed (2026-04-20)
+
+| commit | scope |
+|---|---|
+| `eaffe4e` | 1c-0 skeletons — wire tags (16 inbound / 9 outbound), typed newtypes (Sql / StmtName / PortalName), ReplyKind markers (QueryKind / ParseKind / CloseKind). |
+| `4e3896b` | 1c-1a — `Action<'w, 'r>` two-lifetime refactor + `StreamRow` variant. `'w` for outbound, `'r` for inbound row slices borrowed from `ReadBuf`. |
+| `14d386d` | 1c-1b — SimpleQuery dispatch end-to-end. Four new `ProtoState` variants, `StagedAction::StreamRowRange` (absolute coords into `ReadBuf::populated` — survives per-frame advance), `FrameCoords` dispatcher arg, query-level errors survive via `SimpleQueryDrainRfqAfterError`. `CommandInProgress` + `MalformedCommandComplete` error classifications added. `PgCommand` size cap 1344 → 2112 (Sql dominates). |
+| `4c33eb0` | 1c-1c — 12 integration tests + generic `Truncating` sealed marker (now covers BoundedStrTag + SqlTag uniformly). Tests: 0-row SELECT, N-row SELECT streaming, DML, empty query, query-level error + connection survival, mid-stream error, in-flight push rejection, Errored-state push rejection, malformed CommandComplete teardown, unexpected-RFQ teardown, across-call row streaming, Q-frame wire layout drift-pin. |
+
+Finding 3 (typed CommandTag) — partially shipped: `QueryCompletePayload::command_tag: BoundedStr<32>` carries the raw PG tag verbatim. Upgrade to typed `CommandTag { kind: CommandKind, rows_affected: Option<u64>, insert_oid: Option<u32> }` deferred to 1c-6 hardening — the parse lives at the ingest boundary in `dispatch::parse_command_tag` so the upgrade is a local refactor.
+
+Test count: 83 → 95 (+12 from `simple_query_spec.rs`).
+
 ### Round-4 discipline
 
 Prior rounds (1/2/3) caught overclaims via stress-testing
