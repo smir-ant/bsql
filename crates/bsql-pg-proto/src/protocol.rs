@@ -452,7 +452,8 @@ impl PgProtocol {
                 ]);
             }
             ProtoState::AwaitingPingReply(id)
-            | ProtoState::ConnectingStartup { reply: id, .. }
+            | ProtoState::ConnectingStartupTrust { reply: id }
+            | ProtoState::ConnectingStartupScram { reply: id, .. }
             | ProtoState::ConnectingScramAwaitServerFirst { reply: id, .. }
             | ProtoState::ConnectingScramAwaitServerFinal { reply: id, .. }
             | ProtoState::ConnectingScramAwaitAuthOk(id)
@@ -587,7 +588,8 @@ fn compute_push_ping(
             ]);
             ProtoState::AwaitingPingReply(prev_reply)
         }
-        other @ (ProtoState::ConnectingStartup { .. }
+        other @ (ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
         | ProtoState::ConnectingScramAwaitServerFirst { .. }
         | ProtoState::ConnectingScramAwaitServerFinal { .. }
         | ProtoState::ConnectingScramAwaitAuthOk(_)
@@ -643,7 +645,21 @@ fn compute_push_startup(
                 emit_actions!(staged, budget: 1, [
                     StagedAction::SendBytesRange { start, end },
                 ]);
-                ProtoState::ConnectingStartup { reply, credentials }
+                // DEF-097: discriminate Trust vs Scram *here* — the
+                // post-push state carries only what its auth method
+                // needs. Trust: 24 bytes. Scram: 24 + ScramSession
+                // (~1040). The "server sent AUTH_SASL on a Trust
+                // connection" case is now a per-variant dispatcher
+                // arm instead of a runtime classification.
+                match credentials {
+                    Credentials::Trust => ProtoState::ConnectingStartupTrust { reply },
+                    Credentials::ScramPassword(password) => {
+                        ProtoState::ConnectingStartupScram {
+                            reply,
+                            scram: crate::scram::session::ScramSession::from_password(password),
+                        }
+                    }
+                }
             }
             Err(_) => {
                 // Architecturally unreachable; classified as
@@ -667,7 +683,8 @@ fn compute_push_startup(
             ProtoState::Errored(prior_kind)
         }
         other @ (ProtoState::AwaitingPingReply(_)
-        | ProtoState::ConnectingStartup { .. }
+        | ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
         | ProtoState::ConnectingScramAwaitServerFirst { .. }
         | ProtoState::ConnectingScramAwaitServerFinal { .. }
         | ProtoState::ConnectingScramAwaitAuthOk(_)
@@ -715,7 +732,8 @@ fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
         | ProtoState::AwaitingPingReply(_)
         | ProtoState::ConnectingPostAuthWaitKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. } => true,
-        ProtoState::ConnectingStartup { .. }
+        ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
         | ProtoState::ConnectingScramAwaitServerFirst { .. }
         | ProtoState::ConnectingScramAwaitServerFinal { .. }
         | ProtoState::ConnectingScramAwaitAuthOk(_)
@@ -847,7 +865,7 @@ mod allows_unsolicited_param_status_tests {
     //! Category (1) per reforge.md §4.11.
 
     use super::*;
-    use crate::password::{Credentials, Password};
+    use crate::password::Password;
     use crate::reply_id::ReplyId;
     use crate::scram::types::SecretDigest;
     use crate::sensitive::Sensitive;
@@ -872,7 +890,8 @@ mod allows_unsolicited_param_status_tests {
                 // fires on such calls) and no `let _` (banned).
                 id.consume();
             }
-            ProtoState::ConnectingStartup { reply, .. }
+            ProtoState::ConnectingStartupTrust { reply }
+            | ProtoState::ConnectingStartupScram { reply, .. }
             | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
             | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
@@ -910,30 +929,39 @@ mod allows_unsolicited_param_status_tests {
         consume_state(have_key);
 
         // --- Rejecting states (policy = false) ---
-        let startup = ProtoState::ConnectingStartup {
+        let startup_trust = ProtoState::ConnectingStartupTrust {
             reply: ReplyId::from_raw(nz(4)),
-            credentials: Credentials::Trust,
         };
-        assert!(!allows_unsolicited_param_status(&startup));
-        consume_state(startup);
+        assert!(!allows_unsolicited_param_status(&startup_trust));
+        consume_state(startup_trust);
+
+        // ConnectingStartupScram — DEF-097 typestate carrying a
+        // ScramSession. Constructor is infallible once we have a
+        // Password (try_from_bytes is the only Err surface here,
+        // architecturally unreachable for the fixture b"pw").
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+            let startup_scram = ProtoState::ConnectingStartupScram {
+                reply: ReplyId::from_raw(nz(4001)),
+                scram,
+            };
+            assert!(!allows_unsolicited_param_status(&startup_scram));
+            consume_state(startup_scram);
+        }
 
         // ConnectingScramAwaitServerFirst requires a Password *and* a
-        // ScramSession (audit A2 typestate). Both constructors have
-        // architecturally-dead Err branches for our fixture inputs;
-        // we skip the sub-case on either Err to keep the test within
-        // the crate-root forbid bundle (no `unwrap` / `panic`).
+        // ScramSession (audit A2 typestate). The Password err branch
+        // is architecturally unreachable for the fixture.
         if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let creds = Credentials::ScramPassword(Sensitive::new(pw));
-            if let Ok(scram) = crate::scram::session::ScramSession::try_from_credentials(creds) {
-                let scram_first = ProtoState::ConnectingScramAwaitServerFirst {
-                    reply: ReplyId::from_raw(nz(5)),
-                    scram,
-                    client_first_bare: heapless::Vec::new(),
-                    client_nonce_b64: heapless::Vec::new(),
-                };
-                assert!(!allows_unsolicited_param_status(&scram_first));
-                consume_state(scram_first);
-            }
+            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+            let scram_first = ProtoState::ConnectingScramAwaitServerFirst {
+                reply: ReplyId::from_raw(nz(5)),
+                scram,
+                client_first_bare: heapless::Vec::new(),
+                client_nonce_b64: heapless::Vec::new(),
+            };
+            assert!(!allows_unsolicited_param_status(&scram_first));
+            consume_state(scram_first);
         }
 
         let scram_final = ProtoState::ConnectingScramAwaitServerFinal {
@@ -1001,7 +1029,8 @@ mod compute_push_tests {
             | ProtoState::ConnectingPostAuthWaitKey(id) => {
                 id.consume();
             }
-            ProtoState::ConnectingStartup { reply, .. }
+            ProtoState::ConnectingStartupTrust { reply }
+            | ProtoState::ConnectingStartupScram { reply, .. }
             | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
             | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
@@ -1026,10 +1055,13 @@ mod compute_push_tests {
         }
     }
 
-    /// Like [`take_awaiting_ping_raw`] but for `ConnectingStartup`.
+    /// Like [`take_awaiting_ping_raw`] but for `ConnectingStartup*`
+    /// (either Trust or Scram variant — both are valid post-push
+    /// states depending on the credentials).
     fn take_connecting_startup_raw(new_state: ProtoState) -> Option<NonZeroU64> {
         match new_state {
-            ProtoState::ConnectingStartup { reply, .. } => Some(reply.consume()),
+            ProtoState::ConnectingStartupTrust { reply }
+            | ProtoState::ConnectingStartupScram { reply, .. } => Some(reply.consume()),
             other => {
                 consume_state(other);
                 None
@@ -1146,13 +1178,12 @@ mod compute_push_tests {
     /// green (exhaustive match still satisfied), runtime drifts.
     #[test]
     fn ping_from_any_connecting_state_fails_with_startup_in_progress() {
-        // ConnectingStartup — Trust credentials (no Password needed).
+        // ConnectingStartupTrust — no credentials payload (DEF-097).
         {
             let raw_prev = nz(201);
             let raw_new = nz(202);
-            let prev = ProtoState::ConnectingStartup {
+            let prev = ProtoState::ConnectingStartupTrust {
                 reply: ReplyId::from_raw(raw_prev),
-                credentials: Credentials::Trust,
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -1170,40 +1201,63 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
+        // ConnectingStartupScram — carries the ScramSession typestate
+        // (DEF-097). Constructed via ScramSession::from_password.
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+            let raw_prev = nz(201_050);
+            let raw_new = nz(201_051);
+            let prev = ProtoState::ConnectingStartupScram {
+                reply: ReplyId::from_raw(raw_prev),
+                scram,
+            };
+            let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+            let (new_state, staged) = compute_staged(cmd, prev);
+            assert_eq!(staged.len(), 1);
+            assert!(
+                matches!(
+                    staged.first(),
+                    Some(StagedAction::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ConnectingStartupScram → expected StartupAlreadyInProgress",
+            );
+            assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
+        }
+
         // ConnectingScramAwaitServerFirst — needs a Password and
-        // ScramSession (audit A2 typestate; construction rejects Trust
-        // at the credentials boundary).
-        if let Ok(pw) = Password::try_from_bytes(b"pw")
-            && let Ok(scram) = crate::scram::session::ScramSession::try_from_credentials(
-                Credentials::ScramPassword(Sensitive::new(pw)),
-            ) {
-                let raw_prev = nz(203);
-                let raw_new = nz(204);
-                let prev = ProtoState::ConnectingScramAwaitServerFirst {
-                    reply: ReplyId::from_raw(raw_prev),
-                    scram,
-                    client_first_bare: heapless::Vec::new(),
-                    client_nonce_b64: heapless::Vec::new(),
-                };
-                let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
-                let (new_state, staged) = compute_staged(cmd, prev);
-                assert_eq!(staged.len(), 1);
-                assert!(
-                    matches!(
-                        staged.first(),
-                        Some(StagedAction::FailReply {
-                            id,
-                            cause: ProtocolError::StartupAlreadyInProgress,
-                        }) if *id == raw_new
-                    ),
-                    "ScramAwaitServerFirst → expected FailReply(StartupAlreadyInProgress)",
-                );
-                assert!(matches!(
-                    &new_state,
-                    ProtoState::ConnectingScramAwaitServerFirst { .. }
-                ));
-                consume_state(new_state);
-            }
+        // ScramSession.
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+            let raw_prev = nz(203);
+            let raw_new = nz(204);
+            let prev = ProtoState::ConnectingScramAwaitServerFirst {
+                reply: ReplyId::from_raw(raw_prev),
+                scram,
+                client_first_bare: heapless::Vec::new(),
+                client_nonce_b64: heapless::Vec::new(),
+            };
+            let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
+            let (new_state, staged) = compute_staged(cmd, prev);
+            assert_eq!(staged.len(), 1);
+            assert!(
+                matches!(
+                    staged.first(),
+                    Some(StagedAction::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ScramAwaitServerFirst → expected FailReply(StartupAlreadyInProgress)",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingScramAwaitServerFirst { .. }
+            ));
+            consume_state(new_state);
+        }
 
         // ConnectingScramAwaitServerFinal.
         {
@@ -1420,13 +1474,13 @@ mod compute_push_tests {
             assert_eq!(take_awaiting_ping_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingStartup.
+        // ConnectingStartupTrust (DEF-097 — the old
+        // `ConnectingStartup { credentials }` split).
         if let Some(user) = mk_user() {
             let raw_prev = nz(403);
             let raw_new = nz(404);
-            let prev = ProtoState::ConnectingStartup {
+            let prev = ProtoState::ConnectingStartupTrust {
                 reply: ReplyId::from_raw(raw_prev),
-                credentials: Credentials::Trust,
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
@@ -1438,43 +1492,66 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "ConnectingStartup → expected StartupAlreadyInProgress",
+                "ConnectingStartupTrust → expected StartupAlreadyInProgress",
+            );
+            assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
+        }
+
+        // ConnectingStartupScram — the other half of the DEF-097
+        // credential split.
+        if let (Some(user), Ok(pw)) = (mk_user(), Password::try_from_bytes(b"pw")) {
+            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+            let raw_prev = nz(405_100);
+            let raw_new = nz(405_101);
+            let prev = ProtoState::ConnectingStartupScram {
+                reply: ReplyId::from_raw(raw_prev),
+                scram,
+            };
+            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(staged.len(), 1);
+            assert!(
+                matches!(
+                    staged.first(),
+                    Some(StagedAction::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ConnectingStartupScram → expected StartupAlreadyInProgress",
             );
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
         // ConnectingScramAwaitServerFirst. Construction requires
         // Password + ScramSession (audit A2 typestate).
-        if let (Some(user), Ok(pw)) = (mk_user(), Password::try_from_bytes(b"pw"))
-            && let Ok(scram) = crate::scram::session::ScramSession::try_from_credentials(
-                Credentials::ScramPassword(Sensitive::new(pw)),
-            ) {
-                let raw_prev = nz(405);
-                let raw_new = nz(406);
-                let prev = ProtoState::ConnectingScramAwaitServerFirst {
-                    reply: ReplyId::from_raw(raw_prev),
-                    scram,
-                    client_first_bare: heapless::Vec::new(),
-                    client_nonce_b64: heapless::Vec::new(),
-                };
-                let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-                assert_eq!(staged.len(), 1);
-                assert!(
-                    matches!(
-                        staged.first(),
-                        Some(StagedAction::FailReply {
-                            id,
-                            cause: ProtocolError::StartupAlreadyInProgress,
-                        }) if *id == raw_new
-                    ),
-                    "ScramAwaitServerFirst → expected StartupAlreadyInProgress",
-                );
-                assert!(matches!(
-                    &new_state,
-                    ProtoState::ConnectingScramAwaitServerFirst { .. }
-                ));
-                consume_state(new_state);
-            }
+        if let (Some(user), Ok(pw)) = (mk_user(), Password::try_from_bytes(b"pw")) {
+            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+            let raw_prev = nz(405);
+            let raw_new = nz(406);
+            let prev = ProtoState::ConnectingScramAwaitServerFirst {
+                reply: ReplyId::from_raw(raw_prev),
+                scram,
+                client_first_bare: heapless::Vec::new(),
+                client_nonce_b64: heapless::Vec::new(),
+            };
+            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(staged.len(), 1);
+            assert!(
+                matches!(
+                    staged.first(),
+                    Some(StagedAction::FailReply {
+                        id,
+                        cause: ProtocolError::StartupAlreadyInProgress,
+                    }) if *id == raw_new
+                ),
+                "ScramAwaitServerFirst → expected StartupAlreadyInProgress",
+            );
+            assert!(matches!(
+                &new_state,
+                ProtoState::ConnectingScramAwaitServerFirst { .. }
+            ));
+            consume_state(new_state);
+        }
 
         // ConnectingScramAwaitServerFinal.
         if let Some(user) = mk_user() {

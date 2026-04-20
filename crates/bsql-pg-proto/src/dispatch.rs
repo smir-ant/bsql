@@ -17,7 +17,6 @@
 
 use crate::action::{Reply, StagedAction};
 use crate::error::ProtocolError;
-use crate::password::Credentials;
 use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
 use crate::wire::{
@@ -111,25 +110,57 @@ pub(crate) fn dispatch(
         },
 
         // =============================================================
-        // ConnectingStartup — awaiting initial auth response
+        // ConnectingStartupTrust — awaiting AuthenticationOk
+        // (DEF-097: Trust connections cannot accept AUTH_SASL — that
+        // case is a per-variant dispatcher arm now, not a runtime
+        // classification.)
         // =============================================================
-        (ProtoState::ConnectingStartup { reply, credentials }, TAG_AUTHENTICATION) => {
-            dispatch_auth_in_startup(reply, credentials, payload, write_buf)
+        (ProtoState::ConnectingStartupTrust { reply }, TAG_AUTHENTICATION) => {
+            dispatch_auth_in_startup_trust(reply, payload)
         }
-        (ProtoState::ConnectingStartup { reply, .. }, TAG_ERROR_RESPONSE) => {
+        (ProtoState::ConnectingStartupTrust { reply }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
             DispatchOutcome::Errored {
                 reply_id: Some(reply),
                 cause,
             }
         }
-        (ProtoState::ConnectingStartup { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
+        (ProtoState::ConnectingStartupTrust { reply }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
             DispatchOutcome::Errored {
                 reply_id: Some(reply),
                 cause: ProtocolError::UnsupportedProtocolOption,
             }
         }
-        (ProtoState::ConnectingStartup { reply, .. }, other) => DispatchOutcome::Errored {
+        (ProtoState::ConnectingStartupTrust { reply }, other) => DispatchOutcome::Errored {
+            reply_id: Some(reply),
+            cause: ProtocolError::UnexpectedFrame { tag: other },
+        },
+
+        // =============================================================
+        // ConnectingStartupScram — awaiting AuthenticationSASL
+        // (DEF-097: mirror of the Trust arm. A Scram connection
+        // receiving AUTH_OK in this state is classified as
+        // `UnsupportedAuthMethod` — the server accepted without
+        // challenge while the user supplied a password, a PG policy
+        // mismatch worth surfacing.)
+        // =============================================================
+        (ProtoState::ConnectingStartupScram { reply, scram }, TAG_AUTHENTICATION) => {
+            dispatch_auth_in_startup_scram(reply, scram, payload, write_buf)
+        }
+        (ProtoState::ConnectingStartupScram { reply, .. }, TAG_ERROR_RESPONSE) => {
+            let cause = parse_error_response(payload);
+            DispatchOutcome::Errored {
+                reply_id: Some(reply),
+                cause,
+            }
+        }
+        (ProtoState::ConnectingStartupScram { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
+            DispatchOutcome::Errored {
+                reply_id: Some(reply),
+                cause: ProtocolError::UnsupportedProtocolOption,
+            }
+        }
+        (ProtoState::ConnectingStartupScram { reply, .. }, other) => DispatchOutcome::Errored {
             reply_id: Some(reply),
             cause: ProtocolError::UnexpectedFrame { tag: other },
         },
@@ -320,10 +351,51 @@ fn auth_sub_code(payload: &[u8]) -> Result<(u32, &[u8]), ProtocolError> {
     }
 }
 
-/// Dispatch an Authentication message while in ConnectingStartup.
-fn dispatch_auth_in_startup(
+/// Dispatch an Authentication message while in
+/// [`ProtoState::ConnectingStartupTrust`]. DEF-097.
+///
+/// Only `AUTH_OK` is acceptable here: the user provided no password,
+/// so a SCRAM challenge from the server is classified as
+/// `UnsupportedAuthMethod` (the server's pg_hba.conf disagrees with
+/// the client's no-password configuration). The dispatcher match
+/// cannot reach this arm with SCRAM payloads already buffered,
+/// because the Scram variant of the state has its own handler —
+/// this separation is the tier-1 compile guarantee DEF-097 buys.
+fn dispatch_auth_in_startup_trust(reply: ReplyId, payload: &[u8]) -> DispatchOutcome {
+    let (code, _rest) = match auth_sub_code(payload) {
+        Ok(pair) => pair,
+        Err(cause) => {
+            return DispatchOutcome::Errored {
+                reply_id: Some(reply),
+                cause,
+            }
+        }
+    };
+
+    match code {
+        AUTH_OK => DispatchOutcome::AdvancedSilent {
+            new_state: ProtoState::ConnectingPostAuthWaitKey(reply),
+        },
+        // AUTH_SASL / AUTH_SASL_CONTINUE / AUTH_SASL_FINAL / anything
+        // else: a Trust connection never requested SCRAM, so a SASL
+        // challenge means the server expects an auth method we are
+        // not configured for.
+        _ => DispatchOutcome::Errored {
+            reply_id: Some(reply),
+            cause: ProtocolError::UnsupportedAuthMethod { sub_code: code },
+        },
+    }
+}
+
+/// Dispatch an Authentication message while in
+/// [`ProtoState::ConnectingStartupScram`]. DEF-097.
+///
+/// Only `AUTH_SASL` is acceptable here; the server taking `AUTH_OK`
+/// without asking for the password is an auth-method mismatch on
+/// the server side (client expected SCRAM).
+fn dispatch_auth_in_startup_scram(
     reply: ReplyId,
-    credentials: Credentials,
+    scram: crate::scram::session::ScramSession,
     payload: &[u8],
     write_buf: &mut WriteBuf,
 ) -> DispatchOutcome {
@@ -338,30 +410,7 @@ fn dispatch_auth_in_startup(
     };
 
     match code {
-        AUTH_OK => {
-            // Trust auth succeeded. Move to post-auth chain.
-            DispatchOutcome::AdvancedSilent {
-                new_state: ProtoState::ConnectingPostAuthWaitKey(reply),
-            }
-        }
         AUTH_SASL => {
-            // Server wants SASL. Tier-1 boundary (audit A2): the
-            // `Trust`-vs-`ScramPassword` discrimination happens here,
-            // exactly once. Every downstream site takes `ScramSession`
-            // by value or reference; the `Trust` variant cannot drift
-            // into them.
-            let scram = match crate::scram::session::ScramSession::try_from_credentials(
-                credentials,
-            ) {
-                Ok(s) => s,
-                Err(()) => {
-                    return DispatchOutcome::Errored {
-                        reply_id: Some(reply),
-                        cause: ProtocolError::UnsupportedAuthMethod { sub_code: code },
-                    };
-                }
-            };
-
             if !mechanism_list_contains_scram(rest) {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),

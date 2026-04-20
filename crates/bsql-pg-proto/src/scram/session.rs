@@ -1,31 +1,30 @@
-//! Typestate: credentials guaranteed to support SCRAM-SHA-256.
+//! Typestate: a credentialed session guaranteed to carry a password
+//! for SCRAM-SHA-256.
 //!
 //! [`ScramSession`] is a private typestate that eliminates the
-//! `Trust`-vs-`ScramPassword` double-match seam (audit 2026-04-19
-//! finding A2). Before this type, two independent sites in
-//! `dispatch.rs` — the `AUTH_SASL` arm of `dispatch_auth_in_startup`
-//! and the head of `build_sasl_initial_response` — each matched
-//! [`Credentials`] directly and classified the `Trust` variant as
-//! an error. A body swap between arms (e.g. classifying `Trust` as
-//! success in one site and `ScramPassword` as failure) compiled
-//! cleanly: the two sites had no structural linkage.
+//! `Trust`-vs-`ScramPassword` seam (audit 2026-04-19 finding A2,
+//! tightened by DEF-097).
 //!
-//! With `ScramSession`, the discrimination exists exactly *once* —
-//! at [`ScramSession::try_from_credentials`]. Every downstream site
-//! (the SCRAM-state variant of [`crate::state::ProtoState`],
-//! [`build_sasl_initial_response`], [`dispatch_auth_sasl_continue`])
-//! takes [`&ScramSession`] or owns one. The `Trust` variant cannot
-//! reach those sites — it was consumed at construction.
+//! **DEF-097 update.** The `Trust`/`ScramPassword` discrimination
+//! moved out of this module and into
+//! [`crate::PgProtocol::push_command`] — specifically the
+//! `compute_push_startup` branch that routes a Trust command into
+//! [`crate::state::ProtoState::ConnectingStartupTrust`] and a Scram
+//! command into [`crate::state::ProtoState::ConnectingStartupScram`].
+//! From that point on, the state machine has *two disjoint pre-auth
+//! state variants* and the dispatcher's arms are type-split:
+//! the Trust arm can only receive `AuthenticationOk`, the Scram arm
+//! can only receive `AuthenticationSASL`. The "server sent the
+//! wrong auth method for this credential" case is a type-level
+//! impossibility rather than a runtime `UnsupportedAuthMethod`
+//! classification.
 //!
-//! Tier-1 compile: an arm-body drift in any downstream site becomes
-//! a type error (the variant does not exist in `ScramSession`'s
-//! shape), not silent semantic breakage.
-//!
-//! [`build_sasl_initial_response`]: crate::dispatch
-//! [`dispatch_auth_sasl_continue`]: crate::dispatch
-//! [`&ScramSession`]: ScramSession
+//! `ScramSession` itself now only has a direct constructor
+//! [`ScramSession::from_password`]; there is no longer a
+//! `try_from_credentials` path because `Credentials::Trust` never
+//! reaches this module.
 
-use crate::password::{Credentials, Password};
+use crate::password::Password;
 use crate::sensitive::Sensitive;
 
 /// Owned SCRAM session bundle — the password to use during the
@@ -51,25 +50,12 @@ pub struct ScramSession {
 }
 
 impl ScramSession {
-    /// Try to build a `ScramSession` from user-supplied
-    /// [`Credentials`]. Returns `Err(())` for any credentials that
-    /// cannot drive SCRAM (today: `Credentials::Trust`).
-    ///
-    /// The `Err` branch is the unique site at which the
-    /// `Trust`-vs-`ScramPassword` split is decided — after this
-    /// function returns [`Ok`], the `Trust` variant is not in scope
-    /// anywhere in the SCRAM path, by type.
-    ///
-    /// `Err(())` (zero-sized) rather than `Err(Credentials)` — the
-    /// caller always classifies to a different error (`UnsupportedAuthMethod`)
-    /// and does not need the original value. Zero-sized Err keeps
-    /// the return type small (`sizeof ScramSession + 0` ≈ 32 bytes)
-    /// and avoids `clippy::result_large_err`.
-    pub(crate) fn try_from_credentials(credentials: Credentials) -> Result<Self, ()> {
-        match credentials {
-            Credentials::ScramPassword(password) => Ok(Self { password }),
-            Credentials::Trust => Err(()),
-        }
+    /// Build a `ScramSession` from an already-extracted password.
+    /// Infallible — the caller has already discriminated away the
+    /// `Credentials::Trust` variant at its own site (DEF-097).
+    #[inline]
+    pub(crate) const fn from_password(password: Sensitive<Password>) -> Self {
+        Self { password }
     }
 
     /// Borrow the password bytes for HMAC / PBKDF2 computation.

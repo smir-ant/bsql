@@ -20,7 +20,6 @@
 //! become true no-ops instead of silent mis-advances).
 
 use crate::error::ErrorKind;
-use crate::password::Credentials;
 use crate::reply_id::ReplyId;
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
@@ -65,18 +64,43 @@ pub enum ProtoState {
     // Phase 1b: startup + auth handshake states (DEF-001..DEF-004)
     // ---------------------------------------------------------------
 
-    /// A `StartupMessage` was sent; awaiting the server's authentication
-    /// response. DEF-001.
+    /// A `StartupMessage` was sent by a Trust-auth connection;
+    /// awaiting `AuthenticationOk`. DEF-001 + DEF-097.
     ///
-    /// The carried `credentials` determine what authentication we can
-    /// perform: `Trust` expects immediate `AuthenticationOk`;
-    /// `ScramPassword` expects `AuthenticationSASL` offering
-    /// `SCRAM-SHA-256`.
-    ConnectingStartup {
+    /// # Why split from the Scram variant
+    ///
+    /// Before DEF-097 a single `ConnectingStartup { reply, credentials }`
+    /// variant carried the full [`crate::password::Credentials`] enum
+    /// until the server responded. Two consequences:
+    ///
+    /// - ~1040 bytes of password buffer lived in state until the
+    ///   first frame arrived (Trust connections paid the Scram-sized
+    ///   stack footprint).
+    /// - The "server requested SASL on a Trust connection" case was
+    ///   classified at runtime (`UnsupportedAuthMethod`), not at
+    ///   compile time.
+    ///
+    /// The Trust/Scram split moves discrimination to
+    /// [`crate::PgProtocol::push_command`]. Each variant now only
+    /// carries what its authentication path needs. A server frame
+    /// of the wrong shape for the connection's credential type
+    /// becomes a per-variant dispatcher arm — a missed arm is a
+    /// build failure.
+    ConnectingStartupTrust {
         /// Correlator for the Startup command.
         reply: ReplyId,
-        /// Credentials supplied by the user.
-        credentials: Credentials,
+    },
+
+    /// A `StartupMessage` was sent by a SCRAM-auth connection;
+    /// awaiting `AuthenticationSASL` offering SCRAM-SHA-256.
+    /// DEF-001 + DEF-097.
+    ConnectingStartupScram {
+        /// Correlator for the Startup command.
+        reply: ReplyId,
+        /// SCRAM session (the password the user provided). Tier-1
+        /// typestate via [`ScramSession`] — `Credentials::Trust`
+        /// cannot reach this variant by construction.
+        scram: ScramSession,
     },
 
     /// SCRAM step 1 complete (client-first sent); awaiting
@@ -151,11 +175,14 @@ impl core::fmt::Debug for ProtoState {
         match self {
             Self::Idle => f.write_str("Idle"),
             Self::AwaitingPingReply(id) => write!(f, "AwaitingPingReply({id:?})"),
-            Self::ConnectingStartup { reply, credentials } => f
-                .debug_struct("ConnectingStartup")
+            Self::ConnectingStartupTrust { reply } => f
+                .debug_struct("ConnectingStartupTrust")
                 .field("reply", reply)
-                .field("credentials", credentials)
                 .finish(),
+            Self::ConnectingStartupScram { reply, .. } => f
+                .debug_struct("ConnectingStartupScram")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
             Self::ConnectingScramAwaitServerFirst { reply, .. } => f
                 .debug_struct("ConnectingScramAwaitServerFirst")
                 .field("reply", reply)

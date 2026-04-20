@@ -209,7 +209,7 @@ fn trust_auth_handshake_end_to_end() {
     }
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingStartup { .. }
+        ProtoState::ConnectingStartupTrust { .. }
     ));
 
     // Feed AuthenticationOk.
@@ -707,7 +707,7 @@ fn scram_sha256_handshake_end_to_end() {
         }
         other => panic!("expected SendBytes(StartupMessage), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::ConnectingStartup { .. }));
+    assert!(matches!(proto.state(), ProtoState::ConnectingStartupScram { .. }));
 
     // Step 2: Server sends AuthenticationSASL with SCRAM-SHA-256.
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
