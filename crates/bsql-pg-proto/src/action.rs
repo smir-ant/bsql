@@ -497,6 +497,32 @@ pub enum Reply {
         /// Transaction status from `ReadyForQuery` (`'I'`, `'T'`, `'E'`).
         tx_status: u8,
     },
+
+    // ───────────────── Phase 1c reply variants ─────────────────
+    //
+    // Payloads are stubs — sub-phase 1c-1 fills the CommandTag
+    // parsing, 1c-3 fills the Parse/Close result shapes.
+
+    /// A Query / BindExecute command completed. Delivered on the
+    /// terminal `CommandComplete + ReadyForQuery` pair at the end
+    /// of the result stream. Rows (if any) were emitted
+    /// individually via `Action::StreamRow` (sub-phase 1c-1).
+    QueryComplete {
+        /// Raw ASCII command tag (`"SELECT 5"` etc.). 1c-1 ships a
+        /// parser into a typed `CommandTag` struct via round-4
+        /// finding #3; this raw form is the interim shape.
+        command_tag: crate::ident::BoundedStr<32>,
+        /// Transaction status from the trailing `ReadyForQuery`.
+        tx_status: u8,
+    },
+
+    /// A `Parse` command succeeded (server accepted the prepared
+    /// statement). Carries no additional data.
+    ParseComplete,
+
+    /// A `Close` of a prepared statement or portal succeeded.
+    /// Carries no additional data.
+    CloseComplete,
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -550,5 +576,65 @@ impl From<StartupCompletePayload> for Reply {
             secret_key: p.secret_key,
             tx_status: p.tx_status,
         }
+    }
+}
+
+// ───────────────── Phase 1c payload stubs ─────────────────────
+//
+// Payloads for Query / Parse / Close kinds land in sub-phase
+// 1c-1 (simple query) and 1c-3 (extended). These stubs pin the
+// DEF-112 sealed-deliver pathway for each new kind; payload
+// structure is minimal to start.
+
+/// Typed payload for [`crate::reply_id::QueryKind`] replies.
+///
+/// Delivered on `CommandComplete` at the end of a simple-query or
+/// extended-query result stream. `command_tag` is the raw ASCII
+/// tag PG returns (`"SELECT 5"`, `"INSERT 0 3"`, etc.) —
+/// sub-phase 1c-1 parses this into a typed `CommandTag` struct
+/// (round-4 finding #3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryCompletePayload {
+    /// Raw ASCII tag from `CommandComplete` body.
+    pub command_tag: crate::ident::BoundedStr<32>,
+    /// Transaction-status indicator from the trailing `ReadyForQuery`.
+    pub tx_status: u8,
+}
+
+impl From<QueryCompletePayload> for Reply {
+    #[inline]
+    fn from(p: QueryCompletePayload) -> Self {
+        Self::QueryComplete {
+            command_tag: p.command_tag,
+            tx_status: p.tx_status,
+        }
+    }
+}
+
+/// Typed payload for [`crate::reply_id::ParseKind`] replies.
+///
+/// `ParseComplete` carries no body; the struct is a ZST.
+/// Preserves the DEF-112 sealed-deliver pathway for Parse's
+/// `ReplyId<ParseKind>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParseCompletePayload;
+
+impl From<ParseCompletePayload> for Reply {
+    #[inline]
+    fn from(_: ParseCompletePayload) -> Self {
+        Self::ParseComplete
+    }
+}
+
+/// Typed payload for [`crate::reply_id::CloseKind`] replies.
+///
+/// `CloseComplete` carries no body; ZST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CloseCompletePayload;
+
+impl From<CloseCompletePayload> for Reply {
+    #[inline]
+    fn from(_: CloseCompletePayload) -> Self {
+        Self::CloseComplete
     }
 }

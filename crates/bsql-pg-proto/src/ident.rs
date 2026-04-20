@@ -58,6 +58,21 @@ pub const MAX_IDENT_LEN: usize = 63;
 /// like `myapp-worker-pod-abc123def456`.
 pub const MAX_APP_NAME_LEN: usize = 128;
 
+/// Maximum byte length for a SQL query text (Phase 1c). 2 KiB
+/// covers typical statements; anything longer is either a pathological
+/// generated query or a COPY command that uses a different path.
+/// Extension-statements (`CREATE EXTENSION …`) and multi-statement
+/// batch strings fit. If this cap is tightened, the `Sql` type's
+/// truncation semantics (via [`BoundedStr::from_str_truncating`])
+/// preserve up-to-cap prefix with `"…"` marker — not silent drop.
+pub const MAX_SQL_LEN: usize = 2048;
+
+/// Maximum byte length for a PG statement / portal name. PG's
+/// `NAMEDATALEN = 64` applies here too (same as [`MAX_IDENT_LEN`]);
+/// duplicated const name gives the typed wrapper a distinct
+/// compile-time identity.
+pub const MAX_PG_NAME_LEN: usize = 63;
+
 /// Sealing module for [`FixedStrKind`] and [`Validated`]. Private
 /// to this module so external crates cannot impl the sealed
 /// supertrait — and thus cannot impl the public traits either.
@@ -170,6 +185,61 @@ impl FixedStrKind for BoundedStrTag {
 // supertrait makes this impossible externally anyway, but the
 // explicit omission documents the intent.
 
+// ───────────────── Phase 1c typed newtypes ────────────────────
+//
+// Each PG-level identifier concept gets its own tag so the type
+// system rejects cross-use. A `fn execute(stmt: StmtName, portal:
+// PortalName)` with arguments swapped is a compile error. Parallels
+// the DEF-096 Ident/DatabaseName pattern.
+//
+// Round-4 finding #2 (2026-04-20). Sealed via DEF-115 seal.
+
+/// Tag for [`Sql`] — SQL query text, truncating on overflow.
+///
+/// Uses the `BoundedStr`-like truncating constructor (not
+/// `Validated`) because arbitrary SQL may contain any UTF-8
+/// characters — NUL, empty string, binary-seeming bytes — so the
+/// strict `try_from_str` path doesn't fit. Over-length SQL
+/// truncates with the `"…"` marker; the caller sees a visibly
+/// truncated statement instead of a silent drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlTag {}
+impl sealed::FixedStrKindSealed for SqlTag {}
+impl FixedStrKind for SqlTag {
+    const DEBUG_NAME: &'static str = "Sql";
+    const ALLOW_EMPTY: bool = true;
+}
+// Not Validated — truncating constructor only.
+
+/// Tag for [`StmtName`] — a PG prepared-statement name. Validated:
+/// non-empty, no NUL, max [`MAX_PG_NAME_LEN`] bytes. Empty name is
+/// PG's "unnamed statement" convention, handled via a separate
+/// `StmtName::unnamed()` constructor; the typed wrapper treats
+/// empty-input-to-`try_from_str` as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StmtNameTag {}
+impl sealed::FixedStrKindSealed for StmtNameTag {}
+impl sealed::ValidatedSealed for StmtNameTag {}
+impl FixedStrKind for StmtNameTag {
+    const DEBUG_NAME: &'static str = "StmtName";
+    const ALLOW_EMPTY: bool = false;
+}
+impl Validated for StmtNameTag {}
+
+/// Tag for [`PortalName`] — a PG portal name (bound statement
+/// instance). Same validation shape as [`StmtNameTag`] but a
+/// distinct compile-time type: passing a `PortalName` where a
+/// `StmtName` is expected is a build failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortalNameTag {}
+impl sealed::FixedStrKindSealed for PortalNameTag {}
+impl sealed::ValidatedSealed for PortalNameTag {}
+impl FixedStrKind for PortalNameTag {
+    const DEBUG_NAME: &'static str = "PortalName";
+    const ALLOW_EMPTY: bool = false;
+}
+impl Validated for PortalNameTag {}
+
 /// POD fixed-capacity byte string with a phantom `Tag` for nominal
 /// typing.
 ///
@@ -248,6 +318,26 @@ pub type ApplicationName = FixedStr<MAX_APP_NAME_LEN, ApplicationNameTag>;
 /// Used in [`crate::error::ServerErrorResponse`] to hold server-sent
 /// error message fields with a hard byte cap and no silent truncation.
 pub type BoundedStr<const N: usize> = FixedStr<N, BoundedStrTag>;
+
+/// A bounded SQL query text. Capacity [`MAX_SQL_LEN`] = 2048 bytes.
+/// Overflow truncates at UTF-8 boundary with `"…"` marker (no silent
+/// drop — user sees a visibly-truncated statement).
+///
+/// Round-4 finding #2 — Phase 1c typed newtype.
+pub type Sql = FixedStr<MAX_SQL_LEN, SqlTag>;
+
+/// A PG prepared-statement name. Capacity [`MAX_PG_NAME_LEN`] = 63
+/// (PG's `NAMEDATALEN - 1`). Validated: non-empty, no NUL.
+///
+/// Round-4 finding #2 — Phase 1c typed newtype.
+pub type StmtName = FixedStr<MAX_PG_NAME_LEN, StmtNameTag>;
+
+/// A PG portal name (bound statement instance). Capacity and
+/// validation match [`StmtName`], but distinct compile-time type —
+/// a function expecting `StmtName` rejects `PortalName` at type-check.
+///
+/// Round-4 finding #2 — Phase 1c typed newtype.
+pub type PortalName = FixedStr<MAX_PG_NAME_LEN, PortalNameTag>;
 
 /// POD raw-byte buffer — the `FixedStr` cousin without UTF-8
 /// semantics. Used for wire-protocol byte slices that aren't strings

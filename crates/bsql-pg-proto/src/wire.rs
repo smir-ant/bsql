@@ -94,6 +94,102 @@ pub const TAG_NOTICE_RESPONSE: u8 = b'N';
 pub const TAG_SASL_RESPONSE: u8 = b'p';
 
 // ---------------------------------------------------------------
+// Phase 1c tags — Simple Query + Extended Query flow (PG §55.7)
+// ---------------------------------------------------------------
+
+// Inbound responses (backend → frontend):
+
+/// Backend `RowDescription` message tag (`'T'`).
+///
+/// Describes the columns of a result set: name, type OID, size,
+/// format. Precedes the run of `DataRow` frames for a query.
+pub const TAG_ROW_DESCRIPTION: u8 = b'T';
+
+/// Backend `DataRow` message tag (`'D'`).
+///
+/// One row of a result set. Shares the byte with the frontend
+/// `Describe` tag; disambiguated by direction (architect §2 +
+/// assert_all_distinct! runs per-direction only).
+pub const TAG_DATA_ROW: u8 = b'D';
+
+/// Backend `CommandComplete` message tag (`'C'`).
+///
+/// Signals end-of-result-set for the current command. Body is an
+/// ASCII tag like `"SELECT 5"`, `"INSERT 0 3"`, `"UPDATE 7"`.
+/// Shares the byte with the frontend `Close` tag.
+pub const TAG_COMMAND_COMPLETE: u8 = b'C';
+
+/// Backend `EmptyQueryResponse` message tag (`'I'`).
+///
+/// Sent when the client submitted an empty / whitespace-only
+/// simple-query string. Contains no body.
+pub const TAG_EMPTY_QUERY_RESPONSE: u8 = b'I';
+
+/// Backend `NoData` message tag (`'n'`).
+///
+/// Sent after `Describe` when the described statement or portal
+/// produces no result rows (e.g. `INSERT` without `RETURNING`).
+/// Contains no body.
+pub const TAG_NO_DATA: u8 = b'n';
+
+/// Backend `ParseComplete` message tag (`'1'`).
+///
+/// Sent after a successful `Parse` of a prepared statement.
+/// Contains no body.
+pub const TAG_PARSE_COMPLETE: u8 = b'1';
+
+/// Backend `BindComplete` message tag (`'2'`).
+///
+/// Sent after a successful `Bind` binding a portal to a prepared
+/// statement's parameters. Contains no body.
+pub const TAG_BIND_COMPLETE: u8 = b'2';
+
+/// Backend `CloseComplete` message tag (`'3'`).
+///
+/// Sent after a successful `Close` of a prepared statement or
+/// portal. Contains no body.
+pub const TAG_CLOSE_COMPLETE: u8 = b'3';
+
+/// Backend `ParameterDescription` message tag (`'t'`).
+///
+/// Sent in response to a `Describe` of a prepared statement:
+/// lists the parameter type OIDs the statement expects.
+pub const TAG_PARAMETER_DESCRIPTION: u8 = b't';
+
+// Outbound commands (frontend → backend):
+
+/// Frontend `Query` message tag (`'Q'`) — simple-query string.
+pub const TAG_QUERY: u8 = b'Q';
+
+/// Frontend `Parse` message tag (`'P'`) — prepare a statement.
+pub const TAG_PARSE: u8 = b'P';
+
+/// Frontend `Bind` message tag (`'B'`) — bind parameters to a
+/// prepared statement, producing a portal.
+pub const TAG_BIND: u8 = b'B';
+
+/// Frontend `Describe` message tag (`'D'`) — request metadata for
+/// a statement or portal. Shares the byte with backend `DataRow`
+/// (disambiguated by direction).
+pub const TAG_DESCRIBE: u8 = b'D';
+
+/// Frontend `Execute` message tag (`'E'`) — run a bound portal.
+/// Shares the byte with backend `ErrorResponse` (disambiguated by
+/// direction).
+pub const TAG_EXECUTE: u8 = b'E';
+
+/// Frontend `Close` message tag (`'C'`) — close a prepared
+/// statement or portal. Shares the byte with backend
+/// `CommandComplete` (disambiguated by direction).
+pub const TAG_CLOSE: u8 = b'C';
+
+/// Frontend `Flush` message tag (`'H'`) — send buffered responses
+/// without advancing the transaction state. (`Sync` commits the
+/// implicit transaction and emits `ReadyForQuery`; `Flush` does
+/// not.)
+pub const TAG_FLUSH: u8 = b'H';
+
+// ---------------------------------------------------------------
 // Authentication sub-codes (first 4 bytes of 'R' payload)
 // ---------------------------------------------------------------
 
@@ -201,10 +297,32 @@ assert_all_distinct!(
     TAG_BACKEND_KEY_DATA,
     TAG_NEGOTIATE_PROTOCOL_VERSION,
     TAG_NOTICE_RESPONSE,
+    // Phase 1c additions:
+    TAG_ROW_DESCRIPTION,
+    TAG_DATA_ROW,
+    TAG_COMMAND_COMPLETE,
+    TAG_EMPTY_QUERY_RESPONSE,
+    TAG_NO_DATA,
+    TAG_PARSE_COMPLETE,
+    TAG_BIND_COMPLETE,
+    TAG_CLOSE_COMPLETE,
+    TAG_PARAMETER_DESCRIPTION,
 );
 
 // **Outbound** (frontend → backend) tag-distinctness.
-assert_all_distinct!("outbound PG wire tag", TAG_SYNC, TAG_SASL_RESPONSE);
+assert_all_distinct!(
+    "outbound PG wire tag",
+    TAG_SYNC,
+    TAG_SASL_RESPONSE,
+    // Phase 1c additions:
+    TAG_QUERY,
+    TAG_PARSE,
+    TAG_BIND,
+    TAG_DESCRIBE,
+    TAG_EXECUTE,
+    TAG_CLOSE,
+    TAG_FLUSH,
+);
 
 // **Authentication sub-codes** distinctness. The sub-code is
 // the first four bytes of an `AUTHENTICATION` payload; a

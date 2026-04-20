@@ -102,15 +102,20 @@ pub mod state;
 pub mod wire;
 pub mod write_buf;
 
-pub use action::{Action, OutActions, PongPayload, Reply, StartupCompletePayload};
+pub use action::{
+    Action, CloseCompletePayload, OutActions, ParseCompletePayload, PongPayload,
+    QueryCompletePayload, Reply, StartupCompletePayload,
+};
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::PgCommand;
 pub use error::ProtocolError;
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
-pub use ident::{ApplicationName, DatabaseName, Ident, IdentError};
+pub use ident::{
+    ApplicationName, DatabaseName, Ident, IdentError, PortalName, Sql, StmtName,
+};
 pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{MAX_ACTIONS_PER_CALL, PgProtocol};
-pub use reply_id::{PingKind, ReplyId, ReplyKind, StartupKind};
+pub use reply_id::{CloseKind, ParseKind, PingKind, QueryKind, ReplyId, ReplyKind, StartupKind};
 pub use sensitive::Sensitive;
 pub use session_params::{Encoding, OtherEncoding, SessionParams};
 pub use state::ProtoState;

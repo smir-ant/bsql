@@ -117,6 +117,49 @@ impl ReplyKind for StartupKind {
     const NAME: &'static str = "Startup";
 }
 
+// ───────────────── Phase 1c ReplyKind markers ─────────────────
+//
+// Each Query-flow command carries a typed `ReplyId<K>` binding
+// the final reply payload. Mirror the DEF-112 pattern
+// established for PingKind / StartupKind. Dispatch wiring lands
+// in sub-phases 1c-1 (Query) and 1c-3 (Parse / Close).
+
+/// Kind marker for `PgCommand::SimpleQuery` and
+/// `PgCommand::BindExecute` replies. Payload type:
+/// [`crate::action::QueryCompletePayload`].
+///
+/// Delivered on the terminal `CommandComplete` + `ReadyForQuery`
+/// pair after the row stream (which is emitted separately via
+/// `Action::StreamRow`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryKind {}
+impl sealed::Sealed for QueryKind {}
+impl ReplyKind for QueryKind {
+    type Payload = crate::action::QueryCompletePayload;
+    const NAME: &'static str = "Query";
+}
+
+/// Kind marker for `PgCommand::Parse` replies. Payload:
+/// [`crate::action::ParseCompletePayload`] (ZST).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseKind {}
+impl sealed::Sealed for ParseKind {}
+impl ReplyKind for ParseKind {
+    type Payload = crate::action::ParseCompletePayload;
+    const NAME: &'static str = "Parse";
+}
+
+/// Kind marker for `PgCommand::CloseStatement` / `CloseP portal`
+/// replies. Payload: [`crate::action::CloseCompletePayload`]
+/// (ZST).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseKind {}
+impl sealed::Sealed for CloseKind {}
+impl ReplyKind for CloseKind {
+    type Payload = crate::action::CloseCompletePayload;
+    const NAME: &'static str = "Close";
+}
+
 /// Typed opaque handle correlating a pushed command with its
 /// eventual reply.
 ///
