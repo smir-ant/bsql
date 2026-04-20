@@ -35,7 +35,82 @@
 
 use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
-use core::num::NonZeroU64;
+use core::num::{NonZeroU64, NonZeroUsize};
+
+/// Typed non-empty range into a write buffer, replacing the raw
+/// `(start, end): (usize, usize)` pair on [`StagedAction::SendBytesRange`].
+/// DEF-100.
+///
+/// # Invariants
+///
+/// - `start` is the offset where the emission began.
+/// - `len` is `NonZeroUsize` — construction of a zero-length range
+///   is a type-level impossibility, which in turn makes
+///   `Action::SendBytes(&[])` a type-level impossibility along the
+///   range path.
+/// - At construction, `start.saturating_add(len) ≤ bounds` is
+///   checked; the constructor returns `None` otherwise.
+///
+/// # Tier elevation
+///
+/// Before DEF-100, `SendBytesRange { start, end }` carried two raw
+/// `usize`s with no proof of `start ≤ end` or `end ≤ write_buf.len()`.
+/// `materialise` fell back silently to `&[]` on any violation — a
+/// tier-3 audit-enforced seam. After DEF-100:
+///
+/// - `start ≤ end` is guaranteed by `len: NonZeroUsize` built via
+///   `end.checked_sub(start)?` — you cannot construct a range with
+///   `start > end` (the `checked_sub` yields `None`).
+/// - `end ≤ bounds` is checked explicitly in [`NonEmptyRange::new`].
+/// - `materialise`'s `.apply(buf)` can only return `None` if a bug
+///   in the caller passes a `buf` shorter than the emission-time
+///   `bounds` — architecturally the same buffer is used, so this
+///   branch is dead at call-site level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NonEmptyRange {
+    start: usize,
+    len: NonZeroUsize,
+}
+
+impl NonEmptyRange {
+    /// Construct a non-empty range validated against a buffer length.
+    /// Returns `None` if `start > end`, `end > bounds`, or the range
+    /// is empty (`start == end`).
+    #[inline]
+    pub(crate) fn new(start: usize, end: usize, bounds: usize) -> Option<Self> {
+        if end > bounds {
+            return None;
+        }
+        let len = end.checked_sub(start)?;
+        let len = NonZeroUsize::new(len)?;
+        Some(Self { start, len })
+    }
+
+    /// Construct from a write operation into `write_buf`: capture
+    /// `start` before the writes; after the writes, `write_buf.len()`
+    /// is the post-state end. Returns `None` if no bytes were
+    /// written since `start`.
+    ///
+    /// This is the primary constructor at emission sites — it ties
+    /// the range's validity to the `write_buf` state at emission.
+    #[inline]
+    pub(crate) fn from_write_span(start: usize, write_buf: &crate::write_buf::WriteBuf) -> Option<Self> {
+        Self::new(start, write_buf.len(), write_buf.len())
+    }
+
+    /// Resolve the range against a buffer, returning the slice or
+    /// `None` on bounds mismatch.
+    ///
+    /// The None branch is architecturally unreachable when `buf` is
+    /// the same `write_buf` used at construction — the constructor
+    /// already proved `start + len ≤ bounds` and we use the same
+    /// buffer at `materialise` time.
+    #[inline]
+    pub(crate) fn apply<'a>(&self, buf: &'a [u8]) -> Option<&'a [u8]> {
+        let end = self.start.checked_add(self.len.get())?;
+        buf.get(self.start..end)
+    }
+}
 
 /// Bounded list of actions emitted by a single protocol entry-point
 /// call.
@@ -280,13 +355,10 @@ pub enum Action<'buf> {
     reason = "Same root as Action<'_>: FailReply.cause dominates. StagedAction is staging-only — never stored, one-shot."
 )]
 pub(crate) enum StagedAction {
-    /// Bytes live at `write_buf[start..end]`. Materialiser slices.
-    SendBytesRange {
-        /// Inclusive start offset.
-        start: usize,
-        /// Exclusive end offset.
-        end: usize,
-    },
+    /// Bytes live at the range `[start..start+len]` inside the
+    /// emission-time `write_buf`. Typed as [`NonEmptyRange`] —
+    /// non-zero length is a type invariant (DEF-100).
+    SendBytesRange(NonEmptyRange),
     /// Bytes are a static compile-time constant. Materialiser passes
     /// through directly — no write, no copy.
     SendBytesStatic(&'static [u8]),

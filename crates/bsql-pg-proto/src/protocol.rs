@@ -641,9 +641,9 @@ fn compute_push_startup(
             app_name.as_ref(),
             write_buf,
         ) {
-            Ok((start, end)) => {
+            Ok(range) => {
                 emit_actions!(staged, budget: 1, [
-                    StagedAction::SendBytesRange { start, end },
+                    StagedAction::SendBytesRange(range),
                 ]);
                 // DEF-097: discriminate Trust vs Scram *here* — the
                 // post-push state carries only what its auth method
@@ -768,12 +768,14 @@ fn build_startup_message(
     database: Option<&DatabaseName>,
     app_name: Option<&ApplicationName>,
     write_buf: &mut WriteBuf,
-) -> Result<(usize, usize), crate::write_buf::WriteBufFull> {
+) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
     use crate::write_buf::WriteBufFull;
 
-    // DEF-094: write in-place into the caller-owned `write_buf` and
-    // return `(start, end)` for the entry-point to materialise as
-    // `Action::SendBytes(&'buf [u8])`.
+    // DEF-094: write in-place into the caller-owned `write_buf`.
+    // DEF-100: return a typed `NonEmptyRange` instead of `(start,
+    // end)` — non-zero length is a type invariant, materialise's
+    // silent-empty fallback closes from tier-3 (audit) to tier-2
+    // (type-checked construction).
     let start = write_buf.len();
     write_buf.with_length_prefix(|w| {
         // Protocol version 3.0 = 196608
@@ -795,8 +797,12 @@ fn build_startup_message(
         w.push_u8(0).map_err(|_| WriteBufFull)?;
         Ok(())
     })?;
-    let end = write_buf.len();
-    Ok((start, end))
+    // StartupMessage always writes the 4-byte length-prefix minimum,
+    // so the range is non-empty by construction. The Option cannot
+    // be None unless the writes above all succeeded *and* produced
+    // zero bytes — a type-level contradiction given the 4-byte
+    // length prefix.
+    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
 }
 
 /// Phase-2 materialiser: convert the write-phase's
@@ -813,8 +819,14 @@ fn materialise<'buf>(staged: StagedActions, buf: &'buf [u8]) -> OutActions<'buf>
     let mut out = OutActions::new();
     for sa in staged {
         let a: Action<'buf> = match sa {
-            StagedAction::SendBytesRange { start, end } => {
-                Action::SendBytes(buf.get(start..end).unwrap_or(&[]))
+            StagedAction::SendBytesRange(range) => {
+                // DEF-100: `range: NonEmptyRange` was constructor-
+                // validated at emission (`end ≤ write_buf.len()` at
+                // emission, `len > 0` via `NonZeroUsize`). `apply(buf)`
+                // can only be None if `buf` is shorter than the
+                // emission-time `write_buf` — architecturally the
+                // same buffer, so this branch is dead.
+                Action::SendBytes(range.apply(buf).unwrap_or(&[]))
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
             StagedAction::DeliverReply { id, value } => Action::DeliverReply { id, value },
@@ -1386,13 +1398,12 @@ mod compute_push_tests {
 
         // Action: SendBytes with non-empty payload (startup frame, no tag).
         // DEF-094: Startup from Idle writes the message into `wb` via
-        // a StagedAction::SendBytesRange { start, end }.
+        // a StagedAction::SendBytesRange(NonEmptyRange). DEF-100:
+        // non-empty is a type invariant, so presence of the variant
+        // alone is sufficient — no explicit `end > start` check.
         assert_eq!(staged.len(), 1);
         assert!(
-            matches!(
-                staged.first(),
-                Some(StagedAction::SendBytesRange { start, end }) if *end > *start
-            ),
+            matches!(staged.first(), Some(StagedAction::SendBytesRange(_))),
             "expected SendBytesRange into write_buf",
         );
 

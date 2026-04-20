@@ -423,7 +423,7 @@ fn dispatch_auth_in_startup_scram(
             // and record the range; materialise at the entry-point
             // boundary after the mutable write phase releases.
             match build_sasl_initial_response(&scram, write_buf) {
-                Ok((start, end, client_first_bare, client_nonce_b64)) => {
+                Ok((range, client_first_bare, client_nonce_b64)) => {
                     DispatchOutcome::AdvancedWithAction {
                         new_state: ProtoState::ConnectingScramAwaitServerFirst {
                             reply,
@@ -431,7 +431,7 @@ fn dispatch_auth_in_startup_scram(
                             client_first_bare,
                             client_nonce_b64,
                         },
-                        action: StagedAction::SendBytesRange { start, end },
+                        action: StagedAction::SendBytesRange(range),
                     }
                 }
                 Err(cause) => DispatchOutcome::Errored {
@@ -479,8 +479,11 @@ fn build_sasl_initial_response(
     write_buf: &mut WriteBuf,
 ) -> Result<
     (
-        usize,  // start offset in write_buf
-        usize,  // end offset (exclusive)
+        // DEF-100: typed non-empty range into write_buf (replaces
+        // raw `(start, end): (usize, usize)`). Non-zero length is
+        // a type invariant; silent-empty fallback in `materialise`
+        // closes from tier-3 audit to tier-2 structural.
+        crate::action::NonEmptyRange,
         // DEF-099: POD state-bound buffers instead of heapless::Vec.
         // Copy-capable, Drop-free — no `Vec::drop` propagation into
         // ProtoState.
@@ -539,7 +542,12 @@ fn build_sasl_initial_response(
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     let client_nonce_b64 = crate::ident::PodBytes::try_from_slice(&client_nonce_vec)
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
-    Ok((start, end, client_first_bare, client_nonce_b64))
+    // DEF-100: typed NonEmptyRange. The SASLInitialResponse frame
+    // always writes ≥1 byte (the tag byte), so the `from_write_span`
+    // None-branch is architecturally unreachable.
+    let range = crate::action::NonEmptyRange::new(start, end, write_buf.len())
+        .ok_or(ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
+    Ok((range, client_first_bare, client_nonce_b64))
 }
 
 /// Dispatch AuthenticationSASLContinue (server-first-message).
@@ -675,14 +683,22 @@ fn dispatch_auth_sasl_continue(
             cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
         };
     }
-    let end = write_buf.len();
+    // DEF-100: typed NonEmptyRange. The SASLResponse frame always
+    // includes the 1-byte tag, so `from_write_span` cannot yield
+    // None under a successful write path.
+    let Some(range) = crate::action::NonEmptyRange::from_write_span(start, write_buf) else {
+        return DispatchOutcome::Errored {
+            reply_id: Some(reply),
+            cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
+        };
+    };
 
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::ConnectingScramAwaitServerFinal {
             reply,
             expected_server_sig,
         },
-        action: StagedAction::SendBytesRange { start, end },
+        action: StagedAction::SendBytesRange(range),
     }
 }
 
