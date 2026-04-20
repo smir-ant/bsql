@@ -16,7 +16,7 @@
 use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
 use crate::command::PgCommand;
-use crate::dispatch::{DispatchOutcome, dispatch};
+use crate::dispatch::{DispatchOutcome, FrameCoords, dispatch};
 use crate::error::ProtocolError;
 use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
 use crate::ident::{ApplicationName, DatabaseName, Ident};
@@ -314,7 +314,7 @@ impl PgProtocol {
                 },
                 &mut staged,
             );
-            return materialise(staged, write_buf.as_bytes(), self.read_buf.unread());
+            return materialise(staged, write_buf.as_bytes(), self.read_buf.populated());
         }
 
         // Drain as many complete frames as possible. Bounded by
@@ -386,8 +386,30 @@ impl PgProtocol {
                         continue;
                     }
 
+                    // 1c-1b: absolute frame start/payload bounds into
+                    // `populated()` are stable across the upcoming
+                    // `advance` — the bytes themselves don't move
+                    // until the next `append` triggers lazy
+                    // compaction, which can't happen while
+                    // OutActions is alive. Pass to dispatch so the
+                    // DataRow arm can construct an absolute row_range.
+                    let abs_frame_start = self.read_buf.cursor_position();
+                    let abs_payload_start = abs_frame_start.saturating_add(HEADER_LEN);
+                    let abs_frame_end = abs_frame_start.saturating_add(total_len);
+                    let populated_len = self.read_buf.populated().len();
+
                     let prev = core::mem::take(&mut self.state);
-                    let outcome = dispatch(prev, tag, payload, write_buf);
+                    let outcome = dispatch(
+                        prev,
+                        tag,
+                        payload,
+                        write_buf,
+                        FrameCoords {
+                            payload_start: abs_payload_start,
+                            payload_end: abs_frame_end,
+                            populated_len,
+                        },
+                    );
                     match outcome {
                         DispatchOutcome::AdvancedSilent { new_state } => {
                             self.state = new_state;
@@ -440,11 +462,13 @@ impl PgProtocol {
             }
         }
 
-        // 1c-1a: two buffers feed `materialise`. `write_buf`
-        // supplies `'w` for `SendBytes` slices; `self.read_buf`
-        // supplies `'r` for `StreamRow` slices (not emitted yet
-        // in 1c-1a — wired in 1c-1b).
-        materialise(staged, write_buf.as_bytes(), self.read_buf.unread())
+        // 1c-1b: `populated()` — the full buffer contents including
+        // bytes advanced past the cursor during this loop — so that
+        // `StreamRowRange` slices resolve correctly. The bytes
+        // remain valid until the next `append` triggers lazy
+        // compaction, which the borrow checker forbids while
+        // `OutActions<'_, 'r>` is alive (`'r = &'r mut self`).
+        materialise(staged, write_buf.as_bytes(), self.read_buf.populated())
     }
 
     /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
@@ -493,7 +517,7 @@ impl PgProtocol {
         // `NonZeroU64` individually.
         let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
         let raw_id: Option<core::num::NonZeroU64> = match prev {
-            ProtoState::Idle => None,
+            ProtoState::Idle | ProtoState::SimpleQueryDrainRfqAfterError => None,
             ProtoState::AwaitingPingReply(id) => Some(id.consume()),
             ProtoState::ConnectingStartupTrust { reply }
             | ProtoState::ConnectingStartupScram { reply, .. }
@@ -502,6 +526,9 @@ impl PgProtocol {
             | ProtoState::ConnectingScramAwaitAuthOk(reply)
             | ProtoState::ConnectingPostAuthWaitKey(reply)
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
+            ProtoState::SimpleQueryAwaitFirstResponse(id)
+            | ProtoState::SimpleQueryStreamingRows(id) => Some(id.consume()),
+            ProtoState::SimpleQueryAwaitRfq { reply, .. } => Some(reply.consume()),
             ProtoState::Errored(original_kind) => {
                 // Already Errored — preserve the ORIGINAL kind
                 // (the `replace` above wrote the new one; revert).
@@ -582,6 +609,9 @@ fn compute_push(
             &mut staged,
             write_buf,
         ),
+        PgCommand::SimpleQuery { sql, reply } => {
+            compute_push_simple_query(state, sql, reply, &mut staged, write_buf)
+        }
     };
     (new_state, staged)
 }
@@ -648,6 +678,18 @@ fn compute_push_ping(
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
+                },
+            ]);
+            other
+        }
+        other @ (ProtoState::SimpleQueryAwaitFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryDrainRfqAfterError) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::CommandInProgress,
                 },
             ]);
             other
@@ -747,7 +789,126 @@ fn compute_push_startup(
             ]);
             other
         }
+        other @ (ProtoState::SimpleQueryAwaitFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryDrainRfqAfterError) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::CommandInProgress,
+                },
+            ]);
+            other
+        }
     }
+}
+
+/// Compute the transition for [`PgCommand::SimpleQuery`] against the
+/// current [`ProtoState`]. Pure; see [`compute_push`] for framing.
+///
+/// Decision table:
+///
+/// | current state                | action                              | new state                            |
+/// |------------------------------|-------------------------------------|--------------------------------------|
+/// | `Idle` (build OK)            | `SendBytes('Q' frame)`              | `SimpleQueryAwaitFirstResponse(id)`  |
+/// | `Idle` (build Err)           | `FailReply(ProtocolInvariantBroken)`| `Idle` (unchanged)                   |
+/// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
+/// | any `Connecting*`            | `FailReply(StartupAlreadyInProgress)`| same state preserved                |
+/// | `AwaitingPingReply(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
+/// | any `SimpleQuery*`           | `FailReply(CommandInProgress)`      | same                                 |
+fn compute_push_simple_query(
+    state: ProtoState,
+    sql: crate::ident::Sql,
+    reply: ReplyId<crate::reply_id::QueryKind>,
+    staged: &mut StagedActions,
+    write_buf: &mut WriteBuf,
+) -> ProtoState {
+    match state {
+        ProtoState::Idle => match build_query_message(&sql, write_buf) {
+            Ok(range) => {
+                emit_actions!(staged, budget: 1, [
+                    StagedAction::SendBytesRange(range),
+                ]);
+                ProtoState::SimpleQueryAwaitFirstResponse(reply)
+            }
+            Err(_) => {
+                // Architecturally unreachable — `Sql` is bounded
+                // 2048 bytes, `WriteBuf` is 512 bytes. The `build`
+                // function caps SQL length at the WriteBuf
+                // envelope; on overflow the fail path classifies
+                // as a `ProtocolInvariantBroken` (matches the
+                // Startup analogue).
+                emit_actions!(staged, budget: 1, [
+                    StagedAction::FailReply {
+                        id: reply.consume(),
+                        cause: ProtocolError::ProtocolInvariantBroken,
+                    },
+                ]);
+                ProtoState::Idle
+            }
+        },
+        ProtoState::Errored(prior_kind) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
+                },
+            ]);
+            ProtoState::Errored(prior_kind)
+        }
+        other @ (ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
+        | ProtoState::ConnectingScramAwaitServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitAuthOk(_)
+        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::StartupAlreadyInProgress,
+                },
+            ]);
+            other
+        }
+        other @ (ProtoState::AwaitingPingReply(_)
+        | ProtoState::SimpleQueryAwaitFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryDrainRfqAfterError) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::CommandInProgress,
+                },
+            ]);
+            other
+        }
+    }
+}
+
+/// Build a PostgreSQL simple-query frame: `'Q'` + 4-byte length +
+/// NUL-terminated SQL.
+///
+/// PG frame body layout (§55.7 "Simple Query"):
+/// - Tag: `'Q'` (1 byte)
+/// - Length: u32 BE including itself
+/// - Query string: NUL-terminated
+fn build_query_message(
+    sql: &crate::ident::Sql,
+    write_buf: &mut WriteBuf,
+) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
+    use crate::write_buf::WriteBufFull;
+
+    let start = write_buf.len();
+    write_buf.push_u8(crate::wire::TAG_QUERY)?;
+    write_buf.with_length_prefix(|w| {
+        w.push_nul_terminated(sql.as_bytes())
+    })?;
+    // The 'Q' frame is always ≥ 6 bytes (tag + length + NUL) — the
+    // NonEmptyRange constructor succeeds by construction.
+    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
 }
 
 /// Whether the current protocol state accepts unsolicited
@@ -780,7 +941,11 @@ fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
         ProtoState::Idle
         | ProtoState::AwaitingPingReply(_)
         | ProtoState::ConnectingPostAuthWaitKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. } => true,
+        | ProtoState::ConnectingPostAuthHaveKey { .. }
+        | ProtoState::SimpleQueryAwaitFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryDrainRfqAfterError => true,
         ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
         | ProtoState::ConnectingScramAwaitServerFirst { .. }
@@ -868,11 +1033,8 @@ fn build_startup_message(
 fn materialise<'w, 'r>(
     staged: StagedActions,
     write_buf_bytes: &'w [u8],
-    _read_buf_bytes: &'r [u8],
+    read_buf_bytes: &'r [u8],
 ) -> OutActions<'w, 'r> {
-    // `_read_buf_bytes` is unused in 1c-1a — wired in 1c-1b when
-    // `StagedAction::StreamRowRange` is introduced. Until then the
-    // `'r` parameter on `OutActions` is phantom.
     let mut out = OutActions::new();
     for sa in staged {
         let a: Action<'w, 'r> = match sa {
@@ -893,6 +1055,16 @@ fn materialise<'w, 'r>(
                 value: entry.value(),
             },
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
+            // 1c-1b: row_range is absolute coordinates into the
+            // read buffer's populated region (`ReadBuf::populated`),
+            // valid from emission through materialise because
+            // the `'r` borrow on OutActions blocks all
+            // `&mut self.read_buf` calls on PgProtocol until the
+            // caller drops the returned actions.
+            StagedAction::StreamRowRange { id, row_range } => Action::StreamRow {
+                id,
+                row_bytes: row_range.apply(read_buf_bytes).unwrap_or(&[]),
+            },
             StagedAction::CloseSocket => Action::CloseSocket,
         };
         // `staged` and `out` share `MAX_ACTIONS_PER_CALL` as their
@@ -958,7 +1130,9 @@ mod allows_unsolicited_param_status_tests {
         // Splitting per kind keeps the match exhaustive (compiler
         // will still flag a missing variant on future additions).
         match state {
-            ProtoState::Idle | ProtoState::Errored(_) => {}
+            ProtoState::Idle
+            | ProtoState::Errored(_)
+            | ProtoState::SimpleQueryDrainRfqAfterError => {}
             ProtoState::AwaitingPingReply(id) => {
                 id.consume();
             }
@@ -971,6 +1145,13 @@ mod allows_unsolicited_param_status_tests {
             | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
             | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
+                reply.consume();
+            }
+            ProtoState::SimpleQueryAwaitFirstResponse(id)
+            | ProtoState::SimpleQueryStreamingRows(id) => {
+                id.consume();
+            }
+            ProtoState::SimpleQueryAwaitRfq { reply, .. } => {
                 reply.consume();
             }
         }
@@ -1057,6 +1238,29 @@ mod allows_unsolicited_param_status_tests {
         let errored = ProtoState::Errored(crate::error::ErrorKind::Framing);
         assert!(!allows_unsolicited_param_status(&errored));
         consume_state(errored);
+
+        // 1c-1b: simple-query states all accept unsolicited PS
+        // (server may emit ParameterStatus mid-query if an
+        // `ALTER SYSTEM` fires). Exhaustive enumeration pins the
+        // policy row per-variant.
+        let q_first = ProtoState::SimpleQueryAwaitFirstResponse(ReplyId::from_raw(nz(8001)));
+        assert!(allows_unsolicited_param_status(&q_first));
+        consume_state(q_first);
+
+        let q_rows = ProtoState::SimpleQueryStreamingRows(ReplyId::from_raw(nz(8002)));
+        assert!(allows_unsolicited_param_status(&q_rows));
+        consume_state(q_rows);
+
+        let q_rfq = ProtoState::SimpleQueryAwaitRfq {
+            reply: ReplyId::from_raw(nz(8003)),
+            command_tag: crate::error::BoundedStr::default(),
+        };
+        assert!(allows_unsolicited_param_status(&q_rfq));
+        consume_state(q_rfq);
+
+        let q_drain = ProtoState::SimpleQueryDrainRfqAfterError;
+        assert!(allows_unsolicited_param_status(&q_drain));
+        consume_state(q_drain);
     }
 }
 
@@ -1100,7 +1304,9 @@ mod compute_push_tests {
     fn consume_state(state: ProtoState) {
         // DEF-112: per-kind split (see sibling module's consume_state).
         match state {
-            ProtoState::Idle | ProtoState::Errored(_) => {}
+            ProtoState::Idle
+            | ProtoState::Errored(_)
+            | ProtoState::SimpleQueryDrainRfqAfterError => {}
             ProtoState::AwaitingPingReply(id) => {
                 id.consume();
             }
@@ -1113,6 +1319,13 @@ mod compute_push_tests {
             | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
             | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
+                reply.consume();
+            }
+            ProtoState::SimpleQueryAwaitFirstResponse(id)
+            | ProtoState::SimpleQueryStreamingRows(id) => {
+                id.consume();
+            }
+            ProtoState::SimpleQueryAwaitRfq { reply, .. } => {
                 reply.consume();
             }
         }

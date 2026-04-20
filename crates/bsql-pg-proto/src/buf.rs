@@ -127,6 +127,43 @@ impl ReadBuf {
         // still handling the case the type system cannot prove.
     }
 
+    /// Borrow the full populated region, including bytes already
+    /// advanced past the cursor. Used by the `StreamRow` materialiser
+    /// (1c-1b) which needs absolute-position slices into rows whose
+    /// frames were advanced-past during the dispatch loop but whose
+    /// bytes must remain valid until `OutActions` drops.
+    ///
+    /// # Lifetime invariant
+    ///
+    /// The returned slice is valid until the next `&mut self` method
+    /// call on this buffer (`append`, `advance`, `clear`) — same as
+    /// [`unread`]. Compaction happens lazily on the next `append`;
+    /// by then no outstanding borrow can be alive (the borrow
+    /// checker refuses the `&mut` call otherwise). Callers emit
+    /// [`crate::action::Action::StreamRow`] with slices carved out
+    /// of this region during [`crate::PgProtocol::feed_bytes`]; the
+    /// `'r` lifetime on `OutActions<'w, 'r>` ties those slices back
+    /// to the `&'r mut self` borrow on `PgProtocol`, which blocks
+    /// the next `feed_bytes` call while they are alive.
+    ///
+    /// [`unread`]: ReadBuf::unread
+    #[inline]
+    #[must_use]
+    pub fn populated(&self) -> &[u8] {
+        self.inner.as_slice()
+    }
+
+    /// Absolute position of the read cursor, in bytes from the start
+    /// of [`populated`]. Used by the dispatch loop to compute absolute
+    /// row-range coordinates (1c-1b).
+    ///
+    /// [`populated`]: ReadBuf::populated
+    #[inline]
+    #[must_use]
+    pub fn cursor_position(&self) -> usize {
+        usize::from(self.cursor)
+    }
+
     /// Advance the read cursor by `n` bytes.
     ///
     /// Returns [`AdvancePastEnd`] if `n` exceeds the unread length.

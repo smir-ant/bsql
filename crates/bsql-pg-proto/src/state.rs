@@ -19,9 +19,10 @@
 //! (no action, no state change — post-`CloseSocket` packet flushes
 //! become true no-ops instead of silent mis-advances).
 
+use crate::error::BoundedStr;
 use crate::error::ErrorKind;
 use crate::ident::PodBytes;
-use crate::reply_id::{PingKind, ReplyId, StartupKind};
+use crate::reply_id::{PingKind, QueryKind, ReplyId, StartupKind};
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
 
@@ -156,6 +157,48 @@ pub enum ProtoState {
         secret_key: i32,
     },
 
+    // ---------------------------------------------------------------
+    // Phase 1c-1b: Simple Query flow (PgCommand::SimpleQuery)
+    // ---------------------------------------------------------------
+
+    /// A `Query` frame was sent; awaiting the first response —
+    /// which may be `RowDescription` (SELECT), `CommandComplete`
+    /// (DML), `EmptyQueryResponse` (empty SQL), or `ErrorResponse`.
+    ///
+    /// The carried [`ReplyId<QueryKind>`] is the only path to the
+    /// inner correlator; state-as-data invariant (§7.2). Subsequent
+    /// transitions either consume it into a [`crate::Action::DeliverReply`]
+    /// / [`crate::Action::FailReply`] or forward it into the next
+    /// phase state.
+    SimpleQueryAwaitFirstResponse(ReplyId<QueryKind>),
+
+    /// `RowDescription` received; now streaming `DataRow` frames.
+    /// Terminal transitions: `DataRow` → emit `Action::StreamRow`,
+    /// stay here; `CommandComplete` → [`Self::SimpleQueryAwaitRfq`]
+    /// with the parsed command tag.
+    SimpleQueryStreamingRows(ReplyId<QueryKind>),
+
+    /// `CommandComplete` or `EmptyQueryResponse` received; awaiting
+    /// the trailing `ReadyForQuery`. The command tag captured at `C`
+    /// (empty for `EmptyQueryResponse`) ships in the final
+    /// [`crate::Reply::QueryComplete`] payload.
+    SimpleQueryAwaitRfq {
+        /// Correlator for the in-flight query.
+        reply: ReplyId<QueryKind>,
+        /// Command tag — `"SELECT 5"`, `"INSERT 0 3"`, or empty
+        /// for empty-query responses. Capacity 32 bytes handles
+        /// PG's documented tag shapes (the longest standard tag,
+        /// `"INSERT <oid> <n>"` with 10-digit values, is ~23 bytes).
+        command_tag: BoundedStr<32>,
+    },
+
+    /// `ErrorResponse` received mid-query; `FailReply` already
+    /// emitted. Awaiting the trailing `ReadyForQuery` that PG sends
+    /// after query-level errors — per spec, `Z` follows `E` and the
+    /// connection stays open. This variant silently consumes that
+    /// `Z` and transitions back to [`Self::Idle`].
+    SimpleQueryDrainRfqAfterError,
+
     /// Terminal: the connection has been classified as unrecoverable.
     ///
     /// Entered by any path that calls `fail_inflight_and_close` or
@@ -204,6 +247,20 @@ impl core::fmt::Debug for ProtoState {
                 .field("reply", reply)
                 .field("pid", pid)
                 .finish_non_exhaustive(),
+            Self::SimpleQueryAwaitFirstResponse(id) => {
+                write!(f, "SimpleQueryAwaitFirstResponse({id:?})")
+            }
+            Self::SimpleQueryStreamingRows(id) => {
+                write!(f, "SimpleQueryStreamingRows({id:?})")
+            }
+            Self::SimpleQueryAwaitRfq { reply, command_tag } => f
+                .debug_struct("SimpleQueryAwaitRfq")
+                .field("reply", reply)
+                .field("command_tag", command_tag)
+                .finish(),
+            Self::SimpleQueryDrainRfqAfterError => {
+                f.write_str("SimpleQueryDrainRfqAfterError")
+            }
             Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }

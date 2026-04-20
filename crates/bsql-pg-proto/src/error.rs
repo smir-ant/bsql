@@ -302,6 +302,23 @@ pub enum ProtocolError {
     /// already in progress.
     StartupAlreadyInProgress,
 
+    /// Attempted to push a command while another query or the
+    /// startup handshake already occupies the connection. 1c-1b:
+    /// simple-query states reject new pushes with this error — the
+    /// existing query must complete first.
+    CommandInProgress,
+
+    /// Server sent a `CommandComplete` (`'C'`) payload that was not
+    /// NUL-terminated or otherwise malformed. 1c-1b: the
+    /// `CommandComplete` body is an ASCII command tag
+    /// (`"SELECT 5"`, `"INSERT 0 3"`, …) terminated by a single
+    /// NUL byte; a missing terminator or non-ASCII bytes beyond
+    /// the cap signal framing desync.
+    MalformedCommandComplete {
+        /// Actual payload byte count.
+        payload_len: usize,
+    },
+
     /// A local protocol-crate invariant was violated.
     ///
     /// Classified rather than silent: in Phase 1a the only emission site
@@ -418,7 +435,9 @@ impl ProtocolError {
             Self::UnsupportedAuthMethod { .. }
             | Self::UnsupportedProtocolOption
             | Self::Scram(_)
-            | Self::StartupAlreadyInProgress => ErrorKind::Auth,
+            | Self::StartupAlreadyInProgress
+            | Self::CommandInProgress => ErrorKind::Auth,
+            Self::MalformedCommandComplete { .. } => ErrorKind::Framing,
             Self::ProtocolInvariantBroken => ErrorKind::Internal,
             Self::ConnectionAlreadyClosed { .. } => ErrorKind::AlreadyClosed,
         }
@@ -483,6 +502,13 @@ impl fmt::Display for ProtocolError {
             Self::StartupAlreadyInProgress => {
                 f.write_str("startup handshake already in progress")
             }
+            Self::CommandInProgress => {
+                f.write_str("another command is in progress on this connection")
+            }
+            Self::MalformedCommandComplete { payload_len } => write!(
+                f,
+                "malformed CommandComplete: {payload_len}-byte payload missing NUL terminator",
+            ),
             Self::ProtocolInvariantBroken => {
                 f.write_str("protocol invariant violated — internal bsql-pg-proto logic bug")
             }

@@ -411,6 +411,24 @@ pub(crate) enum StagedAction {
         /// Why the protocol failed.
         cause: ProtocolError,
     },
+    /// Map to [`Action::StreamRow`] at materialise time. `row_range`
+    /// is absolute coordinates into [`crate::buf::ReadBuf::populated`]
+    /// — the full populated region of the inbound buffer, including
+    /// bytes already advanced past the cursor. 1c-1b.
+    ///
+    /// Absolute (not unread-relative) coordinates survive the
+    /// cursor advance that `feed_bytes` performs between dispatch
+    /// and materialise: the bytes themselves remain in place until
+    /// the next `append` triggers lazy compaction (which in turn
+    /// cannot run while the `OutActions<'_, 'r>` borrow is alive).
+    StreamRowRange {
+        /// Raw correlator (`reply.get()`; reply is NOT consumed here
+        /// — rows are in-progress, the reply commits on terminal
+        /// `CommandComplete`).
+        id: NonZeroU64,
+        /// Absolute range into the read buffer's populated region.
+        row_range: NonEmptyRange,
+    },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,
 }

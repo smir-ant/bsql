@@ -145,6 +145,7 @@ const _: fn() = || {
     // every `K`; checking one concrete `K` is sufficient.
     assert_send::<reply_id::ReplyId<reply_id::PingKind>>();
     assert_send::<reply_id::ReplyId<reply_id::StartupKind>>();
+    assert_send::<reply_id::ReplyId<reply_id::QueryKind>>();
     assert_send::<state::ProtoState>();
     // Phase 1b types
     assert_send::<ident::Ident>();
@@ -275,9 +276,11 @@ const _: () = assert!(
      state variant add a large buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<command::PgCommand>() <= 1344,
-    "PgCommand size regression — post-DEF-095/096 budget is 1344 bytes. \
-     Startup carries user/database/app_name (FixedStr-POD) + credentials.",
+    core::mem::size_of::<command::PgCommand>() <= 2112,
+    "PgCommand size regression — post-1c-1b budget is 2112 bytes. \
+     SimpleQuery dominates: Sql = FixedStr<2048, SqlTag> (2050 bytes) + \
+     ReplyId<QueryKind> (16) + discriminant + padding. Bumping \
+     MAX_SQL_LEN must move this limit in lockstep.",
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() <= 6336,

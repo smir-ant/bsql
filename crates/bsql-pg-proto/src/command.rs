@@ -9,9 +9,9 @@
 //! variants (`Query`, `Execute`, `Begin`, …) land with their drivers
 //! per reforge.md §3.5.
 
-use crate::ident::{ApplicationName, DatabaseName, Ident};
+use crate::ident::{ApplicationName, DatabaseName, Ident, Sql};
 use crate::password::Credentials;
-use crate::reply_id::{PingKind, ReplyId, StartupKind};
+use crate::reply_id::{PingKind, QueryKind, ReplyId, StartupKind};
 
 /// A command pushed by the wrapper into the protocol state machine.
 ///
@@ -77,5 +77,44 @@ pub enum PgCommand {
         /// DEF-112: typed `ReplyId<StartupKind>` binds the reply
         /// payload to [`crate::action::StartupCompletePayload`].
         reply: ReplyId<StartupKind>,
+    },
+
+    /// Execute a single SQL statement via PG's Simple Query protocol
+    /// (`Q`-frame). 1c-1b.
+    ///
+    /// **Precondition:** protocol must be in [`crate::ProtoState::Idle`].
+    /// Any other state yields a `FailReply(CommandInProgress)` —
+    /// the caller must wait for the current command to finish.
+    ///
+    /// # Response sequence
+    ///
+    /// - SELECT: `RowDescription` → 0..N `DataRow` (streamed via
+    ///   [`crate::Action::StreamRow`]) → `CommandComplete` →
+    ///   `ReadyForQuery` → [`crate::Reply::QueryComplete`] delivered.
+    /// - DML (INSERT/UPDATE/DELETE): `CommandComplete` →
+    ///   `ReadyForQuery` → `QueryComplete` (no rows).
+    /// - Empty query (whitespace-only SQL): `EmptyQueryResponse` →
+    ///   `ReadyForQuery` → `QueryComplete { command_tag: "" }`.
+    /// - Error: `ErrorResponse` → `ReadyForQuery` →
+    ///   `FailReply(ServerErrorResponse { ... })`. The connection
+    ///   stays open — per PG spec, `Z` follows `E` in query-level
+    ///   errors.
+    ///
+    /// # Multi-statement batches
+    ///
+    /// PG's Simple Query allows `;`-separated statement batches;
+    /// each statement produces its own `C` response and they all
+    /// share a single trailing `Z`. 1c-1b-MVP accepts a single
+    /// statement; multi-statement batch support lands in 1c-1-multi.
+    SimpleQuery {
+        /// SQL text — bounded to [`crate::ident::MAX_SQL_LEN`] =
+        /// 2048 bytes with explicit `"…"` truncation on overflow
+        /// (no silent drop).
+        sql: Sql,
+        /// Correlator for the reply.
+        ///
+        /// DEF-112: typed `ReplyId<QueryKind>` binds the payload to
+        /// [`crate::action::QueryCompletePayload`] at compile time.
+        reply: ReplyId<QueryKind>,
     },
 }

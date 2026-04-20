@@ -21,10 +21,34 @@ use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
 use crate::wire::{
     AUTH_OK, AUTH_SASL, AUTH_SASL_CONTINUE, AUTH_SASL_FINAL, SCRAM_SHA_256_MECHANISM,
-    TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_ERROR_RESPONSE, TAG_NEGOTIATE_PROTOCOL_VERSION,
-    TAG_READY_FOR_QUERY,
+    TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_COMMAND_COMPLETE, TAG_DATA_ROW,
+    TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE, TAG_NEGOTIATE_PROTOCOL_VERSION,
+    TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 use crate::write_buf::WriteBuf;
+
+/// Absolute byte-coordinates of the frame being dispatched, resolved
+/// against [`crate::buf::ReadBuf::populated`]. 1c-1b.
+///
+/// The dispatcher uses these to construct
+/// [`StagedAction::StreamRowRange`] for `DataRow` frames — the
+/// `row_range` must survive the post-dispatch `ReadBuf::advance` call,
+/// which only moves the cursor (the bytes themselves stay in place
+/// until the next `append` triggers lazy compaction). `populated_len`
+/// is the current total populated length, used as bounds in
+/// [`crate::action::NonEmptyRange::new`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameCoords {
+    /// Absolute offset (in populated bytes) where the frame payload
+    /// begins — i.e. right after the 5-byte header.
+    pub payload_start: usize,
+    /// Absolute offset where the frame ends (one-past-last payload
+    /// byte). `payload_end - payload_start == payload_len`.
+    pub payload_end: usize,
+    /// Current `populated()` length, used as `bounds` for
+    /// [`crate::action::NonEmptyRange::new`].
+    pub populated_len: usize,
+}
 
 /// What to do after dispatching a single frame.
 ///
@@ -103,6 +127,7 @@ pub(crate) fn dispatch(
     tag: u8,
     payload: &[u8],
     write_buf: &mut WriteBuf,
+    coords: FrameCoords,
 ) -> DispatchOutcome {
     match (prev, tag) {
         // =============================================================
@@ -285,6 +310,161 @@ pub(crate) fn dispatch(
         }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // =============================================================
+        // Phase 1c-1b: Simple Query flow
+        //
+        // State transitions per PG §55.2.3:
+        //   Q sent → AwaitFirstResponse
+        //     T (RowDescription)   → StreamingRows
+        //     C (CommandComplete)  → AwaitRfq(command_tag)
+        //     I (EmptyQueryResp)   → AwaitRfq(empty tag)
+        //     E (ErrorResponse)    → DrainRfqAfterError (FailReply emitted)
+        //   StreamingRows
+        //     D (DataRow)          → emit StreamRow; stay
+        //     C                    → AwaitRfq(command_tag)
+        //     E                    → DrainRfqAfterError (FailReply emitted)
+        //   AwaitRfq
+        //     Z                    → DeliverReply QueryComplete; Idle
+        //   DrainRfqAfterError
+        //     Z                    → silent; Idle (reply already sent)
+        //
+        // Errors within simple-query states: query-level `E` is
+        // recoverable (connection survives); framing-level `E`
+        // during the handshake states would tear down, but those
+        // states are never entered from simple-query flow.
+        // =============================================================
+
+        // AwaitFirstResponse: T / C / I / E / Z(no) — see below for Z
+        (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
+            DispatchOutcome::AdvancedSilent {
+                new_state: ProtoState::SimpleQueryStreamingRows(reply),
+            }
+        }
+        (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
+            match parse_command_tag(payload) {
+                Ok(command_tag) => DispatchOutcome::AdvancedSilent {
+                    new_state: ProtoState::SimpleQueryAwaitRfq {
+                        reply,
+                        command_tag,
+                    },
+                },
+                Err(cause) => errored(Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
+            DispatchOutcome::AdvancedSilent {
+                new_state: ProtoState::SimpleQueryAwaitRfq {
+                    reply,
+                    command_tag: crate::error::BoundedStr::default(),
+                },
+            }
+        }
+        (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_ERROR_RESPONSE) => {
+            let cause = parse_error_response(payload);
+            DispatchOutcome::AdvancedWithAction {
+                new_state: ProtoState::SimpleQueryDrainRfqAfterError,
+                action: StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause,
+                },
+            }
+        }
+        (ProtoState::SimpleQueryAwaitFirstResponse(reply), other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // StreamingRows: D / C / E — any other tag is out-of-spec
+        (ProtoState::SimpleQueryStreamingRows(reply), TAG_DATA_ROW) => {
+            // 1c-1b: emit StreamRow with absolute row_range.
+            match crate::action::NonEmptyRange::new(
+                coords.payload_start,
+                coords.payload_end,
+                coords.populated_len,
+            ) {
+                Some(row_range) => {
+                    let id = reply.get();
+                    DispatchOutcome::AdvancedWithAction {
+                        new_state: ProtoState::SimpleQueryStreamingRows(reply),
+                        action: StagedAction::StreamRowRange { id, row_range },
+                    }
+                }
+                None => {
+                    // Architecturally unreachable — feed_bytes already
+                    // validated the frame bounds via parse_header +
+                    // unread length check. Classify as a broken
+                    // invariant rather than silent misbehaviour.
+                    errored(Some(reply.consume()), ProtocolError::ProtocolInvariantBroken)
+                }
+            }
+        }
+        (ProtoState::SimpleQueryStreamingRows(reply), TAG_COMMAND_COMPLETE) => {
+            match parse_command_tag(payload) {
+                Ok(command_tag) => DispatchOutcome::AdvancedSilent {
+                    new_state: ProtoState::SimpleQueryAwaitRfq {
+                        reply,
+                        command_tag,
+                    },
+                },
+                Err(cause) => errored(Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::SimpleQueryStreamingRows(reply), TAG_ERROR_RESPONSE) => {
+            let cause = parse_error_response(payload);
+            DispatchOutcome::AdvancedWithAction {
+                new_state: ProtoState::SimpleQueryDrainRfqAfterError,
+                action: StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause,
+                },
+            }
+        }
+        (ProtoState::SimpleQueryStreamingRows(reply), other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // AwaitRfq: Z is the only legal frame
+        (ProtoState::SimpleQueryAwaitRfq { reply, command_tag }, TAG_READY_FOR_QUERY) => {
+            match payload {
+                [tx_status] => DispatchOutcome::AdvancedWithAction {
+                    new_state: ProtoState::Idle,
+                    action: crate::action::deliver(
+                        reply,
+                        crate::action::QueryCompletePayload {
+                            command_tag,
+                            tx_status: *tx_status,
+                        },
+                    ),
+                },
+                other => errored(
+                    Some(reply.consume()),
+                    ProtocolError::MalformedReadyForQuery {
+                        payload_len: other.len(),
+                    },
+                ),
+            }
+        }
+        (ProtoState::SimpleQueryAwaitRfq { reply, .. }, other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // DrainRfqAfterError: silent consume of Z → Idle
+        (ProtoState::SimpleQueryDrainRfqAfterError, TAG_READY_FOR_QUERY) => {
+            match payload {
+                [_] => DispatchOutcome::AdvancedSilent {
+                    new_state: ProtoState::Idle,
+                },
+                other => errored(
+                    None,
+                    ProtocolError::MalformedReadyForQuery {
+                        payload_len: other.len(),
+                    },
+                ),
+            }
+        }
+        (ProtoState::SimpleQueryDrainRfqAfterError, other) => {
+            errored(None, ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -792,6 +972,36 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 // -----------------------------------------------------------------
 // Helper: parse BackendKeyData
 // -----------------------------------------------------------------
+
+/// Parse `CommandComplete` payload into a bounded command tag.
+///
+/// PG §55.7 CommandComplete body: a single NUL-terminated ASCII
+/// string — e.g. `"SELECT 5\0"`, `"INSERT 0 3\0"`, `"UPDATE 7\0"`.
+/// A missing NUL terminator is treated as a framing error
+/// ([`ProtocolError::MalformedCommandComplete`]); the bytes-before-NUL
+/// are truncating-fitted into a [`crate::error::BoundedStr<32>`].
+///
+/// Capacity 32 bytes handles PG's documented tag shapes with
+/// headroom: the longest standard tag,
+/// `"INSERT <oid:10-digit> <n:10-digit>\0"`, is ~23 bytes.
+/// Overflow appends `"…"` rather than silently truncating (DEF-060
+/// pattern — BoundedStr's `from_str_truncating`).
+///
+/// Cold path: called once per completed command. Not on any
+/// per-row hot path.
+#[cold]
+#[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
+fn parse_command_tag(payload: &[u8]) -> Result<crate::error::BoundedStr<32>, ProtocolError> {
+    use crate::error::BoundedStr;
+    // Strip the trailing NUL terminator. Missing NUL → framing error.
+    let Some(body) = payload.strip_suffix(b"\0") else {
+        return Err(ProtocolError::MalformedCommandComplete {
+            payload_len: payload.len(),
+        });
+    };
+    let s = core::str::from_utf8(body).unwrap_or("");
+    Ok(BoundedStr::from_str_truncating(s))
+}
 
 /// Parse BackendKeyData payload: 8 bytes = pid(i32 BE) + secret_key(i32 BE).
 ///
