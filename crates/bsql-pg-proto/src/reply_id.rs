@@ -165,7 +165,7 @@ impl ReplyId {
 }
 
 impl Drop for ReplyId {
-    /// Tier-2 structural consume-discipline guard (runtime safety net).
+    /// Tier-2 runtime consume-discipline guard (safety net).
     ///
     /// Fires when a `ReplyId` reaches end-of-scope without
     /// [`ReplyId::consume`] ever being called. Under the workspace
@@ -175,27 +175,61 @@ impl Drop for ReplyId {
     /// otherwise hang the caller's `oneshot::Receiver` forever — is
     /// made loudly visible at the moment it happens.
     ///
-    /// # Known diagnostic-masking limitation (tracked as DEF-052)
+    /// # Why the Drop-guard stays (DEF-101 re-scoping)
     ///
-    /// Under `panic = "unwind"` (the test profile), a test that
-    /// panics for an unrelated reason while a non-delivered `ReplyId`
-    /// is alive runs this Drop during unwinding; the assert below
-    /// trips a double-panic that translates to `SIGABRT` before the
-    /// harness prints the original panic message. **The safety
-    /// property is not weakened** (the guard still catches the
-    /// undelivered-drop bug class), but the test-time diagnostic
-    /// for an *unrelated* panic can be masked.
+    /// An earlier DEF-101 proposal was to *remove* the Drop impl
+    /// entirely after a full-path audit proved no production path
+    /// reaches an undelivered drop. The audit is clean (every
+    /// `mem::take(&mut state)` site exhaustively matches and either
+    /// consumes via `.consume()` or re-places the id in the new
+    /// state — verified at the six sites: `push_command`, the
+    /// `feed_bytes` dispatcher loop's three outcome arms, and
+    /// `fail_inflight_and_close`). But removing Drop would be a
+    /// **tier regression** on stable Rust, not an elevation, because:
     ///
-    /// Mitigation today: tests that leave an in-flight `ReplyId` must
-    /// drive the state to a consuming arm via
-    /// `PgProtocol::feed_bytes` (see `drain_pending_ping` in the
-    /// integration tests). A future `PgProtocol::terminate(self,
-    /// cause) -> OutActions` shipping with the async wrapper (Phase
-    /// 1e) will be the canonical teardown path. Deeper fix —
-    /// `std::thread::panicking()` guard — requires a feature flag to
-    /// avoid pulling `std` into `no_std` downstream consumers; see
-    /// DEF-052.
+    /// 1. Stable Rust has no linear types. "Cannot drop unconsumed"
+    ///    cannot be a tier-1 compile invariant — even with
+    ///    `#[must_use]` + `deny(unused_variables)`, patterns like
+    ///    `let r = id(); r.get(); // scope-drop` silently compile.
+    /// 2. The Drop-guard catches exactly this residual class at
+    ///    runtime. Removing it would replace tier-2 runtime with
+    ///    tier-3 audit (= strictly weaker).
+    /// 3. Production has `panic = "abort"`, so the guard aborts the
+    ///    process cleanly — no undefined behaviour, no hang.
+    ///
+    /// DEF-101 therefore keeps the guard and fixes the *actual*
+    /// pain point, DEF-052 (diagnostic-masking), below.
+    ///
+    /// # DEF-052 close — unwind-safe guard
+    ///
+    /// The historical problem: a test that panics for an *unrelated*
+    /// reason while a non-delivered `ReplyId` is alive ran this Drop
+    /// during unwinding; the `assert!` below double-panicked →
+    /// `SIGABRT` → the original panic message was lost. The safety
+    /// property was not weakened (the guard still caught undelivered
+    /// drops), but the test-time diagnostic masked the original
+    /// failure.
+    ///
+    /// The fix: a `std::thread::panicking()` check gated on
+    /// `#[cfg(test)]` skips the assert during unwinding. `cfg(test)`
+    /// gating is essential and load-bearing:
+    ///
+    /// - Production is `#![no_std]` and `panic = "abort"`. Unwinding
+    ///   never happens; the guard always fires or never runs. The
+    ///   `cfg(test)` branch is dead → zero cost.
+    /// - `std::thread::panicking()` lives in `std`, not `core`. The
+    ///   crate's `#[cfg(test)] extern crate std;` (in `lib.rs`)
+    ///   brings `std` in for the test binary only — no production
+    ///   `std` pull-in, `no_std` consumers stay happy.
     fn drop(&mut self) {
+        // DEF-052 close: during a test-time unwind, skip the guard
+        // to prevent double-panic from masking the original panic
+        // message. Production builds never reach this line
+        // (panic = "abort" never unwinds).
+        #[cfg(test)]
+        if std::thread::panicking() {
+            return;
+        }
         assert!(
             self.delivered,
             "ReplyId {} dropped without delivery — the caller's oneshot receiver will never resolve",
@@ -265,4 +299,38 @@ mod reply_id_semantics {
         drop(id);
     }
 
+    /// Category (2) — tier-2 runtime invariant (DEF-052 close).
+    ///
+    /// If a test panics for an *unrelated* reason while a
+    /// non-delivered `ReplyId` is alive, the Drop-guard historically
+    /// tripped a double-panic during unwinding, producing `SIGABRT`
+    /// and hiding the original panic message from the test harness.
+    /// DEF-101 gated the Drop-guard on `std::thread::panicking()`
+    /// under `#[cfg(test)]`; during unwinding the guard returns
+    /// early, letting the original panic propagate cleanly.
+    ///
+    /// This test proves the fix: the panic message observed by the
+    /// harness is the ORIGINAL `"unrelated panic"`, NOT the
+    /// Drop-guard's `"dropped without delivery"`. If the fix
+    /// regresses (e.g. the `thread::panicking()` check is removed
+    /// or the cfg gate changes), `#[should_panic(expected = ...)]`
+    /// will fail because the Drop-guard's message would surface
+    /// instead.
+    #[test]
+    #[should_panic(expected = "unrelated panic")]
+    fn unrelated_panic_while_reply_id_alive_surfaces_original_message() {
+        // Without DEF-052's close, this `id`'s Drop during unwind
+        // would double-panic; with the close, the guard's
+        // `thread::panicking()` check returns early and the original
+        // panic message propagates.
+        //
+        // The panic itself is emitted via `assert_eq!` (not `panic!`
+        // macro — `clippy::panic` is forbid-level) with the substring
+        // "unrelated panic" in the message; `should_panic(expected =
+        // "unrelated panic")` matches the substring.
+        let raw = NonZeroU64::new(11).unwrap_or(NonZeroU64::MIN);
+        let id = ReplyId::from_raw(raw);
+        let actual = id.get().get();
+        assert_eq!(actual, 0, "unrelated panic (id was {actual})");
+    }
 }

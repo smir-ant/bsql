@@ -213,7 +213,7 @@ mechanism fully closes the observable behaviour".
 | DEF-050 | SASLPrep for unicode passwords: `stringprep` crate integration, opt-in. ASCII passwords are the common case; non-ASCII without SASLPrep can fail interop with PG servers that normalize. Tier-3 best-effort without the dep; tier-2 structural with it. | 1b (optional) or later | 2-3 (design decision) |
 | DEF-051 | Empty-password rejection: `Password::try_from_str` → `Err(PasswordError::Empty)`. | 1b | **CLOSED** — landed (690e30e). tier-1 via Result return. |
 | DEF-053 | Channel binding (SCRAM-SHA-256-PLUS): Phase 1b uses `n,,` GS2 header and `biws` cbind data (no channel binding). Requires TLS channel binding data from the transport layer, which does not exist until the async wrapper lands in Phase 1e. GS2 header always `n,,`, cbind always `biws`. | 1e (with TLS) | 2 (structural — requires transport-layer data not yet available) |
-| DEF-052 | `ReplyId::drop` diagnostic-masking under `panic = "unwind"`. When a test panics for an unrelated reason while a non-delivered `ReplyId` is alive, the Drop-guard's `assert!` fires during unwinding → double-panic → `SIGABRT` → original panic message is masked. Safety property is NOT weakened (the guard still catches undelivered-drop); only test-time diagnostic quality degrades. Fix direction: use `cfg_select!` (stable since Rust 1.95, now our MSRV) to conditionally compile `if std::thread::panicking() { return; }` in debug/test builds without pulling `std` into release or `no_std` downstream builds. `cfg_select!` replaces the previously-considered `cfg-if` dep or manual `#[cfg]` stacking. Mitigation today: tests that leave an in-flight ReplyId call `drain_pending_ping` (integration tests) or complete the flow to `Idle`/`Errored` (library internal tests). The permanent `PgProtocol::terminate(self, cause) -> OutActions` lands with the async wrapper in Phase 1e and subsumes this concern for wrapper-driven teardown. | 1e (with wrapper) or sooner with cfg_select! | 2 (diagnostic-quality, not safety) |
+| DEF-052 | **CLOSED** (DEF-101) — `ReplyId::drop` now guards on `std::thread::panicking()` under `#[cfg(test)]` and returns early during unwinding. The `cfg(test)` gate is zero-cost in production (`panic = "abort"` never unwinds) and uses the pre-existing `#[cfg(test)] extern crate std;` — no new feature flag, no new dep. Regression test `unrelated_panic_while_reply_id_alive_surfaces_original_message` exercises the fix: it panics for an unrelated reason with a live ReplyId, `#[should_panic(expected = "unrelated panic")]` asserts the original message reaches the harness without double-panic masking. |
 
 ## 11. Phase-1b hardening (2026-04-18)
 
@@ -443,10 +443,51 @@ See `reforge.md` §17.1 for the master table. Execution is tier-elevation
 | `fd1f5cd` | **DEF-098** | `size_of` drift-guard tightening post DEF-095/096/097 (ProtoState budget 2048 → 1280, etc.) |
 | `ecee97c` | **DEF-099** | `PodBytes<N>` for SCRAM state buffers + pattern-rationale doc (`.get(..n).unwrap_or(&[])` is forbid-bundle idiom, not kludge) |
 | `8ff256f` | **DEF-100** | `NonEmptyRange { start, len: NonZeroUsize }` replaces raw `(start, end)` on `StagedAction::SendBytesRange` — non-empty is a type invariant, zero-length SendBytes can't compile. Tier-3 audit → tier-2 structural. |
+| *next*   | **DEF-101** | Path audit + DEF-052 close via `cfg(test)` thread-panicking guard (re-scoped from original "remove Drop" — honest tier analysis in the block below). |
 
-### Open — tier-elevation (HIGHEST priority)
+### DEF-101 re-scoping (honest tier analysis)
 
-- **DEF-101** — `ReplyId` linearity via full-path audit. Audit every `ProtoState` extraction site to confirm every consume-path is structural (no `mem::take`-and-drop without consume). Then remove `Drop` from `ReplyId`. **Closes DEF-052 entirely** — the diagnostic-masking risk under `panic = "unwind"` goes away because there is no Drop to mask. Tier-2 runtime guard → tier-1 compile guarantee. **NEXT UP.**
+The architect's original proposal (audit finding #7) was to *remove*
+the `ReplyId::Drop` impl after a full-path audit proves no production
+path reaches an undelivered drop. After landing the work I realised
+removing Drop would be a **tier regression**, not elevation:
+
+- **Stable Rust has no linear types.** "Cannot drop unconsumed" is
+  structurally impossible as a tier-1 compile invariant. Even with
+  `#[must_use]` + `deny(unused_variables)` + no-Copy, patterns like
+  `let r = id(); r.get(); // scope-drops` silently compile.
+- **The Drop-guard catches exactly that residual class at runtime.**
+  Removing it would replace tier-2 runtime with tier-3 audit
+  (= strictly weaker guarantee).
+- Production uses `panic = "abort"`, so the guard aborts cleanly —
+  no UB, no hang. It *is* the ceiling for stable-Rust safety on this
+  invariant.
+
+**What DEF-101 actually delivered:**
+
+1. **Full-path audit (tier-3 → tier-2 evidence).** Every
+   `core::mem::take(&mut self.state)` site in `protocol.rs`
+   (`push_command`, `feed_bytes` dispatcher loop, `fail_inflight_and_close`)
+   exhaustively matches the returned state. Every ReplyId-carrying
+   variant either consumes via `.consume()` or re-places the id in
+   the next state variant. Every `DispatchOutcome::Errored { reply_id:
+   Some(id), ... }` site consumes `id.consume()` exactly once at the
+   feed_bytes layer. Every `compute_push_*` function owns the
+   incoming `reply: ReplyId` and threads it to consume or
+   re-placement. No path reaches scope-drop in production.
+2. **DEF-052 close.** The `Drop::drop` body now has a
+   `#[cfg(test)] if std::thread::panicking() { return; }` branch
+   that prevents the double-panic diagnostic-masking class. Zero
+   cost in production (`panic = "abort"` never unwinds).
+3. **Regression test** `unrelated_panic_while_reply_id_alive_surfaces_original_message`
+   exercises the fix: a test panics for an unrelated reason while a
+   non-delivered ReplyId is alive; `#[should_panic(expected =
+   "unrelated panic")]` asserts the original message survives.
+
+The Drop-guard stays. The user-facing guarantee is strictly stronger
+than before (audit written down + regression test added + DEF-052
+closed), but the tier label remains "tier-2 runtime" — because that
+*is* the stable-Rust ceiling and we're not going to pretend otherwise.
 
 ### Open — security
 

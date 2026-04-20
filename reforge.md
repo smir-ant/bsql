@@ -1101,7 +1101,7 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 | 4 | ⏳     | 104  | ALGO/CACHE         | `parse_error_response` field-kind `[Option<FieldKind>; 256]` table + kind-match |
 | 5 | ❌     | —    | ALGO               | `Severity::from_bytes` first-byte dispatch — cold path, LLVM already folds; re-evaluate via DEF-109 |
 | 6 | ✅     | 095  | ALLOC              | `Password.len: usize → u16` (−6B × propagation through state/command chain) |
-| 7 | ⏳     | 101  | TYPESTATE          | `ReplyId` linearity via state-by-value everywhere → remove Drop-guard, close DEF-052 |
+| 7 | ✅     | 101  | TYPESTATE          | Full-path audit + DEF-052 close via `cfg(test)` thread-panicking guard. Drop-guard KEPT (stable-Rust tier-2 ceiling; removing it would regress to tier-3 audit). See deferred §16 for analysis. |
 | 8 | ❌     | —    | ALLOC/ALGO         | ASCII fast-path bit — stdlib `from_utf8` already SIMD-dispatches ASCII; caching saves nothing under forbid(unsafe_code) |
 | 9 | ❌     | —    | ARCH               | `WriteBuf::with_length_prefix` closure inline — already inlined by LLVM |
 | 10| ⏳     | 102  | ALGO/SECURITY      | `base64` → `base64ct` — constant-time SCRAM ClientProof encoding |
@@ -1121,8 +1121,8 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 | 24| ❌     | —    | CACHE              | `emit_actions!` `unlikely` hint — const-asserted dead branch; LLVM cold-hoists already |
 
 **Priority ordering for remaining work** (per user request 2026-04-20):
-1. Tier-elevation: DEF-101 (DEF-100 shipped `8ff256f`).
-2. Security: DEF-102.
+1. Tier-elevation: both DEF-100 and DEF-101 shipped. Closed.
+2. Security: DEF-102 `base64ct` swap — NEXT UP.
 3. Perf/architecture: DEF-103 → DEF-108.
 4. Validation gates: DEF-109, DEF-110.
 
@@ -1133,7 +1133,8 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 - `fd1f5cd` DEF-098 ✅
 - `ecee97c` DEF-099 ✅
 - `8ff256f` DEF-100 ✅
-- *next:* DEF-101 ReplyId linearity — full-path audit + Drop removal.
+- *pending commit:* DEF-101 (re-scoped — full-path audit + DEF-052 close, Drop-guard kept)
+- *next:* DEF-102 `base64ct` swap.
 
 ## §18. Command enum
 
@@ -3430,7 +3431,7 @@ Acceptance:
 - 1c — Query / Execute / post-auth chain / basic codec. Binding commitments from the 1b-hardening audit: **DEF-059** compute/apply split in `PgProtocol`, **DEF-060** typed error enums replacing `heapless::String<N>` in cold-path errors (kills silent-truncation class), **DEF-061** `Errored(ErrorKind)` instead of `Errored(ProtocolError)` (zero-clone on subsequent pushes), **DEF-062** `NoticeResponse` pre-dispatch filter, **DEF-063** handshake-flow typestate extraction (tier-2→1 on "invalid handshake call from wrong state"), **DEF-064** bounded-iterations loop in `parse_error_response`, **DEF-065** SCRAM message assembly direct-to-`WriteBuf`. Measurement milestone **DEF-067** (`cargo asm` verification) and **DEF-068** (base64-simd benchmark decision) land at the end of 1c.
 - **1c-batch-5 (2026-04-20) — post-DEF-094 architect audit + 24-findings execution.** Full `bsql-pg-proto` audit by the rust-senior-architect agent catalogued 24 improvement opportunities ranked by `(win × tier-elevation) / cost`. Execution is split across sub-phases; priority order is tier-elevation → security → perf/architecture. See §17.1 below for the full table.
   - **Shipped ✅:** DEF-095 (u16 password len + SCRAM const-generic drift guard + `record_param_status` compression), DEF-096 (`FixedStr<N, Tag>` generic consolidation — `Ident`/`DatabaseName`/`ApplicationName`/`BoundedStr` all POD), DEF-097 (`ConnectingStartup` → `ConnectingStartupTrust | ConnectingStartupScram` typestate split), DEF-098 (`size_of` assert tightening), DEF-099 (`PodBytes<N>` for SCRAM state buffers + pattern-rationale doc), DEF-100 (`NonEmptyRange` for `StagedAction::SendBytesRange` — non-empty is type invariant, silent-empty SendBytes no-op closes tier-3 → tier-2).
-  - **Tier-elevation (HIGHEST priority, in flight):** **DEF-101** `ReplyId` linearity via full-path audit — removes the Drop-guard panic, closes DEF-052 diagnostic-masking class entirely.
+  - **Tier-elevation ✅ done:** **DEF-101** full-path audit + DEF-052 close via `cfg(test) + std::thread::panicking()` guard. Re-scoped from the architect's original "remove Drop" proposal after tier analysis: stable Rust has no linear types, so removing the Drop-guard would be a tier REGRESSION (tier-2 runtime → tier-3 audit), not an elevation. Drop-guard kept; DEF-052 diagnostic-masking class closed. See deferred.md §16 for the honest analysis.
   - **Security:** **DEF-102** `base64ct` swap (constant-time encode over the SCRAM ClientProof — RustCrypto).
   - **Perf/architecture wave:** **DEF-103** `core::hint::cold_path()` at every `DispatchOutcome::Errored` site; **DEF-104** `ErrorResponse` field-kind table (`[Option<FieldKind>; 256]` replaces nine-arm match); **DEF-105** `OutActions` shrink via `ServerErrorResponse` BoundedStr bounds tuning; **DEF-106** `SessionParams` POD layout (9 × `heapless::String<128>` → flat byte buffer + slot ends); **DEF-107** SCRAM wire builders write-into (`generate_client_nonce_into`, `build_client_first_bare_into` — no return-value `heapless::Vec`); **DEF-108** `std::simd::u8x32` XOR for SCRAM ClientKey ⊕ ClientSignature (constant-time, vectorised — cold path, architectural).
   - **Validation gates (close only after `cargo asm` confirms win):** **DEF-109** `Severity::from_bytes` first-byte dispatch review; **DEF-110** `ProtocolError::kind` repr review.
