@@ -73,6 +73,23 @@ pub(crate) enum DispatchOutcome {
     },
 }
 
+/// DEF-103: `#[cold] #[inline]` helper centralising every
+/// `DispatchOutcome::Errored` construction. The `#[cold]` marker
+/// tells LLVM to push the Errored-path basic block out of the
+/// hot-path I-cache footprint; `#[inline]` keeps the call-site
+/// free of an actual function call (the helper body folds into
+/// the caller). Net: every Errored site in this module shares
+/// the cold-hint treatment through a single canonical function.
+///
+/// `reply_id` is `Option<NonZeroU64>` (already-consumed raw
+/// value) per DEF-112's pre-consume convention.
+#[cold]
+#[inline]
+fn errored(reply_id: Option<core::num::NonZeroU64>, cause: ProtocolError) -> DispatchOutcome {
+    DispatchOutcome::Errored { reply_id, cause }
+}
+
+
 /// Dispatch a single frame.
 ///
 /// `write_buf` is the caller-owned outbound staging buffer (DEF-094);
@@ -105,24 +122,15 @@ pub(crate) fn dispatch(
                     },
                 ),
             },
-            other => DispatchOutcome::Errored {
-                reply_id: Some(id.consume()),
-                cause: ProtocolError::MalformedReadyForQuery {
+            other => errored(Some(id.consume()), ProtocolError::MalformedReadyForQuery {
                     payload_len: other.len(),
-                },
-            },
+                }),
         },
         (ProtoState::AwaitingPingReply(id), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
-            DispatchOutcome::Errored {
-                reply_id: Some(id.consume()),
-                cause,
-            }
+            errored(Some(id.consume()), cause)
         }
-        (ProtoState::AwaitingPingReply(id), other) => DispatchOutcome::Errored {
-            reply_id: Some(id.consume()),
-            cause: ProtocolError::UnexpectedFrame { tag: other },
-        },
+        (ProtoState::AwaitingPingReply(id), other) => errored(Some(id.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupTrust — awaiting AuthenticationOk
@@ -135,21 +143,12 @@ pub(crate) fn dispatch(
         }
         (ProtoState::ConnectingStartupTrust { reply }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingStartupTrust { reply }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::UnsupportedProtocolOption,
-            }
+            errored(Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
         }
-        (ProtoState::ConnectingStartupTrust { reply }, other) => DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnexpectedFrame { tag: other },
-        },
+        (ProtoState::ConnectingStartupTrust { reply }, other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupScram — awaiting AuthenticationSASL
@@ -164,21 +163,12 @@ pub(crate) fn dispatch(
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::UnsupportedProtocolOption,
-            }
+            errored(Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
         }
-        (ProtoState::ConnectingStartupScram { reply, .. }, other) => DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnexpectedFrame { tag: other },
-        },
+        (ProtoState::ConnectingStartupScram { reply, .. }, other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // SCRAM: awaiting server-first-message
@@ -196,16 +186,10 @@ pub(crate) fn dispatch(
         }
         (ProtoState::ConnectingScramAwaitServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitServerFirst { reply, .. }, other) => {
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::UnexpectedFrame { tag: other },
-            }
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -220,16 +204,10 @@ pub(crate) fn dispatch(
         ) => dispatch_auth_sasl_final(reply, expected_server_sig, payload),
         (ProtoState::ConnectingScramAwaitServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitServerFinal { reply, .. }, other) => {
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::UnexpectedFrame { tag: other },
-            }
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -240,15 +218,9 @@ pub(crate) fn dispatch(
         }
         (ProtoState::ConnectingScramAwaitAuthOk(reply), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingScramAwaitAuthOk(reply), other) => DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnexpectedFrame { tag: other },
-        },
+        (ProtoState::ConnectingScramAwaitAuthOk(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Post-auth: waiting for BackendKeyData
@@ -266,23 +238,14 @@ pub(crate) fn dispatch(
                         secret_key,
                     },
                 },
-                Err(cause) => DispatchOutcome::Errored {
-                    reply_id: Some(reply.consume()),
-                    cause,
-                },
+                Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::ConnectingPostAuthWaitKey(reply), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingPostAuthWaitKey(reply), other) => DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnexpectedFrame { tag: other },
-        },
+        (ProtoState::ConnectingPostAuthWaitKey(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Post-auth: have BackendKeyData, waiting for ReadyForQuery
@@ -312,34 +275,22 @@ pub(crate) fn dispatch(
                     },
                 ),
             },
-            other => DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::MalformedReadyForQuery {
+            other => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery {
                     payload_len: other.len(),
-                },
-            },
+                }),
         },
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, other) => {
-            DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::UnexpectedFrame { tag: other },
-            }
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
         // Idle — unsolicited frames are out-of-spec
         // =============================================================
-        (ProtoState::Idle, other) => DispatchOutcome::Errored {
-            reply_id: None,
-            cause: ProtocolError::UnexpectedFrame { tag: other },
-        },
+        (ProtoState::Idle, other) => errored(None, ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Errored — terminal sink (Phase 1a pattern carried forward)
@@ -382,10 +333,7 @@ fn dispatch_auth_in_startup_trust(reply: ReplyId<crate::reply_id::StartupKind>, 
     let (code, _rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            return errored(Some(reply.consume()), cause)
         }
     };
 
@@ -397,10 +345,7 @@ fn dispatch_auth_in_startup_trust(reply: ReplyId<crate::reply_id::StartupKind>, 
         // else: a Trust connection never requested SCRAM, so a SASL
         // challenge means the server expects an auth method we are
         // not configured for.
-        _ => DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnsupportedAuthMethod { sub_code: code },
-        },
+        _ => errored(Some(reply.consume()), ProtocolError::UnsupportedAuthMethod { sub_code: code }),
     }
 }
 
@@ -419,20 +364,14 @@ fn dispatch_auth_in_startup_scram(
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            return errored(Some(reply.consume()), cause)
         }
     };
 
     match code {
         AUTH_SASL => {
             if !mechanism_list_contains_scram(rest) {
-                return DispatchOutcome::Errored {
-                    reply_id: Some(reply.consume()),
-                    cause: ProtocolError::Scram(crate::scram::wire::ScramError::NoSupportedMechanism),
-                };
+                return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::NoSupportedMechanism));
             }
 
             // Build client-first-message and SASLInitialResponse.
@@ -451,16 +390,10 @@ fn dispatch_auth_in_startup_scram(
                         action: StagedAction::SendBytesRange(range),
                     }
                 }
-                Err(cause) => DispatchOutcome::Errored {
-                    reply_id: Some(reply.consume()),
-                    cause,
-                },
+                Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
-        _ => DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnsupportedAuthMethod { sub_code: code },
-        },
+        _ => errored(Some(reply.consume()), ProtocolError::UnsupportedAuthMethod { sub_code: code }),
     }
 }
 
@@ -590,18 +523,12 @@ fn dispatch_auth_sasl_continue(
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            return errored(Some(reply.consume()), cause)
         }
     };
 
     if code != AUTH_SASL_CONTINUE {
-        return DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION },
-        };
+        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
     // `rest` is the server-first-message body.
@@ -609,10 +536,7 @@ fn dispatch_auth_sasl_continue(
         match crate::scram::wire::parse_server_first(rest, client_nonce_b64.as_slice()) {
             Ok(sf) => sf,
             Err(e) => {
-                return DispatchOutcome::Errored {
-                    reply_id: Some(reply.consume()),
-                    cause: ProtocolError::Scram(e),
-                };
+                return errored(Some(reply.consume()), ProtocolError::Scram(e));
             }
         };
 
@@ -627,10 +551,7 @@ fn dispatch_auth_sasl_continue(
         ) {
             Ok(v) => v,
             Err(e) => {
-                return DispatchOutcome::Errored {
-                    reply_id: Some(reply.consume()),
-                    cause: ProtocolError::Scram(e),
-                };
+                return errored(Some(reply.consume()), ProtocolError::Scram(e));
             }
         };
 
@@ -656,19 +577,13 @@ fn dispatch_auth_sasl_continue(
         match crate::scram::wire::base64_encode_to_buf(proof.as_ref(), &mut proof_b64_buf) {
             Ok(n) => n,
             Err(_) => {
-                return DispatchOutcome::Errored {
-                    reply_id: Some(reply.consume()),
-                    cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
-                }
+                return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))
             }
         };
     let proof_b64 = match proof_b64_buf.get(..proof_b64_len) {
         Some(s) => s,
         None => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
-            }
+            return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))
         }
     };
 
@@ -679,10 +594,7 @@ fn dispatch_auth_sasl_continue(
     ) {
         Ok(v) => v,
         Err(e) => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::Scram(e),
-            };
+            return errored(Some(reply.consume()), ProtocolError::Scram(e));
         }
     };
 
@@ -695,19 +607,13 @@ fn dispatch_auth_sasl_continue(
             .with_length_prefix(|w| w.push_bytes(&client_final_msg))
             .is_err()
     {
-        return DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
-        };
+        return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
     }
     // DEF-100: typed NonEmptyRange. The SASLResponse frame always
     // includes the 1-byte tag, so `from_write_span` cannot yield
     // None under a successful write path.
     let Some(range) = crate::action::NonEmptyRange::from_write_span(start, write_buf) else {
-        return DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
-        };
+        return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
     };
 
     DispatchOutcome::AdvancedWithAction {
@@ -728,37 +634,25 @@ fn dispatch_auth_sasl_final(
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            return errored(Some(reply.consume()), cause)
         }
     };
 
     if code != AUTH_SASL_FINAL {
-        return DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION },
-        };
+        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
     // Parse server-final-message.
     let received_sig = match crate::scram::wire::parse_server_final(rest) {
         Ok(sig) => sig,
         Err(e) => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause: ProtocolError::Scram(e),
-            };
+            return errored(Some(reply.consume()), ProtocolError::Scram(e));
         }
     };
 
     // Constant-time comparison (DEF-039).
     if !bool::from(expected_server_sig.ct_eq(&received_sig)) {
-        return DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::Scram(crate::scram::wire::ScramError::SignatureMismatch),
-        };
+        return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::SignatureMismatch));
     }
 
     // Signature matches. Await AuthenticationOk.
@@ -775,18 +669,12 @@ fn dispatch_auth_ok_after_scram(reply: ReplyId<crate::reply_id::StartupKind>, pa
     let code = match auth_sub_code(payload) {
         Ok((code, _)) => code,
         Err(cause) => {
-            return DispatchOutcome::Errored {
-                reply_id: Some(reply.consume()),
-                cause,
-            }
+            return errored(Some(reply.consume()), cause)
         }
     };
 
     if code != AUTH_OK {
-        return DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION },
-        };
+        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
     DispatchOutcome::AdvancedSilent {
