@@ -155,6 +155,15 @@ impl fmt::Display for SqlStateCode {
 
 /// Bounded string with explicit truncation on overflow. DEF-060 part 2.
 ///
+/// **POD layout — Copy, no Drop.** Stores bytes in a fixed-size
+/// `[u8; N]` + `u16` length rather than `heapless::String` (which
+/// wraps heapless::Vec and carries a blanket `Drop` impl even for
+/// `u8` elements). The raw-array form makes `BoundedStr`, and
+/// transitively `ProtocolError` + `Action<'buf>` + `OutActions<'buf>`,
+/// Copy-and-POD. Consequence: Rust's NLL releases borrow lifetimes at
+/// last use (not at end-of-scope), which removes the need for
+/// explicit `drop()` calls in tests.
+///
 /// Replaces `heapless::String::try_from(s).unwrap_or_default()` — a
 /// tier-4 silent-truncation pattern where oversized input silently
 /// became empty. On overflow this type truncates at a UTF-8-safe
@@ -162,12 +171,24 @@ impl fmt::Display for SqlStateCode {
 /// never receives silently-lost content.
 ///
 /// `N` is the inclusive byte budget (marker included in the budget).
-/// Messages of length ≤ N-3 fit verbatim; longer messages become
+/// Strings of length ≤ N-3 fit verbatim; longer strings become
 /// `&input[..max_fit] + "…"`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundedStr<const N: usize> {
-    inner: heapless::String<N>,
+    /// Fixed-size storage. Bytes past `len` are unspecified
+    /// (left-padded from previous state or init).
+    buf: [u8; N],
+    /// Number of valid UTF-8 bytes in `buf[..len]`.
+    /// `u16` covers any realistic `N` (max 65535 bytes) without
+    /// forcing the user into heavier `usize` alignment. Asserted
+    /// at compile time: `N <= u16::MAX as usize`.
+    len: u16,
+}
+
+impl<const N: usize> Default for BoundedStr<N> {
+    fn default() -> Self {
+        Self { buf: [0; N], len: 0 }
+    }
 }
 
 impl<const N: usize> BoundedStr<N> {
@@ -175,18 +196,32 @@ impl<const N: usize> BoundedStr<N> {
     /// Never panics, never silently drops.
     #[must_use]
     pub fn from_str_truncating(source: &str) -> Self {
-        if let Ok(inner) = heapless::String::try_from(source) {
-            return Self { inner };
+        // Compile-time drift guard: `N` must fit the u16 length
+        // prefix. `const { ... }` block evaluates at monomorph time;
+        // `N > 65_535` fails the build rather than silently truncating
+        // at runtime. `65_535` hard-coded instead of `u16::MAX as
+        // usize` because `as` casts are banned (forbid bundle).
+        const { assert!(N <= 65_535, "BoundedStr<N>: N must fit u16 length prefix (≤ 65535)"); }
+        let src_bytes = source.as_bytes();
+        if src_bytes.len() <= N {
+            let mut out = Self::default();
+            // Copy via explicit loop (avoids `[..] = ..` slicing
+            // which trips `clippy::indexing_slicing`).
+            let mut i = 0;
+            while i < src_bytes.len() {
+                if let (Some(dst), Some(byte)) = (out.buf.get_mut(i), src_bytes.get(i)) {
+                    *dst = *byte;
+                }
+                i = i.saturating_add(1);
+            }
+            out.len = u16::try_from(src_bytes.len()).unwrap_or(0);
+            return out;
         }
         // Source too long. UTF-8-ellipsis marker is 3 bytes.
-        // `…` — precomputed constant.
-        const MARKER: &str = "…";
+        const MARKER: &[u8] = "…".as_bytes();
         const MARKER_LEN: usize = MARKER.len();
-        // Largest byte-budget for the prefix that leaves room for
-        // the marker. `saturating_sub` avoids underflow when
-        // N < MARKER_LEN (pathologically small N).
         let budget = N.saturating_sub(MARKER_LEN);
-        // Walk char boundaries to find the largest prefix ≤ budget.
+        // Walk UTF-8 char boundaries to find the largest prefix ≤ budget.
         let mut fit_end = 0usize;
         for (i, _) in source.char_indices() {
             if i > budget {
@@ -194,32 +229,48 @@ impl<const N: usize> BoundedStr<N> {
             }
             fit_end = i;
         }
-        let prefix = source.get(..fit_end).unwrap_or("");
-        let mut out = heapless::String::<N>::new();
-        // Both pushes are infallible given the construction above;
-        // the `.is_err()` guards surface a regression honestly rather
-        // than via `let _`.
-        if out.push_str(prefix).is_err() {
-            return Self { inner: heapless::String::new() };
+        let prefix = source.get(..fit_end).unwrap_or("").as_bytes();
+        let mut out = Self::default();
+        let mut i = 0;
+        while i < prefix.len() {
+            if let (Some(dst), Some(byte)) = (out.buf.get_mut(i), prefix.get(i)) {
+                *dst = *byte;
+            }
+            i = i.saturating_add(1);
         }
-        if out.push_str(MARKER).is_err() {
-            return Self { inner: out };
+        // Append marker.
+        let mut j = 0;
+        while j < MARKER.len() {
+            let slot = prefix.len().saturating_add(j);
+            if let (Some(dst), Some(byte)) = (out.buf.get_mut(slot), MARKER.get(j)) {
+                *dst = *byte;
+            }
+            j = j.saturating_add(1);
         }
-        Self { inner: out }
+        let total = prefix.len().saturating_add(MARKER_LEN);
+        out.len = u16::try_from(total).unwrap_or(0);
+        out
     }
 
     /// Borrow the string content.
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.inner
+        let end = usize::from(self.len).min(N);
+        let bytes = self.buf.get(..end).unwrap_or(&[]);
+        // `bytes` is always valid UTF-8 by construction
+        // (`from_str_truncating` only copies from `&str` and from
+        // the UTF-8 marker, both guaranteed UTF-8). The `.unwrap_or`
+        // fallback is architecturally dead; surfacing it honestly
+        // avoids the forbidden `.unwrap()`.
+        core::str::from_utf8(bytes).unwrap_or("")
     }
 
     /// Whether the string is empty (never-assigned absent field).
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -240,9 +291,9 @@ impl<const N: usize> fmt::Display for BoundedStr<N> {
 /// async wrapper, not user-visible types — the wrapper translates them
 /// into its public `BackendError` (Phase 1e). Variants are kept narrow
 /// and self-describing; the wrapper never has to invent error context.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; ProtocolError is constructed on error paths only, never hot path")]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; ProtocolError is constructed on error paths only, never hot path. Now Copy-and-POD (DEF-060 part 2 + POD BoundedStr) — making Action<'buf> and OutActions<'buf> Drop-free so NLL releases borrows at last use without explicit drop().")]
 pub enum ProtocolError {
     /// The header's length-field is below the legal minimum (4).
     ///

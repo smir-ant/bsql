@@ -36,31 +36,147 @@
 use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
 use core::num::NonZeroU64;
-use heapless::Vec;
 
 /// Bounded list of actions emitted by a single protocol entry-point
 /// call.
 ///
+/// # POD, no Drop
+///
+/// [`OutActions`] is a pure-POD struct (`Copy` + no `Drop` impl) —
+/// a fixed `[Action<'buf>; MAX_ACTIONS_PER_CALL]` + `u8` length,
+/// not a `heapless::Vec` (which carries an unconditional `Drop`
+/// impl even for `Copy` elements). The POD form lets Rust's NLL
+/// release the `'buf` borrow at last-use rather than end-of-scope,
+/// so tests do NOT need explicit `drop(out)` calls between
+/// consecutive entry-point invocations.
+///
+/// # Lifetime
+///
 /// The `'buf` lifetime ties [`Action::SendBytes`] references back to
 /// the caller-owned [`crate::write_buf::WriteBuf`] that was passed
-/// to `feed_bytes` / `push_command`. Callers drain the actions
-/// (typically: execute each in order, write SendBytes bytes to the
-/// transport) and drop the whole `OutActions`; the next entry-point
-/// call requires `&mut WriteBuf`, which the borrow checker refuses
-/// until `OutActions<'buf>` drops.
+/// to `feed_bytes` / `push_command`. While any emitted
+/// `Action<'buf>::SendBytes` is still alive, the caller cannot
+/// re-borrow `&mut WriteBuf` — the borrow checker refuses.
 ///
 /// `MAX_ACTIONS_PER_CALL` is intentionally tiny in Phase 1a — see
 /// its definition in `protocol.rs` for the per-method audit.
 /// Overflow handling is compile-enforced via the `emit_actions!`
 /// macro's `const _: () = assert!(MAX_ACTIONS_PER_CALL >= budget)`
 /// checks at every push site.
-pub type OutActions<'buf> = Vec<Action<'buf>, MAX_ACTIONS_PER_CALL>;
+#[derive(Debug, Clone, Copy)]
+pub struct OutActions<'buf> {
+    /// Fixed slot storage; slots past `len` hold the default
+    /// sentinel ([`Action::CloseSocket`]) from construction.
+    items: [Action<'buf>; MAX_ACTIONS_PER_CALL],
+    /// Number of populated slots in `items[..len]`. `u8` suffices
+    /// since `MAX_ACTIONS_PER_CALL` is tiny (currently 4).
+    len: u8,
+}
+
+impl Default for OutActions<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'buf> OutActions<'buf> {
+    /// Construct an empty `OutActions`.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        // Fill with the Copy `CloseSocket` sentinel; the `len`
+        // field tracks the actual occupancy.
+        Self {
+            items: [Action::CloseSocket; MAX_ACTIONS_PER_CALL],
+            len: 0,
+        }
+    }
+
+    /// Number of populated actions.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        // `u8 → usize` via `From` impl (infallible, widening). `as`
+        // casts are banned by the crate forbid bundle; `usize::from`
+        // is the only accepted form.
+        usize::from(self.len)
+    }
+
+    /// Whether no actions have been pushed.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrow the populated prefix as a slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[Action<'buf>] {
+        self.items.get(..self.len()).unwrap_or(&[])
+    }
+
+    /// Return the first populated action (or `None` if empty).
+    /// Convenience for test assertions.
+    #[inline]
+    pub fn first(&self) -> Option<&Action<'buf>> {
+        self.as_slice().first()
+    }
+
+    /// Push an action. Returns `Err(action)` (mirrors heapless's
+    /// convention) if the container is full.
+    #[inline]
+    #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; mirrors heapless::Vec::push API. Err is only hit under architecturally-bounded overflow (compile-time emit_actions! budget).")]
+    pub fn push(&mut self, action: Action<'buf>) -> Result<(), Action<'buf>> {
+        let idx = self.len();
+        if idx >= MAX_ACTIONS_PER_CALL {
+            return Err(action);
+        }
+        let Some(slot) = self.items.get_mut(idx) else {
+            return Err(action);
+        };
+        *slot = action;
+        self.len = self.len.saturating_add(1);
+        Ok(())
+    }
+}
+
+impl<'buf> IntoIterator for OutActions<'buf> {
+    type Item = Action<'buf>;
+    type IntoIter = OutActionsIter<'buf>;
+    fn into_iter(self) -> Self::IntoIter {
+        OutActionsIter { inner: self, pos: 0 }
+    }
+}
+
+/// Move-iterator for [`OutActions`]. Produces each populated
+/// [`Action<'buf>`] in insertion order, then ends.
+#[derive(Debug)]
+pub struct OutActionsIter<'buf> {
+    inner: OutActions<'buf>,
+    pos: u8,
+}
+
+impl<'buf> Iterator for OutActionsIter<'buf> {
+    type Item = Action<'buf>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.inner.len {
+            return None;
+        }
+        let idx = usize::from(self.pos);
+        let item = *self.inner.items.get(idx)?;
+        self.pos = self.pos.saturating_add(1);
+        Some(item)
+    }
+}
 
 /// Internal staged list: dispatchers emit `StagedAction` during the
 /// write-phase (`&mut write_buf`-holding) loop, the entry-point
 /// materialises them into [`Action<'buf>`] in phase two (shared
 /// borrow of `write_buf`). `pub(crate)` — not a public API.
-pub(crate) type StagedActions = Vec<StagedAction, MAX_ACTIONS_PER_CALL>;
+///
+/// Uses `heapless::Vec` (which does carry `Drop` — but that's fine
+/// for an internal staging type that doesn't leak lifetimes).
+pub(crate) type StagedActions = heapless::Vec<StagedAction, MAX_ACTIONS_PER_CALL>;
 
 /// A directive from the protocol to its host.
 ///
@@ -75,13 +191,14 @@ pub(crate) type StagedActions = Vec<StagedAction, MAX_ACTIONS_PER_CALL>;
 /// (`StreamRow`, etc.). Internal `match` over `Action` is *not*
 /// `non_exhaustive` (we treat the type's own crate as authoritative
 /// for the internal exhaustive check).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
 #[expect(
     clippy::large_enum_variant,
     reason = "no_alloc: Box unavailable; FailReply.cause (ProtocolError ~280 bytes after DEF-060) dominates. \
-              Shrinking further requires a typed ErrorDetail pointer indirection — deferred to post-1c."
+              Shrinking further requires a typed ErrorDetail pointer indirection — deferred to post-1c. \
+              Copy-derived so OutActions<'buf> can be Drop-free and NLL releases borrows at last use."
 )]
 pub enum Action<'buf> {
     /// Send these bytes verbatim to the server.

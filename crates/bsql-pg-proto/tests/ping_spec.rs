@@ -183,7 +183,6 @@ fn ping_from_idle_emits_sync_bytes() {
 
     // Tier-2 structural consume-discipline: drain the in-flight reply
     // before the protocol drops. See [`drain_pending_ping`].
-    drop(out);
     drain_pending_ping(&mut proto, &mut wb);
 }
 
@@ -482,7 +481,6 @@ fn pipelined_ping_is_refused_without_disturbing_first() {
 
     // Drain the still-pending first-ping reply so its ReplyId is
     // consumed before the protocol drops. See [`drain_pending_ping`].
-    drop(out);
     drain_pending_ping(&mut proto, &mut wb);
 }
 
@@ -587,7 +585,6 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
 
     // First post-terminal frame: a well-formed RFQ. Expect zero actions
     // (the terminal sink silently drops it) and the kind preserved.
-    drop(err_out);
     let post_out_1 = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(
         post_out_1.len(),
@@ -602,7 +599,6 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     // Second post-terminal frame: an ErrorResponse that would *normally*
     // classify as a separate ServerError. The original kind must still
     // win — the terminal sink does not overwrite.
-    drop(post_out_1);
     let post_out_2 = proto.feed_bytes(&error_frame(), &mut wb);
     assert_eq!(
         post_out_2.len(),
@@ -641,7 +637,6 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
     // original diagnostic was surfaced in the first FailReply at
     // transition-to-Errored (the wrapper has preserved it).
     use bsql_pg_proto::error::ErrorKind;
-    drop(err_out);
     let second_raw = raw(51);
     let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) }, &mut wb);
 

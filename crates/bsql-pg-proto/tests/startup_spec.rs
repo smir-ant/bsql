@@ -213,7 +213,6 @@ fn trust_auth_handshake_end_to_end() {
     ));
 
     // Feed AuthenticationOk.
-    drop(out);
     let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0, "AuthOk produces no actions (state transition only)");
     assert!(matches!(
@@ -222,15 +221,12 @@ fn trust_auth_handshake_end_to_end() {
     ));
 
     // Feed ParameterStatus messages.
-    drop(out);
     let out = proto.feed_bytes(&param_status_frame("server_version", "17.2"), &mut wb);
     assert_eq!(out.len(), 0);
-    drop(out);
     let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"), &mut wb);
     assert_eq!(out.len(), 0);
 
     // Feed BackendKeyData.
-    drop(out);
     let out = proto.feed_bytes(&backend_key_data_frame(12345, 67890), &mut wb);
     assert_eq!(out.len(), 0);
     assert!(matches!(
@@ -239,12 +235,10 @@ fn trust_auth_handshake_end_to_end() {
     ));
 
     // Feed more ParameterStatus after BackendKeyData (allowed).
-    drop(out);
     let out = proto.feed_bytes(&param_status_frame("client_encoding", "UTF8"), &mut wb);
     assert_eq!(out.len(), 0);
 
     // Feed ReadyForQuery — completes the handshake.
-    drop(out);
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1, "RFQ completes handshake with DeliverReply");
     match out.as_slice() {
@@ -399,13 +393,10 @@ fn pipelined_startup_is_rejected() {
     }
 
     // Drain the first startup to avoid Drop-guard panic.
-    drop(out);
     let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0);
-    drop(out);
     let out = proto.feed_bytes(&backend_key_data_frame(1, 2), &mut wb);
     assert_eq!(out.len(), 0);
-    drop(out);
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1);
 }
@@ -427,7 +418,6 @@ fn startup_on_errored_state_fails_with_stored_cause() {
     // Push Startup on Errored.
     let second_raw = raw(21);
     let user = Ident::try_from_str("x").unwrap_or_else(|e| panic!("{e}"));
-    drop(out);
     let out = proto.push_command(PgCommand::Startup {
         user,
         database: None,
@@ -559,13 +549,10 @@ fn startup_message_wire_format() {
     }
 
     // Drain.
-    drop(out);
     let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0);
-    drop(out);
     let out = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
     assert_eq!(out.len(), 0);
-    drop(out);
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1);
 }
@@ -623,7 +610,6 @@ fn connecting_states_become_errored_on_bad_frame() {
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
 
     // Post-terminal frames are dropped silently.
-    drop(out);
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 0, "post-terminal frame must emit zero actions");
 }
@@ -724,7 +710,6 @@ fn scram_sha256_handshake_end_to_end() {
     assert!(matches!(proto.state(), ProtoState::ConnectingStartup { .. }));
 
     // Step 2: Server sends AuthenticationSASL with SCRAM-SHA-256.
-    drop(out);
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     // This should produce a SASLInitialResponse.
     assert_eq!(out.len(), 1, "AuthSASL → SendBytes(SASLInitialResponse)");
@@ -765,7 +750,6 @@ fn scram_sha256_handshake_end_to_end() {
     let server_first = format!("r={server_nonce_str},s={salt_b64},i={iterations}");
 
     // Step 5: Feed AuthenticationSASLContinue with server-first.
-    drop(out);
     let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()), &mut wb);
     // This should produce a SASLResponse (client-final-message).
     assert_eq!(out.len(), 1, "SASLContinue → SendBytes(SASLResponse)");
@@ -802,7 +786,6 @@ fn scram_sha256_handshake_end_to_end() {
     let server_final = format!("v={sig_b64}");
 
     // Step 7: Feed AuthenticationSASLFinal with server-final.
-    drop(out);
     let out = proto.feed_bytes(&auth_sasl_final_frame(server_final.as_bytes()), &mut wb);
     assert_eq!(out.len(), 0, "SASLFinal → state transition only (awaiting AuthOk)");
     assert!(matches!(
@@ -811,7 +794,6 @@ fn scram_sha256_handshake_end_to_end() {
     ));
 
     // Step 8: Feed AuthenticationOk.
-    drop(out);
     let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0, "AuthOk after SCRAM → post-auth chain");
     assert!(matches!(
@@ -820,13 +802,10 @@ fn scram_sha256_handshake_end_to_end() {
     ));
 
     // Step 9: Complete post-auth chain.
-    drop(out);
     let out = proto.feed_bytes(&param_status_frame("server_version", "17.2"), &mut wb);
     assert_eq!(out.len(), 0);
-    drop(out);
     let out = proto.feed_bytes(&backend_key_data_frame(42, 99), &mut wb);
     assert_eq!(out.len(), 0);
-    drop(out);
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1);
     match out.as_slice() {
@@ -872,13 +851,11 @@ fn scram_signature_mismatch_is_rejected() {
     let server_nonce_str = std::str::from_utf8(&server_nonce).unwrap_or("");
 
     let server_first = format!("r={server_nonce_str},s={salt_b64},i=4096");
-    drop(out);
     let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()), &mut wb);
     assert_eq!(out.len(), 1, "SASLContinue → SendBytes(SASLResponse)");
 
     // Send a WRONG server signature.
     let wrong_sig = "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-    drop(out);
     let out = proto.feed_bytes(&auth_sasl_final_frame(wrong_sig.as_bytes()), &mut wb);
 
     assert_eq!(out.len(), 2, "sig mismatch → FailReply + CloseSocket");
@@ -917,7 +894,6 @@ fn scram_iterations_too_low_is_rejected() {
 
     // iterations = 100 (below minimum 4096)
     let server_first = format!("r={server_nonce_str},s=QSXCR+Q6sek8bf92,i=100");
-    drop(out);
     let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()), &mut wb);
 
     assert_eq!(out.len(), 2, "low iterations → FailReply + CloseSocket");
@@ -945,7 +921,6 @@ fn scram_nonce_prefix_mismatch_is_rejected() {
 
     // Server-first with a nonce that does NOT start with client nonce.
     let server_first = b"r=COMPLETELY_DIFFERENT_NONCE,s=QSXCR+Q6sek8bf92,i=4096";
-    drop(out);
     let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first), &mut wb);
 
     assert_eq!(out.len(), 2, "nonce mismatch → FailReply + CloseSocket");
@@ -1053,9 +1028,9 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     // memory (`feedback_no_underscore_vars`). Post-auth shape is
     // verified below via state and out assertions on the real test
     // body (PS frame).
-    drop(proto.feed_bytes(&auth_ok_frame(), &mut wb));
-    drop(proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb));
-    drop(proto.feed_bytes(&rfq_frame(b'I'), &mut wb));
+    _ = proto.feed_bytes(&auth_ok_frame(), &mut wb);
+    _ = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
+    _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert!(
         matches!(proto.state(), ProtoState::Idle),
         "handshake should land in Idle, got {:?}",
@@ -1098,9 +1073,9 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     let startup_raw = raw(200);
     startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
     // Explicit `drop` (see preceding test for rationale).
-    drop(proto.feed_bytes(&auth_ok_frame(), &mut wb));
-    drop(proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb));
-    drop(proto.feed_bytes(&rfq_frame(b'I'), &mut wb));
+    _ = proto.feed_bytes(&auth_ok_frame(), &mut wb);
+    _ = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
+    _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
     // Send a ping. State → AwaitingPingReply.
     let ping_raw = raw(201);
@@ -1119,7 +1094,6 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
 
     // Server emits ParameterStatus before RFQ (e.g. an ALTER SYSTEM
     // committed during our ping's round-trip).
-    drop(push_out);
     let out = proto.feed_bytes(&param_status_frame("client_encoding", "LATIN1"), &mut wb);
     assert_eq!(out.len(), 0, "PS during flight emits no actions");
     assert!(
@@ -1132,7 +1106,6 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     );
 
     // Now feed RFQ — ping completes normally.
-    drop(out);
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1, "RFQ completes ping with DeliverReply");
     match out.as_slice() {
@@ -1173,7 +1146,7 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
     // Server offers SASL → we emit SASLInitialResponse → state is now
     // ConnectingScramAwaitServerFirst. Setup frame's actions discarded
     // explicitly — `let _ = ...` is banned.
-    drop(proto.feed_bytes(&auth_sasl_frame(), &mut wb));
+    _ = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     assert!(matches!(
         proto.state(),
         ProtoState::ConnectingScramAwaitServerFirst { .. },

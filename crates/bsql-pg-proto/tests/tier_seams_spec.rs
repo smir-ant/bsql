@@ -157,9 +157,9 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     let ping_raw = raw(7777);
     // Push ping and feed a FrameTooLarge frame. Setup-action list
     // discarded explicitly (`let _ = ...` is banned by user feedback).
-    drop(proto.push_command(PgCommand::Ping {
+    _ = proto.push_command(PgCommand::Ping {
         reply: id(ping_raw),
-    }, &mut wb));
+    }, &mut wb);
     // Declared length = 0xDEAD (way above MAX_FRAME_LEN_FIELD=4095).
     let frame = [b'Z', 0x00, 0x00, 0xDE, 0xAD];
     let out = proto.feed_bytes(&frame, &mut wb);
@@ -194,7 +194,6 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     // wrapper preserved the original diagnostic from the first
     // FailReply; this reply just classifies "already closed".
     let second_raw = raw(7778);
-    drop(out);
     let out = proto.push_command(PgCommand::Ping {
         reply: id(second_raw),
     }, &mut wb);
@@ -306,16 +305,16 @@ fn backend_key_data_wrong_payload_size_is_classified() {
     let startup_raw = raw(9000);
     // Setup: push Startup, feed AuthOk. Action lists are discarded
     // explicitly via `drop(...)` — `let _ = ...` is banned.
-    drop(proto.push_command(PgCommand::Startup {
+    _ = proto.push_command(PgCommand::Startup {
         user: Ident::try_from_str("u").unwrap_or_else(|_| panic!("valid ident")),
         database: None,
         app_name: None,
         credentials: Credentials::Trust,
         reply: id(startup_raw),
-    }, &mut wb));
+    }, &mut wb);
     // Feed AuthOk — now ConnectingPostAuthWaitKey.
     let auth_ok_frame: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
-    drop(proto.feed_bytes(&auth_ok_frame, &mut wb));
+    _ = proto.feed_bytes(&auth_ok_frame, &mut wb);
     assert!(matches!(
         proto.state(),
         ProtoState::ConnectingPostAuthWaitKey(_),

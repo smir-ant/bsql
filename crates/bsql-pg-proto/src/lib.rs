@@ -343,3 +343,20 @@ const _: () = assert!(
     !core::mem::needs_drop::<scram::types::ServerNonceTooLong>(),
     "ServerNonceTooLong must stay drop-free — error sentinel",
 );
+// DEF-094 follow-up: Action<'_> is Copy (post POD BoundedStr), so
+// `needs_drop::<Action<'static>>()` must be false — that's what
+// makes `OutActions<'buf>` releases-at-last-use under NLL (no
+// explicit `drop(out)` needed in tests).
+const _: () = assert!(
+    !core::mem::needs_drop::<action::Action<'static>>(),
+    "Action<'buf> must stay drop-free — POD BoundedStr + typed ProtocolError + Copy variants",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<error::ProtocolError>(),
+    "ProtocolError must stay drop-free — all variants' fields are Copy (DEF-060 POD BoundedStr)",
+);
+const _: () = assert!(
+    !core::mem::needs_drop::<action::OutActions<'static>>(),
+    "OutActions<'_> must stay drop-free — custom POD array (not heapless::Vec); \
+     this is what lets NLL release borrows at last use (no `drop()` calls needed in tests).",
+);
