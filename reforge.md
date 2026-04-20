@@ -1095,12 +1095,16 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 
 | # | Status | DEF  | Category           | One-liner |
 |---|--------|------|--------------------|-----------|
-| 1 | ✅     | 096  | ARCH/ALLOC/LIFETIME | `FixedStr<N, Tag>` unifies `Ident`/`DatabaseName`/`ApplicationName`/`BoundedStr`, POD, phantom-tag nominal typing |
+| 1 | ✅     | 096, 115 | ARCH/ALLOC/LIFETIME | DEF-096 `FixedStr<N, Tag>` unifies 4 string types via phantom tag; **DEF-115 escalation**: sealed `FixedStrKind`/`Validated` supertraits close the tier-4 hole where external crates could introduce their own tags. |
 | 2 | ✅     | 097, 112 | TYPESTATE/ALLOC | DEF-097 `Trust | Scram` split; **DEF-112** typed `ReplyId<K: ReplyKind>` with associated `Payload` — "dispatcher emits wrong Reply variant for this command-kind" is a tier-1 compile error; the sealed `action::deliver<K>(id, payload)` helper is the only sanctioned `DeliverReply` constructor (module-private fields) |
 | 3 | ✅     | 099  | ALLOC/CACHE        | `PodBytes<N>` replaces `heapless::Vec<u8, N>` in SCRAM state buffers (−16 bytes, Drop-free buffers) |
 | 4 | ⏳     | 104  | ALGO/CACHE         | `parse_error_response` field-kind `[Option<FieldKind>; 256]` table + kind-match |
 | 5 | ❌     | —    | ALGO               | `Severity::from_bytes` first-byte dispatch — cold path, LLVM already folds; re-evaluate via DEF-109 |
 | §5 | ❌    | 113  | ARCH               | StagedAction Success/Teardown split — skipped after exploration: `compute_push`'s success + soft-reject dual role breaks the clean two-way partition. See deferred §16 "Re-evaluated and skipped" block. Revisit post Phase 1c driver reshape. |
+| §10 | ✅   | 111, 116 | CONST/AUDIT   | DEF-111 N²-unrolled pairwise `const _: () = assert!()` for TAG/AUTH distinctness. **DEF-116 escalation** blocked on MSRV 1.95 (`<[T]>::get` not const-stable, `arr[i]` banned); pragmatic: + `#[cfg(test)]` drift-guard tests walking parallel arrays. Revisit when Rust stabilises. |
+| §2.15| ✅    | 117  | TYPESTATE          | `core::mem::replace(state, Errored(kind))` in `fail_inflight_and_close` — eliminates the "Default-is-Idle is load-bearing for transient window" tier-3 invariant. The transient window IS the post-state. |
+| §6 | ⏳    | 118  | TYPESTATE          | `ParsedFrame<'_>` proof-token for parse_header → advance. Explored both ambitious (generative lifetime) and minimal (pub(crate) token) forms — minimal doesn't elevate tier. Deferred to Phase 1c pipelining rework. |
+| §2.1 | ⏳  | 119  | TYPESTATE          | `PgProtocol<Phase>` outer typestate. Architect-rated "biggest tier elevation available". Scheduled for Phase 1c alongside pipelining. |
 | 6 | ✅     | 095  | ALLOC              | `Password.len: usize → u16` (−6B × propagation through state/command chain) |
 | 7 | ✅     | 101  | TYPESTATE          | Full-path audit + DEF-052 close via `cfg(test)` thread-panicking guard. Drop-guard KEPT (stable-Rust tier-2 ceiling; removing it would regress to tier-3 audit). See deferred §16 for analysis. |
 | 8 | ❌     | —    | ALLOC/ALGO         | ASCII fast-path bit — stdlib `from_utf8` already SIMD-dispatches ASCII; caching saves nothing under forbid(unsafe_code) |
@@ -1129,16 +1133,13 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 4. Validation gates: DEF-109, DEF-110.
 
 **Execution log:**
-- `8e4690a` DEF-095 ✅
-- `ac57e62` DEF-096 ✅
-- `052febe` DEF-097 ✅
-- `fd1f5cd` DEF-098 ✅
-- `ecee97c` DEF-099 ✅
-- `8ff256f` DEF-100 ✅
-- `b0dbd46` DEF-101 ✅ (re-scoped: full-path audit + DEF-052 close, Drop-guard kept)
-- `43c1877` DEF-111 ✅ (§10 wire TAG collision asserts)
-- *pending commit:* DEF-112 (§2 `ReplyId<K: ReplyKind>` type-tagged per command)
-- *next:* DEF-113 (§5 internal StagedAction split) → DEF-114 (§4 typed session params) → DEF-102 (base64ct).
+- `8e4690a` DEF-095 ✅ • `ac57e62` DEF-096 ✅ • `052febe` DEF-097 ✅ • `fd1f5cd` DEF-098 ✅ • `ecee97c` DEF-099 ✅ • `8ff256f` DEF-100 ✅
+- `b0dbd46` DEF-101 ✅ (re-scoped) • `43c1877` DEF-111 ✅ • `ce6a8bf` DEF-112 ✅ • `406e36a` DEF-114 ✅
+- `324948f` DEF-115/116/117 ✅ (round-3 escalations — honest tier analysis)
+- **Rejected** DEF-113 (StagedAction Success/Teardown split) — `compute_push`'s dual role breaks clean partition.
+- **Deferred** DEF-118 (ParsedFrame proof-token) — ambitious form is a natural fit for Phase 1c pipelining rework.
+- **Deferred to Phase 1c** DEF-119 (`PgProtocol<Phase>` outer typestate) — architect-rated "biggest tier elevation available"; folds naturally into pipelining.
+- *next:* DEF-102 (base64ct security) → DEF-103..108 perf wave.
 
 ## §18. Command enum
 

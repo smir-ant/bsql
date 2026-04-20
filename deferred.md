@@ -512,6 +512,28 @@ Close only after `cargo asm` confirms the win is real:
 - **DEF-109** — `Severity::from_bytes` first-byte dispatch. Current: 9-arm `match bytes` on byte-slice literals. If LLVM folds to byte-tree / memcmp chain (likely): skip. If branch chain (unlikely on cold path): ship first-byte table.
 - **DEF-110** — `ProtocolError::kind` repr optimisation. Current: exhaustive match, called on every fatal classification. If jump-table already emitted: skip. Otherwise: `#[repr(u8)]` discriminant reordering to pack by ErrorKind.
 
+### Round 3 — additional escalations (2026-04-20)
+
+Round 3 architect audit caught tier overclaims that rounds 1/2 missed.
+All reaffirmations / escalations below.
+
+| Commit | ID | One-liner |
+|---|---|---|
+| `324948f` | **DEF-115** | seal `FixedStrKind` / `Validated` (escalation of DEF-096) — external crates could impl these for their own tags; tier-4 hole closed by sealed supertrait. |
+| `324948f` | **DEF-116** | sorted-array collision loop (escalation of DEF-111) — **blocked** on MSRV 1.95 (`<[T]>::get` not const-stable; `arr[i]` banned by `forbid(indexing_slicing)`). Pragmatic form: keep hand-unrolled const asserts + add `#[cfg(test)]` drift-guard tests walking parallel `*_FOR_RUNTIME_CHECK` arrays. Revisit when Rust stabilises `<[T]>::get` in const. |
+| `324948f` | **DEF-117** | `core::mem::replace` instead of `take` in `fail_inflight_and_close` — eliminates the "`ProtoState::Default = Idle` is load-bearing for transient window safety" invariant. tier-3 → tier-1. |
+
+### Round 3 — deferred with honest rationale
+
+- **DEF-118 — `ParsedFrame<'_>` proof-token for parse_header → advance (P2.6).** Architect proposed tying `ReadBuf::advance`'s amount to `parse_header`'s output via a non-Clone typed token, so that a future refactor passing the wrong `total_len` becomes a compile error. **Two forms were explored:**
+
+  - *Ambitious form* (generative lifetime): `HeaderParse<'a>::Ok { advance: FrameAdvance<'a> }`, with `consume_frame(&mut self, FrameAdvance<'_>)`. Real tier-1 compile gate. Cost: changes `HeaderParse` to non-Copy, lifetime-carrying; propagates to every caller (including external tests). Non-trivial rework.
+  - *Minimal form*: `FrameAdvance { total_len: usize }` with `pub(crate)` constructor, added alongside existing `pub fn advance(usize)`. Inside `feed_bytes`, internal dispatchers use `consume_parsed(FrameAdvance)`; external tests retain `advance(usize)`. The tier claim becomes "internal dispatchers use the typed path" — **tier-3 audit (internal convention), not tier-1 compile**. Does not beat DEF-111's current form.
+
+  Both forms punt against the current API shape. The real tier gain requires the ambitious form; the minimal form doesn't elevate. **Defer until Phase 1c pipelining reshapes the feed_bytes loop anyway**, at which point the ambitious form is a natural extension.
+
+- **DEF-119 — `PgProtocol<Phase>` outer typestate (§2.1).** Architect: "single biggest tier elevation available". `PgProtocol<Idle>` accepts `push_command`; `PgProtocol<InFlight<K>>` does not. `push_command` while `AwaitingPingReply` → compile error instead of runtime `FailReply(UnexpectedFrame)`. Three classes of runtime failures (push-while-in-flight, startup-twice, command-after-close) → compile errors. Cost: ~150 LoC `PgProtocol` restructure + every test harness update; changes `push_command` signature to `self → Self` transition. **Schedule with Phase 1c pipelining** — the transition is natural there, and pipelining forces a new in-flight model anyway that DEF-119 naturally folds into.
+
 ### Re-evaluated and skipped after exploratory work
 
 - **DEF-113 / §5 — Internal StagedAction Success/Teardown split.**
