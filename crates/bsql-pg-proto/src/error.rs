@@ -116,15 +116,14 @@ impl SqlStateCode {
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut out = [b' '; 5];
-        let mut i = 0;
-        while i < 5 && i < bytes.len() {
-            let b = bytes.get(i).copied().unwrap_or(b'?');
-            let safe = if b.is_ascii() { b } else { b'?' };
-            match out.get_mut(i) {
-                Some(slot) => *slot = safe,
-                None => break,
+        let take = bytes.len().min(5);
+        if let (Some(dst), Some(src)) = (out.get_mut(..take), bytes.get(..take)) {
+            dst.copy_from_slice(src);
+        }
+        for byte in &mut out {
+            if !byte.is_ascii() {
+                *byte = b'?';
             }
-            i = i.saturating_add(1);
         }
         Self { bytes: out }
     }
@@ -192,77 +191,75 @@ impl<const N: usize> Default for BoundedStr<N> {
 }
 
 impl<const N: usize> BoundedStr<N> {
+    /// UTF-8 ellipsis marker appended on overflow. 3 bytes.
+    /// `as_bytes()` on a `&str` literal is const since Rust 1.39.
+    const OVERFLOW_MARKER: &[u8] = "…".as_bytes();
+
     /// Construct from a `&str`, truncating with `"…"` on overflow.
-    /// Never panics, never silently drops.
+    /// Never panics, never silently drops content.
+    ///
+    /// Happy path (source fits): one `copy_from_slice` memcpy.
+    /// Overflow path: `is_char_boundary` walks up to 3 bytes backward
+    /// to find the nearest UTF-8 boundary — O(1), not O(N).
     #[must_use]
     pub fn from_str_truncating(source: &str) -> Self {
         // Compile-time drift guard: `N` must fit the u16 length
-        // prefix. `const { ... }` block evaluates at monomorph time;
-        // `N > 65_535` fails the build rather than silently truncating
-        // at runtime. `65_535` hard-coded instead of `u16::MAX as
-        // usize` because `as` casts are banned (forbid bundle).
+        // prefix. `const { ... }` inline-const block evaluates at
+        // monomorphisation time; `N > 65_535` fails the build rather
+        // than silently truncating at runtime. `65_535` hard-coded
+        // instead of `u16::MAX as usize` because `as` casts are
+        // banned by the crate forbid bundle.
         const { assert!(N <= 65_535, "BoundedStr<N>: N must fit u16 length prefix (≤ 65535)"); }
-        let src_bytes = source.as_bytes();
-        if src_bytes.len() <= N {
-            let mut out = Self::default();
-            // Copy via explicit loop (avoids `[..] = ..` slicing
-            // which trips `clippy::indexing_slicing`).
-            let mut i = 0;
-            while i < src_bytes.len() {
-                if let (Some(dst), Some(byte)) = (out.buf.get_mut(i), src_bytes.get(i)) {
-                    *dst = *byte;
-                }
-                i = i.saturating_add(1);
+
+        let mut out = Self::default();
+        let src = source.as_bytes();
+
+        // Fast path: source fits verbatim.
+        if src.len() <= N {
+            if let Some(dst) = out.buf.get_mut(..src.len()) {
+                dst.copy_from_slice(src);
             }
-            out.len = u16::try_from(src_bytes.len()).unwrap_or(0);
+            out.len = u16::try_from(src.len()).unwrap_or(0);
             return out;
         }
-        // Source too long. UTF-8-ellipsis marker is 3 bytes.
-        const MARKER: &[u8] = "…".as_bytes();
-        const MARKER_LEN: usize = MARKER.len();
-        let budget = N.saturating_sub(MARKER_LEN);
-        // Walk UTF-8 char boundaries to find the largest prefix ≤ budget.
-        let mut fit_end = 0usize;
-        for (i, _) in source.char_indices() {
-            if i > budget {
-                break;
-            }
-            fit_end = i;
+
+        // Slow path: truncate to the largest UTF-8 prefix that fits
+        // in `N - MARKER.len()` bytes, then append the marker.
+        let budget = N.saturating_sub(Self::OVERFLOW_MARKER.len());
+        let mut fit_end = budget.min(src.len());
+        // A UTF-8 char is 1..=4 bytes; this loop converges in ≤ 3 steps.
+        while fit_end > 0 && !source.is_char_boundary(fit_end) {
+            fit_end = fit_end.saturating_sub(1);
         }
-        let prefix = source.get(..fit_end).unwrap_or("").as_bytes();
-        let mut out = Self::default();
-        let mut i = 0;
-        while i < prefix.len() {
-            if let (Some(dst), Some(byte)) = (out.buf.get_mut(i), prefix.get(i)) {
-                *dst = *byte;
-            }
-            i = i.saturating_add(1);
+
+        // Copy prefix `src[..fit_end]` into `out.buf[..fit_end]`.
+        if let (Some(dst), Some(slice)) = (out.buf.get_mut(..fit_end), src.get(..fit_end)) {
+            dst.copy_from_slice(slice);
         }
-        // Append marker.
-        let mut j = 0;
-        while j < MARKER.len() {
-            let slot = prefix.len().saturating_add(j);
-            if let (Some(dst), Some(byte)) = (out.buf.get_mut(slot), MARKER.get(j)) {
-                *dst = *byte;
-            }
-            j = j.saturating_add(1);
+        // Copy marker into `out.buf[fit_end..fit_end + marker_len]`.
+        let marker_end = fit_end.saturating_add(Self::OVERFLOW_MARKER.len());
+        if let Some(dst) = out.buf.get_mut(fit_end..marker_end) {
+            dst.copy_from_slice(Self::OVERFLOW_MARKER);
         }
-        let total = prefix.len().saturating_add(MARKER_LEN);
-        out.len = u16::try_from(total).unwrap_or(0);
+        out.len = u16::try_from(marker_end).unwrap_or(0);
         out
     }
 
     /// Borrow the string content.
+    ///
+    /// **Cost: O(N) in worst case** — `core::str::from_utf8` validates
+    /// UTF-8 on every call. The bytes are guaranteed UTF-8 by
+    /// construction (only ever copied from `&str` or the static UTF-8
+    /// marker), but safe Rust has no "trust-me-don't-check" form;
+    /// `unsafe { from_utf8_unchecked }` is forbidden by the crate
+    /// `#![forbid(unsafe_code)]`. `BoundedStr::as_str` lives only on
+    /// error-path `Display` — cold enough that the O(N) cost is
+    /// acceptable. The `.unwrap_or("")` fallback surfaces a future
+    /// construction bug rather than panicking.
     #[inline]
-    #[must_use]
     pub fn as_str(&self) -> &str {
         let end = usize::from(self.len).min(N);
         let bytes = self.buf.get(..end).unwrap_or(&[]);
-        // `bytes` is always valid UTF-8 by construction
-        // (`from_str_truncating` only copies from `&str` and from
-        // the UTF-8 marker, both guaranteed UTF-8). The `.unwrap_or`
-        // fallback is architecturally dead; surfacing it honestly
-        // avoids the forbidden `.unwrap()`.
         core::str::from_utf8(bytes).unwrap_or("")
     }
 

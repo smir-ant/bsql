@@ -813,14 +813,13 @@ fn materialise<'buf>(staged: StagedActions, buf: &'buf [u8]) -> OutActions<'buf>
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
             StagedAction::CloseSocket => Action::CloseSocket,
         };
-        // Both collectors have the same MAX_ACTIONS_PER_CALL bound, so
-        // this push is architecturally infallible. An `if`-consume
-        // with an unreachable body satisfies `must_use` without a
-        // `let _` (banned) or a `drop(bool)` (triggers
-        // `clippy::drop_non_drop`).
-        if out.push(a).is_err() {
-            // Architecturally unreachable per the identical bounds.
-        }
+        // `staged` and `out` share `MAX_ACTIONS_PER_CALL` as their
+        // bound — staged's length is ≤ out's capacity, so push never
+        // fails. `unwrap_or(())` discards the (unreachable) Err
+        // branch cleanly: both Ok and Err arms evaluate to `()`,
+        // satisfying the `must_use` on `push` without `let _` (banned)
+        // or `drop(bool)` (clippy::drop_non_drop).
+        out.push(a).unwrap_or(());
     }
     out
 }

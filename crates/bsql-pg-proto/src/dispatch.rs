@@ -365,7 +365,7 @@ fn dispatch_auth_in_startup(
             if !mechanism_list_contains_scram(rest) {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: scram_err(crate::scram::wire::ScramError::NoSupportedMechanism),
+                    cause: ProtocolError::Scram(crate::scram::wire::ScramError::NoSupportedMechanism),
                 };
             }
 
@@ -444,13 +444,13 @@ fn build_sasl_initial_response(
     // an empty "n=" field is accepted per RFC 5802.
     let user_bytes: &[u8] = b"";
 
-    let client_nonce_b64 = wire::generate_client_nonce().map_err(scram_err)?;
+    let client_nonce_b64 = wire::generate_client_nonce().map_err(ProtocolError::Scram)?;
 
     let client_first_bare =
-        wire::build_client_first_bare(user_bytes, &client_nonce_b64).map_err(scram_err)?;
+        wire::build_client_first_bare(user_bytes, &client_nonce_b64).map_err(ProtocolError::Scram)?;
 
     let client_first_msg =
-        wire::build_client_first_message(user_bytes, &client_nonce_b64).map_err(scram_err)?;
+        wire::build_client_first_message(user_bytes, &client_nonce_b64).map_err(ProtocolError::Scram)?;
 
     // Build SASLInitialResponse frame in-place in the caller-owned
     // `write_buf`. DEF-094: the entry-point materialises the
@@ -459,7 +459,7 @@ fn build_sasl_initial_response(
     let start = write_buf.len();
     write_buf
         .push_u8(crate::wire::TAG_SASL_RESPONSE)
-        .map_err(|_| scram_err(crate::scram::wire::ScramError::BufferOverflow))?;
+        .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     write_buf
         .with_length_prefix(|w| {
             // Mechanism name NUL-terminated.
@@ -476,7 +476,7 @@ fn build_sasl_initial_response(
                 .map_err(|_| crate::write_buf::WriteBufFull)?;
             Ok(())
         })
-        .map_err(|_| scram_err(crate::scram::wire::ScramError::BufferOverflow))?;
+        .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     let end = write_buf.len();
 
     Ok((start, end, client_first_bare, client_nonce_b64))
@@ -526,7 +526,7 @@ fn dispatch_auth_sasl_continue(
             Err(e) => {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: scram_err(e),
+                    cause: ProtocolError::Scram(e),
                 };
             }
         };
@@ -544,7 +544,7 @@ fn dispatch_auth_sasl_continue(
             Err(e) => {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: scram_err(e),
+                    cause: ProtocolError::Scram(e),
                 };
             }
         };
@@ -573,7 +573,7 @@ fn dispatch_auth_sasl_continue(
             Err(_) => {
                 return DispatchOutcome::Errored {
                     reply_id: Some(reply),
-                    cause: scram_err(crate::scram::wire::ScramError::BufferOverflow),
+                    cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
                 }
             }
         };
@@ -582,7 +582,7 @@ fn dispatch_auth_sasl_continue(
         None => {
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),
-                cause: scram_err(crate::scram::wire::ScramError::BufferOverflow),
+                cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
             }
         }
     };
@@ -596,7 +596,7 @@ fn dispatch_auth_sasl_continue(
         Err(e) => {
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),
-                cause: scram_err(e),
+                cause: ProtocolError::Scram(e),
             };
         }
     };
@@ -612,7 +612,7 @@ fn dispatch_auth_sasl_continue(
     {
         return DispatchOutcome::Errored {
             reply_id: Some(reply),
-            cause: scram_err(crate::scram::wire::ScramError::BufferOverflow),
+            cause: ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow),
         };
     }
     let end = write_buf.len();
@@ -655,7 +655,7 @@ fn dispatch_auth_sasl_final(
         Err(e) => {
             return DispatchOutcome::Errored {
                 reply_id: Some(reply),
-                cause: scram_err(e),
+                cause: ProtocolError::Scram(e),
             };
         }
     };
@@ -664,7 +664,7 @@ fn dispatch_auth_sasl_final(
     if !bool::from(expected_server_sig.ct_eq(&received_sig)) {
         return DispatchOutcome::Errored {
             reply_id: Some(reply),
-            cause: scram_err(crate::scram::wire::ScramError::SignatureMismatch),
+            cause: ProtocolError::Scram(crate::scram::wire::ScramError::SignatureMismatch),
         };
     }
 
@@ -812,24 +812,6 @@ fn parse_backend_key_data(payload: &[u8]) -> Result<(i32, i32), ProtocolError> {
             payload_len: other.len(),
         }),
     }
-}
-
-/// Wrap a [`scram::wire::ScramError`] into the protocol's typed
-/// [`ProtocolError::Scram`] variant. The helper exists so the call
-/// sites can write `.map_err(scram_err)` instead of
-/// `.map_err(ProtocolError::Scram)` — more discoverable by name and
-/// one place to hook diagnostics in the future.
-///
-/// DEF-060: this replaces the earlier `scram_err<E: Display>`
-/// which formatted the source into a `heapless::String<128>` — the
-/// tier-3 silent-truncation class (oversized messages collapsed to
-/// empty via `unwrap_or_default`). Typed variants eliminate the
-/// class entirely.
-///
-/// [`scram::wire::ScramError`]: crate::scram::wire::ScramError
-#[cold]
-fn scram_err(failure: crate::scram::wire::ScramError) -> ProtocolError {
-    ProtocolError::Scram(failure)
 }
 
 #[cfg(test)]
