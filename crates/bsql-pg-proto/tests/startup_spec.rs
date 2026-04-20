@@ -165,7 +165,7 @@ fn startup_trust<'a>(
     user: &str,
     db: Option<&str>,
     reply_raw: NonZeroU64,
-) -> bsql_pg_proto::OutActions<'a> {
+) -> bsql_pg_proto::OutActions<'a, 'static> {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let database = db.map(|d| {
         bsql_pg_proto::DatabaseName::try_from_str(d).unwrap_or_else(|e| panic!("bad db: {e}"))
@@ -197,7 +197,7 @@ fn trust_auth_handshake_end_to_end() {
     assert_eq!(out.len(), 1, "Startup emits exactly 1 action (SendBytes)");
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
-            let bytes = *send_buf;
+            let bytes = send_buf;
             // Verify the StartupMessage wire format.
             // First 4 bytes: length (includes self).
             // Next 4 bytes: protocol version 196608.
@@ -520,7 +520,7 @@ fn startup_message_wire_format() {
 
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
-            let bytes = *send_buf;
+            let bytes = send_buf;
             // Parse the length prefix.
             let len_bytes = bytes.get(..4).unwrap_or(&[]);
             let declared = u32::from_be_bytes([
@@ -630,7 +630,7 @@ fn startup_scram<'a>(
     user: &str,
     password: &str,
     reply_raw: NonZeroU64,
-) -> bsql_pg_proto::OutActions<'a> {
+) -> bsql_pg_proto::OutActions<'a, 'static> {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
     proto.push_command(PgCommand::Startup {
@@ -702,7 +702,7 @@ fn scram_sha256_handshake_end_to_end() {
     // 0x00030000) occupies bytes [4..8] after the 4-byte length prefix.
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
-            let bytes = *send_buf;
+            let bytes = send_buf;
             assert!(bytes.len() >= 8, "StartupMessage must be >= 8 bytes");
             assert_eq!(
                 bytes.get(4..8),
@@ -1088,7 +1088,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     match push_out.as_slice() {
         [Action::SendBytes(send_buf)] => {
             assert_eq!(
-                *send_buf,
+                send_buf,
                 &bsql_pg_proto::wire::SYNC_WIRE_BYTES,
                 "Ping must emit the 5-byte const Sync wire payload",
             );

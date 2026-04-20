@@ -133,8 +133,8 @@ const _: fn() = || {
     // Phase 1a types. `Action<'_>` and `OutActions<'_>` carry a
     // lifetime (DEF-094); asserting for `'static` implies Send for
     // any shorter lifetime by covariance.
-    assert_send::<action::Action<'static>>();
-    assert_send::<action::OutActions<'static>>();
+    assert_send::<action::Action<'static, 'static>>();
+    assert_send::<action::OutActions<'static, 'static>>();
     assert_send::<action::Reply>();
     assert_send::<command::PgCommand>();
     assert_send::<error::ProtocolError>();
@@ -252,7 +252,7 @@ const _: () = assert!(
      variant add a large inline buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action<'static>>() <= 320,
+    core::mem::size_of::<action::Action<'static, 'static>>() <= 320,
     "Action<'_> size regression — post-DEF-094/096 budget is 320 bytes. \
      Action is dominated by FailReply.cause (ProtocolError ~304 bytes); \
      SendBytes is now a 16-byte &[u8]. If this trips, someone grew \
@@ -287,7 +287,7 @@ const _: () = assert!(
      session_params ~420 + padding.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static>>() <= 1280,
+    core::mem::size_of::<action::OutActions<'static, 'static>>() <= 1280,
     "OutActions<'_> size regression — 4 × sizeof(Action<'_>) + u8 len + \
      padding. Post-DEF-094/096 budget: 1280 bytes.",
 );
@@ -373,7 +373,7 @@ const _: () = assert!(
 // makes `OutActions<'buf>` releases-at-last-use under NLL (no
 // explicit `drop(out)` needed in tests).
 const _: () = assert!(
-    !core::mem::needs_drop::<action::Action<'static>>(),
+    !core::mem::needs_drop::<action::Action<'static, 'static>>(),
     "Action<'buf> must stay drop-free — POD BoundedStr + typed ProtocolError + Copy variants",
 );
 const _: () = assert!(
@@ -381,7 +381,7 @@ const _: () = assert!(
     "ProtocolError must stay drop-free — all variants' fields are Copy (DEF-060 POD BoundedStr)",
 );
 const _: () = assert!(
-    !core::mem::needs_drop::<action::OutActions<'static>>(),
+    !core::mem::needs_drop::<action::OutActions<'static, 'static>>(),
     "OutActions<'_> must stay drop-free — custom POD array (not heapless::Vec); \
      this is what lets NLL release borrows at last use (no `drop()` calls needed in tests).",
 );

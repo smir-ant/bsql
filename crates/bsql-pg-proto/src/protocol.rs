@@ -262,16 +262,21 @@ impl PgProtocol {
     /// field) so no observer can witness the window; the split is
     /// safe even though the intermediate is not the terminal state.
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn push_command<'buf>(
+    pub fn push_command<'w>(
         &mut self,
         cmd: PgCommand,
-        write_buf: &'buf mut WriteBuf,
-    ) -> OutActions<'buf> {
+        write_buf: &'w mut WriteBuf,
+    ) -> OutActions<'w, 'static> {
+        // 1c-1a: push never produces `StreamRow` (rows arrive via
+        // server responses, handled in `feed_bytes`). The `'r`
+        // lifetime parameter on `OutActions<'w, 'r>` is phantom on
+        // this path — unifying it to `'static` gives the caller
+        // freedom over what they pair the result with later.
         write_buf.clear();
         let prev = core::mem::take(&mut self.state);
         let (new_state, staged) = compute_push(cmd, prev, write_buf);
         self.state = new_state;
-        materialise(staged, write_buf.as_bytes())
+        materialise(staged, write_buf.as_bytes(), &[])
     }
 
     /// Feed inbound wire bytes.
@@ -280,13 +285,19 @@ impl PgProtocol {
     /// DEF-094: caller-owned `write_buf` — see [`push_command`] for
     /// the staged-dispatch architecture.
     ///
+    /// 1c-1a: `&'r mut self` — the row slices in `Action::StreamRow`
+    /// borrow from `self.read_buf`. The `'r` lifetime propagates
+    /// into `OutActions<'w, 'r>`; the borrow checker blocks
+    /// subsequent `&mut self` calls (and thus the next `feed_bytes`)
+    /// until `OutActions` drops.
+    ///
     /// [`push_command`]: Self::push_command
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn feed_bytes<'buf>(
-        &mut self,
+    pub fn feed_bytes<'w, 'r>(
+        &'r mut self,
         bytes: &[u8],
-        write_buf: &'buf mut WriteBuf,
-    ) -> OutActions<'buf> {
+        write_buf: &'w mut WriteBuf,
+    ) -> OutActions<'w, 'r> {
         write_buf.clear();
         let mut staged = StagedActions::new();
 
@@ -303,7 +314,7 @@ impl PgProtocol {
                 },
                 &mut staged,
             );
-            return materialise(staged, write_buf.as_bytes());
+            return materialise(staged, write_buf.as_bytes(), self.read_buf.unread());
         }
 
         // Drain as many complete frames as possible. Bounded by
@@ -429,7 +440,11 @@ impl PgProtocol {
             }
         }
 
-        materialise(staged, write_buf.as_bytes())
+        // 1c-1a: two buffers feed `materialise`. `write_buf`
+        // supplies `'w` for `SendBytes` slices; `self.read_buf`
+        // supplies `'r` for `StreamRow` slices (not emitted yet
+        // in 1c-1a — wired in 1c-1b).
+        materialise(staged, write_buf.as_bytes(), self.read_buf.unread())
     }
 
     /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
@@ -840,27 +855,33 @@ fn build_startup_message(
 }
 
 /// Phase-2 materialiser: convert the write-phase's
-/// [`StagedActions`] into [`OutActions<'buf>`] with references into
-/// `buf` (range variants) or static references (constants).
+/// [`StagedActions`] into [`OutActions<'w, 'r>`] with references
+/// into `write_buf_bytes` (`'w` — range variants, static constants)
+/// or `read_buf_bytes` (`'r` — StreamRow variants once 1c-1b wires
+/// row emission).
 ///
-/// DEF-094 lifetime plumbing: `buf` is the caller-owned
-/// [`WriteBuf`]'s shared-borrow slice; the `'buf` lifetime
-/// propagates into every emitted [`Action::SendBytes`]. The borrow
-/// checker refuses any `&mut WriteBuf` re-borrow while the returned
-/// `OutActions<'buf>` is alive, enforcing consume-before-next-call
-/// at tier-1 compile.
-fn materialise<'buf>(staged: StagedActions, buf: &'buf [u8]) -> OutActions<'buf> {
+/// DEF-094 + 1c-1a lifetime plumbing: `write_buf_bytes` supplies
+/// `'w`; `read_buf_bytes` supplies `'r`. The borrow checker
+/// refuses any `&mut WriteBuf` re-borrow while the returned
+/// `OutActions<'w, 'r>` is alive, and any `&mut self` re-borrow
+/// on `PgProtocol` (thus `feed_bytes`) while `'r` is alive.
+fn materialise<'w, 'r>(
+    staged: StagedActions,
+    write_buf_bytes: &'w [u8],
+    _read_buf_bytes: &'r [u8],
+) -> OutActions<'w, 'r> {
+    // `_read_buf_bytes` is unused in 1c-1a — wired in 1c-1b when
+    // `StagedAction::StreamRowRange` is introduced. Until then the
+    // `'r` parameter on `OutActions` is phantom.
     let mut out = OutActions::new();
     for sa in staged {
-        let a: Action<'buf> = match sa {
+        let a: Action<'w, 'r> = match sa {
             StagedAction::SendBytesRange(range) => {
                 // DEF-100: `range: NonEmptyRange` was constructor-
-                // validated at emission (`end ≤ write_buf.len()` at
-                // emission, `len > 0` via `NonZeroUsize`). `apply(buf)`
-                // can only be None if `buf` is shorter than the
-                // emission-time `write_buf` — architecturally the
-                // same buffer, so this branch is dead.
-                Action::SendBytes(range.apply(buf).unwrap_or(&[]))
+                // validated at emission. `apply(write_buf_bytes)`
+                // can only be None if the buffer is shorter than
+                // emission-time — architecturally the same buffer.
+                Action::SendBytes(range.apply(write_buf_bytes).unwrap_or(&[]))
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
             // DEF-112: `DeliverReplyEntry` fields are module-private.

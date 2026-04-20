@@ -139,22 +139,22 @@ impl NonEmptyRange {
 /// macro's `const _: () = assert!(MAX_ACTIONS_PER_CALL >= budget)`
 /// checks at every push site.
 #[derive(Debug, Clone, Copy)]
-pub struct OutActions<'buf> {
+pub struct OutActions<'w, 'r> {
     /// Fixed slot storage; slots past `len` hold the default
     /// sentinel ([`Action::CloseSocket`]) from construction.
-    items: [Action<'buf>; MAX_ACTIONS_PER_CALL],
+    items: [Action<'w, 'r>; MAX_ACTIONS_PER_CALL],
     /// Number of populated slots in `items[..len]`. `u8` suffices
     /// since `MAX_ACTIONS_PER_CALL` is tiny (currently 4).
     len: u8,
 }
 
-impl Default for OutActions<'_> {
+impl Default for OutActions<'_, '_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'buf> OutActions<'buf> {
+impl<'w, 'r> OutActions<'w, 'r> {
     /// Construct an empty `OutActions`.
     #[inline]
     #[must_use]
@@ -186,14 +186,14 @@ impl<'buf> OutActions<'buf> {
 
     /// Borrow the populated prefix as a slice.
     #[inline]
-    pub fn as_slice(&self) -> &[Action<'buf>] {
+    pub fn as_slice(&self) -> &[Action<'w, 'r>] {
         self.items.get(..self.len()).unwrap_or(&[])
     }
 
     /// Return the first populated action (or `None` if empty).
     /// Convenience for test assertions.
     #[inline]
-    pub fn first(&self) -> Option<&Action<'buf>> {
+    pub fn first(&self) -> Option<&Action<'w, 'r>> {
         self.as_slice().first()
     }
 
@@ -201,7 +201,7 @@ impl<'buf> OutActions<'buf> {
     /// convention) if the container is full.
     #[inline]
     #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; mirrors heapless::Vec::push API. Err is only hit under architecturally-bounded overflow (compile-time emit_actions! budget).")]
-    pub fn push(&mut self, action: Action<'buf>) -> Result<(), Action<'buf>> {
+    pub fn push(&mut self, action: Action<'w, 'r>) -> Result<(), Action<'w, 'r>> {
         let idx = self.len();
         if idx >= MAX_ACTIONS_PER_CALL {
             return Err(action);
@@ -215,24 +215,24 @@ impl<'buf> OutActions<'buf> {
     }
 }
 
-impl<'buf> IntoIterator for OutActions<'buf> {
-    type Item = Action<'buf>;
-    type IntoIter = OutActionsIter<'buf>;
+impl<'w, 'r> IntoIterator for OutActions<'w, 'r> {
+    type Item = Action<'w, 'r>;
+    type IntoIter = OutActionsIter<'w, 'r>;
     fn into_iter(self) -> Self::IntoIter {
         OutActionsIter { inner: self, pos: 0 }
     }
 }
 
 /// Move-iterator for [`OutActions`]. Produces each populated
-/// [`Action<'buf>`] in insertion order, then ends.
+/// [`Action<'w, 'r>`] in insertion order, then ends.
 #[derive(Debug)]
-pub struct OutActionsIter<'buf> {
-    inner: OutActions<'buf>,
+pub struct OutActionsIter<'w, 'r> {
+    inner: OutActions<'w, 'r>,
     pos: u8,
 }
 
-impl<'buf> Iterator for OutActionsIter<'buf> {
-    type Item = Action<'buf>;
+impl<'w, 'r> Iterator for OutActionsIter<'w, 'r> {
+    type Item = Action<'w, 'r>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.pos >= self.inner.len {
             return None;
@@ -262,10 +262,24 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, MAX_ACTIONS_PER_CALL
 /// into that `WriteBuf` (for runtime-built frames) or a static
 /// reference (for compile-time constants; `'static: 'buf`).
 ///
-/// `#[non_exhaustive]` because more variants land with later sub-phases
-/// (`StreamRow`, etc.). Internal `match` over `Action` is *not*
-/// `non_exhaustive` (we treat the type's own crate as authoritative
-/// for the internal exhaustive check).
+/// # Two lifetimes (1c-1a)
+///
+/// `'w` names bytes living in the caller's `WriteBuf` (outbound —
+/// `SendBytes`). `'r` names bytes living in the protocol's
+/// `ReadBuf` (inbound — `StreamRow`). Two distinct lifetimes
+/// because the two buffers are distinct sources and the borrow
+/// checker needs the information to enforce:
+///
+/// - Next `&mut WriteBuf` call blocked while `SendBytes(&'w …)`
+///   alive (DEF-094 invariant).
+/// - Next `&mut PgProtocol` call blocked while `StreamRow(&'r …)`
+///   alive — the row slice is inside `self.read_buf`, so
+///   `feed_bytes` takes `&'r mut self` and the output's `'r`
+///   borrows back from `self`.
+///
+/// `#[non_exhaustive]` because more variants land with later
+/// sub-phases. Internal `match` over `Action` is *not*
+/// `non_exhaustive`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
@@ -273,23 +287,22 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, MAX_ACTIONS_PER_CALL
     clippy::large_enum_variant,
     reason = "no_alloc: Box unavailable; FailReply.cause (ProtocolError ~280 bytes after DEF-060) dominates. \
               Shrinking further requires a typed ErrorDetail pointer indirection — deferred to post-1c. \
-              Copy-derived so OutActions<'buf> can be Drop-free and NLL releases borrows at last use."
+              Copy-derived so OutActions<'_, '_> can be Drop-free and NLL releases borrows at last use."
 )]
-pub enum Action<'buf> {
+pub enum Action<'w, 'r> {
     /// Send these bytes verbatim to the server.
     ///
     /// The slice references the caller-owned [`crate::write_buf::WriteBuf`]
     /// (for runtime-built frames) or static storage (for compile-time
-    /// constants). The host reads the slice, writes it to the socket,
-    /// and drops the [`Action`]; no data is copied out of the
-    /// protocol. Zero-copy.
+    /// constants; `'static: 'w`). The host reads the slice, writes
+    /// it to the socket, and drops the [`Action`]; no data is copied
+    /// out of the protocol. Zero-copy.
     ///
-    /// The `'buf` lifetime ensures the slice is valid for exactly
-    /// as long as the owning `OutActions<'buf>` is alive — the next
-    /// protocol entry-point call is blocked by the borrow checker
-    /// until the caller drops `OutActions` and releases the
-    /// `&mut WriteBuf`.
-    SendBytes(&'buf [u8]),
+    /// The `'w` lifetime ensures the slice is valid for exactly
+    /// as long as the owning `OutActions<'w, '_>` is alive — the
+    /// next `&mut WriteBuf` call is blocked by the borrow checker
+    /// until the caller drops `OutActions`.
+    SendBytes(&'w [u8]),
 
     /// Deliver a successful reply to the wrapper.
     ///
@@ -321,6 +334,30 @@ pub enum Action<'buf> {
         id: NonZeroU64,
         /// Why the protocol failed the in-flight command.
         cause: ProtocolError,
+    },
+
+    /// Stream one row of a query result to the wrapper.
+    ///
+    /// The `row_bytes` slice points into the protocol's `ReadBuf`
+    /// and is valid for the lifetime of the owning `OutActions<'_, 'r>`.
+    /// The wrapper copies / decodes the bytes before the next
+    /// `feed_bytes` call — architecturally enforced because that
+    /// call requires `&'r mut self` which blocks while the row
+    /// reference is alive. Zero-copy row delivery.
+    ///
+    /// The `id` matches the in-flight query's `ReplyId<QueryKind>`;
+    /// the `ReplyId` itself is NOT consumed here — rows are
+    /// "in-progress signals", the terminal `CommandComplete` consumes
+    /// the `ReplyId` into `DeliverReply { value: QueryComplete {…} }`.
+    ///
+    /// Round-4 finding #1 / 1c-1a.
+    StreamRow {
+        /// Correlator of the in-flight query.
+        id: NonZeroU64,
+        /// Raw row bytes as delivered by PG (PG's `DataRow` body
+        /// after the column-count prefix). Parsing into typed
+        /// columns happens via `decode_column` (1c-2).
+        row_bytes: &'r [u8],
     },
 
     /// The socket is no longer safe to use; close it.

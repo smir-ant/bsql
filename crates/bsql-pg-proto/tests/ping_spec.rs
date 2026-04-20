@@ -140,7 +140,7 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
             assert_eq!(
-                *send_buf,
+                send_buf,
                 &SYNC_WIRE_BYTES,
                 "Ping setup: SendBytes must carry the 5-byte const Sync wire payload",
             );
@@ -174,7 +174,7 @@ fn ping_from_idle_emits_sync_bytes() {
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
             assert_eq!(
-                *send_buf,
+                send_buf,
                 &SYNC_WIRE_BYTES,
                 "must send the const Sync wire bytes",
             );
