@@ -44,14 +44,20 @@ hmac = { version = "0.12", default-features = false }
 # passwords (RFC 7677). Timing-safe implementation from RustCrypto.
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 
-# `base64` — RFC 4648 encoding/decoding for SCRAM wire messages.
-# Alphabet confusion and padding semantics are non-trivial;
-# DEF-META-01 covers encoding formats. `default-features = false`
-# drops std but keeps the core engine; we only need `no_std` + alloc
-# for the Engine trait. Note: base64 0.22 requires `alloc` feature
-# for most operations, but we only need stack-based encode/decode
-# via `engine::general_purpose::STANDARD` with pre-sized buffers.
-base64 = { version = "0.22", default-features = false }
+# `base64ct` — **constant-time** RFC 4648 base64 for SCRAM wire
+# messages. DEF-102 swap from `base64` v0.22 → `base64ct` v1.
+# Rationale: the SCRAM ClientProof is derived from the user's
+# password; its base64 encoding is one step in the authentication
+# sequence where a data-dependent branch or table-lookup-time
+# could in principle leak password-correlated bits via timing.
+# `base64` v0.22's `STANDARD` engine is essentially constant-time
+# in practice (cache-line-sized lookup table) but does not
+# formalise it; `base64ct` is branchless by construction and
+# audited by the RustCrypto working group. DEF-META-01 (policy 9:
+# never hand-roll expert-domain code) — RustCrypto is the
+# sanctioned source for cryptographic primitives.
+# `default-features = false` keeps it `no_std` + `no_alloc`.
+base64ct = { version = "1", default-features = false }
 
 # `subtle` — constant-time comparison for SCRAM server-signature
 # verification. Prevents timing side-channels on secret-derived

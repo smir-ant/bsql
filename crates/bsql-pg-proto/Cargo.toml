@@ -20,7 +20,7 @@ heapless = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 pbkdf2 = { workspace = true }
-base64 = { workspace = true }
+base64ct = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
 

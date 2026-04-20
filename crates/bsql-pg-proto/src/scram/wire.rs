@@ -375,44 +375,61 @@ pub fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError> {
     }
 }
 
-/// Base64-encode into a stack buffer. Returns the encoded bytes.
+/// Base64-encode into a stack buffer. Returns the length written.
 ///
-/// Uses `base64::engine::general_purpose::STANDARD` directly per
-/// DEF-META-01 (no facade).
+/// **DEF-102 (security).** Uses `base64ct::Base64` —
+/// RustCrypto's constant-time, branchless, `no_std` base64
+/// encoder. The prior `base64` v0.22 `STANDARD` engine is
+/// essentially constant-time in practice (cache-line-sized
+/// alphabet table) but does not formalise the property; this
+/// encoding step runs on the SCRAM `ClientProof`, which is
+/// derived from the user's password via HMAC. Switching to
+/// `base64ct` elevates this step's side-channel posture from
+/// tier-3 (audit "yeah the table is cache-line-sized so it's
+/// probably fine") to tier-1 (RustCrypto-audited constant-time).
+///
+/// `Base64` is the standard-with-padding alphabet (RFC 4648 §4),
+/// matching what PG emits. `default-features = false` keeps the
+/// crate `no_std` + `no_alloc`.
 pub fn base64_encode_to_buf(
     input: &[u8],
     out: &mut [u8],
 ) -> Result<usize, ScramError> {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
+    use base64ct::{Base64, Encoding};
 
-    let encoded_len = base64::encoded_len(input.len(), true).ok_or(ScramError::BufferOverflow)?;
+    let encoded_len = Base64::encoded_len(input);
     if encoded_len > out.len() {
         return Err(ScramError::BufferOverflow);
     }
-    let written = STANDARD
-        .encode_slice(input, out)
-        .map_err(|_| ScramError::BufferOverflow)?;
-    Ok(written)
+    // `Base64::encode` returns `Result<&str, InvalidLengthError>`.
+    // The &str's bytes ARE `out[..encoded_len]`; the returned ref
+    // is a borrow into `out`. We care about the length; discard
+    // the &str handle.
+    Base64::encode(input, out).map_err(|_| ScramError::BufferOverflow)?;
+    Ok(encoded_len)
 }
 
 /// Base64-decode into a bounded heapless::Vec.
+///
+/// DEF-102: same constant-time guarantees as the encoder, applied
+/// to the salt. (The salt is not secret per se — the server sends
+/// it cleartext — but consistency with the encode path keeps the
+/// side-channel posture uniform across SCRAM wire parsing.)
 fn base64_decode_bounded(
     input: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_SALT_LEN>, ScramError> {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
+    use base64ct::{Base64, Encoding};
 
-    // Decoded length is at most 3/4 of input length.
+    // base64ct's `decode` accepts `&[u8]` directly (no preliminary
+    // `from_utf8` needed — the decoder validates the alphabet as
+    // it goes, rejecting anything outside the RFC 4648 §4 set).
+    // This removes one step vs the prior `base64` v0.22 API.
     let mut decode_buf = [0u8; MAX_SALT_LEN];
-    let input_str = core::str::from_utf8(input).map_err(|_| ScramError::Base64DecodeError)?;
-    let decoded_len = STANDARD
-        .decode_slice(input_str, &mut decode_buf)
+    let decoded: &[u8] = Base64::decode(input, &mut decode_buf)
         .map_err(|_| ScramError::Base64DecodeError)?;
     let mut result = heapless::Vec::new();
-    let src = decode_buf.get(..decoded_len).ok_or(ScramError::Base64DecodeError)?;
     result
-        .extend_from_slice(src)
+        .extend_from_slice(decoded)
         .map_err(|_| ScramError::InvalidSalt)?;
     Ok(result)
 }
