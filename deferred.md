@@ -311,7 +311,7 @@ pass by the architect sub-agent found:
 
 | ID | Commitment | Phase | Rationale / note |
 |---|---|---|---|
-| DEF-077 | **`NonErroredState` refactor** — extract non-Errored variants into a separate enum; `take_state_or_read_errored_cause()` helper returns either `NonErroredState` (moved out) or `&ProtocolError` (borrowed from Errored). Forgetting to restore Errored becomes compile-impossible (you literally never get the cause out to lose). Currently tier-2 by audit; refactor raises to tier-1. **Deferred to Phase 1c** because it touches every state-handling function and naturally bundles with DEF-059 (compute/apply split). Not urgent because all current `mem::take` sites correctly restore `Errored` (pinned by U3 test `errored_cause_is_preserved_in_state_and_reply`). | 1c | Architect second pass U2. |
+| DEF-077 | **CLOSED** (superseded by DEF-061 + DEF-117) — `NonErroredState` refactor is architecturally unnecessary after the two composing DEFs. DEF-061 shrunk Errored to 1-byte `ErrorKind` (preservation clone is free). DEF-117 changed `fail_inflight_and_close` from `mem::take` to `mem::replace(&mut self.state, Errored(kind))` — the transient window no longer defaults to Idle; it IS the post-state. The "forget to restore Errored" class cannot arise at that site, and no other site exhibits the pattern. Tier-3 regression test `errored_cause_is_preserved_in_state_and_reply` stays as category-2 guard. | — | Closed 2026-04-20 (round-3 audit wave). |
 | DEF-078 | `parse_server_first` accepts RFC 5802 extension fields (`m=required` prefix) — currently `splitn(3, ',')` may silently ignore extra comma-separated fields. Bumping split cap + classifying unexpected `m=` prefix per RFC. | 1c (with query flow) | Architect second pass B3. Real-world PG servers don't send extensions, but strict spec-conformance for future interop. |
 | DEF-079 | `record_param_status` edge-shape coverage — tests for empty key (leading NUL), missing trailing NUL, missing value-NUL. All handled by current code (`strip_suffix(&[0])` falls back to region, `checked_add` bounds the walk), but no spec-conformance test pins the behaviour. Low-risk, worth documenting. | 1c | Architect second pass B2. |
 | DEF-080 | `buf::compact` proptest — random sequences of `append → partial advance → append` exercise the `copy_within` overlap cases. `heapless::Vec::copy_within` is safe per std semantics, but DEF-058 changed the code; a property test formalizes the invariant. | 6 (verification infra) | Architect second pass B4. Falls into the proptest bundle (DEF-026). |
@@ -424,7 +424,7 @@ polish items flow around them).
 **Registered, not blocking:**
 - **DEF-063** — handshake-flow typestate module (tier-2 → tier-1 on invalid-step call).
 - **DEF-065** — SCRAM message assembly writes into WriteBuf directly (perf + simplification). Superseded by DEF-107.
-- **DEF-077** — `NonErroredState` typestate. **Recommend skip after DEF-061**: Errored is now 1 byte, so "preserve Errored across mem::take" costs ~zero. DEF-077 would move it from tier-2 structural to tier-1 compile, but the payoff is marginal now. Re-evaluate if the preservation pattern becomes a hotspot.
+- **DEF-077** — `NonErroredState` typestate. **CLOSED — superseded** by DEF-061 + DEF-117. The original seam was "`mem::take(&mut self.state)` swaps Errored out and defaults to Idle in the transient window; forgetting to write Errored back silently re-opens the connection." DEF-061 made `Errored` a 1-byte `ErrorKind` (clone cost ≈ zero), and DEF-117 replaced the load-bearing `mem::take` in `fail_inflight_and_close` with `mem::replace(&mut self.state, ProtoState::Errored(kind))` — the transient window IS the post-state, so the "forget to restore Errored" class is architecturally impossible. A separate `NonErroredState` typestate would add ~80 LoC of wrapping for a seam that has already been closed at its root. Tier-3 `errored_cause_is_preserved_in_state_and_reply` test still pins the preservation behaviour as category-2 regression guard.
 
 ## 16. Phase-1c batch 5 — post-DEF-094 architect audit (2026-04-20)
 
@@ -579,6 +579,72 @@ All reaffirmations / escalations below.
 - **#16 — `parse_u32` replaced by stdlib.** Current hand-rolled form takes `&[u8]` (already ASCII digits from SCRAM parse); stdlib `str::parse::<u32>` would require `core::str::from_utf8` first — an O(N) UTF-8 revalidation on already-ASCII bytes. Net negative.
 - **#19 — Session-params perfect-hash dispatch.** Cold path (9 ParameterStatus frames per connection); current linear match against 9 byte-string literals is already compiler-optimal for this size. Re-evaluate if session_params set is called mid-flight for DB SET commands.
 - **#24 — `emit_actions!` `unlikely` hint.** The overflow branch is const-asserted as architecturally dead (`const _: () = assert!(MAX_ACTIONS_PER_CALL >= N)` per emit site). LLVM cold-hoists the dead branch during DCE. Adding `unlikely` over a provably-dead branch is redundant.
+
+## 17. Test audit — tier classification per reforge §4.11 (2026-04-20)
+
+Walk-through of every test in `bsql-pg-proto` against the
+category framework of reforge §4.11. Per the framework, a test
+exists only if it defends one of:
+
+- **(1) Spec conformance** — externally-observable API behaviour
+  on valid/invalid input matches the PostgreSQL wire contract.
+- **(2) Tier-3 invariant defense** — a narrow seam the compiler
+  does not express structurally (arm-body drift, key→field
+  routing, etc.).
+- **(3) Compile-time invariant documentation** — `assert_send::`,
+  `const _: () = assert!(…)`, `compile_fail` doctests.
+
+Tier-1 and tier-2 invariants have no place in tests — they are
+held architecturally (build failure or structural impossibility).
+
+### Test inventory
+
+82 tests total, spread across 5 integration files + 4 unit
+modules. Each file's preamble documents its category scope
+(rechecked during the round-3 audit):
+
+| File | Tests | Category | Scope |
+|---|---|---|---|
+| `tests/bounded_buffers_spec.rs` | 15 | (1) | `ReadBuf` / `WriteBuf` / `CappedServerNonce` API contract: bounded-capacity overflow (exact `ReadBufFull` sizes), `advance` returns `AdvancePastEnd`, lazy-compact correctness. Every test is a contract pin that protects against silent drift in the buffer primitives the wire layer depends on. |
+| `tests/frame_parse.rs` | 7 | (1) | `parse_header`'s observable contract: clean header → `HeaderParse::Ok {tag, declared_len, total_len}`, empty → `Empty`, incomplete → `Incomplete`, declared < 4 → `MalformedLength`, declared > cap → `FrameTooLarge`. Panic-freedom and no-index-panics are tier-1 closures held architecturally (forbid-bundle + slice patterns); not tested here. |
+| `tests/ping_spec.rs` | 12 | (1) + (2) | Phase-1a end-to-end Ping flow against spec (A); bad-path coverage (ErrorResponse mid-flight, unsolicited ParameterStatus, extra RFQ in Idle, malformed RFQ, dropped ping at end). Category-2 coverage: the "silent reply loss" class (Drop-guard) and `PgProtocol: !Sync` compile-asserts in `src/lib.rs`. |
+| `tests/startup_spec.rs` | 21 | (1) + (2) | Phase-1b full handshake: trust auth end-to-end, SCRAM-SHA-256 with RFC 7677 Appendix A vectors, NegotiateProtocolVersion rejection, pipelined-startup rejection, unsolicited ParameterStatus variants across every pre-auth state, SCRAM iteration-count-too-low, nonce-prefix-mismatch, unknown auth sub-code, ErrorResponse mid-handshake. Category-2: `errored_state_is_terminal_and_drops_subsequent_frames`, `startup_on_errored_state_fails_with_stored_cause`. |
+| `tests/tier_seams_spec.rs` | 8 | (2) | Pure category-2 tier-3-shield tests. `session_params_set_key_routing_table` (S3 seam — key→field arm drift), `errored_cause_is_preserved_in_state_and_reply` (U3 seam — mem::replace preservation pinned even after DEF-117 made it structural, as category-2 regression guard), `database_name_validation`, `application_name_validation_allows_empty`, `backend_key_data_wrong_payload_size_is_classified`. |
+| `src/dispatch.rs::parse_error_response_tests` | 7 | (1) | `parse_error_response`'s field-type arm coverage (S/V/C/M/D/H/unknown), empty payload, severity ordering (S wins over later V; V used when S absent), duplicate code handling, unterminated final field. Category-1 contract pins on the `ErrorResponse` parser's observable behaviour. |
+| `src/protocol.rs::compute_push_tests` | 8 | (2) | Compute-push arm seams per pg-command × proto-state table: Ping from Errored/AwaitingPingReply/each Connecting* state, Startup from every non-Idle state, each Startup-chain variant preserves its `StartupKind` correlator. Closes the compute-push-arm drift class. |
+| `src/protocol.rs::allows_unsolicited_param_status_tests` | 1 (`policy_per_variant`) | (2) | Exhaustive walk of every `ProtoState` variant through the `allows_unsolicited_param_status` predicate. Pins "which variants accept unsolicited PS" as tier-3 regression guard — adding a new variant that "forgot" which side of the predicate it sits on fails this test. |
+| `src/reply_id.rs::reply_id_semantics` | 3 | (2) | `undelivered_drop_panics` (Drop-guard fires), `unrelated_panic_while_reply_id_alive_surfaces_original_message` (DEF-052 close: `cfg(test)` + `thread::panicking()` skip preserves original panic message), `debug_prints_kind_name` (DEF-112 `ReplyId<K>` Debug format pin). |
+| `src/scram/crypto.rs::tests` | 1 | (1) | RFC 7677 Appendix A SCRAM-SHA-256 reference exchange bit-exact match (PBKDF2 + HMAC + XOR proof + server signature). Category-1 spec conformance. |
+
+### Conclusions from the walk-through
+
+- **Every test has a documented category.** No test defends a
+  tier-1 or tier-2 invariant (those are held architecturally —
+  build failure or structural impossibility).
+- **Category-2 tests concentrate in `tier_seams_spec.rs`
+  (8 tests), `src/protocol.rs` compute-push (8), and allowance
+  predicate (1).** These are the surfaces where compiler cannot
+  express the invariant — exactly where category-2 tests
+  belong.
+- **No test duplicates a tier-1 build-failure assertion.** The
+  `assert_send::` / `size_of::` / `needs_drop::` /
+  `assert_all_distinct!` calls in `src/lib.rs` and `src/wire.rs`
+  are category (3), held at compile time — they are not
+  replicated as runtime tests.
+- **Three tests were removed in round-3.** DEF-116's macro-based
+  pairwise distinctness obsoleted `collision_drift_guard` (3
+  tests). Architectural move-up from tier-3 test to tier-1
+  compile; tests disappeared as the surface that could drift
+  disappeared. This matches §4.11's stated ideal.
+
+### Pending audit items
+
+- None. 82 tests, all categorised. `tests/bounded_buffers_spec.rs`
+  and `tests/frame_parse.rs` could be shortened if their
+  contracts are downgraded to "documented in rustdoc examples"
+  instead of independent test assertions — but the dichotomy
+  `rustdoc example || integration test` is itself a style choice
+  rather than a tier gap. Hold as-is.
 
 ## 10. Closed
 

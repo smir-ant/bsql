@@ -1101,7 +1101,7 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 | 4 | ⏳     | 104  | ALGO/CACHE         | `parse_error_response` field-kind `[Option<FieldKind>; 256]` table + kind-match |
 | 5 | ❌     | —    | ALGO               | `Severity::from_bytes` first-byte dispatch — cold path, LLVM already folds; re-evaluate via DEF-109 |
 | §5 | ❌    | 113  | ARCH               | StagedAction Success/Teardown split — skipped after exploration: `compute_push`'s success + soft-reject dual role breaks the clean two-way partition. See deferred §16 "Re-evaluated and skipped" block. Revisit post Phase 1c driver reshape. |
-| §10 | ✅   | 111, 116 | CONST/AUDIT   | DEF-111 N²-unrolled pairwise `const _: () = assert!()` for TAG/AUTH distinctness. **DEF-116 escalation** blocked on MSRV 1.95 (`<[T]>::get` not const-stable, `arr[i]` banned); pragmatic: + `#[cfg(test)]` drift-guard tests walking parallel arrays. Revisit when Rust stabilises. |
+| §10 | ✅   | 111, 116 | CONST/AUDIT   | DEF-111 pairwise const asserts. **DEF-116** closed via declarative `macro_rules! assert_all_distinct!` — recursive pair expansion at parse time generates N² `const _: () = assert!` anonymous items. Sidesteps MSRV 1.95's non-const `<[T]>::get` entirely. Auto-scales: adding a tag = one ident in the invocation. Parallel drift-guard tests removed (now redundant). |
 | §2.15| ✅    | 117  | TYPESTATE          | `core::mem::replace(state, Errored(kind))` in `fail_inflight_and_close` — eliminates the "Default-is-Idle is load-bearing for transient window" tier-3 invariant. The transient window IS the post-state. |
 | §6 | ⏳    | 118  | TYPESTATE          | `ParsedFrame<'_>` proof-token for parse_header → advance. Explored both ambitious (generative lifetime) and minimal (pub(crate) token) forms — minimal doesn't elevate tier. Deferred to Phase 1c pipelining rework. |
 | §2.1 | ⏳  | 119  | TYPESTATE          | `PgProtocol<Phase>` outer typestate. Architect-rated "biggest tier elevation available". Scheduled for Phase 1c alongside pipelining. |
@@ -1137,6 +1137,9 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 - `b0dbd46` DEF-101 ✅ (re-scoped) • `43c1877` DEF-111 ✅ • `ce6a8bf` DEF-112 ✅ • `406e36a` DEF-114 ✅
 - `324948f` DEF-115/116/117 ✅ (round-3 escalations — honest tier analysis)
 - `3129d1e` DEF-102 ✅ (base64ct security) • `5d2d03d` DEF-103 ✅ (cold-path helper) • `f6313c5` DEF-106 ✅ (SessionParams POD)
+- `91a0f5e` DEF-116 ✅ (re-closed via declarative macro — auto-scaling pairwise distinctness, sidesteps MSRV 1.95 const-fn blocker)
+- **DEF-077 ✅ CLOSED as superseded** by DEF-061 (compact Errored) + DEF-117 (`mem::replace` in `fail_inflight_and_close`). The `NonErroredState` typestate's original rationale — "forgetting to restore Errored across `mem::take`" — is architecturally impossible after those two DEFs. Test `errored_cause_is_preserved_in_state_and_reply` retained as category-2 regression guard.
+- **Test audit ✅** — 82 tests classified per §4.11 categories (1)/(2)/(3). See deferred.md §17 for the full inventory + conclusions.
 - **Rejected** DEF-113 (StagedAction Success/Teardown split) — `compute_push`'s dual role breaks clean partition.
 - **Skipped with rationale** DEF-104 (field-kind table — cold-path legibility only) • DEF-105 (OutActions shrink — needs PG error-length profile to justify) • DEF-108 (std::simd XOR — portable SIMD unstable on MSRV 1.95).
 - **Deferred** DEF-107 (SCRAM in-place writes — low cost-benefit standalone, revisit in Phase 1c).
