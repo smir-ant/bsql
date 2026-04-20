@@ -267,10 +267,10 @@ fn trust_auth_handshake_end_to_end() {
 
     // Verify session params were recorded.
     assert_eq!(
-        proto.session_params().server_version.as_deref(),
+        proto.session_params().server_version.as_ref().map(|s| s.as_str()),
         Some("17.2"),
     );
-    assert_eq!(proto.session_params().time_zone.as_deref(), Some("UTC"));
+    assert_eq!(proto.session_params().time_zone.as_ref().map(|s| s.as_str()), Some("UTC"));
     // DEF-114: client_encoding is now a typed Encoding enum.
     assert_eq!(
         proto.session_params().client_encoding,
@@ -1054,7 +1054,7 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
         proto.state(),
     );
     assert_eq!(
-        proto.session_params().time_zone.as_deref(),
+        proto.session_params().time_zone.as_ref().map(|s| s.as_str()),
         Some("America/New_York"),
         "PS must update session_params",
     );

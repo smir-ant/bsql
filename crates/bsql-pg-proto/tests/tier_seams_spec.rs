@@ -92,19 +92,19 @@ fn session_params_set_key_routing_table() {
 
     // Each value must arrive in its dedicated field — a swap of any
     // two arms would land the wrong value in the wrong field.
-    assert_eq!(p.server_version.as_deref(), Some("17.2"));
+    assert_eq!(p.server_version.as_ref().map(|s| s.as_str()), Some("17.2"));
     // DEF-114: typed fields — Encoding/bool instead of strings.
     assert_eq!(p.server_encoding, Some(bsql_pg_proto::session_params::Encoding::Utf8));
     assert_eq!(
         p.client_encoding,
         Some(bsql_pg_proto::session_params::Encoding::Latin1),
     );
-    assert_eq!(p.application_name.as_deref(), Some("myapp"));
+    assert_eq!(p.application_name.as_ref().map(|s| s.as_str()), Some("myapp"));
     assert_eq!(p.is_superuser, Some(false));
-    assert_eq!(p.session_authorization.as_deref(), Some("alice"));
-    assert_eq!(p.date_style.as_deref(), Some("ISO, MDY"));
+    assert_eq!(p.session_authorization.as_ref().map(|s| s.as_str()), Some("alice"));
+    assert_eq!(p.date_style.as_ref().map(|s| s.as_str()), Some("ISO, MDY"));
     assert_eq!(p.integer_datetimes, Some(true));
-    assert_eq!(p.time_zone.as_deref(), Some("America/New_York"));
+    assert_eq!(p.time_zone.as_ref().map(|s| s.as_str()), Some("America/New_York"));
 }
 
 /// Invariant (spec): an unknown key is silently dropped; no matching
@@ -127,7 +127,7 @@ fn session_params_set_non_utf8_value_is_skipped() {
     // Invalid UTF-8 (a lone continuation byte).
     p.set(b"server_version", &[0x80]);
     // Previous value preserved — the bad one did not overwrite.
-    assert_eq!(p.server_version.as_deref(), Some("17.2"));
+    assert_eq!(p.server_version.as_ref().map(|s| s.as_str()), Some("17.2"));
 }
 
 /// Invariant (spec): a second valid set to the same key overwrites
@@ -137,7 +137,7 @@ fn session_params_set_second_value_overwrites() {
     let mut p = SessionParams::new();
     p.set(b"TimeZone", b"UTC");
     p.set(b"TimeZone", b"America/New_York");
-    assert_eq!(p.time_zone.as_deref(), Some("America/New_York"));
+    assert_eq!(p.time_zone.as_ref().map(|s| s.as_str()), Some("America/New_York"));
 }
 
 // =================================================================

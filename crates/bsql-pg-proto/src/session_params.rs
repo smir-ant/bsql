@@ -37,19 +37,37 @@
 //!
 //! # Capacity
 //!
-//! Each string field is bounded at 128 bytes. PG parameter values
-//! are all well under this; `TimeZone = "America/Argentina/Buenos_Aires"`
-//! is the longest at 33 bytes. An over-length value from the server
-//! is silently dropped (DEF-042).
+//! # DEF-106 — per-field POD capacity + `BoundedStr`
+//!
+//! Each string field was historically `Option<heapless::String<128>>`
+//! — uniform 128-byte capacity across all five freeform fields, 5 ×
+//! ~144 bytes ≈ 720 bytes plus a blanket `heapless::Vec::drop`
+//! propagation through `SessionParams` → `PgProtocol`.
+//!
+//! DEF-106 right-sizes per-field capacity via
+//! [`crate::ident::BoundedStr<N>`] (POD, `Copy`, Drop-free from
+//! DEF-096 / DEF-099):
+//!
+//! - `server_version`: 32 bytes (e.g. `"17.2 (Debian 17.2-1.pgdg120+1)"` fits).
+//! - `application_name`: 64 bytes.
+//! - `session_authorization`: 64 bytes (role names, bounded like `Ident` at 63).
+//! - `date_style`: 32 bytes (`"ISO, MDY"` + variants).
+//! - `time_zone`: 64 bytes (longest IANA `"America/Argentina/Buenos_Aires"` = 33).
+//!
+//! Total string footprint: 32 + 64 + 64 + 32 + 64 = 256 bytes of
+//! `buf` + `u16 len` per field + Option-discriminant + padding.
+//! About 400 bytes saved in `SessionParams` (and therefore in
+//! `PgProtocol`).
+//!
+//! An over-length value from the server is **not silently dropped**
+//! anymore — `BoundedStr::from_str_truncating` appends a `"…"`
+//! marker, preserving information that the value was oversized.
+//! This is a slight behaviour upgrade from pre-DEF-106 (which used
+//! `heapless::String::try_from(s).ok()` — Err → `None`, i.e. the
+//! parameter appeared absent even though the server sent it).
 
 use core::fmt;
-
-/// Maximum byte length for a single stringly-typed session parameter.
-const MAX_PARAM_VALUE_LEN: usize = 128;
-
-/// Bounded string type for parameter values (kept for the five
-/// fields that still carry freeform / composite text).
-type ParamValue = heapless::String<MAX_PARAM_VALUE_LEN>;
+use crate::ident::BoundedStr;
 
 /// Maximum byte length for the raw bytes stored in
 /// [`Encoding::Other`]. Longest PG encoding name is
@@ -195,28 +213,45 @@ fn parse_pg_bool(value: &[u8]) -> Option<bool> {
 /// Per DEF-114: four fields are parsed to typed form at ingest:
 /// `is_superuser` / `integer_datetimes` → `Option<bool>`;
 /// `server_encoding` / `client_encoding` → `Option<Encoding>`.
+///
+/// Per DEF-106: each string field uses a right-sized
+/// `BoundedStr<N>` (POD, Drop-free) instead of a uniform 128-byte
+/// `heapless::String`. Reduces `SessionParams` footprint by ~400
+/// bytes and breaks the `heapless::Vec::drop` chain through
+/// `PgProtocol`.
 #[derive(Default)]
 pub struct SessionParams {
-    /// PostgreSQL server version string (e.g. `"17.2"`).
-    pub server_version: Option<ParamValue>,
+    /// PostgreSQL server version string (e.g. `"17.2"`,
+    /// `"17.2 (Debian 17.2-1.pgdg120+1)"`). BoundedStr<32> — PG's
+    /// version string is occasionally embellished with build
+    /// provenance but stays under 32 bytes. DEF-106.
+    pub server_version: Option<BoundedStr<32>>,
     /// Server-side encoding, parsed to a typed enum. DEF-114.
     pub server_encoding: Option<Encoding>,
     /// Client-side encoding, parsed to a typed enum. DEF-114.
     pub client_encoding: Option<Encoding>,
-    /// Application name echoed back by the server.
-    pub application_name: Option<ParamValue>,
+    /// Application name echoed back by the server. BoundedStr<64>
+    /// — deployment-tagged names (`myapp-worker-pod-abc123`) fit
+    /// comfortably. DEF-106.
+    pub application_name: Option<BoundedStr<64>>,
     /// Whether the connected role is a superuser. DEF-114.
     /// `Some(true)` / `Some(false)` / `None` (server sent neither
     /// `"on"` nor `"off"`).
     pub is_superuser: Option<bool>,
-    /// The authorised session user.
-    pub session_authorization: Option<ParamValue>,
-    /// DateStyle setting (e.g. `"ISO, MDY"`).
-    pub date_style: Option<ParamValue>,
+    /// The authorised session user. BoundedStr<64> — role names
+    /// are bounded like PG's `NAMEDATALEN` (63 usable chars).
+    /// DEF-106.
+    pub session_authorization: Option<BoundedStr<64>>,
+    /// DateStyle setting (e.g. `"ISO, MDY"`). BoundedStr<32> —
+    /// the grammar is `"<format>, <order>"` with short
+    /// components. DEF-106.
+    pub date_style: Option<BoundedStr<32>>,
     /// Whether integer datetimes are used. DEF-114.
     pub integer_datetimes: Option<bool>,
     /// Server timezone (e.g. `"UTC"`, `"America/New_York"`).
-    pub time_zone: Option<ParamValue>,
+    /// BoundedStr<64> — longest documented IANA zone
+    /// `"America/Argentina/Buenos_Aires"` = 33 bytes. DEF-106.
+    pub time_zone: Option<BoundedStr<64>>,
 }
 
 impl SessionParams {
@@ -267,31 +302,32 @@ impl SessionParams {
                 }
             }
 
-            // ═══ Remaining freeform / composite fields ═══
-            b"server_version"
-            | b"application_name"
-            | b"session_authorization"
-            | b"DateStyle"
-            | b"TimeZone" => {
-                let Ok(value_str) = core::str::from_utf8(value) else {
-                    return;
-                };
-                let Ok(parsed) = ParamValue::try_from(value_str) else {
-                    return;
-                };
-                match key {
-                    b"server_version" => self.server_version = Some(parsed),
-                    b"application_name" => self.application_name = Some(parsed),
-                    b"session_authorization" => self.session_authorization = Some(parsed),
-                    b"DateStyle" => self.date_style = Some(parsed),
-                    b"TimeZone" => self.time_zone = Some(parsed),
-                    // Unreachable by the outer `match key` guard;
-                    // no fallback needed — the outer match is the
-                    // gate.
-                    _ => {}
-                }
+            // ═══ Remaining freeform / composite fields (DEF-106) ═══
+            //
+            // BoundedStr::from_str_truncating right-sizes per-field:
+            // oversized input trims to N-3 bytes + "…" marker
+            // (no silent value-drop, unlike the prior
+            // heapless::String::try_from → None path).
+            b"server_version" => {
+                let Ok(s) = core::str::from_utf8(value) else { return };
+                self.server_version = Some(BoundedStr::<32>::from_str_truncating(s));
             }
-
+            b"application_name" => {
+                let Ok(s) = core::str::from_utf8(value) else { return };
+                self.application_name = Some(BoundedStr::<64>::from_str_truncating(s));
+            }
+            b"session_authorization" => {
+                let Ok(s) = core::str::from_utf8(value) else { return };
+                self.session_authorization = Some(BoundedStr::<64>::from_str_truncating(s));
+            }
+            b"DateStyle" => {
+                let Ok(s) = core::str::from_utf8(value) else { return };
+                self.date_style = Some(BoundedStr::<32>::from_str_truncating(s));
+            }
+            b"TimeZone" => {
+                let Ok(s) = core::str::from_utf8(value) else { return };
+                self.time_zone = Some(BoundedStr::<64>::from_str_truncating(s));
+            }
             _ => {
                 // Unknown key — silently dropped (DEF-042).
             }

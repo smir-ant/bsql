@@ -275,8 +275,11 @@ const _: () = assert!(
      Startup carries user/database/app_name (FixedStr-POD) + credentials.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() <= 6720,
-    "PgProtocol size regression — ReadBuf growth or state bloat?",
+    core::mem::size_of::<protocol::PgProtocol>() <= 6336,
+    "PgProtocol size regression — post-DEF-106 budget is 6336 bytes \
+     (SessionParams right-sized per field; ~400 bytes saved vs 5 × \
+     heapless::String<128>). Budget: ReadBuf 4096 + state ~1224 + \
+     session_params ~420 + padding.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static>>() <= 1280,
