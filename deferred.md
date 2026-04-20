@@ -242,9 +242,9 @@ closes.
 
 | ID | Commitment | Phase | Target tier |
 |---|---|---|---|
-| DEF-062 | `NoticeResponse` (tag `'N'`) pre-dispatch filter — extracts the notice from any state, emits `Action::EmitNotice(...)`, skips the dispatcher. Matches the DEF-054 pattern for ParameterStatus. Supersedes DEF-043 with concrete shape. | 1c | 1 (single-site, structural) |
+| DEF-062 | **CLOSED** (landed `cccc909`) — pre-dispatch filter in `feed_bytes` silently consumes tag `'N'` frames, mirroring the DEF-054 ParameterStatus pattern. Phase 1b form drops notices; future `Action::EmitNotice(...)` lands in Phase 1c+ when the wrapper surfaces notices. Regression test `notice_response_mid_flight_is_silently_consumed` in `ping_spec.rs`. |
 | DEF-063 | Handshake-flow typestate extraction. The linear chain `Idle → ConnectingStartup → ConnectingScram* → ConnectingPostAuth* → Idle` becomes a dedicated `handshake` module with typestate transitions: each step is `fn step(PrevState, ...) -> Result<(NextState, Action), ProtocolError>`. Reactive states (AwaitingQueryReply, StreamingRows, InTransaction) remain in the enum — typestate doesn't apply to them because server events can drive multiple outcomes. Tier 2 → 1 on "invalid handshake-step call from wrong state". | 1c | 1 on handshake path |
-| DEF-064 | `parse_error_response` bounded-iterations loop — replace unbounded `loop { pos += 1; ... }` with `for _ in 0..MAX_ERROR_FIELDS (=16) { ... }`. Closes a potential DoS vector on malformed `ErrorResponse` with adversarially-crafted fields. | 1c | 2 (structural bound) |
+| DEF-064 | **CLOSED** (landed `cccc909`) — `for _ in 0..MAX_ERROR_FIELDS` with `MAX_ERROR_FIELDS = 32` (≥ 2× PG's ~18 documented fields). Iteration is O(1) regardless of adversarial payload size. Beyond the cap, parsing stops and returns already-extracted fields — benign truncation. Tier-2 structural via the `for` range expression. |
 | DEF-065 | SCRAM message assembly writes directly into `WriteBuf` — remove `build_client_first_bare` / `build_client_first_message` intermediate `heapless::Vec` buffers (currently 128 + 136 = 264 bytes stack + 2 memcpy per SCRAM init). Save state `client_first_bare` only (the one input needed later for HMAC). | 1c | — (perf + simplification) |
 
 ### Phase-1e+ binding commitments (open)
@@ -418,8 +418,8 @@ polish items flow around them).
 ### Remaining open (re-prioritised)
 
 **Blocking for Phase 1c close:**
-- **DEF-062** — NoticeResponse pre-dispatch filter. Small, structural, follows DEF-054 pattern.
-- **DEF-064** — `parse_error_response` bounded loop. Tiny DoS-shield fix.
+- ✅ ~~**DEF-062**~~ — landed `cccc909` (pulled forward into Phase-1b hardening).
+- ✅ ~~**DEF-064**~~ — landed `cccc909`.
 
 **Registered, not blocking:**
 - **DEF-063** — handshake-flow typestate module (tier-2 → tier-1 on invalid-step call).
