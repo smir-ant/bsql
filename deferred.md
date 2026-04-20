@@ -757,16 +757,16 @@ Will ship in **1c-5** (pipelining sub-phase).
    → None (classified as protocol error). Tier-2 runtime vs
    tier-3 audit miss.
 
-### Sub-phase placement
+### Sub-phase placement & status
 
-- **1c-0 / 1c-1:** findings 2, 3 (typed newtypes + CommandTag).
-  Foundation layer types, used by every later sub-phase.
-- **1c-2:** finding 5 (text-format rejection) — text-format class
-  of error lives alongside codec.
-- **1c-3:** finding 6 (ParamsWriter zero-copy) — lands with
-  Parse/Bind/Execute.
-- **1c-5:** findings 1, 4, 7, **DEF-119 via guards** —
-  pipelining sub-phase, all queue/phase work together.
+| sub-phase | status | findings landed | scope |
+|---|---|---|---|
+| **1c-0 / 1c-1** | ✅ done | #2 typed newtypes (Sql/StmtName/PortalName); #3 CommandTag as BoundedStr<32> (typed-struct upgrade deferred to 1c-6) | SimpleQuery end-to-end, Action::StreamRow, DEF-121 gate |
+| **1c-2** | 🚧 in progress | #5 text-format rejection (scheduled with decoder) | RowDesc parse, column iter, FromPgText primitives |
+| **1c-3** | ⏳ pending | #6 ParamsWriter zero-copy | Parse/Bind/Describe/Execute/Close extended-query flow |
+| **1c-4** | ⏳ pending | — | BEGIN/COMMIT/ROLLBACK + tx_status tracking + SAVEPOINT |
+| **1c-5** | ⏳ pending | #1 InFlightSlot sum enum; #4 Flush/Sync guard; #7 RowDescRef arena; **DEF-119 witness-guard** | Pipelining — biggest tier-lift of Phase 1c |
+| **1c-6** | ⏳ pending | #3 typed CommandTag upgrade; DEF-109/110 cargo-asm validation | Hardening + fuzzing + proptest before 1d |
 
 ### 1c-1 landed (2026-04-20)
 

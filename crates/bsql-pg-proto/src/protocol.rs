@@ -207,6 +207,19 @@ pub struct PgProtocol {
     /// during startup from ParameterStatus messages. Read-only after
     /// startup completes (accessible via `session_params()`).
     session_params: SessionParams,
+    /// Row schema for the current streaming query. 1c-2a.
+    ///
+    /// Lifecycle:
+    /// - `None` at construction; `None` between queries.
+    /// - Populated on `RowDescription` ('T') arrival in
+    ///   `SimpleQueryAwaitFirstResponse`.
+    /// - Referenced by [`crate::Action::StreamRow::desc`] during
+    ///   streaming and copied into [`crate::Reply::QueryComplete::row_desc`]
+    ///   on the terminal `ReadyForQuery`.
+    /// - Cleared on the next [`PgCommand::SimpleQuery`] push so a
+    ///   stale schema from a prior query never leaks into a new DML
+    ///   call's `Reply::QueryComplete { row_desc: None }`.
+    row_desc: Option<crate::decode::RowDesc>,
     /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
     /// Load-bearing: the crate-root ambiguous-impl gate verifies that
     /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
@@ -228,6 +241,7 @@ impl PgProtocol {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
+            row_desc: None,
             sync_marker: PhantomData,
         }
     }
@@ -291,10 +305,20 @@ impl PgProtocol {
         // this path — unifying it to `'static` gives the caller
         // freedom over what they pair the result with later.
         write_buf.clear();
+
+        // 1c-2a: new SimpleQuery push clears any stale `row_desc`
+        // from a prior query — so a DML push after a SELECT gets
+        // `Reply::QueryComplete { row_desc: None }` (no schema
+        // leaked from the earlier query). Arrives before
+        // `compute_push` transitions state.
+        if matches!(cmd, PgCommand::SimpleQuery { .. }) {
+            self.row_desc = None;
+        }
+
         let prev = core::mem::take(&mut self.state);
         let (new_state, staged) = compute_push(cmd, prev, write_buf);
         self.state = new_state;
-        materialise(staged, write_buf.as_bytes(), &[])
+        materialise(staged, write_buf.as_bytes(), &[], None)
     }
 
     /// Feed inbound wire bytes.
@@ -332,7 +356,12 @@ impl PgProtocol {
                 },
                 &mut staged,
             );
-            return materialise(staged, write_buf.as_bytes(), self.read_buf.populated());
+            return materialise(
+                staged,
+                write_buf.as_bytes(),
+                self.read_buf.populated(),
+                self.row_desc.as_ref(),
+            );
         }
 
         // Drain as many complete frames as possible. Bounded by
@@ -449,6 +478,7 @@ impl PgProtocol {
                             payload_end: abs_frame_end,
                             populated_len,
                         },
+                        &mut self.row_desc,
                     );
                     match outcome {
                         DispatchOutcome::AdvancedSilent { new_state } => {
@@ -508,7 +538,15 @@ impl PgProtocol {
         // remain valid until the next `append` triggers lazy
         // compaction, which the borrow checker forbids while
         // `OutActions<'_, 'r>` is alive (`'r = &'r mut self`).
-        materialise(staged, write_buf.as_bytes(), self.read_buf.populated())
+        //
+        // 1c-2a: pass `row_desc` so `StreamRow` actions get `&'r RowDesc`
+        // references for zero-copy schema propagation.
+        materialise(
+            staged,
+            write_buf.as_bytes(),
+            self.read_buf.populated(),
+            self.row_desc.as_ref(),
+        )
     }
 
     /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
@@ -1074,6 +1112,7 @@ fn materialise<'w, 'r>(
     staged: StagedActions,
     write_buf_bytes: &'w [u8],
     read_buf_bytes: &'r [u8],
+    row_desc: Option<&'r crate::decode::RowDesc>,
 ) -> OutActions<'w, 'r> {
     let mut out = OutActions::new();
     for sa in staged {
@@ -1101,9 +1140,18 @@ fn materialise<'w, 'r>(
             // the `'r` borrow on OutActions blocks all
             // `&mut self.read_buf` calls on PgProtocol until the
             // caller drops the returned actions.
+            //
+            // 1c-2a: `desc` reference comes from
+            // `PgProtocol.row_desc`, populated by the 'T' dispatch
+            // arm. `row_desc` is `Some` whenever a StreamRowRange
+            // was staged (StreamingRows state only enters on 'T');
+            // the `unwrap_or(&RowDesc::EMPTY)` fallback is
+            // architecturally unreachable, surfaced as a safe
+            // default (0-column desc) rather than a panic.
             StagedAction::StreamRowRange { id, row_range } => Action::StreamRow {
                 id,
                 row_bytes: row_range.apply(read_buf_bytes).unwrap_or(&[]),
+                desc: row_desc.unwrap_or(&crate::decode::RowDesc::EMPTY),
             },
             StagedAction::CloseSocket => Action::CloseSocket,
         };

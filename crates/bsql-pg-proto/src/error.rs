@@ -319,6 +319,38 @@ pub enum ProtocolError {
         payload_len: usize,
     },
 
+    /// Server sent a malformed `RowDescription` (`'T'`) payload —
+    /// short header, negative column count, missing name NUL,
+    /// truncated per-column metadata, or trailing bytes after the
+    /// declared columns. 1c-2a framing-desync classification. The
+    /// connection is torn down (the wire is out of sync with the
+    /// per-column 18-byte stride).
+    MalformedRowDescription {
+        /// Actual payload byte count.
+        payload_len: usize,
+    },
+
+    /// Server's `RowDescription` declares more columns than
+    /// [`crate::MAX_ROW_COLUMNS`] — this crate's bounded inline
+    /// storage cannot accommodate the result-set. The query is
+    /// failed and the connection is torn down; the user retries
+    /// with a narrower projection. 1c-2a.
+    TooManyColumns {
+        /// Column count declared by the server.
+        count: usize,
+        /// Maximum supported — [`crate::MAX_ROW_COLUMNS`].
+        max: usize,
+    },
+
+    /// Server's `RowDescription` carried a per-column format code
+    /// outside the legal `{0, 1}` range. Round-4 finding #5: text
+    /// (`0`) and binary (`1`) are the only values PG defines; any
+    /// other value is a server-side wire violation. 1c-2a.
+    UnexpectedFormatCode {
+        /// The offending format code from the server.
+        code: i16,
+    },
+
     /// A local protocol-crate invariant was violated.
     ///
     /// Classified rather than silent: in Phase 1a the only emission site
@@ -437,7 +469,10 @@ impl ProtocolError {
             | Self::Scram(_)
             | Self::StartupAlreadyInProgress
             | Self::CommandInProgress => ErrorKind::Auth,
-            Self::MalformedCommandComplete { .. } => ErrorKind::Framing,
+            Self::MalformedCommandComplete { .. }
+            | Self::MalformedRowDescription { .. }
+            | Self::TooManyColumns { .. }
+            | Self::UnexpectedFormatCode { .. } => ErrorKind::Framing,
             Self::ProtocolInvariantBroken => ErrorKind::Internal,
             Self::ConnectionAlreadyClosed { .. } => ErrorKind::AlreadyClosed,
         }
@@ -508,6 +543,18 @@ impl fmt::Display for ProtocolError {
             Self::MalformedCommandComplete { payload_len } => write!(
                 f,
                 "malformed CommandComplete: {payload_len}-byte payload missing NUL terminator",
+            ),
+            Self::MalformedRowDescription { payload_len } => write!(
+                f,
+                "malformed RowDescription: {payload_len}-byte payload (short header, negative count, missing name NUL, or truncated metadata)",
+            ),
+            Self::TooManyColumns { count, max } => write!(
+                f,
+                "result-set too wide: {count} columns (max supported {max})",
+            ),
+            Self::UnexpectedFormatCode { code } => write!(
+                f,
+                "unexpected format code in RowDescription: {code} (expected 0 text or 1 binary)",
             ),
             Self::ProtocolInvariantBroken => {
                 f.write_str("protocol invariant violated — internal bsql-pg-proto logic bug")

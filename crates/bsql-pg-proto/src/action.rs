@@ -283,12 +283,6 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, MAX_ACTIONS_PER_CALL
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "no_alloc: Box unavailable; FailReply.cause (ProtocolError ~280 bytes after DEF-060) dominates. \
-              Shrinking further requires a typed ErrorDetail pointer indirection — deferred to post-1c. \
-              Copy-derived so OutActions<'_, '_> can be Drop-free and NLL releases borrows at last use."
-)]
 pub enum Action<'w, 'r> {
     /// Send these bytes verbatim to the server.
     ///
@@ -350,14 +344,30 @@ pub enum Action<'w, 'r> {
     /// "in-progress signals", the terminal `CommandComplete` consumes
     /// the `ReplyId` into `DeliverReply { value: QueryComplete {…} }`.
     ///
-    /// Round-4 finding #1 / 1c-1a.
+    /// # 1c-2a: `desc` schema reference
+    ///
+    /// `desc` points to [`crate::RowDesc`] inside
+    /// [`crate::PgProtocol`], populated by the preceding
+    /// `RowDescription` frame. Its lifetime `'r` ties it to the
+    /// `&'r mut PgProtocol` borrow — the schema stays available
+    /// exactly as long as the row bytes. Pairing is tier-2
+    /// structural: a `StreamRow` action can't exist without a
+    /// matching schema because `SimpleQueryStreamingRows` state is
+    /// entered only via the 'T' dispatcher arm which populates the
+    /// schema before staging any row.
+    ///
+    /// Round-4 finding #1 / 1c-1a; row_desc wiring in 1c-2a.
     StreamRow {
         /// Correlator of the in-flight query.
         id: NonZeroU64,
-        /// Raw row bytes as delivered by PG (PG's `DataRow` body
-        /// after the column-count prefix). Parsing into typed
-        /// columns happens via `decode_column` (1c-2).
+        /// Raw row bytes as delivered by PG (PG's `DataRow` body —
+        /// column-count prefix followed by per-column
+        /// length/bytes pairs). Parsing into typed columns happens
+        /// via [`crate::decode`] primitives (1c-2b).
         row_bytes: &'r [u8],
+        /// Result-set schema — type OIDs + format codes per column.
+        /// Stable across the entire row stream.
+        desc: &'r crate::decode::RowDesc,
     },
 
     /// The socket is no longer safe to use; close it.
@@ -387,10 +397,6 @@ pub enum Action<'w, 'r> {
 ///   materialiser emits the static ref directly (zero write, zero
 ///   copy — `Sync` bypasses `write_buf` entirely).
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Same root as Action<'_>: FailReply.cause dominates. StagedAction is staging-only — never stored, one-shot."
-)]
 pub(crate) enum StagedAction {
     /// Bytes live at the range `[start..start+len]` inside the
     /// emission-time `write_buf`. Typed as [`NonEmptyRange`] —
@@ -524,6 +530,10 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// `BackendKeyData`, …) land with their drivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "1c-2a: no_alloc crate; QueryComplete.row_desc carries an inline RowDesc (MAX_ROW_COLUMNS=32 columns × 8 bytes ≈ 260 bytes). Pong / ParseComplete / CloseComplete variants are small. Shrinking would require boxing row_desc, unavailable without alloc; the alternative (caller-managed schema arena) lands with DEF-119 pipelining in 1c-5."
+)]
 pub enum Reply {
     /// The server is alive and responsive.
     ///
@@ -569,6 +579,11 @@ pub enum Reply {
         command_tag: crate::ident::BoundedStr<32>,
         /// Transaction status from the trailing `ReadyForQuery`.
         tx_status: u8,
+        /// Result-set schema. `Some` for SELECT queries (including
+        /// 0-row SELECTs — `RowDescription` arrived but no
+        /// `DataRow`s followed); `None` for DML (no
+        /// `RowDescription`) and empty-query responses. 1c-2a.
+        row_desc: Option<crate::decode::RowDesc>,
     },
 
     /// A `Parse` command succeeded (server accepted the prepared
@@ -648,12 +663,18 @@ impl From<StartupCompletePayload> for Reply {
 /// tag PG returns (`"SELECT 5"`, `"INSERT 0 3"`, etc.) —
 /// sub-phase 1c-1 parses this into a typed `CommandTag` struct
 /// (round-4 finding #3).
+///
+/// 1c-2a: `row_desc` carries the result-set schema — `Some` for
+/// SELECT queries (even 0-row), `None` for DML / empty-query. The
+/// schema is copied by value (RowDesc is `Copy` POD).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryCompletePayload {
     /// Raw ASCII tag from `CommandComplete` body.
     pub command_tag: crate::ident::BoundedStr<32>,
     /// Transaction-status indicator from the trailing `ReadyForQuery`.
     pub tx_status: u8,
+    /// Result-set schema, if any. See [`Reply::QueryComplete::row_desc`].
+    pub row_desc: Option<crate::decode::RowDesc>,
 }
 
 impl From<QueryCompletePayload> for Reply {
@@ -662,6 +683,7 @@ impl From<QueryCompletePayload> for Reply {
         Self::QueryComplete {
             command_tag: p.command_tag,
             tx_status: p.tx_status,
+            row_desc: p.row_desc,
         }
     }
 }

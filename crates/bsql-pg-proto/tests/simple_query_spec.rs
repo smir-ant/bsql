@@ -29,8 +29,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply, ReplyId, Sql,
-    WriteBuf,
+    Action, FormatCode, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply,
+    ReplyId, RowDesc, Sql, WriteBuf,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
         TAG_QUERY, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
@@ -191,7 +191,7 @@ fn select_zero_rows_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let q_raw = raw(100);
-    let _sent = simple_query_setup(&mut proto, id(q_raw), &mut wb);
+    simple_query_setup(&mut proto, id(q_raw), &mut wb);
 
     // After push: state should be SimpleQueryAwaitFirstResponse.
     assert!(matches!(
@@ -211,9 +211,15 @@ fn select_zero_rows_end_to_end() {
         [Action::DeliverReply { id: delivered_id, value }] => {
             assert_eq!(*delivered_id, q_raw, "correlator round-trips");
             match value {
-                Reply::QueryComplete { command_tag, tx_status } => {
+                Reply::QueryComplete { command_tag, tx_status, row_desc } => {
                     assert_eq!(command_tag.as_str(), "SELECT 0");
                     assert_eq!(*tx_status, b'I');
+                    // 1c-2a: 0-row SELECT delivers schema via Reply
+                    // (no StreamRow to carry it).
+                    assert!(
+                        matches!(row_desc, Some(desc) if desc.is_empty()),
+                        "0-row SELECT: row_desc must be Some(empty-desc), got {row_desc:?}",
+                    );
                 }
                 other => panic!("expected QueryComplete, got {other:?}"),
             }
@@ -250,11 +256,36 @@ fn select_multiple_rows_stream_then_deliver() {
     let actions = out.as_slice();
     assert_eq!(actions.len(), 4, "3 rows + 1 DeliverReply = 4 actions");
 
-    // First three actions = StreamRow with matching id and row bytes.
+    // First three actions = StreamRow with matching id, schema, and row bytes.
+    let mut first_desc: Option<&RowDesc> = None;
     for (i, expected_value) in row_values.iter().enumerate() {
         match actions.get(i) {
-            Some(Action::StreamRow { id, row_bytes }) => {
+            Some(Action::StreamRow { id, row_bytes, desc }) => {
                 assert_eq!(*id, q_raw, "StreamRow id must match in-flight reply");
+                // 1c-2a: every StreamRow carries the same schema ref.
+                // Pin the schema shape: 1 column of TEXT (oid 25) in
+                // text format.
+                assert!(
+                    matches!(
+                        desc.get(0),
+                        Some(&bsql_pg_proto::ColumnDesc {
+                            type_oid: 25,
+                            format_code: FormatCode::Text,
+                        }),
+                    ) && desc.len() == 1,
+                    "expected 1-column TEXT/text RowDesc, got {desc:?}",
+                );
+                // Structural: all StreamRows borrow the same RowDesc
+                // (tier-2 via pointer identity — if the protocol
+                // reparsed per-row, this would trip).
+                match first_desc {
+                    None => first_desc = Some(*desc),
+                    Some(prev) => assert!(
+                        core::ptr::eq(prev, *desc),
+                        "StreamRow.desc must share the same RowDesc pointer across the stream",
+                    ),
+                }
+
                 // Body = column-count (2 bytes BE) + len (4 bytes BE) + value.
                 assert_eq!(
                     row_bytes.get(..2),
@@ -277,12 +308,25 @@ fn select_multiple_rows_stream_then_deliver() {
         }
     }
 
-    // Fourth = DeliverReply QueryComplete.
+    // Fourth = DeliverReply QueryComplete — schema also present.
     match actions.get(3) {
-        Some(Action::DeliverReply { id: delivered_id, value: Reply::QueryComplete { command_tag, tx_status } }) => {
+        Some(Action::DeliverReply {
+            id: delivered_id,
+            value: Reply::QueryComplete { command_tag, tx_status, row_desc },
+        }) => {
             assert_eq!(*delivered_id, q_raw);
             assert_eq!(command_tag.as_str(), "SELECT 3");
             assert_eq!(*tx_status, b'I');
+            assert!(
+                matches!(
+                    row_desc,
+                    Some(desc) if desc.len() == 1 && matches!(
+                        desc.get(0),
+                        Some(&bsql_pg_proto::ColumnDesc { type_oid: 25, .. }),
+                    ),
+                ),
+                "SELECT with rows: row_desc must be Some(1-col TEXT), got {row_desc:?}",
+            );
         }
         other => panic!("expected DeliverReply(QueryComplete), got {other:?}"),
     }
@@ -307,10 +351,25 @@ fn dml_no_rows_end_to_end() {
     let out = proto.feed_bytes(&bytes, &mut wb);
     assert_eq!(out.len(), 1, "DML emits exactly DeliverReply");
     match out.as_slice() {
-        [Action::DeliverReply { id: delivered_id, value: Reply::QueryComplete { command_tag, tx_status } }] => {
+        [Action::DeliverReply {
+            id: delivered_id,
+            value: Reply::QueryComplete {
+                command_tag,
+                tx_status,
+                row_desc,
+            },
+        }] => {
             assert_eq!(*delivered_id, q_raw);
             assert_eq!(command_tag.as_str(), "INSERT 0 3");
             assert_eq!(*tx_status, b'T');
+            // 1c-2a: DML never received a 'T' frame — row_desc is None.
+            // Critical invariant: push_command clears prior SELECT's
+            // row_desc, so a DML following a SELECT gets None here,
+            // not stale schema.
+            assert!(
+                row_desc.is_none(),
+                "DML receives no RowDescription → row_desc must be None",
+            );
         }
         other => panic!("expected DeliverReply(QueryComplete(INSERT 0 3)), got {other:?}"),
     }
@@ -679,6 +738,61 @@ fn overflow_backpressure_preserves_delivery_across_calls() {
     }
     assert_eq!(total_rows, row_count, "every row delivered exactly once");
     assert!(matches!(proto.state(), ProtoState::Idle));
+}
+
+/// Invariant (1c-2a): a DML query following a SELECT must receive
+/// `Reply::QueryComplete { row_desc: None }` — NOT the prior
+/// SELECT's schema. This pins the `push_command` clear at line
+/// `self.row_desc = None` (in `PgCommand::SimpleQuery` branch).
+///
+/// Without the clear, `feed_bytes` on the DML path would `copy` the
+/// stale row_desc from `PgProtocol.row_desc` into the Reply, leaking
+/// query 1's schema into query 2's result.
+#[test]
+fn dml_after_select_clears_row_desc() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+
+    // Query 1: SELECT with 1 TEXT column. After this, proto carries
+    // a populated row_desc internally.
+    let q1_raw = raw(300);
+    simple_query_setup(&mut proto, id(q1_raw), &mut wb);
+    let mut q1_bytes = std::vec::Vec::new();
+    q1_bytes.extend_from_slice(&row_description_frame(1));
+    q1_bytes.extend_from_slice(&data_row_frame(b"hello"));
+    q1_bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
+    q1_bytes.extend_from_slice(&rfq_frame(b'I'));
+    {
+        let out = proto.feed_bytes(&q1_bytes, &mut wb);
+        // Expect at least one StreamRow and one DeliverReply.
+        let mut saw_deliver = false;
+        for a in out.as_slice() {
+            if matches!(a, Action::DeliverReply { .. }) {
+                saw_deliver = true;
+            }
+        }
+        assert!(saw_deliver, "query 1 must deliver");
+    }
+
+    // Query 2: DML. push_command clears row_desc.
+    let q2_raw = raw(301);
+    simple_query_setup(&mut proto, id(q2_raw), &mut wb);
+    let mut q2_bytes = std::vec::Vec::new();
+    q2_bytes.extend_from_slice(&command_complete_frame(b"DELETE 3"));
+    q2_bytes.extend_from_slice(&rfq_frame(b'I'));
+    let out = proto.feed_bytes(&q2_bytes, &mut wb);
+    match out.as_slice() {
+        [Action::DeliverReply {
+            value: Reply::QueryComplete { row_desc, .. },
+            ..
+        }] => {
+            assert!(
+                row_desc.is_none(),
+                "DML following SELECT must NOT inherit prior schema; got {row_desc:?}",
+            );
+        }
+        other => panic!("expected single DeliverReply for DML, got {other:?}"),
+    }
 }
 
 /// Invariant: the outbound `Q` frame layout is tag + BE-length +

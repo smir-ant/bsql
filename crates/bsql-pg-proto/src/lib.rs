@@ -88,6 +88,7 @@ extern crate std;
 pub mod action;
 pub mod buf;
 pub mod command;
+pub mod decode;
 mod dispatch;
 pub mod error;
 pub mod frame;
@@ -108,6 +109,7 @@ pub use action::{
 };
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::PgCommand;
+pub use decode::{ColumnDesc, FormatCode, MAX_ROW_COLUMNS, RowDesc};
 pub use error::ProtocolError;
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use ident::{
@@ -260,8 +262,11 @@ const _: () = assert!(
      ProtocolError or added a large inline variant.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Reply>() <= 64,
-    "Reply size regression — did a variant add a large field?",
+    core::mem::size_of::<action::Reply>() <= 320,
+    "Reply size regression — post-1c-2a budget is 320 bytes. \
+     Reply::QueryComplete now carries row_desc: Option<RowDesc> \
+     (MAX_ROW_COLUMNS=32 columns × 8 bytes + count + discriminant); \
+     variant dominates Reply's enum size.",
 );
 const _: () = assert!(
     core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,

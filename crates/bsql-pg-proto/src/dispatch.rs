@@ -128,6 +128,7 @@ pub(crate) fn dispatch(
     payload: &[u8],
     write_buf: &mut WriteBuf,
     coords: FrameCoords,
+    row_desc_slot: &mut Option<crate::decode::RowDesc>,
 ) -> DispatchOutcome {
     match (prev, tag) {
         // =============================================================
@@ -338,8 +339,18 @@ pub(crate) fn dispatch(
 
         // AwaitFirstResponse: T / C / I / E — any other tag is desync
         (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
-            DispatchOutcome::AdvancedSilent {
-                new_state: ProtoState::SimpleQueryStreamingRows(reply),
+            // 1c-2a: parse the schema and stash it in PgProtocol's
+            // row_desc slot before transitioning to StreamingRows.
+            // Subsequent DataRow frames' StreamRowRange emissions
+            // will borrow from this slot at materialise time.
+            match crate::decode::parse_row_description(payload) {
+                Ok(desc) => {
+                    *row_desc_slot = Some(desc);
+                    DispatchOutcome::AdvancedSilent {
+                        new_state: ProtoState::SimpleQueryStreamingRows(reply),
+                    }
+                }
+                Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
@@ -377,16 +388,26 @@ pub(crate) fn dispatch(
         // AwaitRfq: Z is the only legal frame
         (ProtoState::SimpleQueryAwaitRfq { reply, command_tag }, TAG_READY_FOR_QUERY) => {
             match payload {
-                [tx_status] => DispatchOutcome::AdvancedWithAction {
-                    new_state: ProtoState::Idle,
-                    action: crate::action::deliver(
-                        reply,
-                        crate::action::QueryCompletePayload {
-                            command_tag,
-                            tx_status: *tx_status,
-                        },
-                    ),
-                },
+                [tx_status] => {
+                    // 1c-2a: copy the schema out of the protocol's
+                    // `row_desc` slot into the terminal reply. The
+                    // slot is NOT cleared here — any `StreamRowRange`
+                    // staged earlier in this same `feed_bytes` call
+                    // still borrows it through materialise; the slot
+                    // is cleared at the next `push_command(SimpleQuery)`.
+                    let row_desc = *row_desc_slot;
+                    DispatchOutcome::AdvancedWithAction {
+                        new_state: ProtoState::Idle,
+                        action: crate::action::deliver(
+                            reply,
+                            crate::action::QueryCompletePayload {
+                                command_tag,
+                                tx_status: *tx_status,
+                                row_desc,
+                            },
+                        ),
+                    }
+                }
                 other => errored(
                     Some(reply.consume()),
                     ProtocolError::MalformedReadyForQuery {
