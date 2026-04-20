@@ -1117,14 +1117,23 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 | 20| ⏳     | 103  | CACHE              | `core::hint::cold_path()` at every `DispatchOutcome::Errored` site |
 | 21| ✅     | 098  | ALLOC              | `size_of` drift-guard tightening post DEF-095/096/097 |
 | 22| ✅     | 095  | CONST/TYPESTATE    | SCRAM state buf capacities pinned to `MAX_CLIENT_*_LEN` via const-generic expressions |
-| 23| ⏳     | 100  | TYPESTATE          | `NonZeroRange` for `StagedAction::SendBytesRange` — closes `unwrap_or(&[])` silent-empty seam |
+| 23| ✅     | 100  | TYPESTATE          | `NonEmptyRange { start, len: NonZeroUsize }` replaces raw `(start, end)` — non-empty SendBytes is a type invariant |
 | 24| ❌     | —    | CACHE              | `emit_actions!` `unlikely` hint — const-asserted dead branch; LLVM cold-hoists already |
 
 **Priority ordering for remaining work** (per user request 2026-04-20):
-1. Tier-elevation: DEF-100 → DEF-101.
+1. Tier-elevation: DEF-101 (DEF-100 shipped `8ff256f`).
 2. Security: DEF-102.
 3. Perf/architecture: DEF-103 → DEF-108.
 4. Validation gates: DEF-109, DEF-110.
+
+**Execution log:**
+- `8e4690a` DEF-095 ✅
+- `ac57e62` DEF-096 ✅
+- `052febe` DEF-097 ✅
+- `fd1f5cd` DEF-098 ✅
+- `ecee97c` DEF-099 ✅
+- `8ff256f` DEF-100 ✅
+- *next:* DEF-101 ReplyId linearity — full-path audit + Drop removal.
 
 ## §18. Command enum
 
@@ -3420,8 +3429,8 @@ Acceptance:
 - **1b hardening (2026-04-18)** — latent Phase-1c bug fix + regression-brittleness lockdown before 1c begins. Closed: DEF-054 (exhaustive `allows_unsolicited_param_status`, unsolicited PS works in Idle), DEF-055 (`emit_actions!` two-form split, no `#[allow]` left), DEF-056 (`MalformedParameterStatus` manufactured variant removed), DEF-057 (`const fn` size math ties `MAX_OWNED_SEND_LEN` / SCRAM bounds to `MAX_IDENT_LEN`/`MAX_APP_NAME_LEN`/`MAX_SERVER_NONCE_LEN`), DEF-058 (`ReadBuf` lazy-compact + inline hints). ✅
 - 1c — Query / Execute / post-auth chain / basic codec. Binding commitments from the 1b-hardening audit: **DEF-059** compute/apply split in `PgProtocol`, **DEF-060** typed error enums replacing `heapless::String<N>` in cold-path errors (kills silent-truncation class), **DEF-061** `Errored(ErrorKind)` instead of `Errored(ProtocolError)` (zero-clone on subsequent pushes), **DEF-062** `NoticeResponse` pre-dispatch filter, **DEF-063** handshake-flow typestate extraction (tier-2→1 on "invalid handshake call from wrong state"), **DEF-064** bounded-iterations loop in `parse_error_response`, **DEF-065** SCRAM message assembly direct-to-`WriteBuf`. Measurement milestone **DEF-067** (`cargo asm` verification) and **DEF-068** (base64-simd benchmark decision) land at the end of 1c.
 - **1c-batch-5 (2026-04-20) — post-DEF-094 architect audit + 24-findings execution.** Full `bsql-pg-proto` audit by the rust-senior-architect agent catalogued 24 improvement opportunities ranked by `(win × tier-elevation) / cost`. Execution is split across sub-phases; priority order is tier-elevation → security → perf/architecture. See §17.1 below for the full table.
-  - **Shipped ✅:** DEF-095 (u16 password len + SCRAM const-generic drift guard + `record_param_status` compression), DEF-096 (`FixedStr<N, Tag>` generic consolidation — `Ident`/`DatabaseName`/`ApplicationName`/`BoundedStr` all POD), DEF-097 (`ConnectingStartup` → `ConnectingStartupTrust | ConnectingStartupScram` typestate split), DEF-098 (`size_of` assert tightening), DEF-099 (`PodBytes<N>` for SCRAM state buffers + pattern-rationale doc).
-  - **Tier-elevation (HIGHEST priority):** **DEF-100** `NonZeroRange` for `StagedAction::SendBytesRange` (closes `unwrap_or(&[])` silent-empty seam in `materialise`); **DEF-101** `ReplyId` linearity via full-path audit — removes the Drop-guard panic, closes DEF-052 diagnostic-masking class entirely.
+  - **Shipped ✅:** DEF-095 (u16 password len + SCRAM const-generic drift guard + `record_param_status` compression), DEF-096 (`FixedStr<N, Tag>` generic consolidation — `Ident`/`DatabaseName`/`ApplicationName`/`BoundedStr` all POD), DEF-097 (`ConnectingStartup` → `ConnectingStartupTrust | ConnectingStartupScram` typestate split), DEF-098 (`size_of` assert tightening), DEF-099 (`PodBytes<N>` for SCRAM state buffers + pattern-rationale doc), DEF-100 (`NonEmptyRange` for `StagedAction::SendBytesRange` — non-empty is type invariant, silent-empty SendBytes no-op closes tier-3 → tier-2).
+  - **Tier-elevation (HIGHEST priority, in flight):** **DEF-101** `ReplyId` linearity via full-path audit — removes the Drop-guard panic, closes DEF-052 diagnostic-masking class entirely.
   - **Security:** **DEF-102** `base64ct` swap (constant-time encode over the SCRAM ClientProof — RustCrypto).
   - **Perf/architecture wave:** **DEF-103** `core::hint::cold_path()` at every `DispatchOutcome::Errored` site; **DEF-104** `ErrorResponse` field-kind table (`[Option<FieldKind>; 256]` replaces nine-arm match); **DEF-105** `OutActions` shrink via `ServerErrorResponse` BoundedStr bounds tuning; **DEF-106** `SessionParams` POD layout (9 × `heapless::String<128>` → flat byte buffer + slot ends); **DEF-107** SCRAM wire builders write-into (`generate_client_nonce_into`, `build_client_first_bare_into` — no return-value `heapless::Vec`); **DEF-108** `std::simd::u8x32` XOR for SCRAM ClientKey ⊕ ClientSignature (constant-time, vectorised — cold path, architectural).
   - **Validation gates (close only after `cargo asm` confirms win):** **DEF-109** `Severity::from_bytes` first-byte dispatch review; **DEF-110** `ProtocolError::kind` repr review.

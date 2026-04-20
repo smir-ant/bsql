@@ -442,11 +442,11 @@ See `reforge.md` §17.1 for the master table. Execution is tier-elevation
 | `052febe` | **DEF-097** | `ConnectingStartup` → `Trust | Scram` typestate split. "Server asked wrong auth method" becomes a type-level impossibility. |
 | `fd1f5cd` | **DEF-098** | `size_of` drift-guard tightening post DEF-095/096/097 (ProtoState budget 2048 → 1280, etc.) |
 | `ecee97c` | **DEF-099** | `PodBytes<N>` for SCRAM state buffers + pattern-rationale doc (`.get(..n).unwrap_or(&[])` is forbid-bundle idiom, not kludge) |
+| `8ff256f` | **DEF-100** | `NonEmptyRange { start, len: NonZeroUsize }` replaces raw `(start, end)` on `StagedAction::SendBytesRange` — non-empty is a type invariant, zero-length SendBytes can't compile. Tier-3 audit → tier-2 structural. |
 
 ### Open — tier-elevation (HIGHEST priority)
 
-- **DEF-100** — `NonZeroRange` for `StagedAction::SendBytesRange`. Currently carries raw `(start, end): (usize, usize)`; `materialise` does `buf.get(start..end).unwrap_or(&[])` — the `unwrap_or(&[])` branch opens a silent-empty-SendBytes seam. Typed constructor proves `start ≤ end ≤ write_buf.len()` at emission time; the match in `materialise` becomes infallible. Tier-3 audit → tier-2 structural elevation.
-- **DEF-101** — `ReplyId` linearity via full-path audit. Audit every `ProtoState` extraction site to confirm every consume-path is structural (no `mem::take`-and-drop without consume). Then remove `Drop` from `ReplyId`. **Closes DEF-052 entirely** — the diagnostic-masking risk under `panic = "unwind"` goes away because there is no Drop to mask. Tier-2 runtime guard → tier-1 compile guarantee.
+- **DEF-101** — `ReplyId` linearity via full-path audit. Audit every `ProtoState` extraction site to confirm every consume-path is structural (no `mem::take`-and-drop without consume). Then remove `Drop` from `ReplyId`. **Closes DEF-052 entirely** — the diagnostic-masking risk under `panic = "unwind"` goes away because there is no Drop to mask. Tier-2 runtime guard → tier-1 compile guarantee. **NEXT UP.**
 
 ### Open — security
 
