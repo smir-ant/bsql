@@ -523,6 +523,22 @@ All reaffirmations / escalations below.
 | `324948f` | **DEF-116** | sorted-array collision loop (escalation of DEF-111) — **blocked** on MSRV 1.95 (`<[T]>::get` not const-stable; `arr[i]` banned by `forbid(indexing_slicing)`). Pragmatic form: keep hand-unrolled const asserts + add `#[cfg(test)]` drift-guard tests walking parallel `*_FOR_RUNTIME_CHECK` arrays. Revisit when Rust stabilises `<[T]>::get` in const. |
 | `324948f` | **DEF-117** | `core::mem::replace` instead of `take` in `fail_inflight_and_close` — eliminates the "`ProtoState::Default = Idle` is load-bearing for transient window safety" invariant. tier-3 → tier-1. |
 
+### Round 3 — additional closures (perf / security wave)
+
+| Commit | ID | One-liner |
+|---|---|---|
+| `3129d1e` | **DEF-102** | `base64ct` swap (constant-time SCRAM proof encoding; tier-3 audit → tier-1 RustCrypto-audited) |
+| `5d2d03d` | **DEF-103** | `#[cold] #[inline] fn errored(...)` helper centralises 44 DispatchOutcome::Errored sites for LLVM block-layout cold-hinting |
+| `f6313c5` | **DEF-106** | `SessionParams` per-field right-sized `BoundedStr<N>` — ~400 bytes saved in `PgProtocol`, Drop-free, overflow now truncates with `"…"` marker instead of silent value-drop |
+
+### Round 3 — honestly skipped with rationale
+
+- **DEF-104 — ErrorResponse field-kind table.** Architect: "architectural legibility, not perf — cold path". Current 6-arm match on `field_type` byte compiles to a byte-tree that LLVM folds. Separating into "byte→kind" + "kind→action" double-match would move the arm-body drift seam but not close it. Skip.
+- **DEF-105 — `OutActions` shrink via `ServerErrorResponse.{message,detail,hint}` bounds tuning.** Reducing 128/96/64 → 96/64/48 saves ~64-144 bytes per `ProtocolError` but truncates real PG error messages more aggressively. Requires production error-length profile to justify. Skip without data.
+- **DEF-108 — `std::simd::u8x32` XOR for ClientKey ⊕ ClientSignature.** `std::simd` portable SIMD is still unstable on MSRV 1.95 (tracked in rust-lang/rust#86656). Current zip-iterator form auto-vectorises via LLVM on x86-64-v2+ and aarch64. No stable-Rust path. Defer until portable SIMD lands on stable.
+- **DEF-107 — SCRAM wire builders write-into-caller-buffer.** Architectural cleanup: eliminates the heapless::Vec → PodBytes copy step in `build_sasl_initial_response`. Cold path (SCRAM once per connection). Worth doing but scope-boundary fit is awkward (`build_client_first_message` is short-lived and fine returning heapless::Vec; only the two state-bound builders benefit). Schedule: revisit during Phase 1c if the SCRAM flow reshapes; standalone commit has low cost-benefit ratio.
+- **DEF-109 / DEF-110 — `Severity::from_bytes` / `ProtocolError::kind` codegen review gates.** Pending `cargo asm` infrastructure. Not blocking Phase 1b.
+
 ### Round 3 — deferred with honest rationale
 
 - **DEF-118 — `ParsedFrame<'_>` proof-token for parse_header → advance (P2.6).** Architect proposed tying `ReadBuf::advance`'s amount to `parse_header`'s output via a non-Clone typed token, so that a future refactor passing the wrong `total_len` becomes a compile error. **Two forms were explored:**

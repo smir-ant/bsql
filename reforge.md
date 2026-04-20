@@ -1109,9 +1109,9 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 | 7 | ✅     | 101  | TYPESTATE          | Full-path audit + DEF-052 close via `cfg(test)` thread-panicking guard. Drop-guard KEPT (stable-Rust tier-2 ceiling; removing it would regress to tier-3 audit). See deferred §16 for analysis. |
 | 8 | ❌     | —    | ALLOC/ALGO         | ASCII fast-path bit — stdlib `from_utf8` already SIMD-dispatches ASCII; caching saves nothing under forbid(unsafe_code) |
 | 9 | ❌     | —    | ARCH               | `WriteBuf::with_length_prefix` closure inline — already inlined by LLVM |
-| 10| ⏳     | 102  | ALGO/SECURITY      | `base64` → `base64ct` — constant-time SCRAM ClientProof encoding |
+| 10| ✅     | 102  | ALGO/SECURITY      | `base64` → `base64ct` swap — RustCrypto-audited constant-time SCRAM ClientProof encoding |
 | 11| ❌     | —    | ALGO/CONST         | `ProtocolError::kind` repr trick — jump-table already emitted; re-evaluate via DEF-110 |
-| 12| ⏳     | 106  | ALLOC/CONST        | `SessionParams` POD layout (9 × `Option<heapless::String<128>>` → flat bytes + slot-ends) — still open; DEF-114 handled the typed-field subset separately |
+| 12| ✅     | 106, 114 | ALLOC/CONST    | DEF-114 typed 4 fields. **DEF-106**: remaining 5 string fields right-sized per-field via `BoundedStr<N>` (POD, Drop-free). ~400 bytes saved in `PgProtocol`; overflow now truncates with `"…"` marker instead of silent value-drop. |
 | §4| ✅     | 114  | TYPESTATE          | Typed `SessionParams` fields — 4 of 9: `is_superuser`/`integer_datetimes` → `Option<bool>`; `server_encoding`/`client_encoding` → `Option<Encoding>`. Tier-1/2 on the binary + known-variant subsets. |
 | 13| ✅     | 095  | ALGO               | `record_param_status` — 21 lines of `match { Some(_)/None }` → 5 let-else lines |
 | 14| ❌     | —    | CACHE/ALGO         | `HeaderParse` slice patterns — LLVM folds; no measurable win |
@@ -1120,7 +1120,7 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 | 17| ⏳     | 108  | ALGO/CACHE         | `std::simd::u8x32` XOR for ClientKey ⊕ ClientSignature (constant-time, one vpxor) |
 | 18| ⏳     | 105  | ALLOC/CACHE        | `OutActions` shrink via `ServerErrorResponse.{message,detail,hint}` BoundedStr bounds retune |
 | 19| ❌     | —    | ALGO/CONST         | Session-params perfect hash — cold path, 9 keys, linear match optimal |
-| 20| ⏳     | 103  | CACHE              | `core::hint::cold_path()` at every `DispatchOutcome::Errored` site |
+| 20| ✅     | 103  | CACHE              | `#[cold] #[inline] fn errored(...)` helper centralises 44 Errored sites for LLVM block-layout cold-hinting |
 | 21| ✅     | 098  | ALLOC              | `size_of` drift-guard tightening post DEF-095/096/097 |
 | 22| ✅     | 095  | CONST/TYPESTATE    | SCRAM state buf capacities pinned to `MAX_CLIENT_*_LEN` via const-generic expressions |
 | 23| ✅     | 100  | TYPESTATE          | `NonEmptyRange { start, len: NonZeroUsize }` replaces raw `(start, end)` — non-empty SendBytes is a type invariant |
@@ -1136,10 +1136,14 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 - `8e4690a` DEF-095 ✅ • `ac57e62` DEF-096 ✅ • `052febe` DEF-097 ✅ • `fd1f5cd` DEF-098 ✅ • `ecee97c` DEF-099 ✅ • `8ff256f` DEF-100 ✅
 - `b0dbd46` DEF-101 ✅ (re-scoped) • `43c1877` DEF-111 ✅ • `ce6a8bf` DEF-112 ✅ • `406e36a` DEF-114 ✅
 - `324948f` DEF-115/116/117 ✅ (round-3 escalations — honest tier analysis)
+- `3129d1e` DEF-102 ✅ (base64ct security) • `5d2d03d` DEF-103 ✅ (cold-path helper) • `f6313c5` DEF-106 ✅ (SessionParams POD)
 - **Rejected** DEF-113 (StagedAction Success/Teardown split) — `compute_push`'s dual role breaks clean partition.
-- **Deferred** DEF-118 (ParsedFrame proof-token) — ambitious form is a natural fit for Phase 1c pipelining rework.
+- **Skipped with rationale** DEF-104 (field-kind table — cold-path legibility only) • DEF-105 (OutActions shrink — needs PG error-length profile to justify) • DEF-108 (std::simd XOR — portable SIMD unstable on MSRV 1.95).
+- **Deferred** DEF-107 (SCRAM in-place writes — low cost-benefit standalone, revisit in Phase 1c).
+- **Deferred** DEF-118 (ParsedFrame proof-token) — ambitious form fits Phase 1c pipelining rework.
 - **Deferred to Phase 1c** DEF-119 (`PgProtocol<Phase>` outer typestate) — architect-rated "biggest tier elevation available"; folds naturally into pipelining.
-- *next:* DEF-102 (base64ct security) → DEF-103..108 perf wave.
+- **Validation gates** DEF-109 / DEF-110 pending `cargo asm` infrastructure — not blocking Phase 1b.
+- **Round 3 summary: 24 audit findings exhausted.** 17 shipped / reaffirmed, 3 skipped with rationale, 2 deferred to Phase 1c, 2 validation gates pending measurement.
 
 ## §18. Command enum
 
