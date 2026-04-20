@@ -911,12 +911,17 @@ fn compute_push_simple_query(
                 ProtoState::SimpleQueryAwaitFirstResponse(reply)
             }
             Err(_) => {
-                // Architecturally unreachable — `Sql` is bounded
-                // 2048 bytes, `WriteBuf` is 512 bytes. The `build`
-                // function caps SQL length at the WriteBuf
-                // envelope; on overflow the fail path classifies
-                // as a `ProtocolInvariantBroken` (matches the
-                // Startup analogue).
+                // TIER-1 COMPILE DEAD BRANCH. The const assert in
+                // `write_buf.rs`:
+                //     MAX_OWNED_SEND_LEN >= max_simple_query_message_size()
+                // proves at build time that a `Sql` constructed via
+                // `from_str_truncating` (bounded `MAX_SQL_LEN`) cannot
+                // overflow the WriteBuf. `build_query_message`'s
+                // `Err(WriteBufFull)` therefore cannot fire in
+                // production — the arm exists solely to satisfy
+                // `match` exhaustiveness under the `clippy::unwrap_used`
+                // ban. A future refactor that breaks the size
+                // invariant would fail the const assert first.
                 emit_actions!(staged, budget: 1, [
                     StagedAction::FailReply {
                         id: reply.consume(),

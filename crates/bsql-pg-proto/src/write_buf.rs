@@ -24,10 +24,19 @@ use core::fmt;
 /// Maximum byte capacity for an owned outbound frame.
 ///
 /// Derived from the worst case across StartupMessage, SASLInitialResponse,
-/// and SASLResponse — see [`max_startup_message_size`] and the
-/// `scram::wire::sasl_*_frame_size` counterparts. 512 bytes provides
-/// comfortable headroom above the ~389-byte worst-case SASLResponse.
-pub const MAX_OWNED_SEND_LEN: usize = 512;
+/// SASLResponse, **and SimpleQuery** (1c-1b). The cap is a const
+/// computed from the worst-case contributing inputs; const asserts
+/// below tie it to every frame-builder's size math so a future
+/// change to any contributing constant (e.g. `MAX_SQL_LEN`) without
+/// growing this cap becomes a build error, not a runtime overflow.
+///
+/// Size breakdown (current values):
+/// - StartupMessage worst case: ~305 bytes.
+/// - SASLInitialResponse worst case: ~147 bytes.
+/// - SASLResponse worst case: ~389 bytes.
+/// - **SimpleQuery (`Q`) worst case: 2054 bytes** (tag + length +
+///   MAX_SQL_LEN + NUL). Dominates; drives the cap.
+pub const MAX_OWNED_SEND_LEN: usize = 2112;
 
 /// Worst-case byte size of a PostgreSQL `StartupMessage` frame.
 ///
@@ -71,6 +80,42 @@ pub const fn max_startup_message_size() -> usize {
 // MAX_APP_NAME_LEN) or adding a StartupMessage parameter without
 // growing MAX_OWNED_SEND_LEN fails the build here.
 const _: () = assert!(MAX_OWNED_SEND_LEN >= max_startup_message_size());
+
+/// Worst-case byte size of a PostgreSQL `Query` (`'Q'`) frame —
+/// Simple Query protocol. 1c-1b.
+///
+/// Layout (PG §55.7 Simple Query):
+/// - Tag: `'Q'` (1 byte)
+/// - Length: `u32` BE including itself
+/// - SQL text: up to [`crate::ident::MAX_SQL_LEN`] bytes
+/// - NUL terminator (1 byte)
+///
+/// # Drift guard
+///
+/// Bumping [`crate::ident::MAX_SQL_LEN`] (truncation threshold on
+/// `Sql::from_str_truncating`) without growing [`MAX_OWNED_SEND_LEN`]
+/// fails the `const _` assert below — the overflow cannot silently
+/// sneak in.
+pub const fn max_simple_query_message_size() -> usize {
+    1usize // tag 'Q'
+        .saturating_add(4) // length prefix (includes itself)
+        .saturating_add(crate::ident::MAX_SQL_LEN)
+        .saturating_add(1) // NUL terminator
+}
+
+// 1c-1b safety drift-pin: the `build_query_message` Err(WriteBufFull)
+// branch is architecturally unreachable if and only if
+// `MAX_OWNED_SEND_LEN >= max_simple_query_message_size()`. Previously
+// this invariant was NOT asserted — a full-size SQL (`MAX_SQL_LEN=2048`)
+// would in fact overflow a 512-byte WriteBuf at runtime, masquerading
+// as `ProtocolError::ProtocolInvariantBroken`. Now: bumping
+// `MAX_SQL_LEN` without growing the WriteBuf cap is a build error.
+const _: () = assert!(
+    MAX_OWNED_SEND_LEN >= max_simple_query_message_size(),
+    "MAX_OWNED_SEND_LEN below worst-case SimpleQuery ('Q') frame size — \
+     full-size SQL would overflow the caller's WriteBuf. Grow \
+     MAX_OWNED_SEND_LEN or shrink MAX_SQL_LEN in lockstep.",
+);
 
 /// Bounded outbound frame buffer with PG wire builders.
 ///

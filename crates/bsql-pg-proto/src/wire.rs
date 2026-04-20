@@ -335,3 +335,55 @@ assert_all_distinct!(
     AUTH_SASL_CONTINUE,
     AUTH_SASL_FINAL,
 );
+
+// ---------------------------------------------------------------
+// Tier-1 compile drift-pin: tag bytes and auth sub-codes match
+// the PG wire spec (PG §55.7 "Message Formats"). A typo
+// (`TAG_QUERY = b'q'` instead of `b'Q'`) or a deliberate rename
+// would break the build here.
+//
+// This uplifts the "tag values match spec" invariant from
+// tier-3 (documentation + audit) to tier-1 (compile-enforced).
+// Complements `assert_all_distinct!` which only verified
+// *distinctness* within a direction — silent drift of an
+// individual tag to a wrong-but-distinct byte was possible.
+// ---------------------------------------------------------------
+const _: () = {
+    // Inbound (backend → frontend).
+    assert!(TAG_READY_FOR_QUERY == b'Z', "TAG_READY_FOR_QUERY drift");
+    assert!(TAG_ERROR_RESPONSE == b'E', "TAG_ERROR_RESPONSE drift");
+    assert!(TAG_AUTHENTICATION == b'R', "TAG_AUTHENTICATION drift");
+    assert!(TAG_PARAMETER_STATUS == b'S', "TAG_PARAMETER_STATUS drift");
+    assert!(TAG_BACKEND_KEY_DATA == b'K', "TAG_BACKEND_KEY_DATA drift");
+    assert!(TAG_NEGOTIATE_PROTOCOL_VERSION == b'v', "TAG_NEGOTIATE_PROTOCOL_VERSION drift");
+    assert!(TAG_NOTICE_RESPONSE == b'N', "TAG_NOTICE_RESPONSE drift");
+    assert!(TAG_ROW_DESCRIPTION == b'T', "TAG_ROW_DESCRIPTION drift");
+    assert!(TAG_DATA_ROW == b'D', "TAG_DATA_ROW drift");
+    assert!(TAG_COMMAND_COMPLETE == b'C', "TAG_COMMAND_COMPLETE drift");
+    assert!(TAG_EMPTY_QUERY_RESPONSE == b'I', "TAG_EMPTY_QUERY_RESPONSE drift");
+    assert!(TAG_NO_DATA == b'n', "TAG_NO_DATA drift");
+    assert!(TAG_PARSE_COMPLETE == b'1', "TAG_PARSE_COMPLETE drift");
+    assert!(TAG_BIND_COMPLETE == b'2', "TAG_BIND_COMPLETE drift");
+    assert!(TAG_CLOSE_COMPLETE == b'3', "TAG_CLOSE_COMPLETE drift");
+    assert!(TAG_PARAMETER_DESCRIPTION == b't', "TAG_PARAMETER_DESCRIPTION drift");
+
+    // Outbound (frontend → backend).
+    assert!(TAG_SYNC == b'S', "TAG_SYNC drift");
+    assert!(TAG_SASL_RESPONSE == b'p', "TAG_SASL_RESPONSE drift");
+    assert!(TAG_QUERY == b'Q', "TAG_QUERY drift");
+    assert!(TAG_PARSE == b'P', "TAG_PARSE drift");
+    assert!(TAG_BIND == b'B', "TAG_BIND drift");
+    assert!(TAG_DESCRIBE == b'D', "TAG_DESCRIBE drift");
+    assert!(TAG_EXECUTE == b'E', "TAG_EXECUTE drift");
+    assert!(TAG_CLOSE == b'C', "TAG_CLOSE drift");
+    assert!(TAG_FLUSH == b'H', "TAG_FLUSH drift");
+
+    // Auth sub-codes.
+    assert!(AUTH_OK == 0, "AUTH_OK drift");
+    assert!(AUTH_SASL == 10, "AUTH_SASL drift");
+    assert!(AUTH_SASL_CONTINUE == 11, "AUTH_SASL_CONTINUE drift");
+    assert!(AUTH_SASL_FINAL == 12, "AUTH_SASL_FINAL drift");
+
+    // Protocol version.
+    assert!(PROTOCOL_VERSION_3_0 == 196608, "PROTOCOL_VERSION_3_0 drift from PG 3.0 (0x00030000)");
+};
