@@ -1083,7 +1083,48 @@ pub enum ProtoState {
 
 **Variants добавляются** когда их путь реализуется. Manufactured-future variants (без кода входа/выхода) — запрещены §4.6.
 
-**Phase 1c split-plan (DEF-063):** handshake-флоу (`ConnectingStartup → ConnectingScram* → ConnectingPostAuth* → Idle`) — **линейная цепочка**, где typestate даёт реальный tier-1 выигрыш: нельзя вызвать шаг 3 handshake'а минуя шаг 2. Phase 1c выделяет handshake в отдельный `handshake` модуль с typestate-transitions (`fn step_n(PrevState, ...) -> Result<(NextState, Action), ProtocolError>`). **Реактивные состояния** (`AwaitingQueryReply`, `StreamingRows`, `InTransaction`) остаются в enum — typestate там не работает, потому что один и тот же server-event (`'N'`, `'Z'`, `'E'`, ...) может вести в несколько исходов, sum-type неизбежен. Это гибрид: чистая tier-1 форма для линейных участков, enum для реактивных. См. DEF-063.
+**Phase 1c split-plan (DEF-063):** handshake-флоу (`ConnectingStartup* → ConnectingScram* → ConnectingPostAuth* → Idle`) — **линейная цепочка**, где typestate даёт реальный tier-1 выигрыш: нельзя вызвать шаг 3 handshake'а минуя шаг 2. Phase 1c выделяет handshake в отдельный `handshake` модуль с typestate-transitions (`fn step_n(PrevState, ...) -> Result<(NextState, Action), ProtocolError>`). **Реактивные состояния** (`AwaitingQueryReply`, `StreamingRows`, `InTransaction`) остаются в enum — typestate там не работает, потому что один и тот же server-event (`'N'`, `'Z'`, `'E'`, ...) может вести в несколько исходов, sum-type неизбежен. Это гибрид: чистая tier-1 форма для линейных участков, enum для реактивных. См. DEF-063.
+
+**DEF-097 update (shipped 2026-04-20).** `ConnectingStartup { reply, credentials }` расщеплён на **два disjoint варианта**: `ConnectingStartupTrust { reply }` (24 байта) и `ConnectingStartupScram { reply, scram: ScramSession }`. Дискриминация `Credentials::Trust` vs `Credentials::ScramPassword` переехала в `compute_push_startup` (push-time), а дальше цепочка auth-ответов обслуживается **двумя разными arm'ами диспетчера** — Trust-вариант принимает только `AUTH_OK`, Scram — только `AUTH_SASL`. "Server sent wrong auth method for credentials" превратился из tier-3 runtime-классификации в **type-level impossibility**: перемещение arm body между вариантами — compile error. Trust-connections больше не носят password-буфер (~1040 байт) на первом сетевом round-trip'е.
+
+### §17.1. Post-DEF-094 architect audit — 24 findings table
+
+**Audit date:** 2026-04-20. **Agent:** rust-senior-architect. **Scope:** full `bsql-pg-proto` crate. **Ranking:** `(expected_win × tier_elevation) / implementation_cost`.
+
+Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with rationale.
+
+| # | Status | DEF  | Category           | One-liner |
+|---|--------|------|--------------------|-----------|
+| 1 | ✅     | 096  | ARCH/ALLOC/LIFETIME | `FixedStr<N, Tag>` unifies `Ident`/`DatabaseName`/`ApplicationName`/`BoundedStr`, POD, phantom-tag nominal typing |
+| 2 | ✅     | 097  | TYPESTATE/ALLOC    | `ConnectingStartup` → `Trust | Scram` typestate split — Credentials removed from post-push states |
+| 3 | ✅     | 099  | ALLOC/CACHE        | `PodBytes<N>` replaces `heapless::Vec<u8, N>` in SCRAM state buffers (−16 bytes, Drop-free buffers) |
+| 4 | ⏳     | 104  | ALGO/CACHE         | `parse_error_response` field-kind `[Option<FieldKind>; 256]` table + kind-match |
+| 5 | ❌     | —    | ALGO               | `Severity::from_bytes` first-byte dispatch — cold path, LLVM already folds; re-evaluate via DEF-109 |
+| 6 | ✅     | 095  | ALLOC              | `Password.len: usize → u16` (−6B × propagation through state/command chain) |
+| 7 | ⏳     | 101  | TYPESTATE          | `ReplyId` linearity via state-by-value everywhere → remove Drop-guard, close DEF-052 |
+| 8 | ❌     | —    | ALLOC/ALGO         | ASCII fast-path bit — stdlib `from_utf8` already SIMD-dispatches ASCII; caching saves nothing under forbid(unsafe_code) |
+| 9 | ❌     | —    | ARCH               | `WriteBuf::with_length_prefix` closure inline — already inlined by LLVM |
+| 10| ⏳     | 102  | ALGO/SECURITY      | `base64` → `base64ct` — constant-time SCRAM ClientProof encoding |
+| 11| ❌     | —    | ALGO/CONST         | `ProtocolError::kind` repr trick — jump-table already emitted; re-evaluate via DEF-110 |
+| 12| ⏳     | 106  | ALLOC/CONST        | `SessionParams` POD layout (9 × `Option<heapless::String<128>>` → flat bytes + slot-ends) |
+| 13| ✅     | 095  | ALGO               | `record_param_status` — 21 lines of `match { Some(_)/None }` → 5 let-else lines |
+| 14| ❌     | —    | CACHE/ALGO         | `HeaderParse` slice patterns — LLVM folds; no measurable win |
+| 15| ⏳     | 107  | ALLOC/CACHE        | SCRAM wire builders write-into (`generate_client_nonce_into`, etc.) — no heapless::Vec returns |
+| 16| ❌     | —    | ALGO/TRAIT         | `parse_u32` — hand-rolled is CORRECT for pre-validated ASCII digits (stdlib adds wasteful UTF-8 revalidation) |
+| 17| ⏳     | 108  | ALGO/CACHE         | `std::simd::u8x32` XOR for ClientKey ⊕ ClientSignature (constant-time, one vpxor) |
+| 18| ⏳     | 105  | ALLOC/CACHE        | `OutActions` shrink via `ServerErrorResponse.{message,detail,hint}` BoundedStr bounds retune |
+| 19| ❌     | —    | ALGO/CONST         | Session-params perfect hash — cold path, 9 keys, linear match optimal |
+| 20| ⏳     | 103  | CACHE              | `core::hint::cold_path()` at every `DispatchOutcome::Errored` site |
+| 21| ✅     | 098  | ALLOC              | `size_of` drift-guard tightening post DEF-095/096/097 |
+| 22| ✅     | 095  | CONST/TYPESTATE    | SCRAM state buf capacities pinned to `MAX_CLIENT_*_LEN` via const-generic expressions |
+| 23| ⏳     | 100  | TYPESTATE          | `NonZeroRange` for `StagedAction::SendBytesRange` — closes `unwrap_or(&[])` silent-empty seam |
+| 24| ❌     | —    | CACHE              | `emit_actions!` `unlikely` hint — const-asserted dead branch; LLVM cold-hoists already |
+
+**Priority ordering for remaining work** (per user request 2026-04-20):
+1. Tier-elevation: DEF-100 → DEF-101.
+2. Security: DEF-102.
+3. Perf/architecture: DEF-103 → DEF-108.
+4. Validation gates: DEF-109, DEF-110.
 
 ## §18. Command enum
 
@@ -3378,6 +3419,13 @@ Acceptance:
 - 1b — SCRAM-SHA-256 в pure-sync (hardest — ~300 LoC HMAC-SHA256 + PBKDF2 + base64 + nonce generation). ✅
 - **1b hardening (2026-04-18)** — latent Phase-1c bug fix + regression-brittleness lockdown before 1c begins. Closed: DEF-054 (exhaustive `allows_unsolicited_param_status`, unsolicited PS works in Idle), DEF-055 (`emit_actions!` two-form split, no `#[allow]` left), DEF-056 (`MalformedParameterStatus` manufactured variant removed), DEF-057 (`const fn` size math ties `MAX_OWNED_SEND_LEN` / SCRAM bounds to `MAX_IDENT_LEN`/`MAX_APP_NAME_LEN`/`MAX_SERVER_NONCE_LEN`), DEF-058 (`ReadBuf` lazy-compact + inline hints). ✅
 - 1c — Query / Execute / post-auth chain / basic codec. Binding commitments from the 1b-hardening audit: **DEF-059** compute/apply split in `PgProtocol`, **DEF-060** typed error enums replacing `heapless::String<N>` in cold-path errors (kills silent-truncation class), **DEF-061** `Errored(ErrorKind)` instead of `Errored(ProtocolError)` (zero-clone on subsequent pushes), **DEF-062** `NoticeResponse` pre-dispatch filter, **DEF-063** handshake-flow typestate extraction (tier-2→1 on "invalid handshake call from wrong state"), **DEF-064** bounded-iterations loop in `parse_error_response`, **DEF-065** SCRAM message assembly direct-to-`WriteBuf`. Measurement milestone **DEF-067** (`cargo asm` verification) and **DEF-068** (base64-simd benchmark decision) land at the end of 1c.
+- **1c-batch-5 (2026-04-20) — post-DEF-094 architect audit + 24-findings execution.** Full `bsql-pg-proto` audit by the rust-senior-architect agent catalogued 24 improvement opportunities ranked by `(win × tier-elevation) / cost`. Execution is split across sub-phases; priority order is tier-elevation → security → perf/architecture. See §17.1 below for the full table.
+  - **Shipped ✅:** DEF-095 (u16 password len + SCRAM const-generic drift guard + `record_param_status` compression), DEF-096 (`FixedStr<N, Tag>` generic consolidation — `Ident`/`DatabaseName`/`ApplicationName`/`BoundedStr` all POD), DEF-097 (`ConnectingStartup` → `ConnectingStartupTrust | ConnectingStartupScram` typestate split), DEF-098 (`size_of` assert tightening), DEF-099 (`PodBytes<N>` for SCRAM state buffers + pattern-rationale doc).
+  - **Tier-elevation (HIGHEST priority):** **DEF-100** `NonZeroRange` for `StagedAction::SendBytesRange` (closes `unwrap_or(&[])` silent-empty seam in `materialise`); **DEF-101** `ReplyId` linearity via full-path audit — removes the Drop-guard panic, closes DEF-052 diagnostic-masking class entirely.
+  - **Security:** **DEF-102** `base64ct` swap (constant-time encode over the SCRAM ClientProof — RustCrypto).
+  - **Perf/architecture wave:** **DEF-103** `core::hint::cold_path()` at every `DispatchOutcome::Errored` site; **DEF-104** `ErrorResponse` field-kind table (`[Option<FieldKind>; 256]` replaces nine-arm match); **DEF-105** `OutActions` shrink via `ServerErrorResponse` BoundedStr bounds tuning; **DEF-106** `SessionParams` POD layout (9 × `heapless::String<128>` → flat byte buffer + slot ends); **DEF-107** SCRAM wire builders write-into (`generate_client_nonce_into`, `build_client_first_bare_into` — no return-value `heapless::Vec`); **DEF-108** `std::simd::u8x32` XOR for SCRAM ClientKey ⊕ ClientSignature (constant-time, vectorised — cold path, architectural).
+  - **Validation gates (close only after `cargo asm` confirms win):** **DEF-109** `Severity::from_bytes` first-byte dispatch review; **DEF-110** `ProtocolError::kind` repr review.
+  - **Legitimately skipped (documented, not deferred):** audit finding #8 (ASCII fast-path bit — stdlib `from_utf8` already SIMD-dispatches ASCII; caching the bit saves nothing under `#![forbid(unsafe_code)]`); #9 (`with_length_prefix` closure inline — already inlined by LLVM); #14 (`HeaderParse` slice-pattern match — already folds to length check); #16 (hand-rolled `parse_u32` — correct for pre-validated ASCII digits, `str::parse` would add a wasteful UTF-8 revalidation pass); #19 (session-params perfect hash — cold path, 9 keys, linear match already optimal); #24 (`emit_actions!` `unlikely` hint — const-asserted dead branch). Each is a principled reject, not a deferral; re-evaluate only if profile data shows the opposite.
 - 1d — Streaming, COPY, LISTEN/NOTIFY.
 - 1e — bsql-backend + PgBackend + run_io + live ping integration. Binding: **DEF-027** sealed-token pattern, **DEF-047** wrapper typestate (`Client<Idle>` / `Transaction<Active>` / `QueryStream<Open>`), **DEF-031** `JoinHandle` owned inside `Client`, **DEF-035** semaphore-gated `max_inflight`, **DEF-052** `cfg_select!` for `ReplyId::drop` diagnostic under `panic = "unwind"`, **DEF-053** SCRAM channel binding (requires TLS), **DEF-066** `ReplyId` bit-packing (if measured benefit warrants).
 - 1f — full query integration test (real SELECT against live PG, using raw codec; NO macro yet).

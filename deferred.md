@@ -423,8 +423,59 @@ polish items flow around them).
 
 **Registered, not blocking:**
 - **DEF-063** — handshake-flow typestate module (tier-2 → tier-1 on invalid-step call).
-- **DEF-065** — SCRAM message assembly writes into WriteBuf directly (perf + simplification).
+- **DEF-065** — SCRAM message assembly writes into WriteBuf directly (perf + simplification). Superseded by DEF-107.
 - **DEF-077** — `NonErroredState` typestate. **Recommend skip after DEF-061**: Errored is now 1 byte, so "preserve Errored across mem::take" costs ~zero. DEF-077 would move it from tier-2 structural to tier-1 compile, but the payoff is marginal now. Re-evaluate if the preservation pattern becomes a hotspot.
+
+## 16. Phase-1c batch 5 — post-DEF-094 architect audit (2026-04-20)
+
+Full `bsql-pg-proto` audit by the rust-senior-architect agent
+catalogued **24 findings** ranked by `(win × tier-elevation) / cost`.
+See `reforge.md` §17.1 for the master table. Execution is tier-elevation
+→ security → perf, per user directive.
+
+### Closed in this session
+
+| Commit | ID | One-liner |
+|---|---|---|
+| `8e4690a` | **DEF-095** | `Password.len: u16` + SCRAM const-generic drift guard + `record_param_status` let-else compression |
+| `ac57e62` | **DEF-096** | `FixedStr<N, Tag>` generic — 4 string types → 1 POD form with phantom-tag nominal typing |
+| `052febe` | **DEF-097** | `ConnectingStartup` → `Trust | Scram` typestate split. "Server asked wrong auth method" becomes a type-level impossibility. |
+| `fd1f5cd` | **DEF-098** | `size_of` drift-guard tightening post DEF-095/096/097 (ProtoState budget 2048 → 1280, etc.) |
+| `ecee97c` | **DEF-099** | `PodBytes<N>` for SCRAM state buffers + pattern-rationale doc (`.get(..n).unwrap_or(&[])` is forbid-bundle idiom, not kludge) |
+
+### Open — tier-elevation (HIGHEST priority)
+
+- **DEF-100** — `NonZeroRange` for `StagedAction::SendBytesRange`. Currently carries raw `(start, end): (usize, usize)`; `materialise` does `buf.get(start..end).unwrap_or(&[])` — the `unwrap_or(&[])` branch opens a silent-empty-SendBytes seam. Typed constructor proves `start ≤ end ≤ write_buf.len()` at emission time; the match in `materialise` becomes infallible. Tier-3 audit → tier-2 structural elevation.
+- **DEF-101** — `ReplyId` linearity via full-path audit. Audit every `ProtoState` extraction site to confirm every consume-path is structural (no `mem::take`-and-drop without consume). Then remove `Drop` from `ReplyId`. **Closes DEF-052 entirely** — the diagnostic-masking risk under `panic = "unwind"` goes away because there is no Drop to mask. Tier-2 runtime guard → tier-1 compile guarantee.
+
+### Open — security
+
+- **DEF-102** — `base64` → `base64ct` swap. `base64ct` is RustCrypto's constant-time, `no_std`, branchless encoder. ClientProof encoding over a secret-derived byte array becomes side-channel-free in formal sense (vs current "probably constant-time because the lookup table is cache-line-sized"). Small API shift — replaces workspace `base64 = "0.22"`.
+
+### Open — perf/architecture wave
+
+- **DEF-103** — `core::hint::cold_path()` at every `DispatchOutcome::Errored` construction site. ~20 sites in `dispatch.rs`. Hot-path I-cache improvement via LLVM block-layout.
+- **DEF-104** — `parse_error_response` field dispatch via `[Option<FieldKind>; 256]` static table. The nine-arm match on field_type byte becomes a table lookup + six-variant kind match. Legibility + jump-table emission on cold path.
+- **DEF-105** — `OutActions<'_>` shrink via retuning `ServerErrorResponse.{message,detail,hint}` `BoundedStr` bounds. Current: 128/96/64. Candidate: 96/64/48 (−64B) or 64/48/32 (−144B per `ProtocolError`). Propagates to `Action<'_>` and `OutActions<'_>`. Weigh against real-world PG error-message length profile.
+- **DEF-106** — `SessionParams` POD layout. Current: 9 × `Option<heapless::String<128>>` ≈ 1233 bytes (90%+ zeroed padding). Candidate: flat `[u8; TOTAL]` + `slot_bitmap: u16` + `slot_ends: [u16; 9]` ≈ 600 bytes. POD, Drop-free, better cache behaviour.
+- **DEF-107** (supersedes DEF-065) — SCRAM wire builders write-into caller-owned buffers. `generate_client_nonce()` returning `heapless::Vec<u8, N>` → `generate_client_nonce_into(&mut PodBytes<N>) -> Result<(), ScramError>`. Same for `build_client_first_bare`, `build_client_first_message`, `build_client_final_*`. Removes the heapless::Vec builder-return pattern from the SCRAM hot path; state bufs already POD (DEF-099), wire bufs follow.
+- **DEF-108** — `std::simd::u8x32` for ClientKey ⊕ ClientSignature XOR in `compute_client_proof`. Current: 32-iteration zip loop; candidate: single `vpxor`. Cold path (once per connection), but architectural correctness — constant-time XOR via portable SIMD is the canonical SCRAM pattern.
+
+### Open — validation gates
+
+Close only after `cargo asm` confirms the win is real:
+
+- **DEF-109** — `Severity::from_bytes` first-byte dispatch. Current: 9-arm `match bytes` on byte-slice literals. If LLVM folds to byte-tree / memcmp chain (likely): skip. If branch chain (unlikely on cold path): ship first-byte table.
+- **DEF-110** — `ProtocolError::kind` repr optimisation. Current: exhaustive match, called on every fatal classification. If jump-table already emitted: skip. Otherwise: `#[repr(u8)]` discriminant reordering to pack by ErrorKind.
+
+### Legitimately rejected — do not revisit without new evidence
+
+- **#8 — ASCII fast-path bit on `FixedStr::as_str`.** stdlib `core::str::from_utf8` already SIMD-dispatches on ASCII; the "cache the ascii bit" optimisation would skip nothing unless we also skipped from_utf8 entirely, which requires `unsafe { from_utf8_unchecked }` → banned by `#![forbid(unsafe_code)]`. No win.
+- **#9 — `WriteBuf::with_length_prefix` closure inline.** Already inlined by LLVM at every known call site; `#[inline]` hint redundant.
+- **#14 — `HeaderParse` slice-pattern match.** LLVM folds slice-pattern exhaustive matches to a length check + field extract; `cargo asm` confirms equivalent codegen to manual length-check.
+- **#16 — `parse_u32` replaced by stdlib.** Current hand-rolled form takes `&[u8]` (already ASCII digits from SCRAM parse); stdlib `str::parse::<u32>` would require `core::str::from_utf8` first — an O(N) UTF-8 revalidation on already-ASCII bytes. Net negative.
+- **#19 — Session-params perfect-hash dispatch.** Cold path (9 ParameterStatus frames per connection); current linear match against 9 byte-string literals is already compiler-optimal for this size. Re-evaluate if session_params set is called mid-flight for DB SET commands.
+- **#24 — `emit_actions!` `unlikely` hint.** The overflow branch is const-asserted as architecturally dead (`const _: () = assert!(MAX_ACTIONS_PER_CALL >= N)` per emit site). LLVM cold-hoists the dead branch during DCE. Adding `unlikely` over a provably-dead branch is redundant.
 
 ## 10. Closed
 
