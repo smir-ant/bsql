@@ -117,3 +117,73 @@ const _: () = assert!(
         && SYNC_WIRE_BYTES[4] == 4,
     "Sync length-field must be 4 (length includes itself, no payload)",
 );
+
+// ---------------------------------------------------------------
+// Tag collision defenses (§10 of DEF-094 audit round 2, 2026-04-20)
+//
+// PG wire semantics: each direction has its own tag-space. Inside
+// a direction, two distinct messages MUST carry distinct tag
+// bytes; cross-direction collisions are fine (the canonical
+// example is `TAG_SYNC` = `b'S'` outbound vs
+// `TAG_PARAMETER_STATUS` = `b'S'` inbound — same byte, different
+// direction, disambiguated at the dispatcher by "who initiated
+// this frame").
+//
+// Without these asserts, a copy-paste introducing
+// `TAG_FOO: u8 = b'E'` duplicating `TAG_ERROR_RESPONSE` would
+// compile silently and silently hijack one message arm. The
+// exhaustive `match` in `dispatch.rs` would see both arms;
+// whichever is listed first wins. Tier-3 audit hazard.
+//
+// Per-direction pairwise distinctness is cheap to assert in
+// `const` (N = 6 inbound, 2 outbound — N² comparisons compiled
+// away). Lifts the invariant from tier-3 (audit) to tier-1 (build
+// failure on drift).
+// ---------------------------------------------------------------
+
+/// **Inbound** (backend → frontend) tag-distinctness assertions.
+///
+/// If PG ships a new inbound tag and we add a const above, add it
+/// to the chain below. A miss would not fire this assert; that's
+/// accepted — the goal is "no two constants sharing one byte",
+/// not "every byte is a known tag".
+const _: () = assert!(
+    TAG_READY_FOR_QUERY != TAG_ERROR_RESPONSE
+        && TAG_READY_FOR_QUERY != TAG_AUTHENTICATION
+        && TAG_READY_FOR_QUERY != TAG_PARAMETER_STATUS
+        && TAG_READY_FOR_QUERY != TAG_BACKEND_KEY_DATA
+        && TAG_READY_FOR_QUERY != TAG_NEGOTIATE_PROTOCOL_VERSION
+        && TAG_ERROR_RESPONSE != TAG_AUTHENTICATION
+        && TAG_ERROR_RESPONSE != TAG_PARAMETER_STATUS
+        && TAG_ERROR_RESPONSE != TAG_BACKEND_KEY_DATA
+        && TAG_ERROR_RESPONSE != TAG_NEGOTIATE_PROTOCOL_VERSION
+        && TAG_AUTHENTICATION != TAG_PARAMETER_STATUS
+        && TAG_AUTHENTICATION != TAG_BACKEND_KEY_DATA
+        && TAG_AUTHENTICATION != TAG_NEGOTIATE_PROTOCOL_VERSION
+        && TAG_PARAMETER_STATUS != TAG_BACKEND_KEY_DATA
+        && TAG_PARAMETER_STATUS != TAG_NEGOTIATE_PROTOCOL_VERSION
+        && TAG_BACKEND_KEY_DATA != TAG_NEGOTIATE_PROTOCOL_VERSION,
+    "Two inbound PG wire tags share a byte — dispatcher arms will collide. \
+     If this assert fires, someone duplicated a const in wire.rs.",
+);
+
+/// **Outbound** (frontend → backend) tag-distinctness assertions.
+const _: () = assert!(
+    TAG_SYNC != TAG_SASL_RESPONSE,
+    "Two outbound PG wire tags share a byte — frame construction will \
+     silently target the wrong message type.",
+);
+
+/// **Authentication sub-codes** distinctness. The sub-code is the
+/// first four bytes of an `AUTHENTICATION` payload; a collision
+/// would make two auth methods indistinguishable at the dispatcher.
+const _: () = assert!(
+    AUTH_OK != AUTH_SASL
+        && AUTH_OK != AUTH_SASL_CONTINUE
+        && AUTH_OK != AUTH_SASL_FINAL
+        && AUTH_SASL != AUTH_SASL_CONTINUE
+        && AUTH_SASL != AUTH_SASL_FINAL
+        && AUTH_SASL_CONTINUE != AUTH_SASL_FINAL,
+    "Two SCRAM auth sub-codes share a value — dispatcher arms will \
+     collide on AUTH_* matching.",
+);
