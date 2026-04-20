@@ -290,9 +290,11 @@ const _: () = assert!(
      session_params ~420 + padding.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() <= 1280,
-    "OutActions<'_> size regression — 4 × sizeof(Action<'_>) + u8 len + \
-     padding. Post-DEF-094/096 budget: 1280 bytes.",
+    core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2560,
+    "OutActions<'_> size regression — 8 × sizeof(Action<'_>) + u8 len + \
+     padding. Post-1c-1b bump (MAX_ACTIONS_PER_CALL 4 → 8) budget: 2560 bytes. \
+     Grew to fit row-streaming batching — per-iter WORST_CASE_PER_DISPATCH=2 \
+     gives 6 actions of real headroom per feed_bytes.",
 );
 
 // ---------------------------------------------------------------------

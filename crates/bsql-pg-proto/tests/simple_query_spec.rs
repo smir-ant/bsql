@@ -600,6 +600,87 @@ fn rows_across_multiple_feed_bytes_calls() {
     assert!(matches!(proto.state(), ProtoState::Idle));
 }
 
+/// Invariant (DEF-121 backpressure gate): if an inbound chunk
+/// contains more actionable frames than `OutActions` can hold, the
+/// `feed_bytes` loop must break **before** consuming any reply /
+/// mutating state — leaving the overflowing frames in the read
+/// buffer for the next `feed_bytes` call. Without the gate, the
+/// in-macro `on_overflow: break` fires AFTER `deliver()` /
+/// `errored()` have already consumed the reply, silently dropping
+/// the action and orphaning the caller's oneshot.
+///
+/// Construction: push SimpleQuery, feed 10 DataRow frames + C + Z
+/// in ONE chunk. `MAX_ACTIONS_PER_CALL=8`, `WORST_CASE_PER_DISPATCH=2`
+/// — so the first call emits ≤ 7 StreamRows and leaves the rest in
+/// the buffer. The second call (empty bytes) drains the remainder
+/// and the terminal DeliverReply.
+#[test]
+fn overflow_backpressure_preserves_delivery_across_calls() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(200);
+    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+
+    let mut bytes = std::vec::Vec::new();
+    bytes.extend_from_slice(&row_description_frame(1));
+    let row_count = 10usize;
+    for i in 0..row_count {
+        let Ok(digit) = u8::try_from(i) else { unreachable!() };
+        let payload = [b'r', digit.saturating_add(b'0')];
+        bytes.extend_from_slice(&data_row_frame(&payload));
+    }
+    bytes.extend_from_slice(&command_complete_frame(b"SELECT 10"));
+    bytes.extend_from_slice(&rfq_frame(b'I'));
+
+    // First call: gate caps emission under MAX_ACTIONS_PER_CALL.
+    let mut total_rows = 0usize;
+    let mut saw_deliver = false;
+    let first = proto.feed_bytes(&bytes, &mut wb);
+    assert!(
+        first.len() <= 8,
+        "first call must not exceed MAX_ACTIONS_PER_CALL=8",
+    );
+    for a in first.as_slice() {
+        match a {
+            Action::StreamRow { id: sid, .. } => {
+                assert_eq!(*sid, q_raw);
+                total_rows = total_rows.saturating_add(1);
+            }
+            Action::DeliverReply { .. } => saw_deliver = true,
+            other => panic!("unexpected action in first call: {other:?}"),
+        }
+    }
+    // State is still a simple-query state (not consumed to Idle).
+    let still_streaming = matches!(
+        proto.state(),
+        ProtoState::SimpleQueryStreamingRows(_)
+            | ProtoState::SimpleQueryAwaitRfq { .. }
+            | ProtoState::SimpleQueryAwaitFirstResponse(_),
+    );
+    assert!(
+        still_streaming,
+        "state must stay in simple-query flow — reply not consumed mid-overflow",
+    );
+
+    // Subsequent calls drain the remaining frames.
+    while !saw_deliver {
+        let out = proto.feed_bytes(&[], &mut wb);
+        assert!(out.len() <= 8);
+        for a in out.as_slice() {
+            match a {
+                Action::StreamRow { id: sid, .. } => {
+                    assert_eq!(*sid, q_raw);
+                    total_rows = total_rows.saturating_add(1);
+                }
+                Action::DeliverReply { .. } => saw_deliver = true,
+                other => panic!("unexpected action while draining: {other:?}"),
+            }
+        }
+    }
+    assert_eq!(total_rows, row_count, "every row delivered exactly once");
+    assert!(matches!(proto.state(), ProtoState::Idle));
+}
+
 /// Invariant: the outbound `Q` frame layout is tag + BE-length +
 /// NUL-terminated SQL. Drift-pin on the wire builder:
 ///

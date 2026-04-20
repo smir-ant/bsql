@@ -158,19 +158,37 @@ macro_rules! emit_actions {
 /// - `feed_bytes(error_response)` from any flight state → 2 actions
 ///   (`FailReply` + `CloseSocket`).
 /// - `feed_bytes(malformed)` → 2 actions (or 1 if no in-flight reply).
-/// - `feed_bytes(multiple frames in one chunk)` — the drain loop in
-///   `feed_bytes` bails on `OutActions` full via `on_overflow: break`.
+/// - `feed_bytes(multiple frames in one chunk)` — per-iteration
+///   budget check (below) gates entry; overflow is architecturally
+///   unreachable.
 ///
-/// The worst-case single-site emission in Phase 1a/1b is **2** actions.
-/// `MAX_ACTIONS_PER_CALL = 4` gives the dispatcher loop one frame's
-/// slack (two actions absorbed, room for one more iteration's emission
-/// before the bail-break fires). Bumping happens in 1c with the first
-/// multi-action path (compute/apply split — DEF-059 — may surface new
-/// emission sites).
-pub const MAX_ACTIONS_PER_CALL: usize = 4;
+/// # 1c-1b bump: 4 → 8
+///
+/// Row streaming emits one `StreamRow` per `DataRow` frame. A single
+/// `feed_bytes` call receiving 7 rows + `CommandComplete` +
+/// `ReadyForQuery` produces 7 × `StreamRow` + 1 × `DeliverReply`.
+/// Keeping `MAX_ACTIONS_PER_CALL = 4` would force 2+ extra
+/// `feed_bytes` calls per batch; 8 covers realistic streaming
+/// density with single-digit call counts on typical row sizes.
+pub const MAX_ACTIONS_PER_CALL: usize = 8;
 
-// Sanity assert — the budget audit above demands at least 2.
-const _: () = assert!(MAX_ACTIONS_PER_CALL >= 2);
+/// Worst-case number of actions a single dispatch iteration can
+/// emit. Used as the budget-check reserve in [`PgProtocol::feed_bytes`]:
+/// a loop iteration enters only if
+/// `staged.len() + WORST_CASE_PER_DISPATCH ≤ MAX_ACTIONS_PER_CALL`,
+/// so overflow inside the iteration is architecturally unreachable —
+/// no partial emission, no silent reply loss (1c-1b DEF-121).
+///
+/// Current worst case: [`DispatchOutcome::Errored`] with `Some(reply_id)`
+/// emits `FailReply + CloseSocket` = 2. Bumping this to 3 would require
+/// a new 3-action dispatch outcome.
+const WORST_CASE_PER_DISPATCH: usize = 2;
+
+// Sanity asserts — the budget audit above demands at least
+// WORST_CASE_PER_DISPATCH; practical batching needs meaningful
+// headroom above that.
+const _: () = assert!(MAX_ACTIONS_PER_CALL >= WORST_CASE_PER_DISPATCH);
+const _: () = assert!(MAX_ACTIONS_PER_CALL >= 4, "practical batching needs ≥4 slots");
 
 /// PostgreSQL wire-protocol state machine.
 ///
@@ -397,6 +415,28 @@ impl PgProtocol {
                     let abs_payload_start = abs_frame_start.saturating_add(HEADER_LEN);
                     let abs_frame_end = abs_frame_start.saturating_add(total_len);
                     let populated_len = self.read_buf.populated().len();
+
+                    // DEF-121 budget gate — prevent mid-transition
+                    // overflow. A dispatch iteration can emit up to
+                    // `WORST_CASE_PER_DISPATCH` (2) actions; if
+                    // staged cannot absorb them we break **before**
+                    // `core::mem::take(&mut self.state)` and
+                    // `dispatch()` — so no reply is consumed, no
+                    // state is mutated. The frame stays in the read
+                    // buffer for the next `feed_bytes` call.
+                    //
+                    // Without this gate the `on_overflow: break`
+                    // inside `emit_actions!` would fire AFTER the
+                    // dispatcher had already consumed the reply
+                    // (via `deliver()` or `errored()`) and
+                    // transitioned state — dropping the action and
+                    // orphaning the caller's oneshot. Tier-4 silent
+                    // reply loss → tier-2 structural via the gate.
+                    if staged.len().saturating_add(WORST_CASE_PER_DISPATCH)
+                        > MAX_ACTIONS_PER_CALL
+                    {
+                        break;
+                    }
 
                     let prev = core::mem::take(&mut self.state);
                     let outcome = dispatch(

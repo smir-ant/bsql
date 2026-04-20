@@ -336,22 +336,14 @@ pub(crate) fn dispatch(
         // states are never entered from simple-query flow.
         // =============================================================
 
-        // AwaitFirstResponse: T / C / I / E / Z(no) — see below for Z
+        // AwaitFirstResponse: T / C / I / E — any other tag is desync
         (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
             DispatchOutcome::AdvancedSilent {
                 new_state: ProtoState::SimpleQueryStreamingRows(reply),
             }
         }
         (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
-            match parse_command_tag(payload) {
-                Ok(command_tag) => DispatchOutcome::AdvancedSilent {
-                    new_state: ProtoState::SimpleQueryAwaitRfq {
-                        reply,
-                        command_tag,
-                    },
-                },
-                Err(cause) => errored(Some(reply.consume()), cause),
-            }
+            advance_to_await_rfq(reply, payload)
         }
         (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
             DispatchOutcome::AdvancedSilent {
@@ -362,63 +354,21 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
-            DispatchOutcome::AdvancedWithAction {
-                new_state: ProtoState::SimpleQueryDrainRfqAfterError,
-                action: StagedAction::FailReply {
-                    id: reply.consume(),
-                    cause,
-                },
-            }
+            advance_to_drain_after_error(reply, payload)
         }
         (ProtoState::SimpleQueryAwaitFirstResponse(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        // StreamingRows: D / C / E — any other tag is out-of-spec
+        // StreamingRows: D / C / E — any other tag is desync
         (ProtoState::SimpleQueryStreamingRows(reply), TAG_DATA_ROW) => {
-            // 1c-1b: emit StreamRow with absolute row_range.
-            match crate::action::NonEmptyRange::new(
-                coords.payload_start,
-                coords.payload_end,
-                coords.populated_len,
-            ) {
-                Some(row_range) => {
-                    let id = reply.get();
-                    DispatchOutcome::AdvancedWithAction {
-                        new_state: ProtoState::SimpleQueryStreamingRows(reply),
-                        action: StagedAction::StreamRowRange { id, row_range },
-                    }
-                }
-                None => {
-                    // Architecturally unreachable — feed_bytes already
-                    // validated the frame bounds via parse_header +
-                    // unread length check. Classify as a broken
-                    // invariant rather than silent misbehaviour.
-                    errored(Some(reply.consume()), ProtocolError::ProtocolInvariantBroken)
-                }
-            }
+            stream_row_or_errored(reply, coords)
         }
         (ProtoState::SimpleQueryStreamingRows(reply), TAG_COMMAND_COMPLETE) => {
-            match parse_command_tag(payload) {
-                Ok(command_tag) => DispatchOutcome::AdvancedSilent {
-                    new_state: ProtoState::SimpleQueryAwaitRfq {
-                        reply,
-                        command_tag,
-                    },
-                },
-                Err(cause) => errored(Some(reply.consume()), cause),
-            }
+            advance_to_await_rfq(reply, payload)
         }
         (ProtoState::SimpleQueryStreamingRows(reply), TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
-            DispatchOutcome::AdvancedWithAction {
-                new_state: ProtoState::SimpleQueryDrainRfqAfterError,
-                action: StagedAction::FailReply {
-                    id: reply.consume(),
-                    cause,
-                },
-            }
+            advance_to_drain_after_error(reply, payload)
         }
         (ProtoState::SimpleQueryStreamingRows(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -972,6 +922,84 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 // -----------------------------------------------------------------
 // Helper: parse BackendKeyData
 // -----------------------------------------------------------------
+
+/// 1c-1b helper: shared body for the `C` arm in both
+/// `AwaitFirstResponse` and `StreamingRows` states. Transition to
+/// `AwaitRfq { reply, command_tag }` on well-formed tag; classify
+/// missing-NUL / framing error as `Errored`.
+///
+/// Centralises the "`CommandComplete` → AwaitRfq" invariant in one
+/// place — an arm-body edit in only one of the two call sites
+/// would diverge silently; the helper makes the transition atomic.
+fn advance_to_await_rfq(
+    reply: ReplyId<crate::reply_id::QueryKind>,
+    payload: &[u8],
+) -> DispatchOutcome {
+    match parse_command_tag(payload) {
+        Ok(command_tag) => DispatchOutcome::AdvancedSilent {
+            new_state: ProtoState::SimpleQueryAwaitRfq {
+                reply,
+                command_tag,
+            },
+        },
+        Err(cause) => errored(Some(reply.consume()), cause),
+    }
+}
+
+/// 1c-1b helper: shared body for the `E` arm in both
+/// `AwaitFirstResponse` and `StreamingRows` states. Emit
+/// `FailReply` (NO `CloseSocket` — query-level errors are
+/// connection-survivable per PG §55.2.3) and transition to
+/// `DrainRfqAfterError` so the trailing `Z` returns the state to
+/// `Idle`.
+///
+/// Centralises the "query-level E → recoverable" invariant. The
+/// contrast with fatal error paths (which return
+/// `DispatchOutcome::Errored { .. }` → forced `CloseSocket`) is
+/// the load-bearing distinction test 5
+/// (`query_error_emits_fail_reply_and_connection_survives`) pins.
+fn advance_to_drain_after_error(
+    reply: ReplyId<crate::reply_id::QueryKind>,
+    payload: &[u8],
+) -> DispatchOutcome {
+    let cause = parse_error_response(payload);
+    DispatchOutcome::AdvancedWithAction {
+        new_state: ProtoState::SimpleQueryDrainRfqAfterError,
+        action: StagedAction::FailReply {
+            id: reply.consume(),
+            cause,
+        },
+    }
+}
+
+/// 1c-1b helper: build a `StreamRowRange` for a `DataRow` frame, or
+/// classify as `ProtocolInvariantBroken` on a malformed empty body.
+///
+/// `reply.get()` — not `.consume()` — rows are in-progress signals;
+/// the `ReplyId` commits on the terminal `CommandComplete` →
+/// `ReadyForQuery` pair. The `NonEmptyRange` constructor's `None`
+/// branch is architecturally unreachable when `parse_header` has
+/// already validated frame bounds, but surfacing it as a classified
+/// error (vs a panic) preserves the crate-root panic ban.
+fn stream_row_or_errored(
+    reply: ReplyId<crate::reply_id::QueryKind>,
+    coords: FrameCoords,
+) -> DispatchOutcome {
+    match crate::action::NonEmptyRange::new(
+        coords.payload_start,
+        coords.payload_end,
+        coords.populated_len,
+    ) {
+        Some(row_range) => {
+            let id = reply.get();
+            DispatchOutcome::AdvancedWithAction {
+                new_state: ProtoState::SimpleQueryStreamingRows(reply),
+                action: StagedAction::StreamRowRange { id, row_range },
+            }
+        }
+        None => errored(Some(reply.consume()), ProtocolError::ProtocolInvariantBroken),
+    }
+}
 
 /// Parse `CommandComplete` payload into a bounded command tag.
 ///
