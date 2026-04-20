@@ -669,3 +669,38 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
         ProtoState::Errored(ErrorKind::ServerError),
     ));
 }
+
+/// Invariant (spec, DEF-062): `NoticeResponse` (tag `'N'`) is a
+/// PG advisory frame that can arrive in any state. The pre-dispatch
+/// filter in `feed_bytes` silently consumes it — state unchanged,
+/// no actions emitted, subsequent frames are processed normally.
+///
+/// Without the filter, a Notice would reach the dispatcher and land
+/// in the `(state, other)` arm as `UnexpectedFrame` → connection
+/// teardown. This test pins the filter: a Notice followed by an RFQ
+/// must complete the ping flow cleanly.
+#[test]
+fn notice_response_mid_flight_is_silently_consumed() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let ping_raw = raw(7001);
+    ping_setup(&mut proto, id(ping_raw), &mut wb);
+
+    // Build a NoticeResponse frame: tag 'N', minimal body with a
+    // single field (`M` = message) then terminator. Body: 'M' +
+    // "hi" + \0 + \0 terminator = 5 bytes. Declared length = 5 + 4
+    // (self-inclusive) = 9.
+    let notice: [u8; 10] = [b'N', 0, 0, 0, 9, b'M', b'h', b'i', 0, 0];
+    let out = proto.feed_bytes(&notice, &mut wb);
+    assert_eq!(out.len(), 0, "NoticeResponse emits no actions");
+    expect_awaiting_ping_reply(proto.state(), ping_raw);
+
+    // Now complete the ping normally.
+    let rfq: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+    let out = proto.feed_bytes(&rfq, &mut wb);
+    assert_eq!(out.len(), 1, "RFQ completes the ping after filtered notice");
+    match out.as_slice() {
+        [Action::DeliverReply { id, .. }] => assert_eq!(id, &ping_raw),
+        other => panic!("expected DeliverReply, got {other:?}"),
+    }
+}

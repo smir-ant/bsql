@@ -709,8 +709,25 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
     let mut detail: BoundedStr<96> = BoundedStr::default();
     let mut hint: BoundedStr<64> = BoundedStr::default();
 
+    // DEF-064: bounded-iteration DoS shield. PG's documented
+    // ErrorResponse field set has ~18 tags total (S, V, C, M, D,
+    // H, P, p, q, W, s, t, c, n, F, L, R, plus future). A
+    // legitimate server sends each at most once. Cap at 32 — 2×
+    // headroom for any future addition. Beyond the cap, we stop
+    // parsing and use whatever fields we've already extracted.
+    //
+    // Without this cap the loop is still bounded by
+    // `payload.len() ≤ MAX_FRAME_LEN_FIELD ≈ 4KB` (pos advances
+    // monotonically, `payload.get(pos)` returns `None` at
+    // end-of-payload), so a 4 KB pathological frame could
+    // produce ~1300 tight iterations. The cap keeps the work
+    // bounded to O(field_count) regardless of frame size. Tier-2
+    // structural — the invariant is enforced by the `for _ in
+    // 0..N` bound, not an audit of `pos` math.
+    const MAX_ERROR_FIELDS: usize = 32;
+
     let mut pos: usize = 0;
-    loop {
+    for _ in 0..MAX_ERROR_FIELDS {
         let field_type = match payload.get(pos) {
             Some(0) | None => break, // Terminator or end of payload.
             Some(b) => *b,

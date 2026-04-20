@@ -76,6 +76,17 @@ pub const TAG_BACKEND_KEY_DATA: u8 = b'K';
 /// DEF-044.
 pub const TAG_NEGOTIATE_PROTOCOL_VERSION: u8 = b'v';
 
+/// Backend `NoticeResponse` message tag (`'N'`).
+///
+/// PG emits `NoticeResponse` for advisory warnings (e.g. `NOTICE:
+/// identifier will be truncated`). Any state can receive one at any
+/// time — mid-query, during startup, in idle, etc. DEF-062 installs
+/// a pre-dispatch filter in `feed_bytes` that silently consumes
+/// notices and advances past, analogous to the `ParameterStatus`
+/// filter (DEF-054). Future `Action::EmitNotice(...)` in Phase 1c+
+/// will surface notices to the wrapper; Phase 1b drops them.
+pub const TAG_NOTICE_RESPONSE: u8 = b'N';
+
 /// Frontend `SASLInitialResponse` / `SASLResponse` message tag (`'p'`).
 ///
 /// Used for both the initial SASL response (mechanism + client-first)
@@ -189,6 +200,7 @@ assert_all_distinct!(
     TAG_PARAMETER_STATUS,
     TAG_BACKEND_KEY_DATA,
     TAG_NEGOTIATE_PROTOCOL_VERSION,
+    TAG_NOTICE_RESPONSE,
 );
 
 // **Outbound** (frontend → backend) tag-distinctness.

@@ -356,6 +356,25 @@ impl PgProtocol {
                         continue;
                     }
 
+                    // DEF-062: NoticeResponse pre-dispatch filter.
+                    // PG can emit NoticeResponse (tag 'N') in any
+                    // state — warnings that do not affect protocol
+                    // flow. Silently consume and continue; the
+                    // dispatcher never sees them. Future Phase 1c+
+                    // can replace the `continue` with an
+                    // `Action::EmitNotice(...)` emission when the
+                    // wrapper wants visibility.
+                    if tag == crate::wire::TAG_NOTICE_RESPONSE {
+                        let Ok(()) = self.read_buf.advance(total_len) else {
+                            self.fail_inflight_and_close(
+                                ProtocolError::ProtocolInvariantBroken,
+                                &mut staged,
+                            );
+                            break;
+                        };
+                        continue;
+                    }
+
                     let prev = core::mem::take(&mut self.state);
                     let outcome = dispatch(prev, tag, payload, write_buf);
                     match outcome {
