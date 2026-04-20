@@ -112,7 +112,7 @@ pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{MAX_ACTIONS_PER_CALL, PgProtocol};
 pub use reply_id::{PingKind, ReplyId, ReplyKind, StartupKind};
 pub use sensitive::Sensitive;
-pub use session_params::SessionParams;
+pub use session_params::{Encoding, OtherEncoding, SessionParams};
 pub use state::ProtoState;
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 

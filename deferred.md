@@ -445,7 +445,8 @@ See `reforge.md` §17.1 for the master table. Execution is tier-elevation
 | `8ff256f` | **DEF-100** | `NonEmptyRange { start, len: NonZeroUsize }` replaces raw `(start, end)` on `StagedAction::SendBytesRange` — non-empty is a type invariant, zero-length SendBytes can't compile. Tier-3 audit → tier-2 structural. |
 | `b0dbd46` | **DEF-101** | Path audit + DEF-052 close via `cfg(test)` thread-panicking guard (re-scoped from original "remove Drop" — honest tier analysis below). |
 | `43c1877` | **DEF-111** | §10: const-assert per-direction `wire::TAG_*` distinctness + `AUTH_*` sub-code distinctness. Catches copy-paste duplication at build time. |
-| *next*   | **DEF-112** | §2: typed `ReplyId<K: ReplyKind>` + sealed `action::deliver<K>(id, payload)` constructor. Tier-1 compile on "dispatcher emits wrong Reply variant for command-kind". |
+| `ce6a8bf` | **DEF-112** | §2: typed `ReplyId<K: ReplyKind>` + sealed `action::deliver<K>(id, payload)` constructor. Tier-1 compile on "dispatcher emits wrong Reply variant for command-kind". |
+| *next*   | **DEF-114** | §4 (selective): `is_superuser` / `integer_datetimes` → `Option<bool>`; `server_encoding` / `client_encoding` → `Option<Encoding>` with `Other(OtherEncoding)` information-preserving fallback. |
 
 ### DEF-101 re-scoping (honest tier analysis)
 
@@ -510,6 +511,27 @@ Close only after `cargo asm` confirms the win is real:
 
 - **DEF-109** — `Severity::from_bytes` first-byte dispatch. Current: 9-arm `match bytes` on byte-slice literals. If LLVM folds to byte-tree / memcmp chain (likely): skip. If branch chain (unlikely on cold path): ship first-byte table.
 - **DEF-110** — `ProtocolError::kind` repr optimisation. Current: exhaustive match, called on every fatal classification. If jump-table already emitted: skip. Otherwise: `#[repr(u8)]` discriminant reordering to pack by ErrorKind.
+
+### Re-evaluated and skipped after exploratory work
+
+- **DEF-113 / §5 — Internal StagedAction Success/Teardown split.**
+  Architect's original proposal: split `StagedAction` into
+  `SuccessStaged` (SendBytes\*/DeliverReply) and `TeardownStaged`
+  (FailReply + CloseSocket), so a dispatcher function signed
+  `fn … -> SuccessStaged` cannot emit CloseSocket. Explored and
+  dropped: `compute_push_*` naturally produces BOTH success
+  emissions AND "soft-reject" FailReply emissions (e.g. pushing
+  Ping onto an Errored connection yields `FailReply { cause:
+  ConnectionAlreadyClosed }` without CloseSocket — the socket is
+  already closed). A clean Success/Teardown partition requires
+  a third "SoftReject" bucket, inflating the enum family and the
+  dispatcher signatures. The CloseSocket-via-sealed-constructor
+  variant gives a weaker gate (tier-3: "only sanctioned helpers
+  call the constructor, anyone crate-internal can call the
+  helpers"). Net: the tier-1 claim requires restructuring
+  `compute_push` that doesn't pay for itself at Phase 1c scope.
+  Re-evaluate when the driver work in Phase 1c lands new command
+  variants and the action surface reshapes anyway.
 
 ### Legitimately rejected — do not revisit without new evidence
 

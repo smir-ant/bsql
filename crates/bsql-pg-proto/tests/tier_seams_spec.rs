@@ -93,13 +93,17 @@ fn session_params_set_key_routing_table() {
     // Each value must arrive in its dedicated field — a swap of any
     // two arms would land the wrong value in the wrong field.
     assert_eq!(p.server_version.as_deref(), Some("17.2"));
-    assert_eq!(p.server_encoding.as_deref(), Some("UTF8"));
-    assert_eq!(p.client_encoding.as_deref(), Some("LATIN1"));
+    // DEF-114: typed fields — Encoding/bool instead of strings.
+    assert_eq!(p.server_encoding, Some(bsql_pg_proto::session_params::Encoding::Utf8));
+    assert_eq!(
+        p.client_encoding,
+        Some(bsql_pg_proto::session_params::Encoding::Latin1),
+    );
     assert_eq!(p.application_name.as_deref(), Some("myapp"));
-    assert_eq!(p.is_superuser.as_deref(), Some("off"));
+    assert_eq!(p.is_superuser, Some(false));
     assert_eq!(p.session_authorization.as_deref(), Some("alice"));
     assert_eq!(p.date_style.as_deref(), Some("ISO, MDY"));
-    assert_eq!(p.integer_datetimes.as_deref(), Some("on"));
+    assert_eq!(p.integer_datetimes, Some(true));
     assert_eq!(p.time_zone.as_deref(), Some("America/New_York"));
 }
 

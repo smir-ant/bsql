@@ -271,9 +271,10 @@ fn trust_auth_handshake_end_to_end() {
         Some("17.2"),
     );
     assert_eq!(proto.session_params().time_zone.as_deref(), Some("UTC"));
+    // DEF-114: client_encoding is now a typed Encoding enum.
     assert_eq!(
-        proto.session_params().client_encoding.as_deref(),
-        Some("UTF8"),
+        proto.session_params().client_encoding,
+        Some(bsql_pg_proto::Encoding::Utf8),
     );
 }
 
@@ -1104,9 +1105,10 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
         matches!(proto.state(), ProtoState::AwaitingPingReply(_)),
         "PS must not disturb the AwaitingPingReply state",
     );
+    // DEF-114: typed Encoding.
     assert_eq!(
-        proto.session_params().client_encoding.as_deref(),
-        Some("LATIN1"),
+        proto.session_params().client_encoding,
+        Some(bsql_pg_proto::Encoding::Latin1),
     );
 
     // Now feed RFQ — ping completes normally.

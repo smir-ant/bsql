@@ -1100,13 +1100,15 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 | 3 | ✅     | 099  | ALLOC/CACHE        | `PodBytes<N>` replaces `heapless::Vec<u8, N>` in SCRAM state buffers (−16 bytes, Drop-free buffers) |
 | 4 | ⏳     | 104  | ALGO/CACHE         | `parse_error_response` field-kind `[Option<FieldKind>; 256]` table + kind-match |
 | 5 | ❌     | —    | ALGO               | `Severity::from_bytes` first-byte dispatch — cold path, LLVM already folds; re-evaluate via DEF-109 |
+| §5 | ❌    | 113  | ARCH               | StagedAction Success/Teardown split — skipped after exploration: `compute_push`'s success + soft-reject dual role breaks the clean two-way partition. See deferred §16 "Re-evaluated and skipped" block. Revisit post Phase 1c driver reshape. |
 | 6 | ✅     | 095  | ALLOC              | `Password.len: usize → u16` (−6B × propagation through state/command chain) |
 | 7 | ✅     | 101  | TYPESTATE          | Full-path audit + DEF-052 close via `cfg(test)` thread-panicking guard. Drop-guard KEPT (stable-Rust tier-2 ceiling; removing it would regress to tier-3 audit). See deferred §16 for analysis. |
 | 8 | ❌     | —    | ALLOC/ALGO         | ASCII fast-path bit — stdlib `from_utf8` already SIMD-dispatches ASCII; caching saves nothing under forbid(unsafe_code) |
 | 9 | ❌     | —    | ARCH               | `WriteBuf::with_length_prefix` closure inline — already inlined by LLVM |
 | 10| ⏳     | 102  | ALGO/SECURITY      | `base64` → `base64ct` — constant-time SCRAM ClientProof encoding |
 | 11| ❌     | —    | ALGO/CONST         | `ProtocolError::kind` repr trick — jump-table already emitted; re-evaluate via DEF-110 |
-| 12| ⏳     | 106  | ALLOC/CONST        | `SessionParams` POD layout (9 × `Option<heapless::String<128>>` → flat bytes + slot-ends) |
+| 12| ⏳     | 106  | ALLOC/CONST        | `SessionParams` POD layout (9 × `Option<heapless::String<128>>` → flat bytes + slot-ends) — still open; DEF-114 handled the typed-field subset separately |
+| §4| ✅     | 114  | TYPESTATE          | Typed `SessionParams` fields — 4 of 9: `is_superuser`/`integer_datetimes` → `Option<bool>`; `server_encoding`/`client_encoding` → `Option<Encoding>`. Tier-1/2 on the binary + known-variant subsets. |
 | 13| ✅     | 095  | ALGO               | `record_param_status` — 21 lines of `match { Some(_)/None }` → 5 let-else lines |
 | 14| ❌     | —    | CACHE/ALGO         | `HeaderParse` slice patterns — LLVM folds; no measurable win |
 | 15| ⏳     | 107  | ALLOC/CACHE        | SCRAM wire builders write-into (`generate_client_nonce_into`, etc.) — no heapless::Vec returns |
