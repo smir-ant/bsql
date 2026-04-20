@@ -323,6 +323,17 @@ pub enum DecodeError {
         /// Bytes actually remaining in the row body.
         remaining: usize,
     },
+    /// Column bytes are not valid UTF-8. Applies to text-format
+    /// columns (including `&str` and all integer decoders, which
+    /// read ASCII digits). 1c-2c.
+    NonUtf8,
+    /// Failed to parse a numeric text-format column into the target
+    /// Rust integer type — bad digit, sign out of range, or
+    /// overflow. 1c-2c.
+    IntParse,
+    /// Failed to parse a boolean — PG text format emits `"t"` / `"f"`;
+    /// anything else classifies here. 1c-2c.
+    BoolParse,
 }
 
 impl fmt::Display for DecodeError {
@@ -344,6 +355,9 @@ impl fmt::Display for DecodeError {
                 f,
                 "column {column_idx}: data truncated — declared {declared_len} bytes, only {remaining} remain",
             ),
+            Self::NonUtf8 => f.write_str("column bytes are not valid UTF-8"),
+            Self::IntParse => f.write_str("column text is not a valid integer for the target type"),
+            Self::BoolParse => f.write_str("column text is not a PG boolean (expected \"t\" or \"f\")"),
         }
     }
 }
@@ -528,6 +542,141 @@ impl<'a> Iterator for ColumnsIter<'a> {
 
 impl ExactSizeIterator for ColumnsIter<'_> {}
 impl core::iter::FusedIterator for ColumnsIter<'_> {}
+
+// ════════════════════════════════════════════════════════════════════
+// 1c-2c — Text-format decoders
+// ════════════════════════════════════════════════════════════════════
+
+/// PostgreSQL **text-format** column decoder for a Rust type.
+///
+/// PG's text format — the default for Simple Query — encodes all
+/// values as ASCII-ish strings (`"42"`, `"t"`, `"hello"`). This
+/// trait's implementations wrap `core::str::from_utf8` and
+/// `FromStr`-style parses with type-specific error classification.
+///
+/// # Lifetime
+///
+/// `'a` ties the decoder's output to the input byte slice. For
+/// `&str` the output borrows the input directly (zero-copy). For
+/// owned types like `i32` / `bool`, `'a` is phantom.
+///
+/// # Usage
+///
+/// ```ignore
+/// use bsql_pg_proto::{Action, DataRowRef, FromPgText};
+///
+/// let Action::StreamRow { row_bytes, .. } = action else { return };
+/// let row = DataRowRef::parse(row_bytes)?;
+/// let mut cols = row.columns();
+/// let id: i32 = cols.next().unwrap()?.map(i32::from_pg_text).transpose()?
+///     .ok_or("id cannot be NULL")?;
+/// let name: &str = cols.next().unwrap()?.map(<&str>::from_pg_text).transpose()?
+///     .ok_or("name cannot be NULL")?;
+/// ```
+///
+/// # Error
+///
+/// [`DecodeError::NonUtf8`] for non-UTF-8 bytes; type-specific
+/// parse errors:
+/// - integer types → [`DecodeError::IntParse`]
+/// - `bool` → [`DecodeError::BoolParse`]
+///
+/// # Binary format
+///
+/// For PG binary-format columns (selected via Bind in Extended
+/// Query, 1c-3), a parallel `FromPgBinary` trait lands alongside
+/// the binary codec. Text vs binary dispatch at the caller level
+/// via `ColumnDesc::format_code`.
+pub trait FromPgText<'a>: Sized {
+    /// Decode the column's text-format bytes.
+    fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError>;
+}
+
+// Integer decoders: ASCII digits (optionally leading `-`). Uses
+// stdlib `FromStr` which validates range + rejects trailing
+// garbage.
+macro_rules! impl_from_pg_text_int {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl FromPgText<'_> for $t {
+                #[inline]
+                fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+                    let s = core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)?;
+                    s.parse::<$t>().map_err(|_| DecodeError::IntParse)
+                }
+            }
+        )+
+    };
+}
+
+impl_from_pg_text_int!(i16, i32, i64, u32);
+
+/// PG boolean text format: `"t"` = true, `"f"` = false. Anything
+/// else (including `"true"`, `"TRUE"`, `"1"`, `"0"`) classifies as
+/// [`DecodeError::BoolParse`] — PG is strict about its own format.
+impl FromPgText<'_> for bool {
+    #[inline]
+    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+        match bytes {
+            b"t" => Ok(true),
+            b"f" => Ok(false),
+            _ => Err(DecodeError::BoolParse),
+        }
+    }
+}
+
+/// Text column as `&str` — zero-copy, validates UTF-8 only.
+impl<'a> FromPgText<'a> for &'a str {
+    #[inline]
+    fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+        core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
+    }
+}
+
+/// PostgreSQL built-in type OID constants for the subset 1c-2
+/// decoders cover. Full list at
+/// `https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat`.
+///
+/// Callers match these against [`ColumnDesc::type_oid`] to
+/// dispatch the right [`FromPgText`] impl. The macro layer
+/// (Phase 2) consumes this mapping at compile time via
+/// `query!`-generated decoders.
+pub mod oids {
+    /// `bool` (1-byte typtype `b`).
+    pub const BOOL: u32 = 16;
+    /// `bytea`.
+    pub const BYTEA: u32 = 17;
+    /// `"char"` — internal 1-byte char, not standard `char(n)`.
+    pub const CHAR: u32 = 18;
+    /// `name` — fixed 64-byte identifier (NAMEDATALEN).
+    pub const NAME: u32 = 19;
+    /// `int8` / `bigint`.
+    pub const INT8: u32 = 20;
+    /// `int2` / `smallint`.
+    pub const INT2: u32 = 21;
+    /// `int4` / `integer`.
+    pub const INT4: u32 = 23;
+    /// `text`.
+    pub const TEXT: u32 = 25;
+    /// `oid` — object identifier (u32).
+    pub const OID: u32 = 26;
+    /// `float4` / `real`.
+    pub const FLOAT4: u32 = 700;
+    /// `float8` / `double precision`.
+    pub const FLOAT8: u32 = 701;
+    /// `bpchar` — `char(n)`, blank-padded.
+    pub const BPCHAR: u32 = 1042;
+    /// `varchar` — `varchar(n)`.
+    pub const VARCHAR: u32 = 1043;
+    /// `timestamp` — timestamp without time zone.
+    pub const TIMESTAMP: u32 = 1114;
+    /// `timestamptz` — timestamp with time zone.
+    pub const TIMESTAMPTZ: u32 = 1184;
+    /// `uuid`.
+    pub const UUID: u32 = 2950;
+    /// `jsonb`.
+    pub const JSONB: u32 = 3802;
+}
 
 #[cfg(test)]
 mod parse_tests {
@@ -966,5 +1115,138 @@ mod data_row_tests {
             Some(_) | None => {}
         }
         assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+}
+
+#[cfg(test)]
+mod from_pg_text_tests {
+    //! `FromPgText` impls — per-type text-format decoding plus the
+    //! bad-path classification matrix (non-UTF-8, unparsable digits,
+    //! overflow, non-canonical bool).
+
+    use super::*;
+
+    // ---- integers ----
+
+    #[test]
+    fn i32_positive_and_negative() {
+        assert!(matches!(i32::from_pg_text(b"0"), Ok(0)));
+        assert!(matches!(i32::from_pg_text(b"42"), Ok(42)));
+        assert!(matches!(i32::from_pg_text(b"-17"), Ok(-17)));
+        assert!(matches!(i32::from_pg_text(b"2147483647"), Ok(i32::MAX)));
+        assert!(matches!(i32::from_pg_text(b"-2147483648"), Ok(i32::MIN)));
+    }
+
+    #[test]
+    fn i32_overflow_is_int_parse() {
+        assert!(matches!(i32::from_pg_text(b"2147483648"), Err(DecodeError::IntParse)));
+        assert!(matches!(i32::from_pg_text(b"-2147483649"), Err(DecodeError::IntParse)));
+    }
+
+    #[test]
+    fn i32_garbage_is_int_parse() {
+        assert!(matches!(i32::from_pg_text(b""), Err(DecodeError::IntParse)));
+        assert!(matches!(i32::from_pg_text(b"abc"), Err(DecodeError::IntParse)));
+        assert!(matches!(i32::from_pg_text(b"12a"), Err(DecodeError::IntParse)));
+        // Leading whitespace is not canonical PG text.
+        assert!(matches!(i32::from_pg_text(b" 12"), Err(DecodeError::IntParse)));
+    }
+
+    #[test]
+    fn i32_non_utf8() {
+        // 0xFF is not valid UTF-8 as a single byte.
+        assert!(matches!(i32::from_pg_text(&[0xFF]), Err(DecodeError::NonUtf8)));
+    }
+
+    #[test]
+    fn i16_i64_u32_round_trip() {
+        assert!(matches!(i16::from_pg_text(b"32767"), Ok(i16::MAX)));
+        assert!(matches!(i16::from_pg_text(b"-32768"), Ok(i16::MIN)));
+        assert!(matches!(i16::from_pg_text(b"32768"), Err(DecodeError::IntParse)));
+
+        assert!(matches!(i64::from_pg_text(b"9223372036854775807"), Ok(i64::MAX)));
+        assert!(matches!(i64::from_pg_text(b"9223372036854775808"), Err(DecodeError::IntParse)));
+
+        assert!(matches!(u32::from_pg_text(b"0"), Ok(0)));
+        assert!(matches!(u32::from_pg_text(b"4294967295"), Ok(u32::MAX)));
+        assert!(matches!(u32::from_pg_text(b"4294967296"), Err(DecodeError::IntParse)));
+        // u32 rejects negative values.
+        assert!(matches!(u32::from_pg_text(b"-1"), Err(DecodeError::IntParse)));
+    }
+
+    // ---- bool ----
+
+    #[test]
+    fn bool_canonical_pg_text() {
+        assert!(matches!(bool::from_pg_text(b"t"), Ok(true)));
+        assert!(matches!(bool::from_pg_text(b"f"), Ok(false)));
+    }
+
+    #[test]
+    fn bool_rejects_non_canonical_forms() {
+        // PG is strict: "true" / "false" / "1" / "0" / "yes" / "no" / "on" / "off"
+        // are all NOT the text wire format, even though some SQL contexts
+        // accept them as boolean literals.
+        for bad in [
+            &b"true"[..],
+            &b"false"[..],
+            &b"TRUE"[..],
+            &b"T"[..],
+            &b"F"[..],
+            &b"1"[..],
+            &b"0"[..],
+            &b"yes"[..],
+            &b"no"[..],
+            &b""[..],
+        ] {
+            assert!(
+                matches!(bool::from_pg_text(bad), Err(DecodeError::BoolParse)),
+                "expected BoolParse for {bad:?}",
+            );
+        }
+    }
+
+    // ---- &str ----
+
+    #[test]
+    fn str_is_zero_copy_identity() {
+        let bytes: &[u8] = b"hello world";
+        let result = <&str>::from_pg_text(bytes);
+        assert!(matches!(result, Ok("hello world")));
+        // Lifetime: output reference should share provenance with input.
+        // (Verified by compile — this test body compiles only if the
+        // type signature preserves the borrow.)
+        if let Ok(s) = result {
+            assert_eq!(s.as_ptr(), bytes.as_ptr());
+        }
+    }
+
+    #[test]
+    fn str_rejects_non_utf8() {
+        // 0x80 alone is a lone continuation byte — invalid UTF-8.
+        let bytes: &[u8] = &[0x80];
+        assert!(matches!(<&str>::from_pg_text(bytes), Err(DecodeError::NonUtf8)));
+    }
+
+    #[test]
+    fn str_empty_is_ok() {
+        assert!(matches!(<&str>::from_pg_text(b""), Ok("")));
+    }
+
+    // ---- OID constants sanity ----
+
+    #[test]
+    fn oid_constants_match_pg_catalog() {
+        // Pinned values from postgres/src/include/catalog/pg_type.dat.
+        // Changing these would break wire-level compatibility — a
+        // literal-swap shield.
+        assert_eq!(oids::BOOL, 16);
+        assert_eq!(oids::INT2, 21);
+        assert_eq!(oids::INT4, 23);
+        assert_eq!(oids::INT8, 20);
+        assert_eq!(oids::TEXT, 25);
+        assert_eq!(oids::VARCHAR, 1043);
+        assert_eq!(oids::OID, 26);
+        assert_eq!(oids::UUID, 2950);
     }
 }

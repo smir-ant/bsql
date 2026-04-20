@@ -29,8 +29,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, DataRowRef, FormatCode, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind,
-    Reply, ReplyId, RowDesc, Sql, WriteBuf,
+    Action, DataRowRef, FormatCode, FromPgText, PgCommand, PgProtocol, ProtoState, ProtocolError,
+    QueryKind, Reply, ReplyId, RowDesc, Sql, WriteBuf, oids,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
         TAG_QUERY, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
@@ -799,6 +799,108 @@ fn stream_row_bytes_decode_via_data_row_ref() {
         }
     }
     assert!(saw_stream, "test fixture must produce a StreamRow");
+}
+
+/// Invariant (1c-2c): full decode round-trip — push a SELECT,
+/// server replies with typed rows, caller uses `DataRowRef` +
+/// `FromPgText` to reconstruct Rust values. This is the end-to-end
+/// user-level API that Phase 2 macros will target.
+#[test]
+fn end_to_end_decode_typed_row() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(500);
+    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+
+    // RowDescription: 2 cols — id INT4, name TEXT.
+    let mut rd_body = std::vec::Vec::new();
+    rd_body.extend_from_slice(&2i16.to_be_bytes());
+    for (name, oid) in [(&b"id"[..], oids::INT4), (&b"name"[..], oids::TEXT)] {
+        rd_body.extend_from_slice(name);
+        rd_body.push(0);
+        rd_body.extend_from_slice(&0i32.to_be_bytes()); // table_oid
+        rd_body.extend_from_slice(&0i16.to_be_bytes()); // attr_num
+        rd_body.extend_from_slice(&oid.to_be_bytes()); // type_oid
+        rd_body.extend_from_slice(&(-1i16).to_be_bytes()); // type_size
+        rd_body.extend_from_slice(&(-1i32).to_be_bytes()); // type_mod
+        rd_body.extend_from_slice(&0i16.to_be_bytes()); // format = text
+    }
+
+    // DataRow: id=42, name="alice".
+    let mut dr_body = std::vec::Vec::new();
+    dr_body.extend_from_slice(&2i16.to_be_bytes());
+    let id_text = b"42";
+    let Ok(id_len) = i32::try_from(id_text.len()) else { unreachable!() };
+    dr_body.extend_from_slice(&id_len.to_be_bytes());
+    dr_body.extend_from_slice(id_text);
+    let name_text = b"alice";
+    let Ok(name_len) = i32::try_from(name_text.len()) else { unreachable!() };
+    dr_body.extend_from_slice(&name_len.to_be_bytes());
+    dr_body.extend_from_slice(name_text);
+
+    let mut bytes = std::vec::Vec::new();
+    bytes.push(TAG_ROW_DESCRIPTION);
+    let Ok(rd_len) = u32::try_from(rd_body.len().saturating_add(4)) else { unreachable!() };
+    bytes.extend_from_slice(&rd_len.to_be_bytes());
+    bytes.extend_from_slice(&rd_body);
+    bytes.push(TAG_DATA_ROW);
+    let Ok(dr_len) = u32::try_from(dr_body.len().saturating_add(4)) else { unreachable!() };
+    bytes.extend_from_slice(&dr_len.to_be_bytes());
+    bytes.extend_from_slice(&dr_body);
+    bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
+    bytes.extend_from_slice(&rfq_frame(b'I'));
+
+    let out = proto.feed_bytes(&bytes, &mut wb);
+    let mut decoded_id: Option<i32> = None;
+    let mut decoded_name: Option<std::string::String> = None;
+
+    for a in out.as_slice() {
+        if let Action::StreamRow { row_bytes, desc, .. } = a {
+            // Sanity-check schema: 2 cols, INT4 + TEXT in text format.
+            assert!(
+                matches!(
+                    desc.get(0),
+                    Some(&bsql_pg_proto::ColumnDesc {
+                        type_oid: oids::INT4,
+                        format_code: FormatCode::Text,
+                    }),
+                ) && matches!(
+                    desc.get(1),
+                    Some(&bsql_pg_proto::ColumnDesc {
+                        type_oid: oids::TEXT,
+                        format_code: FormatCode::Text,
+                    }),
+                ) && desc.len() == 2,
+                "schema mismatch: {desc:?}",
+            );
+
+            // Decode row bytes.
+            let Ok(row) = DataRowRef::parse(row_bytes) else {
+                panic!("DataRowRef::parse should succeed");
+            };
+            let mut cols = row.columns();
+            // Column 0: INT4, non-NULL → i32.
+            match cols.next() {
+                Some(Ok(Some(bytes))) => match i32::from_pg_text(bytes) {
+                    Ok(v) => decoded_id = Some(v),
+                    Err(e) => panic!("i32 decode: {e:?}"),
+                },
+                other => panic!("col 0 unexpected: {other:?}"),
+            }
+            // Column 1: TEXT, non-NULL → &str.
+            match cols.next() {
+                Some(Ok(Some(bytes))) => match <&str>::from_pg_text(bytes) {
+                    Ok(s) => decoded_name = Some(std::string::String::from(s)),
+                    Err(e) => panic!("str decode: {e:?}"),
+                },
+                other => panic!("col 1 unexpected: {other:?}"),
+            }
+            assert!(cols.next().is_none(), "no more columns");
+        }
+    }
+
+    assert_eq!(decoded_id, Some(42));
+    assert_eq!(decoded_name.as_deref(), Some("alice"));
 }
 
 /// Invariant (1c-2a): a DML query following a SELECT must receive
