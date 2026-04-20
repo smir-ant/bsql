@@ -230,7 +230,7 @@ const _: fn() = || {
 //   ReplyId:          16
 //   ProtocolError:   304  (DEF-060 typed variants + FixedStr tail)
 //   Action<'_>:      312  (FailReply.cause is the dominator)
-//   ProtoState:     1240  (ConnectingScramAwaitServerFirst dominant)
+//   ProtoState:     1224  (post DEF-099: SCRAM bufs POD, -16 bytes)
 //   PgCommand:      1312  (Startup carries Credentials + names)
 //   PgProtocol:     6648  (ReadBuf 4096 + state 1240 + session_params ~1200)
 //   OutActions:     1256  (4 × Action + u8 len, padded)
@@ -257,10 +257,10 @@ const _: () = assert!(
     "ReplyId size regression — did a bookkeeping field get added?",
 );
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() <= 1280,
-    "ProtoState size regression — post-DEF-096/097 budget is 1280 bytes \
-     (Scram path is dominant; Trust path now just 24 bytes). Did a state \
-     variant add a large buffer?",
+    core::mem::size_of::<state::ProtoState>() <= 1248,
+    "ProtoState size regression — post-DEF-099 budget is 1248 bytes \
+     (Scram path dominant at ~1224; Trust path just 24 bytes). Did a \
+     state variant add a large buffer?",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 1344,

@@ -20,6 +20,7 @@
 //! become true no-ops instead of silent mis-advances).
 
 use crate::error::ErrorKind;
+use crate::ident::PodBytes;
 use crate::reply_id::ReplyId;
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
@@ -114,12 +115,13 @@ pub enum ProtoState {
         scram: ScramSession,
         /// The `client-first-message-bare` (saved for AuthMessage).
         /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN`]
-        /// so a bump in one place fails to compile in the other (DEF-095).
-        client_first_bare: heapless::Vec<u8, { crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
+        /// (DEF-095 const-generic drift guard). POD buffer — no
+        /// `heapless::Vec` Drop propagation into the state enum
+        /// (DEF-099).
+        client_first_bare: PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
         /// The client nonce (base64-encoded, for prefix validation).
-        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN`]
-        /// (DEF-095 drift guard).
-        client_nonce_b64: heapless::Vec<u8, { crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
+        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN`].
+        client_nonce_b64: PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     },
 
     /// SCRAM step 2 complete (client-final sent); awaiting

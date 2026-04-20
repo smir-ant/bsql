@@ -957,8 +957,8 @@ mod allows_unsolicited_param_status_tests {
             let scram_first = ProtoState::ConnectingScramAwaitServerFirst {
                 reply: ReplyId::from_raw(nz(5)),
                 scram,
-                client_first_bare: heapless::Vec::new(),
-                client_nonce_b64: heapless::Vec::new(),
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
             };
             assert!(!allows_unsolicited_param_status(&scram_first));
             consume_state(scram_first);
@@ -1236,8 +1236,8 @@ mod compute_push_tests {
             let prev = ProtoState::ConnectingScramAwaitServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
                 scram,
-                client_first_bare: heapless::Vec::new(),
-                client_nonce_b64: heapless::Vec::new(),
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -1531,8 +1531,8 @@ mod compute_push_tests {
             let prev = ProtoState::ConnectingScramAwaitServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
                 scram,
-                client_first_bare: heapless::Vec::new(),
-                client_nonce_b64: heapless::Vec::new(),
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);

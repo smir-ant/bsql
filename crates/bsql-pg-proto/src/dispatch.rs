@@ -481,8 +481,11 @@ fn build_sasl_initial_response(
     (
         usize,  // start offset in write_buf
         usize,  // end offset (exclusive)
-        heapless::Vec<u8, 128>,
-        heapless::Vec<u8, 48>,
+        // DEF-099: POD state-bound buffers instead of heapless::Vec.
+        // Copy-capable, Drop-free — no `Vec::drop` propagation into
+        // ProtoState.
+        crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
+        crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     ),
     ProtocolError,
 > {
@@ -493,13 +496,13 @@ fn build_sasl_initial_response(
     // an empty "n=" field is accepted per RFC 5802.
     let user_bytes: &[u8] = b"";
 
-    let client_nonce_b64 = wire::generate_client_nonce().map_err(ProtocolError::Scram)?;
+    let client_nonce_vec = wire::generate_client_nonce().map_err(ProtocolError::Scram)?;
 
-    let client_first_bare =
-        wire::build_client_first_bare(user_bytes, &client_nonce_b64).map_err(ProtocolError::Scram)?;
+    let client_first_bare_vec =
+        wire::build_client_first_bare(user_bytes, &client_nonce_vec).map_err(ProtocolError::Scram)?;
 
     let client_first_msg =
-        wire::build_client_first_message(user_bytes, &client_nonce_b64).map_err(ProtocolError::Scram)?;
+        wire::build_client_first_message(user_bytes, &client_nonce_vec).map_err(ProtocolError::Scram)?;
 
     // Build SASLInitialResponse frame in-place in the caller-owned
     // `write_buf`. DEF-094: the entry-point materialises the
@@ -528,6 +531,14 @@ fn build_sasl_initial_response(
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     let end = write_buf.len();
 
+    // DEF-099: convert heapless::Vec output of the scram::wire
+    // builders into POD PodBytes for state storage. One extra copy
+    // on the cold SCRAM handshake path; structural win is that the
+    // state variant becomes `Vec::drop`-free.
+    let client_first_bare = crate::ident::PodBytes::try_from_slice(&client_first_bare_vec)
+        .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
+    let client_nonce_b64 = crate::ident::PodBytes::try_from_slice(&client_nonce_vec)
+        .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     Ok((start, end, client_first_bare, client_nonce_b64))
 }
 
@@ -546,8 +557,8 @@ fn build_sasl_initial_response(
 fn dispatch_auth_sasl_continue(
     reply: ReplyId,
     scram: crate::scram::session::ScramSession,
-    client_first_bare: heapless::Vec<u8, 128>,
-    client_nonce_b64: heapless::Vec<u8, 48>,
+    client_first_bare: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
+    client_nonce_b64: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     payload: &[u8],
     write_buf: &mut WriteBuf,
 ) -> DispatchOutcome {
@@ -570,7 +581,7 @@ fn dispatch_auth_sasl_continue(
 
     // `rest` is the server-first-message body.
     let server_first =
-        match crate::scram::wire::parse_server_first(rest, &client_nonce_b64) {
+        match crate::scram::wire::parse_server_first(rest, client_nonce_b64.as_slice()) {
             Ok(sf) => sf,
             Err(e) => {
                 return DispatchOutcome::Errored {
@@ -609,7 +620,7 @@ fn dispatch_auth_sasl_continue(
         password_bytes,
         &server_first.salt,
         server_first.iterations,
-        &client_first_bare,
+        client_first_bare.as_slice(),
         rest,
         &client_final_without_proof,
     );

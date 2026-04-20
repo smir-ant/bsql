@@ -207,6 +207,132 @@ pub type ApplicationName = FixedStr<MAX_APP_NAME_LEN, ApplicationNameTag>;
 /// error message fields with a hard byte cap and no silent truncation.
 pub type BoundedStr<const N: usize> = FixedStr<N, BoundedStrTag>;
 
+/// POD raw-byte buffer — the `FixedStr` cousin without UTF-8
+/// semantics. Used for wire-protocol byte slices that aren't strings
+/// (e.g. SCRAM `client-first-message-bare`, base64-encoded nonces).
+///
+/// # Why a separate type
+///
+/// [`FixedStr<N, _>`] carries UTF-8 invariants (its `as_str` assumes
+/// the bytes decode). Raw SCRAM wire bytes can be arbitrary, and a
+/// silent `as_str() → ""` on malformed input would mask bugs. Keeping
+/// the two types separate makes the "this is bytes, not a string"
+/// promise load-bearing at the type level.
+///
+/// # Layout
+///
+/// Identical to `FixedStr` minus the phantom tag: `{ buf: [u8; N],
+/// len: u16 }`. `Copy`, `Clone`, `PartialEq`, `Eq`, no `Drop`,
+/// `Default`. Replaces `heapless::Vec<u8, N>` in state fields where
+/// the blanket `Vec::drop` impl (empty body for `u8`, but
+/// `needs_drop = true`) propagated up into [`crate::state::ProtoState`]
+/// — DEF-099.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct PodBytes<const N: usize> {
+    buf: [u8; N],
+    len: u16,
+}
+
+/// Error from [`PodBytes::try_from_slice`] when input exceeds `N`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodBytesOverflow {
+    /// Actual byte length of the rejected input.
+    pub len: usize,
+    /// Maximum capacity `N`.
+    pub max: usize,
+}
+
+impl fmt::Display for PodBytesOverflow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "PodBytes<{}> overflow: {} bytes (max {})",
+            self.max, self.len, self.max,
+        )
+    }
+}
+
+impl<const N: usize> PodBytes<N> {
+    /// Empty value. Compile-asserts `N ≤ u16::MAX` at monomorph time.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        const {
+            assert!(
+                N <= 65_535,
+                "PodBytes<N>: N must fit u16 length prefix (≤ 65_535)",
+            );
+        }
+        Self {
+            buf: [0u8; N],
+            len: 0,
+        }
+    }
+
+    /// Construct from a byte slice. Rejects over-length inputs with
+    /// [`PodBytesOverflow`].
+    pub fn try_from_slice(src: &[u8]) -> Result<Self, PodBytesOverflow> {
+        if src.len() > N {
+            return Err(PodBytesOverflow {
+                len: src.len(),
+                max: N,
+            });
+        }
+        let len = u16::try_from(src.len()).map_err(|_| PodBytesOverflow {
+            len: src.len(),
+            max: N,
+        })?;
+        let mut out = Self::new();
+        if let Some(dst) = out.buf.get_mut(..src.len()) {
+            dst.copy_from_slice(src);
+        }
+        out.len = len;
+        Ok(out)
+    }
+
+    /// Populated byte length.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    /// Whether no bytes have been stored.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrow the populated bytes.
+    ///
+    /// See [`FixedStr::as_bytes`] for the rationale behind the
+    /// `.get(..n).unwrap_or(&[])` idiom — same forbid-bundle
+    /// constraints apply here.
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        self.buf.get(..self.len()).unwrap_or(&[])
+    }
+}
+
+impl<const N: usize> Default for PodBytes<N> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> fmt::Debug for PodBytes<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Prints as a normal byte slice. Strings-pretending-to-be-bytes
+        // print as their ASCII equivalent where possible (the
+        // stdlib's Debug for &[u8] does this).
+        f.debug_tuple("PodBytes").field(&self.as_slice()).finish()
+    }
+}
+
 /// Errors from validated-tag [`FixedStr`] construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentError {
@@ -276,10 +402,29 @@ impl<const N: usize, Tag> FixedStr<N, Tag> {
     }
 
     /// Borrow the populated bytes.
+    ///
+    /// # Pattern commentary
+    ///
+    /// The body is `self.buf.get(..self.len()).unwrap_or(&[])`. This
+    /// is not a defensive-programming kludge — it is the
+    /// minimum-overhead stable-library form that satisfies the crate's
+    /// forbid-bundle simultaneously:
+    ///
+    /// - `&self.buf[..self.len()]` is rejected by
+    ///   `clippy::indexing_slicing`.
+    /// - `self.buf.get_unchecked(..self.len())` is rejected by
+    ///   `#![forbid(unsafe_code)]`.
+    /// - `self.buf.get(..self.len()).unwrap()` / `.expect(..)` are
+    ///   rejected by the panic / unwrap bans.
+    ///
+    /// `self.len ≤ N` by constructor invariant, so `get(..n)` always
+    /// returns `Some`; the `unwrap_or(&[])` branch is
+    /// architecturally unreachable and LLVM eliminates it under any
+    /// non-zero optimisation level. The generated machine code is
+    /// identical to `&self.buf[..self.len()]`.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        // `self.len` is clamped to `≤ N` by every constructor.
         self.buf.get(..self.len()).unwrap_or(&[])
     }
 
