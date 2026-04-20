@@ -155,12 +155,13 @@ fn negotiate_proto_version_frame() -> Vec<u8> {
 }
 
 /// Push a Startup command (trust auth) and return the actions.
-fn startup_trust(
+fn startup_trust<'a>(
     proto: &mut PgProtocol,
+    wb: &'a mut bsql_pg_proto::WriteBuf,
     user: &str,
     db: Option<&str>,
     reply_raw: NonZeroU64,
-) -> bsql_pg_proto::OutActions {
+) -> bsql_pg_proto::OutActions<'a> {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let database = db.map(|d| {
         bsql_pg_proto::DatabaseName::try_from_str(d).unwrap_or_else(|e| panic!("bad db: {e}"))
@@ -171,7 +172,7 @@ fn startup_trust(
         app_name: None,
         credentials: Credentials::Trust,
         reply: id(reply_raw),
-    })
+    }, wb)
 }
 
 // ------------------------------------------------------------------
@@ -184,14 +185,15 @@ fn startup_trust(
 #[test]
 fn trust_auth_handshake_end_to_end() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(1);
 
     // Push Startup (trust).
-    let out = startup_trust(&mut proto, "testuser", Some("testdb"), startup_raw);
+    let out = startup_trust(&mut proto, &mut wb, "testuser", Some("testdb"), startup_raw);
     assert_eq!(out.len(), 1, "Startup emits exactly 1 action (SendBytes)");
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
-            let bytes = send_buf.as_bytes();
+            let bytes = *send_buf;
             // Verify the StartupMessage wire format.
             // First 4 bytes: length (includes self).
             // Next 4 bytes: protocol version 196608.
@@ -211,7 +213,8 @@ fn trust_auth_handshake_end_to_end() {
     ));
 
     // Feed AuthenticationOk.
-    let out = proto.feed_bytes(&auth_ok_frame());
+    drop(out);
+    let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0, "AuthOk produces no actions (state transition only)");
     assert!(matches!(
         proto.state(),
@@ -219,13 +222,16 @@ fn trust_auth_handshake_end_to_end() {
     ));
 
     // Feed ParameterStatus messages.
-    let out = proto.feed_bytes(&param_status_frame("server_version", "17.2"));
+    drop(out);
+    let out = proto.feed_bytes(&param_status_frame("server_version", "17.2"), &mut wb);
     assert_eq!(out.len(), 0);
-    let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"));
+    drop(out);
+    let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"), &mut wb);
     assert_eq!(out.len(), 0);
 
     // Feed BackendKeyData.
-    let out = proto.feed_bytes(&backend_key_data_frame(12345, 67890));
+    drop(out);
+    let out = proto.feed_bytes(&backend_key_data_frame(12345, 67890), &mut wb);
     assert_eq!(out.len(), 0);
     assert!(matches!(
         proto.state(),
@@ -233,11 +239,13 @@ fn trust_auth_handshake_end_to_end() {
     ));
 
     // Feed more ParameterStatus after BackendKeyData (allowed).
-    let out = proto.feed_bytes(&param_status_frame("client_encoding", "UTF8"));
+    drop(out);
+    let out = proto.feed_bytes(&param_status_frame("client_encoding", "UTF8"), &mut wb);
     assert_eq!(out.len(), 0);
 
     // Feed ReadyForQuery — completes the handshake.
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    drop(out);
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1, "RFQ completes handshake with DeliverReply");
     match out.as_slice() {
         [Action::DeliverReply { id: delivered_id, value }] => {
@@ -276,11 +284,12 @@ fn trust_auth_handshake_end_to_end() {
 #[test]
 fn error_response_during_startup_is_classified() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(2);
-    startup_trust(&mut proto, "baduser", None, startup_raw);
+    startup_trust(&mut proto, &mut wb, "baduser", None, startup_raw);
 
     let err_frame = error_response_frame("FATAL", "28P01", "password authentication failed");
-    let out = proto.feed_bytes(&err_frame);
+    let out = proto.feed_bytes(&err_frame, &mut wb);
 
     assert_eq!(out.len(), 2, "ErrorResponse → FailReply + CloseSocket");
     match out.as_slice() {
@@ -312,10 +321,11 @@ fn error_response_during_startup_is_classified() {
 #[test]
 fn negotiate_protocol_version_during_startup() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(3);
-    startup_trust(&mut proto, "testuser", None, startup_raw);
+    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
 
-    let out = proto.feed_bytes(&negotiate_proto_version_frame());
+    let out = proto.feed_bytes(&negotiate_proto_version_frame(), &mut wb);
 
     assert_eq!(out.len(), 2);
     match out.as_slice() {
@@ -335,12 +345,13 @@ fn negotiate_protocol_version_during_startup() {
 #[test]
 fn unknown_auth_subcode_is_rejected() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(4);
-    startup_trust(&mut proto, "testuser", None, startup_raw);
+    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
 
     // Build an Authentication frame with sub-code 99 (unknown).
     let frame = [b'R', 0, 0, 0, 8, 0, 0, 0, 99];
-    let out = proto.feed_bytes(&frame);
+    let out = proto.feed_bytes(&frame, &mut wb);
 
     assert_eq!(out.len(), 2);
     match out.as_slice() {
@@ -359,10 +370,11 @@ fn unknown_auth_subcode_is_rejected() {
 #[test]
 fn pipelined_startup_is_rejected() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let first_raw = raw(10);
     let second_raw = raw(11);
 
-    startup_trust(&mut proto, "testuser", None, first_raw);
+    startup_trust(&mut proto, &mut wb, "testuser", None, first_raw);
 
     // Push a second Startup while the first is in ConnectingStartup.
     let user = Ident::try_from_str("other").unwrap_or_else(|e| panic!("{e}"));
@@ -372,7 +384,7 @@ fn pipelined_startup_is_rejected() {
         app_name: None,
         credentials: Credentials::Trust,
         reply: id(second_raw),
-    });
+    }, &mut wb);
 
     assert_eq!(out.len(), 1);
     match out.as_slice() {
@@ -387,11 +399,14 @@ fn pipelined_startup_is_rejected() {
     }
 
     // Drain the first startup to avoid Drop-guard panic.
-    let out = proto.feed_bytes(&auth_ok_frame());
+    drop(out);
+    let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0);
-    let out = proto.feed_bytes(&backend_key_data_frame(1, 2));
+    drop(out);
+    let out = proto.feed_bytes(&backend_key_data_frame(1, 2), &mut wb);
     assert_eq!(out.len(), 0);
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    drop(out);
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1);
 }
 
@@ -400,24 +415,26 @@ fn pipelined_startup_is_rejected() {
 #[test]
 fn startup_on_errored_state_fails_with_stored_cause() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let first_raw = raw(20);
-    startup_trust(&mut proto, "testuser", None, first_raw);
+    startup_trust(&mut proto, &mut wb, "testuser", None, first_raw);
 
     // Drive into Errored via ErrorResponse.
     let err = error_response_frame("FATAL", "28000", "auth failed");
-    let out = proto.feed_bytes(&err);
+    let out = proto.feed_bytes(&err, &mut wb);
     assert_eq!(out.len(), 2);
 
     // Push Startup on Errored.
     let second_raw = raw(21);
     let user = Ident::try_from_str("x").unwrap_or_else(|e| panic!("{e}"));
+    drop(out);
     let out = proto.push_command(PgCommand::Startup {
         user,
         database: None,
         app_name: None,
         credentials: Credentials::Trust,
         reply: id(second_raw),
-    });
+    }, &mut wb);
 
     assert_eq!(out.len(), 1);
     match out.as_slice() {
@@ -502,12 +519,13 @@ fn password_validation() {
 #[test]
 fn startup_message_wire_format() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(100);
-    let out = startup_trust(&mut proto, "alice", Some("mydb"), startup_raw);
+    let out = startup_trust(&mut proto, &mut wb, "alice", Some("mydb"), startup_raw);
 
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
-            let bytes = send_buf.as_bytes();
+            let bytes = *send_buf;
             // Parse the length prefix.
             let len_bytes = bytes.get(..4).unwrap_or(&[]);
             let declared = u32::from_be_bytes([
@@ -541,11 +559,14 @@ fn startup_message_wire_format() {
     }
 
     // Drain.
-    let out = proto.feed_bytes(&auth_ok_frame());
+    drop(out);
+    let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0);
-    let out = proto.feed_bytes(&backend_key_data_frame(1, 1));
+    drop(out);
+    let out = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
     assert_eq!(out.len(), 0);
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    drop(out);
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1);
 }
 
@@ -581,12 +602,13 @@ fn contains_nul_terminated_pair(data: &[u8], key: &[u8], value: &[u8]) -> bool {
 #[test]
 fn connecting_states_become_errored_on_bad_frame() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(200);
-    startup_trust(&mut proto, "testuser", None, startup_raw);
+    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
 
     // Feed a completely unexpected frame tag during ConnectingStartup.
     let garbage_frame = [b'X', 0, 0, 0, 4]; // tag X, minimal legal length
-    let out = proto.feed_bytes(&garbage_frame);
+    let out = proto.feed_bytes(&garbage_frame, &mut wb);
 
     assert_eq!(out.len(), 2, "unexpected frame → FailReply + CloseSocket");
     match out.as_slice() {
@@ -601,7 +623,8 @@ fn connecting_states_become_errored_on_bad_frame() {
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
 
     // Post-terminal frames are dropped silently.
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    drop(out);
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 0, "post-terminal frame must emit zero actions");
 }
 
@@ -610,12 +633,13 @@ fn connecting_states_become_errored_on_bad_frame() {
 // ------------------------------------------------------------------
 
 /// Helper: push Startup with SCRAM password credentials.
-fn startup_scram(
+fn startup_scram<'a>(
     proto: &mut PgProtocol,
+    wb: &'a mut bsql_pg_proto::WriteBuf,
     user: &str,
     password: &str,
     reply_raw: NonZeroU64,
-) -> bsql_pg_proto::OutActions {
+) -> bsql_pg_proto::OutActions<'a> {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
     proto.push_command(PgCommand::Startup {
@@ -624,7 +648,7 @@ fn startup_scram(
         app_name: None,
         credentials: Credentials::ScramPassword(Sensitive::new(pw)),
         reply: id(reply_raw),
-    })
+    }, wb)
 }
 
 /// Extract the client-first-message from a SASLInitialResponse frame.
@@ -676,17 +700,18 @@ fn scram_sha256_handshake_end_to_end() {
     use bsql_pg_proto::scram::wire::base64_encode_to_buf;
 
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(300);
     let password = "pencil";
 
     // Step 1: Push Startup with SCRAM password.
-    let out = startup_scram(&mut proto, "user", password, startup_raw);
+    let out = startup_scram(&mut proto, &mut wb, "user", password, startup_raw);
     assert_eq!(out.len(), 1);
     // StartupMessage has no tag byte; protocol version 3.0 (196608 =
     // 0x00030000) occupies bytes [4..8] after the 4-byte length prefix.
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
-            let bytes = send_buf.as_bytes();
+            let bytes = *send_buf;
             assert!(bytes.len() >= 8, "StartupMessage must be >= 8 bytes");
             assert_eq!(
                 bytes.get(4..8),
@@ -699,11 +724,12 @@ fn scram_sha256_handshake_end_to_end() {
     assert!(matches!(proto.state(), ProtoState::ConnectingStartup { .. }));
 
     // Step 2: Server sends AuthenticationSASL with SCRAM-SHA-256.
-    let out = proto.feed_bytes(&auth_sasl_frame());
+    drop(out);
+    let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     // This should produce a SASLInitialResponse.
     assert_eq!(out.len(), 1, "AuthSASL → SendBytes(SASLInitialResponse)");
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
-        [Action::SendBytes(send_buf)] => send_buf.as_bytes().to_vec(),
+        [Action::SendBytes(send_buf)] => send_buf.to_vec(),
         other => panic!("expected SendBytes(Owned), got {other:?}"),
     };
     assert!(matches!(
@@ -739,7 +765,8 @@ fn scram_sha256_handshake_end_to_end() {
     let server_first = format!("r={server_nonce_str},s={salt_b64},i={iterations}");
 
     // Step 5: Feed AuthenticationSASLContinue with server-first.
-    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()));
+    drop(out);
+    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()), &mut wb);
     // This should produce a SASLResponse (client-final-message).
     assert_eq!(out.len(), 1, "SASLContinue → SendBytes(SASLResponse)");
     match out.as_slice() {
@@ -775,7 +802,8 @@ fn scram_sha256_handshake_end_to_end() {
     let server_final = format!("v={sig_b64}");
 
     // Step 7: Feed AuthenticationSASLFinal with server-final.
-    let out = proto.feed_bytes(&auth_sasl_final_frame(server_final.as_bytes()));
+    drop(out);
+    let out = proto.feed_bytes(&auth_sasl_final_frame(server_final.as_bytes()), &mut wb);
     assert_eq!(out.len(), 0, "SASLFinal → state transition only (awaiting AuthOk)");
     assert!(matches!(
         proto.state(),
@@ -783,7 +811,8 @@ fn scram_sha256_handshake_end_to_end() {
     ));
 
     // Step 8: Feed AuthenticationOk.
-    let out = proto.feed_bytes(&auth_ok_frame());
+    drop(out);
+    let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0, "AuthOk after SCRAM → post-auth chain");
     assert!(matches!(
         proto.state(),
@@ -791,11 +820,14 @@ fn scram_sha256_handshake_end_to_end() {
     ));
 
     // Step 9: Complete post-auth chain.
-    let out = proto.feed_bytes(&param_status_frame("server_version", "17.2"));
+    drop(out);
+    let out = proto.feed_bytes(&param_status_frame("server_version", "17.2"), &mut wb);
     assert_eq!(out.len(), 0);
-    let out = proto.feed_bytes(&backend_key_data_frame(42, 99));
+    drop(out);
+    let out = proto.feed_bytes(&backend_key_data_frame(42, 99), &mut wb);
     assert_eq!(out.len(), 0);
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    drop(out);
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1);
     match out.as_slice() {
         [Action::DeliverReply { id: delivered_id, value }] => {
@@ -814,13 +846,14 @@ fn scram_sha256_handshake_end_to_end() {
 #[test]
 fn scram_signature_mismatch_is_rejected() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(400);
 
     // Start SCRAM handshake.
-    startup_scram(&mut proto, "user", "pencil", startup_raw);
-    let out = proto.feed_bytes(&auth_sasl_frame());
+    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
-        [Action::SendBytes(send_buf)] => send_buf.as_bytes().to_vec(),
+        [Action::SendBytes(send_buf)] => send_buf.to_vec(),
         other => panic!("expected SendBytes, got {other:?}"),
     };
 
@@ -839,12 +872,14 @@ fn scram_signature_mismatch_is_rejected() {
     let server_nonce_str = std::str::from_utf8(&server_nonce).unwrap_or("");
 
     let server_first = format!("r={server_nonce_str},s={salt_b64},i=4096");
-    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()));
+    drop(out);
+    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()), &mut wb);
     assert_eq!(out.len(), 1, "SASLContinue → SendBytes(SASLResponse)");
 
     // Send a WRONG server signature.
     let wrong_sig = "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-    let out = proto.feed_bytes(&auth_sasl_final_frame(wrong_sig.as_bytes()));
+    drop(out);
+    let out = proto.feed_bytes(&auth_sasl_final_frame(wrong_sig.as_bytes()), &mut wb);
 
     assert_eq!(out.len(), 2, "sig mismatch → FailReply + CloseSocket");
     match out.as_slice() {
@@ -862,12 +897,13 @@ fn scram_signature_mismatch_is_rejected() {
 #[test]
 fn scram_iterations_too_low_is_rejected() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(500);
 
-    startup_scram(&mut proto, "user", "pencil", startup_raw);
-    let out = proto.feed_bytes(&auth_sasl_frame());
+    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
-        [Action::SendBytes(send_buf)] => send_buf.as_bytes().to_vec(),
+        [Action::SendBytes(send_buf)] => send_buf.to_vec(),
         other => panic!("expected SendBytes, got {other:?}"),
     };
 
@@ -881,7 +917,8 @@ fn scram_iterations_too_low_is_rejected() {
 
     // iterations = 100 (below minimum 4096)
     let server_first = format!("r={server_nonce_str},s=QSXCR+Q6sek8bf92,i=100");
-    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()));
+    drop(out);
+    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()), &mut wb);
 
     assert_eq!(out.len(), 2, "low iterations → FailReply + CloseSocket");
     match out.as_slice() {
@@ -899,15 +936,17 @@ fn scram_iterations_too_low_is_rejected() {
 #[test]
 fn scram_nonce_prefix_mismatch_is_rejected() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(600);
 
-    startup_scram(&mut proto, "user", "pencil", startup_raw);
-    let out = proto.feed_bytes(&auth_sasl_frame());
+    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     assert_eq!(out.len(), 1);
 
     // Server-first with a nonce that does NOT start with client nonce.
     let server_first = b"r=COMPLETELY_DIFFERENT_NONCE,s=QSXCR+Q6sek8bf92,i=4096";
-    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first));
+    drop(out);
+    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first), &mut wb);
 
     assert_eq!(out.len(), 2, "nonce mismatch → FailReply + CloseSocket");
     match out.as_slice() {
@@ -1004,8 +1043,9 @@ fn credentials_debug_does_not_leak_password() {
 #[test]
 fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(100);
-    startup_trust(&mut proto, "testuser", None, startup_raw);
+    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
 
     // Complete startup: AuthOk → BackendKeyData → RFQ → Idle.
     // Setup frames' actions are discarded explicitly (`drop`) rather
@@ -1013,9 +1053,9 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     // memory (`feedback_no_underscore_vars`). Post-auth shape is
     // verified below via state and out assertions on the real test
     // body (PS frame).
-    drop(proto.feed_bytes(&auth_ok_frame()));
-    drop(proto.feed_bytes(&backend_key_data_frame(1, 1)));
-    drop(proto.feed_bytes(&rfq_frame(b'I')));
+    drop(proto.feed_bytes(&auth_ok_frame(), &mut wb));
+    drop(proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb));
+    drop(proto.feed_bytes(&rfq_frame(b'I'), &mut wb));
     assert!(
         matches!(proto.state(), ProtoState::Idle),
         "handshake should land in Idle, got {:?}",
@@ -1026,7 +1066,7 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     // SET command finishes). Before DEF-054 this would trigger
     // UnexpectedFrame → CloseSocket. After DEF-054 it is recorded
     // silently.
-    let out = proto.feed_bytes(&param_status_frame("TimeZone", "America/New_York"));
+    let out = proto.feed_bytes(&param_status_frame("TimeZone", "America/New_York"), &mut wb);
     assert_eq!(out.len(), 0, "unsolicited PS in Idle emits no actions");
     assert!(
         matches!(proto.state(), ProtoState::Idle),
@@ -1054,20 +1094,21 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     use bsql_pg_proto::PgCommand;
 
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(200);
-    startup_trust(&mut proto, "testuser", None, startup_raw);
+    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
     // Explicit `drop` (see preceding test for rationale).
-    drop(proto.feed_bytes(&auth_ok_frame()));
-    drop(proto.feed_bytes(&backend_key_data_frame(1, 1)));
-    drop(proto.feed_bytes(&rfq_frame(b'I')));
+    drop(proto.feed_bytes(&auth_ok_frame(), &mut wb));
+    drop(proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb));
+    drop(proto.feed_bytes(&rfq_frame(b'I'), &mut wb));
 
     // Send a ping. State → AwaitingPingReply.
     let ping_raw = raw(201);
-    let push_out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) });
+    let push_out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
     match push_out.as_slice() {
         [Action::SendBytes(send_buf)] => {
             assert_eq!(
-                send_buf.as_bytes(),
+                *send_buf,
                 &bsql_pg_proto::wire::SYNC_WIRE_BYTES,
                 "Ping must emit the 5-byte const Sync wire payload",
             );
@@ -1078,7 +1119,8 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
 
     // Server emits ParameterStatus before RFQ (e.g. an ALTER SYSTEM
     // committed during our ping's round-trip).
-    let out = proto.feed_bytes(&param_status_frame("client_encoding", "LATIN1"));
+    drop(push_out);
+    let out = proto.feed_bytes(&param_status_frame("client_encoding", "LATIN1"), &mut wb);
     assert_eq!(out.len(), 0, "PS during flight emits no actions");
     assert!(
         matches!(proto.state(), ProtoState::AwaitingPingReply(_)),
@@ -1090,7 +1132,8 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     );
 
     // Now feed RFQ — ping completes normally.
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    drop(out);
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(out.len(), 1, "RFQ completes ping with DeliverReply");
     match out.as_slice() {
         [Action::DeliverReply { id: delivered, .. }] => {
@@ -1124,19 +1167,20 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
 #[test]
 fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(901);
-    startup_scram(&mut proto, "user", "pencil", startup_raw);
+    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
     // Server offers SASL → we emit SASLInitialResponse → state is now
     // ConnectingScramAwaitServerFirst. Setup frame's actions discarded
     // explicitly — `let _ = ...` is banned.
-    drop(proto.feed_bytes(&auth_sasl_frame()));
+    drop(proto.feed_bytes(&auth_sasl_frame(), &mut wb));
     assert!(matches!(
         proto.state(),
         ProtoState::ConnectingScramAwaitServerFirst { .. },
     ));
 
     // Unsolicited ParameterStatus during SCRAM — must be classified.
-    let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"));
+    let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"), &mut wb);
     assert_eq!(out.len(), 2, "PS during SCRAM → FailReply + CloseSocket");
     match out.as_slice() {
         [Action::FailReply { id, cause }, Action::CloseSocket] => {
@@ -1163,11 +1207,12 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
 #[test]
 fn param_status_during_pre_auth_is_unexpected() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(300);
-    startup_trust(&mut proto, "testuser", None, startup_raw);
+    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
     // State is now ConnectingStartup. Server should send
     // AuthenticationOk / SASL / ErrorResponse — not ParameterStatus.
-    let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"));
+    let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"), &mut wb);
     assert_eq!(out.len(), 2, "pre-auth PS → FailReply + CloseSocket");
     match out.as_slice() {
         [Action::FailReply { id: failed, cause }, Action::CloseSocket] => {

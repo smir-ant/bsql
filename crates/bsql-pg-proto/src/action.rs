@@ -7,32 +7,69 @@
 //! harness pattern-matches them directly. The protocol itself does
 //! neither.
 //!
-//! Phase 1a ships only the actions the Ping flow produces:
-//! [`Action::SendBytes`] (carrying a [`SendBuf`]) and
-//! [`Action::DeliverReply`] / [`Action::FailReply`] (carrying
-//! [`Reply::Pong`]). [`Action::CloseSocket`] is also shipped because
-//! protocol-error paths in 1a require it.
+//! # DEF-094 — staged dispatch + lifetime-bound SendBytes
 //!
-//! Other actions (`StreamRow`, additional `Reply` variants) land
-//! with their drivers — reforge.md §3.5.
+//! [`Action::SendBytes`] carries a `&'buf [u8]` reference into a
+//! **caller-owned** [`crate::write_buf::WriteBuf`] that is passed to
+//! every entry-point call. The host reads the slice, writes it to the
+//! socket, and drops the [`Action`]; the backing bytes live in the
+//! caller's `WriteBuf` until the caller reuses it on the next call
+//! (each entry-point call clears the buffer at entry).
+//!
+//! The borrow-checker enforces the "consume before next call"
+//! invariant at compile time: [`OutActions<'buf>`] borrows the
+//! caller's `WriteBuf` for `'buf`; the next `&mut WriteBuf` call is
+//! rejected while any `Action<'buf>` is alive. Zero-copy with tier-1
+//! compile enforcement. **Inspection via `proto.state()` still works
+//! alongside** — `OutActions` does NOT borrow `PgProtocol`, only the
+//! separate `WriteBuf`, so shared `&self` reads on the protocol are
+//! never blocked.
+//!
+//! Internally, dispatchers emit [`StagedAction`] values (range-based,
+//! no refs) during the write phase; the entry-point materialises them
+//! into ref-bound [`Action<'buf>`]s once the mutable write phase
+//! completes. This two-phase split sidesteps the borrow-checker
+//! conflict that had blocked an earlier DEF-094 attempt: holding
+//! `Action<'buf>::SendBytes(&'buf [u8])` while re-entering the
+//! dispatcher for the next frame in the same `feed_bytes` call.
 
 use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
-use crate::write_buf::MAX_OWNED_SEND_LEN;
 use core::num::NonZeroU64;
 use heapless::Vec;
 
 /// Bounded list of actions emitted by a single protocol entry-point
 /// call.
 ///
-/// `MAX_ACTIONS_PER_CALL` is intentionally tiny in Phase 1a — see its
-/// definition for the per-method audit. The `heapless::Vec` returns
-/// `Err` on overflow; our internal helper [`crate::protocol::push_action`]
-/// turns that into a compile-time impossibility via per-call-site
-/// `const _: () = assert!(MAX_ACTIONS_PER_CALL >= …)`.
-pub type OutActions = Vec<Action, MAX_ACTIONS_PER_CALL>;
+/// The `'buf` lifetime ties [`Action::SendBytes`] references back to
+/// the caller-owned [`crate::write_buf::WriteBuf`] that was passed
+/// to `feed_bytes` / `push_command`. Callers drain the actions
+/// (typically: execute each in order, write SendBytes bytes to the
+/// transport) and drop the whole `OutActions`; the next entry-point
+/// call requires `&mut WriteBuf`, which the borrow checker refuses
+/// until `OutActions<'buf>` drops.
+///
+/// `MAX_ACTIONS_PER_CALL` is intentionally tiny in Phase 1a — see
+/// its definition in `protocol.rs` for the per-method audit.
+/// Overflow handling is compile-enforced via the `emit_actions!`
+/// macro's `const _: () = assert!(MAX_ACTIONS_PER_CALL >= budget)`
+/// checks at every push site.
+pub type OutActions<'buf> = Vec<Action<'buf>, MAX_ACTIONS_PER_CALL>;
+
+/// Internal staged list: dispatchers emit `StagedAction` during the
+/// write-phase (`&mut write_buf`-holding) loop, the entry-point
+/// materialises them into [`Action<'buf>`] in phase two (shared
+/// borrow of `write_buf`). `pub(crate)` — not a public API.
+pub(crate) type StagedActions = Vec<StagedAction, MAX_ACTIONS_PER_CALL>;
 
 /// A directive from the protocol to its host.
+///
+/// # Lifetime
+///
+/// `'buf` is the lifetime of the host's caller-owned [`crate::write_buf::WriteBuf`].
+/// [`Action::SendBytes`] carries `&'buf [u8]` — either a reference
+/// into that `WriteBuf` (for runtime-built frames) or a static
+/// reference (for compile-time constants; `'static: 'buf`).
 ///
 /// `#[non_exhaustive]` because more variants land with later sub-phases
 /// (`StreamRow`, etc.). Internal `match` over `Action` is *not*
@@ -41,13 +78,26 @@ pub type OutActions = Vec<Action, MAX_ACTIONS_PER_CALL>;
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
-pub enum Action {
+#[expect(
+    clippy::large_enum_variant,
+    reason = "no_alloc: Box unavailable; FailReply.cause (ProtocolError ~280 bytes after DEF-060) dominates. \
+              Shrinking further requires a typed ErrorDetail pointer indirection — deferred to post-1c."
+)]
+pub enum Action<'buf> {
     /// Send these bytes verbatim to the server.
     ///
-    /// The buffer is owned by the [`SendBuf`] enum; the host pulls
-    /// `as_bytes()` and writes them. Once the host has performed the
-    /// write, it drops the [`Action`] — the buffer goes with it.
-    SendBytes(SendBuf),
+    /// The slice references the caller-owned [`crate::write_buf::WriteBuf`]
+    /// (for runtime-built frames) or static storage (for compile-time
+    /// constants). The host reads the slice, writes it to the socket,
+    /// and drops the [`Action`]; no data is copied out of the
+    /// protocol. Zero-copy.
+    ///
+    /// The `'buf` lifetime ensures the slice is valid for exactly
+    /// as long as the owning `OutActions<'buf>` is alive — the next
+    /// protocol entry-point call is blocked by the borrow checker
+    /// until the caller drops `OutActions` and releases the
+    /// `&mut WriteBuf`.
+    SendBytes(&'buf [u8]),
 
     /// Deliver a successful reply to the wrapper.
     ///
@@ -90,96 +140,55 @@ pub enum Action {
     CloseSocket,
 }
 
-/// A wire-bytes buffer for [`Action::SendBytes`].
+/// Internal staging variant emitted by dispatchers during the
+/// write-phase loop.
 ///
-/// Newtype wrapper around `heapless::Vec<u8, MAX_OWNED_SEND_LEN>`.
-/// All outbound frames — whether 5-byte `Sync` or runtime-built
-/// `StartupMessage` / SASL messages — flow through the same bounded
-/// stack buffer. This is DEF-089: the previous two-arm enum
-/// (`Static(&'static [u8])` / `Owned(heapless::Vec<u8, N>)`) had a
-/// **tier-3 shield seam** in `as_bytes` — a silent swap of the two
-/// match arms would compile and cross-wire every outbound message.
-/// The collapsed single-path design eliminates the seam at tier-1
-/// structural (no enum, no match, no swap).
+/// `StagedAction` carries ranges into the caller's `WriteBuf` (not
+/// references) and owned values (for DeliverReply / FailReply). No
+/// lifetime. Materialised by the entry-point into [`Action<'buf>`]
+/// once the mutable write-phase completes.
 ///
-/// Cost: a 5-byte `memcpy` for the const `Sync` message on every
-/// ping (before: zero-copy via `&'static [u8]`). Negligible — Ping is
-/// rare, 5 bytes fit in one cache line. Full zero-copy via
-/// lifetime-bound `&'buf [u8]` references is the DEF-059 / Phase 1c
-/// work where compute/apply split naturally threads the lifetime.
+/// Two variants map to [`Action::SendBytes`] at materialisation:
 ///
-/// `#[non_exhaustive]` prevents external crates from constructing
-/// `SendBuf(inner)` directly — construction must go through the
-/// public `from_slice` constructor (which validates capacity) or the
-/// `pub(crate)` `from_owned` (used when we already built a `WriteBuf`
-/// and move its inner Vec).
-///
-/// `#[repr(transparent)]` guarantees ABI-identical layout with the
-/// inner `heapless::Vec<u8, N>` — formal zero-cost abstraction.
-#[derive(Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-#[repr(transparent)]
-pub struct SendBuf {
-    /// Backing storage. Named field (not tuple-struct positional `.0`)
-    /// for consistency with every other newtype in the crate
-    /// (`Ident.buf`, `DatabaseName.buf`, `ApplicationName.buf`,
-    /// `SecretDigest.bytes`, `CappedServerNonce.buf`,
-    /// `Sensitive.inner`). `#[repr(transparent)]` holds with one
-    /// named field same as with a positional one.
-    inner: heapless::Vec<u8, MAX_OWNED_SEND_LEN>,
-}
-
-/// Returned when a slice passed to [`SendBuf::from_slice`] exceeds
-/// the bounded capacity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SendBufFull {
-    /// Actual byte length of the rejected input.
-    pub attempted: usize,
-}
-
-impl core::fmt::Display for SendBufFull {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "send buffer full: tried to store {} bytes (max {})",
-            self.attempted, MAX_OWNED_SEND_LEN,
-        )
-    }
-}
-
-impl SendBuf {
-    /// Construct from a byte slice. Fails if the slice exceeds
-    /// [`MAX_OWNED_SEND_LEN`].
-    ///
-    /// Error classification is the caller's responsibility — in
-    /// protocol-internal call sites where input is compile-time-known
-    /// to fit (e.g. the 5-byte `SYNC_WIRE_BYTES`), the Err branch is
-    /// dead but surfaced honestly via `let-else` → `ProtocolError::ProtocolInvariantBroken`.
-    pub fn from_slice(bytes: &[u8]) -> Result<Self, SendBufFull> {
-        let mut inner = heapless::Vec::new();
-        inner
-            .extend_from_slice(bytes)
-            .map_err(|_| SendBufFull {
-                attempted: bytes.len(),
-            })?;
-        Ok(Self { inner })
-    }
-
-    /// Construct from an already-owned bounded buffer. `pub(crate)`
-    /// because the normal path through external callers is
-    /// [`SendBuf::from_slice`]; this exists for internal use when
-    /// `WriteBuf::into_inner()` has already produced the buffer.
-    #[inline]
-    pub(crate) const fn from_owned(inner: heapless::Vec<u8, MAX_OWNED_SEND_LEN>) -> Self {
-        Self { inner }
-    }
-
-    /// Borrow the underlying wire bytes.
-    #[inline]
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.inner
-    }
+/// - [`Self::SendBytesRange`] — bytes were written into
+///   `write_buf[start..end]`; the materialiser emits a slice ref
+///   into that range.
+/// - [`Self::SendBytesStatic`] — bytes are a compile-time `'static`
+///   constant (e.g. the 5-byte `Sync` wire payload); the
+///   materialiser emits the static ref directly (zero write, zero
+///   copy — `Sync` bypasses `write_buf` entirely).
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Same root as Action<'_>: FailReply.cause dominates. StagedAction is staging-only — never stored, one-shot."
+)]
+pub(crate) enum StagedAction {
+    /// Bytes live at `write_buf[start..end]`. Materialiser slices.
+    SendBytesRange {
+        /// Inclusive start offset.
+        start: usize,
+        /// Exclusive end offset.
+        end: usize,
+    },
+    /// Bytes are a static compile-time constant. Materialiser passes
+    /// through directly — no write, no copy.
+    SendBytesStatic(&'static [u8]),
+    /// Map to [`Action::DeliverReply`].
+    DeliverReply {
+        /// Raw correlator (post-consume of the `ReplyId`).
+        id: NonZeroU64,
+        /// Typed payload.
+        value: Reply,
+    },
+    /// Map to [`Action::FailReply`].
+    FailReply {
+        /// Raw correlator (post-consume of the `ReplyId`).
+        id: NonZeroU64,
+        /// Why the protocol failed.
+        cause: ProtocolError,
+    },
+    /// Map to [`Action::CloseSocket`].
+    CloseSocket,
 }
 
 /// A typed protocol reply payload.

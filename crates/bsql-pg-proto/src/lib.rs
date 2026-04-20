@@ -102,7 +102,7 @@ pub mod state;
 pub mod wire;
 pub mod write_buf;
 
-pub use action::{Action, OutActions, Reply, SendBuf, SendBufFull};
+pub use action::{Action, OutActions, Reply};
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::PgCommand;
 pub use error::ProtocolError;
@@ -125,11 +125,12 @@ pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 // ---------------------------------------------------------------------
 const _: fn() = || {
     fn assert_send<T: Send>() {}
-    // Phase 1a types
-    assert_send::<action::Action>();
-    assert_send::<action::OutActions>();
+    // Phase 1a types. `Action<'_>` and `OutActions<'_>` carry a
+    // lifetime (DEF-094); asserting for `'static` implies Send for
+    // any shorter lifetime by covariance.
+    assert_send::<action::Action<'static>>();
+    assert_send::<action::OutActions<'static>>();
     assert_send::<action::Reply>();
-    assert_send::<action::SendBuf>();
     assert_send::<command::PgCommand>();
     assert_send::<error::ProtocolError>();
     assert_send::<protocol::PgProtocol>();
@@ -153,7 +154,6 @@ const _: fn() = || {
     assert_send::<buf::AdvancePastEnd>();
     assert_send::<buf::ReadBufFull>();
     assert_send::<write_buf::WriteBufFull>();
-    assert_send::<action::SendBufFull>();
     assert_send::<scram::types::ServerNonceTooLong>();
     assert_send::<ident::IdentError>();
     assert_send::<password::PasswordError>();
@@ -237,14 +237,11 @@ const _: () = assert!(
      variant add a large inline buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action>() <= 1024,
-    "Action size regression — dominated by SendBuf::Owned (512-byte inline) \
-     and FailReply.cause (ProtocolError). DEF-094 will replace SendBuf \
-     with &'buf [u8] (16 bytes), shrinking Action to ~300 bytes.",
-);
-const _: () = assert!(
-    core::mem::size_of::<action::SendBuf>() <= 768,
-    "SendBuf size regression — MAX_OWNED_SEND_LEN growth?",
+    core::mem::size_of::<action::Action<'static>>() <= 384,
+    "Action<'_> size regression — post-DEF-094 budget is 384 bytes. \
+     Action is dominated by FailReply.cause (ProtocolError ~280 bytes); \
+     SendBytes is now a 16-byte &[u8]. SendBuf removed — if this assert \
+     trips, someone grew ProtocolError or added a large inline variant.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Reply>() <= 64,
@@ -267,8 +264,9 @@ const _: () = assert!(
     "PgProtocol size regression — ReadBuf growth or state bloat?",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions>() <= 4096,
-    "OutActions size regression — MAX_ACTIONS_PER_CALL * sizeof(Action)?",
+    core::mem::size_of::<action::OutActions<'static>>() <= 1600,
+    "OutActions<'_> size regression — 4 * sizeof(Action<'_>) + len. \
+     Post-DEF-094 budget: 1600 bytes (was 4096 pre-DEF-094).",
 );
 
 // ---------------------------------------------------------------------
@@ -340,10 +338,6 @@ const _: () = assert!(
 const _: () = assert!(
     !core::mem::needs_drop::<write_buf::WriteBufFull>(),
     "WriteBufFull must stay drop-free — error sentinel",
-);
-const _: () = assert!(
-    !core::mem::needs_drop::<action::SendBufFull>(),
-    "SendBufFull must stay drop-free — error sentinel",
 );
 const _: () = assert!(
     !core::mem::needs_drop::<scram::types::ServerNonceTooLong>(),

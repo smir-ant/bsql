@@ -15,7 +15,7 @@
 //! pattern (`[b0]`, `[b0, b1, ..]`, etc.) so the compiler enforces the
 //! length / presence check.
 
-use crate::action::{Action, Reply, SendBuf};
+use crate::action::{Reply, StagedAction};
 use crate::error::ProtocolError;
 use crate::password::Credentials;
 use crate::reply_id::ReplyId;
@@ -25,6 +25,7 @@ use crate::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_ERROR_RESPONSE, TAG_NEGOTIATE_PROTOCOL_VERSION,
     TAG_READY_FOR_QUERY,
 };
+use crate::write_buf::WriteBuf;
 
 /// What to do after dispatching a single frame.
 ///
@@ -35,7 +36,7 @@ use crate::wire::{
 /// compiled silently — now such a drift is a compile error
 /// (`AdvancedWithAction` requires the field, `AdvancedSilent` does not).
 #[derive(Debug)]
-#[expect(clippy::large_enum_variant, reason = "no_alloc: Box unavailable; DispatchOutcome is a one-shot return, not stored")]
+#[expect(clippy::large_enum_variant, reason = "no_alloc: Box unavailable; DispatchOutcome is a one-shot return, not stored. FailReply.cause (ProtocolError ~280 bytes) dominates.")]
 pub(crate) enum DispatchOutcome {
     /// Frame consumed; transition to `new_state`. No action emitted.
     /// Used by ParameterStatus, BackendKeyData, AuthenticationOk,
@@ -46,13 +47,14 @@ pub(crate) enum DispatchOutcome {
         new_state: ProtoState,
     },
     /// Frame consumed; transition to `new_state` **and** emit one
-    /// action. Used by ReadyForQuery → DeliverReply and by
-    /// SASL intermediate replies that produce an outbound frame.
+    /// staged action. DEF-094: `StagedAction` is range-based — the
+    /// entry-point materialises into a ref-bound `Action<'buf>`
+    /// after the write phase releases.
     AdvancedWithAction {
         /// The state to transition to.
         new_state: ProtoState,
-        /// The single side-effect to push into `out`.
-        action: Action,
+        /// The single side-effect to push — range-based, ref-free.
+        action: StagedAction,
     },
     /// Frame rejected; connection irrecoverable. Caller tears down.
     Errored {
@@ -62,7 +64,19 @@ pub(crate) enum DispatchOutcome {
 }
 
 /// Dispatch a single frame.
-pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOutcome {
+///
+/// `write_buf` is the caller-owned outbound staging buffer (DEF-094);
+/// dispatchers that produce [`StagedAction::SendBytesRange`] write
+/// into it and record the range. The caller (feed_bytes) is
+/// responsible for clearing `write_buf` at the start of each
+/// entry-point call and materialising the ranges into `&'buf [u8]`
+/// slices after the write-phase mutable borrow completes.
+pub(crate) fn dispatch(
+    prev: ProtoState,
+    tag: u8,
+    payload: &[u8],
+    write_buf: &mut WriteBuf,
+) -> DispatchOutcome {
     match (prev, tag) {
         // =============================================================
         // Ping flow (Phase 1a, carried forward)
@@ -70,7 +84,7 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
         (ProtoState::AwaitingPingReply(id), TAG_READY_FOR_QUERY) => match payload {
             [tx_status] => DispatchOutcome::AdvancedWithAction {
                 new_state: ProtoState::Idle,
-                action: Action::DeliverReply {
+                action: StagedAction::DeliverReply {
                     id: id.consume(),
                     value: Reply::Pong {
                         tx_status: *tx_status,
@@ -100,7 +114,7 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
         // ConnectingStartup — awaiting initial auth response
         // =============================================================
         (ProtoState::ConnectingStartup { reply, credentials }, TAG_AUTHENTICATION) => {
-            dispatch_auth_in_startup(reply, credentials, payload)
+            dispatch_auth_in_startup(reply, credentials, payload, write_buf)
         }
         (ProtoState::ConnectingStartup { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
@@ -132,7 +146,7 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
             },
             TAG_AUTHENTICATION,
         ) => {
-            dispatch_auth_sasl_continue(reply, scram, client_first_bare, client_nonce_b64, payload)
+            dispatch_auth_sasl_continue(reply, scram, client_first_bare, client_nonce_b64, payload, write_buf)
         }
         (ProtoState::ConnectingScramAwaitServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
@@ -241,7 +255,7 @@ pub(crate) fn dispatch(prev: ProtoState, tag: u8, payload: &[u8]) -> DispatchOut
         ) => match payload {
             [tx_status] => DispatchOutcome::AdvancedWithAction {
                 new_state: ProtoState::Idle,
-                action: Action::DeliverReply {
+                action: StagedAction::DeliverReply {
                     id: reply.consume(),
                     value: Reply::StartupComplete {
                         pid,
@@ -311,6 +325,7 @@ fn dispatch_auth_in_startup(
     reply: ReplyId,
     credentials: Credentials,
     payload: &[u8],
+    write_buf: &mut WriteBuf,
 ) -> DispatchOutcome {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
@@ -355,8 +370,11 @@ fn dispatch_auth_in_startup(
             }
 
             // Build client-first-message and SASLInitialResponse.
-            match build_sasl_initial_response(&scram) {
-                Ok((send_buf, client_first_bare, client_nonce_b64)) => {
+            // DEF-094: write directly into the caller-owned `write_buf`
+            // and record the range; materialise at the entry-point
+            // boundary after the mutable write phase releases.
+            match build_sasl_initial_response(&scram, write_buf) {
+                Ok((start, end, client_first_bare, client_nonce_b64)) => {
                     DispatchOutcome::AdvancedWithAction {
                         new_state: ProtoState::ConnectingScramAwaitServerFirst {
                             reply,
@@ -364,7 +382,7 @@ fn dispatch_auth_in_startup(
                             client_first_bare,
                             client_nonce_b64,
                         },
-                        action: Action::SendBytes(send_buf),
+                        action: StagedAction::SendBytesRange { start, end },
                     }
                 }
                 Err(cause) => DispatchOutcome::Errored {
@@ -409,16 +427,17 @@ fn mechanism_list_contains_scram(data: &[u8]) -> bool {
 #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
 fn build_sasl_initial_response(
     _: &crate::scram::session::ScramSession,
+    write_buf: &mut WriteBuf,
 ) -> Result<
     (
-        SendBuf,
+        usize,  // start offset in write_buf
+        usize,  // end offset (exclusive)
         heapless::Vec<u8, 128>,
         heapless::Vec<u8, 48>,
     ),
     ProtocolError,
 > {
     use crate::scram::wire;
-    use crate::write_buf::WriteBuf;
 
     // SCRAM client-first uses the username in "n=<user>".
     // PostgreSQL already has the username from the StartupMessage;
@@ -433,33 +452,34 @@ fn build_sasl_initial_response(
     let client_first_msg =
         wire::build_client_first_message(user_bytes, &client_nonce_b64).map_err(scram_err)?;
 
-    // Build SASLInitialResponse frame:
-    // tag 'p', length-prefix, mechanism-name NUL, i32 body-length, body
-    let mut wb = WriteBuf::new();
-    wb.push_u8(crate::wire::TAG_SASL_RESPONSE)
+    // Build SASLInitialResponse frame in-place in the caller-owned
+    // `write_buf`. DEF-094: the entry-point materialises the
+    // `(start, end)` range into a `&'buf [u8]` ref after the write
+    // phase releases — zero-copy SendBytes.
+    let start = write_buf.len();
+    write_buf
+        .push_u8(crate::wire::TAG_SASL_RESPONSE)
         .map_err(|_| scram_err(crate::scram::wire::ScramError::BufferOverflow))?;
-    wb.with_length_prefix(|w| {
-        // Mechanism name NUL-terminated
-        w.push_bytes(SCRAM_SHA_256_MECHANISM)
-            .map_err(|_| crate::write_buf::WriteBufFull)?;
-        w.push_u8(0).map_err(|_| crate::write_buf::WriteBufFull)?;
-        // Body length as i32
-        let body_len =
-            i32::try_from(client_first_msg.len()).map_err(|_| crate::write_buf::WriteBufFull)?;
-        w.push_i32_be(body_len)
-            .map_err(|_| crate::write_buf::WriteBufFull)?;
-        // Body = client-first-message
-        w.push_bytes(&client_first_msg)
-            .map_err(|_| crate::write_buf::WriteBufFull)?;
-        Ok(())
-    })
-    .map_err(|_| scram_err(crate::scram::wire::ScramError::BufferOverflow))?;
+    write_buf
+        .with_length_prefix(|w| {
+            // Mechanism name NUL-terminated.
+            w.push_bytes(SCRAM_SHA_256_MECHANISM)
+                .map_err(|_| crate::write_buf::WriteBufFull)?;
+            w.push_u8(0).map_err(|_| crate::write_buf::WriteBufFull)?;
+            // Body length as i32.
+            let body_len =
+                i32::try_from(client_first_msg.len()).map_err(|_| crate::write_buf::WriteBufFull)?;
+            w.push_i32_be(body_len)
+                .map_err(|_| crate::write_buf::WriteBufFull)?;
+            // Body = client-first-message.
+            w.push_bytes(&client_first_msg)
+                .map_err(|_| crate::write_buf::WriteBufFull)?;
+            Ok(())
+        })
+        .map_err(|_| scram_err(crate::scram::wire::ScramError::BufferOverflow))?;
+    let end = write_buf.len();
 
-    Ok((
-        SendBuf::from_owned(wb.into_inner()),
-        client_first_bare,
-        client_nonce_b64,
-    ))
+    Ok((start, end, client_first_bare, client_nonce_b64))
 }
 
 /// Dispatch AuthenticationSASLContinue (server-first-message).
@@ -480,6 +500,7 @@ fn dispatch_auth_sasl_continue(
     client_first_bare: heapless::Vec<u8, 128>,
     client_nonce_b64: heapless::Vec<u8, 48>,
     payload: &[u8],
+    write_buf: &mut WriteBuf,
 ) -> DispatchOutcome {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
@@ -580,10 +601,12 @@ fn dispatch_auth_sasl_continue(
         }
     };
 
-    // Build SASLResponse frame.
-    let mut wb = crate::write_buf::WriteBuf::new();
-    if wb.push_u8(crate::wire::TAG_SASL_RESPONSE).is_err()
-        || wb
+    // Build SASLResponse frame directly in the caller-owned
+    // `write_buf`. DEF-094 — materialises to `&'buf [u8]` at the
+    // entry-point boundary (zero-copy SendBytes).
+    let start = write_buf.len();
+    if write_buf.push_u8(crate::wire::TAG_SASL_RESPONSE).is_err()
+        || write_buf
             .with_length_prefix(|w| w.push_bytes(&client_final_msg))
             .is_err()
     {
@@ -592,13 +615,14 @@ fn dispatch_auth_sasl_continue(
             cause: scram_err(crate::scram::wire::ScramError::BufferOverflow),
         };
     }
+    let end = write_buf.len();
 
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::ConnectingScramAwaitServerFinal {
             reply,
             expected_server_sig,
         },
-        action: Action::SendBytes(SendBuf::from_owned(wb.into_inner())),
+        action: StagedAction::SendBytesRange { start, end },
     }
 }
 

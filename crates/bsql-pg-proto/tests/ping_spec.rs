@@ -108,8 +108,8 @@ fn expect_awaiting_ping_reply(state: &ProtoState, expected: NonZeroU64) {
 /// [`crate::PgProtocol::terminate`] (not shipped yet; lands with the
 /// async wrapper in 1e).
 #[track_caller]
-fn drain_pending_ping(proto: &mut PgProtocol) {
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) {
+    let out = proto.feed_bytes(&rfq_frame(b'I'), wb);
     assert_eq!(
         out.len(),
         1,
@@ -124,7 +124,7 @@ fn drain_pending_ping(proto: &mut PgProtocol) {
 /// Push a Ping command and assert the single expected emission —
 /// one `SendBytes` action carrying the const `SYNC_WIRE_BYTES`.
 ///
-/// Using this helper instead of `let _ = proto.push_command(...)`
+/// Using this helper instead of `let _ = proto.push_command(..., &mut wb)`
 /// verifies the setup is well-formed on every call site — any
 /// regression in the push path (wrong number of actions, wrong
 /// action kind, wrong bytes) is surfaced at the top of the test,
@@ -132,13 +132,13 @@ fn drain_pending_ping(proto: &mut PgProtocol) {
 /// validates push-content for free, without duplicating the
 /// content assertion in each test's body.
 #[track_caller]
-fn ping_setup(proto: &mut PgProtocol, reply: ReplyId) {
-    let out = proto.push_command(PgCommand::Ping { reply });
+fn ping_setup(proto: &mut PgProtocol, reply: ReplyId, wb: &mut bsql_pg_proto::WriteBuf) {
+    let out = proto.push_command(PgCommand::Ping { reply }, wb);
     assert_eq!(out.len(), 1, "Ping setup: push emits exactly 1 action");
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
             assert_eq!(
-                send_buf.as_bytes(),
+                *send_buf,
                 &SYNC_WIRE_BYTES,
                 "Ping setup: SendBytes must carry the 5-byte const Sync wire payload",
             );
@@ -162,16 +162,17 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId) {
 #[test]
 fn ping_from_idle_emits_sync_bytes() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     assert!(matches!(proto.state(), ProtoState::Idle));
 
     let ping_raw = raw(1);
-    let out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) });
+    let out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
 
     assert_eq!(out.len(), 1, "Phase 1a budget: push_command emits exactly 1 action");
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
             assert_eq!(
-                send_buf.as_bytes(),
+                *send_buf,
                 &SYNC_WIRE_BYTES,
                 "must send the const Sync wire bytes",
             );
@@ -182,7 +183,8 @@ fn ping_from_idle_emits_sync_bytes() {
 
     // Tier-2 structural consume-discipline: drain the in-flight reply
     // before the protocol drops. See [`drain_pending_ping`].
-    drain_pending_ping(&mut proto);
+    drop(out);
+    drain_pending_ping(&mut proto, &mut wb);
 }
 
 /// Invariant (spec): feeding a complete `ReadyForQuery` frame while
@@ -192,10 +194,11 @@ fn ping_from_idle_emits_sync_bytes() {
 #[test]
 fn rfq_delivers_pong_and_returns_to_idle() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let ping_raw = raw(42);
-    ping_setup(&mut proto, id(ping_raw));
+    ping_setup(&mut proto, id(ping_raw), &mut wb);
 
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
     assert_eq!(out.len(), 1, "Phase 1a budget: feed_bytes(RFQ) emits exactly 1 action");
     match out.as_slice() {
@@ -228,12 +231,13 @@ fn rfq_delivers_pong_and_returns_to_idle() {
 #[test]
 fn partial_rfq_feeds_are_buffered_until_complete() {
     let mut proto = PgProtocol::new();
-    ping_setup(&mut proto, id(raw(7)));
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    ping_setup(&mut proto, id(raw(7)), &mut wb);
     let frame = rfq_frame(b'I');
 
     // Feed the header one byte at a time, then the payload.
     for (i, byte) in frame.iter().enumerate().take(5) {
-        let out = proto.feed_bytes(core::slice::from_ref(byte));
+        let out = proto.feed_bytes(core::slice::from_ref(byte), &mut wb);
         assert_eq!(
             out.len(),
             0,
@@ -250,7 +254,7 @@ fn partial_rfq_feeds_are_buffered_until_complete() {
         Some(b) => core::slice::from_ref(b),
         None => panic!("frame has 6 bytes; .last() must be Some"),
     };
-    let out = proto.feed_bytes(last_slice);
+    let out = proto.feed_bytes(last_slice, &mut wb);
     assert_eq!(out.len(), 1);
     assert!(matches!(out.as_slice(), [Action::DeliverReply { .. }]));
     assert!(matches!(proto.state(), ProtoState::Idle));
@@ -268,7 +272,8 @@ fn partial_rfq_feeds_are_buffered_until_complete() {
 #[test]
 fn rfq_in_idle_is_unexpected_frame() {
     let mut proto = PgProtocol::new();
-    let out = proto.feed_bytes(&rfq_frame(b'I'));
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
     // Expect exactly one action: CloseSocket. No FailReply because
     // nothing was in-flight.
@@ -282,10 +287,11 @@ fn rfq_in_idle_is_unexpected_frame() {
 #[test]
 fn error_response_fails_the_in_flight_ping() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let ping_raw = raw(5);
-    ping_setup(&mut proto, id(ping_raw));
+    ping_setup(&mut proto, id(ping_raw), &mut wb);
 
-    let out = proto.feed_bytes(&error_frame());
+    let out = proto.feed_bytes(&error_frame(), &mut wb);
 
     assert_eq!(
         out.len(),
@@ -312,12 +318,13 @@ fn error_response_fails_the_in_flight_ping() {
 #[test]
 fn malformed_length_fails_and_closes() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let ping_raw = raw(9);
-    ping_setup(&mut proto, id(ping_raw));
+    ping_setup(&mut proto, id(ping_raw), &mut wb);
 
     // Tag 'Z', length field = 3 (illegal: min is 4).
     let frame = [TAG_READY_FOR_QUERY, 0, 0, 0, 3, b'I'];
-    let out = proto.feed_bytes(&frame);
+    let out = proto.feed_bytes(&frame, &mut wb);
 
     assert_eq!(out.len(), 2);
     match out.as_slice() {
@@ -360,14 +367,15 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
     use bsql_pg_proto::READ_BUF_CAP;
 
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let ping_raw = raw(333);
-    ping_setup(&mut proto, id(ping_raw));
+    ping_setup(&mut proto, id(ping_raw), &mut wb);
 
     // Feed a chunk one byte larger than READ_BUF_CAP. `append` rejects
     // with `ReadBufFull { attempted: CAP+1, available: CAP }`.
     let overflow_len = READ_BUF_CAP.saturating_add(1);
     let chunk = vec![0xAA_u8; overflow_len];
-    let out = proto.feed_bytes(&chunk);
+    let out = proto.feed_bytes(&chunk, &mut wb);
 
     assert_eq!(
         out.len(),
@@ -420,13 +428,14 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
 #[test]
 fn frame_too_large_is_rejected_pre_buffer() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let ping_raw = raw(11);
-    ping_setup(&mut proto, id(ping_raw));
+    ping_setup(&mut proto, id(ping_raw), &mut wb);
 
     // Tag 'Z', length field = u32::MAX (obviously > MAX_FRAME_LEN_FIELD).
     // Only the 5-byte header is fed; the body is never sent.
     let frame = [TAG_READY_FOR_QUERY, 0xFF, 0xFF, 0xFF, 0xFF];
-    let out = proto.feed_bytes(&frame);
+    let out = proto.feed_bytes(&frame, &mut wb);
 
     assert_eq!(out.len(), 2);
     match out.as_slice() {
@@ -451,11 +460,12 @@ fn frame_too_large_is_rejected_pre_buffer() {
 #[test]
 fn pipelined_ping_is_refused_without_disturbing_first() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let first_raw = raw(1);
     let second_raw = raw(2);
-    ping_setup(&mut proto, id(first_raw));
+    ping_setup(&mut proto, id(first_raw), &mut wb);
 
-    let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) });
+    let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) }, &mut wb);
 
     assert_eq!(out.len(), 1);
     match out.as_slice() {
@@ -472,7 +482,8 @@ fn pipelined_ping_is_refused_without_disturbing_first() {
 
     // Drain the still-pending first-ping reply so its ReplyId is
     // consumed before the protocol drops. See [`drain_pending_ping`].
-    drain_pending_ping(&mut proto);
+    drop(out);
+    drain_pending_ping(&mut proto, &mut wb);
 }
 
 /// Build a `ReadyForQuery` frame with a custom payload length. Payload
@@ -510,11 +521,12 @@ fn build_rfq_frame_with_payload_len(payload_len: usize) -> Vec<u8> {
 fn rfq_with_non_single_byte_payload_is_rejected() {
     for payload_len in [0_usize, 2, 3, 10] {
         let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
         let ping_raw = raw(100);
-        ping_setup(&mut proto, id(ping_raw));
+        ping_setup(&mut proto, id(ping_raw), &mut wb);
 
         let frame = build_rfq_frame_with_payload_len(payload_len);
-        let out = proto.feed_bytes(&frame);
+        let out = proto.feed_bytes(&frame, &mut wb);
 
         assert_eq!(
             out.len(),
@@ -558,11 +570,12 @@ fn rfq_with_non_single_byte_payload_is_rejected() {
 #[test]
 fn errored_state_is_terminal_and_drops_subsequent_frames() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let ping_raw = raw(100);
-    ping_setup(&mut proto, id(ping_raw));
+    ping_setup(&mut proto, id(ping_raw), &mut wb);
 
     // Drive into Errored via an ErrorResponse — `ServerError` cause.
-    let err_out = proto.feed_bytes(&error_frame());
+    let err_out = proto.feed_bytes(&error_frame(), &mut wb);
     assert_eq!(err_out.len(), 2, "entering Errored emits FailReply + CloseSocket");
     // DEF-061: state carries ErrorKind::ServerError (1 byte), the
     // full diagnostic cause went out in the FailReply above.
@@ -574,7 +587,8 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
 
     // First post-terminal frame: a well-formed RFQ. Expect zero actions
     // (the terminal sink silently drops it) and the kind preserved.
-    let post_out_1 = proto.feed_bytes(&rfq_frame(b'I'));
+    drop(err_out);
+    let post_out_1 = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert_eq!(
         post_out_1.len(),
         0,
@@ -588,7 +602,8 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     // Second post-terminal frame: an ErrorResponse that would *normally*
     // classify as a separate ServerError. The original kind must still
     // win — the terminal sink does not overwrite.
-    let post_out_2 = proto.feed_bytes(&error_frame());
+    drop(post_out_1);
+    let post_out_2 = proto.feed_bytes(&error_frame(), &mut wb);
     assert_eq!(
         post_out_2.len(),
         0,
@@ -613,11 +628,12 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
 #[test]
 fn push_command_on_errored_state_fails_with_stored_cause() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let first_raw = raw(50);
-    ping_setup(&mut proto, id(first_raw));
+    ping_setup(&mut proto, id(first_raw), &mut wb);
 
     // Drive into Errored via ErrorResponse.
-    let err_out = proto.feed_bytes(&error_frame());
+    let err_out = proto.feed_bytes(&error_frame(), &mut wb);
     assert_eq!(err_out.len(), 2);
 
     // Push a new Ping while Errored. DEF-061: the FailReply carries
@@ -625,8 +641,9 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
     // original diagnostic was surfaced in the first FailReply at
     // transition-to-Errored (the wrapper has preserved it).
     use bsql_pg_proto::error::ErrorKind;
+    drop(err_out);
     let second_raw = raw(51);
-    let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) });
+    let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) }, &mut wb);
 
     assert_eq!(
         out.len(),

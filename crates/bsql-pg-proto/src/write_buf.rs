@@ -180,6 +180,19 @@ impl WriteBuf {
         self.inner.is_empty()
     }
 
+    /// Reset the buffer length to zero without deallocating.
+    ///
+    /// DEF-094: called by [`crate::PgProtocol::push_command`] and
+    /// [`crate::PgProtocol::feed_bytes`] at entry to reuse the
+    /// caller-owned bounded storage across calls. Any previously
+    /// issued `&[u8]` borrows into this buffer are invalidated — the
+    /// borrow checker enforces that no such borrows exist at the
+    /// point of `clear()` via the `&mut self` receiver.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
     /// Consume the builder, returning the underlying `heapless::Vec`.
     #[inline]
     #[must_use]

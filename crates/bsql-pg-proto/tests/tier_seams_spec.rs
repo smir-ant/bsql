@@ -153,15 +153,16 @@ fn session_params_set_second_value_overwrites() {
 #[test]
 fn errored_cause_is_preserved_in_state_and_reply() {
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let ping_raw = raw(7777);
     // Push ping and feed a FrameTooLarge frame. Setup-action list
     // discarded explicitly (`let _ = ...` is banned by user feedback).
     drop(proto.push_command(PgCommand::Ping {
         reply: id(ping_raw),
-    }));
+    }, &mut wb));
     // Declared length = 0xDEAD (way above MAX_FRAME_LEN_FIELD=4095).
     let frame = [b'Z', 0x00, 0x00, 0xDE, 0xAD];
-    let out = proto.feed_bytes(&frame);
+    let out = proto.feed_bytes(&frame, &mut wb);
     assert_eq!(out.len(), 2);
 
     // First fatal: FailReply carries the FULL ProtocolError
@@ -193,9 +194,10 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     // wrapper preserved the original diagnostic from the first
     // FailReply; this reply just classifies "already closed".
     let second_raw = raw(7778);
+    drop(out);
     let out = proto.push_command(PgCommand::Ping {
         reply: id(second_raw),
-    });
+    }, &mut wb);
     assert_eq!(out.len(), 1);
     match out.as_slice() {
         [Action::FailReply {
@@ -300,6 +302,7 @@ fn application_name_validation_allows_empty() {
 fn backend_key_data_wrong_payload_size_is_classified() {
     // Set up: drive to ConnectingPostAuthWaitKey.
     let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(9000);
     // Setup: push Startup, feed AuthOk. Action lists are discarded
     // explicitly via `drop(...)` — `let _ = ...` is banned.
@@ -309,10 +312,10 @@ fn backend_key_data_wrong_payload_size_is_classified() {
         app_name: None,
         credentials: Credentials::Trust,
         reply: id(startup_raw),
-    }));
+    }, &mut wb));
     // Feed AuthOk — now ConnectingPostAuthWaitKey.
     let auth_ok_frame: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
-    drop(proto.feed_bytes(&auth_ok_frame));
+    drop(proto.feed_bytes(&auth_ok_frame, &mut wb));
     assert!(matches!(
         proto.state(),
         ProtoState::ConnectingPostAuthWaitKey(_),
@@ -320,7 +323,7 @@ fn backend_key_data_wrong_payload_size_is_classified() {
 
     // Feed a BackendKeyData frame with a 4-byte body (wrong — spec says 8).
     let bad_bkd: [u8; 9] = [b'K', 0, 0, 0, 8, 0x11, 0x22, 0x33, 0x44];
-    let out = proto.feed_bytes(&bad_bkd);
+    let out = proto.feed_bytes(&bad_bkd, &mut wb);
     assert_eq!(
         out.len(),
         2,

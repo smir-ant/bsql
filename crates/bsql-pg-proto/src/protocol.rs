@@ -13,7 +13,7 @@
 //! Per-call-site `const _: () = assert!(MAX_ACTIONS_PER_CALL >= …)`
 //! makes overflow impossible at build time.
 
-use crate::action::{Action, OutActions, SendBuf};
+use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
 use crate::command::PgCommand;
 use crate::dispatch::{DispatchOutcome, dispatch};
@@ -262,19 +262,33 @@ impl PgProtocol {
     /// field) so no observer can witness the window; the split is
     /// safe even though the intermediate is not the terminal state.
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn push_command(&mut self, cmd: PgCommand) -> OutActions {
+    pub fn push_command<'buf>(
+        &mut self,
+        cmd: PgCommand,
+        write_buf: &'buf mut WriteBuf,
+    ) -> OutActions<'buf> {
+        write_buf.clear();
         let prev = core::mem::take(&mut self.state);
-        let (new_state, actions) = compute_push(cmd, prev);
+        let (new_state, staged) = compute_push(cmd, prev, write_buf);
         self.state = new_state;
-        actions
+        materialise(staged, write_buf.as_bytes())
     }
 
     /// Feed inbound wire bytes.
     ///
     /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].
+    /// DEF-094: caller-owned `write_buf` — see [`push_command`] for
+    /// the staged-dispatch architecture.
+    ///
+    /// [`push_command`]: Self::push_command
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn feed_bytes(&mut self, bytes: &[u8]) -> OutActions {
-        let mut out = OutActions::new();
+    pub fn feed_bytes<'buf>(
+        &mut self,
+        bytes: &[u8],
+        write_buf: &'buf mut WriteBuf,
+    ) -> OutActions<'buf> {
+        write_buf.clear();
+        let mut staged = StagedActions::new();
 
         // Append into the bounded buffer. Overflow → fatal.
         if let Err(ReadBufFull {
@@ -287,9 +301,9 @@ impl PgProtocol {
                     attempted,
                     available,
                 },
-                &mut out,
+                &mut staged,
             );
-            return out;
+            return materialise(staged, write_buf.as_bytes());
         }
 
         // Drain as many complete frames as possible. Bounded by
@@ -303,14 +317,14 @@ impl PgProtocol {
                 HeaderParse::MalformedLength { declared } => {
                     self.fail_inflight_and_close(
                         ProtocolError::MalformedFrameLength { declared },
-                        &mut out,
+                        &mut staged,
                     );
                     break;
                 }
                 HeaderParse::FrameTooLarge { declared } => {
                     self.fail_inflight_and_close(
                         ProtocolError::FrameTooLarge { declared },
-                        &mut out,
+                        &mut staged,
                     );
                     break;
                 }
@@ -323,29 +337,11 @@ impl PgProtocol {
                         // Body not yet fully buffered.
                         break;
                     }
-                    // Slice the payload (bytes after the header).
-                    // `total_len >= HEADER_LEN` is guaranteed by
-                    // `parse_header` (it rejects declared_len < 4, so
-                    // total_len = declared_len + 1 >= 5 = HEADER_LEN).
-                    // `unread().len() >= total_len` was verified just
-                    // above. Therefore `get(HEADER_LEN..total_len)` is
-                    // always `Some`; the empty-slice fallback is
-                    // defensive against a future refactor that breaks
-                    // either invariant — the dispatcher's payload-
-                    // shape patterns classify such inputs as
-                    // `Malformed…` rather than accepting them silently.
                     let payload = self
                         .read_buf
                         .unread()
                         .get(HEADER_LEN..total_len)
                         .unwrap_or(&[]);
-                    // ParameterStatus pre-dispatch filter: if the
-                    // current state accepts unsolicited parameter
-                    // updates, record the param and skip the
-                    // dispatcher entirely. PostgreSQL emits PS during
-                    // the post-auth handshake, after session `SET`
-                    // commands, and on `ALTER SYSTEM` — all reachable
-                    // from `Idle` and post-startup states. DEF-054.
                     if tag == crate::wire::TAG_PARAMETER_STATUS
                         && allows_unsolicited_param_status(&self.state)
                     {
@@ -353,30 +349,22 @@ impl PgProtocol {
                         let Ok(()) = self.read_buf.advance(total_len) else {
                             self.fail_inflight_and_close(
                                 ProtocolError::ProtocolInvariantBroken,
-                                &mut out,
+                                &mut staged,
                             );
                             break;
                         };
                         continue;
                     }
 
-                    // Take ownership of state for the dispatcher.
                     let prev = core::mem::take(&mut self.state);
-                    let outcome = dispatch(prev, tag, payload);
+                    let outcome = dispatch(prev, tag, payload, write_buf);
                     match outcome {
                         DispatchOutcome::AdvancedSilent { new_state } => {
                             self.state = new_state;
-                            // `advance(total_len)` was proved in-bounds
-                            // above (`unread().len() >= total_len`).
-                            // The Result surface is kept honest via
-                            // `let-else`; a future refactor that
-                            // breaks that local invariant classifies as
-                            // a typed protocol error rather than
-                            // silently corrupting the read cursor.
                             let Ok(()) = self.read_buf.advance(total_len) else {
                                 self.fail_inflight_and_close(
                                     ProtocolError::ProtocolInvariantBroken,
-                                    &mut out,
+                                    &mut staged,
                                 );
                                 break;
                             };
@@ -386,11 +374,11 @@ impl PgProtocol {
                             let Ok(()) = self.read_buf.advance(total_len) else {
                                 self.fail_inflight_and_close(
                                     ProtocolError::ProtocolInvariantBroken,
-                                    &mut out,
+                                    &mut staged,
                                 );
                                 break;
                             };
-                            emit_actions!(&mut out, budget: 1, on_overflow: break, [
+                            emit_actions!(&mut staged, budget: 1, on_overflow: break, [
                                 action,
                             ]);
                         }
@@ -401,17 +389,17 @@ impl PgProtocol {
                             self.state = ProtoState::Errored(cause.kind());
                             match reply_id {
                                 Some(id) => {
-                                    emit_actions!(&mut out, budget: 2, on_overflow: break, [
-                                        Action::FailReply {
+                                    emit_actions!(&mut staged, budget: 2, on_overflow: break, [
+                                        StagedAction::FailReply {
                                             id: id.consume(),
                                             cause,
                                         },
-                                        Action::CloseSocket,
+                                        StagedAction::CloseSocket,
                                     ]);
                                 }
                                 None => {
-                                    emit_actions!(&mut out, budget: 1, on_overflow: break, [
-                                        Action::CloseSocket,
+                                    emit_actions!(&mut staged, budget: 1, on_overflow: break, [
+                                        StagedAction::CloseSocket,
                                     ]);
                                 }
                             }
@@ -422,7 +410,7 @@ impl PgProtocol {
             }
         }
 
-        out
+        materialise(staged, write_buf.as_bytes())
     }
 
     /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
@@ -446,23 +434,21 @@ impl PgProtocol {
     fn fail_inflight_and_close(
         &mut self,
         cause: ProtocolError,
-        out: &mut OutActions,
+        staged: &mut StagedActions,
     ) {
-        // DEF-061: compute kind before `cause` is moved into the
-        // FailReply action. Stored in state as 1-byte ErrorKind;
-        // full cause goes out in the one FailReply emitted below.
+        // DEF-061 + DEF-094: compute kind before `cause` is moved
+        // into the FailReply StagedAction. Stored in state as 1-byte
+        // ErrorKind; full cause goes out in the one FailReply emitted
+        // below. `staged` is the phase-1 accumulator; entry-point
+        // materialises into `OutActions<'buf>`.
         let kind = cause.kind();
         let prev = core::mem::take(&mut self.state);
         match prev {
             ProtoState::Idle => {
-                // No in-flight correlator — only CloseSocket. The
-                // full `cause` goes out of scope at the end of this
-                // arm and drops normally (wrapper reads terminal
-                // state via `.state()`).
                 self.state = ProtoState::Errored(kind);
                 self.read_buf.clear();
-                emit_actions!(out, budget: 1, [
-                    Action::CloseSocket,
+                emit_actions!(staged, budget: 1, [
+                    StagedAction::CloseSocket,
                 ]);
             }
             ProtoState::AwaitingPingReply(id)
@@ -474,20 +460,18 @@ impl PgProtocol {
             | ProtoState::ConnectingPostAuthHaveKey { reply: id, .. } => {
                 self.state = ProtoState::Errored(kind);
                 self.read_buf.clear();
-                emit_actions!(out, budget: 2, [
-                    Action::FailReply {
+                emit_actions!(staged, budget: 2, [
+                    StagedAction::FailReply {
                         id: id.consume(),
                         cause,
                     },
-                    Action::CloseSocket,
+                    StagedAction::CloseSocket,
                 ]);
             }
             ProtoState::Errored(original_kind) => {
                 // Already Errored — preserve the original kind. Do not
                 // emit another FailReply / CloseSocket; the wrapper
-                // already saw them on the first fatal. The fresh
-                // `cause` is the redundant classification of the same
-                // root cause; drops normally at end of arm.
+                // already saw them on the first fatal.
                 self.state = ProtoState::Errored(original_kind);
             }
         }
@@ -524,19 +508,32 @@ impl PgProtocol {
 /// ([`compute_push_ping`], [`compute_push_startup`]); `compute_push`
 /// dispatches on the command variant. Adding a new `PgCommand` variant
 /// fails the build here until a matching helper is wired up.
-fn compute_push(cmd: PgCommand, state: ProtoState) -> (ProtoState, OutActions) {
-    let mut out = OutActions::new();
+fn compute_push(
+    cmd: PgCommand,
+    state: ProtoState,
+    write_buf: &mut WriteBuf,
+) -> (ProtoState, StagedActions) {
+    let mut staged = StagedActions::new();
     let new_state = match cmd {
-        PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut out),
+        PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
         PgCommand::Startup {
             user,
             database,
             app_name,
             credentials,
             reply,
-        } => compute_push_startup(state, user, database, app_name, credentials, reply, &mut out),
+        } => compute_push_startup(
+            state,
+            user,
+            database,
+            app_name,
+            credentials,
+            reply,
+            &mut staged,
+            write_buf,
+        ),
     };
-    (new_state, out)
+    (new_state, staged)
 }
 
 /// Compute the transition for [`PgCommand::Ping`] against the current
@@ -559,32 +556,22 @@ fn compute_push(cmd: PgCommand, state: ProtoState) -> (ProtoState, OutActions) {
 fn compute_push_ping(
     state: ProtoState,
     reply: ReplyId,
-    out: &mut OutActions,
+    staged: &mut StagedActions,
 ) -> ProtoState {
     match state {
         ProtoState::Idle => {
-            // DEF-089: SendBuf is a single-shape newtype — no Static /
-            // Owned enum arms to swap. `from_slice` copies 5 bytes into
-            // the stack-bounded buffer. Err branch is dead (SYNC is 5
-            // bytes, fits 512-byte cap) but surfaced honestly via
-            // let-else → classified ProtocolInvariantBroken.
-            let Ok(sync_buf) = SendBuf::from_slice(&SYNC_WIRE_BYTES) else {
-                reply.consume();
-                emit_actions!(out, budget: 1, [Action::CloseSocket]);
-                // DEF-061: state carries ErrorKind, not the full
-                // ProtocolError. The dead-branch classification is
-                // `Internal` (ProtocolInvariantBroken).
-                return ProtoState::Errored(crate::error::ErrorKind::Internal);
-            };
-            emit_actions!(out, budget: 1, [Action::SendBytes(sync_buf)]);
+            // DEF-094: Sync is a compile-time const (5 bytes). Emit
+            // `StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES)` so the
+            // materialiser passes the static reference through
+            // directly — zero write to write_buf, zero copy.
+            emit_actions!(staged, budget: 1, [
+                StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES),
+            ]);
             ProtoState::AwaitingPingReply(reply)
         }
         ProtoState::Errored(prior_kind) => {
-            // DEF-061: state carries ErrorKind (1-byte Copy); no clone.
-            // Emit `ConnectionAlreadyClosed { prior_kind }` — carries
-            // the earlier classification for diagnostic context.
-            emit_actions!(out, budget: 1, [
-                Action::FailReply {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
@@ -592,8 +579,8 @@ fn compute_push_ping(
             ProtoState::Errored(prior_kind)
         }
         ProtoState::AwaitingPingReply(prev_reply) => {
-            emit_actions!(out, budget: 1, [
-                Action::FailReply {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::UnexpectedFrame { tag: b'P' },
                 },
@@ -606,8 +593,8 @@ fn compute_push_ping(
         | ProtoState::ConnectingScramAwaitAuthOk(_)
         | ProtoState::ConnectingPostAuthWaitKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
-            emit_actions!(out, budget: 1, [
-                Action::FailReply {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
@@ -634,6 +621,7 @@ fn compute_push_ping(
 /// — a future refactor that breaks the const drift-guard on
 /// `MAX_OWNED_SEND_LEN` classifies as a typed reply failure instead of
 /// silent truncation.
+#[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
 fn compute_push_startup(
     state: ProtoState,
     user: Ident,
@@ -641,27 +629,27 @@ fn compute_push_startup(
     app_name: Option<ApplicationName>,
     credentials: Credentials,
     reply: ReplyId,
-    out: &mut OutActions,
+    staged: &mut StagedActions,
+    write_buf: &mut WriteBuf,
 ) -> ProtoState {
     match state {
-        ProtoState::Idle => match build_startup_message(&user, database.as_ref(), app_name.as_ref())
-        {
-            Ok(send_buf) => {
-                emit_actions!(out, budget: 1, [Action::SendBytes(send_buf)]);
+        ProtoState::Idle => match build_startup_message(
+            &user,
+            database.as_ref(),
+            app_name.as_ref(),
+            write_buf,
+        ) {
+            Ok((start, end)) => {
+                emit_actions!(staged, budget: 1, [
+                    StagedAction::SendBytesRange { start, end },
+                ]);
                 ProtoState::ConnectingStartup { reply, credentials }
             }
             Err(_) => {
-                // Architecturally unreachable: the const drift-guard
-                // `MAX_OWNED_SEND_LEN >= max_startup_message_size()`
-                // (write_buf.rs) proves StartupMessage fits the cap.
-                // Classify as `ProtocolInvariantBroken` — if this
-                // branch ever fires at runtime, it is a logic bug
-                // in this crate (drift-guard removed without cap
-                // growth). Previously mis-classified as ScramError
-                // with a 128-byte string (tier-4 silent-truncation);
-                // DEF-060 replaces the string with the typed kind.
-                emit_actions!(out, budget: 1, [
-                    Action::FailReply {
+                // Architecturally unreachable; classified as
+                // ProtocolInvariantBroken (DEF-060 / DEF-094).
+                emit_actions!(staged, budget: 1, [
+                    StagedAction::FailReply {
                         id: reply.consume(),
                         cause: ProtocolError::ProtocolInvariantBroken,
                     },
@@ -670,10 +658,8 @@ fn compute_push_startup(
             }
         },
         ProtoState::Errored(prior_kind) => {
-            // Same DEF-061 pattern as compute_push_ping — emit
-            // ConnectionAlreadyClosed, preserve kind (Copy).
-            emit_actions!(out, budget: 1, [
-                Action::FailReply {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
@@ -687,8 +673,8 @@ fn compute_push_startup(
         | ProtoState::ConnectingScramAwaitAuthOk(_)
         | ProtoState::ConnectingPostAuthWaitKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
-            emit_actions!(out, budget: 1, [
-                Action::FailReply {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
@@ -773,11 +759,15 @@ fn build_startup_message(
     user: &Ident,
     database: Option<&DatabaseName>,
     app_name: Option<&ApplicationName>,
-) -> Result<SendBuf, crate::write_buf::WriteBufFull> {
+    write_buf: &mut WriteBuf,
+) -> Result<(usize, usize), crate::write_buf::WriteBufFull> {
     use crate::write_buf::WriteBufFull;
 
-    let mut wb = WriteBuf::new();
-    wb.with_length_prefix(|w| {
+    // DEF-094: write in-place into the caller-owned `write_buf` and
+    // return `(start, end)` for the entry-point to materialise as
+    // `Action::SendBytes(&'buf [u8])`.
+    let start = write_buf.len();
+    write_buf.with_length_prefix(|w| {
         // Protocol version 3.0 = 196608
         w.push_u32_be(crate::wire::PROTOCOL_VERSION_3_0)?;
         // user=<username>\0
@@ -797,7 +787,42 @@ fn build_startup_message(
         w.push_u8(0).map_err(|_| WriteBufFull)?;
         Ok(())
     })?;
-    Ok(SendBuf::from_owned(wb.into_inner()))
+    let end = write_buf.len();
+    Ok((start, end))
+}
+
+/// Phase-2 materialiser: convert the write-phase's
+/// [`StagedActions`] into [`OutActions<'buf>`] with references into
+/// `buf` (range variants) or static references (constants).
+///
+/// DEF-094 lifetime plumbing: `buf` is the caller-owned
+/// [`WriteBuf`]'s shared-borrow slice; the `'buf` lifetime
+/// propagates into every emitted [`Action::SendBytes`]. The borrow
+/// checker refuses any `&mut WriteBuf` re-borrow while the returned
+/// `OutActions<'buf>` is alive, enforcing consume-before-next-call
+/// at tier-1 compile.
+fn materialise<'buf>(staged: StagedActions, buf: &'buf [u8]) -> OutActions<'buf> {
+    let mut out = OutActions::new();
+    for sa in staged {
+        let a: Action<'buf> = match sa {
+            StagedAction::SendBytesRange { start, end } => {
+                Action::SendBytes(buf.get(start..end).unwrap_or(&[]))
+            }
+            StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
+            StagedAction::DeliverReply { id, value } => Action::DeliverReply { id, value },
+            StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
+            StagedAction::CloseSocket => Action::CloseSocket,
+        };
+        // Both collectors have the same MAX_ACTIONS_PER_CALL bound, so
+        // this push is architecturally infallible. An `if`-consume
+        // with an unreachable body satisfies `must_use` without a
+        // `let _` (banned) or a `drop(bool)` (triggers
+        // `clippy::drop_non_drop`).
+        if out.push(a).is_err() {
+            // Architecturally unreachable per the identical bounds.
+        }
+    }
+    out
 }
 
 impl Default for PgProtocol {
@@ -1030,6 +1055,15 @@ mod compute_push_tests {
         Ident::try_from_str("u").ok()
     }
 
+    /// Test helper — run [`compute_push`] with a fresh [`WriteBuf`] and
+    /// return (state, staged). DEF-094 made compute_push take
+    /// `&mut WriteBuf`; this wrapper keeps the test-body callsites
+    /// terse.
+    fn compute_staged(cmd: PgCommand, state: ProtoState) -> (ProtoState, StagedActions) {
+        let mut wb = WriteBuf::new();
+        compute_push(cmd, state, &mut wb)
+    }
+
     // -----------------------------------------------------------------
     // Ping — per-variant policy table
     // -----------------------------------------------------------------
@@ -1038,16 +1072,17 @@ mod compute_push_tests {
     fn ping_from_idle_emits_sync_and_awaits() {
         let raw_id = nz(101);
         let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_id) };
-        let (new_state, out) = compute_push(cmd, ProtoState::Idle);
+        let (new_state, staged) = compute_staged(cmd, ProtoState::Idle);
 
         // Action: exactly one SendBytes whose payload is SYNC_WIRE_BYTES.
-        assert_eq!(out.len(), 1);
+        // DEF-094: Ping from Idle emits the static SYNC const.
+        assert_eq!(staged.len(), 1);
         assert!(
             matches!(
-                out.first(),
-                Some(Action::SendBytes(sb)) if sb.as_bytes() == SYNC_WIRE_BYTES.as_slice()
+                staged.first(),
+                Some(StagedAction::SendBytesStatic(s)) if *s == SYNC_WIRE_BYTES.as_slice()
             ),
-            "expected SendBytes(SYNC)",
+            "expected SendBytesStatic(SYNC)",
         );
 
         // State: AwaitingPingReply(raw_id).
@@ -1065,14 +1100,14 @@ mod compute_push_tests {
         let raw_id = nz(102);
         let prior_kind = ErrorKind::Framing;
         let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_id) };
-        let (new_state, out) = compute_push(cmd, ProtoState::Errored(prior_kind));
+        let (new_state, staged) = compute_staged(cmd, ProtoState::Errored(prior_kind));
 
         // Action: FailReply(ConnectionAlreadyClosed{prior_kind}).
-        assert_eq!(out.len(), 1);
+        assert_eq!(staged.len(), 1);
         assert!(
             matches!(
-                out.first(),
-                Some(Action::FailReply {
+                staged.first(),
+                Some(StagedAction::FailReply {
                     id,
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
                 }) if *id == raw_id && *pk == prior_kind
@@ -1094,14 +1129,14 @@ mod compute_push_tests {
         let raw_new = nz(104);
         let prev_state = ProtoState::AwaitingPingReply(ReplyId::from_raw(raw_prev));
         let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
-        let (new_state, out) = compute_push(cmd, prev_state);
+        let (new_state, staged) = compute_staged(cmd, prev_state);
 
         // Action: FailReply(UnexpectedFrame { tag: b'P' }) for the NEW reply.
-        assert_eq!(out.len(), 1);
+        assert_eq!(staged.len(), 1);
         assert!(
             matches!(
-                out.first(),
-                Some(Action::FailReply {
+                staged.first(),
+                Some(StagedAction::FailReply {
                     id,
                     cause: ProtocolError::UnexpectedFrame { tag: b'P' },
                 }) if *id == raw_new
@@ -1131,12 +1166,12 @@ mod compute_push_tests {
                 credentials: Credentials::Trust,
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
-            let (new_state, out) = compute_push(cmd, prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(cmd, prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1162,12 +1197,12 @@ mod compute_push_tests {
                     client_nonce_b64: heapless::Vec::new(),
                 };
                 let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
-                let (new_state, out) = compute_push(cmd, prev);
-                assert_eq!(out.len(), 1);
+                let (new_state, staged) = compute_staged(cmd, prev);
+                assert_eq!(staged.len(), 1);
                 assert!(
                     matches!(
-                        out.first(),
-                        Some(Action::FailReply {
+                        staged.first(),
+                        Some(StagedAction::FailReply {
                             id,
                             cause: ProtocolError::StartupAlreadyInProgress,
                         }) if *id == raw_new
@@ -1190,12 +1225,12 @@ mod compute_push_tests {
                 expected_server_sig: SecretDigest::new([0u8; 32]),
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
-            let (new_state, out) = compute_push(cmd, prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(cmd, prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1215,12 +1250,12 @@ mod compute_push_tests {
             let raw_new = nz(208);
             let prev = ProtoState::ConnectingScramAwaitAuthOk(ReplyId::from_raw(raw_prev));
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
-            let (new_state, out) = compute_push(cmd, prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(cmd, prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1240,12 +1275,12 @@ mod compute_push_tests {
             let raw_new = nz(210);
             let prev = ProtoState::ConnectingPostAuthWaitKey(ReplyId::from_raw(raw_prev));
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
-            let (new_state, out) = compute_push(cmd, prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(cmd, prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1269,12 +1304,12 @@ mod compute_push_tests {
                 secret_key: 1337,
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
-            let (new_state, out) = compute_push(cmd, prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(cmd, prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1304,16 +1339,18 @@ mod compute_push_tests {
             credentials: Credentials::Trust,
             reply: ReplyId::from_raw(raw_id),
         };
-        let (new_state, out) = compute_push(cmd, ProtoState::Idle);
+        let (new_state, staged) = compute_staged(cmd, ProtoState::Idle);
 
         // Action: SendBytes with non-empty payload (startup frame, no tag).
-        assert_eq!(out.len(), 1);
+        // DEF-094: Startup from Idle writes the message into `wb` via
+        // a StagedAction::SendBytesRange { start, end }.
+        assert_eq!(staged.len(), 1);
         assert!(
             matches!(
-                out.first(),
-                Some(Action::SendBytes(sb)) if !sb.as_bytes().is_empty()
+                staged.first(),
+                Some(StagedAction::SendBytesRange { start, end }) if *end > *start
             ),
-            "expected non-empty SendBytes(StartupMessage)",
+            "expected SendBytesRange into write_buf",
         );
 
         // State: ConnectingStartup with the pushed reply id.
@@ -1335,14 +1372,14 @@ mod compute_push_tests {
             credentials: Credentials::Trust,
             reply: ReplyId::from_raw(raw_id),
         };
-        let (new_state, out) = compute_push(cmd, ProtoState::Errored(prior_kind));
+        let (new_state, staged) = compute_staged(cmd, ProtoState::Errored(prior_kind));
 
         // Action: FailReply(ConnectionAlreadyClosed{prior_kind}).
-        assert_eq!(out.len(), 1);
+        assert_eq!(staged.len(), 1);
         assert!(
             matches!(
-                out.first(),
-                Some(Action::FailReply {
+                staged.first(),
+                Some(StagedAction::FailReply {
                     id,
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
                 }) if *id == raw_id && *pk == prior_kind
@@ -1379,12 +1416,12 @@ mod compute_push_tests {
             let raw_prev = nz(401);
             let raw_new = nz(402);
             let prev = ProtoState::AwaitingPingReply(ReplyId::from_raw(raw_prev));
-            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1402,12 +1439,12 @@ mod compute_push_tests {
                 reply: ReplyId::from_raw(raw_prev),
                 credentials: Credentials::Trust,
             };
-            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1431,12 +1468,12 @@ mod compute_push_tests {
                     client_first_bare: heapless::Vec::new(),
                     client_nonce_b64: heapless::Vec::new(),
                 };
-                let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
-                assert_eq!(out.len(), 1);
+                let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+                assert_eq!(staged.len(), 1);
                 assert!(
                     matches!(
-                        out.first(),
-                        Some(Action::FailReply {
+                        staged.first(),
+                        Some(StagedAction::FailReply {
                             id,
                             cause: ProtocolError::StartupAlreadyInProgress,
                         }) if *id == raw_new
@@ -1458,12 +1495,12 @@ mod compute_push_tests {
                 reply: ReplyId::from_raw(raw_prev),
                 expected_server_sig: SecretDigest::new([0u8; 32]),
             };
-            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1482,12 +1519,12 @@ mod compute_push_tests {
             let raw_prev = nz(409);
             let raw_new = nz(410);
             let prev = ProtoState::ConnectingScramAwaitAuthOk(ReplyId::from_raw(raw_prev));
-            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1506,12 +1543,12 @@ mod compute_push_tests {
             let raw_prev = nz(411);
             let raw_new = nz(412);
             let prev = ProtoState::ConnectingPostAuthWaitKey(ReplyId::from_raw(raw_prev));
-            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -1534,12 +1571,12 @@ mod compute_push_tests {
                 pid: 1,
                 secret_key: 2,
             };
-            let (new_state, out) = compute_push(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(out.len(), 1);
+            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
+            assert_eq!(staged.len(), 1);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(Action::FailReply {
+                    staged.first(),
+                    Some(StagedAction::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
