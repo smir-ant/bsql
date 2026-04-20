@@ -831,8 +831,15 @@ fn compute_push_startup(
                 }
             }
             Err(_) => {
-                // Architecturally unreachable; classified as
-                // ProtocolInvariantBroken (DEF-060 / DEF-094).
+                // TIER-1 COMPILE DEAD BRANCH. The const assert in
+                // `write_buf.rs`:
+                //     MAX_OWNED_SEND_LEN >= max_startup_message_size()
+                // proves at build time that `build_startup_message`
+                // with validated `Ident` + `DatabaseName` +
+                // `ApplicationName` inputs cannot overflow the
+                // WriteBuf — their total bounded length is
+                // accounted for in the size computation. The Err
+                // arm is preserved for `match` exhaustiveness only.
                 emit_actions!(staged, budget: 1, [
                     StagedAction::FailReply {
                         id: reply.consume(),
