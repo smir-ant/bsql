@@ -28,6 +28,16 @@ use crate::frame::READ_BUF_CAP;
 use core::fmt;
 use heapless::{CapacityError, Vec};
 
+// DEF-120 drift guard: `ReadBuf::cursor` (below) is `u16`. The
+// type is sound only while `READ_BUF_CAP` fits a u16. A future
+// capacity bump that breaks this invariant must also widen the
+// cursor type. Hard `65_535` literal (not `u16::MAX as usize`) —
+// `as` casts are banned by the crate forbid-bundle.
+const _: () = assert!(
+    READ_BUF_CAP <= 65_535,
+    "READ_BUF_CAP must fit ReadBuf::cursor (u16). Widen both together.",
+);
+
 /// Bounded byte buffer for inbound wire data.
 ///
 /// Capacity is the const [`READ_BUF_CAP`] (4096 in Phase 1a; tunable
@@ -45,9 +55,14 @@ pub struct ReadBuf {
     /// Read cursor. Bytes in `inner[..cursor]` are consumed and may be
     /// reclaimed on the next [`compact`] call.
     ///
-    /// Invariant: `cursor <= inner.len()` (enforced by every mutator
-    /// path; see the assertion comments in `advance`).
-    cursor: usize,
+    /// Invariant: `cursor <= inner.len() <= READ_BUF_CAP <= 65_535`
+    /// (enforced by every mutator path + the const assert above).
+    ///
+    /// DEF-120: `u16` (not `usize`) — `READ_BUF_CAP = 4096` fits
+    /// with headroom; narrower type saves 6 bytes per `ReadBuf`
+    /// on 64-bit and propagates nothing into hot arithmetic (the
+    /// few widenings to `usize` use `usize::from`, infallible).
+    cursor: u16,
 }
 
 impl ReadBuf {
@@ -104,8 +119,9 @@ impl ReadBuf {
         // maintained `<= self.inner.len()` by every mutator, so the
         // slice expression cannot index out of bounds. We use `get`
         // rather than `[..]` because the forbid-bundle bans
-        // `indexing_slicing`.
-        self.inner.get(self.cursor..).unwrap_or(&[])
+        // `indexing_slicing`. DEF-120: `u16 → usize` via infallible
+        // widening `From` impl (no `as` cast).
+        self.inner.get(usize::from(self.cursor)..).unwrap_or(&[])
         // The `unwrap_or` is dead in practice (cursor <= len always),
         // but it lets us avoid `unwrap()` in production code while
         // still handling the case the type system cannot prove.
@@ -126,10 +142,17 @@ impl ReadBuf {
                 available,
             });
         }
-        // checked_add cannot overflow: cursor + n <= cursor + available
-        //   <= cursor + (inner.len() - cursor) == inner.len() <= READ_BUF_CAP.
-        // We use checked_add to satisfy `arithmetic_side_effects`.
-        let new_cursor = self.cursor.checked_add(n).ok_or(AdvancePastEnd {
+        // DEF-120: cursor is `u16`. Widen to usize for the
+        // add-check, then narrow via `u16::try_from`. Both steps
+        // preserved for forbid-bundle safety (no `as`). Arithmetic
+        // is architecturally bounded: cursor + n <= inner.len() <=
+        // READ_BUF_CAP <= 65_535, so the `try_from` Err branch is
+        // dead — kept as belt-and-braces.
+        let new_cursor_usize = usize::from(self.cursor).checked_add(n).ok_or(AdvancePastEnd {
+            requested: n,
+            available,
+        })?;
+        let new_cursor = u16::try_from(new_cursor_usize).map_err(|_| AdvancePastEnd {
             requested: n,
             available,
         })?;
@@ -150,7 +173,9 @@ impl ReadBuf {
     #[inline]
     #[must_use]
     pub fn unread_len(&self) -> usize {
-        self.inner.len().saturating_sub(self.cursor)
+        // DEF-120: cursor is u16; widen via `usize::from` for the
+        // subtraction (infallible, no `as`).
+        self.inner.len().saturating_sub(usize::from(self.cursor))
     }
 
     /// Reclaim the consumed prefix `[0..cursor)`.
@@ -161,12 +186,14 @@ impl ReadBuf {
         if self.cursor == 0 {
             return;
         }
+        // DEF-120: cursor is u16; widen once for all uses.
+        let cursor = usize::from(self.cursor);
         let len = self.inner.len();
         // `cursor <= len` invariant; subtraction safe.
-        let unread_len = len.saturating_sub(self.cursor);
+        let unread_len = len.saturating_sub(cursor);
         // `copy_within` accepts a Range; the source range is
         // `cursor..len` and dest is `0`. Both inside `len`.
-        self.inner.copy_within(self.cursor..len, 0);
+        self.inner.copy_within(cursor..len, 0);
         // truncate to the new (compacted) length; `Vec::truncate`
         // never panics, only shortens.
         self.inner.truncate(unread_len);

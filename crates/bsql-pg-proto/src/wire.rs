@@ -141,35 +141,19 @@ const _: () = assert!(
 // failure on drift).
 // ---------------------------------------------------------------
 
-/// Declarative macro generating `O(N²)` pairwise `const _: () =
-/// assert!(A != B, …)` distinctness checks for the supplied list
-/// of identifiers. Each pair's assertion is emitted as an
-/// anonymous `const` item (`const _`), which Rust evaluates at
-/// monomorphisation time — the same build-time guarantee as a
-/// hand-unrolled conjunction, with the ergonomic win that adding
-/// a new identifier auto-scales (the macro re-expands and picks
-/// up every new pair automatically).
+/// Pairwise `const _: () = assert!(A != B, …)` distinctness at
+/// build time — recursive macro expansion generates one
+/// anonymous const per pair, auto-scaling as the caller's ident
+/// list grows. Tier-1 compile. DEF-111 / DEF-116.
 ///
-/// # Why not a `const fn` walk
-///
-/// The round-3 audit originally proposed `const fn
-/// assert_distinct_pairwise(arr: &[T], …)` iterating with
-/// `<[T]>::get(i)`. On MSRV 1.95 that path is blocked:
-/// [`<[T]>::get`] is not yet const-stable
-/// (rust-lang/rust#143874), and `arr[i]` direct indexing is
+/// **Why macro, not `const fn`.** MSRV 1.95 blocks the obvious
+/// `const fn walk(arr: &[u8])` form: safe `<[T]>::get(i)` is not
+/// yet const-stable (rust-lang/rust#143874), and `arr[i]` is
 /// banned by the crate-root `forbid(clippy::indexing_slicing)`
-/// (which `#[expect]` cannot downgrade). Declarative macros
-/// sidestep this entirely — pairs are expanded at parse time
-/// before const-eval ever runs.
-///
-/// # Tier
-///
-/// Tier-1 compile. Adding or removing a tag updates the macro
-/// invocation's argument list and the N² check regenerates — no
-/// parallel list to keep in sync, no runtime drift-guard test
-/// required. DEF-111 / DEF-116.
-///
-/// [`<[T]>::get`]: core::slice
+/// (forbid cannot be downgraded by `#[expect]`). Macro expansion
+/// runs at parse time — no slice indexing, so neither blocker
+/// applies. Fold back to a `const fn` when `<[T]>::get`
+/// stabilises in const.
 macro_rules! assert_all_distinct {
     // Base cases: empty / single element — nothing to compare.
     ($scope:literal $(,)?) => {};
