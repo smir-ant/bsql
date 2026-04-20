@@ -794,6 +794,58 @@ Test count: 96 → 131 (+35 across all 1c-2 commits).
 
 **Round-4 finding #5 closed** — text-format rejection ships as `ProtocolError::UnexpectedFormatCode { code }` in `parse_row_description`: format codes outside `{0, 1}` tear the connection down. 1c-3 will layer `FromPgBinary` on top of the same infrastructure (Extended Query selects binary per-column via Bind; decoder dispatch uses `ColumnDesc::format_code`).
 
+### 1c-2 tier-audit — explicit safety guarantees
+
+User flagged: *"главное это ГАРАНТИИ безопасности и стабильности, а не тесты"*. Honest classification of every 1c-2 invariant by tier — what is compile-enforced, what is runtime-checked-and-structural, what is audit-enforced.
+
+**Tier-1 compile (cannot be violated — the build fails):**
+
+| Invariant | Mechanism |
+|---|---|
+| `MAX_ROW_COLUMNS = 32` bounds `RowDesc.columns` array | Fixed-size array type `[ColumnDesc; MAX_ROW_COLUMNS]` |
+| `ColumnDesc` has exactly 2 fields — `type_oid: u32` + `format_code: FormatCode` | Struct definition |
+| `FormatCode` is exactly `{Text=0, Binary=1}` | `#[repr(u8)]` enum with explicit discriminants |
+| `RowDesc` is POD (Copy, no Drop) | `#[derive(Copy)]` + all fields Copy; `needs_drop::<RowDesc>() == false` asserted indirectly via `Reply` needs_drop contract |
+| `Action::StreamRow.desc: &'r RowDesc` can never outlive `PgProtocol` | `'r` lifetime binds to `&'r mut self`; borrow checker rejects re-entry |
+| `Action::StreamRow.row_bytes: &'r [u8]` can never outlive `PgProtocol.read_buf` | Same `'r` lifetime |
+| `OutActions<'w, 'r>` cannot be held across `&mut PgProtocol` | Exclusive borrow prevents re-entry |
+| `Reply::QueryComplete.row_desc: Option<RowDesc>` is owned (Copy) — safe to send across async boundary | No lifetime; owned by-value |
+| `DataRowRef` fields are private; only constructor is `parse()` | Module privacy |
+| `ColumnsIter` fields are private; only constructor is `DataRowRef::columns()` | Module privacy |
+| PG OID constants match canonical `pg_type.dat` values (drift-pin) | `const _: () = assert!(BOOL == 16); ...` in `oids` module (tier-lifted from runtime test in this audit) |
+| `FromPgText` trait return type enforces `Result<Self, DecodeError>` on every impl | Trait signature |
+| `<&str>::from_pg_text` preserves borrow (zero-copy) | Lifetime parametrisation `FromPgText<'a> for &'a str` — compiler rejects any impl that copies |
+| `FailReply + CloseSocket` vs `FailReply (recoverable)` never confused | Distinct `DispatchOutcome` variants (`Errored` vs `AdvancedWithAction`) |
+
+**Tier-2 structural (runtime-checked; check-site is load-bearing architecturally):**
+
+| Invariant | Mechanism |
+|---|---|
+| `RowDesc.n_columns ≤ MAX_ROW_COLUMNS` in all constructed values | `parse_row_description` rejects over-cap with `TooManyColumns`; no other constructor exposes `n_columns` |
+| `row_desc cleared on new SimpleQuery push` — stale schema cannot leak into next query | Single clear site in `PgProtocol::push_command(SimpleQuery)`; regression test `dml_after_select_clears_row_desc` pins the site |
+| `format_code ∈ {0, 1}` in every parsed `RowDesc` | Parser rejects otherwise with `UnexpectedFormatCode` (round-4 #5) |
+| `ColumnsIter fuses after error` — no infinite loops, no post-error stale yields | Explicit `remaining = &[]; columns_left = 0` on error path |
+| DEF-121 budget gate — no partial dispatch emission | Pre-dispatch `staged.len() + WORST_CASE_PER_DISPATCH > MAX` check before `mem::take(state)` |
+| `Action::StreamRow.desc` points to live schema | When `StreamRowRange` is staged, `self.row_desc.is_some()` (enforced by T dispatch arm writing before StreamingRows state is entered); materialise's `unwrap_or(&EMPTY)` is structurally-dead fallback |
+
+**Tier-3 audit (runtime-checked; correctness relies on code review):**
+
+| Invariant | Mechanism | Why not uplift |
+|---|---|---|
+| `parse_row_description` correctly classifies every malformed input variant | Explicit match arms + slice patterns; unit tests pin the matrix | Parser operates on arbitrary server bytes; no type lifts runtime classification to compile |
+| `DataRowRef::parse` + `ColumnsIter::next` correctly walk the wire layout | Same | Same |
+| `FromPgText` impls correctly delegate to stdlib + map failures | Macro-generated impls with uniform shape | Runtime data |
+| `parse_command_tag` correctly strips NUL and bounds-checks | Slice patterns + `BoundedStr` | Runtime data |
+
+**Excluded from tier claims:**
+
+- Stdlib behavior (integer overflow in `str::parse`, UTF-8 validation in `core::str::from_utf8`) — trusted library contract.
+- Hardware-level invariants (bytes in RAM, etc).
+
+**Test philosophy after 1c-2 audit:** one invariant → one test, with the test named after what breaks if the invariant fails. Tests for stdlib behavior or tier-1 compile guarantees are pruned (OID drift-pin moved from runtime test to `const _: () = assert!(...)` block). Tests for tier-3 audit invariants remain — they're the *only* shield.
+
+Test count after audit: 131 → 124 (−7 merged/eliminated). Further reductions possible at 1c-6 hardening pass.
+
 ### DEF-121 — silent reply loss on `feed_bytes` loop overflow
 
 Self-audit of 1c-1b found the hazard: `emit_actions!(..., on_overflow: break, ...)` bails out of the loop **after** the dispatcher has already consumed the `ReplyId` (via `deliver()` or `errored()`) and mutated `self.state`. The dropped action is silent — the caller's `oneshot::Sender` is orphaned forever, and the `ReplyId::Drop`-guard doesn't fire because the id was marked delivered.

@@ -641,6 +641,13 @@ impl<'a> FromPgText<'a> for &'a str {
 /// dispatch the right [`FromPgText`] impl. The macro layer
 /// (Phase 2) consumes this mapping at compile time via
 /// `query!`-generated decoders.
+///
+/// # Tier-1 compile drift-pin
+///
+/// The `const _: () = { assert!(...) }` block below asserts every
+/// constant against its canonical PG catalog value. A typo
+/// (`INT4 = 32` instead of `23`) fails the build. No runtime test
+/// required — the drift guard is the type system itself.
 pub mod oids {
     /// `bool` (1-byte typtype `b`).
     pub const BOOL: u32 = 16;
@@ -676,6 +683,29 @@ pub mod oids {
     pub const UUID: u32 = 2950;
     /// `jsonb`.
     pub const JSONB: u32 = 3802;
+
+    // Tier-1 compile drift-pin against the canonical PG catalog
+    // (src/include/catalog/pg_type.dat). A typo in any constant
+    // above breaks the build here — no runtime test needed.
+    const _: () = {
+        assert!(BOOL == 16, "oids::BOOL drift from pg_type.dat");
+        assert!(BYTEA == 17, "oids::BYTEA drift from pg_type.dat");
+        assert!(CHAR == 18, "oids::CHAR drift from pg_type.dat");
+        assert!(NAME == 19, "oids::NAME drift from pg_type.dat");
+        assert!(INT8 == 20, "oids::INT8 drift from pg_type.dat");
+        assert!(INT2 == 21, "oids::INT2 drift from pg_type.dat");
+        assert!(INT4 == 23, "oids::INT4 drift from pg_type.dat");
+        assert!(TEXT == 25, "oids::TEXT drift from pg_type.dat");
+        assert!(OID == 26, "oids::OID drift from pg_type.dat");
+        assert!(FLOAT4 == 700, "oids::FLOAT4 drift from pg_type.dat");
+        assert!(FLOAT8 == 701, "oids::FLOAT8 drift from pg_type.dat");
+        assert!(BPCHAR == 1042, "oids::BPCHAR drift from pg_type.dat");
+        assert!(VARCHAR == 1043, "oids::VARCHAR drift from pg_type.dat");
+        assert!(TIMESTAMP == 1114, "oids::TIMESTAMP drift from pg_type.dat");
+        assert!(TIMESTAMPTZ == 1184, "oids::TIMESTAMPTZ drift from pg_type.dat");
+        assert!(UUID == 2950, "oids::UUID drift from pg_type.dat");
+        assert!(JSONB == 3802, "oids::JSONB drift from pg_type.dat");
+    };
 }
 
 #[cfg(test)]
@@ -1126,78 +1156,74 @@ mod from_pg_text_tests {
 
     use super::*;
 
-    // ---- integers ----
-
+    /// **One invariant, one test**: `i32::from_pg_text` correctly
+    /// maps PG text representation into the Result<i32, DecodeError>
+    /// contract — happy paths, overflow, malformed digits, non-UTF-8.
+    /// An arm-body swap in my impl (e.g., returning `NonUtf8` for
+    /// overflow) fails this table.
     #[test]
-    fn i32_positive_and_negative() {
+    fn i32_decoder_matrix() {
+        // Happy paths.
         assert!(matches!(i32::from_pg_text(b"0"), Ok(0)));
         assert!(matches!(i32::from_pg_text(b"42"), Ok(42)));
         assert!(matches!(i32::from_pg_text(b"-17"), Ok(-17)));
         assert!(matches!(i32::from_pg_text(b"2147483647"), Ok(i32::MAX)));
         assert!(matches!(i32::from_pg_text(b"-2147483648"), Ok(i32::MIN)));
-    }
 
-    #[test]
-    fn i32_overflow_is_int_parse() {
+        // Overflow → IntParse.
         assert!(matches!(i32::from_pg_text(b"2147483648"), Err(DecodeError::IntParse)));
         assert!(matches!(i32::from_pg_text(b"-2147483649"), Err(DecodeError::IntParse)));
-    }
 
-    #[test]
-    fn i32_garbage_is_int_parse() {
+        // Garbage → IntParse (empty, non-digit, trailing, whitespace).
         assert!(matches!(i32::from_pg_text(b""), Err(DecodeError::IntParse)));
         assert!(matches!(i32::from_pg_text(b"abc"), Err(DecodeError::IntParse)));
         assert!(matches!(i32::from_pg_text(b"12a"), Err(DecodeError::IntParse)));
-        // Leading whitespace is not canonical PG text.
         assert!(matches!(i32::from_pg_text(b" 12"), Err(DecodeError::IntParse)));
-    }
 
-    #[test]
-    fn i32_non_utf8() {
-        // 0xFF is not valid UTF-8 as a single byte.
+        // Non-UTF-8 → NonUtf8 (distinct from IntParse — classification
+        // tells the caller whether retry would help).
         assert!(matches!(i32::from_pg_text(&[0xFF]), Err(DecodeError::NonUtf8)));
     }
 
+    /// **One invariant, one test**: parallel `i16` / `i64` / `u32`
+    /// impls delegate to stdlib `FromStr` with per-type ranges and
+    /// map failures to `IntParse`. Catches macro-expansion errors
+    /// where a type's impl would mis-wire to another's range.
     #[test]
-    fn i16_i64_u32_round_trip() {
+    fn other_integer_decoders_matrix() {
+        // i16 boundaries.
         assert!(matches!(i16::from_pg_text(b"32767"), Ok(i16::MAX)));
         assert!(matches!(i16::from_pg_text(b"-32768"), Ok(i16::MIN)));
         assert!(matches!(i16::from_pg_text(b"32768"), Err(DecodeError::IntParse)));
 
+        // i64 boundaries.
         assert!(matches!(i64::from_pg_text(b"9223372036854775807"), Ok(i64::MAX)));
         assert!(matches!(i64::from_pg_text(b"9223372036854775808"), Err(DecodeError::IntParse)));
 
+        // u32 boundaries + negative rejection.
         assert!(matches!(u32::from_pg_text(b"0"), Ok(0)));
         assert!(matches!(u32::from_pg_text(b"4294967295"), Ok(u32::MAX)));
         assert!(matches!(u32::from_pg_text(b"4294967296"), Err(DecodeError::IntParse)));
-        // u32 rejects negative values.
         assert!(matches!(u32::from_pg_text(b"-1"), Err(DecodeError::IntParse)));
     }
 
-    // ---- bool ----
-
+    /// **One invariant, one test**: `bool::from_pg_text` accepts
+    /// **exactly** PG's canonical `"t"` / `"f"` wire form — nothing
+    /// else. PG server is strict on wire format; lax parsers that
+    /// accept `"true"` / `"1"` / etc. would mask protocol desync if
+    /// the server ever switched to a non-standard encoding.
     #[test]
-    fn bool_canonical_pg_text() {
+    fn bool_decoder_matrix() {
+        // Canonical accepts.
         assert!(matches!(bool::from_pg_text(b"t"), Ok(true)));
         assert!(matches!(bool::from_pg_text(b"f"), Ok(false)));
-    }
 
-    #[test]
-    fn bool_rejects_non_canonical_forms() {
-        // PG is strict: "true" / "false" / "1" / "0" / "yes" / "no" / "on" / "off"
-        // are all NOT the text wire format, even though some SQL contexts
-        // accept them as boolean literals.
+        // Every non-canonical form (including common false-friends
+        // from SQL literal contexts) must classify as BoolParse, NOT
+        // be coerced.
         for bad in [
-            &b"true"[..],
-            &b"false"[..],
-            &b"TRUE"[..],
-            &b"T"[..],
-            &b"F"[..],
-            &b"1"[..],
-            &b"0"[..],
-            &b"yes"[..],
-            &b"no"[..],
-            &b""[..],
+            &b"true"[..], &b"false"[..], &b"TRUE"[..], &b"T"[..], &b"F"[..],
+            &b"1"[..], &b"0"[..], &b"yes"[..], &b"no"[..], &b""[..],
         ] {
             assert!(
                 matches!(bool::from_pg_text(bad), Err(DecodeError::BoolParse)),
@@ -1206,47 +1232,29 @@ mod from_pg_text_tests {
         }
     }
 
-    // ---- &str ----
-
+    /// **One invariant, one test**: `&str::from_pg_text` is a
+    /// zero-copy UTF-8 validator. Output pointer must equal input
+    /// pointer (no internal copy); non-UTF-8 input classifies as
+    /// `NonUtf8`; empty input is valid.
     #[test]
-    fn str_is_zero_copy_identity() {
+    fn str_decoder_matrix() {
         let bytes: &[u8] = b"hello world";
         let result = <&str>::from_pg_text(bytes);
         assert!(matches!(result, Ok("hello world")));
-        // Lifetime: output reference should share provenance with input.
-        // (Verified by compile — this test body compiles only if the
-        // type signature preserves the borrow.)
         if let Ok(s) = result {
+            // Zero-copy invariant — the returned &str borrows the
+            // same memory region as the input &[u8].
             assert_eq!(s.as_ptr(), bytes.as_ptr());
         }
-    }
 
-    #[test]
-    fn str_rejects_non_utf8() {
-        // 0x80 alone is a lone continuation byte — invalid UTF-8.
-        let bytes: &[u8] = &[0x80];
-        assert!(matches!(<&str>::from_pg_text(bytes), Err(DecodeError::NonUtf8)));
-    }
-
-    #[test]
-    fn str_empty_is_ok() {
+        // Empty is valid.
         assert!(matches!(<&str>::from_pg_text(b""), Ok("")));
+
+        // Non-UTF-8 (lone continuation byte).
+        assert!(matches!(<&str>::from_pg_text(&[0x80]), Err(DecodeError::NonUtf8)));
     }
 
-    // ---- OID constants sanity ----
-
-    #[test]
-    fn oid_constants_match_pg_catalog() {
-        // Pinned values from postgres/src/include/catalog/pg_type.dat.
-        // Changing these would break wire-level compatibility — a
-        // literal-swap shield.
-        assert_eq!(oids::BOOL, 16);
-        assert_eq!(oids::INT2, 21);
-        assert_eq!(oids::INT4, 23);
-        assert_eq!(oids::INT8, 20);
-        assert_eq!(oids::TEXT, 25);
-        assert_eq!(oids::VARCHAR, 1043);
-        assert_eq!(oids::OID, 26);
-        assert_eq!(oids::UUID, 2950);
-    }
+    // OID drift-pin is tier-1 compile — see `decode::oids::const _`
+    // block. Runtime test removed (was redundant with the
+    // compile-time assertion).
 }
