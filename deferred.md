@@ -443,7 +443,9 @@ See `reforge.md` §17.1 for the master table. Execution is tier-elevation
 | `fd1f5cd` | **DEF-098** | `size_of` drift-guard tightening post DEF-095/096/097 (ProtoState budget 2048 → 1280, etc.) |
 | `ecee97c` | **DEF-099** | `PodBytes<N>` for SCRAM state buffers + pattern-rationale doc (`.get(..n).unwrap_or(&[])` is forbid-bundle idiom, not kludge) |
 | `8ff256f` | **DEF-100** | `NonEmptyRange { start, len: NonZeroUsize }` replaces raw `(start, end)` on `StagedAction::SendBytesRange` — non-empty is a type invariant, zero-length SendBytes can't compile. Tier-3 audit → tier-2 structural. |
-| *next*   | **DEF-101** | Path audit + DEF-052 close via `cfg(test)` thread-panicking guard (re-scoped from original "remove Drop" — honest tier analysis in the block below). |
+| `b0dbd46` | **DEF-101** | Path audit + DEF-052 close via `cfg(test)` thread-panicking guard (re-scoped from original "remove Drop" — honest tier analysis below). |
+| `43c1877` | **DEF-111** | §10: const-assert per-direction `wire::TAG_*` distinctness + `AUTH_*` sub-code distinctness. Catches copy-paste duplication at build time. |
+| *next*   | **DEF-112** | §2: typed `ReplyId<K: ReplyKind>` + sealed `action::deliver<K>(id, payload)` constructor. Tier-1 compile on "dispatcher emits wrong Reply variant for command-kind". |
 
 ### DEF-101 re-scoping (honest tier analysis)
 

@@ -24,7 +24,7 @@
 
 use bsql_pg_proto::{
     Action, Credentials, Ident, PgCommand, PgProtocol, Password, ProtoState, ProtocolError,
-    Reply, ReplyId, Sensitive,
+    Reply, ReplyId, ReplyKind, Sensitive,
 };
 use core::num::NonZeroU64;
 
@@ -32,7 +32,11 @@ fn raw(value: u64) -> NonZeroU64 {
     NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
 }
 
-fn id(value: NonZeroU64) -> ReplyId {
+/// Generic over `K: ReplyKind` — call-site infers the kind from the
+/// command being constructed (e.g. `PgCommand::Startup { reply:
+/// id(...) }` selects `StartupKind`; `PgCommand::Ping { reply:
+/// id(...) }` selects `PingKind`).
+fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
     ReplyId::from_raw(value)
 }
 

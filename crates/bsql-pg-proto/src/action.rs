@@ -362,13 +362,11 @@ pub(crate) enum StagedAction {
     /// Bytes are a static compile-time constant. Materialiser passes
     /// through directly — no write, no copy.
     SendBytesStatic(&'static [u8]),
-    /// Map to [`Action::DeliverReply`].
-    DeliverReply {
-        /// Raw correlator (post-consume of the `ReplyId`).
-        id: NonZeroU64,
-        /// Typed payload.
-        value: Reply,
-    },
+    /// Map to [`Action::DeliverReply`]. Opaque [`DeliverReplyEntry`]
+    /// — the only construction path is [`deliver`] (below), which
+    /// enforces kind-payload pairing at compile time via
+    /// [`crate::reply_id::ReplyKind::Payload`]. DEF-112.
+    DeliverReply(DeliverReplyEntry),
     /// Map to [`Action::FailReply`].
     FailReply {
         /// Raw correlator (post-consume of the `ReplyId`).
@@ -378,6 +376,91 @@ pub(crate) enum StagedAction {
     },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,
+}
+
+// ═════════════════════════════════════════════════════════════════
+// §2 / DEF-112 — typed DeliverReply gate
+//
+// The sole authority to construct a `StagedAction::DeliverReply` is
+// the `deliver()` function below, whose generic signature
+// `fn deliver<K: ReplyKind>(id: ReplyId<K>, payload: K::Payload) ->
+// StagedAction` forces the reply id's kind and the payload type to
+// match via the `ReplyKind::Payload` associated type.
+//
+// Passing a `ReplyId<PingKind>` with a `StartupCompletePayload` is
+// a compile error (mismatched associated type). The historical
+// runtime misroute class — dispatcher emits wrong `Reply` variant
+// for the kind — becomes a tier-1 compile invariant.
+//
+// The nested `mod deliver_entry_priv` wraps the struct so its
+// fields are module-private: even code inside `action.rs` (outside
+// the inner module) cannot directly construct
+// `DeliverReplyEntry { id, value }`. The only escape hatch is the
+// internal `pub(super) fn new(...)` constructor, called once from
+// `deliver()` itself.
+// ═════════════════════════════════════════════════════════════════
+
+mod deliver_entry_priv {
+    use super::{NonZeroU64, Reply};
+
+    /// Opaque payload for [`super::StagedAction::DeliverReply`].
+    ///
+    /// Fields are module-private (`deliver_entry_priv`-only
+    /// visibility). The only constructor is `pub(super) fn new`,
+    /// reachable exclusively from [`super::deliver`] — which in
+    /// turn requires a typed [`crate::reply_id::ReplyId<K>`] and
+    /// its matching `K::Payload`. DEF-112.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DeliverReplyEntry {
+        id: NonZeroU64,
+        value: Reply,
+    }
+
+    impl DeliverReplyEntry {
+        /// Module-gated constructor — called only from
+        /// [`super::deliver`]. Sealing this constructor at
+        /// `pub(super)` is the load-bearing mechanism: a rogue
+        /// dispatcher cannot produce a `DeliverReplyEntry` outside
+        /// the typed path.
+        #[inline]
+        pub(super) fn new(id: NonZeroU64, value: Reply) -> Self {
+            Self { id, value }
+        }
+
+        /// Read access for the materialiser. `pub(crate)` because
+        /// `protocol::materialise` lives outside this module.
+        #[inline]
+        pub(crate) fn id(&self) -> NonZeroU64 {
+            self.id
+        }
+
+        /// Read access for the materialiser.
+        #[inline]
+        pub(crate) fn value(&self) -> Reply {
+            self.value
+        }
+    }
+}
+
+pub(crate) use deliver_entry_priv::DeliverReplyEntry;
+
+/// Construct a [`StagedAction::DeliverReply`] from a typed
+/// [`ReplyId<K>`](crate::reply_id::ReplyId) and its kind-matching
+/// payload.
+///
+/// The `K: ReplyKind` bound + the `K::Payload` argument type jointly
+/// enforce at the call site that the payload matches the reply id's
+/// kind. Passing a `ReplyId<PingKind>` with a
+/// `StartupCompletePayload` — or any other mismatch — fails to
+/// compile. DEF-112 tier-1 elevation of the "wrong payload per
+/// reply kind" class.
+#[inline]
+#[must_use]
+pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
+    id: crate::reply_id::ReplyId<K>,
+    payload: K::Payload,
+) -> StagedAction {
+    StagedAction::DeliverReply(DeliverReplyEntry::new(id.consume(), payload.into()))
 }
 
 /// A typed protocol reply payload.
@@ -414,4 +497,58 @@ pub enum Reply {
         /// Transaction status from `ReadyForQuery` (`'I'`, `'T'`, `'E'`).
         tx_status: u8,
     },
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Typed per-kind payload structs (DEF-112)
+//
+// Each `ReplyKind` in `reply_id.rs` has an associated `Payload`
+// type. The `From<Payload> for Reply` impls are the only bridges
+// from typed payload → erased sum; the typed dispatcher path
+// (`deliver` above) relies on them.
+// ═════════════════════════════════════════════════════════════════
+
+/// Typed payload for [`crate::reply_id::PingKind`] replies.
+///
+/// Mirrors the `Reply::Pong` variant's field layout. Separate type
+/// so the dispatcher's kind-to-payload bond is type-enforced rather
+/// than audit-enforced (DEF-112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PongPayload {
+    /// Transaction-status indicator byte (`'I'`, `'T'`, `'E'`) from
+    /// the matching `ReadyForQuery` frame.
+    pub tx_status: u8,
+}
+
+impl From<PongPayload> for Reply {
+    #[inline]
+    fn from(p: PongPayload) -> Self {
+        Self::Pong {
+            tx_status: p.tx_status,
+        }
+    }
+}
+
+/// Typed payload for [`crate::reply_id::StartupKind`] replies.
+///
+/// Mirrors the `Reply::StartupComplete` variant's field layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupCompletePayload {
+    /// Backend process ID from the `BackendKeyData` frame.
+    pub pid: i32,
+    /// Backend secret key (for cancel requests).
+    pub secret_key: i32,
+    /// Transaction status from the final `ReadyForQuery`.
+    pub tx_status: u8,
+}
+
+impl From<StartupCompletePayload> for Reply {
+    #[inline]
+    fn from(p: StartupCompletePayload) -> Self {
+        Self::StartupComplete {
+            pid: p.pid,
+            secret_key: p.secret_key,
+            tx_status: p.tx_status,
+        }
+    }
 }

@@ -21,7 +21,7 @@
 
 use crate::error::ErrorKind;
 use crate::ident::PodBytes;
-use crate::reply_id::ReplyId;
+use crate::reply_id::{PingKind, ReplyId, StartupKind};
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
 
@@ -59,7 +59,7 @@ pub enum ProtoState {
     /// will leave the user's `oneshot::Receiver` permanently pending —
     /// that is exactly the bug class the state-as-data pattern makes
     /// impossible to write.
-    AwaitingPingReply(ReplyId),
+    AwaitingPingReply(ReplyId<PingKind>),
 
     // ---------------------------------------------------------------
     // Phase 1b: startup + auth handshake states (DEF-001..DEF-004)
@@ -89,7 +89,7 @@ pub enum ProtoState {
     /// build failure.
     ConnectingStartupTrust {
         /// Correlator for the Startup command.
-        reply: ReplyId,
+        reply: ReplyId<StartupKind>,
     },
 
     /// A `StartupMessage` was sent by a SCRAM-auth connection;
@@ -97,7 +97,7 @@ pub enum ProtoState {
     /// DEF-001 + DEF-097.
     ConnectingStartupScram {
         /// Correlator for the Startup command.
-        reply: ReplyId,
+        reply: ReplyId<StartupKind>,
         /// SCRAM session (the password the user provided). Tier-1
         /// typestate via [`ScramSession`] — `Credentials::Trust`
         /// cannot reach this variant by construction.
@@ -108,7 +108,7 @@ pub enum ProtoState {
     /// `AuthenticationSASLContinue` (server-first-message). DEF-002.
     ConnectingScramAwaitServerFirst {
         /// Correlator for the Startup command.
-        reply: ReplyId,
+        reply: ReplyId<StartupKind>,
         /// SCRAM session (password bundle). Tier-1 typestate via
         /// [`ScramSession`] — the `Credentials::Trust` variant
         /// cannot appear here by construction (audit A2).
@@ -128,28 +128,28 @@ pub enum ProtoState {
     /// `AuthenticationSASLFinal` (server-final-message). DEF-002.
     ConnectingScramAwaitServerFinal {
         /// Correlator for the Startup command.
-        reply: ReplyId,
+        reply: ReplyId<StartupKind>,
         /// Expected server signature for constant-time comparison.
         expected_server_sig: SecretDigest,
     },
 
     /// SCRAM step 3 complete (server signature verified); awaiting
     /// `AuthenticationOk`. DEF-002.
-    ConnectingScramAwaitAuthOk(ReplyId),
+    ConnectingScramAwaitAuthOk(ReplyId<StartupKind>),
 
     /// Authentication succeeded; waiting for `BackendKeyData`. DEF-003.
     ///
     /// `ParameterStatus` messages received in this state are recorded
     /// on [`crate::PgProtocol::session_params`] by the `feed_bytes`
     /// loop. `BackendKeyData` transitions to `ConnectingPostAuthHaveKey`.
-    ConnectingPostAuthWaitKey(ReplyId),
+    ConnectingPostAuthWaitKey(ReplyId<StartupKind>),
 
     /// `BackendKeyData` received; waiting for `ReadyForQuery`. DEF-004.
     ///
     /// Additional `ParameterStatus` messages may arrive before RFQ.
     ConnectingPostAuthHaveKey {
         /// Correlator for the Startup command.
-        reply: ReplyId,
+        reply: ReplyId<StartupKind>,
         /// The backend process ID.
         pid: i32,
         /// The backend secret key (for cancel requests).

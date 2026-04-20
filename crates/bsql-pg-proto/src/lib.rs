@@ -102,7 +102,7 @@ pub mod state;
 pub mod wire;
 pub mod write_buf;
 
-pub use action::{Action, OutActions, Reply};
+pub use action::{Action, OutActions, PongPayload, Reply, StartupCompletePayload};
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::PgCommand;
 pub use error::ProtocolError;
@@ -110,7 +110,7 @@ pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use ident::{ApplicationName, DatabaseName, Ident, IdentError};
 pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{MAX_ACTIONS_PER_CALL, PgProtocol};
-pub use reply_id::ReplyId;
+pub use reply_id::{PingKind, ReplyId, ReplyKind, StartupKind};
 pub use sensitive::Sensitive;
 pub use session_params::SessionParams;
 pub use state::ProtoState;
@@ -134,7 +134,12 @@ const _: fn() = || {
     assert_send::<command::PgCommand>();
     assert_send::<error::ProtocolError>();
     assert_send::<protocol::PgProtocol>();
-    assert_send::<reply_id::ReplyId>();
+    // DEF-112: `ReplyId` is now generic over `K: ReplyKind`. The
+    // nominal kind parameter is `PhantomData<fn() -> K>` (ZST,
+    // unconditionally `Send + Sync`), so assert_send holds for
+    // every `K`; checking one concrete `K` is sufficient.
+    assert_send::<reply_id::ReplyId<reply_id::PingKind>>();
+    assert_send::<reply_id::ReplyId<reply_id::StartupKind>>();
     assert_send::<state::ProtoState>();
     // Phase 1b types
     assert_send::<ident::Ident>();
@@ -253,8 +258,10 @@ const _: () = assert!(
     "Reply size regression — did a variant add a large field?",
 );
 const _: () = assert!(
-    core::mem::size_of::<reply_id::ReplyId>() <= 24,
-    "ReplyId size regression — did a bookkeeping field get added?",
+    core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,
+    "ReplyId<K> size regression — the `PhantomData<fn() -> K>` kind \
+     tag is zero-size; ReplyId's footprint is u64 value + bool \
+     delivered + padding. Did a bookkeeping field get added?",
 );
 const _: () = assert!(
     core::mem::size_of::<state::ProtoState>() <= 1248,
@@ -301,8 +308,10 @@ const _: () = assert!(
     "SecretDigest must have Drop for zeroize-on-drop",
 );
 const _: () = assert!(
-    core::mem::needs_drop::<reply_id::ReplyId>(),
-    "ReplyId must have Drop for the consume-discipline guard (DEF-028)",
+    core::mem::needs_drop::<reply_id::ReplyId<reply_id::PingKind>>(),
+    "ReplyId<K> must have Drop for the consume-discipline guard (DEF-028 / \
+     DEF-101 — same guarantee, now per-kind after DEF-112's type \
+     parameterisation).",
 );
 const _: () = assert!(
     !core::mem::needs_drop::<action::Reply>(),

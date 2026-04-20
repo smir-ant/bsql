@@ -1096,7 +1096,7 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 | # | Status | DEF  | Category           | One-liner |
 |---|--------|------|--------------------|-----------|
 | 1 | ✅     | 096  | ARCH/ALLOC/LIFETIME | `FixedStr<N, Tag>` unifies `Ident`/`DatabaseName`/`ApplicationName`/`BoundedStr`, POD, phantom-tag nominal typing |
-| 2 | ✅     | 097  | TYPESTATE/ALLOC    | `ConnectingStartup` → `Trust | Scram` typestate split — Credentials removed from post-push states |
+| 2 | ✅     | 097, 112 | TYPESTATE/ALLOC | DEF-097 `Trust | Scram` split; **DEF-112** typed `ReplyId<K: ReplyKind>` with associated `Payload` — "dispatcher emits wrong Reply variant for this command-kind" is a tier-1 compile error; the sealed `action::deliver<K>(id, payload)` helper is the only sanctioned `DeliverReply` constructor (module-private fields) |
 | 3 | ✅     | 099  | ALLOC/CACHE        | `PodBytes<N>` replaces `heapless::Vec<u8, N>` in SCRAM state buffers (−16 bytes, Drop-free buffers) |
 | 4 | ⏳     | 104  | ALGO/CACHE         | `parse_error_response` field-kind `[Option<FieldKind>; 256]` table + kind-match |
 | 5 | ❌     | —    | ALGO               | `Severity::from_bytes` first-byte dispatch — cold path, LLVM already folds; re-evaluate via DEF-109 |
@@ -1133,8 +1133,10 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 - `fd1f5cd` DEF-098 ✅
 - `ecee97c` DEF-099 ✅
 - `8ff256f` DEF-100 ✅
-- *pending commit:* DEF-101 (re-scoped — full-path audit + DEF-052 close, Drop-guard kept)
-- *next:* DEF-102 `base64ct` swap.
+- `b0dbd46` DEF-101 ✅ (re-scoped: full-path audit + DEF-052 close, Drop-guard kept)
+- `43c1877` DEF-111 ✅ (§10 wire TAG collision asserts)
+- *pending commit:* DEF-112 (§2 `ReplyId<K: ReplyKind>` type-tagged per command)
+- *next:* DEF-113 (§5 internal StagedAction split) → DEF-114 (§4 typed session params) → DEF-102 (base64ct).
 
 ## §18. Command enum
 

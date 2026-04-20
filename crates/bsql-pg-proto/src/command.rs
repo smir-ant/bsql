@@ -11,7 +11,7 @@
 
 use crate::ident::{ApplicationName, DatabaseName, Ident};
 use crate::password::Credentials;
-use crate::reply_id::ReplyId;
+use crate::reply_id::{PingKind, ReplyId, StartupKind};
 
 /// A command pushed by the wrapper into the protocol state machine.
 ///
@@ -48,7 +48,12 @@ pub enum PgCommand {
     Ping {
         /// Correlator the wrapper will use to route the matching
         /// [`crate::Reply::Pong`] back to the caller.
-        reply: ReplyId,
+        ///
+        /// DEF-112: the type parameter `PingKind` binds the reply
+        /// payload to [`crate::action::PongPayload`] at compile
+        /// time — the dispatcher cannot produce any other payload
+        /// for this id.
+        reply: ReplyId<PingKind>,
     },
 
     /// Initiate the PostgreSQL startup handshake.
@@ -68,6 +73,9 @@ pub enum PgCommand {
         /// Authentication credentials.
         credentials: Credentials,
         /// Correlator for the Startup command.
-        reply: ReplyId,
+        ///
+        /// DEF-112: typed `ReplyId<StartupKind>` binds the reply
+        /// payload to [`crate::action::StartupCompletePayload`].
+        reply: ReplyId<StartupKind>,
     },
 }

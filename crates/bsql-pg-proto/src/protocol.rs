@@ -388,12 +388,12 @@ impl PgProtocol {
                             // `FailReply` below, exactly once.
                             self.state = ProtoState::Errored(cause.kind());
                             match reply_id {
+                                // DEF-112: `reply_id` is now
+                                // `Option<NonZeroU64>` — already
+                                // consumed by the dispatcher.
                                 Some(id) => {
                                     emit_actions!(&mut staged, budget: 2, on_overflow: break, [
-                                        StagedAction::FailReply {
-                                            id: id.consume(),
-                                            cause,
-                                        },
+                                        StagedAction::FailReply { id, cause },
                                         StagedAction::CloseSocket,
                                     ]);
                                 }
@@ -443,37 +443,43 @@ impl PgProtocol {
         // materialises into `OutActions<'buf>`.
         let kind = cause.kind();
         let prev = core::mem::take(&mut self.state);
-        match prev {
-            ProtoState::Idle => {
-                self.state = ProtoState::Errored(kind);
-                self.read_buf.clear();
+        // DEF-112: each ReplyId-carrying variant now has its own
+        // typed kind (`PingKind` vs `StartupKind`). An or-pattern
+        // binding `id` across variants would require all arms to
+        // share the same type — they don't anymore. Extract the
+        // raw `NonZeroU64` per-arm via `.consume()`; from there on
+        // the teardown path is kind-agnostic.
+        let raw_id: Option<core::num::NonZeroU64> = match prev {
+            ProtoState::Idle => None,
+            ProtoState::AwaitingPingReply(id) => Some(id.consume()),
+            ProtoState::ConnectingStartupTrust { reply }
+            | ProtoState::ConnectingStartupScram { reply, .. }
+            | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
+            | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
+            | ProtoState::ConnectingScramAwaitAuthOk(reply)
+            | ProtoState::ConnectingPostAuthWaitKey(reply)
+            | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
+            ProtoState::Errored(original_kind) => {
+                // Already Errored — preserve the original kind. Do
+                // not emit another FailReply / CloseSocket; the
+                // wrapper already saw them on the first fatal.
+                self.state = ProtoState::Errored(original_kind);
+                return;
+            }
+        };
+        self.state = ProtoState::Errored(kind);
+        self.read_buf.clear();
+        match raw_id {
+            Some(id) => {
+                emit_actions!(staged, budget: 2, [
+                    StagedAction::FailReply { id, cause },
+                    StagedAction::CloseSocket,
+                ]);
+            }
+            None => {
                 emit_actions!(staged, budget: 1, [
                     StagedAction::CloseSocket,
                 ]);
-            }
-            ProtoState::AwaitingPingReply(id)
-            | ProtoState::ConnectingStartupTrust { reply: id }
-            | ProtoState::ConnectingStartupScram { reply: id, .. }
-            | ProtoState::ConnectingScramAwaitServerFirst { reply: id, .. }
-            | ProtoState::ConnectingScramAwaitServerFinal { reply: id, .. }
-            | ProtoState::ConnectingScramAwaitAuthOk(id)
-            | ProtoState::ConnectingPostAuthWaitKey(id)
-            | ProtoState::ConnectingPostAuthHaveKey { reply: id, .. } => {
-                self.state = ProtoState::Errored(kind);
-                self.read_buf.clear();
-                emit_actions!(staged, budget: 2, [
-                    StagedAction::FailReply {
-                        id: id.consume(),
-                        cause,
-                    },
-                    StagedAction::CloseSocket,
-                ]);
-            }
-            ProtoState::Errored(original_kind) => {
-                // Already Errored — preserve the original kind. Do not
-                // emit another FailReply / CloseSocket; the wrapper
-                // already saw them on the first fatal.
-                self.state = ProtoState::Errored(original_kind);
             }
         }
     }
@@ -556,7 +562,7 @@ fn compute_push(
 /// bodies could be swapped without a compile error.
 fn compute_push_ping(
     state: ProtoState,
-    reply: ReplyId,
+    reply: ReplyId<crate::reply_id::PingKind>,
     staged: &mut StagedActions,
 ) -> ProtoState {
     match state {
@@ -630,7 +636,7 @@ fn compute_push_startup(
     database: Option<DatabaseName>,
     app_name: Option<ApplicationName>,
     credentials: Credentials,
-    reply: ReplyId,
+    reply: ReplyId<crate::reply_id::StartupKind>,
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
@@ -829,7 +835,14 @@ fn materialise<'buf>(staged: StagedActions, buf: &'buf [u8]) -> OutActions<'buf>
                 Action::SendBytes(range.apply(buf).unwrap_or(&[]))
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
-            StagedAction::DeliverReply { id, value } => Action::DeliverReply { id, value },
+            // DEF-112: `DeliverReplyEntry` fields are module-private.
+            // Access via accessor methods. The entry was constructed
+            // by the typed `action::deliver` path — type-payload
+            // pairing was enforced there.
+            StagedAction::DeliverReply(entry) => Action::DeliverReply {
+                id: entry.id(),
+                value: entry.value(),
+            },
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
             StagedAction::CloseSocket => Action::CloseSocket,
         };
@@ -890,16 +903,18 @@ mod allows_unsolicited_param_status_tests {
     /// Consume any ReplyId carried by a state so the Drop-guard does
     /// not trip at end-of-scope.
     fn consume_state(state: ProtoState) {
+        // DEF-112: per-variant extraction. `ReplyId<PingKind>` and
+        // `ReplyId<StartupKind>` are distinct types; an or-pattern
+        // binding needs all alternatives to share the binding type.
+        // Splitting per kind keeps the match exhaustive (compiler
+        // will still flag a missing variant on future additions).
         match state {
             ProtoState::Idle | ProtoState::Errored(_) => {}
-            ProtoState::AwaitingPingReply(id)
-            | ProtoState::ConnectingScramAwaitAuthOk(id)
+            ProtoState::AwaitingPingReply(id) => {
+                id.consume();
+            }
+            ProtoState::ConnectingScramAwaitAuthOk(id)
             | ProtoState::ConnectingPostAuthWaitKey(id) => {
-                // `.consume()` marks the ReplyId as delivered so the
-                // Drop-guard does not fire. The returned `NonZeroU64`
-                // is discarded as a statement — no `drop()` call
-                // (NonZeroU64 is not Drop; clippy's `drop_non_drop`
-                // fires on such calls) and no `let _` (banned).
                 id.consume();
             }
             ProtoState::ConnectingStartupTrust { reply }
@@ -1034,10 +1049,13 @@ mod compute_push_tests {
     /// without cross-module `pub(super)` exposure, and a 20-line
     /// match is cheaper than the coupling.
     fn consume_state(state: ProtoState) {
+        // DEF-112: per-kind split (see sibling module's consume_state).
         match state {
             ProtoState::Idle | ProtoState::Errored(_) => {}
-            ProtoState::AwaitingPingReply(id)
-            | ProtoState::ConnectingScramAwaitAuthOk(id)
+            ProtoState::AwaitingPingReply(id) => {
+                id.consume();
+            }
+            ProtoState::ConnectingScramAwaitAuthOk(id)
             | ProtoState::ConnectingPostAuthWaitKey(id) => {
                 id.consume();
             }

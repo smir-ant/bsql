@@ -38,7 +38,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply, ReplyId,
+    Action, PgCommand, PgProtocol, PingKind, ProtoState, ProtocolError, Reply, ReplyId, ReplyKind,
     wire::{SYNC_WIRE_BYTES, TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
 };
 use core::num::NonZeroU64;
@@ -72,7 +72,9 @@ fn raw(value: u64) -> NonZeroU64 {
 /// A distinguishable `ReplyId` for a single-command test, minted from a
 /// raw counter value. Consumes the raw so the caller also remembers the
 /// value on the side if they need to assert the round-trip.
-fn id(value: NonZeroU64) -> ReplyId {
+/// Generic over `K: ReplyKind` — call-site infers the kind from the
+/// command. Most ping_spec callers pass Ping commands, so K ≈ PingKind.
+fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
     ReplyId::from_raw(value)
 }
 
@@ -132,7 +134,7 @@ fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) 
 /// validates push-content for free, without duplicating the
 /// content assertion in each test's body.
 #[track_caller]
-fn ping_setup(proto: &mut PgProtocol, reply: ReplyId, wb: &mut bsql_pg_proto::WriteBuf) {
+fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg_proto::WriteBuf) {
     let out = proto.push_command(PgCommand::Ping { reply }, wb);
     assert_eq!(out.len(), 1, "Ping setup: push emits exactly 1 action");
     match out.as_slice() {

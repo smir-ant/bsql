@@ -39,7 +39,7 @@
 
 use bsql_pg_proto::{
     Action, ApplicationName, Credentials, DatabaseName, Ident, IdentError, PgCommand, PgProtocol,
-    ProtoState, ProtocolError, ReplyId, SessionParams,
+    ProtoState, ProtocolError, ReplyId, ReplyKind, SessionParams,
 };
 use core::num::NonZeroU64;
 
@@ -47,7 +47,11 @@ fn raw(value: u64) -> NonZeroU64 {
     NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
 }
 
-fn id(value: NonZeroU64) -> ReplyId {
+/// Generic over `K: ReplyKind` so tests can mint either
+/// `ReplyId<PingKind>` or `ReplyId<StartupKind>` with the same
+/// helper. Call site infers K from usage context (e.g. `PgCommand::Ping
+/// { reply: id(raw(1)) }` picks `PingKind`).
+fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
     ReplyId::from_raw(value)
 }
 
