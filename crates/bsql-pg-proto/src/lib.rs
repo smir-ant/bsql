@@ -222,26 +222,31 @@ const _: fn() = || {
 // Measurement baseline (x86_64 Linux, 2026-04-20):
 //   ProtocolError:   856  (five heapless::String<N>, N<=256)
 //   Action:          864  (SendBuf::Owned contains 512-byte vec)
-//   SendBuf:         528
+// Post-DEF-095/096/097 measurements (aarch64-apple-darwin):
+//   Ident:            66  (was 72 — heapless::Vec<u8,63>+usize → POD FixedStr)
+//   DatabaseName:     66
+//   ApplicationName: 130
 //   Reply:            12
 //   ReplyId:          16
-//   ProtoState:     1248  (ConnectingScramAwaitServerFirst is dominant)
-//   PgCommand:      1352  (Startup carries Credentials + names)
-//   PgProtocol:     6656  (ReadBuf 4096 + state 1248 + session_params ~ 1200)
-//   OutActions:     3464  (4 * Action)
+//   ProtocolError:   304  (DEF-060 typed variants + FixedStr tail)
+//   Action<'_>:      312  (FailReply.cause is the dominator)
+//   ProtoState:     1240  (ConnectingScramAwaitServerFirst dominant)
+//   PgCommand:      1312  (Startup carries Credentials + names)
+//   PgProtocol:     6648  (ReadBuf 4096 + state 1240 + session_params ~1200)
+//   OutActions:     1256  (4 × Action + u8 len, padded)
 // ---------------------------------------------------------------------
 const _: () = assert!(
-    core::mem::size_of::<error::ProtocolError>() <= 320,
-    "ProtocolError size regression — post-DEF-060/061 budget is 320 bytes. \
+    core::mem::size_of::<error::ProtocolError>() <= 312,
+    "ProtocolError size regression — post-DEF-060/061/096 budget is 312 bytes. \
      Did ServerErrorResponse.message/detail/hint bounds grow, or did a \
      variant add a large inline buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action<'static>>() <= 384,
-    "Action<'_> size regression — post-DEF-094 budget is 384 bytes. \
-     Action is dominated by FailReply.cause (ProtocolError ~280 bytes); \
-     SendBytes is now a 16-byte &[u8]. SendBuf removed — if this assert \
-     trips, someone grew ProtocolError or added a large inline variant.",
+    core::mem::size_of::<action::Action<'static>>() <= 320,
+    "Action<'_> size regression — post-DEF-094/096 budget is 320 bytes. \
+     Action is dominated by FailReply.cause (ProtocolError ~304 bytes); \
+     SendBytes is now a 16-byte &[u8]. If this trips, someone grew \
+     ProtocolError or added a large inline variant.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Reply>() <= 64,
@@ -252,21 +257,24 @@ const _: () = assert!(
     "ReplyId size regression — did a bookkeeping field get added?",
 );
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() <= 2048,
-    "ProtoState size regression — did a state variant add a large buffer?",
+    core::mem::size_of::<state::ProtoState>() <= 1280,
+    "ProtoState size regression — post-DEF-096/097 budget is 1280 bytes \
+     (Scram path is dominant; Trust path now just 24 bytes). Did a state \
+     variant add a large buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<command::PgCommand>() <= 2048,
-    "PgCommand size regression — did a command variant grow?",
+    core::mem::size_of::<command::PgCommand>() <= 1344,
+    "PgCommand size regression — post-DEF-095/096 budget is 1344 bytes. \
+     Startup carries user/database/app_name (FixedStr-POD) + credentials.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() <= 8192,
+    core::mem::size_of::<protocol::PgProtocol>() <= 6720,
     "PgProtocol size regression — ReadBuf growth or state bloat?",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static>>() <= 1600,
-    "OutActions<'_> size regression — 4 * sizeof(Action<'_>) + len. \
-     Post-DEF-094 budget: 1600 bytes (was 4096 pre-DEF-094).",
+    core::mem::size_of::<action::OutActions<'static>>() <= 1280,
+    "OutActions<'_> size regression — 4 × sizeof(Action<'_>) + u8 len + \
+     padding. Post-DEF-094/096 budget: 1280 bytes.",
 );
 
 // ---------------------------------------------------------------------
