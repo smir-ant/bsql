@@ -776,10 +776,31 @@ Will ship in **1c-5** (pipelining sub-phase).
 | `4e3896b` | 1c-1a — `Action<'w, 'r>` two-lifetime refactor + `StreamRow` variant. `'w` for outbound, `'r` for inbound row slices borrowed from `ReadBuf`. |
 | `14d386d` | 1c-1b — SimpleQuery dispatch end-to-end. Four new `ProtoState` variants, `StagedAction::StreamRowRange` (absolute coords into `ReadBuf::populated` — survives per-frame advance), `FrameCoords` dispatcher arg, query-level errors survive via `SimpleQueryDrainRfqAfterError`. `CommandInProgress` + `MalformedCommandComplete` error classifications added. `PgCommand` size cap 1344 → 2112 (Sql dominates). |
 | `4c33eb0` | 1c-1c — 12 integration tests + generic `Truncating` sealed marker (now covers BoundedStrTag + SqlTag uniformly). Tests: 0-row SELECT, N-row SELECT streaming, DML, empty query, query-level error + connection survival, mid-stream error, in-flight push rejection, Errored-state push rejection, malformed CommandComplete teardown, unexpected-RFQ teardown, across-call row streaming, Q-frame wire layout drift-pin. |
+| `6bc1744` | **DEF-121** fix + polish — per-iter budget gate before dispatch (tier-4 silent-reply-loss → tier-2 structural). `MAX_ACTIONS_PER_CALL` 4 → 8 + `WORST_CASE_PER_DISPATCH=2` named reserve. Three shared dispatch helpers (`advance_to_await_rfq`, `advance_to_drain_after_error`, `stream_row_or_errored`) centralise invariants previously duplicated across AwaitFirstResponse / StreamingRows arms. Regression test `overflow_backpressure_preserves_delivery_across_calls`. |
 
 Finding 3 (typed CommandTag) — partially shipped: `QueryCompletePayload::command_tag: BoundedStr<32>` carries the raw PG tag verbatim. Upgrade to typed `CommandTag { kind: CommandKind, rows_affected: Option<u64>, insert_oid: Option<u32> }` deferred to 1c-6 hardening — the parse lives at the ingest boundary in `dispatch::parse_command_tag` so the upgrade is a local refactor.
 
-Test count: 83 → 95 (+12 from `simple_query_spec.rs`).
+Test count: 83 → 96 (+12 simple-query spec + DEF-121 regression).
+
+### DEF-121 — silent reply loss on `feed_bytes` loop overflow
+
+Self-audit of 1c-1b found the hazard: `emit_actions!(..., on_overflow: break, ...)` bails out of the loop **after** the dispatcher has already consumed the `ReplyId` (via `deliver()` or `errored()`) and mutated `self.state`. The dropped action is silent — the caller's `oneshot::Sender` is orphaned forever, and the `ReplyId::Drop`-guard doesn't fire because the id was marked delivered.
+
+**Before 1c-1b** this was dormant: Phase 1a (Ping, 1 action/call) and Phase 1b (Startup, ≤2 actions/call with the auth chain all `AdvancedSilent` except terminal Z) stayed under the `MAX_ACTIONS_PER_CALL=4` ceiling. 1c-1b row streaming made the hazard live — 5 `DataRow` frames + `CommandComplete` + `ReadyForQuery` in one chunk would overflow.
+
+**Fix:** per-iteration budget gate in `feed_bytes`, checked BEFORE `core::mem::take(&mut self.state)`:
+
+```rust
+if staged.len().saturating_add(WORST_CASE_PER_DISPATCH) > MAX_ACTIONS_PER_CALL {
+    break;  // frame stays in read buffer for the next call
+}
+```
+
+`WORST_CASE_PER_DISPATCH = 2` is a named const so a future 3-action outcome causes a conspicuous bump, not a quiet overrun.
+
+**Tier:** tier-4 (silent corruption) → tier-2 structural (the gate is a runtime check, but the check position — before any reply consumption or state mutation — is structurally load-bearing; the commit message makes this explicit).
+
+Tier-1 would require the compiler to verify "every outcome has a slot" per iteration — possible via a dependent-types sketch but not on stable Rust. The gate is the honest ceiling.
 
 ### Round-4 discipline
 
