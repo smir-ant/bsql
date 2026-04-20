@@ -96,6 +96,8 @@ mod sealed {
     pub trait FixedStrKindSealed {}
     /// Supertrait seal for [`super::Validated`].
     pub trait ValidatedSealed {}
+    /// Supertrait seal for [`super::Truncating`].
+    pub trait TruncatingSealed {}
 }
 
 /// Tag trait supplying the per-kind debug name. Every
@@ -127,6 +129,16 @@ pub trait FixedStrKind: sealed::FixedStrKindSealed {
 /// **Sealed** (DEF-115): only the crate's own tags can be
 /// `Validated`.
 pub trait Validated: FixedStrKind + sealed::ValidatedSealed {}
+
+/// Marker trait opting a tag into the truncating
+/// `from_str_truncating` constructor — source over the cap is
+/// truncated at a UTF-8-safe boundary and an explicit `"…"` marker
+/// appended. Used by tags that accept arbitrary user-supplied text
+/// (SQL, server error messages) where strict rejection would be
+/// hostile.
+///
+/// **Sealed** (DEF-115).
+pub trait Truncating: FixedStrKind + sealed::TruncatingSealed {}
 
 /// Tag for [`Ident`] — non-empty, no NUL, max 63 bytes.
 ///
@@ -175,10 +187,12 @@ impl Validated for ApplicationNameTag {}
 pub enum BoundedStrTag {}
 
 impl sealed::FixedStrKindSealed for BoundedStrTag {}
+impl sealed::TruncatingSealed for BoundedStrTag {}
 impl FixedStrKind for BoundedStrTag {
     const DEBUG_NAME: &'static str = "BoundedStr";
     const ALLOW_EMPTY: bool = true;
 }
+impl Truncating for BoundedStrTag {}
 // Deliberately *not* `impl Validated for BoundedStrTag` — its
 // constructor is `from_str_truncating`, not `try_from_str`. Also
 // deliberately *not* `impl sealed::ValidatedSealed` — the sealed
@@ -205,10 +219,12 @@ impl FixedStrKind for BoundedStrTag {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlTag {}
 impl sealed::FixedStrKindSealed for SqlTag {}
+impl sealed::TruncatingSealed for SqlTag {}
 impl FixedStrKind for SqlTag {
     const DEBUG_NAME: &'static str = "Sql";
     const ALLOW_EMPTY: bool = true;
 }
+impl Truncating for SqlTag {}
 // Not Validated — truncating constructor only.
 
 /// Tag for [`StmtName`] — a PG prepared-statement name. Validated:
@@ -633,9 +649,9 @@ impl<const N: usize, Tag: Validated> FixedStr<N, Tag> {
     }
 }
 
-// ───────────────── BoundedStr-specific truncating constructor ─────────
+// ───────────────── Truncating-tag constructor (BoundedStr / Sql) ──────
 
-impl<const N: usize> FixedStr<N, BoundedStrTag> {
+impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
     /// UTF-8 ellipsis marker appended on overflow. 3 bytes.
     const OVERFLOW_MARKER: &[u8] = "…".as_bytes();
 
