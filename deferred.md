@@ -646,6 +646,140 @@ modules. Each file's preamble documents its category scope
   `rustdoc example || integration test` is itself a style choice
   rather than a tier gap. Hold as-is.
 
+## 18. Phase 1c pre-work architectural findings (round 4, 2026-04-20)
+
+Deeper architectural probe before 1c implementation begins. The
+architect's 1c analysis recommended runtime-phase-field for
+DEF-119 on "async ergonomics" grounds; this round-4 pass
+challenged that and found a middle-ground pattern architect had
+not enumerated. Plus 6 orthogonal angles on the 1c design
+surface.
+
+### DEF-119 re-evaluation — **witness-guard pattern**
+
+**Prior framing (architect round-3).** Move-based typestate
+(`PgProtocol<Phase>` consuming `self` on transitions) delivers
+tier-1 compile on "cannot push when not Ready", but costs async
+ergonomics: async tasks storing `PgProtocol` as a field cannot
+update the field's type per operation without wrapping in an
+enum (`PgProtocolAnyPhase`) that loses the tier-1 gate.
+
+**Round-4 middle ground.** Witness-guard pattern: `PgProtocol`
+stays one type; `ReadyGuard<'p>` / `PipeliningGuard<'p>` are
+short-lived borrow-witnesses minted via `proto.as_ready()` /
+`proto.as_pipelining()` (returning `Option<Guard<'_>>`).
+`push_command` is a method of the guard, not of `PgProtocol`.
+
+```rust
+impl PgProtocol {
+    pub fn as_ready(&mut self) -> Option<ReadyGuard<'_>>;
+    // push_command is NOT on PgProtocol
+}
+
+impl<'p> ReadyGuard<'p> {
+    pub fn push_command(self, cmd, wb) -> OutActions<'_, 'static>;
+}
+```
+
+**Tier-1 claim delivered.** "Cannot call push_command without
+proving current phase permits it" — `push_command` is not
+callable on `PgProtocol` directly; obtaining a guard requires
+handling `Option::None` (forced by `unused_must_use`).
+
+**Async storage preserved.** `PgProtocol` is one type;
+tokio tasks hold it as a regular field. Guards come and go
+inside select! arms. No enum wrapper needed, no async
+gymnastics.
+
+**Honest tier boundary.** Witness-guard gives tier-1 compile on
+"push requires guard" but tier-3 on "guard existence matches
+phase" (runtime `Option` return). That's the same floor as full
+typestate at the push-check seam — the typestate's extra tier
+claim ("phase transitions carry across calls") is the part
+async-incompatible anyway. Guards capture the real available
+tier without paying the cost.
+
+Will ship in **1c-5** (pipelining sub-phase).
+
+### Six orthogonal 1c design findings
+
+1. **`InFlightSlot` as sum enum, not u8-discriminant struct.**
+   Architect's `InFlightHead { kind_tag: u8, reply_id, row_desc_ref: Option<u16> }`
+   loses exhaustive-match discipline on slot kind. Replace with
+   `enum InFlightSlot { Query{...}, Parse{...}, BindExecute{...},
+   Close{...} }` — tier-2 structural via exhaustive match on slot
+   variant. Per-slot size ≈ 12 bytes (8-slot queue → 96 bytes).
+
+2. **Typed sealed newtypes for Sql / StmtName / PortalName.**
+   Mirror the DEF-096 Ident/DatabaseName pattern via
+   `FixedStr<N, Tag>` sealed. `fn bind(portal: PortalName, stmt:
+   StmtName)` — swapped args = compile error. Free out of
+   established machinery.
+
+3. **Typed `CommandTag` parsed at ingest.** PG's
+   `CommandComplete` body `"SELECT 5"` / `"INSERT 0 3"` parsed
+   into `struct CommandTag { kind: CommandKind, rows_affected:
+   Option<u64>, insert_oid: Option<u32> }`. User code does
+   exhaustive match on `CommandKind` — tier-1 on "typo in
+   command-name comparison".
+
+4. **`Flush` vs `Sync` sequencing via guard consumption.**
+   Extended-query chains end with `Sync`; `Flush` mid-stream is a
+   different semantic. Guard-based: `PipeliningGuard::push_bind_execute(&mut self)`
+   keeps guard alive; `PipeliningGuard::finish_with_sync(self)`
+   consumes guard and emits terminal Sync. A chain ending on
+   Flush alone doesn't consume the guard — cannot satisfy
+   guard's Drop-invariant (or terminal transition). Tier-2
+   structural via method placement.
+
+5. **Text-format column rejection as typed error.** PG's
+   RowDescription specifies per-column `format_code` (0=text,
+   1=binary). 1c ships binary-only; text format must surface as
+   typed error, not generic `MalformedFrame`:
+   `ProtocolError::UnexpectedTextFormatColumn { column_idx }`.
+   Tier-3 audit at server-interop layer; user gets clear
+   diagnostic.
+
+6. **Zero-copy param binding via `ParamsWriter` trait.** User's
+   `(i32, &str, bool)` params should flow directly to WriteBuf
+   without intermediate `Params { storage: heapless::Vec<u8,
+   1024> }` copy. `trait ParamsWriter { const COUNT: u16; fn
+   write_to(self, dst: &mut WriteBuf) -> Result<(), _>; }` +
+   per-tuple impls. COUNT const-known → Bind frame's param-count
+   field filled at compile time.
+
+7. **`RowDescRef` generational arena guard.** 2-slot `[RowDescriptorBytes;
+   2]` arena with simple `u16` index has a stale-ref class: slot
+   freed, reused, old InFlightSlot's ref points at wrong row
+   shape. Add generation counter: `RowDescRef { slot: u8,
+   generation: u8 }` — 2 bytes, arena bumps generation on free.
+   `arena.get(RowDescRef)` checks generation match — stale ref
+   → None (classified as protocol error). Tier-2 runtime vs
+   tier-3 audit miss.
+
+### Sub-phase placement
+
+- **1c-0 / 1c-1:** findings 2, 3 (typed newtypes + CommandTag).
+  Foundation layer types, used by every later sub-phase.
+- **1c-2:** finding 5 (text-format rejection) — text-format class
+  of error lives alongside codec.
+- **1c-3:** finding 6 (ParamsWriter zero-copy) — lands with
+  Parse/Bind/Execute.
+- **1c-5:** findings 1, 4, 7, **DEF-119 via guards** —
+  pipelining sub-phase, all queue/phase work together.
+
+### Round-4 discipline
+
+Prior rounds (1/2/3) caught overclaims via stress-testing
+tier-1 claims. Round 4 found a prior-round *underclaim* — the
+"async ergonomics rejected" dismissal missed the witness-guard
+pattern. Lesson: challenge not only "is the claim too strong"
+but also "is the rejection too strong".
+
+Future audits should probe `rejected` items with the same rigor
+as `claimed` items. A rejection's rationale can itself be
+wrong.
+
 ## 10. Closed
 
 Move entries here when a deferral is genuinely resolved — not just

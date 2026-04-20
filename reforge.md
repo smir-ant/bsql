@@ -1144,7 +1144,7 @@ Legend: **✅** shipped | **⏳** registered (open DEF) | **❌** rejected with 
 - **Skipped with rationale** DEF-104 (field-kind table — cold-path legibility only) • DEF-105 (OutActions shrink — needs PG error-length profile to justify) • DEF-108 (std::simd XOR — portable SIMD unstable on MSRV 1.95).
 - **Deferred** DEF-107 (SCRAM in-place writes — low cost-benefit standalone, revisit in Phase 1c).
 - **Deferred** DEF-118 (ParsedFrame proof-token) — ambitious form fits Phase 1c pipelining rework.
-- **Deferred to Phase 1c** DEF-119 (`PgProtocol<Phase>` outer typestate) — architect-rated "biggest tier elevation available"; folds naturally into pipelining.
+- **Deferred to Phase 1c** DEF-119 (`PgProtocol<Phase>` outer typestate) — **round-4 (2026-04-20) reshaped to witness-guard pattern**: `ReadyGuard<'p>`/`PipeliningGuard<'p>` short-lived borrow-witnesses via `proto.as_ready()` → `Option<Guard<'_>>`. `push_command` is a method of the guard, not `PgProtocol`. Tier-1 compile gate on "cannot push without proving phase" WITHOUT the move-based typestate's async-storage cost. See `deferred.md` §18 for the round-4 analysis challenging architect's original "async-rejected" dismissal.
 - **Validation gates** DEF-109 / DEF-110 pending `cargo asm` infrastructure — not blocking Phase 1b.
 - **Round 3 summary: 24 audit findings exhausted.** 17 shipped / reaffirmed, 3 skipped with rationale, 2 deferred to Phase 1c, 2 validation gates pending measurement.
 
