@@ -242,8 +242,6 @@ closes.
 
 | ID | Commitment | Phase | Target tier |
 |---|---|---|---|
-| DEF-060 | Typed SCRAM / wire error enums replacing `ProtocolError::ScramError { detail: heapless::String<128> }` and all `heapless::String::try_from("…").unwrap_or_default()` sites. Replace with sub-enums of discrete failure kinds (`ScramFailure::NoMechanism`, `::NoncePrefixMismatch`, etc.) + `Display` over `&'static str`. Kills the silent-truncation class from cold path entirely. Tier 3 → 1. | 1c | 1 |
-| DEF-061 | `ProtoState::Errored(ErrorKind)` instead of `ProtoState::Errored(ProtocolError)`. First fatal emits the full `ProtocolError` in the `FailReply` action; subsequent pushes into `Errored` see `ErrorKind` (u8-size discriminant) and emit a classified "connection closed, see earlier error" reply. Eliminates ~1.3 KB per-push stack clone on the cold path while preserving diagnostic quality (full error goes out once on the first fatal). | 1c | — (perf + simplification) |
 | DEF-062 | `NoticeResponse` (tag `'N'`) pre-dispatch filter — extracts the notice from any state, emits `Action::EmitNotice(...)`, skips the dispatcher. Matches the DEF-054 pattern for ParameterStatus. Supersedes DEF-043 with concrete shape. | 1c | 1 (single-site, structural) |
 | DEF-063 | Handshake-flow typestate extraction. The linear chain `Idle → ConnectingStartup → ConnectingScram* → ConnectingPostAuth* → Idle` becomes a dedicated `handshake` module with typestate transitions: each step is `fn step(PrevState, ...) -> Result<(NextState, Action), ProtocolError>`. Reactive states (AwaitingQueryReply, StreamingRows, InTransaction) remain in the enum — typestate doesn't apply to them because server events can drive multiple outcomes. Tier 2 → 1 on "invalid handshake-step call from wrong state". | 1c | 1 on handshake path |
 | DEF-064 | `parse_error_response` bounded-iterations loop — replace unbounded `loop { pos += 1; ... }` with `for _ in 0..MAX_ERROR_FIELDS (=16) { ... }`. Closes a potential DoS vector on malformed `ErrorResponse` with adversarially-crafted fields. | 1c | 2 (structural bound) |
@@ -380,6 +378,53 @@ audit-finding cluster to preserve bisect-ability.
 | ID | Status | What closed it |
 |---|---|---|
 | AUDIT-A2 | Closed | **`Credentials` double-match seam eliminated via `ScramSession` typestate (tier-3 → tier-1 compile).** Before the fix, two independent sites in `dispatch.rs` — the `AUTH_SASL` arm of `dispatch_auth_in_startup` and the head of `build_sasl_initial_response` — each matched `Credentials` directly, classifying `Trust` as an error. A body swap between the two sites' arms (e.g. flipping `Trust → success, ScramPassword → error`) compiled cleanly: the two match sites had no structural linkage — the compiler could not see that they were discriminating the same value across call boundaries. Fix: new `pub(crate)` module `scram::session` with struct `ScramSession { password: Sensitive<Password> }`. The only constructor is `ScramSession::try_from_credentials(Credentials) -> Result<Self, ()>` — the unique decision site for Trust-vs-ScramPassword. Every downstream site takes `&ScramSession` (shared borrow) or owns one: `build_sasl_initial_response(_: &ScramSession)` (parameter shape load-bearing; anonymous binding since password isn't needed until SASL-continue), `dispatch_auth_sasl_continue(scram: ScramSession, ...)` (owns), `ProtoState::ConnectingScramAwaitServerFirst { scram: ScramSession, ... }` (field-owns). **The `Credentials::Trust` variant cannot reach any SCRAM-path site by type** — a body drift in any one site becomes a compile error (the variant does not exist in `ScramSession`'s shape), not silent semantic breakage. Bonus: `Err(())` instead of `Err(Credentials)` keeps the result-type 32 bytes vs 1040 bytes; no `#[expect(clippy::result_large_err)]` needed. Memory-layout savings on `ProtoState::ConnectingScramAwaitServerFirst`: ~8 bytes per instance (Credentials's enum discriminant + padding eliminated). Test construction sites updated to nest `if let Ok(pw) && let Ok(scram) = ...` (let-chain, stable Rust 1.65+). |
+
+## 15. Phase-1c batch 3 + 4 (2026-04-19, mega-session)
+
+Paranoid audit round 2 surfaced 27 findings; the most impactful
+landed in this session. Sequence driven by the architect's
+recommended order (DEF-061 unblocks DEF-060 and DEF-094; A4 and
+polish items flow around them).
+
+### Commits in this session
+
+| Commit | ID | Notes |
+|---|---|---|
+| `c616f1b` | AUDIT-C1/D1/E1 | `_not_sync` → `sync_marker`; +11 Send asserts; +7 needs_drop asserts |
+| `3047ef2` | AUDIT-A4 | `DispatchOutcome::Advanced { action: Option<Action> }` → 2 distinct variants (AdvancedSilent / AdvancedWithAction). Tier-3 arm-drift seam elevated to tier-1 compile. |
+| `adf14da` | AUDIT-H1/H2/H3/H4 | reforge.md §16/§17/§19/§20 drifts corrected to match actual code |
+| `6d2bb9f` | **DEF-061** | `ProtoState::Errored(ErrorKind)` — 1-byte state vs 856-byte ProtocolError |
+| `e827bf2` | **DEF-060 pt1** | `ProtocolError::Scram(ScramError)` typed variant, silent-truncation class eliminated (5 sites) |
+| `19e2aab` | **DEF-060 pt2** | `ServerErrorResponse` typed fields: `Severity` enum (1 byte), `SqlStateCode` newtype ([u8;5]), `BoundedStr<N>` with explicit `"…"` truncation marker. Size 848 → 280 bytes. |
+| `1ff1c2d` | **DEF-094** | `Action<'buf>::SendBytes(&'buf [u8])` staged dispatch. Caller-owned `WriteBuf`. Zero-copy send path. |
+
+### Closed DEFs
+
+| ID | Status | What closed it |
+|---|---|---|
+| DEF-060 | **Closed** | Two parts. (1) `ScramError { detail: String<128> }` → `Scram(scram::wire::ScramError)` (typed 11-variant enum). The `unwrap_or_default()` silent-truncation class is structurally absent — no intermediate string to truncate. `scram_err_from<E: Display>` helper gone. (2) `ServerErrorResponse` fields: severity → `Severity` enum (1 byte, 9 variants + Unknown); code → `SqlStateCode([u8; 5])` (5 bytes, byte-packed); message/detail/hint → `BoundedStr<N>` (96/64/64 bytes) with explicit `"…"` truncation marker on overflow (previously `unwrap_or_default` → empty string). Size: 848 → ~280 bytes. Tier-4 silent-truncation eliminated across 5 parse-time sites + 4 static-string construction sites. |
+| DEF-061 | **Closed** | `ProtoState::Errored(ErrorKind)` — `ErrorKind` is a 6-variant `#[repr(u8)]` enum (Framing / Transport / ServerError / Auth / Internal / AlreadyClosed). Fatal's full `ProtocolError` goes out **once** in the first `FailReply` action; subsequent pushes against Errored emit `ProtocolError::ConnectionAlreadyClosed { prior_kind: ErrorKind }` (17-byte compact echo). `ProtoState::Errored` went from 856 bytes to 1 byte. Cold-path clone cost on every push against Errored: eliminated. `ProtocolError::kind(&self) -> ErrorKind` exhaustive match — adding a new ProtocolError variant without classifying it is a build error (tier-1 compile). |
+| DEF-094 | **Closed** | Two-phase staged dispatch. **Phase 1 (write):** dispatchers take `&mut WriteBuf` (caller-owned) and emit `StagedAction` values carrying ranges (`SendBytesRange { start, end }` or `SendBytesStatic(&'static [u8])`) — no refs. **Phase 2 (ref):** once the write-phase's mutable borrow releases, the entry-point iterates `StagedActions` and materialises `Action<'buf>::SendBytes(&'buf [u8])` into `OutActions<'buf>`. The `'buf` lifetime is tied to the caller's WriteBuf (not PgProtocol) — **`proto.state()` / other shared-borrow inspection works alongside a live `OutActions<'buf>`**; only the next `&mut wb` call is blocked until OutActions drops. Tier-1 compile enforcement of consume-before-next-call. `SendBuf` / `SendBufFull` removed from public API. `Action::SendBytes` shrank from 528 bytes (inline buffer) to 16 bytes (fat pointer). Ping's static `SYNC_WIRE_BYTES` takes the zero-write path via `SendBytesStatic`. ~74 test sites threaded a `&mut wb` parameter and `let mut wb = WriteBuf::new()` at the top of each test. Post-`OutActions` inspection of `proto.state()` works cleanly (no blocker). |
+
+### Audit-finding cleanup
+
+| ID | Status | What closed it |
+|---|---|---|
+| AUDIT-C1 | Closed | `_not_sync` field → `sync_marker`. Load-bearing !Sync gate; leading underscore was misleading ("unused in purpose" convention — but the field IS structurally used). Also: `let (code, _rest) = ...` in `dispatch_auth_ok_after_scram` → `Ok((code, _))` anonymous-pattern discard (not a `_`-prefixed identifier). |
+| AUDIT-A4 | Closed | `DispatchOutcome::Advanced { action: Option<Action> }` split into `AdvancedSilent { new_state }` and `AdvancedWithAction { new_state, action }`. Drift that flipped a meaningful `Some(act)` to `None` silently compiled before; now a compile error (AdvancedWithAction requires the field). 9 dispatch sites reclassified; 3 match arms in `feed_bytes` exhaustively handle the three variants. |
+| AUDIT-D1/E1 | Closed | Send + needs_drop const-assertion coverage expanded from 17+7 types to 28+13 types. Future refactor introducing non-Send or non-Drop semantics into any of the protected types fails at crate root. |
+| AUDIT-H1/H2/H3/H4 | Closed | reforge.md drifts fixed: §16 PgProtocol shape (Phase 1b actual vs full target); §17 ProtoState (single ConnectingScram → three typestate variants per DEF-002); §19 SendBuf (two-arm enum → single-shape newtype per DEF-089; plus DEF-094 target shape); §20 parse_header (spec text contained a forbidden `as` cast — replaced with `usize::try_from` form). |
+
+### Remaining open (re-prioritised)
+
+**Blocking for Phase 1c close:**
+- **DEF-062** — NoticeResponse pre-dispatch filter. Small, structural, follows DEF-054 pattern.
+- **DEF-064** — `parse_error_response` bounded loop. Tiny DoS-shield fix.
+
+**Registered, not blocking:**
+- **DEF-063** — handshake-flow typestate module (tier-2 → tier-1 on invalid-step call).
+- **DEF-065** — SCRAM message assembly writes into WriteBuf directly (perf + simplification).
+- **DEF-077** — `NonErroredState` typestate. **Recommend skip after DEF-061**: Errored is now 1 byte, so "preserve Errored across mem::take" costs ~zero. DEF-077 would move it from tier-2 structural to tier-1 compile, but the payoff is marginal now. Re-evaluate if the preservation pattern becomes a hotspot.
 
 ## 10. Closed
 
