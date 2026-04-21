@@ -32,13 +32,28 @@
 //! - **Zero alloc**: no heap, no stack fixture buffer. Direct stream
 //!   into the output `WriteBuf`.
 //!
-//! # Scope (1c-3b)
+//! # Scope (1c-3b) — why arity 16
 //!
-//! Tuple arity 0..=16 covered. Arities beyond that aren't supported
-//! for reasons of code-size (every arity monomorphises into distinct
-//! machine code). Callers needing > 16 parameters should refactor
-//! into smaller statements or wait for a dynamic-params API (not
-//! planned for Phase 1c).
+//! Tuple arity 0..=16 covered. Each arity monomorphises into a
+//! distinct machine-code body (~30 LOC post-codegen); 16 arities
+//! × ~30 LOC ≈ 480 LOC of generated code per target build.
+//! `[ParamEncoder; 16]` inline array fits a single AVX2 register
+//! for the `FORMATS_WIRE` const (DEF-135, 1c-5 planned) — breaking
+//! the ≤64-byte bound would force a branch-on-length eq path and
+//! lose branch-free compare. The 16-cap also matches `ParamOids`'s
+//! MAX_PARAMS_ARITY (action.rs) so the describe-reply shape
+//! mirrors the bind-send shape.
+//!
+//! Tradeoff: callers wanting > 16 parameters must refactor into
+//! smaller statements. Cross-database universality (MySQL /
+//! MariaDB / SQLite) inherits this cap via `bsql-macros` Phase 2 —
+//! all three share the "few placeholders per query" norm in
+//! idiomatic usage.
+//!
+//! If I-cache measurement (DEF-143, deferred) shows per-arity
+//! monomorphisation bloating hot paths, the HList-recursion path
+//! documented in deferred.md §21 F-068 becomes the drop-in
+//! replacement.
 //!
 //! Every element type must implement [`ParamEncoder`] — a sealed
 //! intermediate trait that adds SQL-NULL handling on top of

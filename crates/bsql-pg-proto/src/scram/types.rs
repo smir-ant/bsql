@@ -54,6 +54,16 @@ impl SecretDigest {
 }
 
 impl fmt::Debug for SecretDigest {
+    /// Prints `"SecretDigest(<REDACTED>)"`. The digest bytes
+    /// (proof / signature / derived key) never appear in Debug output.
+    ///
+    /// # Test coverage note
+    ///
+    /// No dedicated Debug-redaction test exists for `SecretDigest` — the
+    /// same invariant is exercised transitively by SCRAM integration
+    /// paths. If a future audit suggests adding one, the sibling test
+    /// `tests/startup_spec.rs::sensitive_debug_does_not_leak_inner_value`
+    /// is the template.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SecretDigest(<REDACTED>)")
     }
@@ -108,6 +118,16 @@ impl CappedServerNonce {
     }
 
     /// Borrow the nonce bytes.
+    ///
+    /// # Not a secret
+    ///
+    /// The SCRAM server nonce is transmitted in the clear as part of
+    /// `server-first-message` (RFC 5802 §5.1). It is NOT secret-derived
+    /// and does NOT need constant-time handling — downstream uses
+    /// (hashing into AuthMessage, embedding into `client-final-message`)
+    /// can branch freely on its bytes. Documented to prevent a future
+    /// misguided "secure the nonce" refactor that would add unwarranted
+    /// `subtle::ConstantTimeEq` machinery.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {

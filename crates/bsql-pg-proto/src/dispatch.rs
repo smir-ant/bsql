@@ -1013,18 +1013,40 @@ fn mechanism_list_contains_scram(data: &[u8]) -> bool {
 
 /// Build the SASLInitialResponse frame for SCRAM-SHA-256.
 ///
-/// Takes a [`ScramSession`] by shared reference. The parameter is
-/// not dereferenced — the password is not needed until the
-/// SASL-continue step — but the signature makes the call-site
-/// typestate explicit: calling this function without constructing a
-/// `ScramSession` first is a compile error. The
-/// `Credentials`-vs-`ScramPassword` split happens exactly once at
-/// [`ScramSession::try_from_credentials`] (audit A2). The `_` in
-/// `_: &ScramSession` uses Rust's anonymous-parameter syntax — the
-/// parameter shape is load-bearing, its binding is not.
+/// # Pattern: compile-time capability proof
+///
+/// Takes `_: &ScramSession` — an anonymous-parameter typed reference
+/// that is **never dereferenced**. The function does not use the
+/// password inside the `ScramSession`; the password is consumed only
+/// later in `dispatch_auth_sasl_continue`. So why require the
+/// parameter at all?
+///
+/// The parameter is a **capability proof**. To construct a
+/// `ScramSession` the caller must have discriminated away
+/// `Credentials::Trust` (see `compute_push_startup` routing — Trust
+/// lands in `ConnectingStartupTrust` which never reaches this
+/// function; Scram lands in `ConnectingStartupScram { scram, .. }`
+/// which does). Accepting `&ScramSession` as an argument forces the
+/// caller to have that evidence at hand; passing no argument or the
+/// wrong type is a compile error.
+///
+/// The anonymous `_` binding is intentional — the parameter shape is
+/// load-bearing (the type `&ScramSession`), the binding is not (we
+/// never read the value). The crate's "no `_var` prefixed discards"
+/// rule applies to `let _prefix = expr;` bindings, not to
+/// anonymous-parameter match discards (which are standard idiomatic
+/// Rust for capability-proof parameters — see
+/// e.g. `std::marker::Unpin` witness patterns).
+///
+/// # Audit A2 + DEF-097
+///
+/// The `Credentials`-vs-`ScramPassword` split happens exactly once at
+/// `ScramSession::from_password`; this function cannot be reached
+/// from a Trust-credentials push path because the state variant it
+/// destructures from (`ConnectingStartupScram { scram, .. }`) carries
+/// a `ScramSession`, not a `Credentials`.
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
-/// [`ScramSession::try_from_credentials`]: crate::scram::session::ScramSession::try_from_credentials
 #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
 fn build_sasl_initial_response(
     _: &crate::scram::session::ScramSession,

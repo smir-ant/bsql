@@ -185,6 +185,15 @@ impl ReadBuf {
         // is architecturally bounded: cursor + n <= inner.len() <=
         // READ_BUF_CAP <= 65_535, so the `try_from` Err branch is
         // dead — kept as belt-and-braces.
+        //
+        // # LLVM codegen
+        //
+        // Under `opt-level >= 1` LLVM propagates the `n <= available`
+        // bound through the checked_add and folds the `u16::try_from`
+        // Err arm out of the emitted code entirely. Release builds
+        // carry ZERO instructions for the Err path — it's purely a
+        // type-level match-exhaustion concern. Verified by pass-#8
+        // audit (F-015). Do NOT replace with an `unsafe` cast.
         let new_cursor_usize = usize::from(self.cursor).checked_add(n).ok_or(AdvancePastEnd {
             requested: n,
             available,

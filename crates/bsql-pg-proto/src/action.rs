@@ -200,6 +200,32 @@ impl NonEmptyRange {
 /// Overflow handling is compile-enforced via the `emit_actions!`
 /// macro's `const _: () = assert!(MAX_ACTIONS_PER_CALL >= budget)`
 /// checks at every push site.
+///
+/// # Stack-init cost and the no-unsafe tradeoff
+///
+/// `OutActions::new()` writes a `CloseSocket` sentinel into all 8
+/// slots (3 KB under current `size_of::<Action>() ≈ 384 B`). Every
+/// `feed_bytes` / `push_command` call pays this init — even the
+/// typical 1-action Ping path walks the full array.
+///
+/// The eager-init path is the **cost of `#![forbid(unsafe_code)]`**.
+/// Safe alternatives considered:
+/// - `[MaybeUninit<Action>; 8]` + `assume_init` on populated slots
+///   — requires `unsafe`, forbidden.
+/// - `[Option<Action>; 8]` — `Option<Action>` is 392 B (discriminant
+///   + pad), strictly WORSE than the sentinel-fill.
+/// - Drop the sentinel and only-initialise populated slots via
+///   `heapless::Vec<Action, 8>` — propagates `heapless::Vec<T>`'s
+///   Drop into `OutActions`, breaking the POD shape required for
+///   NLL last-use borrow-release (tests would need explicit
+///   `drop(out)` between calls).
+///
+/// Net: the 3 KB init cost is the Pareto-optimal choice under the
+/// forbid bundle. Shrinking `Action` itself shrinks this
+/// proportionally — DEF-119's schema-arena refactor (1c-5)
+/// externalises `RowDesc` out of `Reply::*Complete` payloads,
+/// dropping `Action` from ~384 B to ~128 B and `OutActions` init
+/// cost from 3 KB to ~1 KB.
 #[derive(Debug, Clone, Copy)]
 pub struct OutActions<'w, 'r> {
     /// Fixed slot storage; slots past `len` hold the default
@@ -996,6 +1022,21 @@ impl ParamOids {
     }
 
     /// Get one OID by index, or `None` if out of range.
+    ///
+    /// # Returns `Option<u32>` by value (not `Option<&u32>`)
+    ///
+    /// On 64-bit targets `u32` is 4 bytes vs `&u32` at 8 bytes. Returning
+    /// the value directly is strictly smaller. The asymmetry with
+    /// [`crate::decode::RowDesc::get`] (which returns `Option<&ColumnDesc>`)
+    /// is **intentional and size-driven**: `ColumnDesc` is 8 bytes on
+    /// x86_64, so `&ColumnDesc` (8 B) and `ColumnDesc` (8 B) are
+    /// equivalent at the ABI — but `&ColumnDesc` preserves identity
+    /// if the caller wants pointer-stability. For `ParamOids::get`
+    /// none of those pointer-stability arguments apply: OIDs are
+    /// opaque u32 catalog lookups, never-mutated, cheap to copy.
+    ///
+    /// Do NOT "normalise" this to `Option<&u32>` in a future refactor
+    /// — the by-value form is deliberate.
     #[inline]
     #[must_use]
     pub fn get(&self, idx: usize) -> Option<u32> {

@@ -32,3 +32,4 @@ examples/.bsql/
 crates/*/.bsql/
 
 TODO
+*.txt

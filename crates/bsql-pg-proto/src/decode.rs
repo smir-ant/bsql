@@ -875,6 +875,24 @@ impl FromPgBinary<'_> for bool {
 }
 
 /// PG binary `text`: raw UTF-8 bytes. Zero-copy borrow.
+///
+/// # UTF-8 validation cost
+///
+/// Every column read walks the column bytes to verify UTF-8 well-formedness
+/// — `core::str::from_utf8` is O(N) with a well-tuned SSE2 fast path (~1 ns
+/// per byte on modern x86). A 32-byte text column costs ~32 ns; a typical
+/// 1000-row SELECT with 5 text columns pays ~160 μs of total validation.
+///
+/// Under `#![forbid(unsafe_code)]` this validation cannot be skipped —
+/// `core::str::from_utf8_unchecked` is unsafe and inaccessible in the crate.
+/// Callers who need to bypass should hold the bytes as `&[u8]` (via a
+/// separate `FromPgBinary<Target = &[u8]>` impl — not implemented today)
+/// and validate externally if / when they need a `&str`.
+///
+/// PG binary `text` is NOMINALLY UTF-8 per `client_encoding`; a buggy
+/// server / misconfigured encoding setting could produce invalid bytes.
+/// The Err path classifies as [`DecodeError::NonUtf8`] without
+/// panicking — consistent with the column-level safety contract.
 impl sealed::FromPgBinarySealed for &str {}
 impl<'a> FromPgBinary<'a> for &'a str {
     const OID: u32 = oids::TEXT;

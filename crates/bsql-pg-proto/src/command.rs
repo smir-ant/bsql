@@ -110,6 +110,28 @@ pub enum PgCommand {
     /// 1c-3a does not ship parameter-type hints — the `n_param_types`
     /// field is always zero on the wire. Type hints land in 1c-3b
     /// alongside `Bind` + `ParamsWriter`.
+    ///
+    /// # Stack cost per push
+    ///
+    /// `PgCommand::Parse` is the dominant variant of the `PgCommand`
+    /// enum — ~2132 B (stmt_name 66 + sql 2050 + reply 16). Every
+    /// `push_command(PgCommand::Parse { .. })` call allocates this
+    /// on the caller's stack even for a 10-byte SQL. The cost is
+    /// inherent to the `no_alloc` design: we cannot `Box<Sql>` the
+    /// payload.
+    ///
+    /// Tradeoffs considered and rejected:
+    /// 1. Shrink [`crate::ident::MAX_SQL_LEN`] from 2048 to 512 —
+    ///    breaks users with larger SQL. 4× shrink for marginal stack
+    ///    win.
+    /// 2. Streaming API `push_parse_streamed(stmt, |w| write_sql_to(w))`
+    ///    — more complex user API, not compatible with the unified
+    ///    `PgCommand` enum; would require a separate method like
+    ///    `push_bind_execute`.
+    ///
+    /// Accept: 2 KB of stack per Parse push is fine on tokio / std;
+    /// more problematic on embedded `no_std` + thin stacks. Document
+    /// and move on.
     Parse {
         /// The prepared-statement name. Empty (the "unnamed statement"
         /// per PG convention) or a validated `StmtName` up to

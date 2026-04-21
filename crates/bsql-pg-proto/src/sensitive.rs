@@ -54,6 +54,17 @@ impl<T: Zeroize> Sensitive<T> {
 }
 
 impl<T: Zeroize> fmt::Debug for Sensitive<T> {
+    /// Prints `"<REDACTED>"` unconditionally — never delegates to `T`'s
+    /// Debug.
+    ///
+    /// # Test-pinned invariant
+    ///
+    /// Pinned by `tests/startup_spec.rs::sensitive_debug_does_not_leak_inner_value`
+    /// which asserts the output contains `"REDACTED"` and does NOT
+    /// contain the inner value's bytes. A one-line impl drift
+    /// (e.g., replacing `write_str("<REDACTED>")` with
+    /// `debug_struct("Sensitive").field("inner", &self.inner).finish()`)
+    /// compiles silently but fails that test.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<REDACTED>")
     }

@@ -130,6 +130,15 @@ impl Password {
 }
 
 impl fmt::Debug for Password {
+    /// Prints `"Password(<REDACTED>)"` — the password bytes never leak.
+    ///
+    /// # Test-pinned invariant
+    ///
+    /// Pinned by `tests/startup_spec.rs::password_debug_does_not_leak_bytes`
+    /// which constructs a `Password` from `b"hunter2"` and asserts the
+    /// Debug output contains `"REDACTED"` and does NOT contain the
+    /// literal `"hunter2"`. Drift-shield against future Debug-derive
+    /// refactors.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Password(<REDACTED>)")
     }
@@ -153,6 +162,25 @@ pub enum Credentials {
 }
 
 impl fmt::Debug for Credentials {
+    /// Manual impl — exhaustive match per variant. See module-level
+    /// design rationale.
+    ///
+    /// # `#[non_exhaustive]` + exhaustive-inside-crate match
+    ///
+    /// `Credentials` carries `#[non_exhaustive]` so downstream crates
+    /// MUST use a catch-all when matching. Inside THIS crate the
+    /// match below is still exhaustive; adding a new variant is a
+    /// build error HERE until the new variant's Debug path is
+    /// declared. The combination is the tier-1 drift shield:
+    /// a new internal variant cannot silently inherit a derived
+    /// Debug that would leak secrets. DEF-048.
+    ///
+    /// # Test-pinned invariant
+    ///
+    /// Pinned by `tests/startup_spec.rs::credentials_debug_does_not_leak_password`
+    /// which constructs a `Credentials::ScramPassword` from a known
+    /// password string and asserts the Debug output contains
+    /// `"REDACTED"` and does NOT contain the password.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Trust => f.write_str("Credentials::Trust"),
