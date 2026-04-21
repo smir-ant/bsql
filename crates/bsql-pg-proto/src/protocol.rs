@@ -718,6 +718,51 @@ impl PgProtocol {
         )
     }
 
+    /// DEF-149 — atomic state-terminus transition.
+    ///
+    /// Install `ProtoState::Errored(kind)`, extract any in-flight
+    /// reply's raw correlator (via the authoritative
+    /// [`ProtoState::take_inflight_reply_raw_id`] matcher), and clear
+    /// `read_buf`. Returns the extracted raw correlator so the caller
+    /// can emit `FailReply { id, cause }`.
+    ///
+    /// # Why one helper, one caller
+    ///
+    /// The three operations form ONE conceptual unit at the
+    /// state-machine-terminus boundary. A future refactor that
+    /// reorders or splits them could produce observable state where:
+    /// - state is Errored but `read_buf` still holds post-fatal bytes
+    ///   (stale parse-ahead attempts leak CPU), OR
+    /// - state is intermediate while `read_buf` is already cleared
+    ///   (a concurrent `&self` reader — if one ever lands — sees an
+    ///   inconsistent snapshot).
+    ///
+    /// Naming this triple as a single method makes the atomicity
+    /// intent visible to IDE navigation and makes drift mechanically
+    /// harder. Currently one caller
+    /// ([`Self::fail_inflight_and_close`]); the helper shape is
+    /// durable if a new fatal path is added later.
+    ///
+    /// # Tier
+    ///
+    /// Tier-3 audit ordering pairing → tier-2 structural (one body,
+    /// one ordering, one contract).
+    ///
+    /// # DEF-117 preservation
+    ///
+    /// Uses [`core::mem::replace`] (not `take` + assign) to install
+    /// the terminal state directly; there is no transient `Idle`
+    /// window a concurrent `&self` read could misread as "healthy".
+    #[inline]
+    fn replace_state_errored_and_drain(
+        &mut self,
+        kind: crate::error::StateErrorKind,
+    ) -> Option<core::num::NonZeroU64> {
+        let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
+        self.read_buf.clear();
+        prev.take_inflight_reply_raw_id()
+    }
+
     /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
     /// and transition the state to [`ProtoState::Errored`].
     ///
@@ -771,19 +816,14 @@ impl PgProtocol {
         // bans unwrap but `unwrap_or` takes a default and is safe.
         let state_kind = crate::error::StateErrorKind::try_from_kind(kind)
             .unwrap_or(crate::error::StateErrorKind::INTERNAL_FALLBACK);
-        // DEF-117: `core::mem::replace` directly installs the
-        // terminal `Errored(kind)` state, eliminating the
-        // transient `Idle`-window that `core::mem::take` would
-        // create. No intermediate `Idle` for a concurrent &self
-        // read (if one were added) to misinterpret as "healthy".
-        //
-        // DEF-112: typed `ReplyId<K>` are distinct types per phase
-        // kind; extraction is centralised in
-        // [`ProtoState::take_inflight_reply_raw_id`] — one exhaustive
-        // match in `state.rs`, not duplicated here.
-        let prev = core::mem::replace(&mut self.state, ProtoState::Errored(state_kind));
-        let raw_id = prev.take_inflight_reply_raw_id();
-        self.read_buf.clear();
+        // DEF-149: `replace_state_errored_and_drain` centralises the
+        // atomic "install Errored(kind) + drain inflight raw_id +
+        // clear read_buf" triple. The three operations form one
+        // conceptual unit at the state-machine-terminus boundary;
+        // a future refactor that reorders them could produce
+        // observable state where Errored is set but read_buf still
+        // holds post-fatal bytes. The helper pins the ordering.
+        let raw_id = self.replace_state_errored_and_drain(state_kind);
         match raw_id {
             Some(id) => {
                 emit_actions!(staged, budget: 2, [
