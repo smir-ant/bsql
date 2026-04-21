@@ -201,7 +201,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
         other => panic!("expected [FailReply(FrameTooLarge 0xDEAD), CloseSocket], got {other:?}"),
     }
     assert!(
-        matches!(proto.state(), ProtoState::Errored(ErrorKind::Framing)),
+        matches!(proto.state(), ProtoState::Errored(k) if k.as_kind() == ErrorKind::Framing),
         "state after first fatal must be Errored(Framing), got {:?}",
         proto.state(),
     );
@@ -221,7 +221,8 @@ fn errored_cause_is_preserved_in_state_and_reply() {
             cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
             ..
         }] => {
-            assert_eq!(*prior_kind, ErrorKind::Framing,
+            // DEF-142 (pass-#8): prior_kind is StateErrorKind newtype.
+            assert_eq!(prior_kind.as_kind(), ErrorKind::Framing,
                 "ConnectionAlreadyClosed must carry the prior_kind classification");
         }
         other => panic!(
@@ -230,7 +231,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     }
     // State preservation: still Errored(Framing) after the push.
     assert!(
-        matches!(proto.state(), ProtoState::Errored(ErrorKind::Framing)),
+        matches!(proto.state(), ProtoState::Errored(k) if k.as_kind() == ErrorKind::Framing),
         "state must stay Errored(Framing) after push, got {:?}",
         proto.state(),
     );

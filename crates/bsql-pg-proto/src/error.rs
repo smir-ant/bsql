@@ -515,7 +515,13 @@ pub enum ProtocolError {
         /// connection. The full cause was emitted exactly once in
         /// the first `FailReply` action; the wrapper is expected to
         /// have preserved it.
-        prior_kind: ErrorKind,
+        ///
+        /// DEF-142 (pass-#8 F-056): typed as [`StateErrorKind`] (not
+        /// [`ErrorKind`]) so the type system proves this field can
+        /// never recursively be `AlreadyClosed` — a
+        /// `ConnectionAlreadyClosed { prior_kind: AlreadyClosed }`
+        /// nonsense value is a type error at construction.
+        prior_kind: StateErrorKind,
     },
 }
 
@@ -622,6 +628,131 @@ pub enum ErrorKind {
     /// the culprit. Pass-#8 F-052. 1 byte (repr(u8)).
     ClientOrdering = 6,
 }
+
+/// Subset of [`ErrorKind`] that CAN be stored in
+/// [`crate::state::ProtoState::Errored`] and carried as
+/// `prior_kind` of [`ProtocolError::ConnectionAlreadyClosed`].
+///
+/// # DEF-142 (pass-#8 F-056): tier-1 compile invariant
+///
+/// The invariant "state never holds `ErrorKind::AlreadyClosed`" was
+/// previously tier-3 audit — maintained by the `fail_inflight_and_close`
+/// early-return guard on already-Errored state. A future refactor
+/// that dropped the guard could route `AlreadyClosed` into state
+/// and the `prior_kind` field, producing nonsensical
+/// `ConnectionAlreadyClosed { prior_kind: AlreadyClosed }` diagnostics.
+///
+/// This newtype makes the invariant tier-1: the constructor
+/// [`Self::try_from_kind`] rejects `AlreadyClosed`, so
+/// `ProtoState::Errored(StateErrorKind)` cannot type-check with
+/// an `AlreadyClosed` kind at the construction site.
+///
+/// # Layout
+///
+/// `#[repr(transparent)]` — zero-cost over `ErrorKind`. Same 1-byte
+/// footprint; no discriminant or padding bloat. The newtype is
+/// compile-time only.
+///
+/// # Niche optimisation
+///
+/// Wrapping `ErrorKind` (which is `#[repr(u8)]` with 7 variants
+/// 0..=6) preserves the 248 unused discriminant values as niches,
+/// so `Option<StateErrorKind>` is still 1 byte just like
+/// `Option<ErrorKind>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct StateErrorKind(ErrorKind);
+
+impl StateErrorKind {
+    /// Const-evaluable fallback for the architecturally-dead branch
+    /// in `fail_inflight_and_close` where `try_from_kind` would
+    /// otherwise return `None`. Maps to `ErrorKind::Internal` —
+    /// the honest classification of "crate bug: a code path that
+    /// shouldn't be reachable fired."
+    ///
+    /// Never used in production traffic; exists solely so the
+    /// `unwrap_or_else` fallback in `fail_inflight_and_close` can
+    /// resolve to a concrete `StateErrorKind` without panic.
+    pub const INTERNAL_FALLBACK: Self = Self(ErrorKind::Internal);
+
+    /// Construct from a full [`ErrorKind`]. Returns `None` when
+    /// passed [`ErrorKind::AlreadyClosed`] — that variant is the
+    /// reply-only "pseudo-kind" that never reaches state.
+    ///
+    /// # Tier-1 pin
+    ///
+    /// The const match below is exhaustive; a future addition to
+    /// `ErrorKind` forces an explicit decision (state-storable or
+    /// not) here. Adding a new state-reachable variant without
+    /// extending this match is a build error.
+    #[inline]
+    #[must_use]
+    pub const fn try_from_kind(k: ErrorKind) -> Option<Self> {
+        match k {
+            ErrorKind::AlreadyClosed => None,
+            ErrorKind::Framing
+            | ErrorKind::Transport
+            | ErrorKind::ServerError
+            | ErrorKind::Auth
+            | ErrorKind::Internal
+            | ErrorKind::ClientOrdering => Some(Self(k)),
+        }
+    }
+
+    /// Infallible conversion — maps [`ErrorKind::AlreadyClosed`] to
+    /// `Internal` (a nonsensical `AlreadyClosed` reaching state
+    /// implies a crate bug, which is precisely what `Internal`
+    /// classifies).
+    ///
+    /// # When to use
+    ///
+    /// Production code should prefer [`Self::try_from_kind`] paired
+    /// with `.unwrap_or(Self::INTERNAL_FALLBACK)` at THE single
+    /// architecturally-dead call site in `fail_inflight_and_close`
+    /// — explicit fallback documents the intent.
+    ///
+    /// Tests and fixture code use `from_kind_or_internal(X)` to
+    /// produce a `StateErrorKind` from a known-valid literal
+    /// without Option ceremony.
+    #[inline]
+    #[must_use]
+    pub const fn from_kind_or_internal(k: ErrorKind) -> Self {
+        match Self::try_from_kind(k) {
+            Some(s) => s,
+            None => Self::INTERNAL_FALLBACK,
+        }
+    }
+
+    /// Unwrap to the underlying [`ErrorKind`]. Always non-
+    /// `AlreadyClosed` by the constructor's invariant.
+    #[inline]
+    #[must_use]
+    pub const fn as_kind(self) -> ErrorKind {
+        self.0
+    }
+}
+
+impl fmt::Display for StateErrorKind {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Delegate to ErrorKind's Debug (it doesn't impl Display
+        // currently; use Debug for uniformity).
+        write!(f, "{:?}", self.0)
+    }
+}
+
+// Drift pin: size/niche invariant. If these break, downstream
+// `ProtoState::Errored(StateErrorKind)` and `ConnectionAlreadyClosed
+// { prior_kind: StateErrorKind }` would grow beyond the documented
+// 1-byte budget.
+const _: () = assert!(
+    core::mem::size_of::<StateErrorKind>() == 1,
+    "StateErrorKind must stay 1 byte (#[repr(transparent)] over ErrorKind)",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<StateErrorKind>>() == 1,
+    "Option<StateErrorKind> must niche-pack to 1 byte (ErrorKind uses 7 of 256 u8 discriminants)",
+);
 
 impl ProtocolError {
     /// Compact kind classification for this error.

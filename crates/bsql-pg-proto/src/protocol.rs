@@ -608,10 +608,26 @@ impl PgProtocol {
                             ]);
                         }
                         DispatchOutcome::Errored { reply_id, cause } => {
-                            // DEF-061: store the compact 1-byte kind in
-                            // state; the full cause goes out in the
-                            // `FailReply` below, exactly once.
-                            self.state = ProtoState::Errored(cause.kind());
+                            // DEF-061 + DEF-142: store the compact
+                            // 1-byte `StateErrorKind` in state; the
+                            // full cause goes out in the `FailReply`
+                            // below, exactly once.
+                            //
+                            // `try_from_kind` returns None ONLY for
+                            // `ErrorKind::AlreadyClosed`, which is
+                            // emitted only by
+                            // `ProtocolError::ConnectionAlreadyClosed`,
+                            // which is only constructed by the
+                            // already-Errored push paths — and those
+                            // paths never reach `dispatch` (they
+                            // short-circuit in `push_command`). So
+                            // `unwrap_or(INTERNAL_FALLBACK)` is
+                            // architecturally dead here; fallback
+                            // classifies the nonsense case as
+                            // crate-internal.
+                            let state_kind = crate::error::StateErrorKind::try_from_kind(cause.kind())
+                                .unwrap_or(crate::error::StateErrorKind::INTERNAL_FALLBACK);
+                            self.state = ProtoState::Errored(state_kind);
                             match reply_id {
                                 // DEF-112: `reply_id` is now
                                 // `Option<NonZeroU64>` — already
@@ -679,12 +695,28 @@ impl PgProtocol {
         if matches!(self.state, ProtoState::Errored(_)) {
             return;
         }
-        // DEF-061 + DEF-094: compute kind before `cause` is moved
-        // into the FailReply StagedAction. Stored in state as 1-byte
-        // ErrorKind; full cause goes out in the one FailReply emitted
-        // below. `staged` is the phase-1 accumulator; entry-point
-        // materialises into `OutActions<'buf>`.
+        // DEF-061 + DEF-094 + DEF-142: compute kind before `cause`
+        // is moved into the FailReply StagedAction. Stored in state
+        // as 1-byte `StateErrorKind`; full cause goes out in the one
+        // FailReply emitted below.
+        //
+        // `StateErrorKind::try_from_kind` returns `None` ONLY for
+        // `ErrorKind::AlreadyClosed`. That kind is only produced by
+        // `ProtocolError::ConnectionAlreadyClosed`, which in turn
+        // is only emitted for already-Errored connections — and the
+        // `if matches!(self.state, Errored(_))` early-return above
+        // short-circuits BEFORE we reach this point for such cases.
+        // So `try_from_kind` is architecturally guaranteed to return
+        // `Some` here; the `unwrap_or_else` fallback is dead-safety
+        // (falls back to `Internal` as the honest "crate-bug" kind
+        // rather than panic — forbid-bundle bans panic).
         let kind = cause.kind();
+        // Architecturally `try_from_kind` returns Some here — see
+        // fallback doc above. `unwrap_or(INTERNAL_FALLBACK)` gives
+        // a const-evaluable fallback without panic; forbid-bundle
+        // bans unwrap but `unwrap_or` takes a default and is safe.
+        let state_kind = crate::error::StateErrorKind::try_from_kind(kind)
+            .unwrap_or(crate::error::StateErrorKind::INTERNAL_FALLBACK);
         // DEF-117: `core::mem::replace` directly installs the
         // terminal `Errored(kind)` state, eliminating the
         // transient `Idle`-window that `core::mem::take` would
@@ -695,7 +727,7 @@ impl PgProtocol {
         // kind; extraction is centralised in
         // [`ProtoState::take_inflight_reply_raw_id`] — one exhaustive
         // match in `state.rs`, not duplicated here.
-        let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
+        let prev = core::mem::replace(&mut self.state, ProtoState::Errored(state_kind));
         let raw_id = prev.take_inflight_reply_raw_id();
         self.read_buf.clear();
         match raw_id {
@@ -2167,9 +2199,9 @@ mod allows_unsolicited_param_status_tests {
         consume_state(scram_authok);
 
         // Errored — rejecting (terminal; no traffic accepted).
-        // DEF-061: Errored carries ErrorKind (1 byte), not the full
-        // ProtocolError.
-        let errored = ProtoState::Errored(crate::error::ErrorKind::Framing);
+        // DEF-061 + DEF-142: Errored carries `StateErrorKind`
+        // (1 byte, AlreadyClosed-excluded newtype over ErrorKind).
+        let errored = ProtoState::Errored(crate::error::StateErrorKind::from_kind_or_internal(crate::error::ErrorKind::Framing));
         assert!(!allows_unsolicited_param_status(&errored));
         consume_state(errored);
 
@@ -2337,9 +2369,12 @@ mod compute_push_tests {
         // cause was surfaced in the earlier FailReply (when the
         // connection was first torn down). The state retains only the
         // kind (1-byte Copy).
+        // DEF-142 (pass-#8): prior_kind is now `StateErrorKind` — the
+        // AlreadyClosed-free newtype. Test constructs via helper.
         use crate::error::ErrorKind;
         let raw_id = nz(102);
-        let prior_kind = ErrorKind::Framing;
+        let prior_kind_raw = ErrorKind::Framing;
+        let prior_kind = crate::error::StateErrorKind::from_kind_or_internal(prior_kind_raw);
         let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_id) };
         let (new_state, staged) = compute_staged(cmd, ProtoState::Errored(prior_kind));
 
@@ -2353,7 +2388,7 @@ mod compute_push_tests {
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
                 }) if *id == raw_id && *pk == prior_kind
             ),
-            "expected FailReply(ConnectionAlreadyClosed{{prior_kind={prior_kind:?}}})",
+            "expected FailReply(ConnectionAlreadyClosed{{prior_kind={prior_kind_raw:?}}})",
         );
 
         // State: Errored(prior_kind) preserved unchanged.
@@ -2625,12 +2660,13 @@ mod compute_push_tests {
 
     #[test]
     fn startup_from_errored_preserves_kind_and_fails_with_connection_already_closed() {
-        // DEF-061 semantic — same shape as
+        // DEF-061 + DEF-142 semantic — same shape as
         // `ping_from_errored_preserves_kind_and_fails_with_connection_already_closed`.
         use crate::error::ErrorKind;
         let Some(user) = mk_user() else { return };
         let raw_id = nz(302);
-        let prior_kind = ErrorKind::Framing;
+        let prior_kind_raw = ErrorKind::Framing;
+        let prior_kind = crate::error::StateErrorKind::from_kind_or_internal(prior_kind_raw);
         let cmd = PgCommand::Startup {
             user,
             database: None,
@@ -2650,7 +2686,7 @@ mod compute_push_tests {
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
                 }) if *id == raw_id && *pk == prior_kind
             ),
-            "expected FailReply(ConnectionAlreadyClosed{{prior_kind={prior_kind:?}}})",
+            "expected FailReply(ConnectionAlreadyClosed{{prior_kind={prior_kind_raw:?}}})",
         );
 
         // State: Errored(prior_kind) preserved.

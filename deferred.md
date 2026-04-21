@@ -1734,3 +1734,55 @@ Current form is optimal under the forbid bundle.
 Audit this section at each MSRV bump. When an entry's feature
 stabilises, the entry turns into a work item (add to sub-phase
 task list, implement, delete from here).
+
+---
+
+## 23. Closed DEFs from pass-#8
+
+### DEF-138 — rename `inflight_reply_raw_id` → `take_inflight_reply_raw_id` ✅ CLOSED (2026-04-21)
+
+See §21 entry (pass-#7 deferred record) — closed in pass-#8 polish
+commit. Method receiver is `self` by value (consuming); `take_`
+prefix mirrors `Option::take` / `Vec::drain` stdlib convention.
+
+### DEF-139 — `debug_assert!` in `materialise` on `range.apply` None ✅ CLOSED (2026-04-21)
+
+Closed transitively by pass-#8 F-007: `debug_assert!(slice.is_some())`
+added INSIDE `NonEmptyRange::apply` (action.rs:183), covering both
+`materialise` call sites through one shield.
+
+### DEF-140 — `FromPgText` doctest freshness ✅ CLOSED (2026-04-21)
+
+Doctest rewritten to model crate discipline — no `.unwrap()` in
+happy path, `let-else` + `?` for error propagation.
+
+### DEF-142 — ErrorKind split via StateErrorKind newtype ✅ CLOSED (2026-04-21)
+
+**Origin.** Pass-#8 F-056 — `ErrorKind::AlreadyClosed` is
+documented as a "pseudo-kind" that never reaches state, but the
+invariant was tier-3 audit. A future refactor that accidentally
+routed `AlreadyClosed` into state would produce nonsensical
+`ConnectionAlreadyClosed { prior_kind: AlreadyClosed }` replies.
+
+**Fix.** New `StateErrorKind(ErrorKind)` newtype with
+`#[repr(transparent)]` — same 1-byte footprint, same niche-packed
+`Option<_>`, but the constructor `try_from_kind` rejects
+`AlreadyClosed`. `ProtoState::Errored(StateErrorKind)` and
+`ProtocolError::ConnectionAlreadyClosed { prior_kind: StateErrorKind }`
+both narrowed to the AlreadyClosed-free subset. Tier-3 audit →
+tier-1 compile.
+
+**Convenience.** `StateErrorKind::from_kind_or_internal(k)` is the
+infallible fallback (maps `AlreadyClosed` to `Internal`) for test
+fixtures. Production `fail_inflight_and_close` uses
+`try_from_kind(k).unwrap_or(INTERNAL_FALLBACK)` at the one
+architecturally-dead construction site.
+
+**Touched files.** error.rs (+ newtype + 2 const-asserts),
+state.rs (type change), protocol.rs (2 call sites + test helpers),
+3 test files (pattern rewrites: nested `prior_kind:` patterns
+unpacked to outer `match` + inner `as_kind()` compare because
+guard-patterns-inside-patterns remain unstable). lib.rs re-export.
+
+**Test count.** 188 → 188 (semantics preserved, no new tests
+needed — existing tests exercise the new types).

@@ -418,7 +418,7 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
     // FailReply action above, which the test already pins.
     use bsql_pg_proto::error::ErrorKind;
     match proto.state() {
-        ProtoState::Errored(ErrorKind::Transport) => {}
+        ProtoState::Errored(k) if k.as_kind() == ErrorKind::Transport => {}
         other => panic!(
             "state must be Errored(Transport), got {other:?}",
         ),
@@ -619,10 +619,11 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     // DEF-061: state carries ErrorKind::ServerError (1 byte), the
     // full diagnostic cause went out in the FailReply above.
     use bsql_pg_proto::error::ErrorKind;
-    assert!(matches!(
-        proto.state(),
-        ProtoState::Errored(ErrorKind::ServerError),
-    ));
+    // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
+    match proto.state() {
+        ProtoState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
+        other => panic!("expected Errored(ServerError), got {other:?}"),
+    }
 
     // First post-terminal frame: a well-formed RFQ. Expect zero actions
     // (the terminal sink silently drops it) and the kind preserved.
@@ -632,10 +633,11 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
         0,
         "post-terminal RFQ must emit zero actions, got {post_out_1:?}",
     );
-    assert!(matches!(
-        proto.state(),
-        ProtoState::Errored(ErrorKind::ServerError),
-    ));
+    // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
+    match proto.state() {
+        ProtoState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
+        other => panic!("expected Errored(ServerError), got {other:?}"),
+    }
 
     // Second post-terminal frame: an ErrorResponse that would *normally*
     // classify as a separate ServerError. The original kind must still
@@ -646,10 +648,11 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
         0,
         "post-terminal ErrorResponse must emit zero actions, got {post_out_2:?}",
     );
-    assert!(matches!(
-        proto.state(),
-        ProtoState::Errored(ErrorKind::ServerError),
-    ));
+    // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
+    match proto.state() {
+        ProtoState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
+        other => panic!("expected Errored(ServerError), got {other:?}"),
+    }
 }
 
 /// Invariant (spec): `push_command` on a protocol that has already
@@ -689,24 +692,31 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
     match out.as_slice() {
         [Action::FailReply { id: failed_id, cause }] => {
             assert_eq!(failed_id, &second_raw, "fail correlates to the new command");
-            assert!(
-                matches!(
-                    cause,
-                    ProtocolError::ConnectionAlreadyClosed {
-                        prior_kind: ErrorKind::ServerError,
-                    }
-                ),
-                "cause must be ConnectionAlreadyClosed{{ServerError}}, got {cause:?}",
-            );
+            // DEF-142 (pass-#8): `prior_kind` is `StateErrorKind`,
+            // a newtype over `ErrorKind`. We pattern-match the outer
+            // variant then check `.as_kind()` via an outer guard —
+            // guard patterns inside patterns are still experimental.
+            match cause {
+                ProtocolError::ConnectionAlreadyClosed { prior_kind: pk } => {
+                    assert_eq!(
+                        pk.as_kind(),
+                        ErrorKind::ServerError,
+                        "cause must be ConnectionAlreadyClosed{{ServerError}}, got {cause:?}",
+                    );
+                }
+                other => panic!("cause must be ConnectionAlreadyClosed, got {other:?}"),
+            }
         }
         other => panic!("unexpected action shape: {other:?}"),
     }
 
     // State unchanged — kind preserved.
-    assert!(matches!(
-        proto.state(),
-        ProtoState::Errored(ErrorKind::ServerError),
-    ));
+    match proto.state() {
+        ProtoState::Errored(k) => {
+            assert_eq!(k.as_kind(), ErrorKind::ServerError);
+        }
+        other => panic!("expected Errored(ServerError), got {other:?}"),
+    }
 }
 
 /// Invariant (spec, DEF-062): `NoticeResponse` (tag `'N'`) is a

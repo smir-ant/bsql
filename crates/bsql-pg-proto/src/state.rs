@@ -22,7 +22,7 @@
 use crate::action::{DescribedRows, ParamOids};
 use crate::decode::RowDesc;
 use crate::error::BoundedStr;
-use crate::error::ErrorKind;
+use crate::error::StateErrorKind;
 use crate::ident::PodBytes;
 use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
@@ -453,12 +453,23 @@ pub enum ProtoState {
     /// same call, so by the time the state is observable as `Errored`
     /// the wrapper has already received the diagnostic.
     ///
-    /// Never left. DEF-061: carries [`ErrorKind`] (1 byte) not the full
-    /// [`ProtocolError`]. The full cause went out once in the first
-    /// `FailReply`; subsequent pushes get a compact
+    /// Never left. DEF-061 + DEF-142: carries [`StateErrorKind`]
+    /// (1 byte), the `AlreadyClosed`-free subset of
+    /// [`crate::error::ErrorKind`]. The full cause went out once in
+    /// the first `FailReply`; subsequent pushes get a compact
     /// [`crate::error::ProtocolError::ConnectionAlreadyClosed`]
     /// carrying the `prior_kind` for diagnostic context.
-    Errored(ErrorKind),
+    ///
+    /// # Why `StateErrorKind` and not `ErrorKind`
+    ///
+    /// DEF-142 (pass-#8 F-056) narrows the carried type from the
+    /// full `ErrorKind` to the `StateErrorKind` newtype. The
+    /// invariant "state never holds the `AlreadyClosed`
+    /// pseudo-kind" was previously tier-3 audit (maintained by the
+    /// `fail_inflight_and_close` early-return guard); now it's
+    /// tier-1 compile — constructing `Errored(AlreadyClosed)` is a
+    /// type error at the `StateErrorKind::try_from_kind` call site.
+    Errored(StateErrorKind),
 }
 
 impl ProtoState {
