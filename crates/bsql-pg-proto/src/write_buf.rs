@@ -222,6 +222,17 @@ impl WriteBuf {
             .map_err(|_| WriteBufFull)
     }
 
+    /// Push a `u16` in big-endian. Used for non-negative count fields
+    /// in PG wire messages (e.g., `n_params` in Bind). Equivalent to
+    /// `push_i16_be(val as i16)` when the value fits `i16::MAX`, but
+    /// the crate bans `as` casts — call `push_u16_be` directly instead.
+    pub fn push_u16_be(&mut self, val: u16) -> Result<(), WriteBufFull> {
+        let bytes = val.to_be_bytes();
+        self.inner
+            .extend_from_slice(&bytes)
+            .map_err(|_| WriteBufFull)
+    }
+
     /// Push raw bytes.
     pub fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
         self.inner
@@ -263,6 +274,43 @@ impl WriteBuf {
         // Patch the placeholder at `start..start+4`.
         if let Some(slot) = self.inner.get_mut(start..start.saturating_add(4)) {
             slot.copy_from_slice(&len_bytes);
+        }
+        Ok(())
+    }
+
+    /// Write an `i32` length-prefixed body where the length counts
+    /// ONLY the body bytes (not the 4-byte length field itself).
+    ///
+    /// PG Bind frame `per-param: len i32 + bytes` uses this shape
+    /// (vs [`with_length_prefix`] which uses the "length includes
+    /// itself" convention for top-level frames).
+    ///
+    /// The placeholder is reserved, the body function runs, the
+    /// placeholder is patched with the body-only byte count. If any
+    /// write overflows the buffer, `Err(WriteBufFull)` propagates.
+    ///
+    /// Note: for PG's SQL NULL param (wire length `-1`, no body),
+    /// callers should `push_i32_be(-1)` directly instead of using
+    /// this helper.
+    pub fn with_i32_length_prefixed_body<F>(
+        &mut self,
+        body_fn: F,
+    ) -> Result<(), WriteBufFull>
+    where
+        F: FnOnce(&mut Self) -> Result<(), WriteBufFull>,
+    {
+        let len_offset = self.inner.len();
+        self.push_i32_be(0)?; // placeholder
+        let body_start = self.inner.len();
+        body_fn(self)?;
+        let body_len = self.inner.len().saturating_sub(body_start);
+        let body_len_i32 = i32::try_from(body_len).map_err(|_| WriteBufFull)?;
+        let bytes = body_len_i32.to_be_bytes();
+        if let Some(slot) = self
+            .inner
+            .get_mut(len_offset..len_offset.saturating_add(4))
+        {
+            slot.copy_from_slice(&bytes);
         }
         Ok(())
     }

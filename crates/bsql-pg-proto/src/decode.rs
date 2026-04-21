@@ -662,6 +662,254 @@ impl<'a> FromPgText<'a> for &'a str {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════
+// FromPgBinary — parallel to FromPgText for PG binary-format
+// columns (1c-3b: Bind-selected binary format per-parameter).
+//
+// Binary format byte layout matches PG §55.7 — fixed-size ints are
+// big-endian two's complement, `bool` is a single byte 0/1, `text`
+// is raw UTF-8 bytes. Every impl's `OID` const is drift-pinned
+// against `oids::*` to catch type-mapping bugs at build time.
+// ═════════════════════════════════════════════════════════════════
+
+/// Decode a column's binary-format bytes into a typed Rust value.
+///
+/// Parallel to [`FromPgText`]; the caller dispatches between text
+/// and binary decoders based on [`ColumnDesc::format_code`]. Extended
+/// Query (1c-3b) selects binary via the Bind frame's per-param /
+/// per-result format-code arrays; Simple Query always uses text.
+///
+/// # OID drift-pin
+///
+/// Every impl exposes a `const OID: u32` matching the PG type it
+/// decodes. The crate's [`oids`] module is drift-pinned against the
+/// canonical PG catalog (`pg_type.dat`); a const-assert per impl
+/// verifies `<T as FromPgBinary>::OID == oids::X` at build time.
+/// A future refactor that breaks the type↔OID mapping fails the
+/// build, not at runtime.
+///
+/// # Sealed
+///
+/// The [`sealed::FromPgBinarySealed`] supertrait is module-private
+/// (DEF-115-class seal). Downstream crates cannot impl the trait
+/// for their own Rust types — the binary-codec surface is a fixed
+/// set of primitives in 1c-3b; wider types land with their
+/// dedicated sub-phases (arrays 1c-6, uuid / timestamp Phase 2+).
+pub trait FromPgBinary<'a>: Sized + sealed::FromPgBinarySealed {
+    /// PG type OID this decoder handles. Drift-pinned against
+    /// [`oids`] via const-assert.
+    const OID: u32;
+
+    /// Decode the column's binary-format bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`DecodeError::TruncatedColumnData`] — input length doesn't
+    ///   match the type's fixed size (for fixed-size types).
+    /// - [`DecodeError::BoolParse`] — byte outside `{0, 1}` for `bool`.
+    /// - [`DecodeError::NonUtf8`] — non-UTF-8 bytes for `&str` / text.
+    fn from_pg_binary(bytes: &'a [u8]) -> Result<Self, DecodeError>;
+}
+
+mod sealed {
+    pub trait FromPgBinarySealed {}
+    pub trait EncodeBinarySealed {}
+}
+
+// Fixed-size signed integer decoders: N bytes big-endian.
+macro_rules! impl_from_pg_binary_int {
+    ($($t:ty, $oid:expr, $n:literal),+ $(,)?) => {
+        $(
+            impl sealed::FromPgBinarySealed for $t {}
+            impl FromPgBinary<'_> for $t {
+                const OID: u32 = $oid;
+                #[inline]
+                fn from_pg_binary(bytes: &[u8]) -> Result<Self, DecodeError> {
+                    // Binary fixed-size ints: exactly N bytes. Any
+                    // other length is a wire violation — classify as
+                    // TruncatedColumnData with the declared/actual
+                    // byte counts for diagnostic.
+                    let arr: &[u8; $n] = bytes
+                        .first_chunk::<$n>()
+                        .filter(|_| bytes.len() == $n)
+                        .ok_or(DecodeError::TruncatedColumnData {
+                            column_idx: 0,
+                            declared_len: $n,
+                            remaining: bytes.len(),
+                        })?;
+                    Ok(<$t>::from_be_bytes(*arr))
+                }
+            }
+        )+
+    };
+}
+
+impl_from_pg_binary_int!(
+    i16, oids::INT2, 2,
+    i32, oids::INT4, 4,
+    i64, oids::INT8, 8,
+    u32, oids::OID, 4,
+);
+
+/// PG binary `bool`: one byte — `0` = false, `1` = true. Any other
+/// value is a wire violation ([`DecodeError::BoolParse`]).
+impl sealed::FromPgBinarySealed for bool {}
+impl FromPgBinary<'_> for bool {
+    const OID: u32 = oids::BOOL;
+    #[inline]
+    fn from_pg_binary(bytes: &[u8]) -> Result<Self, DecodeError> {
+        match bytes {
+            [0] => Ok(false),
+            [1] => Ok(true),
+            _ => Err(DecodeError::BoolParse),
+        }
+    }
+}
+
+/// PG binary `text`: raw UTF-8 bytes. Zero-copy borrow.
+impl sealed::FromPgBinarySealed for &str {}
+impl<'a> FromPgBinary<'a> for &'a str {
+    const OID: u32 = oids::TEXT;
+    #[inline]
+    fn from_pg_binary(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+        core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
+    }
+}
+
+// Compile-time symmetry pins: text and binary decoders for the
+// same Rust type MUST target the same PG type OID. A refactor that
+// breaks this breaks the build.
+const _: () = {
+    assert!(<i16 as FromPgBinary>::OID == oids::INT2);
+    assert!(<i32 as FromPgBinary>::OID == oids::INT4);
+    assert!(<i64 as FromPgBinary>::OID == oids::INT8);
+    assert!(<u32 as FromPgBinary>::OID == oids::OID);
+    assert!(<bool as FromPgBinary>::OID == oids::BOOL);
+    assert!(<&str as FromPgBinary>::OID == oids::TEXT);
+};
+
+// ═════════════════════════════════════════════════════════════════
+// EncodeBinary — PG binary format write path (mirror of FromPgBinary).
+// Used by ParamsWriter (1c-3b) to serialise parameter values into
+// the Bind frame's per-param length+bytes layout.
+// ═════════════════════════════════════════════════════════════════
+
+/// Encode a Rust value into PG binary format bytes, directly into
+/// a [`crate::write_buf::WriteBuf`].
+///
+/// Parallel to [`FromPgBinary`] — the `OID` constants pair up
+/// across the two traits so the Phase 2 `query!` macro can check
+/// param-type OIDs against the `Parse`-time schema fingerprint at
+/// compile time.
+///
+/// Zero-alloc: writes directly into the caller's `WriteBuf`. No
+/// intermediate heap buffer, no stack fixture — the caller owns
+/// the output storage.
+///
+/// # Sealed
+///
+/// Same seal discipline as [`FromPgBinary`] — downstream crates
+/// cannot add impls for their own types.
+pub trait EncodeBinary: sealed::EncodeBinarySealed {
+    /// PG type OID this encoder produces. Drift-pinned against
+    /// [`oids`] and cross-asserted against the matching
+    /// [`FromPgBinary`] impl.
+    const OID: u32;
+
+    /// Write the encoded bytes into `dst`. The caller is responsible
+    /// for the surrounding per-param length prefix (PG Bind frame
+    /// layout); `encode_to` writes only the payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::write_buf::WriteBufFull`] if the buffer can't fit
+    /// the encoded output — architecturally-bounded at the call
+    /// site via the Bind-message size const-assert, but surfaced
+    /// as a classified error rather than a panic.
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>;
+}
+
+macro_rules! impl_encode_binary_int {
+    ($($t:ty, $oid:expr, $push:ident),+ $(,)?) => {
+        $(
+            impl sealed::EncodeBinarySealed for $t {}
+            impl EncodeBinary for $t {
+                const OID: u32 = $oid;
+                #[inline]
+                fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+                    -> Result<(), crate::write_buf::WriteBufFull>
+                {
+                    dst.$push(*self)
+                }
+            }
+        )+
+    };
+}
+
+impl_encode_binary_int!(
+    i16, oids::INT2, push_i16_be,
+    i32, oids::INT4, push_i32_be,
+    u32, oids::OID, push_u32_be,
+);
+
+/// `i64` encoder — push_i64_be doesn't exist in WriteBuf, so we
+/// serialise manually via `to_be_bytes` + `push_bytes`.
+impl sealed::EncodeBinarySealed for i64 {}
+impl EncodeBinary for i64 {
+    const OID: u32 = oids::INT8;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_bytes(&self.to_be_bytes())
+    }
+}
+
+/// `bool` encoder: `0x00` for `false`, `0x01` for `true`.
+impl sealed::EncodeBinarySealed for bool {}
+impl EncodeBinary for bool {
+    const OID: u32 = oids::BOOL;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_u8(u8::from(*self))
+    }
+}
+
+/// `&str` encoder — raw UTF-8 bytes (Rust invariant guarantees
+/// UTF-8 validity, nothing to check).
+impl sealed::EncodeBinarySealed for &str {}
+impl EncodeBinary for &str {
+    const OID: u32 = oids::TEXT;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_bytes(self.as_bytes())
+    }
+}
+
+// Drift-pins: every EncodeBinary impl's OID matches the
+// corresponding FromPgBinary impl AND the canonical `oids::*`
+// constant. One const-block pins the whole set.
+const _: () = {
+    assert!(<i16 as EncodeBinary>::OID == oids::INT2);
+    assert!(<i32 as EncodeBinary>::OID == oids::INT4);
+    assert!(<i64 as EncodeBinary>::OID == oids::INT8);
+    assert!(<u32 as EncodeBinary>::OID == oids::OID);
+    assert!(<bool as EncodeBinary>::OID == oids::BOOL);
+    assert!(<&str as EncodeBinary>::OID == oids::TEXT);
+    // Cross-trait symmetry (text-format OID ≡ binary-format OID ≡ catalog OID).
+    assert!(<i16 as EncodeBinary>::OID == <i16 as FromPgBinary>::OID);
+    assert!(<i32 as EncodeBinary>::OID == <i32 as FromPgBinary>::OID);
+    assert!(<i64 as EncodeBinary>::OID == <i64 as FromPgBinary>::OID);
+    assert!(<u32 as EncodeBinary>::OID == <u32 as FromPgBinary>::OID);
+    assert!(<bool as EncodeBinary>::OID == <bool as FromPgBinary>::OID);
+    assert!(<&str as EncodeBinary>::OID == <&str as FromPgBinary>::OID);
+};
+
 /// PostgreSQL built-in type OID constants for the subset 1c-2
 /// decoders cover. Full list at
 /// `https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat`.

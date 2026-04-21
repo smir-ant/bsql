@@ -93,6 +93,7 @@ mod dispatch;
 pub mod error;
 pub mod frame;
 pub mod ident;
+pub mod params;
 pub mod password;
 pub mod protocol;
 pub mod reply_id;
