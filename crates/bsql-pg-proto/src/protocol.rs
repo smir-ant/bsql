@@ -336,10 +336,12 @@ impl PgProtocol {
     ///   macro-compile time); `None` for DML / RETURNING-less stmts.
     ///   A `None` row_desc + server-emitted DataRow is a tier-2
     ///   shield — the dispatch arm classifies as UnexpectedFrame.
-    /// - `max_rows` — 1c-3b scope restricts to `0` (fetch all). A
-    ///   non-zero value triggers `PortalSuspended` which the
-    ///   dispatch path classifies as UnexpectedFrame (tier-2); full
-    ///   chunked-fetch support lands in 1c-6.
+    /// - `fetch` — row-count scope. 1c-3b only accepts
+    ///   [`crate::FetchRows::All`] (fetch all rows). The enum's
+    ///   `#[non_exhaustive]` leaves room for a `Chunked(NonZeroU32)`
+    ///   variant in 1c-6 when chunked-fetch flow lands. F83: using
+    ///   an enum instead of `u32` promotes the "must be zero" scope
+    ///   guard from tier-3 docs to tier-1 compile.
     /// - `reply` — typed correlator; delivered via
     ///   [`crate::Action::DeliverReply`] as [`crate::Reply::QueryComplete`]
     ///   on success.
@@ -365,7 +367,7 @@ impl PgProtocol {
         stmt_name: &crate::ident::StmtName,
         params: &P,
         row_desc: Option<crate::decode::RowDesc>,
-        max_rows: u32,
+        fetch: crate::command::FetchRows,
         reply: ReplyId<crate::reply_id::QueryKind>,
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 'static> {
@@ -378,7 +380,7 @@ impl PgProtocol {
             stmt_name,
             params,
             row_desc,
-            max_rows,
+            fetch,
             reply,
             &mut staged,
             write_buf,
@@ -1310,13 +1312,13 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
 /// 'E' | len_i32 | portal_name NUL | max_rows_i32
 /// ```
 ///
-/// `max_rows = 0` = fetch all rows, no `PortalSuspended`. 1c-3b
-/// restricts to this value at the API level (push_bind_execute
-/// takes a `u32`, but the dispatch arm classifies PortalSuspended
-/// as `UnexpectedFrame`). 1c-6 lifts the restriction.
+/// `max_rows` is derived from the caller's [`crate::FetchRows`] —
+/// 1c-3b scope produces `0` (fetch all). F83: the enum narrows the
+/// API to only variants the sub-phase supports, turning tier-3 docs
+/// into tier-1 compile.
 fn build_execute_message(
     portal_name: &crate::ident::PortalName,
-    max_rows: u32,
+    fetch: crate::command::FetchRows,
     write_buf: &mut WriteBuf,
 ) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
     use crate::write_buf::WriteBufFull;
@@ -1325,7 +1327,7 @@ fn build_execute_message(
     write_buf.push_u8(crate::wire::TAG_EXECUTE.byte())?;
     write_buf.with_length_prefix(|w| {
         w.push_nul_terminated(portal_name.as_bytes())?;
-        w.push_u32_be(max_rows)
+        w.push_i32_be(fetch.as_wire_i32())
     })?;
     crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
 }
@@ -1354,7 +1356,7 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
     stmt_name: &crate::ident::StmtName,
     params: &P,
     row_desc: Option<crate::decode::RowDesc>,
-    max_rows: u32,
+    fetch: crate::command::FetchRows,
     reply: ReplyId<crate::reply_id::QueryKind>,
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
@@ -1366,7 +1368,7 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
             // build-unreachable path (const-asserted fit) — we
             // surface it the same way as other stages.
             match build_bind_message(portal_name, stmt_name, params, write_buf) {
-                Ok(bind_range) => match build_execute_message(portal_name, max_rows, write_buf) {
+                Ok(bind_range) => match build_execute_message(portal_name, fetch, write_buf) {
                     Ok(execute_range) => {
                         emit_actions!(staged, budget: 3, [
                             StagedAction::SendBytesRange(bind_range),

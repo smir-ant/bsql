@@ -25,7 +25,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, PgProtocol, PortalName, ProtoState, ProtocolError, QueryKind, Reply, ReplyId, StmtName,
+    Action, FetchRows, PgProtocol, PortalName, ProtoState, ProtocolError, QueryKind, Reply, ReplyId, StmtName,
     WriteBuf,
     decode::RowDesc,
     wire::{
@@ -128,7 +128,7 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
         &stmt_unnamed(),
         &(),
         None,
-        0,
+        FetchRows::All,
         id(reply_raw),
         &mut wb,
     );
@@ -170,7 +170,7 @@ fn bind_execute_dml_full_round_trip() {
         &stmt_unnamed(),
         &(42i32,),
         None,
-        0,
+        FetchRows::All,
         id(reply_raw),
         &mut wb,
     );
@@ -214,7 +214,7 @@ fn bind_execute_select_with_schema_streams_rows() {
         &stmt_unnamed(),
         &(),
         Some(schema),
-        0,
+        FetchRows::All,
         id(reply_raw),
         &mut wb,
     );
@@ -255,7 +255,7 @@ fn bind_error_is_recoverable() {
         &stmt_unnamed(),
         &(),
         None,
-        0,
+        FetchRows::All,
         id(reply_raw),
         &mut wb,
     );
@@ -303,7 +303,7 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
         &stmt_unnamed(),
         &(),
         None, // DML path
-        0,
+        FetchRows::All,
         id(reply_raw),
         &mut wb,
     );
@@ -342,7 +342,7 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
         &stmt_unnamed(),
         &(),
         None,
-        0,
+        FetchRows::All,
         id(reply_raw),
         &mut wb,
     );
@@ -392,7 +392,7 @@ fn bind_execute_from_errored_is_connection_already_closed() {
         &stmt_unnamed(),
         &(),
         None,
-        0,
+        FetchRows::All,
         id(reply_raw),
         &mut wb,
     );
@@ -423,7 +423,7 @@ fn bind_execute_while_in_flight_is_command_in_progress() {
         &stmt_unnamed(),
         &(),
         None,
-        0,
+        FetchRows::All,
         id(first),
         &mut wb,
     );
@@ -439,7 +439,7 @@ fn bind_execute_while_in_flight_is_command_in_progress() {
         &stmt_unnamed(),
         &(),
         None,
-        0,
+        FetchRows::All,
         id(second),
         &mut wb,
     );
@@ -482,7 +482,7 @@ fn bind_frame_wire_layout_empty_params() {
         &stmt_unnamed(),
         &(),
         None,
-        0,
+        FetchRows::All,
         id(raw(900)),
         &mut wb,
     );
@@ -526,7 +526,7 @@ fn execute_frame_wire_layout_unnamed_portal() {
         &stmt_unnamed(),
         &(),
         None,
-        0,
+        FetchRows::All,
         id(raw(901)),
         &mut wb,
     );
@@ -568,7 +568,7 @@ fn bind_frame_null_param_wire_layout() {
         &stmt_unnamed(),
         &(none_i32,),
         None,
-        0,
+        FetchRows::All,
         id(raw(903)),
         &mut wb,
     );
@@ -616,7 +616,7 @@ fn bind_frame_optional_mixed_with_some_and_none() {
         &stmt_unnamed(),
         &(Some(42i32), None::<&str>),
         None,
-        0,
+        FetchRows::All,
         id(raw(904)),
         &mut wb,
     );
@@ -668,7 +668,7 @@ fn bind_frame_wire_layout_one_i32_param() {
         &stmt_unnamed(),
         &(42i32,),
         None,
-        0,
+        FetchRows::All,
         id(raw(902)),
         &mut wb,
     );

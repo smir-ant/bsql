@@ -161,3 +161,56 @@ pub enum PgCommand {
         reply: ReplyId<QueryKind>,
     },
 }
+
+/// How many rows a bound portal should produce before pausing.
+///
+/// Parameter of [`crate::PgProtocol::push_bind_execute`]. Encoded on
+/// the wire in the PG `Execute` frame as a 4-byte `i32` — but the
+/// type system narrows the user-facing API to the variants this
+/// sub-phase supports.
+///
+/// # F83 (pass #6 audit, 2026-04-21)
+///
+/// Pre-F83 `push_bind_execute` took `max_rows: u32`. User supplying
+/// any non-zero value caused the server to emit `PortalSuspended`
+/// which the dispatcher classified as `UnexpectedFrame` → connection
+/// teardown. Tier-3 runtime trap documented only in the method's
+/// docstring; the compiler gave users no signal.
+///
+/// F83 replaces `u32` with this enum. In 1c-3b scope, only
+/// [`Self::All`] exists — a user passing anything else is a build
+/// error. The `#[non_exhaustive]` leaves room for [`Self::Chunked`]
+/// in 1c-6 when the full chunked-fetch protocol flow lands (proper
+/// `PortalSuspended` handling with subsequent `Execute` calls to
+/// resume). When that ships, users transition from `All` to
+/// `Chunked(NonZeroU32)` and the variant-level dispatch threads the
+/// correct response shape.
+///
+/// # Tier uplift
+///
+/// `max_rows: u32` → tier-3 docs ("must be zero").
+/// `FetchRows::All` → tier-1 compile ("only variant exists").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FetchRows {
+    /// Fetch all rows the portal produces (no `PortalSuspended`).
+    /// Maps to the wire value `max_rows = 0`.
+    All,
+    // Future (1c-6):
+    //   /// Cap the per-Execute row count. Server emits
+    //   /// `PortalSuspended` after the limit; resume with a
+    //   /// subsequent Execute.
+    //   Chunked(core::num::NonZeroU32),
+}
+
+impl FetchRows {
+    /// Wire-encoding — the `i32` value PG expects in the Execute
+    /// frame's `max_rows` field.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn as_wire_i32(self) -> i32 {
+        match self {
+            Self::All => 0,
+        }
+    }
+}

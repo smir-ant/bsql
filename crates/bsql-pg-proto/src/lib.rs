@@ -109,7 +109,7 @@ pub use action::{
     QueryCompletePayload, Reply, StartupCompletePayload, TxStatus,
 };
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
-pub use command::PgCommand;
+pub use command::{FetchRows, PgCommand};
 pub use decode::{
     ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, FromPgText, MAX_ROW_COLUMNS,
     RowDesc, oids,
