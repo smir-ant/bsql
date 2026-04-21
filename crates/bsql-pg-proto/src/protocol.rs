@@ -848,10 +848,13 @@ fn compute_push_ping(
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindComplete { .. }
-        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -970,10 +973,13 @@ fn compute_push_startup(
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindComplete { .. }
-        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1067,10 +1073,13 @@ fn compute_push_simple_query(
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindComplete { .. }
-        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1219,10 +1228,13 @@ fn compute_push_parse(
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindComplete { .. }
-        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1268,16 +1280,15 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
     write_buf.with_length_prefix(|w| {
         w.push_nul_terminated(portal_name.as_bytes())?;
         w.push_nul_terminated(stmt_name.as_bytes())?;
-        // n_param_formats = COUNT — every param ships in binary.
+        // n_param_formats = COUNT, followed by COUNT × Binary (wire
+        // value 1). The `ParamEncoder` seal guarantees every param
+        // ships in binary format — no Text path to dispatch, just
+        // write the wire value `1` directly COUNT times. Eliminates
+        // the per-element `match format { ... }` of the initial
+        // 1c-3b draft — fewer branches in the hot bind path.
         w.push_u16_be(P::COUNT)?;
-        for format in P::FORMATS {
-            // `FormatCode::Binary as u16 == 1`; crate bans `as`, use
-            // explicit match in push_u16_be-compatible form.
-            let code = match format {
-                crate::decode::FormatCode::Text => 0,
-                crate::decode::FormatCode::Binary => 1,
-            };
-            w.push_u16_be(code)?;
+        for _ in 0..P::COUNT {
+            w.push_u16_be(1)?;
         }
         w.push_u16_be(P::COUNT)?;
         params.write_params(w)?;
@@ -1331,7 +1342,7 @@ fn build_execute_message(
 ///
 /// | current state             | action                                   | new state                                   |
 /// |---------------------------|------------------------------------------|---------------------------------------------|
-/// | `Idle` (build OK)         | 3× `SendBytes(Bind, Execute, SYNC)`      | `BindExecuteAwaitingBindComplete { reply }` |
+/// | `Idle` (build OK)         | 3× `SendBytes(Bind, Execute, SYNC)`      | `BindExecuteAwaitingBindComplete{Dml,Select}` (depending on row_desc) |
 /// | `Idle` (build Err)        | `FailReply(OutboundFrameBuildUnreachable)` | `Idle` (unchanged)                        |
 /// | `Errored(kind)`           | `FailReply(ConnectionAlreadyClosed)`     | `Errored(kind)` preserved                   |
 /// | any `Connecting*`         | `FailReply(StartupAlreadyInProgress)`    | same state preserved                        |
@@ -1362,7 +1373,21 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                             StagedAction::SendBytesRange(execute_range),
                             StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
                         ]);
-                        ProtoState::BindExecuteAwaitingBindComplete { reply, row_desc }
+                        // Tier-1 structural dispatch: decide the
+                        // schema-lessDML vs schema-bearing SELECT
+                        // path ONCE, here at push time. Downstream
+                        // dispatch arms match on the specific
+                        // variant — no runtime `match row_desc`
+                        // at the 'D' arm.
+                        match row_desc {
+                            Some(desc) => {
+                                ProtoState::BindExecuteAwaitingBindCompleteSelect {
+                                    reply,
+                                    row_desc: desc,
+                                }
+                            }
+                            None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
+                        }
                     }
                     Err(_) => {
                         // TIER-1 COMPILE DEAD BRANCH — const assert
@@ -1423,10 +1448,13 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindComplete { .. }
-        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1475,10 +1503,13 @@ const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindComplete { .. }
-        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfq { .. } => true,
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. } => true,
         ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
         | ProtoState::ConnectingScramAwaitingServerFirst { .. }
@@ -1727,12 +1758,17 @@ mod allows_unsolicited_param_status_tests {
             ProtoState::SimpleQueryAwaitingFirstResponse(id) => {
                 id.consume();
             }
+            ProtoState::BindExecuteAwaitingBindCompleteDml(id)
+            | ProtoState::BindExecuteAwaitingCommandCompleteDml(id) => {
+                id.consume();
+            }
             ProtoState::SimpleQueryStreamingRows { reply, .. }
             | ProtoState::SimpleQueryAwaitingRfq { reply, .. }
-            | ProtoState::BindExecuteAwaitingBindComplete { reply, .. }
-            | ProtoState::BindExecuteAwaitingDataOrComplete { reply, .. }
+            | ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }
+            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }
             | ProtoState::BindExecuteStreamingRows { reply, .. }
-            | ProtoState::BindExecuteAwaitingRfq { reply, .. } => {
+            | ProtoState::BindExecuteAwaitingRfqSelect { reply, .. }
+            | ProtoState::BindExecuteAwaitingRfqDml { reply, .. } => {
                 reply.consume();
             }
             ProtoState::ParseAwaitingParseComplete(reply)
@@ -1913,12 +1949,17 @@ mod compute_push_tests {
             ProtoState::SimpleQueryAwaitingFirstResponse(id) => {
                 id.consume();
             }
+            ProtoState::BindExecuteAwaitingBindCompleteDml(id)
+            | ProtoState::BindExecuteAwaitingCommandCompleteDml(id) => {
+                id.consume();
+            }
             ProtoState::SimpleQueryStreamingRows { reply, .. }
             | ProtoState::SimpleQueryAwaitingRfq { reply, .. }
-            | ProtoState::BindExecuteAwaitingBindComplete { reply, .. }
-            | ProtoState::BindExecuteAwaitingDataOrComplete { reply, .. }
+            | ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }
+            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }
             | ProtoState::BindExecuteStreamingRows { reply, .. }
-            | ProtoState::BindExecuteAwaitingRfq { reply, .. } => {
+            | ProtoState::BindExecuteAwaitingRfqSelect { reply, .. }
+            | ProtoState::BindExecuteAwaitingRfqDml { reply, .. } => {
                 reply.consume();
             }
             ProtoState::ParseAwaitingParseComplete(reply)

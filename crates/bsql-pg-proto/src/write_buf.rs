@@ -289,6 +289,25 @@ impl WriteBuf {
             .map_err(|_| WriteBufFull)
     }
 
+    /// Push an `i64` in big-endian — used by the PG binary-format
+    /// encoder for `int8` / `bigint` columns.
+    pub fn push_i64_be(&mut self, val: i64) -> Result<(), WriteBufFull> {
+        let bytes = val.to_be_bytes();
+        self.inner
+            .extend_from_slice(&bytes)
+            .map_err(|_| WriteBufFull)
+    }
+
+    /// Push a `u64` in big-endian — reserved for future unsigned
+    /// 8-byte PG wire fields (1c-3b has none, added for API symmetry
+    /// with the `u32` / `u16` pair).
+    pub fn push_u64_be(&mut self, val: u64) -> Result<(), WriteBufFull> {
+        let bytes = val.to_be_bytes();
+        self.inner
+            .extend_from_slice(&bytes)
+            .map_err(|_| WriteBufFull)
+    }
+
     /// Push raw bytes.
     pub fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
         self.inner

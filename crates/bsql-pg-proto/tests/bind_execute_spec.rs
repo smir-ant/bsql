@@ -145,7 +145,8 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
 
     assert!(matches!(
         proto.state(),
-        ProtoState::BindExecuteAwaitingBindComplete { .. }
+        ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+            | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
     ));
 
     // Drain to Idle so ReplyId's Drop-guard doesn't trip.
@@ -286,10 +287,11 @@ fn bind_error_is_recoverable() {
 // Scope guards — 1c-3b restrictions classify loudly
 // ═════════════════════════════════════════════════════════════════
 
-/// F19-style structural shield: `BindExecuteAwaitingDataOrComplete`
-/// with `row_desc = None` + server-emitted DataRow → UnexpectedFrame.
-/// User asked for DML-shape but server sent rows — classify, don't
-/// silently decode without schema.
+/// Tier-1 structural shield: DML path (`AwaitingCommandCompleteDml`)
+/// has NO 'D' dispatch arm — server-emitted DataRow → UnexpectedFrame
+/// at the typed variant level, not via `match row_desc: Option<_>`.
+/// Users asking for DML-shape and server shipping rows is caught
+/// by variant dispatch.
 #[test]
 fn bind_execute_data_row_without_schema_is_unexpected_frame() {
     let mut proto = PgProtocol::new();
@@ -427,7 +429,8 @@ fn bind_execute_while_in_flight_is_command_in_progress() {
     );
     assert!(matches!(
         proto.state(),
-        ProtoState::BindExecuteAwaitingBindComplete { .. }
+        ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+            | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
     ));
 
     let second = raw(802);
@@ -450,7 +453,8 @@ fn bind_execute_while_in_flight_is_command_in_progress() {
     // First state preserved.
     assert!(matches!(
         proto.state(),
-        ProtoState::BindExecuteAwaitingBindComplete { .. }
+        ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+            | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
     ));
 
     // Drain the first reply so its ReplyId doesn't trip the Drop-guard.
@@ -539,6 +543,108 @@ fn execute_frame_wire_layout_unnamed_portal() {
             b'E', 0, 0, 0, 9, // tag + length=9
             0,    // empty portal + NUL
             0, 0, 0, 0, // max_rows = 0 (fetch all)
+        ],
+    );
+
+    // Drain.
+    let mut drain = std::vec::Vec::new();
+    drain.extend_from_slice(&bind_complete_frame());
+    drain.extend_from_slice(&command_complete_frame(b""));
+    drain.extend_from_slice(&rfq_frame(b'I'));
+    let _ = proto.feed_bytes(&drain, &mut wb);
+}
+
+/// Option<T: EncodeBinary> NULL-path: `None` emits `len = -1` with
+/// no body bytes (SQL NULL on the wire). Verifies the
+/// `ParamEncoder for Option<T>` impl.
+#[test]
+fn bind_frame_null_param_wire_layout() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+
+    let none_i32: Option<i32> = None;
+    let out = proto.push_bind_execute(
+        &portal_unnamed(),
+        &stmt_unnamed(),
+        &(none_i32,),
+        None,
+        0,
+        id(raw(903)),
+        &mut wb,
+    );
+    let bind_bytes = match out.as_slice() {
+        [Action::SendBytes(bind), ..] => bind.to_vec(),
+        other => panic!("expected SendBytes as first action, got {other:?}"),
+    };
+    // Expected:
+    //   'B' | len | '\0' portal | '\0' stmt |
+    //   0x0001 nf | 0x0001 Binary |
+    //   0x0001 np | 0xFFFFFFFF (-1 = SQL NULL, no body) |
+    //   0x0000 nr
+    // Total body = 4 + 2 + 2 + 2 + 2 + 4 + 2 = 18; length field = 18
+    assert_eq!(
+        bind_bytes,
+        vec![
+            b'B', 0, 0, 0, 18,       // tag + length
+            0,                        // portal NUL
+            0,                        // stmt NUL
+            0, 1,                     // n_param_formats = 1
+            0, 1,                     // format[0] = Binary
+            0, 1,                     // n_params = 1
+            0xff, 0xff, 0xff, 0xff,   // param[0].length = -1 (NULL)
+            0, 0,                     // n_result_formats = 0
+        ],
+    );
+
+    // Drain.
+    let mut drain = std::vec::Vec::new();
+    drain.extend_from_slice(&bind_complete_frame());
+    drain.extend_from_slice(&command_complete_frame(b""));
+    drain.extend_from_slice(&rfq_frame(b'I'));
+    let _ = proto.feed_bytes(&drain, &mut wb);
+}
+
+/// Option<T> mixed: `Some(42)` writes the body normally, `None`
+/// writes -1. Verifies the impl dispatches correctly per element.
+#[test]
+fn bind_frame_optional_mixed_with_some_and_none() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+
+    let out = proto.push_bind_execute(
+        &portal_unnamed(),
+        &stmt_unnamed(),
+        &(Some(42i32), None::<&str>),
+        None,
+        0,
+        id(raw(904)),
+        &mut wb,
+    );
+    let bind_bytes = match out.as_slice() {
+        [Action::SendBytes(bind), ..] => bind.to_vec(),
+        other => panic!("expected SendBytes, got {other:?}"),
+    };
+    // Expected:
+    //   tag + len + NUL + NUL + 0x0002 nf + 2×Binary(0x0001) +
+    //   0x0002 np + [0x00000004 + i32=42] + [0xFFFFFFFF NULL] +
+    //   0x0000 nr
+    // Length computation:
+    //   4 (len_field) + 1 (portal NUL) + 1 (stmt NUL) +
+    //   2 (nf) + 2*2 (formats) + 2 (np) +
+    //   4 (p0.len) + 4 (p0.body i32) + 4 (p1.len = -1) + 2 (nr)
+    //   = 28 bytes body; length field value = 28
+    //   Total frame = 1 (tag) + 28 = 29 bytes
+    assert_eq!(
+        bind_bytes,
+        vec![
+            b'B', 0, 0, 0, 28,        // tag + length=28
+            0, 0,                     // NUL-NUL (portal + stmt both empty)
+            0, 2,                     // n_param_formats = 2
+            0, 1, 0, 1,               // 2× Binary
+            0, 2,                     // n_params = 2
+            0, 0, 0, 4, 0, 0, 0, 42,  // Some(42): len=4, i32=42 BE
+            0xff, 0xff, 0xff, 0xff,   // None: len=-1
+            0, 0,                     // n_result_formats = 0
         ],
     );
 

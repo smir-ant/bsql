@@ -40,20 +40,94 @@
 //! into smaller statements or wait for a dynamic-params API (not
 //! planned for Phase 1c).
 //!
-//! Every element type must implement [`crate::decode::EncodeBinary`];
-//! the trait is sealed, so the supported type set is fixed per sub-phase
-//! (1c-3b: `i16` / `i32` / `i64` / `u32` / `bool` / `&str`).
+//! Every element type must implement [`ParamEncoder`] — a sealed
+//! intermediate trait that adds SQL-NULL handling on top of
+//! [`crate::decode::EncodeBinary`]:
+//!
+//! - `T: EncodeBinary` gets a blanket `impl ParamEncoder for T` that
+//!   writes the non-NULL path (4-byte length prefix + body).
+//! - `Option<T: EncodeBinary>` gets a dedicated impl that writes
+//!   `-1` + no body for `None` (SQL NULL) or defers to the blanket
+//!   for `Some(v)`.
+//!
+//! Result: `push_bind_execute(&(user_id, maybe_email))` where
+//! `maybe_email: Option<&str>` encodes `user_id` as non-NULL and
+//! `maybe_email` as NULL-or-bytes with zero user intervention.
 
 use crate::decode::{EncodeBinary, FormatCode};
 use crate::write_buf::{WriteBuf, WriteBufFull};
 
 /// Module-private seal. Only the tuple impls inside this crate can
-/// opt a type into [`ParamsWriter`].
+/// opt a type into [`ParamsWriter`], and only `ParamEncoder` impls
+/// in THIS module can satisfy the per-element trait.
 mod sealed {
     /// Supertrait seal for [`super::ParamsWriter`]. Module-private
     /// so external crates cannot impl it, closing downstream
     /// "custom tuple-like types" holes (DEF-115-class seal).
     pub trait ParamsWriterSealed {}
+
+    /// Supertrait seal for [`super::ParamEncoder`]. Gates which
+    /// Rust types can appear as PG Bind-frame parameters. Module-
+    /// private so no downstream crate can introduce a custom
+    /// `ParamEncoder` that bypasses the NULL/non-NULL discipline.
+    pub trait ParamEncoderSealed {}
+}
+
+/// Per-element parameter encoder — writes the PG Bind-frame's
+/// `{len_i32, [u8; len]}` shape for ONE parameter value, handling
+/// the SQL NULL case (`len = -1`, no body) if the element is an
+/// [`Option`].
+///
+/// # Sealed
+///
+/// Module-private seal via [`sealed::ParamEncoderSealed`] — only
+/// two impls exist:
+/// - `impl<T: EncodeBinary> ParamEncoder for T` — the non-NULL
+///   path, writes `len` + bytes via
+///   [`WriteBuf::with_i32_length_prefixed_body`].
+/// - `impl<T: EncodeBinary> ParamEncoder for Option<T>` — the
+///   NULL-aware path.
+///
+/// These two impls don't overlap at trait-resolution time because
+/// `Option<T>` doesn't impl [`EncodeBinary`] — the blanket doesn't
+/// apply to it, so the dedicated `Option` impl is the only
+/// candidate.
+pub trait ParamEncoder: sealed::ParamEncoderSealed {
+    /// PG type OID this encoder targets. For `T: EncodeBinary`
+    /// this equals `T::OID`; for `Option<T>` it equals `T::OID`
+    /// (the SQL NULL's type is the inner value's type).
+    const OID: u32;
+
+    /// Write exactly one param's `{len_i32, [u8; len]}` (non-NULL)
+    /// or `{-1}` (NULL) pair into `dst`.
+    fn write_param(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull>;
+}
+
+// Blanket impl for all non-Option EncodeBinary types.
+impl<T: EncodeBinary> sealed::ParamEncoderSealed for T {}
+impl<T: EncodeBinary> ParamEncoder for T {
+    const OID: u32 = <T as EncodeBinary>::OID;
+    #[inline]
+    fn write_param(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
+        dst.with_i32_length_prefixed_body(|w| self.encode_to(w))
+    }
+}
+
+// Dedicated impl for Option<T> — None → SQL NULL wire form.
+// Does NOT conflict with the blanket because Option<T> doesn't
+// impl EncodeBinary (intentionally — the NULL concept belongs in
+// the param layer, not the byte encoder).
+impl<T: EncodeBinary> sealed::ParamEncoderSealed for Option<T> {}
+impl<T: EncodeBinary> ParamEncoder for Option<T> {
+    const OID: u32 = <T as EncodeBinary>::OID;
+    #[inline]
+    fn write_param(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
+        match self {
+            Some(value) => dst.with_i32_length_prefixed_body(|w| value.encode_to(w)),
+            // SQL NULL wire form: length = -1, no body bytes follow.
+            None => dst.push_i32_be(-1),
+        }
+    }
 }
 
 /// Upper bound on tuple arity supported by [`ParamsWriter`] impls
@@ -155,30 +229,26 @@ macro_rules! params_writer_impl {
     // sequence of tuple field indices (0, 1, ..., N-1), `$($t:ident)+`
     // is the sequence of type parameters (A, B, ..., Z-style).
     ($count:literal, [$($t:ident : $idx:tt),+ $(,)?]) => {
-        impl<$($t: EncodeBinary),+> sealed::ParamsWriterSealed for ($($t,)+) {}
+        impl<$($t: ParamEncoder),+> sealed::ParamsWriterSealed for ($($t,)+) {}
 
-        impl<$($t: EncodeBinary),+> ParamsWriter for ($($t,)+) {
+        impl<$($t: ParamEncoder),+> ParamsWriter for ($($t,)+) {
             const COUNT: u16 = $count;
-            // Every current EncodeBinary param ships in binary format —
-            // the trait seal guarantees this.
-            const FORMATS: &'static [FormatCode] = &[$({
-                // Introduce the type-param dependency so the array
-                // literal is (trivially) a function of `$t`, not
-                // a free-standing repeat.
-                let _ = <$t as EncodeBinary>::OID;
-                FormatCode::Binary
-            }),+];
-            const OIDS: &'static [u32] = &[$(<$t as EncodeBinary>::OID),+];
+            // Every param ships Binary format. Token-muncher macro
+            // `emit_binary_per_token!($t)` consumes the `$t` ident
+            // and produces the literal `FormatCode::Binary` — this
+            // pattern avoids `let _ = <$t>::OID;` (banned by the
+            // crate's `never let _` rule) while keeping the macro
+            // repetition tied to the type-param list.
+            const FORMATS: &'static [FormatCode] = &[$(emit_binary_per_token!($t)),+];
+            const OIDS: &'static [u32] = &[$(<$t as ParamEncoder>::OID),+];
 
             #[inline]
             fn write_params(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
                 $(
-                    // Each param: i32 length prefix + body bytes.
-                    // `with_i32_length_prefixed_body` reserves the
-                    // 4-byte length slot, lets the encoder write the
-                    // body, then patches the length with the actual
-                    // body-byte count.
-                    dst.with_i32_length_prefixed_body(|w| self.$idx.encode_to(w))?;
+                    // Each param goes through `ParamEncoder::write_param`
+                    // which handles len-prefix + body (non-NULL) or
+                    // len=-1 (SQL NULL for Option<T>).
+                    self.$idx.write_param(dst)?;
                 )+
                 Ok(())
             }
@@ -186,16 +256,13 @@ macro_rules! params_writer_impl {
 
         // Per-arity coherence drift-pin: `COUNT == $count`.
         //
-        // Note on `FORMATS.len() == COUNT` and `OIDS.len() == COUNT`:
-        // these invariants are enforced STRUCTURALLY by the macro —
-        // the number of `$t` repetitions in the invocation literally
-        // determines both the arity AND the length of the generated
-        // FORMATS/OIDS slices. A hand-coherent miscount (e.g.,
-        // declaring COUNT=3 while writing two elements) is impossible
-        // via the macro — the caller's invocation can only list N
-        // `$t:$idx` pairs for one specific N. So the runtime `.len()`
-        // assert would be tautological (and `usize::from(u16)` isn't
-        // const-stable in MSRV 1.95 regardless).
+        // `FORMATS.len() == COUNT` and `OIDS.len() == COUNT` are
+        // enforced STRUCTURALLY by the macro — the number of `$t`
+        // repetitions drives both the arity and the slice lengths,
+        // so the caller-invocation `$count, [A:0, B:1, C:2]` can
+        // only describe ONE N-triple. Runtime `.len()` asserts
+        // would be tautological (and `usize::from(u16)` isn't
+        // const-stable in MSRV 1.95).
         const _: () = {
             type Anchor = ($(repeat_as_i32!($t),)+);
             assert!(<Anchor as ParamsWriter>::COUNT == $count);
@@ -210,6 +277,14 @@ macro_rules! params_writer_impl {
 /// reference `<Anchor as ParamsWriter>::COUNT`).
 macro_rules! repeat_as_i32 {
     ($_t:ident) => { i32 };
+}
+
+/// Token-munging helper — consume a `$t` ident and emit the literal
+/// `FormatCode::Binary`. Lets the `params_writer_impl!` macro thread
+/// its `$t` repetition through FORMATS without resorting to
+/// `let _ = <$t>::OID;` (crate-banned).
+macro_rules! emit_binary_per_token {
+    ($_t:ident) => { FormatCode::Binary };
 }
 
 // ───────────────── Arity 0..=16 impls ─────────────────

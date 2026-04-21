@@ -596,71 +596,133 @@ pub(crate) fn dispatch(
         // =============================================================
         // Phase 1c-3b: Extended Query — Bind + Execute flow
         //
-        // State transitions per PG §55.2.2:
-        //   BindExecute+Sync sent → AwaitingBindComplete
-        //     '2' (BindComplete)    → AwaitingDataOrComplete
-        //     'E' (ErrorResponse)   → DrainRfqAfterError (FailReply,
-        //                             query-level recoverable)
-        //   AwaitingDataOrComplete
-        //     'D' (DataRow) + schema → StreamingRows + StreamRow emit
-        //     'D' (DataRow) no schema→ UnexpectedFrame (can't decode
-        //                              rows without schema — user
-        //                              provided None; 1c-3b DML-only
-        //                              path without pre-Describe)
-        //     'C' (CommandComplete)  → AwaitingRfq
-        //     'E' (ErrorResponse)    → DrainRfqAfterError
-        //     's' (PortalSuspended)  → UnexpectedFrame (1c-3b scope:
-        //                              max_rows=0 only; 1c-6 lifts
-        //                              this restriction)
-        //   StreamingRows
-        //     'D' (DataRow)          → stream_row_or_errored
-        //     'C'                    → AwaitingRfq
-        //     'E'                    → DrainRfqAfterError
-        //     's'                    → UnexpectedFrame (scope)
-        //   AwaitingRfq
-        //     'Z' (ReadyForQuery)    → Idle + DeliverReply(QueryComplete)
+        // Flow splits at `push_bind_execute` call time by whether the
+        // caller provided a `row_desc`:
+        //
+        // • SCHEMA-LESS (DML) path — 3 states, 'D' is UnexpectedFrame
+        //   at every stage since there's no schema to decode rows with:
+        //     AwaitingBindCompleteDml → '2' → AwaitingCommandCompleteDml
+        //     AwaitingCommandCompleteDml → 'C' → AwaitingRfqDml
+        //     AwaitingRfqDml → 'Z' → Idle + DeliverReply(row_desc=None)
+        //
+        // • SCHEMA-BEARING (SELECT) path — 4 states, 'D' streams rows:
+        //     AwaitingBindCompleteSelect → '2' → AwaitingDataOrCompleteSelect
+        //     AwaitingDataOrCompleteSelect → 'D' → StreamingRows (+emit)
+        //                                  → 'C' → AwaitingRfqSelect
+        //     StreamingRows → 'D' → StreamingRows (+emit)
+        //                   → 'C' → AwaitingRfqSelect
+        //     AwaitingRfqSelect → 'Z' → Idle + DeliverReply(row_desc=Some)
+        //
+        // Shared-across-paths:
+        //   'E' (ErrorResponse) at ANY state → drain-after-error
+        //                                      (query-level recoverable)
+        //   's' (PortalSuspended) → UnexpectedFrame (1c-3b scope;
+        //                           1c-6 lifts for chunked fetch)
+        //
+        // Tier uplift vs pre-split: the "can we stream rows?"
+        // decision is resolved at the VARIANT level (tier-1 structural
+        // dispatch) instead of via a runtime `match row_desc: Option<_>`
+        // at the 'D' arm.
         // =============================================================
 
-        (ProtoState::BindExecuteAwaitingBindComplete { reply, row_desc }, TAG_BIND_COMPLETE) => {
+        // ─── DML path ───
+
+        (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_BIND_COMPLETE) => {
             DispatchOutcome::AdvancedSilent {
-                new_state: ProtoState::BindExecuteAwaitingDataOrComplete { reply, row_desc },
+                new_state: ProtoState::BindExecuteAwaitingCommandCompleteDml(reply),
             }
         }
-        (ProtoState::BindExecuteAwaitingBindComplete { reply, .. }, TAG_ERROR_RESPONSE) => {
+        (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply, payload)
         }
-        (ProtoState::BindExecuteAwaitingBindComplete { reply, .. }, other) => {
+        (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        (ProtoState::BindExecuteAwaitingDataOrComplete { reply, row_desc }, TAG_DATA_ROW) => {
-            // F19 structural invariant: StreamingRows implies schema.
-            // If user supplied None (DML path) and server unexpectedly
-            // emitted a DataRow, there's no schema to embed — classify
-            // as UnexpectedFrame. This is the 1c-3b "tier-2 shield on
-            // decoded-row-needs-schema" from the design doc.
-            match row_desc {
-                Some(desc) => stream_row_or_errored(reply, desc, coords),
-                None => errored(
-                    Some(reply.consume()),
-                    ProtocolError::UnexpectedFrame { tag: TAG_DATA_ROW },
-                ),
+        (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_COMMAND_COMPLETE) => {
+            match parse_command_tag(payload) {
+                Ok(command_tag) => DispatchOutcome::AdvancedSilent {
+                    new_state: ProtoState::BindExecuteAwaitingRfqDml { reply, command_tag },
+                },
+                Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
-        (ProtoState::BindExecuteAwaitingDataOrComplete { reply, row_desc }, TAG_COMMAND_COMPLETE) => {
-            advance_to_bindexecute_awaiting_rfq(reply, payload, row_desc)
-        }
-        (ProtoState::BindExecuteAwaitingDataOrComplete { reply, .. }, TAG_ERROR_RESPONSE) => {
+        (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply, payload)
         }
-        (ProtoState::BindExecuteAwaitingDataOrComplete { reply, .. }, TAG_PORTAL_SUSPENDED) => {
-            // 1c-3b scope: max_rows = 0 only. Server emitting
-            // PortalSuspended implies a non-zero max_rows somewhere
-            // — shouldn't happen under our current API. Classify
-            // explicitly (not silently ignored).
+        (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_PORTAL_SUSPENDED) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED })
         }
-        (ProtoState::BindExecuteAwaitingDataOrComplete { reply, .. }, other) => {
+        (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), other) => {
+            // Includes 'D' (DataRow) — structurally no schema here,
+            // server emitting rows is a wire violation.
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        (
+            ProtoState::BindExecuteAwaitingRfqDml { reply, command_tag },
+            TAG_READY_FOR_QUERY,
+        ) => match payload {
+            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
+                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
+                    new_state: ProtoState::Idle,
+                    action: crate::action::deliver(
+                        reply,
+                        crate::action::QueryCompletePayload {
+                            command_tag,
+                            tx_status,
+                            row_desc: None,
+                        },
+                    ),
+                },
+                None => errored(
+                    Some(reply.consume()),
+                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+                ),
+            },
+            other => errored(
+                Some(reply.consume()),
+                ProtocolError::MalformedReadyForQuery { payload_len: other.len() },
+            ),
+        },
+        (ProtoState::BindExecuteAwaitingRfqDml { reply, .. }, other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // ─── SELECT path ───
+
+        (
+            ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, row_desc },
+            TAG_BIND_COMPLETE,
+        ) => DispatchOutcome::AdvancedSilent {
+            new_state: ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc },
+        },
+        (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(reply, payload)
+        }
+        (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        (
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc },
+            TAG_DATA_ROW,
+        ) => stream_row_or_errored(reply, row_desc, coords),
+        (
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc },
+            TAG_COMMAND_COMPLETE,
+        ) => advance_to_bindexecute_awaiting_rfq_select(reply, payload, row_desc),
+        (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(reply, payload)
+        }
+        (
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. },
+            TAG_PORTAL_SUSPENDED,
+        ) => errored(
+            Some(reply.consume()),
+            ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED },
+        ),
+        (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
@@ -668,7 +730,7 @@ pub(crate) fn dispatch(
             stream_row_or_errored(reply, row_desc, coords)
         }
         (ProtoState::BindExecuteStreamingRows { reply, row_desc }, TAG_COMMAND_COMPLETE) => {
-            advance_to_bindexecute_awaiting_rfq(reply, payload, Some(row_desc))
+            advance_to_bindexecute_awaiting_rfq_select(reply, payload, row_desc)
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply, payload)
@@ -681,7 +743,7 @@ pub(crate) fn dispatch(
         }
 
         (
-            ProtoState::BindExecuteAwaitingRfq { reply, command_tag, row_desc },
+            ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag, row_desc },
             TAG_READY_FOR_QUERY,
         ) => match payload {
             [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
@@ -692,7 +754,7 @@ pub(crate) fn dispatch(
                         crate::action::QueryCompletePayload {
                             command_tag,
                             tx_status,
-                            row_desc,
+                            row_desc: Some(row_desc),
                         },
                     ),
                 },
@@ -703,12 +765,10 @@ pub(crate) fn dispatch(
             },
             other => errored(
                 Some(reply.consume()),
-                ProtocolError::MalformedReadyForQuery {
-                    payload_len: other.len(),
-                },
+                ProtocolError::MalformedReadyForQuery { payload_len: other.len() },
             ),
         },
-        (ProtoState::BindExecuteAwaitingRfq { reply, .. }, other) => {
+        (ProtoState::BindExecuteAwaitingRfqSelect { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
@@ -1282,21 +1342,21 @@ fn advance_to_awaiting_rfq(
     }
 }
 
-/// 1c-3b helper: `CommandComplete` → `BindExecuteAwaitingRfq`.
+/// 1c-3b helper: `CommandComplete` on the schema-bearing (SELECT)
+/// path → `BindExecuteAwaitingRfqSelect`. The schema (`RowDesc`) is
+/// mandatory by the target variant's shape — caller pattern-matched
+/// it from `AwaitingDataOrCompleteSelect` or `StreamingRows`.
 ///
-/// Parallel to [`advance_to_awaiting_rfq`] for the Extended Query
-/// Bind/Execute flow. Each of the `AwaitingDataOrComplete` and
-/// `StreamingRows` states needs this transition on `'C'`; the helper
-/// centralises the "command-tag parse + state construction" pair in
-/// one place so an arm-body edit in only one call site cannot diverge.
-fn advance_to_bindexecute_awaiting_rfq(
+/// The DML path's 'C' transition is inlined directly in the dispatch
+/// arm (one call-site only) and doesn't need a helper.
+fn advance_to_bindexecute_awaiting_rfq_select(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
-    row_desc: Option<crate::decode::RowDesc>,
+    row_desc: crate::decode::RowDesc,
 ) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
-            new_state: ProtoState::BindExecuteAwaitingRfq {
+            new_state: ProtoState::BindExecuteAwaitingRfqSelect {
                 reply,
                 command_tag,
                 row_desc,

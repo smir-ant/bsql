@@ -357,6 +357,19 @@ pub enum DecodeError {
     /// Failed to parse a boolean — PG text format emits `"t"` / `"f"`;
     /// anything else classifies here. 1c-2c.
     BoolParse,
+    /// A binary-format fixed-size column's byte length doesn't match
+    /// the decoder's expectation (e.g. an `i32` decoder receiving 3
+    /// bytes, or 5). 1c-3b binary-path classification — separate from
+    /// [`Self::TruncatedColumnData`] which reports row-scoped
+    /// truncation with a column index. Binary decoders run per-column
+    /// through [`FromPgBinary`] and don't know the column index at
+    /// their call site; this variant is honest about that.
+    BinaryLengthMismatch {
+        /// Bytes the decoder expected (fixed-size for ints / bool).
+        expected_len: u8,
+        /// Bytes actually received.
+        actual_len: u16,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -381,6 +394,10 @@ impl fmt::Display for DecodeError {
             Self::NonUtf8 => f.write_str("column bytes are not valid UTF-8"),
             Self::IntParse => f.write_str("column text is not a valid integer for the target type"),
             Self::BoolParse => f.write_str("column text is not a PG boolean (expected \"t\" or \"f\")"),
+            Self::BinaryLengthMismatch { expected_len, actual_len } => write!(
+                f,
+                "binary column byte length mismatch: expected {expected_len}, got {actual_len}",
+            ),
         }
     }
 }
@@ -726,16 +743,16 @@ macro_rules! impl_from_pg_binary_int {
                 #[inline]
                 fn from_pg_binary(bytes: &[u8]) -> Result<Self, DecodeError> {
                     // Binary fixed-size ints: exactly N bytes. Any
-                    // other length is a wire violation — classify as
-                    // TruncatedColumnData with the declared/actual
-                    // byte counts for diagnostic.
+                    // other length is classified via
+                    // `BinaryLengthMismatch` — a per-type honest error
+                    // that doesn't lie about a column index the decoder
+                    // can't know.
                     let arr: &[u8; $n] = bytes
                         .first_chunk::<$n>()
                         .filter(|_| bytes.len() == $n)
-                        .ok_or(DecodeError::TruncatedColumnData {
-                            column_idx: 0,
-                            declared_len: $n,
-                            remaining: bytes.len(),
+                        .ok_or_else(|| DecodeError::BinaryLengthMismatch {
+                            expected_len: $n,
+                            actual_len: u16::try_from(bytes.len()).unwrap_or(u16::MAX),
                         })?;
                     Ok(<$t>::from_be_bytes(*arr))
                 }
@@ -751,8 +768,10 @@ impl_from_pg_binary_int!(
     u32, oids::OID, 4,
 );
 
-/// PG binary `bool`: one byte — `0` = false, `1` = true. Any other
-/// value is a wire violation ([`DecodeError::BoolParse`]).
+/// PG binary `bool`: one byte — `0` = false, `1` = true.
+/// Wrong byte length classifies as [`DecodeError::BinaryLengthMismatch`];
+/// length-1 with an out-of-range byte classifies as
+/// [`DecodeError::BoolParse`].
 impl sealed::FromPgBinarySealed for bool {}
 impl FromPgBinary<'_> for bool {
     const OID: u32 = oids::BOOL;
@@ -761,7 +780,11 @@ impl FromPgBinary<'_> for bool {
         match bytes {
             [0] => Ok(false),
             [1] => Ok(true),
-            _ => Err(DecodeError::BoolParse),
+            [_] => Err(DecodeError::BoolParse),
+            _ => Err(DecodeError::BinaryLengthMismatch {
+                expected_len: 1,
+                actual_len: u16::try_from(bytes.len()).unwrap_or(u16::MAX),
+            }),
         }
     }
 }
@@ -853,8 +876,6 @@ impl_encode_binary_int!(
     u32, oids::OID, push_u32_be,
 );
 
-/// `i64` encoder — push_i64_be doesn't exist in WriteBuf, so we
-/// serialise manually via `to_be_bytes` + `push_bytes`.
 impl sealed::EncodeBinarySealed for i64 {}
 impl EncodeBinary for i64 {
     const OID: u32 = oids::INT8;
@@ -862,7 +883,7 @@ impl EncodeBinary for i64 {
     fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
-        dst.push_bytes(&self.to_be_bytes())
+        dst.push_i64_be(*self)
     }
 }
 

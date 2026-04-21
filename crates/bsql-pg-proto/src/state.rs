@@ -266,59 +266,88 @@ pub enum ProtoState {
     // carried through state transitions same as F19 — no separate
     // slot on PgProtocol.
 
+    // The BindExecute flow splits into TWO state families based on
+    // whether the user provided a row_desc (SELECT with schema) or
+    // not (DML / RETURNING-less). The split encodes the "can we
+    // stream decoded rows?" decision at the VARIANT level rather
+    // than runtime-matching on `Option<RowDesc>` at the 'D'
+    // dispatch arm. Tier uplift: tier-2 runtime match → tier-1
+    // structural dispatch.
+    //
+    // The decision is made once at `push_bind_execute` call time
+    // (based on caller's `Option<RowDesc>`) and threaded through
+    // the three-stage pipeline (BindComplete → Data/Complete →
+    // AwaitingRfq). Six variants total.
+
+    // ─── Schema-less path (DML / RETURNING-less) ───
+
     /// `Bind` + `Execute` + `Sync` bundle was sent; awaiting
-    /// `BindComplete` (`'2'`). The user-supplied `row_desc` (if any)
-    /// threads through to `AwaitingDataOrComplete` once the server
-    /// accepts the bind.
-    BindExecuteAwaitingBindComplete {
-        /// Correlator for the in-flight command.
-        reply: ReplyId<QueryKind>,
-        /// User-supplied schema. `Some` for SELECT (caller must
-        /// have Describe'd externally or at macro-compile time);
-        /// `None` for DML / RETURNING-less statements.
-        row_desc: Option<RowDesc>,
-    },
+    /// `BindComplete` (`'2'`). DML path — caller passed
+    /// `row_desc = None`, meaning any server-emitted DataRow is
+    /// an invariant break (user asked for DML, server shipped
+    /// rows). The arm classifies `'D'` as UnexpectedFrame.
+    BindExecuteAwaitingBindCompleteDml(ReplyId<QueryKind>),
 
-    /// `BindComplete` received; awaiting either a `DataRow` (SELECT)
-    /// or `CommandComplete` (DML). Schema threads through.
-    BindExecuteAwaitingDataOrComplete {
-        /// Correlator for the in-flight command.
-        reply: ReplyId<QueryKind>,
-        /// User-supplied schema — relevant only if `'D'` arrives.
-        row_desc: Option<RowDesc>,
-    },
+    /// `BindComplete` received on the schema-less path; awaiting
+    /// `CommandComplete` or server error. `DataRow` is a wire
+    /// violation here (no schema was provided to decode rows).
+    BindExecuteAwaitingCommandCompleteDml(ReplyId<QueryKind>),
 
-    /// Streaming `DataRow` frames. Mirrors
-    /// [`Self::SimpleQueryStreamingRows`] — schema is required
-    /// (user pre-provided `Some(row_desc)`, otherwise it'd be an
-    /// undecodable row stream).
-    ///
-    /// F19-style structural invariant: `StreamingRows` implies
-    /// schema. `PgCommand::BindExecute` constructed with
-    /// `row_desc: None` and a SELECT statement reaches
-    /// [`Self::BindExecuteAwaitingDataOrComplete`] but **cannot**
-    /// transition here — the `'D'` arm bails to `UnexpectedFrame`
-    /// since there's no schema to embed. This is the tier-2
-    /// structural shield on "decoded rows need a schema".
-    BindExecuteStreamingRows {
-        /// Correlator for the in-flight command.
-        reply: ReplyId<QueryKind>,
-        /// Schema the user provided (guaranteed present).
-        row_desc: RowDesc,
-    },
-
-    /// `CommandComplete` received; awaiting the trailing
-    /// `ReadyForQuery`. Command tag captured; schema threaded
-    /// for the terminal `QueryComplete` reply. Mirrors
-    /// [`Self::SimpleQueryAwaitingRfq`] — same helper
-    /// `advance_to_awaiting_rfq` constructs this variant.
-    BindExecuteAwaitingRfq {
+    /// `CommandComplete` received on the schema-less path; awaiting
+    /// the trailing `ReadyForQuery`. Terminal reply carries
+    /// `row_desc: None`.
+    BindExecuteAwaitingRfqDml {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
         /// Command tag parsed from the `C` frame body.
         command_tag: BoundedStr<32>,
-        /// User-supplied schema (Some) or absence marker (None).
-        row_desc: Option<RowDesc>,
+    },
+
+    // ─── Schema-bearing path (SELECT with pre-provided schema) ───
+
+    /// `Bind` + `Execute` + `Sync` bundle was sent; awaiting
+    /// `BindComplete` (`'2'`). SELECT path — caller pre-provided
+    /// `row_desc`. The schema is threaded through to
+    /// [`Self::BindExecuteStreamingRows`] once `'2'` arrives.
+    BindExecuteAwaitingBindCompleteSelect {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+        /// User-supplied schema, required (variant shape guarantees
+        /// its presence — tier-1 structural).
+        row_desc: RowDesc,
+    },
+
+    /// `BindComplete` received on the schema-bearing path; awaiting
+    /// either a `DataRow` (transition to [`Self::BindExecuteStreamingRows`])
+    /// or `CommandComplete` (0-row SELECT, transition to
+    /// [`Self::BindExecuteAwaitingRfqSelect`]). Schema threads through.
+    BindExecuteAwaitingDataOrCompleteSelect {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+        /// Schema (guaranteed present by variant shape — tier-1).
+        row_desc: RowDesc,
+    },
+
+    /// Streaming `DataRow` frames on the schema-bearing path.
+    /// Mirrors [`Self::SimpleQueryStreamingRows`] — schema required
+    /// by variant shape.
+    BindExecuteStreamingRows {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+        /// Schema (guaranteed present by variant shape).
+        row_desc: RowDesc,
+    },
+
+    /// `CommandComplete` received on the schema-bearing path;
+    /// awaiting the trailing `ReadyForQuery`. Terminal reply
+    /// carries `row_desc: Some(schema)`.
+    BindExecuteAwaitingRfqSelect {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+        /// Command tag parsed from the `C` frame body.
+        command_tag: BoundedStr<32>,
+        /// Schema to ship in the terminal `QueryComplete` reply.
+        row_desc: RowDesc,
     },
 
     /// Terminal: the connection has been classified as unrecoverable.
@@ -365,10 +394,13 @@ impl ProtoState {
             Self::SimpleQueryAwaitingFirstResponse(id) => Some(id.consume()),
             Self::SimpleQueryStreamingRows { reply, .. }
             | Self::SimpleQueryAwaitingRfq { reply, .. }
-            | Self::BindExecuteAwaitingBindComplete { reply, .. }
-            | Self::BindExecuteAwaitingDataOrComplete { reply, .. }
+            | Self::BindExecuteAwaitingBindCompleteSelect { reply, .. }
+            | Self::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }
             | Self::BindExecuteStreamingRows { reply, .. }
-            | Self::BindExecuteAwaitingRfq { reply, .. } => Some(reply.consume()),
+            | Self::BindExecuteAwaitingRfqSelect { reply, .. }
+            | Self::BindExecuteAwaitingRfqDml { reply, .. } => Some(reply.consume()),
+            Self::BindExecuteAwaitingBindCompleteDml(reply)
+            | Self::BindExecuteAwaitingCommandCompleteDml(reply) => Some(reply.consume()),
             Self::ParseAwaitingParseComplete(reply) | Self::ParseAwaitingRfq(reply) => {
                 Some(reply.consume())
             }
@@ -421,26 +453,34 @@ impl core::fmt::Debug for ProtoState {
                 .field("command_tag", command_tag)
                 .field("row_desc_is_some", &row_desc.is_some())
                 .finish(),
-            Self::BindExecuteAwaitingBindComplete { reply, row_desc } => f
-                .debug_struct("BindExecuteAwaitingBindComplete")
+            Self::BindExecuteAwaitingBindCompleteDml(id) => {
+                write!(f, "BindExecuteAwaitingBindCompleteDml({id:?})")
+            }
+            Self::BindExecuteAwaitingCommandCompleteDml(id) => {
+                write!(f, "BindExecuteAwaitingCommandCompleteDml({id:?})")
+            }
+            Self::BindExecuteAwaitingRfqDml { reply, command_tag } => f
+                .debug_struct("BindExecuteAwaitingRfqDml")
                 .field("reply", reply)
-                .field("row_desc_is_some", &row_desc.is_some())
+                .field("command_tag", command_tag)
                 .finish(),
-            Self::BindExecuteAwaitingDataOrComplete { reply, row_desc } => f
-                .debug_struct("BindExecuteAwaitingDataOrComplete")
+            Self::BindExecuteAwaitingBindCompleteSelect { reply, .. } => f
+                .debug_struct("BindExecuteAwaitingBindCompleteSelect")
                 .field("reply", reply)
-                .field("row_desc_is_some", &row_desc.is_some())
-                .finish(),
+                .finish_non_exhaustive(),
+            Self::BindExecuteAwaitingDataOrCompleteSelect { reply, .. } => f
+                .debug_struct("BindExecuteAwaitingDataOrCompleteSelect")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
             Self::BindExecuteStreamingRows { reply, .. } => f
                 .debug_struct("BindExecuteStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::BindExecuteAwaitingRfq { reply, command_tag, row_desc } => f
-                .debug_struct("BindExecuteAwaitingRfq")
+            Self::BindExecuteAwaitingRfqSelect { reply, command_tag, .. } => f
+                .debug_struct("BindExecuteAwaitingRfqSelect")
                 .field("reply", reply)
                 .field("command_tag", command_tag)
-                .field("row_desc_is_some", &row_desc.is_some())
-                .finish(),
+                .finish_non_exhaustive(),
             Self::DrainRfqAfterError => {
                 f.write_str("DrainRfqAfterError")
             }
