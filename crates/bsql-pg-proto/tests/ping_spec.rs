@@ -553,6 +553,38 @@ fn rfq_with_non_single_byte_payload_is_rejected() {
     }
 }
 
+/// Invariant (tier-1 shield): a 1-byte RFQ payload with a value
+/// outside `{'I', 'T', 'E'}` is rejected by the `TxStatus::try_from_byte`
+/// parse at the dispatch layer — users NEVER receive a `Reply::Pong`
+/// with an unrecognised `tx_status`. Regression-pins the 2026-04-21
+/// TxStatus uplift.
+///
+/// Pre-uplift: the byte slipped through as `Reply::Pong { tx_status: b'X' }`
+/// — raw u8 — and user code pattern-matching only on `I`/`T`/`E`
+/// would silently ignore the frame.
+#[test]
+fn rfq_with_invalid_tx_status_byte_is_rejected() {
+    for bad in [b'X', b'\0', b'i', b't', b'e', 0xFF] {
+        let mut proto = PgProtocol::new();
+        let mut wb = bsql_pg_proto::WriteBuf::new();
+        let ping_raw = raw(300);
+        ping_setup(&mut proto, id(ping_raw), &mut wb);
+
+        let out = proto.feed_bytes(&rfq_frame(bad), &mut wb);
+        let actions = out.as_slice();
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::FailReply {
+                    cause: ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+                    ..
+                }
+            )),
+            "bad={bad:#04x}: expected FailReply(MalformedReadyForQuery{{1}}), got {actions:?}",
+        );
+    }
+}
+
 /// Invariant (spec): once `ProtoState::Errored(cause)` is entered, the
 /// state machine stays terminal — subsequent `feed_bytes` calls drop
 /// the incoming frames silently (zero actions emitted) and do **not**
