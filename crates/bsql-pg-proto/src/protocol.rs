@@ -209,24 +209,16 @@ pub struct PgProtocol {
     /// during startup from ParameterStatus messages. Read-only after
     /// startup completes (accessible via `session_params()`).
     session_params: SessionParams,
-    /// Row schema for the current streaming query. 1c-2a.
-    ///
-    /// Lifecycle:
-    /// - `None` at construction; `None` between queries.
-    /// - Populated on `RowDescription` ('T') arrival in
-    ///   `SimpleQueryAwaitingFirstResponse`.
-    /// - Referenced by [`crate::Action::StreamRow::desc`] during
-    ///   streaming and copied into [`crate::Reply::QueryComplete::row_desc`]
-    ///   on the terminal `ReadyForQuery`.
-    /// - Cleared on the next [`PgCommand::SimpleQuery`] push so a
-    ///   stale schema from a prior query never leaks into a new DML
-    ///   call's `Reply::QueryComplete { row_desc: None }`.
-    row_desc: Option<crate::decode::RowDesc>,
     /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
     /// Load-bearing: the crate-root ambiguous-impl gate verifies that
     /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
     /// `_not_sync` (leading-underscore convention for structurally-used
     /// fields is forbidden per user-feedback memory).
+    ///
+    /// F19 removed the former `row_desc: Option<RowDesc>` slot —
+    /// schema now lives inline in the `SimpleQueryStreamingRows` /
+    /// `SimpleQueryAwaitingRfq` state variants. The slot-vs-state
+    /// parallel-representation drift seam is closed structurally.
     sync_marker: PhantomData<Cell<()>>,
 }
 
@@ -243,7 +235,6 @@ impl PgProtocol {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
-            row_desc: None,
             sync_marker: PhantomData,
         }
     }
@@ -308,19 +299,15 @@ impl PgProtocol {
         // freedom over what they pair the result with later.
         write_buf.clear();
 
-        // 1c-2a: new SimpleQuery push clears any stale `row_desc`
-        // from a prior query — so a DML push after a SELECT gets
-        // `Reply::QueryComplete { row_desc: None }` (no schema
-        // leaked from the earlier query). Arrives before
-        // `compute_push` transitions state.
-        if matches!(cmd, PgCommand::SimpleQuery { .. }) {
-            self.row_desc = None;
-        }
-
+        // F19: no slot-clear needed. Schema lives in state variants
+        // (`SimpleQueryStreamingRows` / `SimpleQueryAwaitingRfq`)
+        // which are consumed by Z → Idle on query completion. A new
+        // `SimpleQuery` push from Idle has no prior schema to carry
+        // over; the state variants don't exist outside their query.
         let prev = core::mem::take(&mut self.state);
         let (new_state, staged) = compute_push(cmd, prev, write_buf);
         self.state = new_state;
-        materialise(staged, write_buf.as_bytes(), &[], None)
+        materialise(staged, write_buf.as_bytes(), &[])
     }
 
     /// Feed inbound wire bytes.
@@ -362,7 +349,6 @@ impl PgProtocol {
                 staged,
                 write_buf.as_bytes(),
                 self.read_buf.populated(),
-                self.row_desc.as_ref(),
             );
         }
 
@@ -482,7 +468,6 @@ impl PgProtocol {
                         payload,
                         write_buf,
                         FrameCoords::new(frame_start, frame_len, populated),
-                        &mut self.row_desc,
                     );
                     match outcome {
                         DispatchOutcome::AdvancedSilent { new_state } => {
@@ -543,14 +528,10 @@ impl PgProtocol {
         // compaction, which the borrow checker forbids while
         // `OutActions<'_, 'r>` is alive (`'r = &'r mut self`).
         //
-        // 1c-2a: pass `row_desc` so `StreamRow` actions get `&'r RowDesc`
-        // references for zero-copy schema propagation.
-        materialise(
-            staged,
-            write_buf.as_bytes(),
-            self.read_buf.populated(),
-            self.row_desc.as_ref(),
-        )
+        // F19: `StreamRow` actions now carry `RowDesc` BY VALUE,
+        // copied from the StreamingRows state variant at emission.
+        // No separate `row_desc` arg to materialise.
+        materialise(staged, write_buf.as_bytes(), self.read_buf.populated())
     }
 
     /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
@@ -775,7 +756,7 @@ fn compute_push_ping(
             other
         }
         other @ (ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
@@ -893,7 +874,7 @@ fn compute_push_startup(
             other
         }
         other @ (ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
@@ -986,7 +967,7 @@ fn compute_push_simple_query(
         }
         other @ (ProtoState::PingAwaitingRfq(_)
         | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
@@ -1134,7 +1115,7 @@ fn compute_push_parse(
         }
         other @ (ProtoState::PingAwaitingRfq(_)
         | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
@@ -1182,7 +1163,7 @@ const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
         | ProtoState::ConnectingPostAuthAwaitingKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. }
         | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
@@ -1275,7 +1256,6 @@ fn materialise<'w, 'r>(
     staged: StagedActions,
     write_buf_bytes: &'w [u8],
     read_buf_bytes: &'r [u8],
-    row_desc: Option<&'r crate::decode::RowDesc>,
 ) -> OutActions<'w, 'r> {
     let mut out = OutActions::new();
     for sa in staged {
@@ -1304,17 +1284,18 @@ fn materialise<'w, 'r>(
             // `&mut self.read_buf` calls on PgProtocol until the
             // caller drops the returned actions.
             //
-            // 1c-2a: `desc` reference comes from
-            // `PgProtocol.row_desc`, populated by the 'T' dispatch
-            // arm. `row_desc` is `Some` whenever a StreamRowRange
-            // was staged (StreamingRows state only enters on 'T');
-            // the `unwrap_or(&RowDesc::EMPTY)` fallback is
-            // architecturally unreachable, surfaced as a safe
-            // default (0-column desc) rather than a panic.
-            StagedAction::StreamRowRange { id, row_range } => Action::StreamRow {
+            // F19: `row_desc` is carried BY VALUE in the staged
+            // action (copied from the `StreamingRows { row_desc }`
+            // state variant at emission). No external `PgProtocol.row_desc`
+            // slot to look up; no `unwrap_or(&EMPTY)` fallback.
+            // Schema-state pairing is tier-2 structural — the staged
+            // action can't exist without a schema (no constructor path
+            // other than `stream_row_or_errored` which receives
+            // `RowDesc` from the pattern-matched state).
+            StagedAction::StreamRowRange { id, row_range, row_desc } => Action::StreamRow {
                 id,
                 row_bytes: row_range.apply(read_buf_bytes).unwrap_or(&[]),
-                desc: row_desc.unwrap_or(&crate::decode::RowDesc::EMPTY),
+                desc: row_desc,
             },
             StagedAction::CloseSocket => Action::CloseSocket,
         };
@@ -1393,11 +1374,11 @@ mod allows_unsolicited_param_status_tests {
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
                 reply.consume();
             }
-            ProtoState::SimpleQueryAwaitingFirstResponse(id)
-            | ProtoState::SimpleQueryStreamingRows(id) => {
+            ProtoState::SimpleQueryAwaitingFirstResponse(id) => {
                 id.consume();
             }
-            ProtoState::SimpleQueryAwaitingRfq { reply, .. } => {
+            ProtoState::SimpleQueryStreamingRows { reply, .. }
+            | ProtoState::SimpleQueryAwaitingRfq { reply, .. } => {
                 reply.consume();
             }
             ProtoState::ParseAwaitingParseComplete(reply)
@@ -1497,13 +1478,17 @@ mod allows_unsolicited_param_status_tests {
         assert!(allows_unsolicited_param_status(&q_first));
         consume_state(q_first);
 
-        let q_rows = ProtoState::SimpleQueryStreamingRows(ReplyId::from_raw(nz(8002)));
+        let q_rows = ProtoState::SimpleQueryStreamingRows {
+            reply: ReplyId::from_raw(nz(8002)),
+            row_desc: crate::decode::RowDesc::EMPTY,
+        };
         assert!(allows_unsolicited_param_status(&q_rows));
         consume_state(q_rows);
 
         let q_rfq = ProtoState::SimpleQueryAwaitingRfq {
             reply: ReplyId::from_raw(nz(8003)),
             command_tag: crate::error::BoundedStr::default(),
+            row_desc: None,
         };
         assert!(allows_unsolicited_param_status(&q_rfq));
         consume_state(q_rfq);
@@ -1571,11 +1556,11 @@ mod compute_push_tests {
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
                 reply.consume();
             }
-            ProtoState::SimpleQueryAwaitingFirstResponse(id)
-            | ProtoState::SimpleQueryStreamingRows(id) => {
+            ProtoState::SimpleQueryAwaitingFirstResponse(id) => {
                 id.consume();
             }
-            ProtoState::SimpleQueryAwaitingRfq { reply, .. } => {
+            ProtoState::SimpleQueryStreamingRows { reply, .. }
+            | ProtoState::SimpleQueryAwaitingRfq { reply, .. } => {
                 reply.consume();
             }
             ProtoState::ParseAwaitingParseComplete(reply)

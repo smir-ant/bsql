@@ -19,6 +19,7 @@
 //! (no action, no state change — post-`CloseSocket` packet flushes
 //! become true no-ops instead of silent mis-advances).
 
+use crate::decode::RowDesc;
 use crate::error::BoundedStr;
 use crate::error::ErrorKind;
 use crate::ident::PodBytes;
@@ -176,12 +177,35 @@ pub enum ProtoState {
     /// Terminal transitions: `DataRow` → emit `Action::StreamRow`,
     /// stay here; `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`]
     /// with the parsed command tag.
-    SimpleQueryStreamingRows(ReplyId<QueryKind>),
+    ///
+    /// F19: carries the parsed `RowDesc` inline. Entering this variant
+    /// ONLY via the 'T' dispatcher arm (which parses `RowDescription`)
+    /// makes "StreamingRows implies schema" a tier-2 structural
+    /// invariant — the variant shape itself requires a schema. Prior
+    /// design held the schema in a separate `PgProtocol.row_desc` slot,
+    /// leaving state-and-slot as two parallel facts that could drift
+    /// (tier-3 audit pairing).
+    SimpleQueryStreamingRows {
+        /// Correlator for the in-flight query.
+        reply: ReplyId<QueryKind>,
+        /// Result-set schema parsed from `RowDescription`. Copied into
+        /// each staged `StreamRowRange` on every `DataRow` frame; copied
+        /// into `AwaitingRfq` on `CommandComplete`.
+        row_desc: RowDesc,
+    },
 
     /// `CommandComplete` or `EmptyQueryResponse` received; awaiting
     /// the trailing `ReadyForQuery`. The command tag captured at `C`
     /// (empty for `EmptyQueryResponse`) ships in the final
     /// [`crate::Reply::QueryComplete`] payload.
+    ///
+    /// F19: carries `row_desc: Option<RowDesc>` — `Some(desc)` when
+    /// entered from `SimpleQueryStreamingRows` (SELECT path, schema
+    /// preserved through terminal transitions), `None` when entered
+    /// from `SimpleQueryAwaitingFirstResponse` via `CommandComplete`
+    /// (DML path: no RowDescription was received) or
+    /// `EmptyQueryResponse` (empty query: ditto). Preserves the
+    /// public-API distinction "0-row SELECT (Some(empty)) vs DML (None)".
     SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
@@ -190,6 +214,9 @@ pub enum ProtoState {
         /// PG's documented tag shapes (the longest standard tag,
         /// `"INSERT <oid> <n>"` with 10-digit values, is ~23 bytes).
         command_tag: BoundedStr<32>,
+        /// Schema from the SELECT path (`Some`) or absence marker
+        /// (`None`) from DML / empty-query paths.
+        row_desc: Option<RowDesc>,
     },
 
     /// `ErrorResponse` received mid-query; `FailReply` already
@@ -259,9 +286,9 @@ impl ProtoState {
             | Self::ConnectingScramAwaitingAuthOk(reply)
             | Self::ConnectingPostAuthAwaitingKey(reply)
             | Self::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
-            Self::SimpleQueryAwaitingFirstResponse(id)
-            | Self::SimpleQueryStreamingRows(id) => Some(id.consume()),
-            Self::SimpleQueryAwaitingRfq { reply, .. } => Some(reply.consume()),
+            Self::SimpleQueryAwaitingFirstResponse(id) => Some(id.consume()),
+            Self::SimpleQueryStreamingRows { reply, .. }
+            | Self::SimpleQueryAwaitingRfq { reply, .. } => Some(reply.consume()),
             Self::ParseAwaitingParseComplete(reply) | Self::ParseAwaitingRfq(reply) => {
                 Some(reply.consume())
             }
@@ -304,13 +331,15 @@ impl core::fmt::Debug for ProtoState {
             Self::SimpleQueryAwaitingFirstResponse(id) => {
                 write!(f, "SimpleQueryAwaitingFirstResponse({id:?})")
             }
-            Self::SimpleQueryStreamingRows(id) => {
-                write!(f, "SimpleQueryStreamingRows({id:?})")
-            }
-            Self::SimpleQueryAwaitingRfq { reply, command_tag } => f
+            Self::SimpleQueryStreamingRows { reply, .. } => f
+                .debug_struct("SimpleQueryStreamingRows")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::SimpleQueryAwaitingRfq { reply, command_tag, row_desc } => f
                 .debug_struct("SimpleQueryAwaitingRfq")
                 .field("reply", reply)
                 .field("command_tag", command_tag)
+                .field("row_desc_is_some", &row_desc.is_some())
                 .finish(),
             Self::DrainRfqAfterError => {
                 f.write_str("DrainRfqAfterError")

@@ -950,7 +950,24 @@ records the remaining findings that were DEFERRED with their design
 rationale, so a future implementer doesn't repeat the dead-end
 analyses already performed.
 
-### DEF-124 — F19: embed `RowDesc` in `StreamingRows` / `AwaitingRfq` variants (DEFERRED)
+### DEF-124 — F19: embed `RowDesc` in `StreamingRows` / `AwaitingRfq` variants (CLOSED 2026-04-21)
+
+**Status: SHIPPED.** Implemented via option 2 (grow `Action::StreamRow`
+to carry `RowDesc` by value). State variants now embed schema
+directly — `SimpleQueryStreamingRows { reply, row_desc }` and
+`SimpleQueryAwaitingRfq { reply, command_tag, row_desc }`. The
+former `PgProtocol.row_desc: Option<RowDesc>` slot is removed. Tier
+claim "StreamingRows implies schema" is now tier-1 compile via
+struct-variant field requirement; "StreamRow action carries matching
+schema" is tier-2 structural via `stream_row_or_errored` requiring
+`RowDesc` arg from the pattern-matched state. Size budgets held
+(`Action` stays ≤320 because DeliverReply was already bigger;
+`PgProtocol` lost the slot). 135 tests pass, clippy clean.
+See commit for full details.
+
+(Original design analysis retained below for historical context.)
+
+---
 
 **Goal.** Eliminate the `PgProtocol.row_desc: Option<RowDesc>` slot;
 move schema storage into the state variants themselves. Tier aim:

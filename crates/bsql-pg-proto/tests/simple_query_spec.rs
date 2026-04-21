@@ -257,7 +257,9 @@ fn select_multiple_rows_stream_then_deliver() {
     assert_eq!(actions.len(), 4, "3 rows + 1 DeliverReply = 4 actions");
 
     // First three actions = StreamRow with matching id, schema, and row bytes.
-    let mut first_desc: Option<&RowDesc> = None;
+    // F19: RowDesc is carried BY VALUE in Action::StreamRow; store as
+    // owned `Option<RowDesc>` (Copy POD).
+    let mut first_desc: Option<RowDesc> = None;
     for (i, expected_value) in row_values.iter().enumerate() {
         match actions.get(i) {
             Some(Action::StreamRow { id, row_bytes, desc }) => {
@@ -275,14 +277,16 @@ fn select_multiple_rows_stream_then_deliver() {
                     ) && desc.len() == 1,
                     "expected 1-column TEXT/text RowDesc, got {desc:?}",
                 );
-                // Structural: all StreamRows borrow the same RowDesc
-                // (tier-2 via pointer identity — if the protocol
-                // reparsed per-row, this would trip).
+                // F19: RowDesc is Copy POD carried by value in each
+                // StreamRow. All StreamRows in a stream carry an
+                // equal-valued schema (tier-2 via value equality —
+                // if the protocol reparsed per-row with different
+                // values, this would trip).
                 match first_desc {
                     None => first_desc = Some(*desc),
-                    Some(prev) => assert!(
-                        core::ptr::eq(prev, *desc),
-                        "StreamRow.desc must share the same RowDesc pointer across the stream",
+                    Some(prev) => assert_eq!(
+                        prev, *desc,
+                        "StreamRow.desc must be byte-equal across the stream",
                     ),
                 }
 
@@ -637,7 +641,7 @@ fn rows_across_multiple_feed_bytes_calls() {
         // `'r` borrow — no explicit `drop()` needed (clippy warns
         // that dropping Copy types is a no-op).
     }
-    assert!(matches!(proto.state(), ProtoState::SimpleQueryStreamingRows(_)));
+    assert!(matches!(proto.state(), ProtoState::SimpleQueryStreamingRows { .. }));
 
     // Batch 2: one more D + C + Z.
     let mut batch2 = std::vec::Vec::new();
@@ -708,7 +712,7 @@ fn overflow_backpressure_preserves_delivery_across_calls() {
     // State is still a simple-query state (not consumed to Idle).
     let still_streaming = matches!(
         proto.state(),
-        ProtoState::SimpleQueryStreamingRows(_)
+        ProtoState::SimpleQueryStreamingRows { .. }
             | ProtoState::SimpleQueryAwaitingRfq { .. }
             | ProtoState::SimpleQueryAwaitingFirstResponse(_),
     );
@@ -907,13 +911,24 @@ fn end_to_end_decode_typed_row() {
 /// Without the clear, `feed_bytes` on the DML path would `copy` the
 /// stale row_desc from `PgProtocol.row_desc` into the Reply, leaking
 /// query 1's schema into query 2's result.
+/// F19 regression (was "clears row_desc slot" pre-F19): after a
+/// SELECT Q1 that terminates via the StreamingRows → AwaitingRfq →
+/// Idle transitions, the schema lives ONLY inside those state
+/// variants. By Idle time (Q1 done), the schema is gone
+/// architecturally — there's no slot to clear. A following DML Q2
+/// starts fresh at Idle → AwaitingFirstResponse → AwaitingRfq
+/// (row_desc=None, no `T` frame arrived) → Idle. Its QueryComplete
+/// payload carries `row_desc: None` by construction, not by discipline.
 #[test]
 fn dml_after_select_clears_row_desc() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    // Query 1: SELECT with 1 TEXT column. After this, proto carries
-    // a populated row_desc internally.
+    // Query 1: SELECT with 1 TEXT column. Schema lives in the
+    // SimpleQueryStreamingRows { row_desc } state for the duration
+    // of the stream; transitions to AwaitingRfq { row_desc: Some(..) }
+    // on `C`; consumed on `Z` into DeliverReply(QueryComplete).
+    // Post-Q1 state = Idle (no residual schema anywhere).
     let q1_raw = raw(300);
     simple_query_setup(&mut proto, id(q1_raw), &mut wb);
     let mut q1_bytes = std::vec::Vec::new();
@@ -933,7 +948,8 @@ fn dml_after_select_clears_row_desc() {
         assert!(saw_deliver, "query 1 must deliver");
     }
 
-    // Query 2: DML. push_command clears row_desc.
+    // Query 2: DML path. No `T` frame → AwaitingRfq never gets a
+    // schema in its row_desc field. QueryComplete carries None.
     let q2_raw = raw(301);
     simple_query_setup(&mut proto, id(q2_raw), &mut wb);
     let mut q2_bytes = std::vec::Vec::new();

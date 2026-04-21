@@ -96,10 +96,11 @@ pub struct RowDesc {
 }
 
 impl RowDesc {
-    /// Empty descriptor (0 columns). Used as an architecturally-unreachable
-    /// safe fallback in [`crate::action::Action::StreamRow`]
-    /// materialisation when protocol state is inconsistent.
-    pub(crate) const EMPTY: Self = Self {
+    /// Empty descriptor (0 columns). Used to populate the `row_desc`
+    /// field of `SimpleQueryAwaitingRfq` on the empty-query
+    /// ([`crate::wire::TAG_EMPTY_QUERY_RESPONSE`]) transition where
+    /// no `RowDescription` precedes — and as a test fixture.
+    pub const EMPTY: Self = Self {
         n_columns: 0,
         columns: [ColumnDesc {
             type_oid: 0,

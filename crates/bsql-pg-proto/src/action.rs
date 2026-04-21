@@ -445,6 +445,20 @@ pub enum Action<'w, 'r> {
     /// schema before staging any row.
     ///
     /// Round-4 finding #1 / 1c-1a; row_desc wiring in 1c-2a.
+    ///
+    /// F19 (2026-04-21): `desc` is carried BY VALUE, not by reference.
+    /// Rationale: after F19 embedded `RowDesc` directly into the
+    /// `SimpleQueryStreamingRows { row_desc }` state variant (tier-3
+    /// audit-paired slot → tier-2 structural pairing), the schema's
+    /// lifetime is now bounded by the StreamingRows variant — which
+    /// may transition to `Idle` before `materialise` runs at the end
+    /// of `feed_bytes`. By-value avoids the self-referential lifetime
+    /// issue (Action would need to borrow from state, but state mutates
+    /// mid-loop). Cost: `Action::StreamRow` grows from ~32 bytes to
+    /// ~292 bytes, matching the existing `Action::DeliverReply`
+    /// envelope (which already carries a full `RowDesc` via
+    /// `QueryCompletePayload`). `OutActions` size bump is ~96 bytes
+    /// on the `feed_bytes` stack frame — acceptable for the tier win.
     StreamRow {
         /// Correlator of the in-flight query.
         id: NonZeroU64,
@@ -454,8 +468,9 @@ pub enum Action<'w, 'r> {
         /// via [`crate::decode`] primitives (1c-2b).
         row_bytes: &'r [u8],
         /// Result-set schema — type OIDs + format codes per column.
-        /// Stable across the entire row stream.
-        desc: &'r crate::decode::RowDesc,
+        /// Stable across the entire row stream. By-value copy from
+        /// the `SimpleQueryStreamingRows { row_desc }` state variant.
+        desc: crate::decode::RowDesc,
     },
 
     /// The socket is no longer safe to use; close it.
@@ -515,6 +530,12 @@ pub(crate) enum StagedAction {
     /// and materialise: the bytes themselves remain in place until
     /// the next `append` triggers lazy compaction (which in turn
     /// cannot run while the `OutActions<'_, 'r>` borrow is alive).
+    ///
+    /// F19: carries `RowDesc` by value (copied from the
+    /// `SimpleQueryStreamingRows { row_desc }` state variant at
+    /// emission time). Avoids the lifetime issue of pointing at state
+    /// that may have transitioned (StreamingRows → AwaitingRfq → Idle)
+    /// by materialise time.
     StreamRowRange {
         /// Raw correlator (`reply.get()`; reply is NOT consumed here
         /// — rows are in-progress, the reply commits on terminal
@@ -522,6 +543,8 @@ pub(crate) enum StagedAction {
         id: NonZeroU64,
         /// Absolute range into the read buffer's populated region.
         row_range: NonEmptyRange,
+        /// Schema at emission time (copy from StreamingRows state).
+        row_desc: crate::decode::RowDesc,
     },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,

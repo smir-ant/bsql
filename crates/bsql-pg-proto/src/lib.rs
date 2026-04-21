@@ -292,10 +292,11 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() <= 6336,
-    "PgProtocol size regression — post-DEF-106 budget is 6336 bytes \
-     (SessionParams right-sized per field; ~400 bytes saved vs 5 × \
-     heapless::String<128>). Budget: ReadBuf 4096 + state ~1224 + \
-     session_params ~420 + padding.",
+    "PgProtocol size regression — post-DEF-106 + F19 budget is 6336 \
+     bytes. F19 removed the `row_desc: Option<RowDesc>` slot (~268 \
+     bytes), moving schema into state variants; overall footprint \
+     dropped correspondingly. Budget: ReadBuf 4096 + state ~1224 + \
+     session_params ~420 + padding + headroom.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2560,

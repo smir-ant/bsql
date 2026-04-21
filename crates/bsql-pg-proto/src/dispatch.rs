@@ -199,7 +199,6 @@ pub(crate) fn dispatch(
     payload: &[u8],
     write_buf: &mut WriteBuf,
     coords: FrameCoords,
-    row_desc_slot: &mut Option<crate::decode::RowDesc>,
 ) -> DispatchOutcome {
     match (prev, tag) {
         // =============================================================
@@ -429,28 +428,28 @@ pub(crate) fn dispatch(
 
         // AwaitingFirstResponse: T / C / I / E — any other tag is desync
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
-            // 1c-2a: parse the schema and stash it in PgProtocol's
-            // row_desc slot before transitioning to StreamingRows.
-            // Subsequent DataRow frames' StreamRowRange emissions
-            // will borrow from this slot at materialise time.
+            // F19: parsed schema embeds directly into the new state
+            // variant. No longer a `*row_desc_slot = Some(desc)` side
+            // effect — state shape itself carries the invariant
+            // "StreamingRows implies schema".
             match crate::decode::parse_row_description(payload) {
-                Ok(desc) => {
-                    *row_desc_slot = Some(desc);
-                    DispatchOutcome::AdvancedSilent {
-                        new_state: ProtoState::SimpleQueryStreamingRows(reply),
-                    }
-                }
+                Ok(row_desc) => DispatchOutcome::AdvancedSilent {
+                    new_state: ProtoState::SimpleQueryStreamingRows { reply, row_desc },
+                },
                 Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
-            advance_to_awaiting_rfq(reply, payload)
+            // DML path: no RowDescription → AwaitingRfq with row_desc=None.
+            advance_to_awaiting_rfq(reply, payload, None)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
+            // Empty-query path: no schema to preserve.
             DispatchOutcome::AdvancedSilent {
                 new_state: ProtoState::SimpleQueryAwaitingRfq {
                     reply,
                     command_tag: crate::error::BoundedStr::default(),
+                    row_desc: None,
                 },
             }
         }
@@ -462,31 +461,28 @@ pub(crate) fn dispatch(
         }
 
         // StreamingRows: D / C / E — any other tag is desync
-        (ProtoState::SimpleQueryStreamingRows(reply), TAG_DATA_ROW) => {
-            stream_row_or_errored(reply, coords)
+        (ProtoState::SimpleQueryStreamingRows { reply, row_desc }, TAG_DATA_ROW) => {
+            stream_row_or_errored(reply, row_desc, coords)
         }
-        (ProtoState::SimpleQueryStreamingRows(reply), TAG_COMMAND_COMPLETE) => {
-            advance_to_awaiting_rfq(reply, payload)
+        (ProtoState::SimpleQueryStreamingRows { reply, row_desc }, TAG_COMMAND_COMPLETE) => {
+            // SELECT path terminates: preserve schema into AwaitingRfq
+            // so the trailing RFQ's QueryComplete carries it.
+            advance_to_awaiting_rfq(reply, payload, Some(row_desc))
         }
-        (ProtoState::SimpleQueryStreamingRows(reply), TAG_ERROR_RESPONSE) => {
+        (ProtoState::SimpleQueryStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply, payload)
         }
-        (ProtoState::SimpleQueryStreamingRows(reply), other) => {
+        (ProtoState::SimpleQueryStreamingRows { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // AwaitingRfq: Z is the only legal frame
-        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag }, TAG_READY_FOR_QUERY) => {
+        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag, row_desc }, TAG_READY_FOR_QUERY) => {
             match payload {
                 [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
                     Some(tx_status) => {
-                        // 1c-2a: copy the schema out of the protocol's
-                        // `row_desc` slot into the terminal reply. The
-                        // slot is NOT cleared here — any `StreamRowRange`
-                        // staged earlier in this same `feed_bytes` call
-                        // still borrows it through materialise; the slot
-                        // is cleared at the next `push_command(SimpleQuery)`.
-                        let row_desc = *row_desc_slot;
+                        // F19: schema lives in state; consumed into the
+                        // terminal reply. No standalone slot to read/clear.
                         DispatchOutcome::AdvancedWithAction {
                             new_state: ProtoState::Idle,
                             action: crate::action::deliver(
@@ -1152,12 +1148,14 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 fn advance_to_awaiting_rfq(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
+    row_desc: Option<crate::decode::RowDesc>,
 ) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::SimpleQueryAwaitingRfq {
                 reply,
                 command_tag,
+                row_desc,
             },
         },
         Err(cause) => errored(Some(reply.consume()), cause),
@@ -1201,6 +1199,7 @@ fn advance_to_drain_after_error(
 /// error (vs a panic) preserves the crate-root panic ban.
 fn stream_row_or_errored(
     reply: ReplyId<crate::reply_id::QueryKind>,
+    row_desc: crate::decode::RowDesc,
     coords: FrameCoords,
 ) -> DispatchOutcome {
     match crate::action::NonEmptyRange::new(
@@ -1211,8 +1210,11 @@ fn stream_row_or_errored(
         Some(row_range) => {
             let id = reply.get();
             DispatchOutcome::AdvancedWithAction {
-                new_state: ProtoState::SimpleQueryStreamingRows(reply),
-                action: StagedAction::StreamRowRange { id, row_range },
+                // F19: preserve row_desc back into the state variant.
+                // StagedAction::StreamRowRange carries a copy — state
+                // retains its own copy for the next iteration.
+                new_state: ProtoState::SimpleQueryStreamingRows { reply, row_desc },
+                action: StagedAction::StreamRowRange { id, row_range, row_desc },
             }
         }
         None => errored(Some(reply.consume()), ProtocolError::RowRangeConstructionUnreachable),
