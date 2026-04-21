@@ -310,6 +310,83 @@ impl PgProtocol {
         materialise(staged, write_buf.as_bytes(), &[])
     }
 
+    /// Extended Query "Bind + Execute + Sync" pipeline — send a
+    /// prepared statement's portal with bound parameters and run it.
+    ///
+    /// Sibling to [`Self::push_command`]; lives on a separate method
+    /// because `PgCommand` is a type-unified enum with no generic
+    /// parameter surface, whereas Bind/Execute is parameterised over
+    /// the caller's parameter tuple type `P: ParamsWriter`.
+    ///
+    /// # Parameters
+    ///
+    /// - `portal_name` — the name the server will use to address the
+    ///   bound portal. Pass `PortalName::default()` for the
+    ///   unnamed-portal convention (most common).
+    /// - `stmt_name` — name of a previously-[`push_command`]'d
+    ///   [`PgCommand::Parse`] statement. Passing an unparsed stmt
+    ///   name → server `ErrorResponse` → `FailReply` (tier-3 server
+    ///   check; Phase 2 macro elevates to tier-1 via stmt-cache
+    ///   fingerprint).
+    /// - `params` — a tuple implementing [`crate::params::ParamsWriter`].
+    ///   Arity 0..=16 supported by default impls. The tuple's
+    ///   element types must each impl [`crate::decode::EncodeBinary`].
+    /// - `row_desc` — pre-provided result-set schema. `Some(desc)`
+    ///   for SELECT (caller ran a prior Describe externally or at
+    ///   macro-compile time); `None` for DML / RETURNING-less stmts.
+    ///   A `None` row_desc + server-emitted DataRow is a tier-2
+    ///   shield — the dispatch arm classifies as UnexpectedFrame.
+    /// - `max_rows` — 1c-3b scope restricts to `0` (fetch all). A
+    ///   non-zero value triggers `PortalSuspended` which the
+    ///   dispatch path classifies as UnexpectedFrame (tier-2); full
+    ///   chunked-fetch support lands in 1c-6.
+    /// - `reply` — typed correlator; delivered via
+    ///   [`crate::Action::DeliverReply`] as [`crate::Reply::QueryComplete`]
+    ///   on success.
+    /// - `write_buf` — caller-owned outbound staging buffer (DEF-094).
+    ///
+    /// # Emitted actions (happy path)
+    ///
+    /// Three [`crate::Action::SendBytes`] actions: the Bind frame,
+    /// the Execute frame, and the 5-byte static `Sync`. The caller
+    /// writes all three to the socket in order.
+    ///
+    /// # Failure modes
+    ///
+    /// See `compute_push_bind_execute`'s decision table for per-state
+    /// policy. Every non-`Idle` entry state emits a classified
+    /// `FailReply` and preserves the prior state; the connection
+    /// is not torn down.
+    #[expect(clippy::too_many_arguments, reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1 — each argument is a distinct wire-protocol input. Splitting into a struct-arg (BindExecuteRequest { ... }) trades arg-count for construction verbosity at every call site, no tier or safety win.")]
+    #[must_use = "the returned actions carry side-effects that must be executed"]
+    pub fn push_bind_execute<'w, P: crate::params::ParamsWriter>(
+        &mut self,
+        portal_name: &crate::ident::PortalName,
+        stmt_name: &crate::ident::StmtName,
+        params: &P,
+        row_desc: Option<crate::decode::RowDesc>,
+        max_rows: u32,
+        reply: ReplyId<crate::reply_id::QueryKind>,
+        write_buf: &'w mut WriteBuf,
+    ) -> OutActions<'w, 'static> {
+        write_buf.clear();
+        let mut staged = StagedActions::new();
+        let prev = core::mem::take(&mut self.state);
+        let new_state = compute_push_bind_execute(
+            prev,
+            portal_name,
+            stmt_name,
+            params,
+            row_desc,
+            max_rows,
+            reply,
+            &mut staged,
+            write_buf,
+        );
+        self.state = new_state;
+        materialise(staged, write_buf.as_bytes(), &[])
+    }
+
     /// Feed inbound wire bytes.
     ///
     /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].
@@ -770,7 +847,11 @@ fn compute_push_ping(
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)) => {
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindComplete { .. }
+        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -888,7 +969,11 @@ fn compute_push_startup(
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)) => {
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindComplete { .. }
+        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -981,7 +1066,11 @@ fn compute_push_simple_query(
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)) => {
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindComplete { .. }
+        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1129,7 +1218,215 @@ fn compute_push_parse(
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)) => {
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindComplete { .. }
+        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::CommandInProgress,
+                },
+            ]);
+            other
+        }
+    }
+}
+
+/// Build a PostgreSQL `Bind` (`'B'`) frame into `write_buf`.
+///
+/// Wire layout per PG §55.2.2:
+///
+/// ```text
+/// 'B' | len_i32 | portal_name NUL | stmt_name NUL |
+///   n_param_formats_i16 | [format_code_i16; N] |
+///   n_params_i16 | [len_i32 + bytes; N] |
+///   n_result_formats_i16
+/// ```
+///
+/// The length prefix uses PG's "includes itself" convention via
+/// [`WriteBuf::with_length_prefix`]. Per-parameter length prefixes
+/// use the "excludes self" convention via
+/// [`WriteBuf::with_i32_length_prefixed_body`] — see that helper's
+/// docs for the rationale on the two different length semantics
+/// in the PG wire format.
+///
+/// Zero-alloc: params are streamed directly from the tuple into
+/// `write_buf` via [`crate::params::ParamsWriter::write_params`];
+/// no intermediate buffer.
+fn build_bind_message<P: crate::params::ParamsWriter>(
+    portal_name: &crate::ident::PortalName,
+    stmt_name: &crate::ident::StmtName,
+    params: &P,
+    write_buf: &mut WriteBuf,
+) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
+    use crate::write_buf::WriteBufFull;
+
+    let start = write_buf.len();
+    write_buf.push_u8(crate::wire::TAG_BIND.byte())?;
+    write_buf.with_length_prefix(|w| {
+        w.push_nul_terminated(portal_name.as_bytes())?;
+        w.push_nul_terminated(stmt_name.as_bytes())?;
+        // n_param_formats = COUNT — every param ships in binary.
+        w.push_u16_be(P::COUNT)?;
+        for format in P::FORMATS {
+            // `FormatCode::Binary as u16 == 1`; crate bans `as`, use
+            // explicit match in push_u16_be-compatible form.
+            let code = match format {
+                crate::decode::FormatCode::Text => 0,
+                crate::decode::FormatCode::Binary => 1,
+            };
+            w.push_u16_be(code)?;
+        }
+        w.push_u16_be(P::COUNT)?;
+        params.write_params(w)?;
+        // n_result_formats = 0 → server default (all text). 1c-3b
+        // does not negotiate per-column result formats; the user
+        // dispatches between text and binary decoders via the
+        // `ColumnDesc::format_code` in the provided row_desc.
+        w.push_u16_be(0)?;
+        Ok(())
+    })?;
+    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+}
+
+/// Build a PostgreSQL `Execute` (`'E'`) frame into `write_buf`.
+///
+/// Wire layout per PG §55.2.2:
+///
+/// ```text
+/// 'E' | len_i32 | portal_name NUL | max_rows_i32
+/// ```
+///
+/// `max_rows = 0` = fetch all rows, no `PortalSuspended`. 1c-3b
+/// restricts to this value at the API level (push_bind_execute
+/// takes a `u32`, but the dispatch arm classifies PortalSuspended
+/// as `UnexpectedFrame`). 1c-6 lifts the restriction.
+fn build_execute_message(
+    portal_name: &crate::ident::PortalName,
+    max_rows: u32,
+    write_buf: &mut WriteBuf,
+) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
+    use crate::write_buf::WriteBufFull;
+
+    let start = write_buf.len();
+    write_buf.push_u8(crate::wire::TAG_EXECUTE.byte())?;
+    write_buf.with_length_prefix(|w| {
+        w.push_nul_terminated(portal_name.as_bytes())?;
+        w.push_u32_be(max_rows)
+    })?;
+    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+}
+
+/// Compute the transition for `push_bind_execute` against the
+/// current [`ProtoState`]. Pure helper mirroring the compute_push_*
+/// family — wrapped by the `push_bind_execute` method below.
+///
+/// Happy path emits THREE actions: `SendBytes(Bind frame)` +
+/// `SendBytes(Execute frame)` + `SendBytes(SYNC)`. Bind and
+/// Execute are written into `write_buf`; Sync is the static const.
+///
+/// Decision table:
+///
+/// | current state             | action                                   | new state                                   |
+/// |---------------------------|------------------------------------------|---------------------------------------------|
+/// | `Idle` (build OK)         | 3× `SendBytes(Bind, Execute, SYNC)`      | `BindExecuteAwaitingBindComplete { reply }` |
+/// | `Idle` (build Err)        | `FailReply(OutboundFrameBuildUnreachable)` | `Idle` (unchanged)                        |
+/// | `Errored(kind)`           | `FailReply(ConnectionAlreadyClosed)`     | `Errored(kind)` preserved                   |
+/// | any `Connecting*`         | `FailReply(StartupAlreadyInProgress)`    | same state preserved                        |
+/// | any in-flight             | `FailReply(CommandInProgress)`           | same state preserved                        |
+#[expect(clippy::too_many_arguments, reason = "compute_push_bind_execute is an internal helper; its arg count matches `push_bind_execute`'s parameter surface + the accumulator + write_buf. Splitting into a struct-arg would obscure the pure-compute framing.")]
+fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
+    state: ProtoState,
+    portal_name: &crate::ident::PortalName,
+    stmt_name: &crate::ident::StmtName,
+    params: &P,
+    row_desc: Option<crate::decode::RowDesc>,
+    max_rows: u32,
+    reply: ReplyId<crate::reply_id::QueryKind>,
+    staged: &mut StagedActions,
+    write_buf: &mut WriteBuf,
+) -> ProtoState {
+    match state {
+        ProtoState::Idle => {
+            // Build both outbound frames into the same WriteBuf. If
+            // Bind succeeds but Execute fails, that's still a
+            // build-unreachable path (const-asserted fit) — we
+            // surface it the same way as other stages.
+            match build_bind_message(portal_name, stmt_name, params, write_buf) {
+                Ok(bind_range) => match build_execute_message(portal_name, max_rows, write_buf) {
+                    Ok(execute_range) => {
+                        emit_actions!(staged, budget: 3, [
+                            StagedAction::SendBytesRange(bind_range),
+                            StagedAction::SendBytesRange(execute_range),
+                            StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+                        ]);
+                        ProtoState::BindExecuteAwaitingBindComplete { reply, row_desc }
+                    }
+                    Err(_) => {
+                        // TIER-1 COMPILE DEAD BRANCH — const assert
+                        // in write_buf.rs proves the Bind+Execute+Sync
+                        // bundle fits MAX_OWNED_SEND_LEN.
+                        emit_actions!(staged, budget: 1, [
+                            StagedAction::FailReply {
+                                id: reply.consume(),
+                                cause: ProtocolError::OutboundFrameBuildUnreachable {
+                                    stage: crate::error::FrameBuildStage::Execute,
+                                },
+                            },
+                        ]);
+                        ProtoState::Idle
+                    }
+                },
+                Err(_) => {
+                    emit_actions!(staged, budget: 1, [
+                        StagedAction::FailReply {
+                            id: reply.consume(),
+                            cause: ProtocolError::OutboundFrameBuildUnreachable {
+                                stage: crate::error::FrameBuildStage::Bind,
+                            },
+                        },
+                    ]);
+                    ProtoState::Idle
+                }
+            }
+        }
+        ProtoState::Errored(prior_kind) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
+                },
+            ]);
+            ProtoState::Errored(prior_kind)
+        }
+        other @ (ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::StartupAlreadyInProgress,
+                },
+            ]);
+            other
+        }
+        other @ (ProtoState::PingAwaitingRfq(_)
+        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
+        | ProtoState::DrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindComplete { .. }
+        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1177,7 +1474,11 @@ const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
         | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_) => true,
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindComplete { .. }
+        | ProtoState::BindExecuteAwaitingDataOrComplete { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfq { .. } => true,
         ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
         | ProtoState::ConnectingScramAwaitingServerFirst { .. }
@@ -1427,7 +1728,11 @@ mod allows_unsolicited_param_status_tests {
                 id.consume();
             }
             ProtoState::SimpleQueryStreamingRows { reply, .. }
-            | ProtoState::SimpleQueryAwaitingRfq { reply, .. } => {
+            | ProtoState::SimpleQueryAwaitingRfq { reply, .. }
+            | ProtoState::BindExecuteAwaitingBindComplete { reply, .. }
+            | ProtoState::BindExecuteAwaitingDataOrComplete { reply, .. }
+            | ProtoState::BindExecuteStreamingRows { reply, .. }
+            | ProtoState::BindExecuteAwaitingRfq { reply, .. } => {
                 reply.consume();
             }
             ProtoState::ParseAwaitingParseComplete(reply)
@@ -1609,7 +1914,11 @@ mod compute_push_tests {
                 id.consume();
             }
             ProtoState::SimpleQueryStreamingRows { reply, .. }
-            | ProtoState::SimpleQueryAwaitingRfq { reply, .. } => {
+            | ProtoState::SimpleQueryAwaitingRfq { reply, .. }
+            | ProtoState::BindExecuteAwaitingBindComplete { reply, .. }
+            | ProtoState::BindExecuteAwaitingDataOrComplete { reply, .. }
+            | ProtoState::BindExecuteStreamingRows { reply, .. }
+            | ProtoState::BindExecuteAwaitingRfq { reply, .. } => {
                 reply.consume();
             }
             ProtoState::ParseAwaitingParseComplete(reply)

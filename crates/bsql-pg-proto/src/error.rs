@@ -494,6 +494,11 @@ pub enum FrameBuildStage {
     /// [`crate::protocol::build_parse_message`] — const-pinned by
     /// `MAX_OWNED_SEND_LEN >= max_parse_message_size()`.
     Parse = 2,
+    /// [`crate::protocol::build_bind_message`] — const-pinned by
+    /// `MAX_OWNED_SEND_LEN >= max_bind_message_size() + max_execute_message_size() + 5`.
+    Bind = 3,
+    /// [`crate::protocol::build_execute_message`] — const-pinned with Bind.
+    Execute = 4,
 }
 
 /// Compact 1-byte classification of a [`ProtocolError`], stored in

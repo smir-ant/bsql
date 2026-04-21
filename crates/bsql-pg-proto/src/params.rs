@@ -56,6 +56,26 @@ mod sealed {
     pub trait ParamsWriterSealed {}
 }
 
+/// Upper bound on tuple arity supported by [`ParamsWriter`] impls
+/// in this module. Referenced by [`crate::write_buf::max_bind_message_size`]
+/// for the worst-case Bind-frame size computation — changing this
+/// const without updating the tuple-impl invocation list would
+/// silently break the budget.
+pub const MAX_PARAMS_ARITY: usize = 16;
+
+/// Upper bound on total parameter-data bytes across all 16 params
+/// in a single Bind frame. Per-param individual size isn't capped
+/// structurally — the caller can send one 1 KB text param OR 16 ×
+/// 64-byte params, provided the SUM stays under this limit.
+///
+/// Enforcement is runtime (via [`crate::write_buf::WriteBufFull`]
+/// when the encoded bytes exceed the buffer's remaining capacity),
+/// classified as tier-2 structural. The const is consulted by
+/// [`crate::write_buf::max_bind_message_size`] to size the worst
+/// case against [`crate::write_buf::MAX_OWNED_SEND_LEN`] at build
+/// time (tier-1 compile).
+pub const MAX_PARAMS_DATA_TOTAL: usize = 1024;
+
 /// Serialise a tuple of PG parameter values into a Bind frame.
 ///
 /// See module-level docs for the full wire-format contract and tier

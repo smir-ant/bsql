@@ -159,6 +159,62 @@ const _: () = assert!(
      in lockstep.",
 );
 
+/// Worst-case byte size of a PostgreSQL `Bind` (`'B'`) frame —
+/// tag + length prefix + portal name + stmt name + n_param_formats
+/// + format codes + n_params + per-param length+data + n_result_formats.
+///
+/// Per-param format codes: [`crate::params::MAX_PARAMS_ARITY`] × 2 bytes.
+/// Per-param length prefixes: [`crate::params::MAX_PARAMS_ARITY`] × 4 bytes.
+/// Per-param data bytes total: [`crate::params::MAX_PARAMS_DATA_TOTAL`].
+///
+/// Bumping either const without growing [`MAX_OWNED_SEND_LEN`]
+/// fails the `const _` assert on the Bind+Execute+Sync bundle below.
+pub const fn max_bind_message_size() -> usize {
+    1usize // tag 'B'
+        .saturating_add(4) // length prefix (includes itself)
+        .saturating_add(crate::ident::MAX_PG_NAME_LEN)
+        .saturating_add(1) // portal NUL
+        .saturating_add(crate::ident::MAX_PG_NAME_LEN)
+        .saturating_add(1) // stmt NUL
+        .saturating_add(2) // n_param_formats
+        .saturating_add(crate::params::MAX_PARAMS_ARITY.saturating_mul(2)) // format codes
+        .saturating_add(2) // n_params
+        .saturating_add(crate::params::MAX_PARAMS_ARITY.saturating_mul(4)) // per-param length prefixes
+        .saturating_add(crate::params::MAX_PARAMS_DATA_TOTAL) // param data
+        .saturating_add(2) // n_result_formats (= 0 in 1c-3b, but field is always present)
+}
+
+/// Worst-case byte size of a PostgreSQL `Execute` (`'E'`) frame —
+/// tag + length + portal name NUL-terminated + max_rows i32.
+pub const fn max_execute_message_size() -> usize {
+    1usize // tag 'E'
+        .saturating_add(4) // length prefix
+        .saturating_add(crate::ident::MAX_PG_NAME_LEN)
+        .saturating_add(1) // portal NUL
+        .saturating_add(4) // max_rows i32
+}
+
+/// Drift-pin (1c-3b): the Bind + Execute + Sync bundle ships in
+/// a single `push_bind_execute` call, so the caller's WriteBuf must
+/// fit all three worst-case messages simultaneously. Bumping
+/// `MAX_PARAMS_DATA_TOTAL` / `MAX_PARAMS_ARITY` / `MAX_PG_NAME_LEN`
+/// without growing `MAX_OWNED_SEND_LEN` is a build failure.
+///
+/// `SYNC_WIRE_BYTES` is a 5-byte static const (tag 'S' + BE u32
+/// length=4); hard-coded as `5` here instead of referencing the
+/// const to avoid a module cycle (wire.rs imports nothing from
+/// write_buf, keeping that direction clean).
+const _: () = assert!(
+    MAX_OWNED_SEND_LEN
+        >= max_bind_message_size()
+            .saturating_add(max_execute_message_size())
+            .saturating_add(5),
+    "MAX_OWNED_SEND_LEN below worst-case Bind+Execute+Sync bundle \
+     (1c-3b: push_bind_execute emits all three). Grow MAX_OWNED_SEND_LEN \
+     or shrink params::MAX_PARAMS_ARITY / MAX_PARAMS_DATA_TOTAL / \
+     MAX_PG_NAME_LEN.",
+);
+
 /// Bounded outbound frame buffer with PG wire builders.
 ///
 /// See [module-level docs](self) for sizing rationale.

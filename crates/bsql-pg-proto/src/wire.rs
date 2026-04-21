@@ -228,6 +228,19 @@ pub const TAG_CLOSE_COMPLETE: InboundTag = InboundTag::from_byte(b'3');
 /// lists the parameter type OIDs the statement expects.
 pub const TAG_PARAMETER_DESCRIPTION: InboundTag = InboundTag::from_byte(b't');
 
+/// Backend `PortalSuspended` message tag (`'s'`).
+///
+/// Sent mid-stream when an `Execute` with a non-zero `max_rows`
+/// limit has produced its row quota. The portal is not closed —
+/// a subsequent `Execute` continues from where this one paused.
+///
+/// **1c-3b scope:** `max_rows = 0` (fetch all) is the only
+/// supported shape; if a user-supplied `max_rows != 0` causes
+/// the server to emit `PortalSuspended`, the dispatch path
+/// classifies as `UnexpectedFrame` (tier-2 structural). Chunked
+/// fetching with portal suspension is scheduled for 1c-6.
+pub const TAG_PORTAL_SUSPENDED: InboundTag = InboundTag::from_byte(b's');
+
 // Outbound commands (frontend → backend):
 
 /// Frontend `Query` message tag (`'Q'`) — simple-query string.
@@ -486,6 +499,7 @@ assert_all_distinct!(
     TAG_BIND_COMPLETE,
     TAG_CLOSE_COMPLETE,
     TAG_PARAMETER_DESCRIPTION,
+    TAG_PORTAL_SUSPENDED,
 );
 
 // **Outbound** (frontend → backend) tag-distinctness.

@@ -245,6 +245,82 @@ pub enum ProtoState {
     /// [`crate::Reply::ParseComplete`] and transition to Idle.
     ParseAwaitingRfq(ReplyId<ParseKind>),
 
+    // ---------------------------------------------------------------
+    // Phase 1c-3b: Extended Query — Bind + Execute flow
+    // ---------------------------------------------------------------
+    //
+    // `push_bind_execute` emits `Bind` + `Execute` + `Sync` as one
+    // bundle. Server response shape (PG §55.2.2):
+    //
+    //   '2' (BindComplete)     — server accepted params
+    //   ['T'] (RowDescription) — ONLY if a prior Describe ran;
+    //                            1c-3b doesn't auto-describe, so user-
+    //                            supplied row_desc is threaded from
+    //                            the push call
+    //   'D'* (DataRow)         — result rows (zero rows for DML)
+    //   'C' (CommandComplete)  — result-set boundary
+    //   'Z' (ReadyForQuery)    — sync boundary
+    //
+    // The four state variants below mirror the SimpleQuery shape
+    // with a `BindComplete` prefix state. Schema (row_desc) is
+    // carried through state transitions same as F19 — no separate
+    // slot on PgProtocol.
+
+    /// `Bind` + `Execute` + `Sync` bundle was sent; awaiting
+    /// `BindComplete` (`'2'`). The user-supplied `row_desc` (if any)
+    /// threads through to `AwaitingDataOrComplete` once the server
+    /// accepts the bind.
+    BindExecuteAwaitingBindComplete {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+        /// User-supplied schema. `Some` for SELECT (caller must
+        /// have Describe'd externally or at macro-compile time);
+        /// `None` for DML / RETURNING-less statements.
+        row_desc: Option<RowDesc>,
+    },
+
+    /// `BindComplete` received; awaiting either a `DataRow` (SELECT)
+    /// or `CommandComplete` (DML). Schema threads through.
+    BindExecuteAwaitingDataOrComplete {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+        /// User-supplied schema — relevant only if `'D'` arrives.
+        row_desc: Option<RowDesc>,
+    },
+
+    /// Streaming `DataRow` frames. Mirrors
+    /// [`Self::SimpleQueryStreamingRows`] — schema is required
+    /// (user pre-provided `Some(row_desc)`, otherwise it'd be an
+    /// undecodable row stream).
+    ///
+    /// F19-style structural invariant: `StreamingRows` implies
+    /// schema. `PgCommand::BindExecute` constructed with
+    /// `row_desc: None` and a SELECT statement reaches
+    /// [`Self::BindExecuteAwaitingDataOrComplete`] but **cannot**
+    /// transition here — the `'D'` arm bails to `UnexpectedFrame`
+    /// since there's no schema to embed. This is the tier-2
+    /// structural shield on "decoded rows need a schema".
+    BindExecuteStreamingRows {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+        /// Schema the user provided (guaranteed present).
+        row_desc: RowDesc,
+    },
+
+    /// `CommandComplete` received; awaiting the trailing
+    /// `ReadyForQuery`. Command tag captured; schema threaded
+    /// for the terminal `QueryComplete` reply. Mirrors
+    /// [`Self::SimpleQueryAwaitingRfq`] — same helper
+    /// `advance_to_awaiting_rfq` constructs this variant.
+    BindExecuteAwaitingRfq {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+        /// Command tag parsed from the `C` frame body.
+        command_tag: BoundedStr<32>,
+        /// User-supplied schema (Some) or absence marker (None).
+        row_desc: Option<RowDesc>,
+    },
+
     /// Terminal: the connection has been classified as unrecoverable.
     ///
     /// Entered by any path that calls `fail_inflight_and_close` or
@@ -288,7 +364,11 @@ impl ProtoState {
             | Self::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
             Self::SimpleQueryAwaitingFirstResponse(id) => Some(id.consume()),
             Self::SimpleQueryStreamingRows { reply, .. }
-            | Self::SimpleQueryAwaitingRfq { reply, .. } => Some(reply.consume()),
+            | Self::SimpleQueryAwaitingRfq { reply, .. }
+            | Self::BindExecuteAwaitingBindComplete { reply, .. }
+            | Self::BindExecuteAwaitingDataOrComplete { reply, .. }
+            | Self::BindExecuteStreamingRows { reply, .. }
+            | Self::BindExecuteAwaitingRfq { reply, .. } => Some(reply.consume()),
             Self::ParseAwaitingParseComplete(reply) | Self::ParseAwaitingRfq(reply) => {
                 Some(reply.consume())
             }
@@ -337,6 +417,26 @@ impl core::fmt::Debug for ProtoState {
                 .finish_non_exhaustive(),
             Self::SimpleQueryAwaitingRfq { reply, command_tag, row_desc } => f
                 .debug_struct("SimpleQueryAwaitingRfq")
+                .field("reply", reply)
+                .field("command_tag", command_tag)
+                .field("row_desc_is_some", &row_desc.is_some())
+                .finish(),
+            Self::BindExecuteAwaitingBindComplete { reply, row_desc } => f
+                .debug_struct("BindExecuteAwaitingBindComplete")
+                .field("reply", reply)
+                .field("row_desc_is_some", &row_desc.is_some())
+                .finish(),
+            Self::BindExecuteAwaitingDataOrComplete { reply, row_desc } => f
+                .debug_struct("BindExecuteAwaitingDataOrComplete")
+                .field("reply", reply)
+                .field("row_desc_is_some", &row_desc.is_some())
+                .finish(),
+            Self::BindExecuteStreamingRows { reply, .. } => f
+                .debug_struct("BindExecuteStreamingRows")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::BindExecuteAwaitingRfq { reply, command_tag, row_desc } => f
+                .debug_struct("BindExecuteAwaitingRfq")
                 .field("reply", reply)
                 .field("command_tag", command_tag)
                 .field("row_desc_is_some", &row_desc.is_some())
