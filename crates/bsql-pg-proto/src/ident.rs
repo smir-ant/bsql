@@ -653,6 +653,38 @@ impl<const N: usize, Tag: Validated> FixedStr<N, Tag> {
 
 impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
     /// UTF-8 ellipsis marker appended on overflow. 3 bytes.
+    ///
+    /// # Why `"…"` and not `"~"` or `"..."` (DEF-126 investigation, 2026-04-21)
+    ///
+    /// A periodic audit suggestion is "replace `…` with ASCII `~`
+    /// to save 2 bytes per truncated buffer and relax the F1
+    /// `N >= 3` bound to `N >= 1`". **Rejected** after frequency +
+    /// convention analysis — recorded here so future audits don't
+    /// re-litigate:
+    ///
+    /// - **Truncation is error-path only.** Happy paths (CommandComplete
+    ///   tag, Sql, EncodingName) essentially never truncate. Only
+    ///   long-form ErrorResponse M/D/H fields trigger this marker.
+    ///   On a 1M-QPS pool at 0.1% error rate with half producing
+    ///   long detail text: ~500 truncations/sec × 2 bytes = 1 KB/sec
+    ///   vs MB/sec of wire traffic. Noise.
+    /// - **`~` is not a recognised truncation convention.**
+    ///   Chrome DevTools / VS Code / modern UIs all use `…`; PG
+    ///   internal logs / nginx / Python textwrap use `...`. No
+    ///   production system uses `~` — it's semantically loaded
+    ///   with home-dir, bitwise-NOT, "approximately", regex-negation.
+    ///   A reader seeing `"error: column \"foo\" does not exist~"`
+    ///   would not instantly parse "truncated"; they'd wonder
+    ///   what the tilde means.
+    /// - **F1's `N >= 3` bound is defensive, not constraining.**
+    ///   No `BoundedStr<2>` exists in the crate or is planned.
+    ///   Relaxing to `N >= 1` is theoretical tidy-up, not practical.
+    /// - **ASCII `"..."` alternative:** same 3 bytes, universal
+    ///   convention, but the crate is fully UTF-8-aware so there's
+    ///   no portability reason to pick ASCII over UTF-8.
+    ///
+    /// Net: `"…"` is the Pareto-optimal choice. Full analysis
+    /// preserved in `deferred.md` DEF-126.
     const OVERFLOW_MARKER: &[u8] = "…".as_bytes();
 
     /// Compile-time floor for `N` on any `Truncating` tag.

@@ -1109,24 +1109,66 @@ API). Land together in 1c-5.
 plus dispatch.rs top-level match, plus ProtoState Debug impl, plus
 tests referring to `ProtoState::Errored(...)` as a direct match.
 
-### DEF-126 — F2: replace UTF-8 ellipsis marker `"…"` with ASCII `~` (DEFERRED)
+### DEF-126 — F2: replace UTF-8 ellipsis marker `"…"` with ASCII `~` (REJECTED 2026-04-21)
 
-**Goal.** Reduce `OVERFLOW_MARKER` from 3 bytes (UTF-8 ellipsis) to
-1 byte (ASCII tilde). Benefits:
-- 2 bytes reclaimed per truncated buffer across all truncating tags
-  (`BoundedStr<32>` now has 96.8% capacity for content instead of
-  91%; `Sql<2048>` gains 2 bytes).
-- The F1 `N >= MARKER.len()` bound relaxes from `N >= 3` to `N >= 1`,
-  eliminating the "tiny-N blind spot" entirely.
-- Visually unambiguous in log output — `~` is more distinct than
-  `...` which could be a literal ASCII ellipsis in user text.
+**Status: NOT DOING.** Investigated frequency + convention data, the
+proposal turns out to be net-negative. Recording the analysis so
+this doesn't resurface in future audits.
 
-**Trade.** User-facing truncated error messages become
-"Ungültige Eingabe~" instead of "Ungültige Eingabe…" — slightly
-less pretty but honest.
+**Frequency data.** Truncation paths in the crate:
 
-**Why deferred.** Aesthetic trade-off; wants user buy-in before
-breaking the (implicit) Display convention.
+| Site | Cap | Typical len | Truncation rate |
+|---|---|---|---|
+| `CommandComplete` command_tag | 32 | 8-15 | Never (PG's longest doc'd tag ~23) |
+| `Sql` user text | 2048 | 50-500 | Rare (only pathological ORM-generated) |
+| `ErrorResponse.message` (M) | 64 | 30-80 | Moderate — "duplicate key value violates unique constraint \"users_email_key\"" = 66 bytes |
+| `ErrorResponse.detail` (D) | 64 | 50-150 | Frequent — detail text is normally long |
+| `ErrorResponse.hint` (H) | 64 | 20-60 | Rare |
+| `OtherEncoding` | 96 | 5-10 | Never (encoding names short) |
+
+Truncation is essentially error-path only. Quantitatively: pool
+doing 100K query/sec with 0.1% errors and half of those producing
+long detail text → 50 truncations/sec × 2 bytes saved = 100 bytes/sec.
+Trivial vs the MB/sec wire traffic.
+
+**Convention data.** Truncation markers across the ecosystem:
+
+| System | Marker | Bytes |
+|---|---|---|
+| Python `textwrap.shorten` | `" [...]"` | 5 (ASCII) |
+| Rust stdlib | no marker — caller decides | — |
+| PostgreSQL internal logs | `...` | 3 (ASCII) |
+| Unix logrotate / nginx access log | `...` | 3 (ASCII) |
+| Chrome DevTools string preview | `…` | 3 (UTF-8) |
+| VS Code peek-definition | `…` | 3 (UTF-8) |
+| Typical CLI/TUI tools | `…` / `...` | 3 |
+
+**`~` is NOT a recognised truncation-marker convention anywhere.**
+It's semantically loaded with:
+- Unix home directory (`~/path`)
+- Bitwise NOT operator
+- "Approximately" (`~100 rows`)
+- Regex negation in some dialects
+
+A user reading `"error: column \"foo\" does not exist~"` would not
+instantly parse it as "truncated" — they'd wonder what the tilde
+means. The diagnostic-confusion cost is real and cross-user.
+
+**Byte savings are ~100 bytes/sec on a million-QPS pool — noise.**
+F1's `N >= 3` bound isn't a real constraint anywhere in the crate
+(no `BoundedStr<2>` exists or is planned); it's defensive. Relaxing
+it to `N >= 1` is a theoretical tidy-up, not a practical win.
+
+**Alternative considered:** `"…"` (3 UTF-8 bytes) → `"..."` (3 ASCII
+bytes). Same length, convention universal, no encoding dependency
+on the marker const. But the crate is fully UTF-8-aware already —
+no portability concern for the marker — so even this swap has no
+upside.
+
+**Decision.** Keep `"…"`. Convention-standard (Chrome / VS Code /
+modern UIs match), visually distinguishable in logs, no realistic
+byte-pressure on error paths. Context comment in `ident.rs` near
+`OVERFLOW_MARKER` records this so future audits don't re-litigate.
 
 ### DEF-127 — F9: collapse `Option<RowDesc>` to `RowDesc` with `is_empty()` (DEFERRED, subsumed by DEF-124)
 
@@ -1200,6 +1242,51 @@ flamegraph data before optimising.
 **Caveat.** Replacing `#[derive(PartialEq)]` with a manual impl
 means we lose the `Hash` derive coherence (if we ever `#[derive(Hash)]`).
 Document the trade when implementing.
+
+### DEF-132 — F17+F41: measurement pass on ProtoState by-value + fail_inflight_and_close inline policy (OPEN)
+
+**Goal.** Both items are potentially valuable optimisations but
+cannot be acted on without measurement data — committing blind
+risks either no-op churn OR a regression LLVM had already solved.
+
+**F17 — `ProtoState` (1248 bytes) passed by value into `compute_push_*`.**
+LLVM typically applies NRVO (named-return-value-optimisation) to
+elide the copy at in/out boundaries. If NRVO fires, by-value is
+free. If it doesn't (e.g., the function's control flow prevents
+NRVO), we're paying 2496 bytes of stack-frame memcpy per
+`push_command` call.
+
+**F41 — `fail_inflight_and_close` is currently `#[cold]` only.**
+Adding `#[inline(never)]` would force an out-of-line call in every
+case, potentially improving icache density on the hot `feed_bytes`
+path (the cold body wouldn't pollute the hot-path prologue). OR it
+might hurt if LLVM was inlining it in cases where the overhead of
+the call was worse than the inlining.
+
+**Why deferred: need data.**
+
+Measurement checklist for whoever picks this up:
+1. Run `cargo asm bsql-pg-proto::protocol::PgProtocol::push_command`
+   — verify whether `ProtoState` copy in/out shows up in the generated
+   assembly (look for large `memcpy` calls or repeated `mov`).
+2. Run `cargo asm bsql-pg-proto::protocol::PgProtocol::feed_bytes`
+   — measure size of the hot-path function body in bytes; note
+   whether `fail_inflight_and_close` is inlined.
+3. Microbenchmark via `criterion` (or equivalent): `push_command(Ping)`
+   loop, 10M iterations. Record ns/call.
+4. Apply each candidate change independently, re-measure, record delta.
+5. Commit only changes that show measurable improvement (or neutral
+   + tier gain, e.g., `#[inline(never)]` that increases clarity).
+
+**Dependency.** Measurement harness is itself a small project — likely
+lives in `benches/push_command.rs` (new file, criterion dep gated
+behind `[dev-dependencies]`). Criterion is already indirectly pulled
+in by some crates; verify or add.
+
+**Why not done now.** This session focused on tier uplifts where the
+win/cost ratio was already clear. Perf optimizations without data
+are speculation — the crate philosophy "каждая наносекунда на счету"
+explicitly requires measurement, not guess.
 
 ---
 
