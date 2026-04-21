@@ -157,7 +157,25 @@ pub enum ScramError {
     /// Server-first-message has invalid format.
     MalformedServerFirst,
     /// Server-final-message indicates an error (`e=<text>`).
-    ServerScramError,
+    ///
+    /// F30: carries the server-supplied error text (lossy-ASCII-coerced
+    /// via [`crate::ident::BoundedStr::from_bytes_lossy`] so non-UTF-8
+    /// server locales survive as `?`-placeholders, not silent-empty).
+    /// Previously this variant was opaque — wrapper crates could only
+    /// log "server reported authentication error" with zero forensic
+    /// detail. The `e=` field content is the primary diagnostic clue
+    /// (e.g., "invalid-proof", "server-does-support-channel-binding",
+    /// "unknown-user"), so preserving it is load-bearing for ops.
+    ServerScramError {
+        /// Server-supplied error text from `e=<text>` (RFC 5802 §5.1
+        /// server-error-value). RFC-defined tokens are short ASCII
+        /// hyphen-separated strings; the longest standard value is
+        /// `"server-does-support-channel-binding"` (35 bytes).
+        /// Capacity 64 covers all known tokens with ~2× headroom for
+        /// future extensions while keeping `ScramError` well under
+        /// clippy's `result_large_err` 128-byte threshold.
+        message: crate::ident::BoundedStr<64>,
+    },
     /// Server-final-message has invalid format.
     MalformedServerFinal,
     /// Server signature verification failed.
@@ -184,7 +202,9 @@ impl fmt::Display for ScramError {
                 write!(f, "SCRAM: iteration count {iterations} below minimum 4096")
             }
             Self::MalformedServerFirst => f.write_str("SCRAM: malformed server-first-message"),
-            Self::ServerScramError => f.write_str("SCRAM: server reported authentication error"),
+            Self::ServerScramError { message } => {
+                write!(f, "SCRAM: server reported authentication error: {}", message.as_str())
+            }
             Self::MalformedServerFinal => f.write_str("SCRAM: malformed server-final-message"),
             Self::SignatureMismatch => f.write_str("SCRAM: server signature mismatch"),
             Self::Base64DecodeError => f.write_str("SCRAM: base64 decode failed"),
@@ -385,8 +405,15 @@ pub(crate) fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError>
             dest.copy_from_slice(src);
         }
         Ok(SecretDigest::new(arr))
-    } else if msg_str.starts_with("e=") {
-        Err(ScramError::ServerScramError)
+    } else if let Some(err_text) = msg_str.strip_prefix("e=") {
+        // F30: preserve the server-supplied diagnostic. `err_text` may
+        // contain non-ASCII (theoretically — RFC 5802 §7 restricts
+        // server-error-value to `value-safe-char` which is ASCII, but
+        // a mis-implemented server could deviate). `from_bytes_lossy`
+        // guarantees valid-UTF-8 output either way.
+        Err(ScramError::ServerScramError {
+            message: crate::ident::BoundedStr::from_bytes_lossy(err_text.as_bytes()),
+        })
     } else {
         Err(ScramError::MalformedServerFinal)
     }

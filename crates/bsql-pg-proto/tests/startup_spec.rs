@@ -918,6 +918,61 @@ fn scram_iterations_too_low_is_rejected() {
     }
 }
 
+/// F30 regression: SCRAM server-final-message with `e=<text>`
+/// produces `ScramError::ServerScramError { message }` carrying the
+/// RFC-defined error token, not an opaque unit variant. Before F30
+/// the wrapper crate could only log "server reported authentication
+/// error" with no forensic clue to which failure mode fired.
+#[test]
+fn scram_server_error_preserves_diagnostic_message() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(700);
+
+    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
+    let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
+        [Action::SendBytes(send_buf)] => send_buf.to_vec(),
+        other => panic!("expected SendBytes, got {other:?}"),
+    };
+    let (_client_first, client_first_bare) =
+        extract_client_first_from_sasl_initial(&sasl_initial_bytes);
+    let client_nonce = extract_client_nonce_from_bare(&client_first_bare);
+
+    let salt_raw: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let mut salt_b64_buf = [0u8; 64];
+    let salt_b64_len = bsql_pg_proto::scram::wire::base64_encode_to_buf(&salt_raw, &mut salt_b64_buf).unwrap_or(0);
+    let salt_b64 = std::str::from_utf8(salt_b64_buf.get(..salt_b64_len).unwrap_or(&[])).unwrap_or("");
+
+    let mut server_nonce = client_nonce.clone();
+    server_nonce.extend_from_slice(b"SRV");
+    let server_nonce_str = std::str::from_utf8(&server_nonce).unwrap_or("");
+
+    let server_first = format!("r={server_nonce_str},s={salt_b64},i=4096");
+    let _ = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()), &mut wb);
+
+    // Server responds with `e=invalid-proof` instead of `v=<verifier>`.
+    let server_error_msg = b"e=invalid-proof";
+    let out = proto.feed_bytes(&auth_sasl_final_frame(server_error_msg), &mut wb);
+
+    assert_eq!(out.len(), 2, "server e= → FailReply + CloseSocket");
+    match out.as_slice() {
+        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
+            match cause {
+                ProtocolError::Scram(bsql_pg_proto::scram::wire::ScramError::ServerScramError { message }) => {
+                    assert_eq!(
+                        message.as_str(),
+                        "invalid-proof",
+                        "F30: server-error-value must be preserved, not silent-empty",
+                    );
+                }
+                other => panic!("expected ServerScramError{{message}}, got {other:?}"),
+            }
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
 /// Invariant (spec): SCRAM nonce prefix mismatch → classified error.
 #[test]
 fn scram_nonce_prefix_mismatch_is_rejected() {
