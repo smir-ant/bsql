@@ -314,8 +314,18 @@ impl PgProtocol {
         // `SimpleQuery` push from Idle has no prior schema to carry
         // over; the state variants don't exist outside their query.
         // DEF-119: arena cleanup at push entry (mirrors feed_bytes).
+        // DEF-148: clear() has a has_any fast-path — no memset when
+        // arena already empty (Ping-loop hot path benefit).
+        // DEF-152 probe: pin "clear() leaves arena empty" as a
+        // debug-time invariant to catch future regressions where
+        // has_any bookkeeping drifts.
         if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
             self.schema_arena.clear();
+            debug_assert_eq!(
+                self.schema_arena.occupied_count(),
+                0,
+                "DEF-152: clear() must leave arena empty",
+            );
         }
         let prev = core::mem::take(&mut self.state);
         let (new_state, staged) = compute_push(cmd, prev, write_buf);
@@ -388,9 +398,16 @@ impl PgProtocol {
         // DEF-119: arena cleanup at push entry (mirrors feed_bytes).
         // When state is Idle/Errored, prior query's schema (if any)
         // is stale — safely reusable now that previous OutActions
-        // borrow has ended.
+        // borrow has ended. DEF-148: clear() is has_any-guarded (no
+        // memset on already-empty slab). DEF-152 probe pins the
+        // post-clear invariant in debug builds.
         if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
             self.schema_arena.clear();
+            debug_assert_eq!(
+                self.schema_arena.occupied_count(),
+                0,
+                "DEF-152: clear() must leave arena empty",
+            );
         }
         // DEF-119: if the user supplied a row_desc, allocate it into
         // the arena NOW and thread the resulting SchemaRef into the
@@ -446,8 +463,15 @@ impl PgProtocol {
         // prior query are now safely reusable. When state is Idle
         // (command completed cleanly) or Errored (terminal — no
         // further alloc), clear all slots to start fresh.
+        // DEF-148: clear() has_any fast-path — no memset on Ping-loop.
+        // DEF-152 probe pins the post-clear invariant in debug.
         if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
             self.schema_arena.clear();
+            debug_assert_eq!(
+                self.schema_arena.occupied_count(),
+                0,
+                "DEF-152: clear() must leave arena empty",
+            );
         }
 
         // F66 (pass #6 audit): if the connection is already Errored,
@@ -2319,22 +2343,23 @@ mod allows_unsolicited_param_status_tests {
         assert!(allows_unsolicited_param_status(&q_first));
         consume_state(q_first);
 
-        // DEF-119: state carries `schema_ref: SchemaRef` instead of
-        // `row_desc: RowDesc`. Test fixture allocates an empty schema
-        // into a local arena slab to obtain a valid SchemaRef handle;
-        // the handle is 1 byte and carries no lifetime.
+        // DEF-119 + DEF-148: state carries `schema_ref: SchemaRef`
+        // (2 bytes: NonZeroU8 slot + u8 generation). Test fixture
+        // allocates an empty schema into a local arena slab to obtain
+        // a valid SchemaRef handle; the handle carries no lifetime.
         //
         // Forbid-bundle note: `panic!`, `.unwrap()`, `.expect()`,
         // `unreachable!()` are all banned. The `assert!(is_some) +
-        // unwrap_or(fallback)` idiom below fails loudly on precondition
-        // break (alloc on a fresh slab MUST succeed by spec) while
-        // keeping the test expression well-typed as `SchemaRef`. Same
-        // pattern as `must_parse` in `decode::data_row_ref_tests` and
-        // `must_alloc` in `schema_arena::tests`.
+        // unwrap_or(fallback)` idiom fails loudly on precondition
+        // break (alloc on a fresh slab MUST succeed by spec); the
+        // fallback is architecturally dead but must still produce a
+        // well-typed `SchemaRef`. DEF-148 added `SchemaRef::dead_for_test`
+        // as the test-only sentinel replacing the pre-DEF-148 `ZERO`
+        // (`ZERO` could no longer exist — NonZeroU8 forbids 0).
         let mut arena = crate::schema_arena::SchemaSlab::new();
         let alloc_result = arena.alloc(crate::decode::RowDesc::EMPTY);
         assert!(alloc_result.is_some(), "alloc on fresh slab must succeed");
-        let sr = alloc_result.unwrap_or(crate::schema_arena::SchemaRef::ZERO);
+        let sr = alloc_result.unwrap_or_else(crate::schema_arena::SchemaRef::dead_for_test);
         let q_rows = ProtoState::SimpleQueryStreamingRows {
             reply: ReplyId::from_raw(nz(8002)),
             schema_ref: sr,
