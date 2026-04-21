@@ -26,6 +26,7 @@
 //! construction.
 
 use crate::scram::types::SecretDigest;
+use crate::scram::wire::ScramError;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -35,8 +36,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the SCRAM SaltedPassword via PBKDF2-HMAC-SHA-256.
 ///
-/// Per RFC 7677 §3, the minimum iteration count is 4096.
-/// The caller validates this before invoking.
+/// Per RFC 7677 §3, the minimum iteration count is 4096 and (pass #6
+/// audit BS8) the maximum client-accepted count is
+/// [`crate::scram::wire::MAX_SCRAM_ITERATIONS`] — both bounds enforced
+/// at `parse_server_first` before this function is called.
 ///
 /// The result is wrapped in `Zeroizing` for scrub-on-drop.
 fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[u8; 32]> {
@@ -47,33 +50,78 @@ fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[
 
 /// HMAC-SHA-256(key, message) → 32 bytes.
 ///
-/// # Dead-branch analysis (F45, 2026-04-21)
+/// # F54 (pass #6 audit, 2026-04-21) — fail-closed explicit Result
 ///
 /// `HmacSha256::new_from_slice` returns `Result<Self, InvalidLength>`
 /// in signature, but HMAC-SHA-256 structurally accepts keys of ANY
 /// length (RFC 2104: keys shorter than block size are zero-padded,
 /// longer than block size are hashed first). The `Err` branch is
-/// architecturally dead under the intact HMAC construction.
+/// architecturally dead under the intact RustCrypto `hmac` crate.
 ///
-/// **If the invariant ever breaks** (upstream `hmac` crate introduces
-/// a key-length restriction, or we're called with an exotic key type),
-/// the zeroed return causes the downstream SCRAM client-proof to be
-/// computed over zeros → server signature verification fails openly
-/// at the AuthenticationSASLFinal step → classified as
-/// `ScramError::SignatureMismatch`. Tier-2 runtime: silent-key-break
-/// is impossible; the failure surfaces as a typed error with correct
-/// diagnostic ("server signature mismatch").
+/// **Pre-F54 code returned `[0u8; 32]` on the dead Err branch.** F54
+/// replaces this with explicit `Result<[u8; 32], ScramError>` so the
+/// "fail-closed" discipline is visible in the type system, not
+/// documentation-only. Rationale spelled out below.
 ///
-/// Bypass options considered: `unwrap_or_else(|e| match e {})` once
-/// `InvalidLength` becomes convertible to `!` / `Infallible` (blocked
-/// by upstream API shape); `unsafe unwrap_unchecked` (forbid-bundle).
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut mac = match HmacSha256::new_from_slice(key) {
-        Ok(m) => m,
-        Err(_) => return [0u8; 32],
-    };
+/// ## SCRAM fail-closed math (critical — pass-#6 agent got this wrong)
+///
+/// This is the actual math of what happens if the HMAC Err branch
+/// ever fires. The agent's initial audit claimed "server trivially
+/// accepts because ClientProof = [0; 32]." That is **WRONG**.
+/// Triple-check here so future readers don't re-make the mistake.
+///
+/// SCRAM-SHA-256 signature-check (RFC 5802 §3):
+///
+/// - Client computes `ClientKey = HMAC(SaltedPassword, "Client Key")`.
+///   If HMAC returns zeros, `ClientKey = [0; 32]`.
+/// - Client computes `ClientSignature = HMAC(StoredKey, AuthMessage)`
+///   where `StoredKey = SHA-256(ClientKey)`. If HMAC returns zeros,
+///   `ClientSignature = [0; 32]`.
+/// - Client sends `ClientProof = ClientKey XOR ClientSignature = [0; 32]`.
+///
+/// Server-side verification:
+///
+/// - Server has real `StoredKey` from the user's stored credentials.
+/// - Server computes `ClientSignature_server = HMAC(StoredKey, AuthMessage)`
+///   using its real HMAC (not the client's broken one).
+/// - Server derives `ClientKey_candidate = ClientProof XOR ClientSignature_server`.
+///   With `ClientProof = [0; 32]`, this yields `ClientSignature_server`
+///   itself.
+/// - Server checks `SHA-256(ClientKey_candidate) == StoredKey`, i.e.,
+///   `SHA-256(HMAC(StoredKey, AuthMessage)) == StoredKey`.
+///
+/// For that equation to hold, `HMAC(StoredKey, AuthMessage)` would
+/// need to equal the `ClientKey` from which `StoredKey = SHA-256(ClientKey)`
+/// was derived. But those are two HMAC computations with different
+/// inputs (`StoredKey, AuthMessage` vs `SaltedPassword, "Client Key"`)
+/// — the probability of collision is `2^-256`, cryptographically
+/// zero. **Server rejects.** Fail-closed via server rejection.
+///
+/// ## Why fail-closed explicit Result is still better
+///
+/// The silent-zero fallback was fail-closed IN PRACTICE but bad
+/// pattern:
+///
+/// 1. **Supply-chain hardening.** If `hmac` crate ever changed its
+///    contract (new API, stricter key validation, patch-release bug),
+///    silent zeros would be a predictable-ClientProof signal —
+///    pattern recognition surface even if not auth bypass.
+/// 2. **Refactor safety.** A future change to `compute_client_proof`
+///    that short-circuits on zero inputs (optimisation, debugging)
+///    would turn the fallback into a real bypass. Explicit Result
+///    prevents the change from compiling.
+/// 3. **Audit discipline.** Crypto primitives should never silently
+///    degrade. The Result makes the `Err` path visible and forces
+///    every caller to decide its behaviour.
+///
+/// Fail-closed via explicit Result preserves the "server rejects"
+/// outcome while adding a typed diagnostic that `ScramError::HmacKeyRejected`
+/// propagates — the wrapper sees a classified fault, not a timeout
+/// on the SASLFinal step.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<[u8; 32], ScramError> {
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| ScramError::HmacKeyRejected)?;
     mac.update(message);
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 /// HMAC-SHA256 over the SCRAM AuthMessage, computed incrementally.
@@ -86,22 +134,22 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 ///
 /// Tier-1 by construction: overflow is impossible because HMAC accepts
 /// arbitrarily many `update()` calls with arbitrarily sized slices.
+///
+/// F54: returns `Result` on the architecturally-dead HMAC-key-reject
+/// path — see [`hmac_sha256`] for the full fail-closed rationale.
 fn hmac_auth_message(
     key: &[u8],
     client_first_bare: &[u8],
     server_first: &[u8],
     client_final_without_proof: &[u8],
-) -> [u8; 32] {
-    let mut mac = match HmacSha256::new_from_slice(key) {
-        Ok(m) => m,
-        Err(_) => return [0u8; 32],
-    };
+) -> Result<[u8; 32], ScramError> {
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| ScramError::HmacKeyRejected)?;
     mac.update(client_first_bare);
     mac.update(b",");
     mac.update(server_first);
     mac.update(b",");
     mac.update(client_final_without_proof);
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 /// Full SCRAM-SHA-256 client proof computation.
@@ -133,25 +181,30 @@ pub fn compute_client_proof(
     client_first_bare: &[u8],
     server_first: &[u8],
     client_final_without_proof: &[u8],
-) -> (Zeroizing<[u8; 32]>, SecretDigest) {
+) -> Result<(Zeroizing<[u8; 32]>, SecretDigest), ScramError> {
     let salted_pw = salted_password(password, salt, iterations);
 
-    let client_key = Zeroizing::new(hmac_sha256(salted_pw.as_ref(), b"Client Key"));
+    // F54: propagate HMAC errors as typed `ScramError::HmacKeyRejected`
+    // rather than silently computing over zeros. All four HMAC calls
+    // below are architecturally dead Err (RustCrypto HMAC accepts any
+    // key length), but a fail-closed typed error is the correct
+    // discipline for crypto primitives.
+    let client_key = Zeroizing::new(hmac_sha256(salted_pw.as_ref(), b"Client Key")?);
     let stored_key: [u8; 32] = Sha256::digest(client_key.as_ref()).into();
-    let server_key = Zeroizing::new(hmac_sha256(salted_pw.as_ref(), b"Server Key"));
+    let server_key = Zeroizing::new(hmac_sha256(salted_pw.as_ref(), b"Server Key")?);
 
     let client_signature = hmac_auth_message(
         &stored_key,
         client_first_bare,
         server_first,
         client_final_without_proof,
-    );
+    )?;
     let server_signature = SecretDigest::new(hmac_auth_message(
         server_key.as_ref(),
         client_first_bare,
         server_first,
         client_final_without_proof,
-    ));
+    )?);
 
     // ClientProof = ClientKey XOR ClientSignature (element-wise).
     // Bitwise XOR on u8 cannot overflow — `clippy::arithmetic_side_effects`
@@ -161,7 +214,7 @@ pub fn compute_client_proof(
         *p = *ck ^ *cs;
     }
 
-    (proof, server_signature)
+    Ok((proof, server_signature))
 }
 
 #[cfg(test)]
@@ -204,7 +257,7 @@ mod tests {
         let server_first = b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
         let client_final_without_proof = b"c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
 
-        let (proof, server_sig) = compute_client_proof(
+        let result = compute_client_proof(
             password,
             &salt,
             iterations,
@@ -212,6 +265,13 @@ mod tests {
             server_first,
             client_final_without_proof,
         );
+        assert!(result.is_ok(), "RFC 7677 params are well-formed; compute_client_proof must succeed");
+        let (proof, server_sig) = match result {
+            Ok(v) => v,
+            // Dead after the assert above, but the pattern avoids
+            // `.unwrap()` / `.expect()` (both forbid-bundle-banned).
+            Err(_) => return,
+        };
 
         // Verify via base64 encoding of the proof.
         let mut proof_b64_buf = [0u8; 64];

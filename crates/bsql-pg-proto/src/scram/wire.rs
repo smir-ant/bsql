@@ -44,6 +44,21 @@ pub const MAX_CLIENT_FINAL_MSG_LEN: usize = 384;
 /// Minimum SCRAM iteration count per RFC 7677 section 4.2.
 pub const MIN_SCRAM_ITERATIONS: u32 = 4096;
 
+/// Maximum SCRAM iteration count this client will execute.
+///
+/// RFC 7677 does not mandate a maximum, but PBKDF2 work is linear
+/// in iteration count. A malicious or mis-configured server sending
+/// `iterations = u32::MAX` (~4 billion) would stall the client for
+/// minutes to hours per connection attempt — a client-side DoS
+/// surface (pass-#6 audit BS8).
+///
+/// `10_000_000` covers all legitimate PG server configurations with
+/// 1000× headroom above RFC 7677's recommended bound (~10_000 for
+/// PBKDF2-SHA-256). A value above this classifies as
+/// [`ScramError::IterationsTooHigh`] — connection is torn down with
+/// a typed diagnostic, not a stuck handshake.
+pub const MAX_SCRAM_ITERATIONS: u32 = 10_000_000;
+
 /// Maximum base64-decoded salt length.
 pub const MAX_SALT_LEN: usize = 64;
 
@@ -145,7 +160,13 @@ const _: () = assert!(
 );
 
 /// Errors from SCRAM wire message construction or parsing.
+///
+/// `#[non_exhaustive]` (pass #6 audit MI6) — SCRAM wire-spec
+/// extensions (channel-binding, future SASL profiles) may introduce
+/// new error classes. Downstream `_ =>` arms absorb additions;
+/// exhaustive matches have always been a compatibility hazard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScramError {
     /// Server nonce does not start with the client nonce (RFC 5802 section 5.1 MUST).
     NoncePrefixMismatch,
@@ -154,6 +175,33 @@ pub enum ScramError {
         /// The iterations value the server sent.
         iterations: u32,
     },
+    /// Server iteration count exceeds the client's sanity cap
+    /// ([`MAX_SCRAM_ITERATIONS`]). Closes the client-side DoS surface
+    /// where a malicious or mis-configured server would send a
+    /// deliberately-large iteration count to stall PBKDF2 for
+    /// minutes per connection (pass #6 audit BS8).
+    IterationsTooHigh {
+        /// The offending iterations value.
+        iterations: u32,
+    },
+    /// HMAC-SHA-256 key construction rejected. HMAC structurally
+    /// accepts any key length (RFC 2104), so this variant is
+    /// architecturally unreachable with an intact RustCrypto `hmac`
+    /// crate. Emission indicates a supply-chain compromise or
+    /// upstream contract break.
+    ///
+    /// # Why fail-closed, not silent-zero (pass #6 F54)
+    ///
+    /// Pre-F54 the HMAC helpers returned `[0u8; 32]` on the dead Err
+    /// branch. Even though SCRAM's server-side verification would
+    /// REJECT an all-zero `ClientProof` (see the crypto-module docs
+    /// for the signature-check math — server computes
+    /// `SHA-256(ClientProof XOR server-side ClientSignature) == StoredKey`
+    /// which is vanishingly unlikely to hold for an all-zero
+    /// ClientProof), the silent-degradation pattern itself is a bad
+    /// precedent for crypto code. Explicit `Result` propagation
+    /// makes the fail-closed behaviour visible in the type system.
+    HmacKeyRejected,
     /// Server-first-message has invalid format.
     MalformedServerFirst,
     /// Server-final-message indicates an error (`e=<text>`).
@@ -201,6 +249,13 @@ impl fmt::Display for ScramError {
             Self::IterationsTooLow { iterations } => {
                 write!(f, "SCRAM: iteration count {iterations} below minimum 4096")
             }
+            Self::IterationsTooHigh { iterations } => write!(
+                f,
+                "SCRAM: iteration count {iterations} above client sanity cap {MAX_SCRAM_ITERATIONS}",
+            ),
+            Self::HmacKeyRejected => f.write_str(
+                "SCRAM: HMAC-SHA-256 key construction failed (fail-closed — architecturally unreachable with intact `hmac` crate)",
+            ),
             Self::MalformedServerFirst => f.write_str("SCRAM: malformed server-first-message"),
             Self::ServerScramError { message } => {
                 write!(f, "SCRAM: server reported authentication error: {}", message.as_str())
@@ -346,6 +401,12 @@ pub(crate) fn parse_server_first(
         .map_err(|_| ScramError::MalformedServerFirst)?;
     if iterations < MIN_SCRAM_ITERATIONS {
         return Err(ScramError::IterationsTooLow { iterations });
+    }
+    // Pass #6 BS8: bound the upper end. A malicious server sending
+    // `iterations = u32::MAX` stalls PBKDF2 for minutes per connection
+    // — client-side DoS. Reject anything above the 10M sanity cap.
+    if iterations > MAX_SCRAM_ITERATIONS {
+        return Err(ScramError::IterationsTooHigh { iterations });
     }
 
     Ok(ServerFirst {

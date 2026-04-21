@@ -141,6 +141,7 @@ impl fmt::Debug for Password {
 /// accept the connection based on pg_hba.conf rules alone.
 /// `ScramPassword` carries a password for SCRAM-SHA-256 authentication.
 #[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box is unavailable; Password lives on the stack by design and Credentials is constructed once per connection, not per query")]
+#[non_exhaustive]
 pub enum Credentials {
     /// Trust authentication — no password required.
     Trust,

@@ -1071,14 +1071,21 @@ fn dispatch_auth_sasl_continue(
     // separately — compute_client_proof feeds them incrementally into
     // HMAC::update(), with zero intermediate buffer. No staging
     // buffer → no silent-truncation class → tier-1 by construction.
-    let (proof, expected_server_sig) = crate::scram::crypto::compute_client_proof(
+    // F54: `compute_client_proof` returns Result on architecturally-
+    // dead `HmacKeyRejected` path. On Err (supply-chain compromise of
+    // RustCrypto's HMAC, etc.), tear down the handshake with a typed
+    // diagnostic — don't continue with zero-filled bytes. Fail-closed.
+    let (proof, expected_server_sig) = match crate::scram::crypto::compute_client_proof(
         password_bytes,
         &server_first.salt,
         server_first.iterations,
         client_first_bare.as_slice(),
         rest,
         &client_final_without_proof,
-    );
+    ) {
+        Ok(v) => v,
+        Err(e) => return errored(Some(reply.consume()), ProtocolError::Scram(e)),
+    };
 
     // Base64-encode proof.
     let mut proof_b64_buf = [0u8; 64];

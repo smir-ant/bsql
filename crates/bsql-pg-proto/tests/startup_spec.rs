@@ -775,15 +775,22 @@ fn scram_sha256_handshake_end_to_end() {
     let client_first_bare_str = std::str::from_utf8(&client_first_bare).unwrap_or("");
     let client_final_without_proof = format!("c=biws,r={server_nonce_str}");
 
-    let expected_server_sig = compute_client_proof(
+    // F54: compute_client_proof returns Result (fail-closed on the
+    // architecturally-dead HMAC-key-reject path). RFC 7677 params
+    // produce Ok; assert before destructuring.
+    let proof_result = compute_client_proof(
         password.as_bytes(),
         &salt_raw,
         iterations,
         client_first_bare_str.as_bytes(),
         server_first.as_bytes(),
         client_final_without_proof.as_bytes(),
-    )
-    .1;
+    );
+    assert!(proof_result.is_ok(), "compute_client_proof must succeed on well-formed inputs");
+    let expected_server_sig = match proof_result {
+        Ok((_, sig)) => sig,
+        Err(_) => return, // dead after assert above
+    };
 
     // Base64-encode the server signature via dev-dep `base64ct`.
     let mut sig_b64_buf = [0u8; 64];
@@ -915,6 +922,53 @@ fn scram_iterations_too_low_is_rejected() {
                 matches!(cause, ProtocolError::Scram(_)),
                 "expected ScramError for low iterations, got {cause:?}",
             );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// BS8 regression (pass #6 audit): SCRAM iteration count above the
+/// client's sanity cap classifies as `ScramError::IterationsTooHigh`.
+/// Closes the client-side DoS surface where a malicious or
+/// mis-configured server could send `iterations = u32::MAX` to stall
+/// PBKDF2 for minutes per connection.
+#[test]
+fn scram_iterations_above_cap_is_rejected() {
+    use bsql_pg_proto::scram::wire::{MAX_SCRAM_ITERATIONS, ScramError};
+
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(550);
+
+    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
+    let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
+        [Action::SendBytes(send_buf)] => send_buf.to_vec(),
+        other => panic!("expected SendBytes, got {other:?}"),
+    };
+
+    let (_client_first, client_first_bare) =
+        extract_client_first_from_sasl_initial(&sasl_initial_bytes);
+    let client_nonce = extract_client_nonce_from_bare(&client_first_bare);
+
+    let mut server_nonce = client_nonce;
+    server_nonce.extend_from_slice(b"SRV");
+    let server_nonce_str = std::str::from_utf8(&server_nonce).unwrap_or("");
+
+    // iterations above sanity cap (= MAX + 1)
+    let too_high = MAX_SCRAM_ITERATIONS.saturating_add(1);
+    let server_first = format!("r={server_nonce_str},s=QSXCR+Q6sek8bf92,i={too_high}");
+    let out = proto.feed_bytes(&auth_sasl_continue_frame(server_first.as_bytes()), &mut wb);
+
+    assert_eq!(out.len(), 2, "high iterations → FailReply + CloseSocket");
+    match out.as_slice() {
+        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
+            match cause {
+                ProtocolError::Scram(ScramError::IterationsTooHigh { iterations }) => {
+                    assert_eq!(*iterations, too_high);
+                }
+                other => panic!("expected IterationsTooHigh, got {other:?}"),
+            }
         }
         other => panic!("unexpected: {other:?}"),
     }

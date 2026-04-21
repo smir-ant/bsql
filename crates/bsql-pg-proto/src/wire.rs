@@ -324,10 +324,14 @@ pub const AUTH_SASL_FINAL: u32 = 12;
 /// The server may send any `u32`. [`AuthSubCode::try_from_u32`]
 /// returns `None` for codes outside the 4 known values — callers
 /// classify as `ProtocolError::UnsupportedAuthMethod` carrying the
-/// raw u32. The enum itself stays closed (non-`#[non_exhaustive]`),
-/// so exhaustive match works cleanly.
+/// raw u32.
+///
+/// Pass #6 (MI10): marked `#[non_exhaustive]` — PG may add new
+/// authentication methods (scram-sha-512, post-quantum, etc.) and
+/// adding them here should not break downstream exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum AuthSubCode {
     /// `AuthenticationOk` (0). Server accepted authentication.
     Ok = 0,

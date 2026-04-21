@@ -31,6 +31,7 @@ use core::fmt;
 /// rather than a specific level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Severity {
     /// Unrecognised server severity. Fall-through for forward-compat.
     Unknown = 0,

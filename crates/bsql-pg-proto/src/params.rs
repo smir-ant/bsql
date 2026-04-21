@@ -326,6 +326,21 @@ const _: () = {
     let oids = <(i32, &str, bool) as ParamsWriter>::OIDS;
     assert!(oids.len() == 3);
     assert!(matches!(oids, [crate::decode::oids::INT4, crate::decode::oids::TEXT, crate::decode::oids::BOOL]));
+
+    // F60 (pass #6): drift-pin for the `Option<T> as ParamEncoder`
+    // blanket-vs-dedicated impl dispatch. Instantiates the Option
+    // path at compile time — if Rust's trait resolution ever changed
+    // so that the `impl<T: EncodeBinary> ParamEncoder for T` blanket
+    // started matching `Option<T>` (e.g., someone added `impl EncodeBinary
+    // for Option<T>`), this const-assert would produce an ambiguity
+    // error at build. Currently produces: OIDS[i] == T::OID for the
+    // inner T, proving the Option impl dispatches correctly.
+    assert!(<(Option<i32>, Option<&str>) as ParamsWriter>::COUNT == 2);
+    let option_oids = <(Option<i32>, Option<&str>) as ParamsWriter>::OIDS;
+    assert!(option_oids.len() == 2);
+    assert!(matches!(option_oids, [crate::decode::oids::INT4, crate::decode::oids::TEXT]));
+    assert!(<(Option<bool>,) as ParamsWriter>::COUNT == 1);
+    assert!(matches!(<(Option<bool>,) as ParamsWriter>::OIDS, [crate::decode::oids::BOOL]));
 };
 
 #[cfg(test)]
