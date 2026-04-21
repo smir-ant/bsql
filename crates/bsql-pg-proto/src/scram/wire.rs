@@ -248,6 +248,23 @@ pub(crate) fn build_client_first_message(
 }
 
 /// Parsed fields from a server-first-message.
+///
+/// # NOT stored in `ProtoState` — parse-phase local only
+///
+/// `ServerFirst` is built by [`parse_server_first`] inside a single
+/// dispatcher call (`dispatch_auth_in_scram_server_first` in
+/// `dispatch.rs`), consumed immediately to compute the client proof
+/// and [`crate::scram::types::SecretDigest`], then dropped at function
+/// return. It never crosses a `feed_bytes` / `push_command` boundary.
+/// The state that DOES persist to the next call
+/// ([`crate::ProtoState::ConnectingScramAwaitingServerFinal`]) carries
+/// only the POD `SecretDigest` — the `heapless::Vec` fields here
+/// never propagate Drop into the state enum.
+///
+/// Consequence for audits: a "replace `heapless::Vec` with `PodBytes`
+/// for state-Drop-cleanliness" suggestion does NOT apply here. The
+/// fields are fine as `heapless::Vec` — the Drop surface is bounded
+/// to the parse frame's stack scope.
 #[derive(Debug)]
 pub(crate) struct ServerFirst {
     /// The full server nonce (`r=<value>`) — must start with client nonce.

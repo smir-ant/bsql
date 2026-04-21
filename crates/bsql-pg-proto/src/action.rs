@@ -312,8 +312,33 @@ impl<'w, 'r> Iterator for OutActionsIter<'w, 'r> {
 /// materialises them into [`Action<'buf>`] in phase two (shared
 /// borrow of `write_buf`). `pub(crate)` — not a public API.
 ///
-/// Uses `heapless::Vec` (which does carry `Drop` — but that's fine
-/// for an internal staging type that doesn't leak lifetimes).
+/// # Why `heapless::Vec`, NOT the `OutActions` POD-array shape
+///
+/// A recurring audit suggestion is "for consistency with `OutActions`,
+/// replace this alias with `[StagedAction; N] + u8 len`". **Rejected** —
+/// `heapless::Vec<T, N>` is actually the BETTER choice here, not the
+/// worse one:
+///
+/// - **Memory layout**: `heapless::Vec<T, N>` internally stores
+///   `[MaybeUninit<T>; N]`. Stack footprint is identical to a POD
+///   array (`N * size_of::<T>()`).
+/// - **Init cost**: `heapless::Vec::new()` writes ZERO initialised
+///   slots. A POD array `[StagedAction::CloseSocket; 8]` would write
+///   ALL 8 slots eagerly, even when the typical call uses only 1-2.
+///   That's hundreds of bytes of wasted stack init per entry-point
+///   call (Ping=1, SimpleQuery=1, Parse=2, etc.).
+/// - **Drop**: `heapless::Vec<Copy, N>` DOES have an `impl Drop`, but
+///   its body is empty for Copy elements and LLVM elides it. The
+///   "Drop propagation" concern is a compile-time trait bound
+///   phantom, not a runtime cost.
+/// - **Safety**: a hand-rolled POD with `[MaybeUninit<T>; N]` would
+///   require `unsafe { assume_init_read }` on reads. Sans-I/O core
+///   holds zero `unsafe` — that is a crate-level architectural rule.
+///
+/// So: the current alias is the Pareto-optimal choice — smaller init
+/// than POD, smaller surface than `unsafe`, same memory footprint.
+/// Future "consistency" refactors must address all three points
+/// before proposing the change.
 pub(crate) type StagedActions = heapless::Vec<StagedAction, MAX_ACTIONS_PER_CALL>;
 
 /// A directive from the protocol to its host.

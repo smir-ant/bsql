@@ -718,6 +718,23 @@ fn compute_push_ping(
             ]);
             ProtoState::PingAwaitingRfq(reply)
         }
+        // ERRORED ARM — LOAD-BEARING FOR DIAGNOSTIC CLASSIFICATION.
+        //
+        // Without an explicit Errored arm here, the `other @ (...)`
+        // catch-all below would ALSO match Errored (ProtoState is not
+        // #[non_exhaustive] internally; all variants are listed there).
+        // State preservation works either way — `other => other` keeps
+        // Errored intact. BUT the emitted FailReply cause would be
+        // `CommandInProgress` / `StartupAlreadyInProgress` instead of
+        // the correct `ConnectionAlreadyClosed { prior_kind }`, which
+        // is the only diagnostic that tells the wrapper crate "this
+        // connection is already terminal, don't retry".
+        //
+        // So this arm is tier-3 for diagnostic QUALITY (not tier-2 for
+        // state safety). `compute_push_tests::ping_from_errored_preserves_kind...`
+        // pins the invariant; the four sibling helpers
+        // (compute_push_startup / _simple_query / _parse) have an
+        // identical arm for the same reason.
         ProtoState::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {

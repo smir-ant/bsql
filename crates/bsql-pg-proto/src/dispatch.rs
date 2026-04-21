@@ -223,6 +223,10 @@ pub(crate) fn dispatch(
                         crate::action::PongPayload { tx_status },
                     ),
                 },
+                // `payload_len: 1` is structurally pinned by the `[tx_byte]`
+                // pattern above — the slice matched exactly one element.
+                // Not a magic constant; the `1` here IS the literal slice
+                // length the outer arm already proved.
                 None => errored(
                     Some(id.consume()),
                     ProtocolError::MalformedReadyForQuery { payload_len: 1 },
