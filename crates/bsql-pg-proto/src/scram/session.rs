@@ -36,10 +36,10 @@ use crate::sensitive::Sensitive;
 /// struct prints as `ScramSession { password: <REDACTED> }`.
 ///
 /// `pub` visibility with a fully `pub(crate)` surface: the type is
-/// visible through [`crate::ProtoState::ConnectingScramAwaitServerFirst`]'s
+/// visible through [`crate::ProtoState::ConnectingScramAwaitingServerFirst`]'s
 /// `scram` field (which is `pub` by enum-variant rules), but every
 /// constructor and accessor is crate-internal. External code sees
-/// an opaque handle — matching `ConnectingScramAwaitServerFirst
+/// an opaque handle — matching `ConnectingScramAwaitingServerFirst
 /// { scram, .. }` binds a value they can do nothing with, which is
 /// exactly the intent. The type is not part of the crate's
 /// behavioural public surface.

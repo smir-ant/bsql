@@ -156,7 +156,7 @@ macro_rules! emit_actions {
 /// - `push_command(Ping)` from `Idle` → 1 action (`SendBytes`).
 /// - `push_command(Ping)` from non-`Idle` → 1 action (`FailReply`).
 /// - `push_command(Startup)` → 1 action (`SendBytes` or `FailReply`).
-/// - `feed_bytes(rfq)` from `AwaitingPingReply` → 1 action.
+/// - `feed_bytes(rfq)` from `PingAwaitingRfq` → 1 action.
 /// - `feed_bytes(error_response)` from any flight state → 2 actions
 ///   (`FailReply` + `CloseSocket`).
 /// - `feed_bytes(malformed)` → 2 actions (or 1 if no in-flight reply).
@@ -214,7 +214,7 @@ pub struct PgProtocol {
     /// Lifecycle:
     /// - `None` at construction; `None` between queries.
     /// - Populated on `RowDescription` ('T') arrival in
-    ///   `SimpleQueryAwaitFirstResponse`.
+    ///   `SimpleQueryAwaitingFirstResponse`.
     /// - Referenced by [`crate::Action::StreamRow::desc`] during
     ///   streaming and copied into [`crate::Reply::QueryComplete::row_desc`]
     ///   on the terminal `ReadyForQuery`.
@@ -600,19 +600,19 @@ impl PgProtocol {
         let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
         let raw_id: Option<core::num::NonZeroU64> = match prev {
             ProtoState::Idle | ProtoState::DrainRfqAfterError => None,
-            ProtoState::AwaitingPingReply(id) => Some(id.consume()),
+            ProtoState::PingAwaitingRfq(id) => Some(id.consume()),
             ProtoState::ConnectingStartupTrust { reply }
             | ProtoState::ConnectingStartupScram { reply, .. }
-            | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
-            | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
-            | ProtoState::ConnectingScramAwaitAuthOk(reply)
-            | ProtoState::ConnectingPostAuthWaitKey(reply)
+            | ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }
+            | ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }
+            | ProtoState::ConnectingScramAwaitingAuthOk(reply)
+            | ProtoState::ConnectingPostAuthAwaitingKey(reply)
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
-            ProtoState::SimpleQueryAwaitFirstResponse(id)
+            ProtoState::SimpleQueryAwaitingFirstResponse(id)
             | ProtoState::SimpleQueryStreamingRows(id) => Some(id.consume()),
-            ProtoState::SimpleQueryAwaitRfq { reply, .. } => Some(reply.consume()),
+            ProtoState::SimpleQueryAwaitingRfq { reply, .. } => Some(reply.consume()),
             ProtoState::ParseAwaitingParseComplete(reply)
-            | ProtoState::ParseAwaitRfq(reply) => Some(reply.consume()),
+            | ProtoState::ParseAwaitingRfq(reply) => Some(reply.consume()),
             ProtoState::Errored(original_kind) => {
                 // Already Errored — preserve the ORIGINAL kind
                 // (the `replace` above wrote the new one; revert).
@@ -714,9 +714,9 @@ fn compute_push(
 ///
 /// | current state              | action                 | new state                 |
 /// |----------------------------|------------------------|---------------------------|
-/// | `Idle`                     | `SendBytes(SYNC)`      | `AwaitingPingReply(reply)`|
+/// | `Idle`                     | `SendBytes(SYNC)`      | `PingAwaitingRfq(reply)`|
 /// | `Errored(cause)`           | `FailReply(cause)`     | `Errored(cause)` preserved|
-/// | `AwaitingPingReply(prev)`  | `FailReply(UnexpFr)`   | `AwaitingPingReply(prev)` |
+/// | `PingAwaitingRfq(prev)`  | `FailReply(UnexpFr)`   | `PingAwaitingRfq(prev)` |
 /// | any `Connecting*` variant  | `FailReply(InProgr.)`  | same state preserved      |
 ///
 /// The `compute_push_tests` module below pins this table via a
@@ -736,7 +736,7 @@ fn compute_push_ping(
             emit_actions!(staged, budget: 1, [
                 StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES),
             ]);
-            ProtoState::AwaitingPingReply(reply)
+            ProtoState::PingAwaitingRfq(reply)
         }
         ProtoState::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -747,7 +747,7 @@ fn compute_push_ping(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        ProtoState::AwaitingPingReply(prev_reply) => {
+        ProtoState::PingAwaitingRfq(prev_reply) => {
             // Pushing a Ping while another Ping is in flight is a
             // push-path error (not a wire-framing issue), so
             // classify as `CommandInProgress` rather than
@@ -760,14 +760,14 @@ fn compute_push_ping(
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            ProtoState::AwaitingPingReply(prev_reply)
+            ProtoState::PingAwaitingRfq(prev_reply)
         }
         other @ (ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitAuthOk(_)
-        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
@@ -777,12 +777,12 @@ fn compute_push_ping(
             ]);
             other
         }
-        other @ (ProtoState::SimpleQueryAwaitFirstResponse(_)
+        other @ (ProtoState::SimpleQueryAwaitingFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
-        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitRfq(_)) => {
+        | ProtoState::ParseAwaitingRfq(_)) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -877,13 +877,13 @@ fn compute_push_startup(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        other @ (ProtoState::AwaitingPingReply(_)
+        other @ (ProtoState::PingAwaitingRfq(_)
         | ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitAuthOk(_)
-        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
@@ -893,12 +893,12 @@ fn compute_push_startup(
             ]);
             other
         }
-        other @ (ProtoState::SimpleQueryAwaitFirstResponse(_)
+        other @ (ProtoState::SimpleQueryAwaitingFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
-        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitRfq(_)) => {
+        | ProtoState::ParseAwaitingRfq(_)) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -917,11 +917,11 @@ fn compute_push_startup(
 ///
 /// | current state                | action                              | new state                            |
 /// |------------------------------|-------------------------------------|--------------------------------------|
-/// | `Idle` (build OK)            | `SendBytes('Q' frame)`              | `SimpleQueryAwaitFirstResponse(id)`  |
+/// | `Idle` (build OK)            | `SendBytes('Q' frame)`              | `SimpleQueryAwaitingFirstResponse(id)`  |
 /// | `Idle` (build Err)           | `FailReply(ProtocolInvariantBroken)`| `Idle` (unchanged)                   |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
 /// | any `Connecting*`            | `FailReply(StartupAlreadyInProgress)`| same state preserved                |
-/// | `AwaitingPingReply(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
+/// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
 /// | any `SimpleQuery*`           | `FailReply(CommandInProgress)`      | same                                 |
 fn compute_push_simple_query(
     state: ProtoState,
@@ -936,7 +936,7 @@ fn compute_push_simple_query(
                 emit_actions!(staged, budget: 1, [
                     StagedAction::SendBytesRange(range),
                 ]);
-                ProtoState::SimpleQueryAwaitFirstResponse(reply)
+                ProtoState::SimpleQueryAwaitingFirstResponse(reply)
             }
             Err(_) => {
                 // TIER-1 COMPILE DEAD BRANCH. The const assert in
@@ -970,10 +970,10 @@ fn compute_push_simple_query(
         }
         other @ (ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitAuthOk(_)
-        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
@@ -983,13 +983,13 @@ fn compute_push_simple_query(
             ]);
             other
         }
-        other @ (ProtoState::AwaitingPingReply(_)
-        | ProtoState::SimpleQueryAwaitFirstResponse(_)
+        other @ (ProtoState::PingAwaitingRfq(_)
+        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
-        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitRfq(_)) => {
+        | ProtoState::ParseAwaitingRfq(_)) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1116,10 +1116,10 @@ fn compute_push_parse(
         }
         other @ (ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitAuthOk(_)
-        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
@@ -1129,13 +1129,13 @@ fn compute_push_parse(
             ]);
             other
         }
-        other @ (ProtoState::AwaitingPingReply(_)
-        | ProtoState::SimpleQueryAwaitFirstResponse(_)
+        other @ (ProtoState::PingAwaitingRfq(_)
+        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
-        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitRfq(_)) => {
+        | ProtoState::ParseAwaitingRfq(_)) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1175,20 +1175,20 @@ fn compute_push_parse(
 fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
     match state {
         ProtoState::Idle
-        | ProtoState::AwaitingPingReply(_)
-        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::PingAwaitingRfq(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
         | ProtoState::ConnectingPostAuthHaveKey { .. }
-        | ProtoState::SimpleQueryAwaitFirstResponse(_)
+        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
-        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
         | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitRfq(_) => true,
+        | ProtoState::ParseAwaitingRfq(_) => true,
         ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitAuthOk(_)
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
         | ProtoState::Errored(_) => false,
     }
 }
@@ -1376,29 +1376,29 @@ mod allows_unsolicited_param_status_tests {
             ProtoState::Idle
             | ProtoState::Errored(_)
             | ProtoState::DrainRfqAfterError => {}
-            ProtoState::AwaitingPingReply(id) => {
+            ProtoState::PingAwaitingRfq(id) => {
                 id.consume();
             }
-            ProtoState::ConnectingScramAwaitAuthOk(id)
-            | ProtoState::ConnectingPostAuthWaitKey(id) => {
+            ProtoState::ConnectingScramAwaitingAuthOk(id)
+            | ProtoState::ConnectingPostAuthAwaitingKey(id) => {
                 id.consume();
             }
             ProtoState::ConnectingStartupTrust { reply }
             | ProtoState::ConnectingStartupScram { reply, .. }
-            | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
-            | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
+            | ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }
+            | ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
                 reply.consume();
             }
-            ProtoState::SimpleQueryAwaitFirstResponse(id)
+            ProtoState::SimpleQueryAwaitingFirstResponse(id)
             | ProtoState::SimpleQueryStreamingRows(id) => {
                 id.consume();
             }
-            ProtoState::SimpleQueryAwaitRfq { reply, .. } => {
+            ProtoState::SimpleQueryAwaitingRfq { reply, .. } => {
                 reply.consume();
             }
             ProtoState::ParseAwaitingParseComplete(reply)
-            | ProtoState::ParseAwaitRfq(reply) => {
+            | ProtoState::ParseAwaitingRfq(reply) => {
                 reply.consume();
             }
         }
@@ -1416,13 +1416,13 @@ mod allows_unsolicited_param_status_tests {
         assert!(allows_unsolicited_param_status(&idle));
         consume_state(idle);
 
-        let awaiting_ping = ProtoState::AwaitingPingReply(ReplyId::from_raw(nz(1)));
+        let awaiting_ping = ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(1)));
         assert!(allows_unsolicited_param_status(&awaiting_ping));
         consume_state(awaiting_ping);
 
-        let wait_key = ProtoState::ConnectingPostAuthWaitKey(ReplyId::from_raw(nz(2)));
-        assert!(allows_unsolicited_param_status(&wait_key));
-        consume_state(wait_key);
+        let awaiting_key = ProtoState::ConnectingPostAuthAwaitingKey(ReplyId::from_raw(nz(2)));
+        assert!(allows_unsolicited_param_status(&awaiting_key));
+        consume_state(awaiting_key);
 
         let have_key = ProtoState::ConnectingPostAuthHaveKey {
             reply: ReplyId::from_raw(nz(3)),
@@ -1453,12 +1453,12 @@ mod allows_unsolicited_param_status_tests {
             consume_state(startup_scram);
         }
 
-        // ConnectingScramAwaitServerFirst requires a Password *and* a
+        // ConnectingScramAwaitingServerFirst requires a Password *and* a
         // ScramSession (audit A2 typestate). The Password err branch
         // is architecturally unreachable for the fixture.
         if let Ok(pw) = Password::try_from_bytes(b"pw") {
             let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
-            let scram_first = ProtoState::ConnectingScramAwaitServerFirst {
+            let scram_first = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(nz(5)),
                 scram,
                 client_first_bare: crate::ident::PodBytes::new(),
@@ -1468,14 +1468,14 @@ mod allows_unsolicited_param_status_tests {
             consume_state(scram_first);
         }
 
-        let scram_final = ProtoState::ConnectingScramAwaitServerFinal {
+        let scram_final = ProtoState::ConnectingScramAwaitingServerFinal {
             reply: ReplyId::from_raw(nz(6)),
             expected_server_sig: SecretDigest::new([0u8; 32]),
         };
         assert!(!allows_unsolicited_param_status(&scram_final));
         consume_state(scram_final);
 
-        let scram_authok = ProtoState::ConnectingScramAwaitAuthOk(ReplyId::from_raw(nz(7)));
+        let scram_authok = ProtoState::ConnectingScramAwaitingAuthOk(ReplyId::from_raw(nz(7)));
         assert!(!allows_unsolicited_param_status(&scram_authok));
         consume_state(scram_authok);
 
@@ -1490,7 +1490,7 @@ mod allows_unsolicited_param_status_tests {
         // (server may emit ParameterStatus mid-query if an
         // `ALTER SYSTEM` fires). Exhaustive enumeration pins the
         // policy row per-variant.
-        let q_first = ProtoState::SimpleQueryAwaitFirstResponse(ReplyId::from_raw(nz(8001)));
+        let q_first = ProtoState::SimpleQueryAwaitingFirstResponse(ReplyId::from_raw(nz(8001)));
         assert!(allows_unsolicited_param_status(&q_first));
         consume_state(q_first);
 
@@ -1498,7 +1498,7 @@ mod allows_unsolicited_param_status_tests {
         assert!(allows_unsolicited_param_status(&q_rows));
         consume_state(q_rows);
 
-        let q_rfq = ProtoState::SimpleQueryAwaitRfq {
+        let q_rfq = ProtoState::SimpleQueryAwaitingRfq {
             reply: ReplyId::from_raw(nz(8003)),
             command_tag: crate::error::BoundedStr::default(),
         };
@@ -1554,43 +1554,43 @@ mod compute_push_tests {
             ProtoState::Idle
             | ProtoState::Errored(_)
             | ProtoState::DrainRfqAfterError => {}
-            ProtoState::AwaitingPingReply(id) => {
+            ProtoState::PingAwaitingRfq(id) => {
                 id.consume();
             }
-            ProtoState::ConnectingScramAwaitAuthOk(id)
-            | ProtoState::ConnectingPostAuthWaitKey(id) => {
+            ProtoState::ConnectingScramAwaitingAuthOk(id)
+            | ProtoState::ConnectingPostAuthAwaitingKey(id) => {
                 id.consume();
             }
             ProtoState::ConnectingStartupTrust { reply }
             | ProtoState::ConnectingStartupScram { reply, .. }
-            | ProtoState::ConnectingScramAwaitServerFirst { reply, .. }
-            | ProtoState::ConnectingScramAwaitServerFinal { reply, .. }
+            | ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }
+            | ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }
             | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
                 reply.consume();
             }
-            ProtoState::SimpleQueryAwaitFirstResponse(id)
+            ProtoState::SimpleQueryAwaitingFirstResponse(id)
             | ProtoState::SimpleQueryStreamingRows(id) => {
                 id.consume();
             }
-            ProtoState::SimpleQueryAwaitRfq { reply, .. } => {
+            ProtoState::SimpleQueryAwaitingRfq { reply, .. } => {
                 reply.consume();
             }
             ProtoState::ParseAwaitingParseComplete(reply)
-            | ProtoState::ParseAwaitRfq(reply) => {
+            | ProtoState::ParseAwaitingRfq(reply) => {
                 reply.consume();
             }
         }
     }
 
-    /// If `new_state` is `AwaitingPingReply`, consume the inner reply
+    /// If `new_state` is `PingAwaitingRfq`, consume the inner reply
     /// and return its raw value. Otherwise drain any carried reply
     /// and return `None`. Used to express the assertion "new state
-    /// is AwaitingPingReply(expected_raw)" as a single `assert_eq!`
+    /// is PingAwaitingRfq(expected_raw)" as a single `assert_eq!`
     /// without the forbid-bundle incompatibility of `panic!` in an
     /// else branch.
     fn take_awaiting_ping_raw(new_state: ProtoState) -> Option<NonZeroU64> {
         match new_state {
-            ProtoState::AwaitingPingReply(r) => Some(r.consume()),
+            ProtoState::PingAwaitingRfq(r) => Some(r.consume()),
             other => {
                 consume_state(other);
                 None
@@ -1649,7 +1649,7 @@ mod compute_push_tests {
             "expected SendBytesStatic(SYNC)",
         );
 
-        // State: AwaitingPingReply(raw_id).
+        // State: PingAwaitingRfq(raw_id).
         assert_eq!(take_awaiting_ping_raw(new_state), Some(raw_id));
     }
 
@@ -1691,7 +1691,7 @@ mod compute_push_tests {
     fn ping_from_awaiting_ping_reply_fails_with_unexpected_frame_and_preserves_state() {
         let raw_prev = nz(103);
         let raw_new = nz(104);
-        let prev_state = ProtoState::AwaitingPingReply(ReplyId::from_raw(raw_prev));
+        let prev_state = ProtoState::PingAwaitingRfq(ReplyId::from_raw(raw_prev));
         let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
         let (new_state, staged) = compute_staged(cmd, prev_state);
 
@@ -1712,7 +1712,7 @@ mod compute_push_tests {
             "expected FailReply(CommandInProgress) for new reply",
         );
 
-        // State: AwaitingPingReply(raw_prev) — the original prev_reply
+        // State: PingAwaitingRfq(raw_prev) — the original prev_reply
         // is preserved, not replaced by the new one.
         assert_eq!(take_awaiting_ping_raw(new_state), Some(raw_prev));
     }
@@ -1774,13 +1774,13 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingScramAwaitServerFirst — needs a Password and
+        // ConnectingScramAwaitingServerFirst — needs a Password and
         // ScramSession.
         if let Ok(pw) = Password::try_from_bytes(b"pw") {
             let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
             let raw_prev = nz(203);
             let raw_new = nz(204);
-            let prev = ProtoState::ConnectingScramAwaitServerFirst {
+            let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
                 scram,
                 client_first_bare: crate::ident::PodBytes::new(),
@@ -1797,20 +1797,20 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "ScramAwaitServerFirst → expected FailReply(StartupAlreadyInProgress)",
+                "ScramAwaitingServerFirst → expected FailReply(StartupAlreadyInProgress)",
             );
             assert!(matches!(
                 &new_state,
-                ProtoState::ConnectingScramAwaitServerFirst { .. }
+                ProtoState::ConnectingScramAwaitingServerFirst { .. }
             ));
             consume_state(new_state);
         }
 
-        // ConnectingScramAwaitServerFinal.
+        // ConnectingScramAwaitingServerFinal.
         {
             let raw_prev = nz(205);
             let raw_new = nz(206);
-            let prev = ProtoState::ConnectingScramAwaitServerFinal {
+            let prev = ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(raw_prev),
                 expected_server_sig: SecretDigest::new([0u8; 32]),
             };
@@ -1825,20 +1825,20 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "ScramAwaitServerFinal → expected FailReply(StartupAlreadyInProgress)",
+                "ScramAwaitingServerFinal → expected FailReply(StartupAlreadyInProgress)",
             );
             assert!(matches!(
                 &new_state,
-                ProtoState::ConnectingScramAwaitServerFinal { .. }
+                ProtoState::ConnectingScramAwaitingServerFinal { .. }
             ));
             consume_state(new_state);
         }
 
-        // ConnectingScramAwaitAuthOk.
+        // ConnectingScramAwaitingAuthOk.
         {
             let raw_prev = nz(207);
             let raw_new = nz(208);
-            let prev = ProtoState::ConnectingScramAwaitAuthOk(ReplyId::from_raw(raw_prev));
+            let prev = ProtoState::ConnectingScramAwaitingAuthOk(ReplyId::from_raw(raw_prev));
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
             assert_eq!(staged.len(), 1);
@@ -1850,20 +1850,20 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "ScramAwaitAuthOk → expected FailReply(StartupAlreadyInProgress)",
+                "ScramAwaitingAuthOk → expected FailReply(StartupAlreadyInProgress)",
             );
             assert!(matches!(
                 &new_state,
-                ProtoState::ConnectingScramAwaitAuthOk(_)
+                ProtoState::ConnectingScramAwaitingAuthOk(_)
             ));
             consume_state(new_state);
         }
 
-        // ConnectingPostAuthWaitKey.
+        // ConnectingPostAuthAwaitingKey.
         {
             let raw_prev = nz(209);
             let raw_new = nz(210);
-            let prev = ProtoState::ConnectingPostAuthWaitKey(ReplyId::from_raw(raw_prev));
+            let prev = ProtoState::ConnectingPostAuthAwaitingKey(ReplyId::from_raw(raw_prev));
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
             assert_eq!(staged.len(), 1);
@@ -1875,11 +1875,11 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "PostAuthWaitKey → expected FailReply(StartupAlreadyInProgress)",
+                "PostAuthAwaitingKey → expected FailReply(StartupAlreadyInProgress)",
             );
             assert!(matches!(
                 &new_state,
-                ProtoState::ConnectingPostAuthWaitKey(_)
+                ProtoState::ConnectingPostAuthAwaitingKey(_)
             ));
             consume_state(new_state);
         }
@@ -2000,11 +2000,11 @@ mod compute_push_tests {
             reply: ReplyId::from_raw(raw),
         };
 
-        // AwaitingPingReply.
+        // PingAwaitingRfq.
         if let Some(user) = mk_user() {
             let raw_prev = nz(401);
             let raw_new = nz(402);
-            let prev = ProtoState::AwaitingPingReply(ReplyId::from_raw(raw_prev));
+            let prev = ProtoState::PingAwaitingRfq(ReplyId::from_raw(raw_prev));
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
             assert!(
@@ -2015,7 +2015,7 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "AwaitingPingReply → expected StartupAlreadyInProgress",
+                "PingAwaitingRfq → expected StartupAlreadyInProgress",
             );
             assert_eq!(take_awaiting_ping_raw(new_state), Some(raw_prev));
         }
@@ -2068,13 +2068,13 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingScramAwaitServerFirst. Construction requires
+        // ConnectingScramAwaitingServerFirst. Construction requires
         // Password + ScramSession (audit A2 typestate).
         if let (Some(user), Ok(pw)) = (mk_user(), Password::try_from_bytes(b"pw")) {
             let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
             let raw_prev = nz(405);
             let raw_new = nz(406);
-            let prev = ProtoState::ConnectingScramAwaitServerFirst {
+            let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
                 scram,
                 client_first_bare: crate::ident::PodBytes::new(),
@@ -2090,20 +2090,20 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "ScramAwaitServerFirst → expected StartupAlreadyInProgress",
+                "ScramAwaitingServerFirst → expected StartupAlreadyInProgress",
             );
             assert!(matches!(
                 &new_state,
-                ProtoState::ConnectingScramAwaitServerFirst { .. }
+                ProtoState::ConnectingScramAwaitingServerFirst { .. }
             ));
             consume_state(new_state);
         }
 
-        // ConnectingScramAwaitServerFinal.
+        // ConnectingScramAwaitingServerFinal.
         if let Some(user) = mk_user() {
             let raw_prev = nz(407);
             let raw_new = nz(408);
-            let prev = ProtoState::ConnectingScramAwaitServerFinal {
+            let prev = ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(raw_prev),
                 expected_server_sig: SecretDigest::new([0u8; 32]),
             };
@@ -2117,20 +2117,20 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "ScramAwaitServerFinal → expected StartupAlreadyInProgress",
+                "ScramAwaitingServerFinal → expected StartupAlreadyInProgress",
             );
             assert!(matches!(
                 &new_state,
-                ProtoState::ConnectingScramAwaitServerFinal { .. }
+                ProtoState::ConnectingScramAwaitingServerFinal { .. }
             ));
             consume_state(new_state);
         }
 
-        // ConnectingScramAwaitAuthOk.
+        // ConnectingScramAwaitingAuthOk.
         if let Some(user) = mk_user() {
             let raw_prev = nz(409);
             let raw_new = nz(410);
-            let prev = ProtoState::ConnectingScramAwaitAuthOk(ReplyId::from_raw(raw_prev));
+            let prev = ProtoState::ConnectingScramAwaitingAuthOk(ReplyId::from_raw(raw_prev));
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
             assert!(
@@ -2141,20 +2141,20 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "ScramAwaitAuthOk → expected StartupAlreadyInProgress",
+                "ScramAwaitingAuthOk → expected StartupAlreadyInProgress",
             );
             assert!(matches!(
                 &new_state,
-                ProtoState::ConnectingScramAwaitAuthOk(_)
+                ProtoState::ConnectingScramAwaitingAuthOk(_)
             ));
             consume_state(new_state);
         }
 
-        // ConnectingPostAuthWaitKey.
+        // ConnectingPostAuthAwaitingKey.
         if let Some(user) = mk_user() {
             let raw_prev = nz(411);
             let raw_new = nz(412);
-            let prev = ProtoState::ConnectingPostAuthWaitKey(ReplyId::from_raw(raw_prev));
+            let prev = ProtoState::ConnectingPostAuthAwaitingKey(ReplyId::from_raw(raw_prev));
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
             assert!(
@@ -2165,11 +2165,11 @@ mod compute_push_tests {
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
                 ),
-                "PostAuthWaitKey → expected StartupAlreadyInProgress",
+                "PostAuthAwaitingKey → expected StartupAlreadyInProgress",
             );
             assert!(matches!(
                 &new_state,
-                ProtoState::ConnectingPostAuthWaitKey(_)
+                ProtoState::ConnectingPostAuthAwaitingKey(_)
             ));
             consume_state(new_state);
         }

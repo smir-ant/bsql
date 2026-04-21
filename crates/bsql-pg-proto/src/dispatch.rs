@@ -202,7 +202,7 @@ pub(crate) fn dispatch(
         // =============================================================
         // Ping flow (Phase 1a, carried forward)
         // =============================================================
-        (ProtoState::AwaitingPingReply(id), TAG_READY_FOR_QUERY) => match payload {
+        (ProtoState::PingAwaitingRfq(id), TAG_READY_FOR_QUERY) => match payload {
             // DEF-112: `id: ReplyId<PingKind>` — the typed
             // `deliver` helper binds the payload to `PongPayload`
             // at compile time. Attempting to deliver any other
@@ -229,11 +229,11 @@ pub(crate) fn dispatch(
                     payload_len: other.len(),
                 }),
         },
-        (ProtoState::AwaitingPingReply(id), TAG_ERROR_RESPONSE) => {
+        (ProtoState::PingAwaitingRfq(id), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
             errored(Some(id.consume()), cause)
         }
-        (ProtoState::AwaitingPingReply(id), other) => errored(Some(id.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::PingAwaitingRfq(id), other) => errored(Some(id.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupTrust — awaiting AuthenticationOk
@@ -277,7 +277,7 @@ pub(crate) fn dispatch(
         // SCRAM: awaiting server-first-message
         // =============================================================
         (
-            ProtoState::ConnectingScramAwaitServerFirst {
+            ProtoState::ConnectingScramAwaitingServerFirst {
                 reply,
                 scram,
                 client_first_bare,
@@ -287,11 +287,11 @@ pub(crate) fn dispatch(
         ) => {
             dispatch_auth_sasl_continue(reply, scram, client_first_bare, client_nonce_b64, payload, write_buf)
         }
-        (ProtoState::ConnectingScramAwaitServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
+        (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
             errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingScramAwaitServerFirst { reply, .. }, other) => {
+        (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
@@ -299,31 +299,31 @@ pub(crate) fn dispatch(
         // SCRAM: awaiting server-final-message
         // =============================================================
         (
-            ProtoState::ConnectingScramAwaitServerFinal {
+            ProtoState::ConnectingScramAwaitingServerFinal {
                 reply,
                 expected_server_sig,
             },
             TAG_AUTHENTICATION,
         ) => dispatch_auth_sasl_final(reply, expected_server_sig, payload),
-        (ProtoState::ConnectingScramAwaitServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
+        (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
             errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingScramAwaitServerFinal { reply, .. }, other) => {
+        (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
         // SCRAM: awaiting AuthenticationOk after server sig verified
         // =============================================================
-        (ProtoState::ConnectingScramAwaitAuthOk(reply), TAG_AUTHENTICATION) => {
+        (ProtoState::ConnectingScramAwaitingAuthOk(reply), TAG_AUTHENTICATION) => {
             dispatch_auth_ok_after_scram(reply, payload)
         }
-        (ProtoState::ConnectingScramAwaitAuthOk(reply), TAG_ERROR_RESPONSE) => {
+        (ProtoState::ConnectingScramAwaitingAuthOk(reply), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
             errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingScramAwaitAuthOk(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingScramAwaitingAuthOk(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Post-auth: waiting for BackendKeyData
@@ -332,7 +332,7 @@ pub(crate) fn dispatch(
         // `feed_bytes` via `allows_unsolicited_param_status`; the
         // dispatcher never sees it for these states. DEF-054.
         // =============================================================
-        (ProtoState::ConnectingPostAuthWaitKey(reply), TAG_BACKEND_KEY_DATA) => {
+        (ProtoState::ConnectingPostAuthAwaitingKey(reply), TAG_BACKEND_KEY_DATA) => {
             match parse_backend_key_data(payload) {
                 Ok((pid, secret_key)) => DispatchOutcome::AdvancedSilent {
                     new_state: ProtoState::ConnectingPostAuthHaveKey {
@@ -344,11 +344,11 @@ pub(crate) fn dispatch(
                 Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
-        (ProtoState::ConnectingPostAuthWaitKey(reply), TAG_ERROR_RESPONSE) => {
+        (ProtoState::ConnectingPostAuthAwaitingKey(reply), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
             errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingPostAuthWaitKey(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingPostAuthAwaitingKey(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Post-auth: have BackendKeyData, waiting for ReadyForQuery
@@ -400,16 +400,16 @@ pub(crate) fn dispatch(
         // Phase 1c-1b: Simple Query flow
         //
         // State transitions per PG §55.2.3:
-        //   Q sent → AwaitFirstResponse
+        //   Q sent → AwaitingFirstResponse
         //     T (RowDescription)   → StreamingRows
-        //     C (CommandComplete)  → AwaitRfq(command_tag)
-        //     I (EmptyQueryResp)   → AwaitRfq(empty tag)
+        //     C (CommandComplete)  → AwaitingRfq(command_tag)
+        //     I (EmptyQueryResp)   → AwaitingRfq(empty tag)
         //     E (ErrorResponse)    → DrainRfqAfterError (FailReply emitted)
         //   StreamingRows
         //     D (DataRow)          → emit StreamRow; stay
-        //     C                    → AwaitRfq(command_tag)
+        //     C                    → AwaitingRfq(command_tag)
         //     E                    → DrainRfqAfterError (FailReply emitted)
-        //   AwaitRfq
+        //   AwaitingRfq
         //     Z                    → DeliverReply QueryComplete; Idle
         //   DrainRfqAfterError
         //     Z                    → silent; Idle (reply already sent)
@@ -420,8 +420,8 @@ pub(crate) fn dispatch(
         // states are never entered from simple-query flow.
         // =============================================================
 
-        // AwaitFirstResponse: T / C / I / E — any other tag is desync
-        (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
+        // AwaitingFirstResponse: T / C / I / E — any other tag is desync
+        (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
             // 1c-2a: parse the schema and stash it in PgProtocol's
             // row_desc slot before transitioning to StreamingRows.
             // Subsequent DataRow frames' StreamRowRange emissions
@@ -436,21 +436,21 @@ pub(crate) fn dispatch(
                 Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
-        (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
-            advance_to_await_rfq(reply, payload)
+        (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
+            advance_to_awaiting_rfq(reply, payload)
         }
-        (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
+        (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
             DispatchOutcome::AdvancedSilent {
-                new_state: ProtoState::SimpleQueryAwaitRfq {
+                new_state: ProtoState::SimpleQueryAwaitingRfq {
                     reply,
                     command_tag: crate::error::BoundedStr::default(),
                 },
             }
         }
-        (ProtoState::SimpleQueryAwaitFirstResponse(reply), TAG_ERROR_RESPONSE) => {
+        (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply, payload)
         }
-        (ProtoState::SimpleQueryAwaitFirstResponse(reply), other) => {
+        (ProtoState::SimpleQueryAwaitingFirstResponse(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
@@ -459,7 +459,7 @@ pub(crate) fn dispatch(
             stream_row_or_errored(reply, coords)
         }
         (ProtoState::SimpleQueryStreamingRows(reply), TAG_COMMAND_COMPLETE) => {
-            advance_to_await_rfq(reply, payload)
+            advance_to_awaiting_rfq(reply, payload)
         }
         (ProtoState::SimpleQueryStreamingRows(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply, payload)
@@ -468,8 +468,8 @@ pub(crate) fn dispatch(
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        // AwaitRfq: Z is the only legal frame
-        (ProtoState::SimpleQueryAwaitRfq { reply, command_tag }, TAG_READY_FOR_QUERY) => {
+        // AwaitingRfq: Z is the only legal frame
+        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag }, TAG_READY_FOR_QUERY) => {
             match payload {
                 [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
                     Some(tx_status) => {
@@ -505,7 +505,7 @@ pub(crate) fn dispatch(
                 ),
             }
         }
-        (ProtoState::SimpleQueryAwaitRfq { reply, .. }, other) => {
+        (ProtoState::SimpleQueryAwaitingRfq { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
@@ -536,14 +536,14 @@ pub(crate) fn dispatch(
         //                or: 'E' (ErrorResponse) + 'Z' (recoverable)
         //
         // State lifecycle:
-        //   Idle → ParseAwaitingParseComplete(reply) → ParseAwaitRfq(reply) → Idle
+        //   Idle → ParseAwaitingParseComplete(reply) → ParseAwaitingRfq(reply) → Idle
         //                                            ↘ (on E)
         //                                              DrainRfqAfterError → Idle
         // =============================================================
 
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_PARSE_COMPLETE) => {
             DispatchOutcome::AdvancedSilent {
-                new_state: ProtoState::ParseAwaitRfq(reply),
+                new_state: ProtoState::ParseAwaitingRfq(reply),
             }
         }
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_ERROR_RESPONSE) => {
@@ -564,7 +564,7 @@ pub(crate) fn dispatch(
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        (ProtoState::ParseAwaitRfq(reply), TAG_READY_FOR_QUERY) => match payload {
+        (ProtoState::ParseAwaitingRfq(reply), TAG_READY_FOR_QUERY) => match payload {
             [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
                 Some(tx_status) => DispatchOutcome::AdvancedWithAction {
                     new_state: ProtoState::Idle,
@@ -585,7 +585,7 @@ pub(crate) fn dispatch(
                 },
             ),
         },
-        (ProtoState::ParseAwaitRfq(reply), other) => {
+        (ProtoState::ParseAwaitingRfq(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
@@ -654,7 +654,7 @@ fn dispatch_auth_in_startup_trust(reply: ReplyId<crate::reply_id::StartupKind>, 
 
     match code {
         crate::wire::AuthSubCode::Ok => DispatchOutcome::AdvancedSilent {
-            new_state: ProtoState::ConnectingPostAuthWaitKey(reply),
+            new_state: ProtoState::ConnectingPostAuthAwaitingKey(reply),
         },
         // `Sasl` / `SaslContinue` / `SaslFinal`: a Trust connection
         // never requested SCRAM, so any SASL message means the server
@@ -702,7 +702,7 @@ fn dispatch_auth_in_startup_scram(
             match build_sasl_initial_response(&scram, write_buf) {
                 Ok((range, client_first_bare, client_nonce_b64)) => {
                     DispatchOutcome::AdvancedWithAction {
-                        new_state: ProtoState::ConnectingScramAwaitServerFirst {
+                        new_state: ProtoState::ConnectingScramAwaitingServerFirst {
                             reply,
                             scram,
                             client_first_bare,
@@ -833,7 +833,7 @@ fn build_sasl_initial_response(
 /// [`ScramSession::try_from_credentials`] in the parent dispatch
 /// call; this function cannot be reached with `Trust` credentials
 /// because the state variant it destructures from
-/// ([`ProtoState::ConnectingScramAwaitServerFirst`]) carries
+/// ([`ProtoState::ConnectingScramAwaitingServerFirst`]) carries
 /// `ScramSession`, not `Credentials`. Audit A2.
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
@@ -943,7 +943,7 @@ fn dispatch_auth_sasl_continue(
     };
 
     DispatchOutcome::AdvancedWithAction {
-        new_state: ProtoState::ConnectingScramAwaitServerFinal {
+        new_state: ProtoState::ConnectingScramAwaitingServerFinal {
             reply,
             expected_server_sig,
         },
@@ -983,7 +983,7 @@ fn dispatch_auth_sasl_final(
 
     // Signature matches. Await AuthenticationOk.
     DispatchOutcome::AdvancedSilent {
-        new_state: ProtoState::ConnectingScramAwaitAuthOk(reply),
+        new_state: ProtoState::ConnectingScramAwaitingAuthOk(reply),
     }
 }
 
@@ -1004,7 +1004,7 @@ fn dispatch_auth_ok_after_scram(reply: ReplyId<crate::reply_id::StartupKind>, pa
     }
 
     DispatchOutcome::AdvancedSilent {
-        new_state: ProtoState::ConnectingPostAuthWaitKey(reply),
+        new_state: ProtoState::ConnectingPostAuthAwaitingKey(reply),
     }
 }
 
@@ -1130,20 +1130,20 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 // -----------------------------------------------------------------
 
 /// 1c-1b helper: shared body for the `C` arm in both
-/// `AwaitFirstResponse` and `StreamingRows` states. Transition to
-/// `AwaitRfq { reply, command_tag }` on well-formed tag; classify
+/// `AwaitingFirstResponse` and `StreamingRows` states. Transition to
+/// `AwaitingRfq { reply, command_tag }` on well-formed tag; classify
 /// missing-NUL / framing error as `Errored`.
 ///
-/// Centralises the "`CommandComplete` → AwaitRfq" invariant in one
+/// Centralises the "`CommandComplete` → AwaitingRfq" invariant in one
 /// place — an arm-body edit in only one of the two call sites
 /// would diverge silently; the helper makes the transition atomic.
-fn advance_to_await_rfq(
+fn advance_to_awaiting_rfq(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
 ) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
-            new_state: ProtoState::SimpleQueryAwaitRfq {
+            new_state: ProtoState::SimpleQueryAwaitingRfq {
                 reply,
                 command_tag,
             },
@@ -1153,7 +1153,7 @@ fn advance_to_await_rfq(
 }
 
 /// 1c-1b helper: shared body for the `E` arm in both
-/// `AwaitFirstResponse` and `StreamingRows` states. Emit
+/// `AwaitingFirstResponse` and `StreamingRows` states. Emit
 /// `FailReply` (NO `CloseSocket` — query-level errors are
 /// connection-survivable per PG §55.2.3) and transition to
 /// `DrainRfqAfterError` so the trailing `Z` returns the state to

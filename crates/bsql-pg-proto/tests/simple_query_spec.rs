@@ -193,10 +193,10 @@ fn select_zero_rows_end_to_end() {
     let q_raw = raw(100);
     simple_query_setup(&mut proto, id(q_raw), &mut wb);
 
-    // After push: state should be SimpleQueryAwaitFirstResponse.
+    // After push: state should be SimpleQueryAwaitingFirstResponse.
     assert!(matches!(
         proto.state(),
-        ProtoState::SimpleQueryAwaitFirstResponse(_),
+        ProtoState::SimpleQueryAwaitingFirstResponse(_),
     ));
 
     // Feed: T (0 cols) + C ("SELECT 0\0") + Z('I').
@@ -510,7 +510,7 @@ fn simple_query_while_in_flight_yields_command_in_progress() {
     // Original state preserved.
     assert!(matches!(
         proto.state(),
-        ProtoState::SimpleQueryAwaitFirstResponse(_),
+        ProtoState::SimpleQueryAwaitingFirstResponse(_),
     ));
 
     // Drain the first query so the protocol doesn't drop with an
@@ -591,7 +591,7 @@ fn malformed_command_complete_no_nul_terminator_tears_down() {
 }
 
 /// Invariant: a `ReadyForQuery` arriving BEFORE any C (i.e. in
-/// `SimpleQueryAwaitFirstResponse` or `SimpleQueryStreamingRows`)
+/// `SimpleQueryAwaitingFirstResponse` or `SimpleQueryStreamingRows`)
 /// is classified as UnexpectedFrame — desync.
 #[test]
 fn unexpected_rfq_during_await_first_response_tears_down() {
@@ -713,8 +713,8 @@ fn overflow_backpressure_preserves_delivery_across_calls() {
     let still_streaming = matches!(
         proto.state(),
         ProtoState::SimpleQueryStreamingRows(_)
-            | ProtoState::SimpleQueryAwaitRfq { .. }
-            | ProtoState::SimpleQueryAwaitFirstResponse(_),
+            | ProtoState::SimpleQueryAwaitingRfq { .. }
+            | ProtoState::SimpleQueryAwaitingFirstResponse(_),
     );
     assert!(
         still_streaming,

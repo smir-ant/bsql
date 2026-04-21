@@ -307,7 +307,7 @@ fn application_name_validation_allows_empty() {
 /// the fallback `other` arm in `parse_backend_key_data`.
 #[test]
 fn backend_key_data_wrong_payload_size_is_classified() {
-    // Set up: drive to ConnectingPostAuthWaitKey.
+    // Set up: drive to ConnectingPostAuthAwaitingKey.
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(9000);
@@ -320,12 +320,12 @@ fn backend_key_data_wrong_payload_size_is_classified() {
         credentials: Credentials::Trust,
         reply: id(startup_raw),
     }, &mut wb);
-    // Feed AuthOk — now ConnectingPostAuthWaitKey.
+    // Feed AuthOk — now ConnectingPostAuthAwaitingKey.
     let auth_ok_frame: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
     _ = proto.feed_bytes(&auth_ok_frame, &mut wb);
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthWaitKey(_),
+        ProtoState::ConnectingPostAuthAwaitingKey(_),
     ));
 
     // Feed a BackendKeyData frame with a 4-byte body (wrong — spec says 8).

@@ -221,7 +221,7 @@ fn trust_auth_handshake_end_to_end() {
     assert_eq!(out.len(), 0, "AuthOk produces no actions (state transition only)");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthWaitKey(_)
+        ProtoState::ConnectingPostAuthAwaitingKey(_)
     ));
 
     // Feed ParameterStatus messages.
@@ -729,7 +729,7 @@ fn scram_sha256_handshake_end_to_end() {
     };
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingScramAwaitServerFirst { .. }
+        ProtoState::ConnectingScramAwaitingServerFirst { .. }
     ));
 
     // Step 3: Extract client nonce from SASLInitialResponse.
@@ -769,7 +769,7 @@ fn scram_sha256_handshake_end_to_end() {
     }
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingScramAwaitServerFinal { .. }
+        ProtoState::ConnectingScramAwaitingServerFinal { .. }
     ));
 
     // Step 6: Compute the expected server signature.
@@ -800,7 +800,7 @@ fn scram_sha256_handshake_end_to_end() {
     assert_eq!(out.len(), 0, "SASLFinal → state transition only (awaiting AuthOk)");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingScramAwaitAuthOk(_)
+        ProtoState::ConnectingScramAwaitingAuthOk(_)
     ));
 
     // Step 8: Feed AuthenticationOk.
@@ -808,7 +808,7 @@ fn scram_sha256_handshake_end_to_end() {
     assert_eq!(out.len(), 0, "AuthOk after SCRAM → post-auth chain");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthWaitKey(_)
+        ProtoState::ConnectingPostAuthAwaitingKey(_)
     ));
 
     // Step 9: Complete post-auth chain.
@@ -1070,7 +1070,7 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
 }
 
 /// Invariant (spec): ParameterStatus arriving while the protocol is
-/// in `AwaitingPingReply` (or any other post-auth flight state) is
+/// in `PingAwaitingRfq` (or any other post-auth flight state) is
 /// similarly recorded without disturbing the state. PG can emit PS
 /// during query execution if `ALTER SYSTEM` runs server-side.
 ///
@@ -1091,7 +1091,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     _ = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
     _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
-    // Send a ping. State → AwaitingPingReply.
+    // Send a ping. State → PingAwaitingRfq.
     let ping_raw = raw(201);
     let push_out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
     match push_out.as_slice() {
@@ -1104,15 +1104,15 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
         }
         other => panic!("expected SendBytes(SYNC), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::AwaitingPingReply(_)));
+    assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
 
     // Server emits ParameterStatus before RFQ (e.g. an ALTER SYSTEM
     // committed during our ping's round-trip).
     let out = proto.feed_bytes(&param_status_frame("client_encoding", "LATIN1"), &mut wb);
     assert_eq!(out.len(), 0, "PS during flight emits no actions");
     assert!(
-        matches!(proto.state(), ProtoState::AwaitingPingReply(_)),
-        "PS must not disturb the AwaitingPingReply state",
+        matches!(proto.state(), ProtoState::PingAwaitingRfq(_)),
+        "PS must not disturb the PingAwaitingRfq state",
     );
     // DEF-114: typed Encoding.
     assert_eq!(
@@ -1133,7 +1133,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
 }
 
 /// Invariant (spec): ParameterStatus arriving during the SCRAM
-/// handshake (ConnectingScramAwaitServerFirst) is out-of-spec — PG
+/// handshake (ConnectingScramAwaitingServerFirst) is out-of-spec — PG
 /// does not emit PS between SASLInitialResponse and
 /// AuthenticationSASLContinue. Policy (`allows_unsolicited_param_status`)
 /// returns false for all ConnectingScram* states; dispatcher fallback
@@ -1159,12 +1159,12 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
     let startup_raw = raw(901);
     startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
     // Server offers SASL → we emit SASLInitialResponse → state is now
-    // ConnectingScramAwaitServerFirst. Setup frame's actions discarded
+    // ConnectingScramAwaitingServerFirst. Setup frame's actions discarded
     // explicitly — `let _ = ...` is banned.
     _ = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingScramAwaitServerFirst { .. },
+        ProtoState::ConnectingScramAwaitingServerFirst { .. },
     ));
 
     // Unsolicited ParameterStatus during SCRAM — must be classified.

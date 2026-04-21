@@ -78,7 +78,7 @@ fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
     ReplyId::from_raw(value)
 }
 
-/// Assert the state is `AwaitingPingReply` carrying the given raw value.
+/// Assert the state is `PingAwaitingRfq` carrying the given raw value.
 ///
 /// Does **not** construct a temporary `ReplyId` for comparison —
 /// constructing one just to feed PartialEq would be an undelivered
@@ -87,19 +87,19 @@ fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
 #[track_caller]
 fn expect_awaiting_ping_reply(state: &ProtoState, expected: NonZeroU64) {
     match state {
-        ProtoState::AwaitingPingReply(id) => assert_eq!(
+        ProtoState::PingAwaitingRfq(id) => assert_eq!(
             id.get(),
             expected,
-            "state is AwaitingPingReply but carrier id does not match",
+            "state is PingAwaitingRfq but carrier id does not match",
         ),
-        other => panic!("expected AwaitingPingReply({expected}), got {other:?}"),
+        other => panic!("expected PingAwaitingRfq({expected}), got {other:?}"),
     }
 }
 
 /// Drain an in-flight ping reply via synthetic `ReadyForQuery`.
 ///
 /// Required at the end of any test that leaves the state in
-/// `AwaitingPingReply` — because the `ReplyId` inside that variant
+/// `PingAwaitingRfq` — because the `ReplyId` inside that variant
 /// would otherwise be dropped without delivery when the protocol
 /// goes out of scope, tripping its tier-2 structural Drop-guard and
 /// aborting the test process.
@@ -157,7 +157,7 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg
 
 /// Invariant (spec): pushing a Ping from `Idle` emits exactly one
 /// action — `SendBytes(send_buf)` carrying the `SYNC_WIRE_BYTES`
-/// payload. The state transitions to `AwaitingPingReply`.
+/// payload. The state transitions to `PingAwaitingRfq`.
 ///
 /// This corresponds to reforge.md §13 / §19's wire-layer contract:
 /// a Ping maps 1:1 to a `Sync` frame on the wire.
@@ -245,8 +245,8 @@ fn partial_rfq_feeds_are_buffered_until_complete() {
             "no actions until frame is complete (after feeding byte {i})",
         );
         assert!(
-            matches!(proto.state(), ProtoState::AwaitingPingReply(_)),
-            "state stays in AwaitingPingReply while buffering",
+            matches!(proto.state(), ProtoState::PingAwaitingRfq(_)),
+            "state stays in PingAwaitingRfq while buffering",
         );
     }
     // Final byte completes the frame. `frame: [u8; 6]` — slice [5..]
@@ -355,7 +355,7 @@ fn malformed_length_fails_and_closes() {
 ///   with the exact input size and the actual headroom.
 /// - `feed_bytes`'s early-return on ReadBufFull invokes
 ///   `fail_inflight_and_close(ProtocolError::ReadBufferFull{...})`.
-/// - `fail_inflight_and_close` from AwaitingPingReply emits
+/// - `fail_inflight_and_close` from PingAwaitingRfq emits
 ///   FailReply(ping_id) + CloseSocket.
 /// - State becomes `Errored(ReadBufferFull{...})` with matching
 ///   `attempted`/`available` fields preserved byte-for-byte.
@@ -381,7 +381,7 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
     assert_eq!(
         out.len(),
         2,
-        "ReadBufferFull during AwaitingPingReply → FailReply + CloseSocket",
+        "ReadBufferFull during PingAwaitingRfq → FailReply + CloseSocket",
     );
     match out.as_slice() {
         [

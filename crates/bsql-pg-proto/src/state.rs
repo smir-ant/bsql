@@ -1,7 +1,7 @@
 //! Protocol state — state-as-data.
 //!
 //! Each variant carries its in-flight correlator inline (reforge.md
-//! §7.2). Consequence: a transition out of [`ProtoState::AwaitingPingReply`]
+//! §7.2). Consequence: a transition out of [`ProtoState::PingAwaitingRfq`]
 //! that fails to consume the inner [`ReplyId`] is a build error — the
 //! borrow / move checker forces every transition to handle the carried
 //! data explicitly.
@@ -40,7 +40,7 @@ use crate::scram::types::SecretDigest;
 /// state must explicitly preserve the `Errored` case — see the
 /// `fail_inflight_and_close` and `handle_push_ping` bodies in
 /// `protocol.rs`.
-// Deliberately **not** `Copy`: moving out of `AwaitingPingReply(id)`
+// Deliberately **not** `Copy`: moving out of `PingAwaitingRfq(id)`
 // must consume the [`crate::ReplyId`] inline — the state-as-data
 // invariant (reforge.md §7.2). `ProtoState` inherits non-Copy from
 // the non-Copy `ReplyId` field, so the `missing_copy_implementations`
@@ -60,7 +60,7 @@ pub enum ProtoState {
     /// will leave the user's `oneshot::Receiver` permanently pending —
     /// that is exactly the bug class the state-as-data pattern makes
     /// impossible to write.
-    AwaitingPingReply(ReplyId<PingKind>),
+    PingAwaitingRfq(ReplyId<PingKind>),
 
     // ---------------------------------------------------------------
     // Phase 1b: startup + auth handshake states (DEF-001..DEF-004)
@@ -107,7 +107,7 @@ pub enum ProtoState {
 
     /// SCRAM step 1 complete (client-first sent); awaiting
     /// `AuthenticationSASLContinue` (server-first-message). DEF-002.
-    ConnectingScramAwaitServerFirst {
+    ConnectingScramAwaitingServerFirst {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
         /// SCRAM session (password bundle). Tier-1 typestate via
@@ -127,7 +127,7 @@ pub enum ProtoState {
 
     /// SCRAM step 2 complete (client-final sent); awaiting
     /// `AuthenticationSASLFinal` (server-final-message). DEF-002.
-    ConnectingScramAwaitServerFinal {
+    ConnectingScramAwaitingServerFinal {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
         /// Expected server signature for constant-time comparison.
@@ -136,14 +136,14 @@ pub enum ProtoState {
 
     /// SCRAM step 3 complete (server signature verified); awaiting
     /// `AuthenticationOk`. DEF-002.
-    ConnectingScramAwaitAuthOk(ReplyId<StartupKind>),
+    ConnectingScramAwaitingAuthOk(ReplyId<StartupKind>),
 
     /// Authentication succeeded; waiting for `BackendKeyData`. DEF-003.
     ///
     /// `ParameterStatus` messages received in this state are recorded
     /// on [`crate::PgProtocol::session_params`] by the `feed_bytes`
     /// loop. `BackendKeyData` transitions to `ConnectingPostAuthHaveKey`.
-    ConnectingPostAuthWaitKey(ReplyId<StartupKind>),
+    ConnectingPostAuthAwaitingKey(ReplyId<StartupKind>),
 
     /// `BackendKeyData` received; waiting for `ReadyForQuery`. DEF-004.
     ///
@@ -170,11 +170,11 @@ pub enum ProtoState {
     /// transitions either consume it into a [`crate::Action::DeliverReply`]
     /// / [`crate::Action::FailReply`] or forward it into the next
     /// phase state.
-    SimpleQueryAwaitFirstResponse(ReplyId<QueryKind>),
+    SimpleQueryAwaitingFirstResponse(ReplyId<QueryKind>),
 
     /// `RowDescription` received; now streaming `DataRow` frames.
     /// Terminal transitions: `DataRow` → emit `Action::StreamRow`,
-    /// stay here; `CommandComplete` → [`Self::SimpleQueryAwaitRfq`]
+    /// stay here; `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`]
     /// with the parsed command tag.
     SimpleQueryStreamingRows(ReplyId<QueryKind>),
 
@@ -182,7 +182,7 @@ pub enum ProtoState {
     /// the trailing `ReadyForQuery`. The command tag captured at `C`
     /// (empty for `EmptyQueryResponse`) ships in the final
     /// [`crate::Reply::QueryComplete`] payload.
-    SimpleQueryAwaitRfq {
+    SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
         /// Command tag — `"SELECT 5"`, `"INSERT 0 3"`, or empty
@@ -208,7 +208,7 @@ pub enum ProtoState {
     /// the correlator; state-as-data (§7.2).
     ///
     /// Next legitimate frames: `ParseComplete` → transition to
-    /// [`Self::ParseAwaitRfq`]; `ErrorResponse` → emit FailReply +
+    /// [`Self::ParseAwaitingRfq`]; `ErrorResponse` → emit FailReply +
     /// transition to [`Self::DrainRfqAfterError`]
     /// (reused — both paths drain a trailing RFQ back to Idle).
     ParseAwaitingParseComplete(ReplyId<ParseKind>),
@@ -216,7 +216,7 @@ pub enum ProtoState {
     /// `ParseComplete` received; awaiting the `ReadyForQuery` that
     /// follows the bundled `Sync`. On `Z` → deliver
     /// [`crate::Reply::ParseComplete`] and transition to Idle.
-    ParseAwaitRfq(ReplyId<ParseKind>),
+    ParseAwaitingRfq(ReplyId<ParseKind>),
 
     /// Terminal: the connection has been classified as unrecoverable.
     ///
@@ -238,7 +238,7 @@ impl core::fmt::Debug for ProtoState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Idle => f.write_str("Idle"),
-            Self::AwaitingPingReply(id) => write!(f, "AwaitingPingReply({id:?})"),
+            Self::PingAwaitingRfq(id) => write!(f, "PingAwaitingRfq({id:?})"),
             Self::ConnectingStartupTrust { reply } => f
                 .debug_struct("ConnectingStartupTrust")
                 .field("reply", reply)
@@ -247,33 +247,33 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("ConnectingStartupScram")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::ConnectingScramAwaitServerFirst { reply, .. } => f
-                .debug_struct("ConnectingScramAwaitServerFirst")
+            Self::ConnectingScramAwaitingServerFirst { reply, .. } => f
+                .debug_struct("ConnectingScramAwaitingServerFirst")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::ConnectingScramAwaitServerFinal { reply, .. } => f
-                .debug_struct("ConnectingScramAwaitServerFinal")
+            Self::ConnectingScramAwaitingServerFinal { reply, .. } => f
+                .debug_struct("ConnectingScramAwaitingServerFinal")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::ConnectingScramAwaitAuthOk(id) => {
-                write!(f, "ConnectingScramAwaitAuthOk({id:?})")
+            Self::ConnectingScramAwaitingAuthOk(id) => {
+                write!(f, "ConnectingScramAwaitingAuthOk({id:?})")
             }
-            Self::ConnectingPostAuthWaitKey(id) => {
-                write!(f, "ConnectingPostAuthWaitKey({id:?})")
+            Self::ConnectingPostAuthAwaitingKey(id) => {
+                write!(f, "ConnectingPostAuthAwaitingKey({id:?})")
             }
             Self::ConnectingPostAuthHaveKey { reply, pid, .. } => f
                 .debug_struct("ConnectingPostAuthHaveKey")
                 .field("reply", reply)
                 .field("pid", pid)
                 .finish_non_exhaustive(),
-            Self::SimpleQueryAwaitFirstResponse(id) => {
-                write!(f, "SimpleQueryAwaitFirstResponse({id:?})")
+            Self::SimpleQueryAwaitingFirstResponse(id) => {
+                write!(f, "SimpleQueryAwaitingFirstResponse({id:?})")
             }
             Self::SimpleQueryStreamingRows(id) => {
                 write!(f, "SimpleQueryStreamingRows({id:?})")
             }
-            Self::SimpleQueryAwaitRfq { reply, command_tag } => f
-                .debug_struct("SimpleQueryAwaitRfq")
+            Self::SimpleQueryAwaitingRfq { reply, command_tag } => f
+                .debug_struct("SimpleQueryAwaitingRfq")
                 .field("reply", reply)
                 .field("command_tag", command_tag)
                 .finish(),
@@ -283,7 +283,7 @@ impl core::fmt::Debug for ProtoState {
             Self::ParseAwaitingParseComplete(id) => {
                 write!(f, "ParseAwaitingParseComplete({id:?})")
             }
-            Self::ParseAwaitRfq(id) => write!(f, "ParseAwaitRfq({id:?})"),
+            Self::ParseAwaitingRfq(id) => write!(f, "ParseAwaitingRfq({id:?})"),
             Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }
