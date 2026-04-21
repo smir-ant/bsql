@@ -214,3 +214,14 @@ impl FetchRows {
         }
     }
 }
+
+// Compile-time drift-pin: `FetchRows::All` MUST map to wire value 0
+// (PG §55.2.2 — `Execute` frame with `max_rows = 0` means fetch all
+// rows without PortalSuspended). An arm-body edit in `as_wire_i32`
+// that silently returned `1` (or any non-zero) would cause the
+// server to emit PortalSuspended which the dispatcher classifies as
+// UnexpectedFrame → connection teardown. Pin the literal at build.
+const _: () = assert!(
+    FetchRows::All.as_wire_i32() == 0,
+    "FetchRows::All MUST wire-encode as 0 per PG §55.2.2",
+);

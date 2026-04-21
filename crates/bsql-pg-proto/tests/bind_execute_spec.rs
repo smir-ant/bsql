@@ -328,9 +328,10 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
 }
 
 /// 1c-3b scope: server emitting `PortalSuspended` (tag 's') during
-/// streaming → UnexpectedFrame. The current API enforces max_rows=0
-/// but a mis-configured server or intermediary could still produce
-/// it. Classify, don't accept silently.
+/// streaming → UnexpectedFrame. The `FetchRows` enum (F83)
+/// structurally forbids a non-zero max_rows at the API level, but a
+/// mis-configured server or proxy could still emit `PortalSuspended`
+/// — the dispatcher classifies, doesn't accept silently.
 #[test]
 fn portal_suspended_is_unexpected_frame_in_1c_3b() {
     let mut proto = PgProtocol::new();

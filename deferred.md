@@ -1374,6 +1374,143 @@ at v1.0 cutover.
 
 ---
 
+## 20. Architect-audit pass #6 findings (2026-04-21, post-1c-3b uplifts)
+
+Sixth systematic audit pass, triggered by user pushback: "точно ли
+нельзя tier поднять нигде? ... по тестам пройдись, я не уверен что
+тут прям 150+ тестов должно быть". Agent returned 90+ findings
+(F54..F84, BS1-BS9, CR1-CR6, MI1-MI10, test-audit). Triple-checked
+each; documented in full in commit messages `5ad746b..b372399`.
+
+**Landed pass #6:**
+
+| ID | What | Commit |
+|---|---|---|
+| F54 | `hmac_sha256` Result (fail-closed, ScramError::HmacKeyRejected) | `5ad746b` |
+| BS8 | `MAX_SCRAM_ITERATIONS = 10M` + `IterationsTooHigh` | `5ad746b` |
+| F60 | Const-assert for `Option<T> ParamEncoder` OID dispatch | `5ad746b` |
+| MI5/6/7/10 | `#[non_exhaustive]` on `Credentials`/`ScramError`/`Severity`/`AuthSubCode` | `5ad746b` |
+| F83 | `FetchRows` enum (was `max_rows: u32`) — tier-3 docs → tier-1 compile | `bdd210e` |
+| F55 | `SessionParams.set` non-UTF-8 → `from_bytes_lossy` | `b372399` |
+| F61 | `with_length_prefix` / `with_i32_length_prefixed_body` explicit Err | `b372399` |
+| F66 | `feed_bytes` early-return on Errored | `b372399` |
+
+Plus: `FetchRows::All.as_wire_i32() == 0` drift-pin const-assert.
+
+### DEF-134 — F78: cargo-fuzz harness (OPEN, own session)
+
+**Target.** Differential fuzz against `feed_bytes` / `parse_header` /
+`parse_row_description` / `parse_server_first`. 4 fuzz targets,
+~150 LoC + cargo-fuzz setup. The forbid-bundle rules out panic-able
+expressions at compile-time, but:
+- Arithmetic edge cases from pathological frame-length sequences
+- State-machine bugs from adversarial frame ordering (malicious
+  proxies, protocol-desync attacks)
+- Integer-overflow edge cases on NL-terminated string parsing
+
+... are all observable only via fuzzing.
+
+**Why deferred.** Own session. Setup + 4 targets + corpus + CI wiring
+is ~half-day of focused work. No immediate critical gap (all
+surfaces are tier-1/2 by current shields), but "unhandled panic-able
+input = one CVE waiting" per audit rationale.
+
+**Dependencies.** `cargo-fuzz` in `[dev-dependencies]`, separate
+`fuzz/` directory with `Cargo.toml`. CI fuzz-nightly job.
+
+### DEF-135 — F62: precomputed `ALL_BINARY_WIRE` const for Bind format-code emission (OPEN, blocked on DEF-132)
+
+Current `build_bind_message` iterates `0..P::COUNT` and pushes
+`u16_be(1)` per param. LLVM likely unrolls for N ≤ 16. F62 proposes
+a precomputed `&'static [u8; 32]` (16 × `[0, 1]` pairs) + slice-take
+to replace the loop with one `push_bytes` memcpy.
+
+**Why deferred.** Perf-only; win is unclear without measurement.
+Blocked on DEF-132 (measurement pass) — if LLVM already unrolls,
+the precomputed const adds binary size without win.
+
+### DEF-136 — F64: typed `OutboundSlice<'w>` wrapper for `Action::SendBytes` (DEFERRED to v1.0 freeze)
+
+Current `Action::SendBytes(&'w [u8])` can carry any byte source. In
+practice every emission routes through `StagedAction::SendBytesRange`
+(outbound WriteBuf region) or `SendBytesStatic(&SYNC_WIRE_BYTES)` —
+convention ensures only outbound bytes. A typed wrapper would make
+it structural:
+
+```rust
+pub struct OutboundSlice<'w>(&'w [u8]);
+Action::SendBytes(OutboundSlice<'w>)
+```
+
+**Why deferred.** Cost: every user-code pattern-match sprouts a
+`.as_bytes()` call. ~40 test sites affected. Benefit: tier-2
+structural shield on "SendBytes carries outbound-only bytes."
+Worth at v1.0 freeze when we consolidate the public API.
+
+### DEF-137 — F65: typed `StaticWirePayload` enum for `StagedAction::SendBytesStatic` (DEFERRED to 1c-5)
+
+Current `SendBytesStatic(&'static [u8])` accepts any static bytes.
+Only `SYNC_WIRE_BYTES` is used today. Narrow to enum:
+```rust
+enum StaticWirePayload { Sync }  // future: Flush, Terminate
+```
+
+**Why deferred.** Adding 1c-5 (`Flush` wire frame for pipelining)
+will double the use-cases — natural trigger for the enum.
+
+### DEF-138 — F72: rename `inflight_reply_raw_id` → `take_inflight_reply_raw_id` (DEFERRED, polish)
+
+Method name doesn't reflect the `.consume()` side-effect. The
+`self` by-value receiver already implies consumption in Rust
+convention, but `take_` prefix makes it explicit.
+
+**Why deferred.** Pure naming polish; defer to a rename-cleanup
+pass before v1.0.
+
+### DEF-139 — F81: `debug_assert!` in `materialise` on `range.apply` None (DEFERRED, polish)
+
+Architecturally-dead path; the `NonEmptyRange` constructor
+guarantees valid ranges. Adding `debug_assert!(slice.is_some())`
+would catch regressions in test builds without affecting
+release performance.
+
+**Why deferred.** Low-value polish. Consider at 1c-6 hardening pass.
+
+### DEF-140 — F82: `FromPgText` doctest freshness (DEFERRED, polish)
+
+The `///` example uses `Option::unwrap()` pattern which users
+shouldn't cargo-cult. Doctest is `ignore`'d so doesn't run, but
+should model crate's own discipline.
+
+**Why deferred.** Pure doc polish.
+
+### Test count analysis — user's intuition rechecked
+
+User's ask: "155+ тестов должно быть и что каждый из них необходим".
+Agent's initial claim: 11 redundant. After my own re-analysis:
+
+**Actually redundant (drop candidates):** 2 tests.
+- `params::arity_sixteen_supported` — const-assert at module level
+  already pins COUNT; runtime test adds nothing.
+- `params::arity_three_oids_and_formats_coherent` — const-assert
+  on OIDS pattern-matches `[INT4, TEXT, BOOL]`; runtime test overlaps.
+
+**Not redundant (agent was wrong):** 9 tests.
+- `frame_parse::trailing_bytes_do_not_affect_header_parse` — slice
+  pattern is tier-1 but the TEST pins that parse_header returns
+  `HeaderParse::Ok`, not some other variant. Tier-2 arm-body pin.
+- `bounded_buffers::advance_zero_is_noop` — checks observable API
+  (Ok(()) + state unchanged). Not provable structurally.
+- `bounded_buffers::write_buf_push_u32_be_is_big_endian` +
+  `_push_i32_be_is_big_endian` — pin wire-format BE convention at
+  the crate's push methods. LLVM can't prove "our method emits BE";
+  tests do.
+- Other agent claims misidentify tier-2 pins as "trivial".
+
+**Decision:** NOT worth dropping 2 tests for ~0 value. Keep all 156.
+
+---
+
 ## 10. Closed
 
 Move entries here when a deferral is genuinely resolved — not just
