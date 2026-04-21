@@ -753,16 +753,32 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 ///
 /// # Usage
 ///
-/// ```ignore
-/// use bsql_pg_proto::{Action, DataRowRef, FromPgText};
+/// DEF-140 (pass-#8 doc polish): the example models the crate's own
+/// discipline — no `unwrap()` / `panic!()` in the happy path.
+/// `cols.next()` returns `Option<Result<Option<&[u8]>, DecodeError>>`
+/// and is matched structurally via `let Some(...) else`. Real user
+/// code can adapt to its own error strategy (`?` into custom errors,
+/// slogged through a macro in Phase 2's `query!`, etc.).
 ///
-/// let Action::StreamRow { row_bytes, .. } = action else { return };
-/// let row = DataRowRef::parse(row_bytes)?;
-/// let mut cols = row.columns();
-/// let id: i32 = cols.next().unwrap()?.map(i32::from_pg_text).transpose()?
-///     .ok_or("id cannot be NULL")?;
-/// let name: &str = cols.next().unwrap()?.map(<&str>::from_pg_text).transpose()?
-///     .ok_or("name cannot be NULL")?;
+/// ```ignore
+/// use bsql_pg_proto::{Action, DataRowRef, DecodeError, FromPgText};
+///
+/// fn example(action: Action<'_, '_>) -> Result<(), DecodeError> {
+///     let Action::StreamRow { row_bytes, .. } = action else { return Ok(()) };
+///     let row = DataRowRef::parse(row_bytes)?;
+///     let mut cols = row.columns();
+///
+///     // `Option::None` from `next()` = fewer columns than expected.
+///     // `Option::None` from the inner `Ok(None)` = SQL NULL.
+///     // Both surfaces via structural match, no `unwrap()`.
+///     let Some(id_result) = cols.next() else { return Ok(()) };
+///     let _id: Option<i32> = id_result?.map(i32::from_pg_text).transpose()?;
+///
+///     let Some(name_result) = cols.next() else { return Ok(()) };
+///     let _name: Option<&str> = name_result?.map(<&str>::from_pg_text).transpose()?;
+///
+///     Ok(())
+/// }
 /// ```
 ///
 /// # Error

@@ -1458,31 +1458,29 @@ enum StaticWirePayload { Sync }  // future: Flush, Terminate
 **Why deferred.** Adding 1c-5 (`Flush` wire frame for pipelining)
 will double the use-cases — natural trigger for the enum.
 
-### DEF-138 — F72: rename `inflight_reply_raw_id` → `take_inflight_reply_raw_id` (DEFERRED, polish)
+### DEF-138 — F72: rename `inflight_reply_raw_id` → `take_inflight_reply_raw_id` ✅ CLOSED (2026-04-21, pass-#8 polish batch)
 
-Method name doesn't reflect the `.consume()` side-effect. The
-`self` by-value receiver already implies consumption in Rust
-convention, but `take_` prefix makes it explicit.
+Method name didn't reflect the `.consume()` side-effect. Renamed to
+`take_*` per Rust-stdlib convention (`Option::take`, `Vec::drain`,
+`core::mem::take`). Every call site reads the consumption intent
+at a glance. Docstring expanded with the naming-convention rationale.
 
-**Why deferred.** Pure naming polish; defer to a rename-cleanup
-pass before v1.0.
+### DEF-139 — F81: `debug_assert!` in `materialise` on `range.apply` None ✅ CLOSED (2026-04-21, pass-#8 F-007)
 
-### DEF-139 — F81: `debug_assert!` in `materialise` on `range.apply` None (DEFERRED, polish)
+Closed transitively by pass-#8 F-007: `debug_assert!` was added
+INSIDE `NonEmptyRange::apply` itself (action.rs:183), which covers
+both `materialise` call sites (`SendBytesRange` + `StreamRowRange`
+resolution) in one shield. Release builds LLVM-elide; debug builds
+fire on `buf shorter than emission-time bounds` wiring regression.
 
-Architecturally-dead path; the `NonEmptyRange` constructor
-guarantees valid ranges. Adding `debug_assert!(slice.is_some())`
-would catch regressions in test builds without affecting
-release performance.
+### DEF-140 — F82: `FromPgText` doctest freshness ✅ CLOSED (2026-04-21, pass-#8 polish batch)
 
-**Why deferred.** Low-value polish. Consider at 1c-6 hardening pass.
-
-### DEF-140 — F82: `FromPgText` doctest freshness (DEFERRED, polish)
-
-The `///` example uses `Option::unwrap()` pattern which users
-shouldn't cargo-cult. Doctest is `ignore`'d so doesn't run, but
-should model crate's own discipline.
-
-**Why deferred.** Pure doc polish.
+Doctest rewritten to model the crate's own discipline: no
+`.unwrap()` in the happy path, `let-else` + `?` for error
+propagation, explicit `Option`/`Result` handling at each yield
+boundary. `///` example is still `ignore`'d (no fixture mock for
+`Action`) but now parses as idiomatic bsql code a reader could
+copy-paste without picking up bad habits.
 
 ### Test count analysis — user's intuition rechecked
 

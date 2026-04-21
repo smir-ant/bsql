@@ -693,10 +693,10 @@ impl PgProtocol {
         //
         // DEF-112: typed `ReplyId<K>` are distinct types per phase
         // kind; extraction is centralised in
-        // [`ProtoState::inflight_reply_raw_id`] — one exhaustive
+        // [`ProtoState::take_inflight_reply_raw_id`] — one exhaustive
         // match in `state.rs`, not duplicated here.
         let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
-        let raw_id = prev.inflight_reply_raw_id();
+        let raw_id = prev.take_inflight_reply_raw_id();
         self.read_buf.clear();
         match raw_id {
             Some(id) => {
@@ -2060,11 +2060,11 @@ mod allows_unsolicited_param_status_tests {
     /// Consume any ReplyId carried by a state so the Drop-guard does
     /// not trip at end-of-scope.
     ///
-    /// # Pass-#7 F14: delegate to `ProtoState::inflight_reply_raw_id`
+    /// # Pass-#7 F14: delegate to `ProtoState::take_inflight_reply_raw_id`
     ///
     /// Pre-pass-#7 this was a hand-rolled 20-line exhaustive match
     /// over all ~22 `ProtoState` variants. State.rs has THE
-    /// authoritative version (`inflight_reply_raw_id`) which
+    /// authoritative version (`take_inflight_reply_raw_id`) which
     /// (a) takes `self` by value → consumes the carried `ReplyId<_>`
     /// via its `.consume()` method, (b) returns the raw
     /// `Option<NonZeroU64>` which the test doesn't need.
@@ -2079,14 +2079,14 @@ mod allows_unsolicited_param_status_tests {
     /// the forbid-bundle-banned `let _ = ...`). Reading the
     /// `Option::Some(u64)` payload here would add zero value.
     fn consume_state(state: ProtoState) {
-        // Side-effect call: `inflight_reply_raw_id` consumes the
+        // Side-effect call: `take_inflight_reply_raw_id` consumes the
         // carried `ReplyId<_>` via its internal `.consume()` (marks
         // delivered=true so the Drop-guard doesn't fire). The
         // returned `Option<NonZeroU64>` is Copy / no Drop — bare
         // expression-statement form discards without `let _`
         // (user-banned). Same pattern as `ping.consume();` in
         // reply_id tests.
-        match state.inflight_reply_raw_id() {
+        match state.take_inflight_reply_raw_id() {
             Some(_) | None => {}
         }
     }
@@ -2236,25 +2236,25 @@ mod compute_push_tests {
     /// Consume any ReplyId carried by `state` so its Drop-guard does
     /// not trip when the state drops at end of scope.
     ///
-    /// # Pass-#7 F14: delegate to `inflight_reply_raw_id`
+    /// # Pass-#7 F14: delegate to `take_inflight_reply_raw_id`
     ///
     /// Pre-pass-#7 this was a hand-rolled 20-line match, documented
     /// as "copy of the helper in `allows_unsolicited_param_status_tests`
     /// — module privacy forbids re-use without cross-module exposure."
-    /// After pass-#7, `state.rs` exposes `inflight_reply_raw_id` as
+    /// After pass-#7, `state.rs` exposes `take_inflight_reply_raw_id` as
     /// `pub(crate)` — both test modules delegate to it, eliminating
     /// the parallel-match drift surface. New variants categorised
     /// once in `state.rs` automatically flow through all test
     /// helpers.
     fn consume_state(state: ProtoState) {
-        // Side-effect call: `inflight_reply_raw_id` consumes the
+        // Side-effect call: `take_inflight_reply_raw_id` consumes the
         // carried `ReplyId<_>` via its internal `.consume()` (marks
         // delivered=true so the Drop-guard doesn't fire). The
         // returned `Option<NonZeroU64>` is Copy / no Drop — bare
         // expression-statement form discards without `let _`
         // (user-banned). Same pattern as `ping.consume();` in
         // reply_id tests.
-        match state.inflight_reply_raw_id() {
+        match state.take_inflight_reply_raw_id() {
             Some(_) | None => {}
         }
     }

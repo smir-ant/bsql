@@ -467,6 +467,17 @@ impl ProtoState {
     /// reply is in flight ([`Self::Idle`], [`Self::DrainRfqAfterError`],
     /// [`Self::Errored`]).
     ///
+    /// # Naming convention — `take_` prefix (DEF-138)
+    ///
+    /// The `take_` prefix follows Rust-stdlib convention for
+    /// consuming-extraction methods (`Option::take`, `Vec::drain`,
+    /// `core::mem::take`). The `self` by-value receiver already
+    /// signals consumption, but the prefix makes the side-effect
+    /// explicit at every call site: readers see
+    /// `state.take_inflight_reply_raw_id()` and immediately know
+    /// the returned Option represents a drained state — the
+    /// carried `ReplyId<_>` has been `.consume()`d inside the match.
+    ///
     /// # Tier-1 invariant
     ///
     /// Exhaustive match over every variant: adding a variant that
@@ -475,7 +486,7 @@ impl ProtoState {
     /// one consume-site on the tear-down path" rule in one place —
     /// previously open-coded inside `fail_inflight_and_close`.
     #[must_use]
-    pub(crate) fn inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
+    pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
         match self {
             Self::Idle | Self::DrainRfqAfterError | Self::Errored(_) => None,
             Self::PingAwaitingRfq(id) => Some(id.consume()),
