@@ -22,7 +22,7 @@
 use bsql_pg_proto::{
     Action, ParseKind, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply, ReplyId, Sql,
     StmtName, WriteBuf,
-    wire::{SYNC_WIRE_BYTES, TAG_ERROR_RESPONSE, TAG_PARSE, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY},
+    wire::{TAG_ERROR_RESPONSE, TAG_PARSE, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY},
 };
 use core::num::NonZeroU64;
 
@@ -101,9 +101,11 @@ fn parse_setup(
                 Some(&TAG_PARSE.byte()),
                 "first action must be 'P' frame",
             );
+            // F33: assert literal PG Sync wire layout (tag 'S' + BE u32
+            // length=4). Avoids tautology with internal SYNC_WIRE_BYTES.
             assert_eq!(
-                *sync_frame, &SYNC_WIRE_BYTES,
-                "second action must be the static SYNC const",
+                *sync_frame, &[b'S', 0, 0, 0, 4],
+                "second action must be the PG Sync wire bytes",
             );
             p_frame.to_vec()
         }

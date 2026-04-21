@@ -105,19 +105,18 @@ pub const TAG_ERROR_RESPONSE: InboundTag = InboundTag::from_byte(b'E');
 /// This is a `&'static [u8]` because the message is parameter-free; we
 /// ship it via a zero-copy static reference through [`crate::action::Action::SendBytes`].
 ///
-/// # Visibility (F33, 2026-04-21)
+/// # Visibility (F33 revision, 2026-04-21)
 ///
-/// Marked `#[doc(hidden)]` but kept `pub` — the integration-test
-/// wire-format drift-pins in `tests/ping_spec.rs` / `tests/parse_spec.rs`
-/// / `tests/startup_spec.rs` assert that the bytes emitted by
-/// `compute_push_ping` / `compute_push_parse` equal this const. Those
-/// tests compile as separate crates (standard `tests/` integration
-/// layout), so `pub(crate)` would break them. `#[doc(hidden)]` hides
-/// it from `docs.rs` without losing test access — signals "not a
-/// stable user API, may move under `pub(crate)` if we introduce a
-/// test-helpers module".
-#[doc(hidden)]
-pub const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC.byte(), 0, 0, 0, 4];
+/// `pub(crate)` — NOT part of the user-facing API. Integration tests
+/// used to reference this const to assert emitted bytes matched it,
+/// but that was tautological (the emission IS this const, so the
+/// test was essentially `SYNC_WIRE_BYTES == SYNC_WIRE_BYTES`). The
+/// real drift-pin is the `const _: () = assert!(SYNC_WIRE_BYTES[0] == b'S')`
+/// / `SYNC_WIRE_BYTES[1..=4] == [0,0,0,4]` assertions below, which
+/// catch typo-induced wire breaks at BUILD time. Tests now assert
+/// the LITERAL `[b'S', 0, 0, 0, 4]` instead — a stronger check that
+/// fires if either the emission path OR the const drifts.
+pub(crate) const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC.byte(), 0, 0, 0, 4];
 
 // ---------------------------------------------------------------
 // Phase 1b tags

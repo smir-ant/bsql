@@ -100,11 +100,7 @@ impl CappedServerNonce {
     /// Construct from raw bytes.
     ///
     /// Returns `Err` if the nonce exceeds [`MAX_SERVER_NONCE_LEN`].
-    ///
-    /// `pub` rather than `pub(crate)` because `tests/bounded_buffers_spec.rs`
-    /// exercises the over-length rejection as a tier-2 structural
-    /// regression shield.
-    pub fn try_from_bytes(input: &[u8]) -> Result<Self, ServerNonceTooLong> {
+    pub(crate) fn try_from_bytes(input: &[u8]) -> Result<Self, ServerNonceTooLong> {
         let mut buf = heapless::Vec::new();
         buf.extend_from_slice(input)
             .map_err(|_| ServerNonceTooLong { len: input.len() })?;
@@ -128,5 +124,45 @@ impl fmt::Debug for CappedServerNonce {
         } else {
             write!(f, "CappedServerNonce({len} bytes, truncated)")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the `CappedServerNonce` bound invariant.
+    //! Moved here from `tests/bounded_buffers_spec.rs` in the
+    //! 2026-04-21 visibility audit — `try_from_bytes` became
+    //! `pub(crate)` (not user API), so the test belongs with the
+    //! code it tests, not in an integration test file that forced
+    //! the function to be `pub` for access.
+
+    extern crate alloc;
+    use super::{CappedServerNonce, MAX_SERVER_NONCE_LEN, ServerNonceTooLong};
+    use alloc::vec;
+
+    /// Invariant (spec): `CappedServerNonce::try_from_bytes` with a
+    /// slice at the capacity bound succeeds; one byte beyond the
+    /// bound returns `ServerNonceTooLong` with the actual length.
+    ///
+    /// DEF-040 regression guard.
+    #[test]
+    fn capped_server_nonce_bound_classification() {
+        // At bound: OK.
+        let at_bound = vec![0x5Au8; MAX_SERVER_NONCE_LEN];
+        let ok = CappedServerNonce::try_from_bytes(&at_bound);
+        assert!(ok.is_ok(), "nonce at MAX_SERVER_NONCE_LEN must succeed");
+
+        // One over: typed Err carrying the actual offending length.
+        // Uses `assert_eq!(..Err(ServerNonceTooLong { len: X }))`
+        // rather than `match ... panic!(...)` because the crate-root
+        // forbid bundle bans `panic!` (even in unit tests).
+        let over_bound_len = MAX_SERVER_NONCE_LEN.saturating_add(1);
+        let over_bound = vec![0x5Au8; over_bound_len];
+        let err = CappedServerNonce::try_from_bytes(&over_bound);
+        assert_eq!(
+            err.err(),
+            Some(ServerNonceTooLong { len: over_bound_len }),
+            "nonce over MAX_SERVER_NONCE_LEN must fail with length {over_bound_len}",
+        );
     }
 }

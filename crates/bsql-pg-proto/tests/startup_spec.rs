@@ -688,8 +688,8 @@ fn extract_client_nonce_from_bare(bare: &[u8]) -> Vec<u8> {
 /// client's nonce (extracted from the SASLInitialResponse).
 #[test]
 fn scram_sha256_handshake_end_to_end() {
+    use base64ct::{Base64, Encoding};
     use bsql_pg_proto::scram::crypto::compute_client_proof;
-    use bsql_pg_proto::scram::wire::base64_encode_to_buf;
 
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
@@ -742,10 +742,11 @@ fn scram_sha256_handshake_end_to_end() {
     ];
     let iterations = 4096u32;
 
-    // Base64 encode the salt.
+    // Base64-encode the salt via dev-dep `base64ct` — tests don't
+    // depend on crate-internal `base64_encode_to_buf` (which is
+    // `pub(crate)` post-visibility audit).
     let mut salt_b64_buf = [0u8; 64];
-    let salt_b64_len = base64_encode_to_buf(&salt_raw, &mut salt_b64_buf).unwrap_or(0);
-    let salt_b64 = std::str::from_utf8(salt_b64_buf.get(..salt_b64_len).unwrap_or(&[])).unwrap_or("");
+    let salt_b64 = Base64::encode(&salt_raw, &mut salt_b64_buf).unwrap_or("");
 
     // Server nonce = client_nonce + server_suffix.
     let server_suffix = b"ServerSuffix1234";
@@ -784,10 +785,9 @@ fn scram_sha256_handshake_end_to_end() {
     )
     .1;
 
-    // Base64 encode the server signature.
+    // Base64-encode the server signature via dev-dep `base64ct`.
     let mut sig_b64_buf = [0u8; 64];
-    let sig_b64_len = base64_encode_to_buf(expected_server_sig.as_bytes(), &mut sig_b64_buf).unwrap_or(0);
-    let sig_b64 = std::str::from_utf8(sig_b64_buf.get(..sig_b64_len).unwrap_or(&[])).unwrap_or("");
+    let sig_b64 = Base64::encode(expected_server_sig.as_bytes(), &mut sig_b64_buf).unwrap_or("");
 
     let server_final = format!("v={sig_b64}");
 
@@ -853,8 +853,10 @@ fn scram_signature_mismatch_is_rejected() {
     // Build valid server-first.
     let salt_raw: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let mut salt_b64_buf = [0u8; 64];
-    let salt_b64_len = bsql_pg_proto::scram::wire::base64_encode_to_buf(&salt_raw, &mut salt_b64_buf).unwrap_or(0);
-    let salt_b64 = std::str::from_utf8(salt_b64_buf.get(..salt_b64_len).unwrap_or(&[])).unwrap_or("");
+    let salt_b64 = {
+        use base64ct::{Base64, Encoding};
+        Base64::encode(&salt_raw, &mut salt_b64_buf).unwrap_or("")
+    };
 
     let mut server_nonce = client_nonce.clone();
     server_nonce.extend_from_slice(b"SRV");
@@ -941,8 +943,10 @@ fn scram_server_error_preserves_diagnostic_message() {
 
     let salt_raw: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
     let mut salt_b64_buf = [0u8; 64];
-    let salt_b64_len = bsql_pg_proto::scram::wire::base64_encode_to_buf(&salt_raw, &mut salt_b64_buf).unwrap_or(0);
-    let salt_b64 = std::str::from_utf8(salt_b64_buf.get(..salt_b64_len).unwrap_or(&[])).unwrap_or("");
+    let salt_b64 = {
+        use base64ct::{Base64, Encoding};
+        Base64::encode(&salt_raw, &mut salt_b64_buf).unwrap_or("")
+    };
 
     let mut server_nonce = client_nonce.clone();
     server_nonce.extend_from_slice(b"SRV");
@@ -1147,10 +1151,12 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     let push_out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
     match push_out.as_slice() {
         [Action::SendBytes(send_buf)] => {
+            // F33: literal PG Sync wire layout — avoids tautology with
+            // internal SYNC_WIRE_BYTES const (both sourced from same
+            // symbol would mirror any const-drift).
             assert_eq!(
-                send_buf,
-                &bsql_pg_proto::wire::SYNC_WIRE_BYTES,
-                "Ping must emit the 5-byte const Sync wire payload",
+                send_buf, &[b'S', 0, 0, 0, 4],
+                "Ping must emit PG Sync wire bytes: tag 'S' + BE u32 length=4",
             );
         }
         other => panic!("expected SendBytes(SYNC), got {other:?}"),

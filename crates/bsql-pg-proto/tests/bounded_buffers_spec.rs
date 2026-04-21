@@ -1,5 +1,12 @@
 //! Direct unit tests for the bounded-buffer newtypes `ReadBuf` and
-//! `WriteBuf`, plus `CappedServerNonce`.
+//! `WriteBuf`.
+//!
+//! Note: the `CappedServerNonce` bound-rejection test moved into
+//! `src/scram/types.rs` as a `#[cfg(test)] mod tests` unit test
+//! after the 2026-04-21 visibility audit — `try_from_bytes` is
+//! now `pub(crate)` (not user API), so the test goes where it has
+//! legitimate access. Tests in `tests/` here cover only items that
+//! are genuinely user-facing (`ReadBuf`, `WriteBuf`).
 //!
 //! These buffers are the load-bearing structural defence against the
 //! "buffer overflow / silent truncation" bug class (reforge.md §7.4).
@@ -35,10 +42,7 @@
 )]
 #![deny(unused_must_use, unused_lifetimes)]
 
-use bsql_pg_proto::{
-    AdvancePastEnd, READ_BUF_CAP, ReadBuf, ReadBufFull, WriteBuf, WriteBufFull,
-    scram::types::{CappedServerNonce, ServerNonceTooLong},
-};
+use bsql_pg_proto::{AdvancePastEnd, READ_BUF_CAP, ReadBuf, ReadBufFull, WriteBuf, WriteBufFull};
 
 // =================================================================
 // ReadBuf — category (1) spec-conformance on the bounded-buffer API.
@@ -309,31 +313,6 @@ fn write_buf_overflow_returns_full() {
     assert_eq!(wb.len(), bsql_pg_proto::MAX_OWNED_SEND_LEN);
 }
 
-// =================================================================
-// CappedServerNonce — category (1) bound-rejection.
-// DEF-040 regression guard.
-// =================================================================
-
-/// Invariant (spec): `CappedServerNonce::try_from_bytes` with a slice
-/// at the capacity bound succeeds; one byte beyond the bound returns
-/// `ServerNonceTooLong` with the actual length.
-#[test]
-fn capped_server_nonce_bound_classification() {
-    use bsql_pg_proto::scram::types::MAX_SERVER_NONCE_LEN;
-
-    // At bound: OK.
-    let at_bound = vec![0x5Au8; MAX_SERVER_NONCE_LEN];
-    let ok = CappedServerNonce::try_from_bytes(&at_bound);
-    assert!(ok.is_ok(), "nonce at MAX_SERVER_NONCE_LEN must succeed");
-
-    // One over: error with exact length.
-    let over_bound_len = MAX_SERVER_NONCE_LEN.saturating_add(1);
-    let over_bound = vec![0x5Au8; over_bound_len];
-    let err = CappedServerNonce::try_from_bytes(&over_bound);
-    match err {
-        Err(ServerNonceTooLong { len }) => {
-            assert_eq!(len, over_bound_len);
-        }
-        Ok(_) => panic!("nonce over MAX_SERVER_NONCE_LEN must fail"),
-    }
-}
+// CappedServerNonce bound-rejection test moved to
+// `src/scram/types.rs` — see the module-level doc at the top of this
+// file for the visibility-audit rationale.

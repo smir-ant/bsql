@@ -436,11 +436,7 @@ pub(crate) fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError>
 /// `Base64` is the standard-with-padding alphabet (RFC 4648 §4),
 /// matching what PG emits. `default-features = false` keeps the
 /// crate `no_std` + `no_alloc`.
-///
-/// `pub` rather than `pub(crate)` because `tests/startup_spec.rs`
-/// uses it to encode SCRAM fixtures (salt, proof) for synthetic
-/// server-first/server-final bodies.
-pub fn base64_encode_to_buf(
+pub(crate) fn base64_encode_to_buf(
     input: &[u8],
     out: &mut [u8],
 ) -> Result<usize, ScramError> {
@@ -543,16 +539,14 @@ std::thread_local! {
 
 /// Set a fixed nonce for the current test (test-only).
 ///
-/// `pub` rather than `pub(crate)` so rustc's dead-code heuristic
-/// accepts the currently-callerless form — this hook exists for
-/// future deterministic SCRAM test vectors (e.g. RFC 7677 Appendix
-/// A client-side vectors) that would call it before invoking the
-/// handshake dispatcher. The sibling `#[cfg(test)]`
-/// `generate_client_nonce` reads the `FIXED_TEST_NONCE` slot
-/// unconditionally; once a caller exists, this function gets the
-/// test vector's nonce into the slot.
+/// `#[cfg(test)]` gates it to unit-test builds only — integration
+/// tests under `tests/*.rs` compile the crate with `#[cfg(not(test))]`
+/// and never see it, which is the correct scope. `pub(crate)` is
+/// sufficient for the `#[cfg(test)] mod tests` unit tests that
+/// actually call it; the earlier `pub` was a dead-code-lint
+/// workaround from before the test-vector scaffolding landed.
 #[cfg(test)]
-pub fn set_test_nonce(nonce: &str) {
+pub(crate) fn set_test_nonce(nonce: &str) {
     FIXED_TEST_NONCE.with(|cell| {
         *cell.borrow_mut() = Some(std::string::String::from(nonce));
     });
@@ -592,4 +586,51 @@ fn parse_u32(bytes: &[u8]) -> Result<u32, ParseU32Error> {
         result = result.checked_add(u32::from(digit)).ok_or(ParseU32Error::Overflow)?;
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the SCRAM wire helpers.
+    //!
+    //! Test nonce injection (`set_test_nonce` / `FIXED_TEST_NONCE`)
+    //! is exercised here — also serves as the "caller" that kills
+    //! the `dead_code` lint on `set_test_nonce`. Without this test
+    //! `#[cfg(test)] pub(crate) fn set_test_nonce` would be flagged
+    //! as never-used; with it, the injection mechanism ships ready
+    //! for future RFC 7677 Appendix A deterministic test vectors.
+    use super::{FIXED_TEST_NONCE, ParseU32Error, generate_client_nonce, parse_u32, set_test_nonce};
+
+    #[test]
+    fn fixed_test_nonce_injection_round_trips() {
+        let injected = "Fyko+d2lbbFgONRv9qkxdawL";
+        set_test_nonce(injected);
+
+        let generated = generate_client_nonce();
+        assert!(generated.is_ok(), "generate_client_nonce must succeed with injected fixed nonce");
+        let bytes = match generated {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        assert_eq!(
+            bytes.as_slice(),
+            injected.as_bytes(),
+            "injected nonce must round-trip verbatim via FIXED_TEST_NONCE slot",
+        );
+
+        // Cleanup — thread-local persists across tests in the same
+        // thread; clear so the next test gets the default None path.
+        FIXED_TEST_NONCE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+
+    #[test]
+    fn parse_u32_classifies_failure_modes() {
+        assert_eq!(parse_u32(b""), Err(ParseU32Error::Empty));
+        assert_eq!(parse_u32(b"12a"), Err(ParseU32Error::InvalidDigit));
+        assert_eq!(parse_u32(b"4294967296"), Err(ParseU32Error::Overflow));
+        assert_eq!(parse_u32(b"4096"), Ok(4096));
+        assert_eq!(parse_u32(b"0"), Ok(0));
+        assert_eq!(parse_u32(b"4294967295"), Ok(u32::MAX));
+    }
 }

@@ -39,7 +39,7 @@
 
 use bsql_pg_proto::{
     Action, PgCommand, PgProtocol, PingKind, ProtoState, ProtocolError, Reply, ReplyId, ReplyKind,
-    wire::{SYNC_WIRE_BYTES, TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
+    wire::{TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
 };
 use core::num::NonZeroU64;
 
@@ -139,10 +139,16 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg
     assert_eq!(out.len(), 1, "Ping setup: push emits exactly 1 action");
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
+            // F33: assert the LITERAL 5-byte Sync wire layout from
+            // PG §55.7 — tag 'S' + BE u32 length-field `4`. This is
+            // the load-bearing wire contract: stronger than comparing
+            // to the library's own internal `SYNC_WIRE_BYTES` const
+            // (which would be tautological — emission and expectation
+            // both sourced from the same symbol, any const-drift
+            // would be mirrored on both sides).
             assert_eq!(
-                send_buf,
-                &SYNC_WIRE_BYTES,
-                "Ping setup: SendBytes must carry the 5-byte const Sync wire payload",
+                send_buf, &[b'S', 0, 0, 0, 4],
+                "Ping setup: SendBytes must carry PG Sync wire layout: tag 'S' + BE u32 length=4",
             );
         }
         other => panic!(
@@ -173,10 +179,11 @@ fn ping_from_idle_emits_sync_bytes() {
     assert_eq!(out.len(), 1, "Phase 1a budget: push_command emits exactly 1 action");
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
+            // F33: assert literal PG Sync wire layout (tag 'S' + BE u32
+            // length=4). Avoids tautology with internal SYNC_WIRE_BYTES.
             assert_eq!(
-                send_buf,
-                &SYNC_WIRE_BYTES,
-                "must send the const Sync wire bytes",
+                send_buf, &[b'S', 0, 0, 0, 4],
+                "must send PG Sync wire bytes: tag 'S' + BE u32 length=4",
             );
         }
         _ => panic!("unexpected action shape: {out:?}"),

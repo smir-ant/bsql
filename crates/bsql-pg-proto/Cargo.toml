@@ -34,3 +34,14 @@ getrandom = { workspace = true }
 # unwinding cannot occur in production. The forbid-bundle in
 # `lib.rs` rules out panic-able expressions at compile time, so
 # the abort path is unreachable by construction.
+
+[dev-dependencies]
+# SCRAM integration tests (`tests/startup_spec.rs`) build synthetic
+# server-first / server-final message fixtures, which require
+# base64-encoding salt + signature bytes. Pre-audit the tests
+# imported the crate-internal `base64_encode_to_buf` — which forced
+# that function to be `pub` for test access alone. Post-audit the
+# function is `pub(crate)` and tests call `base64ct::Base64::encode`
+# directly via this dev-only entry, closing the "pub for tests"
+# visibility anti-pattern.
+base64ct = { workspace = true }
