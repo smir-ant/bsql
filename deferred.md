@@ -941,6 +941,251 @@ Future audits should probe `rejected` items with the same rigor
 as `claimed` items. A rejection's rationale can itself be
 wrong.
 
+## 19. Architect-audit pass #5 findings (2026-04-21, post-Phase 1c-3a)
+
+Fifth systematic architect pass (47 findings). Documented in full in
+commit messages `802b411..6380f2a`. The landed items (F1, F6, F20,
+F22, F30) are already described via their commit bodies. This section
+records the remaining findings that were DEFERRED with their design
+rationale, so a future implementer doesn't repeat the dead-end
+analyses already performed.
+
+### DEF-124 — F19: embed `RowDesc` in `StreamingRows` / `AwaitingRfq` variants (DEFERRED)
+
+**Goal.** Eliminate the `PgProtocol.row_desc: Option<RowDesc>` slot;
+move schema storage into the state variants themselves. Tier aim:
+"StreamingRows state has a schema" becomes a structural tier-2
+invariant (variant shape enforces it) rather than the current
+tier-3 audit pairing (state + slot are two parallel representations
+that could drift).
+
+**Current design (tier-3 via paired facts).**
+- `ProtoState::SimpleQueryStreamingRows(ReplyId<QueryKind>)` — reply only.
+- `PgProtocol.row_desc: Option<RowDesc>` — separate slot.
+- Dispatcher on `(AwaitingFirstResponse, 'T')` sets the slot to
+  `Some(parsed_desc)` and transitions state to StreamingRows.
+- `materialise` reads `self.row_desc.as_ref()` when producing
+  `Action::StreamRow { desc: &'r RowDesc }`.
+- Slot cleared on next `push_command(SimpleQuery)` — see protocol.rs:316.
+
+**Drift risk.** A future dispatcher arm that enters StreamingRows
+without populating the slot (or enters AwaitingRfq without a prior T)
+produces `&RowDesc::EMPTY` silently instead of a classified error.
+
+**Proposed target.**
+```rust
+enum ProtoState {
+    /* ... */
+    SimpleQueryStreamingRows {
+        reply: ReplyId<QueryKind>,
+        row_desc: RowDesc,                   // always present (tier-1)
+    },
+    SimpleQueryAwaitingRfq {
+        reply: ReplyId<QueryKind>,
+        command_tag: BoundedStr<32>,
+        row_desc: Option<RowDesc>,           // Some for SELECT, None for DML/empty
+    },
+}
+```
+
+**Design challenge — lifetime of `Action::StreamRow.desc`.**
+
+Currently `Action::StreamRow { desc: &'r RowDesc }` — a reference
+(16 bytes). The `'r` lifetime ties to `ReadBuf`, but the actual
+backing storage is `PgProtocol.row_desc` (the slot). Works today
+because the slot outlives OutActions.
+
+Post-F19 without the slot, materialisation runs at the END of
+`feed_bytes` by which point `self.state` may be `Idle` (if the
+terminal `Z` was processed) — so the schema is gone from state.
+
+Three ways to resolve, each with a real trade:
+
+1. **Per-frame materialisation** inside the dispatch loop (before
+   state transitions further). Large refactor — changes the DEF-094
+   staged-dispatch model. Rejected: too big a surface change for
+   the tier win.
+
+2. **Grow `Action::StreamRow` to carry `RowDesc` by value**
+   (32 bytes → 292 bytes). `OutActions` size grows from ~2240 bytes
+   to ~2336 bytes (+96 bytes on hot stack frame). Self-contained,
+   no lifetime gymnastics. Tractable but a measurable perf cost.
+
+3. **Keep the slot but tighten access** via a `row_desc_for_streaming()`
+   method that matches state. Smaller tier win (tier-3 → tier-3 with
+   gated access — no structural uplift; the slot-state desync hazard
+   remains latent).
+
+**Recommendation.** Option 2 (grow Action by-value). Rationale:
+- Tier-3 → tier-2 structural is the primary goal; 96 bytes on a
+  hot-path stack frame is acceptable given OutActions is already
+  ~2KB and the state machine's happy path is few-frames-per-call.
+- Avoids the DEF-094 refactor cost of option 1.
+- Option 3 leaves the load-bearing invariant weak.
+
+**Further scope.** Once embedded, `QueryCompletePayload.row_desc`
+keeps `Option<RowDesc>` to preserve the current public API
+distinction (`Some(empty_rowdesc)` = 0-row SELECT with schema;
+`None` = DML / empty query). Collapsing these into "is_empty"
+semantically loses the distinction — tests pin this.
+
+**Touched files (estimated diff ~200 LoC).**
+- `state.rs` — add `row_desc` to the two variants
+- `dispatch.rs` — pattern changes; `advance_to_awaiting_rfq` grows
+  an `Option<RowDesc>` arg; `row_desc_slot: &mut Option<RowDesc>`
+  param removed from `dispatch()` signature
+- `action.rs` — `StagedAction::StreamRowRange` carries `RowDesc`;
+  `Action::StreamRow.desc: RowDesc` by value (not `&'r RowDesc`)
+- `protocol.rs` — remove `self.row_desc` field + clear discipline;
+  `materialise` gets `RowDesc` from staged action
+- `state.rs::inflight_reply_raw_id` — update patterns
+- `compute_push_*` rejection arms — update patterns
+- Tests — `is_none()` checks still work (AwaitingRfq preserves Option)
+
+**Why deferred from pass #5.** The lifetime analysis above
+concluded option 2 needs to grow `Action::StreamRow`, which touches
+the DEF-094 materialisation contract. Landing it mid-session
+without deeper measurement of stack-frame impact (OutActions is
+already the largest Copy-POD on the feed_bytes stack) risks a silent
+perf regression the 1c test suite wouldn't catch. Ship F19 in a
+dedicated commit series with a microbenchmark harness.
+
+**Ship-order.** Can land before DEF-119 witness-guard (1c-5); the
+two touch different axes (F19 = schema-state pairing; DEF-119 =
+push-from-wrong-phase typestate). No ordering constraint.
+
+### DEF-125 — F5: split `ProtoState` into `Active` / `Terminal` typestate (DEFERRED, paired with DEF-119)
+
+**Problem.** `ProtoState::Errored(ErrorKind)` is a first-class
+variant; `mem::take(&mut self.state)` in `push_command` replaces
+it with `Idle` transiently, relying on the compute_push_* helpers'
+explicit `Errored(prior_kind) => Errored(prior_kind)` arms to
+preserve the terminal state. An `other @ (...)` catch-all that
+omitted the Errored arm would not un-error the state (my triple-
+check confirmed — architect's initial claim was overstated), BUT
+would mis-classify the diagnostic as `CommandInProgress` /
+`StartupAlreadyInProgress` instead of the correct
+`ConnectionAlreadyClosed { prior_kind }`.
+
+**Proposed.** Two-layer enum:
+```rust
+pub enum ProtoState {
+    Active(ActiveState),  // current variants minus Errored
+    Terminal(ErrorKind),
+}
+```
+`mem::take` on `ProtoState::Terminal` would be a type error (no
+`Default` for `Terminal`). `compute_push_*` helpers take
+`ActiveState` by value and produce `ProtoState`; the Terminal branch
+is handled once at the `push_command` entry point.
+
+**Why deferred.** F5's tier claim is "silent un-error" — overstated
+after triple-check. The real invariant (correct diagnostic
+classification) is already tier-3 via the per-helper explicit arm
+plus regression tests. Structural elevation to tier-2 requires the
+full two-layer refactor, which overlaps heavily with DEF-119
+witness-guard territory (both restructure `PgProtocol`'s state
+API). Land together in 1c-5.
+
+**Touched files.** state.rs (enum shape), protocol.rs
+(push_command entry), all four compute_push_* (take ActiveState),
+plus dispatch.rs top-level match, plus ProtoState Debug impl, plus
+tests referring to `ProtoState::Errored(...)` as a direct match.
+
+### DEF-126 — F2: replace UTF-8 ellipsis marker `"…"` with ASCII `~` (DEFERRED)
+
+**Goal.** Reduce `OVERFLOW_MARKER` from 3 bytes (UTF-8 ellipsis) to
+1 byte (ASCII tilde). Benefits:
+- 2 bytes reclaimed per truncated buffer across all truncating tags
+  (`BoundedStr<32>` now has 96.8% capacity for content instead of
+  91%; `Sql<2048>` gains 2 bytes).
+- The F1 `N >= MARKER.len()` bound relaxes from `N >= 3` to `N >= 1`,
+  eliminating the "tiny-N blind spot" entirely.
+- Visually unambiguous in log output — `~` is more distinct than
+  `...` which could be a literal ASCII ellipsis in user text.
+
+**Trade.** User-facing truncated error messages become
+"Ungültige Eingabe~" instead of "Ungültige Eingabe…" — slightly
+less pretty but honest.
+
+**Why deferred.** Aesthetic trade-off; wants user buy-in before
+breaking the (implicit) Display convention.
+
+### DEF-127 — F9: collapse `Option<RowDesc>` to `RowDesc` with `is_empty()` (DEFERRED, subsumed by DEF-124)
+
+**Status.** Superseded by DEF-124 decision to KEEP `Option<RowDesc>`
+in `QueryCompletePayload` (preserves the "0-row SELECT vs DML"
+distinction). The 8-byte `Option` tag cost is the price of the
+distinction — record and close.
+
+### DEF-128 — F32: `FormatCode::try_from_i16` centralised classifier (P2)
+
+**Goal.** Replace the ad-hoc match on raw `i16` format codes
+throughout decode with a `FormatCode::try_from_i16(n: i16) -> Result<Self, UnexpectedFormatCode>` helper. Currently only one call site
+matches on the raw i16; future `Describe` + `BindExecute` paths
+(1c-3b+) would add more sites.
+
+**Why deferred.** Single call site today — premature DRY.
+Implement when the 2nd-and-3rd sites show up in 1c-3b/c.
+
+### DEF-129 — F33: `SYNC_WIRE_BYTES` visibility `pub` → `pub(crate)` (P3)
+
+**Goal.** `wire::SYNC_WIRE_BYTES: [u8; 5]` is `pub` but has no
+documented user-facing use-case. Protocol owns Sync frame
+semantics; the const should be `pub(crate)`.
+
+**Why deferred.** Pure visibility tightening; no behavioural
+change. Trivial commit in a future hygiene pass.
+
+### DEF-130 — F35: `record_param_status` silent-drop classification (P2)
+
+**Goal.** `record_param_status` silently ignores malformed
+ParameterStatus payloads (no NUL separator, over-length key/value,
+etc.). The silent-drop is tier-3 because PG MUST NOT send malformed
+PS — if it does, it's a server/proxy bug worth surfacing.
+
+**Proposed.** Return a classified status:
+```rust
+enum ParamStatusRecordOutcome {
+    Recorded,
+    IgnoredUnknownKey,
+    MalformedPayload { reason: ParamStatusMalformed },
+}
+```
+Caller logs via an optional `Action::EmitPsAdvisory(...)` action
+in Phase 1d+ — currently the wrapper has no channel for this.
+
+**Why deferred.** Phase 1d introduces wrapper-visible advisories.
+Today's wrapper silently drops same as the function does — no end-
+to-end tier win in 1c scope.
+
+### DEF-131 — F46: `FixedStr::PartialEq` compares full N-byte buffer (P2 perf)
+
+**Goal.** `#[derive(PartialEq)]` on `FixedStr<N, Tag>` compares the
+full `[u8; N]` buffer for equality, including the zeroed tail.
+Wasted compare bytes: `N - self.len()`. For `Sql<2048>` with a
+64-byte typical query, that's ~1984 wasted bytes per compare.
+
+**Proposed.** Hand-written `PartialEq` that compares only
+`[..self.len()]`:
+```rust
+impl<const N: usize, Tag> PartialEq for FixedStr<N, Tag> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.as_bytes() == other.as_bytes()
+    }
+}
+```
+
+**Why deferred.** Uncertain whether `FixedStr::PartialEq` is actually
+called on hot paths — Sql compares are rare. Need `cargo asm` or
+flamegraph data before optimising.
+
+**Caveat.** Replacing `#[derive(PartialEq)]` with a manual impl
+means we lose the `Hash` derive coherence (if we ever `#[derive(Hash)]`).
+Document the trade when implementing.
+
+---
+
 ## 10. Closed
 
 Move entries here when a deferral is genuinely resolved — not just
