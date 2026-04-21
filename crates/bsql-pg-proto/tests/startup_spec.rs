@@ -249,14 +249,10 @@ fn trust_auth_handshake_end_to_end() {
         [Action::DeliverReply { id: delivered_id, value }] => {
             assert_eq!(delivered_id, &startup_raw);
             match value {
-                Reply::StartupComplete {
-                    pid,
-                    secret_key,
-                    tx_status,
-                } => {
-                    assert_eq!(*pid, 12345);
-                    assert_eq!(*secret_key, 67890);
-                    assert_eq!(*tx_status, bsql_pg_proto::TxStatus::Idle);
+                Reply::StartupComplete(p) => {
+                    assert_eq!(p.pid, 12345);
+                    assert_eq!(p.secret_key, 67890);
+                    assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
                 }
                 other => panic!("expected StartupComplete, got {other:?}"),
             }
@@ -823,11 +819,11 @@ fn scram_sha256_handshake_end_to_end() {
             assert_eq!(delivered_id, &startup_raw);
             assert!(matches!(
                 value,
-                Reply::StartupComplete {
+                Reply::StartupComplete(bsql_pg_proto::StartupCompletePayload {
                     pid: 42,
                     secret_key: 99,
                     tx_status: bsql_pg_proto::TxStatus::Idle,
-                }
+                })
             ));
         }
         other => panic!("expected DeliverReply(StartupComplete), got {other:?}"),

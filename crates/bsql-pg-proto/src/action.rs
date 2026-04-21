@@ -589,97 +589,63 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 
 /// A typed protocol reply payload.
 ///
-/// `#[non_exhaustive]` because more variants (`QueryResult`, `Row`,
-/// `BackendKeyData`, …) land with their drivers.
+/// Each variant tuple-wraps its matching `*Payload` struct — the
+/// payload IS the variant's inner. One source of truth: adding or
+/// renaming a field on `PongPayload` immediately changes what
+/// `Reply::Pong(..)` matches; no parallel field list to keep in
+/// sync (DEF-112 drift seam closed).
+///
+/// `#[non_exhaustive]` because more variants (`BindComplete`,
+/// `DescribeResult`, `BackendKeyData`, …) land in later sub-phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[expect(
     clippy::large_enum_variant,
-    reason = "1c-2a: no_alloc crate; QueryComplete.row_desc carries an inline RowDesc (MAX_ROW_COLUMNS=32 columns × 8 bytes ≈ 260 bytes). Pong / ParseComplete / CloseComplete variants are small. Shrinking would require boxing row_desc, unavailable without alloc; the alternative (caller-managed schema arena) lands with DEF-119 pipelining in 1c-5."
+    reason = "1c-2a: no_alloc crate; QueryComplete carries an inline RowDesc (MAX_ROW_COLUMNS=32 columns × 8 bytes ≈ 260 bytes). Pong / ParseComplete / CloseComplete variants are small. Shrinking would require boxing row_desc, unavailable without alloc; the alternative (caller-managed schema arena) lands with DEF-119 pipelining in 1c-5."
 )]
 pub enum Reply {
-    /// The server is alive and responsive.
-    ///
-    /// Carries the [transaction-status indicator] from the matching
-    /// `ReadyForQuery` payload byte: `'I'` idle, `'T'` in-transaction,
-    /// `'E'` failed transaction. In Phase 1a we surface it raw; the
-    /// transaction state machine (1c) consumes it.
-    ///
-    /// [transaction-status indicator]: https://www.postgresql.org/docs/current/protocol-message-formats.html
-    Pong {
-        /// The single payload byte — `'I'`, `'T'`, or `'E'`.
-        tx_status: TxStatus,
-    },
+    /// The server is alive and responsive. See [`PongPayload`].
+    Pong(PongPayload),
 
-    /// The startup handshake completed successfully.
-    ///
-    /// The connection is now in [`crate::ProtoState::Idle`] and ready
-    /// for queries. Carries the backend process ID and secret key
-    /// (for cancel requests) and the transaction status byte from the
-    /// final `ReadyForQuery`.
-    StartupComplete {
-        /// Backend process ID from `BackendKeyData`.
-        pid: i32,
-        /// Backend secret key from `BackendKeyData` (cancel key).
-        secret_key: i32,
-        /// Transaction status from `ReadyForQuery` (`'I'`, `'T'`, `'E'`).
-        tx_status: TxStatus,
-    },
-
-    // ───────────────── Phase 1c reply variants ─────────────────
-    //
-    // Payloads are stubs — sub-phase 1c-1 fills the CommandTag
-    // parsing, 1c-3 fills the Parse/Close result shapes.
+    /// The startup handshake completed successfully. The connection
+    /// is now in [`crate::ProtoState::Idle`] and ready for queries.
+    /// See [`StartupCompletePayload`].
+    StartupComplete(StartupCompletePayload),
 
     /// A Query / BindExecute command completed. Delivered on the
     /// terminal `CommandComplete + ReadyForQuery` pair at the end
-    /// of the result stream. Rows (if any) were emitted
-    /// individually via `Action::StreamRow` (sub-phase 1c-1).
-    QueryComplete {
-        /// Raw ASCII command tag (`"SELECT 5"` etc.). 1c-1 ships a
-        /// parser into a typed `CommandTag` struct via round-4
-        /// finding #3; this raw form is the interim shape.
-        command_tag: crate::ident::BoundedStr<32>,
-        /// Transaction status from the trailing `ReadyForQuery`.
-        tx_status: TxStatus,
-        /// Result-set schema. `Some` for SELECT queries (including
-        /// 0-row SELECTs — `RowDescription` arrived but no
-        /// `DataRow`s followed); `None` for DML (no
-        /// `RowDescription`) and empty-query responses. 1c-2a.
-        row_desc: Option<crate::decode::RowDesc>,
-    },
+    /// of the result stream. Rows (if any) were emitted individually
+    /// via `Action::StreamRow` (sub-phase 1c-1). See
+    /// [`QueryCompletePayload`].
+    QueryComplete(QueryCompletePayload),
 
     /// A `Parse` command succeeded (server accepted the prepared
-    /// statement). Carries the transaction-status byte from the
-    /// trailing `ReadyForQuery` — Parse is a schema operation that
-    /// doesn't change tx state by itself, but surfacing it here
-    /// keeps Reply variants uniform (Pong / StartupComplete /
-    /// QueryComplete all carry tx_status) and preserves information
-    /// the dispatcher already validated. 1c-3a.
-    ParseComplete {
-        /// Transaction status from the trailing `ReadyForQuery`.
-        tx_status: TxStatus,
-    },
+    /// statement). See [`ParseCompletePayload`]. 1c-3a.
+    ParseComplete(ParseCompletePayload),
 
     /// A `Close` of a prepared statement or portal succeeded.
-    /// Carries no additional data.
-    CloseComplete,
+    /// See [`CloseCompletePayload`] (ZST — no body).
+    CloseComplete(CloseCompletePayload),
 }
 
 // ═════════════════════════════════════════════════════════════════
 // Typed per-kind payload structs (DEF-112)
 //
 // Each `ReplyKind` in `reply_id.rs` has an associated `Payload`
-// type. The `From<Payload> for Reply` impls are the only bridges
-// from typed payload → erased sum; the typed dispatcher path
-// (`deliver` above) relies on them.
+// type. The `From<Payload> for Reply` impls tuple-wrap the payload
+// into the matching `Reply::X(..)` variant — one-line bridge, no
+// field list to drift.
 // ═════════════════════════════════════════════════════════════════
 
 /// Typed payload for [`crate::reply_id::PingKind`] replies.
 ///
-/// Mirrors the `Reply::Pong` variant's field layout. Separate type
-/// so the dispatcher's kind-to-payload bond is type-enforced rather
-/// than audit-enforced (DEF-112).
+/// The server confirmed it is alive and responsive.
+///
+/// Carries the [transaction-status indicator] from the matching
+/// `ReadyForQuery` payload byte: `'I'` idle, `'T'` in-transaction,
+/// `'E'` failed transaction.
+///
+/// [transaction-status indicator]: https://www.postgresql.org/docs/current/protocol-message-formats.html
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PongPayload {
     /// Transaction-status indicator byte (`'I'`, `'T'`, `'E'`) from
@@ -690,15 +656,15 @@ pub struct PongPayload {
 impl From<PongPayload> for Reply {
     #[inline]
     fn from(p: PongPayload) -> Self {
-        Self::Pong {
-            tx_status: p.tx_status,
-        }
+        Self::Pong(p)
     }
 }
 
 /// Typed payload for [`crate::reply_id::StartupKind`] replies.
 ///
-/// Mirrors the `Reply::StartupComplete` variant's field layout.
+/// Delivered on the final `ReadyForQuery` that closes the startup
+/// handshake. Carries the backend process ID / secret key (for
+/// cancel requests) and the transaction-status byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupCompletePayload {
     /// Backend process ID from the `BackendKeyData` frame.
@@ -712,27 +678,16 @@ pub struct StartupCompletePayload {
 impl From<StartupCompletePayload> for Reply {
     #[inline]
     fn from(p: StartupCompletePayload) -> Self {
-        Self::StartupComplete {
-            pid: p.pid,
-            secret_key: p.secret_key,
-            tx_status: p.tx_status,
-        }
+        Self::StartupComplete(p)
     }
 }
-
-// ───────────────── Phase 1c payload stubs ─────────────────────
-//
-// Payloads for Query / Parse / Close kinds land in sub-phase
-// 1c-1 (simple query) and 1c-3 (extended). These stubs pin the
-// DEF-112 sealed-deliver pathway for each new kind; payload
-// structure is minimal to start.
 
 /// Typed payload for [`crate::reply_id::QueryKind`] replies.
 ///
 /// Delivered on `CommandComplete` at the end of a simple-query or
 /// extended-query result stream. `command_tag` is the raw ASCII
 /// tag PG returns (`"SELECT 5"`, `"INSERT 0 3"`, etc.) —
-/// sub-phase 1c-1 parses this into a typed `CommandTag` struct
+/// sub-phase 1c-6 parses this into a typed `CommandTag` struct
 /// (round-4 finding #3).
 ///
 /// 1c-2a: `row_desc` carries the result-set schema — `Some` for
@@ -744,28 +699,24 @@ pub struct QueryCompletePayload {
     pub command_tag: crate::ident::BoundedStr<32>,
     /// Transaction-status indicator from the trailing `ReadyForQuery`.
     pub tx_status: TxStatus,
-    /// Result-set schema, if any. See [`Reply::QueryComplete::row_desc`].
+    /// Result-set schema, if any. `Some` for SELECT (including
+    /// 0-row SELECTs), `None` for DML / empty-query.
     pub row_desc: Option<crate::decode::RowDesc>,
 }
 
 impl From<QueryCompletePayload> for Reply {
     #[inline]
     fn from(p: QueryCompletePayload) -> Self {
-        Self::QueryComplete {
-            command_tag: p.command_tag,
-            tx_status: p.tx_status,
-            row_desc: p.row_desc,
-        }
+        Self::QueryComplete(p)
     }
 }
 
 /// Typed payload for [`crate::reply_id::ParseKind`] replies.
 ///
 /// Carries the transaction-status byte from the trailing RFQ —
-/// uniform with `PongPayload` / `StartupCompletePayload` /
-/// `QueryCompletePayload`. Was a ZST in 1c-2a; widened in 1c-3a
-/// to preserve the tx_status value the dispatcher already
-/// validates (architect-audit silent-discard fix).
+/// uniform with the other payloads. Was a ZST in 1c-2a; widened
+/// in 1c-3a to preserve the tx_status value the dispatcher
+/// already validates (architect-audit silent-discard fix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseCompletePayload {
     /// Transaction-status indicator from the trailing `ReadyForQuery`.
@@ -775,9 +726,7 @@ pub struct ParseCompletePayload {
 impl From<ParseCompletePayload> for Reply {
     #[inline]
     fn from(p: ParseCompletePayload) -> Self {
-        Self::ParseComplete {
-            tx_status: p.tx_status,
-        }
+        Self::ParseComplete(p)
     }
 }
 
@@ -789,7 +738,7 @@ pub struct CloseCompletePayload;
 
 impl From<CloseCompletePayload> for Reply {
     #[inline]
-    fn from(_: CloseCompletePayload) -> Self {
-        Self::CloseComplete
+    fn from(p: CloseCompletePayload) -> Self {
+        Self::CloseComplete(p)
     }
 }

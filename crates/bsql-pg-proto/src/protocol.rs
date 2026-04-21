@@ -696,7 +696,7 @@ fn compute_push(
 /// |----------------------------|------------------------|---------------------------|
 /// | `Idle`                     | `SendBytes(SYNC)`      | `PingAwaitingRfq(reply)`|
 /// | `Errored(cause)`           | `FailReply(cause)`     | `Errored(cause)` preserved|
-/// | `PingAwaitingRfq(prev)`  | `FailReply(UnexpFr)`   | `PingAwaitingRfq(prev)` |
+/// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)` | `PingAwaitingRfq(prev)`  |
 /// | any `Connecting*` variant  | `FailReply(InProgr.)`  | same state preserved      |
 ///
 /// The `compute_push_tests` module below pins this table via a

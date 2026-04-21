@@ -210,8 +210,8 @@ fn rfq_delivers_pong_and_returns_to_idle() {
                 "reply correlator round-trips unchanged",
             );
             match value {
-                Reply::Pong { tx_status } => assert_eq!(
-                    *tx_status, bsql_pg_proto::TxStatus::Idle,
+                Reply::Pong(p) => assert_eq!(
+                    p.tx_status, bsql_pg_proto::TxStatus::Idle,
                     "Pong must surface the RFQ payload byte (tx-status) unchanged",
                 ),
                 other => panic!("only Reply::Pong defined in Phase 1a; got {other:?}"),

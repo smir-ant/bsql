@@ -211,14 +211,14 @@ fn select_zero_rows_end_to_end() {
         [Action::DeliverReply { id: delivered_id, value }] => {
             assert_eq!(*delivered_id, q_raw, "correlator round-trips");
             match value {
-                Reply::QueryComplete { command_tag, tx_status, row_desc } => {
-                    assert_eq!(command_tag.as_str(), "SELECT 0");
-                    assert_eq!(*tx_status, bsql_pg_proto::TxStatus::Idle);
+                Reply::QueryComplete(p) => {
+                    assert_eq!(p.command_tag.as_str(), "SELECT 0");
+                    assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
                     // 1c-2a: 0-row SELECT delivers schema via Reply
                     // (no StreamRow to carry it).
                     assert!(
-                        matches!(row_desc, Some(desc) if desc.is_empty()),
-                        "0-row SELECT: row_desc must be Some(empty-desc), got {row_desc:?}",
+                        matches!(p.row_desc, Some(desc) if desc.is_empty()),
+                        "0-row SELECT: row_desc must be Some(empty-desc), got {:?}", p.row_desc,
                     );
                 }
                 other => panic!("expected QueryComplete, got {other:?}"),
@@ -312,20 +312,20 @@ fn select_multiple_rows_stream_then_deliver() {
     match actions.get(3) {
         Some(Action::DeliverReply {
             id: delivered_id,
-            value: Reply::QueryComplete { command_tag, tx_status, row_desc },
+            value: Reply::QueryComplete(p),
         }) => {
             assert_eq!(*delivered_id, q_raw);
-            assert_eq!(command_tag.as_str(), "SELECT 3");
-            assert_eq!(*tx_status, bsql_pg_proto::TxStatus::Idle);
+            assert_eq!(p.command_tag.as_str(), "SELECT 3");
+            assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
             assert!(
                 matches!(
-                    row_desc,
+                    p.row_desc,
                     Some(desc) if desc.len() == 1 && matches!(
                         desc.get(0),
                         Some(&bsql_pg_proto::ColumnDesc { type_oid: 25, .. }),
                     ),
                 ),
-                "SELECT with rows: row_desc must be Some(1-col TEXT), got {row_desc:?}",
+                "SELECT with rows: row_desc must be Some(1-col TEXT), got {:?}", p.row_desc,
             );
         }
         other => panic!("expected DeliverReply(QueryComplete), got {other:?}"),
@@ -353,21 +353,17 @@ fn dml_no_rows_end_to_end() {
     match out.as_slice() {
         [Action::DeliverReply {
             id: delivered_id,
-            value: Reply::QueryComplete {
-                command_tag,
-                tx_status,
-                row_desc,
-            },
+            value: Reply::QueryComplete(p),
         }] => {
             assert_eq!(*delivered_id, q_raw);
-            assert_eq!(command_tag.as_str(), "INSERT 0 3");
-            assert_eq!(*tx_status, bsql_pg_proto::TxStatus::InTransaction);
+            assert_eq!(p.command_tag.as_str(), "INSERT 0 3");
+            assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::InTransaction);
             // 1c-2a: DML never received a 'T' frame — row_desc is None.
             // Critical invariant: push_command clears prior SELECT's
             // row_desc, so a DML following a SELECT gets None here,
             // not stale schema.
             assert!(
-                row_desc.is_none(),
+                p.row_desc.is_none(),
                 "DML receives no RowDescription → row_desc must be None",
             );
         }
@@ -393,9 +389,9 @@ fn empty_query_yields_empty_tag() {
     let out = proto.feed_bytes(&bytes, &mut wb);
     assert_eq!(out.len(), 1);
     match out.as_slice() {
-        [Action::DeliverReply { value: Reply::QueryComplete { command_tag, .. }, .. }] => {
+        [Action::DeliverReply { value: Reply::QueryComplete(p), .. }] => {
             assert_eq!(
-                command_tag.as_str(),
+                p.command_tag.as_str(),
                 "",
                 "EmptyQueryResponse surfaces as empty command tag",
             );
@@ -946,12 +942,12 @@ fn dml_after_select_clears_row_desc() {
     let out = proto.feed_bytes(&q2_bytes, &mut wb);
     match out.as_slice() {
         [Action::DeliverReply {
-            value: Reply::QueryComplete { row_desc, .. },
+            value: Reply::QueryComplete(p),
             ..
         }] => {
             assert!(
-                row_desc.is_none(),
-                "DML following SELECT must NOT inherit prior schema; got {row_desc:?}",
+                p.row_desc.is_none(),
+                "DML following SELECT must NOT inherit prior schema; got {:?}", p.row_desc,
             );
         }
         other => panic!("expected single DeliverReply for DML, got {other:?}"),

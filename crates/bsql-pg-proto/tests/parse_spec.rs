@@ -138,10 +138,10 @@ fn parse_success_end_to_end() {
     match out.as_slice() {
         [Action::DeliverReply {
             id: delivered_id,
-            value: Reply::ParseComplete { tx_status },
+            value: Reply::ParseComplete(p),
         }] => {
             assert_eq!(*delivered_id, reply_raw, "correlator round-trips");
-            assert_eq!(*tx_status, bsql_pg_proto::TxStatus::Idle);
+            assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
         }
         other => panic!("expected DeliverReply(ParseComplete), got {other:?}"),
     }
