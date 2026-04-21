@@ -568,7 +568,9 @@ impl PgProtocol {
                         }
                         let Ok(()) = self.read_buf.advance(total_len) else {
                             self.fail_inflight_and_close(
-                                ProtocolError::ReadCursorAdvanceUnreachable,
+                                ProtocolError::InternalCrateBug {
+                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                                },
                                 &mut staged,
                             );
                             break;
@@ -587,7 +589,9 @@ impl PgProtocol {
                     if tag == crate::wire::TAG_NOTICE_RESPONSE {
                         let Ok(()) = self.read_buf.advance(total_len) else {
                             self.fail_inflight_and_close(
-                                ProtocolError::ReadCursorAdvanceUnreachable,
+                                ProtocolError::InternalCrateBug {
+                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                                },
                                 &mut staged,
                             );
                             break;
@@ -658,7 +662,9 @@ impl PgProtocol {
                             self.state = new_state;
                             let Ok(()) = self.read_buf.advance(total_len) else {
                                 self.fail_inflight_and_close(
-                                    ProtocolError::ReadCursorAdvanceUnreachable,
+                                    ProtocolError::InternalCrateBug {
+                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                                },
                                     &mut staged,
                                 );
                                 break;
@@ -668,7 +674,9 @@ impl PgProtocol {
                             self.state = new_state;
                             let Ok(()) = self.read_buf.advance(total_len) else {
                                 self.fail_inflight_and_close(
-                                    ProtocolError::ReadCursorAdvanceUnreachable,
+                                    ProtocolError::InternalCrateBug {
+                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                                },
                                     &mut staged,
                                 );
                                 break;
@@ -1184,7 +1192,7 @@ fn compute_push_startup(
 /// | current state                | action                              | new state                            |
 /// |------------------------------|-------------------------------------|--------------------------------------|
 /// | `Idle` (build OK)            | `SendBytes('Q' frame)`              | `SimpleQueryAwaitingFirstResponse(id)`  |
-/// | `Idle` (build Err)           | `FailReply(OutboundFrameBuildUnreachable)`| `Idle` (unchanged)             |
+/// | `Idle` (build Err)           | `FailReply(InternalCrateBug{OutboundFrameBuild})`| `Idle` (unchanged)             |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
 /// | any `Connecting*`            | `FailReply(StartupAlreadyInProgress)`| same state preserved                |
 /// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
@@ -1329,7 +1337,7 @@ fn build_parse_message(
 /// | current state                | action                              | new state                            |
 /// |------------------------------|-------------------------------------|--------------------------------------|
 /// | `Idle` (build OK)            | 2× `SendBytes(Parse, SYNC)`         | `ParseAwaitingParseComplete(reply)`  |
-/// | `Idle` (build Err)           | `FailReply(OutboundFrameBuildUnreachable)`| `Idle` (unchanged)             |
+/// | `Idle` (build Err)           | `FailReply(InternalCrateBug{OutboundFrameBuild})`| `Idle` (unchanged)             |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                |
 /// | `Awaiting*` / `SimpleQuery*` | `FailReply(CommandInProgress)`      | same                                 |
@@ -1452,7 +1460,9 @@ fn frame_build_unreachable(
     emit_actions!(staged, budget: 1, [
         StagedAction::FailReply {
             id: raw_id,
-            cause: ProtocolError::OutboundFrameBuildUnreachable { stage },
+            cause: ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::OutboundFrameBuild { stage },
+            },
         },
     ]);
     ProtoState::Idle
@@ -1510,7 +1520,7 @@ fn build_describe_message<N: crate::ident::DescribeName>(
 /// | current state                | action                              | new state                                   |
 /// |------------------------------|-------------------------------------|---------------------------------------------|
 /// | `Idle` (build OK)            | 2× `SendBytes(Describe, SYNC)`      | `DescribeStatementAwaitingParamDesc(reply)` |
-/// | `Idle` (build Err)           | `FailReply(OutboundFrameBuildUnreachable)` | `Idle`                               |
+/// | `Idle` (build Err)           | `FailReply(InternalCrateBug{OutboundFrameBuild})` | `Idle`                               |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved                   |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                       |
 /// | any other in-flight          | `FailReply(CommandInProgress)`      | same                                        |
@@ -1795,7 +1805,7 @@ fn build_execute_message(
 /// | current state             | action                                   | new state                                   |
 /// |---------------------------|------------------------------------------|---------------------------------------------|
 /// | `Idle` (build OK)         | 3× `SendBytes(Bind, Execute, SYNC)`      | `BindExecuteAwaitingBindComplete{Dml,Select}` (depending on row_desc) |
-/// | `Idle` (build Err)        | `FailReply(OutboundFrameBuildUnreachable)` | `Idle` (unchanged)                        |
+/// | `Idle` (build Err)        | `FailReply(InternalCrateBug{OutboundFrameBuild})` | `Idle` (unchanged)                        |
 /// | `Errored(kind)`           | `FailReply(ConnectionAlreadyClosed)`     | `Errored(kind)` preserved                   |
 /// | any `Connecting*`         | `FailReply(StartupAlreadyInProgress)`    | same state preserved                        |
 /// | any in-flight             | `FailReply(CommandInProgress)`           | same state preserved                        |

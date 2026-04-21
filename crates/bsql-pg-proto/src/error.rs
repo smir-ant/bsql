@@ -462,41 +462,29 @@ pub enum ProtocolError {
     /// `build_query_message` / `build_parse_message`) returned Err
     /// in a const-assert-dead path.
     ///
-    /// The invariant `MAX_OWNED_SEND_LEN >= max_<kind>_message_size()`
-    /// is pinned by a `const _: () = assert!(...)` in `write_buf.rs`
-    /// per builder. Emission of this variant means the const assert
-    /// has drifted or been bypassed — a crate-internal bug, NOT
-    /// wire-level input.
+    /// A crate-internal invariant failed at a structurally-dead
+    /// code path — emission indicates a bug inside `bsql-pg-proto`
+    /// itself, not a wire-level event.
     ///
-    /// F6: split out from the former catch-all `ProtocolInvariantBroken`
-    /// so the wrapper can distinguish "builder overflow" from other
-    /// unreachable-by-construction paths.
-    OutboundFrameBuildUnreachable {
-        /// Which builder failed (diagnostic only — all three are
-        /// architecturally dead in intact const-assert regime).
-        stage: FrameBuildStage,
+    /// DEF-150: consolidates three pre-merge variants
+    /// (OutboundFrameBuildUnreachable / ReadCursorAdvanceUnreachable
+    /// / RowRangeConstructionUnreachable) plus adds two new loci
+    /// (SchemaArenaAllocFull for DEF-148's arena-full path — A001
+    /// fix from previously-misclassifying as RowRangeConstruction;
+    /// StaleSchemaRef reserved for DEF-154's buffer-witness stale-
+    /// ref diagnostic). Classification is always
+    /// [`ErrorKind::Internal`].
+    ///
+    /// F6 / DEF-150: uniform "internal crate bug" shape replaces
+    /// three separate variants — fewer discriminants, single
+    /// diagnostic template, additive locus enum for new dead-paths
+    /// as they're identified.
+    InternalCrateBug {
+        /// Identifies the specific architecturally-dead code path
+        /// that fired. Diagnostic only — every locus classifies as
+        /// `ErrorKind::Internal`.
+        locus: CrateBugLocus,
     },
-
-    /// [`crate::buf::ReadBuf::advance`] returned Err after
-    /// `parse_header` successfully validated `total_len <= populated.len()`.
-    ///
-    /// The two checks are in the same `feed_bytes` iteration with no
-    /// interleaving mutation — `advance` cannot exceed remaining
-    /// buffer under intact parse-advance coordination. Emission
-    /// indicates a `ReadBuf` lifecycle / coords bug.
-    ///
-    /// F6: split out from `ProtocolInvariantBroken`.
-    ReadCursorAdvanceUnreachable,
-
-    /// [`crate::action::NonEmptyRange::new`] returned None when
-    /// constructing a row-range for a `DataRow` frame.
-    ///
-    /// `parse_header` validates `payload_end <= populated_len` and
-    /// payload_len ≥ 0 → the range is always non-empty and in-bounds.
-    /// Emission indicates a [`crate::dispatch::FrameCoords`] math bug.
-    ///
-    /// F6: split out from `ProtocolInvariantBroken`.
-    RowRangeConstructionUnreachable,
 
     /// A user command arrived on a connection that had already been
     /// torn down by a prior fatal. The wrapper translates this into
@@ -525,8 +513,62 @@ pub enum ProtocolError {
     },
 }
 
+/// DEF-150 locus discriminator for
+/// [`ProtocolError::InternalCrateBug`]. Names the specific
+/// architecturally-dead code path that fired; every locus
+/// classifies as [`ErrorKind::Internal`].
+///
+/// Additive: as new dead-paths are identified (e.g. DEF-154's
+/// buffer-witness stale-ref detection), variants grow WITHOUT
+/// expanding the top-level [`ProtocolError`] enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CrateBugLocus {
+    /// [`crate::write_buf::WriteBuf`]'s frame-builder returned Err
+    /// despite the `MAX_OWNED_SEND_LEN >= max_<kind>_message_size()`
+    /// const-assert pinning non-overflow. Pre-DEF-150: the
+    /// `OutboundFrameBuildUnreachable { stage }` top-level variant.
+    OutboundFrameBuild {
+        /// Which builder failed (diagnostic only — all are
+        /// architecturally dead in intact const-assert regime).
+        stage: FrameBuildStage,
+    },
+
+    /// [`crate::buf::ReadBuf::advance`] returned Err after
+    /// `parse_header` successfully validated
+    /// `total_len <= populated.len()`. The two checks happen in
+    /// the same `feed_bytes` iteration with no interleaving
+    /// mutation; emission indicates a ReadBuf lifecycle or coords
+    /// bug. Pre-DEF-150: `ReadCursorAdvanceUnreachable`.
+    ReadCursorAdvance,
+
+    /// [`crate::action::NonEmptyRange::new`] returned None when
+    /// constructing a row-range for a `DataRow` frame.
+    /// `parse_header` validates `payload_end <= populated_len`;
+    /// emission indicates a [`crate::dispatch::FrameCoords`] math
+    /// bug. Pre-DEF-150: `RowRangeConstructionUnreachable`.
+    RowRangeConstruction,
+
+    /// DEF-148 schema arena's `alloc` returned None — arena full
+    /// in a flow that shouldn't carry more than
+    /// `MAX_ARENA_SLOTS` concurrent schemas. The pre-1c-5
+    /// single-inflight invariant guarantees at most one live
+    /// schema per query cycle. NEW in DEF-150 (pre-merge this
+    /// path was mis-classified as `RowRangeConstructionUnreachable`
+    /// — audit A001).
+    SchemaArenaAllocFull,
+
+    /// DEF-154 reserved — [`crate::schema_arena::SchemaSlab::get`]
+    /// returned None on a ref that should be live (post-successful
+    /// dispatch, pre free/clear). Indicates generational drift in
+    /// the arena's alloc/clear ordering. NOT YET WIRED — DEF-154
+    /// adds the detection sites; this locus is reserved so
+    /// diagnostic consumers see a stable enum shape when DEF-154
+    /// lands.
+    StaleSchemaRef,
+}
+
 /// Which outbound frame builder failed in the const-assert-dead path.
-/// Carried by [`ProtocolError::OutboundFrameBuildUnreachable`] for
+/// Carried by [`CrateBugLocus::OutboundFrameBuild`] for
 /// diagnostic — emission of any variant indicates a crate-internal
 /// bug (const assert drift), not a wire-level issue.
 ///
@@ -606,10 +648,11 @@ pub enum ErrorKind {
     /// error" when the real cause was the user pushing too fast. Those
     /// variants now route to [`Self::ClientOrdering`].
     Auth = 3,
-    /// Internal invariant broken — bug in this crate.
-    /// Covers [`ProtocolError::OutboundFrameBuildUnreachable`],
-    /// [`ProtocolError::ReadCursorAdvanceUnreachable`], and
-    /// [`ProtocolError::RowRangeConstructionUnreachable`] (F6 split).
+    /// Internal invariant broken — bug in this crate. Covers
+    /// [`ProtocolError::InternalCrateBug`] (DEF-150 merge of the
+    /// former three `*Unreachable` variants plus the new
+    /// `SchemaArenaAllocFull` and DEF-154-reserved
+    /// `StaleSchemaRef` loci).
     Internal = 4,
     /// Pseudo-kind for a `ConnectionAlreadyClosed` meta-error. Only
     /// ever appears in `FailReply` replies, never in state (the state
@@ -790,9 +833,7 @@ impl ProtocolError {
             | Self::UnexpectedFormatCode { .. }
             | Self::MalformedParameterDescription { .. }
             | Self::TooManyParameters { .. } => ErrorKind::Framing,
-            Self::OutboundFrameBuildUnreachable { .. }
-            | Self::ReadCursorAdvanceUnreachable
-            | Self::RowRangeConstructionUnreachable => ErrorKind::Internal,
+            Self::InternalCrateBug { .. } => ErrorKind::Internal,
             Self::ConnectionAlreadyClosed { .. } => ErrorKind::AlreadyClosed,
         }
     }
@@ -899,15 +940,9 @@ impl fmt::Display for ProtocolError {
                 f,
                 "unexpected format code in RowDescription: {code} (expected 0 text or 1 binary)",
             ),
-            Self::OutboundFrameBuildUnreachable { stage } => write!(
+            Self::InternalCrateBug { locus } => write!(
                 f,
-                "outbound frame builder returned Err in a const-assert-dead path (stage: {stage:?}) — internal bsql-pg-proto logic bug",
-            ),
-            Self::ReadCursorAdvanceUnreachable => f.write_str(
-                "ReadBuf::advance failed post-header-parse — internal bsql-pg-proto logic bug",
-            ),
-            Self::RowRangeConstructionUnreachable => f.write_str(
-                "DataRow row-range construction failed post-coords-validate — internal bsql-pg-proto logic bug",
+                "internal bsql-pg-proto bug at locus {locus:?}",
             ),
             Self::ConnectionAlreadyClosed { prior_kind } => {
                 write!(

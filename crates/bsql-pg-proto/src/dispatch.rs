@@ -468,13 +468,19 @@ pub(crate) fn dispatch(
                     Some(schema_ref) => DispatchOutcome::AdvancedSilent {
                         new_state: ProtoState::SimpleQueryStreamingRows { reply, schema_ref },
                     },
-                    // Arena capacity exhausted — crate-internal invariant
-                    // break (every query should enter with empty arena
-                    // thanks to entry-point cleanup). Classify as
-                    // Internal crate-bug.
+                    // DEF-150: arena capacity exhausted classifies as
+                    // `SchemaArenaAllocFull` (audit A001 — pre-DEF-150
+                    // this arm mis-classified as
+                    // RowRangeConstructionUnreachable, misdirecting
+                    // operators grepping for the variant name to
+                    // DataRow-parsing code). Crate-internal invariant
+                    // break: every query should enter with an empty
+                    // arena thanks to entry-point cleanup.
                     None => errored(
                         Some(reply.consume()),
-                        ProtocolError::RowRangeConstructionUnreachable,
+                        ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::SchemaArenaAllocFull,
+                        },
                     ),
                 },
                 Err(cause) => errored(Some(reply.consume()), cause),
@@ -828,9 +834,13 @@ pub(crate) fn dispatch(
                         rows: crate::state::DescribedRowsRef::Rows(schema_ref),
                     },
                 },
+                // DEF-150: arena alloc-full classifies as
+                // `SchemaArenaAllocFull` (A001 fix).
                 None => errored(
                     Some(reply.consume()),
-                    ProtocolError::RowRangeConstructionUnreachable,
+                    ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::SchemaArenaAllocFull,
+                    },
                 ),
             },
             Err(cause) => errored(Some(reply.consume()), cause),
@@ -892,9 +902,13 @@ pub(crate) fn dispatch(
                             rows: crate::state::DescribedRowsRef::Rows(schema_ref),
                         },
                     },
+                    // DEF-150: arena alloc-full classifies as
+                    // `SchemaArenaAllocFull` (A001 fix).
                     None => errored(
                         Some(reply.consume()),
-                        ProtocolError::RowRangeConstructionUnreachable,
+                        ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::SchemaArenaAllocFull,
+                        },
                     ),
                 },
                 Err(cause) => errored(Some(reply.consume()), cause),
@@ -1642,7 +1656,7 @@ fn parse_rfq_payload(
 }
 
 /// 1c-1b helper: build a `StreamRowRange` for a `DataRow` frame, or
-/// classify as `RowRangeConstructionUnreachable` on a malformed empty body.
+/// classify as `InternalCrateBug { locus: RowRangeConstruction }` on a malformed empty body.
 ///
 /// `reply.get()` — not `.consume()` — rows are in-progress signals;
 /// the `ReplyId` commits on the terminal `CommandComplete` →
@@ -1672,7 +1686,12 @@ fn stream_row_or_errored(
                 action: StagedAction::StreamRowRange { id, row_range, schema_ref },
             }
         }
-        None => errored(Some(reply.consume()), ProtocolError::RowRangeConstructionUnreachable),
+        None => errored(
+            Some(reply.consume()),
+            ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::RowRangeConstruction,
+            },
+        ),
     }
 }
 
