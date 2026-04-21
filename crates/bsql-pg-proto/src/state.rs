@@ -234,6 +234,41 @@ pub enum ProtoState {
     Errored(ErrorKind),
 }
 
+impl ProtoState {
+    /// Consume `self` and return the raw `NonZeroU64` of the typed
+    /// [`ReplyId<_>`] in flight for this state, or `None` if no
+    /// reply is in flight ([`Self::Idle`], [`Self::DrainRfqAfterError`],
+    /// [`Self::Errored`]).
+    ///
+    /// # Tier-1 invariant
+    ///
+    /// Exhaustive match over every variant: adding a variant that
+    /// carries a `ReplyId<_>` without routing it here is a build
+    /// failure. Centralises the "every in-flight reply has exactly
+    /// one consume-site on the tear-down path" rule in one place —
+    /// previously open-coded inside `fail_inflight_and_close`.
+    #[must_use]
+    pub(crate) fn inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
+        match self {
+            Self::Idle | Self::DrainRfqAfterError | Self::Errored(_) => None,
+            Self::PingAwaitingRfq(id) => Some(id.consume()),
+            Self::ConnectingStartupTrust { reply }
+            | Self::ConnectingStartupScram { reply, .. }
+            | Self::ConnectingScramAwaitingServerFirst { reply, .. }
+            | Self::ConnectingScramAwaitingServerFinal { reply, .. }
+            | Self::ConnectingScramAwaitingAuthOk(reply)
+            | Self::ConnectingPostAuthAwaitingKey(reply)
+            | Self::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
+            Self::SimpleQueryAwaitingFirstResponse(id)
+            | Self::SimpleQueryStreamingRows(id) => Some(id.consume()),
+            Self::SimpleQueryAwaitingRfq { reply, .. } => Some(reply.consume()),
+            Self::ParseAwaitingParseComplete(reply) | Self::ParseAwaitingRfq(reply) => {
+                Some(reply.consume())
+            }
+        }
+    }
+}
+
 impl core::fmt::Debug for ProtoState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

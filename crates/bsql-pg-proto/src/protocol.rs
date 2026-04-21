@@ -576,6 +576,14 @@ impl PgProtocol {
         cause: ProtocolError,
         staged: &mut StagedActions,
     ) {
+        // Already terminal: skip re-fire. The wrapper saw the full
+        // cause on the first fatal; a repeat CloseSocket would be
+        // duplicative, and any FailReply would consume a non-existent
+        // correlator (typestate prevents it — the first transition
+        // already drained the `ReplyId`).
+        if matches!(self.state, ProtoState::Errored(_)) {
+            return;
+        }
         // DEF-061 + DEF-094: compute kind before `cause` is moved
         // into the FailReply StagedAction. Stored in state as 1-byte
         // ErrorKind; full cause goes out in the one FailReply emitted
@@ -585,43 +593,15 @@ impl PgProtocol {
         // DEF-117: `core::mem::replace` directly installs the
         // terminal `Errored(kind)` state, eliminating the
         // transient `Idle`-window that `core::mem::take` would
-        // create. Consequence: the "Default-on-ProtoState-is-Idle
-        // is load-bearing for transient-window safety" invariant
-        // becomes architecturally unneeded here. Even if a future
-        // refactor grew this function body with `&self` reads
-        // between the state swap and the write-back, there is no
-        // intermediate `Idle` to misread — the state is already
-        // `Errored(kind)` from the first instruction.
+        // create. No intermediate `Idle` for a concurrent &self
+        // read (if one were added) to misinterpret as "healthy".
         //
-        // DEF-112: typed `ReplyId<K>` variants have distinct
-        // types; or-pattern `id` bindings are type-incompatible,
-        // so per-variant `.consume()` produces the raw
-        // `NonZeroU64` individually.
+        // DEF-112: typed `ReplyId<K>` are distinct types per phase
+        // kind; extraction is centralised in
+        // [`ProtoState::inflight_reply_raw_id`] — one exhaustive
+        // match in `state.rs`, not duplicated here.
         let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
-        let raw_id: Option<core::num::NonZeroU64> = match prev {
-            ProtoState::Idle | ProtoState::DrainRfqAfterError => None,
-            ProtoState::PingAwaitingRfq(id) => Some(id.consume()),
-            ProtoState::ConnectingStartupTrust { reply }
-            | ProtoState::ConnectingStartupScram { reply, .. }
-            | ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }
-            | ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }
-            | ProtoState::ConnectingScramAwaitingAuthOk(reply)
-            | ProtoState::ConnectingPostAuthAwaitingKey(reply)
-            | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
-            ProtoState::SimpleQueryAwaitingFirstResponse(id)
-            | ProtoState::SimpleQueryStreamingRows(id) => Some(id.consume()),
-            ProtoState::SimpleQueryAwaitingRfq { reply, .. } => Some(reply.consume()),
-            ProtoState::ParseAwaitingParseComplete(reply)
-            | ProtoState::ParseAwaitingRfq(reply) => Some(reply.consume()),
-            ProtoState::Errored(original_kind) => {
-                // Already Errored — preserve the ORIGINAL kind
-                // (the `replace` above wrote the new one; revert).
-                // Do not emit another FailReply / CloseSocket; the
-                // wrapper already saw them on the first fatal.
-                self.state = ProtoState::Errored(original_kind);
-                return;
-            }
-        };
+        let raw_id = prev.inflight_reply_raw_id();
         self.read_buf.clear();
         match raw_id {
             Some(id) => {
