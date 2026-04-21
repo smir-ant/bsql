@@ -694,13 +694,13 @@ fn compute_push(
             write_buf,
         ),
         PgCommand::SimpleQuery { sql, reply } => {
-            compute_push_simple_query(state, sql, reply, &mut staged, write_buf)
+            compute_push_simple_query(state, &sql, reply, &mut staged, write_buf)
         }
         PgCommand::Parse {
             stmt_name,
             sql,
             reply,
-        } => compute_push_parse(state, stmt_name, sql, reply, &mut staged, write_buf),
+        } => compute_push_parse(state, &stmt_name, &sql, reply, &mut staged, write_buf),
     };
     (new_state, staged)
 }
@@ -925,13 +925,13 @@ fn compute_push_startup(
 /// | any `SimpleQuery*`           | `FailReply(CommandInProgress)`      | same                                 |
 fn compute_push_simple_query(
     state: ProtoState,
-    sql: crate::ident::Sql,
+    sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::QueryKind>,
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
     match state {
-        ProtoState::Idle => match build_query_message(&sql, write_buf) {
+        ProtoState::Idle => match build_query_message(sql, write_buf) {
             Ok(range) => {
                 emit_actions!(staged, budget: 1, [
                     StagedAction::SendBytesRange(range),
@@ -1070,14 +1070,14 @@ fn build_parse_message(
 /// | `Parse*`                     | `FailReply(CommandInProgress)`      | same                                 |
 fn compute_push_parse(
     state: ProtoState,
-    stmt_name: crate::ident::StmtName,
-    sql: crate::ident::Sql,
+    stmt_name: &crate::ident::StmtName,
+    sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::ParseKind>,
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
     match state {
-        ProtoState::Idle => match build_parse_message(&stmt_name, &sql, write_buf) {
+        ProtoState::Idle => match build_parse_message(stmt_name, sql, write_buf) {
             Ok(range) => {
                 // Emit Parse frame (range into write_buf) + bundled
                 // Sync (static const). Both needed for PG to flush
@@ -1172,7 +1172,7 @@ fn compute_push_parse(
 /// should handle unsolicited PS. This forecloses the latent-bug class
 /// where a newly-added state "forgot" to be included and silently
 /// tore the connection down on the first runtime PS. DEF-054.
-fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
+const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
     match state {
         ProtoState::Idle
         | ProtoState::PingAwaitingRfq(_)

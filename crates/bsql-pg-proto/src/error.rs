@@ -506,7 +506,7 @@ impl ProtocolError {
     /// Exhaustive match — adding a `ProtocolError` variant without
     /// classifying it is a build error. Tier-1 compile.
     #[must_use]
-    pub fn kind(&self) -> ErrorKind {
+    pub const fn kind(&self) -> ErrorKind {
         match self {
             Self::MalformedFrameLength { .. }
             | Self::FrameTooLarge { .. }

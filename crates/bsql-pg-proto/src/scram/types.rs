@@ -48,7 +48,7 @@ impl SecretDigest {
     /// client-proof computation and for base64-encoding the proof.
     #[inline]
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.bytes
     }
 }

@@ -177,7 +177,10 @@ pub(crate) enum DispatchOutcome {
 /// value) per DEF-112's pre-consume convention.
 #[cold]
 #[inline]
-fn errored(reply_id: Option<core::num::NonZeroU64>, cause: ProtocolError) -> DispatchOutcome {
+const fn errored(
+    reply_id: Option<core::num::NonZeroU64>,
+    cause: ProtocolError,
+) -> DispatchOutcome {
     DispatchOutcome::Errored { reply_id, cause }
 }
 

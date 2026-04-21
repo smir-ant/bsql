@@ -547,20 +547,20 @@ mod deliver_entry_priv {
         /// dispatcher cannot produce a `DeliverReplyEntry` outside
         /// the typed path.
         #[inline]
-        pub(super) fn new(id: NonZeroU64, value: Reply) -> Self {
+        pub(super) const fn new(id: NonZeroU64, value: Reply) -> Self {
             Self { id, value }
         }
 
         /// Read access for the materialiser. `pub(crate)` because
         /// `protocol::materialise` lives outside this module.
         #[inline]
-        pub(crate) fn id(&self) -> NonZeroU64 {
+        pub(crate) const fn id(&self) -> NonZeroU64 {
             self.id
         }
 
         /// Read access for the materialiser.
         #[inline]
-        pub(crate) fn value(&self) -> Reply {
+        pub(crate) const fn value(&self) -> Reply {
             self.value
         }
     }

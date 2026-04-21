@@ -39,7 +39,7 @@ pub struct Sensitive<T: Zeroize> {
 impl<T: Zeroize> Sensitive<T> {
     /// Wrap a value in a `Sensitive` container.
     #[inline]
-    pub fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self { inner: value }
     }
 
@@ -48,7 +48,7 @@ impl<T: Zeroize> Sensitive<T> {
     /// The borrow is intentionally short-lived — the caller must not
     /// store the reference beyond the immediate computation.
     #[inline]
-    pub fn get(&self) -> &T {
+    pub const fn get(&self) -> &T {
         &self.inner
     }
 }
