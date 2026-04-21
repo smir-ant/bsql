@@ -1243,7 +1243,7 @@ flamegraph data before optimising.
 means we lose the `Hash` derive coherence (if we ever `#[derive(Hash)]`).
 Document the trade when implementing.
 
-### DEF-132 — F17+F41: measurement pass on ProtoState by-value + fail_inflight_and_close inline policy (OPEN)
+### DEF-132 — F17+F38+F41: measurement pass on perf candidates (OPEN)
 
 **Goal.** Both items are potentially valuable optimisations but
 cannot be acted on without measurement data — committing blind
@@ -1263,18 +1263,47 @@ path (the cold body wouldn't pollute the hot-path prologue). OR it
 might hurt if LLVM was inlining it in cases where the overhead of
 the call was worse than the inlining.
 
+**F38 — `memchr` crate for SIMD-accelerated NUL scan (3 sites).**
+
+Three call sites currently use scalar byte scan:
+- `ident.rs:679` — `try_from_str` NUL validation (per `push_command`,
+  input 0-128 bytes).
+- `protocol.rs:1227` — `record_param_status` NUL separator scan
+  (per PS frame, input 10-100 bytes).
+- `decode.rs:254` — per-column name NUL scan in RowDescription
+  (per column, up to 32/row; input 5-30 bytes).
+
+At 100K-QPS pool with ~5 cols/row avg, column-name scan fires
+~500K times/sec — the highest-frequency site. Total savings if
+memchr is ~2-3x faster than LLVM-optimised `contains(&0)` on
+aarch64 for these small inputs: ~50ms/sec CPU, 0.5% of a saturated
+core.
+
+**BUT** — memchr's sweet spot is 1KB+ inputs; for 30-byte slices
+its SIMD setup overhead may equal or exceed the win. LLVM 15+
+autovectorises `iter().any(|b| *b == 0)` on aarch64 in many cases,
+making `contains(&0)` already reasonably tight. Without measurement
+we don't know which side wins. Plus dep cost (+1 crate, ~25 KB binary).
+
 **Why deferred: need data.**
 
 Measurement checklist for whoever picks this up:
-1. Run `cargo asm bsql-pg-proto::protocol::PgProtocol::push_command`
+1. **F17** — Run `cargo asm bsql-pg-proto::protocol::PgProtocol::push_command`
    — verify whether `ProtoState` copy in/out shows up in the generated
    assembly (look for large `memcpy` calls or repeated `mov`).
-2. Run `cargo asm bsql-pg-proto::protocol::PgProtocol::feed_bytes`
+2. **F41** — Run `cargo asm bsql-pg-proto::protocol::PgProtocol::feed_bytes`
    — measure size of the hot-path function body in bytes; note
    whether `fail_inflight_and_close` is inlined.
-3. Microbenchmark via `criterion` (or equivalent): `push_command(Ping)`
-   loop, 10M iterations. Record ns/call.
-4. Apply each candidate change independently, re-measure, record delta.
+3. **F38** — Run `cargo asm` on each of the three scan sites
+   (`ident::FixedStr::try_from_str`, `protocol::record_param_status`,
+   `decode::parse_row_description`) — check whether LLVM emitted
+   SIMD instructions (`ld1`, `cmeq`, `umaxv` on aarch64 NEON) or fell
+   back to a scalar loop. If scalar, memchr dep pays off.
+4. Microbenchmark via `criterion` (or equivalent):
+   - `push_command(Ping)` loop, 10M iterations → baseline for F17+F41
+   - `parse_row_description` on typical / wide / edge-case schemas → F38 data
+   Record ns/call.
+5. Apply each candidate change independently, re-measure, record delta.
 5. Commit only changes that show measurable improvement (or neutral
    + tier gain, e.g., `#[inline(never)]` that increases clarity).
 
