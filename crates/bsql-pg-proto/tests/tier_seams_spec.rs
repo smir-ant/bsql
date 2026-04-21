@@ -142,6 +142,49 @@ fn session_params_set_non_utf8_is_lossy_not_silent_skip() {
     assert_eq!(p.server_version.as_ref().map(|s| s.as_str()), Some("?"));
 }
 
+/// DEF-153 (audit A003): a malformed bool value (anything other than
+/// PG's canonical `on`/`off`) leaves the field `None` AND bumps the
+/// `n_malformed_bool_dropped` counter — gives operators a diagnostic
+/// signal distinguishing "server never sent" from "server sent a
+/// value we couldn't parse".
+///
+/// Covers both `is_superuser` and `integer_datetimes` — the two
+/// bool-valued keys in `SessionParams::set`.
+#[test]
+fn session_params_set_malformed_bool_bumps_counter() {
+    let mut p = SessionParams::new();
+    assert_eq!(p.n_malformed_bool_dropped, 0);
+
+    // `yes` is not a valid PG bool (PG expects `on`/`off`).
+    p.set(b"is_superuser", b"yes");
+    assert!(p.is_superuser.is_none(), "malformed → field stays None");
+    assert_eq!(p.n_malformed_bool_dropped, 1, "counter bumps on first drop");
+
+    // `1` is also rejected — parse_pg_bool accepts only PG's canonical forms.
+    p.set(b"integer_datetimes", b"1");
+    assert!(p.integer_datetimes.is_none());
+    assert_eq!(p.n_malformed_bool_dropped, 2, "counter bumps on each drop");
+
+    // Unknown key drop bumps `n_unknown_dropped`, NOT the bool counter.
+    p.set(b"some_future_key", b"value");
+    assert_eq!(p.n_malformed_bool_dropped, 2, "unknown-key drop must not touch bool counter");
+    assert_eq!(p.n_unknown_dropped, 1);
+}
+
+/// DEF-153 companion: a WELL-FORMED bool value does NOT bump the
+/// malformed counter. Pins the negative side of the above test.
+#[test]
+fn session_params_set_well_formed_bool_does_not_bump_counter() {
+    let mut p = SessionParams::new();
+    p.set(b"is_superuser", b"on");
+    p.set(b"is_superuser", b"off");
+    p.set(b"integer_datetimes", b"on");
+    p.set(b"integer_datetimes", b"off");
+    assert_eq!(p.is_superuser, Some(false));
+    assert_eq!(p.integer_datetimes, Some(false));
+    assert_eq!(p.n_malformed_bool_dropped, 0, "well-formed path must not bump");
+}
+
 /// Invariant (spec): a second valid set to the same key overwrites
 /// the first.
 #[test]

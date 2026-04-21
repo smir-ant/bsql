@@ -321,6 +321,20 @@ pub struct SessionParams {
     /// Saturating `u16` — overflows stay pinned at `u16::MAX` rather
     /// than wrapping.
     pub n_unknown_dropped: u16,
+    /// Number of `ParameterStatus` bool-valued fields (`is_superuser`,
+    /// `integer_datetimes`) whose value failed PG's `on`/`off` form.
+    ///
+    /// DEF-153 (audit A003): prior to this, non-standard bool values
+    /// (e.g. `is_superuser=yes` — a common human-error or legacy
+    /// proxy variant vs PG's canonical `on` / `off`) left the field
+    /// as `None`, indistinguishable from "server never sent the
+    /// parameter." Operators investigating "why does the client not
+    /// see superuser state" had no diagnostic signal. Mirrors the
+    /// F-074 `n_unknown_dropped` pattern.
+    ///
+    /// Saturating `u16` — overflows stay pinned at `u16::MAX` rather
+    /// than wrapping.
+    pub n_malformed_bool_dropped: u16,
 }
 
 impl SessionParams {
@@ -339,6 +353,7 @@ impl SessionParams {
             integer_datetimes: None,
             time_zone: None,
             n_unknown_dropped: 0,
+            n_malformed_bool_dropped: 0,
         }
     }
 
@@ -361,14 +376,21 @@ impl SessionParams {
             b"is_superuser" => {
                 if let Some(b) = parse_pg_bool(value) {
                     self.is_superuser = Some(b);
+                } else {
+                    // DEF-153: bump diagnostic counter on malformed
+                    // bool (e.g. `is_superuser=yes` vs PG's `on`/`off`).
+                    // Field stays None; the counter surfaces the drop.
+                    self.n_malformed_bool_dropped =
+                        self.n_malformed_bool_dropped.saturating_add(1);
                 }
-                // Unrecognised bool value: leave as None. Tier-2
-                // structural — the consumer sees the absence,
-                // not a silently-wrong `false`.
             }
             b"integer_datetimes" => {
                 if let Some(b) = parse_pg_bool(value) {
                     self.integer_datetimes = Some(b);
+                } else {
+                    // DEF-153: same treatment as is_superuser above.
+                    self.n_malformed_bool_dropped =
+                        self.n_malformed_bool_dropped.saturating_add(1);
                 }
             }
 
@@ -423,6 +445,8 @@ impl fmt::Debug for SessionParams {
             .field("date_style", &self.date_style)
             .field("integer_datetimes", &self.integer_datetimes)
             .field("time_zone", &self.time_zone)
+            .field("n_unknown_dropped", &self.n_unknown_dropped)
+            .field("n_malformed_bool_dropped", &self.n_malformed_bool_dropped)
             .finish()
     }
 }
