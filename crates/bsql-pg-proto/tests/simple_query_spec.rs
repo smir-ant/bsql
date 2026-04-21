@@ -46,7 +46,7 @@ use core::num::NonZeroU64;
 
 /// Build a `ReadyForQuery` frame: `'Z'` + len=5 + 1-byte tx-status.
 fn rfq_frame(tx_status: u8) -> [u8; 6] {
-    [TAG_READY_FOR_QUERY, 0, 0, 0, 5, tx_status]
+    [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 5, tx_status]
 }
 
 /// Build a PG frame around `body`: tag byte + 4-byte big-endian
@@ -82,7 +82,7 @@ fn row_description_frame(n_columns: u16) -> std::vec::Vec<u8> {
         body.extend_from_slice(&(-1i32).to_be_bytes());
         body.extend_from_slice(&0i16.to_be_bytes()); // text format
     }
-    frame(TAG_ROW_DESCRIPTION, &body)
+    frame(TAG_ROW_DESCRIPTION.byte(), &body)
 }
 
 /// Build a `DataRow` frame carrying a single text column with the
@@ -95,7 +95,7 @@ fn data_row_frame(value: &[u8]) -> std::vec::Vec<u8> {
     };
     body.extend_from_slice(&vlen.to_be_bytes());
     body.extend_from_slice(value);
-    frame(TAG_DATA_ROW, &body)
+    frame(TAG_DATA_ROW.byte(), &body)
 }
 
 /// Build a `CommandComplete` frame carrying a NUL-terminated tag
@@ -103,12 +103,12 @@ fn data_row_frame(value: &[u8]) -> std::vec::Vec<u8> {
 fn command_complete_frame(tag: &[u8]) -> std::vec::Vec<u8> {
     let mut body = std::vec::Vec::from(tag);
     body.push(0);
-    frame(TAG_COMMAND_COMPLETE, &body)
+    frame(TAG_COMMAND_COMPLETE.byte(), &body)
 }
 
 /// Build an `EmptyQueryResponse` frame (no body).
 fn empty_query_response_frame() -> std::vec::Vec<u8> {
-    frame(TAG_EMPTY_QUERY_RESPONSE, &[])
+    frame(TAG_EMPTY_QUERY_RESPONSE.byte(), &[])
 }
 
 /// Build a minimal `ErrorResponse` frame with a severity + message +
@@ -122,7 +122,7 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
     body.extend_from_slice(message);
     body.push(0);
     body.push(0); // terminator
-    frame(TAG_ERROR_RESPONSE, &body)
+    frame(TAG_ERROR_RESPONSE.byte(), &body)
 }
 
 // ------------------------------------------------------------------
@@ -169,7 +169,7 @@ fn simple_query_setup(
             assert!(!send_buf.is_empty(), "SendBytes payload must be non-empty");
             assert_eq!(
                 send_buf.first(),
-                Some(&TAG_QUERY),
+                Some(&TAG_QUERY.byte()),
                 "first byte of outbound must be `'Q'` (simple-query tag)",
             );
             send_buf.to_vec()
@@ -573,7 +573,7 @@ fn malformed_command_complete_no_nul_terminator_tears_down() {
     simple_query_setup(&mut proto, id(q_raw), &mut wb);
 
     // Body without NUL terminator.
-    let bad = frame(TAG_COMMAND_COMPLETE, b"SELECT 1");
+    let bad = frame(TAG_COMMAND_COMPLETE.byte(), b"SELECT 1");
     let out = proto.feed_bytes(&bad, &mut wb);
     let actions = out.as_slice();
     assert!(
@@ -602,13 +602,14 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
 
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     let actions = out.as_slice();
+    let z_byte = TAG_READY_FOR_QUERY.byte();
     assert!(
         actions.iter().any(|a| matches!(
             a,
             Action::FailReply {
-                cause: ProtocolError::UnexpectedFrame { tag: TAG_READY_FOR_QUERY },
+                cause: ProtocolError::UnexpectedFrame { tag },
                 ..
-            }
+            } if *tag == z_byte,
         )),
         "expected FailReply(UnexpectedFrame{{Z}}), got {actions:?}",
     );
@@ -764,7 +765,7 @@ fn stream_row_bytes_decode_via_data_row_ref() {
     row_body.extend_from_slice(col0);
     // col 1: NULL
     row_body.extend_from_slice(&(-1i32).to_be_bytes());
-    bytes.push(TAG_DATA_ROW);
+    bytes.push(TAG_DATA_ROW.byte());
     let Ok(row_framelen) = u32::try_from(row_body.len().saturating_add(4)) else {
         unreachable!()
     };
@@ -839,11 +840,11 @@ fn end_to_end_decode_typed_row() {
     dr_body.extend_from_slice(name_text);
 
     let mut bytes = std::vec::Vec::new();
-    bytes.push(TAG_ROW_DESCRIPTION);
+    bytes.push(TAG_ROW_DESCRIPTION.byte());
     let Ok(rd_len) = u32::try_from(rd_body.len().saturating_add(4)) else { unreachable!() };
     bytes.extend_from_slice(&rd_len.to_be_bytes());
     bytes.extend_from_slice(&rd_body);
-    bytes.push(TAG_DATA_ROW);
+    bytes.push(TAG_DATA_ROW.byte());
     let Ok(dr_len) = u32::try_from(dr_body.len().saturating_add(4)) else { unreachable!() };
     bytes.extend_from_slice(&dr_len.to_be_bytes());
     bytes.extend_from_slice(&dr_body);
@@ -977,7 +978,7 @@ fn query_frame_wire_format() {
     let expected_len_field = 4u32.saturating_add(u32::try_from(expected_sql.len()).unwrap_or(0)).saturating_add(1);
     let expected_total = 1 + 4 + expected_sql.len() + 1; // tag + length + sql + NUL
 
-    assert_eq!(sent.first(), Some(&TAG_QUERY), "tag = 'Q'");
+    assert_eq!(sent.first(), Some(&TAG_QUERY.byte()), "tag = 'Q'");
     assert_eq!(
         sent.get(1..5),
         Some(&expected_len_field.to_be_bytes()[..]),

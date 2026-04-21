@@ -992,7 +992,7 @@ fn build_query_message(
     use crate::write_buf::WriteBufFull;
 
     let start = write_buf.len();
-    write_buf.push_u8(crate::wire::TAG_QUERY)?;
+    write_buf.push_u8(crate::wire::TAG_QUERY.byte())?;
     write_buf.with_length_prefix(|w| {
         w.push_nul_terminated(sql.as_bytes())
     })?;

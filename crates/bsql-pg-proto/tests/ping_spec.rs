@@ -47,14 +47,14 @@ use core::num::NonZeroU64;
 /// payload byte), one byte of tx-status.
 fn rfq_frame(tx_status: u8) -> [u8; 6] {
     // Length field value is 5 (4 bytes of length + 1 payload byte).
-    [TAG_READY_FOR_QUERY, 0, 0, 0, 5, tx_status]
+    [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 5, tx_status]
 }
 
 /// Build an `ErrorResponse` frame with a minimal payload. The frame
 /// parser does not inspect the payload; we use `b'\0'` as a single
 /// terminator byte so the length is the minimum 5.
 fn error_frame() -> [u8; 6] {
-    [TAG_ERROR_RESPONSE, 0, 0, 0, 5, b'\0']
+    [TAG_ERROR_RESPONSE.byte(), 0, 0, 0, 5, b'\0']
 }
 
 /// Non-zero correlator value — the raw counter the wrapper would mint.
@@ -324,7 +324,7 @@ fn malformed_length_fails_and_closes() {
     ping_setup(&mut proto, id(ping_raw), &mut wb);
 
     // Tag 'Z', length field = 3 (illegal: min is 4).
-    let frame = [TAG_READY_FOR_QUERY, 0, 0, 0, 3, b'I'];
+    let frame = [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 3, b'I'];
     let out = proto.feed_bytes(&frame, &mut wb);
 
     assert_eq!(out.len(), 2);
@@ -435,7 +435,7 @@ fn frame_too_large_is_rejected_pre_buffer() {
 
     // Tag 'Z', length field = u32::MAX (obviously > MAX_FRAME_LEN_FIELD).
     // Only the 5-byte header is fed; the body is never sent.
-    let frame = [TAG_READY_FOR_QUERY, 0xFF, 0xFF, 0xFF, 0xFF];
+    let frame = [TAG_READY_FOR_QUERY.byte(), 0xFF, 0xFF, 0xFF, 0xFF];
     let out = proto.feed_bytes(&frame, &mut wb);
 
     assert_eq!(out.len(), 2);
@@ -495,7 +495,7 @@ fn build_rfq_frame_with_payload_len(payload_len: usize) -> Vec<u8> {
     let declared = u32::try_from(declared_usize).unwrap_or(u32::MAX);
     let len_bytes = declared.to_be_bytes();
     let mut frame = Vec::with_capacity(5_usize.saturating_add(payload_len));
-    frame.push(TAG_READY_FOR_QUERY);
+    frame.push(TAG_READY_FOR_QUERY.byte());
     frame.extend_from_slice(&len_bytes);
     frame.extend(std::iter::repeat_n(b'X', payload_len));
     frame

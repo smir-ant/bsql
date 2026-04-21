@@ -108,8 +108,12 @@ pub enum HeaderParse {
     Incomplete,
     /// Header parsed cleanly. The frame is fully described.
     Ok {
-        /// The PG message tag (e.g. `b'Z'` for `ReadyForQuery`).
-        tag: u8,
+        /// The PG message tag, typed as [`crate::wire::InboundTag`]
+        /// — bytes received from the server are wrapped here so
+        /// they cannot cross-pollinate with [`crate::wire::OutboundTag`]
+        /// values elsewhere in the crate (tier-1 compile on
+        /// direction).
+        tag: crate::wire::InboundTag,
         /// The length-field as carried on the wire (includes itself,
         /// excludes the tag). Always `>= 4`.
         declared_len: NonZeroU32,
@@ -189,7 +193,7 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
             // declared >= 4 ⇒ NonZeroU32::new is Some.
             match NonZeroU32::new(declared) {
                 Some(nz) => HeaderParse::Ok {
-                    tag: *tag,
+                    tag: crate::wire::InboundTag::from_byte(*tag),
                     declared_len: nz,
                     total_len,
                 },

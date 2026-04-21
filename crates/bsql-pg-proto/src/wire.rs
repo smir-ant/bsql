@@ -5,17 +5,80 @@
 //! modification is a protocol break and must be reviewed against the
 //! upstream spec.
 //!
-//! The full PG protocol uses dozens of message tags; **Phase 1a only
-//! ships the tags the Ping flow actually traverses**: `Sync` outbound,
-//! `ReadyForQuery` and `ErrorResponse` inbound. Other tags land with
-//! their drivers per reforge.md §3.5 (no manufactured constants).
+//! # Tier-1 direction discipline
+//!
+//! Tags are typed by direction — [`InboundTag`] (backend → frontend)
+//! and [`OutboundTag`] (frontend → backend) — via `#[repr(transparent)]`
+//! newtypes around a raw byte. Cross-direction confusion is a
+//! compile error: a dispatcher expecting `InboundTag` cannot receive
+//! an `OutboundTag`, and vice-versa. PG's wire-tag space overlaps
+//! between directions (e.g. `'E'` = `ErrorResponse` inbound vs
+//! `Execute` outbound); the typed split eliminates that confusion
+//! class at the type level rather than at audit time.
+
+/// A PostgreSQL wire tag received from the server (backend → frontend).
+///
+/// `#[repr(transparent)]` over `u8` — zero runtime cost, same ABI
+/// as a byte. Construction is crate-internal: external consumers
+/// receive instances via [`crate::HeaderParse::Ok::tag`] from
+/// [`crate::parse_header`] and can match against the named
+/// constants ([`TAG_READY_FOR_QUERY`], [`TAG_DATA_ROW`], etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct InboundTag(u8);
+
+impl InboundTag {
+    /// Wrap a raw wire byte as an `InboundTag`. Crate-internal —
+    /// the only legitimate source of an `InboundTag` is the frame
+    /// parser, which consumes bytes received from the server.
+    #[inline]
+    pub(crate) const fn from_byte(b: u8) -> Self {
+        Self(b)
+    }
+
+    /// Extract the underlying wire byte.
+    #[inline]
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        self.0
+    }
+}
+
+/// A PostgreSQL wire tag sent to the server (frontend → backend).
+///
+/// Mirror of [`InboundTag`] for the outbound direction. Used by the
+/// protocol's frame builders ([`crate::PgProtocol::push_command`]
+/// paths). Users never construct `OutboundTag` instances directly —
+/// they reference the named constants ([`TAG_QUERY`], [`TAG_SYNC`],
+/// etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct OutboundTag(u8);
+
+impl OutboundTag {
+    /// Crate-internal constructor — only the tag-declaration section
+    /// below instantiates these. Private callers of
+    /// [`OutboundTag::byte`] serialise the tag byte via
+    /// [`crate::write_buf::WriteBuf::push_u8`].
+    #[inline]
+    pub(crate) const fn from_byte(b: u8) -> Self {
+        Self(b)
+    }
+
+    /// Extract the underlying wire byte.
+    #[inline]
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        self.0
+    }
+}
 
 /// Frontend `Sync` message tag (`'S'`).
 ///
 /// Sent by the client to flush a pipelined batch. In Phase 1a we use it
 /// as the Ping primitive: the only legal server response to a `Sync` in
 /// `Idle` is a `ReadyForQuery`. PG protocol spec §55.2.4 (Extended Query).
-pub const TAG_SYNC: u8 = b'S';
+pub const TAG_SYNC: OutboundTag = OutboundTag::from_byte(b'S');
 
 /// Backend `ReadyForQuery` message tag (`'Z'`).
 ///
@@ -23,7 +86,7 @@ pub const TAG_SYNC: u8 = b'S';
 /// (`'I'` idle, `'T'` in-transaction, `'E'` failed transaction). In
 /// Phase 1a we accept any of the three (we are layer-below the
 /// transaction state machine; it lands in 1c).
-pub const TAG_READY_FOR_QUERY: u8 = b'Z';
+pub const TAG_READY_FOR_QUERY: InboundTag = InboundTag::from_byte(b'Z');
 
 /// Backend `ErrorResponse` message tag (`'E'`).
 ///
@@ -31,7 +94,7 @@ pub const TAG_READY_FOR_QUERY: u8 = b'Z';
 /// dispatcher's [`parse_error_response`][crate::error::ProtocolError::ServerErrorResponse]
 /// extracts severity / code / message / detail / hint into a typed
 /// `ServerErrorResponse` classification.
-pub const TAG_ERROR_RESPONSE: u8 = b'E';
+pub const TAG_ERROR_RESPONSE: InboundTag = InboundTag::from_byte(b'E');
 
 /// The complete `Sync` frame on the wire.
 ///
@@ -40,11 +103,8 @@ pub const TAG_ERROR_RESPONSE: u8 = b'E';
 /// the tag).
 ///
 /// This is a `&'static [u8]` because the message is parameter-free; we
-/// ship it via [`crate::action::SendBuf`] with a 5-byte memcpy into
-/// the bounded stack buffer (DEF-089 collapsed the Static/Owned enum
-/// to a single-shape newtype; zero-copy recovery waits for the
-/// lifetime-parametrised `Action<'buf>` redesign in Phase 1c).
-pub const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC, 0, 0, 0, 4];
+/// ship it via a zero-copy static reference through [`crate::action::Action::SendBytes`].
+pub const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC.byte(), 0, 0, 0, 4];
 
 // ---------------------------------------------------------------
 // Phase 1b tags
@@ -54,27 +114,27 @@ pub const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC, 0, 0, 0, 4];
 ///
 /// Carries a 4-byte sub-code indicating the authentication method:
 /// 0 = Ok, 10 = SASL, 11 = SASLContinue, 12 = SASLFinal.
-pub const TAG_AUTHENTICATION: u8 = b'R';
+pub const TAG_AUTHENTICATION: InboundTag = InboundTag::from_byte(b'R');
 
 /// Backend `ParameterStatus` message tag (`'S'`).
 ///
 /// Carries a key=NUL + value=NUL pair for a session parameter.
-/// Reused for both inbound ParameterStatus and outbound Sync
-/// (the outbound Sync uses `TAG_SYNC` = `b'S'` = same byte;
-/// disambiguation is by direction — we only parse inbound `S`
-/// as ParameterStatus during connecting states).
-pub const TAG_PARAMETER_STATUS: u8 = b'S';
+/// Shares the byte with outbound `Sync` (`TAG_SYNC` = `b'S'`);
+/// disambiguation is tier-1 compile now that [`InboundTag`] and
+/// [`OutboundTag`] are distinct types — the dispatcher expecting
+/// `InboundTag` cannot accidentally match against an `OutboundTag`.
+pub const TAG_PARAMETER_STATUS: InboundTag = InboundTag::from_byte(b'S');
 
 /// Backend `BackendKeyData` message tag (`'K'`).
 ///
 /// Carries 8 bytes: pid (i32 BE) + secret_key (i32 BE).
-pub const TAG_BACKEND_KEY_DATA: u8 = b'K';
+pub const TAG_BACKEND_KEY_DATA: InboundTag = InboundTag::from_byte(b'K');
 
 /// Backend `NegotiateProtocolVersion` message tag (`'v'`).
 ///
 /// Sent when the server does not support a requested protocol option.
 /// DEF-044.
-pub const TAG_NEGOTIATE_PROTOCOL_VERSION: u8 = b'v';
+pub const TAG_NEGOTIATE_PROTOCOL_VERSION: InboundTag = InboundTag::from_byte(b'v');
 
 /// Backend `NoticeResponse` message tag (`'N'`).
 ///
@@ -85,13 +145,13 @@ pub const TAG_NEGOTIATE_PROTOCOL_VERSION: u8 = b'v';
 /// notices and advances past, analogous to the `ParameterStatus`
 /// filter (DEF-054). Future `Action::EmitNotice(...)` in Phase 1c+
 /// will surface notices to the wrapper; Phase 1b drops them.
-pub const TAG_NOTICE_RESPONSE: u8 = b'N';
+pub const TAG_NOTICE_RESPONSE: InboundTag = InboundTag::from_byte(b'N');
 
 /// Frontend `SASLInitialResponse` / `SASLResponse` message tag (`'p'`).
 ///
 /// Used for both the initial SASL response (mechanism + client-first)
 /// and the subsequent SASL response (client-final).
-pub const TAG_SASL_RESPONSE: u8 = b'p';
+pub const TAG_SASL_RESPONSE: OutboundTag = OutboundTag::from_byte(b'p');
 
 // ---------------------------------------------------------------
 // Phase 1c tags — Simple Query + Extended Query flow (PG §55.7)
@@ -103,91 +163,90 @@ pub const TAG_SASL_RESPONSE: u8 = b'p';
 ///
 /// Describes the columns of a result set: name, type OID, size,
 /// format. Precedes the run of `DataRow` frames for a query.
-pub const TAG_ROW_DESCRIPTION: u8 = b'T';
+pub const TAG_ROW_DESCRIPTION: InboundTag = InboundTag::from_byte(b'T');
 
 /// Backend `DataRow` message tag (`'D'`).
 ///
 /// One row of a result set. Shares the byte with the frontend
-/// `Describe` tag; disambiguated by direction (architect §2 +
-/// assert_all_distinct! runs per-direction only).
-pub const TAG_DATA_ROW: u8 = b'D';
+/// `Describe` tag but is distinct at the type level ([`InboundTag`]
+/// vs [`OutboundTag`]) — no runtime ambiguity possible.
+pub const TAG_DATA_ROW: InboundTag = InboundTag::from_byte(b'D');
 
 /// Backend `CommandComplete` message tag (`'C'`).
 ///
 /// Signals end-of-result-set for the current command. Body is an
 /// ASCII tag like `"SELECT 5"`, `"INSERT 0 3"`, `"UPDATE 7"`.
-/// Shares the byte with the frontend `Close` tag.
-pub const TAG_COMMAND_COMPLETE: u8 = b'C';
+/// Shares the byte with the frontend `Close` tag — type-distinct.
+pub const TAG_COMMAND_COMPLETE: InboundTag = InboundTag::from_byte(b'C');
 
 /// Backend `EmptyQueryResponse` message tag (`'I'`).
 ///
 /// Sent when the client submitted an empty / whitespace-only
 /// simple-query string. Contains no body.
-pub const TAG_EMPTY_QUERY_RESPONSE: u8 = b'I';
+pub const TAG_EMPTY_QUERY_RESPONSE: InboundTag = InboundTag::from_byte(b'I');
 
 /// Backend `NoData` message tag (`'n'`).
 ///
 /// Sent after `Describe` when the described statement or portal
 /// produces no result rows (e.g. `INSERT` without `RETURNING`).
 /// Contains no body.
-pub const TAG_NO_DATA: u8 = b'n';
+pub const TAG_NO_DATA: InboundTag = InboundTag::from_byte(b'n');
 
 /// Backend `ParseComplete` message tag (`'1'`).
 ///
 /// Sent after a successful `Parse` of a prepared statement.
 /// Contains no body.
-pub const TAG_PARSE_COMPLETE: u8 = b'1';
+pub const TAG_PARSE_COMPLETE: InboundTag = InboundTag::from_byte(b'1');
 
 /// Backend `BindComplete` message tag (`'2'`).
 ///
 /// Sent after a successful `Bind` binding a portal to a prepared
 /// statement's parameters. Contains no body.
-pub const TAG_BIND_COMPLETE: u8 = b'2';
+pub const TAG_BIND_COMPLETE: InboundTag = InboundTag::from_byte(b'2');
 
 /// Backend `CloseComplete` message tag (`'3'`).
 ///
 /// Sent after a successful `Close` of a prepared statement or
 /// portal. Contains no body.
-pub const TAG_CLOSE_COMPLETE: u8 = b'3';
+pub const TAG_CLOSE_COMPLETE: InboundTag = InboundTag::from_byte(b'3');
 
 /// Backend `ParameterDescription` message tag (`'t'`).
 ///
 /// Sent in response to a `Describe` of a prepared statement:
 /// lists the parameter type OIDs the statement expects.
-pub const TAG_PARAMETER_DESCRIPTION: u8 = b't';
+pub const TAG_PARAMETER_DESCRIPTION: InboundTag = InboundTag::from_byte(b't');
 
 // Outbound commands (frontend → backend):
 
 /// Frontend `Query` message tag (`'Q'`) — simple-query string.
-pub const TAG_QUERY: u8 = b'Q';
+pub const TAG_QUERY: OutboundTag = OutboundTag::from_byte(b'Q');
 
 /// Frontend `Parse` message tag (`'P'`) — prepare a statement.
-pub const TAG_PARSE: u8 = b'P';
+pub const TAG_PARSE: OutboundTag = OutboundTag::from_byte(b'P');
 
 /// Frontend `Bind` message tag (`'B'`) — bind parameters to a
 /// prepared statement, producing a portal.
-pub const TAG_BIND: u8 = b'B';
+pub const TAG_BIND: OutboundTag = OutboundTag::from_byte(b'B');
 
 /// Frontend `Describe` message tag (`'D'`) — request metadata for
 /// a statement or portal. Shares the byte with backend `DataRow`
-/// (disambiguated by direction).
-pub const TAG_DESCRIBE: u8 = b'D';
+/// but is type-distinct ([`OutboundTag`] vs [`InboundTag`]).
+pub const TAG_DESCRIBE: OutboundTag = OutboundTag::from_byte(b'D');
 
 /// Frontend `Execute` message tag (`'E'`) — run a bound portal.
-/// Shares the byte with backend `ErrorResponse` (disambiguated by
-/// direction).
-pub const TAG_EXECUTE: u8 = b'E';
+/// Shares the byte with backend `ErrorResponse` but is type-distinct.
+pub const TAG_EXECUTE: OutboundTag = OutboundTag::from_byte(b'E');
 
 /// Frontend `Close` message tag (`'C'`) — close a prepared
 /// statement or portal. Shares the byte with backend
-/// `CommandComplete` (disambiguated by direction).
-pub const TAG_CLOSE: u8 = b'C';
+/// `CommandComplete` but is type-distinct.
+pub const TAG_CLOSE: OutboundTag = OutboundTag::from_byte(b'C');
 
 /// Frontend `Flush` message tag (`'H'`) — send buffered responses
 /// without advancing the transaction state. (`Sync` commits the
 /// implicit transaction and emits `ReadyForQuery`; `Flush` does
 /// not.)
-pub const TAG_FLUSH: u8 = b'H';
+pub const TAG_FLUSH: OutboundTag = OutboundTag::from_byte(b'H');
 
 // ---------------------------------------------------------------
 // Authentication sub-codes (first 4 bytes of 'R' payload)
@@ -265,8 +324,36 @@ macro_rules! assert_all_distinct {
     // Base cases: empty / single element — nothing to compare.
     ($scope:literal $(,)?) => {};
     ($scope:literal, $single:ident $(,)?) => {};
-    // Recursive case: emit `$first != $rest` for every rest ident,
-    // then recurse on the tail (which picks up the next `$first`).
+    // Recursive case: emit `$first.byte() != $rest.byte()` for every
+    // rest ident, then recurse on the tail. The `.byte()` const method
+    // on `InboundTag`/`OutboundTag` newtypes unwraps to the underlying
+    // `u8` for the const-time comparison — raw auth sub-codes (`u32`)
+    // expose `.byte()` via a free-function path (see the auth-code
+    // invocation below).
+    ($scope:literal, $first:ident, $($rest:ident),+ $(,)?) => {
+        $(
+            const _: () = assert!(
+                $first.byte() != $rest.byte(),
+                concat!(
+                    $scope,
+                    " collision: `",
+                    stringify!($first),
+                    "` and `",
+                    stringify!($rest),
+                    "` share a value — dispatcher arms will collide.",
+                ),
+            );
+        )+
+        assert_all_distinct!($scope, $($rest),+);
+    };
+}
+
+/// Sub-macro for the auth-code distinctness check. Auth codes are
+/// raw `u32`s (not typed newtypes); this variant does the same
+/// pairwise comparison without the `.byte()` method dispatch.
+macro_rules! assert_all_distinct_raw {
+    ($scope:literal $(,)?) => {};
+    ($scope:literal, $single:ident $(,)?) => {};
     ($scope:literal, $first:ident, $($rest:ident),+ $(,)?) => {
         $(
             const _: () = assert!(
@@ -281,7 +368,7 @@ macro_rules! assert_all_distinct {
                 ),
             );
         )+
-        assert_all_distinct!($scope, $($rest),+);
+        assert_all_distinct_raw!($scope, $($rest),+);
     };
 }
 
@@ -328,7 +415,7 @@ assert_all_distinct!(
 // the first four bytes of an `AUTHENTICATION` payload; a
 // collision would make two auth methods indistinguishable at the
 // dispatcher.
-assert_all_distinct!(
+assert_all_distinct_raw!(
     "SCRAM auth sub-code",
     AUTH_OK,
     AUTH_SASL,
@@ -349,36 +436,36 @@ assert_all_distinct!(
 // individual tag to a wrong-but-distinct byte was possible.
 // ---------------------------------------------------------------
 const _: () = {
-    // Inbound (backend → frontend).
-    assert!(TAG_READY_FOR_QUERY == b'Z', "TAG_READY_FOR_QUERY drift");
-    assert!(TAG_ERROR_RESPONSE == b'E', "TAG_ERROR_RESPONSE drift");
-    assert!(TAG_AUTHENTICATION == b'R', "TAG_AUTHENTICATION drift");
-    assert!(TAG_PARAMETER_STATUS == b'S', "TAG_PARAMETER_STATUS drift");
-    assert!(TAG_BACKEND_KEY_DATA == b'K', "TAG_BACKEND_KEY_DATA drift");
-    assert!(TAG_NEGOTIATE_PROTOCOL_VERSION == b'v', "TAG_NEGOTIATE_PROTOCOL_VERSION drift");
-    assert!(TAG_NOTICE_RESPONSE == b'N', "TAG_NOTICE_RESPONSE drift");
-    assert!(TAG_ROW_DESCRIPTION == b'T', "TAG_ROW_DESCRIPTION drift");
-    assert!(TAG_DATA_ROW == b'D', "TAG_DATA_ROW drift");
-    assert!(TAG_COMMAND_COMPLETE == b'C', "TAG_COMMAND_COMPLETE drift");
-    assert!(TAG_EMPTY_QUERY_RESPONSE == b'I', "TAG_EMPTY_QUERY_RESPONSE drift");
-    assert!(TAG_NO_DATA == b'n', "TAG_NO_DATA drift");
-    assert!(TAG_PARSE_COMPLETE == b'1', "TAG_PARSE_COMPLETE drift");
-    assert!(TAG_BIND_COMPLETE == b'2', "TAG_BIND_COMPLETE drift");
-    assert!(TAG_CLOSE_COMPLETE == b'3', "TAG_CLOSE_COMPLETE drift");
-    assert!(TAG_PARAMETER_DESCRIPTION == b't', "TAG_PARAMETER_DESCRIPTION drift");
+    // Inbound (backend → frontend). Compare `.byte()` of the newtype.
+    assert!(TAG_READY_FOR_QUERY.byte() == b'Z', "TAG_READY_FOR_QUERY drift");
+    assert!(TAG_ERROR_RESPONSE.byte() == b'E', "TAG_ERROR_RESPONSE drift");
+    assert!(TAG_AUTHENTICATION.byte() == b'R', "TAG_AUTHENTICATION drift");
+    assert!(TAG_PARAMETER_STATUS.byte() == b'S', "TAG_PARAMETER_STATUS drift");
+    assert!(TAG_BACKEND_KEY_DATA.byte() == b'K', "TAG_BACKEND_KEY_DATA drift");
+    assert!(TAG_NEGOTIATE_PROTOCOL_VERSION.byte() == b'v', "TAG_NEGOTIATE_PROTOCOL_VERSION drift");
+    assert!(TAG_NOTICE_RESPONSE.byte() == b'N', "TAG_NOTICE_RESPONSE drift");
+    assert!(TAG_ROW_DESCRIPTION.byte() == b'T', "TAG_ROW_DESCRIPTION drift");
+    assert!(TAG_DATA_ROW.byte() == b'D', "TAG_DATA_ROW drift");
+    assert!(TAG_COMMAND_COMPLETE.byte() == b'C', "TAG_COMMAND_COMPLETE drift");
+    assert!(TAG_EMPTY_QUERY_RESPONSE.byte() == b'I', "TAG_EMPTY_QUERY_RESPONSE drift");
+    assert!(TAG_NO_DATA.byte() == b'n', "TAG_NO_DATA drift");
+    assert!(TAG_PARSE_COMPLETE.byte() == b'1', "TAG_PARSE_COMPLETE drift");
+    assert!(TAG_BIND_COMPLETE.byte() == b'2', "TAG_BIND_COMPLETE drift");
+    assert!(TAG_CLOSE_COMPLETE.byte() == b'3', "TAG_CLOSE_COMPLETE drift");
+    assert!(TAG_PARAMETER_DESCRIPTION.byte() == b't', "TAG_PARAMETER_DESCRIPTION drift");
 
     // Outbound (frontend → backend).
-    assert!(TAG_SYNC == b'S', "TAG_SYNC drift");
-    assert!(TAG_SASL_RESPONSE == b'p', "TAG_SASL_RESPONSE drift");
-    assert!(TAG_QUERY == b'Q', "TAG_QUERY drift");
-    assert!(TAG_PARSE == b'P', "TAG_PARSE drift");
-    assert!(TAG_BIND == b'B', "TAG_BIND drift");
-    assert!(TAG_DESCRIBE == b'D', "TAG_DESCRIBE drift");
-    assert!(TAG_EXECUTE == b'E', "TAG_EXECUTE drift");
-    assert!(TAG_CLOSE == b'C', "TAG_CLOSE drift");
-    assert!(TAG_FLUSH == b'H', "TAG_FLUSH drift");
+    assert!(TAG_SYNC.byte() == b'S', "TAG_SYNC drift");
+    assert!(TAG_SASL_RESPONSE.byte() == b'p', "TAG_SASL_RESPONSE drift");
+    assert!(TAG_QUERY.byte() == b'Q', "TAG_QUERY drift");
+    assert!(TAG_PARSE.byte() == b'P', "TAG_PARSE drift");
+    assert!(TAG_BIND.byte() == b'B', "TAG_BIND drift");
+    assert!(TAG_DESCRIBE.byte() == b'D', "TAG_DESCRIBE drift");
+    assert!(TAG_EXECUTE.byte() == b'E', "TAG_EXECUTE drift");
+    assert!(TAG_CLOSE.byte() == b'C', "TAG_CLOSE drift");
+    assert!(TAG_FLUSH.byte() == b'H', "TAG_FLUSH drift");
 
-    // Auth sub-codes.
+    // Auth sub-codes (raw u32, no newtype).
     assert!(AUTH_OK == 0, "AUTH_OK drift");
     assert!(AUTH_SASL == 10, "AUTH_SASL drift");
     assert!(AUTH_SASL_CONTINUE == 11, "AUTH_SASL_CONTINUE drift");

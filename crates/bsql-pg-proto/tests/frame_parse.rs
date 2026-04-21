@@ -108,7 +108,7 @@ fn minimal_legal_header_parses_ok() {
             declared_len,
             total_len,
         } => {
-            assert_eq!(tag, b'X');
+            assert_eq!(tag.byte(), b'X');
             assert_eq!(declared_len.get(), 4);
             assert_eq!(total_len, 5);
         }
