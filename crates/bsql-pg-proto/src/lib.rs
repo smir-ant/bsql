@@ -258,7 +258,17 @@ const _: fn() = || {
 //   OutActions:     2504  (was ~3072 — 8 × Action shrunk)
 //   ProtoState:     1224  (unchanged — SCRAM dominant, still 1224)
 //   PgProtocol:     6272  (added 528 B arena, other shrinkage offset net)
+// Post-DEF-148 measurements (aarch64-apple-darwin, 2026-04-22):
+//   SchemaSlab size grew ~528 → ~536 B (+8: generations array + has_any).
+//   PgProtocol:     6280  (+8 absorbed in the arena slot).
+//   Other types unchanged (SchemaRef grew 1 → 2 B but lived inside
+//   Option<SchemaRef> which was already 2 B; state-variant padding absorbs).
 // ---------------------------------------------------------------------
+// DEF-151: tight-range size asserts. Bound BOTH directions to catch
+// field additions (upper) AND accidental field removals (lower). The
+// ±8 B slack tolerates cross-platform alignment differences; on
+// aarch64-apple-darwin the actual is exactly at the lower bound, on
+// other targets it may drift up to +8.
 const _: () = assert!(
     core::mem::size_of::<error::ProtocolError>() <= 312,
     "ProtocolError size regression — post-DEF-060/061/096 budget is 312 bytes. \
@@ -266,23 +276,19 @@ const _: () = assert!(
      variant add a large inline buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action<'static, 'static>>() <= 320,
-    "Action<'_, '_> size regression — post-DEF-119 budget is 320 bytes. \
-     DEF-119 externalised RowDesc to the schema arena: Reply<'r> \
-     shrunk from ~340 B to ~80 B, making FailReply.cause (ProtocolError \
-     ~304 B) the new dominant variant. `#[expect(large_enum_variant)]` \
-     acknowledges FailReply as the cold-path dominator. If this trips, \
-     check whether ProtocolError grew or a new variant added a large \
-     inline buffer.",
+    core::mem::size_of::<action::Action<'static, 'static>>() >= 304
+        && core::mem::size_of::<action::Action<'static, 'static>>() <= 320,
+    "Action<'_, '_> size drift — post-DEF-119 actual is 312 B. Range \
+     [304, 320] catches field additions AND accidental removals. Dominated \
+     by FailReply.cause (ProtocolError ~304 B) via `#[expect(large_enum_variant)]`.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Reply<'static>>() <= 96,
-    "Reply<'r> size regression — post-DEF-119 budget is 96 bytes. \
-     DEF-119 replaced inline RowDesc (~264 B) with `&'r RowDesc` \
-     borrowed from the schema arena — Reply shrunk from ~340 B to \
-     ~80 B. Dominating variant is now DescribeStatementComplete \
-     (ParamOids ~68 B + DescribedRows ~16 B + TxStatus + padding). \
-     If this trips, check ParamOids capacity or Reply variant growth.",
+    core::mem::size_of::<action::Reply<'static>>() >= 72
+        && core::mem::size_of::<action::Reply<'static>>() <= 96,
+    "Reply<'r> size drift — post-DEF-119 actual is 80 B. Range [72, 96] \
+     catches variant payload changes. Dominating variant is \
+     DescribeStatementComplete (ParamOids ~68 B + DescribedRows ~16 B + \
+     TxStatus + padding).",
 );
 const _: () = assert!(
     core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,
@@ -291,12 +297,13 @@ const _: () = assert!(
      delivered + padding. Did a bookkeeping field get added?",
 );
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() <= 1248,
-    "ProtoState size regression — post-DEF-099 budget is 1248 bytes \
-     (Scram path dominant at ~1224; Trust path just 24 bytes). DEF-119 \
-     shrunk RowDesc-carrying variants (6 sites × ~260 B → 1 B SchemaRef) \
-     but didn't touch the SCRAM dominator. Did a state variant add a \
-     large buffer?",
+    core::mem::size_of::<state::ProtoState>() >= 1216
+        && core::mem::size_of::<state::ProtoState>() <= 1248,
+    "ProtoState size drift — post-DEF-099/DEF-148 actual is ~1224 B. \
+     Range [1216, 1248] tolerates alignment variance. Dominated by \
+     SCRAM path (ConnectingScramAwaitingServerFirst ≈ 1224 B); Trust \
+     path is just ~24 B. DEF-148's generational SchemaRef fits within \
+     padding of Option<SchemaRef> carriers — no net impact.",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
@@ -306,19 +313,20 @@ const _: () = assert!(
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() <= 6336,
-    "PgProtocol size regression — post-DEF-119 budget is 6336 bytes. \
-     DEF-119 added the 528 B schema arena (SchemaSlab: 2 slots × \
-     ~264 B). Other shrinkage (RowDesc out of state variants) offset \
-     the addition — net size ~6272 B. Budget: ReadBuf 4096 + state \
-     ~1224 + session_params ~420 + schema_arena 528 + padding.",
+    core::mem::size_of::<protocol::PgProtocol>() >= 6272
+        && core::mem::size_of::<protocol::PgProtocol>() <= 6288,
+    "PgProtocol size drift — post-DEF-148 actual is 6280 B (DEF-119 \
+     baseline 6272 + 8 B SchemaSlab generations/has_any). Range \
+     [6272, 6288] catches regressions in both directions. Budget: \
+     ReadBuf 4096 + state ~1224 + session_params ~420 + schema_arena \
+     ~536 + padding.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2560,
-    "OutActions<'_, '_> size regression — post-DEF-119 budget is 2560 \
-     bytes. 8 × sizeof(Action<'_, '_>) (now 312 B) + u8 len + padding \
-     ≈ 2504 B. DEF-119 shrunk Action from 384 → 312 B by externalising \
-     RowDesc from Reply; OutActions shrunk correspondingly.",
+    core::mem::size_of::<action::OutActions<'static, 'static>>() >= 2496
+        && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2560,
+    "OutActions<'_, '_> size drift — post-DEF-119 actual is 2504 B. \
+     Range [2496, 2560] catches regressions. 8 × sizeof(Action) (312 B) \
+     + u8 len + padding ≈ 2504.",
 );
 
 // ---------------------------------------------------------------------

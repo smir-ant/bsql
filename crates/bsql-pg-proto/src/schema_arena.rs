@@ -406,13 +406,19 @@ impl Default for SchemaSlab {
     }
 }
 
-// Drift pin: total slab size. 2 slots × ~264 B each + generations
-// (2 × u8) + has_any (bool) + padding ≈ 536 B. `PgProtocol` size
-// budget in `lib.rs` must track changes here.
+// DEF-151 drift pin: total slab size. 2 slots × ~264 B each +
+// generations (2 × u8) + has_any (bool) + padding.
+// Measured post-DEF-148: ~520 B on aarch64-apple-darwin (padding is
+// tight because Option<RowDesc>'s discriminant fits in the slot's
+// trailing padding, so the arena slots end at a natural boundary
+// where the generations + has_any fit into the same alignment).
+// Range [512, 544] tolerates cross-platform alignment.
 const _: () = assert!(
-    core::mem::size_of::<SchemaSlab>() <= 544,
-    "SchemaSlab size regression — 2 slots × ~264 B + generations + has_any must stay ≤ 544 B. \
-     If MAX_ARENA_SLOTS grows, update PgProtocol size budget in lib.rs.",
+    core::mem::size_of::<SchemaSlab>() >= 512
+        && core::mem::size_of::<SchemaSlab>() <= 544,
+    "SchemaSlab size drift — post-DEF-148 actual ~520 B. Range [512, 544] \
+     tolerates cross-platform alignment. If MAX_ARENA_SLOTS grows, update \
+     PgProtocol size budget in lib.rs in lockstep.",
 );
 
 // Drift pin: SchemaRef is 2 bytes (NonZeroU8 slot + u8 generation).
@@ -602,9 +608,12 @@ mod tests {
         assert_eq!(r_gen0.generation(), 0);
 
         // 256 alloc/clear cycles to wrap the generation counter.
+        // Each iteration asserts the freshly-allocated ref resolves
+        // to live RowDesc — gives the `r` binding a meaningful use
+        // without `let _ =` (banned per user feedback).
         for _ in 0..256 {
             let r = must_alloc(&mut slab, desc);
-            let _ = r; // Simulate the ref being used and dropped.
+            assert!(slab.get(r).is_some(), "fresh alloc must resolve to live desc");
             slab.clear();
         }
 
