@@ -763,7 +763,11 @@ Will ship in **1c-5** (pipelining sub-phase).
 |---|---|---|---|
 | **1c-0 / 1c-1** | ✅ done | #2 typed newtypes (Sql/StmtName/PortalName); #3 CommandTag as BoundedStr<32> (typed-struct upgrade deferred to 1c-6) | SimpleQuery end-to-end, Action::StreamRow, DEF-121 gate |
 | **1c-2** | ✅ done | #5 text-format rejection (UnexpectedFormatCode classification at parse) | RowDesc parse, DataRowRef + ColumnsIter, FromPgText primitives, oids module |
-| **1c-3** | 🚧 starting | #6 ParamsWriter zero-copy | Parse/Bind/Describe/Execute/Close extended-query flow + FromPgBinary parallel trait |
+| **1c-3** | 🚧 in progress | #6 ParamsWriter zero-copy (1c-3b shipped) | Parse/Bind/Describe/Execute/Close extended-query flow + FromPgBinary parallel trait |
+| **1c-3a** | ✅ done | — | `PgCommand::Parse` + Sync bundle, `ParseComplete → RFQ → Reply::ParseComplete` |
+| **1c-3b** | ✅ done (2026-04-21) | #6 ParamsWriter closed | `push_bind_execute<P: ParamsWriter>` method, sealed `EncodeBinary`/`FromPgBinary` traits, 4 new BindExecute state variants, 12 new dispatch arms, `F19` schema-required shield preserved, `PortalSuspended` classified as UnexpectedFrame (1c-6 lifts) |
+| **1c-3c** | ⏳ pending | — | `Describe` command — `ParameterDescription` + `RowDescription` or `NoData`; enables SELECT-via-extended-query without externally-provided row_desc |
+| **1c-3d** | ⏳ pending | — | `Close` (statement or portal) |
 | **1c-4** | ⏳ pending | — | BEGIN/COMMIT/ROLLBACK + tx_status tracking + SAVEPOINT |
 | **1c-5** | ⏳ pending | #1 InFlightSlot sum enum; #4 Flush/Sync guard; #7 RowDescRef arena; **DEF-119 witness-guard** | Pipelining — biggest tier-lift of Phase 1c |
 | **1c-6** | ⏳ pending | #3 typed CommandTag upgrade; DEF-109/110 cargo-asm validation | Hardening + fuzzing + proptest before 1d |
