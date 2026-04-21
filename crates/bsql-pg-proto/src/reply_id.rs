@@ -160,6 +160,41 @@ impl ReplyKind for CloseKind {
     const NAME: &'static str = "Close";
 }
 
+/// Kind marker for `PgCommand::DescribeStatement` replies.
+///
+/// Payload type: [`crate::action::DescribeStatementCompletePayload`] —
+/// carries `param_oids` (PG's `ParameterDescription`), `rows`
+/// (`RowDescription` → `Rows(..)` / `NoData` → `NoData`), and
+/// `tx_status` from the trailing RFQ.
+///
+/// **Split vs Portal.** DEF-112 drives the kind-based split: a
+/// `ReplyId<DescribeStatementKind>` cannot produce a
+/// `DescribePortalCompletePayload` at the typed `deliver` call site.
+/// The user's oneshot receiver sees only the payload shape the
+/// command-variant invoked — no `Option<ParamOids>` surface-level
+/// uncertainty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribeStatementKind {}
+impl sealed::Sealed for DescribeStatementKind {}
+impl ReplyKind for DescribeStatementKind {
+    type Payload = crate::action::DescribeStatementCompletePayload;
+    const NAME: &'static str = "DescribeStatement";
+}
+
+/// Kind marker for `PgCommand::DescribePortal` replies.
+///
+/// Payload type: [`crate::action::DescribePortalCompletePayload`] —
+/// no `param_oids` (portals are already bound; parameters are
+/// fixed at Bind time and do not appear in a portal-Describe
+/// response per PG §55.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribePortalKind {}
+impl sealed::Sealed for DescribePortalKind {}
+impl ReplyKind for DescribePortalKind {
+    type Payload = crate::action::DescribePortalCompletePayload;
+    const NAME: &'static str = "DescribePortal";
+}
+
 /// Typed opaque handle correlating a pushed command with its
 /// eventual reply.
 ///

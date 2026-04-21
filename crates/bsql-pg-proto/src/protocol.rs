@@ -771,6 +771,12 @@ fn compute_push(
             sql,
             reply,
         } => compute_push_parse(state, &stmt_name, &sql, reply, &mut staged, write_buf),
+        PgCommand::DescribeStatement { stmt_name, reply } => {
+            compute_push_describe_statement(state, &stmt_name, reply, &mut staged, write_buf)
+        }
+        PgCommand::DescribePortal { portal_name, reply } => {
+            compute_push_describe_portal(state, &portal_name, reply, &mut staged, write_buf)
+        }
     };
     (new_state, staged)
 }
@@ -876,7 +882,12 @@ fn compute_push_ping(
         | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
         | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1001,7 +1012,12 @@ fn compute_push_startup(
         | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
         | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1101,7 +1117,12 @@ fn compute_push_simple_query(
         | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
         | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1256,7 +1277,258 @@ fn compute_push_parse(
         | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
         | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::CommandInProgress,
+                },
+            ]);
+            other
+        }
+    }
+}
+
+/// Build a PostgreSQL Extended Query `Describe` (`'D'`) frame
+/// (PG §55.2.2).
+///
+/// Wire layout: tag `'D'`, 4-byte BE length (self-inclusive),
+/// single target byte (`'S'` statement or `'P'` portal via
+/// [`crate::wire::DescribeTargetByte`]), NUL-terminated name.
+///
+/// # Tier-1 target-byte pairing
+///
+/// `target` is a typed enum; the wire byte it encodes is pinned
+/// by const-asserts in `wire.rs`. Passing a random byte is a type
+/// error. The `name` argument is raw `&[u8]` here because the
+/// caller already matched on `PgCommand::Describe{Statement,Portal}`
+/// and extracted the right `StmtName::as_bytes()` /
+/// `PortalName::as_bytes()` — the pairing is enforced at the
+/// `compute_push_describe_*` call site, not inside this builder.
+fn build_describe_message(
+    target: crate::wire::DescribeTargetByte,
+    name: &[u8],
+    write_buf: &mut WriteBuf,
+) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
+    use crate::write_buf::WriteBufFull;
+
+    let start = write_buf.len();
+    write_buf.push_u8(crate::wire::TAG_DESCRIBE.byte())?;
+    write_buf.with_length_prefix(|w| {
+        w.push_u8(target.byte())?;
+        w.push_nul_terminated(name)
+    })?;
+    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+}
+
+/// Compute the transition for [`PgCommand::DescribeStatement`]
+/// against the current [`ProtoState`]. Pure; see [`compute_push`]
+/// for framing. 1c-3c.
+///
+/// Happy path emits TWO actions: `SendBytes(Describe frame)` and
+/// `SendBytes(SYNC)`. The Sync is a static const
+/// (`SYNC_WIRE_BYTES`) emitted via `StagedAction::SendBytesStatic`
+/// for zero-copy; the Describe frame is written into the caller's
+/// `WriteBuf`.
+///
+/// Decision table:
+///
+/// | current state                | action                              | new state                                   |
+/// |------------------------------|-------------------------------------|---------------------------------------------|
+/// | `Idle` (build OK)            | 2× `SendBytes(Describe, SYNC)`      | `DescribeStatementAwaitingParamDesc(reply)` |
+/// | `Idle` (build Err)           | `FailReply(OutboundFrameBuildUnreachable)` | `Idle`                               |
+/// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved                   |
+/// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                       |
+/// | any other in-flight          | `FailReply(CommandInProgress)`      | same                                        |
+fn compute_push_describe_statement(
+    state: ProtoState,
+    stmt_name: &crate::ident::StmtName,
+    reply: ReplyId<crate::reply_id::DescribeStatementKind>,
+    staged: &mut StagedActions,
+    write_buf: &mut WriteBuf,
+) -> ProtoState {
+    match state {
+        ProtoState::Idle => {
+            match build_describe_message(
+                crate::wire::DescribeTargetByte::Statement,
+                stmt_name.as_bytes(),
+                write_buf,
+            ) {
+                Ok(range) => {
+                    // Describe + Sync bundle. Sync is required —
+                    // without it PG buffers Extended Query responses
+                    // and never ships back the `'t'` / `'T'` / `'n'`
+                    // / `'Z'` sequence.
+                    emit_actions!(staged, budget: 2, [
+                        StagedAction::SendBytesRange(range),
+                        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+                    ]);
+                    ProtoState::DescribeStatementAwaitingParamDesc(reply)
+                }
+                Err(_) => {
+                    // TIER-1 COMPILE DEAD BRANCH. `write_buf.rs`'s
+                    //   MAX_OWNED_SEND_LEN >= max_describe_message_size() + 5
+                    // const-assert proves a StmtName-bounded payload
+                    // cannot overflow the WriteBuf.
+                    emit_actions!(staged, budget: 1, [
+                        StagedAction::FailReply {
+                            id: reply.consume(),
+                            cause: ProtocolError::OutboundFrameBuildUnreachable {
+                                stage: crate::error::FrameBuildStage::Describe,
+                            },
+                        },
+                    ]);
+                    ProtoState::Idle
+                }
+            }
+        }
+        ProtoState::Errored(prior_kind) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
+                },
+            ]);
+            ProtoState::Errored(prior_kind)
+        }
+        other @ (ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::StartupAlreadyInProgress,
+                },
+            ]);
+            other
+        }
+        other @ (ProtoState::PingAwaitingRfq(_)
+        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
+        | ProtoState::DrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::CommandInProgress,
+                },
+            ]);
+            other
+        }
+    }
+}
+
+/// Compute the transition for [`PgCommand::DescribePortal`] against
+/// the current [`ProtoState`]. Pure; see [`compute_push`] for
+/// framing. 1c-3c.
+///
+/// Mirrors [`compute_push_describe_statement`] — differs only in
+/// the target byte (`'P'` vs `'S'`) and the initial post-send
+/// state (`DescribePortalAwaitingRowDescOrNoData` — no
+/// `ParameterDescription` precedes, per PG §55.2.2).
+///
+/// Same decision table as statement-describe; see that function's
+/// docstring.
+fn compute_push_describe_portal(
+    state: ProtoState,
+    portal_name: &crate::ident::PortalName,
+    reply: ReplyId<crate::reply_id::DescribePortalKind>,
+    staged: &mut StagedActions,
+    write_buf: &mut WriteBuf,
+) -> ProtoState {
+    match state {
+        ProtoState::Idle => {
+            match build_describe_message(
+                crate::wire::DescribeTargetByte::Portal,
+                portal_name.as_bytes(),
+                write_buf,
+            ) {
+                Ok(range) => {
+                    emit_actions!(staged, budget: 2, [
+                        StagedAction::SendBytesRange(range),
+                        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+                    ]);
+                    ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
+                }
+                Err(_) => {
+                    emit_actions!(staged, budget: 1, [
+                        StagedAction::FailReply {
+                            id: reply.consume(),
+                            cause: ProtocolError::OutboundFrameBuildUnreachable {
+                                stage: crate::error::FrameBuildStage::Describe,
+                            },
+                        },
+                    ]);
+                    ProtoState::Idle
+                }
+            }
+        }
+        ProtoState::Errored(prior_kind) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
+                },
+            ]);
+            ProtoState::Errored(prior_kind)
+        }
+        other @ (ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::StartupAlreadyInProgress,
+                },
+            ]);
+            other
+        }
+        other @ (ProtoState::PingAwaitingRfq(_)
+        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
+        | ProtoState::DrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1476,7 +1748,12 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
         | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
         | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }) => {
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1531,7 +1808,12 @@ const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
         | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
         | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
         | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. } => true,
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. } => true,
         ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
         | ProtoState::ConnectingScramAwaitingServerFirst { .. }
@@ -1797,6 +2079,15 @@ mod allows_unsolicited_param_status_tests {
             | ProtoState::ParseAwaitingRfq(reply) => {
                 reply.consume();
             }
+            ProtoState::DescribeStatementAwaitingParamDesc(reply)
+            | ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. }
+            | ProtoState::DescribeStatementAwaitingRfq { reply, .. } => {
+                reply.consume();
+            }
+            ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
+            | ProtoState::DescribePortalAwaitingRfq { reply, .. } => {
+                reply.consume();
+            }
         }
     }
 
@@ -1986,6 +2277,15 @@ mod compute_push_tests {
             }
             ProtoState::ParseAwaitingParseComplete(reply)
             | ProtoState::ParseAwaitingRfq(reply) => {
+                reply.consume();
+            }
+            ProtoState::DescribeStatementAwaitingParamDesc(reply)
+            | ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. }
+            | ProtoState::DescribeStatementAwaitingRfq { reply, .. } => {
+                reply.consume();
+            }
+            ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
+            | ProtoState::DescribePortalAwaitingRfq { reply, .. } => {
                 reply.consume();
             }
         }

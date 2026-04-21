@@ -644,13 +644,20 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// sync (DEF-112 drift seam closed).
 ///
 /// `#[non_exhaustive]` because more variants (`BindComplete`,
-/// `DescribeResult`, `BackendKeyData`, …) land in later sub-phases.
+/// `BackendKeyData`, …) land in later sub-phases.
+///
+/// # Size note (1c-3c)
+///
+/// Previously carried a `#[expect(clippy::large_enum_variant)]` for
+/// `QueryComplete(..Option<RowDesc>)` (~260 B). As of 1c-3c clippy
+/// reports the lint one level deeper — on [`DescribedRows`] — which
+/// now carries the `expect`. `Reply` itself is large (~340 B
+/// dominated by `DescribeStatementComplete`) but variant sizes are
+/// roughly comparable since `Payload` structs keep the heavy types
+/// inline the same way. DEF-119 (1c-5) schema-arena refactor will
+/// shrink both `DescribedRows` and the containing payloads together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "1c-2a: no_alloc crate; QueryComplete carries an inline RowDesc (MAX_ROW_COLUMNS=32 columns × 8 bytes ≈ 260 bytes). Pong / ParseComplete / CloseComplete variants are small. Shrinking would require boxing row_desc, unavailable without alloc; the alternative (caller-managed schema arena) lands with DEF-119 pipelining in 1c-5."
-)]
 pub enum Reply {
     /// The server is alive and responsive. See [`PongPayload`].
     Pong(PongPayload),
@@ -674,6 +681,14 @@ pub enum Reply {
     /// A `Close` of a prepared statement or portal succeeded.
     /// See [`CloseCompletePayload`] (ZST — no body).
     CloseComplete(CloseCompletePayload),
+
+    /// A statement-level `Describe` (`'D' 'S' name`) completed. See
+    /// [`DescribeStatementCompletePayload`]. 1c-3c.
+    DescribeStatementComplete(DescribeStatementCompletePayload),
+
+    /// A portal-level `Describe` (`'D' 'P' name`) completed. See
+    /// [`DescribePortalCompletePayload`]. 1c-3c.
+    DescribePortalComplete(DescribePortalCompletePayload),
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -788,5 +803,205 @@ impl From<CloseCompletePayload> for Reply {
     #[inline]
     fn from(p: CloseCompletePayload) -> Self {
         Self::CloseComplete(p)
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// 1c-3c — Describe command payloads + helper types
+//
+// Two payload types (statement / portal) instead of one payload
+// with `Option<ParamOids>`. Rationale: a user who called
+// `DescribeStatement` always gets param OIDs back; a user who
+// called `DescribePortal` never does. The split surfaces this as
+// TWO distinct `Reply` variants, so the `oneshot::Receiver<Reply>`
+// resolves with the payload shape that matches the command — no
+// runtime `match Option` + no surface-level "why is this None?"
+// ambiguity. DEF-112 kind-parameterisation carries the guarantee
+// all the way into the `Action::DeliverReply` construction site.
+// ═════════════════════════════════════════════════════════════════
+
+/// Rows-or-not result of a [`crate::PgCommand::DescribeStatement`]
+/// / [`crate::PgCommand::DescribePortal`] query.
+///
+/// PG sends EITHER a `RowDescription` (the statement/portal produces
+/// a result-set) OR a `NoData` (`'n'`) response (no result columns —
+/// e.g. plain `INSERT` without `RETURNING`). This sum type preserves
+/// the distinction at the type level.
+///
+/// # Why named variants over `Option<RowDesc>`
+///
+/// `Option<RowDesc>` is functionally equivalent but semantically
+/// weaker: `None` could mean "server explicitly sent NoData" OR
+/// "we never set this field". The named variants make the server's
+/// intent explicit in one glance, and a future refactor cannot
+/// accidentally "forget to set" the field — constructing
+/// [`DescribedRows`] forces picking one of the two documented PG
+/// outcomes. Tier-1 clarity win.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "1c-3c: no_alloc crate; DescribedRows::Rows embeds a full RowDesc (~260 B inline) because we cannot box without alloc. DEF-119 (1c-5) schema-arena refactor will externalise this. The NoData ZST is intentionally dwarfed — the size is dominated by the legal PG Rows payload, not by padding."
+)]
+pub enum DescribedRows {
+    /// Server sent a `RowDescription` (`'T'`) — the statement/portal
+    /// produces `RowDesc::columns()` result columns. Identical shape
+    /// to the schema a SELECT streams mid-query.
+    Rows(crate::decode::RowDesc),
+    /// Server sent `NoData` (`'n'`) — the statement/portal has no
+    /// result columns. DML without `RETURNING` is the common case.
+    NoData,
+}
+
+/// Bounded list of parameter OIDs returned by server `ParameterDescription`
+/// (`'t'`) in response to a statement-level Describe.
+///
+/// POD shape: `n_params` (populated count) + `[u32; MAX_PARAMS_ARITY]`
+/// array. `Copy + Default`. Mirrors the [`crate::decode::RowDesc`]
+/// layout one-to-one.
+///
+/// # Bound
+///
+/// The capacity is [`crate::params::MAX_PARAMS_ARITY`] = 16, which
+/// matches the crate's Bind-side cap. A server returning more OIDs
+/// than that means the SQL declared more placeholders than we can
+/// ever Bind against — classified as
+/// [`crate::error::ProtocolError::TooManyParameters`] at parse time,
+/// since the result is useless downstream.
+///
+/// # Niche
+///
+/// Not niche-friendly (`u32` OIDs, empty slots fill with 0 which IS
+/// a valid OID sentinel). `Option<ParamOids>` keeps its full 4-byte
+/// length-count overhead. Since the reply shape always includes
+/// ParamOids (statement-describe only), we never need
+/// `Option<ParamOids>` — the type is always present at the API
+/// surface.
+#[derive(Debug, Clone, Copy)]
+pub struct ParamOids {
+    n_params: u16,
+    oids: [u32; crate::params::MAX_PARAMS_ARITY],
+}
+
+impl Default for ParamOids {
+    #[inline]
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl ParamOids {
+    /// Empty descriptor (0 parameters). Used as the default for
+    /// statements that declare no parameters.
+    pub const EMPTY: Self = Self {
+        n_params: 0,
+        oids: [0; crate::params::MAX_PARAMS_ARITY],
+    };
+
+    /// Construct from a populated count + a full-capacity OID array.
+    /// `pub(crate)` — only the parser creates these; users read.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_parts(
+        n_params: u16,
+        oids: [u32; crate::params::MAX_PARAMS_ARITY],
+    ) -> Self {
+        Self { n_params, oids }
+    }
+
+    /// Number of populated parameters.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        usize::from(self.n_params)
+    }
+
+    /// Whether the descriptor carries any parameters.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.n_params == 0
+    }
+
+    /// Borrow the populated OIDs as a slice — tail default-filled
+    /// slots are not exposed.
+    #[inline]
+    #[must_use]
+    pub fn oids(&self) -> &[u32] {
+        self.oids.get(..self.len()).unwrap_or(&[])
+    }
+
+    /// Get one OID by index, or `None` if out of range.
+    #[inline]
+    #[must_use]
+    pub fn get(&self, idx: usize) -> Option<u32> {
+        if idx >= self.len() {
+            return None;
+        }
+        self.oids.get(idx).copied()
+    }
+}
+
+// `ParamOids` uses full-array Eq (tail slots are constructor-filled
+// with 0 and never mutated; byte-equality of the arrays implies
+// logical equality of populated-prefix semantics). Same pattern as
+// `RowDesc` in decode.rs.
+impl PartialEq for ParamOids {
+    fn eq(&self, other: &Self) -> bool {
+        self.n_params == other.n_params && self.oids == other.oids
+    }
+}
+impl Eq for ParamOids {}
+
+/// Typed payload for [`crate::reply_id::DescribeStatementKind`] replies.
+///
+/// Delivered on the trailing `ReadyForQuery` after a statement-level
+/// Describe. Carries:
+///
+/// - `param_oids` — PG type OIDs for each placeholder the statement
+///   expects, parsed from the `ParameterDescription` (`'t'`) frame.
+/// - `rows` — `Rows(..)` if a `RowDescription` arrived, `NoData` if a
+///   `NoData` (`'n'`) arrived.
+/// - `tx_status` — from the final RFQ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescribeStatementCompletePayload {
+    /// Parameter OIDs, in positional order (`$1`, `$2`, …).
+    pub param_oids: ParamOids,
+    /// Rows-or-no-data sum from the subsequent response frame.
+    pub rows: DescribedRows,
+    /// Transaction status from the trailing `ReadyForQuery`.
+    pub tx_status: TxStatus,
+}
+
+impl From<DescribeStatementCompletePayload> for Reply {
+    #[inline]
+    fn from(p: DescribeStatementCompletePayload) -> Self {
+        Self::DescribeStatementComplete(p)
+    }
+}
+
+/// Typed payload for [`crate::reply_id::DescribePortalKind`] replies.
+///
+/// Delivered on the trailing `ReadyForQuery` after a portal-level
+/// Describe. Carries:
+///
+/// - `rows` — `Rows(..)` if a `RowDescription` arrived, `NoData` if a
+///   `NoData` (`'n'`) arrived.
+/// - `tx_status` — from the final RFQ.
+///
+/// No `param_oids` field: portals are bound-state handles; their
+/// parameter values were fixed at Bind time, so PG does not replay
+/// a `ParameterDescription` frame for a portal-Describe per PG §55.2.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescribePortalCompletePayload {
+    /// Rows-or-no-data sum from the response frame.
+    pub rows: DescribedRows,
+    /// Transaction status from the trailing `ReadyForQuery`.
+    pub tx_status: TxStatus,
+}
+
+impl From<DescribePortalCompletePayload> for Reply {
+    #[inline]
+    fn from(p: DescribePortalCompletePayload) -> Self {
+        Self::DescribePortalComplete(p)
     }
 }

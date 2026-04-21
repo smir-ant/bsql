@@ -105,8 +105,10 @@ pub mod wire;
 pub mod write_buf;
 
 pub use action::{
-    Action, CloseCompletePayload, OutActions, ParseCompletePayload, PongPayload,
-    QueryCompletePayload, Reply, StartupCompletePayload, TxStatus,
+    Action, CloseCompletePayload, DescribePortalCompletePayload,
+    DescribeStatementCompletePayload, DescribedRows, OutActions, ParamOids,
+    ParseCompletePayload, PongPayload, QueryCompletePayload, Reply,
+    StartupCompletePayload, TxStatus,
 };
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::{FetchRows, PgCommand};
@@ -121,7 +123,10 @@ pub use ident::{
 };
 pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{MAX_ACTIONS_PER_CALL, PgProtocol};
-pub use reply_id::{CloseKind, ParseKind, PingKind, QueryKind, ReplyId, ReplyKind, StartupKind};
+pub use reply_id::{
+    CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,
+    ReplyId, ReplyKind, StartupKind,
+};
 pub use sensitive::Sensitive;
 pub use session_params::{Encoding, OtherEncoding, SessionParams};
 pub use state::ProtoState;
@@ -259,18 +264,26 @@ const _: () = assert!(
      variant add a large inline buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action<'static, 'static>>() <= 320,
-    "Action<'_> size regression — post-DEF-094/096 budget is 320 bytes. \
-     Action is dominated by FailReply.cause (ProtocolError ~304 bytes); \
-     SendBytes is now a 16-byte &[u8]. If this trips, someone grew \
-     ProtocolError or added a large inline variant.",
+    core::mem::size_of::<action::Action<'static, 'static>>() <= 384,
+    "Action<'_> size regression — post-1c-3c budget is 384 bytes. \
+     Action is now dominated by `DeliverReply{{ value: Reply }}` where \
+     Reply::DescribeStatementComplete carries ParamOids (68 B) + \
+     DescribedRows embedding a RowDesc (~264 B) + TxStatus = ~340 B. \
+     A future DEF-119 arena-based schema ref (planned for 1c-5) will \
+     shrink this back by externalising RowDesc. Prior 320 B budget \
+     (1c-3b) was dominated by FailReply.cause; Describe replies now \
+     dominate. If this trips, check whether a variant added a large \
+     inline buffer or whether ParamOids / RowDesc caps grew.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Reply>() <= 320,
-    "Reply size regression — post-1c-2a budget is 320 bytes. \
-     Reply::QueryComplete now carries row_desc: Option<RowDesc> \
-     (MAX_ROW_COLUMNS=32 columns × 8 bytes + count + discriminant); \
-     variant dominates Reply's enum size.",
+    core::mem::size_of::<action::Reply>() <= 384,
+    "Reply size regression — post-1c-3c budget is 384 bytes. \
+     Reply::DescribeStatementComplete dominates: ParamOids (u16 + \
+     [u32; MAX_PARAMS_ARITY=16] ≈ 68 B) + DescribedRows (tag + \
+     RowDesc ≈ 264 B) + TxStatus (1 B) + padding ≈ 340 B. \
+     Prior 320 B budget (1c-2a) was dominated by QueryComplete's \
+     Option<RowDesc>. DEF-119 (1c-5) will re-shrink by moving \
+     RowDesc to a shared arena.",
 );
 const _: () = assert!(
     core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,
@@ -300,11 +313,12 @@ const _: () = assert!(
      session_params ~420 + padding + headroom.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2560,
+    core::mem::size_of::<action::OutActions<'static, 'static>>() <= 3100,
     "OutActions<'_> size regression — 8 × sizeof(Action<'_>) + u8 len + \
-     padding. Post-1c-1b bump (MAX_ACTIONS_PER_CALL 4 → 8) budget: 2560 bytes. \
-     Grew to fit row-streaming batching — per-iter WORST_CASE_PER_DISPATCH=2 \
-     gives 6 actions of real headroom per feed_bytes.",
+     padding. Post-1c-3c bump (Action grew 320 → 384 to carry Describe \
+     payloads with inline RowDesc/ParamOids) budget: 3100 bytes. \
+     DEF-119 (1c-5) schema-arena refactor will re-shrink by removing \
+     inline RowDesc from Reply.",
 );
 
 // ---------------------------------------------------------------------

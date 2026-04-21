@@ -9,9 +9,12 @@
 //! variants (`Query`, `Execute`, `Begin`, …) land with their drivers
 //! per reforge.md §3.5.
 
-use crate::ident::{ApplicationName, DatabaseName, Ident, Sql, StmtName};
+use crate::ident::{ApplicationName, DatabaseName, Ident, PortalName, Sql, StmtName};
 use crate::password::Credentials;
-use crate::reply_id::{ParseKind, PingKind, QueryKind, ReplyId, StartupKind};
+use crate::reply_id::{
+    DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
+    StartupKind,
+};
 
 /// A command pushed by the wrapper into the protocol state machine.
 ///
@@ -159,6 +162,96 @@ pub enum PgCommand {
         /// DEF-112: typed `ReplyId<QueryKind>` binds the payload to
         /// [`crate::action::QueryCompletePayload`] at compile time.
         reply: ReplyId<QueryKind>,
+    },
+
+    /// Inspect a previously-[`PgCommand::Parse`]'d prepared
+    /// statement via PG's Extended Query `Describe` + `Sync` bundle
+    /// (PG §55.2.2). 1c-3c.
+    ///
+    /// **Precondition:** protocol must be in [`crate::ProtoState::Idle`].
+    /// A Describe while busy yields `FailReply(CommandInProgress)`.
+    ///
+    /// # Response sequence — statement target
+    ///
+    /// Success flow:
+    /// - `ParameterDescription` (`'t'`) — type OIDs for each `$N`
+    ///   placeholder the statement declared.
+    /// - `RowDescription` (`'T'`) **or** `NoData` (`'n'`) —
+    ///   `RowDescription` for row-producing statements
+    ///   (`SELECT`, `INSERT ... RETURNING`, …); `NoData` for DML
+    ///   without `RETURNING`.
+    /// - `ReadyForQuery` (`'Z'`) — delivers
+    ///   [`crate::Reply::DescribeStatementComplete`] containing
+    ///   `param_oids`, `rows: DescribedRows`, and `tx_status`.
+    ///
+    /// Error flow: `ErrorResponse` (e.g. invalid / unknown statement
+    /// name) → `FailReply(ServerErrorResponse)` → `ReadyForQuery` →
+    /// state back to `Idle`. Connection survives — query-level
+    /// error pattern (same as SimpleQuery/Parse per PG §55.2.3).
+    ///
+    /// # Why split from [`Self::DescribePortal`] (tier-1 API shape)
+    ///
+    /// PG §55.2.2 specifies different response shapes per target:
+    /// statement-describe emits `ParameterDescription`, portal-describe
+    /// does not. Two separate command variants with two separate
+    /// [`crate::ReplyKind`] markers give the caller a payload type
+    /// that literally cannot carry the wrong shape — no
+    /// `Option<ParamOids>` runtime ambiguity, no chance of receiving
+    /// a `DescribePortalComplete` when you asked for a statement.
+    /// DEF-112 kind-parameterisation binds the payload at the
+    /// `Action::DeliverReply` construction site.
+    ///
+    /// # Sync-bundling
+    ///
+    /// Emits TWO outbound wire frames in one push: a `Describe`
+    /// frame followed by a `Sync`. Without the Sync, PG buffers
+    /// Extended Query responses indefinitely. Pipelining
+    /// (`Parse + Describe + Sync`, `Bind + Describe + Execute + Sync`)
+    /// lands in 1c-5 behind the witness-guard API.
+    DescribeStatement {
+        /// Prepared-statement name. Empty (the "unnamed statement"
+        /// per PG) or a validated `StmtName` up to
+        /// [`crate::ident::MAX_PG_NAME_LEN`] bytes.
+        stmt_name: StmtName,
+        /// Correlator for the reply.
+        ///
+        /// DEF-112: typed `ReplyId<DescribeStatementKind>` binds
+        /// the payload to
+        /// [`crate::action::DescribeStatementCompletePayload`] at
+        /// compile time.
+        reply: ReplyId<DescribeStatementKind>,
+    },
+
+    /// Inspect a previously-bound portal via PG's Extended Query
+    /// `Describe` + `Sync` bundle (PG §55.2.2). 1c-3c.
+    ///
+    /// **Precondition:** protocol must be in [`crate::ProtoState::Idle`].
+    ///
+    /// # Response sequence — portal target
+    ///
+    /// Success flow:
+    /// - `RowDescription` (`'T'`) **or** `NoData` (`'n'`) — same
+    ///   rules as statement-describe. **No** `ParameterDescription`
+    ///   precedes: portals are bound-state handles, parameters were
+    ///   fixed at Bind time.
+    /// - `ReadyForQuery` (`'Z'`) — delivers
+    ///   [`crate::Reply::DescribePortalComplete`] containing `rows`
+    ///   and `tx_status`.
+    ///
+    /// Error flow: identical to [`Self::DescribeStatement`] — query-
+    /// level recoverable error, connection survives.
+    DescribePortal {
+        /// Portal name. Empty (the "unnamed portal" per PG) or a
+        /// validated `PortalName` up to
+        /// [`crate::ident::MAX_PG_NAME_LEN`] bytes.
+        portal_name: PortalName,
+        /// Correlator for the reply.
+        ///
+        /// DEF-112: typed `ReplyId<DescribePortalKind>` binds the
+        /// payload to
+        /// [`crate::action::DescribePortalCompletePayload`] at
+        /// compile time.
+        reply: ReplyId<DescribePortalKind>,
     },
 }
 

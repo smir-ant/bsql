@@ -766,7 +766,7 @@ Will ship in **1c-5** (pipelining sub-phase).
 | **1c-3** | 🚧 in progress | #6 ParamsWriter zero-copy (1c-3b shipped) | Parse/Bind/Describe/Execute/Close extended-query flow + FromPgBinary parallel trait |
 | **1c-3a** | ✅ done | — | `PgCommand::Parse` + Sync bundle, `ParseComplete → RFQ → Reply::ParseComplete` |
 | **1c-3b** | ✅ done (2026-04-21) | #6 ParamsWriter closed | `push_bind_execute<P: ParamsWriter>` method, sealed `EncodeBinary`/`FromPgBinary` traits, 4 new BindExecute state variants, 12 new dispatch arms, `F19` schema-required shield preserved, `PortalSuspended` classified as UnexpectedFrame (1c-6 lifts) |
-| **1c-3c** | ⏳ pending | — | `Describe` command — `ParameterDescription` + `RowDescription` or `NoData`; enables SELECT-via-extended-query without externally-provided row_desc |
+| **1c-3c** | ✅ done (2026-04-21) | — | `PgCommand::DescribeStatement` / `DescribePortal` — split command variants for tier-1 API (separate reply payload kinds); `DescribedRows` sum type over `Option<RowDesc>`; `ParamOids` bounded container; 5 new `ProtoState` variants (3 stmt + 2 portal); ~15 new dispatch arms; `DescribeTargetByte` typed wire byte with `b'S'`/`b'P'` drift pins; `TooManyParameters` + `MalformedParameterDescription` classifications; generalised `advance_to_drain_after_error<K: ReplyKind>` eliminating per-kind duplication |
 | **1c-3d** | ⏳ pending | — | `Close` (statement or portal) |
 | **1c-4** | ⏳ pending | — | BEGIN/COMMIT/ROLLBACK + tx_status tracking + SAVEPOINT |
 | **1c-5** | ⏳ pending | #1 InFlightSlot sum enum; #4 Flush/Sync guard; #7 RowDescRef arena; **DEF-119 witness-guard** | Pipelining — biggest tier-lift of Phase 1c |

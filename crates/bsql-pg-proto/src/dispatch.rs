@@ -22,8 +22,8 @@ use crate::state::ProtoState;
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
     TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
-    TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_PARSE_COMPLETE, TAG_PORTAL_SUSPENDED, TAG_READY_FOR_QUERY,
-    TAG_ROW_DESCRIPTION,
+    TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NO_DATA, TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE,
+    TAG_PORTAL_SUSPENDED, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 use crate::write_buf::WriteBuf;
 
@@ -773,6 +773,172 @@ pub(crate) fn dispatch(
         }
 
         // =============================================================
+        // Phase 1c-3c: Extended Query — Describe flow
+        //
+        // Statement-target response sequence (PG §55.2.2):
+        //   't' (ParameterDescription) → 'T' (RowDescription) OR
+        //   'n' (NoData) → 'Z' (ReadyForQuery).
+        // Portal-target response sequence:
+        //   'T' or 'n' → 'Z'. NO 't' — portals are bound-state
+        //   handles, parameters fixed at Bind time.
+        //
+        // Either target, 'E' at any point → recoverable (connection
+        // survives, same pattern as SimpleQuery/Parse query-level
+        // error per PG §55.2.3).
+        //
+        // State transitions encode the per-target topology:
+        // statement-describe walks 3 states, portal-describe walks 2.
+        // A `'T'` arrival in `DescribeStatementAwaitingParamDesc` is
+        // UnexpectedFrame — the server has violated the documented
+        // sequence. Tier-1 structural dispatch.
+        // =============================================================
+
+        // ─── Statement-describe path ───
+
+        // Stage 1: awaiting ParameterDescription.
+        (ProtoState::DescribeStatementAwaitingParamDesc(reply), TAG_PARAMETER_DESCRIPTION) => {
+            match crate::decode::parse_parameter_description(payload) {
+                Ok(param_oids) => DispatchOutcome::AdvancedSilent {
+                    new_state: ProtoState::DescribeStatementAwaitingRowDescOrNoData {
+                        reply,
+                        param_oids,
+                    },
+                },
+                Err(cause) => errored(Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::DescribeStatementAwaitingParamDesc(reply), TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(reply, payload)
+        }
+        (ProtoState::DescribeStatementAwaitingParamDesc(reply), other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // Stage 2: awaiting RowDescription or NoData.
+        (
+            ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, param_oids },
+            TAG_ROW_DESCRIPTION,
+        ) => match crate::decode::parse_row_description(payload) {
+            Ok(row_desc) => DispatchOutcome::AdvancedSilent {
+                new_state: ProtoState::DescribeStatementAwaitingRfq {
+                    reply,
+                    param_oids,
+                    rows: crate::action::DescribedRows::Rows(row_desc),
+                },
+            },
+            Err(cause) => errored(Some(reply.consume()), cause),
+        },
+        (
+            ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, param_oids },
+            TAG_NO_DATA,
+        ) => DispatchOutcome::AdvancedSilent {
+            new_state: ProtoState::DescribeStatementAwaitingRfq {
+                reply,
+                param_oids,
+                rows: crate::action::DescribedRows::NoData,
+            },
+        },
+        (
+            ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. },
+            TAG_ERROR_RESPONSE,
+        ) => advance_to_drain_after_error(reply, payload),
+        (ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. }, other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // Stage 3: awaiting ReadyForQuery — deliver the terminal
+        // reply carrying the accumulated param_oids + rows.
+        (
+            ProtoState::DescribeStatementAwaitingRfq {
+                reply,
+                param_oids,
+                rows,
+            },
+            TAG_READY_FOR_QUERY,
+        ) => match payload {
+            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
+                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
+                    new_state: ProtoState::Idle,
+                    action: crate::action::deliver(
+                        reply,
+                        crate::action::DescribeStatementCompletePayload {
+                            param_oids,
+                            rows,
+                            tx_status,
+                        },
+                    ),
+                },
+                None => errored(
+                    Some(reply.consume()),
+                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+                ),
+            },
+            other => errored(
+                Some(reply.consume()),
+                ProtocolError::MalformedReadyForQuery { payload_len: other.len() },
+            ),
+        },
+        (ProtoState::DescribeStatementAwaitingRfq { reply, .. }, other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // ─── Portal-describe path ───
+
+        // Stage 1: awaiting RowDescription or NoData (no ParamDesc).
+        (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ROW_DESCRIPTION) => {
+            match crate::decode::parse_row_description(payload) {
+                Ok(row_desc) => DispatchOutcome::AdvancedSilent {
+                    new_state: ProtoState::DescribePortalAwaitingRfq {
+                        reply,
+                        rows: crate::action::DescribedRows::Rows(row_desc),
+                    },
+                },
+                Err(cause) => errored(Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_NO_DATA) => {
+            DispatchOutcome::AdvancedSilent {
+                new_state: ProtoState::DescribePortalAwaitingRfq {
+                    reply,
+                    rows: crate::action::DescribedRows::NoData,
+                },
+            }
+        }
+        (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(reply, payload)
+        }
+        (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // Stage 2: awaiting ReadyForQuery — deliver portal reply.
+        (
+            ProtoState::DescribePortalAwaitingRfq { reply, rows },
+            TAG_READY_FOR_QUERY,
+        ) => match payload {
+            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
+                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
+                    new_state: ProtoState::Idle,
+                    action: crate::action::deliver(
+                        reply,
+                        crate::action::DescribePortalCompletePayload { rows, tx_status },
+                    ),
+                },
+                None => errored(
+                    Some(reply.consume()),
+                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+                ),
+            },
+            other => errored(
+                Some(reply.consume()),
+                ProtocolError::MalformedReadyForQuery { payload_len: other.len() },
+            ),
+        },
+        (ProtoState::DescribePortalAwaitingRfq { reply, .. }, other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // =============================================================
         // Idle — unsolicited frames are out-of-spec
         // =============================================================
         (ProtoState::Idle, other) => errored(None, ProtocolError::UnexpectedFrame { tag: other }),
@@ -1373,20 +1539,30 @@ fn advance_to_bindexecute_awaiting_rfq_select(
     }
 }
 
-/// 1c-1b helper: shared body for the `E` arm in both
-/// `AwaitingFirstResponse` and `StreamingRows` states. Emit
-/// `FailReply` (NO `CloseSocket` — query-level errors are
-/// connection-survivable per PG §55.2.3) and transition to
-/// `DrainRfqAfterError` so the trailing `Z` returns the state to
-/// `Idle`.
+/// 1c-1b helper (generalised 1c-3c): shared body for the `E` arm
+/// across multiple flows. Emit `FailReply` (NO `CloseSocket` —
+/// query-level errors are connection-survivable per PG §55.2.3)
+/// and transition to `DrainRfqAfterError` so the trailing `Z`
+/// returns the state to `Idle`.
 ///
 /// Centralises the "query-level E → recoverable" invariant. The
 /// contrast with fatal error paths (which return
 /// `DispatchOutcome::Errored { .. }` → forced `CloseSocket`) is
 /// the load-bearing distinction test 5
 /// (`query_error_emits_fail_reply_and_connection_survives`) pins.
-fn advance_to_drain_after_error(
-    reply: ReplyId<crate::reply_id::QueryKind>,
+///
+/// # Generic over `K: ReplyKind` (1c-3c)
+///
+/// Pre-1c-3c this was monomorphic over `QueryKind` because only
+/// SimpleQuery and BindExecute flows drained-after-error. 1c-3c
+/// adds the Describe flow, whose `ReplyId<DescribeStatementKind>`
+/// / `ReplyId<DescribePortalKind>` also need to route through
+/// this helper. The body doesn't depend on `K`: `reply.consume()`
+/// yields `NonZeroU64` regardless, and `StagedAction::FailReply`
+/// takes a raw id. Generalising avoids drift between per-kind
+/// clones of the same three-line body.
+fn advance_to_drain_after_error<K: crate::reply_id::ReplyKind>(
+    reply: ReplyId<K>,
     payload: &[u8],
 ) -> DispatchOutcome {
     let cause = parse_error_response(payload);

@@ -295,6 +295,96 @@ pub(crate) fn parse_row_description(
     })
 }
 
+/// Parse a `ParameterDescription` payload (body of the `'t'` frame,
+/// after the 5-byte header) into a [`crate::action::ParamOids`].
+/// 1c-3c.
+///
+/// Wire layout (PG §55.2.2):
+/// ```text
+///   int16  parameter_count
+///   for each parameter:
+///     int32  type_oid
+/// ```
+///
+/// # Error classifications
+///
+/// - [`crate::error::ProtocolError::MalformedParameterDescription`] —
+///   payload shorter than the 2-byte count header, negative count,
+///   or body length does not match `count × 4`.
+/// - [`crate::error::ProtocolError::TooManyParameters`] — count
+///   exceeds [`crate::params::MAX_PARAMS_ARITY`] (16). A statement
+///   with more placeholders can be Parsed by the server but cannot
+///   be Bound against by this crate, so the describe result is
+///   useless downstream — fail loudly at parse time.
+///
+/// Cold path — called once per statement-level Describe reply.
+#[cold]
+#[expect(
+    clippy::result_large_err,
+    reason = "no_alloc: Box unavailable; ParameterDescription parse is cold (once per Describe)"
+)]
+pub(crate) fn parse_parameter_description(
+    payload: &[u8],
+) -> Result<crate::action::ParamOids, crate::error::ProtocolError> {
+    use crate::error::ProtocolError;
+    let malformed = || ProtocolError::MalformedParameterDescription {
+        payload_len: payload.len(),
+    };
+
+    // parameter_count: i16 BE at offset 0.
+    let (count_bytes, rest) = payload.split_first_chunk::<2>().ok_or_else(malformed)?;
+    let n_params_i16 = i16::from_be_bytes(*count_bytes);
+    if n_params_i16 < 0 {
+        return Err(malformed());
+    }
+    // `n_params_i16 >= 0`, so `u16::try_from` is infallible (widening
+    // from non-negative i16). Keep Result chain for panic-ban
+    // discipline.
+    let n_params = u16::try_from(n_params_i16).map_err(|_| malformed())?;
+    let n_params_usize = usize::from(n_params);
+
+    // Tier-2 structural: reject counts too high for inline storage.
+    // MAX_PARAMS_ARITY matches the Bind-side cap — receiving more
+    // OIDs than we can ever Bind against means the describe result
+    // is useless downstream.
+    if n_params_usize > crate::params::MAX_PARAMS_ARITY {
+        return Err(ProtocolError::TooManyParameters {
+            count: n_params_usize,
+            max: crate::params::MAX_PARAMS_ARITY,
+        });
+    }
+
+    // Body length must exactly equal `count × 4` (one i32 per OID).
+    // Trailing bytes imply wire corruption; short body implies the
+    // declared count lies. Both classify as framing error.
+    let expected_body_len = n_params_usize.checked_mul(4).ok_or_else(malformed)?;
+    if rest.len() != expected_body_len {
+        return Err(malformed());
+    }
+
+    let mut oids = [0u32; crate::params::MAX_PARAMS_ARITY];
+    // `chunks_exact(4)` yields &[u8] slices of LENGTH=4 until the tail
+    // remainder (guaranteed empty here by the body_len check above).
+    // Use slice-pattern destructuring — the `[a, b, c, d]` match is
+    // proved by `chunks_exact(4)`'s contract, so no `malformed` arm
+    // can fire at this point. Keep the `_` fallback as `Err` surface
+    // rather than `unreachable!()` (crate-root forbid).
+    for (slot, chunk) in oids
+        .iter_mut()
+        .zip(rest.chunks_exact(4))
+        .take(n_params_usize)
+    {
+        match chunk {
+            [a, b, c, d] => {
+                *slot = u32::from_be_bytes([*a, *b, *c, *d]);
+            }
+            _ => return Err(malformed()),
+        }
+    }
+
+    Ok(crate::action::ParamOids::from_parts(n_params, oids))
+}
+
 // ════════════════════════════════════════════════════════════════════
 // 1c-2b — DataRow parser + ColumnsIter
 // ════════════════════════════════════════════════════════════════════

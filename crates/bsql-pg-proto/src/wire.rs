@@ -258,6 +258,87 @@ pub const TAG_BIND: OutboundTag = OutboundTag::from_byte(b'B');
 /// but is type-distinct ([`OutboundTag`] vs [`InboundTag`]).
 pub const TAG_DESCRIBE: OutboundTag = OutboundTag::from_byte(b'D');
 
+/// Target-byte discriminator carried inside a frontend `Describe`
+/// frame (PG §55.2.2 field "S or P"). Typed enum with explicit
+/// byte-valued discriminants — the only two legal values at this
+/// wire slot are `'S'` (statement) and `'P'` (portal). 1c-3c.
+///
+/// # Tier-1 vs raw `u8`
+///
+/// Pre-uplift the builder would have taken a `target: u8`
+/// parameter; a call site passing `b'X'` would compile cleanly and
+/// produce a server `ErrorResponse` at runtime (tier-3 audit seam).
+/// The typed enum moves discrimination to the call site:
+/// `DescribeTargetByte::Statement` / `::Portal` are the only paths
+/// to construct a value, and the `byte()` method folds to a single
+/// literal at the monomorphic call site.
+///
+/// Const-asserts below pin the wire bytes to PG spec; an arm-body
+/// edit swapping the two values would fail the build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DescribeTargetByte {
+    /// Describe a prepared statement previously created via
+    /// `PgCommand::Parse`. Wire byte: `'S'`.
+    ///
+    /// Response shape: `ParameterDescription` (`'t'`) →
+    /// `RowDescription` (`'T'`) or `NoData` (`'n'`) → `ReadyForQuery`.
+    Statement = b'S',
+    /// Describe a bound portal previously created via
+    /// `push_bind_execute`. Wire byte: `'P'`.
+    ///
+    /// Response shape: `RowDescription` (`'T'`) or `NoData` (`'n'`)
+    /// → `ReadyForQuery`. **No** `ParameterDescription` — the portal
+    /// is already bound; its parameters are fixed at Bind time per
+    /// PG §55.2.2.
+    Portal = b'P',
+}
+
+impl DescribeTargetByte {
+    /// The PG wire byte for this target. Explicit match (not `as u8`)
+    /// — the crate forbids `clippy::as_conversions`. With the
+    /// `#[repr(u8)]` discriminants above, each arm folds to a
+    /// single literal load at the monomorphic call site.
+    #[inline]
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        match self {
+            Self::Statement => b'S',
+            Self::Portal => b'P',
+        }
+    }
+}
+
+// Drift-pin the wire bytes: an arm-body edit in `byte()` that
+// swapped `b'S'` ↔ `b'P'` (or introduced any other value) would
+// still compile, but the dispatcher's state machine would then
+// route the wrong response shape — the statement-describe path
+// expects a prior `ParameterDescription` (`'t'`) which the server
+// does NOT emit for a portal-describe (per PG §55.2.2). A literal
+// swap here would mean a statement-describe request is answered
+// with a portal-shape response, which the dispatcher classifies
+// as `UnexpectedFrame` on the missing `'t'` → tear-down.
+//
+// These const-asserts pin the invariant at build time. An edit
+// that drifts `byte()` from the discriminant above fails
+// immediately, with a pointer to PG §55.2.2.
+const _: () = assert!(
+    DescribeTargetByte::Statement.byte() == b'S',
+    "DescribeTargetByte::Statement MUST wire-encode as b'S' per PG §55.2.2",
+);
+const _: () = assert!(
+    DescribeTargetByte::Portal.byte() == b'P',
+    "DescribeTargetByte::Portal MUST wire-encode as b'P' per PG §55.2.2",
+);
+// Belt-and-braces: if a future edit somehow lands both literals on
+// the same byte (e.g. both `b'S'`), each per-variant assert above
+// would still catch exactly one case, but this pairwise inequality
+// is the tightest statement of "two distinct PG wire targets."
+const _: () = assert!(
+    DescribeTargetByte::Statement.byte() != DescribeTargetByte::Portal.byte(),
+    "DescribeTargetByte variants MUST map to distinct wire bytes",
+);
+
 /// Frontend `Execute` message tag (`'E'`) — run a bound portal.
 /// Shares the byte with backend `ErrorResponse` but is type-distinct.
 pub const TAG_EXECUTE: OutboundTag = OutboundTag::from_byte(b'E');

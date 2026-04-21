@@ -416,6 +416,34 @@ pub enum ProtocolError {
         code: i16,
     },
 
+    /// Server's `ParameterDescription` (`'t'`) body was ill-formed:
+    /// payload too short to hold the 2-byte count header, declared
+    /// count disagrees with the remaining byte length, or negative
+    /// count. Wire violation; the connection is torn down.
+    ///
+    /// 1c-3c: emitted by [`crate::decode::parse_parameter_description`].
+    MalformedParameterDescription {
+        /// Actual payload byte count.
+        payload_len: usize,
+    },
+
+    /// Server's `ParameterDescription` declared more parameter OIDs
+    /// than this crate's bounded storage can accept.
+    ///
+    /// The cap is [`crate::params::MAX_PARAMS_ARITY`] = 16, which
+    /// matches the crate's Bind-side arity cap. A statement with
+    /// more placeholders than this can be Parsed by the server but
+    /// never Bound against — so the describe result is useless
+    /// downstream.
+    ///
+    /// 1c-3c. Mirrors [`Self::TooManyColumns`] shape.
+    TooManyParameters {
+        /// Count declared by the server.
+        count: usize,
+        /// Maximum supported — [`crate::params::MAX_PARAMS_ARITY`].
+        max: usize,
+    },
+
     /// Outbound frame builder (`build_startup_message` /
     /// `build_query_message` / `build_parse_message`) returned Err
     /// in a const-assert-dead path.
@@ -500,6 +528,9 @@ pub enum FrameBuildStage {
     Bind = 3,
     /// [`crate::protocol::build_execute_message`] — const-pinned with Bind.
     Execute = 4,
+    /// [`crate::protocol::build_describe_message`] — const-pinned by
+    /// `MAX_OWNED_SEND_LEN >= max_describe_message_size()`. 1c-3c.
+    Describe = 5,
 }
 
 /// Compact 1-byte classification of a [`ProtocolError`], stored in
@@ -588,7 +619,9 @@ impl ProtocolError {
             Self::MalformedCommandComplete { .. }
             | Self::MalformedRowDescription { .. }
             | Self::TooManyColumns { .. }
-            | Self::UnexpectedFormatCode { .. } => ErrorKind::Framing,
+            | Self::UnexpectedFormatCode { .. }
+            | Self::MalformedParameterDescription { .. }
+            | Self::TooManyParameters { .. } => ErrorKind::Framing,
             Self::OutboundFrameBuildUnreachable { .. }
             | Self::ReadCursorAdvanceUnreachable
             | Self::RowRangeConstructionUnreachable => ErrorKind::Internal,
@@ -671,6 +704,14 @@ impl fmt::Display for ProtocolError {
             Self::TooManyColumns { count, max } => write!(
                 f,
                 "result-set too wide: {count} columns (max supported {max})",
+            ),
+            Self::MalformedParameterDescription { payload_len } => write!(
+                f,
+                "malformed ParameterDescription: {payload_len}-byte payload (short header, negative count, or body length mismatch)",
+            ),
+            Self::TooManyParameters { count, max } => write!(
+                f,
+                "too many parameters in ParameterDescription: {count} (max supported {max})",
             ),
             Self::UnexpectedFormatCode { code } => write!(
                 f,

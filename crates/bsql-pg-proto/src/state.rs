@@ -19,11 +19,15 @@
 //! (no action, no state change — post-`CloseSocket` packet flushes
 //! become true no-ops instead of silent mis-advances).
 
+use crate::action::{DescribedRows, ParamOids};
 use crate::decode::RowDesc;
 use crate::error::BoundedStr;
 use crate::error::ErrorKind;
 use crate::ident::PodBytes;
-use crate::reply_id::{ParseKind, PingKind, QueryKind, ReplyId, StartupKind};
+use crate::reply_id::{
+    DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
+    StartupKind,
+};
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
 
@@ -350,6 +354,97 @@ pub enum ProtoState {
         row_desc: RowDesc,
     },
 
+    // ---------------------------------------------------------------
+    // Phase 1c-3c: Extended Query — Describe flow
+    // ---------------------------------------------------------------
+    //
+    // `push_command(PgCommand::DescribeStatement | DescribePortal)`
+    // emits a `Describe` + `Sync` bundle. Server response shape
+    // (PG §55.2.2):
+    //
+    //   STATEMENT target:
+    //     't' (ParameterDescription) — always first
+    //     'T' (RowDescription) or 'n' (NoData) — schema or nothing
+    //     'Z' (ReadyForQuery) — sync boundary
+    //
+    //   PORTAL target:
+    //     'T' (RowDescription) or 'n' (NoData) — schema or nothing
+    //     'Z' (ReadyForQuery) — sync boundary
+    //     (NO ParameterDescription — portals are bound-state)
+    //
+    // Error path (either target): 'E' (ErrorResponse) — e.g. invalid
+    // stmt/portal name — is query-level recoverable: emit FailReply
+    // + transition to DrainRfqAfterError. Connection survives.
+    //
+    // The five state variants below encode the per-target response
+    // topology at the VARIANT level: statement-describe has 3
+    // stages (AwaitingParamDesc → AwaitingRowDescOrNoData → AwaitingRfq);
+    // portal-describe has 2 (AwaitingRowDescOrNoData → AwaitingRfq).
+    // A dispatcher arm that receives `'T'` in `AwaitingParamDesc`
+    // is UnexpectedFrame — server violated the described sequence.
+
+    // ─── Statement-describe path ───
+
+    /// A `Describe 'S'` + `Sync` bundle was sent; awaiting
+    /// `ParameterDescription` (`'t'`). The inner
+    /// [`ReplyId<DescribeStatementKind>`] is the only path to the
+    /// correlator; state-as-data (§7.2).
+    ///
+    /// Next legitimate frames:
+    /// - `'t'` → parse ParamOids, transition to
+    ///   [`Self::DescribeStatementAwaitingRowDescOrNoData`].
+    /// - `'E'` (ErrorResponse) → FailReply + `DrainRfqAfterError`
+    ///   (recoverable — connection survives).
+    /// - Anything else → UnexpectedFrame → teardown.
+    DescribeStatementAwaitingParamDesc(ReplyId<DescribeStatementKind>),
+
+    /// `ParameterDescription` parsed; awaiting either
+    /// `RowDescription` (`'T'`) or `NoData` (`'n'`).
+    ///
+    /// Schema branch: `'T'` → [`DescribedRows::Rows(desc)`]; continue
+    /// to [`Self::DescribeStatementAwaitingRfq`].
+    /// No-data branch: `'n'` → [`DescribedRows::NoData`]; continue
+    /// to [`Self::DescribeStatementAwaitingRfq`].
+    DescribeStatementAwaitingRowDescOrNoData {
+        /// Correlator for the Describe command.
+        reply: ReplyId<DescribeStatementKind>,
+        /// Parameter OIDs parsed from the preceding `'t'` frame.
+        /// Threaded through to the terminal reply payload.
+        param_oids: ParamOids,
+    },
+
+    /// Row-desc / no-data known; awaiting the trailing
+    /// `ReadyForQuery` that closes the Sync boundary. On `'Z'` →
+    /// deliver [`crate::Reply::DescribeStatementComplete`] and
+    /// transition to Idle.
+    DescribeStatementAwaitingRfq {
+        /// Correlator for the Describe command.
+        reply: ReplyId<DescribeStatementKind>,
+        /// Parameter OIDs captured at the `'t'` transition.
+        param_oids: ParamOids,
+        /// Rows-or-no-data captured at the `'T'` / `'n'` transition.
+        rows: DescribedRows,
+    },
+
+    // ─── Portal-describe path ───
+
+    /// A `Describe 'P'` + `Sync` bundle was sent; awaiting either
+    /// `RowDescription` (`'T'`) or `NoData` (`'n'`).
+    ///
+    /// **No** `ParameterDescription` precedes per PG §55.2.2 — a
+    /// `'t'` frame here would be UnexpectedFrame.
+    DescribePortalAwaitingRowDescOrNoData(ReplyId<DescribePortalKind>),
+
+    /// Row-desc / no-data known; awaiting `ReadyForQuery`. On `'Z'`
+    /// → deliver [`crate::Reply::DescribePortalComplete`] and
+    /// transition to Idle.
+    DescribePortalAwaitingRfq {
+        /// Correlator for the Describe command.
+        reply: ReplyId<DescribePortalKind>,
+        /// Rows-or-no-data captured at the `'T'` / `'n'` transition.
+        rows: DescribedRows,
+    },
+
     /// Terminal: the connection has been classified as unrecoverable.
     ///
     /// Entered by any path that calls `fail_inflight_and_close` or
@@ -404,6 +499,11 @@ impl ProtoState {
             Self::ParseAwaitingParseComplete(reply) | Self::ParseAwaitingRfq(reply) => {
                 Some(reply.consume())
             }
+            Self::DescribeStatementAwaitingParamDesc(reply)
+            | Self::DescribeStatementAwaitingRowDescOrNoData { reply, .. }
+            | Self::DescribeStatementAwaitingRfq { reply, .. } => Some(reply.consume()),
+            Self::DescribePortalAwaitingRowDescOrNoData(reply)
+            | Self::DescribePortalAwaitingRfq { reply, .. } => Some(reply.consume()),
         }
     }
 }
@@ -488,6 +588,24 @@ impl core::fmt::Debug for ProtoState {
                 write!(f, "ParseAwaitingParseComplete({id:?})")
             }
             Self::ParseAwaitingRfq(id) => write!(f, "ParseAwaitingRfq({id:?})"),
+            Self::DescribeStatementAwaitingParamDesc(id) => {
+                write!(f, "DescribeStatementAwaitingParamDesc({id:?})")
+            }
+            Self::DescribeStatementAwaitingRowDescOrNoData { reply, .. } => f
+                .debug_struct("DescribeStatementAwaitingRowDescOrNoData")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::DescribeStatementAwaitingRfq { reply, .. } => f
+                .debug_struct("DescribeStatementAwaitingRfq")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::DescribePortalAwaitingRowDescOrNoData(id) => {
+                write!(f, "DescribePortalAwaitingRowDescOrNoData({id:?})")
+            }
+            Self::DescribePortalAwaitingRfq { reply, .. } => f
+                .debug_struct("DescribePortalAwaitingRfq")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
             Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }

@@ -215,6 +215,40 @@ const _: () = assert!(
      MAX_PG_NAME_LEN.",
 );
 
+/// Worst-case byte size of a PostgreSQL `Describe` (`'D'`) frame —
+/// Extended Query protocol, 1c-3c.
+///
+/// Wire layout per PG §55.2.2:
+///
+/// ```text
+/// 'D' | len_i32 | target_byte('S'|'P') | name NUL
+/// ```
+///
+/// Same worst-case for both target kinds (statement vs portal): the
+/// name is either a [`crate::ident::StmtName`] or a
+/// [`crate::ident::PortalName`], both of which are
+/// `FixedStr<MAX_PG_NAME_LEN, _>` aliases. Capacity is identical.
+pub const fn max_describe_message_size() -> usize {
+    1usize // tag 'D'
+        .saturating_add(4) // length prefix (includes itself)
+        .saturating_add(1) // target byte 'S' or 'P'
+        .saturating_add(crate::ident::MAX_PG_NAME_LEN)
+        .saturating_add(1) // name NUL
+}
+
+/// Drift-pin (1c-3c): `push_describe_*` emits a
+/// `Describe + Sync` bundle, so the caller's WriteBuf must fit
+/// `max_describe_message_size() + 5` simultaneously. Bumping
+/// `MAX_PG_NAME_LEN` without growing `MAX_OWNED_SEND_LEN` is a
+/// build failure.
+///
+/// `5` here is `SYNC_WIRE_BYTES.len()` (tag `'S'` + BE u32 length=4).
+const _: () = assert!(
+    MAX_OWNED_SEND_LEN >= max_describe_message_size().saturating_add(5),
+    "MAX_OWNED_SEND_LEN below worst-case Describe+Sync bundle. \
+     Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN.",
+);
+
 /// Bounded outbound frame buffer with PG wire builders.
 ///
 /// See [module-level docs](self) for sizing rationale.
