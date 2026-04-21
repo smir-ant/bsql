@@ -400,10 +400,14 @@ impl<'a> DataRowRef<'a> {
         if n_columns_i16 < 0 {
             return Err(DecodeError::TruncatedRow);
         }
-        // `n_columns_i16 >= 0` ⟹ `try_from` infallible; the
-        // `unwrap_or(0)` fallback is architecturally dead but
-        // honours the forbid-bundle ban on `unwrap()`.
-        let n_columns = u16::try_from(n_columns_i16).unwrap_or(0);
+        // `n_columns_i16 >= 0` (proved above) ⟹ `try_from` infallible.
+        // The Err arm is architecturally dead, but classified as
+        // `TruncatedRow` rather than silently fabricating a 0-column
+        // row — if a future refactor of the negative-check above
+        // introduces a seam, the dead arm becomes honest diagnostic
+        // output instead of "empty row with no error". Tier-3 audit
+        // → tier-2 structural: misfire classifies, does not mask.
+        let n_columns = u16::try_from(n_columns_i16).map_err(|_| DecodeError::TruncatedRow)?;
         Ok(Self { body, n_columns })
     }
 

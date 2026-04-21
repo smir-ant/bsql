@@ -717,4 +717,71 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
         out.len = u16::try_from(marker_end).unwrap_or(0);
         out
     }
+
+    /// Construct from possibly-non-UTF-8 bytes without silent drop.
+    ///
+    /// Fast path: if `source` is valid UTF-8, delegates to
+    /// [`Self::from_str_truncating`] — preserves multibyte characters.
+    ///
+    /// Slow path: scans byte-by-byte. Bytes outside `0x20..=0x7e`
+    /// (ASCII printable) and outside `{b'\t', b'\n', b'\r'}` become
+    /// `b'?'`. Output is ASCII-only → always valid UTF-8. Applies the
+    /// same truncation + marker-append policy as the fast path.
+    ///
+    /// # When to use
+    ///
+    /// PG ErrorResponse field values are encoded in the server's
+    /// `client_encoding` setting, which is UTF-8 by default but CAN
+    /// be Latin-1 or a legacy encoding on mis-configured servers.
+    /// Pre-F22 code used `core::str::from_utf8(..).unwrap_or("")`,
+    /// which silently collapsed the WHOLE field to empty on any
+    /// invalid byte — destroying forensic diagnostic info. This
+    /// method preserves the ASCII subset (most of every error
+    /// message) and visibly marks the rest.
+    ///
+    /// # Tier elevation (F22)
+    ///
+    /// - Old: silent-empty-on-invalid-UTF-8 (tier-3 audit — nothing
+    ///   in the type system prevented the diagnostic loss).
+    /// - New: byte-by-byte ASCII coercion is a structural
+    ///   always-valid-UTF-8 guarantee. No information is silently
+    ///   dropped; over-length or invalid bytes are visibly marked.
+    #[must_use]
+    pub fn from_bytes_lossy(source: &[u8]) -> Self {
+        let () = Self::_TRUNCATING_N_MIN;
+        // Fast path: preserve multibyte UTF-8 when the bytes are valid.
+        if let Ok(s) = core::str::from_utf8(source) {
+            return Self::from_str_truncating(s);
+        }
+        // Slow path: coerce every non-ASCII byte to `?`.
+        let mut out = Self::new();
+        let budget = N.saturating_sub(Self::OVERFLOW_MARKER.len());
+        let mut written = 0usize;
+        for &b in source.iter() {
+            if written >= budget {
+                break;
+            }
+            // Accept ASCII printable + common whitespace; everything
+            // else (non-ASCII, control chars, NUL) → `?`.
+            let out_byte = if matches!(b, 0x20..=0x7e | b'\t' | b'\n' | b'\r') {
+                b
+            } else {
+                b'?'
+            };
+            if let Some(dst) = out.buf.get_mut(written) {
+                *dst = out_byte;
+            }
+            written = written.saturating_add(1);
+        }
+        if source.len() > budget {
+            let marker_end = written.saturating_add(Self::OVERFLOW_MARKER.len());
+            if let Some(dst) = out.buf.get_mut(written..marker_end) {
+                dst.copy_from_slice(Self::OVERFLOW_MARKER);
+            }
+            out.len = u16::try_from(marker_end).unwrap_or(0);
+        } else {
+            out.len = u16::try_from(written).unwrap_or(0);
+        }
+        out
+    }
 }

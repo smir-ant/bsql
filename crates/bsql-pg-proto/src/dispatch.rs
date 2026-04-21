@@ -1090,7 +1090,6 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
             };
         }
         let value_bytes = payload.get(start..pos).unwrap_or(&[]);
-        let value_str = core::str::from_utf8(value_bytes).unwrap_or("");
 
         // Skip past the NUL terminator.
         pos = match pos.checked_add(1) {
@@ -1108,14 +1107,20 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
             b'C' => {
                 code = SqlStateCode::from_bytes(value_bytes);
             }
+            // F22: text fields come in as bytes. PG encodes them in
+            // `client_encoding` which MAY be non-UTF-8 on legacy
+            // servers; `from_bytes_lossy` preserves the ASCII subset
+            // and visibly marks non-ASCII bytes with `?`. Previously
+            // `from_utf8(..).unwrap_or("")` silently dropped the entire
+            // field on any single invalid byte — tier-3 diagnostic loss.
             b'M' => {
-                message = BoundedStr::from_str_truncating(value_str);
+                message = BoundedStr::from_bytes_lossy(value_bytes);
             }
             b'D' => {
-                detail = BoundedStr::from_str_truncating(value_str);
+                detail = BoundedStr::from_bytes_lossy(value_bytes);
             }
             b'H' => {
-                hint = BoundedStr::from_str_truncating(value_str);
+                hint = BoundedStr::from_bytes_lossy(value_bytes);
             }
             _ => {} // Unknown field type — skip.
         }
@@ -1416,6 +1421,79 @@ mod parse_error_response_tests {
         let body = build_error_body(&[(b'C', b"FIRST"), (b'C', b"SECOND")]);
         let actual = parse_error_response(&body);
         let expected = mk_err("", "SECOND", "", "", "");
+        assert_eq!(actual, expected);
+    }
+
+    /// F22 regression: non-UTF-8 bytes in M/D/H fields are coerced to
+    /// `?` placeholders, preserving ASCII content, NOT silently
+    /// collapsed to empty.
+    ///
+    /// Before F22: `from_utf8(value).unwrap_or("")` → whole field lost
+    /// on any single invalid byte. A message like
+    /// `b"Ung\xFCltige Eingabe"` (Latin-1 "Ungültige Eingabe") would
+    /// become `""` — full diagnostic loss.
+    ///
+    /// After F22: ASCII subset preserved, non-ASCII byte → `?`.
+    /// `b"Ung\xFCltige Eingabe"` → `"Ung?ltige Eingabe"` — user still
+    /// sees 94% of the original message.
+    #[test]
+    fn non_utf8_message_preserves_ascii_subset() {
+        use crate::error::{BoundedStr, Severity, SqlStateCode};
+        // Latin-1 "Ungültige Eingabe" — the \xFC is ü in Latin-1,
+        // invalid as a standalone UTF-8 byte.
+        let body = build_error_body(&[(b'M', b"Ung\xFCltige Eingabe")]);
+        let actual = parse_error_response(&body);
+        let expected = ProtocolError::ServerErrorResponse {
+            severity: Severity::from_bytes(b""),
+            code: SqlStateCode::from_bytes(b""),
+            message: BoundedStr::from_str_truncating("Ung?ltige Eingabe"),
+            detail: BoundedStr::from_str_truncating(""),
+            hint: BoundedStr::from_str_truncating(""),
+        };
+        assert_eq!(actual, expected);
+    }
+
+    /// F22 regression: valid UTF-8 multibyte sequences pass through
+    /// unchanged (fast path).
+    #[test]
+    fn valid_utf8_message_preserved_verbatim() {
+        use crate::error::{BoundedStr, Severity, SqlStateCode};
+        // Proper UTF-8 "Ungültige Eingabe".
+        let body = build_error_body(&[(b'M', "Ungültige Eingabe".as_bytes())]);
+        let actual = parse_error_response(&body);
+        let expected = ProtocolError::ServerErrorResponse {
+            severity: Severity::from_bytes(b""),
+            code: SqlStateCode::from_bytes(b""),
+            message: BoundedStr::from_str_truncating("Ungültige Eingabe"),
+            detail: BoundedStr::from_str_truncating(""),
+            hint: BoundedStr::from_str_truncating(""),
+        };
+        assert_eq!(actual, expected);
+    }
+
+    /// F22 regression: slow-path control + high-bit bytes in an
+    /// invalid-UTF-8 payload all coerce to `?`. Ensures that binary
+    /// junk in a field doesn't produce an empty message.
+    ///
+    /// Note: the `0xFF` byte triggers slow-path (invalid UTF-8). In
+    /// slow path, every byte that isn't ASCII printable or
+    /// `\t`/`\n`/`\r` coerces — including the otherwise-valid-UTF-8
+    /// control bytes `0x01` / `0x02`. (Fast path, separately tested,
+    /// preserves valid UTF-8 verbatim including control bytes.)
+    #[test]
+    fn non_utf8_control_bytes_coerced_to_question_mark() {
+        use crate::error::{BoundedStr, Severity, SqlStateCode};
+        // Mix: ASCII + 0x01 (valid UTF-8 SOH) + 0xFF (invalid UTF-8
+        // high-bit lead) + 0x02 (SOT). The 0xFF forces slow path.
+        let body = build_error_body(&[(b'M', b"A\x01B\xFFC\x02")]);
+        let actual = parse_error_response(&body);
+        let expected = ProtocolError::ServerErrorResponse {
+            severity: Severity::from_bytes(b""),
+            code: SqlStateCode::from_bytes(b""),
+            message: BoundedStr::from_str_truncating("A?B?C?"),
+            detail: BoundedStr::from_str_truncating(""),
+            hint: BoundedStr::from_str_truncating(""),
+        };
         assert_eq!(actual, expected);
     }
 }
