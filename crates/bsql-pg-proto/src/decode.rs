@@ -299,17 +299,18 @@ pub enum DecodeError {
     /// header. Malformed frame.
     TruncatedRow,
     /// A column's 4-byte length prefix is missing (fewer bytes
-    /// remain than expected). `column_idx` is 0-based.
+    /// remain than expected). `column_idx` is 0-based, bounded by
+    /// [`MAX_ROW_COLUMNS`] = 32 — fits `u8` with headroom.
     TruncatedColumnLen {
         /// Zero-based column index where the truncation was detected.
-        column_idx: usize,
+        column_idx: u8,
     },
     /// A column's declared length prefix is negative and is not the
     /// sentinel `-1` (which encodes SQL `NULL`). Other negative
     /// values are wire-level invalid.
     NegativeColumnLength {
         /// Zero-based column index.
-        column_idx: usize,
+        column_idx: u8,
         /// The offending length value.
         length: i32,
     },
@@ -317,7 +318,7 @@ pub enum DecodeError {
     /// prefix (partial row).
     TruncatedColumnData {
         /// Zero-based column index.
-        column_idx: usize,
+        column_idx: u8,
         /// Length declared by the prefix.
         declared_len: usize,
         /// Bytes actually remaining in the row body.
@@ -439,7 +440,7 @@ impl<'a> DataRowRef<'a> {
         ColumnsIter {
             remaining,
             columns_left: self.n_columns,
-            column_idx: 0,
+            column_idx: 0u8,
         }
     }
 }
@@ -461,7 +462,9 @@ impl<'a> DataRowRef<'a> {
 pub struct ColumnsIter<'a> {
     remaining: &'a [u8],
     columns_left: u16,
-    column_idx: usize,
+    /// Zero-based column index, bounded by [`MAX_ROW_COLUMNS`] = 32 —
+    /// `u8` with headroom. Propagated into `DecodeError::TruncatedColumn*`.
+    column_idx: u8,
 }
 
 impl<'a> Iterator for ColumnsIter<'a> {

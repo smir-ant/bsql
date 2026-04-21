@@ -356,8 +356,13 @@ fn unknown_auth_subcode_is_rejected() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             assert!(
-                matches!(cause, ProtocolError::UnsupportedAuthMethod { sub_code: 99 }),
-                "expected UnsupportedAuthMethod(99), got {cause:?}",
+                matches!(
+                    cause,
+                    ProtocolError::UnsupportedAuthMethod {
+                        sub_code: bsql_pg_proto::error::AuthSubCodeClass::Unknown(99),
+                    },
+                ),
+                "expected UnsupportedAuthMethod(Unknown(99)), got {cause:?}",
             );
         }
         other => panic!("unexpected: {other:?}"),

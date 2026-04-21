@@ -271,10 +271,14 @@ pub struct SessionParams {
     pub server_encoding: Option<Encoding>,
     /// Client-side encoding, parsed to a typed enum. DEF-114.
     pub client_encoding: Option<Encoding>,
-    /// Application name echoed back by the server. BoundedStr<64>
-    /// — deployment-tagged names (`myapp-worker-pod-abc123`) fit
-    /// comfortably. DEF-106.
-    pub application_name: Option<BoundedStr<64>>,
+    /// Application name echoed back by the server. Capacity 128
+    /// bytes — matches the client-side [`crate::ident::MAX_APP_NAME_LEN`]
+    /// so the server-echoed value is byte-faithful for any name the
+    /// client legitimately sent. Pre-uplift capacity was 64, which
+    /// would truncate client-sent names in the 64..128 range with a
+    /// `"…"` marker — a fidelity gap for long deployment-tagged
+    /// names. DEF-106 + architect finding #66 (2026-04-21).
+    pub application_name: Option<BoundedStr<128>>,
     /// Whether the connected role is a superuser. DEF-114.
     /// `Some(true)` / `Some(false)` / `None` (server sent neither
     /// `"on"` nor `"off"`).
@@ -355,7 +359,7 @@ impl SessionParams {
             }
             b"application_name" => {
                 let Ok(s) = core::str::from_utf8(value) else { return };
-                self.application_name = Some(BoundedStr::<64>::from_str_truncating(s));
+                self.application_name = Some(BoundedStr::<128>::from_str_truncating(s));
             }
             b"session_authorization" => {
                 let Ok(s) = core::str::from_utf8(value) else { return };

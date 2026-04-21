@@ -157,6 +157,39 @@ impl fmt::Display for SqlStateCode {
 // downstream code continues to write `error::BoundedStr<128>`.
 pub use crate::ident::BoundedStr;
 
+/// Typed classification for [`ProtocolError::UnsupportedAuthMethod`].
+/// Architect finding #1 (2026-04-21).
+///
+/// Distinguishes "server sent a sub-code we don't know about" from
+/// "server sent a known sub-code that's wrong for the current state"
+/// — the latter preserves the typed [`crate::wire::AuthSubCode`]
+/// enum so diagnostics can say *which* known method the server
+/// requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuthSubCodeClass {
+    /// A sub-code outside the 4 PG-defined values (0/10/11/12).
+    /// Carries the raw u32 for forensic logging.
+    Unknown(u32),
+    /// A recognised sub-code that's legal on the wire but wrong
+    /// for the current state (e.g., server returned `Sasl` while
+    /// the client is in Trust auth with no SCRAM credentials).
+    KnownButWrong(crate::wire::AuthSubCode),
+}
+
+impl fmt::Display for AuthSubCodeClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(code) => write!(f, "unknown sub-code {code}"),
+            Self::KnownButWrong(c) => write!(
+                f,
+                "{:?} (wire value {})",
+                c,
+                c.raw(),
+            ),
+        }
+    }
+}
+
 // -----------------------------------------------------------------
 // ProtocolError (below)
 // -----------------------------------------------------------------
@@ -268,9 +301,21 @@ pub enum ProtocolError {
     /// PG's Authentication message (tag `'R'`) carries a sub-code for
     /// the method. Phase 1b supports only sub-code 0 (Ok), 10 (SASL),
     /// 11 (SASLContinue), 12 (SASLFinal). Anything else lands here.
+    ///
+    /// # Typed classification
+    ///
+    /// [`AuthSubCodeClass`] distinguishes "server sent an unknown
+    /// u32 code" (`Unknown(u32)`) from "server sent a known-but-wrong
+    /// code for this state" (`KnownButWrong(AuthSubCode)`). The
+    /// known-but-wrong case (e.g., server insisted on SASL when
+    /// client connected with Trust auth) preserves the typed
+    /// [`crate::wire::AuthSubCode`] enum rather than widening back
+    /// to u32. Downstream wrappers can render "server insisted on
+    /// SCRAM on a Trust connection" instead of "unsupported auth
+    /// method 10". Architect finding #1 (2026-04-21).
     UnsupportedAuthMethod {
-        /// The sub-code the server requested.
-        sub_code: u32,
+        /// Typed classification of the offending sub-code.
+        sub_code: AuthSubCodeClass,
     },
 
     /// Server sent `NegotiateProtocolVersion` (tag `'v'`) during

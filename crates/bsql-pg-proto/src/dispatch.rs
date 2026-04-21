@@ -561,7 +561,9 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
         [a, b, c, d, rest @ ..] => {
             let raw = u32::from_be_bytes([*a, *b, *c, *d]);
             let code = crate::wire::AuthSubCode::try_from_u32(raw)
-                .ok_or(ProtocolError::UnsupportedAuthMethod { sub_code: raw })?;
+                .ok_or(ProtocolError::UnsupportedAuthMethod {
+                    sub_code: crate::error::AuthSubCodeClass::Unknown(raw),
+                })?;
             Ok((code, rest))
         }
         _ => Err(ProtocolError::MalformedAuthentication {
@@ -601,7 +603,7 @@ fn dispatch_auth_in_startup_trust(reply: ReplyId<crate::reply_id::StartupKind>, 
             | crate::wire::AuthSubCode::SaslContinue
             | crate::wire::AuthSubCode::SaslFinal) => errored(
             Some(reply.consume()),
-            ProtocolError::UnsupportedAuthMethod { sub_code: other.raw() },
+            ProtocolError::UnsupportedAuthMethod { sub_code: crate::error::AuthSubCodeClass::KnownButWrong(other) },
         ),
     }
 }
@@ -654,7 +656,7 @@ fn dispatch_auth_in_startup_scram(
             | crate::wire::AuthSubCode::SaslContinue
             | crate::wire::AuthSubCode::SaslFinal) => errored(
             Some(reply.consume()),
-            ProtocolError::UnsupportedAuthMethod { sub_code: other.raw() },
+            ProtocolError::UnsupportedAuthMethod { sub_code: crate::error::AuthSubCodeClass::KnownButWrong(other) },
         ),
     }
 }
