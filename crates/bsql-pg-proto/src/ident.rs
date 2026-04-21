@@ -655,6 +655,24 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
     /// UTF-8 ellipsis marker appended on overflow. 3 bytes.
     const OVERFLOW_MARKER: &[u8] = "…".as_bytes();
 
+    /// Compile-time floor for `N` on any `Truncating` tag.
+    ///
+    /// If `N < OVERFLOW_MARKER.len()`, the truncation path silently
+    /// drops the marker (`out.buf.get_mut(fit_end..marker_end)`
+    /// returns `None` when `marker_end > N`) while still setting
+    /// `out.len = marker_end`. The resulting `FixedStr` claims
+    /// length 3 but holds at most `N < 3` valid bytes — corrupt
+    /// state. Closing this as tier-1: `BoundedStr<2>` is now a
+    /// build failure instead of a latent silent-corruption path.
+    ///
+    /// All crate-side usages are far above this floor (`BoundedStr<32>`,
+    /// `<64>`, `<96>`, `<128>`, `Sql<2048>`); the bound is purely
+    /// defensive against future `Truncating` tags with tiny `N`.
+    const _TRUNCATING_N_MIN: () = assert!(
+        N >= Self::OVERFLOW_MARKER.len(),
+        "FixedStr<N, Truncating>: N must be >= OVERFLOW_MARKER.len() (3 bytes for UTF-8 ellipsis). Use a larger N or pick a 1-byte marker.",
+    );
+
     /// Construct from a `&str`, truncating at a UTF-8-safe boundary
     /// and appending `"…"` on overflow. Never panics, never silently
     /// drops content.
@@ -664,6 +682,10 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
     /// backward to find the nearest UTF-8 boundary — O(1), not O(N).
     #[must_use]
     pub fn from_str_truncating(source: &str) -> Self {
+        // Force monomorphisation of the floor assert — associated
+        // `const` items are lazy; without this reference the assert
+        // never triggers for bad `N`.
+        let () = Self::_TRUNCATING_N_MIN;
         let mut out = Self::new(); // also runs the N ≤ u16::MAX assert.
         let src = source.as_bytes();
 
