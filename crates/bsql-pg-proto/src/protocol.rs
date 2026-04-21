@@ -1204,11 +1204,6 @@ impl core::fmt::Debug for PgProtocol {
     }
 }
 
-// `push_action` helper removed — all push sites now go through
-// `emit_actions!` which provides compile-time per-site budget
-// enforcement (DEF-045). The old helper's Result handling is
-// subsumed by the macro's `on_overflow` parameter.
-
 #[cfg(test)]
 mod allows_unsolicited_param_status_tests {
     //! Seam-closing table for `allows_unsolicited_param_status`

@@ -206,7 +206,8 @@ pub struct OutActions<'w, 'r> {
     /// sentinel ([`Action::CloseSocket`]) from construction.
     items: [Action<'w, 'r>; MAX_ACTIONS_PER_CALL],
     /// Number of populated slots in `items[..len]`. `u8` suffices
-    /// since `MAX_ACTIONS_PER_CALL` is tiny (currently 4).
+    /// since `MAX_ACTIONS_PER_CALL` is tiny (currently 8 post-1c-1b
+    /// bump from 4).
     len: u8,
 }
 

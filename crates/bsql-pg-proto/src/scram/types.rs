@@ -100,6 +100,10 @@ impl CappedServerNonce {
     /// Construct from raw bytes.
     ///
     /// Returns `Err` if the nonce exceeds [`MAX_SERVER_NONCE_LEN`].
+    ///
+    /// `pub` rather than `pub(crate)` because `tests/bounded_buffers_spec.rs`
+    /// exercises the over-length rejection as a tier-2 structural
+    /// regression shield.
     pub fn try_from_bytes(input: &[u8]) -> Result<Self, ServerNonceTooLong> {
         let mut buf = heapless::Vec::new();
         buf.extend_from_slice(input)

@@ -209,7 +209,7 @@ const CBIND_DATA: &[u8] = b"biws";
 ///
 /// Returns the bare message (without GS2 header) in a bounded buffer.
 /// The caller prepends the GS2 header (`n,,`) for the full client-first.
-pub fn build_client_first_bare(
+pub(crate) fn build_client_first_bare(
     user: &[u8],
     client_nonce_b64: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_CLIENT_FIRST_BARE_LEN>, ScramError> {
@@ -229,7 +229,7 @@ pub fn build_client_first_bare(
 /// Build the full client-first-message: GS2 header + bare.
 ///
 /// `n,,n=<user>,r=<nonce_b64>`
-pub fn build_client_first_message(
+pub(crate) fn build_client_first_message(
     user: &[u8],
     client_nonce_b64: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_CLIENT_FIRST_MSG_LEN>, ScramError> {
@@ -249,13 +249,13 @@ pub fn build_client_first_message(
 
 /// Parsed fields from a server-first-message.
 #[derive(Debug)]
-pub struct ServerFirst {
+pub(crate) struct ServerFirst {
     /// The full server nonce (`r=<value>`) — must start with client nonce.
-    pub server_nonce: CappedServerNonce,
+    pub(crate) server_nonce: CappedServerNonce,
     /// Base64-decoded salt.
-    pub salt: heapless::Vec<u8, MAX_SALT_LEN>,
+    pub(crate) salt: heapless::Vec<u8, MAX_SALT_LEN>,
     /// Iteration count.
-    pub iterations: u32,
+    pub(crate) iterations: u32,
 }
 
 /// Parse a server-first-message: `r=<nonce>,s=<salt_b64>,i=<iters>`.
@@ -264,7 +264,7 @@ pub struct ServerFirst {
 /// - Server nonce starts with the client nonce (RFC 5802 section 5.1 MUST).
 /// - Iteration count >= 4096 (RFC 7677 section 4.2 MUST).
 /// - Salt base64-decodes and fits our bounded buffer.
-pub fn parse_server_first(
+pub(crate) fn parse_server_first(
     msg: &[u8],
     client_nonce_b64: &[u8],
 ) -> Result<ServerFirst, ScramError> {
@@ -321,7 +321,7 @@ pub fn parse_server_first(
 ///
 /// This is used as part of the AuthMessage and to construct the full
 /// client-final-message (by appending `,p=<proof_b64>`).
-pub fn build_client_final_without_proof(
+pub(crate) fn build_client_final_without_proof(
     server_nonce: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_CLIENT_FINAL_MSG_LEN>, ScramError> {
     let mut buf = heapless::Vec::new();
@@ -337,7 +337,7 @@ pub fn build_client_final_without_proof(
 }
 
 /// Build the complete client-final-message: `c=biws,r=<nonce>,p=<proof_b64>`.
-pub fn build_client_final_message(
+pub(crate) fn build_client_final_message(
     server_nonce: &[u8],
     proof_b64: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_CLIENT_FINAL_MSG_LEN>, ScramError> {
@@ -353,7 +353,7 @@ pub fn build_client_final_message(
 ///
 /// Success: `v=<verifier_b64>` — returns the decoded verifier as SecretDigest.
 /// Error: `e=<text>` — returns ScramError::ServerScramError.
-pub fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError> {
+pub(crate) fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError> {
     let msg_str = core::str::from_utf8(msg).map_err(|_| ScramError::MalformedServerFinal)?;
 
     if let Some(verifier_b64) = msg_str.strip_prefix("v=") {
@@ -391,6 +391,10 @@ pub fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError> {
 /// `Base64` is the standard-with-padding alphabet (RFC 4648 §4),
 /// matching what PG emits. `default-features = false` keeps the
 /// crate `no_std` + `no_alloc`.
+///
+/// `pub` rather than `pub(crate)` because `tests/startup_spec.rs`
+/// uses it to encode SCRAM fixtures (salt, proof) for synthetic
+/// server-first/server-final bodies.
 pub fn base64_encode_to_buf(
     input: &[u8],
     out: &mut [u8],
@@ -446,7 +450,7 @@ fn base64_decode_bounded(
 /// This injection point is physically absent from non-test builds
 /// (tier-1 by build configuration).
 #[cfg(not(test))]
-pub fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
+pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
     let mut raw = zeroize::Zeroizing::new([0u8; 18]);
     getrandom::getrandom(raw.as_mut()).map_err(|_| ScramError::BufferOverflow)?;
     let mut b64_buf = [0u8; MAX_CLIENT_NONCE_B64_LEN];
@@ -461,7 +465,7 @@ pub fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_
 
 /// Test-only nonce generator with deterministic injection.
 #[cfg(test)]
-pub fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
+pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
     FIXED_TEST_NONCE.with(|cell| {
         if let Some(fixed) = cell.borrow().as_ref() {
             let mut result = heapless::Vec::new();
@@ -493,6 +497,15 @@ std::thread_local! {
 }
 
 /// Set a fixed nonce for the current test (test-only).
+///
+/// `pub` rather than `pub(crate)` so rustc's dead-code heuristic
+/// accepts the currently-callerless form — this hook exists for
+/// future deterministic SCRAM test vectors (e.g. RFC 7677 Appendix
+/// A client-side vectors) that would call it before invoking the
+/// handshake dispatcher. The sibling `#[cfg(test)]`
+/// `generate_client_nonce` reads the `FIXED_TEST_NONCE` slot
+/// unconditionally; once a caller exists, this function gets the
+/// test vector's nonce into the slot.
 #[cfg(test)]
 pub fn set_test_nonce(nonce: &str) {
     FIXED_TEST_NONCE.with(|cell| {

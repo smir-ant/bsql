@@ -121,8 +121,17 @@ impl Encoding {
     /// Parse a PG encoding name from raw bytes.
     ///
     /// Comparison is case-sensitive — PG's `ParameterStatus`
-    /// conventionally uppercases encoding names. An over-length
-    /// or malformed name maps to `Other(OtherEncoding::empty())`.
+    /// conventionally uppercases encoding names.
+    ///
+    /// # Over-length names
+    ///
+    /// Names longer than [`MAX_ENCODING_NAME_LEN`] are preserved via
+    /// [`OtherEncoding::from_truncated_bytes`] — the visible prefix
+    /// plus a `"…"` truncation marker. Previously (pre-2026-04-21)
+    /// such names silently became `Other(empty)` — a tier-4 silent
+    /// drop that lost forensic information. Now the name is present
+    /// as "{visible-prefix}…" so downstream logging/diagnostics can
+    /// see what the server actually sent. Tier-4 → tier-2 structural.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         match bytes {
@@ -135,7 +144,7 @@ impl Encoding {
             b"EUC_KR" => Self::EucKr,
             b"BIG5" => Self::Big5,
             b"GB18030" => Self::Gb18030,
-            other => Self::Other(OtherEncoding::try_from_bytes(other).unwrap_or_default()),
+            other => Self::Other(OtherEncoding::from_truncated_bytes(other)),
         }
     }
 }
@@ -174,6 +183,38 @@ impl OtherEncoding {
         }
         out.len = len;
         Some(out)
+    }
+
+    /// Construct from a byte slice, truncating with a `"…"` marker
+    /// on overflow — mirror of [`crate::ident::BoundedStr::from_str_truncating`]
+    /// but byte-oriented (encoding names can contain any PG-legal
+    /// bytes). Over-length input preserves the longest prefix that
+    /// fits in `MAX_ENCODING_NAME_LEN - marker_len` followed by
+    /// the 3-byte UTF-8 ellipsis.
+    ///
+    /// Replaces the previous `unwrap_or_default` silent-drop on
+    /// over-length server-sent encoding names — forensic
+    /// information is preserved.
+    #[must_use]
+    pub fn from_truncated_bytes(src: &[u8]) -> Self {
+        const MARKER: &[u8] = "…".as_bytes(); // 3 bytes
+        if src.len() <= MAX_ENCODING_NAME_LEN {
+            // Fast path — fits verbatim.
+            return Self::try_from_bytes(src).unwrap_or_else(Self::empty);
+        }
+        let budget = MAX_ENCODING_NAME_LEN.saturating_sub(MARKER.len());
+        let mut out = Self::empty();
+        if let (Some(dst_prefix), Some(src_prefix)) =
+            (out.buf.get_mut(..budget), src.get(..budget))
+        {
+            dst_prefix.copy_from_slice(src_prefix);
+        }
+        let marker_end = budget.saturating_add(MARKER.len());
+        if let Some(dst_marker) = out.buf.get_mut(budget..marker_end) {
+            dst_marker.copy_from_slice(MARKER);
+        }
+        out.len = u16::try_from(marker_end).unwrap_or(0);
+        out
     }
 
     /// Borrow the raw bytes.
