@@ -353,25 +353,28 @@ impl SessionParams {
             // oversized input trims to N-3 bytes + "…" marker
             // (no silent value-drop, unlike the prior
             // heapless::String::try_from → None path).
+            // F55 (pass #6 audit): non-UTF-8 bytes no longer silently
+            // drop the whole field. A PG server configured with
+            // LATIN1 / legacy client_encoding may emit non-UTF-8
+            // bytes in freeform string fields (application_name
+            // echo with non-UTF-8 user input, etc.). `from_bytes_lossy`
+            // preserves the ASCII subset, coerces non-ASCII bytes to
+            // `?` placeholders, and guarantees valid UTF-8 output —
+            // same F22 treatment used for ErrorResponse M/D/H fields.
             b"server_version" => {
-                let Ok(s) = core::str::from_utf8(value) else { return };
-                self.server_version = Some(BoundedStr::<32>::from_str_truncating(s));
+                self.server_version = Some(BoundedStr::<32>::from_bytes_lossy(value));
             }
             b"application_name" => {
-                let Ok(s) = core::str::from_utf8(value) else { return };
-                self.application_name = Some(BoundedStr::<128>::from_str_truncating(s));
+                self.application_name = Some(BoundedStr::<128>::from_bytes_lossy(value));
             }
             b"session_authorization" => {
-                let Ok(s) = core::str::from_utf8(value) else { return };
-                self.session_authorization = Some(BoundedStr::<64>::from_str_truncating(s));
+                self.session_authorization = Some(BoundedStr::<64>::from_bytes_lossy(value));
             }
             b"DateStyle" => {
-                let Ok(s) = core::str::from_utf8(value) else { return };
-                self.date_style = Some(BoundedStr::<32>::from_str_truncating(s));
+                self.date_style = Some(BoundedStr::<32>::from_bytes_lossy(value));
             }
             b"TimeZone" => {
-                let Ok(s) = core::str::from_utf8(value) else { return };
-                self.time_zone = Some(BoundedStr::<64>::from_str_truncating(s));
+                self.time_zone = Some(BoundedStr::<64>::from_bytes_lossy(value));
             }
             _ => {
                 // Unknown key — silently dropped (DEF-042).

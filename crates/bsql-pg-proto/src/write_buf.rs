@@ -347,9 +347,21 @@ impl WriteBuf {
         let len_u32 = u32::try_from(body_len).map_err(|_| WriteBufFull)?;
         let len_bytes = len_u32.to_be_bytes();
         // Patch the placeholder at `start..start+4`.
-        if let Some(slot) = self.inner.get_mut(start..start.saturating_add(4)) {
-            slot.copy_from_slice(&len_bytes);
-        }
+        //
+        // F61 (pass #6 audit): explicit Err on the architecturally-dead
+        // None branch. The `push_u32_be(0)` above guarantees
+        // `inner.len() >= start + 4` — so `get_mut(start..start+4)`
+        // cannot return None unless a future refactor removes or
+        // reorders the placeholder push. Converting the former silent
+        // no-op (`if let Some(slot)`) into an explicit Err means the
+        // refactor fails with a classified `WriteBufFull` at the
+        // first test run, rather than producing wire frames with a
+        // length field of `0` that the server would reject as
+        // `MalformedFrameLength`.
+        let Some(slot) = self.inner.get_mut(start..start.saturating_add(4)) else {
+            return Err(WriteBufFull);
+        };
+        slot.copy_from_slice(&len_bytes);
         Ok(())
     }
 
@@ -381,12 +393,18 @@ impl WriteBuf {
         let body_len = self.inner.len().saturating_sub(body_start);
         let body_len_i32 = i32::try_from(body_len).map_err(|_| WriteBufFull)?;
         let bytes = body_len_i32.to_be_bytes();
-        if let Some(slot) = self
+        // F61: explicit Err on the architecturally-dead None branch
+        // (mirrors `with_length_prefix`). A future refactor that
+        // removes the placeholder push would fail with a typed error
+        // at build-time tests instead of silently producing frames
+        // with bogus length fields.
+        let Some(slot) = self
             .inner
             .get_mut(len_offset..len_offset.saturating_add(4))
-        {
-            slot.copy_from_slice(&bytes);
-        }
+        else {
+            return Err(WriteBufFull);
+        };
+        slot.copy_from_slice(&bytes);
         Ok(())
     }
 

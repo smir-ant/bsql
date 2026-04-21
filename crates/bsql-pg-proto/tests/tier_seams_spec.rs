@@ -118,16 +118,26 @@ fn session_params_set_unknown_key_is_dropped() {
     assert!(p.time_zone.is_none());
 }
 
-/// Invariant (spec): a non-UTF8 value is silently skipped; the
-/// previously-set value is preserved.
+/// F55 regression (pass #6 audit): non-UTF-8 bytes are lossy-coerced
+/// (non-ASCII → `?`), not silently skipped.
+///
+/// Pre-F55 the `set` path did `let Ok(s) = from_utf8(value) else { return }`
+/// → the previously-set value was silently preserved and the new
+/// (invalid) value dropped. That's a diagnostic-loss class —
+/// operators debugging "why is server_version stale?" had no signal.
+///
+/// Post-F55 the `from_bytes_lossy` constructor replaces non-ASCII
+/// bytes with `?` placeholders and ALWAYS overwrites. The new value
+/// is visibly mangled (operator sees `"?"` where real data should
+/// be) — loud diagnostic, not silent drop.
 #[test]
-fn session_params_set_non_utf8_value_is_skipped() {
+fn session_params_set_non_utf8_is_lossy_not_silent_skip() {
     let mut p = SessionParams::new();
     p.set(b"server_version", b"17.2");
     // Invalid UTF-8 (a lone continuation byte).
     p.set(b"server_version", &[0x80]);
-    // Previous value preserved — the bad one did not overwrite.
-    assert_eq!(p.server_version.as_ref().map(|s| s.as_str()), Some("17.2"));
+    // F55: non-ASCII byte coerced to `?`; the new value overwrote.
+    assert_eq!(p.server_version.as_ref().map(|s| s.as_str()), Some("?"));
 }
 
 /// Invariant (spec): a second valid set to the same key overwrites

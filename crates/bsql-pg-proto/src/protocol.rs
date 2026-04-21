@@ -409,7 +409,27 @@ impl PgProtocol {
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 'r> {
         write_buf.clear();
-        let mut staged = StagedActions::new();
+        let staged = StagedActions::new();
+
+        // F66 (pass #6 audit): if the connection is already Errored,
+        // drop the incoming bytes and return an empty OutActions.
+        // Rationale:
+        //   1. The caller already received `CloseSocket` at the
+        //      original fail point; the socket is being torn down.
+        //   2. The Errored dispatch arm would consume bytes frame-by-
+        //      frame with `AdvancedSilent` — wasted CPU on each byte
+        //      from a connection that's already dead.
+        //   3. An adversarial server flooding a post-close socket
+        //      can't force useless parse work: we skip the loop
+        //      entirely.
+        // Also clear `read_buf` — post-Close bytes are wire-garbage
+        // from a dead connection; keeping them wastes memory.
+        if matches!(self.state, ProtoState::Errored(_)) {
+            self.read_buf.clear();
+            return materialise(staged, write_buf.as_bytes(), self.read_buf.populated());
+        }
+
+        let mut staged = staged;
 
         // Append into the bounded buffer. Overflow → fatal.
         if let Err(ReadBufFull {
