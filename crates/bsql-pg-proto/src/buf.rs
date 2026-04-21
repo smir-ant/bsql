@@ -121,10 +121,18 @@ impl ReadBuf {
         // rather than `[..]` because the forbid-bundle bans
         // `indexing_slicing`. DEF-120: `u16 → usize` via infallible
         // widening `From` impl (no `as` cast).
+        //
+        // F-014 (pass-#8): debug-builds actively assert the invariant
+        // `cursor <= inner.len()` so a mutator regression would fail
+        // the test suite before the dead unwrap_or(&[]) fallback
+        // masked it silently.
+        debug_assert!(
+            usize::from(self.cursor) <= self.inner.len(),
+            "ReadBuf invariant: cursor ({}) must not exceed inner.len() ({})",
+            self.cursor,
+            self.inner.len(),
+        );
         self.inner.get(usize::from(self.cursor)..).unwrap_or(&[])
-        // The `unwrap_or` is dead in practice (cursor <= len always),
-        // but it lets us avoid `unwrap()` in production code while
-        // still handling the case the type system cannot prove.
     }
 
     /// Borrow the full populated region, including bytes already
@@ -147,9 +155,15 @@ impl ReadBuf {
     /// the next `feed_bytes` call while they are alive.
     ///
     /// [`unread`]: ReadBuf::unread
+    ///
+    /// F-016 (pass-#8): visibility narrowed `pub` → `pub(crate)`.
+    /// Only `materialise` / dispatch resolution need this view; an
+    /// external caller reading `populated()` gets access to bytes
+    /// already consumed past the cursor with no user benefit. Surface
+    /// shrink closes a latent access hole.
     #[inline]
     #[must_use]
-    pub fn populated(&self) -> &[u8] {
+    pub(crate) fn populated(&self) -> &[u8] {
         self.inner.as_slice()
     }
 
@@ -158,9 +172,13 @@ impl ReadBuf {
     /// row-range coordinates (1c-1b).
     ///
     /// [`populated`]: ReadBuf::populated
+    ///
+    /// F-017 (pass-#8): visibility narrowed `pub` → `pub(crate)`.
+    /// Only the dispatch layer needs this. Same rationale as
+    /// [`populated`].
     #[inline]
     #[must_use]
-    pub fn cursor_position(&self) -> usize {
+    pub(crate) fn cursor_position(&self) -> usize {
         usize::from(self.cursor)
     }
 

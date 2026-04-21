@@ -260,6 +260,19 @@ fn parse_pg_bool(value: &[u8]) -> Option<bool> {
 /// `heapless::String`. Reduces `SessionParams` footprint by ~400
 /// bytes and breaks the `heapless::Vec::drop` chain through
 /// `PgProtocol`.
+/// # F-073 (pass-#8) — public fields are intentionally readable
+///
+/// Every field below is `pub` so external code (tests today,
+/// `bsql-driver-postgres` wrapper in Phase 1e, user diagnostic code)
+/// can read server-reported session state without a 9-accessor
+/// boilerplate layer. Audit noted the risk of internal writes
+/// bypassing `set()` — acknowledged; internal writers are limited
+/// to `set()` by convention, pinned by the `session_params_set_key_routing_table`
+/// test which exercises every known key.
+///
+/// A future refactor that adds a second writer path must either
+/// call through `set()` (preserving validation) or explicitly
+/// document why a raw assignment is correct.
 #[derive(Default)]
 pub struct SessionParams {
     /// PostgreSQL server version string (e.g. `"17.2"`,
@@ -297,6 +310,17 @@ pub struct SessionParams {
     /// BoundedStr<64> — longest documented IANA zone
     /// `"America/Argentina/Buenos_Aires"` = 33 bytes. DEF-106.
     pub time_zone: Option<BoundedStr<64>>,
+    /// Number of unknown `ParameterStatus` keys the server sent that
+    /// we couldn't classify.
+    ///
+    /// F-074 (pass-#8): prior to this, unknown keys were silently
+    /// dropped (DEF-042 forward-compat policy). That's still the
+    /// right behaviour — PG may add new keys in future versions —
+    /// but operator visibility was zero. Counting lets diagnostics
+    /// surface "we dropped N keys; upgrade the client or report".
+    /// Saturating `u16` — overflows stay pinned at `u16::MAX` rather
+    /// than wrapping.
+    pub n_unknown_dropped: u16,
 }
 
 impl SessionParams {
@@ -314,6 +338,7 @@ impl SessionParams {
             date_style: None,
             integer_datetimes: None,
             time_zone: None,
+            n_unknown_dropped: 0,
         }
     }
 
@@ -378,6 +403,9 @@ impl SessionParams {
             }
             _ => {
                 // Unknown key — silently dropped (DEF-042).
+                // F-074 (pass-#8): count the drop so operators can
+                // detect PG-version mismatches via `n_unknown_dropped`.
+                self.n_unknown_dropped = self.n_unknown_dropped.saturating_add(1);
             }
         }
     }

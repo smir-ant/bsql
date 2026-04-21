@@ -526,6 +526,17 @@ impl<const N: usize> PodBytes<N> {
                 max: N,
             });
         }
+        // F-066 (pass-#8): after the `src.len() > N` guard above and
+        // `N <= 65_535` const-asserted at `Self::new()`, the
+        // `u16::try_from(src.len())` Err branch is architecturally
+        // dead. Debug-builds assert so a future refactor that drops
+        // the guard fails tests loudly; release builds fold the Err
+        // arm away under any non-zero opt level.
+        debug_assert!(
+            src.len() <= N && N <= usize::from(u16::MAX),
+            "PodBytes invariant: src.len ({}) must fit both N ({N}) and u16",
+            src.len(),
+        );
         let len = u16::try_from(src.len()).map_err(|_| PodBytesOverflow {
             len: src.len(),
             max: N,
@@ -672,6 +683,15 @@ impl<const N: usize, Tag> FixedStr<N, Tag> {
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
+        // F-061 (pass-#8): debug-builds assert the invariant
+        // `self.len ≤ N` so a constructor that violates the cap
+        // fails tests loudly instead of the dead `unwrap_or(&[])`
+        // masking it to an empty slice.
+        debug_assert!(
+            self.len() <= N,
+            "FixedStr invariant: len ({}) must not exceed N ({N})",
+            self.len(),
+        );
         self.buf.get(..self.len()).unwrap_or(&[])
     }
 
@@ -695,7 +715,17 @@ impl<const N: usize, Tag: ValidUtf8> FixedStr<N, Tag> {
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
-        core::str::from_utf8(self.as_bytes()).unwrap_or("")
+        let bytes = self.as_bytes();
+        // F-062 (pass-#8): debug-builds assert the `ValidUtf8` tag
+        // invariant — stored bytes must actually decode as UTF-8.
+        // The dead `unwrap_or("")` branch below would mask a future
+        // constructor that forgot to enforce UTF-8; this shield
+        // fails tests loudly instead.
+        debug_assert!(
+            core::str::from_utf8(bytes).is_ok(),
+            "ValidUtf8 tag invariant broken: stored bytes are not UTF-8",
+        );
+        core::str::from_utf8(bytes).unwrap_or("")
     }
 }
 

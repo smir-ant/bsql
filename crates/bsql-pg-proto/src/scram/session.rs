@@ -26,6 +26,7 @@
 
 use crate::password::Password;
 use crate::sensitive::Sensitive;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Owned SCRAM session bundle — the password to use during the
 /// SCRAM-SHA-256 exchange, guarded by [`Sensitive`] zeroisation.
@@ -43,7 +44,17 @@ use crate::sensitive::Sensitive;
 /// { scram, .. }` binds a value they can do nothing with, which is
 /// exactly the intent. The type is not part of the crate's
 /// behavioural public surface.
-#[derive(Debug)]
+///
+/// # F-026 (pass-#8): explicit `Zeroize` / `ZeroizeOnDrop` derive
+///
+/// Pre-F-026 the struct relied on `Sensitive<Password>`'s Drop to
+/// scrub transitively — which works today but is *field-order-
+/// dependent*. A future refactor adding another secret-derived
+/// field (e.g., a cached intermediate key) without a `Zeroize` impl
+/// would silently skip scrubbing. The derive below forces every
+/// field to be `Zeroize` at compile time: any non-Zeroize field
+/// added fails the build.
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 pub struct ScramSession {
     /// The password, zeroed on drop via the inner [`Sensitive`].
     password: Sensitive<Password>,

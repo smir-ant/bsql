@@ -425,17 +425,23 @@ pub enum AuthSubCode {
 }
 
 impl AuthSubCode {
-    /// Classify a raw wire sub-code. Returns `None` for codes outside
-    /// the 4 PG-defined values.
+    /// Classify a raw wire sub-code.
+    ///
+    /// Returns `Err(code)` carrying the offending raw u32 for any
+    /// code outside the 4 PG-defined values — matches the
+    /// [`crate::decode::FormatCode::try_from_wire_i16`] and
+    /// [`crate::action::TxStatus::try_from_byte`] shapes. Callers
+    /// forward the raw value to
+    /// `UnsupportedAuthMethod { sub_code: AuthSubCodeClass::Unknown(u) }`.
+    /// F-046 (pass-#8): consistent sealed-classifier family.
     #[inline]
-    #[must_use]
-    pub const fn try_from_u32(code: u32) -> Option<Self> {
+    pub const fn try_from_u32(code: u32) -> Result<Self, u32> {
         match code {
-            AUTH_OK => Some(Self::Ok),
-            AUTH_SASL => Some(Self::Sasl),
-            AUTH_SASL_CONTINUE => Some(Self::SaslContinue),
-            AUTH_SASL_FINAL => Some(Self::SaslFinal),
-            _ => None,
+            AUTH_OK => Ok(Self::Ok),
+            AUTH_SASL => Ok(Self::Sasl),
+            AUTH_SASL_CONTINUE => Ok(Self::SaslContinue),
+            AUTH_SASL_FINAL => Ok(Self::SaslFinal),
+            other => Err(other),
         }
     }
 

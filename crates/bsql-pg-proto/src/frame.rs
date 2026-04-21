@@ -107,6 +107,20 @@ pub enum HeaderParse {
     /// Fewer than 5 bytes available — header is incomplete. Need more.
     Incomplete,
     /// Header parsed cleanly. The frame is fully described.
+    ///
+    /// # F-058 (pass-#8): `declared_len` removed
+    ///
+    /// Pre-pass-#8 this variant carried both `declared_len: NonZeroU32`
+    /// (4 bytes on the wire) and `total_len: usize` (8 bytes on 64-bit)
+    /// — redundantly, since `total_len = 1 + declared_len` is a type
+    /// invariant (`parse_header` constructs both). Production code
+    /// ignored `declared_len` (`protocol.rs::feed_bytes` uses
+    /// `declared_len: _`); only frame-parse tests read it. Dropping
+    /// the field shrinks the variant by 8 B per return.
+    ///
+    /// Tests that need the declared length compute it inline:
+    /// `let declared = u32::try_from(total_len.saturating_sub(1))
+    ///     .ok().and_then(NonZeroU32::new)`.
     Ok {
         /// The PG message tag, typed as [`crate::wire::InboundTag`]
         /// — bytes received from the server are wrapped here so
@@ -114,12 +128,9 @@ pub enum HeaderParse {
         /// values elsewhere in the crate (tier-1 compile on
         /// direction).
         tag: crate::wire::InboundTag,
-        /// The length-field as carried on the wire (includes itself,
-        /// excludes the tag). Always `>= 4`.
-        declared_len: NonZeroU32,
         /// Total bytes the frame occupies including the tag.
         ///
-        /// `total_len = 1 + declared_len`. Always `<= READ_BUF_CAP`.
+        /// `total_len = 1 + declared_len_on_wire`. Always `<= READ_BUF_CAP`.
         total_len: usize,
     },
     /// Header malformed: length-field below 4.
@@ -190,17 +201,18 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
                     return HeaderParse::FrameTooLarge { declared };
                 }
             };
-            // declared >= 4 ⇒ NonZeroU32::new is Some.
-            match NonZeroU32::new(declared) {
-                Some(nz) => HeaderParse::Ok {
+            // declared >= 4 check: NonZeroU32::new guards against
+            // zero at the type level; a declared of 0..=3 is
+            // malformed. F-058: `declared_len` field dropped from
+            // HeaderParse::Ok — tests compute it from total_len.
+            if NonZeroU32::new(declared).is_some() {
+                HeaderParse::Ok {
                     tag: crate::wire::InboundTag::from_byte(*tag),
-                    declared_len: nz,
                     total_len,
-                },
-                None => {
-                    core::hint::cold_path();
-                    HeaderParse::MalformedLength { declared }
                 }
+            } else {
+                core::hint::cold_path();
+                HeaderParse::MalformedLength { declared }
             }
         }
     }

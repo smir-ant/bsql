@@ -68,17 +68,19 @@ pub enum TxStatus {
 }
 
 impl TxStatus {
-    /// Parse a PG wire byte into the typed status. `None` for any
-    /// byte outside `{'I', 'T', 'E'}` — caller classifies as
-    /// malformed wire.
+    /// Parse a PG wire byte into the typed status.
+    ///
+    /// Returns `Err(b)` carrying the offending byte when `b` is
+    /// outside `{'I', 'T', 'E'}` — lets callers forward the actual
+    /// rejected value to diagnostics if they choose. Mirrors the
+    /// `FormatCode::try_from_wire_i16` shape. F-009 (pass-#8).
     #[inline]
-    #[must_use]
-    pub const fn try_from_byte(b: u8) -> Option<Self> {
+    pub const fn try_from_byte(b: u8) -> Result<Self, u8> {
         match b {
-            b'I' => Some(Self::Idle),
-            b'T' => Some(Self::InTransaction),
-            b'E' => Some(Self::Failed),
-            _ => None,
+            b'I' => Ok(Self::Idle),
+            b'T' => Ok(Self::InTransaction),
+            b'E' => Ok(Self::Failed),
+            other => Err(other),
         }
     }
 
@@ -169,8 +171,20 @@ impl NonEmptyRange {
     /// buffer at `materialise` time.
     #[inline]
     pub(crate) fn apply<'a>(&self, buf: &'a [u8]) -> Option<&'a [u8]> {
+        // F-007 (pass-#8): the None path is architecturally dead when
+        // `buf` is the same buffer used at NonEmptyRange::new construction
+        // (materialise's invariant — see protocol.rs::materialise). The
+        // Option-returning shape is retained for forbid-bundle safety,
+        // but debug-builds actively assert the invariant so a wiring
+        // regression fails the test suite loudly instead of silently
+        // producing `&[]`.
         let end = self.start.checked_add(self.len.get())?;
-        buf.get(self.start..end)
+        let slice = buf.get(self.start..end);
+        debug_assert!(
+            slice.is_some(),
+            "NonEmptyRange::apply: buf shorter than emission-time bounds — check materialise wiring",
+        );
+        slice
     }
 }
 
@@ -309,6 +323,22 @@ impl<'w, 'r> IntoIterator for OutActions<'w, 'r> {
     type IntoIter = OutActionsIter<'w, 'r>;
     fn into_iter(self) -> Self::IntoIter {
         OutActionsIter { inner: self, pos: 0 }
+    }
+}
+
+/// By-reference iteration — `for action in &out` yields `&Action`.
+///
+/// F-002 (pass-#8): callers who want to inspect actions without
+/// consuming the container previously had to reach for
+/// `out.as_slice().iter()`. This `IntoIterator for &OutActions` impl
+/// makes `for a in &out { ... }` do the right thing natively. Both
+/// by-value (`for a in out`) and by-reference (`for a in &out`) are
+/// supported with the same ergonomic shape.
+impl<'a, 'w, 'r> IntoIterator for &'a OutActions<'w, 'r> {
+    type Item = &'a Action<'w, 'r>;
+    type IntoIter = core::slice::Iter<'a, Action<'w, 'r>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
     }
 }
 

@@ -94,23 +94,25 @@ fn one_to_four_bytes_yield_incomplete() {
 ///
 /// Invariant (spec): a well-formed header with `declared = 4` (header-
 /// only frame, empty payload) parses as `Ok` with `total_len = 5`,
-/// `tag` round-tripped, `declared_len` packaged into `NonZeroU32`.
+/// `tag` round-tripped. F-058 (pass-#8): `declared_len` field dropped
+/// from `HeaderParse::Ok` — derived from `total_len - 1` when tests
+/// need it.
 ///
-/// Ties together BE decode + `NonZeroU32::new` + the declared→total
-/// formula. None of those compose at the type level; their aggregate
-/// behaviour is only observable via the returned variant's fields.
+/// Ties together BE decode + the declared→total formula. Neither
+/// composes at the type level; the aggregate behaviour is observable
+/// via the returned variant's `total_len`.
 #[test]
 fn minimal_legal_header_parses_ok() {
     let header = [b'X', 0, 0, 0, 4];
     match parse_header(&header) {
-        HeaderParse::Ok {
-            tag,
-            declared_len,
-            total_len,
-        } => {
+        HeaderParse::Ok { tag, total_len } => {
             assert_eq!(tag.byte(), b'X');
-            assert_eq!(declared_len.get(), 4);
             assert_eq!(total_len, 5);
+            // Derived `declared_len`: `total_len - 1` always, per the
+            // `parse_header` invariant. Test retains the implicit check
+            // via the `5` literal above.
+            let declared_len = total_len.saturating_sub(1);
+            assert_eq!(declared_len, 4);
         }
         other => panic!("expected Ok, got {other:?}"),
     }
@@ -218,16 +220,17 @@ fn total_len_equals_one_plus_declared_len() {
         let bytes = declared.to_be_bytes();
         let header = [b'X', bytes[0], bytes[1], bytes[2], bytes[3]];
         match parse_header(&header) {
-            HeaderParse::Ok {
-                declared_len,
-                total_len,
-                ..
-            } => {
-                assert_eq!(declared_len.get(), declared);
-                let expected = usize::try_from(declared)
-                    .ok()
-                    .and_then(|n| n.checked_add(1))
-                    .unwrap_or(0);
+            HeaderParse::Ok { total_len, .. } => {
+                // F-058 (pass-#8): `declared_len` no longer returned —
+                // derive it from `total_len - 1` per the
+                // `total_len = 1 + declared` invariant. The
+                // formula itself is what this test was always
+                // exercising; dropping the redundant field just
+                // surfaces that fact.
+                let derived_declared = total_len.saturating_sub(1);
+                let declared_usize = usize::try_from(declared).unwrap_or(0);
+                assert_eq!(derived_declared, declared_usize);
+                let expected = declared_usize.saturating_add(1);
                 assert_eq!(total_len, expected);
             }
             other => panic!("declared={declared}: expected Ok, got {other:?}"),

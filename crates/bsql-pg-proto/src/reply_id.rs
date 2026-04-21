@@ -399,4 +399,67 @@ mod reply_id_semantics {
         ping.consume();
         startup.consume();
     }
+
+    // F-004 (pass-#8): per-kind Drop-guard regression pins.
+    //
+    // Pre-F-004 only `PingKind` had a `#[should_panic]` drop test.
+    // Every other kind shared the same generic Drop impl but had no
+    // dedicated bad-path pin. Per user directive "100% bad paths
+    // tested", each kind gets its own test so a refactor that
+    // accidentally specialises the Drop impl per-kind (or breaks
+    // one kind's panic message format) fails the test suite loudly.
+
+    /// Category (2) — StartupKind drop-panic pin.
+    #[test]
+    #[should_panic(expected = "ReplyId<Startup>")]
+    fn startup_undelivered_drop_panics() {
+        let raw = NonZeroU64::new(17).unwrap_or(NonZeroU64::MIN);
+        let id: ReplyId<StartupKind> = ReplyId::from_raw(raw);
+        drop(id);
+    }
+
+    /// Category (2) — QueryKind drop-panic pin.
+    #[test]
+    #[should_panic(expected = "ReplyId<Query>")]
+    fn query_undelivered_drop_panics() {
+        let raw = NonZeroU64::new(19).unwrap_or(NonZeroU64::MIN);
+        let id: ReplyId<QueryKind> = ReplyId::from_raw(raw);
+        drop(id);
+    }
+
+    /// Category (2) — ParseKind drop-panic pin.
+    #[test]
+    #[should_panic(expected = "ReplyId<Parse>")]
+    fn parse_undelivered_drop_panics() {
+        let raw = NonZeroU64::new(23).unwrap_or(NonZeroU64::MIN);
+        let id: ReplyId<ParseKind> = ReplyId::from_raw(raw);
+        drop(id);
+    }
+
+    /// Category (2) — CloseKind drop-panic pin.
+    #[test]
+    #[should_panic(expected = "ReplyId<Close>")]
+    fn close_undelivered_drop_panics() {
+        let raw = NonZeroU64::new(29).unwrap_or(NonZeroU64::MIN);
+        let id: ReplyId<CloseKind> = ReplyId::from_raw(raw);
+        drop(id);
+    }
+
+    /// Category (2) — DescribeStatementKind drop-panic pin.
+    #[test]
+    #[should_panic(expected = "ReplyId<DescribeStatement>")]
+    fn describe_statement_undelivered_drop_panics() {
+        let raw = NonZeroU64::new(31).unwrap_or(NonZeroU64::MIN);
+        let id: ReplyId<DescribeStatementKind> = ReplyId::from_raw(raw);
+        drop(id);
+    }
+
+    /// Category (2) — DescribePortalKind drop-panic pin.
+    #[test]
+    #[should_panic(expected = "ReplyId<DescribePortal>")]
+    fn describe_portal_undelivered_drop_panics() {
+        let raw = NonZeroU64::new(37).unwrap_or(NonZeroU64::MIN);
+        let id: ReplyId<DescribePortalKind> = ReplyId::from_raw(raw);
+        drop(id);
+    }
 }

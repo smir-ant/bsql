@@ -37,21 +37,58 @@ use crate::write_buf::WriteBuf;
 /// Absolute position where a frame begins in
 /// [`crate::buf::ReadBuf::populated`]. Equals the read cursor at the
 /// moment `parse_header` consumed the frame's bytes.
+///
+/// F-018 (pass-#8): field is private; constructed only via
+/// [`Self::new`]. Prior `pub usize` let a caller destructure one
+/// newtype and re-wrap into another (`AbsFrameStart(other.0)`),
+/// weakening the typed-argument anti-swap shield. Private field +
+/// constructor makes the wrap explicit at the one valid call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct AbsFrameStart(pub usize);
+pub(crate) struct AbsFrameStart(usize);
+
+impl AbsFrameStart {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new(v: usize) -> Self { Self(v) }
+    #[inline]
+    #[must_use]
+    pub(crate) const fn get(self) -> usize { self.0 }
+}
 
 /// Total wire bytes the frame occupies — tag (1) + length-prefix
 /// (4) + body.
+///
+/// F-018: private field + constructor, see [`AbsFrameStart`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct FrameTotalLen(pub usize);
+pub(crate) struct FrameTotalLen(usize);
+
+impl FrameTotalLen {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new(v: usize) -> Self { Self(v) }
+    #[inline]
+    #[must_use]
+    pub(crate) const fn get(self) -> usize { self.0 }
+}
 
 /// Current `populated` length of the caller's `ReadBuf`. Serves as
 /// the `bounds` argument for [`crate::action::NonEmptyRange::new`].
+///
+/// F-018: private field + constructor, see [`AbsFrameStart`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct PopulatedLen(pub usize);
+pub(crate) struct PopulatedLen(usize);
+
+impl PopulatedLen {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new(v: usize) -> Self { Self(v) }
+    #[inline]
+    #[must_use]
+    pub(crate) const fn get(self) -> usize { self.0 }
+}
 
 /// Absolute byte-coordinates of the frame being dispatched, resolved
 /// against [`crate::buf::ReadBuf::populated`]. 1c-1b.
@@ -88,9 +125,9 @@ impl FrameCoords {
         populated_len: PopulatedLen,
     ) -> Self {
         Self {
-            frame_start: frame_start.0,
-            total_len: total_len.0,
-            populated_len: populated_len.0,
+            frame_start: frame_start.get(),
+            total_len: total_len.get(),
+            populated_len: populated_len.get(),
         }
     }
 
@@ -224,7 +261,7 @@ pub(crate) fn dispatch(
                         crate::action::PongPayload { tx_status },
                     ),
                 },
-                Err(cause) => errored(Some(id.consume()), cause),
+                Err(payload_len) => errored(Some(id.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         (ProtoState::PingAwaitingRfq(id), TAG_ERROR_RESPONSE) => {
@@ -377,7 +414,7 @@ pub(crate) fn dispatch(
                         },
                     ),
                 },
-                Err(cause) => errored(Some(reply.consume()), cause),
+                Err(payload_len) => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, TAG_ERROR_RESPONSE) => {
@@ -478,7 +515,7 @@ pub(crate) fn dispatch(
                         },
                     ),
                 },
-                Err(cause) => errored(Some(reply.consume()), cause),
+                Err(payload_len) => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         (ProtoState::SimpleQueryAwaitingRfq { reply, .. }, other) => {
@@ -549,7 +586,7 @@ pub(crate) fn dispatch(
                         crate::action::ParseCompletePayload { tx_status },
                     ),
                 },
-                Err(cause) => errored(Some(reply.consume()), cause),
+                Err(payload_len) => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         (ProtoState::ParseAwaitingRfq(reply), other) => {
@@ -637,7 +674,7 @@ pub(crate) fn dispatch(
                     },
                 ),
             },
-            Err(cause) => errored(Some(reply.consume()), cause),
+            Err(payload_len) => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::BindExecuteAwaitingRfqDml { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -711,7 +748,7 @@ pub(crate) fn dispatch(
                     },
                 ),
             },
-            Err(cause) => errored(Some(reply.consume()), cause),
+            Err(payload_len) => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::BindExecuteAwaitingRfqSelect { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -812,7 +849,7 @@ pub(crate) fn dispatch(
                     },
                 ),
             },
-            Err(cause) => errored(Some(reply.consume()), cause),
+            Err(payload_len) => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::DescribeStatementAwaitingRfq { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -859,7 +896,7 @@ pub(crate) fn dispatch(
                     crate::action::DescribePortalCompletePayload { rows, tx_status },
                 ),
             },
-            Err(cause) => errored(Some(reply.consume()), cause),
+            Err(payload_len) => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::DescribePortalAwaitingRfq { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -898,10 +935,14 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
     match payload {
         [a, b, c, d, rest @ ..] => {
             let raw = u32::from_be_bytes([*a, *b, *c, *d]);
-            let code = crate::wire::AuthSubCode::try_from_u32(raw)
-                .ok_or(ProtocolError::UnsupportedAuthMethod {
-                    sub_code: crate::error::AuthSubCodeClass::Unknown(raw),
-                })?;
+            // F-046 (pass-#8): `try_from_u32` returns `Result<Self, u32>`
+            // (not `Option<Self>`) — forward the rejected raw u32 via
+            // `map_err`, no separate `.ok_or(..raw)` layer needed.
+            let code = crate::wire::AuthSubCode::try_from_u32(raw).map_err(|unknown| {
+                ProtocolError::UnsupportedAuthMethod {
+                    sub_code: crate::error::AuthSubCodeClass::Unknown(unknown),
+                }
+            })?;
             Ok((code, rest))
         }
         _ => Err(ProtocolError::MalformedAuthentication {
@@ -1532,34 +1573,40 @@ fn advance_to_drain_after_error(
 /// typed [`crate::action::TxStatus`].
 ///
 /// PG §55.7 `ReadyForQuery` carries exactly one byte: `'I'`, `'T'`,
-/// or `'E'`. Any other shape is a wire violation. Centralised
-/// pass-#7 audit F13: prior to this there were 4 parallel `match
-/// payload { [b] => ..., other => ... }` patterns across Ping /
-/// SimpleQueryAwaitingRfq / ParseAwaitingRfq / BindExecuteAwaitingRfq*
-/// / DescribeStatementAwaitingRfq / DescribePortalAwaitingRfq —
-/// drift surface for a future change that modifies one handler
-/// (e.g., adding a new `TxStatus` variant) and forgets another.
+/// or `'E'`. Any other shape is a wire violation.
 ///
-/// Single-point classifier = tier-3 audit (6 parallel matches) →
-/// tier-2 structural (one function, one literal `payload_len: 1`).
+/// # F-048 (pass-#8) — narrow return type
+///
+/// Returns `Result<TxStatus, usize>` — Err carries the offending
+/// `payload_len` as a bare `usize`. Callers wrap via
+/// `.map_err(|payload_len| ProtocolError::MalformedReadyForQuery { payload_len })`.
+///
+/// Prior shape `Result<TxStatus, ProtocolError>` forced every dispatch
+/// arm to reserve ~304 B of stack for the return slot (dominated by
+/// ProtocolError::ServerErrorResponse). Narrowing to `Result<_, usize>`
+/// shrinks the slot to 16 B (usize + discriminant + padding). 10+
+/// dispatch call sites pay for this return.
+///
+/// # F-013 consolidation
+///
+/// Centralised pass-#7 audit F13 — prior to F13 there were 4+ parallel
+/// `match payload { [b] => ..., other => ... }` patterns across every
+/// `*AwaitingRfq` state. Single-point classifier closes drift between
+/// handlers if a future change alters the `TxStatus` variant set.
 #[cold]
 #[inline]
-#[expect(
-    clippy::result_large_err,
-    reason = "no_alloc: Box unavailable; ProtocolError is Copy-POD and lives on error paths only. The `MalformedReadyForQuery` variant is small (one `usize` payload_len) but the overall `ProtocolError` sum ~300 B dominates. Error path only — not hot."
-)]
 fn parse_rfq_payload(
     payload: &[u8],
-) -> Result<crate::action::TxStatus, ProtocolError> {
+) -> Result<crate::action::TxStatus, usize> {
     match payload {
-        [tx_byte] => crate::action::TxStatus::try_from_byte(*tx_byte).ok_or(
-            // `payload_len: 1` is structurally pinned by the `[tx_byte]`
-            // slice pattern above — the slice matched exactly one element.
-            ProtocolError::MalformedReadyForQuery { payload_len: 1 },
-        ),
-        other => Err(ProtocolError::MalformedReadyForQuery {
-            payload_len: other.len(),
-        }),
+        // `[tx_byte]` pattern proves payload_len == 1 structurally.
+        // F-009: `try_from_byte` returns `Result<Self, u8>`; we drop
+        // the rejected byte and forward just the length-1 classification.
+        // Diagnostic-wise the rejected byte is not currently surfaced
+        // further upstream; if `MalformedReadyForQuery` gains a `byte`
+        // field in the future, this map_err flips to pass it through.
+        [tx_byte] => crate::action::TxStatus::try_from_byte(*tx_byte).map_err(|_| 1usize),
+        other => Err(other.len()),
     }
 }
 
@@ -1622,8 +1669,17 @@ fn parse_command_tag(payload: &[u8]) -> Result<crate::error::BoundedStr<32>, Pro
             payload_len: payload.len(),
         });
     };
-    let s = core::str::from_utf8(body).unwrap_or("");
-    Ok(BoundedStr::from_str_truncating(s))
+    // F-045 (pass-#8): use `from_bytes_lossy` — preserves ASCII subset,
+    // coerces non-ASCII / invalid UTF-8 to `?`. Prior
+    // `core::str::from_utf8(body).unwrap_or("")` silently dropped the
+    // entire tag on any single invalid byte (tier-4 silent-pass). Now a
+    // buggy proxy corrupting a tag byte leaves the rest readable and
+    // marks corruption with `?` in the Debug/Display output.
+    //
+    // Mirrors F22's treatment of ErrorResponse fields (message / detail
+    // / hint) — CommandComplete was missed in that pass; F-045 closes
+    // the class.
+    Ok(BoundedStr::from_bytes_lossy(body))
 }
 
 /// Parse BackendKeyData payload: 8 bytes = pid(i32 BE) + secret_key(i32 BE).

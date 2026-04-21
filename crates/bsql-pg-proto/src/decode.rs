@@ -133,6 +133,15 @@ impl RowDesc {
     };
 
     /// Number of populated columns.
+    ///
+    /// # Why not `const fn`
+    ///
+    /// F-034 (pass-#8) considered making this `const`, but `impl
+    /// From<u16> for usize` is not yet stable as a const trait
+    /// (rust-lang issue #143874). Under the forbid-bundle we cannot
+    /// use `self.n_columns as usize`. When the const `From` impl
+    /// stabilises, this can flip to `const fn` without touching
+    /// the call surface.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
@@ -152,6 +161,17 @@ impl RowDesc {
     #[inline]
     #[must_use]
     pub fn columns(&self) -> &[ColumnDesc] {
+        // F-035 (pass-#8): invariant `self.n_columns <= MAX_ROW_COLUMNS`
+        // is maintained by `parse_row_description` (hard-caps declared
+        // count) and by `EMPTY` (zero). The `.get(..self.len())` None
+        // branch is architecturally dead; debug-builds assert so a
+        // future constructor that skipped the cap fails tests loudly.
+        debug_assert!(
+            self.len() <= self.columns.len(),
+            "RowDesc invariant: n_columns ({}) must not exceed MAX_ROW_COLUMNS ({})",
+            self.len(),
+            self.columns.len(),
+        );
         self.columns.get(..self.len()).unwrap_or(&[])
     }
 
@@ -175,6 +195,19 @@ impl PartialEq for RowDesc {
     }
 }
 impl Eq for RowDesc {}
+
+// F-037 (pass-#8): SIMD-wide Eq invariant pin. `[ColumnDesc; MAX_ROW_COLUMNS]`
+// is 32 × 8 = 256 bytes — fits 8 AVX2 register compares (32 B/reg
+// × 8 = 256 B). Branchless full-array `memcmp` is faster than a
+// populated-prefix length-dispatch + shortened compare for typical
+// column counts. If a future bump pushes MAX_ROW_COLUMNS past 32,
+// revisit eq strategy (populated-prefix may become cheaper). Mirrors
+// the ParamOids SIMD-width assertion in action.rs.
+const _: () = assert!(
+    core::mem::size_of::<[ColumnDesc; MAX_ROW_COLUMNS]>() <= 256,
+    "RowDesc eq is SIMD-wide (≤256 B = 8 AVX2 regs). \
+     Revisit populated-prefix eq if MAX_ROW_COLUMNS grows > 32.",
+);
 
 impl fmt::Display for FormatCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -405,6 +438,20 @@ pub enum DecodeError {
     /// DataRow body too short to contain the 2-byte column count
     /// header. Malformed frame.
     TruncatedRow,
+    /// DataRow's 2-byte column count header parses as a negative
+    /// signed value (PG §55.7 requires a non-negative i16). Wire
+    /// protocol violation — servers never send this under spec
+    /// compliance; arrival implies a bug / corruption / adversarial
+    /// frame. Pass-#8 F-041.
+    ///
+    /// Split from [`Self::TruncatedRow`]: the latter means "body too
+    /// short"; this means "column count is signed-invalid." Different
+    /// classes, different operator diagnostics.
+    InvalidColumnCount {
+        /// The offending i16 count value (always negative; positive
+        /// values are well-formed and don't reach this arm).
+        count: i16,
+    },
     /// A column's 4-byte length prefix is missing (fewer bytes
     /// remain than expected). `column_idx` is 0-based, bounded by
     /// [`MAX_ROW_COLUMNS`] = 32 — fits `u8` with headroom.
@@ -461,6 +508,10 @@ impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TruncatedRow => f.write_str("DataRow body too short for column count header"),
+            Self::InvalidColumnCount { count } => write!(
+                f,
+                "DataRow column count header is negative ({count}); PG §55.7 requires a non-negative i16",
+            ),
             Self::TruncatedColumnLen { column_idx } => {
                 write!(f, "column {column_idx}: length prefix truncated")
             }
@@ -522,7 +573,10 @@ impl<'a> DataRowRef<'a> {
         let (count_bytes, _) = body.split_first_chunk::<2>().ok_or(DecodeError::TruncatedRow)?;
         let n_columns_i16 = i16::from_be_bytes(*count_bytes);
         if n_columns_i16 < 0 {
-            return Err(DecodeError::TruncatedRow);
+            // Pass-#8 F-041: distinguish "body too short" (TruncatedRow)
+            // from "count header signed-invalid" (InvalidColumnCount).
+            // Different classes; different operator diagnostics.
+            return Err(DecodeError::InvalidColumnCount { count: n_columns_i16 });
         }
         // `n_columns_i16 >= 0` (proved above) ⟹ `try_from` infallible.
         // The Err arm is architecturally dead, but classified as
@@ -595,6 +649,23 @@ pub struct ColumnsIter<'a> {
     column_idx: u8,
 }
 
+impl<'a> ColumnsIter<'a> {
+    /// F-042 (pass-#8): centralised fuse-and-error helper.
+    ///
+    /// Before F-042 the pattern `self.remaining = &[]; self.columns_left = 0;
+    /// return Some(Err(...))` appeared at 4 sites in `next`. A future
+    /// refactor adding a 5th error arm and forgetting the fuse would
+    /// let iteration continue past the error — drift-prone. This
+    /// helper makes the fuse+error path a single expression and
+    /// makes every new error arm structurally-fused by default.
+    #[inline]
+    fn fuse_and_error(&mut self, e: DecodeError) -> Option<Result<Option<&'a [u8]>, DecodeError>> {
+        self.remaining = &[];
+        self.columns_left = 0;
+        Some(Err(e))
+    }
+}
+
 impl<'a> Iterator for ColumnsIter<'a> {
     type Item = Result<Option<&'a [u8]>, DecodeError>;
 
@@ -609,12 +680,7 @@ impl<'a> Iterator for ColumnsIter<'a> {
         // 4-byte length prefix.
         let (len_bytes, after_len) = match self.remaining.split_first_chunk::<4>() {
             Some(pair) => pair,
-            None => {
-                // Fuse: drop remaining bytes so subsequent `next` is None.
-                self.remaining = &[];
-                self.columns_left = 0;
-                return Some(Err(DecodeError::TruncatedColumnLen { column_idx: idx }));
-            }
+            None => return self.fuse_and_error(DecodeError::TruncatedColumnLen { column_idx: idx }),
         };
         let len = i32::from_be_bytes(*len_bytes);
 
@@ -625,24 +691,20 @@ impl<'a> Iterator for ColumnsIter<'a> {
         }
 
         if len < 0 {
-            self.remaining = &[];
-            self.columns_left = 0;
-            return Some(Err(DecodeError::NegativeColumnLength {
+            return self.fuse_and_error(DecodeError::NegativeColumnLength {
                 column_idx: idx,
                 length: len,
-            }));
+            });
         }
 
         // `len >= 0` ⟹ `try_from` infallible; defensive fallback.
         let len_usize = match usize::try_from(len) {
             Ok(v) => v,
             Err(_) => {
-                self.remaining = &[];
-                self.columns_left = 0;
-                return Some(Err(DecodeError::NegativeColumnLength {
+                return self.fuse_and_error(DecodeError::NegativeColumnLength {
                     column_idx: idx,
                     length: len,
-                }));
+                });
             }
         };
 
@@ -653,13 +715,11 @@ impl<'a> Iterator for ColumnsIter<'a> {
             }
             None => {
                 let remaining = after_len.len();
-                self.remaining = &[];
-                self.columns_left = 0;
-                Some(Err(DecodeError::TruncatedColumnData {
+                self.fuse_and_error(DecodeError::TruncatedColumnData {
                     column_idx: idx,
                     declared_len: len_usize,
                     remaining,
-                }))
+                })
             }
         }
     }
@@ -719,6 +779,17 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 /// the binary codec. Text vs binary dispatch at the caller level
 /// via `ColumnDesc::format_code`.
 pub trait FromPgText<'a>: Sized {
+    /// PG type OID this text decoder targets.
+    ///
+    /// F-038 (pass-#8): parallel to [`FromPgBinary::OID`] and
+    /// [`EncodeBinary::OID`]. Enables the future `query!` macro
+    /// (Phase 2) to validate at compile time that a Rust type
+    /// chosen by the user matches the PG catalog OID the server
+    /// declared in `RowDescription` — independent of which
+    /// format (text/binary) the column uses. Symmetry-complete
+    /// three-trait family.
+    const OID: u32;
+
     /// Decode the column's text-format bytes.
     fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError>;
 }
@@ -727,9 +798,10 @@ pub trait FromPgText<'a>: Sized {
 // stdlib `FromStr` which validates range + rejects trailing
 // garbage.
 macro_rules! impl_from_pg_text_int {
-    ($($t:ty),+ $(,)?) => {
+    ($($t:ty = $oid:expr),+ $(,)?) => {
         $(
             impl FromPgText<'_> for $t {
+                const OID: u32 = $oid;
                 #[inline]
                 fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
                     let s = core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)?;
@@ -740,12 +812,18 @@ macro_rules! impl_from_pg_text_int {
     };
 }
 
-impl_from_pg_text_int!(i16, i32, i64, u32);
+impl_from_pg_text_int!(
+    i16 = oids::INT2,
+    i32 = oids::INT4,
+    i64 = oids::INT8,
+    u32 = oids::OID,
+);
 
 /// PG boolean text format: `"t"` = true, `"f"` = false. Anything
 /// else (including `"true"`, `"TRUE"`, `"1"`, `"0"`) classifies as
 /// [`DecodeError::BoolParse`] — PG is strict about its own format.
 impl FromPgText<'_> for bool {
+    const OID: u32 = oids::BOOL;
     #[inline]
     fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
         match bytes {
@@ -758,6 +836,7 @@ impl FromPgText<'_> for bool {
 
 /// Text column as `&str` — zero-copy, validates UTF-8 only.
 impl<'a> FromPgText<'a> for &'a str {
+    const OID: u32 = oids::TEXT;
     #[inline]
     fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError> {
         core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
@@ -905,6 +984,11 @@ impl<'a> FromPgBinary<'a> for &'a str {
 // Compile-time symmetry pins: text and binary decoders for the
 // same Rust type MUST target the same PG type OID. A refactor that
 // breaks this breaks the build.
+//
+// F-038 (pass-#8): `FromPgText` now also carries `OID`; the three
+// traits (text / binary / encode) form a closed symmetry family.
+// Adding a new Rust type that impls any ONE of these forces matching
+// impls + identical OIDs across all three, verified here.
 const _: () = {
     assert!(<i16 as FromPgBinary>::OID == oids::INT2);
     assert!(<i32 as FromPgBinary>::OID == oids::INT4);
@@ -912,6 +996,17 @@ const _: () = {
     assert!(<u32 as FromPgBinary>::OID == oids::OID);
     assert!(<bool as FromPgBinary>::OID == oids::BOOL);
     assert!(<&str as FromPgBinary>::OID == oids::TEXT);
+    // Text↔binary OID symmetry: the same Rust type MUST target the
+    // same PG type OID across text and binary decoders. A refactor
+    // that skewed one against the other would mean the same Rust
+    // type decoded differently depending on `ColumnDesc::format_code`
+    // — a classification bug. Pinned below.
+    assert!(<i16 as FromPgText>::OID == <i16 as FromPgBinary>::OID);
+    assert!(<i32 as FromPgText>::OID == <i32 as FromPgBinary>::OID);
+    assert!(<i64 as FromPgText>::OID == <i64 as FromPgBinary>::OID);
+    assert!(<u32 as FromPgText>::OID == <u32 as FromPgBinary>::OID);
+    assert!(<bool as FromPgText>::OID == <bool as FromPgBinary>::OID);
+    assert!(<&str as FromPgText>::OID == <&str as FromPgBinary>::OID);
 };
 
 // ═════════════════════════════════════════════════════════════════
@@ -1431,15 +1526,18 @@ mod data_row_tests {
     }
 
     /// Invariant: negative column count (i.e. count header decodes to
-    /// a negative `i16`) is classified as `TruncatedRow`.
+    /// a negative `i16`) is classified as `InvalidColumnCount { count }`
+    /// with the offending i16 preserved for diagnostics. Pass-#8 F-041
+    /// split this class out from the `TruncatedRow` "body too short"
+    /// bucket to give operators distinct root causes.
     #[test]
     fn negative_column_count() {
         let mut body = alloc::vec::Vec::new();
         body.extend_from_slice(&(-3i16).to_be_bytes());
         let result = DataRowRef::parse(&body);
         assert!(
-            matches!(result, Err(DecodeError::TruncatedRow)),
-            "negative count: expected TruncatedRow, got {result:?}",
+            matches!(result, Err(DecodeError::InvalidColumnCount { count: -3 })),
+            "negative count: expected InvalidColumnCount {{ count: -3 }}, got {result:?}",
         );
     }
 

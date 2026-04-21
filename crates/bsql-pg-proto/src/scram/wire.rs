@@ -238,6 +238,21 @@ pub enum ScramError {
     BufferOverflow,
     /// Server offered no supported SCRAM mechanism.
     NoSupportedMechanism,
+    /// OS-level randomness source unavailable or failing.
+    ///
+    /// Emitted when `getrandom::getrandom` fails to fill the SCRAM
+    /// client-nonce buffer. On Linux this typically means
+    /// `/dev/urandom` is inaccessible (capability-restricted
+    /// container, seccomp filter) or the kernel entropy pool is
+    /// draining (`EAGAIN`). On other platforms: crypto-subsystem
+    /// unavailable.
+    ///
+    /// Pass-#8 F-025: prior to this classification, randomness
+    /// failures masqueraded as [`Self::BufferOverflow`] — operator
+    /// debugging auth errors saw "message buffer overflow" when the
+    /// actual cause was `/dev/urandom` EAGAIN. Now the diagnostic
+    /// names the real root cause.
+    RandomnessUnavailable,
 }
 
 impl fmt::Display for ScramError {
@@ -266,6 +281,9 @@ impl fmt::Display for ScramError {
             Self::InvalidSalt => f.write_str("SCRAM: invalid salt"),
             Self::ServerNonceTooLong => f.write_str("SCRAM: server nonce too long"),
             Self::BufferOverflow => f.write_str("SCRAM: message buffer overflow"),
+            Self::RandomnessUnavailable => f.write_str(
+                "SCRAM: OS randomness source unavailable (getrandom failed — /dev/urandom inaccessible, entropy pool draining, or crypto subsystem down)",
+            ),
             Self::NoSupportedMechanism => {
                 f.write_str("SCRAM: server offered no supported authentication mechanism")
             }
@@ -554,7 +572,11 @@ fn base64_decode_bounded(
 #[cfg(not(test))]
 pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
     let mut raw = zeroize::Zeroizing::new([0u8; 18]);
-    getrandom::getrandom(raw.as_mut()).map_err(|_| ScramError::BufferOverflow)?;
+    // F-025 (pass-#8): classify randomness failure separately from
+    // buffer overflow. Prior `map_err(|_| BufferOverflow)` produced
+    // misleading operator diagnostics on `/dev/urandom` EAGAIN or
+    // container-restricted getrandom calls.
+    getrandom::getrandom(raw.as_mut()).map_err(|_| ScramError::RandomnessUnavailable)?;
     let mut b64_buf = [0u8; MAX_CLIENT_NONCE_B64_LEN];
     let written = base64_encode_to_buf(&*raw, &mut b64_buf)?;
     let mut result = heapless::Vec::new();
@@ -578,7 +600,10 @@ pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NON
         } else {
             // No injection — use real randomness.
             let mut raw = zeroize::Zeroizing::new([0u8; 18]);
-            getrandom::getrandom(raw.as_mut()).map_err(|_| ScramError::BufferOverflow)?;
+            // F-025 (pass-#8): mirror the production path's typed
+            // classification — RandomnessUnavailable on getrandom failure.
+            getrandom::getrandom(raw.as_mut())
+                .map_err(|_| ScramError::RandomnessUnavailable)?;
             let mut b64_buf = [0u8; MAX_CLIENT_NONCE_B64_LEN];
             let written = base64_encode_to_buf(&*raw, &mut b64_buf)?;
             let mut result = heapless::Vec::new();
@@ -633,20 +658,23 @@ pub(crate) enum ParseU32Error {
 }
 
 /// Parse a decimal u32 from ASCII bytes with typed error classification.
+///
+/// F-022 (pass-#8): swapped to stdlib `u32::from_str_radix` via
+/// `core::str::from_utf8` + `ParseIntError::kind()` mapping. Stdlib
+/// impl is heavily optimised (LLVM folds pure integer parsing,
+/// SIMD fast path on some targets). Kind-mapping preserves the
+/// three typed variants (`Empty`, `InvalidDigit`, `Overflow`) that
+/// callers may eventually surface; current SCRAM callers collapse
+/// all three via `.map_err(|_| MalformedServerFirst)`.
 fn parse_u32(bytes: &[u8]) -> Result<u32, ParseU32Error> {
-    if bytes.is_empty() {
-        return Err(ParseU32Error::Empty);
-    }
-    let mut result: u32 = 0;
-    for b in bytes {
-        let digit = (*b).checked_sub(b'0').ok_or(ParseU32Error::InvalidDigit)?;
-        if digit > 9 {
-            return Err(ParseU32Error::InvalidDigit);
-        }
-        result = result.checked_mul(10).ok_or(ParseU32Error::Overflow)?;
-        result = result.checked_add(u32::from(digit)).ok_or(ParseU32Error::Overflow)?;
-    }
-    Ok(result)
+    use core::num::IntErrorKind;
+    let s = core::str::from_utf8(bytes).map_err(|_| ParseU32Error::InvalidDigit)?;
+    s.parse::<u32>().map_err(|e| match e.kind() {
+        IntErrorKind::Empty => ParseU32Error::Empty,
+        IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => ParseU32Error::Overflow,
+        // `InvalidDigit` (and any future IntErrorKind variant) collapses here.
+        _ => ParseU32Error::InvalidDigit,
+    })
 }
 
 #[cfg(test)]

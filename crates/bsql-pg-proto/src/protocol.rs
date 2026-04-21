@@ -473,11 +473,7 @@ impl PgProtocol {
                     );
                     break;
                 }
-                HeaderParse::Ok {
-                    tag,
-                    declared_len: _,
-                    total_len,
-                } => {
+                HeaderParse::Ok { tag, total_len } => {
                     if self.read_buf.unread().len() < total_len {
                         // Body not yet fully buffered.
                         break;
@@ -544,9 +540,18 @@ impl PgProtocol {
                     // Derived offsets (payload_start, payload_end)
                     // live inside `FrameCoords` and cannot be
                     // mis-ordered by a caller.
-                    let frame_start = AbsFrameStart(self.read_buf.cursor_position());
-                    let frame_len = FrameTotalLen(total_len);
-                    let populated = PopulatedLen(self.read_buf.populated().len());
+                    // F-018 (pass-#8): private fields, explicit
+                    // `::new` constructor at each site. Swap
+                    // protection is now structural: a caller who
+                    // swapped `AbsFrameStart::new(total_len)` and
+                    // `FrameTotalLen::new(cursor_position())` would
+                    // compile but the semantic is wrong — the
+                    // typed FrameCoords::new argument order is the
+                    // only remaining shield (and is tier-1 compile
+                    // via distinct types).
+                    let frame_start = AbsFrameStart::new(self.read_buf.cursor_position());
+                    let frame_len = FrameTotalLen::new(total_len);
+                    let populated = PopulatedLen::new(self.read_buf.populated().len());
 
                     // DEF-121 budget gate — prevent mid-transition
                     // overflow. A dispatch iteration can emit up to

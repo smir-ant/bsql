@@ -97,6 +97,20 @@ impl fmt::Display for Severity {
     }
 }
 
+// F-054 (pass-#8): niche-pack invariant pin. `Severity` is `#[repr(u8)]`
+// with 9 variants occupying discriminants 0..=8; values 9..=255 are
+// unused, giving `Option<Severity>` a niche for `None` without
+// growing the layout. The 1-byte total for `Option<Severity>` is
+// load-bearing — `parse_error_response` uses it as the "seen /
+// not-seen" severity slot (DEF-060 pattern) and every byte of the
+// 280-byte ProtocolError variant matters. Adding a 248th+ variant
+// to Severity would overflow the niche and silently grow the
+// Option to 2 bytes — this assert fails the build instead.
+const _: () = assert!(
+    core::mem::size_of::<Option<Severity>>() == 1,
+    "Severity niche-pack: Option<Severity> must stay 1 byte via unused discriminant range",
+);
+
 /// PostgreSQL SQLSTATE code — always exactly 5 ASCII chars (per spec).
 ///
 /// Packed as `[u8; 5]` newtype: 5 bytes, `Copy`, no allocation. If
@@ -576,8 +590,15 @@ pub enum ErrorKind {
     /// Authentication negotiation failed — unsupported method or
     /// SCRAM exchange error. [`ProtocolError::UnsupportedAuthMethod`] +
     /// [`ProtocolError::ScramError`] +
-    /// [`ProtocolError::UnsupportedProtocolOption`] +
-    /// [`ProtocolError::StartupAlreadyInProgress`].
+    /// [`ProtocolError::UnsupportedProtocolOption`].
+    ///
+    /// **Pass-#8 F-052 (2026-04-21).** Prior to pass-#8 this bucket
+    /// also included `StartupAlreadyInProgress` and `CommandInProgress`
+    /// — both client-side push-ordering errors, NOT server-driven auth
+    /// failures. Wrappers reading `ConnectionAlreadyClosed { prior_kind }`
+    /// from a push-race would see `Auth` and report "authentication
+    /// error" when the real cause was the user pushing too fast. Those
+    /// variants now route to [`Self::ClientOrdering`].
     Auth = 3,
     /// Internal invariant broken — bug in this crate.
     /// Covers [`ProtocolError::OutboundFrameBuildUnreachable`],
@@ -588,6 +609,18 @@ pub enum ErrorKind {
     /// ever appears in `FailReply` replies, never in state (the state
     /// retains the real prior kind).
     AlreadyClosed = 5,
+    /// Client-side command-ordering error — caller pushed a new
+    /// command while one was still in flight, or pushed Startup
+    /// after Startup. Covers
+    /// [`ProtocolError::CommandInProgress`] +
+    /// [`ProtocolError::StartupAlreadyInProgress`].
+    ///
+    /// **Not a server auth failure.** This classification distinguishes
+    /// the wrapper-side bug class ("your code ordering") from genuine
+    /// auth path errors ([`Self::Auth`]) so diagnostics in
+    /// `ConnectionAlreadyClosed { prior_kind }` correctly identify
+    /// the culprit. Pass-#8 F-052. 1 byte (repr(u8)).
+    ClientOrdering = 6,
 }
 
 impl ProtocolError {
@@ -613,9 +646,13 @@ impl ProtocolError {
             Self::ServerErrorResponse { .. } => ErrorKind::ServerError,
             Self::UnsupportedAuthMethod { .. }
             | Self::UnsupportedProtocolOption
-            | Self::Scram(_)
-            | Self::StartupAlreadyInProgress
-            | Self::CommandInProgress => ErrorKind::Auth,
+            | Self::Scram(_) => ErrorKind::Auth,
+            // F-052 (pass-#8): client-side push-ordering bugs must
+            // NOT route to `Auth` — they're the user calling push_command
+            // out of order, not a server auth failure. Wrappers reading
+            // `ConnectionAlreadyClosed { prior_kind: Auth }` would
+            // report a misleading "authentication error" diagnostic.
+            Self::StartupAlreadyInProgress | Self::CommandInProgress => ErrorKind::ClientOrdering,
             Self::MalformedCommandComplete { .. }
             | Self::MalformedRowDescription { .. }
             | Self::TooManyColumns { .. }
@@ -668,8 +705,22 @@ impl fmt::Display for ProtocolError {
                 severity,
                 code,
                 message,
-                ..
-            } => write!(f, "server error: {severity} ({code}): {message}"),
+                detail,
+                hint,
+            } => {
+                // F-053 (pass-#8): include detail + hint when non-empty.
+                // Prior Display dropped both, losing operator-actionable
+                // context (e.g. "Key (id)=(42) already exists" detail
+                // and "Use ON CONFLICT..." hint).
+                write!(f, "server error: {severity} ({code}): {message}")?;
+                if !detail.as_str().is_empty() {
+                    write!(f, " — detail: {detail}")?;
+                }
+                if !hint.as_str().is_empty() {
+                    write!(f, " — hint: {hint}")?;
+                }
+                Ok(())
+            },
             // Typed Severity + SqlStateCode + BoundedStr all impl
             // Display — no extra plumbing needed.
             Self::UnsupportedAuthMethod { sub_code } => {
