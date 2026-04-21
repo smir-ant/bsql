@@ -650,8 +650,16 @@ pub enum Reply {
     },
 
     /// A `Parse` command succeeded (server accepted the prepared
-    /// statement). Carries no additional data.
-    ParseComplete,
+    /// statement). Carries the transaction-status byte from the
+    /// trailing `ReadyForQuery` — Parse is a schema operation that
+    /// doesn't change tx state by itself, but surfacing it here
+    /// keeps Reply variants uniform (Pong / StartupComplete /
+    /// QueryComplete all carry tx_status) and preserves information
+    /// the dispatcher already validated. 1c-3a.
+    ParseComplete {
+        /// Transaction status from the trailing `ReadyForQuery`.
+        tx_status: TxStatus,
+    },
 
     /// A `Close` of a prepared statement or portal succeeded.
     /// Carries no additional data.
@@ -753,16 +761,23 @@ impl From<QueryCompletePayload> for Reply {
 
 /// Typed payload for [`crate::reply_id::ParseKind`] replies.
 ///
-/// `ParseComplete` carries no body; the struct is a ZST.
-/// Preserves the DEF-112 sealed-deliver pathway for Parse's
-/// `ReplyId<ParseKind>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ParseCompletePayload;
+/// Carries the transaction-status byte from the trailing RFQ —
+/// uniform with `PongPayload` / `StartupCompletePayload` /
+/// `QueryCompletePayload`. Was a ZST in 1c-2a; widened in 1c-3a
+/// to preserve the tx_status value the dispatcher already
+/// validates (architect-audit silent-discard fix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseCompletePayload {
+    /// Transaction-status indicator from the trailing `ReadyForQuery`.
+    pub tx_status: TxStatus,
+}
 
 impl From<ParseCompletePayload> for Reply {
     #[inline]
-    fn from(_: ParseCompletePayload) -> Self {
-        Self::ParseComplete
+    fn from(p: ParseCompletePayload) -> Self {
+        Self::ParseComplete {
+            tx_status: p.tx_status,
+        }
     }
 }
 

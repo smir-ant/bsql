@@ -208,6 +208,20 @@ impl WriteBuf {
             .map_err(|_| WriteBufFull)
     }
 
+    /// Push a big-endian `i16`. Parallel to [`push_i32_be`] /
+    /// [`push_u32_be`] — used by Extended Query frame builders
+    /// (Parse's `n_param_types`, Bind's per-column format codes,
+    /// etc.). 1c-3a.
+    ///
+    /// [`push_i32_be`]: Self::push_i32_be
+    /// [`push_u32_be`]: Self::push_u32_be
+    pub fn push_i16_be(&mut self, val: i16) -> Result<(), WriteBufFull> {
+        let bytes = val.to_be_bytes();
+        self.inner
+            .extend_from_slice(&bytes)
+            .map_err(|_| WriteBufFull)
+    }
+
     /// Push raw bytes.
     pub fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
         self.inner

@@ -510,7 +510,7 @@ pub(crate) fn dispatch(
         }
 
         // DrainRfqAfterError: silent consume of Z → Idle
-        (ProtoState::SimpleQueryDrainRfqAfterError, TAG_READY_FOR_QUERY) => {
+        (ProtoState::DrainRfqAfterError, TAG_READY_FOR_QUERY) => {
             match payload {
                 [_] => DispatchOutcome::AdvancedSilent {
                     new_state: ProtoState::Idle,
@@ -523,7 +523,7 @@ pub(crate) fn dispatch(
                 ),
             }
         }
-        (ProtoState::SimpleQueryDrainRfqAfterError, other) => {
+        (ProtoState::DrainRfqAfterError, other) => {
             errored(None, ProtocolError::UnexpectedFrame { tag: other })
         }
 
@@ -538,7 +538,7 @@ pub(crate) fn dispatch(
         // State lifecycle:
         //   Idle → ParseAwaitingParseComplete(reply) → ParseAwaitRfq(reply) → Idle
         //                                            ↘ (on E)
-        //                                              SimpleQueryDrainRfqAfterError → Idle
+        //                                              DrainRfqAfterError → Idle
         // =============================================================
 
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_PARSE_COMPLETE) => {
@@ -549,11 +549,11 @@ pub(crate) fn dispatch(
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_ERROR_RESPONSE) => {
             // Recoverable parse error — PG spec sends Z after E, so
             // drain it silently and return to Idle (reusing the
-            // `SimpleQueryDrainRfqAfterError` variant — both drain
+            // `DrainRfqAfterError` variant — both drain
             // the same trailing RFQ pattern).
             let cause = parse_error_response(payload);
             DispatchOutcome::AdvancedWithAction {
-                new_state: ProtoState::SimpleQueryDrainRfqAfterError,
+                new_state: ProtoState::DrainRfqAfterError,
                 action: StagedAction::FailReply {
                     id: reply.consume(),
                     cause,
@@ -565,22 +565,19 @@ pub(crate) fn dispatch(
         }
 
         (ProtoState::ParseAwaitRfq(reply), TAG_READY_FOR_QUERY) => match payload {
-            // tx_status byte is validated here but not forwarded —
-            // `ParseCompletePayload` is a ZST (no tx_status field),
-            // matching the PG spec that Parse is a schema operation
-            // with no transactional side-effect the caller needs to
-            // observe. An invalid byte still classifies as malformed
-            // so users never see a mis-framed RFQ.
-            [tx_byte] if crate::action::TxStatus::try_from_byte(*tx_byte).is_some() => {
-                DispatchOutcome::AdvancedWithAction {
+            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
+                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
                     new_state: ProtoState::Idle,
-                    action: crate::action::deliver(reply, crate::action::ParseCompletePayload),
-                }
-            }
-            [_] => errored(
-                Some(reply.consume()),
-                ProtocolError::MalformedReadyForQuery { payload_len: 1 },
-            ),
+                    action: crate::action::deliver(
+                        reply,
+                        crate::action::ParseCompletePayload { tx_status },
+                    ),
+                },
+                None => errored(
+                    Some(reply.consume()),
+                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+                ),
+            },
             other => errored(
                 Some(reply.consume()),
                 ProtocolError::MalformedReadyForQuery {
@@ -1173,7 +1170,7 @@ fn advance_to_drain_after_error(
 ) -> DispatchOutcome {
     let cause = parse_error_response(payload);
     DispatchOutcome::AdvancedWithAction {
-        new_state: ProtoState::SimpleQueryDrainRfqAfterError,
+        new_state: ProtoState::DrainRfqAfterError,
         action: StagedAction::FailReply {
             id: reply.consume(),
             cause,

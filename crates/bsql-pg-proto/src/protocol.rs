@@ -599,7 +599,7 @@ impl PgProtocol {
         // `NonZeroU64` individually.
         let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
         let raw_id: Option<core::num::NonZeroU64> = match prev {
-            ProtoState::Idle | ProtoState::SimpleQueryDrainRfqAfterError => None,
+            ProtoState::Idle | ProtoState::DrainRfqAfterError => None,
             ProtoState::AwaitingPingReply(id) => Some(id.consume()),
             ProtoState::ConnectingStartupTrust { reply }
             | ProtoState::ConnectingStartupScram { reply, .. }
@@ -780,7 +780,7 @@ fn compute_push_ping(
         other @ (ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitRfq(_)) => {
             emit_actions!(staged, budget: 1, [
@@ -896,7 +896,7 @@ fn compute_push_startup(
         other @ (ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitRfq(_)) => {
             emit_actions!(staged, budget: 1, [
@@ -987,7 +987,7 @@ fn compute_push_simple_query(
         | ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitRfq(_)) => {
             emit_actions!(staged, budget: 1, [
@@ -1044,7 +1044,7 @@ fn build_parse_message(
         w.push_nul_terminated(stmt_name.as_bytes())?;
         w.push_nul_terminated(sql.as_bytes())?;
         // n_param_types = 0; 1c-3b will widen to push actual OIDs here.
-        w.push_bytes(&0i16.to_be_bytes())
+        w.push_i16_be(0)
     })?;
     crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
 }
@@ -1133,7 +1133,7 @@ fn compute_push_parse(
         | ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitRfq(_)) => {
             emit_actions!(staged, budget: 1, [
@@ -1181,7 +1181,7 @@ fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
         | ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::DrainRfqAfterError
         | ProtoState::ParseAwaitingParseComplete(_)
         | ProtoState::ParseAwaitRfq(_) => true,
         ProtoState::ConnectingStartupTrust { .. }
@@ -1375,7 +1375,7 @@ mod allows_unsolicited_param_status_tests {
         match state {
             ProtoState::Idle
             | ProtoState::Errored(_)
-            | ProtoState::SimpleQueryDrainRfqAfterError => {}
+            | ProtoState::DrainRfqAfterError => {}
             ProtoState::AwaitingPingReply(id) => {
                 id.consume();
             }
@@ -1505,7 +1505,7 @@ mod allows_unsolicited_param_status_tests {
         assert!(allows_unsolicited_param_status(&q_rfq));
         consume_state(q_rfq);
 
-        let q_drain = ProtoState::SimpleQueryDrainRfqAfterError;
+        let q_drain = ProtoState::DrainRfqAfterError;
         assert!(allows_unsolicited_param_status(&q_drain));
         consume_state(q_drain);
     }
@@ -1553,7 +1553,7 @@ mod compute_push_tests {
         match state {
             ProtoState::Idle
             | ProtoState::Errored(_)
-            | ProtoState::SimpleQueryDrainRfqAfterError => {}
+            | ProtoState::DrainRfqAfterError => {}
             ProtoState::AwaitingPingReply(id) => {
                 id.consume();
             }

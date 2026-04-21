@@ -197,7 +197,7 @@ pub enum ProtoState {
     /// after query-level errors — per spec, `Z` follows `E` and the
     /// connection stays open. This variant silently consumes that
     /// `Z` and transitions back to [`Self::Idle`].
-    SimpleQueryDrainRfqAfterError,
+    DrainRfqAfterError,
 
     // ---------------------------------------------------------------
     // Phase 1c-3a: Extended Query — Parse flow
@@ -209,7 +209,7 @@ pub enum ProtoState {
     ///
     /// Next legitimate frames: `ParseComplete` → transition to
     /// [`Self::ParseAwaitRfq`]; `ErrorResponse` → emit FailReply +
-    /// transition to [`Self::SimpleQueryDrainRfqAfterError`]
+    /// transition to [`Self::DrainRfqAfterError`]
     /// (reused — both paths drain a trailing RFQ back to Idle).
     ParseAwaitingParseComplete(ReplyId<ParseKind>),
 
@@ -277,8 +277,8 @@ impl core::fmt::Debug for ProtoState {
                 .field("reply", reply)
                 .field("command_tag", command_tag)
                 .finish(),
-            Self::SimpleQueryDrainRfqAfterError => {
-                f.write_str("SimpleQueryDrainRfqAfterError")
+            Self::DrainRfqAfterError => {
+                f.write_str("DrainRfqAfterError")
             }
             Self::ParseAwaitingParseComplete(id) => {
                 write!(f, "ParseAwaitingParseComplete({id:?})")
