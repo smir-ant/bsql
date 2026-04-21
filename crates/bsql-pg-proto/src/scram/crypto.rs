@@ -47,9 +47,26 @@ fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[
 
 /// HMAC-SHA-256(key, message) → 32 bytes.
 ///
-/// HMAC-SHA256 accepts any key length; `new_from_slice` cannot fail.
-/// The Err branch returns zeros → downstream SCRAM proof will fail
-/// server verification openly, not silently.
+/// # Dead-branch analysis (F45, 2026-04-21)
+///
+/// `HmacSha256::new_from_slice` returns `Result<Self, InvalidLength>`
+/// in signature, but HMAC-SHA-256 structurally accepts keys of ANY
+/// length (RFC 2104: keys shorter than block size are zero-padded,
+/// longer than block size are hashed first). The `Err` branch is
+/// architecturally dead under the intact HMAC construction.
+///
+/// **If the invariant ever breaks** (upstream `hmac` crate introduces
+/// a key-length restriction, or we're called with an exotic key type),
+/// the zeroed return causes the downstream SCRAM client-proof to be
+/// computed over zeros → server signature verification fails openly
+/// at the AuthenticationSASLFinal step → classified as
+/// `ScramError::SignatureMismatch`. Tier-2 runtime: silent-key-break
+/// is impossible; the failure surfaces as a typed error with correct
+/// diagnostic ("server signature mismatch").
+///
+/// Bypass options considered: `unwrap_or_else(|e| match e {})` once
+/// `InvalidLength` becomes convertible to `!` / `Infallible` (blocked
+/// by upstream API shape); `unsafe unwrap_unchecked` (forbid-bundle).
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut mac = match HmacSha256::new_from_slice(key) {
         Ok(m) => m,

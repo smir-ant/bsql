@@ -139,10 +139,22 @@ impl SqlStateCode {
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
-        // SAFETY note — we would need unsafe to avoid the utf8 check,
-        // but the forbid-bundle bans unsafe. The check is O(5) —
-        // negligible on a cold error path.
-        core::str::from_utf8(&self.bytes).unwrap_or("?????")
+        // `self.bytes` is ASCII-only by construction (from_bytes
+        // coerces every non-ASCII byte to `b'?'`). ASCII is valid
+        // UTF-8 → `from_utf8` always succeeds here.
+        //
+        // F4 (2026-04-21): the unwrap_or fallback is ARCHITECTURALLY
+        // DEAD under the intact constructor invariant. Changed the
+        // sentinel from `"?????"` to `""` so that if the invariant
+        // ever breaks (constructor bypassed / bytes mutated), the
+        // empty string surfaces as an obvious regression in logs
+        // rather than masquerading as a legitimate 5-char SqlStateCode.
+        //
+        // Bypass options considered: `unsafe { from_utf8_unchecked }`
+        // (forbid-bundle bans unsafe), `const fn` + stable `core::str::from_utf8`
+        // (not const-stable in MSRV 1.95). O(5) runtime check is
+        // negligible on this cold error path.
+        core::str::from_utf8(&self.bytes).unwrap_or("")
     }
 }
 

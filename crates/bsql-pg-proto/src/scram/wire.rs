@@ -342,7 +342,8 @@ pub(crate) fn parse_server_first(
     let iters_str = i_part
         .strip_prefix("i=")
         .ok_or(ScramError::MalformedServerFirst)?;
-    let iterations = parse_u32(iters_str.as_bytes()).ok_or(ScramError::MalformedServerFirst)?;
+    let iterations = parse_u32(iters_str.as_bytes())
+        .map_err(|_| ScramError::MalformedServerFirst)?;
     if iterations < MIN_SCRAM_ITERATIONS {
         return Err(ScramError::IterationsTooLow { iterations });
     }
@@ -557,19 +558,38 @@ pub fn set_test_nonce(nonce: &str) {
     });
 }
 
-/// Parse a decimal u32 from ASCII bytes.
-fn parse_u32(bytes: &[u8]) -> Option<u32> {
+/// Why a decimal u32 parse failed.
+///
+/// F29 (2026-04-21): preserves the specific failure mode for
+/// future callers that want structured diagnostic (e.g., distinguishing
+/// "iteration count is too large" from "iteration count field is empty"
+/// from "iteration count has non-digit bytes"). Current call sites
+/// collapse all three to `ScramError::MalformedServerFirst` via
+/// `.map_err(|_| ...)` — structurally the right classification since
+/// all three are "malformed server-first-message".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParseU32Error {
+    /// Input byte slice was empty.
+    Empty,
+    /// Non-decimal-digit byte encountered (outside `b'0'..=b'9'`).
+    InvalidDigit,
+    /// Accumulated value overflows `u32::MAX`.
+    Overflow,
+}
+
+/// Parse a decimal u32 from ASCII bytes with typed error classification.
+fn parse_u32(bytes: &[u8]) -> Result<u32, ParseU32Error> {
     if bytes.is_empty() {
-        return None;
+        return Err(ParseU32Error::Empty);
     }
     let mut result: u32 = 0;
     for b in bytes {
-        let digit = (*b).checked_sub(b'0')?;
+        let digit = (*b).checked_sub(b'0').ok_or(ParseU32Error::InvalidDigit)?;
         if digit > 9 {
-            return None;
+            return Err(ParseU32Error::InvalidDigit);
         }
-        result = result.checked_mul(10)?;
-        result = result.checked_add(u32::from(digit))?;
+        result = result.checked_mul(10).ok_or(ParseU32Error::Overflow)?;
+        result = result.checked_add(u32::from(digit)).ok_or(ParseU32Error::Overflow)?;
     }
-    Some(result)
+    Ok(result)
 }

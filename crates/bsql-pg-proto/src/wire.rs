@@ -104,6 +104,19 @@ pub const TAG_ERROR_RESPONSE: InboundTag = InboundTag::from_byte(b'E');
 ///
 /// This is a `&'static [u8]` because the message is parameter-free; we
 /// ship it via a zero-copy static reference through [`crate::action::Action::SendBytes`].
+///
+/// # Visibility (F33, 2026-04-21)
+///
+/// Marked `#[doc(hidden)]` but kept `pub` — the integration-test
+/// wire-format drift-pins in `tests/ping_spec.rs` / `tests/parse_spec.rs`
+/// / `tests/startup_spec.rs` assert that the bytes emitted by
+/// `compute_push_ping` / `compute_push_parse` equal this const. Those
+/// tests compile as separate crates (standard `tests/` integration
+/// layout), so `pub(crate)` would break them. `#[doc(hidden)]` hides
+/// it from `docs.rs` without losing test access — signals "not a
+/// stable user API, may move under `pub(crate)` if we introduce a
+/// test-helpers module".
+#[doc(hidden)]
 pub const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC.byte(), 0, 0, 0, 4];
 
 // ---------------------------------------------------------------
