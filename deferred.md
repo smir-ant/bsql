@@ -1786,3 +1786,1003 @@ guard-patterns-inside-patterns remain unstable). lib.rs re-export.
 
 **Test count.** 188 → 188 (semantics preserved, no new tests
 needed — existing tests exercise the new types).
+
+## 24. Post-DEF-119 comprehensive audit (2026-04-22)
+
+### Audit context
+
+Architect session post-DEF-119 landing (commit `f356c88`). Raw
+output lives at `audit.txt` (137 findings, gitignored); reviewer
+verdicts at `audit_accepted.txt` (gitignored). This section
+consolidates the actionable items into DEF tickets plus a
+load-bearing architectural decision (H021).
+
+Scope covered by the audit:
+- Full `src/*.rs` (~12 KLoC), `src/scram/*.rs` (1300 LoC), all
+  integration tests.
+- Specifically re-audited DEF-119 schema arena and its consumers.
+- Cross-referenced against the pre-existing DEF-001..DEF-142 set.
+
+Review methodology: every finding spot-verified against source;
+every rejection asked the forcing question "did our own docs /
+naming / arch mislead the auditor?" → fixes tracked under DEF-163
+(docs/naming hardening pass).
+
+Count by disposition (reviewer decisions):
+- MUST-DO (safety / load-bearing): 10 new DEFs (DEF-144..DEF-153).
+- SHOULD-DO architectural (witness pattern): DEF-154.
+- DEFERRED to future phases: DEF-155..DEF-167 (sketched below).
+- Docs-batch consolidation: DEF-163.
+- REJECTED outright: ~50 items (most self-rejected by the auditor
+  during their own analysis; docs-fix items folded into DEF-163).
+
+### H021 — decision: witness-guard pattern (variant C) selected
+
+**The question.** Post-DEF-119, the crate remains strictly
+single-in-flight. Pipelining (PG §52.5 — Parse+Bind+Execute+Sync
+batched without waiting for replies) is a PG wire-protocol
+feature, scheduled for 1c-5. The architectural question: **is
+pipelining on a single connection a first-class feature of the
+sans-I/O core, or is it a concern we push up into the pool
+layer (`bsql-driver-postgres`)?**
+
+**Three variants considered:**
+
+| Variant | Shape | Tier | Async-friendly |
+|---|---|---|---|
+| A — stay single-shot forever, pool-layer multiplexing | Status quo | Simple — no new compile-gates | ✅ |
+| B — typestate generic `PgProtocol<Phase>` | Each transition changes the concrete type | Tier-1 compile | ❌ (async field storage painful) |
+| C — witness-guard pattern (`ReadyGuard<'p>` / `InFlightGuard<'p>`) minted via `proto.as_ready()` | One PgProtocol type, short-lived borrow-witnesses enforce capability | Tier-1 compile | ✅ |
+
+**Decision: variant C.** Rationale:
+
+1. Pipelining is a _nativepg-wire feature_. Delegating it
+   entirely to the pool layer would surrender a 3-5× latency
+   improvement on short-transaction workloads (batching on one
+   connection beats round-tripping N times on N connections for
+   correlated work). The sans-I/O kernel is exactly the layer
+   that should own wire-level protocol capabilities.
+
+2. Variant B's async friction is a real cost. The witness-guard
+   form delivers the same tier-1 compile guarantee without
+   making `PgProtocol` a type that shape-shifts over the life of
+   an async task.
+
+3. User directive (2026-04-22): "ломай api сколько потребуется,
+   лишь бы чисто и надёжно на выходе" — preferring a clean
+   durable foundation over backwards-compat hacks.
+
+**Consequences for subsequent work:**
+
+- **Arena design is fixed now with pipelining in mind.** DEF-148
+  lands the final `SchemaRef` shape in _one pass_ —
+  `NonZeroU8`-indexed slot _plus_ per-slot generation counter —
+  so pipelining's concurrent-refs story is structurally ready.
+- **DEF-154 buffer-witness** is the prototype for the general
+  witness-guard infrastructure; DEF-158 (`ArenaWriter` /
+  `ArenaReader` witness tokens) is its direct follow-on.
+- **Public API freeze before v1.0** will finalise the
+  `proto.as_ready() → ReadyGuard` vs `proto.as_pipelining() →
+  PipeliningGuard` entry-point choice. Schedule a dedicated
+  architect session after Phase α + β land.
+
+**Explicitly NOT committed yet:** the exact shape of the
+guard types, how `ReplyId<K>` integrates with multiple
+in-flight slots, and the pool-side integration story. Those
+are the witness-guard session's output.
+
+### Phase α — MUST-DO batch (DEF-143..DEF-153)
+
+Ten independent commits, each self-contained. Safe to ship in
+parallel. No inter-dependencies that force ordering.
+
+### DEF-143 — cargo-bench harness for per-frame throughput (OPEN, paired with DEF-134)
+
+**Origin.** User directive post-DEF-119: "сделать и def 134 и
+143, и лишь потом двигаться дальше". Audit H023/H024/H028 all
+point to this.
+
+**Scope.** Criterion-based bench targets for the hot paths:
+- `parse_header` single-frame throughput
+- `feed_bytes` loop on a synthetic 1000-row SELECT reply stream
+- `push_command(Ping)` + `feed_bytes(RFQ)` round-trip
+- `push_bind_execute` with 0/1/16 params
+
+**Ship-order.** Pair with DEF-134 (cargo-fuzz). Both are infra
+prerequisites for the CONSIDER bucket below (B013 LUT dispatch,
+E005 RowDesc::eq prefix, E015 per-state split) — those items
+require measured evidence before committing to restructures.
+
+**Tier lift.** Not a tier lift — enables measurement-dependent
+decisions.
+
+### DEF-144 — `parse_header`: drop dead `NonZeroU32::new` branch (A015)
+
+**Origin.** Audit A015. `frame.rs:178` returns early on
+`declared < 4`; by line 208 `declared >= 4` is proved, so
+`NonZeroU32::new(declared)` always returns Some and the else
+branch (lines 213-216) is architecturally dead.
+
+**Fix.** Remove the `NonZeroU32::new` check. Flow
+`HeaderParse::Ok` directly after the declared-range guards.
+
+**Tier lift.** Tier-3 audit-dead branch → absent. Hottest parser
+on the wire path drops one conditional per frame.
+
+**Touched files.** `src/frame.rs` (one function, ~10 LoC net).
+
+**Test count.** 194 → 194. Existing `tests/frame_parse.rs`
+exercises all four HeaderParse outcomes.
+
+### DEF-145 — `nz(0)` test-helper hardening + centralise (A005)
+
+**Origin.** Audit A005. `nz(n: u64) -> NonZeroU64` duplicated
+across ~6 test files with
+`NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)` — silently
+coerces `0 → 1`. Two tests using `nz(0)` and `nz(1)` would
+silently collide.
+
+**Fix.** Centralise the helper in one place (e.g.
+`src/test_util.rs` under `#[cfg(test)]`). Precede the
+`unwrap_or` with `assert!(n > 0, "nz(0) is a test bug — use
+nz(1..) for non-zero test correlators")`. Assert fires loudly
+on misuse; `unwrap_or(MIN)` satisfies forbid-bundle.
+
+**Tier lift.** Tier-4 silent-coerce → tier-2 runtime assertion.
+
+**Touched files.** New `src/test_util.rs` (test-only module);
+6 test files drop local `nz` definitions and import the shared
+one.
+
+**Test count.** 194 → 194.
+
+### DEF-146 — `StatePushClass` classifier collapses 7× or-pattern duplication (B002)
+
+**Origin.** Audit B002. Seven compute_push_* helpers at
+`protocol.rs:949, 1071, 1161, 1311, 1497, 1592, 1804` each
+enumerate the same ~18 ProtoState variants in identical
+or-patterns for the `CommandInProgress` / similar catch-all
+handling. Adding a new state variant today requires seven
+synchronised edits.
+
+**Fix.** New crate-private enum:
+```rust
+pub(crate) enum StatePushClass {
+    Idle,
+    Errored(StateErrorKind),
+    Connecting,
+    BusyQuery,
+    PingAwaiting,
+}
+
+impl ProtoState {
+    pub(crate) const fn push_class(&self) -> StatePushClass { ... }  // one exhaustive match
+}
+```
+
+Each `compute_push_*` then matches `state.push_class()` — the
+match is exhaustive on `StatePushClass` (no `_` fallback,
+tier-1 compile preserved). Adding a ProtoState variant = 1 edit
+(inside `push_class`); all 7 compute_push_* helpers flow
+through automatically.
+
+**Tier lift.** The pre-form is tier-1 exhaustive-match × 7
+(correct but with 7× drift surface). The post-form is tier-1
+exhaustive × 2 (push_class is exhaustive; each compute_push_*
+match on StatePushClass is exhaustive). Strict improvement —
+same compile-time safety at one-seventh of the drift surface.
+
+**Critical constraint.** The happy-path Idle arm needs `state`
+by value (moves into `compute_push_ping`'s happy-path emission);
+the classifier works by-ref. Structure: match-on-class first,
+then in the `StatePushClass::Idle` arm, re-destructure the
+owned state. Single re-match is acceptable cost.
+
+**Touched files.** `src/state.rs` (+classifier + exhaustive
+match ~60 LoC), `src/protocol.rs` (7 compute_push_* bodies
+collapse; net ~80 LoC deleted).
+
+**Test count.** 194 → 194. The existing
+`compute_push_tests` and `allows_unsolicited_param_status_tests`
+continue to pin the behaviour table.
+
+### DEF-147 — Narrow `FrameCoords` + `NonEmptyRange` from `usize` to `u16` (B005 + E019)
+
+**Origin.** Audit B005 + E019. `FrameCoords` = 3×`usize` = 24 B.
+`NonEmptyRange` = `usize + NonZeroUsize` = 16 B. `READ_BUF_CAP =
+4096` fits `u16` with the existing drift guard at
+`src/buf.rs:36-39` (`READ_BUF_CAP ≤ 65_535`).
+
+**Fix.** Narrow all five newtypes (`AbsFrameStart`,
+`FrameTotalLen`, `PopulatedLen`, plus the two `NonEmptyRange`
+fields) to `u16` / `NonZeroU16`. Widen on access via
+`usize::from` (infallible; zero-cost on 64-bit).
+
+Sizes after:
+- FrameCoords: 24 B → 8 B (aligned).
+- NonEmptyRange: 16 B → 4 B.
+
+**Throughput impact.** On a 1000-row SELECT: `NonEmptyRange`
+emission × 1000 = 12 KB of stack traffic eliminated.
+
+**Tier lift.** Not a tier change — pure byte compression.
+Drift guard on `READ_BUF_CAP ≤ 65_535` already in place; extend
+it to pin the u16 assumption explicitly.
+
+**Touched files.** `src/dispatch.rs` (newtypes + widening at
+call sites), `src/action.rs` (NonEmptyRange constructor +
+apply).
+
+**Test count.** 194 → 194.
+
+### DEF-148 — `SchemaRef` one-pass final shape: `NonZeroU8` slot + generation counter (C001 + B001 + C006 + A009 classification prep)
+
+**Origin.** Audit C001 (NonZeroU8 niche), B001 (ZERO sentinel
+is a structural seam), C006 (generational counter),
+A009 (stale ref silently → NoData). User directive 2026-04-22:
+"если ты можешь за один проход — было бы здорово, чтобы к
+этому вопросу не возвращаться". H021 decision: variant C
+commits the crate to pipelining; SchemaRef must be
+pipelining-ready now.
+
+**Final shape.**
+
+```rust
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaRef {
+    slot: NonZeroU8,    // encodes slot_index + 1; 1..=MAX_ARENA_SLOTS+1
+    generation: u8,     // captured at alloc; checked at get
+}
+// sizeof::<SchemaRef>() == 2; Option<SchemaRef> niche-packs to 2 B
+// (niche on slot field).
+
+pub(crate) struct SchemaSlab {
+    slots: [Option<RowDesc>; MAX_ARENA_SLOTS],
+    generations: [u8; MAX_ARENA_SLOTS],    // per-slot; bumps on free/clear
+    has_any: bool,                          // A007 fast-path for clear()
+}
+// sizeof::<SchemaSlab>() ≈ 2×264 + 2×1 + 1 = 531 bytes, padded ≈ 536.
+```
+
+**Semantics:**
+
+- `alloc(desc)`: find free slot, write `Some(desc)`, capture
+  current `generations[slot]`, set `has_any = true`, return
+  `SchemaRef { slot: NonZeroU8::new(idx+1), generation }`.
+- `get(r)`: if `generations[r.slot-1] == r.generation` AND
+  `slots[r.slot-1].is_some()` → `Some(&desc)`; else `None`
+  (stale ref — classifiable for A009).
+- `free(r)`: if generation matches, bump that slot's
+  generation, set slot to None, recompute `has_any`.
+- `clear()`: if `!has_any`, return early (A007). Else: for each
+  occupied slot, bump generation + set None; `has_any = false`.
+- `generation: u8` wraps — 256-cycle period. At 1 cycle per
+  query completion, that's 256 queries before the same
+  (slot, generation) pair recurs. A **stale ref surviving 256
+  full arena cycles** collides — architecturally impossible in
+  the current flow (arena is cleared between every user-visible
+  query boundary; a stale ref's lifetime ended long before the
+  next query starts). Documented as a tier-3 invariant; if 1c-5
+  pipelining reveals a collision window, promote to `u16`.
+
+**Closed items (one commit):**
+- C001 niche packing (Option<SchemaRef> = 2 B instead of 2 B
+  from plain u8 discriminant — NOT a byte saving vs bare
+  `Option<u8>`, because NonZeroU8 needs one more byte for
+  generation. The saving vs the _combined_ MUST-DO "plain u8 +
+  separate sentinel" design is the ZERO-sentinel elimination,
+  not a raw byte win).
+- B001 ZERO sentinel class retired (no valid SchemaRef can
+  equal the test-fixture sentinel, because NonZeroU8 forbids
+  zero entirely).
+- C006 generational counter.
+- A009 diagnostic path prep (stale ref → None is now
+  classifiable because ALL `arena.get(r).is_none()` cases after
+  successful dispatch are crate bugs; DEF-150's InternalCrateBug
+  locus reads this).
+
+**Tier lift.**
+- Sentinel-that-overlaps-valid-handle: tier-3 structural → tier-1
+  compile (impossible by type).
+- Stale-ref silent-NoData-substitution: tier-4 "should not
+  happen" → tier-2 classifiable diagnostic (via DEF-150).
+- Pipelining concurrent-refs prep: tier-3 "future refactor"
+  → tier-1 structurally ready now.
+
+**Touched files.**
+- `src/schema_arena.rs` — major refactor (~60 LoC net added).
+- `src/dispatch.rs` — 3 alloc sites update (same arms, same
+  match shape, different handle construction).
+- `src/state.rs` — Option<SchemaRef> type unchanged textually.
+- `src/action.rs` — SchemaRef usage unchanged textually.
+- `src/protocol.rs` — test fixtures for SchemaRef construction
+  update (no more `SchemaRef::ZERO`; use
+  `arena.alloc(EMPTY).unwrap_or_else(...)` through the
+  established forbid-compliant pattern).
+- `src/lib.rs` — size pin for SchemaRef unchanged at 2 B;
+  SchemaSlab pin bumps from 528 → 536.
+
+**Test count.** 194 → 194+N (add unit tests for: generation
+bump on clear invalidates old ref; generation bump on free
+invalidates old ref; generation wraparound; `has_any`
+fast-path correctness).
+
+**Coordination.** Must land BEFORE DEF-150 (which classifies
+stale ref via InternalCrateBug) and BEFORE DEF-159 (SCRAM
+arena reuses the pattern).
+
+### DEF-149 — `transition_to_errored` helper consolidates state-set + buffer-clear (A013)
+
+**Origin.** Audit A013. Two sites in `protocol.rs` (lines
+466-474 Errored early-return, and 784-786
+fail_inflight_and_close) maintain the "set Errored +
+read_buf.clear + build OutActions" pairing independently. No
+bug today, but a tier-3 audit pairing (order consistent by
+convention, not structurally).
+
+**Fix.**
+```rust
+impl PgProtocol {
+    fn transition_to_errored(&mut self, kind: StateErrorKind)
+        -> Option<NonZeroU64> {
+        let prev = core::mem::replace(
+            &mut self.state,
+            ProtoState::Errored(kind),
+        );
+        self.read_buf.clear();
+        prev.take_inflight_reply_raw_id()
+    }
+}
+```
+
+Both sites delegate. Atomic state-set + buffer-clear is encoded
+in the helper's single body.
+
+**Tier lift.** Tier-3 audit-pairing → tier-2 structural (one
+helper, two callers).
+
+**Touched files.** `src/protocol.rs` (helper + 2 call-site
+refactors).
+
+**Test count.** 194 → 194.
+
+### DEF-150 — `ProtocolError::InternalCrateBug { locus }` merge + `SchemaArenaAllocFull` + `StaleSchemaRef` loci (A001 + B009 + A009 classification)
+
+**Origin.** Audit A001 (schema arena alloc-full classifies as
+`RowRangeConstructionUnreachable` — the WRONG variant), B009
+(three InternalCrateBug variants should merge), A009
+(post-DEF-148 stale-ref is a classifiable event).
+
+**Fix.** Single unified variant with inner locus enum:
+```rust
+pub enum ProtocolError {
+    ...
+    InternalCrateBug {
+        locus: CrateBugLocus,
+    },
+    ...
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrateBugLocus {
+    /// Frame builder returned Err despite const-asserted capacity.
+    /// (was `ProtocolError::OutboundFrameBuildUnreachable { stage }`)
+    OutboundFrameBuild { stage: FrameBuildStage },
+    /// ReadBuf::advance returned Err despite pre-validated frame bounds.
+    /// (was `ReadCursorAdvanceUnreachable`)
+    ReadCursorAdvance,
+    /// NonEmptyRange::new returned None despite pre-validated frame bounds.
+    /// (was `RowRangeConstructionUnreachable`)
+    RowRangeConstruction,
+    /// Schema arena alloc returned None — arena full in a flow that
+    /// shouldn't have more than MAX_ARENA_SLOTS concurrent schemas.
+    /// NEW (was previously misclassified as RowRangeConstruction).
+    SchemaArenaAllocFull,
+    /// Arena get returned None on a ref that should be live (post
+    /// successful dispatch, pre free/clear). Indicates generational
+    /// drift — a crate bug in alloc/clear ordering.
+    /// NEW (was previously silent NoData substitution).
+    StaleSchemaRef,
+}
+```
+
+All classify as `ErrorKind::Internal`. Display text is
+uniform: `"internal crate bug at {locus:?}"`.
+
+**Tier lift.**
+- A001 diagnostic misdirection: classification lies → correct.
+- B009 variant sprawl: 3 separate variants → 1 with
+  discriminated locus (smaller enum, consistent Display).
+- A009 silent-NoData class: runtime → classifiable +
+  connection-fatal (closer to tier-2).
+
+**Coordination.** Lands AFTER DEF-148 (SchemaRef with
+generation; A009's stale-ref detection requires it).
+
+**Touched files.** `src/error.rs` (variant merge + new loci),
+`src/dispatch.rs` (3 arena-alloc arms), `src/action.rs` /
+`src/protocol.rs` (stale-ref detection sites, DEF-119's
+`unwrap_or(&EMPTY)` replaced with classified fail path).
+
+**Test count.** 194 → 197 (add tests for:
+`SchemaArenaAllocFull` path — requires a test fixture that
+forces arena exhaustion; `StaleSchemaRef` path — forced
+generation mismatch; existing `FrameBuildStage` / advance /
+row-range tests migrate to new variant shape).
+
+### DEF-151 — Tighten size budgets: exact pins on SchemaSlab + PgProtocol (C002 + C010)
+
+**Origin.** Audit C002 + C010. Current assertions use `<=`
+slack (SchemaSlab ≤ 540 vs actual ~528; PgProtocol ≤ 6336 vs
+actual 6272). Slack hides regression-catching signal in both
+directions (ADDED field vs REMOVED field both change size;
+slack only catches additions).
+
+**Fix.** Post-DEF-148 SchemaSlab grows to ~536 B (one extra
+byte per slot + has_any). Post-DEF-147 PgProtocol size is ~net
+zero change (u16 narrowing offsets other growth). Use tight
+ranges to permit ±8 B cross-platform alignment slack:
+
+```rust
+const _: () = assert!(
+    core::mem::size_of::<SchemaSlab>() <= 544
+        && core::mem::size_of::<SchemaSlab>() >= 528,
+    "SchemaSlab size drift — expected ~536 B post-DEF-148."
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::PgProtocol>() <= 6280
+        && core::mem::size_of::<protocol::PgProtocol>() >= 6272,
+    "PgProtocol size drift — expected ~6272 B post-DEF-148."
+);
+```
+
+**Rationale.** Exact-size assertions would be fragile across
+aarch64 / x86_64. Tight range catches drift in either direction
+while tolerating platform alignment.
+
+**Tier lift.** Regression-catching budget slack → tighter
+structural pin.
+
+**Touched files.** `src/lib.rs` (size-assert block).
+
+**Test count.** 194 → 194 (const-asserts are build-time).
+
+### DEF-152 — Arena `has_any` fast-path + debug-assertions invariant probes (A007 + C013)
+
+**Origin.** Audit A007 + C013. `SchemaSlab::clear()` currently
+unconditionally zeroes both slots even when the arena is
+already empty — 528 B of wasted memset per push on the Ping
+loop (state is always Idle between pings). `occupied_count()`
+is `cfg(test)`-gated despite being useful for
+debug-assertions-gated invariant probes.
+
+**Fix.** Bundled with DEF-148 (SchemaSlab is already being
+restructured; adding `has_any` is part of the same change).
+
+Post-DEF-148, `clear()` checks `has_any` first:
+```rust
+pub(crate) fn clear(&mut self) {
+    if !self.has_any { return; }
+    for (slot, gen) in self.slots.iter_mut().zip(self.generations.iter_mut()) {
+        if slot.is_some() {
+            *gen = gen.wrapping_add(1);
+            *slot = None;
+        }
+    }
+    self.has_any = false;
+}
+```
+
+`occupied_count()` switches from `cfg(test)` to
+`cfg(debug_assertions)`. Protocol entry points add invariant
+probes:
+```rust
+if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
+    self.schema_arena.clear();
+    debug_assert_eq!(
+        self.schema_arena.occupied_count(), 0,
+        "clear() must leave arena empty",
+    );
+}
+```
+
+**Perf impact.** Ping loop: 528 B/iter memset eliminated. At 1M
+pings/sec, ~1 GB/s of wasted memory bandwidth freed.
+
+**Tier lift.** Debug-time invariant probe on clear()
+correctness — catches future regressions where a refactor
+breaks the has_any bookkeeping.
+
+**Coordination.** LAND AS PART OF DEF-148 — mechanically
+inseparable (same struct, same method signatures). Documented
+here for reviewer clarity; single commit at DEF-148 time.
+
+**Touched files.** Subsumed into DEF-148's touched-files list.
+
+**Test count.** Subsumed into DEF-148 (existing arena tests
+exercise clear-after-alloc and clear-on-empty paths).
+
+### DEF-153 — SessionParams `n_malformed_bool_dropped` counter (A003)
+
+**Origin.** Audit A003. `session_params.rs:361-373` silently
+drops non-standard bool values (e.g. `is_superuser=yes` vs
+PG's canonical `on`/`off`) — leaves field as `None`,
+indistinguishable from "server never sent the parameter."
+
+**Fix.** Mirror the existing F-074 `n_unknown_dropped` counter:
+```rust
+pub struct SessionParams {
+    ...
+    /// Count of ParameterStatus values that failed bool parsing
+    /// (non-standard forms like "yes" / "1" instead of "on"/"off").
+    /// Saturating u16.
+    pub n_malformed_bool_dropped: u16,
+    ...
+}
+```
+
+Increment in the two bool-parsing arms (is_superuser,
+integer_datetimes) when `parse_pg_bool` returns None.
+
+**Tier lift.** Silent-drop → operator-visible counter. Same
+class as F-074 (`n_unknown_dropped`).
+
+**Touched files.** `src/session_params.rs` (+1 field + 2
+increment sites).
+
+**Test count.** 194 → 196 (add 2 tests: malformed
+`is_superuser=yes` increments counter; parseable
+`is_superuser=on` does not).
+
+### Phase β — SHOULD-DO big piece (DEF-154)
+
+### DEF-154 — Buffer-witness pattern for `apply` / `materialise` infallible access (A008 + A009 + C015 + E016 + B003 alignment)
+
+**Origin.** Audit A008 (NonEmptyRange::apply returns Option
+with silent `&[]` fallback), A009 (stale SchemaRef silently →
+NoData — closed classifier side in DEF-150, open architectural
+side here), C015 (arena.get unwrap_or EMPTY on stale ref),
+E016 (per-row dead Err branch on range construction), plus
+coordinates with DEF-141 (B003 — infallible builders).
+
+**Problem class.** Five independent sites carry "architecturally
+dead Option / Result" from a value produced inside the
+protocol to a value consumed inside the protocol. Each site
+falls back to a silent default on None; each is documented
+as tier-3 audit-dead. Five drift surfaces, one semantic.
+
+**Fix: witness-guard infrastructure.**
+
+```rust
+/// Proof token: this WriteBuf was reserved for N bytes;
+/// constructible only via `WriteBuf::reserve::<N>()`. Moved into
+/// each build_*_message as a capacity proof.
+pub(crate) struct WriteReserved<'a, const N: usize> {
+    buf: &'a mut WriteBuf,
+    start: usize,
+    // ...
+}
+
+/// Proof token: this NonEmptyRange was built from THIS buffer's
+/// state. Can only be applied to the same buffer; a different
+/// buffer is a compile error.
+pub(crate) struct NonEmptyRange<'buf> {
+    start: u16,
+    len: NonZeroU16,
+    _buf: PhantomData<&'buf ()>,
+}
+impl<'buf> NonEmptyRange<'buf> {
+    pub(crate) fn apply(&self, buf: &'buf [u8]) -> &'buf [u8] {
+        // INFALLIBLE — witness proves start + len <= buf.len().
+        &buf[usize::from(self.start)..usize::from(self.start) + self.len.get() as usize]
+    }
+}
+
+/// Proof token: this SchemaRef was built from THIS arena's
+/// state. Combined with DEF-148's generation counter, this
+/// gives compile-time + runtime invalidation. The compile-time
+/// layer catches buffer-type confusion; the runtime layer
+/// catches alloc/free ordering bugs.
+pub(crate) struct ArenaReader<'arena> {
+    slab: &'arena SchemaSlab,
+}
+impl<'arena> ArenaReader<'arena> {
+    pub(crate) fn get(&self, r: SchemaRef) -> Option<&'arena RowDesc> {
+        // ... generation check ...
+    }
+}
+```
+
+**Closed seams:**
+- A008 (`apply` silent `&[]`): compile-time impossible —
+  wrong-buffer is a type error.
+- A009 classifier side (already in DEF-150) + architectural
+  side: `arena.get` is now a method on `ArenaReader<'arena>`;
+  only dispatch can construct `ArenaWriter`, only materialise
+  gets `ArenaReader`.
+- C015 silent EMPTY fallback: same as A008/A009.
+- E016 per-row dead Err branch: witness-bound `NonEmptyRange`
+  is infallible; the Result wrapper goes away.
+- DEF-141 (B003) infallible builders: `WriteReserved<'_, N>`
+  is exactly the capacity-witness it needs. Same infrastructure.
+
+**Tier lift.** Five tier-3 audit-dead paths → tier-1
+structurally-absent. Biggest durability win in this audit.
+
+**Coordination.** Lands AFTER DEF-147 (u16 narrowing is a
+prerequisite for the NonEmptyRange witness shape). Subsumes
+DEF-141 (B003) — the capacity-witness branch of this work IS
+DEF-141, so mark DEF-141 as "subsumed by DEF-154" at commit
+time.
+
+**Touched files.**
+- `src/action.rs` — NonEmptyRange lifetime-bound.
+- `src/write_buf.rs` — WriteReserved witness type.
+- `src/schema_arena.rs` — ArenaReader/ArenaWriter split.
+- `src/dispatch.rs` — dispatch takes ArenaWriter; passes
+  NonEmptyRange-with-lifetime down to StreamRow staging.
+- `src/protocol.rs` — materialise takes ArenaReader; 6
+  build_*_message fns take WriteReserved<_, N>.
+- All push-path call sites construct the witnesses.
+
+**Effort.** L (200-400 LoC net). Biggest architectural piece
+in this batch.
+
+**Test count.** 194 → ~210 (witness misuse tests via
+compile_fail doctests; existing tests flow through; new
+classification tests for A009-via-DEF-150 complete the
+coverage).
+
+### Phase γ — DEFERRED (future phases, sketched)
+
+Each item below has enough context to schedule when its phase
+arrives. Deep DEF entries are written at implementation time.
+
+### DEF-155 — Generational counter prep for 1c-5 pipelining
+
+**Status.** SUBSUMED by DEF-148. The per-slot generation
+counter is landed in DEF-148's final SchemaRef shape. No
+separate DEF needed; kept here as a forwarding pointer for
+audit traceability.
+
+### DEF-156 — `materialise_push` vs `materialise_feed` type split (A014)
+
+**Schedule.** 1c-6 hardening sub-phase.
+
+**Origin.** Audit A014. Current `materialise` handles both
+push-path (write_buf emission, no read_buf / arena) and
+feed-path (full-featured). Push callers pass `&[]` as read_buf
+— a tier-3 audit that push-path never emits StreamRowRange.
+
+**Sketch.** Two staged enums: `PushStagedAction` (no
+StreamRowRange variant) and `FeedStagedAction` (full). Two
+materialise functions. Tier-3 → tier-1 compile ("arena only
+touched by feed-path").
+
+**Effort.** L. Ripples through compute_push / dispatch.
+
+### DEF-157 — ProtoState sum-of-subsums restructure (B006)
+
+**Schedule.** Post-1c-4 (transactions) when state shape is
+stable.
+
+**Origin.** Audit B006. 22 variants of ProtoState make the
+dispatch match dense. Splitting into
+`ProtoState::Ping(PingSubState)` / `::Startup(StartupSubState)`
+/ `::Query(QuerySubState)` / etc. reduces cognitive load and
+collapses dispatch match arms.
+
+**Sketch.** Each sub-enum owns its variants; dispatcher
+pattern-matches the outer, then the inner. Adding a variant
+stays local to the sub-enum.
+
+**Effort.** L. Does NOT shrink ProtoState size (Startup still
+dominates at ~1224 B).
+
+### DEF-158 — Arena witness typestate (C005) — bundled with DEF-154
+
+**Status.** DEF-154 infrastructure already introduces
+`ArenaWriter` / `ArenaReader`. DEF-158 is the name-pointer
+for the "discipline is compile-enforced, not audited" claim
+that DEF-154 makes possible. Track under DEF-154 at commit
+time; no separate work.
+
+### DEF-159 — SCRAM arena (D001)
+
+**Schedule.** Post-1c-5 pipelining lands.
+
+**Origin.** Audit D001. SCRAM state buffers (ScramSession
+~1024 B + PodBytes<128> client_first_bare + PodBytes<48>
+client_nonce_b64) dominate ProtoState at ~1200 B. Extracting
+to `Option<ScramArena>` on PgProtocol drops the state-variant
+cost to near-zero when not in SCRAM (which is most of
+connection lifetime).
+
+**Sketch.**
+```rust
+pub struct PgProtocol {
+    ...
+    scram_arena: Option<ScramArena>,  // Some only during SCRAM
+}
+
+pub(crate) struct ScramArena {
+    session: ScramSession,
+    client_first_bare: PodBytes<128>,
+    client_nonce_b64: PodBytes<48>,
+}
+```
+
+State variants carry a crate-internal `ScramArenaRef` (ZST or
+bool — only one SCRAM ever in flight).
+
+**Expected savings.** PgProtocol steady-state: ~6272 → ~5072 B
+(−19%). SCRAM-active cost unchanged (arena pays the 1200 B
+once, not per-state-variant).
+
+**Constraint.** Must land AFTER H021 witness-guard shape is
+finalised — the SCRAM arena access is part of the witness
+story (mid-handshake transitions need typed access
+through the guard).
+
+**Effort.** M-L.
+
+### DEF-160 — `PgCommand::Parse` carries `&'a str` SQL instead of owned 2 KB (D003)
+
+**Schedule.** 1c-6 / API freeze pre-v1.0.
+
+**Origin.** Audit D003. `PgCommand::Parse { sql: Sql, ... }`
+inlines a 2050-byte buffer even for 10-byte queries. Borrow
+form:
+```rust
+pub enum PgCommand<'a> {
+    ...
+    Parse {
+        sql: &'a str,
+        stmt_name: StmtName,
+        reply: ReplyId<ParseKind>,
+    },
+    ...
+}
+```
+
+**Tradeoff.** Adds lifetime to `PgCommand`. Ripples through
+every consumer. Pre-v1.0 acceptable.
+
+**Effort.** L (API break; ripples through tests and eventual
+driver).
+
+### DEF-161 — Error-body arena for `ProtocolError::ServerErrorResponse` (C008)
+
+**Schedule.** Post-fuzz (DEF-134) if error path becomes a
+bottleneck.
+
+**Origin.** Audit C008. ServerErrorResponse carries 5 inline
+BoundedStr totalling ~300 B. Externalising to an error arena
+shrinks ProtocolError from 304 B → ~16 B; cascades through
+FailReply.cause variants.
+
+**Sketch.** `ErrorArena` on PgProtocol with `heapless::String<384>`
+byte pool + ranges. ProtocolError::ServerErrorResponse carries
+the ref.
+
+**Tradeoff.** Error is currently cold-path. Complexity-to-win
+ratio only favourable if fuzzing or prod telemetry shows
+error-path load.
+
+**Effort.** L.
+
+### DEF-162 — cargo-mutants kill-rate target (H027)
+
+**Schedule.** Infra batch alongside DEF-134 (fuzz) + DEF-143
+(bench).
+
+**Origin.** Audit H027. No current mutation-testing target.
+
+**Sketch.** Run cargo-mutants; evaluate test coverage of
+semantic edits. Kill-rate target ≥85%. Anything below pins a
+missing test.
+
+**Effort.** S infra setup + iterative test additions.
+
+### DEF-163 — Docs / naming hardening pass (consolidated G-series + DOCS-FIX-NEEDED)
+
+**Schedule.** After Phase α + β MUST-DO/SHOULD-DO batches land.
+
+**Origin.** Consolidates all G-series audit items (docs/naming
+polish) PLUS the DOCS-FIX-NEEDED items surfaced when reviewing
+rejected findings. The latter are load-bearing: they prevent
+future audits from repeating the same misreads.
+
+**Items (flat list, one commit per group):**
+
+*Cross-reference + status hygiene:*
+- G001 — cross-reference "1c-5 pipelining" to reforge.md /
+  deferred.md at docstring sites.
+- G002 — split pre/post-DEF-119 size baselines into "CURRENT"
+  vs "HISTORICAL" in lib.rs.
+- G008 — sweep all "Tier-1 compile" claims in rustdoc for
+  enforcement-mechanism citations (forbid bundle line, const
+  assert line, exhaustive match, etc.).
+
+*Naming corrections:*
+- G004 — rename `SchemaSlab` → `SchemaArena` (slab overloads
+  the kernel slab-allocator meaning).
+- G011 — rename `DescribedRowsRef` → `DescribedRowsStaged`
+  ("Ref" suffix conflicts with Rust's borrow-naming convention;
+  the type is staged / lifetime-free, not a reference).
+
+*Load-bearing docstring additions (from rejection DOCS-FIX-NEEDED):*
+- A006 add to ReplyId: "ReplyId::value is a correlator, not a
+  secret — intentionally NOT zeroized on drop."
+- A011 add to `FixedStr::from_str_truncating`: "fit_end=0 is a
+  valid terminal state; output is a 3-byte OVERFLOW_MARKER-only
+  FixedStr, valid by MARKER.len() ≤ N (pinned by
+  _TRUNCATING_N_MIN)."
+- A012 add to dispatch.rs Errored arm: "Architecturally dead
+  under current flow — feed_bytes short-circuits Errored
+  before dispatch (protocol.rs:466-474). Kept for exhaustive
+  match over (ProtoState, tag)."
+- B011 add to `Action<'w, 'r>` docstring: "'w borrows write_buf
+  (push-path emission); 'r borrows read_buf + arena (feed-path
+  streaming). Two lifetimes required because push produces
+  'static-to-'r and feed produces actual-'r; unifying forces
+  'r='static and breaks feed-path row streaming."
+- F001 sweep all `#[doc(hidden)] pub` comments to consistently
+  cite "pub required by public `ReplyKind::StagedPayload`
+  associated type (Rust language rule on pub-in-pub-trait)."
+
+*Arch explanatory additions:*
+- G007 — downgrade arena-discipline claim from "tier-2
+  structural" to honest "tier-3 audit" (OR lift to tier-1 via
+  DEF-158 witness — contingent on DEF-154's witness landing).
+- G012 — add PgProtocol struct-level comment cross-referencing
+  the size budget in lib.rs.
+- G016 — ident.rs module-level ASCII diagram of the
+  `FixedStrKind` trait hierarchy.
+- G017 — scram/mod.rs RFC 5802 exchange-flow diagram.
+- G018 — add top-of-file doc on compute_push vs dispatch
+  naming convention.
+- G021 — template `#[expect(clippy::result_large_err, reason = ...)]`
+  reasons for grep-ability (same phrase everywhere: "no_alloc:
+  Box unavailable; error path only").
+
+**Tier lift.** Docs don't move tiers — but load-bearing
+invariants currently buried in "subtle" places get surfaced,
+reducing the chance a future auditor or contributor misreads
+them again.
+
+**Touched files.** Many — small edits across most .rs files.
+Test suite unchanged.
+
+**Effort.** M (mechanical but broad).
+
+### DEF-164 — `ReplyId.delivered` debug-assertions-gated (B008 sub-idea)
+
+**Schedule.** Later polish — only if release-build size
+shows the delivered-flag as measurable (needs DEF-143 bench).
+
+**Origin.** Audit B008. The typestate idea was rejected (Rust
+Drop coherence). The sub-idea is to gate the runtime
+`delivered: bool` field behind `cfg(debug_assertions)`:
+release builds drop the flag (8 B saved per ReplyId), debug
+builds keep the Drop-guard.
+
+**Tradeoff.** Release builds lose the Drop-guard entirely. The
+guard has caught real bugs; downgrading it is a real cost.
+
+**Effort.** S but probably should not land — if we want tier-2
+runtime Drop-guard, we want it in production too.
+
+### DEF-165 — `ParamOids::n_params` narrow `u16` → `u8` (F005)
+
+**Schedule.** Polish batch alongside DEF-147.
+
+**Origin.** Audit F005. `n_params ≤ MAX_PARAMS_ARITY = 16` fits
+u8 trivially. Widen on consumer access.
+
+**Effort.** S.
+
+### DEF-166 — `PodBytes<N>` visibility `pub → pub(crate)` via state-field privatize (F008)
+
+**Schedule.** v1.0 API freeze.
+
+**Origin.** Audit F008. Currently pub because
+`ProtoState::ConnectingScramAwaitingServerFirst` destructures
+`client_first_bare: PodBytes<...>` publicly.
+
+**Sketch.** Privatise state-variant fields. External users can't
+construct ProtoState anyway (no pub constructors for non-Idle).
+Public matches on field names would break — acceptable pre-v1.0.
+
+**Effort.** S.
+
+### DEF-167 — Split `action.rs` / `dispatch.rs` into submodules (G014 + G015)
+
+**Schedule.** Post-1c-4, once DEF-146 + DEF-157 restructures settle.
+
+**Origin.** Audit G014 + G015. `action.rs` is 1397 LoC,
+`dispatch.rs` is 1965 LoC. Post-DEF-146 classifier + DEF-157
+sum-of-subsums, the natural submodule boundaries become visible.
+
+**Effort.** M (file reorg).
+
+### Phase δ — Architectural review session (H021 follow-on)
+
+Schedule a dedicated rust-senior-architect session AFTER
+Phase α + β land. Agenda:
+- Finalise the `proto.as_ready() → ReadyGuard<'p>` vs
+  `proto.as_pipelining() → PipeliningGuard<'p>` entry-point
+  shape.
+- Decide how `ReplyId<K>` pairs with multiple concurrent
+  in-flight slots (does the raw u64 correlator stay alone, or
+  does it carry a slot-tag?).
+- Settle the public API shape before v1.0 freeze.
+- Output: a dedicated DEF ticket with the definitive witness-
+  guard design and migration sketch.
+
+This is NOT a DEF ticket itself — it's the decision-making
+event whose output is a DEF.
+
+### Rejected items — docs-fix registry
+
+The following audit items were REJECTED as code changes but
+DID surface a misreading of our source by the auditor. Each
+misreading is a symptom of a docstring / naming / arch comment
+that needs a fix to prevent the same misread next time. All
+the docs-fixes are consolidated into DEF-163 (above); this
+subsection is the invariant-registry so future audits can
+cross-check.
+
+| Audit ID | Auditor's misread | Root cause | Docs-fix in DEF-163 |
+|---|---|---|---|
+| A002 | "Arena alloc-on-full is impossible in 1c — lift to infallible" | Missing pipelining-context note on `alloc` docstring | Add "Fallible shape intentional — pipelining flow lands here" |
+| A004 | "record_param_status drops non-UTF8 keys" | No explicit spec-invariant comment on the byte-equal match | Add "PG §55.2.1 — keys are ASCII by spec" + const_assert |
+| A006 | "ReplyId.value not zeroized" | Docstring doesn't explicitly say the field is a correlator, not a secret | Line added per G018 spec |
+| A011 | "BoundedStr fit_end=0 pathological" | The invariant is subtle and not inline-documented | Inline invariant comment per G018 spec |
+| A012 | "Errored dispatch arm silently consumes" | The arm looks real; it's actually dead-by-structure | Pinning comment referencing feed_bytes short-circuit |
+| B001 | "SchemaRef::ZERO sentinel is a seam" | Sentinel's test-only purpose is cfg-gated but the overlap with valid SchemaRef(0) wasn't called out | Subsumed by DEF-148 (NonZeroU8 eliminates the possibility) |
+| B011 | "Two lifetimes on Action<'w, 'r> look unnecessary" | The two-lifetime rationale buried in DEF-094/DEF-119 history, not inline | Inline rationale per B011 DOCS-FIX |
+| C016 | "DescribedRows / DescribedRowsRef duplication" | "Ref" suffix semantically wrong | Rename to DescribedRowsStaged (G011) |
+| F001 | "SchemaRef doc-hidden pub should be pub(crate)" | The "pub-in-pub-trait-associated-type" rationale is in ONE docstring but not consistently on siblings | Consistency sweep per F001 DOCS-FIX |
+| G007 | "Arena discipline is tier-2 structural" — claim is actually tier-3 audit | Tier label overstated | Either downgrade (honest) or lift via DEF-158 witness |
+
+These are the class of "audit surfaces the same issue twice"
+risks. DEF-163's job is to close them all.
+
+### Summary of Phase α-ε ship order
+
+**Phase α (safe to ship in parallel, any order):**
+- DEF-143 (benchmark harness — enables measurement-gated work)
+- DEF-144 (parse_header dead branch)
+- DEF-145 (nz(0) hardening)
+- DEF-148 (SchemaRef final — bundles C001 + B001 + C006 + A007 + C013)
+- DEF-149 (transition_to_errored helper)
+- DEF-150 (InternalCrateBug merge — depends on DEF-148)
+- DEF-151 (size budget pins — depends on DEF-148)
+- DEF-153 (SessionParams counter)
+
+**Phase β (sequenced):**
+- DEF-147 (u16 narrowing — prereq for DEF-154)
+- DEF-146 (StatePushClass classifier — independent)
+- DEF-154 (buffer-witness pattern — subsumes DEF-141)
+
+**Phase γ (deferred to specific future phases):**
+- Listed above (DEF-156..DEF-167).
+
+**Phase δ (architect session before 1c-5):**
+- H021 witness-guard finalisation → produces post-session DEFs.
+
+**Phase ε (after all above):**
+- DEF-163 (docs/naming hardening pass).
+
+**Infra (parallel, as bandwidth allows):**
+- DEF-134 (cargo-fuzz) — ALREADY OPEN
+- DEF-143 (benchmark) — NEW, listed in Phase α
+- DEF-162 (cargo-mutants) — NEW
+
+After Phase ε, the bsql-pg-proto core reaches 1c-5-ready state:
+tier-1 gates on discipline invariants, witness infrastructure
+for pipelining, arena shape final for pipelined flows,
+measurement infra in place to validate CONSIDER-bucket items
+with evidence.

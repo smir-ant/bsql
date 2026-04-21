@@ -130,6 +130,8 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 // ------------------------------------------------------------------
 
 fn raw(v: u64) -> NonZeroU64 {
+    // DEF-145: raw(0) is a test bug; assert fires loud.
+    assert!(v > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
     NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
 }
 

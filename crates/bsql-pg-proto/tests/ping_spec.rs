@@ -65,7 +65,10 @@ fn error_frame() -> [u8; 6] {
 /// cannot hold a reference to it *and* pass it into a command at the
 /// same time.
 fn raw(value: u64) -> NonZeroU64 {
-    // Tests pass 1..= never 0; fall-through is defensive only.
+    // DEF-145: raw(0) is a test bug — tests pass 1..= never 0.
+    // Assert fires loud; `unwrap_or(MIN)` keeps forbid-bundle happy
+    // on the assertion-proved dead branch.
+    assert!(value > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
     NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
 }
 

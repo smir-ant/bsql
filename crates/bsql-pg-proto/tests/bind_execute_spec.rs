@@ -36,6 +36,10 @@ use bsql_pg_proto::{
 use core::num::NonZeroU64;
 
 fn raw(v: u64) -> NonZeroU64 {
+    // DEF-145: raw(0) is a test bug. Assert fires loud; the
+    // `unwrap_or(MIN)` keeps the forbid-bundle happy on the
+    // assertion-proved dead branch.
+    assert!(v > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
     NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
 }
 

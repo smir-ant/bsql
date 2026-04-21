@@ -2144,6 +2144,14 @@ mod allows_unsolicited_param_status_tests {
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
+        // DEF-145: nz(0) is a test bug — a zero raw correlator cannot
+        // be minted by a real ReplyId allocator (NonZeroU64 by type).
+        // Pre-DEF-145 the `unwrap_or(MIN)` fallback silently coerced
+        // `0 → 1`, potentially colliding with a concurrent nz(1).
+        // Assert fires loud; the `unwrap_or(MIN)` keeps the forbid-bundle
+        // happy (clippy::unwrap_used forbidden) on the assertion-proved
+        // dead branch.
+        assert!(n > 0, "nz(0) is a test bug — use nz(1..) for non-zero test correlators");
         NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
     }
 
@@ -2336,6 +2344,14 @@ mod compute_push_tests {
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
+        // DEF-145: nz(0) is a test bug — a zero raw correlator cannot
+        // be minted by a real ReplyId allocator (NonZeroU64 by type).
+        // Pre-DEF-145 the `unwrap_or(MIN)` fallback silently coerced
+        // `0 → 1`, potentially colliding with a concurrent nz(1).
+        // Assert fires loud; the `unwrap_or(MIN)` keeps the forbid-bundle
+        // happy (clippy::unwrap_used forbidden) on the assertion-proved
+        // dead branch.
+        assert!(n > 0, "nz(0) is a test bug — use nz(1..) for non-zero test correlators");
         NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
     }
 
