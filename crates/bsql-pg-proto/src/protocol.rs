@@ -966,8 +966,14 @@ fn compute_push_ping(
     reply: ReplyId<crate::reply_id::PingKind>,
     staged: &mut StagedActions,
 ) -> ProtoState {
-    match state {
-        ProtoState::Idle => {
+    // DEF-146: classifier dispatch. Pre-DEF-146 this function had 5
+    // arms over explicit state variants (with 18-way or-patterns for
+    // the tail catch-alls). Post-DEF-146, the enumeration lives once
+    // in `ProtoState::push_class`; this match is 5 arms over the
+    // classifier's 5 variants — exhaustive, no `_` fallback, tier-1
+    // preserved.
+    match state.push_class() {
+        crate::state::StatePushClass::Idle => {
             // DEF-094: Sync is a compile-time const (5 bytes). Emit
             // `StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES)` so the
             // materialiser passes the static reference through
@@ -977,24 +983,10 @@ fn compute_push_ping(
             ]);
             ProtoState::PingAwaitingRfq(reply)
         }
-        // ERRORED ARM — LOAD-BEARING FOR DIAGNOSTIC CLASSIFICATION.
-        //
-        // Without an explicit Errored arm here, the `other @ (...)`
-        // catch-all below would ALSO match Errored (ProtoState is not
-        // #[non_exhaustive] internally; all variants are listed there).
-        // State preservation works either way — `other => other` keeps
-        // Errored intact. BUT the emitted FailReply cause would be
-        // `CommandInProgress` / `StartupAlreadyInProgress` instead of
-        // the correct `ConnectionAlreadyClosed { prior_kind }`, which
-        // is the only diagnostic that tells the wrapper crate "this
-        // connection is already terminal, don't retry".
-        //
-        // So this arm is tier-3 for diagnostic QUALITY (not tier-2 for
-        // state safety). `compute_push_tests::ping_from_errored_preserves_kind...`
-        // pins the invariant; the four sibling helpers
-        // (compute_push_startup / _simple_query / _parse) have an
-        // identical arm for the same reason.
-        ProtoState::Errored(prior_kind) => {
+        crate::state::StatePushClass::Errored(prior_kind) => {
+            // Preserve the stored cause; emit ConnectionAlreadyClosed
+            // so the wrapper sees "connection terminal" rather than
+            // a generic in-flight error.
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1003,61 +995,29 @@ fn compute_push_ping(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        ProtoState::PingAwaitingRfq(prev_reply) => {
-            // Pushing a Ping while another Ping is in flight is a
-            // push-path error (not a wire-framing issue), so
-            // classify as `CommandInProgress` rather than
-            // overloading `UnexpectedFrame` with a synthetic tag
-            // byte. Matches the semantics used by
-            // `compute_push_simple_query` for the analogous case.
+        // Ping-specific: a pending Ping ("a command is in flight")
+        // classifies as CommandInProgress (not StartupAlreadyInProgress)
+        // because this is a push-path error, not a startup-sequence
+        // error.
+        crate::state::StatePushClass::PingAwaiting
+        | crate::state::StatePushClass::BusyQuery => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            ProtoState::PingAwaitingRfq(prev_reply)
+            state
         }
-        other @ (ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+        // Any Connecting* variant — startup handshake in progress.
+        crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            other
-        }
-        other @ (ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
-            emit_actions!(staged, budget: 1, [
-                StagedAction::FailReply {
-                    id: reply.consume(),
-                    cause: ProtocolError::CommandInProgress,
-                },
-            ]);
-            other
+            state
         }
     }
 }
@@ -1090,8 +1050,14 @@ fn compute_push_startup(
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
-    match state {
-        ProtoState::Idle => match build_startup_message(
+    // DEF-146: single-level classifier dispatch. Startup is the one
+    // helper where PingAwaiting groups with Connecting →
+    // StartupAlreadyInProgress (not CommandInProgress as in the
+    // other 6 helpers). Test:
+    // `startup_from_non_idle_non_errored_fails_with_startup_in_progress`
+    // (PingAwaitingRfq sub-case) pins this.
+    match state.push_class() {
+        crate::state::StatePushClass::Idle => match build_startup_message(
             &user,
             database.as_ref(),
             app_name.as_ref(),
@@ -1130,7 +1096,7 @@ fn compute_push_startup(
                 staged,
             ),
         },
-        ProtoState::Errored(prior_kind) => {
+        crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1139,47 +1105,26 @@ fn compute_push_startup(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        other @ (ProtoState::PingAwaitingRfq(_)
-        | ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+        // Startup-specific: PingAwaiting groups with Connecting
+        // (both imply "startup sequence cannot be re-initiated").
+        crate::state::StatePushClass::PingAwaiting
+        | crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            other
+            state
         }
-        other @ (ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
+        crate::state::StatePushClass::BusyQuery => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            other
+            state
         }
     }
 }
@@ -1204,8 +1149,11 @@ fn compute_push_simple_query(
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
-    match state {
-        ProtoState::Idle => match build_query_message(sql, write_buf) {
+    // DEF-146: single-level classifier dispatch (standard pattern —
+    // Ping + BusyQuery → CommandInProgress, Connecting →
+    // StartupAlreadyInProgress).
+    match state.push_class() {
+        crate::state::StatePushClass::Idle => match build_query_message(sql, write_buf) {
             Ok(range) => {
                 emit_actions!(staged, budget: 1, [
                     StagedAction::SendBytesRange(range),
@@ -1221,7 +1169,7 @@ fn compute_push_simple_query(
                 staged,
             ),
         },
-        ProtoState::Errored(prior_kind) => {
+        crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1230,47 +1178,24 @@ fn compute_push_simple_query(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        other @ (ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+        crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            other
+            state
         }
-        other @ (ProtoState::PingAwaitingRfq(_)
-        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
+        crate::state::StatePushClass::PingAwaiting
+        | crate::state::StatePushClass::BusyQuery => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            other
+            state
         }
     }
 }
@@ -1350,8 +1275,9 @@ fn compute_push_parse(
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
-    match state {
-        ProtoState::Idle => match build_parse_message(stmt_name, sql, write_buf) {
+    // DEF-146: classifier dispatch (standard pattern).
+    match state.push_class() {
+        crate::state::StatePushClass::Idle => match build_parse_message(stmt_name, sql, write_buf) {
             Ok(range) => {
                 // Emit Parse frame (range into write_buf) + bundled
                 // Sync (static const). Both needed for PG to flush
@@ -1371,7 +1297,7 @@ fn compute_push_parse(
                 staged,
             ),
         },
-        ProtoState::Errored(prior_kind) => {
+        crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1380,47 +1306,24 @@ fn compute_push_parse(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        other @ (ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+        crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            other
+            state
         }
-        other @ (ProtoState::PingAwaitingRfq(_)
-        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
+        crate::state::StatePushClass::PingAwaiting
+        | crate::state::StatePushClass::BusyQuery => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            other
+            state
         }
     }
 }
@@ -1531,8 +1434,9 @@ fn compute_push_describe_statement(
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
-    match state {
-        ProtoState::Idle => {
+    // DEF-146: classifier dispatch (standard pattern).
+    match state.push_class() {
+        crate::state::StatePushClass::Idle => {
             match build_describe_message(
                 crate::wire::DescribeTargetByte::Statement,
                 stmt_name,
@@ -1559,7 +1463,7 @@ fn compute_push_describe_statement(
                 ),
             }
         }
-        ProtoState::Errored(prior_kind) => {
+        crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1568,47 +1472,24 @@ fn compute_push_describe_statement(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        other @ (ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+        crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            other
+            state
         }
-        other @ (ProtoState::PingAwaitingRfq(_)
-        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
+        crate::state::StatePushClass::PingAwaiting
+        | crate::state::StatePushClass::BusyQuery => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            other
+            state
         }
     }
 }
@@ -1631,8 +1512,9 @@ fn compute_push_describe_portal(
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
-    match state {
-        ProtoState::Idle => {
+    // DEF-146: classifier dispatch (standard pattern).
+    match state.push_class() {
+        crate::state::StatePushClass::Idle => {
             match build_describe_message(
                 crate::wire::DescribeTargetByte::Portal,
                 portal_name,
@@ -1654,7 +1536,7 @@ fn compute_push_describe_portal(
                 ),
             }
         }
-        ProtoState::Errored(prior_kind) => {
+        crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1663,47 +1545,24 @@ fn compute_push_describe_portal(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        other @ (ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+        crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            other
+            state
         }
-        other @ (ProtoState::PingAwaitingRfq(_)
-        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
+        crate::state::StatePushClass::PingAwaiting
+        | crate::state::StatePushClass::BusyQuery => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            other
+            state
         }
     }
 }
@@ -1821,8 +1680,9 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
-    match state {
-        ProtoState::Idle => {
+    // DEF-146: classifier dispatch (standard pattern).
+    match state.push_class() {
+        crate::state::StatePushClass::Idle => {
             // Build both outbound frames into the same WriteBuf. If
             // Bind succeeds but Execute fails, that's still a
             // build-unreachable path (const-asserted fit) — we
@@ -1866,7 +1726,7 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                 ),
             }
         }
-        ProtoState::Errored(prior_kind) => {
+        crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1875,79 +1735,44 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
             ]);
             ProtoState::Errored(prior_kind)
         }
-        other @ (ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+        crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            other
+            state
         }
-        other @ (ProtoState::PingAwaitingRfq(_)
-        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. }) => {
+        crate::state::StatePushClass::PingAwaiting
+        | crate::state::StatePushClass::BusyQuery => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            other
+            state
         }
     }
 }
 
-// Pass-#7 F6 analysis (deferred, no code lands):
+// Pass-#7 F6 / DEF-146 closure (2026-04-22):
 //
-// The architect-audit proposal was to extract a `const fn
-// is_busy_in_flight(state: &ProtoState) -> bool` and replace the
-// five `compute_push_*` helpers' final or-pattern catch-alls with
-// `other if is_busy_in_flight(&other) => ...`. Goal: centralise the
-// "busy-state set" so adding a new in-flight variant requires
-// touching one list, not five.
+// Pass-#7's F6 audit proposed a `const fn is_busy_in_flight(&ProtoState)
+// -> bool` helper to centralise the "busy-state set" — rejected at
+// the time because a guarded match arm is not exhaustive (needs a
+// `_ =>` fallback, and every forbid-bundle-legal fallback loses the
+// "new variant forces decision" property).
 //
-// REJECTED under the forbid bundle. A guarded arm does NOT prove
-// match exhaustiveness; the match would need a catch-all `_ =>`
-// fallback. All fallback options collide with bans:
-//   - `unreachable!()` / `panic!()` — banned by
-//     `clippy::unreachable` / `clippy::panic`.
-//   - `core::hint::unreachable_unchecked()` — `unsafe`, banned by
-//     `forbid(unsafe_code)`.
-//   - Silently classifying as one of the explicit cases — loses
-//     the "new variant forces decision" property.
-//
-// The existing design keeps the or-pattern enumeration at every
-// `compute_push_*` catch-all AND the exhaustive match at
-// `allows_unsolicited_param_status` — both are tier-1 exhaustive.
-// A new variant fails compilation at BOTH sites, forcing the
-// author to update both. Drift between the two lists is therefore
-// impossible without either site's match dropping to non-exhaustive.
-// Verified: current code is tier-1 on "busy-state classification;"
-// F6 would trade tier-1 compile for tier-2 match guards + runtime
-// fallback.
+// DEF-146 landed the correct form: the classifier is an ENUM
+// (`StatePushClass`), not a bool. Each compute_push_* matches the
+// classifier exhaustively (5 variants, no `_` fallback) → tier-1
+// preserved; the variant enumeration lives once in
+// `ProtoState::push_class` (7 × duplication → 1 × authoritative).
+// Adding a new ProtoState variant fails the build at push_class if
+// uncategorised; the 7 compute_push_* helpers flow through
+// automatically.
 
 /// Whether the current protocol state accepts unsolicited
 /// `ParameterStatus` frames from the server.

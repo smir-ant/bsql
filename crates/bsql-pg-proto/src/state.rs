@@ -556,6 +556,107 @@ impl ProtoState {
             | Self::DescribePortalAwaitingRfq { reply, .. } => Some(reply.consume()),
         }
     }
+
+    /// DEF-146: classify the current state for push-command dispatch.
+    ///
+    /// Pre-DEF-146, each of the 7 `compute_push_*` helpers in
+    /// `protocol.rs` enumerated the same ~18 `ProtoState` variants in
+    /// or-patterns to group them into the failure classes a push
+    /// targets (CommandInProgress / StartupAlreadyInProgress). Adding
+    /// a new `ProtoState` variant required synchronised edits in all
+    /// 7 helpers.
+    ///
+    /// Post-DEF-146, the enumeration lives in ONE place (this method).
+    /// Each `compute_push_*` matches the 5-variant [`StatePushClass`]
+    /// exhaustively — no `_` fallback, so tier-1 compile shield
+    /// preserved. Adding a new `ProtoState` variant requires exactly
+    /// one edit (here) plus whatever per-helper logic the new variant
+    /// needs.
+    ///
+    /// # Classes
+    ///
+    /// - [`StatePushClass::Idle`] — happy-path, accepts any command.
+    /// - [`StatePushClass::Errored`] — terminal; carry `prior_kind`
+    ///   for `ConnectionAlreadyClosed` emission.
+    /// - [`StatePushClass::Connecting`] — any `Connecting*` variant
+    ///   during startup handshake.
+    /// - [`StatePushClass::PingAwaiting`] — the pre-ready `PingAwaitingRfq`.
+    ///   Separate from Connecting because different commands classify
+    ///   it differently: Ping/SimpleQuery/Parse/etc. see it as
+    ///   "command in flight" (→ CommandInProgress); Startup groups
+    ///   it with Connecting (→ StartupAlreadyInProgress) because from
+    ///   Startup's perspective the connection is already past the
+    ///   startup phase.
+    /// - [`StatePushClass::BusyQuery`] — any post-startup in-flight
+    ///   state: SimpleQuery/Parse/Describe/BindExecute/DrainRfqAfterError.
+    ///
+    /// # Tier
+    ///
+    /// Exhaustive match over every `ProtoState` variant — adding a
+    /// variant without classifying it is a build error.
+    #[must_use]
+    pub(crate) const fn push_class(&self) -> StatePushClass {
+        match self {
+            Self::Idle => StatePushClass::Idle,
+            Self::Errored(kind) => StatePushClass::Errored(*kind),
+            Self::PingAwaitingRfq(_) => StatePushClass::PingAwaiting,
+            Self::ConnectingStartupTrust { .. }
+            | Self::ConnectingStartupScram { .. }
+            | Self::ConnectingScramAwaitingServerFirst { .. }
+            | Self::ConnectingScramAwaitingServerFinal { .. }
+            | Self::ConnectingScramAwaitingAuthOk(_)
+            | Self::ConnectingPostAuthAwaitingKey(_)
+            | Self::ConnectingPostAuthHaveKey { .. } => StatePushClass::Connecting,
+            Self::SimpleQueryAwaitingFirstResponse(_)
+            | Self::SimpleQueryStreamingRows { .. }
+            | Self::SimpleQueryAwaitingRfq { .. }
+            | Self::DrainRfqAfterError
+            | Self::ParseAwaitingParseComplete(_)
+            | Self::ParseAwaitingRfq(_)
+            | Self::BindExecuteAwaitingBindCompleteDml(_)
+            | Self::BindExecuteAwaitingCommandCompleteDml(_)
+            | Self::BindExecuteAwaitingRfqDml { .. }
+            | Self::BindExecuteAwaitingBindCompleteSelect { .. }
+            | Self::BindExecuteAwaitingDataOrCompleteSelect { .. }
+            | Self::BindExecuteStreamingRows { .. }
+            | Self::BindExecuteAwaitingRfqSelect { .. }
+            | Self::DescribeStatementAwaitingParamDesc(_)
+            | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
+            | Self::DescribeStatementAwaitingRfq { .. }
+            | Self::DescribePortalAwaitingRowDescOrNoData(_)
+            | Self::DescribePortalAwaitingRfq { .. } => StatePushClass::BusyQuery,
+        }
+    }
+}
+
+/// DEF-146: classifier output for [`ProtoState::push_class`].
+///
+/// Used by the 7 `compute_push_*` helpers in `protocol.rs` to decide
+/// what `FailReply.cause` to emit on a non-Idle push. Each helper's
+/// exhaustive match on `StatePushClass` replaces the pre-DEF-146
+/// per-variant or-patterns (B002).
+///
+/// Exhaustive variants — no `Other` / catch-all. Adding a new
+/// `ProtoState` variant requires classifying it inside
+/// [`ProtoState::push_class`] (build error if forgotten).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatePushClass {
+    /// Connection ready to accept new commands.
+    Idle,
+    /// Terminal — connection has been torn down. Carry the prior
+    /// `StateErrorKind` for `ConnectionAlreadyClosed` emission.
+    Errored(StateErrorKind),
+    /// Any `Connecting*` variant during startup handshake.
+    Connecting,
+    /// `PingAwaitingRfq` — post-startup Ping response pending.
+    /// Separated from `Connecting` / `BusyQuery` because callers
+    /// disagree on whether to classify it as `CommandInProgress` or
+    /// `StartupAlreadyInProgress` — see [`ProtoState::push_class`]
+    /// docstring.
+    PingAwaiting,
+    /// Any post-startup in-flight state: `SimpleQuery*`, `Parse*`,
+    /// `Describe*`, `BindExecute*`, or `DrainRfqAfterError`.
+    BusyQuery,
 }
 
 impl core::fmt::Debug for ProtoState {
