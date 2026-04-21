@@ -98,6 +98,8 @@ mod sealed {
     pub trait ValidatedSealed {}
     /// Supertrait seal for [`super::Truncating`].
     pub trait TruncatingSealed {}
+    /// Supertrait seal for [`super::ValidUtf8`].
+    pub trait ValidUtf8Sealed {}
 }
 
 /// Tag trait supplying the per-kind debug name. Every
@@ -140,6 +142,22 @@ pub trait Validated: FixedStrKind + sealed::ValidatedSealed {}
 /// **Sealed** (DEF-115).
 pub trait Truncating: FixedStrKind + sealed::TruncatingSealed {}
 
+/// Marker trait asserting that a tag's constructors guarantee the
+/// stored bytes are valid UTF-8.
+///
+/// [`FixedStr::as_str`] is only available on `FixedStr<N, Tag>` where
+/// `Tag: ValidUtf8` — tags whose constructors don't guarantee UTF-8
+/// (none exist today — all crate tags take `&str` or coerce to ASCII
+/// via `from_bytes_lossy`) would be statically prevented from
+/// exposing their bytes as `&str`. F3: tier-3 audit pairing (the
+/// `as_str` fallback `""` is safe only because every current tag
+/// happens to produce UTF-8) → tier-2 structural (tag must opt into
+/// `ValidUtf8` to earn `as_str`).
+///
+/// **Sealed** (DEF-115): only the crate's own tags can be
+/// `ValidUtf8`. A downstream tag type cannot bypass the check.
+pub trait ValidUtf8: FixedStrKind + sealed::ValidUtf8Sealed {}
+
 /// Tag for [`Ident`] — non-empty, no NUL, max 63 bytes.
 ///
 /// `enum`-with-no-variants → uninstantiable; the type parameter
@@ -149,11 +167,13 @@ pub enum IdentTag {}
 
 impl sealed::FixedStrKindSealed for IdentTag {}
 impl sealed::ValidatedSealed for IdentTag {}
+impl sealed::ValidUtf8Sealed for IdentTag {}
 impl FixedStrKind for IdentTag {
     const DEBUG_NAME: &'static str = "Ident";
     const ALLOW_EMPTY: bool = false;
 }
 impl Validated for IdentTag {}
+impl ValidUtf8 for IdentTag {}
 
 /// Tag for [`DatabaseName`] — same invariants as [`IdentTag`] but a
 /// distinct compile-time type.
@@ -162,11 +182,13 @@ pub enum DatabaseNameTag {}
 
 impl sealed::FixedStrKindSealed for DatabaseNameTag {}
 impl sealed::ValidatedSealed for DatabaseNameTag {}
+impl sealed::ValidUtf8Sealed for DatabaseNameTag {}
 impl FixedStrKind for DatabaseNameTag {
     const DEBUG_NAME: &'static str = "DatabaseName";
     const ALLOW_EMPTY: bool = false;
 }
 impl Validated for DatabaseNameTag {}
+impl ValidUtf8 for DatabaseNameTag {}
 
 /// Tag for [`ApplicationName`] — may be empty; no NUL; max 128 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,11 +196,13 @@ pub enum ApplicationNameTag {}
 
 impl sealed::FixedStrKindSealed for ApplicationNameTag {}
 impl sealed::ValidatedSealed for ApplicationNameTag {}
+impl sealed::ValidUtf8Sealed for ApplicationNameTag {}
 impl FixedStrKind for ApplicationNameTag {
     const DEBUG_NAME: &'static str = "ApplicationName";
     const ALLOW_EMPTY: bool = true;
 }
 impl Validated for ApplicationNameTag {}
+impl ValidUtf8 for ApplicationNameTag {}
 
 /// Tag for [`BoundedStr<N>`] — truncating constructor with `"…"`
 /// marker, no validation. Used exclusively on error-reporting paths
@@ -188,11 +212,13 @@ pub enum BoundedStrTag {}
 
 impl sealed::FixedStrKindSealed for BoundedStrTag {}
 impl sealed::TruncatingSealed for BoundedStrTag {}
+impl sealed::ValidUtf8Sealed for BoundedStrTag {}
 impl FixedStrKind for BoundedStrTag {
     const DEBUG_NAME: &'static str = "BoundedStr";
     const ALLOW_EMPTY: bool = true;
 }
 impl Truncating for BoundedStrTag {}
+impl ValidUtf8 for BoundedStrTag {}
 // Deliberately *not* `impl Validated for BoundedStrTag` — its
 // constructor is `from_str_truncating`, not `try_from_str`. Also
 // deliberately *not* `impl sealed::ValidatedSealed` — the sealed
@@ -220,11 +246,13 @@ impl Truncating for BoundedStrTag {}
 pub enum SqlTag {}
 impl sealed::FixedStrKindSealed for SqlTag {}
 impl sealed::TruncatingSealed for SqlTag {}
+impl sealed::ValidUtf8Sealed for SqlTag {}
 impl FixedStrKind for SqlTag {
     const DEBUG_NAME: &'static str = "Sql";
     const ALLOW_EMPTY: bool = true;
 }
 impl Truncating for SqlTag {}
+impl ValidUtf8 for SqlTag {}
 // Not Validated — truncating constructor only.
 
 /// Tag for [`StmtName`] — a PG prepared-statement name. Validated:
@@ -235,11 +263,13 @@ impl Truncating for SqlTag {}
 pub enum StmtNameTag {}
 impl sealed::FixedStrKindSealed for StmtNameTag {}
 impl sealed::ValidatedSealed for StmtNameTag {}
+impl sealed::ValidUtf8Sealed for StmtNameTag {}
 impl FixedStrKind for StmtNameTag {
     const DEBUG_NAME: &'static str = "StmtName";
     const ALLOW_EMPTY: bool = true;
 }
 impl Validated for StmtNameTag {}
+impl ValidUtf8 for StmtNameTag {}
 
 /// Tag for [`PortalName`] — a PG portal name (bound statement
 /// instance). Same validation shape as [`StmtNameTag`] (NUL-free,
@@ -250,11 +280,13 @@ impl Validated for StmtNameTag {}
 pub enum PortalNameTag {}
 impl sealed::FixedStrKindSealed for PortalNameTag {}
 impl sealed::ValidatedSealed for PortalNameTag {}
+impl sealed::ValidUtf8Sealed for PortalNameTag {}
 impl FixedStrKind for PortalNameTag {
     const DEBUG_NAME: &'static str = "PortalName";
     const ALLOW_EMPTY: bool = true;
 }
 impl Validated for PortalNameTag {}
+impl ValidUtf8 for PortalNameTag {}
 
 /// POD fixed-capacity byte string with a phantom `Tag` for nominal
 /// typing.
@@ -287,10 +319,13 @@ impl Validated for PortalNameTag {}
 /// unconditional implementations that depend only on the concrete
 /// fields (`[u8; N]` and `u16`, both of which are `Copy + Eq`).
 ///
-/// `Eq`/`PartialEq` use full `[u8; N]` comparison including the tail
-/// past `len`. Since tail bytes past `len` are constructor-zeroed
-/// and never mutated post-construction, this is equivalent to
-/// comparing `as_bytes()` slices.
+/// `Eq`/`PartialEq` (F46) compare only the populated prefix
+/// `[..self.len()]` — not the full `[u8; N]` buffer. Tail bytes are
+/// constructor-zeroed and never mutated, so logically the two forms
+/// are equivalent, but comparing only the populated prefix saves
+/// up to `N - len` bytes per equality check. For `Sql<2048>` with a
+/// typical 64-byte query, the prefix compare is 64 bytes vs 2048
+/// for the full-buffer compare — 32x reduction on every `==`.
 #[repr(C)]
 pub struct FixedStr<const N: usize, Tag> {
     buf: [u8; N],
@@ -309,12 +344,16 @@ impl<const N: usize, Tag> Copy for FixedStr<N, Tag> {}
 impl<const N: usize, Tag> PartialEq for FixedStr<N, Tag> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // `len == len` short-circuits the buffer comparison in the
-        // common "same length" case. Buffers compare byte-wise over
-        // the full `[u8; N]` — tails past `len` are zero-init by
-        // every constructor and never mutated post-hoc, so byte
-        // equality implies string equality.
-        self.len == other.len && self.buf == other.buf
+        // F46: compare `len` first (short-circuit on different
+        // length), then compare only the populated prefix.
+        // `as_bytes()` returns `&self.buf[..len]` via `.get(..len)`;
+        // both sides have identical length once the len-equality
+        // check passes, so the slice compare is byte-exact over
+        // exactly `len` bytes — NOT the full `N`-byte buffer.
+        // Pre-F46 compared `self.buf == other.buf` (full N bytes
+        // including the zeroed tail) — logically equivalent (tail
+        // always zero) but wastes `N - len` byte compares per call.
+        self.len == other.len && self.as_bytes() == other.as_bytes()
     }
 }
 impl<const N: usize, Tag> Eq for FixedStr<N, Tag> {}
@@ -576,15 +615,23 @@ impl<const N: usize, Tag> FixedStr<N, Tag> {
         self.buf.get(..self.len()).unwrap_or(&[])
     }
 
+}
+
+/// `as_str` is available ONLY for tags that opt into [`ValidUtf8`] —
+/// F3 tier-2 structural: a future tag type that doesn't guarantee
+/// UTF-8 won't be able to call this method. All current crate tags
+/// opt in because every constructor takes `&str` or produces ASCII
+/// via `from_bytes_lossy`.
+impl<const N: usize, Tag: ValidUtf8> FixedStr<N, Tag> {
     /// Borrow the populated bytes as `&str`.
     ///
-    /// **Validity:** every constructor on this crate accepts only
-    /// UTF-8 input (`&str`, or a static UTF-8 marker), so the bytes
-    /// are UTF-8 by construction. `core::str::from_utf8` runs an O(N)
-    /// validation pass anyway because the crate's `#![forbid(unsafe_code)]`
-    /// rules out `from_utf8_unchecked`. The `.unwrap_or("")` fallback
-    /// is architecturally unreachable — it surfaces a future
-    /// construction bug rather than panicking.
+    /// **Validity:** every `ValidUtf8` tag's constructor guarantees
+    /// the stored bytes are valid UTF-8. `core::str::from_utf8` runs
+    /// an O(N) validation pass anyway because the crate's
+    /// `#![forbid(unsafe_code)]` rules out `from_utf8_unchecked`.
+    /// The `.unwrap_or("")` fallback is architecturally unreachable
+    /// — it surfaces a future construction-invariant break rather
+    /// than panicking.
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -599,13 +646,17 @@ impl<const N: usize, Tag> Default for FixedStr<N, Tag> {
     }
 }
 
-impl<const N: usize, Tag: FixedStrKind> fmt::Debug for FixedStr<N, Tag> {
+// F3: Debug + Display are gated on `ValidUtf8` — both render via
+// `as_str()` which requires UTF-8 validity. This is in practice
+// unchanged from pre-F3 (every current tag is ValidUtf8), but
+// future non-UTF-8 tags would need separate byte-based impls.
+impl<const N: usize, Tag: FixedStrKind + ValidUtf8> fmt::Debug for FixedStr<N, Tag> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}(\"{}\")", Tag::DEBUG_NAME, self.as_str())
     }
 }
 
-impl<const N: usize, Tag> fmt::Display for FixedStr<N, Tag> {
+impl<const N: usize, Tag: ValidUtf8> fmt::Display for FixedStr<N, Tag> {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())

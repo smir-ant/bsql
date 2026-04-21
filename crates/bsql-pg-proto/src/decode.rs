@@ -63,6 +63,30 @@ pub enum FormatCode {
     Binary = 1,
 }
 
+impl FormatCode {
+    /// Classify a wire i16 format-code byte into the typed variant.
+    ///
+    /// PG §55.2.2 defines exactly two legal values: `0` (text) and
+    /// `1` (binary). Any other value is a server-side wire violation
+    /// and returns the offending code in `Err` for the caller to wrap
+    /// into [`ProtocolError::UnexpectedFormatCode`].
+    ///
+    /// # F32 (2026-04-21)
+    ///
+    /// Centralises the `{0, 1}` classification so future extended-query
+    /// sub-phases (1c-3b Describe / 1c-3c BindExecute) that also parse
+    /// format codes don't each rewrite the same match. A new illegal
+    /// value surfaces with identical diagnostic across every callsite.
+    #[inline]
+    pub const fn try_from_wire_i16(code: i16) -> Result<Self, i16> {
+        match code {
+            0 => Ok(Self::Text),
+            1 => Ok(Self::Binary),
+            other => Err(other),
+        }
+    }
+}
+
 /// Per-column metadata from a `RowDescription` frame.
 ///
 /// Carries the load-bearing fields for row decoding: the PG type OID
@@ -249,11 +273,8 @@ pub(crate) fn parse_row_description(
         ] = meta;
         let type_oid = u32::from_be_bytes([toid0, toid1, toid2, toid3]);
         let format_code_i16 = i16::from_be_bytes([fc0, fc1]);
-        let format_code = match format_code_i16 {
-            0 => FormatCode::Text,
-            1 => FormatCode::Binary,
-            other => return Err(ProtocolError::UnexpectedFormatCode { code: other }),
-        };
+        let format_code = FormatCode::try_from_wire_i16(format_code_i16)
+            .map_err(|code| ProtocolError::UnexpectedFormatCode { code })?;
 
         *slot = ColumnDesc {
             type_oid,
