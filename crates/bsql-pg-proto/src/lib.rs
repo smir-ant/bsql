@@ -284,11 +284,11 @@ const _: () = assert!(
      state variant add a large buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<command::PgCommand>() <= 2112,
-    "PgCommand size regression — post-1c-1b budget is 2112 bytes. \
-     SimpleQuery dominates: Sql = FixedStr<2048, SqlTag> (2050 bytes) + \
-     ReplyId<QueryKind> (16) + discriminant + padding. Bumping \
-     MAX_SQL_LEN must move this limit in lockstep.",
+    core::mem::size_of::<command::PgCommand>() <= 2176,
+    "PgCommand size regression — post-1c-3a budget is 2176 bytes. \
+     Parse dominates: StmtName (66) + Sql (2050) + ReplyId<ParseKind> \
+     (16) + discriminant + padding. Bumping MAX_SQL_LEN or \
+     MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() <= 6336,

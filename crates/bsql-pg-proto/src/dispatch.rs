@@ -22,7 +22,7 @@ use crate::state::ProtoState;
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_COMMAND_COMPLETE,
     TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
-    TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
+    TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 use crate::write_buf::WriteBuf;
 
@@ -525,6 +525,71 @@ pub(crate) fn dispatch(
         }
         (ProtoState::SimpleQueryDrainRfqAfterError, other) => {
             errored(None, ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // =============================================================
+        // Phase 1c-3a: Extended Query — Parse flow
+        //
+        // Parse + Sync sequence:
+        //   Client sends: P frame + S frame (bundled in push_command)
+        //   Server responds: '1' (ParseComplete) + 'Z' (ReadyForQuery)
+        //                or: 'E' (ErrorResponse) + 'Z' (recoverable)
+        //
+        // State lifecycle:
+        //   Idle → ParseAwaitingParseComplete(reply) → ParseAwaitRfq(reply) → Idle
+        //                                            ↘ (on E)
+        //                                              SimpleQueryDrainRfqAfterError → Idle
+        // =============================================================
+
+        (ProtoState::ParseAwaitingParseComplete(reply), TAG_PARSE_COMPLETE) => {
+            DispatchOutcome::AdvancedSilent {
+                new_state: ProtoState::ParseAwaitRfq(reply),
+            }
+        }
+        (ProtoState::ParseAwaitingParseComplete(reply), TAG_ERROR_RESPONSE) => {
+            // Recoverable parse error — PG spec sends Z after E, so
+            // drain it silently and return to Idle (reusing the
+            // `SimpleQueryDrainRfqAfterError` variant — both drain
+            // the same trailing RFQ pattern).
+            let cause = parse_error_response(payload);
+            DispatchOutcome::AdvancedWithAction {
+                new_state: ProtoState::SimpleQueryDrainRfqAfterError,
+                action: StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause,
+                },
+            }
+        }
+        (ProtoState::ParseAwaitingParseComplete(reply), other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        (ProtoState::ParseAwaitRfq(reply), TAG_READY_FOR_QUERY) => match payload {
+            // tx_status byte is validated here but not forwarded —
+            // `ParseCompletePayload` is a ZST (no tx_status field),
+            // matching the PG spec that Parse is a schema operation
+            // with no transactional side-effect the caller needs to
+            // observe. An invalid byte still classifies as malformed
+            // so users never see a mis-framed RFQ.
+            [tx_byte] if crate::action::TxStatus::try_from_byte(*tx_byte).is_some() => {
+                DispatchOutcome::AdvancedWithAction {
+                    new_state: ProtoState::Idle,
+                    action: crate::action::deliver(reply, crate::action::ParseCompletePayload),
+                }
+            }
+            [_] => errored(
+                Some(reply.consume()),
+                ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+            ),
+            other => errored(
+                Some(reply.consume()),
+                ProtocolError::MalformedReadyForQuery {
+                    payload_len: other.len(),
+                },
+            ),
+        },
+        (ProtoState::ParseAwaitRfq(reply), other) => {
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================

@@ -611,6 +611,8 @@ impl PgProtocol {
             ProtoState::SimpleQueryAwaitFirstResponse(id)
             | ProtoState::SimpleQueryStreamingRows(id) => Some(id.consume()),
             ProtoState::SimpleQueryAwaitRfq { reply, .. } => Some(reply.consume()),
+            ProtoState::ParseAwaitingParseComplete(reply)
+            | ProtoState::ParseAwaitRfq(reply) => Some(reply.consume()),
             ProtoState::Errored(original_kind) => {
                 // Already Errored — preserve the ORIGINAL kind
                 // (the `replace` above wrote the new one; revert).
@@ -694,6 +696,11 @@ fn compute_push(
         PgCommand::SimpleQuery { sql, reply } => {
             compute_push_simple_query(state, sql, reply, &mut staged, write_buf)
         }
+        PgCommand::Parse {
+            stmt_name,
+            sql,
+            reply,
+        } => compute_push_parse(state, stmt_name, sql, reply, &mut staged, write_buf),
     };
     (new_state, staged)
 }
@@ -773,7 +780,9 @@ fn compute_push_ping(
         other @ (ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError) => {
+        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitRfq(_)) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -887,7 +896,9 @@ fn compute_push_startup(
         other @ (ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError) => {
+        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitRfq(_)) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -976,7 +987,9 @@ fn compute_push_simple_query(
         | ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError) => {
+        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitRfq(_)) => {
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
@@ -1009,6 +1022,129 @@ fn build_query_message(
     // The 'Q' frame is always ≥ 6 bytes (tag + length + NUL) — the
     // NonEmptyRange constructor succeeds by construction.
     crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+}
+
+/// Build a PostgreSQL Extended Query `Parse` frame (PG §55.7).
+///
+/// Wire layout: tag `'P'`, 4-byte BE length (self-inclusive),
+/// NUL-terminated statement name (empty = unnamed statement),
+/// NUL-terminated SQL text, then an `i16` BE parameter-type count
+/// (always zero in 1c-3a — no parameter-type hints; 1c-3b adds
+/// per-parameter OID hints and widens this field).
+fn build_parse_message(
+    stmt_name: &crate::ident::StmtName,
+    sql: &crate::ident::Sql,
+    write_buf: &mut WriteBuf,
+) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
+    use crate::write_buf::WriteBufFull;
+
+    let start = write_buf.len();
+    write_buf.push_u8(crate::wire::TAG_PARSE.byte())?;
+    write_buf.with_length_prefix(|w| {
+        w.push_nul_terminated(stmt_name.as_bytes())?;
+        w.push_nul_terminated(sql.as_bytes())?;
+        // n_param_types = 0; 1c-3b will widen to push actual OIDs here.
+        w.push_bytes(&0i16.to_be_bytes())
+    })?;
+    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+}
+
+/// Compute the transition for [`PgCommand::Parse`] against the
+/// current [`ProtoState`]. Pure; see [`compute_push`] for framing.
+///
+/// Happy path emits TWO actions: a `SendBytes(Parse frame)` and
+/// a `SendBytes(SYNC)`. The Sync is a `'static` const
+/// (`SYNC_WIRE_BYTES`) emitted via `StagedAction::SendBytesStatic`
+/// for zero-copy; the Parse frame is written into the caller's
+/// `WriteBuf` and referenced via `StagedAction::SendBytesRange`.
+///
+/// Decision table:
+///
+/// | current state                | action                              | new state                            |
+/// |------------------------------|-------------------------------------|--------------------------------------|
+/// | `Idle` (build OK)            | 2× `SendBytes(Parse, SYNC)`         | `ParseAwaitingParseComplete(reply)`  |
+/// | `Idle` (build Err)           | `FailReply(ProtocolInvariantBroken)`| `Idle` (unchanged)                   |
+/// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
+/// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                |
+/// | `Awaiting*` / `SimpleQuery*` | `FailReply(CommandInProgress)`      | same                                 |
+/// | `Parse*`                     | `FailReply(CommandInProgress)`      | same                                 |
+fn compute_push_parse(
+    state: ProtoState,
+    stmt_name: crate::ident::StmtName,
+    sql: crate::ident::Sql,
+    reply: ReplyId<crate::reply_id::ParseKind>,
+    staged: &mut StagedActions,
+    write_buf: &mut WriteBuf,
+) -> ProtoState {
+    match state {
+        ProtoState::Idle => match build_parse_message(&stmt_name, &sql, write_buf) {
+            Ok(range) => {
+                // Emit Parse frame (range into write_buf) + bundled
+                // Sync (static const). Both needed for PG to flush
+                // ParseComplete (without Sync the server buffers
+                // forever). 2-action site.
+                emit_actions!(staged, budget: 2, [
+                    StagedAction::SendBytesRange(range),
+                    StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+                ]);
+                ProtoState::ParseAwaitingParseComplete(reply)
+            }
+            Err(_) => {
+                // TIER-1 COMPILE DEAD BRANCH. The const assert in
+                // write_buf.rs proves:
+                //   MAX_OWNED_SEND_LEN >= max_parse_message_size()
+                // so `build_parse_message` on `StmtName` + `Sql`
+                // bounded by their truncating constructors cannot
+                // overflow the WriteBuf.
+                emit_actions!(staged, budget: 1, [
+                    StagedAction::FailReply {
+                        id: reply.consume(),
+                        cause: ProtocolError::ProtocolInvariantBroken,
+                    },
+                ]);
+                ProtoState::Idle
+            }
+        },
+        ProtoState::Errored(prior_kind) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
+                },
+            ]);
+            ProtoState::Errored(prior_kind)
+        }
+        other @ (ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
+        | ProtoState::ConnectingScramAwaitServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitAuthOk(_)
+        | ProtoState::ConnectingPostAuthWaitKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. }) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::StartupAlreadyInProgress,
+                },
+            ]);
+            other
+        }
+        other @ (ProtoState::AwaitingPingReply(_)
+        | ProtoState::SimpleQueryAwaitFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows(_)
+        | ProtoState::SimpleQueryAwaitRfq { .. }
+        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitRfq(_)) => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::FailReply {
+                    id: reply.consume(),
+                    cause: ProtocolError::CommandInProgress,
+                },
+            ]);
+            other
+        }
+    }
 }
 
 /// Whether the current protocol state accepts unsolicited
@@ -1045,7 +1181,9 @@ fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
         | ProtoState::SimpleQueryAwaitFirstResponse(_)
         | ProtoState::SimpleQueryStreamingRows(_)
         | ProtoState::SimpleQueryAwaitRfq { .. }
-        | ProtoState::SimpleQueryDrainRfqAfterError => true,
+        | ProtoState::SimpleQueryDrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitRfq(_) => true,
         ProtoState::ConnectingStartupTrust { .. }
         | ProtoState::ConnectingStartupScram { .. }
         | ProtoState::ConnectingScramAwaitServerFirst { .. }
@@ -1259,6 +1397,10 @@ mod allows_unsolicited_param_status_tests {
             ProtoState::SimpleQueryAwaitRfq { reply, .. } => {
                 reply.consume();
             }
+            ProtoState::ParseAwaitingParseComplete(reply)
+            | ProtoState::ParseAwaitRfq(reply) => {
+                reply.consume();
+            }
         }
     }
 
@@ -1431,6 +1573,10 @@ mod compute_push_tests {
                 id.consume();
             }
             ProtoState::SimpleQueryAwaitRfq { reply, .. } => {
+                reply.consume();
+            }
+            ProtoState::ParseAwaitingParseComplete(reply)
+            | ProtoState::ParseAwaitRfq(reply) => {
                 reply.consume();
             }
         }

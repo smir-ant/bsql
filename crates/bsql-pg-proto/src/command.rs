@@ -9,9 +9,9 @@
 //! variants (`Query`, `Execute`, `Begin`, …) land with their drivers
 //! per reforge.md §3.5.
 
-use crate::ident::{ApplicationName, DatabaseName, Ident, Sql};
+use crate::ident::{ApplicationName, DatabaseName, Ident, Sql, StmtName};
 use crate::password::Credentials;
-use crate::reply_id::{PingKind, QueryKind, ReplyId, StartupKind};
+use crate::reply_id::{ParseKind, PingKind, QueryKind, ReplyId, StartupKind};
 
 /// A command pushed by the wrapper into the protocol state machine.
 ///
@@ -33,7 +33,6 @@ use crate::reply_id::{PingKind, QueryKind, ReplyId, StartupKind};
 #[derive(Debug)]
 #[non_exhaustive]
 #[must_use = "a PgCommand has no effect until pushed via PgProtocol::push_command"]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; PgCommand is constructed once per user request, not per row")]
 pub enum PgCommand {
     /// Cheap server liveness probe.
     ///
@@ -77,6 +76,50 @@ pub enum PgCommand {
         /// DEF-112: typed `ReplyId<StartupKind>` binds the reply
         /// payload to [`crate::action::StartupCompletePayload`].
         reply: ReplyId<StartupKind>,
+    },
+
+    /// Prepare a named SQL statement via PG's Extended Query protocol
+    /// (`P`-frame + `S`-frame terminator). 1c-3a.
+    ///
+    /// **Precondition:** protocol must be in [`crate::ProtoState::Idle`].
+    /// A Parse while busy yields `FailReply(CommandInProgress)`.
+    ///
+    /// # Response sequence
+    ///
+    /// - Success: `ParseComplete` (`'1'`) → `ReadyForQuery` (`'Z'`) →
+    ///   [`crate::Reply::ParseComplete`] delivered.
+    /// - Server-side syntax error: `ErrorResponse` (`'E'`) →
+    ///   `ReadyForQuery` → `FailReply(ServerErrorResponse{…})`. The
+    ///   connection stays open (same recoverable-error pattern as
+    ///   SimpleQuery per PG §55.2.3).
+    ///
+    /// # Sync-bundling
+    ///
+    /// This command emits **two** outbound wire frames in one push:
+    /// a Parse frame followed by a Sync frame. Without the Sync,
+    /// PG buffers Extended Query responses indefinitely; a bare
+    /// Parse would never reach the client. Bundling keeps the
+    /// single-command API shape consistent with `Ping` / `SimpleQuery`;
+    /// pipelining (many commands before one Sync) lands in 1c-3e.
+    ///
+    /// # Parameter types
+    ///
+    /// 1c-3a does not ship parameter-type hints — the `n_param_types`
+    /// field is always zero on the wire. Type hints land in 1c-3b
+    /// alongside `Bind` + `ParamsWriter`.
+    Parse {
+        /// The prepared-statement name. Empty (the "unnamed statement"
+        /// per PG convention) or a validated `StmtName` up to
+        /// [`crate::ident::MAX_PG_NAME_LEN`] bytes.
+        stmt_name: StmtName,
+        /// SQL text — bounded to [`crate::ident::MAX_SQL_LEN`] with
+        /// truncating constructor.
+        sql: Sql,
+        /// Correlator for the reply.
+        ///
+        /// DEF-112: typed `ReplyId<ParseKind>` binds the payload to
+        /// [`crate::action::ParseCompletePayload`] at compile time.
+        reply: ReplyId<ParseKind>,
     },
 
     /// Execute a single SQL statement via PG's Simple Query protocol

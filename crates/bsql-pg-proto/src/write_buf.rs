@@ -24,19 +24,21 @@ use core::fmt;
 /// Maximum byte capacity for an owned outbound frame.
 ///
 /// Derived from the worst case across StartupMessage, SASLInitialResponse,
-/// SASLResponse, **and SimpleQuery** (1c-1b). The cap is a const
-/// computed from the worst-case contributing inputs; const asserts
-/// below tie it to every frame-builder's size math so a future
-/// change to any contributing constant (e.g. `MAX_SQL_LEN`) without
-/// growing this cap becomes a build error, not a runtime overflow.
+/// SASLResponse, SimpleQuery, **and Parse** (1c-3a). The cap is a
+/// const computed from the worst-case contributing inputs; const
+/// asserts below tie it to every frame-builder's size math so a
+/// future change to any contributing constant (`MAX_SQL_LEN`,
+/// `MAX_PG_NAME_LEN`) without growing this cap becomes a build
+/// error, not a runtime overflow.
 ///
 /// Size breakdown (current values):
 /// - StartupMessage worst case: ~305 bytes.
 /// - SASLInitialResponse worst case: ~147 bytes.
 /// - SASLResponse worst case: ~389 bytes.
-/// - **SimpleQuery (`Q`) worst case: 2054 bytes** (tag + length +
-///   MAX_SQL_LEN + NUL). Dominates; drives the cap.
-pub const MAX_OWNED_SEND_LEN: usize = 2112;
+/// - SimpleQuery (`Q`) worst case: 2054 bytes.
+/// - **Parse (`P`) worst case: 2120 bytes** (tag + length + stmt_name
+///   + NUL + SQL + NUL + i16 param-type count). Dominates.
+pub const MAX_OWNED_SEND_LEN: usize = 2176;
 
 /// Worst-case byte size of a PostgreSQL `StartupMessage` frame.
 ///
@@ -115,6 +117,46 @@ const _: () = assert!(
     "MAX_OWNED_SEND_LEN below worst-case SimpleQuery ('Q') frame size — \
      full-size SQL would overflow the caller's WriteBuf. Grow \
      MAX_OWNED_SEND_LEN or shrink MAX_SQL_LEN in lockstep.",
+);
+
+/// Worst-case byte size of a PostgreSQL `Parse` (`'P'`) frame —
+/// Extended Query protocol, 1c-3a.
+///
+/// Layout (PG §55.7 Parse):
+/// - Tag: `'P'` (1 byte)
+/// - Length: `u32` BE including itself
+/// - Statement name: up to [`crate::ident::MAX_PG_NAME_LEN`] bytes + NUL
+/// - SQL text: up to [`crate::ident::MAX_SQL_LEN`] bytes + NUL
+/// - Parameter type-count: `i16` (can be 0 — no hints)
+/// - Parameter type OIDs: `i32` × count (0 for 1c-3a — no hints)
+///
+/// # Drift guard
+///
+/// Bumping [`crate::ident::MAX_PG_NAME_LEN`] or
+/// [`crate::ident::MAX_SQL_LEN`] without growing
+/// [`MAX_OWNED_SEND_LEN`] fails the `const _` assert below. 1c-3a
+/// does not yet support parameter type hints; when 1c-3b adds them,
+/// this size formula widens (+4 × MAX_PARAM_COUNT).
+pub const fn max_parse_message_size() -> usize {
+    1usize // tag 'P'
+        .saturating_add(4) // length prefix (includes itself)
+        .saturating_add(crate::ident::MAX_PG_NAME_LEN)
+        .saturating_add(1) // stmt_name NUL
+        .saturating_add(crate::ident::MAX_SQL_LEN)
+        .saturating_add(1) // sql NUL
+        .saturating_add(2) // i16 param-type count
+    // No per-param-type OIDs in 1c-3a (count is zero).
+}
+
+// 1c-3a drift-pin: same pattern as SimpleQuery above. Parse without
+// param-type hints fits comfortably under MAX_OWNED_SEND_LEN; param
+// hints will be added in 1c-3b with a corresponding cap bump.
+const _: () = assert!(
+    MAX_OWNED_SEND_LEN >= max_parse_message_size(),
+    "MAX_OWNED_SEND_LEN below worst-case Parse ('P') frame size — \
+     full-size stmt_name + SQL would overflow the caller's WriteBuf. \
+     Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN / MAX_SQL_LEN \
+     in lockstep.",
 );
 
 /// Bounded outbound frame buffer with PG wire builders.

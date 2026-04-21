@@ -22,7 +22,7 @@
 use crate::error::BoundedStr;
 use crate::error::ErrorKind;
 use crate::ident::PodBytes;
-use crate::reply_id::{PingKind, QueryKind, ReplyId, StartupKind};
+use crate::reply_id::{ParseKind, PingKind, QueryKind, ReplyId, StartupKind};
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
 
@@ -199,6 +199,25 @@ pub enum ProtoState {
     /// `Z` and transitions back to [`Self::Idle`].
     SimpleQueryDrainRfqAfterError,
 
+    // ---------------------------------------------------------------
+    // Phase 1c-3a: Extended Query — Parse flow
+    // ---------------------------------------------------------------
+
+    /// A `Parse` + `Sync` frame pair was sent; awaiting `ParseComplete`
+    /// (`'1'`). The inner [`ReplyId<ParseKind>`] is the only path to
+    /// the correlator; state-as-data (§7.2).
+    ///
+    /// Next legitimate frames: `ParseComplete` → transition to
+    /// [`Self::ParseAwaitRfq`]; `ErrorResponse` → emit FailReply +
+    /// transition to [`Self::SimpleQueryDrainRfqAfterError`]
+    /// (reused — both paths drain a trailing RFQ back to Idle).
+    ParseAwaitingParseComplete(ReplyId<ParseKind>),
+
+    /// `ParseComplete` received; awaiting the `ReadyForQuery` that
+    /// follows the bundled `Sync`. On `Z` → deliver
+    /// [`crate::Reply::ParseComplete`] and transition to Idle.
+    ParseAwaitRfq(ReplyId<ParseKind>),
+
     /// Terminal: the connection has been classified as unrecoverable.
     ///
     /// Entered by any path that calls `fail_inflight_and_close` or
@@ -261,6 +280,10 @@ impl core::fmt::Debug for ProtoState {
             Self::SimpleQueryDrainRfqAfterError => {
                 f.write_str("SimpleQueryDrainRfqAfterError")
             }
+            Self::ParseAwaitingParseComplete(id) => {
+                write!(f, "ParseAwaitingParseComplete({id:?})")
+            }
+            Self::ParseAwaitRfq(id) => write!(f, "ParseAwaitRfq({id:?})"),
             Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }

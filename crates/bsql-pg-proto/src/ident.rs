@@ -228,22 +228,22 @@ impl Truncating for SqlTag {}
 // Not Validated — truncating constructor only.
 
 /// Tag for [`StmtName`] — a PG prepared-statement name. Validated:
-/// non-empty, no NUL, max [`MAX_PG_NAME_LEN`] bytes. Empty name is
-/// PG's "unnamed statement" convention, handled via a separate
-/// `StmtName::unnamed()` constructor; the typed wrapper treats
-/// empty-input-to-`try_from_str` as an error.
+/// no NUL, max [`MAX_PG_NAME_LEN`] bytes. **Empty allowed** — PG
+/// treats the empty statement name as the "unnamed statement",
+/// a legitimate wire value (§55.2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StmtNameTag {}
 impl sealed::FixedStrKindSealed for StmtNameTag {}
 impl sealed::ValidatedSealed for StmtNameTag {}
 impl FixedStrKind for StmtNameTag {
     const DEBUG_NAME: &'static str = "StmtName";
-    const ALLOW_EMPTY: bool = false;
+    const ALLOW_EMPTY: bool = true;
 }
 impl Validated for StmtNameTag {}
 
 /// Tag for [`PortalName`] — a PG portal name (bound statement
-/// instance). Same validation shape as [`StmtNameTag`] but a
+/// instance). Same validation shape as [`StmtNameTag`] (NUL-free,
+/// capped, **empty allowed** for the unnamed portal) but a
 /// distinct compile-time type: passing a `PortalName` where a
 /// `StmtName` is expected is a build failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,7 +252,7 @@ impl sealed::FixedStrKindSealed for PortalNameTag {}
 impl sealed::ValidatedSealed for PortalNameTag {}
 impl FixedStrKind for PortalNameTag {
     const DEBUG_NAME: &'static str = "PortalName";
-    const ALLOW_EMPTY: bool = false;
+    const ALLOW_EMPTY: bool = true;
 }
 impl Validated for PortalNameTag {}
 
