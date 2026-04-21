@@ -17,8 +17,6 @@
 //! smallest, most testable unit of the wire layer; a tier-3 randomized
 //! fuzz harness drives it directly (see `tests/frame_parse.rs`).
 
-use core::num::NonZeroU32;
-
 /// Maximum byte capacity of the read buffer.
 ///
 /// 4 KiB is the historical default for PG client read buffers and
@@ -163,9 +161,8 @@ pub enum HeaderParse {
 /// (`unwrap_used`, `indexing_slicing`, `arithmetic_side_effects`,
 /// `as_conversions`, …). Slice patterns bound every byte access;
 /// `u32::from_be_bytes([u8; 4])` is total; `usize::try_from` returns
-/// `Result`; `saturating_add` cannot overflow; `NonZeroU32::new`
-/// returns `Option`. No fuzz harness — there is no path the compiler
-/// does not already close.
+/// `Result`; `saturating_add` cannot overflow. No fuzz harness —
+/// there is no path the compiler does not already close.
 #[inline]
 #[must_use]
 pub fn parse_header(unread: &[u8]) -> HeaderParse {
@@ -201,18 +198,16 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
                     return HeaderParse::FrameTooLarge { declared };
                 }
             };
-            // declared >= 4 check: NonZeroU32::new guards against
-            // zero at the type level; a declared of 0..=3 is
-            // malformed. F-058: `declared_len` field dropped from
-            // HeaderParse::Ok — tests compute it from total_len.
-            if NonZeroU32::new(declared).is_some() {
-                HeaderParse::Ok {
-                    tag: crate::wire::InboundTag::from_byte(*tag),
-                    total_len,
-                }
-            } else {
-                core::hint::cold_path();
-                HeaderParse::MalformedLength { declared }
+            // DEF-144: at this point `declared >= 4` is proved by the
+            // early-return at the top of this arm; the pre-DEF-144
+            // `NonZeroU32::new(declared).is_some()` guard was
+            // architecturally dead (declared >= 4 implies non-zero).
+            // The else branch was tier-3 defence-in-depth, reached
+            // only via a Rust or LLVM correctness regression — removed
+            // per audit A015.
+            HeaderParse::Ok {
+                tag: crate::wire::InboundTag::from_byte(*tag),
+                total_len,
             }
         }
     }
