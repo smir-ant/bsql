@@ -964,8 +964,16 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
     // code → SqlStateCode ([u8;5]); message/detail/hint →
     // BoundedStr<N> with explicit truncation marker (no
     // `.unwrap_or_default()` silent-truncation).
-    let mut severity = Severity::Unknown;
-    let mut severity_set = false;
+    //
+    // Architect audit #3 (2026-04-21): `severity_set: bool` +
+    // `severity = Severity::Unknown` pair collapsed into
+    // `Option<Severity>`. Tier-3 audit (the bool flip had to stay
+    // in sync with the enum assignment) → tier-1 compile (the
+    // `Option` discriminator and the `Some(Severity)` payload are
+    // the same value; impossible to desync). Niche-packed:
+    // `Severity::Unknown = 0` as `#[repr(u8)]` means `Option<Severity>`
+    // stays 1 byte (same as the prior `Severity` alone).
+    let mut severity: Option<Severity> = None;
     let mut code = SqlStateCode::from_bytes(b"");
     let mut message: BoundedStr<128> = BoundedStr::default();
     let mut detail: BoundedStr<96> = BoundedStr::default();
@@ -1021,10 +1029,10 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 
         match field_type {
             // `S` (localised) takes precedence; `V` (non-localised,
-            // PG 9.6+) fills in if `S` didn't.
-            b'S' | b'V' if !severity_set => {
-                severity = Severity::from_bytes(value_bytes);
-                severity_set = true;
+            // PG 9.6+) fills in if `S` didn't. `severity.is_none()`
+            // guard expresses "first-wins" precedence directly.
+            b'S' | b'V' if severity.is_none() => {
+                severity = Some(Severity::from_bytes(value_bytes));
             }
             b'C' => {
                 code = SqlStateCode::from_bytes(value_bytes);
@@ -1043,7 +1051,9 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
     }
 
     ProtocolError::ServerErrorResponse {
-        severity,
+        // No S or V field in payload → `Severity::Unknown` fallback
+        // (public API preserves the pre-uplift shape).
+        severity: severity.unwrap_or(Severity::Unknown),
         code,
         message,
         detail,
