@@ -264,6 +264,86 @@ pub const AUTH_SASL_CONTINUE: u32 = 11;
 /// `AuthenticationSASLFinal` — sub-code 12. Server-final-message follows.
 pub const AUTH_SASL_FINAL: u32 = 12;
 
+/// Typed classification of PG `AuthenticationXxx` sub-codes.
+///
+/// PG's `AuthenticationXxx` frame carries a 4-byte BE `u32` code as
+/// its first payload word. PG spec defines four values in our current
+/// scope: `Ok` (0), `SASL` (10), `SASLContinue` (11), `SASLFinal` (12).
+///
+/// # Tier-1 compile benefits
+///
+/// Dispatch handlers previously matched on raw `u32`:
+///
+/// ```ignore
+/// match code {
+///     AUTH_SASL => ...,
+///     _ => errored(..., UnsupportedAuthMethod { sub_code: code }),
+/// }
+/// ```
+///
+/// The `_` arm swallowed unknown codes alongside unhandled-but-known
+/// codes. Adding a new legitimate sub-code (e.g., future
+/// `AuthenticationMD5Password` support) would have no compile-time
+/// indication at the handlers — they'd silently fall through to
+/// `UnsupportedAuthMethod` even in states where the code is legal.
+///
+/// With [`AuthSubCode`] typed, handlers match on enum variants:
+/// adding a new variant (e.g., `Md5` for AUTH_MD5_PASSWORD) forces
+/// every handler to decide how to treat it — the compiler flags
+/// any handler whose match is not exhaustive. Tier-3 audit on
+/// "every sub-code is considered by every relevant handler" →
+/// tier-1 compile.
+///
+/// # Unknown codes
+///
+/// The server may send any `u32`. [`AuthSubCode::try_from_u32`]
+/// returns `None` for codes outside the 4 known values — callers
+/// classify as `ProtocolError::UnsupportedAuthMethod` carrying the
+/// raw u32. The enum itself stays closed (non-`#[non_exhaustive]`),
+/// so exhaustive match works cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum AuthSubCode {
+    /// `AuthenticationOk` (0). Server accepted authentication.
+    Ok = 0,
+    /// `AuthenticationSASL` (10). Server offers SASL mechanisms.
+    Sasl = 10,
+    /// `AuthenticationSASLContinue` (11). Server-first-message follows.
+    SaslContinue = 11,
+    /// `AuthenticationSASLFinal` (12). Server-final-message follows.
+    SaslFinal = 12,
+}
+
+impl AuthSubCode {
+    /// Classify a raw wire sub-code. Returns `None` for codes outside
+    /// the 4 PG-defined values.
+    #[inline]
+    #[must_use]
+    pub const fn try_from_u32(code: u32) -> Option<Self> {
+        match code {
+            AUTH_OK => Some(Self::Ok),
+            AUTH_SASL => Some(Self::Sasl),
+            AUTH_SASL_CONTINUE => Some(Self::SaslContinue),
+            AUTH_SASL_FINAL => Some(Self::SaslFinal),
+            _ => None,
+        }
+    }
+
+    /// The underlying wire u32 value. Used by handlers emitting
+    /// `UnsupportedAuthMethod { sub_code }` diagnostics with the
+    /// specific typed code.
+    #[inline]
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        match self {
+            Self::Ok => AUTH_OK,
+            Self::Sasl => AUTH_SASL,
+            Self::SaslContinue => AUTH_SASL_CONTINUE,
+            Self::SaslFinal => AUTH_SASL_FINAL,
+        }
+    }
+}
+
 /// The SCRAM-SHA-256 mechanism name as bytes.
 pub const SCRAM_SHA_256_MECHANISM: &[u8] = b"SCRAM-SHA-256";
 

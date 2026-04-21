@@ -16,7 +16,9 @@
 use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
 use crate::command::PgCommand;
-use crate::dispatch::{DispatchOutcome, FrameCoords, dispatch};
+use crate::dispatch::{
+    AbsFrameStart, DispatchOutcome, FrameCoords, FrameTotalLen, PopulatedLen, dispatch,
+};
 use crate::error::ProtocolError;
 use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
 use crate::ident::{ApplicationName, DatabaseName, Ident};
@@ -440,10 +442,16 @@ impl PgProtocol {
                     // compaction, which can't happen while
                     // OutActions is alive. Pass to dispatch so the
                     // DataRow arm can construct an absolute row_range.
-                    let abs_frame_start = self.read_buf.cursor_position();
-                    let abs_payload_start = abs_frame_start.saturating_add(HEADER_LEN);
-                    let abs_frame_end = abs_frame_start.saturating_add(total_len);
-                    let populated_len = self.read_buf.populated().len();
+                    //
+                    // Typed newtypes (`AbsFrameStart`, `FrameTotalLen`,
+                    // `PopulatedLen`) — swap two args at the
+                    // `FrameCoords::new` call site below = build error.
+                    // Derived offsets (payload_start, payload_end)
+                    // live inside `FrameCoords` and cannot be
+                    // mis-ordered by a caller.
+                    let frame_start = AbsFrameStart(self.read_buf.cursor_position());
+                    let frame_len = FrameTotalLen(total_len);
+                    let populated = PopulatedLen(self.read_buf.populated().len());
 
                     // DEF-121 budget gate — prevent mid-transition
                     // overflow. A dispatch iteration can emit up to
@@ -473,11 +481,7 @@ impl PgProtocol {
                         tag,
                         payload,
                         write_buf,
-                        FrameCoords {
-                            payload_start: abs_payload_start,
-                            payload_end: abs_frame_end,
-                            populated_len,
-                        },
+                        FrameCoords::new(frame_start, frame_len, populated),
                         &mut self.row_desc,
                     );
                     match outcome {

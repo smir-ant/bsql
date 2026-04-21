@@ -20,12 +20,37 @@ use crate::error::ProtocolError;
 use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
 use crate::wire::{
-    AUTH_OK, AUTH_SASL, AUTH_SASL_CONTINUE, AUTH_SASL_FINAL, SCRAM_SHA_256_MECHANISM,
-    TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_COMMAND_COMPLETE, TAG_DATA_ROW,
-    TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE, TAG_NEGOTIATE_PROTOCOL_VERSION,
-    TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
+    SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_COMMAND_COMPLETE,
+    TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
+    TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 use crate::write_buf::WriteBuf;
+
+// ════════════════════════════════════════════════════════════════════
+// Typed constructor arguments for `FrameCoords` — each offset has
+// its own nominal type, so `FrameCoords::new` cannot receive swapped
+// arguments at a call site. Tier-1 compile on "don't confuse frame
+// start with total length with populated length".
+// ════════════════════════════════════════════════════════════════════
+
+/// Absolute position where a frame begins in
+/// [`crate::buf::ReadBuf::populated`]. Equals the read cursor at the
+/// moment `parse_header` consumed the frame's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct AbsFrameStart(pub usize);
+
+/// Total wire bytes the frame occupies — tag (1) + length-prefix
+/// (4) + body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct FrameTotalLen(pub usize);
+
+/// Current `populated` length of the caller's `ReadBuf`. Serves as
+/// the `bounds` argument for [`crate::action::NonEmptyRange::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct PopulatedLen(pub usize);
 
 /// Absolute byte-coordinates of the frame being dispatched, resolved
 /// against [`crate::buf::ReadBuf::populated`]. 1c-1b.
@@ -34,20 +59,63 @@ use crate::write_buf::WriteBuf;
 /// [`StagedAction::StreamRowRange`] for `DataRow` frames — the
 /// `row_range` must survive the post-dispatch `ReadBuf::advance` call,
 /// which only moves the cursor (the bytes themselves stay in place
-/// until the next `append` triggers lazy compaction). `populated_len`
-/// is the current total populated length, used as bounds in
-/// [`crate::action::NonEmptyRange::new`].
+/// until the next `append` triggers lazy compaction).
+///
+/// # Tier-1 construction
+///
+/// Internal fields are private; the only constructor is
+/// [`FrameCoords::new`] which takes three distinct newtypes
+/// ([`AbsFrameStart`], [`FrameTotalLen`], [`PopulatedLen`]). Swapping
+/// any two arguments at the call site is a compile error. `payload_start`
+/// and `payload_end` are derived from `frame_start + HEADER_LEN` and
+/// `frame_start + total_len` internally — no opportunity for a caller
+/// to pass a wrong offset into either slot.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FrameCoords {
-    /// Absolute offset (in populated bytes) where the frame payload
-    /// begins — i.e. right after the 5-byte header.
-    pub payload_start: usize,
-    /// Absolute offset where the frame ends (one-past-last payload
-    /// byte). `payload_end - payload_start == payload_len`.
-    pub payload_end: usize,
-    /// Current `populated()` length, used as `bounds` for
-    /// [`crate::action::NonEmptyRange::new`].
-    pub populated_len: usize,
+    frame_start: usize,
+    total_len: usize,
+    populated_len: usize,
+}
+
+impl FrameCoords {
+    /// Typed constructor. Swap any two arguments → build error.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new(
+        frame_start: AbsFrameStart,
+        total_len: FrameTotalLen,
+        populated_len: PopulatedLen,
+    ) -> Self {
+        Self {
+            frame_start: frame_start.0,
+            total_len: total_len.0,
+            populated_len: populated_len.0,
+        }
+    }
+
+    /// Absolute offset where the frame payload begins — right after
+    /// the 5-byte header. Derived from `frame_start + HEADER_LEN`
+    /// (no direct field access, so no swap hazard with `payload_end`).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn payload_start(&self) -> usize {
+        self.frame_start.saturating_add(crate::frame::HEADER_LEN)
+    }
+
+    /// Absolute offset one-past-last of the frame payload. Derived
+    /// from `frame_start + total_len`.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn payload_end(&self) -> usize {
+        self.frame_start.saturating_add(self.total_len)
+    }
+
+    /// Bounds argument for [`crate::action::NonEmptyRange::new`].
+    #[inline]
+    #[must_use]
+    pub(crate) const fn populated_len(&self) -> usize {
+        self.populated_len
+    }
 }
 
 /// What to do after dispatching a single frame.
@@ -477,12 +545,23 @@ pub(crate) fn dispatch(
 // Helper: parse Authentication sub-code from payload
 // -----------------------------------------------------------------
 
-/// Extract the 4-byte BE auth sub-code from an `'R'` payload.
+/// Extract + classify the 4-byte BE auth sub-code from an `'R'`
+/// payload. Returns a typed [`crate::wire::AuthSubCode`] (only the 4
+/// PG-defined values) plus the rest of the payload; classifies
+/// unknown codes as `UnsupportedAuthMethod` at parse time.
+///
+/// Tier-1 uplift: downstream `dispatch_auth_*` handlers now match
+/// on an enum with 4 variants — adding a new PG auth sub-code
+/// forces every handler to decide how to treat it. Previously each
+/// handler's `_ =>` arm swallowed both "unknown" and "known-but-wrong"
+/// codes silently.
 #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
-fn auth_sub_code(payload: &[u8]) -> Result<(u32, &[u8]), ProtocolError> {
+fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), ProtocolError> {
     match payload {
         [a, b, c, d, rest @ ..] => {
-            let code = u32::from_be_bytes([*a, *b, *c, *d]);
+            let raw = u32::from_be_bytes([*a, *b, *c, *d]);
+            let code = crate::wire::AuthSubCode::try_from_u32(raw)
+                .ok_or(ProtocolError::UnsupportedAuthMethod { sub_code: raw })?;
             Ok((code, rest))
         }
         _ => Err(ProtocolError::MalformedAuthentication {
@@ -510,14 +589,20 @@ fn dispatch_auth_in_startup_trust(reply: ReplyId<crate::reply_id::StartupKind>, 
     };
 
     match code {
-        AUTH_OK => DispatchOutcome::AdvancedSilent {
+        crate::wire::AuthSubCode::Ok => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::ConnectingPostAuthWaitKey(reply),
         },
-        // AUTH_SASL / AUTH_SASL_CONTINUE / AUTH_SASL_FINAL / anything
-        // else: a Trust connection never requested SCRAM, so a SASL
-        // challenge means the server expects an auth method we are
-        // not configured for.
-        _ => errored(Some(reply.consume()), ProtocolError::UnsupportedAuthMethod { sub_code: code }),
+        // `Sasl` / `SaslContinue` / `SaslFinal`: a Trust connection
+        // never requested SCRAM, so any SASL message means the server
+        // expects an auth method we are not configured for.
+        // Tier-1 exhaustive — a future new `AuthSubCode` variant
+        // forces this match to be updated.
+        other @ (crate::wire::AuthSubCode::Sasl
+            | crate::wire::AuthSubCode::SaslContinue
+            | crate::wire::AuthSubCode::SaslFinal) => errored(
+            Some(reply.consume()),
+            ProtocolError::UnsupportedAuthMethod { sub_code: other.raw() },
+        ),
     }
 }
 
@@ -541,7 +626,7 @@ fn dispatch_auth_in_startup_scram(
     };
 
     match code {
-        AUTH_SASL => {
+        crate::wire::AuthSubCode::Sasl => {
             if !mechanism_list_contains_scram(rest) {
                 return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::NoSupportedMechanism));
             }
@@ -565,7 +650,12 @@ fn dispatch_auth_in_startup_scram(
                 Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
-        _ => errored(Some(reply.consume()), ProtocolError::UnsupportedAuthMethod { sub_code: code }),
+        other @ (crate::wire::AuthSubCode::Ok
+            | crate::wire::AuthSubCode::SaslContinue
+            | crate::wire::AuthSubCode::SaslFinal) => errored(
+            Some(reply.consume()),
+            ProtocolError::UnsupportedAuthMethod { sub_code: other.raw() },
+        ),
     }
 }
 
@@ -699,7 +789,7 @@ fn dispatch_auth_sasl_continue(
         }
     };
 
-    if code != AUTH_SASL_CONTINUE {
+    if !matches!(code, crate::wire::AuthSubCode::SaslContinue) {
         return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
@@ -810,7 +900,7 @@ fn dispatch_auth_sasl_final(
         }
     };
 
-    if code != AUTH_SASL_FINAL {
+    if !matches!(code, crate::wire::AuthSubCode::SaslFinal) {
         return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
@@ -845,7 +935,7 @@ fn dispatch_auth_ok_after_scram(reply: ReplyId<crate::reply_id::StartupKind>, pa
         }
     };
 
-    if code != AUTH_OK {
+    if !matches!(code, crate::wire::AuthSubCode::Ok) {
         return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
@@ -1028,9 +1118,9 @@ fn stream_row_or_errored(
     coords: FrameCoords,
 ) -> DispatchOutcome {
     match crate::action::NonEmptyRange::new(
-        coords.payload_start,
-        coords.payload_end,
-        coords.populated_len,
+        coords.payload_start(),
+        coords.payload_end(),
+        coords.populated_len(),
     ) {
         Some(row_range) => {
             let id = reply.get();
