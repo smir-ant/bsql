@@ -113,7 +113,7 @@ pub use decode::{
     ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, FromPgText, MAX_ROW_COLUMNS,
     RowDesc, oids,
 };
-pub use error::ProtocolError;
+pub use error::{FrameBuildStage, ProtocolError};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use ident::{
     ApplicationName, DatabaseName, Ident, IdentError, PortalName, Sql, StmtName,

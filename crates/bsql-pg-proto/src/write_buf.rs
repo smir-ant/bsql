@@ -110,7 +110,7 @@ pub const fn max_simple_query_message_size() -> usize {
 // `MAX_OWNED_SEND_LEN >= max_simple_query_message_size()`. Previously
 // this invariant was NOT asserted — a full-size SQL (`MAX_SQL_LEN=2048`)
 // would in fact overflow a 512-byte WriteBuf at runtime, masquerading
-// as `ProtocolError::ProtocolInvariantBroken`. Now: bumping
+// as `ProtocolError::OutboundFrameBuildUnreachable { stage: Query }`. Now: bumping
 // `MAX_SQL_LEN` without growing the WriteBuf cap is a build error.
 const _: () = assert!(
     MAX_OWNED_SEND_LEN >= max_simple_query_message_size(),

@@ -403,21 +403,45 @@ pub enum ProtocolError {
         code: i16,
     },
 
-    /// A local protocol-crate invariant was violated.
+    /// Outbound frame builder (`build_startup_message` /
+    /// `build_query_message` / `build_parse_message`) returned Err
+    /// in a const-assert-dead path.
     ///
-    /// Classified rather than silent: in Phase 1a the only emission site
-    /// is the "advance-past-unread" branch in [`crate::PgProtocol::feed_bytes`]
-    /// that a future refactor could reach if someone broke the local
-    /// `unread().len() >= total_len` check that precedes the advance. The
-    /// branch is currently unreachable by audit of the single function
-    /// that guards it; surfacing it as a classified error rather than
-    /// leaving it mislabelled as `MalformedFrameLength` makes any future
-    /// regression loud (the wrapper sees a distinct error code and the
-    /// connection is torn down cleanly).
+    /// The invariant `MAX_OWNED_SEND_LEN >= max_<kind>_message_size()`
+    /// is pinned by a `const _: () = assert!(...)` in `write_buf.rs`
+    /// per builder. Emission of this variant means the const assert
+    /// has drifted or been bypassed — a crate-internal bug, NOT
+    /// wire-level input.
     ///
-    /// If this error ever appears at runtime it is a logic bug in
-    /// `bsql-pg-proto` itself, not wire-level input — triage accordingly.
-    ProtocolInvariantBroken,
+    /// F6: split out from the former catch-all `ProtocolInvariantBroken`
+    /// so the wrapper can distinguish "builder overflow" from other
+    /// unreachable-by-construction paths.
+    OutboundFrameBuildUnreachable {
+        /// Which builder failed (diagnostic only — all three are
+        /// architecturally dead in intact const-assert regime).
+        stage: FrameBuildStage,
+    },
+
+    /// [`crate::buf::ReadBuf::advance`] returned Err after
+    /// `parse_header` successfully validated `total_len <= populated.len()`.
+    ///
+    /// The two checks are in the same `feed_bytes` iteration with no
+    /// interleaving mutation — `advance` cannot exceed remaining
+    /// buffer under intact parse-advance coordination. Emission
+    /// indicates a `ReadBuf` lifecycle / coords bug.
+    ///
+    /// F6: split out from `ProtocolInvariantBroken`.
+    ReadCursorAdvanceUnreachable,
+
+    /// [`crate::action::NonEmptyRange::new`] returned None when
+    /// constructing a row-range for a `DataRow` frame.
+    ///
+    /// `parse_header` validates `payload_end <= populated_len` and
+    /// payload_len ≥ 0 → the range is always non-empty and in-bounds.
+    /// Emission indicates a [`crate::dispatch::FrameCoords`] math bug.
+    ///
+    /// F6: split out from `ProtocolInvariantBroken`.
+    RowRangeConstructionUnreachable,
 
     /// A user command arrived on a connection that had already been
     /// torn down by a prior fatal. The wrapper translates this into
@@ -438,6 +462,26 @@ pub enum ProtocolError {
         /// have preserved it.
         prior_kind: ErrorKind,
     },
+}
+
+/// Which outbound frame builder failed in the const-assert-dead path.
+/// Carried by [`ProtocolError::OutboundFrameBuildUnreachable`] for
+/// diagnostic — emission of any variant indicates a crate-internal
+/// bug (const assert drift), not a wire-level issue.
+///
+/// F6: typed discriminant added 2026-04-21.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum FrameBuildStage {
+    /// [`crate::protocol::build_startup_message`] — const-pinned by
+    /// `MAX_OWNED_SEND_LEN >= max_startup_message_size()`.
+    Startup = 0,
+    /// [`crate::protocol::build_query_message`] — const-pinned by
+    /// `MAX_OWNED_SEND_LEN >= max_simple_query_message_size()`.
+    Query = 1,
+    /// [`crate::protocol::build_parse_message`] — const-pinned by
+    /// `MAX_OWNED_SEND_LEN >= max_parse_message_size()`.
+    Parse = 2,
 }
 
 /// Compact 1-byte classification of a [`ProtocolError`], stored in
@@ -487,7 +531,9 @@ pub enum ErrorKind {
     /// [`ProtocolError::StartupAlreadyInProgress`].
     Auth = 3,
     /// Internal invariant broken — bug in this crate.
-    /// [`ProtocolError::ProtocolInvariantBroken`].
+    /// Covers [`ProtocolError::OutboundFrameBuildUnreachable`],
+    /// [`ProtocolError::ReadCursorAdvanceUnreachable`], and
+    /// [`ProtocolError::RowRangeConstructionUnreachable`] (F6 split).
     Internal = 4,
     /// Pseudo-kind for a `ConnectionAlreadyClosed` meta-error. Only
     /// ever appears in `FailReply` replies, never in state (the state
@@ -525,7 +571,9 @@ impl ProtocolError {
             | Self::MalformedRowDescription { .. }
             | Self::TooManyColumns { .. }
             | Self::UnexpectedFormatCode { .. } => ErrorKind::Framing,
-            Self::ProtocolInvariantBroken => ErrorKind::Internal,
+            Self::OutboundFrameBuildUnreachable { .. }
+            | Self::ReadCursorAdvanceUnreachable
+            | Self::RowRangeConstructionUnreachable => ErrorKind::Internal,
             Self::ConnectionAlreadyClosed { .. } => ErrorKind::AlreadyClosed,
         }
     }
@@ -610,9 +658,16 @@ impl fmt::Display for ProtocolError {
                 f,
                 "unexpected format code in RowDescription: {code} (expected 0 text or 1 binary)",
             ),
-            Self::ProtocolInvariantBroken => {
-                f.write_str("protocol invariant violated — internal bsql-pg-proto logic bug")
-            }
+            Self::OutboundFrameBuildUnreachable { stage } => write!(
+                f,
+                "outbound frame builder returned Err in a const-assert-dead path (stage: {stage:?}) — internal bsql-pg-proto logic bug",
+            ),
+            Self::ReadCursorAdvanceUnreachable => f.write_str(
+                "ReadBuf::advance failed post-header-parse — internal bsql-pg-proto logic bug",
+            ),
+            Self::RowRangeConstructionUnreachable => f.write_str(
+                "DataRow row-range construction failed post-coords-validate — internal bsql-pg-proto logic bug",
+            ),
             Self::ConnectionAlreadyClosed { prior_kind } => {
                 write!(
                     f,

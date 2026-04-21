@@ -408,7 +408,7 @@ impl PgProtocol {
                         record_param_status(&mut self.session_params, payload);
                         let Ok(()) = self.read_buf.advance(total_len) else {
                             self.fail_inflight_and_close(
-                                ProtocolError::ProtocolInvariantBroken,
+                                ProtocolError::ReadCursorAdvanceUnreachable,
                                 &mut staged,
                             );
                             break;
@@ -427,7 +427,7 @@ impl PgProtocol {
                     if tag == crate::wire::TAG_NOTICE_RESPONSE {
                         let Ok(()) = self.read_buf.advance(total_len) else {
                             self.fail_inflight_and_close(
-                                ProtocolError::ProtocolInvariantBroken,
+                                ProtocolError::ReadCursorAdvanceUnreachable,
                                 &mut staged,
                             );
                             break;
@@ -489,7 +489,7 @@ impl PgProtocol {
                             self.state = new_state;
                             let Ok(()) = self.read_buf.advance(total_len) else {
                                 self.fail_inflight_and_close(
-                                    ProtocolError::ProtocolInvariantBroken,
+                                    ProtocolError::ReadCursorAdvanceUnreachable,
                                     &mut staged,
                                 );
                                 break;
@@ -499,7 +499,7 @@ impl PgProtocol {
                             self.state = new_state;
                             let Ok(()) = self.read_buf.advance(total_len) else {
                                 self.fail_inflight_and_close(
-                                    ProtocolError::ProtocolInvariantBroken,
+                                    ProtocolError::ReadCursorAdvanceUnreachable,
                                     &mut staged,
                                 );
                                 break;
@@ -859,7 +859,9 @@ fn compute_push_startup(
                 emit_actions!(staged, budget: 1, [
                     StagedAction::FailReply {
                         id: reply.consume(),
-                        cause: ProtocolError::ProtocolInvariantBroken,
+                        cause: ProtocolError::OutboundFrameBuildUnreachable {
+                            stage: crate::error::FrameBuildStage::Startup,
+                        },
                     },
                 ]);
                 ProtoState::Idle
@@ -915,7 +917,7 @@ fn compute_push_startup(
 /// | current state                | action                              | new state                            |
 /// |------------------------------|-------------------------------------|--------------------------------------|
 /// | `Idle` (build OK)            | `SendBytes('Q' frame)`              | `SimpleQueryAwaitingFirstResponse(id)`  |
-/// | `Idle` (build Err)           | `FailReply(ProtocolInvariantBroken)`| `Idle` (unchanged)                   |
+/// | `Idle` (build Err)           | `FailReply(OutboundFrameBuildUnreachable)`| `Idle` (unchanged)             |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
 /// | any `Connecting*`            | `FailReply(StartupAlreadyInProgress)`| same state preserved                |
 /// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
@@ -950,7 +952,9 @@ fn compute_push_simple_query(
                 emit_actions!(staged, budget: 1, [
                     StagedAction::FailReply {
                         id: reply.consume(),
-                        cause: ProtocolError::ProtocolInvariantBroken,
+                        cause: ProtocolError::OutboundFrameBuildUnreachable {
+                            stage: crate::error::FrameBuildStage::Query,
+                        },
                     },
                 ]);
                 ProtoState::Idle
@@ -1060,7 +1064,7 @@ fn build_parse_message(
 /// | current state                | action                              | new state                            |
 /// |------------------------------|-------------------------------------|--------------------------------------|
 /// | `Idle` (build OK)            | 2× `SendBytes(Parse, SYNC)`         | `ParseAwaitingParseComplete(reply)`  |
-/// | `Idle` (build Err)           | `FailReply(ProtocolInvariantBroken)`| `Idle` (unchanged)                   |
+/// | `Idle` (build Err)           | `FailReply(OutboundFrameBuildUnreachable)`| `Idle` (unchanged)             |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                |
 /// | `Awaiting*` / `SimpleQuery*` | `FailReply(CommandInProgress)`      | same                                 |
@@ -1096,7 +1100,9 @@ fn compute_push_parse(
                 emit_actions!(staged, budget: 1, [
                     StagedAction::FailReply {
                         id: reply.consume(),
-                        cause: ProtocolError::ProtocolInvariantBroken,
+                        cause: ProtocolError::OutboundFrameBuildUnreachable {
+                            stage: crate::error::FrameBuildStage::Parse,
+                        },
                     },
                 ]);
                 ProtoState::Idle

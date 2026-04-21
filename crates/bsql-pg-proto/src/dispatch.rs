@@ -1191,7 +1191,7 @@ fn advance_to_drain_after_error(
 }
 
 /// 1c-1b helper: build a `StreamRowRange` for a `DataRow` frame, or
-/// classify as `ProtocolInvariantBroken` on a malformed empty body.
+/// classify as `RowRangeConstructionUnreachable` on a malformed empty body.
 ///
 /// `reply.get()` — not `.consume()` — rows are in-progress signals;
 /// the `ReplyId` commits on the terminal `CommandComplete` →
@@ -1215,7 +1215,7 @@ fn stream_row_or_errored(
                 action: StagedAction::StreamRowRange { id, row_range },
             }
         }
-        None => errored(Some(reply.consume()), ProtocolError::ProtocolInvariantBroken),
+        None => errored(Some(reply.consume()), ProtocolError::RowRangeConstructionUnreachable),
     }
 }
 
