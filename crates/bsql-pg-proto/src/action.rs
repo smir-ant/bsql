@@ -35,7 +35,7 @@
 
 use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
-use core::num::{NonZeroU64, NonZeroUsize};
+use core::num::{NonZeroU16, NonZeroU64};
 
 /// PostgreSQL transaction-status indicator carried in every
 /// `ReadyForQuery` frame (PG §55.7).
@@ -108,7 +108,7 @@ impl TxStatus {
 /// # Invariants
 ///
 /// - `start` is the offset where the emission began.
-/// - `len` is `NonZeroUsize` — construction of a zero-length range
+/// - `len` is `NonZeroU16` — construction of a zero-length range
 ///   is a type-level impossibility, which in turn makes
 ///   `Action::SendBytes(&[])` a type-level impossibility along the
 ///   range path.
@@ -122,7 +122,7 @@ impl TxStatus {
 /// `materialise` fell back silently to `&[]` on any violation — a
 /// tier-3 audit-enforced seam. After DEF-100:
 ///
-/// - `start ≤ end` is guaranteed by `len: NonZeroUsize` built via
+/// - `start ≤ end` is guaranteed by `len: NonZeroU16` built via
 ///   `end.checked_sub(start)?` — you cannot construct a range with
 ///   `start > end` (the `checked_sub` yields `None`).
 /// - `end ≤ bounds` is checked explicitly in [`NonEmptyRange::new`].
@@ -130,24 +130,45 @@ impl TxStatus {
 ///   in the caller passes a `buf` shorter than the emission-time
 ///   `bounds` — architecturally the same buffer is used, so this
 ///   branch is dead at call-site level.
+///
+/// # DEF-147 size narrowing
+///
+/// Storage narrowed from `usize + NonZeroUsize` (16 B on 64-bit) to
+/// `u16 + NonZeroU16` (4 B). Valid because all range endpoints
+/// originate in buffers bounded by `READ_BUF_CAP = 4096` or
+/// `MAX_OWNED_SEND_LEN = 2176`, both ≤ `u16::MAX = 65535`
+/// (const-asserted at `crate::buf::READ_BUF_CAP`). On a 1000-row
+/// SELECT, 12 KB of stack traffic saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NonEmptyRange {
-    start: usize,
-    len: NonZeroUsize,
+    start: u16,
+    len: NonZeroU16,
 }
 
 impl NonEmptyRange {
     /// Construct a non-empty range validated against a buffer length.
     /// Returns `None` if `start > end`, `end > bounds`, or the range
     /// is empty (`start == end`).
+    ///
+    /// DEF-147: signature stays `(usize, usize, usize)` for call-site
+    /// compat. The `u16::try_from` narrowing fallbacks are
+    /// architecturally dead for bounded buffer offsets
+    /// (≤ READ_BUF_CAP ≤ u16::MAX) but the explicit try-from satisfies
+    /// the forbid bundle's ban on `as` conversions.
     #[inline]
     pub(crate) fn new(start: usize, end: usize, bounds: usize) -> Option<Self> {
         if end > bounds {
             return None;
         }
-        let len = end.checked_sub(start)?;
-        let len = NonZeroUsize::new(len)?;
-        Some(Self { start, len })
+        // end >= start is enforced by checked_sub returning Some.
+        // len > 0 is enforced by NonZeroU16::new.
+        let len_usize = end.checked_sub(start)?;
+        // Narrow to u16: architecturally dead for bounded buffers
+        // but satisfies forbid-bundle.
+        let len_u16 = u16::try_from(len_usize).ok()?;
+        let len = NonZeroU16::new(len_u16)?;
+        let start_u16 = u16::try_from(start).ok()?;
+        Some(Self { start: start_u16, len })
     }
 
     /// Construct from a write operation into `write_buf`: capture
@@ -178,8 +199,11 @@ impl NonEmptyRange {
         // but debug-builds actively assert the invariant so a wiring
         // regression fails the test suite loudly instead of silently
         // producing `&[]`.
-        let end = self.start.checked_add(self.len.get())?;
-        let slice = buf.get(self.start..end);
+        // DEF-147: widen u16 → usize via infallible usize::from before
+        // slice indexing.
+        let start = usize::from(self.start);
+        let end = start.checked_add(usize::from(self.len.get()))?;
+        let slice = buf.get(start..end);
         debug_assert!(
             slice.is_some(),
             "NonEmptyRange::apply: buf shorter than emission-time bounds — check materialise wiring",
@@ -187,6 +211,16 @@ impl NonEmptyRange {
         slice
     }
 }
+
+// DEF-147 drift pin: NonEmptyRange packs u16 + NonZeroU16 = 4 B.
+// 1000-row SELECT: 12 KB of per-row stack traffic saved (vs the
+// pre-DEF-147 16 B form).
+const _: () = assert!(
+    core::mem::size_of::<NonEmptyRange>() == 4,
+    "NonEmptyRange size regression — DEF-147 narrowed storage to \
+     u16 + NonZeroU16 = 4 B. Buffer offsets ≤ READ_BUF_CAP ≤ u16::MAX \
+     are const-asserted at crate::buf::READ_BUF_CAP.",
+);
 
 /// Bounded list of actions emitted by a single protocol entry-point
 /// call.

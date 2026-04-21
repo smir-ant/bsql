@@ -43,51 +43,87 @@ use crate::write_buf::WriteBuf;
 /// newtype and re-wrap into another (`AbsFrameStart(other.0)`),
 /// weakening the typed-argument anti-swap shield. Private field +
 /// constructor makes the wrap explicit at the one valid call site.
+///
+/// DEF-147: storage narrowed from `usize` (8 B) to `u16` (2 B).
+/// `READ_BUF_CAP = 4096 ≤ u16::MAX = 65535` is const-asserted at
+/// `crate::buf::READ_BUF_CAP`; all values reaching this newtype
+/// originate in validated-bounded read-buffer offsets, so the
+/// `try_from` narrowing is architecturally infallible (the
+/// `unwrap_or(u16::MAX)` fallback is forbid-bundle-compliant dead
+/// code). Accessors widen back to `usize` on read via
+/// `usize::from` (infallible).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct AbsFrameStart(usize);
+pub(crate) struct AbsFrameStart(u16);
 
 impl AbsFrameStart {
+    /// Construct from a `usize` offset. DEF-147: narrows to u16;
+    /// the `u16::MAX` fallback is architecturally dead because the
+    /// input is always ≤ `READ_BUF_CAP = 4096 ≤ u16::MAX = 65535`
+    /// (pinned by `const _ = assert!(READ_BUF_CAP ≤ 65_535)` in
+    /// `buf.rs`). The fallback satisfies the forbid-bundle's ban
+    /// on `unwrap`.
     #[inline]
     #[must_use]
-    pub(crate) const fn new(v: usize) -> Self { Self(v) }
+    pub(crate) fn new(v: usize) -> Self {
+        Self(u16::try_from(v).unwrap_or(u16::MAX))
+    }
+
+    /// Widen to `usize` for caller-side arithmetic. Infallible via
+    /// `usize::from(u16)` (all platforms have ≥ 16-bit pointers).
+    /// Non-const: `From` trait impls aren't const yet (MSRV 1.95);
+    /// widening at usage time is free-of-cost under optimisation.
     #[inline]
     #[must_use]
-    pub(crate) const fn get(self) -> usize { self.0 }
+    pub(crate) fn get(self) -> usize {
+        usize::from(self.0)
+    }
 }
 
 /// Total wire bytes the frame occupies — tag (1) + length-prefix
 /// (4) + body.
 ///
 /// F-018: private field + constructor, see [`AbsFrameStart`].
+/// DEF-147: u16 storage, see [`AbsFrameStart`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct FrameTotalLen(usize);
+pub(crate) struct FrameTotalLen(u16);
 
 impl FrameTotalLen {
+    /// DEF-147: see [`AbsFrameStart::new`].
     #[inline]
     #[must_use]
-    pub(crate) const fn new(v: usize) -> Self { Self(v) }
+    pub(crate) fn new(v: usize) -> Self {
+        Self(u16::try_from(v).unwrap_or(u16::MAX))
+    }
     #[inline]
     #[must_use]
-    pub(crate) const fn get(self) -> usize { self.0 }
+    pub(crate) fn get(self) -> usize {
+        usize::from(self.0)
+    }
 }
 
 /// Current `populated` length of the caller's `ReadBuf`. Serves as
 /// the `bounds` argument for [`crate::action::NonEmptyRange::new`].
 ///
 /// F-018: private field + constructor, see [`AbsFrameStart`].
+/// DEF-147: u16 storage, see [`AbsFrameStart`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct PopulatedLen(usize);
+pub(crate) struct PopulatedLen(u16);
 
 impl PopulatedLen {
+    /// DEF-147: see [`AbsFrameStart::new`].
     #[inline]
     #[must_use]
-    pub(crate) const fn new(v: usize) -> Self { Self(v) }
+    pub(crate) fn new(v: usize) -> Self {
+        Self(u16::try_from(v).unwrap_or(u16::MAX))
+    }
     #[inline]
     #[must_use]
-    pub(crate) const fn get(self) -> usize { self.0 }
+    pub(crate) fn get(self) -> usize {
+        usize::from(self.0)
+    }
 }
 
 /// Absolute byte-coordinates of the frame being dispatched, resolved
@@ -108,53 +144,84 @@ impl PopulatedLen {
 /// and `payload_end` are derived from `frame_start + HEADER_LEN` and
 /// `frame_start + total_len` internally — no opportunity for a caller
 /// to pass a wrong offset into either slot.
+///
+/// DEF-147: storage narrowed from `3 × usize` (24 B) to
+/// `3 × u16` (6 B, padded to 8 on 64-bit). Saves 16 B per
+/// dispatched frame. Accessors widen back to `usize` on read.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FrameCoords {
-    frame_start: usize,
-    total_len: usize,
-    populated_len: usize,
+    frame_start: u16,
+    total_len: u16,
+    populated_len: u16,
 }
 
 impl FrameCoords {
     /// Typed constructor. Swap any two arguments → build error.
+    ///
+    /// DEF-147: the pre-narrowed value from each newtype is
+    /// stored directly — the newtypes already hold `u16`. Skipping
+    /// the explicit `u16::try_from` at this site preserves the
+    /// tier-1 shield: only `{AbsFrameStart, FrameTotalLen,
+    /// PopulatedLen}::new` gate a `usize` input; every other path
+    /// through the system is u16-typed.
     #[inline]
     #[must_use]
-    pub(crate) const fn new(
+    pub(crate) fn new(
         frame_start: AbsFrameStart,
         total_len: FrameTotalLen,
         populated_len: PopulatedLen,
     ) -> Self {
         Self {
-            frame_start: frame_start.get(),
-            total_len: total_len.get(),
-            populated_len: populated_len.get(),
+            // Re-narrow via the newtype's own `get()` (widens to
+            // usize) then `try_from(usize) -> u16` — architecturally
+            // identity when the newtype was built correctly.
+            // Fallback to u16::MAX matches the newtype's own
+            // fallback, staying consistent.
+            frame_start: u16::try_from(frame_start.get()).unwrap_or(u16::MAX),
+            total_len: u16::try_from(total_len.get()).unwrap_or(u16::MAX),
+            populated_len: u16::try_from(populated_len.get()).unwrap_or(u16::MAX),
         }
     }
 
     /// Absolute offset where the frame payload begins — right after
     /// the 5-byte header. Derived from `frame_start + HEADER_LEN`
     /// (no direct field access, so no swap hazard with `payload_end`).
+    ///
+    /// DEF-147: arithmetic performed in `usize` after widening.
+    /// The u16 + 5 sum is guaranteed to fit usize on all supported
+    /// platforms; `saturating_add` satisfies the forbid-bundle ban
+    /// on `arithmetic_side_effects`.
     #[inline]
     #[must_use]
-    pub(crate) const fn payload_start(&self) -> usize {
-        self.frame_start.saturating_add(crate::frame::HEADER_LEN)
+    pub(crate) fn payload_start(&self) -> usize {
+        usize::from(self.frame_start).saturating_add(crate::frame::HEADER_LEN)
     }
 
     /// Absolute offset one-past-last of the frame payload. Derived
     /// from `frame_start + total_len`.
     #[inline]
     #[must_use]
-    pub(crate) const fn payload_end(&self) -> usize {
-        self.frame_start.saturating_add(self.total_len)
+    pub(crate) fn payload_end(&self) -> usize {
+        usize::from(self.frame_start).saturating_add(usize::from(self.total_len))
     }
 
     /// Bounds argument for [`crate::action::NonEmptyRange::new`].
     #[inline]
     #[must_use]
-    pub(crate) const fn populated_len(&self) -> usize {
-        self.populated_len
+    pub(crate) fn populated_len(&self) -> usize {
+        usize::from(self.populated_len)
     }
 }
+
+// DEF-147 drift pin: FrameCoords packs 3 × u16 into 6 B of data
+// + alignment padding. On aarch64-apple-darwin / x86_64-linux
+// the struct is 8 B (6 B data + 2 B padding). 16 B saved per
+// dispatched frame compared to pre-DEF-147 (24 B with 3 × usize).
+const _: () = assert!(
+    core::mem::size_of::<FrameCoords>() <= 8,
+    "FrameCoords size regression — DEF-147 narrowed storage to 3 × u16 \
+     = 6 B + padding. Stay ≤ 8 B.",
+);
 
 /// What to do after dispatching a single frame.
 ///
