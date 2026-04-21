@@ -394,6 +394,66 @@ pub type StmtName = FixedStr<MAX_PG_NAME_LEN, StmtNameTag>;
 /// Round-4 finding #2 — Phase 1c typed newtype.
 pub type PortalName = FixedStr<MAX_PG_NAME_LEN, PortalNameTag>;
 
+// ═════════════════════════════════════════════════════════════════
+// 1c-3c F12 (pass-#7 audit): sealed `DescribeName` trait
+//
+// Narrows the `build_describe_message` builder's `name` parameter
+// from a raw `&[u8]` (tier-3 "caller promises to pass StmtName or
+// PortalName .as_bytes()") to a typed `&impl DescribeName` (tier-1
+// "builder accepts only these two types, sealed against downstream
+// impls"). Catches the bug class where a refactor accidentally
+// passes a raw `&[u8]` containing an embedded NUL — the type system
+// now rejects it at compile time.
+//
+// The trait is sealed against downstream implementation via the
+// private `sealed::Sealed` supertrait — external crates cannot add
+// impls, so the set `{StmtName, PortalName}` is closed at crate
+// boundary.
+// ═════════════════════════════════════════════════════════════════
+
+mod describe_name_sealed {
+    /// Seal: prevents external crates from implementing
+    /// `DescribeName`. The trait's whole job is to enumerate exactly
+    /// the two types PG's Describe frame accepts.
+    pub trait Sealed {}
+    impl Sealed for super::StmtName {}
+    impl Sealed for super::PortalName {}
+}
+
+/// Typed name argument for the PG Extended Query `Describe` builder.
+/// Sealed (`StmtName` + `PortalName` only).
+///
+/// # Why sealed
+///
+/// PG's Describe frame (`'D'`) takes exactly one target-name field:
+/// a prepared-statement name or a portal name. Both are ≤ 63 bytes
+/// (PG's `NAMEDATALEN - 1`) with no embedded NULs. Binding the
+/// builder's `name` parameter to this trait makes "caller passes
+/// the right name type" a tier-1 compile guarantee; a caller who
+/// passes raw `&[u8]` fails to type-check.
+pub trait DescribeName: describe_name_sealed::Sealed {
+    /// The raw NUL-free bytes to embed into the `'D'` frame body,
+    /// followed by the NUL terminator the builder appends. Every
+    /// `FixedStr<N, _>` satisfies "no embedded NUL" via its
+    /// validating constructors.
+    #[must_use]
+    fn as_describe_name_bytes(&self) -> &[u8];
+}
+
+impl DescribeName for StmtName {
+    #[inline]
+    fn as_describe_name_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl DescribeName for PortalName {
+    #[inline]
+    fn as_describe_name_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 /// POD raw-byte buffer — the `FixedStr` cousin without UTF-8
 /// semantics. Used for wire-protocol byte slices that aren't strings
 /// (e.g. SCRAM `client-first-message-bare`, base64-encoded nonces).

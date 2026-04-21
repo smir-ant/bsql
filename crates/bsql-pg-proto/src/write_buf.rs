@@ -249,6 +249,19 @@ const _: () = assert!(
      Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN.",
 );
 
+/// Decomposition drift-pin (pass-#7 F15): PG §55.2.2 Describe frame
+/// is `'D' (1) + len (4) + target (1) + name (N) + NUL (1)`. A
+/// refactor that dropped the NUL, removed the target byte, or
+/// otherwise corrupted the layout formula inside
+/// `max_describe_message_size` would silently produce a wrong
+/// size without this pin. Ties the computed total to the literal
+/// sum of its documented parts.
+const _: () = assert!(
+    max_describe_message_size() == 7usize.saturating_add(crate::ident::MAX_PG_NAME_LEN),
+    "Describe frame layout drift — PG §55.2.2: \
+     'D' (1) + len (4) + target (1) + name (N) + NUL (1) = 7 + N",
+);
+
 /// Bounded outbound frame buffer with PG wire builders.
 ///
 /// See [module-level docs](self) for sizing rationale.

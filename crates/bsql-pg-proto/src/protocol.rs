@@ -954,26 +954,18 @@ fn compute_push_startup(
                     }
                 }
             }
-            Err(_) => {
-                // TIER-1 COMPILE DEAD BRANCH. The const assert in
-                // `write_buf.rs`:
-                //     MAX_OWNED_SEND_LEN >= max_startup_message_size()
-                // proves at build time that `build_startup_message`
-                // with validated `Ident` + `DatabaseName` +
-                // `ApplicationName` inputs cannot overflow the
-                // WriteBuf — their total bounded length is
-                // accounted for in the size computation. The Err
-                // arm is preserved for `match` exhaustiveness only.
-                emit_actions!(staged, budget: 1, [
-                    StagedAction::FailReply {
-                        id: reply.consume(),
-                        cause: ProtocolError::OutboundFrameBuildUnreachable {
-                            stage: crate::error::FrameBuildStage::Startup,
-                        },
-                    },
-                ]);
-                ProtoState::Idle
-            }
+            // TIER-1 COMPILE DEAD BRANCH. The const assert
+            //   MAX_OWNED_SEND_LEN >= max_startup_message_size()
+            // in `write_buf.rs` proves that `build_startup_message`
+            // with validated `Ident` + `DatabaseName` +
+            // `ApplicationName` inputs cannot overflow the WriteBuf.
+            // F16: route through `frame_build_unreachable` — one cold
+            // helper across all 6 build-Err branches.
+            Err(_) => frame_build_unreachable(
+                reply.consume(),
+                crate::error::FrameBuildStage::Startup,
+                staged,
+            ),
         },
         ProtoState::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1057,28 +1049,14 @@ fn compute_push_simple_query(
                 ]);
                 ProtoState::SimpleQueryAwaitingFirstResponse(reply)
             }
-            Err(_) => {
-                // TIER-1 COMPILE DEAD BRANCH. The const assert in
-                // `write_buf.rs`:
-                //     MAX_OWNED_SEND_LEN >= max_simple_query_message_size()
-                // proves at build time that a `Sql` constructed via
-                // `from_str_truncating` (bounded `MAX_SQL_LEN`) cannot
-                // overflow the WriteBuf. `build_query_message`'s
-                // `Err(WriteBufFull)` therefore cannot fire in
-                // production — the arm exists solely to satisfy
-                // `match` exhaustiveness under the `clippy::unwrap_used`
-                // ban. A future refactor that breaks the size
-                // invariant would fail the const assert first.
-                emit_actions!(staged, budget: 1, [
-                    StagedAction::FailReply {
-                        id: reply.consume(),
-                        cause: ProtocolError::OutboundFrameBuildUnreachable {
-                            stage: crate::error::FrameBuildStage::Query,
-                        },
-                    },
-                ]);
-                ProtoState::Idle
-            }
+            // TIER-1 COMPILE DEAD BRANCH — const assert in
+            // `write_buf.rs` proves a bounded `Sql` cannot overflow
+            // the WriteBuf. F16: centralised cold helper.
+            Err(_) => frame_build_unreachable(
+                reply.consume(),
+                crate::error::FrameBuildStage::Query,
+                staged,
+            ),
         },
         ProtoState::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1222,23 +1200,13 @@ fn compute_push_parse(
                 ]);
                 ProtoState::ParseAwaitingParseComplete(reply)
             }
-            Err(_) => {
-                // TIER-1 COMPILE DEAD BRANCH. The const assert in
-                // write_buf.rs proves:
-                //   MAX_OWNED_SEND_LEN >= max_parse_message_size()
-                // so `build_parse_message` on `StmtName` + `Sql`
-                // bounded by their truncating constructors cannot
-                // overflow the WriteBuf.
-                emit_actions!(staged, budget: 1, [
-                    StagedAction::FailReply {
-                        id: reply.consume(),
-                        cause: ProtocolError::OutboundFrameBuildUnreachable {
-                            stage: crate::error::FrameBuildStage::Parse,
-                        },
-                    },
-                ]);
-                ProtoState::Idle
-            }
+            // TIER-1 COMPILE DEAD BRANCH — const assert proves
+            // bounded StmtName + Sql cannot overflow. F16 centralised.
+            Err(_) => frame_build_unreachable(
+                reply.consume(),
+                crate::error::FrameBuildStage::Parse,
+                staged,
+            ),
         },
         ProtoState::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1294,6 +1262,47 @@ fn compute_push_parse(
     }
 }
 
+/// Centralised handler for the architecturally-dead
+/// `build_*_message` `Err(WriteBufFull)` branches.
+///
+/// # Pass-#7 F16 (short-term)
+///
+/// Every `build_<kind>_message` returns `Result<NonEmptyRange,
+/// WriteBufFull>`. The Err branch is const-assert-proven dead
+/// (write_buf.rs pins `MAX_OWNED_SEND_LEN >= max_<kind>_size()`
+/// per builder). Yet the Err arm must still exist for match
+/// exhaustiveness — and pre-pass-#7 the body was inlined at every
+/// call site (~10 lines × 6 call sites = 60 lines of dead emit
+/// code baked into the hot-path frame-build function).
+///
+/// This helper centralises the cold emit. Taking `raw_id:
+/// NonZeroU64` (caller pre-consumes typed `ReplyId<K>`) avoids
+/// monomorphisation over `K` — one function body for all six
+/// callers. `#[cold]` pushes it out of the I-cache for hot
+/// frame-building paths.
+///
+/// # Long-term (DEF-new)
+///
+/// Fix the class: replace `Result<NonEmptyRange, WriteBufFull>`
+/// with an infallible `NonEmptyRange` return (via a capacity-
+/// proven writer witness). Eliminates the dead Err arm entirely
+/// at the type level. Scheduled for later polish sub-phase.
+#[cold]
+#[inline]
+fn frame_build_unreachable(
+    raw_id: core::num::NonZeroU64,
+    stage: crate::error::FrameBuildStage,
+    staged: &mut StagedActions,
+) -> ProtoState {
+    emit_actions!(staged, budget: 1, [
+        StagedAction::FailReply {
+            id: raw_id,
+            cause: ProtocolError::OutboundFrameBuildUnreachable { stage },
+        },
+    ]);
+    ProtoState::Idle
+}
+
 /// Build a PostgreSQL Extended Query `Describe` (`'D'`) frame
 /// (PG §55.2.2).
 ///
@@ -1301,18 +1310,23 @@ fn compute_push_parse(
 /// single target byte (`'S'` statement or `'P'` portal via
 /// [`crate::wire::DescribeTargetByte`]), NUL-terminated name.
 ///
-/// # Tier-1 target-byte pairing
+/// # Tier-1 target-byte pairing (F12, pass-#7)
 ///
 /// `target` is a typed enum; the wire byte it encodes is pinned
-/// by const-asserts in `wire.rs`. Passing a random byte is a type
-/// error. The `name` argument is raw `&[u8]` here because the
-/// caller already matched on `PgCommand::Describe{Statement,Portal}`
-/// and extracted the right `StmtName::as_bytes()` /
-/// `PortalName::as_bytes()` — the pairing is enforced at the
-/// `compute_push_describe_*` call site, not inside this builder.
-fn build_describe_message(
+/// by const-asserts in `wire.rs`. The `name: &impl DescribeName`
+/// constraint (sealed trait in `ident.rs`) restricts callers to
+/// `StmtName` or `PortalName` — passing a raw `&[u8]` is a type
+/// error, closing the tier-3 "caller always passes the right
+/// typed name" audit seam.
+///
+/// `#[inline]` because the function is zero-generic monomorphic
+/// over `N: DescribeName`, the body is ~10 lines of direct buffer
+/// writes, and two call sites (`compute_push_describe_statement` /
+/// `..._portal`) invoke it per push — small enough to fold in.
+#[inline]
+fn build_describe_message<N: crate::ident::DescribeName>(
     target: crate::wire::DescribeTargetByte,
-    name: &[u8],
+    name: &N,
     write_buf: &mut WriteBuf,
 ) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
     use crate::write_buf::WriteBufFull;
@@ -1321,7 +1335,7 @@ fn build_describe_message(
     write_buf.push_u8(crate::wire::TAG_DESCRIBE.byte())?;
     write_buf.with_length_prefix(|w| {
         w.push_u8(target.byte())?;
-        w.push_nul_terminated(name)
+        w.push_nul_terminated(name.as_describe_name_bytes())
     })?;
     crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
 }
@@ -1356,7 +1370,7 @@ fn compute_push_describe_statement(
         ProtoState::Idle => {
             match build_describe_message(
                 crate::wire::DescribeTargetByte::Statement,
-                stmt_name.as_bytes(),
+                stmt_name,
                 write_buf,
             ) {
                 Ok(range) => {
@@ -1370,21 +1384,14 @@ fn compute_push_describe_statement(
                     ]);
                     ProtoState::DescribeStatementAwaitingParamDesc(reply)
                 }
-                Err(_) => {
-                    // TIER-1 COMPILE DEAD BRANCH. `write_buf.rs`'s
-                    //   MAX_OWNED_SEND_LEN >= max_describe_message_size() + 5
-                    // const-assert proves a StmtName-bounded payload
-                    // cannot overflow the WriteBuf.
-                    emit_actions!(staged, budget: 1, [
-                        StagedAction::FailReply {
-                            id: reply.consume(),
-                            cause: ProtocolError::OutboundFrameBuildUnreachable {
-                                stage: crate::error::FrameBuildStage::Describe,
-                            },
-                        },
-                    ]);
-                    ProtoState::Idle
-                }
+                // TIER-1 COMPILE DEAD BRANCH — F16 centralised cold
+                // helper. `MAX_OWNED_SEND_LEN >= max_describe_message_size()
+                // + 5` const-assert proves no overflow.
+                Err(_) => frame_build_unreachable(
+                    reply.consume(),
+                    crate::error::FrameBuildStage::Describe,
+                    staged,
+                ),
             }
         }
         ProtoState::Errored(prior_kind) => {
@@ -1463,7 +1470,7 @@ fn compute_push_describe_portal(
         ProtoState::Idle => {
             match build_describe_message(
                 crate::wire::DescribeTargetByte::Portal,
-                portal_name.as_bytes(),
+                portal_name,
                 write_buf,
             ) {
                 Ok(range) => {
@@ -1473,17 +1480,13 @@ fn compute_push_describe_portal(
                     ]);
                     ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
                 }
-                Err(_) => {
-                    emit_actions!(staged, budget: 1, [
-                        StagedAction::FailReply {
-                            id: reply.consume(),
-                            cause: ProtocolError::OutboundFrameBuildUnreachable {
-                                stage: crate::error::FrameBuildStage::Describe,
-                            },
-                        },
-                    ]);
-                    ProtoState::Idle
-                }
+                // F16 centralised cold helper. Same const-assert
+                // as DescribeStatement — one builder, one invariant.
+                Err(_) => frame_build_unreachable(
+                    reply.consume(),
+                    crate::error::FrameBuildStage::Describe,
+                    staged,
+                ),
             }
         }
         ProtoState::Errored(prior_kind) => {
@@ -1683,32 +1686,19 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                             None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
                         }
                     }
-                    Err(_) => {
-                        // TIER-1 COMPILE DEAD BRANCH — const assert
-                        // in write_buf.rs proves the Bind+Execute+Sync
-                        // bundle fits MAX_OWNED_SEND_LEN.
-                        emit_actions!(staged, budget: 1, [
-                            StagedAction::FailReply {
-                                id: reply.consume(),
-                                cause: ProtocolError::OutboundFrameBuildUnreachable {
-                                    stage: crate::error::FrameBuildStage::Execute,
-                                },
-                            },
-                        ]);
-                        ProtoState::Idle
-                    }
+                    // TIER-1 COMPILE DEAD BRANCH — const assert on
+                    // Bind+Execute+Sync bundle fit. F16 centralised.
+                    Err(_) => frame_build_unreachable(
+                        reply.consume(),
+                        crate::error::FrameBuildStage::Execute,
+                        staged,
+                    ),
                 },
-                Err(_) => {
-                    emit_actions!(staged, budget: 1, [
-                        StagedAction::FailReply {
-                            id: reply.consume(),
-                            cause: ProtocolError::OutboundFrameBuildUnreachable {
-                                stage: crate::error::FrameBuildStage::Bind,
-                            },
-                        },
-                    ]);
-                    ProtoState::Idle
-                }
+                Err(_) => frame_build_unreachable(
+                    reply.consume(),
+                    crate::error::FrameBuildStage::Bind,
+                    staged,
+                ),
             }
         }
         ProtoState::Errored(prior_kind) => {
@@ -1764,6 +1754,35 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
         }
     }
 }
+
+// Pass-#7 F6 analysis (deferred, no code lands):
+//
+// The architect-audit proposal was to extract a `const fn
+// is_busy_in_flight(state: &ProtoState) -> bool` and replace the
+// five `compute_push_*` helpers' final or-pattern catch-alls with
+// `other if is_busy_in_flight(&other) => ...`. Goal: centralise the
+// "busy-state set" so adding a new in-flight variant requires
+// touching one list, not five.
+//
+// REJECTED under the forbid bundle. A guarded arm does NOT prove
+// match exhaustiveness; the match would need a catch-all `_ =>`
+// fallback. All fallback options collide with bans:
+//   - `unreachable!()` / `panic!()` — banned by
+//     `clippy::unreachable` / `clippy::panic`.
+//   - `core::hint::unreachable_unchecked()` — `unsafe`, banned by
+//     `forbid(unsafe_code)`.
+//   - Silently classifying as one of the explicit cases — loses
+//     the "new variant forces decision" property.
+//
+// The existing design keeps the or-pattern enumeration at every
+// `compute_push_*` catch-all AND the exhaustive match at
+// `allows_unsolicited_param_status` — both are tier-1 exhaustive.
+// A new variant fails compilation at BOTH sites, forcing the
+// author to update both. Drift between the two lists is therefore
+// impossible without either site's match dropping to non-exhaustive.
+// Verified: current code is tier-1 on "busy-state classification;"
+// F6 would trade tier-1 compile for tier-2 match guards + runtime
+// fallback.
 
 /// Whether the current protocol state accepts unsolicited
 /// `ParameterStatus` frames from the server.
@@ -2035,59 +2054,35 @@ mod allows_unsolicited_param_status_tests {
 
     /// Consume any ReplyId carried by a state so the Drop-guard does
     /// not trip at end-of-scope.
+    ///
+    /// # Pass-#7 F14: delegate to `ProtoState::inflight_reply_raw_id`
+    ///
+    /// Pre-pass-#7 this was a hand-rolled 20-line exhaustive match
+    /// over all ~22 `ProtoState` variants. State.rs has THE
+    /// authoritative version (`inflight_reply_raw_id`) which
+    /// (a) takes `self` by value → consumes the carried `ReplyId<_>`
+    /// via its `.consume()` method, (b) returns the raw
+    /// `Option<NonZeroU64>` which the test doesn't need.
+    ///
+    /// Drift surface closed: one exhaustive match in `state.rs`,
+    /// zero parallel matches here. Adding a new variant fails the
+    /// build in state.rs's authoritative site and automatically
+    /// flows through `consume_state` without touching this file.
+    ///
+    /// The return value is `Option<NonZeroU64>` — `Copy`, no `Drop`
+    /// — statement-discarded via `drop()` (explicit no-op, avoids
+    /// the forbid-bundle-banned `let _ = ...`). Reading the
+    /// `Option::Some(u64)` payload here would add zero value.
     fn consume_state(state: ProtoState) {
-        // DEF-112: per-variant extraction. `ReplyId<PingKind>` and
-        // `ReplyId<StartupKind>` are distinct types; an or-pattern
-        // binding needs all alternatives to share the binding type.
-        // Splitting per kind keeps the match exhaustive (compiler
-        // will still flag a missing variant on future additions).
-        match state {
-            ProtoState::Idle
-            | ProtoState::Errored(_)
-            | ProtoState::DrainRfqAfterError => {}
-            ProtoState::PingAwaitingRfq(id) => {
-                id.consume();
-            }
-            ProtoState::ConnectingScramAwaitingAuthOk(id)
-            | ProtoState::ConnectingPostAuthAwaitingKey(id) => {
-                id.consume();
-            }
-            ProtoState::ConnectingStartupTrust { reply }
-            | ProtoState::ConnectingStartupScram { reply, .. }
-            | ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }
-            | ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }
-            | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
-                reply.consume();
-            }
-            ProtoState::SimpleQueryAwaitingFirstResponse(id) => {
-                id.consume();
-            }
-            ProtoState::BindExecuteAwaitingBindCompleteDml(id)
-            | ProtoState::BindExecuteAwaitingCommandCompleteDml(id) => {
-                id.consume();
-            }
-            ProtoState::SimpleQueryStreamingRows { reply, .. }
-            | ProtoState::SimpleQueryAwaitingRfq { reply, .. }
-            | ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }
-            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }
-            | ProtoState::BindExecuteStreamingRows { reply, .. }
-            | ProtoState::BindExecuteAwaitingRfqSelect { reply, .. }
-            | ProtoState::BindExecuteAwaitingRfqDml { reply, .. } => {
-                reply.consume();
-            }
-            ProtoState::ParseAwaitingParseComplete(reply)
-            | ProtoState::ParseAwaitingRfq(reply) => {
-                reply.consume();
-            }
-            ProtoState::DescribeStatementAwaitingParamDesc(reply)
-            | ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. }
-            | ProtoState::DescribeStatementAwaitingRfq { reply, .. } => {
-                reply.consume();
-            }
-            ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
-            | ProtoState::DescribePortalAwaitingRfq { reply, .. } => {
-                reply.consume();
-            }
+        // Side-effect call: `inflight_reply_raw_id` consumes the
+        // carried `ReplyId<_>` via its internal `.consume()` (marks
+        // delivered=true so the Drop-guard doesn't fire). The
+        // returned `Option<NonZeroU64>` is Copy / no Drop — bare
+        // expression-statement form discards without `let _`
+        // (user-banned). Same pattern as `ping.consume();` in
+        // reply_id tests.
+        match state.inflight_reply_raw_id() {
+            Some(_) | None => {}
         }
     }
 
@@ -2234,60 +2229,28 @@ mod compute_push_tests {
     }
 
     /// Consume any ReplyId carried by `state` so its Drop-guard does
-    /// not trip when the state drops at end of scope. Copy of the
-    /// helper in `allows_unsolicited_param_status_tests` — test
-    /// modules are siblings; Rust module privacy forbids re-use
-    /// without cross-module `pub(super)` exposure, and a 20-line
-    /// match is cheaper than the coupling.
+    /// not trip when the state drops at end of scope.
+    ///
+    /// # Pass-#7 F14: delegate to `inflight_reply_raw_id`
+    ///
+    /// Pre-pass-#7 this was a hand-rolled 20-line match, documented
+    /// as "copy of the helper in `allows_unsolicited_param_status_tests`
+    /// — module privacy forbids re-use without cross-module exposure."
+    /// After pass-#7, `state.rs` exposes `inflight_reply_raw_id` as
+    /// `pub(crate)` — both test modules delegate to it, eliminating
+    /// the parallel-match drift surface. New variants categorised
+    /// once in `state.rs` automatically flow through all test
+    /// helpers.
     fn consume_state(state: ProtoState) {
-        // DEF-112: per-kind split (see sibling module's consume_state).
-        match state {
-            ProtoState::Idle
-            | ProtoState::Errored(_)
-            | ProtoState::DrainRfqAfterError => {}
-            ProtoState::PingAwaitingRfq(id) => {
-                id.consume();
-            }
-            ProtoState::ConnectingScramAwaitingAuthOk(id)
-            | ProtoState::ConnectingPostAuthAwaitingKey(id) => {
-                id.consume();
-            }
-            ProtoState::ConnectingStartupTrust { reply }
-            | ProtoState::ConnectingStartupScram { reply, .. }
-            | ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }
-            | ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }
-            | ProtoState::ConnectingPostAuthHaveKey { reply, .. } => {
-                reply.consume();
-            }
-            ProtoState::SimpleQueryAwaitingFirstResponse(id) => {
-                id.consume();
-            }
-            ProtoState::BindExecuteAwaitingBindCompleteDml(id)
-            | ProtoState::BindExecuteAwaitingCommandCompleteDml(id) => {
-                id.consume();
-            }
-            ProtoState::SimpleQueryStreamingRows { reply, .. }
-            | ProtoState::SimpleQueryAwaitingRfq { reply, .. }
-            | ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }
-            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }
-            | ProtoState::BindExecuteStreamingRows { reply, .. }
-            | ProtoState::BindExecuteAwaitingRfqSelect { reply, .. }
-            | ProtoState::BindExecuteAwaitingRfqDml { reply, .. } => {
-                reply.consume();
-            }
-            ProtoState::ParseAwaitingParseComplete(reply)
-            | ProtoState::ParseAwaitingRfq(reply) => {
-                reply.consume();
-            }
-            ProtoState::DescribeStatementAwaitingParamDesc(reply)
-            | ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. }
-            | ProtoState::DescribeStatementAwaitingRfq { reply, .. } => {
-                reply.consume();
-            }
-            ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
-            | ProtoState::DescribePortalAwaitingRfq { reply, .. } => {
-                reply.consume();
-            }
+        // Side-effect call: `inflight_reply_raw_id` consumes the
+        // carried `ReplyId<_>` via its internal `.consume()` (marks
+        // delivered=true so the Drop-guard doesn't fire). The
+        // returned `Option<NonZeroU64>` is Copy / no Drop — bare
+        // expression-statement form discards without `let _`
+        // (user-banned). Same pattern as `ping.consume();` in
+        // reply_id tests.
+        match state.inflight_reply_raw_id() {
+            Some(_) | None => {}
         }
     }
 

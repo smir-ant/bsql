@@ -852,6 +852,30 @@ pub enum DescribedRows {
     NoData,
 }
 
+impl DescribedRows {
+    /// Construct from a parsed `RowDescription` (tag `'T'`, PG §55.7).
+    ///
+    /// F8 (pass-#7 audit): named constructors give the dispatch
+    /// arm an intent-telling alias to pair with `TAG_ROW_DESCRIPTION`.
+    /// A swap at the arm body (`Rows(desc)` ↔ `NoData`) still
+    /// compiles but tests flag the mismatch; this factory marks
+    /// the construction site with human-readable intent that will
+    /// fail a code review if inverted.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_row_desc(desc: crate::decode::RowDesc) -> Self {
+        Self::Rows(desc)
+    }
+
+    /// Construct the no-data sentinel. Pair to [`Self::from_row_desc`]
+    /// — used in the dispatch arm for `TAG_NO_DATA` (`'n'`).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn no_data() -> Self {
+        Self::NoData
+    }
+}
+
 /// Bounded list of parameter OIDs returned by server `ParameterDescription`
 /// (`'t'`) in response to a statement-level Describe.
 ///
@@ -876,11 +900,52 @@ pub enum DescribedRows {
 /// ParamOids (statement-describe only), we never need
 /// `Option<ParamOids>` — the type is always present at the API
 /// surface.
+// Layout pinned `#[repr(C, align(4))]` (pass-#7 F4):
+//
+// - `align(4)` matches the natural alignment of `[u32; _]` — no
+//   drift possible if future reorders the fields.
+// - `repr(C)` nails field order: `n_params: u16` at offset 0,
+//   2 bytes padding, `oids` at offset 4, no trailing pad (total
+//   = 4 + 16*4 = 68).
+//
+// The padding bytes at offsets 2..4 are ALWAYS zero via the
+// `EMPTY` / `from_parts` constructors (both initialise `oids` from
+// a fully-populated `[u32; N]`, and the `n_params: u16` slot leaves
+// its two padding bytes untouched — `Copy` struct init zeroes
+// padding in practice, but to remain portable across future
+// refactors, the `const _: () = assert!` below pins size and
+// alignment so any drift fails the build.
 #[derive(Debug, Clone, Copy)]
+#[repr(C, align(4))]
 pub struct ParamOids {
     n_params: u16,
     oids: [u32; crate::params::MAX_PARAMS_ARITY],
 }
+
+// Drift pin: bumping `MAX_PARAMS_ARITY` or swapping the field
+// order without updating this assertion fails the build. Size
+// must be `2 (u16) + 2 (pad) + 4 * MAX_PARAMS_ARITY`.
+const _: () = assert!(
+    core::mem::size_of::<ParamOids>()
+        == 4usize.saturating_add(4usize.saturating_mul(crate::params::MAX_PARAMS_ARITY)),
+    "ParamOids layout drift — expected size = 4 (u16 + 2-byte pad) + 4 * MAX_PARAMS_ARITY",
+);
+const _: () = assert!(
+    core::mem::align_of::<ParamOids>() == 4,
+    "ParamOids alignment drift — expected 4 (u32-aligned oids array forces this)",
+);
+// SIMD-wide PartialEq pin: tail slots are constructor-filled with
+// 0 so full-array `self.oids == other.oids` is byte-equivalent to
+// a populated-prefix compare (Finding 5 — defensible full-array eq).
+// Requiring total array size ≤ 64 bytes keeps it within a single
+// AVX2 register. If `MAX_PARAMS_ARITY` grows past 16, revisit eq
+// strategy (populated-prefix might become cheaper than the wide
+// compare).
+const _: () = assert!(
+    4usize.saturating_mul(crate::params::MAX_PARAMS_ARITY) <= 64,
+    "ParamOids eq is SIMD-wide (≤64 bytes). \
+     Revisit populated-prefix eq if MAX_PARAMS_ARITY grows > 16.",
+);
 
 impl Default for ParamOids {
     #[inline]

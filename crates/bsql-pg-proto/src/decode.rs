@@ -362,24 +362,19 @@ pub(crate) fn parse_parameter_description(
         return Err(malformed());
     }
 
+    // F7 (pass-#7 audit): `split_first_chunk::<4>()` returns typed
+    // `Option<(&[u8; 4], &[u8])>` — the typed fixed-array ref
+    // replaces the `chunks_exact(4)` + `[a,b,c,d]` slice-pattern
+    // approach. No dead `_ =>` fallback arm needed; the Option::None
+    // path is architecturally dead (body_len check above proves
+    // remaining bytes suffice) yet surfaces as `Err(malformed())`
+    // rather than `unreachable!()` (forbid-bundle).
     let mut oids = [0u32; crate::params::MAX_PARAMS_ARITY];
-    // `chunks_exact(4)` yields &[u8] slices of LENGTH=4 until the tail
-    // remainder (guaranteed empty here by the body_len check above).
-    // Use slice-pattern destructuring — the `[a, b, c, d]` match is
-    // proved by `chunks_exact(4)`'s contract, so no `malformed` arm
-    // can fire at this point. Keep the `_` fallback as `Err` surface
-    // rather than `unreachable!()` (crate-root forbid).
-    for (slot, chunk) in oids
-        .iter_mut()
-        .zip(rest.chunks_exact(4))
-        .take(n_params_usize)
-    {
-        match chunk {
-            [a, b, c, d] => {
-                *slot = u32::from_be_bytes([*a, *b, *c, *d]);
-            }
-            _ => return Err(malformed()),
-        }
+    let mut cursor = rest;
+    for slot in oids.iter_mut().take(n_params_usize) {
+        let (chunk, tail) = cursor.split_first_chunk::<4>().ok_or_else(malformed)?;
+        *slot = u32::from_be_bytes(*chunk);
+        cursor = tail;
     }
 
     Ok(crate::action::ParamOids::from_parts(n_params, oids))

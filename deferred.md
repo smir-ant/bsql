@@ -1531,3 +1531,82 @@ feat(pg-proto): close DEF-013 — SendBuf::Owned for StartupMessage
 **Contract:** no architectural deferral is valid unless it is recorded
 here. If you deferred something and did not add it to this file, you
 broke the contract.
+
+---
+
+## 21. Architect-audit pass #7 findings (2026-04-21, post-1c-3c Describe)
+
+Seventh systematic audit pass. 16 findings; 9 P1 tier/perf uplifts
+landed in the 1c-3c audit-follow-up commit; 4 P2 "already optimal
+/ defensible" findings documented here; 1 deferred for a future
+infallible-writer refactor.
+
+**Landed pass #7 (audit-follow-up to 1c-3c):**
+
+| ID | What | Rationale |
+|---|---|---|
+| F1+F2 | `advance_to_drain_after_error` de-generic + `#[cold] #[inline]` | K-oblivious body; pre-consume at call sites (mirrors `errored()` pattern). Eliminates N monomorphisations; I-cache win. |
+| F3 | `#[inline]` on `build_describe_message` | Tiny body, 2 call sites — cheap cross-crate inline. |
+| F4 | `#[repr(C, align(4))]` on `ParamOids` + size/align/SIMD-wide const-asserts | Layout pin: drift in MAX_PARAMS_ARITY or field order fails the build. |
+| F7 | `split_first_chunk::<4>()` in `parse_parameter_description` | Typed fixed-array ref instead of slice-pattern match with dead `_ =>` arm. Idiomatic. |
+| F8 | `DescribedRows::from_row_desc` / `no_data` factory constructors | Intent-named construction at the 4 dispatch sites; swaps are less likely and named at code review. |
+| F12 | Sealed `DescribeName` trait on `StmtName`/`PortalName` | Builder rejects raw `&[u8]` at compile. Tier-3 audit ("caller passes right bytes") → tier-1 compile ("builder accepts only these two types, sealed"). |
+| F13 | `parse_rfq_payload` centralised classifier | 8 parallel `[tx_byte] / other` match bodies collapsed to one function call. Tier-3 audit → tier-2 structural. |
+| F14 | `consume_state` test helpers delegate to `inflight_reply_raw_id` | Two 20-line parallel matches → 3-line calls. Adding a new variant classifies once in state.rs. |
+| F15 | `max_describe_message_size()` decomposition drift-pin | Ties computed total to documented `'D' + len + target + name + NUL` sum. |
+| F16 (short) | `frame_build_unreachable` centralised cold helper | 6 call sites × 10-line dead-branch body → 6 × 1-line calls routing to one `#[cold]` helper. Perf + code-size. |
+
+### F5 / F9 / F11 — already optimal (no change, documented reasoning)
+
+- **F5 `ParamOids::PartialEq` full-array eq** — 64-byte array compare is a single AVX2 register; populated-prefix would branch on length. Pinned via SIMD-wide size const-assert (documents the invariant).
+- **F9 `param_oids` always present in `DescribeStatementComplete`** — not `Option<ParamOids>`; semantic intent is "describe-statement IS a parameter description, which may be empty". Option disambiguation would reintroduce the class DescribedRows eliminated.
+- **F11 per-kind Describe state variants** — merging `DescribePortalAwaitingRowDescOrNoData` with `DescribeStatementAwaitingRowDescOrNoData` would require erasing the kind parameter on `ReplyId<K>`. DEF-112 structural pairing blocks the merge.
+
+### F6 — rejected under forbid bundle (analysis captured inline)
+
+Architect's "centralise `compute_push_*` catch-alls via
+`is_busy_in_flight` + guard" proposal requires a `_ =>` fallback
+arm because match guards don't prove exhaustiveness. Every
+fallback option (`unreachable!()`, `panic!()`,
+`unreachable_unchecked()` unsafe) collides with the forbid bundle.
+Current design — explicit or-patterns at 5 call sites + exhaustive
+match in `allows_unsolicited_param_status` — is tier-1 at every
+site and forces classification on new variants. F6 would trade
+tier-1 compile for tier-2 match guards + runtime fallback. Analysis
+recorded at `protocol.rs:1786` (pre-`allows_unsolicited_param_status`).
+
+### F10 — `DescribedRows::Rows` size: DEF-119 fix, no 1c-3c-scoped uplift
+
+Rust cannot shrink an inline `RowDesc` (~260 B) without either
+`Box` (needs alloc — banned) or an arena ref. The arena ref is
+DEF-119's scope (1c-5 pipelining). Note in `action.rs:851-852`
+documents the plan.
+
+### DEF-141 — F16 long-term: infallible builder returns
+
+**Goal.** Eliminate the `Result<NonEmptyRange, WriteBufFull>` return
+across all `build_*_message` functions. Replace with an infallible
+`NonEmptyRange` signature gated by a "capacity-proven writer
+witness" type — the const-asserts in `write_buf.rs` already prove
+no overflow; the type system should SURFACE that proof.
+
+**Why deferred.** Requires a broader refactor of `WriteBuf`'s
+push API. Current pass-#7 closed the cold-hint gap (F16 short-term)
+by centralising `frame_build_unreachable`. The remaining step —
+deleting the dead Err branch entirely — is the Tier-1 finish.
+
+**Tier lift estimate.** Tier-2 runtime dead branch (architecturally
+dead via const assert, syntactically present for match exhaustion)
+→ tier-1 compile (type signature says Infallible).
+
+**Touched files.** `write_buf.rs` (new witness trait or const-generic
+capacity param on `WriteBuf`), `protocol.rs` (all 5 `build_*`
+signatures), `error.rs` (keep `OutboundFrameBuildUnreachable` for
+legacy or delete entirely).
+
+**Ship-order.** Schedule for 1c-6 hardening sub-phase. Does not
+block 1c-3d (Close) or 1c-4 (transactions).
+
+**Test count after pass-#7.** 182 → 182. No new tests needed —
+audit-follow-up refactors preserve semantics; existing 26 describe
+tests + 156 pre-existing all pass.

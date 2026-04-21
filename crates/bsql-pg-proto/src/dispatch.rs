@@ -205,37 +205,28 @@ pub(crate) fn dispatch(
         // =============================================================
         // Ping flow (Phase 1a, carried forward)
         // =============================================================
-        (ProtoState::PingAwaitingRfq(id), TAG_READY_FOR_QUERY) => match payload {
+        (ProtoState::PingAwaitingRfq(id), TAG_READY_FOR_QUERY) => {
             // DEF-112: `id: ReplyId<PingKind>` — the typed
             // `deliver` helper binds the payload to `PongPayload`
             // at compile time. Attempting to deliver any other
             // payload type here is a type error.
             //
-            // Tier-1 tx_status validation — users never receive a
+            // Tier-1 tx_status validation via the centralised
+            // `parse_rfq_payload` (F13): users never receive a
             // `TxStatus` outside `{Idle, InTransaction, Failed}`;
             // any other byte is a wire violation classified as
-            // `MalformedReadyForQuery`.
-            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
-                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
+            // `MalformedReadyForQuery` with the correct `payload_len`.
+            match parse_rfq_payload(payload) {
+                Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
                     new_state: ProtoState::Idle,
                     action: crate::action::deliver(
                         id,
                         crate::action::PongPayload { tx_status },
                     ),
                 },
-                // `payload_len: 1` is structurally pinned by the `[tx_byte]`
-                // pattern above — the slice matched exactly one element.
-                // Not a magic constant; the `1` here IS the literal slice
-                // length the outer arm already proved.
-                None => errored(
-                    Some(id.consume()),
-                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
-                ),
-            },
-            other => errored(Some(id.consume()), ProtocolError::MalformedReadyForQuery {
-                    payload_len: other.len(),
-                }),
-        },
+                Err(cause) => errored(Some(id.consume()), cause),
+            }
+        }
         (ProtoState::PingAwaitingRfq(id), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
             errored(Some(id.consume()), cause)
@@ -371,11 +362,11 @@ pub(crate) fn dispatch(
                 secret_key,
             },
             TAG_READY_FOR_QUERY,
-        ) => match payload {
+        ) => {
             // DEF-112: `reply: ReplyId<StartupKind>` — typed
             // `deliver` forces a `StartupCompletePayload` payload.
-            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
-                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
+            match parse_rfq_payload(payload) {
+                Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
                     new_state: ProtoState::Idle,
                     action: crate::action::deliver(
                         reply,
@@ -386,15 +377,9 @@ pub(crate) fn dispatch(
                         },
                     ),
                 },
-                None => errored(
-                    Some(reply.consume()),
-                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
-                ),
-            },
-            other => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery {
-                    payload_len: other.len(),
-                }),
-        },
+                Err(cause) => errored(Some(reply.consume()), cause),
+            }
+        }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
             errored(Some(reply.consume()), cause)
@@ -455,7 +440,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -471,7 +456,7 @@ pub(crate) fn dispatch(
             advance_to_awaiting_rfq(reply, payload, Some(row_desc))
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -479,34 +464,21 @@ pub(crate) fn dispatch(
 
         // AwaitingRfq: Z is the only legal frame
         (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag, row_desc }, TAG_READY_FOR_QUERY) => {
-            match payload {
-                [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
-                    Some(tx_status) => {
-                        // F19: schema lives in state; consumed into the
-                        // terminal reply. No standalone slot to read/clear.
-                        DispatchOutcome::AdvancedWithAction {
-                            new_state: ProtoState::Idle,
-                            action: crate::action::deliver(
-                                reply,
-                                crate::action::QueryCompletePayload {
-                                    command_tag,
-                                    tx_status,
-                                    row_desc,
-                                },
-                            ),
-                        }
-                    }
-                    None => errored(
-                        Some(reply.consume()),
-                        ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+            // F19: schema lives in state; consumed into the terminal
+            // reply. No standalone slot to read/clear.
+            match parse_rfq_payload(payload) {
+                Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
+                    new_state: ProtoState::Idle,
+                    action: crate::action::deliver(
+                        reply,
+                        crate::action::QueryCompletePayload {
+                            command_tag,
+                            tx_status,
+                            row_desc,
+                        },
                     ),
                 },
-                other => errored(
-                    Some(reply.consume()),
-                    ProtocolError::MalformedReadyForQuery {
-                        payload_len: other.len(),
-                    },
-                ),
+                Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingRfq { reply, .. }, other) => {
@@ -568,27 +540,18 @@ pub(crate) fn dispatch(
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        (ProtoState::ParseAwaitingRfq(reply), TAG_READY_FOR_QUERY) => match payload {
-            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
-                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
+        (ProtoState::ParseAwaitingRfq(reply), TAG_READY_FOR_QUERY) => {
+            match parse_rfq_payload(payload) {
+                Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
                     new_state: ProtoState::Idle,
                     action: crate::action::deliver(
                         reply,
                         crate::action::ParseCompletePayload { tx_status },
                     ),
                 },
-                None => errored(
-                    Some(reply.consume()),
-                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
-                ),
-            },
-            other => errored(
-                Some(reply.consume()),
-                ProtocolError::MalformedReadyForQuery {
-                    payload_len: other.len(),
-                },
-            ),
-        },
+                Err(cause) => errored(Some(reply.consume()), cause),
+            }
+        }
         (ProtoState::ParseAwaitingRfq(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
@@ -633,7 +596,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -648,7 +611,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_PORTAL_SUSPENDED) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED })
@@ -662,28 +625,19 @@ pub(crate) fn dispatch(
         (
             ProtoState::BindExecuteAwaitingRfqDml { reply, command_tag },
             TAG_READY_FOR_QUERY,
-        ) => match payload {
-            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
-                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
-                    new_state: ProtoState::Idle,
-                    action: crate::action::deliver(
-                        reply,
-                        crate::action::QueryCompletePayload {
-                            command_tag,
-                            tx_status,
-                            row_desc: None,
-                        },
-                    ),
-                },
-                None => errored(
-                    Some(reply.consume()),
-                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+        ) => match parse_rfq_payload(payload) {
+            Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
+                new_state: ProtoState::Idle,
+                action: crate::action::deliver(
+                    reply,
+                    crate::action::QueryCompletePayload {
+                        command_tag,
+                        tx_status,
+                        row_desc: None,
+                    },
                 ),
             },
-            other => errored(
-                Some(reply.consume()),
-                ProtocolError::MalformedReadyForQuery { payload_len: other.len() },
-            ),
+            Err(cause) => errored(Some(reply.consume()), cause),
         },
         (ProtoState::BindExecuteAwaitingRfqDml { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -698,7 +652,7 @@ pub(crate) fn dispatch(
             new_state: ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc },
         },
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -713,7 +667,7 @@ pub(crate) fn dispatch(
             TAG_COMMAND_COMPLETE,
         ) => advance_to_bindexecute_awaiting_rfq_select(reply, payload, row_desc),
         (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. },
@@ -733,7 +687,7 @@ pub(crate) fn dispatch(
             advance_to_bindexecute_awaiting_rfq_select(reply, payload, row_desc)
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_PORTAL_SUSPENDED) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED })
@@ -745,28 +699,19 @@ pub(crate) fn dispatch(
         (
             ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag, row_desc },
             TAG_READY_FOR_QUERY,
-        ) => match payload {
-            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
-                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
-                    new_state: ProtoState::Idle,
-                    action: crate::action::deliver(
-                        reply,
-                        crate::action::QueryCompletePayload {
-                            command_tag,
-                            tx_status,
-                            row_desc: Some(row_desc),
-                        },
-                    ),
-                },
-                None => errored(
-                    Some(reply.consume()),
-                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+        ) => match parse_rfq_payload(payload) {
+            Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
+                new_state: ProtoState::Idle,
+                action: crate::action::deliver(
+                    reply,
+                    crate::action::QueryCompletePayload {
+                        command_tag,
+                        tx_status,
+                        row_desc: Some(row_desc),
+                    },
                 ),
             },
-            other => errored(
-                Some(reply.consume()),
-                ProtocolError::MalformedReadyForQuery { payload_len: other.len() },
-            ),
+            Err(cause) => errored(Some(reply.consume()), cause),
         },
         (ProtoState::BindExecuteAwaitingRfqSelect { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -808,7 +753,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::DescribeStatementAwaitingParamDesc(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (ProtoState::DescribeStatementAwaitingParamDesc(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -823,7 +768,7 @@ pub(crate) fn dispatch(
                 new_state: ProtoState::DescribeStatementAwaitingRfq {
                     reply,
                     param_oids,
-                    rows: crate::action::DescribedRows::Rows(row_desc),
+                    rows: crate::action::DescribedRows::from_row_desc(row_desc),
                 },
             },
             Err(cause) => errored(Some(reply.consume()), cause),
@@ -835,13 +780,13 @@ pub(crate) fn dispatch(
             new_state: ProtoState::DescribeStatementAwaitingRfq {
                 reply,
                 param_oids,
-                rows: crate::action::DescribedRows::NoData,
+                rows: crate::action::DescribedRows::no_data(),
             },
         },
         (
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. },
             TAG_ERROR_RESPONSE,
-        ) => advance_to_drain_after_error(reply, payload),
+        ) => advance_to_drain_after_error(reply.consume(), payload),
         (ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
@@ -855,28 +800,19 @@ pub(crate) fn dispatch(
                 rows,
             },
             TAG_READY_FOR_QUERY,
-        ) => match payload {
-            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
-                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
-                    new_state: ProtoState::Idle,
-                    action: crate::action::deliver(
-                        reply,
-                        crate::action::DescribeStatementCompletePayload {
-                            param_oids,
-                            rows,
-                            tx_status,
-                        },
-                    ),
-                },
-                None => errored(
-                    Some(reply.consume()),
-                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+        ) => match parse_rfq_payload(payload) {
+            Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
+                new_state: ProtoState::Idle,
+                action: crate::action::deliver(
+                    reply,
+                    crate::action::DescribeStatementCompletePayload {
+                        param_oids,
+                        rows,
+                        tx_status,
+                    },
                 ),
             },
-            other => errored(
-                Some(reply.consume()),
-                ProtocolError::MalformedReadyForQuery { payload_len: other.len() },
-            ),
+            Err(cause) => errored(Some(reply.consume()), cause),
         },
         (ProtoState::DescribeStatementAwaitingRfq { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -890,7 +826,7 @@ pub(crate) fn dispatch(
                 Ok(row_desc) => DispatchOutcome::AdvancedSilent {
                     new_state: ProtoState::DescribePortalAwaitingRfq {
                         reply,
-                        rows: crate::action::DescribedRows::Rows(row_desc),
+                        rows: crate::action::DescribedRows::from_row_desc(row_desc),
                     },
                 },
                 Err(cause) => errored(Some(reply.consume()), cause),
@@ -900,12 +836,12 @@ pub(crate) fn dispatch(
             DispatchOutcome::AdvancedSilent {
                 new_state: ProtoState::DescribePortalAwaitingRfq {
                     reply,
-                    rows: crate::action::DescribedRows::NoData,
+                    rows: crate::action::DescribedRows::no_data(),
                 },
             }
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply, payload)
+            advance_to_drain_after_error(reply.consume(), payload)
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -915,24 +851,15 @@ pub(crate) fn dispatch(
         (
             ProtoState::DescribePortalAwaitingRfq { reply, rows },
             TAG_READY_FOR_QUERY,
-        ) => match payload {
-            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
-                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
-                    new_state: ProtoState::Idle,
-                    action: crate::action::deliver(
-                        reply,
-                        crate::action::DescribePortalCompletePayload { rows, tx_status },
-                    ),
-                },
-                None => errored(
-                    Some(reply.consume()),
-                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+        ) => match parse_rfq_payload(payload) {
+            Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
+                new_state: ProtoState::Idle,
+                action: crate::action::deliver(
+                    reply,
+                    crate::action::DescribePortalCompletePayload { rows, tx_status },
                 ),
             },
-            other => errored(
-                Some(reply.consume()),
-                ProtocolError::MalformedReadyForQuery { payload_len: other.len() },
-            ),
+            Err(cause) => errored(Some(reply.consume()), cause),
         },
         (ProtoState::DescribePortalAwaitingRfq { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -1539,39 +1466,78 @@ fn advance_to_bindexecute_awaiting_rfq_select(
     }
 }
 
-/// 1c-1b helper (generalised 1c-3c): shared body for the `E` arm
-/// across multiple flows. Emit `FailReply` (NO `CloseSocket` —
-/// query-level errors are connection-survivable per PG §55.2.3)
+/// 1c-1b helper (pass-#7 audit, 2026-04-21): shared body for the
+/// `E` arm across multiple flows. Emit `FailReply` (NO `CloseSocket`
+/// — query-level errors are connection-survivable per PG §55.2.3)
 /// and transition to `DrainRfqAfterError` so the trailing `Z`
 /// returns the state to `Idle`.
 ///
-/// Centralises the "query-level E → recoverable" invariant. The
-/// contrast with fatal error paths (which return
-/// `DispatchOutcome::Errored { .. }` → forced `CloseSocket`) is
-/// the load-bearing distinction test 5
-/// (`query_error_emits_fail_reply_and_connection_survives`) pins.
+/// # Signature rationale — pre-consume at call site (F1)
 ///
-/// # Generic over `K: ReplyKind` (1c-3c)
+/// Pre-pass-#7 this was generic `<K: ReplyKind>` taking `ReplyId<K>`
+/// by value, forcing monomorphisation once per kind. Since the body
+/// only uses `reply.consume() -> NonZeroU64` (`K`-oblivious), every
+/// call site emitted an identical 3-instruction basic block. After
+/// pass-#7 the signature takes `raw_id: NonZeroU64` — the caller
+/// pre-consumes the typed `ReplyId<K>`, exactly mirroring the pattern
+/// `errored(Some(reply.consume()), …)` elsewhere in this module.
+/// LLVM now emits one function body for all kinds.
 ///
-/// Pre-1c-3c this was monomorphic over `QueryKind` because only
-/// SimpleQuery and BindExecute flows drained-after-error. 1c-3c
-/// adds the Describe flow, whose `ReplyId<DescribeStatementKind>`
-/// / `ReplyId<DescribePortalKind>` also need to route through
-/// this helper. The body doesn't depend on `K`: `reply.consume()`
-/// yields `NonZeroU64` regardless, and `StagedAction::FailReply`
-/// takes a raw id. Generalising avoids drift between per-kind
-/// clones of the same three-line body.
-fn advance_to_drain_after_error<K: crate::reply_id::ReplyKind>(
-    reply: ReplyId<K>,
+/// # `#[cold] #[inline]` (F2)
+///
+/// Error drain is a cold branch — typical dispatch iterations
+/// complete without encountering `ErrorResponse`. `#[cold]` pushes
+/// this body out of the hot-match I-cache footprint; `#[inline]`
+/// allows LLVM to fold the function into each call site when
+/// register pressure permits. Same treatment as `errored()` above.
+#[cold]
+#[inline]
+fn advance_to_drain_after_error(
+    raw_id: core::num::NonZeroU64,
     payload: &[u8],
 ) -> DispatchOutcome {
     let cause = parse_error_response(payload);
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::DrainRfqAfterError,
         action: StagedAction::FailReply {
-            id: reply.consume(),
+            id: raw_id,
             cause,
         },
+    }
+}
+
+/// Parse a `ReadyForQuery` payload (body of the `'Z'` frame) into a
+/// typed [`crate::action::TxStatus`].
+///
+/// PG §55.7 `ReadyForQuery` carries exactly one byte: `'I'`, `'T'`,
+/// or `'E'`. Any other shape is a wire violation. Centralised
+/// pass-#7 audit F13: prior to this there were 4 parallel `match
+/// payload { [b] => ..., other => ... }` patterns across Ping /
+/// SimpleQueryAwaitingRfq / ParseAwaitingRfq / BindExecuteAwaitingRfq*
+/// / DescribeStatementAwaitingRfq / DescribePortalAwaitingRfq —
+/// drift surface for a future change that modifies one handler
+/// (e.g., adding a new `TxStatus` variant) and forgets another.
+///
+/// Single-point classifier = tier-3 audit (6 parallel matches) →
+/// tier-2 structural (one function, one literal `payload_len: 1`).
+#[cold]
+#[inline]
+#[expect(
+    clippy::result_large_err,
+    reason = "no_alloc: Box unavailable; ProtocolError is Copy-POD and lives on error paths only. The `MalformedReadyForQuery` variant is small (one `usize` payload_len) but the overall `ProtocolError` sum ~300 B dominates. Error path only — not hot."
+)]
+fn parse_rfq_payload(
+    payload: &[u8],
+) -> Result<crate::action::TxStatus, ProtocolError> {
+    match payload {
+        [tx_byte] => crate::action::TxStatus::try_from_byte(*tx_byte).ok_or(
+            // `payload_len: 1` is structurally pinned by the `[tx_byte]`
+            // slice pattern above — the slice matched exactly one element.
+            ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+        ),
+        other => Err(ProtocolError::MalformedReadyForQuery {
+            payload_len: other.len(),
+        }),
     }
 }
 
