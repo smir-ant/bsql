@@ -391,7 +391,17 @@ impl PgProtocol {
                     if tag == crate::wire::TAG_PARAMETER_STATUS
                         && allows_unsolicited_param_status(&self.state)
                     {
-                        record_param_status(&mut self.session_params, payload);
+                        // F35: outcome classified but currently both
+                        // variants consumed silently — Phase 1d will
+                        // add `Action::EmitPsAdvisory` to forward
+                        // `MalformedPayload` events to the wrapper
+                        // for proxy-interference detection.
+                        match record_param_status(&mut self.session_params, payload) {
+                            ParamStatusRecordOutcome::Processed
+                            | ParamStatusRecordOutcome::MalformedPayload => {
+                                // Phase 1c: silently consume both.
+                            }
+                        }
                         let Ok(()) = self.read_buf.advance(total_len) else {
                             self.fail_inflight_and_close(
                                 ProtocolError::ReadCursorAdvanceUnreachable,
@@ -1177,19 +1187,58 @@ const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
     }
 }
 
+/// Classification of a `record_param_status` call's outcome.
+///
+/// F35 (2026-04-21): pre-F35 the function returned `()` and
+/// silently dropped malformed payloads (missing NUL separator, etc.).
+/// Now the outcome is typed so the caller has diagnostic info — and
+/// a future Phase 1d wrapper-advisory channel (e.g.,
+/// `Action::EmitPsAdvisory`) can forward `MalformedPayload` events
+/// to the user for proxy-interference detection. Current caller
+/// exhaustive-matches both variants, silently consuming for now,
+/// but the compile surface is ready for the upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamStatusRecordOutcome {
+    /// Payload was well-formed (key NUL + value NUL body); routing
+    /// to `SessionParams::set` completed. Whether the specific key
+    /// was recognised and its typed value stored is
+    /// `session_params.set`'s internal concern — still always
+    /// reports `Processed` here if the payload parsed.
+    Processed,
+    /// Payload violated PG's ParameterStatus wire format (missing
+    /// NUL separator between key and value, or value region
+    /// slice-bounds impossible). PG proper never sends such
+    /// payloads; arrival implies a proxy / debugging tool injecting
+    /// malformed PS, or a wire-corruption event.
+    MalformedPayload,
+}
+
 /// Parse a ParameterStatus payload and record it in session_params.
 ///
 /// Payload format: `key\0value\0`. Compressed with `let-else` to
 /// five short lines (DEF-095). `[T]::split_once` with a predicate
 /// is still unstable (#112811); the `iter().position` idiom is the
 /// stable-library equivalent.
-fn record_param_status(params: &mut SessionParams, payload: &[u8]) {
-    let Some(nul_pos) = payload.iter().position(|b| *b == 0) else { return; };
-    let Some(key) = payload.get(..nul_pos) else { return; };
-    let Some(value_start) = nul_pos.checked_add(1) else { return; };
-    let Some(value_region) = payload.get(value_start..) else { return; };
+#[must_use]
+fn record_param_status(
+    params: &mut SessionParams,
+    payload: &[u8],
+) -> ParamStatusRecordOutcome {
+    let Some(nul_pos) = payload.iter().position(|b| *b == 0) else {
+        return ParamStatusRecordOutcome::MalformedPayload;
+    };
+    let Some(key) = payload.get(..nul_pos) else {
+        return ParamStatusRecordOutcome::MalformedPayload;
+    };
+    let Some(value_start) = nul_pos.checked_add(1) else {
+        return ParamStatusRecordOutcome::MalformedPayload;
+    };
+    let Some(value_region) = payload.get(value_start..) else {
+        return ParamStatusRecordOutcome::MalformedPayload;
+    };
     let value = value_region.strip_suffix(b"\0").unwrap_or(value_region);
     params.set(key, value);
+    ParamStatusRecordOutcome::Processed
 }
 
 /// Build a PostgreSQL StartupMessage frame.
