@@ -427,6 +427,7 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, MAX_ACTIONS_PER_CALL
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; DEF-119 shrunk DeliverReply's Reply<'r> payload from ~312 B to ~88 B — FailReply.cause (ProtocolError ~312 B) is now the dominant variant. FailReply is emitted only on protocol failure (cold path), never in the hot streaming path.")]
 pub enum Action<'w, 'r> {
     /// Send these bytes verbatim to the server.
     ///
@@ -459,7 +460,10 @@ pub enum Action<'w, 'r> {
         /// command.
         id: NonZeroU64,
         /// The typed payload.
-        value: Reply,
+        ///
+        /// DEF-119: `Reply<'r>` borrows schema data from the arena
+        /// via the `'r` lifetime (same as `StreamRow::row_bytes`).
+        value: Reply<'r>,
     },
 
     /// Deliver a failure to the wrapper.
@@ -524,9 +528,17 @@ pub enum Action<'w, 'r> {
         /// via [`crate::decode`] primitives (1c-2b).
         row_bytes: &'r [u8],
         /// Result-set schema — type OIDs + format codes per column.
-        /// Stable across the entire row stream. By-value copy from
-        /// the `SimpleQueryStreamingRows { row_desc }` state variant.
-        desc: crate::decode::RowDesc,
+        /// Stable across the entire row stream.
+        ///
+        /// DEF-119: borrows from `PgProtocol`'s schema arena via `'r`.
+        /// Previously carried BY VALUE (260-byte copy per row);
+        /// now an 8-byte reference. On a 1000-row SELECT this saves
+        /// ~260 KB of per-row copy traffic. The arena slot is held
+        /// live by `SimpleQueryStreamingRows { schema_ref }` state
+        /// throughout the stream and freed at the terminal RFQ →
+        /// Idle transition (after the Reply's `&RowDesc` borrow
+        /// ended when `OutActions` dropped).
+        desc: &'r crate::decode::RowDesc,
     },
 
     /// The socket is no longer safe to use; close it.
@@ -556,6 +568,7 @@ pub enum Action<'w, 'r> {
 ///   materialiser emits the static ref directly (zero write, zero
 ///   copy — `Sync` bypasses `write_buf` entirely).
 #[derive(Debug)]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; DEF-119 shrunk StagedAction::DeliverReply's StagedReply payload from ~312 B to ~80 B — FailReply.cause (ProtocolError ~312 B) is now the dominant variant. FailReply is emitted only on protocol failure (cold path), never in the hot streaming path. Mirrors the `Action<'w, 'r>` rationale.")]
 pub(crate) enum StagedAction {
     /// Bytes live at the range `[start..start+len]` inside the
     /// emission-time `write_buf`. Typed as [`NonEmptyRange`] —
@@ -599,11 +612,208 @@ pub(crate) enum StagedAction {
         id: NonZeroU64,
         /// Absolute range into the read buffer's populated region.
         row_range: NonEmptyRange,
-        /// Schema at emission time (copy from StreamingRows state).
-        row_desc: crate::decode::RowDesc,
+        /// Schema arena handle (copy from StreamingRows state).
+        ///
+        /// DEF-119: 1-byte `SchemaRef` handle instead of the prior
+        /// 260-byte `RowDesc` copy. Materialise resolves via
+        /// `arena.get(schema_ref)` to a `&'r RowDesc` reference for
+        /// the public `Action::StreamRow`.
+        schema_ref: crate::schema_arena::SchemaRef,
     },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,
+}
+
+/// Internal lifetime-free counterpart to the public [`Reply<'r>`].
+///
+/// # DEF-119 rationale
+///
+/// Dispatch runs BEFORE materialise. At dispatch time, the state
+/// machine holds `SchemaRef` arena handles (no borrowing lifetime).
+/// At materialise time, `PgProtocol.schema_arena` is borrowed for
+/// `'r` and handles resolve to `&'r RowDesc` refs for public
+/// `Reply<'r>`. `StagedReply` is the lifetime-free intermediate.
+///
+/// Variants mirror `Reply<'r>` 1:1. Schema-bearing variants carry
+/// staged payload types (with `schema_ref` fields instead of
+/// `&'r RowDesc`); schema-less variants share payloads with the
+/// public side.
+///
+/// # Visibility
+///
+/// The type is nominally `pub` because `ReplyKind::StagedPayload`
+/// (in the public sealed `ReplyKind` trait) references
+/// `Staged*Payload` types which must wrap into `StagedReply` via
+/// `Into<StagedReply>`. Rust requires `pub trait`'s associated
+/// types (and the types they wrap into) to be `pub`. But this is
+/// **`#[doc(hidden)]` + crate-internal-by-convention** — external
+/// users should never construct or match on `StagedReply`; it's
+/// exclusively produced/consumed inside the crate's dispatch /
+/// materialise pipeline.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedReply {
+    #[doc(hidden)] Pong(PongPayload),
+    #[doc(hidden)] StartupComplete(StartupCompletePayload),
+    #[doc(hidden)] QueryComplete(StagedQueryCompletePayload),
+    #[doc(hidden)] ParseComplete(ParseCompletePayload),
+    #[doc(hidden)] CloseComplete(CloseCompletePayload),
+    #[doc(hidden)] DescribeStatementComplete(StagedDescribeStatementCompletePayload),
+    #[doc(hidden)] DescribePortalComplete(StagedDescribePortalCompletePayload),
+}
+
+/// Lifetime-free staged counterpart to [`QueryCompletePayload<'r>`].
+///
+/// Holds `schema_ref: Option<SchemaRef>` instead of the public
+/// `Option<&'r RowDesc>`. Materialise converts via
+/// `arena.get(ref).map(|desc| ...)`.
+///
+/// `#[doc(hidden)] pub` — see [`StagedReply`] for visibility rationale.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagedQueryCompletePayload {
+    #[doc(hidden)] pub command_tag: crate::ident::BoundedStr<32>,
+    #[doc(hidden)] pub tx_status: TxStatus,
+    #[doc(hidden)] pub schema_ref: Option<crate::schema_arena::SchemaRef>,
+}
+
+/// Lifetime-free staged counterpart to
+/// [`DescribeStatementCompletePayload<'r>`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagedDescribeStatementCompletePayload {
+    #[doc(hidden)] pub param_oids: ParamOids,
+    #[doc(hidden)] pub rows: crate::state::DescribedRowsRef,
+    #[doc(hidden)] pub tx_status: TxStatus,
+}
+
+/// Lifetime-free staged counterpart to
+/// [`DescribePortalCompletePayload<'r>`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagedDescribePortalCompletePayload {
+    #[doc(hidden)] pub rows: crate::state::DescribedRowsRef,
+    #[doc(hidden)] pub tx_status: TxStatus,
+}
+
+// From impls: schema-less payloads wrap directly; schema-bearing
+// payloads use their staged form to produce a StagedReply.
+
+impl From<PongPayload> for StagedReply {
+    #[inline]
+    fn from(p: PongPayload) -> Self {
+        Self::Pong(p)
+    }
+}
+impl From<StartupCompletePayload> for StagedReply {
+    #[inline]
+    fn from(p: StartupCompletePayload) -> Self {
+        Self::StartupComplete(p)
+    }
+}
+impl From<StagedQueryCompletePayload> for StagedReply {
+    #[inline]
+    fn from(p: StagedQueryCompletePayload) -> Self {
+        Self::QueryComplete(p)
+    }
+}
+impl From<ParseCompletePayload> for StagedReply {
+    #[inline]
+    fn from(p: ParseCompletePayload) -> Self {
+        Self::ParseComplete(p)
+    }
+}
+impl From<CloseCompletePayload> for StagedReply {
+    #[inline]
+    fn from(p: CloseCompletePayload) -> Self {
+        Self::CloseComplete(p)
+    }
+}
+impl From<StagedDescribeStatementCompletePayload> for StagedReply {
+    #[inline]
+    fn from(p: StagedDescribeStatementCompletePayload) -> Self {
+        Self::DescribeStatementComplete(p)
+    }
+}
+impl From<StagedDescribePortalCompletePayload> for StagedReply {
+    #[inline]
+    fn from(p: StagedDescribePortalCompletePayload) -> Self {
+        Self::DescribePortalComplete(p)
+    }
+}
+
+impl StagedReply {
+    /// Resolve this staged reply into the public [`Reply<'r>`] by
+    /// looking up any arena-borrowed schema via `arena.get(ref)`.
+    ///
+    /// # Stale-ref handling
+    ///
+    /// Architecturally every `SchemaRef` in a StagedReply points to
+    /// a live slot at materialise time — the dispatch arms that
+    /// construct these staged payloads allocate the slot immediately
+    /// before the StagedReply is queued, and the slot stays live
+    /// through materialise. A stale `schema_ref` (slot freed
+    /// prematurely) is a crate-internal bug; `get` returns `None`
+    /// which the conversion maps to `Option::None` / `NoData` —
+    /// silently substituting absence. This is tier-3 "crate bug =
+    /// degraded diagnostic" and is called out in the arena module's
+    /// alloc/free discipline docstring.
+    #[inline]
+    pub(crate) fn into_public<'r>(
+        self,
+        arena: &'r crate::schema_arena::SchemaSlab,
+    ) -> Reply<'r> {
+        match self {
+            Self::Pong(p) => Reply::Pong(p),
+            Self::StartupComplete(p) => Reply::StartupComplete(p),
+            Self::QueryComplete(staged) => Reply::QueryComplete(QueryCompletePayload {
+                command_tag: staged.command_tag,
+                tx_status: staged.tx_status,
+                row_desc: staged.schema_ref.and_then(|r| arena.get(r)),
+            }),
+            Self::ParseComplete(p) => Reply::ParseComplete(p),
+            Self::CloseComplete(p) => Reply::CloseComplete(p),
+            Self::DescribeStatementComplete(staged) => {
+                Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
+                    param_oids: staged.param_oids,
+                    rows: described_rows_ref_into_public(staged.rows, arena),
+                    tx_status: staged.tx_status,
+                })
+            }
+            Self::DescribePortalComplete(staged) => {
+                Reply::DescribePortalComplete(DescribePortalCompletePayload {
+                    rows: described_rows_ref_into_public(staged.rows, arena),
+                    tx_status: staged.tx_status,
+                })
+            }
+        }
+    }
+}
+
+/// Convert state-side [`crate::state::DescribedRowsRef`] to the
+/// public [`DescribedRows<'r>`] by resolving any `SchemaRef` into a
+/// borrow. Stale ref (crate bug) maps to `NoData` silently —
+/// safer than producing a dangling reference.
+///
+/// F8 intent markers: uses [`DescribedRows::from_row_desc`] and
+/// [`DescribedRows::no_data`] factories rather than direct variant
+/// construction. Swapping the arm bodies still type-checks, but the
+/// factory names make the swap obvious on code review and the
+/// `arena.get(s)` resolution arm explicit.
+#[inline]
+fn described_rows_ref_into_public<'r>(
+    r: crate::state::DescribedRowsRef,
+    arena: &'r crate::schema_arena::SchemaSlab,
+) -> DescribedRows<'r> {
+    match r {
+        crate::state::DescribedRowsRef::Rows(s) => match arena.get(s) {
+            Some(desc) => DescribedRows::from_row_desc(desc),
+            // Arena slot freed early — architecturally dead. Fall back
+            // to NoData rather than dangle.
+            None => DescribedRows::no_data(),
+        },
+        crate::state::DescribedRowsRef::NoData => DescribedRows::no_data(),
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -629,7 +839,7 @@ pub(crate) enum StagedAction {
 // ═════════════════════════════════════════════════════════════════
 
 mod deliver_entry_priv {
-    use super::{NonZeroU64, Reply};
+    use super::{NonZeroU64, StagedReply};
 
     /// Opaque payload for [`super::StagedAction::DeliverReply`].
     ///
@@ -637,11 +847,16 @@ mod deliver_entry_priv {
     /// visibility). The only constructor is `pub(super) fn new`,
     /// reachable exclusively from [`super::deliver`] — which in
     /// turn requires a typed [`crate::reply_id::ReplyId<K>`] and
-    /// its matching `K::Payload`. DEF-112.
+    /// its matching `K::StagedPayload`. DEF-112 + DEF-119.
+    ///
+    /// DEF-119: carries [`StagedReply`] (lifetime-free) rather than
+    /// the public [`super::Reply`] (which now has a `'r` lifetime
+    /// tied to the arena). Materialise converts staged → public via
+    /// `StagedReply::into_public(&arena)`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct DeliverReplyEntry {
         id: NonZeroU64,
-        value: Reply,
+        value: StagedReply,
     }
 
     impl DeliverReplyEntry {
@@ -651,7 +866,7 @@ mod deliver_entry_priv {
         /// dispatcher cannot produce a `DeliverReplyEntry` outside
         /// the typed path.
         #[inline]
-        pub(super) const fn new(id: NonZeroU64, value: Reply) -> Self {
+        pub(super) const fn new(id: NonZeroU64, value: StagedReply) -> Self {
             Self { id, value }
         }
 
@@ -662,9 +877,11 @@ mod deliver_entry_priv {
             self.id
         }
 
-        /// Read access for the materialiser.
+        /// Read access for the materialiser. DEF-119: returns
+        /// `StagedReply` (not the lifetime-bound public `Reply<'r>`)
+        /// — materialise borrows the arena and converts.
         #[inline]
-        pub(crate) const fn value(&self) -> Reply {
+        pub(crate) const fn staged(&self) -> StagedReply {
             self.value
         }
     }
@@ -674,19 +891,20 @@ pub(crate) use deliver_entry_priv::DeliverReplyEntry;
 
 /// Construct a [`StagedAction::DeliverReply`] from a typed
 /// [`ReplyId<K>`](crate::reply_id::ReplyId) and its kind-matching
-/// payload.
+/// STAGED payload.
 ///
-/// The `K: ReplyKind` bound + the `K::Payload` argument type jointly
-/// enforce at the call site that the payload matches the reply id's
-/// kind. Passing a `ReplyId<PingKind>` with a
+/// The `K: ReplyKind` bound + the `K::StagedPayload` argument type
+/// jointly enforce at the call site that the payload matches the
+/// reply id's kind. Passing a `ReplyId<PingKind>` with a
 /// `StartupCompletePayload` — or any other mismatch — fails to
 /// compile. DEF-112 tier-1 elevation of the "wrong payload per
-/// reply kind" class.
+/// reply kind" class; preserved across DEF-119 via
+/// `ReplyKind::StagedPayload`.
 #[inline]
 #[must_use]
 pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
     id: crate::reply_id::ReplyId<K>,
-    payload: K::Payload,
+    payload: K::StagedPayload,
 ) -> StagedAction {
     StagedAction::DeliverReply(DeliverReplyEntry::new(id.consume(), payload.into()))
 }
@@ -702,19 +920,36 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// `#[non_exhaustive]` because more variants (`BindComplete`,
 /// `BackendKeyData`, …) land in later sub-phases.
 ///
-/// # Size note (1c-3c)
+/// # DEF-119 — lifetime `'r`
 ///
-/// Previously carried a `#[expect(clippy::large_enum_variant)]` for
-/// `QueryComplete(..Option<RowDesc>)` (~260 B). As of 1c-3c clippy
-/// reports the lint one level deeper — on [`DescribedRows`] — which
-/// now carries the `expect`. `Reply` itself is large (~340 B
-/// dominated by `DescribeStatementComplete`) but variant sizes are
-/// roughly comparable since `Payload` structs keep the heavy types
-/// inline the same way. DEF-119 (1c-5) schema-arena refactor will
-/// shrink both `DescribedRows` and the containing payloads together.
+/// Schema-bearing payloads (`QueryComplete`, `DescribeStatementComplete`,
+/// `DescribePortalComplete`) previously owned a 260-byte `RowDesc`
+/// inline. DEF-119 externalises the schema into `PgProtocol`'s
+/// [`crate::schema_arena::SchemaSlab`]; payloads now borrow
+/// `&'r RowDesc` from the arena. The `'r` lifetime ties the borrow
+/// to the `&'r mut PgProtocol` that produced the reply — same
+/// lifetime as [`Action::StreamRow::row_bytes`], so both row bytes
+/// and row schema have identical validity windows.
+///
+/// **User code ergonomics unchanged**: pattern-match on the variant
+/// and access `payload.row_desc` / `payload.rows` as before; the
+/// only difference is the field type is `Option<&RowDesc>` /
+/// `DescribedRows<'r>` rather than owned.
+///
+/// **Lifetime-irrelevant variants** (Pong, StartupComplete,
+/// ParseComplete, CloseComplete) carry no schema; the `'r` parameter
+/// is phantom for them. Rust permits unused lifetime parameters on
+/// enums — only the schema-bearing variants constrain `'r`.
+///
+/// # Size impact
+///
+/// Pre-DEF-119: `Reply` ~340 B (dominated by DescribeStatementComplete's
+/// inline RowDesc + ParamOids).
+/// Post-DEF-119: `Reply<'r>` ~96 B (DescribeStatementComplete holds
+/// `&RowDesc` ref + ParamOids 68 + TxStatus = ~80 B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Reply {
+pub enum Reply<'r> {
     /// The server is alive and responsive. See [`PongPayload`].
     Pong(PongPayload),
 
@@ -728,7 +963,7 @@ pub enum Reply {
     /// of the result stream. Rows (if any) were emitted individually
     /// via `Action::StreamRow` (sub-phase 1c-1). See
     /// [`QueryCompletePayload`].
-    QueryComplete(QueryCompletePayload),
+    QueryComplete(QueryCompletePayload<'r>),
 
     /// A `Parse` command succeeded (server accepted the prepared
     /// statement). See [`ParseCompletePayload`]. 1c-3a.
@@ -740,11 +975,11 @@ pub enum Reply {
 
     /// A statement-level `Describe` (`'D' 'S' name`) completed. See
     /// [`DescribeStatementCompletePayload`]. 1c-3c.
-    DescribeStatementComplete(DescribeStatementCompletePayload),
+    DescribeStatementComplete(DescribeStatementCompletePayload<'r>),
 
     /// A portal-level `Describe` (`'D' 'P' name`) completed. See
     /// [`DescribePortalCompletePayload`]. 1c-3c.
-    DescribePortalComplete(DescribePortalCompletePayload),
+    DescribePortalComplete(DescribePortalCompletePayload<'r>),
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -772,7 +1007,7 @@ pub struct PongPayload {
     pub tx_status: TxStatus,
 }
 
-impl From<PongPayload> for Reply {
+impl<'r> From<PongPayload> for Reply<'r> {
     #[inline]
     fn from(p: PongPayload) -> Self {
         Self::Pong(p)
@@ -794,7 +1029,7 @@ pub struct StartupCompletePayload {
     pub tx_status: TxStatus,
 }
 
-impl From<StartupCompletePayload> for Reply {
+impl<'r> From<StartupCompletePayload> for Reply<'r> {
     #[inline]
     fn from(p: StartupCompletePayload) -> Self {
         Self::StartupComplete(p)
@@ -809,23 +1044,30 @@ impl From<StartupCompletePayload> for Reply {
 /// sub-phase 1c-6 parses this into a typed `CommandTag` struct
 /// (round-4 finding #3).
 ///
-/// 1c-2a: `row_desc` carries the result-set schema — `Some` for
-/// SELECT queries (even 0-row), `None` for DML / empty-query. The
-/// schema is copied by value (RowDesc is `Copy` POD).
+/// DEF-119: `row_desc` borrows from `PgProtocol`'s schema arena via
+/// the `'r` lifetime. `Some(&desc)` for SELECT (including 0-row),
+/// `None` for DML / empty-query. The schema stays valid for the
+/// lifetime of the owning `OutActions<'w, 'r>`; the next
+/// `&mut PgProtocol` call is blocked by the borrow checker until
+/// the caller drops the actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueryCompletePayload {
+pub struct QueryCompletePayload<'r> {
     /// Raw ASCII tag from `CommandComplete` body.
     pub command_tag: crate::ident::BoundedStr<32>,
     /// Transaction-status indicator from the trailing `ReadyForQuery`.
     pub tx_status: TxStatus,
     /// Result-set schema, if any. `Some` for SELECT (including
     /// 0-row SELECTs), `None` for DML / empty-query.
-    pub row_desc: Option<crate::decode::RowDesc>,
+    ///
+    /// DEF-119: borrowed from the arena. Previously owned
+    /// (`Option<RowDesc>`, 260 B inline); now `Option<&'r RowDesc>`
+    /// (8 B ref).
+    pub row_desc: Option<&'r crate::decode::RowDesc>,
 }
 
-impl From<QueryCompletePayload> for Reply {
+impl<'r> From<QueryCompletePayload<'r>> for Reply<'r> {
     #[inline]
-    fn from(p: QueryCompletePayload) -> Self {
+    fn from(p: QueryCompletePayload<'r>) -> Self {
         Self::QueryComplete(p)
     }
 }
@@ -842,7 +1084,7 @@ pub struct ParseCompletePayload {
     pub tx_status: TxStatus,
 }
 
-impl From<ParseCompletePayload> for Reply {
+impl<'r> From<ParseCompletePayload> for Reply<'r> {
     #[inline]
     fn from(p: ParseCompletePayload) -> Self {
         Self::ParseComplete(p)
@@ -855,7 +1097,7 @@ impl From<ParseCompletePayload> for Reply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CloseCompletePayload;
 
-impl From<CloseCompletePayload> for Reply {
+impl<'r> From<CloseCompletePayload> for Reply<'r> {
     #[inline]
     fn from(p: CloseCompletePayload) -> Self {
         Self::CloseComplete(p)
@@ -893,25 +1135,35 @@ impl From<CloseCompletePayload> for Reply {
 /// accidentally "forget to set" the field — constructing
 /// [`DescribedRows`] forces picking one of the two documented PG
 /// outcomes. Tier-1 clarity win.
+///
+/// # DEF-119 — borrowed `&'r RowDesc`
+///
+/// Prior to DEF-119 this enum embedded a 260-byte `RowDesc` inline
+/// in the `Rows` variant, triggering `clippy::large_enum_variant`.
+/// DEF-119 externalises the schema into `PgProtocol`'s schema
+/// arena; the `Rows` variant now holds a `&'r RowDesc` reference
+/// borrowed through the `'r` lifetime tied to the `&'r mut PgProtocol`
+/// borrow.
+///
+/// Size: ~8 B (ref + discriminant) vs ~264 B pre-arena. The
+/// `large_enum_variant` expect can be dropped alongside this
+/// refactor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "1c-3c: no_alloc crate; DescribedRows::Rows embeds a full RowDesc (~260 B inline) because we cannot box without alloc. DEF-119 (1c-5) schema-arena refactor will externalise this. The NoData ZST is intentionally dwarfed — the size is dominated by the legal PG Rows payload, not by padding."
-)]
-pub enum DescribedRows {
+pub enum DescribedRows<'r> {
     /// Server sent a `RowDescription` (`'T'`) — the statement/portal
-    /// produces `RowDesc::columns()` result columns. Identical shape
-    /// to the schema a SELECT streams mid-query.
-    Rows(crate::decode::RowDesc),
+    /// produces result columns. The schema borrows from
+    /// `PgProtocol`'s schema arena; `'r` matches the containing
+    /// `Reply<'r>` / `Action<'_, 'r>` lifetime.
+    Rows(&'r crate::decode::RowDesc),
     /// Server sent `NoData` (`'n'`) — the statement/portal has no
     /// result columns. DML without `RETURNING` is the common case.
     NoData,
 }
 
-impl DescribedRows {
+impl<'r> DescribedRows<'r> {
     /// Construct from a parsed `RowDescription` (tag `'T'`, PG §55.7).
     ///
-    /// F8 (pass-#7 audit): named constructors give the dispatch
+    /// F8 (pass-#7 audit): named constructors give the materialise
     /// arm an intent-telling alias to pair with `TAG_ROW_DESCRIPTION`.
     /// A swap at the arm body (`Rows(desc)` ↔ `NoData`) still
     /// compiles but tests flag the mismatch; this factory marks
@@ -919,7 +1171,7 @@ impl DescribedRows {
     /// fail a code review if inverted.
     #[inline]
     #[must_use]
-    pub(crate) const fn from_row_desc(desc: crate::decode::RowDesc) -> Self {
+    pub(crate) const fn from_row_desc(desc: &'r crate::decode::RowDesc) -> Self {
         Self::Rows(desc)
     }
 
@@ -1099,18 +1351,19 @@ impl Eq for ParamOids {}
 ///   `NoData` (`'n'`) arrived.
 /// - `tx_status` — from the final RFQ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DescribeStatementCompletePayload {
+pub struct DescribeStatementCompletePayload<'r> {
     /// Parameter OIDs, in positional order (`$1`, `$2`, …).
     pub param_oids: ParamOids,
     /// Rows-or-no-data sum from the subsequent response frame.
-    pub rows: DescribedRows,
+    /// DEF-119: `DescribedRows` now holds a `&'r RowDesc` borrow.
+    pub rows: DescribedRows<'r>,
     /// Transaction status from the trailing `ReadyForQuery`.
     pub tx_status: TxStatus,
 }
 
-impl From<DescribeStatementCompletePayload> for Reply {
+impl<'r> From<DescribeStatementCompletePayload<'r>> for Reply<'r> {
     #[inline]
-    fn from(p: DescribeStatementCompletePayload) -> Self {
+    fn from(p: DescribeStatementCompletePayload<'r>) -> Self {
         Self::DescribeStatementComplete(p)
     }
 }
@@ -1128,16 +1381,17 @@ impl From<DescribeStatementCompletePayload> for Reply {
 /// parameter values were fixed at Bind time, so PG does not replay
 /// a `ParameterDescription` frame for a portal-Describe per PG §55.2.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DescribePortalCompletePayload {
+pub struct DescribePortalCompletePayload<'r> {
     /// Rows-or-no-data sum from the response frame.
-    pub rows: DescribedRows,
+    /// DEF-119: `DescribedRows` now holds a `&'r RowDesc` borrow.
+    pub rows: DescribedRows<'r>,
     /// Transaction status from the trailing `ReadyForQuery`.
     pub tx_status: TxStatus,
 }
 
-impl From<DescribePortalCompletePayload> for Reply {
+impl<'r> From<DescribePortalCompletePayload<'r>> for Reply<'r> {
     #[inline]
-    fn from(p: DescribePortalCompletePayload) -> Self {
+    fn from(p: DescribePortalCompletePayload<'r>) -> Self {
         Self::DescribePortalComplete(p)
     }
 }

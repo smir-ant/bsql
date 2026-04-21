@@ -19,8 +19,7 @@
 //! (no action, no state change — post-`CloseSocket` packet flushes
 //! become true no-ops instead of silent mis-advances).
 
-use crate::action::{DescribedRows, ParamOids};
-use crate::decode::RowDesc;
+use crate::action::ParamOids;
 use crate::error::BoundedStr;
 use crate::error::StateErrorKind;
 use crate::ident::PodBytes;
@@ -28,8 +27,32 @@ use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
     StartupKind,
 };
+use crate::schema_arena::SchemaRef;
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
+
+/// State-side counterpart to the public
+/// [`crate::action::DescribedRows<'r>`].
+///
+/// DEF-119: state variants cannot carry a lifetime (they're owned
+/// by `PgProtocol`, not borrowed), so the state-storable form holds
+/// a [`SchemaRef`] handle into the arena. Materialise converts this
+/// to the lifetime-bound public form.
+///
+/// | Variant | State-side | Public `DescribedRows<'r>` |
+/// |---|---|---|
+/// | Rows | `Rows(SchemaRef)` (1 B) | `Rows(&'r RowDesc)` (8 B) |
+/// | NoData | `NoData` (ZST) | `NoData` (ZST) |
+///
+/// Total: 2 B state-side vs 264 B pre-arena.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribedRowsRef {
+    /// Schema present at `SchemaRef` in the arena.
+    #[doc(hidden)] Rows(SchemaRef),
+    /// Server sent `NoData` (`'n'`) — no result columns.
+    #[doc(hidden)] NoData,
+}
 
 /// Where the protocol is right now.
 ///
@@ -192,10 +215,13 @@ pub enum ProtoState {
     SimpleQueryStreamingRows {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
-        /// Result-set schema parsed from `RowDescription`. Copied into
-        /// each staged `StreamRowRange` on every `DataRow` frame; copied
-        /// into `AwaitingRfq` on `CommandComplete`.
-        row_desc: RowDesc,
+        /// Schema arena handle. DEF-119: was inline `row_desc: RowDesc`
+        /// (260 B), now 1-byte `SchemaRef`. Arena slot allocated at the
+        /// `TAG_ROW_DESCRIPTION` dispatch; each staged `StreamRowRange`
+        /// copies the handle (1 B) instead of the schema (260 B);
+        /// threaded into `AwaitingRfq` on `CommandComplete`; slot freed
+        /// at the terminal RFQ → Idle transition.
+        schema_ref: SchemaRef,
     },
 
     /// `CommandComplete` or `EmptyQueryResponse` received; awaiting
@@ -218,9 +244,11 @@ pub enum ProtoState {
         /// PG's documented tag shapes (the longest standard tag,
         /// `"INSERT <oid> <n>"` with 10-digit values, is ~23 bytes).
         command_tag: BoundedStr<32>,
-        /// Schema from the SELECT path (`Some`) or absence marker
-        /// (`None`) from DML / empty-query paths.
-        row_desc: Option<RowDesc>,
+        /// Schema handle from the SELECT path (`Some(ref)` into
+        /// the arena) or absence marker (`None`) from DML /
+        /// empty-query paths. DEF-119: was inline
+        /// `Option<RowDesc>` (264 B), now `Option<SchemaRef>` (2 B).
+        schema_ref: Option<SchemaRef>,
     },
 
     /// `ErrorResponse` received mid-query; `FailReply` already
@@ -318,7 +346,7 @@ pub enum ProtoState {
         reply: ReplyId<QueryKind>,
         /// User-supplied schema, required (variant shape guarantees
         /// its presence — tier-1 structural).
-        row_desc: RowDesc,
+        schema_ref: SchemaRef,
     },
 
     /// `BindComplete` received on the schema-bearing path; awaiting
@@ -329,7 +357,7 @@ pub enum ProtoState {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
         /// Schema (guaranteed present by variant shape — tier-1).
-        row_desc: RowDesc,
+        schema_ref: SchemaRef,
     },
 
     /// Streaming `DataRow` frames on the schema-bearing path.
@@ -339,7 +367,7 @@ pub enum ProtoState {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
         /// Schema (guaranteed present by variant shape).
-        row_desc: RowDesc,
+        schema_ref: SchemaRef,
     },
 
     /// `CommandComplete` received on the schema-bearing path;
@@ -351,7 +379,7 @@ pub enum ProtoState {
         /// Command tag parsed from the `C` frame body.
         command_tag: BoundedStr<32>,
         /// Schema to ship in the terminal `QueryComplete` reply.
-        row_desc: RowDesc,
+        schema_ref: SchemaRef,
     },
 
     // ---------------------------------------------------------------
@@ -423,7 +451,7 @@ pub enum ProtoState {
         /// Parameter OIDs captured at the `'t'` transition.
         param_oids: ParamOids,
         /// Rows-or-no-data captured at the `'T'` / `'n'` transition.
-        rows: DescribedRows,
+        rows: DescribedRowsRef,
     },
 
     // ─── Portal-describe path ───
@@ -442,7 +470,7 @@ pub enum ProtoState {
         /// Correlator for the Describe command.
         reply: ReplyId<DescribePortalKind>,
         /// Rows-or-no-data captured at the `'T'` / `'n'` transition.
-        rows: DescribedRows,
+        rows: DescribedRowsRef,
     },
 
     /// Terminal: the connection has been classified as unrecoverable.
@@ -569,11 +597,11 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("SimpleQueryStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::SimpleQueryAwaitingRfq { reply, command_tag, row_desc } => f
+            Self::SimpleQueryAwaitingRfq { reply, command_tag, schema_ref } => f
                 .debug_struct("SimpleQueryAwaitingRfq")
                 .field("reply", reply)
                 .field("command_tag", command_tag)
-                .field("row_desc_is_some", &row_desc.is_some())
+                .field("schema_ref_is_some", &schema_ref.is_some())
                 .finish(),
             Self::BindExecuteAwaitingBindCompleteDml(id) => {
                 write!(f, "BindExecuteAwaitingBindCompleteDml({id:?})")

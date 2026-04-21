@@ -98,6 +98,7 @@ pub mod password;
 pub mod protocol;
 pub mod reply_id;
 pub mod scram;
+mod schema_arena;
 pub mod sensitive;
 pub mod session_params;
 pub mod state;
@@ -146,7 +147,7 @@ const _: fn() = || {
     // any shorter lifetime by covariance.
     assert_send::<action::Action<'static, 'static>>();
     assert_send::<action::OutActions<'static, 'static>>();
-    assert_send::<action::Reply>();
+    assert_send::<action::Reply<'static>>();
     assert_send::<command::PgCommand>();
     assert_send::<error::ProtocolError>();
     assert_send::<protocol::PgProtocol>();
@@ -248,14 +249,15 @@ const _: fn() = || {
 //   Ident:            66  (was 72 — heapless::Vec<u8,63>+usize → POD FixedStr)
 //   DatabaseName:     66
 //   ApplicationName: 130
-//   Reply:            12
-//   ReplyId:          16
 //   ProtocolError:   304  (DEF-060 typed variants + FixedStr tail)
-//   Action<'_>:      312  (FailReply.cause is the dominator)
-//   ProtoState:     1224  (post DEF-099: SCRAM bufs POD, -16 bytes)
-//   PgCommand:      1312  (Startup carries Credentials + names)
-//   PgProtocol:     6648  (ReadBuf 4096 + state 1240 + session_params ~1200)
-//   OutActions:     1256  (4 × Action + u8 len, padded)
+//   ReplyId:          16
+//   PgCommand:      2136  (Parse dominates: StmtName + Sql + ReplyId)
+// Post-DEF-119 measurements (aarch64-apple-darwin, 2026-04-21):
+//   Reply<'_>:        80  (was ~340 — RowDesc externalised to arena)
+//   Action<'_,'_>:   312  (was ~384 — FailReply.cause now dominant)
+//   OutActions:     2504  (was ~3072 — 8 × Action shrunk)
+//   ProtoState:     1224  (unchanged — SCRAM dominant, still 1224)
+//   PgProtocol:     6272  (added 528 B arena, other shrinkage offset net)
 // ---------------------------------------------------------------------
 const _: () = assert!(
     core::mem::size_of::<error::ProtocolError>() <= 312,
@@ -264,26 +266,23 @@ const _: () = assert!(
      variant add a large inline buffer?",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action<'static, 'static>>() <= 384,
-    "Action<'_> size regression — post-1c-3c budget is 384 bytes. \
-     Action is now dominated by `DeliverReply{{ value: Reply }}` where \
-     Reply::DescribeStatementComplete carries ParamOids (68 B) + \
-     DescribedRows embedding a RowDesc (~264 B) + TxStatus = ~340 B. \
-     A future DEF-119 arena-based schema ref (planned for 1c-5) will \
-     shrink this back by externalising RowDesc. Prior 320 B budget \
-     (1c-3b) was dominated by FailReply.cause; Describe replies now \
-     dominate. If this trips, check whether a variant added a large \
-     inline buffer or whether ParamOids / RowDesc caps grew.",
+    core::mem::size_of::<action::Action<'static, 'static>>() <= 320,
+    "Action<'_, '_> size regression — post-DEF-119 budget is 320 bytes. \
+     DEF-119 externalised RowDesc to the schema arena: Reply<'r> \
+     shrunk from ~340 B to ~80 B, making FailReply.cause (ProtocolError \
+     ~304 B) the new dominant variant. `#[expect(large_enum_variant)]` \
+     acknowledges FailReply as the cold-path dominator. If this trips, \
+     check whether ProtocolError grew or a new variant added a large \
+     inline buffer.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Reply>() <= 384,
-    "Reply size regression — post-1c-3c budget is 384 bytes. \
-     Reply::DescribeStatementComplete dominates: ParamOids (u16 + \
-     [u32; MAX_PARAMS_ARITY=16] ≈ 68 B) + DescribedRows (tag + \
-     RowDesc ≈ 264 B) + TxStatus (1 B) + padding ≈ 340 B. \
-     Prior 320 B budget (1c-2a) was dominated by QueryComplete's \
-     Option<RowDesc>. DEF-119 (1c-5) will re-shrink by moving \
-     RowDesc to a shared arena.",
+    core::mem::size_of::<action::Reply<'static>>() <= 96,
+    "Reply<'r> size regression — post-DEF-119 budget is 96 bytes. \
+     DEF-119 replaced inline RowDesc (~264 B) with `&'r RowDesc` \
+     borrowed from the schema arena — Reply shrunk from ~340 B to \
+     ~80 B. Dominating variant is now DescribeStatementComplete \
+     (ParamOids ~68 B + DescribedRows ~16 B + TxStatus + padding). \
+     If this trips, check ParamOids capacity or Reply variant growth.",
 );
 const _: () = assert!(
     core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,
@@ -294,8 +293,10 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::size_of::<state::ProtoState>() <= 1248,
     "ProtoState size regression — post-DEF-099 budget is 1248 bytes \
-     (Scram path dominant at ~1224; Trust path just 24 bytes). Did a \
-     state variant add a large buffer?",
+     (Scram path dominant at ~1224; Trust path just 24 bytes). DEF-119 \
+     shrunk RowDesc-carrying variants (6 sites × ~260 B → 1 B SchemaRef) \
+     but didn't touch the SCRAM dominator. Did a state variant add a \
+     large buffer?",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
@@ -306,19 +307,18 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() <= 6336,
-    "PgProtocol size regression — post-DEF-106 + F19 budget is 6336 \
-     bytes. F19 removed the `row_desc: Option<RowDesc>` slot (~268 \
-     bytes), moving schema into state variants; overall footprint \
-     dropped correspondingly. Budget: ReadBuf 4096 + state ~1224 + \
-     session_params ~420 + padding + headroom.",
+    "PgProtocol size regression — post-DEF-119 budget is 6336 bytes. \
+     DEF-119 added the 528 B schema arena (SchemaSlab: 2 slots × \
+     ~264 B). Other shrinkage (RowDesc out of state variants) offset \
+     the addition — net size ~6272 B. Budget: ReadBuf 4096 + state \
+     ~1224 + session_params ~420 + schema_arena 528 + padding.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() <= 3100,
-    "OutActions<'_> size regression — 8 × sizeof(Action<'_>) + u8 len + \
-     padding. Post-1c-3c bump (Action grew 320 → 384 to carry Describe \
-     payloads with inline RowDesc/ParamOids) budget: 3100 bytes. \
-     DEF-119 (1c-5) schema-arena refactor will re-shrink by removing \
-     inline RowDesc from Reply.",
+    core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2560,
+    "OutActions<'_, '_> size regression — post-DEF-119 budget is 2560 \
+     bytes. 8 × sizeof(Action<'_, '_>) (now 312 B) + u8 len + padding \
+     ≈ 2504 B. DEF-119 shrunk Action from 384 → 312 B by externalising \
+     RowDesc from Reply; OutActions shrunk correspondingly.",
 );
 
 // ---------------------------------------------------------------------
@@ -351,8 +351,10 @@ const _: () = assert!(
      parameterisation).",
 );
 const _: () = assert!(
-    !core::mem::needs_drop::<action::Reply>(),
-    "Reply must stay drop-free — all variants are Copy-like (small value type)",
+    !core::mem::needs_drop::<action::Reply<'static>>(),
+    "Reply must stay drop-free — all variants are Copy-like (small value type). \
+     DEF-119: Reply<'r> borrows &'r RowDesc from the schema arena; borrows \
+     don't add Drop.",
 );
 const _: () = assert!(
     !core::mem::needs_drop::<frame::HeaderParse>(),

@@ -277,16 +277,16 @@ fn select_multiple_rows_stream_then_deliver() {
                     ) && desc.len() == 1,
                     "expected 1-column TEXT/text RowDesc, got {desc:?}",
                 );
-                // F19: RowDesc is Copy POD carried by value in each
-                // StreamRow. All StreamRows in a stream carry an
-                // equal-valued schema (tier-2 via value equality —
-                // if the protocol reparsed per-row with different
-                // values, this would trip).
+                // F19 + DEF-119: `desc` is `&'r RowDesc` borrowed from
+                // the arena. All StreamRows in a stream resolve to
+                // ref-equal schemas (they point at the same arena
+                // slot). Deref to value and compare — byte-equal
+                // within the stream by construction.
                 match first_desc {
-                    None => first_desc = Some(*desc),
+                    None => first_desc = Some(**desc),
                     Some(prev) => assert_eq!(
-                        prev, *desc,
-                        "StreamRow.desc must be byte-equal across the stream",
+                        prev, **desc,
+                        "StreamRow.desc must resolve to equal schema across the stream",
                     ),
                 }
 

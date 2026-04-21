@@ -160,12 +160,12 @@ fn negotiate_proto_version_frame() -> Vec<u8> {
 
 /// Push a Startup command (trust auth) and return the actions.
 fn startup_trust<'a>(
-    proto: &mut PgProtocol,
+    proto: &'a mut PgProtocol,
     wb: &'a mut bsql_pg_proto::WriteBuf,
     user: &str,
     db: Option<&str>,
     reply_raw: NonZeroU64,
-) -> bsql_pg_proto::OutActions<'a, 'static> {
+) -> bsql_pg_proto::OutActions<'a, 'a> {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let database = db.map(|d| {
         bsql_pg_proto::DatabaseName::try_from_str(d).unwrap_or_else(|e| panic!("bad db: {e}"))
@@ -629,12 +629,12 @@ fn connecting_states_become_errored_on_bad_frame() {
 
 /// Helper: push Startup with SCRAM password credentials.
 fn startup_scram<'a>(
-    proto: &mut PgProtocol,
+    proto: &'a mut PgProtocol,
     wb: &'a mut bsql_pg_proto::WriteBuf,
     user: &str,
     password: &str,
     reply_raw: NonZeroU64,
-) -> bsql_pg_proto::OutActions<'a, 'static> {
+) -> bsql_pg_proto::OutActions<'a, 'a> {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
     proto.push_command(PgCommand::Startup {

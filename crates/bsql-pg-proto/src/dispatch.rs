@@ -231,11 +231,20 @@ const fn errored(
 /// responsible for clearing `write_buf` at the start of each
 /// entry-point call and materialising the ranges into `&'buf [u8]`
 /// slices after the write-phase mutable borrow completes.
+///
+/// # DEF-119 — `arena: &mut SchemaSlab`
+///
+/// The schema arena is threaded in mutably so the `'T' arm can
+/// allocate a `SchemaRef` on `parse_row_description` success and
+/// carry it into the new state variant. Arena frees happen at
+/// entry-point cleanup (`feed_bytes` / `push_command` top) — see
+/// [`crate::schema_arena`] for the alloc/free discipline.
 pub(crate) fn dispatch(
     prev: ProtoState,
     tag: crate::wire::InboundTag,
     payload: &[u8],
     write_buf: &mut WriteBuf,
+    arena: &mut crate::schema_arena::SchemaSlab,
     coords: FrameCoords,
 ) -> DispatchOutcome {
     match (prev, tag) {
@@ -451,19 +460,28 @@ pub(crate) fn dispatch(
 
         // AwaitingFirstResponse: T / C / I / E — any other tag is desync
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
-            // F19: parsed schema embeds directly into the new state
-            // variant. No longer a `*row_desc_slot = Some(desc)` side
-            // effect — state shape itself carries the invariant
-            // "StreamingRows implies schema".
+            // F19 + DEF-119: parsed schema allocates into the arena;
+            // state carries the 1-byte SchemaRef. The StreamingRows
+            // variant now holds the ref (not the full RowDesc).
             match crate::decode::parse_row_description(payload) {
-                Ok(row_desc) => DispatchOutcome::AdvancedSilent {
-                    new_state: ProtoState::SimpleQueryStreamingRows { reply, row_desc },
+                Ok(row_desc) => match arena.alloc(row_desc) {
+                    Some(schema_ref) => DispatchOutcome::AdvancedSilent {
+                        new_state: ProtoState::SimpleQueryStreamingRows { reply, schema_ref },
+                    },
+                    // Arena capacity exhausted — crate-internal invariant
+                    // break (every query should enter with empty arena
+                    // thanks to entry-point cleanup). Classify as
+                    // Internal crate-bug.
+                    None => errored(
+                        Some(reply.consume()),
+                        ProtocolError::RowRangeConstructionUnreachable,
+                    ),
                 },
                 Err(cause) => errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
-            // DML path: no RowDescription → AwaitingRfq with row_desc=None.
+            // DML path: no RowDescription → AwaitingRfq with schema_ref=None.
             advance_to_awaiting_rfq(reply, payload, None)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
@@ -472,7 +490,7 @@ pub(crate) fn dispatch(
                 new_state: ProtoState::SimpleQueryAwaitingRfq {
                     reply,
                     command_tag: crate::error::BoundedStr::default(),
-                    row_desc: None,
+                    schema_ref: None,
                 },
             }
         }
@@ -484,13 +502,13 @@ pub(crate) fn dispatch(
         }
 
         // StreamingRows: D / C / E — any other tag is desync
-        (ProtoState::SimpleQueryStreamingRows { reply, row_desc }, TAG_DATA_ROW) => {
-            stream_row_or_errored(reply, row_desc, coords)
+        (ProtoState::SimpleQueryStreamingRows { reply, schema_ref }, TAG_DATA_ROW) => {
+            stream_row_or_errored(reply, schema_ref, coords)
         }
-        (ProtoState::SimpleQueryStreamingRows { reply, row_desc }, TAG_COMMAND_COMPLETE) => {
+        (ProtoState::SimpleQueryStreamingRows { reply, schema_ref }, TAG_COMMAND_COMPLETE) => {
             // SELECT path terminates: preserve schema into AwaitingRfq
             // so the trailing RFQ's QueryComplete carries it.
-            advance_to_awaiting_rfq(reply, payload, Some(row_desc))
+            advance_to_awaiting_rfq(reply, payload, Some(schema_ref))
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply.consume(), payload)
@@ -500,18 +518,19 @@ pub(crate) fn dispatch(
         }
 
         // AwaitingRfq: Z is the only legal frame
-        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag, row_desc }, TAG_READY_FOR_QUERY) => {
-            // F19: schema lives in state; consumed into the terminal
-            // reply. No standalone slot to read/clear.
+        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag, schema_ref }, TAG_READY_FOR_QUERY) => {
+            // F19 + DEF-119: schema arena handle lives in state; staged
+            // into the terminal reply. Arena slot stays occupied until
+            // entry-point cleanup (after user drops OutActions).
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
                     new_state: ProtoState::Idle,
                     action: crate::action::deliver(
                         reply,
-                        crate::action::QueryCompletePayload {
+                        crate::action::StagedQueryCompletePayload {
                             command_tag,
                             tx_status,
-                            row_desc,
+                            schema_ref,
                         },
                     ),
                 },
@@ -667,10 +686,10 @@ pub(crate) fn dispatch(
                 new_state: ProtoState::Idle,
                 action: crate::action::deliver(
                     reply,
-                    crate::action::QueryCompletePayload {
+                    crate::action::StagedQueryCompletePayload {
                         command_tag,
                         tx_status,
-                        row_desc: None,
+                        schema_ref: None,
                     },
                 ),
             },
@@ -683,10 +702,10 @@ pub(crate) fn dispatch(
         // ─── SELECT path ───
 
         (
-            ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, row_desc },
+            ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, schema_ref },
             TAG_BIND_COMPLETE,
         ) => DispatchOutcome::AdvancedSilent {
-            new_state: ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc },
+            new_state: ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref },
         },
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply.consume(), payload)
@@ -696,13 +715,13 @@ pub(crate) fn dispatch(
         }
 
         (
-            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc },
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref },
             TAG_DATA_ROW,
-        ) => stream_row_or_errored(reply, row_desc, coords),
+        ) => stream_row_or_errored(reply, schema_ref, coords),
         (
-            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc },
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref },
             TAG_COMMAND_COMPLETE,
-        ) => advance_to_bindexecute_awaiting_rfq_select(reply, payload, row_desc),
+        ) => advance_to_bindexecute_awaiting_rfq_select(reply, payload, schema_ref),
         (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply.consume(), payload)
         }
@@ -717,11 +736,11 @@ pub(crate) fn dispatch(
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        (ProtoState::BindExecuteStreamingRows { reply, row_desc }, TAG_DATA_ROW) => {
-            stream_row_or_errored(reply, row_desc, coords)
+        (ProtoState::BindExecuteStreamingRows { reply, schema_ref }, TAG_DATA_ROW) => {
+            stream_row_or_errored(reply, schema_ref, coords)
         }
-        (ProtoState::BindExecuteStreamingRows { reply, row_desc }, TAG_COMMAND_COMPLETE) => {
-            advance_to_bindexecute_awaiting_rfq_select(reply, payload, row_desc)
+        (ProtoState::BindExecuteStreamingRows { reply, schema_ref }, TAG_COMMAND_COMPLETE) => {
+            advance_to_bindexecute_awaiting_rfq_select(reply, payload, schema_ref)
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(reply.consume(), payload)
@@ -734,17 +753,17 @@ pub(crate) fn dispatch(
         }
 
         (
-            ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag, row_desc },
+            ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag, schema_ref },
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => DispatchOutcome::AdvancedWithAction {
                 new_state: ProtoState::Idle,
                 action: crate::action::deliver(
                     reply,
-                    crate::action::QueryCompletePayload {
+                    crate::action::StagedQueryCompletePayload {
                         command_tag,
                         tx_status,
-                        row_desc: Some(row_desc),
+                        schema_ref: Some(schema_ref),
                     },
                 ),
             },
@@ -801,12 +820,18 @@ pub(crate) fn dispatch(
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, param_oids },
             TAG_ROW_DESCRIPTION,
         ) => match crate::decode::parse_row_description(payload) {
-            Ok(row_desc) => DispatchOutcome::AdvancedSilent {
-                new_state: ProtoState::DescribeStatementAwaitingRfq {
-                    reply,
-                    param_oids,
-                    rows: crate::action::DescribedRows::from_row_desc(row_desc),
+            Ok(row_desc) => match arena.alloc(row_desc) {
+                Some(schema_ref) => DispatchOutcome::AdvancedSilent {
+                    new_state: ProtoState::DescribeStatementAwaitingRfq {
+                        reply,
+                        param_oids,
+                        rows: crate::state::DescribedRowsRef::Rows(schema_ref),
+                    },
                 },
+                None => errored(
+                    Some(reply.consume()),
+                    ProtocolError::RowRangeConstructionUnreachable,
+                ),
             },
             Err(cause) => errored(Some(reply.consume()), cause),
         },
@@ -817,7 +842,7 @@ pub(crate) fn dispatch(
             new_state: ProtoState::DescribeStatementAwaitingRfq {
                 reply,
                 param_oids,
-                rows: crate::action::DescribedRows::no_data(),
+                rows: crate::state::DescribedRowsRef::NoData,
             },
         },
         (
@@ -842,7 +867,7 @@ pub(crate) fn dispatch(
                 new_state: ProtoState::Idle,
                 action: crate::action::deliver(
                     reply,
-                    crate::action::DescribeStatementCompletePayload {
+                    crate::action::StagedDescribeStatementCompletePayload {
                         param_oids,
                         rows,
                         tx_status,
@@ -860,11 +885,17 @@ pub(crate) fn dispatch(
         // Stage 1: awaiting RowDescription or NoData (no ParamDesc).
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ROW_DESCRIPTION) => {
             match crate::decode::parse_row_description(payload) {
-                Ok(row_desc) => DispatchOutcome::AdvancedSilent {
-                    new_state: ProtoState::DescribePortalAwaitingRfq {
-                        reply,
-                        rows: crate::action::DescribedRows::from_row_desc(row_desc),
+                Ok(row_desc) => match arena.alloc(row_desc) {
+                    Some(schema_ref) => DispatchOutcome::AdvancedSilent {
+                        new_state: ProtoState::DescribePortalAwaitingRfq {
+                            reply,
+                            rows: crate::state::DescribedRowsRef::Rows(schema_ref),
+                        },
                     },
+                    None => errored(
+                        Some(reply.consume()),
+                        ProtocolError::RowRangeConstructionUnreachable,
+                    ),
                 },
                 Err(cause) => errored(Some(reply.consume()), cause),
             }
@@ -873,7 +904,7 @@ pub(crate) fn dispatch(
             DispatchOutcome::AdvancedSilent {
                 new_state: ProtoState::DescribePortalAwaitingRfq {
                     reply,
-                    rows: crate::action::DescribedRows::no_data(),
+                    rows: crate::state::DescribedRowsRef::NoData,
                 },
             }
         }
@@ -893,7 +924,7 @@ pub(crate) fn dispatch(
                 new_state: ProtoState::Idle,
                 action: crate::action::deliver(
                     reply,
-                    crate::action::DescribePortalCompletePayload { rows, tx_status },
+                    crate::action::StagedDescribePortalCompletePayload { rows, tx_status },
                 ),
             },
             Err(payload_len) => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
@@ -1491,14 +1522,14 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 fn advance_to_awaiting_rfq(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
-    row_desc: Option<crate::decode::RowDesc>,
+    schema_ref: Option<crate::schema_arena::SchemaRef>,
 ) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::SimpleQueryAwaitingRfq {
                 reply,
                 command_tag,
-                row_desc,
+                schema_ref,
             },
         },
         Err(cause) => errored(Some(reply.consume()), cause),
@@ -1515,14 +1546,14 @@ fn advance_to_awaiting_rfq(
 fn advance_to_bindexecute_awaiting_rfq_select(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
-    row_desc: crate::decode::RowDesc,
+    schema_ref: crate::schema_arena::SchemaRef,
 ) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::BindExecuteAwaitingRfqSelect {
                 reply,
                 command_tag,
-                row_desc,
+                schema_ref,
             },
         },
         Err(cause) => errored(Some(reply.consume()), cause),
@@ -1621,7 +1652,7 @@ fn parse_rfq_payload(
 /// error (vs a panic) preserves the crate-root panic ban.
 fn stream_row_or_errored(
     reply: ReplyId<crate::reply_id::QueryKind>,
-    row_desc: crate::decode::RowDesc,
+    schema_ref: crate::schema_arena::SchemaRef,
     coords: FrameCoords,
 ) -> DispatchOutcome {
     match crate::action::NonEmptyRange::new(
@@ -1632,11 +1663,13 @@ fn stream_row_or_errored(
         Some(row_range) => {
             let id = reply.get();
             DispatchOutcome::AdvancedWithAction {
-                // F19: preserve row_desc back into the state variant.
-                // StagedAction::StreamRowRange carries a copy — state
-                // retains its own copy for the next iteration.
-                new_state: ProtoState::SimpleQueryStreamingRows { reply, row_desc },
-                action: StagedAction::StreamRowRange { id, row_range, row_desc },
+                // F19 + DEF-119: preserve schema_ref back into the state
+                // variant. StagedAction::StreamRowRange carries a copy
+                // of the ref (1 byte) — state retains its own copy for
+                // the next iteration. Materialise resolves the ref to
+                // `&'r RowDesc` via the arena.
+                new_state: ProtoState::SimpleQueryStreamingRows { reply, schema_ref },
+                action: StagedAction::StreamRowRange { id, row_range, schema_ref },
             }
         }
         None => errored(Some(reply.consume()), ProtocolError::RowRangeConstructionUnreachable),

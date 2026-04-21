@@ -84,9 +84,25 @@ mod sealed {
 ///
 /// [`Payload`]: ReplyKind::Payload
 pub trait ReplyKind: sealed::Sealed {
-    /// The typed payload delivered on success. Must convert to the
-    /// erased [`crate::action::Reply`] sum for wire-level dispatch.
-    type Payload: Into<crate::action::Reply> + Copy + fmt::Debug + 'static;
+    /// The typed STAGED payload constructed at dispatch time. Must
+    /// convert to the internal [`crate::action::StagedReply`] sum.
+    ///
+    /// # DEF-119 — staged vs public payload split
+    ///
+    /// The dispatch site constructs the staged payload (with
+    /// `schema_ref: Option<SchemaRef>` fields where applicable);
+    /// materialise converts to the public `Reply<'r>` (with
+    /// `&'r RowDesc` refs). The DEF-112 kind-payload pairing is
+    /// preserved — `ReplyId<K>` still constrains what payload the
+    /// dispatcher can stage, and the `Into<StagedReply>` bound
+    /// keeps the seal one-way.
+    ///
+    /// For schema-less kinds (Ping, Startup, Parse, Close),
+    /// StagedPayload == PublicPayload (no schema to borrow). For
+    /// schema-bearing kinds (Query, DescribeStatement,
+    /// DescribePortal), StagedPayload is the crate-private
+    /// `Staged*Payload` struct.
+    type StagedPayload: Into<crate::action::StagedReply> + Copy + fmt::Debug + 'static;
 
     /// Human-readable name for Debug output — `"Ping"`,
     /// `"Startup"`, etc.
@@ -102,7 +118,7 @@ pub trait ReplyKind: sealed::Sealed {
 pub enum PingKind {}
 impl sealed::Sealed for PingKind {}
 impl ReplyKind for PingKind {
-    type Payload = crate::action::PongPayload;
+    type StagedPayload = crate::action::PongPayload;
     const NAME: &'static str = "Ping";
 }
 
@@ -113,7 +129,7 @@ impl ReplyKind for PingKind {
 pub enum StartupKind {}
 impl sealed::Sealed for StartupKind {}
 impl ReplyKind for StartupKind {
-    type Payload = crate::action::StartupCompletePayload;
+    type StagedPayload = crate::action::StartupCompletePayload;
     const NAME: &'static str = "Startup";
 }
 
@@ -135,7 +151,7 @@ impl ReplyKind for StartupKind {
 pub enum QueryKind {}
 impl sealed::Sealed for QueryKind {}
 impl ReplyKind for QueryKind {
-    type Payload = crate::action::QueryCompletePayload;
+    type StagedPayload = crate::action::StagedQueryCompletePayload;
     const NAME: &'static str = "Query";
 }
 
@@ -145,7 +161,7 @@ impl ReplyKind for QueryKind {
 pub enum ParseKind {}
 impl sealed::Sealed for ParseKind {}
 impl ReplyKind for ParseKind {
-    type Payload = crate::action::ParseCompletePayload;
+    type StagedPayload = crate::action::ParseCompletePayload;
     const NAME: &'static str = "Parse";
 }
 
@@ -156,7 +172,7 @@ impl ReplyKind for ParseKind {
 pub enum CloseKind {}
 impl sealed::Sealed for CloseKind {}
 impl ReplyKind for CloseKind {
-    type Payload = crate::action::CloseCompletePayload;
+    type StagedPayload = crate::action::CloseCompletePayload;
     const NAME: &'static str = "Close";
 }
 
@@ -177,7 +193,7 @@ impl ReplyKind for CloseKind {
 pub enum DescribeStatementKind {}
 impl sealed::Sealed for DescribeStatementKind {}
 impl ReplyKind for DescribeStatementKind {
-    type Payload = crate::action::DescribeStatementCompletePayload;
+    type StagedPayload = crate::action::StagedDescribeStatementCompletePayload;
     const NAME: &'static str = "DescribeStatement";
 }
 
@@ -191,7 +207,7 @@ impl ReplyKind for DescribeStatementKind {
 pub enum DescribePortalKind {}
 impl sealed::Sealed for DescribePortalKind {}
 impl ReplyKind for DescribePortalKind {
-    type Payload = crate::action::DescribePortalCompletePayload;
+    type StagedPayload = crate::action::StagedDescribePortalCompletePayload;
     const NAME: &'static str = "DescribePortal";
 }
 

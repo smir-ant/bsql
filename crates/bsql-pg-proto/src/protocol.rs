@@ -209,16 +209,24 @@ pub struct PgProtocol {
     /// during startup from ParameterStatus messages. Read-only after
     /// startup completes (accessible via `session_params()`).
     session_params: SessionParams,
+    /// DEF-119 schema arena — externalised `RowDesc` storage.
+    ///
+    /// Two-slot slab (see [`crate::schema_arena`] module docs).
+    /// State variants / staged actions / staged reply payloads
+    /// carry 1-byte `SchemaRef` handles; public `Reply<'r>` and
+    /// `Action::StreamRow::desc` resolve refs through the arena at
+    /// materialise time.
+    ///
+    /// Cost: ~528 B on `PgProtocol`, paid once per connection.
+    /// Benefit: state drops from ~1224 B → ~300 B;
+    /// `Action::StreamRow` drops from ~280 B → ~32 B;
+    /// per-row DataRow emission saves ~260 B (hot path on SELECT).
+    schema_arena: crate::schema_arena::SchemaSlab,
     /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
     /// Load-bearing: the crate-root ambiguous-impl gate verifies that
     /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
     /// `_not_sync` (leading-underscore convention for structurally-used
     /// fields is forbidden per user-feedback memory).
-    ///
-    /// F19 removed the former `row_desc: Option<RowDesc>` slot —
-    /// schema now lives inline in the `SimpleQueryStreamingRows` /
-    /// `SimpleQueryAwaitingRfq` state variants. The slot-vs-state
-    /// parallel-representation drift seam is closed structurally.
     sync_marker: PhantomData<Cell<()>>,
 }
 
@@ -235,6 +243,7 @@ impl PgProtocol {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
+            schema_arena: crate::schema_arena::SchemaSlab::new(),
             sync_marker: PhantomData,
         }
     }
@@ -287,11 +296,11 @@ impl PgProtocol {
     /// field) so no observer can witness the window; the split is
     /// safe even though the intermediate is not the terminal state.
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn push_command<'w>(
-        &mut self,
+    pub fn push_command<'w, 's>(
+        &'s mut self,
         cmd: PgCommand,
         write_buf: &'w mut WriteBuf,
-    ) -> OutActions<'w, 'static> {
+    ) -> OutActions<'w, 's> {
         // 1c-1a: push never produces `StreamRow` (rows arrive via
         // server responses, handled in `feed_bytes`). The `'r`
         // lifetime parameter on `OutActions<'w, 'r>` is phantom on
@@ -304,10 +313,14 @@ impl PgProtocol {
         // which are consumed by Z → Idle on query completion. A new
         // `SimpleQuery` push from Idle has no prior schema to carry
         // over; the state variants don't exist outside their query.
+        // DEF-119: arena cleanup at push entry (mirrors feed_bytes).
+        if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
+            self.schema_arena.clear();
+        }
         let prev = core::mem::take(&mut self.state);
         let (new_state, staged) = compute_push(cmd, prev, write_buf);
         self.state = new_state;
-        materialise(staged, write_buf.as_bytes(), &[])
+        materialise(staged, write_buf.as_bytes(), &[], &self.schema_arena)
     }
 
     /// Extended Query "Bind + Execute + Sync" pipeline — send a
@@ -361,8 +374,8 @@ impl PgProtocol {
     /// is not torn down.
     #[expect(clippy::too_many_arguments, reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1 — each argument is a distinct wire-protocol input. Splitting into a struct-arg (BindExecuteRequest { ... }) trades arg-count for construction verbosity at every call site, no tier or safety win.")]
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn push_bind_execute<'w, P: crate::params::ParamsWriter>(
-        &mut self,
+    pub fn push_bind_execute<'w, 's, P: crate::params::ParamsWriter>(
+        &'s mut self,
         portal_name: &crate::ident::PortalName,
         stmt_name: &crate::ident::StmtName,
         params: &P,
@@ -370,8 +383,24 @@ impl PgProtocol {
         fetch: crate::command::FetchRows,
         reply: ReplyId<crate::reply_id::QueryKind>,
         write_buf: &'w mut WriteBuf,
-    ) -> OutActions<'w, 'static> {
+    ) -> OutActions<'w, 's> {
         write_buf.clear();
+        // DEF-119: arena cleanup at push entry (mirrors feed_bytes).
+        // When state is Idle/Errored, prior query's schema (if any)
+        // is stale — safely reusable now that previous OutActions
+        // borrow has ended.
+        if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
+            self.schema_arena.clear();
+        }
+        // DEF-119: if the user supplied a row_desc, allocate it into
+        // the arena NOW and thread the resulting SchemaRef into the
+        // state machine. The owned RowDesc goes into the arena slab;
+        // state + actions carry 1-byte handles. `None` means DML
+        // path (no schema) → no alloc.
+        let schema_ref = match row_desc {
+            Some(desc) => self.schema_arena.alloc(desc),
+            None => None,
+        };
         let mut staged = StagedActions::new();
         let prev = core::mem::take(&mut self.state);
         let new_state = compute_push_bind_execute(
@@ -379,14 +408,14 @@ impl PgProtocol {
             portal_name,
             stmt_name,
             params,
-            row_desc,
+            schema_ref,
             fetch,
             reply,
             &mut staged,
             write_buf,
         );
         self.state = new_state;
-        materialise(staged, write_buf.as_bytes(), &[])
+        materialise(staged, write_buf.as_bytes(), &[], &self.schema_arena)
     }
 
     /// Feed inbound wire bytes.
@@ -411,6 +440,16 @@ impl PgProtocol {
         write_buf.clear();
         let staged = StagedActions::new();
 
+        // DEF-119 arena cleanup — any prior OutActions<'_, 'r_prev>
+        // has drained (borrow checker enforces it before this
+        // `&'r mut self` call), so any arena slots left from the
+        // prior query are now safely reusable. When state is Idle
+        // (command completed cleanly) or Errored (terminal — no
+        // further alloc), clear all slots to start fresh.
+        if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
+            self.schema_arena.clear();
+        }
+
         // F66 (pass #6 audit): if the connection is already Errored,
         // drop the incoming bytes and return an empty OutActions.
         // Rationale:
@@ -426,7 +465,12 @@ impl PgProtocol {
         // from a dead connection; keeping them wastes memory.
         if matches!(self.state, ProtoState::Errored(_)) {
             self.read_buf.clear();
-            return materialise(staged, write_buf.as_bytes(), self.read_buf.populated());
+            return materialise(
+                staged,
+                write_buf.as_bytes(),
+                self.read_buf.populated(),
+                &self.schema_arena,
+            );
         }
 
         let mut staged = staged;
@@ -448,6 +492,7 @@ impl PgProtocol {
                 staged,
                 write_buf.as_bytes(),
                 self.read_buf.populated(),
+                &self.schema_arena,
             );
         }
 
@@ -581,6 +626,7 @@ impl PgProtocol {
                         tag,
                         payload,
                         write_buf,
+                        &mut self.schema_arena,
                         FrameCoords::new(frame_start, frame_len, populated),
                     );
                     match outcome {
@@ -658,10 +704,18 @@ impl PgProtocol {
         // compaction, which the borrow checker forbids while
         // `OutActions<'_, 'r>` is alive (`'r = &'r mut self`).
         //
-        // F19: `StreamRow` actions now carry `RowDesc` BY VALUE,
-        // copied from the StreamingRows state variant at emission.
-        // No separate `row_desc` arg to materialise.
-        materialise(staged, write_buf.as_bytes(), self.read_buf.populated())
+        // DEF-119: `StreamRow` actions carry a `SchemaRef` handle;
+        // materialise resolves to `&'r RowDesc` via `self.schema_arena`.
+        // The `'r` lifetime on OutActions ties the arena borrow to the
+        // `&'r mut self` parameter — the next `&mut self` call can only
+        // run after the caller drops OutActions, at which point
+        // feed_bytes entry-cleanup will reclaim the arena slot.
+        materialise(
+            staged,
+            write_buf.as_bytes(),
+            self.read_buf.populated(),
+            &self.schema_arena,
+        )
     }
 
     /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
@@ -1687,7 +1741,7 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
     params: &P,
-    row_desc: Option<crate::decode::RowDesc>,
+    schema_ref: Option<crate::schema_arena::SchemaRef>,
     fetch: crate::command::FetchRows,
     reply: ReplyId<crate::reply_id::QueryKind>,
     staged: &mut StagedActions,
@@ -1713,11 +1767,11 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                         // dispatch arms match on the specific
                         // variant — no runtime `match row_desc`
                         // at the 'D' arm.
-                        match row_desc {
-                            Some(desc) => {
+                        match schema_ref {
+                            Some(sr) => {
                                 ProtoState::BindExecuteAwaitingBindCompleteSelect {
                                     reply,
-                                    row_desc: desc,
+                                    schema_ref: sr,
                                 }
                             }
                             None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
@@ -1997,6 +2051,7 @@ fn materialise<'w, 'r>(
     staged: StagedActions,
     write_buf_bytes: &'w [u8],
     read_buf_bytes: &'r [u8],
+    arena: &'r crate::schema_arena::SchemaSlab,
 ) -> OutActions<'w, 'r> {
     let mut out = OutActions::new();
     for sa in staged {
@@ -2009,13 +2064,15 @@ fn materialise<'w, 'r>(
                 Action::SendBytes(range.apply(write_buf_bytes).unwrap_or(&[]))
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
-            // DEF-112: `DeliverReplyEntry` fields are module-private.
-            // Access via accessor methods. The entry was constructed
-            // by the typed `action::deliver` path — type-payload
-            // pairing was enforced there.
+            // DEF-112 + DEF-119: `DeliverReplyEntry` carries a
+            // lifetime-free `StagedReply`. Materialise resolves any
+            // `SchemaRef` handles into `&'r RowDesc` borrows via the
+            // arena, producing the public `Reply<'r>`. The entry was
+            // constructed by the typed `action::deliver` path —
+            // kind-payload pairing was enforced at dispatch time.
             StagedAction::DeliverReply(entry) => Action::DeliverReply {
                 id: entry.id(),
-                value: entry.value(),
+                value: entry.staged().into_public(arena),
             },
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
             // 1c-1b: row_range is absolute coordinates into the
@@ -2025,18 +2082,19 @@ fn materialise<'w, 'r>(
             // `&mut self.read_buf` calls on PgProtocol until the
             // caller drops the returned actions.
             //
-            // F19: `row_desc` is carried BY VALUE in the staged
-            // action (copied from the `StreamingRows { row_desc }`
-            // state variant at emission). No external `PgProtocol.row_desc`
-            // slot to look up; no `unwrap_or(&EMPTY)` fallback.
-            // Schema-state pairing is tier-2 structural — the staged
-            // action can't exist without a schema (no constructor path
-            // other than `stream_row_or_errored` which receives
-            // `RowDesc` from the pattern-matched state).
-            StagedAction::StreamRowRange { id, row_range, row_desc } => Action::StreamRow {
+            // DEF-119: `schema_ref` is a 1-byte arena handle. We
+            // resolve via `arena.get(ref)` to a `&'r RowDesc`. The
+            // resolution `None` branch is architecturally dead —
+            // alloc happens in dispatch at the same moment the
+            // state variant is entered that the staged action was
+            // constructed from, so the slot is live. `unwrap_or`
+            // falls back to `RowDesc::EMPTY` to avoid any panic;
+            // callers that see `desc.is_empty()` in place of real
+            // columns are observing a crate bug.
+            StagedAction::StreamRowRange { id, row_range, schema_ref } => Action::StreamRow {
                 id,
                 row_bytes: row_range.apply(read_buf_bytes).unwrap_or(&[]),
-                desc: row_desc,
+                desc: arena.get(schema_ref).unwrap_or(&crate::decode::RowDesc::EMPTY),
             },
             StagedAction::CloseSocket => Action::CloseSocket,
         };
@@ -2213,9 +2271,25 @@ mod allows_unsolicited_param_status_tests {
         assert!(allows_unsolicited_param_status(&q_first));
         consume_state(q_first);
 
+        // DEF-119: state carries `schema_ref: SchemaRef` instead of
+        // `row_desc: RowDesc`. Test fixture allocates an empty schema
+        // into a local arena slab to obtain a valid SchemaRef handle;
+        // the handle is 1 byte and carries no lifetime.
+        //
+        // Forbid-bundle note: `panic!`, `.unwrap()`, `.expect()`,
+        // `unreachable!()` are all banned. The `assert!(is_some) +
+        // unwrap_or(fallback)` idiom below fails loudly on precondition
+        // break (alloc on a fresh slab MUST succeed by spec) while
+        // keeping the test expression well-typed as `SchemaRef`. Same
+        // pattern as `must_parse` in `decode::data_row_ref_tests` and
+        // `must_alloc` in `schema_arena::tests`.
+        let mut arena = crate::schema_arena::SchemaSlab::new();
+        let alloc_result = arena.alloc(crate::decode::RowDesc::EMPTY);
+        assert!(alloc_result.is_some(), "alloc on fresh slab must succeed");
+        let sr = alloc_result.unwrap_or(crate::schema_arena::SchemaRef::ZERO);
         let q_rows = ProtoState::SimpleQueryStreamingRows {
             reply: ReplyId::from_raw(nz(8002)),
-            row_desc: crate::decode::RowDesc::EMPTY,
+            schema_ref: sr,
         };
         assert!(allows_unsolicited_param_status(&q_rows));
         consume_state(q_rows);
@@ -2223,7 +2297,7 @@ mod allows_unsolicited_param_status_tests {
         let q_rfq = ProtoState::SimpleQueryAwaitingRfq {
             reply: ReplyId::from_raw(nz(8003)),
             command_tag: crate::error::BoundedStr::default(),
-            row_desc: None,
+            schema_ref: None,
         };
         assert!(allows_unsolicited_param_status(&q_rfq));
         consume_state(q_rfq);
