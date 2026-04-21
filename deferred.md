@@ -794,6 +794,22 @@ Test count: 96 → 131 (+35 across all 1c-2 commits).
 
 **Round-4 finding #5 closed** — text-format rejection ships as `ProtocolError::UnexpectedFormatCode { code }` in `parse_row_description`: format codes outside `{0, 1}` tear the connection down. 1c-3 will layer `FromPgBinary` on top of the same infrastructure (Extended Query selects binary per-column via Bind; decoder dispatch uses `ColumnDesc::format_code`).
 
+### Tier-1 uplift batch (2026-04-21)
+
+User-driven aggressive tier-1 hunt. User clarified: *"никаких стеклянных архитектур"* meant **uplift must not introduce fragility**, NOT that uplift itself is bad — tier-1 IS the primary goal, zero-cost perf second, all-around safety third. Refactor decisions graded against: does the uplift ADD fragility? If no, do it.
+
+Uplifts landed:
+
+| uplift | tier change | mechanism | scope |
+|---|---|---|---|
+| Wire tag value drift-pin (26 tags + 4 auth codes + proto version) | tier-3 audit → **tier-1 compile** | `const _: () = { assert!(TAG_QUERY.byte() == b'Q'); … }` | 1 file, 30 const-asserts |
+| OID catalog drift-pin (17 OIDs) | tier-3 audit → **tier-1 compile** | Same pattern inside `oids` module | 1 file, 17 const-asserts |
+| MAX_SQL_LEN vs MAX_OWNED_SEND_LEN sizing | tier-3 audit → **tier-1 compile** | `const _: () = assert!(MAX_OWNED_SEND_LEN >= max_simple_query_message_size())` | 1 file, 1 const-assert; closed latent SimpleQuery WriteBuf overflow |
+| `InboundTag` / `OutboundTag` newtypes (wire direction) | tier-3 audit → **tier-1 compile** | `#[repr(transparent)]` over `u8`; cross-direction assignment = build error | 5 files, ~200 LoC; 26 tag constants retyped |
+| `TxStatus` enum (was raw u8 in Reply payloads) | tier-3 audit → **tier-1 compile** | `#[repr(u8)]` enum with `try_from_byte`; invalid bytes rejected at dispatch | 4 files, ~100 LoC |
+| `UnexpectedFrame.tag: InboundTag` (was raw u8) | tier-3 audit → **tier-1 compile** | Typed wire-direction at the error level | 2 files, ~20 LoC |
+| Ping-in-flight semantics (`UnexpectedFrame { tag: b'P' }` → `CommandInProgress`) | semantic correction | Drop the synthetic byte; use the proper push-path error kind | protocol.rs |
+
 ### 1c-2 tier-audit — explicit safety guarantees
 
 User flagged: *"главное это ГАРАНТИИ безопасности и стабильности, а не тесты"*. Honest classification of every 1c-2 invariant by tier — what is compile-enforced, what is runtime-checked-and-structural, what is audit-enforced.
