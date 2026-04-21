@@ -763,7 +763,7 @@ Will ship in **1c-5** (pipelining sub-phase).
 |---|---|---|---|
 | **1c-0 / 1c-1** | ✅ done | #2 typed newtypes (Sql/StmtName/PortalName); #3 CommandTag as BoundedStr<32> (typed-struct upgrade deferred to 1c-6) | SimpleQuery end-to-end, Action::StreamRow, DEF-121 gate |
 | **1c-2** | ✅ done | #5 text-format rejection (UnexpectedFormatCode classification at parse) | RowDesc parse, DataRowRef + ColumnsIter, FromPgText primitives, oids module |
-| **1c-3** | ⏳ pending | #6 ParamsWriter zero-copy | Parse/Bind/Describe/Execute/Close extended-query flow + FromPgBinary parallel trait |
+| **1c-3** | 🚧 starting | #6 ParamsWriter zero-copy | Parse/Bind/Describe/Execute/Close extended-query flow + FromPgBinary parallel trait |
 | **1c-4** | ⏳ pending | — | BEGIN/COMMIT/ROLLBACK + tx_status tracking + SAVEPOINT |
 | **1c-5** | ⏳ pending | #1 InFlightSlot sum enum; #4 Flush/Sync guard; #7 RowDescRef arena; **DEF-119 witness-guard** | Pipelining — biggest tier-lift of Phase 1c |
 | **1c-6** | ⏳ pending | #3 typed CommandTag upgrade; DEF-109/110 cargo-asm validation | Hardening + fuzzing + proptest before 1d |
@@ -793,6 +793,53 @@ Test count: 83 → 96 (+12 simple-query spec + DEF-121 regression).
 Test count: 96 → 131 (+35 across all 1c-2 commits).
 
 **Round-4 finding #5 closed** — text-format rejection ships as `ProtocolError::UnexpectedFormatCode { code }` in `parse_row_description`: format codes outside `{0, 1}` tear the connection down. 1c-3 will layer `FromPgBinary` on top of the same infrastructure (Extended Query selects binary per-column via Bind; decoder dispatch uses `ColumnDesc::format_code`).
+
+### Architect-agent deep audit (2026-04-21)
+
+Launched the `rust-senior-architect` agent for a systematic audit — 75 findings returned, each triple-checked by the agent. I then re-verified every "TAKE" recommendation with my own triple-check across three axes (real uplift? introduces fragility? conflicts with DEF-119 / future work?).
+
+**Findings breakdown:**
+- **35 "NO FINDING"** — agent verified the current code is optimal.
+- **26 "DROP"** — marginal / risky / better handled in a bigger refactor.
+- **6 "DEFER"** — reserved for DEF-119, DEF-053, 1c-6.
+- **14 "TAKE"** — landed in 3 batches below.
+
+**Agent recommendations I rejected on my triple-check:**
+- **#33 StagedActions POD** — agent KEEP, I DROP. `heapless::Vec<StagedAction, N>` uses `MaybeUninit` internally, avoiding the 2.5KB stack init that a POD array would require. The `needs_drop = true` on `heapless::Vec<Copy, N>` is a nominal tier cost; LLVM elides the empty Drop body for Copy elements. Consistency-with-`OutActions` argument didn't outweigh the perf trade-off.
+- **#2 payload_len usize → u16** — agent marginal TAKE, I DROP. Saves 6 bytes per variant in `ProtocolError`, but the size is budgeted (`ProtocolError ≤ 312`); the fallible-narrowing cost at every call site outweighs the marginal packing.
+
+**Batch A — commit `c54b6b9` — visibility + overflow fidelity:**
+
+| # | Change | Tier | LoC |
+|---|--------|------|-----|
+| #16 | `set_test_nonce` stays `pub` with explanatory doc (downgrade blocked by dead-code lint on the currently-unused test hook) | — | 4 |
+| #17 | 8 SCRAM wire helpers `pub → pub(crate)` | tier-3 → tier-2 structural | 8 |
+| #18 | `CappedServerNonce::try_from_bytes` stays `pub` (used by `tests/bounded_buffers_spec.rs`) | — | 3 |
+| #19 | `ServerFirst` struct + `server_nonce`/`salt`/`iterations` fields → `pub(crate)` | tier-3 → tier-2 structural | 4 |
+| #65 | `Encoding::from_bytes` over-length: silent `Other(empty)` drop → `from_truncated_bytes` with `"…"` marker | tier-4 → tier-2 structural | 35 |
+| #73 | `OutActions.len` field comment updated ("currently 4" → "currently 8 post-1c-1b") | — | 2 |
+| #75 | Removed stale `push_action` helper-removal note | — | 4 |
+
+**Batch B — commit `f8e5e62` — `Option<Severity>`:**
+
+| # | Change | Tier | LoC |
+|---|--------|------|-----|
+| #3 | `parse_error_response`: `severity: Severity::Unknown + severity_set: bool` pair → `severity: Option<Severity>` | tier-3 audit → tier-1 compile | 17 |
+
+Desync between the bool flag and the enum value was a tier-3 audit seam. `Option<Severity>` makes the discriminator and the payload the same value — impossible to desync. Niche-packed (1 byte total, same as raw `Severity`) — no size cost.
+
+**Batch C — commit `c46802d` — typed narrow ints:**
+
+| # | Change | Tier | LoC |
+|---|--------|------|-----|
+| #1 | `UnsupportedAuthMethod.sub_code: u32 → AuthSubCodeClass { Unknown(u32) \| KnownButWrong(AuthSubCode) }` | tier-3 → tier-2 structural | 40 |
+| #4 | `DecodeError::TruncatedColumnLen/NegativeColumnLength/TruncatedColumnData.column_idx: usize → u8` (MAX_ROW_COLUMNS=32 fits u8 with headroom) | tier-3 → tier-2 structural | 8 |
+| #5 | `ColumnsIter.column_idx: usize → u8` (bundled with #4) | tier-3 → tier-2 | 4 |
+| #66 | `SessionParams.application_name: BoundedStr<64> → BoundedStr<128>` for symmetric client↔server fidelity | tier-2 truncation-loss → tier-2 lossless | 3 |
+
+`AuthSubCodeClass` preserves type information in the "server insisted on SASL on a Trust connection" diagnostic — downstream logging/wrapping renders the typed wire-method instead of widening back to an anonymous u32.
+
+**Session total:** 14 architect-audit changes across 3 commits, 125 tests unchanged, clippy clean, forbid-bundle intact. Combined with the 86 individual tier-1 shields landed in prior 2026-04-21 work (Inbound/Outbound tags, TxStatus, FrameCoords typed construction, AuthSubCode enum, 48 const-asserted drift-pins), the crate now has **~100 compile-time shield points** covering wire-spec conformance, type-direction separation, size invariants, and exhaustive dispatch tables.
 
 ### Tier-1 uplift batch (2026-04-21)
 
