@@ -199,8 +199,15 @@ pub enum ProtocolError {
     /// (we never sent anything to provoke it) — the connection is
     /// out-of-sync and must be discarded.
     UnexpectedFrame {
-        /// The offending PG message tag.
-        tag: u8,
+        /// The offending PG message tag, received from the server.
+        ///
+        /// Tier-1 typed as [`crate::wire::InboundTag`] — the field
+        /// can only hold bytes that came through the frame parser.
+        /// A refactor that tried to stuff an outbound tag byte here
+        /// (via `.byte()` extraction) would lose the type-safety;
+        /// forcing construction through `InboundTag` at every
+        /// emission site makes cross-direction confusion impossible.
+        tag: crate::wire::InboundTag,
     },
 
     /// A `ReadyForQuery` frame had an unexpected payload size.
@@ -491,13 +498,15 @@ impl fmt::Display for ProtocolError {
                 "frame too large: declared length {declared} exceeds buffer cap",
             ),
             Self::UnexpectedFrame { tag } => {
-                // Print the tag as a character if it is in the printable
-                // ASCII range; otherwise hex. PG message tags are all in
-                // `0x20..=0x7e`, so the printable branch is the norm.
-                if matches!(*tag, 0x20..=0x7e) {
-                    write!(f, "unexpected frame tag '{}' ({tag:#04x})", char::from(*tag))
+                // Print the underlying byte — `InboundTag` wraps a u8
+                // via `.byte()`. Printable-ASCII branch for PG tags
+                // (all within `0x20..=0x7e`); hex fallback is dead
+                // in practice but preserved for robustness.
+                let b = tag.byte();
+                if matches!(b, 0x20..=0x7e) {
+                    write!(f, "unexpected frame tag '{}' ({b:#04x})", char::from(b))
                 } else {
-                    write!(f, "unexpected frame tag {tag:#04x}")
+                    write!(f, "unexpected frame tag {b:#04x}")
                 }
             }
             Self::MalformedReadyForQuery { payload_len } => write!(

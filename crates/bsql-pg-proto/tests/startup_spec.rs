@@ -256,7 +256,7 @@ fn trust_auth_handshake_end_to_end() {
                 } => {
                     assert_eq!(*pid, 12345);
                     assert_eq!(*secret_key, 67890);
-                    assert_eq!(*tx_status, b'I');
+                    assert_eq!(*tx_status, bsql_pg_proto::TxStatus::Idle);
                 }
                 other => panic!("expected StartupComplete, got {other:?}"),
             }
@@ -606,7 +606,7 @@ fn connecting_states_become_errored_on_bad_frame() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { tag: b'X' }),
+                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'X'),
                 "expected UnexpectedFrame(X), got {cause:?}",
             );
         }
@@ -818,7 +818,11 @@ fn scram_sha256_handshake_end_to_end() {
             assert_eq!(delivered_id, &startup_raw);
             assert!(matches!(
                 value,
-                Reply::StartupComplete { pid: 42, secret_key: 99, tx_status: b'I' }
+                Reply::StartupComplete {
+                    pid: 42,
+                    secret_key: 99,
+                    tx_status: bsql_pg_proto::TxStatus::Idle,
+                }
             ));
         }
         other => panic!("expected DeliverReply(StartupComplete), got {other:?}"),
@@ -1165,7 +1169,7 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
         [Action::FailReply { id, cause }, Action::CloseSocket] => {
             assert_eq!(id, &startup_raw);
             assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { tag: b'S' }),
+                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'S'),
                 "expected UnexpectedFrame('S'), got {cause:?}",
             );
         }
@@ -1197,7 +1201,7 @@ fn param_status_during_pre_auth_is_unexpected() {
         [Action::FailReply { id: failed, cause }, Action::CloseSocket] => {
             assert_eq!(failed, &startup_raw);
             assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { tag: b'S' }),
+                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'S'),
                 "expected UnexpectedFrame('S'), got {cause:?}",
             );
         }

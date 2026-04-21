@@ -737,10 +737,16 @@ fn compute_push_ping(
             ProtoState::Errored(prior_kind)
         }
         ProtoState::AwaitingPingReply(prev_reply) => {
+            // Pushing a Ping while another Ping is in flight is a
+            // push-path error (not a wire-framing issue), so
+            // classify as `CommandInProgress` rather than
+            // overloading `UnexpectedFrame` with a synthetic tag
+            // byte. Matches the semantics used by
+            // `compute_push_simple_query` for the analogous case.
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
-                    cause: ProtocolError::UnexpectedFrame { tag: b'P' },
+                    cause: ProtocolError::CommandInProgress,
                 },
             ]);
             ProtoState::AwaitingPingReply(prev_reply)
@@ -1544,17 +1550,21 @@ mod compute_push_tests {
         let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
         let (new_state, staged) = compute_staged(cmd, prev_state);
 
-        // Action: FailReply(UnexpectedFrame { tag: b'P' }) for the NEW reply.
+        // Action: FailReply(CommandInProgress) for the NEW reply.
+        // (Previously `UnexpectedFrame { tag: b'P' }` — retyped to
+        // `CommandInProgress` during the tier-1 uplift to `InboundTag`
+        // on `UnexpectedFrame.tag`; the synthetic `b'P'` byte wasn't
+        // a real inbound tag anyway.)
         assert_eq!(staged.len(), 1);
         assert!(
             matches!(
                 staged.first(),
                 Some(StagedAction::FailReply {
                     id,
-                    cause: ProtocolError::UnexpectedFrame { tag: b'P' },
+                    cause: ProtocolError::CommandInProgress,
                 }) if *id == raw_new
             ),
-            "expected FailReply(UnexpectedFrame{{tag: b'P'}}) for new reply",
+            "expected FailReply(CommandInProgress) for new reply",
         );
 
         // State: AwaitingPingReply(raw_prev) — the original prev_reply

@@ -105,7 +105,7 @@ pub mod write_buf;
 
 pub use action::{
     Action, CloseCompletePayload, OutActions, ParseCompletePayload, PongPayload,
-    QueryCompletePayload, Reply, StartupCompletePayload,
+    QueryCompletePayload, Reply, StartupCompletePayload, TxStatus,
 };
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::PgCommand;

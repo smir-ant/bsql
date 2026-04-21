@@ -139,13 +139,22 @@ pub(crate) fn dispatch(
             // `deliver` helper binds the payload to `PongPayload`
             // at compile time. Attempting to deliver any other
             // payload type here is a type error.
-            [tx_status] => DispatchOutcome::AdvancedWithAction {
-                new_state: ProtoState::Idle,
-                action: crate::action::deliver(
-                    id,
-                    crate::action::PongPayload {
-                        tx_status: *tx_status,
-                    },
+            //
+            // Tier-1 tx_status validation — users never receive a
+            // `TxStatus` outside `{Idle, InTransaction, Failed}`;
+            // any other byte is a wire violation classified as
+            // `MalformedReadyForQuery`.
+            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
+                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
+                    new_state: ProtoState::Idle,
+                    action: crate::action::deliver(
+                        id,
+                        crate::action::PongPayload { tx_status },
+                    ),
+                },
+                None => errored(
+                    Some(id.consume()),
+                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
                 ),
             },
             other => errored(Some(id.consume()), ProtocolError::MalformedReadyForQuery {
@@ -156,7 +165,7 @@ pub(crate) fn dispatch(
             let cause = parse_error_response(payload);
             errored(Some(id.consume()), cause)
         }
-        (ProtoState::AwaitingPingReply(id), other) => errored(Some(id.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() }),
+        (ProtoState::AwaitingPingReply(id), other) => errored(Some(id.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupTrust — awaiting AuthenticationOk
@@ -174,7 +183,7 @@ pub(crate) fn dispatch(
         (ProtoState::ConnectingStartupTrust { reply }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
             errored(Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
         }
-        (ProtoState::ConnectingStartupTrust { reply }, other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() }),
+        (ProtoState::ConnectingStartupTrust { reply }, other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupScram — awaiting AuthenticationSASL
@@ -194,7 +203,7 @@ pub(crate) fn dispatch(
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
             errored(Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
         }
-        (ProtoState::ConnectingStartupScram { reply, .. }, other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() }),
+        (ProtoState::ConnectingStartupScram { reply, .. }, other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // SCRAM: awaiting server-first-message
@@ -215,7 +224,7 @@ pub(crate) fn dispatch(
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitServerFirst { reply, .. }, other) => {
-            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() })
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -233,7 +242,7 @@ pub(crate) fn dispatch(
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitServerFinal { reply, .. }, other) => {
-            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() })
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -246,7 +255,7 @@ pub(crate) fn dispatch(
             let cause = parse_error_response(payload);
             errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingScramAwaitAuthOk(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() }),
+        (ProtoState::ConnectingScramAwaitAuthOk(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Post-auth: waiting for BackendKeyData
@@ -271,7 +280,7 @@ pub(crate) fn dispatch(
             let cause = parse_error_response(payload);
             errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingPostAuthWaitKey(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() }),
+        (ProtoState::ConnectingPostAuthWaitKey(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Post-auth: have BackendKeyData, waiting for ReadyForQuery
@@ -290,15 +299,21 @@ pub(crate) fn dispatch(
         ) => match payload {
             // DEF-112: `reply: ReplyId<StartupKind>` — typed
             // `deliver` forces a `StartupCompletePayload` payload.
-            [tx_status] => DispatchOutcome::AdvancedWithAction {
-                new_state: ProtoState::Idle,
-                action: crate::action::deliver(
-                    reply,
-                    crate::action::StartupCompletePayload {
-                        pid,
-                        secret_key,
-                        tx_status: *tx_status,
-                    },
+            [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
+                Some(tx_status) => DispatchOutcome::AdvancedWithAction {
+                    new_state: ProtoState::Idle,
+                    action: crate::action::deliver(
+                        reply,
+                        crate::action::StartupCompletePayload {
+                            pid,
+                            secret_key,
+                            tx_status,
+                        },
+                    ),
+                },
+                None => errored(
+                    Some(reply.consume()),
+                    ProtocolError::MalformedReadyForQuery { payload_len: 1 },
                 ),
             },
             other => errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery {
@@ -310,7 +325,7 @@ pub(crate) fn dispatch(
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, other) => {
-            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() })
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -368,7 +383,7 @@ pub(crate) fn dispatch(
             advance_to_drain_after_error(reply, payload)
         }
         (ProtoState::SimpleQueryAwaitFirstResponse(reply), other) => {
-            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() })
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // StreamingRows: D / C / E — any other tag is desync
@@ -382,32 +397,38 @@ pub(crate) fn dispatch(
             advance_to_drain_after_error(reply, payload)
         }
         (ProtoState::SimpleQueryStreamingRows(reply), other) => {
-            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() })
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // AwaitRfq: Z is the only legal frame
         (ProtoState::SimpleQueryAwaitRfq { reply, command_tag }, TAG_READY_FOR_QUERY) => {
             match payload {
-                [tx_status] => {
-                    // 1c-2a: copy the schema out of the protocol's
-                    // `row_desc` slot into the terminal reply. The
-                    // slot is NOT cleared here — any `StreamRowRange`
-                    // staged earlier in this same `feed_bytes` call
-                    // still borrows it through materialise; the slot
-                    // is cleared at the next `push_command(SimpleQuery)`.
-                    let row_desc = *row_desc_slot;
-                    DispatchOutcome::AdvancedWithAction {
-                        new_state: ProtoState::Idle,
-                        action: crate::action::deliver(
-                            reply,
-                            crate::action::QueryCompletePayload {
-                                command_tag,
-                                tx_status: *tx_status,
-                                row_desc,
-                            },
-                        ),
+                [tx_byte] => match crate::action::TxStatus::try_from_byte(*tx_byte) {
+                    Some(tx_status) => {
+                        // 1c-2a: copy the schema out of the protocol's
+                        // `row_desc` slot into the terminal reply. The
+                        // slot is NOT cleared here — any `StreamRowRange`
+                        // staged earlier in this same `feed_bytes` call
+                        // still borrows it through materialise; the slot
+                        // is cleared at the next `push_command(SimpleQuery)`.
+                        let row_desc = *row_desc_slot;
+                        DispatchOutcome::AdvancedWithAction {
+                            new_state: ProtoState::Idle,
+                            action: crate::action::deliver(
+                                reply,
+                                crate::action::QueryCompletePayload {
+                                    command_tag,
+                                    tx_status,
+                                    row_desc,
+                                },
+                            ),
+                        }
                     }
-                }
+                    None => errored(
+                        Some(reply.consume()),
+                        ProtocolError::MalformedReadyForQuery { payload_len: 1 },
+                    ),
+                },
                 other => errored(
                     Some(reply.consume()),
                     ProtocolError::MalformedReadyForQuery {
@@ -417,7 +438,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::SimpleQueryAwaitRfq { reply, .. }, other) => {
-            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other.byte() })
+            errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // DrainRfqAfterError: silent consume of Z → Idle
@@ -435,13 +456,13 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::SimpleQueryDrainRfqAfterError, other) => {
-            errored(None, ProtocolError::UnexpectedFrame { tag: other.byte() })
+            errored(None, ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
         // Idle — unsolicited frames are out-of-spec
         // =============================================================
-        (ProtoState::Idle, other) => errored(None, ProtocolError::UnexpectedFrame { tag: other.byte() }),
+        (ProtoState::Idle, other) => errored(None, ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Errored — terminal sink (Phase 1a pattern carried forward)
@@ -679,7 +700,7 @@ fn dispatch_auth_sasl_continue(
     };
 
     if code != AUTH_SASL_CONTINUE {
-        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION.byte() });
+        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
     // `rest` is the server-first-message body.
@@ -790,7 +811,7 @@ fn dispatch_auth_sasl_final(
     };
 
     if code != AUTH_SASL_FINAL {
-        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION.byte() });
+        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
     // Parse server-final-message.
@@ -825,7 +846,7 @@ fn dispatch_auth_ok_after_scram(reply: ReplyId<crate::reply_id::StartupKind>, pa
     };
 
     if code != AUTH_OK {
-        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION.byte() });
+        return errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
     DispatchOutcome::AdvancedSilent {

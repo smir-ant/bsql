@@ -37,6 +37,68 @@ use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
 use core::num::{NonZeroU64, NonZeroUsize};
 
+/// PostgreSQL transaction-status indicator carried in every
+/// `ReadyForQuery` frame (PG §55.7).
+///
+/// PG defines exactly three legal values on the wire:
+/// `'I'` (idle), `'T'` (in-transaction), `'E'` (failed transaction
+/// — needs `ROLLBACK`). Any other byte is a server-side wire
+/// violation and classifies as
+/// [`crate::ProtocolError::MalformedReadyForQuery`] at dispatch
+/// time — users never receive an invalid `TxStatus`.
+///
+/// # Tier-1 compile guarantees for consumers
+///
+/// Exhaustive `match` on `TxStatus` catches every legal state at
+/// build time. A refactor that adds a new PG tx-status (future
+/// spec change) forces every consumer to handle it. Compare to
+/// the pre-uplift `tx_status: u8` form where a byte-match had no
+/// compiler help and forgetting the `'E'` arm was a tier-3 audit
+/// seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum TxStatus {
+    /// `'I'` — idle, no transaction in progress.
+    Idle = b'I',
+    /// `'T'` — inside an explicit or implicit transaction block.
+    InTransaction = b'T',
+    /// `'E'` — transaction failed; commands are ignored until
+    /// `ROLLBACK` or `ROLLBACK TO SAVEPOINT`.
+    Failed = b'E',
+}
+
+impl TxStatus {
+    /// Parse a PG wire byte into the typed status. `None` for any
+    /// byte outside `{'I', 'T', 'E'}` — caller classifies as
+    /// malformed wire.
+    #[inline]
+    #[must_use]
+    pub const fn try_from_byte(b: u8) -> Option<Self> {
+        match b {
+            b'I' => Some(Self::Idle),
+            b'T' => Some(Self::InTransaction),
+            b'E' => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    /// The underlying PG wire byte. Used by builders + diagnostics.
+    ///
+    /// Explicit match (not `self as u8`) — the crate forbids
+    /// `clippy::as_conversions`. With `#[repr(u8)]` and explicit
+    /// discriminants above, each arm is a direct literal lookup;
+    /// LLVM folds the match to a constant per monomorphic call.
+    #[inline]
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        match self {
+            Self::Idle => b'I',
+            Self::InTransaction => b'T',
+            Self::Failed => b'E',
+        }
+    }
+}
+
 /// Typed non-empty range into a write buffer, replacing the raw
 /// `(start, end): (usize, usize)` pair on [`StagedAction::SendBytesRange`].
 /// DEF-100.
@@ -545,7 +607,7 @@ pub enum Reply {
     /// [transaction-status indicator]: https://www.postgresql.org/docs/current/protocol-message-formats.html
     Pong {
         /// The single payload byte — `'I'`, `'T'`, or `'E'`.
-        tx_status: u8,
+        tx_status: TxStatus,
     },
 
     /// The startup handshake completed successfully.
@@ -560,7 +622,7 @@ pub enum Reply {
         /// Backend secret key from `BackendKeyData` (cancel key).
         secret_key: i32,
         /// Transaction status from `ReadyForQuery` (`'I'`, `'T'`, `'E'`).
-        tx_status: u8,
+        tx_status: TxStatus,
     },
 
     // ───────────────── Phase 1c reply variants ─────────────────
@@ -578,7 +640,7 @@ pub enum Reply {
         /// finding #3; this raw form is the interim shape.
         command_tag: crate::ident::BoundedStr<32>,
         /// Transaction status from the trailing `ReadyForQuery`.
-        tx_status: u8,
+        tx_status: TxStatus,
         /// Result-set schema. `Some` for SELECT queries (including
         /// 0-row SELECTs — `RowDescription` arrived but no
         /// `DataRow`s followed); `None` for DML (no
@@ -613,7 +675,7 @@ pub enum Reply {
 pub struct PongPayload {
     /// Transaction-status indicator byte (`'I'`, `'T'`, `'E'`) from
     /// the matching `ReadyForQuery` frame.
-    pub tx_status: u8,
+    pub tx_status: TxStatus,
 }
 
 impl From<PongPayload> for Reply {
@@ -635,7 +697,7 @@ pub struct StartupCompletePayload {
     /// Backend secret key (for cancel requests).
     pub secret_key: i32,
     /// Transaction status from the final `ReadyForQuery`.
-    pub tx_status: u8,
+    pub tx_status: TxStatus,
 }
 
 impl From<StartupCompletePayload> for Reply {
@@ -672,7 +734,7 @@ pub struct QueryCompletePayload {
     /// Raw ASCII tag from `CommandComplete` body.
     pub command_tag: crate::ident::BoundedStr<32>,
     /// Transaction-status indicator from the trailing `ReadyForQuery`.
-    pub tx_status: u8,
+    pub tx_status: TxStatus,
     /// Result-set schema, if any. See [`Reply::QueryComplete::row_desc`].
     pub row_desc: Option<crate::decode::RowDesc>,
 }

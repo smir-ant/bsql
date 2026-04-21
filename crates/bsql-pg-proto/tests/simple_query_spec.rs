@@ -213,7 +213,7 @@ fn select_zero_rows_end_to_end() {
             match value {
                 Reply::QueryComplete { command_tag, tx_status, row_desc } => {
                     assert_eq!(command_tag.as_str(), "SELECT 0");
-                    assert_eq!(*tx_status, b'I');
+                    assert_eq!(*tx_status, bsql_pg_proto::TxStatus::Idle);
                     // 1c-2a: 0-row SELECT delivers schema via Reply
                     // (no StreamRow to carry it).
                     assert!(
@@ -316,7 +316,7 @@ fn select_multiple_rows_stream_then_deliver() {
         }) => {
             assert_eq!(*delivered_id, q_raw);
             assert_eq!(command_tag.as_str(), "SELECT 3");
-            assert_eq!(*tx_status, b'I');
+            assert_eq!(*tx_status, bsql_pg_proto::TxStatus::Idle);
             assert!(
                 matches!(
                     row_desc,
@@ -361,7 +361,7 @@ fn dml_no_rows_end_to_end() {
         }] => {
             assert_eq!(*delivered_id, q_raw);
             assert_eq!(command_tag.as_str(), "INSERT 0 3");
-            assert_eq!(*tx_status, b'T');
+            assert_eq!(*tx_status, bsql_pg_proto::TxStatus::InTransaction);
             // 1c-2a: DML never received a 'T' frame — row_desc is None.
             // Critical invariant: push_command clears prior SELECT's
             // row_desc, so a DML following a SELECT gets None here,
@@ -602,14 +602,13 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
 
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     let actions = out.as_slice();
-    let z_byte = TAG_READY_FOR_QUERY.byte();
     assert!(
         actions.iter().any(|a| matches!(
             a,
             Action::FailReply {
-                cause: ProtocolError::UnexpectedFrame { tag },
+                cause: ProtocolError::UnexpectedFrame { tag: TAG_READY_FOR_QUERY },
                 ..
-            } if *tag == z_byte,
+            },
         )),
         "expected FailReply(UnexpectedFrame{{Z}}), got {actions:?}",
     );
