@@ -1317,6 +1317,57 @@ win/cost ratio was already clear. Perf optimizations without data
 are speculation — the crate philosophy "каждая наносекунда на счету"
 explicitly requires measurement, not guess.
 
+### DEF-133 — finalise `scram::types` public API before v1.0 (OPEN)
+
+**Status.** The 2026-04-21 visibility audit killed the concrete
+"pub for tests" hacks (SYNC_WIRE_BYTES, base64_encode_to_buf,
+CappedServerNonce::try_from_bytes, set_test_nonce — all now
+`pub(crate)` with their tests moved / rewritten). Remaining
+formally-public items in `scram::types` are:
+
+- `pub struct CappedServerNonce` (constructor is `pub(crate)` —
+  manufacture blocked, but type name is visible)
+- `pub struct ServerNonceTooLong` (error struct — not currently
+  surfaced through any `ScramError` variant)
+- `pub const MAX_SERVER_NONCE_LEN: usize = 256;`
+- `pub mod scram` / `pub mod types` (module visibility)
+
+**Cost-benefit.** Users CANNOT actively use these — no public API
+path produces a `CappedServerNonce`, no `ScramError` variant carries
+`ServerNonceTooLong`. So the `pub` annotations cost:
+
+- API versioning lock-in at v1.0 (every pub item freezes into the
+  SemVer contract)
+- docs.rs clutter — users see internal SCRAM plumbing with no clear
+  "why this is here" context
+- Lost freedom to restructure the SCRAM module in response to the
+  Phase 1e wrapper crate's actual needs
+
+Benefits of keeping them `pub` (today): zero. No user can
+meaningfully depend on them.
+
+**Why deferred, not fixed now.** Phase 1e (`bsql-driver-postgres`
+wrapper) hasn't landed yet. When it does, the wrapper will need
+SOME SCRAM types exposed (e.g., for structured logging of
+handshake state, or for custom error variants carrying the typed
+SCRAM failure). Deciding "what's public" before the wrapper
+exists is speculation; after it ships, the answer becomes
+mechanical.
+
+**Pre-v1.0 checklist for whoever takes this up:**
+1. Enumerate every `pub` item in `scram/`, `error::ScramError` /
+   `ServerErrorResponse`, etc.
+2. For each: is it transitively reachable from the wrapper crate's
+   published API? If yes, keep `pub`. If no, `pub(crate)`.
+3. Apply the same question to `wire::*` public items and all
+   crate-root re-exports.
+4. Commit as "final API surface freeze for v1.0" — one atomic
+   pre-release audit.
+
+**Non-goal.** Ship as pub-minimal version right now. Shrinking and
+then re-expanding as Phase 1e needs emerge is churn; freeze once
+at v1.0 cutover.
+
 ---
 
 ## 10. Closed
