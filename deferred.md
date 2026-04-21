@@ -1610,3 +1610,129 @@ block 1c-3d (Close) or 1c-4 (transactions).
 **Test count after pass-#7.** 182 → 182. No new tests needed —
 audit-follow-up refactors preserve semantics; existing 26 describe
 tests + 156 pre-existing all pass.
+
+---
+
+## 22. Rust-unstable watchlist
+
+Features we're currently working around because they aren't yet on
+stable. Each entry cites the rust-lang tracking issue and the sites
+in our codebase that would simplify the moment the feature lands on
+stable. Revisit this section on every MSRV bump.
+
+**Why a dedicated section.** Individual "when X stabilises…" notes
+are scattered across source comments and commit messages — a
+refactor done two years from now would have to grep blindly. Here
+we centralise the dependency on the Rust stabilisation pipeline so
+a single pass at each MSRV bump can sweep every site.
+
+### RU-01 — `<[T]>::get` / `From<u16> for usize` / `u32::try_from` in const
+
+**Tracking:** [rust-lang/rust#143874](https://github.com/rust-lang/rust/issues/143874)
+(const-traits / const-impls of standard conversions)
+
+**Status (MSRV 1.95):** not yet stable. `usize::from(u16_value)`,
+`u32::try_from(usize_value)`, `<[T]>::get(i)` cannot appear inside
+`const fn` bodies or `const _: () = { … }` blocks.
+
+**Worked-around sites:**
+
+| Site | Today's form | Flip-to |
+|---|---|---|
+| `src/decode.rs:140` `RowDesc::len` | `pub fn len(&self) -> usize` | `pub const fn len(&self) -> usize` |
+| `src/frame.rs:50` `MAX_FRAME_LEN_FIELD` | Hard-coded literal `4095` | Derive via `const { u32::try_from(READ_BUF_CAP - 1).unwrap() }` |
+| `src/wire.rs:519` `assert_all_distinct!` macro | Recursive macro expansion | Fold into `const fn walk(arr: &[u8]) -> bool` using `arr.get(i)` |
+| `src/decode.rs` other `usize::from(u16)` sites | Non-const `fn` | Promote to `const fn` once stable |
+
+**Action on stabilisation.** One-line keyword flips where possible;
+the `assert_all_distinct!` macro collapse is medium-effort (rewrite
+macro body as a const walker, retain call sites unchanged).
+
+**Note (pass-#8 F-034).** Pre-verified that the flip is source-
+compatible: MSRV bump alone enables the change.
+
+### RU-02 — `<[T]>::split_once` with predicate
+
+**Tracking:** [rust-lang/rust#112811](https://github.com/rust-lang/rust/issues/112811)
+(slice `split_once_*` family)
+
+**Status (MSRV 1.95):** not yet stable. Must use the `iter().position(pred)`
++ manual `split_at` idiom.
+
+**Worked-around site:**
+
+| Site | Today's form | Flip-to |
+|---|---|---|
+| `src/protocol.rs:1882` `record_param_status` | `payload.iter().position(\|b\| *b == 0)` + manual split | `payload.split_once(\|b\| *b == 0)` (single `.split_once` call) |
+
+**Action on stabilisation.** Five-line tightening; net reduction
+in `let Some(...) else` cascade.
+
+### RU-03 — `generic_const_exprs` for capacity-witness patterns
+
+**Tracking:** [rust-lang/rust#76560](https://github.com/rust-lang/rust/issues/76560)
+(generic const expressions in type positions)
+
+**Status (MSRV 1.95):** not yet stable. Prevents the proper
+capacity-proven writer-witness refactor planned for **DEF-141**
+(`build_*_message` infallible returns).
+
+**Blocked work:**
+
+- **DEF-141** — eliminate architecturally-dead `Err(WriteBufFull)`
+  branches from every `build_*_message` via a type-level capacity
+  witness. Current short-term hint: `frame_build_unreachable`
+  centralised cold helper.
+- **F-006 (pass-#8)** — same class: `OutActions::push_infallible<const IDX>`
+  with compile-asserted `IDX < MAX_ACTIONS_PER_CALL`. Blocked on
+  `generic_const_exprs` for the const-generic index bound check.
+
+**Action on stabilisation.** Full-week refactor to thread witness
+types through `WriteBuf` / `build_*_message` signatures; eliminates
+~50 LoC of dead Err branches.
+
+### RU-04 — `std::simd` portable SIMD
+
+**Tracking:** [rust-lang/rust#86656](https://github.com/rust-lang/rust/issues/86656)
+(portable SIMD abstractions)
+
+**Status (MSRV 1.95):** `core::simd::u8x32` and friends remain
+unstable.
+
+**Blocked work:**
+
+- **DEF-108** — `u8x32` XOR for ClientKey ⊕ ClientSignature in
+  SCRAM client-proof. Current form (zip-iterator) auto-vectorises
+  on x86-64-v2+ / aarch64 via LLVM, so the perf gap is near-zero
+  today; portable SIMD would tighten the guarantee to ALL targets.
+
+**Action on stabilisation.** Swap the zip-iterator form in
+`scram/crypto.rs` for a `u8x32::from_slice(a) ^ u8x32::from_slice(b)`
+one-liner. Preserves semantics; tightens perf on non-auto-vec
+targets.
+
+### RU-05 — `core::hint::unreachable_unchecked` as safe
+
+**Tracking:** no tracking issue (architectural — the hint IS unsafe
+by design today).
+
+**Status (MSRV 1.95):** `unreachable_unchecked` exists but requires
+`unsafe`. Since the crate is `#![forbid(unsafe_code)]`, we cannot
+use it even for genuinely-impossible match arms.
+
+**Worked-around sites:**
+
+| Site | Today's form | Ideal-world form |
+|---|---|---|
+| Various `_ => {}` dead catch-alls | Explicit exhaustive or-patterns | Terminal `_ => core::hint::unreachable_unchecked()` |
+
+**Action.** Unlikely to ever stabilise as safe — fundamentally unsafe
+by spec. Watch for alternative "proved-unreachable via typestate"
+language features (e.g., `never_type` stabilisation on stable).
+Current form is optimal under the forbid bundle.
+
+### Review cadence
+
+Audit this section at each MSRV bump. When an entry's feature
+stabilises, the entry turns into a work item (add to sub-phase
+task list, implement, delete from here).
