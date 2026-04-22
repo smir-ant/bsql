@@ -20,6 +20,11 @@
 //! SASL frame sizes have analogous drift-guards in `scram::wire`.
 
 use core::fmt;
+// `PhantomData` is used only by the Phase B1 branded types below,
+// all of which are `#[cfg(test)]`-gated until Phase B3 wires them
+// into production. Gate the import to match.
+#[cfg(test)]
+use core::marker::PhantomData;
 
 /// Maximum byte capacity for an owned outbound frame.
 ///
@@ -700,5 +705,383 @@ impl fmt::Debug for WriteBuf {
             .field("len", &self.inner.len())
             .field("cap", &MAX_OWNED_SEND_LEN)
             .finish()
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-154 (B) Phase B1 — generatively-branded buffer scaffolding
+// ═════════════════════════════════════════════════════════════════════
+//
+// Goal: upgrade [`WriteReserved<'a>`] (DEF-154 (A)) from capacity-only
+// witness to capacity + **buffer-identity** witness. The identity
+// proof comes from a generative lifetime `'brand` (GhostCell pattern):
+// two distinct `with_branded` closures produce disjoint brands that
+// the type system refuses to unify, closing the "apply range from
+// buffer A to buffer B of same lifetime" crossover seam that a plain
+// `&[u8]` lifetime cannot prove.
+//
+// Phase B1 scope — foundational types only:
+//   - [`BrandedBytes<'brand, 'a>`]       — invariant-branded slice view
+//   - [`BrandedWriteBuf<'brand, 'a>`]    — invariant-branded WriteBuf
+//     mutable borrow
+//   - [`BrandedWriteReserved<'brand, 'a>`] — branded capacity witness
+//   - [`WriteBuf::with_branded`]         — HRTB generative constructor
+//
+// Phase B1 does NOT:
+//   - Add push methods to `BrandedWriteReserved` (those land in B3
+//     when `NonEmptyRange<'brand>` consumers need them).
+//   - Touch existing `WriteReserved` / builder call sites (stays
+//     side-by-side until B3 swaps the builders to the branded form).
+//   - Thread brands through `StagedAction` / `dispatch` / `materialise`
+//     (those land in B3/B4/B5).
+//
+// # `#[cfg(test)]` gating rationale — temporary through Phase B2
+//
+// These types have NO production callers in B1 — production code
+// still uses the unbranded `WriteReserved` path. The crate-root
+// `-D warnings` flag turns rustc's `dead_code` warning into an
+// error, so pub(crate) items with zero call sites in non-test
+// builds would fail compilation.
+//
+// Each B1 branded item carries `#[cfg(test)]` individually below.
+// The gate is TEMPORARY: Phase B3 removes it when branded
+// builders land and push_* methods on `BrandedWriteReserved`
+// become production-reachable. Do NOT swap for
+// `#[allow(dead_code)]` or `#[expect(dead_code)]` — both are
+// project-banned per the "fix root cause, no lint hiding" policy.
+// `cfg(test)` is honest scaffolding; `allow/expect` is drift.
+//
+// # Invariance mechanism
+//
+// Each branded type carries `PhantomData<fn(&'brand ()) -> &'brand ()>`
+// — `'brand` appears in BOTH input and output position of the
+// phantom function pointer, making it **invariant**. Covariant
+// phantoms (e.g. `PhantomData<&'brand ()>`) would let the borrow
+// checker subtype `'brand` to `'static` or to a shorter lifetime,
+// breaking the generativity seal. This is the single most common
+// trap in the GhostCell-style pattern.
+//
+// # Generativity via HRTB
+//
+// [`WriteBuf::with_branded`] takes `F: for<'brand> FnOnce(...)` —
+// the higher-rank trait bound means `f` must accept ANY `'brand`
+// the caller picks, so the caller cannot pre-fix `'brand` to a
+// value they share with another scope. Each call creates a fresh,
+// disjoint brand.
+
+/// Generatively-branded view of a byte slice.
+///
+/// Wraps `&'a [u8]` with an invariant `'brand` lifetime that ties
+/// the slice to the [`BrandedWriteBuf`] (or future `BrandedReadBuf`)
+/// it was created from. [`crate::action::NonEmptyRange`] will (in
+/// Phase B3) gain a matching `'brand` parameter; its `apply` method
+/// will accept only a [`BrandedBytes`] of the same brand — converting
+/// the current `Option<&[u8]>` return into infallible `&[u8]`.
+///
+/// # Unbranding at the materialise boundary
+///
+/// The brand's job is construction-time safety. [`Self::as_slice`]
+/// returns the underlying `&'a [u8]` — after a branded range has
+/// been applied, the resulting slice is "unbranded" and can flow
+/// into `Action::SendBytes(&'w [u8])` without infecting the public
+/// types with a third lifetime parameter.
+#[cfg(test)]
+pub(crate) struct BrandedBytes<'brand, 'a> {
+    /// Underlying slice — lifetime `'a` propagates through
+    /// [`Self::as_slice`] for the unbranding boundary.
+    bytes: &'a [u8],
+    /// Invariant phantom (see module-level "Invariance mechanism").
+    _brand: PhantomData<fn(&'brand ()) -> &'brand ()>,
+}
+
+#[cfg(test)]
+impl<'a> BrandedBytes<'_, 'a> {
+    /// Discharge the brand — return the underlying slice.
+    ///
+    /// Used by the materialiser AFTER a branded range has applied
+    /// to produce the unbranded `&'w [u8]` that flows into
+    /// `Action::SendBytes`. Callers must use this only at the
+    /// boundary — within a branded scope, prefer the branded APIs.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn as_slice(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Length of the underlying slice.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+impl<'brand> BrandedBytes<'brand, 'static> {
+    /// Empty branded slice (`&'static []`) — placeholder for
+    /// push-path materialise calls where no read buffer is in
+    /// scope (`push_command` / `push_bind_execute`). Phase B4 uses
+    /// this to keep the `materialise(..., read_bytes)` parameter
+    /// signature uniform between feed and push entry points.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            bytes: &[],
+            _brand: PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for BrandedBytes<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrandedBytes")
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// Generatively-branded mutable borrow of a [`WriteBuf`].
+///
+/// Constructed via [`WriteBuf::with_branded`]. Inside the closure,
+/// `'brand` is fresh and unique — it cannot be unified with any
+/// brand outside the closure. Calling [`Self::reserve`] yields a
+/// [`BrandedWriteReserved<'brand, '_>`] that carries the same
+/// brand; builders (Phase B3) take `&mut BrandedWriteReserved`
+/// and return `WriteRange<'brand>` ranges tied to this buffer.
+///
+/// See module-level "Invariance mechanism" and "Generativity via
+/// HRTB" for the soundness argument.
+#[cfg(test)]
+pub(crate) struct BrandedWriteBuf<'brand, 'a> {
+    /// Underlying mutable WriteBuf borrow. Access via
+    /// [`Self::reserve`] → [`BrandedWriteReserved`] for builder
+    /// scope, or via [`Self::as_bytes_branded`] for the final
+    /// materialise slice view.
+    buf: &'a mut WriteBuf,
+    /// Invariant phantom (see module-level "Invariance mechanism").
+    _brand: PhantomData<fn(&'brand ()) -> &'brand ()>,
+}
+
+#[cfg(test)]
+impl<'brand, 'a> BrandedWriteBuf<'brand, 'a> {
+    /// Reserve the buffer for a builder, producing a capacity +
+    /// brand witness. Mirrors [`WriteBuf::reserve`] (DEF-154 (A))
+    /// with the added brand binding.
+    #[inline]
+    #[must_use]
+    pub(crate) fn reserve(self) -> BrandedWriteReserved<'brand, 'a> {
+        debug_assert!(
+            self.buf.is_empty(),
+            "BrandedWriteBuf::reserve must be called on a freshly-cleared buffer \
+             — same MAX_OWNED_SEND_LEN capacity invariant as WriteBuf::reserve.",
+        );
+        BrandedWriteReserved {
+            buf: self.buf,
+            _brand: PhantomData,
+        }
+    }
+
+    /// Branded view of the underlying bytes.
+    ///
+    /// Used at materialise time (Phase B4) to produce a
+    /// [`BrandedBytes<'brand, '_>`] that [`crate::action::NonEmptyRange::apply`]
+    /// (Phase B3 branded variant) accepts. The `'brand` matches
+    /// the one carried by ranges produced from this buffer, so
+    /// `apply` returns `&[u8]` infallibly.
+    #[inline]
+    #[must_use]
+    pub(crate) fn as_bytes_branded(&self) -> BrandedBytes<'brand, '_> {
+        BrandedBytes {
+            bytes: self.buf.as_bytes(),
+            _brand: PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for BrandedWriteBuf<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrandedWriteBuf")
+            .field("len", &self.buf.len())
+            .finish()
+    }
+}
+
+/// Branded capacity witness — the Phase B3 successor to
+/// [`WriteReserved`] (DEF-154 (A)). Phase B1 defines the shape;
+/// push methods land when builders are migrated in Phase B3.
+///
+/// Constructed via [`BrandedWriteBuf::reserve`]; holds a mutable
+/// borrow of the underlying buffer. Same capacity guarantee as
+/// [`WriteReserved`] (const-asserted ≥ every builder's max message
+/// size) plus the brand-identity binding to the source
+/// [`BrandedWriteBuf`].
+#[cfg(test)]
+pub(crate) struct BrandedWriteReserved<'brand, 'a> {
+    /// Underlying buffer — shares the pre-existing WriteBuf type
+    /// so Phase B3 builder migration can reuse `push_*` logic by
+    /// delegating to the unbranded `WriteReserved` wrapper (same
+    /// shape, different brand).
+    buf: &'a mut WriteBuf,
+    /// Invariant phantom (see module-level "Invariance mechanism").
+    _brand: PhantomData<fn(&'brand ()) -> &'brand ()>,
+}
+
+#[cfg(test)]
+impl BrandedWriteReserved<'_, '_> {
+    /// Current buffer length. Used by builder bodies to compute
+    /// emission-time range endpoints (the same pattern as
+    /// [`WriteReserved::len`]).
+    #[inline]
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for BrandedWriteReserved<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BrandedWriteReserved")
+            .field("len", &self.buf.len())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+impl WriteBuf {
+    /// Enter a generatively-branded scope.
+    ///
+    /// The HRTB `for<'brand>` in the closure bound forces the
+    /// caller to accept ANY `'brand` the compiler chooses —
+    /// producing a fresh, disjoint brand per call that cannot
+    /// unify with any other scope's brand. Inside the closure,
+    /// [`BrandedWriteBuf<'brand, '_>`] wraps `self` with that
+    /// brand. Builders (Phase B3) take
+    /// `&mut BrandedWriteReserved<'brand, '_>` and produce
+    /// ranges tied to this brand; [`Self::as_bytes_branded`] at
+    /// materialise time accepts only same-brand ranges.
+    ///
+    /// # Example (Phase B5 call site — illustrative)
+    ///
+    /// ```ignore
+    /// self.write_buf.with_branded(|wb| {
+    ///     let mut reserved = wb.reserve();
+    ///     let range = build_query_message(&mut reserved, &cmd);
+    ///     // range: WriteRange<'brand>; wb.as_bytes_branded(): BrandedBytes<'brand, '_>
+    ///     let bytes = range.apply(wb.as_bytes_branded());
+    ///     Action::SendBytes(bytes)  // &[u8] is unbranded — escapes the closure
+    /// })
+    /// ```
+    ///
+    /// # Soundness argument
+    ///
+    /// Each call to [`Self::with_branded`] instantiates the `'brand`
+    /// parameter with a FRESH existential lifetime (HRTB semantics).
+    /// The invariant phantom `PhantomData<fn(&'brand ()) ->
+    /// &'brand ()>` on [`BrandedWriteBuf`] / [`BrandedBytes`] /
+    /// [`BrandedWriteReserved`] prevents the subtyping system from
+    /// equating two distinct brands. Therefore a range built under
+    /// brand X cannot be applied to bytes branded under Y — a
+    /// compile error, not a runtime check.
+    #[inline]
+    pub(crate) fn with_branded<R, F>(&mut self, f: F) -> R
+    where
+        F: for<'brand> FnOnce(BrandedWriteBuf<'brand, '_>) -> R,
+    {
+        f(BrandedWriteBuf {
+            buf: self,
+            _brand: PhantomData,
+        })
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-154 (B) Phase B1 — tests
+// ═════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod phase_b1_tests {
+    //! Phase B1 behavioural + structural pins.
+    //!
+    //! Compile-fail cases (two brands rejected at the type level)
+    //! land in a trybuild harness during a later phase. Phase B1
+    //! pins: the happy path round-trips, brand-bearing types are
+    //! non-zero-size-neutral (phantom ZST), unbranding produces the
+    //! underlying slice.
+    use super::*;
+
+    /// B1-1: `with_branded` round-trip — construct a buffer, brand
+    /// it, discharge the brand via `as_bytes_branded().as_slice()`,
+    /// observe the slice unchanged. Pins the generative-constructor
+    /// contract against accidental brand leakage. The `as_slice()`
+    /// call is load-bearing: it exercises the unbranding boundary
+    /// that Phase B4's materialise will use.
+    #[test]
+    fn with_branded_round_trip_empty() {
+        let mut buf = WriteBuf::new();
+        // Two checks inside the same branded scope: `len()` and
+        // `as_slice()`. The `as_slice()` yields `&[u8]` which
+        // outlives the closure (unbranded); length must match.
+        let (observed_len, slice_len) = buf.with_branded(|wb| {
+            let branded = wb.as_bytes_branded();
+            // Discharge brand via as_slice — this is the Phase B4
+            // materialise-boundary operation. Returning the slice
+            // directly would borrow-check-fail because `wb` drops
+            // at closure exit, but returning the len is fine.
+            (branded.len(), branded.as_slice().len())
+        });
+        assert_eq!(observed_len, 0, "fresh buffer must branded-view as empty");
+        assert_eq!(slice_len, 0, "unbranded slice len must match branded len");
+    }
+
+    /// B1-2: `with_branded` produces a `BrandedWriteReserved` via
+    /// `reserve()` — the capacity-witness path is intact. The
+    /// reserved's `len()` must mirror the buffer's `len()` on
+    /// construction.
+    #[test]
+    fn branded_reserve_preserves_len() {
+        let mut buf = WriteBuf::new();
+        let reserved_len = buf.with_branded(|wb| wb.reserve().len());
+        assert_eq!(reserved_len, 0);
+    }
+
+    /// B1-3: `BrandedBytes::empty()` builds a `&'static []` branded
+    /// sentinel — used in Phase B4 for push-path materialise where
+    /// no read buffer exists.
+    #[test]
+    fn branded_bytes_empty_is_empty() {
+        // Helper fixes the brand via a generic fn: BrandedBytes::empty
+        // is polymorphic in 'brand, so we need to use it in a branded
+        // scope to observe its behaviour.
+        let mut buf = WriteBuf::new();
+        let len = buf.with_branded(|_wb| BrandedBytes::<'_, 'static>::empty().len());
+        assert_eq!(len, 0);
+    }
+
+    /// B1-4: drift pin on sizes — branded wrappers carry phantom
+    /// only, so a reader should be pointer-sized and a buf/reserved
+    /// wrapper should match its underlying `&mut WriteBuf` size.
+    /// `PhantomData<fn(..) -> ..>` is a ZST; any non-ZST sneak-in
+    /// would trip these.
+    #[test]
+    fn branded_wrapper_sizes_are_phantom_only() {
+        assert_eq!(
+            core::mem::size_of::<BrandedBytes<'_, '_>>(),
+            core::mem::size_of::<&[u8]>(),
+            "BrandedBytes must be slice-ref-sized (phantom is ZST).",
+        );
+        assert_eq!(
+            core::mem::size_of::<BrandedWriteBuf<'_, '_>>(),
+            core::mem::size_of::<&mut WriteBuf>(),
+            "BrandedWriteBuf must be &mut-WriteBuf-sized (phantom is ZST).",
+        );
+        assert_eq!(
+            core::mem::size_of::<BrandedWriteReserved<'_, '_>>(),
+            core::mem::size_of::<&mut WriteBuf>(),
+            "BrandedWriteReserved must be &mut-WriteBuf-sized (phantom is ZST).",
+        );
     }
 }
