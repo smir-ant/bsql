@@ -761,3 +761,256 @@ impl core::fmt::Debug for ProtoState {
         }
     }
 }
+
+#[cfg(test)]
+mod push_class_tests {
+    //! DEF-169 (audit2 A003): per-variant pinning for the
+    //! [`ProtoState::push_class`] classifier introduced by DEF-146.
+    //!
+    //! The exhaustive-match shield on `push_class` proves that every
+    //! `ProtoState` variant is classified; it does NOT prove the
+    //! classification is CORRECT. A swap at an arm body (e.g.,
+    //! `ConnectingStartupTrust { .. } => StatePushClass::BusyQuery`
+    //! instead of `Connecting`) compiles because every arm returns
+    //! the same type. Without a per-variant table, such a drift
+    //! would silently change the `FailReply` cause emitted on
+    //! pushes against that state.
+    //!
+    //! Category (1) per reforge.md §4.11 — mirror of
+    //! `protocol.rs::allows_unsolicited_param_status_tests::policy_per_variant`
+    //! for its sibling classifier.
+    //!
+    //! # Forbid-bundle compliance
+    //!
+    //! `panic!`, `unwrap()`, `expect()`, `unreachable!()` all banned
+    //! crate-wide. Fixture construction uses the `assert!(is_some) +
+    //! unwrap_or(fallback)` idiom where needed; `nz()` asserts on
+    //! `0` before falling back to `MIN`. SchemaRef fixtures use
+    //! `SchemaRef::dead_for_test()` as the test-only sentinel.
+    //!
+    //! # Coverage
+    //!
+    //! Every ProtoState variant appears once. Adding a new variant
+    //! requires updating `push_class` (build failure if forgotten)
+    //! AND this test (the new variant needs an explicit assertion).
+    //! The combination closes both halves: "every variant is
+    //! classified" AND "every variant has the CORRECT classification."
+
+    use super::*;
+    use crate::error::{BoundedStr, ErrorKind};
+    use crate::password::Password;
+    use crate::reply_id::ReplyId;
+    use crate::scram::types::SecretDigest;
+    use crate::sensitive::Sensitive;
+    use core::num::NonZeroU64;
+
+    fn nz(n: u64) -> NonZeroU64 {
+        // DEF-145: assert on 0, forbid-bundle-safe fallback.
+        assert!(n > 0, "nz(0) is a test bug — use nz(1..) for non-zero test correlators");
+        NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
+    }
+
+    /// Consume the ReplyId carried by a state so Drop-guard doesn't
+    /// trip at scope end. Delegates to `take_inflight_reply_raw_id`.
+    fn consume_state(state: ProtoState) {
+        match state.take_inflight_reply_raw_id() {
+            Some(_) | None => {}
+        }
+    }
+
+    // Helper: classify + consume + return the class the test expects.
+    // The `expected` argument is checked against `state.push_class()`;
+    // `state` is then consumed via `consume_state`.
+    fn pin(state: ProtoState, expected: StatePushClass) {
+        let actual = state.push_class();
+        assert_eq!(
+            actual, expected,
+            "push_class classification drift: {state:?} expected {expected:?}, got {actual:?}",
+        );
+        consume_state(state);
+    }
+
+    /// Invariant (tier-1 shield for DEF-146): every ProtoState variant
+    /// maps to exactly the StatePushClass declared here.
+    #[test]
+    fn every_variant_pinned() {
+        // ─── Idle ───
+        pin(ProtoState::Idle, StatePushClass::Idle);
+
+        // ─── PingAwaiting ───
+        pin(
+            ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(1_001))),
+            StatePushClass::PingAwaiting,
+        );
+
+        // ─── Connecting* (7 variants) ───
+        pin(
+            ProtoState::ConnectingStartupTrust {
+                reply: ReplyId::from_raw(nz(2_001)),
+            },
+            StatePushClass::Connecting,
+        );
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+            pin(
+                ProtoState::ConnectingStartupScram {
+                    reply: ReplyId::from_raw(nz(2_002)),
+                    scram,
+                },
+                StatePushClass::Connecting,
+            );
+        }
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+            pin(
+                ProtoState::ConnectingScramAwaitingServerFirst {
+                    reply: ReplyId::from_raw(nz(2_003)),
+                    scram,
+                    client_first_bare: crate::ident::PodBytes::new(),
+                    client_nonce_b64: crate::ident::PodBytes::new(),
+                },
+                StatePushClass::Connecting,
+            );
+        }
+        pin(
+            ProtoState::ConnectingScramAwaitingServerFinal {
+                reply: ReplyId::from_raw(nz(2_004)),
+                expected_server_sig: SecretDigest::new([0_u8; 32]),
+            },
+            StatePushClass::Connecting,
+        );
+        pin(
+            ProtoState::ConnectingScramAwaitingAuthOk(ReplyId::from_raw(nz(2_005))),
+            StatePushClass::Connecting,
+        );
+        pin(
+            ProtoState::ConnectingPostAuthAwaitingKey(ReplyId::from_raw(nz(2_006))),
+            StatePushClass::Connecting,
+        );
+        pin(
+            ProtoState::ConnectingPostAuthHaveKey {
+                reply: ReplyId::from_raw(nz(2_007)),
+                pid: 1,
+                secret_key: 1,
+            },
+            StatePushClass::Connecting,
+        );
+
+        // ─── SimpleQuery* (4 variants — incl. DrainRfqAfterError) ───
+        pin(
+            ProtoState::SimpleQueryAwaitingFirstResponse(ReplyId::from_raw(nz(3_001))),
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::SimpleQueryStreamingRows {
+                reply: ReplyId::from_raw(nz(3_002)),
+                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+            },
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::SimpleQueryAwaitingRfq {
+                reply: ReplyId::from_raw(nz(3_003)),
+                command_tag: BoundedStr::default(),
+                schema_ref: None,
+            },
+            StatePushClass::BusyQuery,
+        );
+        pin(ProtoState::DrainRfqAfterError, StatePushClass::BusyQuery);
+
+        // ─── Parse* (2 variants) ───
+        pin(
+            ProtoState::ParseAwaitingParseComplete(ReplyId::from_raw(nz(4_001))),
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::ParseAwaitingRfq(ReplyId::from_raw(nz(4_002))),
+            StatePushClass::BusyQuery,
+        );
+
+        // ─── BindExecute* (7 variants: 3 DML + 4 SELECT) ───
+        pin(
+            ProtoState::BindExecuteAwaitingBindCompleteDml(ReplyId::from_raw(nz(5_001))),
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::BindExecuteAwaitingCommandCompleteDml(ReplyId::from_raw(nz(5_002))),
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::BindExecuteAwaitingRfqDml {
+                reply: ReplyId::from_raw(nz(5_003)),
+                command_tag: BoundedStr::default(),
+            },
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::BindExecuteAwaitingBindCompleteSelect {
+                reply: ReplyId::from_raw(nz(5_004)),
+                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+            },
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect {
+                reply: ReplyId::from_raw(nz(5_005)),
+                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+            },
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::BindExecuteStreamingRows {
+                reply: ReplyId::from_raw(nz(5_006)),
+                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+            },
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::BindExecuteAwaitingRfqSelect {
+                reply: ReplyId::from_raw(nz(5_007)),
+                command_tag: BoundedStr::default(),
+                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+            },
+            StatePushClass::BusyQuery,
+        );
+
+        // ─── Describe* (5 variants: 3 Statement + 2 Portal) ───
+        pin(
+            ProtoState::DescribeStatementAwaitingParamDesc(ReplyId::from_raw(nz(6_001))),
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::DescribeStatementAwaitingRowDescOrNoData {
+                reply: ReplyId::from_raw(nz(6_002)),
+                param_oids: crate::action::ParamOids::EMPTY,
+            },
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::DescribeStatementAwaitingRfq {
+                reply: ReplyId::from_raw(nz(6_003)),
+                param_oids: crate::action::ParamOids::EMPTY,
+                rows: DescribedRowsRef::NoData,
+            },
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::DescribePortalAwaitingRowDescOrNoData(ReplyId::from_raw(nz(6_004))),
+            StatePushClass::BusyQuery,
+        );
+        pin(
+            ProtoState::DescribePortalAwaitingRfq {
+                reply: ReplyId::from_raw(nz(6_005)),
+                rows: DescribedRowsRef::NoData,
+            },
+            StatePushClass::BusyQuery,
+        );
+
+        // ─── Errored ───
+        let errored_kind = StateErrorKind::from_kind_or_internal(ErrorKind::Framing);
+        pin(
+            ProtoState::Errored(errored_kind),
+            StatePushClass::Errored(errored_kind),
+        );
+    }
+}
