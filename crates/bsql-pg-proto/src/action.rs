@@ -819,11 +819,19 @@ impl StagedReply {
     /// construct these staged payloads allocate the slot immediately
     /// before the StagedReply is queued, and the slot stays live
     /// through materialise. A stale `schema_ref` (slot freed
-    /// prematurely) is a crate-internal bug; `get` returns `None`
-    /// which the conversion maps to `Option::None` / `NoData` —
-    /// silently substituting absence. This is tier-3 "crate bug =
-    /// degraded diagnostic" and is called out in the arena module's
-    /// alloc/free discipline docstring.
+    /// prematurely) is a crate-internal bug.
+    ///
+    /// Tier classification (post-DEF-170, DEF-183 P1-C):
+    /// - **Tier-2 structural runtime** in debug/test via
+    ///   `debug_assert!(d.is_some(), ...)` — the shield fires loud
+    ///   on any stale ref that slips past architectural invariants.
+    /// - **Tier-4 silent fallback** in release — `get` returns
+    ///   `None` which the conversion maps to `Option::None` /
+    ///   `NoData` (forbid-bundle bans `panic!` in release user code,
+    ///   so this is the tightest non-witness closure).
+    /// - **Tier-1 compile-time** closure of the class is scheduled
+    ///   in DEF-154 (D) — stale-ref compile elimination via
+    ///   buffer-witness-with-brand + ArenaReader (C shipped).
     #[inline]
     pub(crate) fn into_public<'r>(
         self,

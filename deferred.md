@@ -3017,3 +3017,46 @@ DEF-154 (B) buffer-witness-with-brand.
 comments (DEF-171 deleted the field but two size-bucket comments
 still mentioned it). Corrected to reflect post-DEF-171 reality
 (SchemaSlab ~520 B, PgProtocol ~6272 B DEF-119 baseline preserved).
+
+### DEF-183 — Senior audit follow-up (P1-A/B/C + P2-A/B) — SHIPPED
+
+**Shipped** 2026-04-22 (same session as DEF-154 (C) + DEF-182).
+
+Independent `Senior` agent audit of the DEF-154 (C) + DEF-181 +
+DEF-182 commits returned P0: Nothing material; P1: 3 findings;
+P2: 2 actionable findings + 2 no-action. All 5 actionable items
+shipped:
+
+- **P1-A.** `push_bind_execute` at `protocol.rs:397` bypassed the
+  DEF-154 (C) writer witness — `self.schema_arena.alloc(desc)`
+  direct call asymmetric with dispatch's `ArenaWriter` routing.
+  Fix: route via `self.schema_arena.as_writer().alloc(desc)`. Zero
+  semantic change; closes the asymmetric drift surface where a
+  future refactor that moves the alloc logic would inherit unfettered
+  SchemaSlab access.
+- **P1-B.** `reader_witness_is_copy` test pins Copy behaviourally
+  (move-after-use produces a compile error) but not at the *trait*
+  level. Fix: add `const _: fn() = || { const fn _assert_copy<T:
+  Copy>() {} _assert_copy::<ArenaReader<'_>>(); };` — a trait-
+  bound Copy assertion that fails with a clear error if a future
+  refactor adds a non-Copy field.
+- **P1-C.** `StagedReply::into_public` docstring called the stale-
+  ref class "tier-3 crate bug = degraded diagnostic", but DEF-170
+  already lifted the class to tier-2 via debug_assert shields 25
+  lines below. Fix: rewrite the tier classification section to
+  reflect post-DEF-170 reality (tier-2 debug/test, tier-4 release
+  fallback, tier-1 compile closure scheduled in DEF-154 (D)).
+- **P2-A.** DEF-181 cfg-fix docstring on `occupied_count` asserted
+  LLVM DCE but didn't name the call site, making the argument
+  fragile against future call-site additions. Fix: name the caller
+  (`PgProtocol::clear_arena_if_idle_or_errored`) and add an
+  explicit "Adding callers" advisory.
+- **P2-B.** Drift-pin docstrings for `ArenaReader` /
+  `ArenaWriter` sizes correct but terse. Fix: explain why `&SchemaSlab`
+  is always thin (SchemaSlab is Sized; future `dyn Trait` conversion
+  would trip the pin first).
+
+No-action items: P2-C (DEF-182 site coverage complete — 3 hot-path
+sites shielded; `dispatch.rs:1572` + `decode.rs:621` reachable-by-
+design, not DEF-182 candidates) and P2-D (no codegen regression —
+release build passes, wrappers are `#[inline]` + single-field).

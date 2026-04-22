@@ -394,8 +394,18 @@ impl PgProtocol {
         // state machine. The owned RowDesc goes into the arena slab;
         // state + actions carry 1-byte handles. `None` means DML
         // path (no schema) → no alloc.
+        //
+        // DEF-183 (P1-A from Senior audit): routed through
+        // `as_writer()` witness for consistency with dispatch()'s
+        // alloc path. Same narrowed API — `alloc` only, no `get`/
+        // `clear`/`free` — so a future refactor that moves this
+        // logic into a helper inherits the tier-2 narrowing
+        // automatically. The writer borrow ends at the last use
+        // (this assignment) under NLL; subsequent
+        // `core::mem::take(&mut self.state)` sees an un-borrowed
+        // self.schema_arena.
         let schema_ref = match row_desc {
-            Some(desc) => self.schema_arena.alloc(desc),
+            Some(desc) => self.schema_arena.as_writer().alloc(desc),
             None => None,
         };
         let mut staged = StagedActions::new();

@@ -442,11 +442,20 @@ impl SchemaSlab {
     /// which released builds type-check-failed because `debug_assert_eq!`
     /// expands to `if cfg!(debug_assertions) { assert_eq!(args) }` —
     /// the `args` still need to typecheck in release, and a cfg-gated-
-    /// out method is not in scope. Post-DEF-154 (C) the fn is always
-    /// present; LLVM's dead-code elimination removes the single
-    /// release-unused call site (the DEF-152 debug_assert_eq probe
+    /// out method is not in scope. Post-DEF-154 (C)/DEF-181 the fn is
+    /// always present; LLVM's dead-code elimination removes the
+    /// single release-unused call site (the DEF-152 debug_assert_eq
+    /// probe inside [`crate::protocol::PgProtocol::clear_arena_if_idle_or_errored`]
     /// optimises to nothing, so the counted result is unused → call
     /// is DCE'd). Net: same release-mode cost, compiles cleanly.
+    ///
+    /// # Adding callers
+    ///
+    /// A future caller OUTSIDE a `debug_assert*!` context would make
+    /// the call non-DCE'd — still correct (the fn is side-effect-free,
+    /// ~6 cycles on the 2-slot arena) but the DCE-cost argument
+    /// above no longer applies. Either extend this docstring or
+    /// ensure the new caller is also debug-only.
     #[inline]
     #[must_use]
     pub(crate) fn occupied_count(&self) -> u8 {
@@ -599,20 +608,35 @@ const _: () = assert!(
 
 // DEF-154 (C) drift pins: the witness wrappers must stay
 // pointer-sized. `ArenaReader<'r>` wraps `&'r SchemaSlab` (a thin
-// reference — SchemaSlab is not a DST); `ArenaWriter<'a>` wraps
-// `&'a mut SchemaSlab`. On all supported targets both collapse to
-// one usize. A future refactor that adds generation / brand fields
-// to either wrapper would trip these pins — at which point the
-// materialise / dispatch call sites need perf-impact review before
-// lifting the bound.
+// reference — `SchemaSlab` is `Sized`, so the reference has no
+// metadata on any supported target); `ArenaWriter<'a>` wraps
+// `&'a mut SchemaSlab` (also thin for the same reason). On all
+// supported targets both collapse to one usize. A future refactor
+// that adds generation / brand fields — or (hypothetically)
+// switches to `dyn Trait` storage that would force a fat reference
+// — would trip these pins first, forcing a perf-impact review at
+// the materialise / dispatch call sites before lifting.
 const _: () = assert!(
     core::mem::size_of::<ArenaReader<'_>>() == core::mem::size_of::<usize>(),
-    "ArenaReader must stay pointer-sized (thin &SchemaSlab wrapper).",
+    "ArenaReader must stay pointer-sized (thin &SchemaSlab wrapper; SchemaSlab is Sized).",
 );
 const _: () = assert!(
     core::mem::size_of::<ArenaWriter<'_>>() == core::mem::size_of::<usize>(),
-    "ArenaWriter must stay pointer-sized (thin &mut SchemaSlab wrapper).",
+    "ArenaWriter must stay pointer-sized (thin &mut SchemaSlab wrapper; SchemaSlab is Sized).",
 );
+
+// DEF-183 (P1-B from Senior audit): compile-time Copy pin for
+// ArenaReader. The `reader_witness_is_copy` test below pins Copy
+// behaviourally (assignment without move); this const check pins
+// Copy at the *trait* level. A future refactor that adds a
+// non-Copy field (e.g., a generative-brand `PhantomData<fn(&'a ())
+// -> &'a ()>` — still Copy, fine — but a real non-Copy payload)
+// would fail compilation here with a clear trait-bound error, not
+// a confusing move-after-use error at the behavioural test site.
+const _: fn() = || {
+    const fn _assert_copy<T: Copy>() {}
+    _assert_copy::<ArenaReader<'_>>();
+};
 
 #[cfg(test)]
 mod tests {
