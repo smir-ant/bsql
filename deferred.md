@@ -2786,3 +2786,134 @@ tier-1 gates on discipline invariants, witness infrastructure
 for pipelining, arena shape final for pipelined flows,
 measurement infra in place to validate CONSIDER-bucket items
 with evidence.
+
+## 25. Phase α (executed 2026-04-22) — Phase α2 (second-audit close)
+
+### Phase α shipped (commits `1e8bb0a`..`55fe7b8`)
+
+Ten DEFs from §24 Phase α landed in a single session:
+
+| DEF | Commit | Item |
+|-----|--------|------|
+| DEF-144 | `1e8bb0a` | parse_header: dropped dead `NonZeroU32::new` branch |
+| DEF-145 | `734a64c` | nz/raw test helpers: `assert!(n > 0)` + comment |
+| DEF-146 | `55fe7b8` | `StatePushClass` classifier (7× or-pattern collapse) |
+| DEF-147 | `f65f280` | `FrameCoords` + `NonEmptyRange` u16 narrowing |
+| DEF-148 + DEF-152 | `6537cc9` | `SchemaRef` final shape (NonZeroU8 + u8 gen + has_any + debug probes) |
+| DEF-149 | `0ba97f9` | `replace_state_errored_and_drain` atomic helper |
+| DEF-150 | `dd76cc6` | `InternalCrateBug { locus }` merge + `SchemaArenaAllocFull` |
+| DEF-151 | `768601c` | Tight-range size asserts (lib.rs) |
+| DEF-153 | `22755d7` | `SessionParams.n_malformed_bool_dropped` counter |
+
+### Phase α2 — second-pass audit follow-up (commits `0f152c9`..`5810661`)
+
+Second `rust-senior-architect` pass (`audit2.txt`) found 39 findings
+post Phase α landing, including 2 P0 items from my own DEF-149 /
+DEF-148 refactors that were half-applied. Shipped in Phase α2:
+
+| DEF | Commit | Item |
+|-----|--------|------|
+| DEF-168 + DEF-175 | `0f152c9` | feed_bytes dispatch-Errored arm: route through `replace_state_errored_and_drain` helper (closes DEF-149's atomicity claim) + explicit `debug_assert` on `StateErrorKind::try_from_kind` None branch (closes silent `unwrap_or(INTERNAL_FALLBACK)` shield) |
+| DEF-169 | `60c3cdd` | `push_class` per-variant test module (27 variants × 1 assertion each) — category-1 shield for DEF-146's new classifier |
+| DEF-170 | `2e841fa` | debug_assert shields at 3 stale-SchemaRef materialise sites (protocol.rs + 2× action.rs) — bridge to DEF-154 full structural closure |
+| DEF-171 | `784c603` | Delete `has_any: bool` from SchemaSlab — derived-state fallback with silent-corruption failure mode; 2-slot walk equivalent codegen |
+| DEF-172 | `0d35985` | `clear_arena_if_idle_or_errored` helper (collapse 3× duplication across entry points) |
+| DEF-174 | `c17fd4b` | `FrameCoords::new` eliminate u16→usize→u16 identity round-trip + delete dead `.get()` accessors on 3 newtypes |
+| DEF-176 | `092fc1a` | `ProtocolError::state_kind()` helper composing `kind() + try_from_kind` — closes the pair |
+| DEF-177 | `ac39d55` | Cold helpers: `fail_read_cursor_advance` (4 sites in feed_bytes) + `internal_bug` (4 sites in dispatch) |
+| DEF-173 | `15cefbb` | `CrateBugLocus` dedicated `Display` impl + 5 operator-string pin tests |
+| DEF-178 | `d117dec` | Polish bundle (6 XS items: `#[inline]` on push_class, `const fn` dead_for_test, docs for derived-state coupling, etc.) |
+| DEF-179 | `fb7dbcd` | 1c-5 pipelining blocker markers at 4 sites (WORST_CASE_PER_DISPATCH, take_inflight_reply_raw_id, fail_inflight_and_close, clear_arena helper) |
+| DEF-180 | `5810661` | Delete `generation_wraps_around_at_256_cycles` test — architecturally-dead scenario documented with honest rationale on the `generations` field |
+
+Net Phase α + α2 impact:
+- Tests: 188 → 203 (+15).
+- Clippy: clean throughout.
+- Closed silent-corruption / silent-shield classes: A001 (wrong error variant), A005 (nz(0) coerce), A003 (malformed bool drop), A007 (Ping-loop memset waste), A001 (diagnostic misdirection), A010 stale-ref silent EMPTY (debug-time), A012 INTERNAL_FALLBACK silent, A002 has_any derived-state drift, dead `.get()` accessors, dead NonZeroU32 branch, dead `generation_wraps_around_at_256_cycles` test.
+- Tier lifts: DEF-146 classifier (7×1), DEF-148 generation + NonZeroU8, DEF-149 + DEF-168 atomic-terminus helper, DEF-150 InternalCrateBug merge, DEF-171 derived-state elimination, DEF-174 type-round-trip elimination, DEF-176 match-pair consolidation.
+- Code shrinkage: net −274 +99 in protocol.rs (DEF-146), deletion of 3 dead `.get()` accessors, deletion of 1 dead test.
+
+### DEF-180 follow-on decision (deferred)
+
+The `u8 generation` counter is retained as defence-in-depth for
+(a) crate bugs that might leak a SchemaRef beyond its architectural
+lifetime, (b) 1c-5 pipelining where concurrent inflight refs make
+the stale-ref class real. Under current single-inflight the wrap
+is architecturally unreachable (no SchemaRef can be live when
+`clear()` runs, per DEF-180 commit's trace analysis).
+
+**Potential future lift: `u8 generation → u16`.** Not done
+preemptively because:
+1. Under current flow the u8 horizon is architecturally-dead wide.
+2. Widening preemptively is "growing a fallback for a null-class
+   of bugs" — wrong direction under user's "минимизировать
+   fallback" philosophy (user directive 2026-04-22).
+3. Real pipelining collision analysis needs evidence — at H021
+   witness-guard session, the actual concurrency shape will
+   inform whether u8 is too tight or overprovisioned.
+
+**Decision point:** defer the u8 vs u16 choice to the **H021
+witness-guard architect session** (pre-1c-5), where pipelining's
+concurrency shape will be designed and the collision-window
+analysis can be made with evidence, not preemptively. If u16
+turns out needed, lift at that time; otherwise u8 stays.
+
+### Remaining audit2 items — re-classified
+
+- **A008** (u8 → u16 generation): **deferred to H021** per above.
+- **A018** (OutActions 2.5 KB eager sentinel fill): **architectural
+  limit of forbid-bundle** (MaybeUninit / unsafe banned). Not
+  "deferred" — not closable without relaxing forbid. Documented
+  in-situ.
+- **A026** (DispatchOutcome 320 B move per dispatch): **bench-gated
+  by DEF-143**. Refactor cost is 60+ dispatch arm updates; needs
+  measured evidence of gain before committing.
+- **A013** (split SimpleQueryAwaitingRfq Dml/Select): **bundled
+  with DEF-157** (ProtoState sum-of-subsums, already deferred to
+  post-1c-4). Avoid duplicate work.
+
+## 26. Phase γ — witness pattern (in progress)
+
+Next architectural piece: **DEF-154 buffer-witness pattern** (big
+refactor, subsumes DEF-141). Shipping incrementally:
+
+### DEF-154 (A) — infallible builders via capacity witness (subsumes DEF-141)
+
+**Goal.** Eliminate the `Result<NonEmptyRange, WriteBufFull>` return
+shape on all 6 `build_*_message` functions. Replace with infallible
+`NonEmptyRange` return guaranteed by type-level capacity proof.
+
+**Mechanism.** Introduce `WriteReserved<'a>` token — constructible
+only via `WriteBuf::reserve()` after `clear()` — guaranteeing
+`MAX_OWNED_SEND_LEN` free capacity. Builders take `WriteReserved`
+and return `NonEmptyRange` directly. Internal push methods on
+`WriteReserved` shield the architecturally-dead overflow branch
+via `debug_assert!` (release keeps the fallback, debug fires loud
+on invariant break).
+
+**Closed seams:**
+- 6 dead `Err(WriteBufFull)` arms at compute_push_* call sites.
+- `frame_build_unreachable` helper → DELETED.
+- `CrateBugLocus::OutboundFrameBuild { stage }` variant → DELETED.
+- `FrameBuildStage` enum → DELETED (only used by OutboundFrameBuild).
+- Tier-3 const-assert-guarded dead Err paths → tier-2 structural
+  (type-system-enforced capacity).
+
+### DEF-154 (B) — NonEmptyRange lifetime binding
+
+Scheduled after (A). Binds `NonEmptyRange<'buf>` to the specific
+buffer's lifetime; `apply(buf)` becomes infallible via the
+lifetime proving the buffer match. Closes A008, A009 arch side,
+C015.
+
+### DEF-154 (C) — ArenaReader / ArenaWriter witness tokens
+
+Scheduled after (A) + (B). Tokens tie dispatch's alloc permission
+and materialise's read permission to separate types. C005 arena
+discipline tier lift.
+
+### DEF-154 (D) — stale-ref compile elimination
+
+Scheduled after (B) + (C). Combines buffer-witness + arena-witness
+to make stale SchemaRef detection compile-time (upgrade DEF-170
+debug_asserts from runtime-check to type-system-impossible).
