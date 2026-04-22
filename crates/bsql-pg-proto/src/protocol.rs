@@ -3152,4 +3152,95 @@ mod compute_push_tests {
             consume_state(new_state);
         }
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // DEF-154 (B) Phase B4-W P0-3 + P2 — ParamsWriterOverflow
+    // classified-Err end-to-end routing test
+    // ═════════════════════════════════════════════════════════════
+
+    /// A user-space `ParamsWriter` that always returns
+    /// `Err(WriteBufFull)` — simulating a buggy / adversarial impl
+    /// whose `write_params` overflows its advertised budget.
+    /// Exercises the classified-Err path: `build_bind_message` →
+    /// `CrateBugLocus::ParamsWriterOverflow` →
+    /// `try_builder!` macro → `FailReply + CloseSocket + Errored`.
+    ///
+    /// Pre-P0-3 the `Err` was silently discarded with
+    /// `debug_assert!(false, …)`, shipping a truncated Bind frame
+    /// with miscomputed length prefix in release — tier-4 silent
+    /// wire-level corruption. This test pins the classified
+    /// routing end-to-end: a failing ParamsWriter MUST produce
+    /// `Action::FailReply` + `Action::CloseSocket`, NOT a broken
+    /// Bind/Execute/Sync triplet.
+    #[test]
+    fn bind_execute_params_overflow_routes_to_classified_failreply() {
+        use crate::action::Action;
+        use crate::error::{CrateBugLocus, ProtocolError};
+        use crate::params::OverflowParams;
+
+        let mut proto = PgProtocol::new();
+        let mut wb = WriteBuf::new();
+        // Drive through a trivial startup so push_bind_execute
+        // routes through the Idle-state arm (without a startup the
+        // state is pre-handshake and Bind would fail-route as
+        // "StartupAlreadyInProgress" — the wrong code path).
+        //
+        // PgProtocol::new() starts in ProtoState::Idle per
+        // tests/bind_execute_spec.rs precedent (bind_execute_spec
+        // line 126 calls push_bind_execute immediately after
+        // PgProtocol::new() and hits the Idle arm). No handshake
+        // drive needed.
+        let reply_raw = nz(999);
+        let out = proto.push_bind_execute(
+            &crate::ident::PortalName::default(),
+            &crate::ident::StmtName::default(),
+            &OverflowParams,
+            None, // No row_desc; DML-style path
+            crate::FetchRows::All,
+            ReplyId::from_raw(reply_raw),
+            &mut wb,
+        );
+
+        // Classified Err routing expects exactly TWO actions:
+        // FailReply + CloseSocket. Pre-P0-3 this would have been
+        // THREE: Bind (truncated) + Execute + Sync.
+        assert_eq!(
+            out.len(),
+            2,
+            "ParamsWriter Err must route to FailReply + CloseSocket (2 actions), \
+             NOT the 3-action Bind+Execute+Sync bundle. Pre-P0-3 silent \
+             corruption would give the latter.",
+        );
+
+        // `matches!` with `if` guard — forbid-bundle bans
+        // `assert!(false, …)` / `panic!` in tests, so pattern
+        // matching is converted to a bool and asserted.
+        let matches_expected = matches!(
+            out.as_slice(),
+            [
+                Action::FailReply {
+                    id,
+                    cause: ProtocolError::InternalCrateBug {
+                        locus: CrateBugLocus::ParamsWriterOverflow,
+                    },
+                },
+                Action::CloseSocket,
+            ] if *id == reply_raw
+        );
+        assert!(
+            matches_expected,
+            "expected [FailReply(reply_raw, ParamsWriterOverflow), CloseSocket]; \
+             out = {:?}",
+            out.as_slice(),
+        );
+
+        // State must have transitioned to Errored — the connection
+        // is terminal per the usual InternalCrateBug discipline.
+        assert!(
+            matches!(proto.state(), ProtoState::Errored(_)),
+            "ParamsWriterOverflow triggers terminal Errored state, \
+             not a recoverable preserved-state path. Got: {:?}",
+            proto.state(),
+        );
+    }
 }

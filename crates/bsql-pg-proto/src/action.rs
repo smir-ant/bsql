@@ -589,6 +589,53 @@ mod phase_b3_tests {
         });
         assert_eq!(byte, b'X');
     }
+
+    /// DEF-154 (B) Phase B4-W P0-2 + P2 closure: exercise the
+    /// classified Err path of `WriteRange::from_branded_write_span`.
+    ///
+    /// `NonEmptyRange::new(start, end, bounds)` returns `None` iff
+    /// `end <= start` OR `end > bounds`. Post-builder,
+    /// `end = reserved.len()` = `bounds`. So the only way to force
+    /// None is `start >= reserved.len()` — simulating a builder
+    /// that captured `start` post-push, skipped pushes, or
+    /// overflowed the usize into the end field (all genuine
+    /// builder-drift scenarios).
+    ///
+    /// The test forces `start > reserved.len()` by calling
+    /// `from_branded_write_span(10, ...)` on a fresh (empty)
+    /// reserved. Err path fires with
+    /// `CrateBugLocus::EmptyWriteRange` — pre-P0-2 this silently
+    /// returned `WriteRange(DEAD_FALLBACK)`, a tier-4 0-byte
+    /// Action::SendBytes on apply.
+    #[test]
+    fn from_branded_write_span_err_classified_as_empty_write_range() {
+        let mut buf = crate::write_buf::WriteBuf::new();
+        // The `Result<WriteRange<'brand>, _>` itself cannot escape
+        // the branded closure — `'brand` is HRTB-fresh and
+        // invariant. Inside the closure, observe the Err variant
+        // and return a brand-free discriminant (`true` iff
+        // classified as EmptyWriteRange). This also doubles as a
+        // *generativity smoke test*: if `WriteRange<'brand>` could
+        // escape, the test would fail to compile.
+        let is_empty_write_range = buf.with_branded(|mut wb| {
+            let reserved = wb.reserve();
+            // reserved.len() == 0 (fresh). start=10 > 0 forces
+            // NonEmptyRange::new None → EmptyWriteRange.
+            let result = WriteRange::from_branded_write_span(10, &reserved);
+            matches!(
+                result,
+                Err(crate::error::ProtocolError::InternalCrateBug {
+                    locus: crate::error::CrateBugLocus::EmptyWriteRange,
+                })
+            )
+        });
+        assert!(
+            is_empty_write_range,
+            "from_branded_write_span must return Err(EmptyWriteRange) when \
+             start > reserved.len() — pre-P0-2 this silently fell back to \
+             DEAD_FALLBACK (tier-4 0-byte Action::SendBytes).",
+        );
+    }
 }
 
 /// Bounded list of actions emitted by a single protocol entry-point
