@@ -2021,20 +2021,36 @@ fn materialise<'w, 'r>(
             // `&mut self.read_buf` calls on PgProtocol until the
             // caller drops the returned actions.
             //
-            // DEF-119: `schema_ref` is a 1-byte arena handle. We
-            // resolve via `arena.get(ref)` to a `&'r RowDesc`. The
-            // resolution `None` branch is architecturally dead —
-            // alloc happens in dispatch at the same moment the
-            // state variant is entered that the staged action was
-            // constructed from, so the slot is live. `unwrap_or`
-            // falls back to `RowDesc::EMPTY` to avoid any panic;
-            // callers that see `desc.is_empty()` in place of real
-            // columns are observing a crate bug.
-            StagedAction::StreamRowRange { id, row_range, schema_ref } => Action::StreamRow {
-                id,
-                row_bytes: row_range.apply(read_buf_bytes).unwrap_or(&[]),
-                desc: arena.get(schema_ref).unwrap_or(&crate::decode::RowDesc::EMPTY),
-            },
+            // DEF-119: `schema_ref` is a 2-byte arena handle
+            // (post-DEF-148 NonZeroU8 + generation). We resolve via
+            // `arena.get(ref)` to a `&'r RowDesc`. The resolution
+            // `None` branch is architecturally dead — alloc happens
+            // in dispatch at the same moment the state variant is
+            // entered that the staged action was constructed from,
+            // so the slot is live.
+            //
+            // DEF-170 (audit2 A010): debug_assert shields the dead
+            // None branch loudly in tests. DEF-150 reserved
+            // `CrateBugLocus::StaleSchemaRef` for the full structural
+            // classification; DEF-154 (buffer-witness) will
+            // eliminate the class entirely by making the resolution
+            // compile-enforced. Until then: debug-time loud, release
+            // falls back to `RowDesc::EMPTY` — forbid-bundle bans
+            // `panic!` so this is the tightest non-witness closure.
+            StagedAction::StreamRowRange { id, row_range, schema_ref } => {
+                let desc_opt = arena.get(schema_ref);
+                debug_assert!(
+                    desc_opt.is_some(),
+                    "DEF-170: stale SchemaRef at materialise (StreamRowRange) — \
+                     crate bug; DEF-154 witness-pattern will eliminate \
+                     this class structurally.",
+                );
+                Action::StreamRow {
+                    id,
+                    row_bytes: row_range.apply(read_buf_bytes).unwrap_or(&[]),
+                    desc: desc_opt.unwrap_or(&crate::decode::RowDesc::EMPTY),
+                }
+            }
             StagedAction::CloseSocket => Action::CloseSocket,
         };
         // `staged` and `out` share `MAX_ACTIONS_PER_CALL` as their

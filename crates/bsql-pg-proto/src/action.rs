@@ -803,7 +803,23 @@ impl StagedReply {
             Self::QueryComplete(staged) => Reply::QueryComplete(QueryCompletePayload {
                 command_tag: staged.command_tag,
                 tx_status: staged.tx_status,
-                row_desc: staged.schema_ref.and_then(|r| arena.get(r)),
+                // DEF-170 (audit2 A010): stale SchemaRef → silent
+                // `None` was the pre-DEF-170 behaviour, corrupting
+                // SELECT→DML classification at the user boundary.
+                // Debug build now fires loud on stale refs; release
+                // preserves the `None` fallback (forbid-bundle bans
+                // panic). DEF-154 witness-pattern will eliminate the
+                // stale class structurally.
+                row_desc: staged.schema_ref.and_then(|r| {
+                    let d = arena.get(r);
+                    debug_assert!(
+                        d.is_some(),
+                        "DEF-170: stale SchemaRef at QueryComplete materialise \
+                         — crate bug; DEF-154 witness-pattern will eliminate \
+                         this class structurally.",
+                    );
+                    d
+                }),
             }),
             Self::ParseComplete(p) => Reply::ParseComplete(p),
             Self::CloseComplete(p) => Reply::CloseComplete(p),
@@ -826,8 +842,14 @@ impl StagedReply {
 
 /// Convert state-side [`crate::state::DescribedRowsRef`] to the
 /// public [`DescribedRows<'r>`] by resolving any `SchemaRef` into a
-/// borrow. Stale ref (crate bug) maps to `NoData` silently —
-/// safer than producing a dangling reference.
+/// borrow.
+///
+/// DEF-170 (audit2 A010): stale `Rows(ref)` → silent `NoData` was
+/// the pre-DEF-170 behaviour, corrupting schema-bearing describe
+/// results at the user boundary. Debug build now fires loud on
+/// stale refs; release preserves the `NoData` fallback
+/// (forbid-bundle bans panic). DEF-154 witness-pattern will
+/// eliminate the stale class structurally.
 ///
 /// F8 intent markers: uses [`DescribedRows::from_row_desc`] and
 /// [`DescribedRows::no_data`] factories rather than direct variant
@@ -842,9 +864,15 @@ fn described_rows_ref_into_public<'r>(
     match r {
         crate::state::DescribedRowsRef::Rows(s) => match arena.get(s) {
             Some(desc) => DescribedRows::from_row_desc(desc),
-            // Arena slot freed early — architecturally dead. Fall back
-            // to NoData rather than dangle.
-            None => DescribedRows::no_data(),
+            None => {
+                debug_assert!(
+                    false,
+                    "DEF-170: stale SchemaRef at described_rows_ref_into_public \
+                     — crate bug; DEF-154 witness-pattern will eliminate \
+                     this class structurally.",
+                );
+                DescribedRows::no_data()
+            }
         },
         crate::state::DescribedRowsRef::NoData => DescribedRows::no_data(),
     }
