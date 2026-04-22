@@ -567,6 +567,115 @@ pub enum CrateBugLocus {
     StaleSchemaRef,
 }
 
+impl fmt::Display for CrateBugLocus {
+    /// DEF-173 (audit2 A006 + A031): dedicated Display impl for
+    /// operator-facing log output. Pre-DEF-173,
+    /// [`ProtocolError::InternalCrateBug`]'s Display used `{locus:?}`
+    /// (Debug) which renders `OutboundFrameBuild { stage: Query }`
+    /// as a Rust struct-expression — cluttered in operator logs and
+    /// fragile to a future Debug derive change.
+    ///
+    /// This impl renders each locus as a stable kebab-case tag:
+    /// - `OutboundFrameBuild { stage }` → `"outbound-frame-build:{stage:?}"`
+    /// - `ReadCursorAdvance` → `"read-cursor-advance"`
+    /// - `RowRangeConstruction` → `"row-range-construction"`
+    /// - `SchemaArenaAllocFull` → `"schema-arena-alloc-full"`
+    /// - `StaleSchemaRef` → `"stale-schema-ref"`
+    ///
+    /// Test module `crate_bug_locus_display_tests` pins each string
+    /// literal — a future variant rename cannot silently change
+    /// operator logs without tripping the test.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutboundFrameBuild { stage } => {
+                write!(f, "outbound-frame-build:{stage:?}")
+            }
+            Self::ReadCursorAdvance => f.write_str("read-cursor-advance"),
+            Self::RowRangeConstruction => f.write_str("row-range-construction"),
+            Self::SchemaArenaAllocFull => f.write_str("schema-arena-alloc-full"),
+            Self::StaleSchemaRef => f.write_str("stale-schema-ref"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod crate_bug_locus_display_tests {
+    //! DEF-173 pin: each [`CrateBugLocus`] variant renders to its
+    //! canonical operator-facing string. A rename or Debug-derive
+    //! refactor that breaks the rendering will trip these tests
+    //! loudly instead of silently corrupting production log output.
+
+    use super::*;
+    extern crate alloc;
+    use alloc::format;
+
+    #[test]
+    fn read_cursor_advance_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::ReadCursorAdvance,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus read-cursor-advance",
+        );
+    }
+
+    #[test]
+    fn row_range_construction_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::RowRangeConstruction,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus row-range-construction",
+        );
+    }
+
+    #[test]
+    fn schema_arena_alloc_full_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::SchemaArenaAllocFull,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus schema-arena-alloc-full",
+        );
+    }
+
+    #[test]
+    fn stale_schema_ref_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::StaleSchemaRef,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus stale-schema-ref",
+        );
+    }
+
+    #[test]
+    fn outbound_frame_build_display_per_stage() {
+        for stage in [
+            FrameBuildStage::Startup,
+            FrameBuildStage::Query,
+            FrameBuildStage::Parse,
+            FrameBuildStage::Bind,
+            FrameBuildStage::Execute,
+            FrameBuildStage::Describe,
+        ] {
+            let locus = CrateBugLocus::OutboundFrameBuild { stage };
+            let e = ProtocolError::InternalCrateBug { locus };
+            // Debug rendering of stage is its variant name (derived
+            // Debug on simple enum) — pinned here so a Debug-derive
+            // change would trip this test.
+            let expected = format!(
+                "internal bsql-pg-proto bug at locus outbound-frame-build:{stage:?}",
+            );
+            assert_eq!(format!("{e}"), expected, "OutboundFrameBuild stage={stage:?}");
+        }
+    }
+}
+
 /// Which outbound frame builder failed in the const-assert-dead path.
 /// Carried by [`CrateBugLocus::OutboundFrameBuild`] for
 /// diagnostic — emission of any variant indicates a crate-internal
@@ -961,7 +1070,7 @@ impl fmt::Display for ProtocolError {
             ),
             Self::InternalCrateBug { locus } => write!(
                 f,
-                "internal bsql-pg-proto bug at locus {locus:?}",
+                "internal bsql-pg-proto bug at locus {locus}",
             ),
             Self::ConnectionAlreadyClosed { prior_kind } => {
                 write!(
