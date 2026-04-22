@@ -661,20 +661,21 @@ impl PgProtocol {
                             // debug_assert pins this architectural
                             // invariant loudly in tests; release keeps
                             // the INTERNAL_FALLBACK shield per DEF-175.
-                            let kind = cause.kind();
-                            let state_kind = match crate::error::StateErrorKind::try_from_kind(kind) {
-                                Some(k) => k,
-                                None => {
-                                    debug_assert!(
-                                        false,
-                                        "DEF-175: AlreadyClosed reached dispatch-Errored — \
-                                         impossible per DEF-142 seal (ConnectionAlreadyClosed is \
-                                         only emitted from push-path on already-Errored state, \
-                                         which short-circuits before dispatch).",
-                                    );
-                                    crate::error::StateErrorKind::INTERNAL_FALLBACK
-                                }
-                            };
+                            // DEF-175 + DEF-176: `state_kind()` composes
+                            // `kind() + try_from_kind`; returns None
+                            // only for AlreadyClosed (DEF-142-sealed out
+                            // of dispatch paths). debug_assert pins
+                            // the dead None branch.
+                            let state_kind = cause.state_kind().unwrap_or_else(|| {
+                                debug_assert!(
+                                    false,
+                                    "DEF-175: AlreadyClosed reached dispatch-Errored — \
+                                     impossible per DEF-142 seal (ConnectionAlreadyClosed is \
+                                     only emitted from push-path on already-Errored state, \
+                                     which short-circuits before dispatch).",
+                                );
+                                crate::error::StateErrorKind::INTERNAL_FALLBACK
+                            });
                             // DEF-168 (A001): route through the DEF-149
                             // atomic-terminus helper. Closes the
                             // "state-replace + read_buf.clear" pairing
@@ -853,29 +854,22 @@ impl PgProtocol {
         // `Some` here; the `unwrap_or_else` fallback is dead-safety
         // (falls back to `Internal` as the honest "crate-bug" kind
         // rather than panic — forbid-bundle bans panic).
-        let kind = cause.kind();
-        // DEF-175 (A012): explicit match + debug_assert on the
-        // architecturally-dead None branch. Pre-DEF-175 this was
-        // `unwrap_or(INTERNAL_FALLBACK)` — a silent shield that
-        // would have produced state=Internal + cause=AlreadyClosed
-        // DISAGREEMENT if the dead branch ever fired, leading to
-        // misleading operator diagnostics. Debug builds now fail
-        // loud; release preserves the fallback for forbid-bundle
-        // compliance.
-        let state_kind = match crate::error::StateErrorKind::try_from_kind(kind) {
-            Some(k) => k,
-            None => {
-                debug_assert!(
-                    false,
-                    "DEF-175: AlreadyClosed reached fail_inflight_and_close — \
-                     impossible per DEF-142 seal (ConnectionAlreadyClosed is \
-                     only emitted from push-path on already-Errored state, \
-                     which short-circuits via the `if matches!(Errored)` \
-                     early-return above).",
-                );
-                crate::error::StateErrorKind::INTERNAL_FALLBACK
-            }
-        };
+        // DEF-175 (A012) + DEF-176 (A016): `state_kind()` composes
+        // `kind() + try_from_kind`; returns None only for
+        // AlreadyClosed (DEF-142-sealed out of this path via the
+        // `if matches!(Errored)` early-return above). debug_assert
+        // pins the dead None branch loudly in tests.
+        let state_kind = cause.state_kind().unwrap_or_else(|| {
+            debug_assert!(
+                false,
+                "DEF-175: AlreadyClosed reached fail_inflight_and_close — \
+                 impossible per DEF-142 seal (ConnectionAlreadyClosed is \
+                 only emitted from push-path on already-Errored state, \
+                 which short-circuits via the `if matches!(Errored)` \
+                 early-return above).",
+            );
+            crate::error::StateErrorKind::INTERNAL_FALLBACK
+        });
         // DEF-149: `replace_state_errored_and_drain` centralises the
         // atomic "install Errored(kind) + drain inflight raw_id +
         // clear read_buf" triple. The three operations form one

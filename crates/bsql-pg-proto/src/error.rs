@@ -837,6 +837,25 @@ impl ProtocolError {
             Self::ConnectionAlreadyClosed { .. } => ErrorKind::AlreadyClosed,
         }
     }
+
+    /// DEF-176 (audit2 A016): the [`StateErrorKind`] projection of
+    /// this error's kind, or `None` if the kind is not storable in
+    /// [`crate::state::ProtoState::Errored`] (only
+    /// [`ErrorKind::AlreadyClosed`] fails this check, per DEF-142's
+    /// state-storability seal).
+    ///
+    /// Composition shortcut for the pre-DEF-176 pattern
+    ///     `StateErrorKind::try_from_kind(cause.kind())`
+    /// which required naming both APIs. The helper closes the
+    /// kind/try_from pair as "one authoritative match (kind),
+    /// projection to state-storable subset." Callers use
+    /// `cause.state_kind().unwrap_or_else(|| { debug_assert!(false,
+    /// ...); INTERNAL_FALLBACK })` (see DEF-175).
+    #[inline]
+    #[must_use]
+    pub const fn state_kind(&self) -> Option<StateErrorKind> {
+        StateErrorKind::try_from_kind(self.kind())
+    }
 }
 
 impl fmt::Display for ProtocolError {
