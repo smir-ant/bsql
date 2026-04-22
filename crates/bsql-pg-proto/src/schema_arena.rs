@@ -258,13 +258,35 @@ pub(crate) struct SchemaSlab {
     /// [`SchemaRef`] captures the current generation at alloc; any
     /// subsequent `get()` validates the counter still matches.
     ///
-    /// `u8` wraps with a 256-cycle period. A stale ref surviving
-    /// 256 full arena cycles on the same slot would collide; for
-    /// the current flow (single-inflight, arena cleared between
-    /// user-visible query boundaries) a stale ref's lifetime ends
-    /// long before the next cycle even starts, so the collision
-    /// window is architecturally dead. If 1c-5 pipelining reveals
-    /// a real collision path, promote to `u16`.
+    /// `u8` wraps at 256 cycles. Under single-inflight (pre-1c-5)
+    /// the wrap is architecturally unreachable — a SchemaRef
+    /// cannot be live when `clear()` runs:
+    ///
+    /// - SchemaRef lives only in mid-query ProtoState variants,
+    ///   transient StagedAction / StagedReply during one
+    ///   feed_bytes call, and resolved `&'r RowDesc` borrows in
+    ///   materialised OutActions.
+    /// - `clear()` is invoked only at entry-point boundaries with
+    ///   `state ∈ {Idle, Errored}`, neither of which carries a
+    ///   SchemaRef.
+    /// - The borrow checker forces OutActions's `'r` to end before
+    ///   the next `&mut self` call, so the next `clear()` sees no
+    ///   live `&'r RowDesc` either.
+    ///
+    /// The generation counter is defence-in-depth for two classes:
+    /// 1. Crate bugs that leak a SchemaRef beyond its architectural
+    ///    lifetime (currently no known path exists; catching the
+    ///    drift at arena.get() is tier-2 safety net).
+    /// 2. 1c-5 pipelining — concurrent queries each holding refs
+    ///    make the stale class real. At that point the u8 horizon
+    ///    may be too tight; audit2 A008 flagged the lift as
+    ///    deferred (revisit during H021 witness-guard session).
+    ///
+    /// DEF-180 deleted the `generation_wraps_around_at_256_cycles`
+    /// test which exercised the wrap via manual stale-ref holding —
+    /// architecturally-impossible scenario under current flow, so
+    /// the test was testing dead behaviour. Core detection path
+    /// still pinned by `stale_ref_across_clear_resolves_to_none`.
     generations: [u8; MAX_ARENA_SLOTS],
 }
 
@@ -619,46 +641,31 @@ mod tests {
         assert!(slab.get(r_after).is_some());
     }
 
-    /// DEF-148 generational wraparound: after 256 clear cycles on
-    /// the same slot, the generation wraps to 0 — a stale ref from
-    /// generation 0 would then falsely validate. This collision
-    /// window is architecturally dead in the current single-inflight
-    /// flow (stale refs don't survive across even a single clear by
-    /// design). Test documents the wraparound behaviour for future
-    /// audit.
-    #[test]
-    fn generation_wraps_around_at_256_cycles() {
-        let mut slab = SchemaSlab::new();
-        let desc = RowDesc::EMPTY;
-        let r_gen0 = must_alloc(&mut slab, desc);
-        assert_eq!(r_gen0.generation(), 0);
-
-        // 256 alloc/clear cycles to wrap the generation counter.
-        // Each iteration asserts the freshly-allocated ref resolves
-        // to live RowDesc — gives the `r` binding a meaningful use
-        // without `let _ =` (banned per user feedback).
-        for _ in 0..256 {
-            let r = must_alloc(&mut slab, desc);
-            assert!(slab.get(r).is_some(), "fresh alloc must resolve to live desc");
-            slab.clear();
-        }
-
-        // After 256 cycles, generation for slot 0 is back to 0 (u8
-        // wraparound). A fresh alloc captures generation 0 — same
-        // as r_gen0's captured generation.
-        let r_wrapped = must_alloc(&mut slab, desc);
-        assert_eq!(r_wrapped.generation(), 0, "u8 generation wraps at 256");
-
-        // Document the collision: BOTH r_gen0 and r_wrapped validate
-        // against slot 0 with generation 0. Architecturally dead in
-        // the current flow (r_gen0's lifetime ended long before the
-        // 256-cycle wrap); if 1c-5 pipelining reveals a real
-        // collision path, promote `generation` to u16.
-        assert_eq!(r_gen0.slot_idx(), r_wrapped.slot_idx());
-        assert_eq!(r_gen0.generation(), r_wrapped.generation());
-        assert!(
-            slab.get(r_gen0).is_some(),
-            "expected collision: u8 generation wraps to the same value after 256 cycles",
-        );
-    }
+    // DEF-180: the pre-DEF-180 `generation_wraps_around_at_256_cycles`
+    // test was DELETED. It exercised the u8 wrap behavior by manually
+    // holding a SchemaRef across 256 clear() calls — a scenario
+    // architecturally impossible in production code:
+    //
+    // - SchemaRef lives only in: (a) mid-query ProtoState variants,
+    //   (b) StagedAction within one feed_bytes call, (c) StagedReply
+    //   within materialise scope. In all three, its lifetime is
+    //   upper-bounded by the OutActions 'r that the borrow checker
+    //   forces to end before the next `&mut self` entry point.
+    // - `clear()` runs only when state ∈ {Idle, Errored}, neither
+    //   of which carries a SchemaRef.
+    // - Therefore: no SchemaRef can be live when clear() runs, so
+    //   the 256-cycle-wrap-while-holding-stale-ref collision cannot
+    //   materialise under intact code.
+    //
+    // The generation counter is retained as defence-in-depth for
+    // crate-bug scenarios (a refactor that somehow leaks a
+    // SchemaRef beyond its architectural lifetime) and for 1c-5
+    // pipelining prep (concurrent refs will make the stale-ref
+    // class a real possibility, at which point the u8 horizon may
+    // need widening — see A008 marker in audit2.txt).
+    //
+    // `stale_ref_across_clear_resolves_to_none` above still exercises
+    // the generation detection path (manually holding a ref across
+    // one clear() — still synthetic but it pins the core detection
+    // mechanism rather than the u8-specific wrap edge).
 }
