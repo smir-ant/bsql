@@ -975,23 +975,20 @@ pub(crate) enum StagedAction<'wb, 'r> {
     },
     /// Map to [`Action::StreamRow`] at materialise time.
     ///
-    /// DEF-154 (H): `row_bytes: &'r [u8]` is the actual row-body
-    /// slice of the inbound buffer's populated region — validated
-    /// and borrowed at dispatch time. Pre-(H) this field was
-    /// `row_range: ReadRange<'rb>`, an opaque (start, len) pair + a
-    /// phantom brand for scope identity. Apply at materialise time
-    /// did `populated.get(start..end).unwrap_or(&[])` — a tier-2
-    /// shield with silent `&[]` fallback on invariant break.
+    /// DEF-154 (H): `row_bytes: &'r [u8]` borrowed at dispatch.
+    /// Schema resolution stays handle-based (SchemaRef → RowDesc
+    /// resolved at materialise via ArenaReader) — the alternative
+    /// (direct `&'r RowDesc` in StagedAction) conflicts with the
+    /// dispatch-loop mutation discipline: loop iter N's outcome
+    /// carrying `&'r RowDesc` would block iter N+1's
+    /// `schema_arena.alloc(...)` via Rust's shared-xor-mut rule.
     ///
-    /// Post-(H) the slice is stored directly, apply is the identity
-    /// function (tier-1 infallible), and `ReadRange<'brand>` +
-    /// `BrandedReadBuf` + read-side scope bookkeeping are deleted
-    /// entirely. DEF-149 atomic-terminus triple is preserved by
-    /// `PgProtocol.pending_advance: u16` — the dispatch loop stages
-    /// slice borrows into `populated`, post-loop records
-    /// `frames_consumed` as pending, and the NEXT feed_bytes call
-    /// applies the pending advance at entry before re-dispatching
-    /// (see protocol.rs).
+    /// DEF-154 (J) P0-D: materialise now CLASSIFIES stale
+    /// SchemaRef as a crate-bug (`StaleSchemaRef` locus) via an
+    /// explicit `FailReply + CloseSocket` emission — replacing
+    /// the pre-(J) silent `RowDesc::EMPTY` fallback. Stale ref
+    /// remains architecturally dead under DEF-172 entry-point
+    /// arena semantics, but emission is classified not silent.
     StreamRowRange {
         /// Raw correlator (`reply.get()`; reply is NOT consumed here
         /// — rows are in-progress, the reply commits on terminal
@@ -999,12 +996,7 @@ pub(crate) enum StagedAction<'wb, 'r> {
         id: NonZeroU64,
         /// Row-body slice. Borrows from `read_buf.populated()`.
         row_bytes: &'r [u8],
-        /// Schema arena handle (copy from StreamingRows state).
-        ///
-        /// DEF-119: 1-byte `SchemaRef` handle instead of the prior
-        /// 260-byte `RowDesc` copy. Materialise resolves via
-        /// `arena.get(schema_ref)` to a `&'r RowDesc` reference for
-        /// the public `Action::StreamRow`.
+        /// Schema arena handle — resolved at materialise time.
         schema_ref: crate::schema_arena::SchemaRef,
     },
     /// Map to [`Action::CloseSocket`].
@@ -1133,73 +1125,72 @@ impl StagedReply {
     /// Resolve this staged reply into the public [`Reply<'r>`] by
     /// looking up any arena-borrowed schema via `arena.get(ref)`.
     ///
-    /// # Stale-ref handling
+    /// DEF-154 (J) P0-D: returns `Err(StaleSchemaRef)` if any
+    /// contained `SchemaRef` is stale in `arena`. Pre-(J) stale
+    /// refs silently mapped to `None` (QueryComplete.row_desc) or
+    /// `NoData` (DescribedRows) — invisible corruption at the user
+    /// boundary (debug_assert shield in debug, silent in release).
+    /// Post-(J) the caller (materialise) classifies and emits
+    /// `FailReply { StaleSchemaRef } + CloseSocket` instead of the
+    /// silently-degraded payload.
     ///
-    /// Architecturally every `SchemaRef` in a StagedReply points to
-    /// a live slot at materialise time — the dispatch arms that
-    /// construct these staged payloads allocate the slot immediately
-    /// before the StagedReply is queued, and the slot stays live
-    /// through materialise. A stale `schema_ref` (slot freed
-    /// prematurely) is a crate-internal bug.
-    ///
-    /// Tier classification (post-DEF-170, DEF-183 P1-C):
-    /// - **Tier-2 structural runtime** in debug/test via
-    ///   `debug_assert!(d.is_some(), ...)` — the shield fires loud
-    ///   on any stale ref that slips past architectural invariants.
-    /// - **Tier-4 silent fallback** in release — `get` returns
-    ///   `None` which the conversion maps to `Option::None` /
-    ///   `NoData` (forbid-bundle bans `panic!` in release user code,
-    ///   so this is the tightest non-witness closure).
-    /// - **Tier-1 compile-time** closure of the class is scheduled
-    ///   in DEF-154 (D) — stale-ref compile elimination via
-    ///   buffer-witness-with-brand + ArenaReader (C shipped).
+    /// Architecturally every `SchemaRef` here points to a live slot
+    /// — dispatch arms alloc the slot and the slot stays live
+    /// through materialise. A stale `schema_ref` is a crate bug;
+    /// Err propagation replaces the prior debug_assert + silent
+    /// fallback dyad.
     #[inline]
     pub(crate) fn into_public<'r>(
         self,
         arena: crate::schema_arena::ArenaReader<'r>,
-    ) -> Reply<'r> {
+    ) -> Result<Reply<'r>, StaleSchemaRef> {
         match self {
-            Self::Pong(p) => Reply::Pong(p),
-            Self::StartupComplete(p) => Reply::StartupComplete(p),
-            Self::QueryComplete(staged) => Reply::QueryComplete(QueryCompletePayload {
-                command_tag: staged.command_tag,
-                tx_status: staged.tx_status,
-                // DEF-170 (audit2 A010): stale SchemaRef → silent
-                // `None` was the pre-DEF-170 behaviour, corrupting
-                // SELECT→DML classification at the user boundary.
-                // Debug build now fires loud on stale refs; release
-                // preserves the `None` fallback (forbid-bundle bans
-                // panic). DEF-154 witness-pattern will eliminate the
-                // stale class structurally.
-                row_desc: staged.schema_ref.and_then(|r| {
-                    let d = arena.get(r);
-                    debug_assert!(
-                        d.is_some(),
-                        "DEF-170: stale SchemaRef at QueryComplete materialise \
-                         — crate bug; DEF-154 witness-pattern will eliminate \
-                         this class structurally.",
-                    );
-                    d
-                }),
-            }),
-            Self::ParseComplete(p) => Reply::ParseComplete(p),
-            Self::CloseComplete(p) => Reply::CloseComplete(p),
-            Self::DescribeStatementComplete(staged) => {
-                Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
-                    param_oids: staged.param_oids,
-                    rows: described_rows_ref_into_public(staged.rows, arena),
+            Self::Pong(p) => Ok(Reply::Pong(p)),
+            Self::StartupComplete(p) => Ok(Reply::StartupComplete(p)),
+            Self::QueryComplete(staged) => {
+                // `schema_ref: Option<SchemaRef>` — None is
+                // legitimate (DML with no schema). Some(ref) must
+                // resolve; stale → classified Err.
+                let row_desc = match staged.schema_ref {
+                    Some(r) => match arena.get(r) {
+                        Some(d) => Some(d),
+                        None => return Err(StaleSchemaRef),
+                    },
+                    None => None,
+                };
+                Ok(Reply::QueryComplete(QueryCompletePayload {
+                    command_tag: staged.command_tag,
                     tx_status: staged.tx_status,
-                })
+                    row_desc,
+                }))
+            }
+            Self::ParseComplete(p) => Ok(Reply::ParseComplete(p)),
+            Self::CloseComplete(p) => Ok(Reply::CloseComplete(p)),
+            Self::DescribeStatementComplete(staged) => {
+                let rows = described_rows_ref_into_public(staged.rows, arena)?;
+                Ok(Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
+                    param_oids: staged.param_oids,
+                    rows,
+                    tx_status: staged.tx_status,
+                }))
             }
             Self::DescribePortalComplete(staged) => {
-                Reply::DescribePortalComplete(DescribePortalCompletePayload {
-                    rows: described_rows_ref_into_public(staged.rows, arena),
+                let rows = described_rows_ref_into_public(staged.rows, arena)?;
+                Ok(Reply::DescribePortalComplete(DescribePortalCompletePayload {
+                    rows,
                     tx_status: staged.tx_status,
-                })
+                }))
             }
         }
     }
 }
+
+/// DEF-154 (J): classified sentinel for stale-SchemaRef at
+/// materialise. Zero-sized; no payload needed — materialise
+/// constructs a `ProtocolError::InternalCrateBug { StaleSchemaRef }`
+/// when it sees this.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StaleSchemaRef;
 
 /// Convert state-side [`crate::state::DescribedRowsRef`] to the
 /// public [`DescribedRows<'r>`] by resolving any `SchemaRef` into a
@@ -1221,21 +1212,18 @@ impl StagedReply {
 fn described_rows_ref_into_public<'r>(
     r: crate::state::DescribedRowsRef,
     arena: crate::schema_arena::ArenaReader<'r>,
-) -> DescribedRows<'r> {
+) -> Result<DescribedRows<'r>, StaleSchemaRef> {
     match r {
         crate::state::DescribedRowsRef::Rows(s) => match arena.get(s) {
-            Some(desc) => DescribedRows::from_row_desc(desc),
-            None => {
-                debug_assert!(
-                    false,
-                    "DEF-170: stale SchemaRef at described_rows_ref_into_public \
-                     — crate bug; DEF-154 witness-pattern will eliminate \
-                     this class structurally.",
-                );
-                DescribedRows::no_data()
-            }
+            Some(desc) => Ok(DescribedRows::from_row_desc(desc)),
+            // DEF-154 (J): stale ref classification — Err propagates
+            // through `into_public` → materialise emits classified
+            // FailReply + CloseSocket. Pre-(J) the `NoData` fallback
+            // was silent and indistinguishable from a legitimate
+            // no-schema Describe result.
+            None => Err(StaleSchemaRef),
         },
-        crate::state::DescribedRowsRef::NoData => DescribedRows::no_data(),
+        crate::state::DescribedRowsRef::NoData => Ok(DescribedRows::no_data()),
     }
 }
 

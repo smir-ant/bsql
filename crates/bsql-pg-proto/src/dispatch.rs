@@ -1747,11 +1747,14 @@ fn stream_row_or_errored<'wb, 'r>(
     coords: FrameCoords,
     populated: &'r [u8],
 ) -> DispatchOutcome<'wb, 'r> {
-    // DEF-154 (H): tier-1 apply — we slice `populated` directly,
-    // store the resulting `&'r [u8]` in the staged action. No
-    // intermediate (start, len) + brand dance, no Option-returning
-    // apply seam, no unwrap_or fallback. The slice is borrow-
-    // checked against the populated region's lifetime.
+    // DEF-154 (H): tier-1 apply — slice `populated` directly; the
+    // stored `&'r [u8]` is borrow-checked against the populated
+    // region's lifetime.
+    //
+    // DEF-154 (J): `schema_ref` is passed through as a handle;
+    // resolution to `&RowDesc` happens at materialise time with
+    // classified stale-ref handling (see materialise's
+    // StreamRowRange arm in protocol.rs).
     //
     // None classifies as `MalformedDataRow` — server-side framing
     // desync (DataRow with `total_len == HEADER_LEN`, i.e. empty

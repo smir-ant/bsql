@@ -1930,6 +1930,43 @@ fn materialise<'w, 'r, 'wb>(
 ) -> OutActions<'w, 'r> {
     let mut out = OutActions::new();
     for sa in staged {
+        // DEF-154 (J): StreamRowRange needs two-action emission on
+        // stale-ref (FailReply + CloseSocket) which doesn't fit the
+        // one-Action-per-StagedAction match-arm shape. Handle it
+        // here via `continue` — the arm below pushes 1 or 2 actions
+        // directly and bypasses the single-action `let a` binding.
+        if let StagedAction::StreamRowRange {
+            id,
+            row_bytes,
+            schema_ref,
+        } = sa
+        {
+            match arena.get(schema_ref) {
+                Some(desc) => {
+                    out.push(Action::StreamRow { id, row_bytes, desc }).unwrap_or(());
+                }
+                None => {
+                    // Stale SchemaRef — architecturally dead under
+                    // DEF-172 entry-point arena semantics (arena is
+                    // cleared only at Idle/Errored entry; mid-query
+                    // no free fires). Pre-(J) the fallback was
+                    // silent `RowDesc::EMPTY` — user saw an empty-
+                    // schema row indistinguishable from a valid
+                    // empty result. Post-(J): classified crate-bug
+                    // emission replacing the silent fallback.
+                    out.push(Action::FailReply {
+                        id,
+                        cause: ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::StaleSchemaRef,
+                        },
+                    })
+                    .unwrap_or(());
+                    out.push(Action::CloseSocket).unwrap_or(());
+                }
+            }
+            continue;
+        }
+
         let a: Action<'w, 'r> = match sa {
             StagedAction::SendBytesRange(range) => {
                 // DEF-154 (B): WriteRange<'wb>::apply takes
@@ -1951,10 +1988,31 @@ fn materialise<'w, 'r, 'wb>(
             // arena, producing the public `Reply<'r>`. The entry was
             // constructed by the typed `action::deliver` path —
             // kind-payload pairing was enforced at dispatch time.
-            StagedAction::DeliverReply(entry) => Action::DeliverReply {
-                id: entry.id(),
-                value: entry.staged().into_public(arena),
-            },
+            StagedAction::DeliverReply(entry) => {
+                // DEF-154 (J) P0-D: into_public returns
+                // Err(StaleSchemaRef) on stale ref — classify as
+                // crate-bug FailReply + CloseSocket instead of the
+                // pre-(J) silent `None` / `NoData` degraded-payload
+                // fallback.
+                let entry_id = entry.id();
+                match entry.staged().into_public(arena) {
+                    Ok(value) => Action::DeliverReply {
+                        id: entry_id,
+                        value,
+                    },
+                    Err(_stale) => {
+                        out.push(Action::FailReply {
+                            id: entry_id,
+                            cause: ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::StaleSchemaRef,
+                            },
+                        })
+                        .unwrap_or(());
+                        out.push(Action::CloseSocket).unwrap_or(());
+                        continue;
+                    }
+                }
+            }
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
             // DEF-154 (H): `row_bytes: &'r [u8]` carried directly by
             // the staged action — no range-apply dance. Tier-1
@@ -1964,22 +2022,8 @@ fn materialise<'w, 'r, 'wb>(
             // the `'r` lifetime ties it to the read_buf borrow that
             // blocks any `&mut self.read_buf` call until OutActions
             // drops. Identity apply here.
-            StagedAction::StreamRowRange { id, row_bytes, schema_ref } => {
-                // DEF-170 shield on stale SchemaRef; DEF-154 (D)
-                // arena-brand will eliminate that class.
-                let desc_opt = arena.get(schema_ref);
-                debug_assert!(
-                    desc_opt.is_some(),
-                    "DEF-170: stale SchemaRef at materialise (StreamRowRange) — \
-                     crate bug; DEF-154 (D) arena-brand will eliminate \
-                     this class structurally.",
-                );
-                Action::StreamRow {
-                    id,
-                    row_bytes,
-                    desc: desc_opt.unwrap_or(&crate::decode::RowDesc::EMPTY),
-                }
-            }
+            // StreamRowRange handled in the early `if let` above.
+            StagedAction::StreamRowRange { .. } => continue,
             StagedAction::CloseSocket => Action::CloseSocket,
         };
         // `staged` and `out` share `MAX_ACTIONS_PER_CALL` as their
