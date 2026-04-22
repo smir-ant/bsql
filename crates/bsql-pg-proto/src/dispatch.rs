@@ -187,6 +187,16 @@ impl FrameCoords {
     pub(crate) fn payload_end(&self) -> usize {
         usize::from(self.frame_start).saturating_add(usize::from(self.total_len))
     }
+
+    /// Total frame length (header + body) in bytes. Used by
+    /// `stream_row_or_errored` to classify a malformed DataRow
+    /// (server sent `total_len == HEADER_LEN`, i.e. no body) via
+    /// `ProtocolError::MalformedDataRow { total_len }`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn total_len(&self) -> usize {
+        usize::from(self.total_len)
+    }
 }
 
 // DEF-147 drift pin: FrameCoords packs 3 × u16 into 6 B of data
@@ -1735,21 +1745,21 @@ fn stream_row_or_errored<'wb, 'rb>(
     read_witness: crate::write_buf::BrandedBytes<'rb, '_>,
 ) -> DispatchOutcome<'wb, 'rb> {
     // DEF-154 (E): tier-1 branded range via witness.
-    // `ReadRange::new(start, end, witness) -> Result<ReadRange<'rb>, _>`
-    // validates bounds against witness.len() — same numeric check as
-    // pre-E `NonEmptyRange::new(start, end, populated_len)`, but the
-    // brand on the result proves buffer-identity for materialise-time
-    // apply (tier-1 infallible).
+    // `ReadRange::new(start, end, witness) -> Option<ReadRange<'rb>>`
+    // validates bounds against witness.len(); the brand on the
+    // result proves buffer-identity for materialise-time apply.
     //
-    // Err classifies as `EmptyReadRange` — architecturally dead
-    // under intact FrameCoords math (parse_header already validated
-    // total_len <= populated.len()).
+    // DEF-154 (F): None classifies as `MalformedDataRow` — this is
+    // a server-side framing desync (DataRow with no body, i.e.
+    // total_len == HEADER_LEN), NOT a crate bug. Pre-(F) the None
+    // case was routed through `CrateBugLocus::EmptyReadRange` which
+    // misled operators reading the log.
     match crate::action::ReadRange::<'rb>::new(
         coords.payload_start(),
         coords.payload_end(),
         read_witness,
     ) {
-        Ok(row_range) => {
+        Some(row_range) => {
             let id = reply.get();
             DispatchOutcome::AdvancedWithAction {
                 // F19 + DEF-119: preserve schema_ref back into the state
@@ -1761,10 +1771,12 @@ fn stream_row_or_errored<'wb, 'rb>(
                 action: StagedAction::StreamRowRange { id, row_range, schema_ref },
             }
         }
-        Err(_cause) => internal_bug(
-            Some(reply.consume()),
-            crate::error::CrateBugLocus::EmptyReadRange,
-        ),
+        None => DispatchOutcome::Errored {
+            reply_id: Some(reply.consume()),
+            cause: crate::error::ProtocolError::MalformedDataRow {
+                total_len: coords.total_len(),
+            },
+        },
     }
 }
 

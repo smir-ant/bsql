@@ -409,6 +409,26 @@ pub enum ProtocolError {
         payload_len: usize,
     },
 
+    /// DEF-154 (F): server sent a `DataRow` (`'D'`) frame with no
+    /// body — the 5-byte header is followed by zero payload bytes
+    /// (`total_len == HEADER_LEN`). PG's wire spec mandates at
+    /// minimum a 2-byte column count in the body even for zero-
+    /// column rows; a 0-byte body signals framing desync or a
+    /// malformed/adversarial server.
+    ///
+    /// Pre-DEF-154 (F) this case routed to
+    /// `InternalCrateBug { locus: EmptyReadRange }` via the
+    /// `NonEmptyRange::new` None branch in `ReadRange::new` — a
+    /// misclassification: the crate isn't buggy, the server is.
+    /// Operators reading a log that says "internal bsql-pg-proto
+    /// bug" would chase the wrong target.
+    MalformedDataRow {
+        /// Declared frame total length (tag + length-prefix + body
+        /// = HEADER_LEN + body_len). Valid DataRow has
+        /// `total_len > HEADER_LEN`.
+        total_len: usize,
+    },
+
     /// Server's `RowDescription` declares more columns than
     /// [`crate::MAX_ROW_COLUMNS`] — this crate's bounded inline
     /// storage cannot accommodate the result-set. The query is
@@ -571,17 +591,6 @@ pub enum CrateBugLocus {
     /// prefix — tier-4 silent corruption. Tier-3 classified now.
     ParamsWriterOverflow,
 
-    /// DEF-154 (E): read-side counterpart of `EmptyWriteRange`.
-    /// `ReadRange::new(start, end, witness)` received `None` from
-    /// `NonEmptyRange::new(start, end, witness.as_slice().len())` —
-    /// meaning dispatch's `stream_row_or_errored` computed
-    /// `payload_start..payload_end` bounds that don't fit the
-    /// current populated region. Architecturally dead under intact
-    /// `FrameCoords` math + `parse_header` pre-validation; emission
-    /// indicates a `FrameCoords` construction bug or a cursor-math
-    /// drift. Tier-3 classified.
-    EmptyReadRange,
-
     /// DEF-154 (B) Phase B4-W P0-2: a `build_*_message` branded
     /// builder produced a zero-length span when
     /// `WriteRange::from_branded_write_span` invoked
@@ -630,7 +639,6 @@ impl fmt::Display for CrateBugLocus {
             Self::StaleSchemaRef => f.write_str("stale-schema-ref"),
             Self::ParamsWriterOverflow => f.write_str("params-writer-overflow"),
             Self::EmptyWriteRange => f.write_str("empty-write-range"),
-            Self::EmptyReadRange => f.write_str("empty-read-range"),
         }
     }
 }
@@ -709,17 +717,6 @@ mod crate_bug_locus_display_tests {
         assert_eq!(
             format!("{e}"),
             "internal bsql-pg-proto bug at locus empty-write-range",
-        );
-    }
-
-    #[test]
-    fn empty_read_range_display() {
-        let e = ProtocolError::InternalCrateBug {
-            locus: CrateBugLocus::EmptyReadRange,
-        };
-        assert_eq!(
-            format!("{e}"),
-            "internal bsql-pg-proto bug at locus empty-read-range",
         );
     }
 
@@ -965,6 +962,7 @@ impl ProtocolError {
             Self::StartupAlreadyInProgress | Self::CommandInProgress => ErrorKind::ClientOrdering,
             Self::MalformedCommandComplete { .. }
             | Self::MalformedRowDescription { .. }
+            | Self::MalformedDataRow { .. }
             | Self::TooManyColumns { .. }
             | Self::UnexpectedFormatCode { .. }
             | Self::MalformedParameterDescription { .. }
@@ -1078,6 +1076,10 @@ impl fmt::Display for ProtocolError {
             Self::MalformedRowDescription { payload_len } => write!(
                 f,
                 "malformed RowDescription: {payload_len}-byte payload (short header, negative count, missing name NUL, or truncated metadata)",
+            ),
+            Self::MalformedDataRow { total_len } => write!(
+                f,
+                "malformed DataRow: total frame length {total_len} has no body (min valid body = 2-byte column count)",
             ),
             Self::TooManyColumns { count, max } => write!(
                 f,

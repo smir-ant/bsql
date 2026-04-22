@@ -468,7 +468,31 @@ fn error_after_some_rows_emits_stream_then_fail() {
     let out = proto.feed_bytes(&bytes, &mut wb);
     let actions = out.as_slice();
     assert_eq!(actions.len(), 2, "1 StreamRow + 1 FailReply = 2 actions");
-    assert!(matches!(actions.first(), Some(Action::StreamRow { .. })));
+    // DEF-154 (F) P0-1 pin: pre-fix, fatal-path `clear_scope_local`
+    // wiped `populated()` BEFORE materialise applied the
+    // `StreamRowRange` from the preceding successful D iteration —
+    // resulting in `row_bytes: &[]` (silent empty-row corruption).
+    // Asserting full row contents proves the range applies against
+    // the unchanged populated region.
+    match actions.first() {
+        Some(Action::StreamRow { row_bytes, .. }) => {
+            // DataRow body = column-count(i16=1) + vlen(i32=7) +
+            // "partial" → 2 + 4 + 7 = 13 bytes.
+            assert_eq!(
+                row_bytes.len(),
+                13,
+                "StreamRow.row_bytes must carry the full DataRow body even \
+                 when a later frame in the same feed_bytes call triggers a \
+                 fatal transition — DEF-154 (F) P0-1 pin.",
+            );
+            // Last 7 bytes must be the literal `partial` value.
+            let Some(tail) = row_bytes.get(6..) else {
+                panic!("row_bytes too short: len={}", row_bytes.len());
+            };
+            assert_eq!(tail, b"partial");
+        }
+        other => panic!("expected StreamRow, got {other:?}"),
+    }
     assert!(matches!(
         actions.get(1),
         Some(Action::FailReply {
@@ -562,6 +586,110 @@ fn simple_query_on_errored_state_fails() {
         }
         other => panic!("expected FailReply(ConnectionAlreadyClosed), got {other:?}"),
     }
+}
+
+/// DEF-154 (F) P0-1 pin: a malformed `CommandComplete` arriving
+/// AFTER one or more successful `DataRow` frames in the SAME
+/// `feed_bytes` call must still deliver the preceding rows with
+/// their full byte content. Pre-(F), the fatal-path
+/// `clear_scope_local` wiped `populated()` before materialise,
+/// causing the already-staged `StreamRowRange` to apply against
+/// an empty slice — `row_bytes: &[]` silent corruption.
+///
+/// This is distinct from `error_after_some_rows_emits_stream_then_fail`
+/// which exercises a server-sent `ErrorResponse` (graceful fail,
+/// state returns to Idle after Z). Here the fatal transition
+/// fires from `DispatchOutcome::Errored` due to WIRE MALFORMATION
+/// — no Z arrives, the connection closes.
+#[test]
+fn data_row_then_malformed_command_complete_preserves_row_bytes() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(106);
+    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+
+    let mut bytes = std::vec::Vec::new();
+    bytes.extend_from_slice(&row_description_frame(1));
+    bytes.extend_from_slice(&data_row_frame(b"intact"));
+    // CommandComplete frame WITHOUT NUL terminator — framing desync.
+    bytes.extend_from_slice(&frame(TAG_COMMAND_COMPLETE.byte(), b"SELECT 1"));
+
+    let out = proto.feed_bytes(&bytes, &mut wb);
+    let actions = out.as_slice();
+    // Expect: StreamRow (preserved) + FailReply + CloseSocket.
+    match actions.first() {
+        Some(Action::StreamRow { row_bytes, .. }) => {
+            // Body = col-count(2) + vlen(4) + "intact"(6) = 12 bytes.
+            assert_eq!(
+                row_bytes.len(),
+                12,
+                "row_bytes must be the FULL pre-fatal DataRow body \
+                 (P0-1 pin: pre-fix was &[] due to in-scope clear_scope_local).",
+            );
+            let Some(tail) = row_bytes.get(6..) else {
+                panic!("row_bytes too short: len={}", row_bytes.len());
+            };
+            assert_eq!(tail, b"intact");
+        }
+        other => panic!("expected StreamRow as first action, got {other:?}"),
+    }
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::FailReply {
+                cause: ProtocolError::MalformedCommandComplete { .. },
+                ..
+            }
+        )),
+        "expected FailReply(MalformedCommandComplete), got {actions:?}",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::CloseSocket)),
+        "wire-framing desync must close the socket",
+    );
+    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+}
+
+/// DEF-154 (F) P1-3 pin: a `DataRow` frame with `total_len == HEADER_LEN`
+/// (i.e. empty body — no column count, no payload) is server-side
+/// malformed, not a crate bug. Must classify as `MalformedDataRow`
+/// rather than `InternalCrateBug { locus: EmptyReadRange }` (the
+/// pre-(F) misclassification).
+#[test]
+fn zero_body_data_row_classified_as_malformed_data_row() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(107);
+    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+
+    // Build a DataRow 'D' frame with length-prefix = 4 (just the
+    // 4-byte length field itself, zero body bytes). parse_header
+    // validates total_len >= HEADER_LEN (5), which holds for a
+    // length-field value of 4 → total_len = 1 + 4 = 5. Dispatch
+    // reaches `stream_row_or_errored` with `payload_start == payload_end == 5`.
+    let mut bytes = std::vec::Vec::new();
+    bytes.extend_from_slice(&row_description_frame(1));
+    bytes.push(TAG_DATA_ROW.byte());
+    bytes.extend_from_slice(&4i32.to_be_bytes());
+
+    let out = proto.feed_bytes(&bytes, &mut wb);
+    let actions = out.as_slice();
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::FailReply {
+                cause: ProtocolError::MalformedDataRow { total_len: 5 },
+                ..
+            }
+        )),
+        "expected FailReply(MalformedDataRow {{ total_len: 5 }}) — \
+         server-side malformed, NOT an internal crate bug. \
+         Got: {actions:?}",
+    );
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::CloseSocket)),
+        "MalformedDataRow is a framing-desync; tear the socket down.",
+    );
 }
 
 /// Invariant: a `CommandComplete` with no NUL terminator is

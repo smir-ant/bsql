@@ -609,7 +609,6 @@ impl PgProtocol {
             read_buf.with_branded(|mut rb| {
                 let mut staged: StagedActions<'_, '_> = StagedActions::new();
                 let mut frames_consumed: usize = 0_usize;
-                let mut clear_after_loop = false;
 
                 // Dispatch loop in its own block: `reserved` holds
                 // `&mut wb.buf`, which must be released before
@@ -641,7 +640,6 @@ impl PgProtocol {
                                 ProtocolError::MalformedFrameLength { declared },
                                 &mut staged,
                             );
-                            clear_after_loop = true;
                             break;
                         }
                         HeaderParse::FrameTooLarge { declared } => {
@@ -650,7 +648,6 @@ impl PgProtocol {
                                 ProtocolError::FrameTooLarge { declared },
                                 &mut staged,
                             );
-                            clear_after_loop = true;
                             break;
                         }
                         HeaderParse::Ok { tag, total_len } => {
@@ -758,21 +755,27 @@ impl PgProtocol {
                                         );
                                         crate::error::StateErrorKind::INTERNAL_FALLBACK
                                     });
-                                    // Install terminal state. read_buf
-                                    // clear is deferred to post-loop
-                                    // via clear_after_loop = true;
-                                    // the DEF-149 atomic-terminus
-                                    // triple (state + read_buf +
-                                    // reply_drain) is still atomic
-                                    // from the caller's perspective
-                                    // (PgProtocol is !Sync; no
-                                    // observer between scope exit
-                                    // and feed_bytes return).
-                                    let _prev = core::mem::replace(
-                                        state,
-                                        ProtoState::Errored(state_kind),
-                                    );
-                                    clear_after_loop = true;
+                                    // Install terminal state. The
+                                    // read_buf clear is deferred to
+                                    // the NEXT feed_bytes call's
+                                    // is_errored fast-path (see DEF-154
+                                    // (F) P0-1 fix): clearing inside
+                                    // this branded scope would shrink
+                                    // `populated()` to 0 and cause any
+                                    // already-staged
+                                    // `StreamRowRange<'rb>` from the
+                                    // PREVIOUS successful iteration
+                                    // to apply against an empty
+                                    // witness at materialise —
+                                    // silent empty-row corruption.
+                                    // DEF-149 atomic-terminus triple
+                                    // still atomic per-call: the caller
+                                    // observes (state + actions) from
+                                    // THIS feed_bytes as one unit;
+                                    // the buffered bytes are internal
+                                    // state and next-call's fast-path
+                                    // wipes them before any dispatch.
+                                    *state = ProtoState::Errored(state_kind);
                                     // DEF-112: reply_id came
                                     // pre-consumed from the dispatcher.
                                     match reply_id {
@@ -805,18 +808,29 @@ impl PgProtocol {
                 } // end of reserved scope — NLL releases its &mut borrow of wb
 
                 // Post-loop logical-cursor application.
-                // - clear_after_loop: fatal path wiped buffer.
-                // - else: advance by accumulated frames_consumed.
-                // Both mutations happen via rb's scope-local methods.
-                if clear_after_loop {
-                    rb.clear_scope_local();
-                } else if frames_consumed > 0
+                //
+                // P0-1 fix (DEF-154 (F)): fatal-path `clear_scope_local`
+                // is NOT performed here. If dispatch installed
+                // `ProtoState::Errored`, the read_buf is left
+                // untouched so any `StreamRowRange<'rb>` staged by an
+                // earlier successful iteration still applies against
+                // the unchanged `populated()` at materialise — no
+                // silent empty-row corruption. The NEXT `feed_bytes`
+                // call hits the `is_errored` fast-path, which wipes
+                // the buffer before any new dispatch. PgProtocol is
+                // !Sync, so no external observer sees the interim
+                // buffered bytes.
+                //
+                // Non-fatal: advance by accumulated frames_consumed.
+                // `advance_scope_local` Err is architecturally dead
+                // (frames_consumed sums validated total_len values
+                // against the base populated len); classify via
+                // field-level fail. No clear here either — the NEXT
+                // feed_bytes call will wipe via is_errored fast-path.
+                if !matches!(state, ProtoState::Errored(_))
+                    && frames_consumed > 0
                     && rb.advance_scope_local(frames_consumed).is_err()
                 {
-                    // Architecturally dead: frames_consumed sums
-                    // validated total_len values against the
-                    // base populated len. Classify via field-level
-                    // fail + clear.
                     fail_inflight_no_readbuf(
                         state,
                         ProtocolError::InternalCrateBug {
@@ -824,7 +838,6 @@ impl PgProtocol {
                         },
                         &mut staged,
                     );
-                    rb.clear_scope_local();
                 }
 
                 materialise(

@@ -443,38 +443,26 @@ impl<'brand> ReadRange<'brand> {
     /// HRTB closure's generativity. `start..end` is validated
     /// against `witness.as_slice().len()`; if within bounds, the
     /// returned `ReadRange<'brand>` carries the proof that `apply`
-    /// will succeed against any same-brand bytes (non-shrinking
-    /// invariant enforced by `BrandedReadBuf`'s API narrow — no
-    /// truncating ops reachable outside the explicit
-    /// `advance_scope_local` / `clear_scope_local` mutations, and
-    /// those happen AFTER all range-construction sites per the
-    /// feed_bytes dispatch-loop discipline).
+    /// will succeed against any same-brand bytes.
     ///
-    /// # Err classification (P0-2 pattern, mirror of write side)
+    /// # Domain-neutral None
     ///
-    /// `CrateBugLocus::EmptyReadRange` on `NonEmptyRange::new` None —
-    /// indicates dispatch computed `payload_start..payload_end`
-    /// bounds that don't fit the current populated region. Routes
-    /// through `DispatchOutcome::Errored` → `FailReply + CloseSocket`.
-    #[expect(
-        clippy::result_large_err,
-        reason = "Err carries ProtocolError (~300 B, large_enum_variant \
-                  already accepted on ProtocolError). Cold path (dispatch \
-                  arm invariant break); by-value matches dispatch's \
-                  DispatchOutcome::Errored surface."
-    )]
+    /// DEF-154 (F): returns `Option<Self>` rather than
+    /// `Result<Self, ProtocolError>` — the None case is
+    /// domain-neutral (unsatisfied bounds) and callers attach
+    /// the semantic classification themselves
+    /// (e.g. `stream_row_or_errored` → `MalformedDataRow`). This
+    /// moved the classification to the call site, deleting the
+    /// pre-(F) `CrateBugLocus::EmptyReadRange` variant that
+    /// misclassified server-malformed input as a crate bug.
     #[inline]
+    #[must_use]
     pub(crate) fn new(
         start: usize,
         end: usize,
         witness: crate::write_buf::BrandedBytes<'brand, '_>,
-    ) -> Result<Self, crate::error::ProtocolError> {
-        match NonEmptyRange::new(start, end, witness.as_slice().len()) {
-            Some(raw) => Ok(Self::from_raw(raw)),
-            None => Err(crate::error::ProtocolError::InternalCrateBug {
-                locus: crate::error::CrateBugLocus::EmptyReadRange,
-            }),
-        }
+    ) -> Option<Self> {
+        NonEmptyRange::new(start, end, witness.as_slice().len()).map(Self::from_raw)
     }
 
     /// Apply the range to same-branded bytes — **infallible**.
