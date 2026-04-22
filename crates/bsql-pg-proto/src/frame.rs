@@ -128,8 +128,18 @@ pub enum HeaderParse {
         tag: crate::wire::InboundTag,
         /// Total bytes the frame occupies including the tag.
         ///
-        /// `total_len = 1 + declared_len_on_wire`. Always `<= READ_BUF_CAP`.
-        total_len: usize,
+        /// `total_len = 1 + declared_len_on_wire`.
+        /// `5 <= total_len <= READ_BUF_CAP <= u16::MAX` — the u16
+        /// type encodes the upper bound at the type level so
+        /// downstream consumers (`AbsFrameStart::new`,
+        /// `FrameTotalLen::new`, feed_bytes cursor math) work in
+        /// u16 without silent narrowing.
+        ///
+        /// DEF-154 (G): pre-(G) this was `total_len: usize`, which
+        /// forced every downstream callsite that wanted to store it
+        /// in a u16 newtype to call `u16::try_from(v).unwrap_or(u16::MAX)`
+        /// — silent clamp on drift.
+        total_len: u16,
     },
     /// Header malformed: length-field below 4.
     ///
@@ -186,13 +196,19 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
                 return HeaderParse::FrameTooLarge { declared };
             }
             // declared >= 4 and declared <= MAX_FRAME_LEN_FIELD <= READ_BUF_CAP - 1;
-            // total_len = 1 + declared <= READ_BUF_CAP. checked_add
-            // satisfies arithmetic_side_effects with no real cost
-            // (compiles to add + jno; and we already know it cannot
-            // overflow for declared <= READ_BUF_CAP - 1, so the Err
-            // path is dead).
-            let total_len = match usize::try_from(declared) {
-                Ok(n) => n.saturating_add(1),
+            // total_len = 1 + declared <= READ_BUF_CAP.
+            //
+            // DEF-154 (G): narrow to u16 in one step — `declared: u32`,
+            // `declared + 1` fits u32 always; the `u16::try_from`
+            // narrowing is routed through the classified
+            // `FrameTooLarge` variant on Err (architecturally dead
+            // under `const _ = assert!(READ_BUF_CAP <= 65_535)` in
+            // `buf.rs`, but structurally classified — NOT a silent
+            // fallback). Post-(G) there is no silent narrowing
+            // anywhere on the ingress path.
+            let total_len_u32 = declared.saturating_add(1);
+            let total_len = match u16::try_from(total_len_u32) {
+                Ok(n) => n,
                 Err(_) => {
                     core::hint::cold_path();
                     return HeaderParse::FrameTooLarge { declared };

@@ -58,16 +58,17 @@ use crate::wire::{
 pub(crate) struct AbsFrameStart(u16);
 
 impl AbsFrameStart {
-    /// Construct from a `usize` offset. DEF-147: narrows to u16;
-    /// the `u16::MAX` fallback is architecturally dead because the
-    /// input is always ≤ `READ_BUF_CAP = 4096 ≤ u16::MAX = 65535`
-    /// (pinned by `const _ = assert!(READ_BUF_CAP ≤ 65_535)` in
-    /// `buf.rs`). The fallback satisfies the forbid-bundle's ban
-    /// on `unwrap`.
+    /// Construct from a `u16` offset — tier-1 total. DEF-154 (G):
+    /// caller must prove `v` fits `u16` (bounded by
+    /// `READ_BUF_CAP = 4096 <= u16::MAX` via const-assert in `buf.rs`).
+    /// Pre-(G), the constructor did `u16::try_from(v_usize).unwrap_or(u16::MAX)`
+    /// — silent narrowing that collapsed any post-drift `usize`
+    /// value >65535 into a single `u16::MAX` slot without error
+    /// signal. Now narrowing is classified at the callsite.
     #[inline]
     #[must_use]
-    pub(crate) fn new(v: usize) -> Self {
-        Self(u16::try_from(v).unwrap_or(u16::MAX))
+    pub(crate) const fn new(v: u16) -> Self {
+        Self(v)
     }
 
     /// DEF-174 (audit2 A004): crate-internal u16 accessor — no
@@ -96,11 +97,11 @@ impl AbsFrameStart {
 pub(crate) struct FrameTotalLen(u16);
 
 impl FrameTotalLen {
-    /// DEF-147: see [`AbsFrameStart::new`].
+    /// DEF-154 (G): see [`AbsFrameStart::new`] — tier-1 total.
     #[inline]
     #[must_use]
-    pub(crate) fn new(v: usize) -> Self {
-        Self(u16::try_from(v).unwrap_or(u16::MAX))
+    pub(crate) const fn new(v: u16) -> Self {
+        Self(v)
     }
     /// DEF-174: see [`AbsFrameStart::get_u16`]. No `.get() -> usize`
     /// accessor — unused post-DEF-174, deleted per no-dead-code.

@@ -227,11 +227,15 @@ fn total_len_equals_one_plus_declared_len() {
                 // formula itself is what this test was always
                 // exercising; dropping the redundant field just
                 // surfaces that fact.
-                let derived_declared = total_len.saturating_sub(1);
+                // DEF-154 (G): total_len is now u16 (bounded by
+                // READ_BUF_CAP <= u16::MAX). Compare in usize to
+                // match the u32 declared value from the test vec.
+                let total_len_usize = usize::from(total_len);
+                let derived_declared = total_len_usize.saturating_sub(1);
                 let declared_usize = usize::try_from(declared).unwrap_or(0);
                 assert_eq!(derived_declared, declared_usize);
                 let expected = declared_usize.saturating_add(1);
-                assert_eq!(total_len, expected);
+                assert_eq!(total_len_usize, expected);
             }
             other => panic!("declared={declared}: expected Ok, got {other:?}"),
         }

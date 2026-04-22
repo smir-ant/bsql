@@ -172,15 +172,18 @@ impl ReadBuf {
     /// of [`populated`]. Used by the dispatch loop to compute absolute
     /// row-range coordinates (1c-1b).
     ///
-    /// [`populated`]: ReadBuf::populated
-    ///
-    /// F-017 (pass-#8): visibility narrowed `pub` → `pub(crate)`.
-    /// Only the dispatch layer needs this. Same rationale as
-    /// [`populated`].
+    /// DEF-154 (G): u16 cursor accessor — storage type itself.
+    /// Used by dispatch cursor math that wants to stay in u16 all
+    /// the way through `AbsFrameStart::new(u16)` without ever
+    /// widening to usize. Pre-(G) there was also a
+    /// `cursor_position() -> usize` widening accessor, deleted
+    /// because the only production callsite
+    /// (`BrandedReadBuf::cursor_position_scope_local`) now returns
+    /// u16, and no other callers remain.
     #[inline]
     #[must_use]
-    pub(crate) fn cursor_position(&self) -> usize {
-        usize::from(self.cursor)
+    pub(crate) const fn cursor_position_u16(&self) -> u16 {
+        self.cursor
     }
 
     /// Advance the read cursor by `n` bytes.
@@ -481,10 +484,15 @@ impl<'brand, 'a> BrandedReadBuf<'brand, 'a> {
     /// Inside the branded scope, the underlying `&mut ReadBuf`
     /// is held by `rb`; this method is the brand-compatible
     /// accessor.
+    ///
+    /// DEF-154 (G): returns `u16` (storage type) — not a widened
+    /// `usize` — so dispatch cursor math stays in u16 without
+    /// silent narrowing at downstream newtype constructors.
+    /// `READ_BUF_CAP <= u16::MAX` is const-asserted in this file.
     #[inline]
     #[must_use]
-    pub(crate) fn cursor_position_scope_local(&self) -> usize {
-        self.buf.cursor_position()
+    pub(crate) fn cursor_position_scope_local(&self) -> u16 {
+        self.buf.cursor_position_u16()
     }
 
     /// DEF-154 (E) Spike 1: scope-local clear of the underlying

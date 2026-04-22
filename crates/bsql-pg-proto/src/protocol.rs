@@ -608,7 +608,11 @@ impl PgProtocol {
         write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
             read_buf.with_branded(|mut rb| {
                 let mut staged: StagedActions<'_, '_> = StagedActions::new();
-                let mut frames_consumed: usize = 0_usize;
+                // DEF-154 (G): cursor math stays in u16 end-to-end.
+                // `cursor_position_scope_local() + frames_consumed`
+                // is bounded by `READ_BUF_CAP <= u16::MAX` (const-
+                // asserted in buf.rs). No silent narrowing anywhere.
+                let mut frames_consumed: u16 = 0_u16;
 
                 // Dispatch loop in its own block: `reserved` holds
                 // `&mut wb.buf`, which must be released before
@@ -628,7 +632,7 @@ impl PgProtocol {
                     let after_consumed = rb
                         .unread_branded()
                         .as_slice()
-                        .get(frames_consumed..)
+                        .get(usize::from(frames_consumed)..)
                         .unwrap_or(&[]);
 
                     let header = parse_header(after_consumed);
@@ -651,7 +655,10 @@ impl PgProtocol {
                             break;
                         }
                         HeaderParse::Ok { tag, total_len } => {
-                            if after_consumed.len() < total_len {
+                            // total_len: u16 (DEF-154 (G)), bounded
+                            // `5..=READ_BUF_CAP` by parse_header.
+                            let total_len_usize = usize::from(total_len);
+                            if after_consumed.len() < total_len_usize {
                                 break;
                             }
                             // DEF-182 site 1 (payload extraction):
@@ -663,7 +670,7 @@ impl PgProtocol {
                             // closed by DEF-154 (E) — brand doesn't help
                             // at length-arith; separate refactor needed.
                             let payload_opt =
-                                after_consumed.get(HEADER_LEN..total_len);
+                                after_consumed.get(HEADER_LEN..total_len_usize);
                             debug_assert!(
                                 payload_opt.is_some(),
                                 "DEF-182: payload slice .get(HEADER_LEN..total_len) None",
@@ -703,6 +710,13 @@ impl PgProtocol {
                             // (no mutation exposed beyond
                             // advance_scope_local + clear_scope_local,
                             // and those fire OUTSIDE the loop below).
+                            //
+                            // DEF-154 (G): all operands are u16 —
+                            // `cursor_position_scope_local() -> u16`,
+                            // `frames_consumed: u16`. The sum is
+                            // bounded by READ_BUF_CAP (cursor + any
+                            // consumed-prefix ≤ populated.len() ≤
+                            // READ_BUF_CAP ≤ u16::MAX).
                             let abs_frame_start = rb
                                 .cursor_position_scope_local()
                                 .saturating_add(frames_consumed);
@@ -829,7 +843,9 @@ impl PgProtocol {
                 // feed_bytes call will wipe via is_errored fast-path.
                 if !matches!(state, ProtoState::Errored(_))
                     && frames_consumed > 0
-                    && rb.advance_scope_local(frames_consumed).is_err()
+                    && rb
+                        .advance_scope_local(usize::from(frames_consumed))
+                        .is_err()
                 {
                     fail_inflight_no_readbuf(
                         state,
