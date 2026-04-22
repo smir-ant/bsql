@@ -270,6 +270,26 @@ pub struct PgProtocol {
     /// `Action::StreamRow` drops from ~280 B → ~32 B;
     /// per-row DataRow emission saves ~260 B (hot path on SELECT).
     schema_arena: crate::schema_arena::SchemaSlab,
+    /// DEF-154 (H): deferred `read_buf` cursor advance — bytes to
+    /// skip at the start of the NEXT `feed_bytes` call before any
+    /// new frame parsing.
+    ///
+    /// Pre-(H), the advance fired in-scope via
+    /// `BrandedReadBuf::advance_scope_local` so that staged
+    /// `ReadRange<'rb>` (start/len pair + phantom brand) could stay
+    /// unaffected by the cursor move. Post-(H), `StreamRowRange`
+    /// carries `&'r [u8]` slices of `read_buf.populated()` directly;
+    /// Rust's borrow checker blocks any `&mut self.read_buf` call
+    /// while OutActions holds those `'r` slices — so advance must
+    /// defer until OutActions drops (which happens before the next
+    /// feed_bytes call, per `&'r mut self` re-borrow rules).
+    ///
+    /// `PgProtocol: !Sync`, so no external observer sees the interim
+    /// "not-yet-advanced" cursor state between calls.
+    ///
+    /// `u16` matches `read_buf.cursor` storage — any value fits by
+    /// the `READ_BUF_CAP <= u16::MAX` const-assert.
+    pending_advance: u16,
     /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
     /// Load-bearing: the crate-root ambiguous-impl gate verifies that
     /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
@@ -292,6 +312,7 @@ impl PgProtocol {
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
             schema_arena: crate::schema_arena::SchemaSlab::new(),
+            pending_advance: 0,
             sync_marker: PhantomData,
         }
     }
@@ -316,10 +337,21 @@ impl PgProtocol {
     /// Borrow the current unread bytes in the read buffer.
     ///
     /// Useful for tests; production hosts have no need.
+    ///
+    /// DEF-154 (H): returns the EFFECTIVE unread region — raw
+    /// `read_buf.unread()` with the deferred `pending_advance`
+    /// prefix skipped. Pre-(H), `feed_bytes` applied the advance
+    /// in-scope so `unread()` never showed a not-yet-advanced
+    /// state; post-(H), advance defers to the NEXT feed_bytes
+    /// call's entry, but external observers (tests, introspection
+    /// hosts) still see the dispatched frames as "consumed".
     #[inline]
     #[must_use]
     pub fn unread(&self) -> &[u8] {
-        self.read_buf.unread()
+        self.read_buf
+            .unread()
+            .get(usize::from(self.pending_advance)..)
+            .unwrap_or(&[])
     }
 
     /// Push a user command.
@@ -359,33 +391,20 @@ impl PgProtocol {
         // DEF-172: centralised entry-point arena reclamation.
         self.clear_arena_if_idle_or_errored();
 
-        // DEF-154 (B): write-side branded scope for tier-1 apply;
-        // read-side uses unbranded &[u8] (push paths don't emit
-        // ReadRange so read-branding would be phantom; a future
-        // DEF-154 (E): push paths have no inbound read activity,
-        // but materialise signature now takes BrandedBytes<'rb, 'r>
-        // for the read side. Wrap self.read_buf in a (phantom)
-        // branded scope to produce the witness — into_populated_branded
-        // yields an empty branded view since read_buf.populated() is
-        // empty in the push context (server hasn't responded yet).
+        // DEF-154 (B+H): write-side keeps its brand (`'wb`) for
+        // tier-1 `WriteRange::apply`; read side is unbranded (push
+        // paths never emit StreamRowRange so the read-buf view is
+        // unused by materialise — pass no read slice).
         let state = &mut self.state;
-        let read_buf = &mut self.read_buf;
         let schema_arena = &mut self.schema_arena;
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
-            read_buf.with_branded(|rb| {
-                let prev = core::mem::take(state);
-                let (new_state, staged) = {
-                    let mut reserved = wb.reserve();
-                    compute_push(cmd, prev, &mut reserved)
-                };
-                *state = new_state;
-                materialise(
-                    staged,
-                    wb.into_bytes_branded(),
-                    rb.into_populated_branded(),
-                    schema_arena.as_reader(),
-                )
-            })
+            let prev = core::mem::take(state);
+            let (new_state, staged) = {
+                let mut reserved = wb.reserve();
+                compute_push(cmd, prev, &mut reserved)
+            };
+            *state = new_state;
+            materialise(staged, wb.into_bytes_branded(), schema_arena.as_reader())
         })
     }
 
@@ -465,39 +484,29 @@ impl PgProtocol {
             None => None,
         };
 
-        // DEF-154 (B+E) branded scopes — same shape as push_command.
-        // Push paths don't emit ReadRange; read-side materialise
-        // input comes from rb.into_populated_branded() on the
-        // (empty) read buffer.
+        // DEF-154 (B+H): write-brand only. Push paths emit no
+        // StreamRowRange; materialise doesn't need a read view.
         let state = &mut self.state;
-        let read_buf = &mut self.read_buf;
         let schema_arena = &mut self.schema_arena;
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
-            read_buf.with_branded(|rb| {
-                let prev = core::mem::take(state);
-                let mut staged = StagedActions::new();
-                let new_state = {
-                    let mut reserved = wb.reserve();
-                    compute_push_bind_execute(
-                        prev,
-                        portal_name,
-                        stmt_name,
-                        params,
-                        schema_ref,
-                        fetch,
-                        reply,
-                        &mut staged,
-                        &mut reserved,
-                    )
-                };
-                *state = new_state;
-                materialise(
-                    staged,
-                    wb.into_bytes_branded(),
-                    rb.into_populated_branded(),
-                    schema_arena.as_reader(),
+            let prev = core::mem::take(state);
+            let mut staged = StagedActions::new();
+            let new_state = {
+                let mut reserved = wb.reserve();
+                compute_push_bind_execute(
+                    prev,
+                    portal_name,
+                    stmt_name,
+                    params,
+                    schema_ref,
+                    fetch,
+                    reply,
+                    &mut staged,
+                    &mut reserved,
                 )
-            })
+            };
+            *state = new_state;
+            materialise(staged, wb.into_bytes_branded(), schema_arena.as_reader())
         })
     }
 
@@ -523,346 +532,282 @@ impl PgProtocol {
         write_buf.clear();
         self.clear_arena_if_idle_or_errored();
 
-        // F66: already-Errored state — handled inline (no nested
-        // closures to escape borrow through).
-        let is_errored = matches!(self.state, ProtoState::Errored(_));
+        // DEF-154 (H): apply any pending cursor advance from the
+        // PREVIOUS feed_bytes call. Previously, advance fired
+        // in-scope via `BrandedReadBuf::advance_scope_local` so that
+        // staged `ReadRange<'rb>` could stay unaffected by the cursor
+        // move — a brand-magic requirement. Post-(H), StreamRowRange
+        // carries `&'r [u8]` slices directly, so the stage-time
+        // borrow blocks any &mut on read_buf until OutActions drops.
+        // Deferring advance to the next call's entry breaks the
+        // conflict at zero extra state cost: one u16 field. See
+        // DEF-149 preservation note on StagedAction::StreamRowRange.
+        //
+        // Err branch is architecturally dead (pending_advance was
+        // computed as `sum(total_len)` from validated parse_header
+        // frames against the call-time populated length; between
+        // calls, only append occurs, which only grows inner). On
+        // actual Err (e.g. a hypothetical regression in cursor math)
+        // we classify as InternalCrateBug and fall through to the
+        // Errored fast-path below.
+        let mut pending_advance_err = false;
+        if self.pending_advance > 0 {
+            if self
+                .read_buf
+                .advance(usize::from(self.pending_advance))
+                .is_err()
+            {
+                pending_advance_err = true;
+            }
+            self.pending_advance = 0;
+        }
 
-        // DEF-154 (E): pre-append path needs `&mut self.read_buf`
-        // without a branded borrow held. If overflow, classify before
-        // entering any branded scope.
-        let append_err = if is_errored {
+        let is_errored_or_recovering =
+            pending_advance_err || matches!(self.state, ProtoState::Errored(_));
+
+        // DEF-154 (H): append BEFORE destructure (append takes
+        // `&mut self.read_buf`; destructure holds it as a
+        // field-level &mut borrow and would conflict).
+        let append_err = if is_errored_or_recovering {
             None
         } else {
             self.read_buf.append(bytes).err()
         };
 
-        // DEF-154 (E): field-level destructure. Closures CANNOT see
-        // disjoint field borrows through `self`; if `self.X` is used
-        // inside a closure, the closure captures `self` wholesale,
-        // conflicting with any sibling `self.Y` borrow. Splitting
-        // into separate local bindings lets each closure capture a
-        // single field ref — disjoint access restored.
-        //
-        // Lifetimes: all four bindings have the method's call lifetime
-        // (implicitly `'_`), which is tied to `&'r mut self`. Inside
-        // the branded scopes below, these refs are live for the
-        // closure-body extent — exactly what's needed.
+        // DEF-154 (E) + (H): field-level destructure. Closures cannot
+        // see disjoint field borrows through `self`; splitting into
+        // separate `&mut` bindings gives each consumer a single-field
+        // borrow. `state` + `pending_advance` + `read_buf` are held
+        // DISJOINTLY — the main dispatch loop takes a shared view of
+        // `populated` from `read_buf` while `state` is separately
+        // `&mut` for state transitions and `pending_advance` is
+        // separately `&mut` for the post-loop deferred-advance
+        // record.
         let state = &mut self.state;
         let read_buf = &mut self.read_buf;
         let session_params = &mut self.session_params;
         let schema_arena = &mut self.schema_arena;
+        let pending_advance = &mut self.pending_advance;
 
-        // F66 / ReadBufFull fast paths — both wrap read_buf in its
-        // own brand scope (clear_scope_local); state / schema_arena
-        // accessed through the destructured locals, NOT `self`.
-        if is_errored {
+        // Fast-path: already-Errored or pending_advance crate-bug
+        // recovery. Clear read_buf to reset to consistent state;
+        // return empty action list (or crate-bug classified if
+        // pending_advance failed).
+        if pending_advance_err {
+            read_buf.clear();
             return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                read_buf.with_branded(|mut rb| {
-                    rb.clear_scope_local();
-                    let staged: StagedActions<'_, '_> = StagedActions::new();
-                    materialise(
-                        staged,
-                        wb.into_bytes_branded(),
-                        rb.into_populated_branded(),
-                        schema_arena.as_reader(),
-                    )
-                })
+                let mut staged: StagedActions<'_, 'r> = StagedActions::new();
+                fail_inflight_no_readbuf(
+                    state,
+                    ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                    },
+                    &mut staged,
+                );
+                materialise(staged, wb.into_bytes_branded(), schema_arena.as_reader())
+            });
+        }
+        if matches!(state, ProtoState::Errored(_)) {
+            read_buf.clear();
+            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+                let staged: StagedActions<'_, 'r> = StagedActions::new();
+                materialise(staged, wb.into_bytes_branded(), schema_arena.as_reader())
             });
         }
 
+        // Fast-path: ReadBufFull. Clear read_buf + stage FailReply +
+        // CloseSocket + transition state to Errored.
         if let Some(ReadBufFull {
             attempted,
             available,
         }) = append_err
         {
+            read_buf.clear();
             return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                // Fail path: state mutation + staged actions live
-                // WITH the inner read_buf.with_branded scope so
-                // their brand lifetimes (`'wb`, `'rb`) bind to the
-                // materialise inputs uniformly. Placing `staged`
-                // outside the inner closure would force its brand
-                // to unify across outer vs inner scopes, which
-                // generativity forbids.
-                read_buf.with_branded(|mut rb| {
-                    let mut staged: StagedActions<'_, '_> = StagedActions::new();
-                    fail_inflight_no_readbuf(
-                        state,
-                        ProtocolError::ReadBufferFull { attempted, available },
-                        &mut staged,
-                    );
-                    rb.clear_scope_local();
-                    materialise(
-                        staged,
-                        wb.into_bytes_branded(),
-                        rb.into_populated_branded(),
-                        schema_arena.as_reader(),
-                    )
-                })
+                let mut staged: StagedActions<'_, 'r> = StagedActions::new();
+                fail_inflight_no_readbuf(
+                    state,
+                    ProtocolError::ReadBufferFull { attempted, available },
+                    &mut staged,
+                );
+                materialise(staged, wb.into_bytes_branded(), schema_arena.as_reader())
             });
         }
 
-        // MAIN DISPATCH + MATERIALISE BRANDED SCOPE.
-        // Single read-brand window spans both phases — ReadRange<'rb>
-        // constructed at dispatch applies against BrandedBytes<'rb, 'r>
-        // at materialise without brand mismatch.
+        // Main dispatch. Take shared borrow of populated + cursor
+        // (both via immutable reborrow of read_buf's &mut).
+        let populated: &'r [u8] = read_buf.populated();
+        let cursor: u16 = read_buf.cursor_position_u16();
+
         write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
-            read_buf.with_branded(|mut rb| {
-                let mut staged: StagedActions<'_, '_> = StagedActions::new();
-                // DEF-154 (G): cursor math stays in u16 end-to-end.
-                // `cursor_position_scope_local() + frames_consumed`
-                // is bounded by `READ_BUF_CAP <= u16::MAX` (const-
-                // asserted in buf.rs). No silent narrowing anywhere.
-                let mut frames_consumed: u16 = 0_u16;
+            let mut staged: StagedActions<'_, 'r> = StagedActions::new();
+            // DEF-154 (G): cursor math stays in u16 end-to-end,
+            // bounded by `READ_BUF_CAP <= u16::MAX` const-assert in
+            // buf.rs. No silent narrowing anywhere.
+            let mut frames_consumed: u16 = 0_u16;
 
-                // Dispatch loop in its own block: `reserved` holds
-                // `&mut wb.buf`, which must be released before
-                // `wb.into_bytes_branded()` runs post-loop. Block
-                // scope ends `reserved`'s borrow at the `}` — NLL
-                // releases automatically, no explicit drop needed
-                // (BrandedWriteReserved is not Drop; `drop()` would
-                // be a clippy::drop_non_drop).
-                {
-                let mut reserved = wb.reserve();
-                loop {
-                    // Logical-cursor peek: unread bytes minus the
-                    // in-scope-consumed prefix. `frames_consumed`
-                    // is addend-only; each increment is gated on
-                    // `after_consumed.len() >= total_len` so the
-                    // slice is always in bounds.
-                    let after_consumed = rb
-                        .unread_branded()
-                        .as_slice()
-                        .get(usize::from(frames_consumed)..)
-                        .unwrap_or(&[]);
+            // Dispatch loop block: `reserved` holds `&mut wb.buf`
+            // which must release before `wb.into_bytes_branded()`
+            // post-loop. NLL ends `reserved`'s borrow at the `}`.
+            {
+            let mut reserved = wb.reserve();
+            loop {
+                // Logical-cursor peek into unread: skip already-
+                // dispatched prefix. `frames_consumed` is
+                // addend-only; each increment is gated on
+                // `after_consumed.len() >= total_len` so the
+                // subsequent slice is always in bounds.
+                let absolute_start = cursor.saturating_add(frames_consumed);
+                let after_consumed = populated
+                    .get(usize::from(absolute_start)..)
+                    .unwrap_or(&[]);
 
-                    let header = parse_header(after_consumed);
-                    match header {
-                        HeaderParse::Empty | HeaderParse::Incomplete => break,
-                        HeaderParse::MalformedLength { declared } => {
-                            fail_inflight_no_readbuf(
-                                state,
-                                ProtocolError::MalformedFrameLength { declared },
-                                &mut staged,
-                            );
+                let header = parse_header(after_consumed);
+                match header {
+                    HeaderParse::Empty | HeaderParse::Incomplete => break,
+                    HeaderParse::MalformedLength { declared } => {
+                        fail_inflight_no_readbuf(
+                            state,
+                            ProtocolError::MalformedFrameLength { declared },
+                            &mut staged,
+                        );
+                        break;
+                    }
+                    HeaderParse::FrameTooLarge { declared } => {
+                        fail_inflight_no_readbuf(
+                            state,
+                            ProtocolError::FrameTooLarge { declared },
+                            &mut staged,
+                        );
+                        break;
+                    }
+                    HeaderParse::Ok { tag, total_len } => {
+                        // total_len: u16 (DEF-154 (G)), bounded
+                        // `5..=READ_BUF_CAP` by parse_header.
+                        let total_len_usize = usize::from(total_len);
+                        if after_consumed.len() < total_len_usize {
                             break;
                         }
-                        HeaderParse::FrameTooLarge { declared } => {
-                            fail_inflight_no_readbuf(
-                                state,
-                                ProtocolError::FrameTooLarge { declared },
-                                &mut staged,
-                            );
+                        // DEF-182 site 1 (payload extraction):
+                        // length-arith invariant — parse_header Ok
+                        // ⇒ total_len >= HEADER_LEN; the len-check
+                        // above ensures total_len <= after_consumed
+                        // .len(). Classified as tier-2 structural
+                        // shield (architecturally dead None).
+                        let payload_opt =
+                            after_consumed.get(HEADER_LEN..total_len_usize);
+                        debug_assert!(
+                            payload_opt.is_some(),
+                            "DEF-182: payload slice .get(HEADER_LEN..total_len) None",
+                        );
+                        let payload = payload_opt.unwrap_or(&[]);
+
+                        // Pre-dispatch filters.
+                        if tag == crate::wire::TAG_PARAMETER_STATUS
+                            && allows_unsolicited_param_status(state)
+                        {
+                            match record_param_status(session_params, payload) {
+                                ParamStatusRecordOutcome::Processed
+                                | ParamStatusRecordOutcome::MalformedPayload => {}
+                            }
+                            frames_consumed =
+                                frames_consumed.saturating_add(total_len);
+                            continue;
+                        }
+                        if tag == crate::wire::TAG_NOTICE_RESPONSE {
+                            frames_consumed =
+                                frames_consumed.saturating_add(total_len);
+                            continue;
+                        }
+
+                        // FrameCoords absolute offsets (relative to
+                        // populated(), which is the whole inner
+                        // buffer including pre-cursor bytes).
+                        let frame_start = AbsFrameStart::new(absolute_start);
+                        let frame_len = FrameTotalLen::new(total_len);
+
+                        if staged
+                            .len()
+                            .saturating_add(WORST_CASE_PER_DISPATCH)
+                            > MAX_ACTIONS_PER_CALL
+                        {
                             break;
                         }
-                        HeaderParse::Ok { tag, total_len } => {
-                            // total_len: u16 (DEF-154 (G)), bounded
-                            // `5..=READ_BUF_CAP` by parse_header.
-                            let total_len_usize = usize::from(total_len);
-                            if after_consumed.len() < total_len_usize {
-                                break;
-                            }
-                            // DEF-182 site 1 (payload extraction):
-                            // length-arith invariant — parse_header Ok
-                            // ⇒ total_len >= HEADER_LEN; the len-check
-                            // above ensures total_len <= after_consumed
-                            // .len(). Classified as tier-2 structural
-                            // shield (architecturally dead None). NOT
-                            // closed by DEF-154 (E) — brand doesn't help
-                            // at length-arith; separate refactor needed.
-                            let payload_opt =
-                                after_consumed.get(HEADER_LEN..total_len_usize);
-                            debug_assert!(
-                                payload_opt.is_some(),
-                                "DEF-182: payload slice .get(HEADER_LEN..total_len) None",
-                            );
-                            let payload = payload_opt.unwrap_or(&[]);
 
-                            // Pre-dispatch filters: ParameterStatus /
-                            // NoticeResponse bump the logical cursor
-                            // and continue without dispatching.
-                            if tag == crate::wire::TAG_PARAMETER_STATUS
-                                && allows_unsolicited_param_status(state)
-                            {
-                                match record_param_status(
-                                    session_params,
-                                    payload,
-                                ) {
-                                    ParamStatusRecordOutcome::Processed
-                                    | ParamStatusRecordOutcome::MalformedPayload => {}
-                                }
+                        let prev = core::mem::take(state);
+                        let mut arena_writer = schema_arena.as_writer();
+                        let outcome = dispatch(
+                            prev,
+                            tag,
+                            payload,
+                            &mut reserved,
+                            &mut arena_writer,
+                            FrameCoords::new(frame_start, frame_len),
+                            populated,
+                        );
+                        match outcome {
+                            DispatchOutcome::AdvancedSilent { new_state } => {
+                                *state = new_state;
                                 frames_consumed =
                                     frames_consumed.saturating_add(total_len);
-                                continue;
                             }
-                            if tag == crate::wire::TAG_NOTICE_RESPONSE {
+                            DispatchOutcome::AdvancedWithAction {
+                                new_state,
+                                action,
+                            } => {
+                                *state = new_state;
                                 frames_consumed =
                                     frames_consumed.saturating_add(total_len);
-                                continue;
-                            }
-
-                            // FrameCoords absolute offsets. Cursor
-                            // position PLUS logical-consumed: the
-                            // physical cursor stays put (no in-scope
-                            // advance) so `cursor_position() +
-                            // frames_consumed` is the absolute
-                            // frame_start into populated(). populated
-                            // bytes are UNCHANGED inside the rb scope
-                            // (no mutation exposed beyond
-                            // advance_scope_local + clear_scope_local,
-                            // and those fire OUTSIDE the loop below).
-                            //
-                            // DEF-154 (G): all operands are u16 —
-                            // `cursor_position_scope_local() -> u16`,
-                            // `frames_consumed: u16`. The sum is
-                            // bounded by READ_BUF_CAP (cursor + any
-                            // consumed-prefix ≤ populated.len() ≤
-                            // READ_BUF_CAP ≤ u16::MAX).
-                            let abs_frame_start = rb
-                                .cursor_position_scope_local()
-                                .saturating_add(frames_consumed);
-                            let frame_start = AbsFrameStart::new(abs_frame_start);
-                            let frame_len = FrameTotalLen::new(total_len);
-
-                            if staged
-                                .len()
-                                .saturating_add(WORST_CASE_PER_DISPATCH)
-                                > MAX_ACTIONS_PER_CALL
-                            {
-                                break;
-                            }
-
-                            let prev = core::mem::take(state);
-                            let mut arena_writer = schema_arena.as_writer();
-                            let read_witness = rb.populated_branded();
-                            let outcome = dispatch(
-                                prev,
-                                tag,
-                                payload,
-                                &mut reserved,
-                                &mut arena_writer,
-                                FrameCoords::new(frame_start, frame_len),
-                                read_witness,
-                            );
-                            match outcome {
-                                DispatchOutcome::AdvancedSilent { new_state } => {
-                                    *state = new_state;
-                                    frames_consumed =
-                                        frames_consumed.saturating_add(total_len);
-                                }
-                                DispatchOutcome::AdvancedWithAction {
-                                    new_state,
+                                emit_actions!(&mut staged, budget: 1, on_overflow: break, [
                                     action,
-                                } => {
-                                    *state = new_state;
-                                    frames_consumed =
-                                        frames_consumed.saturating_add(total_len);
-                                    emit_actions!(&mut staged, budget: 1, on_overflow: break, [
-                                        action,
-                                    ]);
-                                }
-                                DispatchOutcome::Errored { reply_id, cause } => {
-                                    let state_kind = cause.state_kind().unwrap_or_else(|| {
-                                        debug_assert!(
-                                            false,
-                                            "DEF-175: AlreadyClosed reached dispatch-Errored — \
-                                             impossible per DEF-142 seal.",
-                                        );
-                                        crate::error::StateErrorKind::INTERNAL_FALLBACK
-                                    });
-                                    // Install terminal state. The
-                                    // read_buf clear is deferred to
-                                    // the NEXT feed_bytes call's
-                                    // is_errored fast-path (see DEF-154
-                                    // (F) P0-1 fix): clearing inside
-                                    // this branded scope would shrink
-                                    // `populated()` to 0 and cause any
-                                    // already-staged
-                                    // `StreamRowRange<'rb>` from the
-                                    // PREVIOUS successful iteration
-                                    // to apply against an empty
-                                    // witness at materialise —
-                                    // silent empty-row corruption.
-                                    // DEF-149 atomic-terminus triple
-                                    // still atomic per-call: the caller
-                                    // observes (state + actions) from
-                                    // THIS feed_bytes as one unit;
-                                    // the buffered bytes are internal
-                                    // state and next-call's fast-path
-                                    // wipes them before any dispatch.
-                                    *state = ProtoState::Errored(state_kind);
-                                    // DEF-112: reply_id came
-                                    // pre-consumed from the dispatcher.
-                                    match reply_id {
-                                        Some(id) => {
-                                            emit_actions!(&mut staged, budget: 2, on_overflow: break, [
-                                                StagedAction::FailReply { id, cause },
-                                                StagedAction::CloseSocket,
-                                            ]);
-                                        }
-                                        None => {
-                                            emit_actions!(&mut staged, budget: 1, on_overflow: break, [
-                                                StagedAction::CloseSocket,
-                                            ]);
-                                        }
-                                    }
-                                    break;
-                                }
-                                DispatchOutcome::_Phantom(_) => {
+                                ]);
+                            }
+                            DispatchOutcome::Errored { reply_id, cause } => {
+                                let state_kind = cause.state_kind().unwrap_or_else(|| {
                                     debug_assert!(
                                         false,
-                                        "DEF-154 (B+E): DispatchOutcome::_Phantom constructed — crate bug.",
+                                        "DEF-175: AlreadyClosed reached dispatch-Errored — \
+                                         impossible per DEF-142 seal.",
                                     );
-                                    break;
+                                    crate::error::StateErrorKind::INTERNAL_FALLBACK
+                                });
+                                *state = ProtoState::Errored(state_kind);
+                                match reply_id {
+                                    Some(id) => {
+                                        emit_actions!(&mut staged, budget: 2, on_overflow: break, [
+                                            StagedAction::FailReply { id, cause },
+                                            StagedAction::CloseSocket,
+                                        ]);
+                                    }
+                                    None => {
+                                        emit_actions!(&mut staged, budget: 1, on_overflow: break, [
+                                            StagedAction::CloseSocket,
+                                        ]);
+                                    }
                                 }
+                                break;
                             }
                         }
                     }
                 }
+            }
+            } // end of reserved scope
 
-                } // end of reserved scope — NLL releases its &mut borrow of wb
+            // DEF-154 (H) P0-1 preservation: record pending_advance
+            // INSTEAD of applying it in-scope. Staged StreamRowRange
+            // holds `&'r [u8]` slices of populated — we cannot &mut
+            // read_buf while they're alive. Next feed_bytes call
+            // applies the advance at entry before any new dispatch.
+            //
+            // If state transitioned to Errored this call, DON'T
+            // record pending_advance — next call's is_errored
+            // fast-path will CLEAR the buffer anyway (pending advance
+            // becomes moot).
+            if !matches!(state, ProtoState::Errored(_)) && frames_consumed > 0 {
+                *pending_advance = frames_consumed;
+            }
 
-                // Post-loop logical-cursor application.
-                //
-                // P0-1 fix (DEF-154 (F)): fatal-path `clear_scope_local`
-                // is NOT performed here. If dispatch installed
-                // `ProtoState::Errored`, the read_buf is left
-                // untouched so any `StreamRowRange<'rb>` staged by an
-                // earlier successful iteration still applies against
-                // the unchanged `populated()` at materialise — no
-                // silent empty-row corruption. The NEXT `feed_bytes`
-                // call hits the `is_errored` fast-path, which wipes
-                // the buffer before any new dispatch. PgProtocol is
-                // !Sync, so no external observer sees the interim
-                // buffered bytes.
-                //
-                // Non-fatal: advance by accumulated frames_consumed.
-                // `advance_scope_local` Err is architecturally dead
-                // (frames_consumed sums validated total_len values
-                // against the base populated len); classify via
-                // field-level fail. No clear here either — the NEXT
-                // feed_bytes call will wipe via is_errored fast-path.
-                if !matches!(state, ProtoState::Errored(_))
-                    && frames_consumed > 0
-                    && rb
-                        .advance_scope_local(usize::from(frames_consumed))
-                        .is_err()
-                {
-                    fail_inflight_no_readbuf(
-                        state,
-                        ProtocolError::InternalCrateBug {
-                            locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                        },
-                        &mut staged,
-                    );
-                }
-
-                materialise(
-                    staged,
-                    wb.into_bytes_branded(),
-                    rb.into_populated_branded(),
-                    schema_arena.as_reader(),
-                )
-            })
+            materialise(staged, wb.into_bytes_branded(), schema_arena.as_reader())
         })
     }
     /// DEF-172 — entry-point arena reclamation.
@@ -1992,10 +1937,9 @@ fn build_startup_message<'brand>(
 /// refuses any `&mut WriteBuf` re-borrow while the returned
 /// `OutActions<'w, 'r>` is alive, and any `&mut self` re-borrow
 /// on `PgProtocol` (thus `feed_bytes`) while `'r` is alive.
-fn materialise<'w, 'r, 'wb, 'rb>(
-    staged: StagedActions<'wb, 'rb>,
+fn materialise<'w, 'r, 'wb>(
+    staged: StagedActions<'wb, 'r>,
     write_bytes: crate::write_buf::BrandedBytes<'wb, 'w>,
-    read_bytes: crate::write_buf::BrandedBytes<'rb, 'r>,
     arena: crate::schema_arena::ArenaReader<'r>,
 ) -> OutActions<'w, 'r> {
     let mut out = OutActions::new();
@@ -2003,16 +1947,15 @@ fn materialise<'w, 'r, 'wb, 'rb>(
         let a: Action<'w, 'r> = match sa {
             StagedAction::SendBytesRange(range) => {
                 // DEF-154 (B): WriteRange<'wb>::apply takes
-                // BrandedBytes<'wb, 'w> and returns &'w [u8]
-                // **INFALLIBLY**. The `'wb` brand on both operands
-                // is the same (generative closure scope), and
-                // `WriteRange::from_branded_write_span` validated
-                // `start + len <= buf.len()` at construction —
-                // combined with BrandedWriteBuf's API narrow
-                // (no truncating ops reachable inside the branded
-                // scope), the bounds hold at apply time. No
-                // debug_assert shield needed — the class is
-                // closed at the type level.
+                // BrandedBytes<'wb, 'w> and returns &'w [u8].
+                // Same 'wb brand on both operands (generative closure
+                // scope), construction-time bounds validation, and
+                // BrandedWriteBuf's API narrow close the class
+                // structurally. The body's `unwrap_or(&[])` fallback
+                // on `NonEmptyRange::apply`'s None is the last
+                // remaining runtime shield on the write side —
+                // architecturally dead, flagged for future closure
+                // via a NonEmptyRange apply-typestate refactor.
                 Action::SendBytes(range.apply(write_bytes))
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
@@ -2027,30 +1970,15 @@ fn materialise<'w, 'r, 'wb, 'rb>(
                 value: entry.staged().into_public(arena),
             },
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
-            // 1c-1b: row_range is absolute coordinates into the
-            // read buffer's populated region (`ReadBuf::populated`),
-            // valid from emission through materialise because
-            // the `'r` borrow on OutActions blocks all
-            // `&mut self.read_buf` calls on PgProtocol until the
-            // caller drops the returned actions.
-            //
-            // DEF-119: `schema_ref` is a 2-byte arena handle
-            // (post-DEF-148 NonZeroU8 + generation). We resolve via
-            // `arena.get(ref)` to a `&'r RowDesc`. The resolution
-            // `None` branch is architecturally dead — alloc happens
-            // in dispatch at the same moment the state variant is
-            // entered that the staged action was constructed from,
-            // so the slot is live.
-            //
-            // DEF-170 (audit2 A010): debug_assert shields the dead
-            // None branch loudly in tests. DEF-150 reserved
-            // `CrateBugLocus::StaleSchemaRef` for the full structural
-            // classification; DEF-154 (buffer-witness) will
-            // eliminate the class entirely by making the resolution
-            // compile-enforced. Until then: debug-time loud, release
-            // falls back to `RowDesc::EMPTY` — forbid-bundle bans
-            // `panic!` so this is the tightest non-witness closure.
-            StagedAction::StreamRowRange { id, row_range, schema_ref } => {
+            // DEF-154 (H): `row_bytes: &'r [u8]` carried directly by
+            // the staged action — no range-apply dance. Tier-1
+            // infallible: the slice was validated at dispatch time
+            // (via `populated.get(start..end)` bounds check;
+            // out-of-bounds routed through `MalformedDataRow`) and
+            // the `'r` lifetime ties it to the read_buf borrow that
+            // blocks any `&mut self.read_buf` call until OutActions
+            // drops. Identity apply here.
+            StagedAction::StreamRowRange { id, row_bytes, schema_ref } => {
                 // DEF-170 shield on stale SchemaRef; DEF-154 (D)
                 // arena-brand will eliminate that class.
                 let desc_opt = arena.get(schema_ref);
@@ -2060,20 +1988,13 @@ fn materialise<'w, 'r, 'wb, 'rb>(
                      crate bug; DEF-154 (D) arena-brand will eliminate \
                      this class structurally.",
                 );
-                // DEF-154 (E): tier-1 infallible apply via branded
-                // ReadRange<'rb> + BrandedBytes<'rb, 'r>. No shield,
-                // no unwrap_or — class closed structurally.
                 Action::StreamRow {
                     id,
-                    row_bytes: row_range.apply(read_bytes),
+                    row_bytes,
                     desc: desc_opt.unwrap_or(&crate::decode::RowDesc::EMPTY),
                 }
             }
             StagedAction::CloseSocket => Action::CloseSocket,
-            // DEF-154 (B) Phase B4: _Phantom is never constructed
-            // (brand anchor — see StagedAction enum doc). Handled
-            // as a continue (skip) for exhaustive-match compliance.
-            StagedAction::_Phantom(_) => continue,
         };
         // `staged` and `out` share `MAX_ACTIONS_PER_CALL` as their
         // bound — staged's length is ≤ out's capacity, so push never
@@ -2451,11 +2372,6 @@ mod compute_push_tests {
                 // for exhaustive-match compliance (never observed here).
                 StagedAction::StreamRowRange { .. } => Self::CloseSocket,
                 StagedAction::CloseSocket => Self::CloseSocket,
-                // DEF-154 (B) Phase B4 brand anchor — never
-                // constructed. Handle as CloseSocket-equivalent
-                // neutral sentinel (forbid-bundle bans
-                // `unreachable!()`).
-                StagedAction::_Phantom(_) => Self::CloseSocket,
             }
         }
     }

@@ -220,7 +220,7 @@ const _: () = assert!(
 /// (`AdvancedWithAction` requires the field, `AdvancedSilent` does not).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant, reason = "no_alloc: Box unavailable; DispatchOutcome is a one-shot return, not stored. FailReply.cause (ProtocolError ~280 bytes) dominates.")]
-pub(crate) enum DispatchOutcome<'wb, 'rb> {
+pub(crate) enum DispatchOutcome<'wb, 'r> {
     /// Frame consumed; transition to `new_state`. No action emitted.
     /// Used by ParameterStatus, BackendKeyData, AuthenticationOk,
     /// SASLFinal — frames that advance state without user-visible
@@ -233,11 +233,16 @@ pub(crate) enum DispatchOutcome<'wb, 'rb> {
     /// staged action. DEF-094: `StagedAction` is range-based — the
     /// entry-point materialises into a ref-bound `Action<'buf>`
     /// after the write phase releases.
+    ///
+    /// DEF-154 (H): `'wb` is the write-buffer brand (preserved for
+    /// tier-1 WriteRange::apply); `'r` is the read-buffer borrow
+    /// lifetime (replaced the removed `'rb` brand). Both are
+    /// anchored here via `StagedAction`.
     AdvancedWithAction {
         /// The state to transition to.
         new_state: ProtoState,
-        /// The single side-effect to push — range-based, ref-free.
-        action: StagedAction<'wb, 'rb>,
+        /// The single side-effect to push.
+        action: StagedAction<'wb, 'r>,
     },
     /// Frame rejected; connection irrecoverable. Caller tears down.
     ///
@@ -251,16 +256,13 @@ pub(crate) enum DispatchOutcome<'wb, 'rb> {
     /// payload). Pre-consuming at each dispatcher's Errored
     /// construction site keeps the DispatchOutcome kind-free and
     /// avoids forcing DispatchOutcome to be generic over K.
+    ///
+    /// DEF-154 (H): `_Phantom(DualBrandInvariant)` variant deleted
+    /// — `'wb` and `'r` are both anchored in `AdvancedWithAction`.
     Errored {
         reply_id: Option<core::num::NonZeroU64>,
         cause: ProtocolError,
     },
-    /// DEF-154 (B+E) brand anchor for BOTH `'wb` and `'rb`.
-    /// Mirror of `StagedAction::_Phantom` pattern; reuses the
-    /// `DualBrandInvariant` alias to keep the type simple for
-    /// clippy::type_complexity.
-    #[doc(hidden)]
-    _Phantom(crate::action::DualBrandInvariant<'wb, 'rb>),
 }
 
 /// DEF-103: `#[cold] #[inline]` helper centralising every
@@ -275,10 +277,10 @@ pub(crate) enum DispatchOutcome<'wb, 'rb> {
 /// value) per DEF-112's pre-consume convention.
 #[cold]
 #[inline]
-const fn errored<'wb, 'rb>(
+const fn errored<'wb, 'r>(
     reply_id: Option<core::num::NonZeroU64>,
     cause: ProtocolError,
-) -> DispatchOutcome<'wb, 'rb> {
+) -> DispatchOutcome<'wb, 'r> {
     DispatchOutcome::Errored { reply_id, cause }
 }
 
@@ -292,10 +294,10 @@ const fn errored<'wb, 'rb>(
 /// Audit2 A014.
 #[cold]
 #[inline]
-const fn internal_bug<'wb, 'rb>(
+const fn internal_bug<'wb, 'r>(
     reply_id: Option<core::num::NonZeroU64>,
     locus: crate::error::CrateBugLocus,
-) -> DispatchOutcome<'wb, 'rb> {
+) -> DispatchOutcome<'wb, 'r> {
     errored(reply_id, ProtocolError::InternalCrateBug { locus })
 }
 
@@ -324,15 +326,15 @@ const fn internal_bug<'wb, 'rb>(
 /// not expose those methods. Tier-2 structural closure of the "only
 /// alloc in dispatch" invariant that was previously tier-3
 /// code-review discipline.
-pub(crate) fn dispatch<'wb, 'rb>(
+pub(crate) fn dispatch<'wb, 'r>(
     prev: ProtoState,
     tag: crate::wire::InboundTag,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
     arena: &mut crate::schema_arena::ArenaWriter<'_>,
     coords: FrameCoords,
-    read_witness: crate::write_buf::BrandedBytes<'rb, '_>,
-) -> DispatchOutcome<'wb, 'rb> {
+    populated: &'r [u8],
+) -> DispatchOutcome<'wb, 'r> {
     match (prev, tag) {
         // =============================================================
         // Ping flow (Phase 1a, carried forward)
@@ -593,7 +595,7 @@ pub(crate) fn dispatch<'wb, 'rb>(
 
         // StreamingRows: D / C / E — any other tag is desync
         (ProtoState::SimpleQueryStreamingRows { reply, schema_ref }, TAG_DATA_ROW) => {
-            stream_row_or_errored(reply, schema_ref, coords, read_witness)
+            stream_row_or_errored(reply, schema_ref, coords, populated)
         }
         (ProtoState::SimpleQueryStreamingRows { reply, schema_ref }, TAG_COMMAND_COMPLETE) => {
             // SELECT path terminates: preserve schema into AwaitingRfq
@@ -807,7 +809,7 @@ pub(crate) fn dispatch<'wb, 'rb>(
         (
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref },
             TAG_DATA_ROW,
-        ) => stream_row_or_errored(reply, schema_ref, coords, read_witness),
+        ) => stream_row_or_errored(reply, schema_ref, coords, populated),
         (
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref },
             TAG_COMMAND_COMPLETE,
@@ -827,7 +829,7 @@ pub(crate) fn dispatch<'wb, 'rb>(
         }
 
         (ProtoState::BindExecuteStreamingRows { reply, schema_ref }, TAG_DATA_ROW) => {
-            stream_row_or_errored(reply, schema_ref, coords, read_witness)
+            stream_row_or_errored(reply, schema_ref, coords, populated)
         }
         (ProtoState::BindExecuteStreamingRows { reply, schema_ref }, TAG_COMMAND_COMPLETE) => {
             advance_to_bindexecute_awaiting_rfq_select(reply, payload, schema_ref)
@@ -1087,7 +1089,7 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
 /// cannot reach this arm with SCRAM payloads already buffered,
 /// because the Scram variant of the state has its own handler —
 /// this separation is the tier-1 compile guarantee DEF-097 buys.
-fn dispatch_auth_in_startup_trust<'wb, 'rb>(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome<'wb, 'rb> {
+fn dispatch_auth_in_startup_trust<'wb, 'r>(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome<'wb, 'r> {
     let (code, _rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1119,12 +1121,12 @@ fn dispatch_auth_in_startup_trust<'wb, 'rb>(reply: ReplyId<crate::reply_id::Star
 /// Only `AUTH_SASL` is acceptable here; the server taking `AUTH_OK`
 /// without asking for the password is an auth-method mismatch on
 /// the server side (client expected SCRAM).
-fn dispatch_auth_in_startup_scram<'wb, 'rb>(
+fn dispatch_auth_in_startup_scram<'wb, 'r>(
     reply: ReplyId<crate::reply_id::StartupKind>,
     scram: crate::scram::session::ScramSession,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
-) -> DispatchOutcome<'wb, 'rb> {
+) -> DispatchOutcome<'wb, 'r> {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1290,14 +1292,14 @@ fn build_sasl_initial_response<'wb>(
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
 /// [`ScramSession::try_from_credentials`]: crate::scram::session::ScramSession::try_from_credentials
-fn dispatch_auth_sasl_continue<'wb, 'rb>(
+fn dispatch_auth_sasl_continue<'wb, 'r>(
     reply: ReplyId<crate::reply_id::StartupKind>,
     scram: crate::scram::session::ScramSession,
     client_first_bare: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
     client_nonce_b64: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
-) -> DispatchOutcome<'wb, 'rb> {
+) -> DispatchOutcome<'wb, 'r> {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1418,11 +1420,11 @@ fn dispatch_auth_sasl_continue<'wb, 'rb>(
 }
 
 /// Dispatch AuthenticationSASLFinal (server-final-message).
-fn dispatch_auth_sasl_final<'wb, 'rb>(
+fn dispatch_auth_sasl_final<'wb, 'r>(
     reply: ReplyId<crate::reply_id::StartupKind>,
     expected_server_sig: crate::scram::types::SecretDigest,
     payload: &[u8],
-) -> DispatchOutcome<'wb, 'rb> {
+) -> DispatchOutcome<'wb, 'r> {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1454,7 +1456,7 @@ fn dispatch_auth_sasl_final<'wb, 'rb>(
 }
 
 /// Dispatch AuthenticationOk after SCRAM verification.
-fn dispatch_auth_ok_after_scram<'wb, 'rb>(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome<'wb, 'rb> {
+fn dispatch_auth_ok_after_scram<'wb, 'r>(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome<'wb, 'r> {
     // AuthOk has no trailing data; destructure with anonymous `_`
     // pattern (pattern-discard, not a `_`-prefixed identifier —
     // allowed by the `no underscore vars` discipline).
@@ -1608,11 +1610,11 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 /// Centralises the "`CommandComplete` → AwaitingRfq" invariant in one
 /// place — an arm-body edit in only one of the two call sites
 /// would diverge silently; the helper makes the transition atomic.
-fn advance_to_awaiting_rfq<'wb, 'rb>(
+fn advance_to_awaiting_rfq<'wb, 'r>(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
     schema_ref: Option<crate::schema_arena::SchemaRef>,
-) -> DispatchOutcome<'wb, 'rb> {
+) -> DispatchOutcome<'wb, 'r> {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::SimpleQueryAwaitingRfq {
@@ -1632,11 +1634,11 @@ fn advance_to_awaiting_rfq<'wb, 'rb>(
 ///
 /// The DML path's 'C' transition is inlined directly in the dispatch
 /// arm (one call-site only) and doesn't need a helper.
-fn advance_to_bindexecute_awaiting_rfq_select<'wb, 'rb>(
+fn advance_to_bindexecute_awaiting_rfq_select<'wb, 'r>(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
     schema_ref: crate::schema_arena::SchemaRef,
-) -> DispatchOutcome<'wb, 'rb> {
+) -> DispatchOutcome<'wb, 'r> {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::BindExecuteAwaitingRfqSelect {
@@ -1675,10 +1677,10 @@ fn advance_to_bindexecute_awaiting_rfq_select<'wb, 'rb>(
 /// register pressure permits. Same treatment as `errored()` above.
 #[cold]
 #[inline]
-fn advance_to_drain_after_error<'wb, 'rb>(
+fn advance_to_drain_after_error<'wb, 'r>(
     raw_id: core::num::NonZeroU64,
     payload: &[u8],
-) -> DispatchOutcome<'wb, 'rb> {
+) -> DispatchOutcome<'wb, 'r> {
     let cause = parse_error_response(payload);
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::DrainRfqAfterError,
@@ -1739,37 +1741,27 @@ fn parse_rfq_payload(
 /// branch is architecturally unreachable when `parse_header` has
 /// already validated frame bounds, but surfacing it as a classified
 /// error (vs a panic) preserves the crate-root panic ban.
-fn stream_row_or_errored<'wb, 'rb>(
+fn stream_row_or_errored<'wb, 'r>(
     reply: ReplyId<crate::reply_id::QueryKind>,
     schema_ref: crate::schema_arena::SchemaRef,
     coords: FrameCoords,
-    read_witness: crate::write_buf::BrandedBytes<'rb, '_>,
-) -> DispatchOutcome<'wb, 'rb> {
-    // DEF-154 (E): tier-1 branded range via witness.
-    // `ReadRange::new(start, end, witness) -> Option<ReadRange<'rb>>`
-    // validates bounds against witness.len(); the brand on the
-    // result proves buffer-identity for materialise-time apply.
+    populated: &'r [u8],
+) -> DispatchOutcome<'wb, 'r> {
+    // DEF-154 (H): tier-1 apply — we slice `populated` directly,
+    // store the resulting `&'r [u8]` in the staged action. No
+    // intermediate (start, len) + brand dance, no Option-returning
+    // apply seam, no unwrap_or fallback. The slice is borrow-
+    // checked against the populated region's lifetime.
     //
-    // DEF-154 (F): None classifies as `MalformedDataRow` — this is
-    // a server-side framing desync (DataRow with no body, i.e.
-    // total_len == HEADER_LEN), NOT a crate bug. Pre-(F) the None
-    // case was routed through `CrateBugLocus::EmptyReadRange` which
-    // misled operators reading the log.
-    match crate::action::ReadRange::<'rb>::new(
-        coords.payload_start(),
-        coords.payload_end(),
-        read_witness,
-    ) {
-        Some(row_range) => {
+    // None classifies as `MalformedDataRow` — server-side framing
+    // desync (DataRow with `total_len == HEADER_LEN`, i.e. empty
+    // body), NOT a crate bug.
+    match populated.get(coords.payload_start()..coords.payload_end()) {
+        Some(row_bytes) => {
             let id = reply.get();
             DispatchOutcome::AdvancedWithAction {
-                // F19 + DEF-119: preserve schema_ref back into the state
-                // variant. StagedAction::StreamRowRange carries a copy
-                // of the ref (1 byte) — state retains its own copy for
-                // the next iteration. Materialise resolves the ref to
-                // `&'r RowDesc` via the arena.
                 new_state: ProtoState::SimpleQueryStreamingRows { reply, schema_ref },
-                action: StagedAction::StreamRowRange { id, row_range, schema_ref },
+                action: StagedAction::StreamRowRange { id, row_bytes, schema_ref },
             }
         }
         None => DispatchOutcome::Errored {

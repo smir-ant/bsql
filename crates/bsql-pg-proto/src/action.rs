@@ -405,112 +405,30 @@ impl<'brand> WriteRange<'brand> {
     }
 }
 
-/// Generatively-branded range into an inbound [`crate::buf::ReadBuf`].
-///
-/// Symmetric partner to [`WriteRange<'brand>`] on the read side.
-/// DEF-154 (E): production-visible post read-side tier-1 lift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReadRange<'brand> {
-    /// Underlying non-empty range (see [`WriteRange::inner`]).
-    inner: NonEmptyRange,
-    /// Invariant phantom — see write_buf.rs Phase B1 block.
-    _brand: core::marker::PhantomData<fn(&'brand ()) -> &'brand ()>,
-}
+// DEF-154 (H): `ReadRange<'brand>` type + `BrandedReadBuf` +
+// `DualBrandInvariant` + the entire `'rb` brand scaffolding on
+// the read side DELETED. `StagedAction::StreamRowRange` now
+// carries `row_bytes: &'r [u8]` directly — slice is borrowed at
+// dispatch time from `read_buf.populated()`, stored in staged,
+// and passed through materialise unchanged (tier-1 identity apply).
+//
+// The `'rb` brand was introduced in (E) to prove "same buffer"
+// for `ReadRange::apply` bounds-safety. But Rust's borrow checker
+// already tracks slice lifetime — storing `&'r [u8]` directly is
+// strictly simpler and gives tier-1 apply "for free" (no Option,
+// no unwrap_or, no debug_assert). The only reason `(start, len)`
+// indirection was needed was to decouple stage-time borrow from
+// post-loop `advance_scope_local` mutation. DEF-154 (H) replaces
+// that mutation with `PgProtocol.pending_advance: u16` —
+// deferring the advance to the next feed_bytes call's entry —
+// which allows the stage-time slice to keep its shared borrow
+// through materialise without conflicting with a cursor move.
 
-impl<'brand> ReadRange<'brand> {
-    /// Brand a raw [`NonEmptyRange`] — crate-internal factory.
-    ///
-    /// Production callers should prefer [`Self::new`] which
-    /// threads the brand through a same-brand bounds-check
-    /// witness (tier-1 soundness for apply). This raw form is
-    /// kept for drift tests and corner cases where the witness
-    /// shape doesn't fit.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn from_raw(inner: NonEmptyRange) -> Self {
-        Self {
-            inner,
-            _brand: core::marker::PhantomData,
-        }
-    }
-
-    /// DEF-154 (E) tier-1 constructor — validate bounds against a
-    /// same-brand witness.
-    ///
-    /// `witness: BrandedBytes<'brand, '_>` is the read buffer's
-    /// branded view (typically from `BrandedReadBuf::populated_branded()`);
-    /// its brand `'brand` matches the range's own `'brand` by the
-    /// HRTB closure's generativity. `start..end` is validated
-    /// against `witness.as_slice().len()`; if within bounds, the
-    /// returned `ReadRange<'brand>` carries the proof that `apply`
-    /// will succeed against any same-brand bytes.
-    ///
-    /// # Domain-neutral None
-    ///
-    /// DEF-154 (F): returns `Option<Self>` rather than
-    /// `Result<Self, ProtocolError>` — the None case is
-    /// domain-neutral (unsatisfied bounds) and callers attach
-    /// the semantic classification themselves
-    /// (e.g. `stream_row_or_errored` → `MalformedDataRow`). This
-    /// moved the classification to the call site, deleting the
-    /// pre-(F) `CrateBugLocus::EmptyReadRange` variant that
-    /// misclassified server-malformed input as a crate bug.
-    #[inline]
-    #[must_use]
-    pub(crate) fn new(
-        start: usize,
-        end: usize,
-        witness: crate::write_buf::BrandedBytes<'brand, '_>,
-    ) -> Option<Self> {
-        NonEmptyRange::new(start, end, witness.as_slice().len()).map(Self::from_raw)
-    }
-
-    /// Apply the range to same-branded bytes — **infallible**.
-    ///
-    /// Tier-1 soundness chain (mirror of `WriteRange::apply`):
-    /// 1. Same `'brand` ⇒ same `with_branded` closure ⇒ same
-    ///    `&mut ReadBuf`.
-    /// 2. `BrandedReadBuf` exposes only shared views
-    ///    (`populated_branded`, `unread_branded`) + scope-local
-    ///    mutations (`advance_scope_local`, `clear_scope_local`).
-    ///    The mutations don't shrink populated content; advance
-    ///    bumps the cursor but bytes remain in `populated()`.
-    /// 3. `ReadRange::new(start, end, witness)` validated
-    ///    `end <= witness.len()` at construction; (2) preserves
-    ///    that bound through subsequent apply.
-    /// 4. `NonEmptyRange::apply` body is `buf.get(start..end)` —
-    ///    Some by (3). The `unwrap_or(&[])` fallback is forbid-
-    ///    bundle compliance; architecturally dead under intact
-    ///    brand discipline.
-    ///
-    /// No `debug_assert` shield — the class is closed structurally
-    /// by the brand + bounds-validated constructor.
-    #[inline]
-    #[must_use]
-    pub(crate) fn apply<'a>(&self, bytes: crate::write_buf::BrandedBytes<'brand, 'a>) -> &'a [u8] {
-        self.inner.apply(bytes.as_slice()).unwrap_or(&[])
-    }
-
-    /// Access the underlying [`NonEmptyRange`] — for drift pins +
-    /// tests. Production materialise path applies via `apply` +
-    /// branded witness; direct unwrap is test-only.
-    #[cfg(test)]
-    #[inline]
-    #[must_use]
-    pub(crate) const fn inner(&self) -> NonEmptyRange {
-        self.inner
-    }
-}
-
-// Phase B3 drift pins: branded ranges must stay the same size as
+// Phase B3 drift pin: WriteRange must stay the same size as
 // the underlying `NonEmptyRange` (phantom is ZST).
 const _: () = assert!(
     core::mem::size_of::<WriteRange<'_>>() == core::mem::size_of::<NonEmptyRange>(),
     "WriteRange<'brand> size regression — brand phantom must be ZST (4 B total).",
-);
-const _: () = assert!(
-    core::mem::size_of::<ReadRange<'_>>() == core::mem::size_of::<NonEmptyRange>(),
-    "ReadRange<'brand> size regression — brand phantom must be ZST (4 B total).",
 );
 
 #[cfg(test)]
@@ -572,12 +490,12 @@ mod phase_b3_tests {
         assert_eq!(byte, 0x42, "branded WriteRange apply round-trips the pushed byte");
     }
 
-    /// B3-2: drift pin — WriteRange / ReadRange are 4 bytes
-    /// (phantom ZST + 4-byte NonEmptyRange).
+    /// B3-2: drift pin — WriteRange is 4 bytes (phantom ZST +
+    /// 4-byte NonEmptyRange). DEF-154 (H) deleted `ReadRange` so
+    /// only the write side remains under drift pin.
     #[test]
     fn branded_range_sizes_match_raw() {
         assert_eq!(core::mem::size_of::<WriteRange<'_>>(), 4);
-        assert_eq!(core::mem::size_of::<ReadRange<'_>>(), 4);
         assert_eq!(
             core::mem::size_of::<Option<WriteRange<'_>>>(),
             4,
@@ -588,37 +506,12 @@ mod phase_b3_tests {
     /// B3-3: `inner()` accessor round-trips the underlying
     /// NonEmptyRange — drift pin against accidental accessor
     /// removal (used by debug-output paths during migration).
+    /// DEF-154 (H): ReadRange deleted; WriteRange-only.
     #[test]
     fn branded_range_inner_roundtrip() {
         let raw = NonEmptyRange::DEAD_FALLBACK;
         let w = WriteRange::<'static>::from_raw(raw);
-        let r = ReadRange::<'static>::from_raw(raw);
         assert_eq!(w.inner(), raw);
-        assert_eq!(r.inner(), raw);
-    }
-
-    /// B3-4: ReadRange apply via `ReadBuf::with_branded` scope —
-    /// tier-1 lift on the read side. Uses the real Phase B2
-    /// branded-read-buffer constructor to establish `'brand`
-    /// naturally via HRTB, then constructs + applies a
-    /// same-branded range.
-    #[test]
-    fn read_range_apply_returns_infallible_slice() {
-        let mut rbuf = crate::buf::ReadBuf::new();
-        let appended = rbuf.append(b"XY");
-        assert!(appended.is_ok());
-        let byte = rbuf.with_branded(|rb| {
-            let bytes = rb.populated_branded();
-            // The `'brand` here is HRTB-fresh; `ReadRange::from_raw`
-            // inherits it from the expected type at the call site
-            // (the `apply(bytes)` call below fixes `'brand` to
-            // match `bytes`'s brand).
-            let raw = NonEmptyRange::new(0, 2, 2).unwrap_or(NonEmptyRange::DEAD_FALLBACK);
-            let range = ReadRange::from_raw(raw);
-            let slice: &[u8] = range.apply(bytes);
-            slice.first().copied().unwrap_or(0)
-        });
-        assert_eq!(byte, b'X');
     }
 
     /// DEF-154 (B) Phase B4-W P0-2 + P2 closure: exercise the
@@ -885,7 +778,7 @@ impl<'w, 'r> Iterator for OutActionsIter<'w, 'r> {
 /// than POD, smaller surface than `unsafe`, same memory footprint.
 /// Future "consistency" refactors must address all three points
 /// before proposing the change.
-pub(crate) type StagedActions<'wb, 'rb> = heapless::Vec<StagedAction<'wb, 'rb>, MAX_ACTIONS_PER_CALL>;
+pub(crate) type StagedActions<'wb, 'r> = heapless::Vec<StagedAction<'wb, 'r>, MAX_ACTIONS_PER_CALL>;
 
 /// A directive from the protocol to its host.
 ///
@@ -1059,7 +952,7 @@ pub enum Action<'w, 'r> {
 ///   copy — `Sync` bypasses `write_buf` entirely).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable. Mirrors the `Action<'w, 'r>` rationale above — DEF-119 shrunk the DeliverReply payload; FailReply.cause (ProtocolError) dominates. FailReply is cold-path.")]
-pub(crate) enum StagedAction<'wb, 'rb> {
+pub(crate) enum StagedAction<'wb, 'r> {
     /// Bytes live at the range `[start..start+len]` inside the
     /// emission-time branded `write_buf` (brand `'wb`). Typed as
     /// [`WriteRange<'wb>`] — brand proves buffer-identity +
@@ -1080,32 +973,32 @@ pub(crate) enum StagedAction<'wb, 'rb> {
         /// Why the protocol failed.
         cause: ProtocolError,
     },
-    /// Map to [`Action::StreamRow`] at materialise time. `row_range`
-    /// is absolute coordinates into [`crate::buf::ReadBuf::populated`]
-    /// — the full populated region of the inbound buffer, including
-    /// bytes already advanced past the cursor. 1c-1b.
+    /// Map to [`Action::StreamRow`] at materialise time.
     ///
-    /// Absolute (not unread-relative) coordinates survive the
-    /// cursor advance that `feed_bytes` performs between dispatch
-    /// and materialise: the bytes themselves remain in place until
-    /// the next `append` triggers lazy compaction (which in turn
-    /// cannot run while the `OutActions<'_, 'r>` borrow is alive).
+    /// DEF-154 (H): `row_bytes: &'r [u8]` is the actual row-body
+    /// slice of the inbound buffer's populated region — validated
+    /// and borrowed at dispatch time. Pre-(H) this field was
+    /// `row_range: ReadRange<'rb>`, an opaque (start, len) pair + a
+    /// phantom brand for scope identity. Apply at materialise time
+    /// did `populated.get(start..end).unwrap_or(&[])` — a tier-2
+    /// shield with silent `&[]` fallback on invariant break.
     ///
-    /// F19: carries `RowDesc` by value (copied from the
-    /// `SimpleQueryStreamingRows { row_desc }` state variant at
-    /// emission time). Avoids the lifetime issue of pointing at state
-    /// that may have transitioned (StreamingRows → AwaitingRfq → Idle)
-    /// by materialise time.
+    /// Post-(H) the slice is stored directly, apply is the identity
+    /// function (tier-1 infallible), and `ReadRange<'brand>` +
+    /// `BrandedReadBuf` + read-side scope bookkeeping are deleted
+    /// entirely. DEF-149 atomic-terminus triple is preserved by
+    /// `PgProtocol.pending_advance: u16` — the dispatch loop stages
+    /// slice borrows into `populated`, post-loop records
+    /// `frames_consumed` as pending, and the NEXT feed_bytes call
+    /// applies the pending advance at entry before re-dispatching
+    /// (see protocol.rs).
     StreamRowRange {
         /// Raw correlator (`reply.get()`; reply is NOT consumed here
         /// — rows are in-progress, the reply commits on terminal
         /// `CommandComplete`).
         id: NonZeroU64,
-        /// Absolute range into the read buffer's populated region.
-        /// DEF-154 (E): `ReadRange<'rb>` — brand proves buffer-
-        /// identity with the read scope; `apply` at materialise
-        /// time is tier-1 infallible.
-        row_range: ReadRange<'rb>,
+        /// Row-body slice. Borrows from `read_buf.populated()`.
+        row_bytes: &'r [u8],
         /// Schema arena handle (copy from StreamingRows state).
         ///
         /// DEF-119: 1-byte `SchemaRef` handle instead of the prior
@@ -1116,33 +1009,7 @@ pub(crate) enum StagedAction<'wb, 'rb> {
     },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,
-    /// DEF-154 (B+E) brand-lifetime anchor for BOTH `'wb` and `'rb`.
-    ///
-    /// `'wb` is carried by [`Self::SendBytesRange`] via
-    /// [`WriteRange<'wb>`]; `'rb` by [`Self::StreamRowRange`] via
-    /// [`ReadRange<'rb>`]. This variant anchors BOTH so that
-    /// variants not carrying either brand still fix the lifetime
-    /// parameters at the enum level. Tuple of two invariant
-    /// phantom-fn pointers keeps both brands invariant under
-    /// subtyping.
-    ///
-    /// # NEVER CONSTRUCT THIS VARIANT
-    ///
-    /// See `StagedAction`'s original `_Phantom` doc for the full
-    /// contract. Match arms handle as neutral no-op.
-    #[doc(hidden)]
-    _Phantom(DualBrandInvariant<'wb, 'rb>),
 }
-
-/// DEF-154 (E): invariant-anchor for both `'wb` and `'rb`.
-/// Factored out of `StagedAction::_Phantom` to silence
-/// clippy::type_complexity on the enum definition. ZST; matches
-/// the pair of `fn(&'X ()) -> &'X ()` phantom-fn-pointers pattern
-/// from Phase B1 (see `write_buf.rs` "Invariance mechanism" block).
-pub(crate) type DualBrandInvariant<'wb, 'rb> = core::marker::PhantomData<(
-    fn(&'wb ()) -> &'wb (),
-    fn(&'rb ()) -> &'rb (),
-)>;
 
 /// Internal lifetime-free counterpart to the public [`Reply<'r>`].
 ///
@@ -1459,10 +1326,10 @@ pub(crate) use deliver_entry_priv::DeliverReplyEntry;
 /// `ReplyKind::StagedPayload`.
 #[inline]
 #[must_use]
-pub(crate) fn deliver<'wb, 'rb, K: crate::reply_id::ReplyKind>(
+pub(crate) fn deliver<'wb, 'r, K: crate::reply_id::ReplyKind>(
     id: crate::reply_id::ReplyId<K>,
     payload: K::StagedPayload,
-) -> StagedAction<'wb, 'rb> {
+) -> StagedAction<'wb, 'r> {
     StagedAction::DeliverReply(DeliverReplyEntry::new(id.consume(), payload.into()))
 }
 

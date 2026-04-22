@@ -647,25 +647,13 @@ impl<'brand> BrandedBytes<'brand, 'static> {
     }
 }
 
-impl<'brand, 'a> BrandedBytes<'brand, 'a> {
-    /// Crate-internal factory: wrap a raw `&'a [u8]` with brand
-    /// `'brand`. Used by the symmetric `BrandedReadBuf` in `buf.rs`
-    /// (Phase B2) so both sides can produce [`BrandedBytes`] without
-    /// duplicating the struct field layout across modules.
-    ///
-    /// DEF-154 (B+E): factory used by `BrandedReadBuf`'s production
-    /// accessors + Phase B3 tests. Production
-    /// `BrandedWriteBuf::into_bytes_branded` constructs via direct
-    /// struct literal instead.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn from_slice_branded(bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            _brand: PhantomData,
-        }
-    }
-}
+// DEF-154 (H): `impl<'brand, 'a> BrandedBytes<'brand, 'a>` block
+// carrying `from_slice_branded` — DELETED. After read-side brand
+// removal, production call sites evaporated
+// (`BrandedReadBuf::{populated_branded,unread_branded,into_populated_branded}`
+// gone). `BrandedWriteReserved::as_bytes_branded` remains test-only
+// and constructs via the struct literal inside its own impl block.
+
 
 impl fmt::Debug for BrandedBytes<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -928,7 +916,10 @@ impl<'brand> BrandedWriteReserved<'brand, '_> {
     #[inline]
     #[must_use]
     pub(crate) fn as_bytes_branded(&self) -> BrandedBytes<'brand, '_> {
-        BrandedBytes::from_slice_branded(self.buf.as_bytes())
+        BrandedBytes {
+            bytes: self.buf.as_bytes(),
+            _brand: PhantomData,
+        }
     }
 }
 
