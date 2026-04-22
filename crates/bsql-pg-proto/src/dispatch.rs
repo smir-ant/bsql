@@ -298,6 +298,23 @@ const fn errored(
     DispatchOutcome::Errored { reply_id, cause }
 }
 
+/// DEF-177 — cold helper for InternalCrateBug DispatchOutcome::Errored
+/// construction. Used by the 4 dispatch arms that detect a crate-
+/// internal invariant break (arena alloc-full × 3 sites + row-range
+/// construction × 1 site). Pre-DEF-177 each inline-constructed the
+/// full `ProtocolError::InternalCrateBug { locus }` variant; the
+/// helper centralises the construction + cold-path annotation.
+///
+/// Audit2 A014.
+#[cold]
+#[inline]
+const fn internal_bug(
+    reply_id: Option<core::num::NonZeroU64>,
+    locus: crate::error::CrateBugLocus,
+) -> DispatchOutcome {
+    errored(reply_id, ProtocolError::InternalCrateBug { locus })
+}
+
 
 /// Dispatch a single frame.
 ///
@@ -552,11 +569,9 @@ pub(crate) fn dispatch(
                     // DataRow-parsing code). Crate-internal invariant
                     // break: every query should enter with an empty
                     // arena thanks to entry-point cleanup.
-                    None => errored(
+                    None => internal_bug(
                         Some(reply.consume()),
-                        ProtocolError::InternalCrateBug {
-                            locus: crate::error::CrateBugLocus::SchemaArenaAllocFull,
-                        },
+                        crate::error::CrateBugLocus::SchemaArenaAllocFull,
                     ),
                 },
                 Err(cause) => errored(Some(reply.consume()), cause),
@@ -912,11 +927,10 @@ pub(crate) fn dispatch(
                 },
                 // DEF-150: arena alloc-full classifies as
                 // `SchemaArenaAllocFull` (A001 fix).
-                None => errored(
+                // DEF-177: via cold `internal_bug` helper.
+                None => internal_bug(
                     Some(reply.consume()),
-                    ProtocolError::InternalCrateBug {
-                        locus: crate::error::CrateBugLocus::SchemaArenaAllocFull,
-                    },
+                    crate::error::CrateBugLocus::SchemaArenaAllocFull,
                 ),
             },
             Err(cause) => errored(Some(reply.consume()), cause),
@@ -980,11 +994,9 @@ pub(crate) fn dispatch(
                     },
                     // DEF-150: arena alloc-full classifies as
                     // `SchemaArenaAllocFull` (A001 fix).
-                    None => errored(
+                    None => internal_bug(
                         Some(reply.consume()),
-                        ProtocolError::InternalCrateBug {
-                            locus: crate::error::CrateBugLocus::SchemaArenaAllocFull,
-                        },
+                        crate::error::CrateBugLocus::SchemaArenaAllocFull,
                     ),
                 },
                 Err(cause) => errored(Some(reply.consume()), cause),
@@ -1762,11 +1774,9 @@ fn stream_row_or_errored(
                 action: StagedAction::StreamRowRange { id, row_range, schema_ref },
             }
         }
-        None => errored(
+        None => internal_bug(
             Some(reply.consume()),
-            ProtocolError::InternalCrateBug {
-                locus: crate::error::CrateBugLocus::RowRangeConstruction,
-            },
+            crate::error::CrateBugLocus::RowRangeConstruction,
         ),
     }
 }

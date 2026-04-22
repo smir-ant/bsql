@@ -526,12 +526,7 @@ impl PgProtocol {
                             }
                         }
                         let Ok(()) = self.read_buf.advance(total_len) else {
-                            self.fail_inflight_and_close(
-                                ProtocolError::InternalCrateBug {
-                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                                },
-                                &mut staged,
-                            );
+                            self.fail_read_cursor_advance(&mut staged);
                             break;
                         };
                         continue;
@@ -547,12 +542,7 @@ impl PgProtocol {
                     // wrapper wants visibility.
                     if tag == crate::wire::TAG_NOTICE_RESPONSE {
                         let Ok(()) = self.read_buf.advance(total_len) else {
-                            self.fail_inflight_and_close(
-                                ProtocolError::InternalCrateBug {
-                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                                },
-                                &mut staged,
-                            );
+                            self.fail_read_cursor_advance(&mut staged);
                             break;
                         };
                         continue;
@@ -620,24 +610,14 @@ impl PgProtocol {
                         DispatchOutcome::AdvancedSilent { new_state } => {
                             self.state = new_state;
                             let Ok(()) = self.read_buf.advance(total_len) else {
-                                self.fail_inflight_and_close(
-                                    ProtocolError::InternalCrateBug {
-                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                                },
-                                    &mut staged,
-                                );
+                                self.fail_read_cursor_advance(&mut staged);
                                 break;
                             };
                         }
                         DispatchOutcome::AdvancedWithAction { new_state, action } => {
                             self.state = new_state;
                             let Ok(()) = self.read_buf.advance(total_len) else {
-                                self.fail_inflight_and_close(
-                                    ProtocolError::InternalCrateBug {
-                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                                },
-                                    &mut staged,
-                                );
+                                self.fail_read_cursor_advance(&mut staged);
                                 break;
                             };
                             emit_actions!(&mut staged, budget: 1, on_overflow: break, [
@@ -732,6 +712,35 @@ impl PgProtocol {
             self.read_buf.populated(),
             &self.schema_arena,
         )
+    }
+
+    /// DEF-177 — cold helper for the 4 ReadCursorAdvance failure
+    /// sites in `feed_bytes`.
+    ///
+    /// `ReadBuf::advance` returning Err after `parse_header` succeeded
+    /// is architecturally dead — the two checks run in the same
+    /// iteration with no interleaving mutation. The failure path
+    /// classifies as `CrateBugLocus::ReadCursorAdvance`.
+    ///
+    /// Pre-DEF-177, the 4 sites (around the NoticeResponse /
+    /// ParameterStatus / post-dispatch advance calls) open-coded:
+    ///     self.fail_inflight_and_close(
+    ///         ProtocolError::InternalCrateBug {
+    ///             locus: CrateBugLocus::ReadCursorAdvance,
+    ///         },
+    ///         &mut staged,
+    ///     );
+    /// ~6 LoC per site + inline IR cost on a hot dispatch loop.
+    /// Post-DEF-177 each site is a one-liner cold call. Audit2 A014.
+    #[cold]
+    #[inline]
+    fn fail_read_cursor_advance(&mut self, staged: &mut StagedActions) {
+        self.fail_inflight_and_close(
+            ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+            },
+            staged,
+        );
     }
 
     /// DEF-172 — entry-point arena reclamation.
