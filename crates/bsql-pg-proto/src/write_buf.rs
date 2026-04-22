@@ -959,7 +959,7 @@ pub(crate) struct BrandedWriteReserved<'brand, 'a> {
 }
 
 #[cfg(test)]
-impl BrandedWriteReserved<'_, '_> {
+impl<'brand> BrandedWriteReserved<'brand, '_> {
     /// Current buffer length. Used by builder bodies to compute
     /// emission-time range endpoints (the same pattern as
     /// [`WriteReserved::len`]).
@@ -967,6 +967,31 @@ impl BrandedWriteReserved<'_, '_> {
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Branded view of the underlying bytes — shared borrow.
+    ///
+    /// Enables the "build then apply in same branded scope" pattern
+    /// (Phase B4):
+    ///
+    /// ```ignore
+    /// buf.with_branded(|wb| {
+    ///     let reserved = wb.reserve();
+    ///     let range = build_query_message(&mut reserved, &cmd);  // WriteRange<'brand>
+    ///     let bytes = reserved.as_bytes_branded();                // BrandedBytes<'brand, '_>
+    ///     range.apply(bytes)                                      // infallible &[u8]
+    /// })
+    /// ```
+    ///
+    /// The brand `'brand` on the returned [`BrandedBytes`] matches
+    /// the brand carried by ranges produced from this reserved
+    /// buffer; [`WriteRange::apply`] (Phase B3, action.rs) returns
+    /// `&[u8]` — no `Option`, no `unwrap_or(&[])` fallback, no
+    /// DEF-182 debug_assert needed.
+    #[inline]
+    #[must_use]
+    pub(crate) fn as_bytes_branded(&self) -> BrandedBytes<'brand, '_> {
+        BrandedBytes::from_slice_branded(self.buf.as_bytes())
     }
 }
 
@@ -1075,6 +1100,23 @@ mod phase_b1_tests {
         let mut buf = WriteBuf::new();
         let reserved_len = buf.with_branded(|wb| wb.reserve().len());
         assert_eq!(reserved_len, 0);
+    }
+
+    /// B1-2b: `BrandedWriteReserved::as_bytes_branded()` — Phase
+    /// B4 builder-then-apply pattern needs shared-branded bytes
+    /// access on the reserved itself (so a builder can run,
+    /// produce a WriteRange, and then resolve that range against
+    /// `reserved.as_bytes_branded()` inside the same branded
+    /// scope). Pins the shape.
+    #[test]
+    fn branded_reserve_as_bytes_branded_len_mirrors_buf() {
+        let mut buf = WriteBuf::new();
+        let (reserved_bytes_len, reserved_len) = buf.with_branded(|wb| {
+            let reserved = wb.reserve();
+            (reserved.as_bytes_branded().len(), reserved.len())
+        });
+        assert_eq!(reserved_bytes_len, 0, "fresh reserved bytes view is empty");
+        assert_eq!(reserved_bytes_len, reserved_len, "bytes-branded len must mirror reserved.len()");
     }
 
     /// B1-3: `BrandedBytes::empty()` builds a `&'static []` branded

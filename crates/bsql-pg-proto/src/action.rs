@@ -245,6 +245,307 @@ const _: () = assert!(
      are const-asserted at crate::buf::READ_BUF_CAP.",
 );
 
+// ═════════════════════════════════════════════════════════════════════
+// DEF-154 (B) Phase B3 — branded range newtypes
+// ═════════════════════════════════════════════════════════════════════
+//
+// `WriteRange<'brand>` and `ReadRange<'brand>` wrap [`NonEmptyRange`]
+// with a generative brand lifetime tied to the buffer the range was
+// constructed against. Their `apply(BrandedBytes<'brand, '_>) -> &[u8]`
+// methods are INFALLIBLE — the brand-identity proof combined with
+// the `NonEmptyRange::new` construction-time bounds-check eliminates
+// the "buffer shorter than emission-time bounds" failure mode that
+// Phase B2's shielded `apply() -> Option<&[u8]>` retained at
+// tier-2 runtime.
+//
+// # Tier-1 soundness argument
+//
+// Given a `WriteRange<'brand>` `r` and a `BrandedBytes<'brand, '_>`
+// `b`:
+//
+// 1. Same brand `'brand` ⇒ same generative-lifetime scope ⇒ same
+//    `with_branded` closure ⇒ same `BrandedWriteBuf` (invariant on
+//    `'brand` prevents cross-closure leakage).
+// 2. Inside the closure, [`crate::write_buf::BrandedWriteBuf`] exposes
+//    only `reserve()` and `as_bytes_branded()`; neither `clear()`
+//    nor any truncating op is reachable. The underlying `WriteBuf`
+//    cannot shrink between `r`'s construction and `b`'s production.
+// 3. `r`'s `start + len <= buf.len()` was validated at construction
+//    (via `NonEmptyRange::new` or `from_write_span`); combined with
+//    (2), `start + len <= buf.len() <= b.len()` holds at apply
+//    time.
+// 4. Therefore `b.as_slice().get(start..start + len)` is `Some` —
+//    the brand-pattern closes the class structurally, and
+//    `apply` returns `&[u8]` with no Option.
+//
+// Phase B3 scope — `#[cfg(test)]` scaffolding:
+//   - Types and `apply` method defined and tested.
+//   - Not yet threaded through [`StagedAction`] or [`materialise`]
+//     (those land in B4).
+//   - Existing [`NonEmptyRange::apply`] retained for the legacy
+//     code path until B4 completes the migration.
+
+/// Generatively-branded range into an outbound [`crate::write_buf::WriteBuf`].
+///
+/// Constructed by Phase B3+ branded builders (`build_*` on
+/// [`crate::write_buf::BrandedWriteReserved<'brand, '_>`]); applied
+/// at Phase B4 materialise time against
+/// `BrandedWriteReserved::as_bytes_branded()`. The brand `'brand`
+/// ties the range to the specific buffer + scope it was built for;
+/// two distinct `with_branded` closures produce disjoint brands so
+/// cross-buffer apply is a compile error.
+///
+/// Wraps [`NonEmptyRange`] by composition — storage layout is
+/// `u16 + NonZeroU16 + ZST phantom = 4 B` (same as NonEmptyRange);
+/// the brand is zero-cost at runtime.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteRange<'brand> {
+    /// Underlying non-empty range — carries the validated
+    /// `start`/`len` pair. Validation at construction proves
+    /// `start + len <= buf.len()` at emission time; the brand
+    /// preserves that bound through apply (see module block).
+    inner: NonEmptyRange,
+    /// Invariant phantom — see write_buf.rs Phase B1 block.
+    _brand: core::marker::PhantomData<fn(&'brand ()) -> &'brand ()>,
+}
+
+#[cfg(test)]
+impl<'brand> WriteRange<'brand> {
+    /// Brand a raw [`NonEmptyRange`] — crate-internal factory.
+    ///
+    /// Called by Phase B3+ branded builders after producing a
+    /// `NonEmptyRange` via `from_write_span` on the branded buffer's
+    /// underlying slab. The `'brand` is inferred from the caller's
+    /// `BrandedWriteReserved<'brand, '_>` scope, so misuse across
+    /// scopes is a compile error (the HRTB-fresh `'brand` cannot
+    /// unify with another scope's brand).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_raw(inner: NonEmptyRange) -> Self {
+        Self {
+            inner,
+            _brand: core::marker::PhantomData,
+        }
+    }
+
+    /// Apply the range to same-branded bytes — **infallible**.
+    ///
+    /// The same brand `'brand` on both operands, combined with the
+    /// `BrandedWriteBuf`'s API narrow (no truncating ops reachable
+    /// inside the branded scope) and the construction-time bounds
+    /// check on `inner`, guarantees `bytes.as_slice().get(start..end)`
+    /// is `Some`.
+    ///
+    /// The `unwrap_or(&[])` below is architecturally-dead fallback
+    /// to satisfy the forbid-bundle's ban on `panic!` in release;
+    /// debug builds fire `debug_assert!` if the invariant is ever
+    /// violated (which would indicate a crate bug in the brand
+    /// scaffolding, not a user error).
+    #[inline]
+    #[must_use]
+    pub(crate) fn apply<'a>(&self, bytes: crate::write_buf::BrandedBytes<'brand, 'a>) -> &'a [u8] {
+        let slice = self.inner.apply(bytes.as_slice());
+        debug_assert!(
+            slice.is_some(),
+            "WriteRange<'brand>::apply None — brand invariant broken. \
+             See action.rs Phase B3 block comment for the tier-1 \
+             soundness argument; a `None` here is a crate bug in the \
+             brand scaffolding, not a usage error.",
+        );
+        slice.unwrap_or(&[])
+    }
+
+    /// Access the underlying [`NonEmptyRange`] — for debug output
+    /// and drift tests only. Production code works through the
+    /// branded type.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn inner(&self) -> NonEmptyRange {
+        self.inner
+    }
+}
+
+/// Generatively-branded range into an inbound [`crate::buf::ReadBuf`].
+///
+/// Symmetric partner to [`WriteRange<'brand>`] on the read side.
+/// Constructed by Phase B3+ branded dispatch arms from
+/// `FrameCoords` during `feed_bytes`; applied at Phase B4
+/// materialise time against `BrandedReadBuf::populated_branded()`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadRange<'brand> {
+    /// Underlying non-empty range (see [`WriteRange::inner`]).
+    inner: NonEmptyRange,
+    /// Invariant phantom — see write_buf.rs Phase B1 block.
+    _brand: core::marker::PhantomData<fn(&'brand ()) -> &'brand ()>,
+}
+
+#[cfg(test)]
+impl<'brand> ReadRange<'brand> {
+    /// Brand a raw [`NonEmptyRange`] — crate-internal factory.
+    ///
+    /// Same mechanics as [`WriteRange::from_raw`] but for the read
+    /// side.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_raw(inner: NonEmptyRange) -> Self {
+        Self {
+            inner,
+            _brand: core::marker::PhantomData,
+        }
+    }
+
+    /// Apply the range to same-branded bytes — **infallible**.
+    ///
+    /// See [`WriteRange::apply`] for the tier-1 soundness argument;
+    /// the read-side analogue follows identically from
+    /// [`crate::buf::BrandedReadBuf`]'s API narrow (no mutating ops
+    /// reachable inside the branded scope).
+    #[inline]
+    #[must_use]
+    pub(crate) fn apply<'a>(&self, bytes: crate::write_buf::BrandedBytes<'brand, 'a>) -> &'a [u8] {
+        let slice = self.inner.apply(bytes.as_slice());
+        debug_assert!(
+            slice.is_some(),
+            "ReadRange<'brand>::apply None — brand invariant broken. \
+             See action.rs Phase B3 block comment; crate bug in brand \
+             scaffolding, not a usage error.",
+        );
+        slice.unwrap_or(&[])
+    }
+
+    /// Access the underlying [`NonEmptyRange`] — for debug + drift
+    /// tests.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn inner(&self) -> NonEmptyRange {
+        self.inner
+    }
+}
+
+// Phase B3 drift pins: branded ranges must stay the same size as
+// the underlying `NonEmptyRange` (phantom is ZST).
+#[cfg(test)]
+const _: () = assert!(
+    core::mem::size_of::<WriteRange<'_>>() == core::mem::size_of::<NonEmptyRange>(),
+    "WriteRange<'brand> size regression — brand phantom must be ZST (4 B total).",
+);
+#[cfg(test)]
+const _: () = assert!(
+    core::mem::size_of::<ReadRange<'_>>() == core::mem::size_of::<NonEmptyRange>(),
+    "ReadRange<'brand> size regression — brand phantom must be ZST (4 B total).",
+);
+
+#[cfg(test)]
+mod phase_b3_tests {
+    //! DEF-154 (B) Phase B3 — branded range newtype tests.
+    //!
+    //! Phase B3 covers the shape + infallible `apply` of the
+    //! branded ranges. Actual end-to-end builder → apply
+    //! round-tripping (pushing bytes into a buffer via a branded
+    //! reserved and applying the range against same-brand bytes)
+    //! requires push methods on `BrandedWriteReserved`, which land
+    //! in Phase B4 alongside builder migration. Phase B3 tests
+    //! what CAN be tested without that:
+    //!   - Types are constructible via `from_raw`.
+    //!   - `inner()` accessor round-trips.
+    //!   - Size is 4 B (phantom ZST).
+    //!   - `apply()` on a same-brand `BrandedBytes` returns
+    //!     `&[u8]` (not `Option<&[u8]>`) — tier-1 lift at the
+    //!     type level, infallibility verified by the
+    //!     construction-bounds + brand-identity argument in the
+    //!     module block.
+    //!
+    //! Cross-brand rejection is a compile-time property and lands
+    //! in a future trybuild harness.
+    use super::*;
+    use crate::write_buf::WriteBuf;
+
+    /// B3-1: happy-path apply — build a range whose `(start=0,
+    /// len=1)` fits the 1-byte populated buffer, apply it
+    /// same-branded, observe the expected single-byte slice with
+    /// no call-site `Option` unwrap.
+    ///
+    /// The byte is pushed BEFORE entering the branded scope
+    /// (Phase B3 doesn't yet migrate push methods onto
+    /// `BrandedWriteReserved` — that's Phase B4). Inside the
+    /// branded scope we use `as_bytes_branded()` directly from
+    /// `BrandedWriteBuf` (no `reserve()` call, since reserve's
+    /// `is_empty` debug_assert is designed for fresh buffers at
+    /// build-start, not for materialise-time read access).
+    #[test]
+    fn write_range_apply_returns_infallible_slice() {
+        let mut buf = WriteBuf::new();
+        let push_ok = buf.push_u8(0x42);
+        assert!(push_ok.is_ok(), "push_u8 must succeed on fresh buffer");
+        let byte = buf.with_branded(|wb| {
+            // `as_bytes_branded()` is the materialise-time branded
+            // view — no capacity gate, just a shared-brand slice.
+            let bytes = wb.as_bytes_branded();
+            // Build a raw NonEmptyRange covering [0, 1) against
+            // the 1-byte buffer — validated by NonEmptyRange::new.
+            let raw = NonEmptyRange::new(0, 1, 1).unwrap_or(NonEmptyRange::DEAD_FALLBACK);
+            let range = WriteRange::from_raw(raw);
+            // The `apply` return type is `&[u8]`, NOT
+            // `Option<&[u8]>` — that's the tier-1 lift. No
+            // unwrap_or at this call site.
+            let slice: &[u8] = range.apply(bytes);
+            slice.first().copied().unwrap_or(0)
+        });
+        assert_eq!(byte, 0x42, "branded WriteRange apply round-trips the pushed byte");
+    }
+
+    /// B3-2: drift pin — WriteRange / ReadRange are 4 bytes
+    /// (phantom ZST + 4-byte NonEmptyRange).
+    #[test]
+    fn branded_range_sizes_match_raw() {
+        assert_eq!(core::mem::size_of::<WriteRange<'_>>(), 4);
+        assert_eq!(core::mem::size_of::<ReadRange<'_>>(), 4);
+        assert_eq!(
+            core::mem::size_of::<Option<WriteRange<'_>>>(),
+            4,
+            "Option<WriteRange> must niche-pack on NonZeroU16 inside NonEmptyRange.len",
+        );
+    }
+
+    /// B3-3: `inner()` accessor round-trips the underlying
+    /// NonEmptyRange — drift pin against accidental accessor
+    /// removal (used by debug-output paths during migration).
+    #[test]
+    fn branded_range_inner_roundtrip() {
+        let raw = NonEmptyRange::DEAD_FALLBACK;
+        let w = WriteRange::<'static>::from_raw(raw);
+        let r = ReadRange::<'static>::from_raw(raw);
+        assert_eq!(w.inner(), raw);
+        assert_eq!(r.inner(), raw);
+    }
+
+    /// B3-4: ReadRange apply via `ReadBuf::with_branded` scope —
+    /// tier-1 lift on the read side. Uses the real Phase B2
+    /// branded-read-buffer constructor to establish `'brand`
+    /// naturally via HRTB, then constructs + applies a
+    /// same-branded range.
+    #[test]
+    fn read_range_apply_returns_infallible_slice() {
+        let mut rbuf = crate::buf::ReadBuf::new();
+        let appended = rbuf.append(b"XY");
+        assert!(appended.is_ok());
+        let byte = rbuf.with_branded(|rb| {
+            let bytes = rb.populated_branded();
+            // The `'brand` here is HRTB-fresh; `ReadRange::from_raw`
+            // inherits it from the expected type at the call site
+            // (the `apply(bytes)` call below fixes `'brand` to
+            // match `bytes`'s brand).
+            let raw = NonEmptyRange::new(0, 2, 2).unwrap_or(NonEmptyRange::DEAD_FALLBACK);
+            let range = ReadRange::from_raw(raw);
+            let slice: &[u8] = range.apply(bytes);
+            slice.first().copied().unwrap_or(0)
+        });
+        assert_eq!(byte, b'X');
+    }
+}
+
 /// Bounded list of actions emitted by a single protocol entry-point
 /// call.
 ///
