@@ -1111,44 +1111,33 @@ fn compute_push_startup(
     // `startup_from_non_idle_non_errored_fails_with_startup_in_progress`
     // (PingAwaitingRfq sub-case) pins this.
     match state.push_class() {
-        crate::state::StatePushClass::Idle => match build_startup_message(
-            &user,
-            database.as_ref(),
-            app_name.as_ref(),
-            write_buf,
-        ) {
-            Ok(range) => {
-                emit_actions!(staged, budget: 1, [
-                    StagedAction::SendBytesRange(range),
-                ]);
-                // DEF-097: discriminate Trust vs Scram *here* — the
-                // post-push state carries only what its auth method
-                // needs. Trust: 24 bytes. Scram: 24 + ScramSession
-                // (~1040). The "server sent AUTH_SASL on a Trust
-                // connection" case is now a per-variant dispatcher
-                // arm instead of a runtime classification.
-                match credentials {
-                    Credentials::Trust => ProtoState::ConnectingStartupTrust { reply },
-                    Credentials::ScramPassword(password) => {
-                        ProtoState::ConnectingStartupScram {
-                            reply,
-                            scram: crate::scram::session::ScramSession::from_password(password),
-                        }
+        crate::state::StatePushClass::Idle => {
+            // DEF-154 (A): infallible builder via WriteReserved.
+            let mut reserved = write_buf.reserve();
+            let range = build_startup_message(
+                &user,
+                database.as_ref(),
+                app_name.as_ref(),
+                &mut reserved,
+            );
+            emit_actions!(staged, budget: 1, [
+                StagedAction::SendBytesRange(range),
+            ]);
+            // DEF-097: discriminate Trust vs Scram *here* — the
+            // post-push state carries only what its auth method
+            // needs. Trust: 24 bytes. Scram: 24 + ScramSession
+            // (~1040). The "server sent AUTH_SASL on a Trust
+            // connection" case is now a per-variant dispatcher
+            // arm instead of a runtime classification.
+            match credentials {
+                Credentials::Trust => ProtoState::ConnectingStartupTrust { reply },
+                Credentials::ScramPassword(password) => {
+                    ProtoState::ConnectingStartupScram {
+                        reply,
+                        scram: crate::scram::session::ScramSession::from_password(password),
                     }
                 }
             }
-            // TIER-1 COMPILE DEAD BRANCH. The const assert
-            //   MAX_OWNED_SEND_LEN >= max_startup_message_size()
-            // in `write_buf.rs` proves that `build_startup_message`
-            // with validated `Ident` + `DatabaseName` +
-            // `ApplicationName` inputs cannot overflow the WriteBuf.
-            // F16: route through `frame_build_unreachable` — one cold
-            // helper across all 6 build-Err branches.
-            Err(_) => frame_build_unreachable(
-                reply.consume(),
-                crate::error::FrameBuildStage::Startup,
-                staged,
-            ),
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1191,7 +1180,7 @@ fn compute_push_startup(
 /// | current state                | action                              | new state                            |
 /// |------------------------------|-------------------------------------|--------------------------------------|
 /// | `Idle` (build OK)            | `SendBytes('Q' frame)`              | `SimpleQueryAwaitingFirstResponse(id)`  |
-/// | `Idle` (build Err)           | `FailReply(InternalCrateBug{OutboundFrameBuild})`| `Idle` (unchanged)             |
+/// | `Idle` (build OK infallibly) | `SendBytes` + state transition                  | new post-push state            |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
 /// | any `Connecting*`            | `FailReply(StartupAlreadyInProgress)`| same state preserved                |
 /// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
@@ -1207,21 +1196,16 @@ fn compute_push_simple_query(
     // Ping + BusyQuery → CommandInProgress, Connecting →
     // StartupAlreadyInProgress).
     match state.push_class() {
-        crate::state::StatePushClass::Idle => match build_query_message(sql, write_buf) {
-            Ok(range) => {
-                emit_actions!(staged, budget: 1, [
-                    StagedAction::SendBytesRange(range),
-                ]);
-                ProtoState::SimpleQueryAwaitingFirstResponse(reply)
-            }
-            // TIER-1 COMPILE DEAD BRANCH — const assert in
-            // `write_buf.rs` proves a bounded `Sql` cannot overflow
-            // the WriteBuf. F16: centralised cold helper.
-            Err(_) => frame_build_unreachable(
-                reply.consume(),
-                crate::error::FrameBuildStage::Query,
-                staged,
-            ),
+        crate::state::StatePushClass::Idle => {
+            // DEF-154 (A): capacity witness. Builder is infallible —
+            // the pre-DEF-154 `Err(WriteBufFull)` arm is eliminated
+            // at the type level.
+            let mut reserved = write_buf.reserve();
+            let range = build_query_message(sql, &mut reserved);
+            emit_actions!(staged, budget: 1, [
+                StagedAction::SendBytesRange(range),
+            ]);
+            ProtoState::SimpleQueryAwaitingFirstResponse(reply)
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1254,6 +1238,35 @@ fn compute_push_simple_query(
     }
 }
 
+/// DEF-154 (A) — infallible counterpart of
+/// [`crate::action::NonEmptyRange::from_write_span`].
+///
+/// Every PG wire builder in this crate (`build_{query,parse,bind,
+/// execute,describe,startup}_message`) emits ≥ 5 bytes (tag +
+/// length prefix + body). `from_write_span` therefore always returns
+/// `Some` — `debug_assert!` shields the architecturally-dead `None`
+/// branch. Single-level fallback to
+/// [`crate::action::NonEmptyRange::DEAD_FALLBACK`] keeps the
+/// forbid-bundle happy without nested `unwrap_or_else` sprawl.
+#[inline]
+fn from_write_span_infallible(
+    start: usize,
+    reserved: &crate::write_buf::WriteReserved<'_>,
+) -> crate::action::NonEmptyRange {
+    match crate::action::NonEmptyRange::from_write_span(start, reserved.as_write_buf()) {
+        Some(r) => r,
+        None => {
+            debug_assert!(
+                false,
+                "DEF-154: build_*_message produced zero-length span — every \
+                 PG wire frame is ≥ 5 bytes; const-assert on \
+                 MAX_OWNED_SEND_LEN or a missing push_*() would cause this.",
+            );
+            crate::action::NonEmptyRange::DEAD_FALLBACK
+        }
+    }
+}
+
 /// Build a PostgreSQL simple-query frame: `'Q'` + 4-byte length +
 /// NUL-terminated SQL.
 ///
@@ -1263,18 +1276,17 @@ fn compute_push_simple_query(
 /// - Query string: NUL-terminated
 fn build_query_message(
     sql: &crate::ident::Sql,
-    write_buf: &mut WriteBuf,
-) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
-    use crate::write_buf::WriteBufFull;
-
-    let start = write_buf.len();
-    write_buf.push_u8(crate::wire::TAG_QUERY.byte())?;
-    write_buf.with_length_prefix(|w| {
-        w.push_nul_terminated(sql.as_bytes())
-    })?;
-    // The 'Q' frame is always ≥ 6 bytes (tag + length + NUL) — the
-    // NonEmptyRange constructor succeeds by construction.
-    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+    reserved: &mut crate::write_buf::WriteReserved<'_>,
+) -> crate::action::NonEmptyRange {
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_QUERY.byte());
+    reserved.with_length_prefix(|w| {
+        w.push_nul_terminated(sql.as_bytes());
+    });
+    // DEF-154 (A): 'Q' frame is ≥ 6 bytes (tag + length + NUL), so
+    // `from_write_span` always returns Some. `DEAD_FALLBACK` shields
+    // the architecturally-dead zero-span branch.
+    from_write_span_infallible(start, reserved)
 }
 
 /// Build a PostgreSQL Extended Query `Parse` frame (PG §55.7).
@@ -1287,19 +1299,17 @@ fn build_query_message(
 fn build_parse_message(
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
-    write_buf: &mut WriteBuf,
-) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
-    use crate::write_buf::WriteBufFull;
-
-    let start = write_buf.len();
-    write_buf.push_u8(crate::wire::TAG_PARSE.byte())?;
-    write_buf.with_length_prefix(|w| {
-        w.push_nul_terminated(stmt_name.as_bytes())?;
-        w.push_nul_terminated(sql.as_bytes())?;
+    reserved: &mut crate::write_buf::WriteReserved<'_>,
+) -> crate::action::NonEmptyRange {
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_PARSE.byte());
+    reserved.with_length_prefix(|w| {
+        w.push_nul_terminated(stmt_name.as_bytes());
+        w.push_nul_terminated(sql.as_bytes());
         // n_param_types = 0; 1c-3b will widen to push actual OIDs here.
-        w.push_i16_be(0)
-    })?;
-    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+        w.push_i16_be(0);
+    });
+    from_write_span_infallible(start, reserved)
 }
 
 /// Compute the transition for [`PgCommand::Parse`] against the
@@ -1316,7 +1326,7 @@ fn build_parse_message(
 /// | current state                | action                              | new state                            |
 /// |------------------------------|-------------------------------------|--------------------------------------|
 /// | `Idle` (build OK)            | 2× `SendBytes(Parse, SYNC)`         | `ParseAwaitingParseComplete(reply)`  |
-/// | `Idle` (build Err)           | `FailReply(InternalCrateBug{OutboundFrameBuild})`| `Idle` (unchanged)             |
+/// | `Idle` (build OK infallibly) | `SendBytes` + state transition                  | new post-push state            |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved            |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                |
 /// | `Awaiting*` / `SimpleQuery*` | `FailReply(CommandInProgress)`      | same                                 |
@@ -1329,27 +1339,19 @@ fn compute_push_parse(
     staged: &mut StagedActions,
     write_buf: &mut WriteBuf,
 ) -> ProtoState {
-    // DEF-146: classifier dispatch (standard pattern).
+    // DEF-146: classifier dispatch. DEF-154 (A): infallible builder.
     match state.push_class() {
-        crate::state::StatePushClass::Idle => match build_parse_message(stmt_name, sql, write_buf) {
-            Ok(range) => {
-                // Emit Parse frame (range into write_buf) + bundled
-                // Sync (static const). Both needed for PG to flush
-                // ParseComplete (without Sync the server buffers
-                // forever). 2-action site.
-                emit_actions!(staged, budget: 2, [
-                    StagedAction::SendBytesRange(range),
-                    StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
-                ]);
-                ProtoState::ParseAwaitingParseComplete(reply)
-            }
-            // TIER-1 COMPILE DEAD BRANCH — const assert proves
-            // bounded StmtName + Sql cannot overflow. F16 centralised.
-            Err(_) => frame_build_unreachable(
-                reply.consume(),
-                crate::error::FrameBuildStage::Parse,
-                staged,
-            ),
+        crate::state::StatePushClass::Idle => {
+            let mut reserved = write_buf.reserve();
+            let range = build_parse_message(stmt_name, sql, &mut reserved);
+            // Emit Parse frame (range into write_buf) + bundled Sync
+            // (static const). Both needed for PG to flush ParseComplete
+            // (without Sync the server buffers forever).
+            emit_actions!(staged, budget: 2, [
+                StagedAction::SendBytesRange(range),
+                StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+            ]);
+            ProtoState::ParseAwaitingParseComplete(reply)
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1382,48 +1384,12 @@ fn compute_push_parse(
     }
 }
 
-/// Centralised handler for the architecturally-dead
-/// `build_*_message` `Err(WriteBufFull)` branches.
-///
-/// # Pass-#7 F16 (short-term)
-///
-/// Every `build_<kind>_message` returns `Result<NonEmptyRange,
-/// WriteBufFull>`. The Err branch is const-assert-proven dead
-/// (write_buf.rs pins `MAX_OWNED_SEND_LEN >= max_<kind>_size()`
-/// per builder). Yet the Err arm must still exist for match
-/// exhaustiveness — and pre-pass-#7 the body was inlined at every
-/// call site (~10 lines × 6 call sites = 60 lines of dead emit
-/// code baked into the hot-path frame-build function).
-///
-/// This helper centralises the cold emit. Taking `raw_id:
-/// NonZeroU64` (caller pre-consumes typed `ReplyId<K>`) avoids
-/// monomorphisation over `K` — one function body for all six
-/// callers. `#[cold]` pushes it out of the I-cache for hot
-/// frame-building paths.
-///
-/// # Long-term (DEF-new)
-///
-/// Fix the class: replace `Result<NonEmptyRange, WriteBufFull>`
-/// with an infallible `NonEmptyRange` return (via a capacity-
-/// proven writer witness). Eliminates the dead Err arm entirely
-/// at the type level. Scheduled for later polish sub-phase.
-#[cold]
-#[inline]
-fn frame_build_unreachable(
-    raw_id: core::num::NonZeroU64,
-    stage: crate::error::FrameBuildStage,
-    staged: &mut StagedActions,
-) -> ProtoState {
-    emit_actions!(staged, budget: 1, [
-        StagedAction::FailReply {
-            id: raw_id,
-            cause: ProtocolError::InternalCrateBug {
-                locus: crate::error::CrateBugLocus::OutboundFrameBuild { stage },
-            },
-        },
-    ]);
-    ProtoState::Idle
-}
+// DEF-154 (A) closed pass-#7 F16: `frame_build_unreachable` helper
+// + `CrateBugLocus::OutboundFrameBuild { stage }` variant +
+// `FrameBuildStage` enum all DELETED. The `build_*_message`
+// builders are now infallible via the `WriteReserved` capacity
+// witness in `write_buf.rs`; no Err branch exists at call sites,
+// no cold helper needed, no locus variant to classify a null case.
 
 /// Build a PostgreSQL Extended Query `Describe` (`'D'`) frame
 /// (PG §55.2.2).
@@ -1449,17 +1415,15 @@ fn frame_build_unreachable(
 fn build_describe_message<N: crate::ident::DescribeName>(
     target: crate::wire::DescribeTargetByte,
     name: &N,
-    write_buf: &mut WriteBuf,
-) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
-    use crate::write_buf::WriteBufFull;
-
-    let start = write_buf.len();
-    write_buf.push_u8(crate::wire::TAG_DESCRIBE.byte())?;
-    write_buf.with_length_prefix(|w| {
-        w.push_u8(target.byte())?;
-        w.push_nul_terminated(name.as_describe_name_bytes())
-    })?;
-    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+    reserved: &mut crate::write_buf::WriteReserved<'_>,
+) -> crate::action::NonEmptyRange {
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_DESCRIBE.byte());
+    reserved.with_length_prefix(|w| {
+        w.push_u8(target.byte());
+        w.push_nul_terminated(name.as_describe_name_bytes());
+    });
+    from_write_span_infallible(start, reserved)
 }
 
 /// Compute the transition for [`PgCommand::DescribeStatement`]
@@ -1477,7 +1441,7 @@ fn build_describe_message<N: crate::ident::DescribeName>(
 /// | current state                | action                              | new state                                   |
 /// |------------------------------|-------------------------------------|---------------------------------------------|
 /// | `Idle` (build OK)            | 2× `SendBytes(Describe, SYNC)`      | `DescribeStatementAwaitingParamDesc(reply)` |
-/// | `Idle` (build Err)           | `FailReply(InternalCrateBug{OutboundFrameBuild})` | `Idle`                               |
+/// | (build infallible post-DEF-154) | —                                           | —                                    |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved                   |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                       |
 /// | any other in-flight          | `FailReply(CommandInProgress)`      | same                                        |
@@ -1491,31 +1455,21 @@ fn compute_push_describe_statement(
     // DEF-146: classifier dispatch (standard pattern).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            match build_describe_message(
+            // DEF-154 (A): infallible builder via WriteReserved.
+            let mut reserved = write_buf.reserve();
+            let range = build_describe_message(
                 crate::wire::DescribeTargetByte::Statement,
                 stmt_name,
-                write_buf,
-            ) {
-                Ok(range) => {
-                    // Describe + Sync bundle. Sync is required —
-                    // without it PG buffers Extended Query responses
-                    // and never ships back the `'t'` / `'T'` / `'n'`
-                    // / `'Z'` sequence.
-                    emit_actions!(staged, budget: 2, [
-                        StagedAction::SendBytesRange(range),
-                        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
-                    ]);
-                    ProtoState::DescribeStatementAwaitingParamDesc(reply)
-                }
-                // TIER-1 COMPILE DEAD BRANCH — F16 centralised cold
-                // helper. `MAX_OWNED_SEND_LEN >= max_describe_message_size()
-                // + 5` const-assert proves no overflow.
-                Err(_) => frame_build_unreachable(
-                    reply.consume(),
-                    crate::error::FrameBuildStage::Describe,
-                    staged,
-                ),
-            }
+                &mut reserved,
+            );
+            // Describe + Sync bundle. Sync is required — without it
+            // PG buffers Extended Query responses and never ships
+            // back the `'t'` / `'T'` / `'n'` / `'Z'` sequence.
+            emit_actions!(staged, budget: 2, [
+                StagedAction::SendBytesRange(range),
+                StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+            ]);
+            ProtoState::DescribeStatementAwaitingParamDesc(reply)
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1569,26 +1523,18 @@ fn compute_push_describe_portal(
     // DEF-146: classifier dispatch (standard pattern).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            match build_describe_message(
+            // DEF-154 (A): infallible builder via WriteReserved.
+            let mut reserved = write_buf.reserve();
+            let range = build_describe_message(
                 crate::wire::DescribeTargetByte::Portal,
                 portal_name,
-                write_buf,
-            ) {
-                Ok(range) => {
-                    emit_actions!(staged, budget: 2, [
-                        StagedAction::SendBytesRange(range),
-                        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
-                    ]);
-                    ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
-                }
-                // F16 centralised cold helper. Same const-assert
-                // as DescribeStatement — one builder, one invariant.
-                Err(_) => frame_build_unreachable(
-                    reply.consume(),
-                    crate::error::FrameBuildStage::Describe,
-                    staged,
-                ),
-            }
+                &mut reserved,
+            );
+            emit_actions!(staged, budget: 2, [
+                StagedAction::SendBytesRange(range),
+                StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+            ]);
+            ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1646,35 +1592,46 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
     params: &P,
-    write_buf: &mut WriteBuf,
-) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
-    use crate::write_buf::WriteBufFull;
-
-    let start = write_buf.len();
-    write_buf.push_u8(crate::wire::TAG_BIND.byte())?;
-    write_buf.with_length_prefix(|w| {
-        w.push_nul_terminated(portal_name.as_bytes())?;
-        w.push_nul_terminated(stmt_name.as_bytes())?;
+    reserved: &mut crate::write_buf::WriteReserved<'_>,
+) -> crate::action::NonEmptyRange {
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_BIND.byte());
+    reserved.with_length_prefix(|w| {
+        w.push_nul_terminated(portal_name.as_bytes());
+        w.push_nul_terminated(stmt_name.as_bytes());
         // n_param_formats = COUNT, followed by COUNT × Binary (wire
         // value 1). The `ParamEncoder` seal guarantees every param
         // ships in binary format — no Text path to dispatch, just
         // write the wire value `1` directly COUNT times. Eliminates
         // the per-element `match format { ... }` of the initial
         // 1c-3b draft — fewer branches in the hot bind path.
-        w.push_u16_be(P::COUNT)?;
+        w.push_u16_be(P::COUNT);
         for _ in 0..P::COUNT {
-            w.push_u16_be(1)?;
+            w.push_u16_be(1);
         }
-        w.push_u16_be(P::COUNT)?;
-        params.write_params(w)?;
+        w.push_u16_be(P::COUNT);
+        // DEF-154 (A) escape hatch: ParamsWriter is a pub trait
+        // predating the witness pattern; it takes &mut WriteBuf.
+        // Use as_write_buf_mut() + debug_assert on the dead Err
+        // branch. ParamsWriter impls are const-asserted safe under
+        // MAX_OWNED_SEND_LEN; the Err branch is architecturally
+        // dead under that invariant.
+        match params.write_params(w.as_write_buf_mut()) {
+            Ok(()) => {}
+            Err(_) => debug_assert!(
+                false,
+                "DEF-154: params.write_params overflowed — capacity \
+                 invariant broken or ParamsWriter impl wrote past \
+                 max_bind_message_size bound",
+            ),
+        }
         // n_result_formats = 0 → server default (all text). 1c-3b
         // does not negotiate per-column result formats; the user
         // dispatches between text and binary decoders via the
         // `ColumnDesc::format_code` in the provided row_desc.
-        w.push_u16_be(0)?;
-        Ok(())
-    })?;
-    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+        w.push_u16_be(0);
+    });
+    from_write_span_infallible(start, reserved)
 }
 
 /// Build a PostgreSQL `Execute` (`'E'`) frame into `write_buf`.
@@ -1692,17 +1649,15 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
 fn build_execute_message(
     portal_name: &crate::ident::PortalName,
     fetch: crate::command::FetchRows,
-    write_buf: &mut WriteBuf,
-) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
-    use crate::write_buf::WriteBufFull;
-
-    let start = write_buf.len();
-    write_buf.push_u8(crate::wire::TAG_EXECUTE.byte())?;
-    write_buf.with_length_prefix(|w| {
-        w.push_nul_terminated(portal_name.as_bytes())?;
-        w.push_i32_be(fetch.as_wire_i32())
-    })?;
-    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+    reserved: &mut crate::write_buf::WriteReserved<'_>,
+) -> crate::action::NonEmptyRange {
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_EXECUTE.byte());
+    reserved.with_length_prefix(|w| {
+        w.push_nul_terminated(portal_name.as_bytes());
+        w.push_i32_be(fetch.as_wire_i32());
+    });
+    from_write_span_infallible(start, reserved)
 }
 
 /// Compute the transition for `push_bind_execute` against the
@@ -1718,7 +1673,7 @@ fn build_execute_message(
 /// | current state             | action                                   | new state                                   |
 /// |---------------------------|------------------------------------------|---------------------------------------------|
 /// | `Idle` (build OK)         | 3× `SendBytes(Bind, Execute, SYNC)`      | `BindExecuteAwaitingBindComplete{Dml,Select}` (depending on row_desc) |
-/// | `Idle` (build Err)        | `FailReply(InternalCrateBug{OutboundFrameBuild})` | `Idle` (unchanged)                        |
+/// | (build infallible post-DEF-154) | —                                              | —                                          |
 /// | `Errored(kind)`           | `FailReply(ConnectionAlreadyClosed)`     | `Errored(kind)` preserved                   |
 /// | any `Connecting*`         | `FailReply(StartupAlreadyInProgress)`    | same state preserved                        |
 /// | any in-flight             | `FailReply(CommandInProgress)`           | same state preserved                        |
@@ -1737,47 +1692,28 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
     // DEF-146: classifier dispatch (standard pattern).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // Build both outbound frames into the same WriteBuf. If
-            // Bind succeeds but Execute fails, that's still a
-            // build-unreachable path (const-asserted fit) — we
-            // surface it the same way as other stages.
-            match build_bind_message(portal_name, stmt_name, params, write_buf) {
-                Ok(bind_range) => match build_execute_message(portal_name, fetch, write_buf) {
-                    Ok(execute_range) => {
-                        emit_actions!(staged, budget: 3, [
-                            StagedAction::SendBytesRange(bind_range),
-                            StagedAction::SendBytesRange(execute_range),
-                            StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
-                        ]);
-                        // Tier-1 structural dispatch: decide the
-                        // schema-lessDML vs schema-bearing SELECT
-                        // path ONCE, here at push time. Downstream
-                        // dispatch arms match on the specific
-                        // variant — no runtime `match row_desc`
-                        // at the 'D' arm.
-                        match schema_ref {
-                            Some(sr) => {
-                                ProtoState::BindExecuteAwaitingBindCompleteSelect {
-                                    reply,
-                                    schema_ref: sr,
-                                }
-                            }
-                            None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
-                        }
-                    }
-                    // TIER-1 COMPILE DEAD BRANCH — const assert on
-                    // Bind+Execute+Sync bundle fit. F16 centralised.
-                    Err(_) => frame_build_unreachable(
-                        reply.consume(),
-                        crate::error::FrameBuildStage::Execute,
-                        staged,
-                    ),
+            // DEF-154 (A): both Bind and Execute run against the
+            // same WriteReserved. MAX_OWNED_SEND_LEN is const-
+            // asserted ≥ bind + execute + sync bundle, so both
+            // builders are infallible.
+            let mut reserved = write_buf.reserve();
+            let bind_range = build_bind_message(portal_name, stmt_name, params, &mut reserved);
+            let execute_range = build_execute_message(portal_name, fetch, &mut reserved);
+            emit_actions!(staged, budget: 3, [
+                StagedAction::SendBytesRange(bind_range),
+                StagedAction::SendBytesRange(execute_range),
+                StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+            ]);
+            // Tier-1 structural dispatch: decide the schema-less
+            // DML vs schema-bearing SELECT path ONCE, here at push
+            // time. Downstream dispatch arms match on the specific
+            // variant — no runtime `match row_desc` at the 'D' arm.
+            match schema_ref {
+                Some(sr) => ProtoState::BindExecuteAwaitingBindCompleteSelect {
+                    reply,
+                    schema_ref: sr,
                 },
-                Err(_) => frame_build_unreachable(
-                    reply.consume(),
-                    crate::error::FrameBuildStage::Bind,
-                    staged,
-                ),
+                None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
             }
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -1951,42 +1887,35 @@ fn build_startup_message(
     user: &Ident,
     database: Option<&DatabaseName>,
     app_name: Option<&ApplicationName>,
-    write_buf: &mut WriteBuf,
-) -> Result<crate::action::NonEmptyRange, crate::write_buf::WriteBufFull> {
-    use crate::write_buf::WriteBufFull;
-
+    reserved: &mut crate::write_buf::WriteReserved<'_>,
+) -> crate::action::NonEmptyRange {
     // DEF-094: write in-place into the caller-owned `write_buf`.
     // DEF-100: return a typed `NonEmptyRange` instead of `(start,
     // end)` — non-zero length is a type invariant, materialise's
     // silent-empty fallback closes from tier-3 (audit) to tier-2
     // (type-checked construction).
-    let start = write_buf.len();
-    write_buf.with_length_prefix(|w| {
+    // DEF-154 (A): infallible via WriteReserved capacity witness.
+    let start = reserved.len();
+    reserved.with_length_prefix(|w| {
         // Protocol version 3.0 = 196608
-        w.push_u32_be(crate::wire::PROTOCOL_VERSION_3_0)?;
+        w.push_u32_be(crate::wire::PROTOCOL_VERSION_3_0);
         // user=<username>\0
-        w.push_nul_terminated(b"user")?;
-        w.push_nul_terminated(user.as_bytes())?;
+        w.push_nul_terminated(b"user");
+        w.push_nul_terminated(user.as_bytes());
         // database=<dbname>\0 (optional)
         if let Some(db) = database {
-            w.push_nul_terminated(b"database")?;
-            w.push_nul_terminated(db.as_bytes())?;
+            w.push_nul_terminated(b"database");
+            w.push_nul_terminated(db.as_bytes());
         }
         // application_name=<name>\0 (optional)
         if let Some(name) = app_name {
-            w.push_nul_terminated(b"application_name")?;
-            w.push_nul_terminated(name.as_bytes())?;
+            w.push_nul_terminated(b"application_name");
+            w.push_nul_terminated(name.as_bytes());
         }
         // Trailing empty key NUL
-        w.push_u8(0).map_err(|_| WriteBufFull)?;
-        Ok(())
-    })?;
-    // StartupMessage always writes the 4-byte length-prefix minimum,
-    // so the range is non-empty by construction. The Option cannot
-    // be None unless the writes above all succeeded *and* produced
-    // zero bytes — a type-level contradiction given the 4-byte
-    // length prefix.
-    crate::action::NonEmptyRange::from_write_span(start, write_buf).ok_or(WriteBufFull)
+        w.push_u8(0);
+    });
+    from_write_span_infallible(start, reserved)
 }
 
 /// Phase-2 materialiser: convert the write-phase's

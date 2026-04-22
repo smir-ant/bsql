@@ -496,12 +496,202 @@ impl WriteBuf {
     pub fn as_bytes(&self) -> &[u8] {
         &self.inner
     }
+
+    /// DEF-154 (A) — capacity-proof token constructor.
+    ///
+    /// Returns a [`WriteReserved`] wrapping this buffer. The token's
+    /// push methods are infallible by construction: the buffer is
+    /// required to be empty at reserve-time (debug-asserted), and
+    /// `MAX_OWNED_SEND_LEN` is const-asserted to be ≥ every
+    /// `max_{kind}_message_size()` worst-case (see module-level
+    /// drift guards). So any single `build_*_message` that runs
+    /// against a reserved buffer has enough room for all its writes.
+    ///
+    /// Pre-DEF-154 builders returned
+    /// `Result<NonEmptyRange, WriteBufFull>` — the `Err` arm was
+    /// architecturally dead (const-assert-proven) but had to be
+    /// named, classified as `CrateBugLocus::OutboundFrameBuild`,
+    /// and propagated to callers who routed it through
+    /// `frame_build_unreachable`. DEF-154 (A) eliminates the entire
+    /// dead-path chain at the type level.
+    ///
+    /// # Tier
+    ///
+    /// Tier-3 const-assert-proven dead `Err` at 6 builder call
+    /// sites → tier-2 structural (capacity witness). Builder bodies
+    /// retain `debug_assert` shields inside
+    /// [`WriteReserved::push_u8`] etc. to fire loudly if the
+    /// const-assert is ever broken by a refactor; release keeps the
+    /// underlying `Result`-returning pushes as a forbid-bundle-
+    /// compliant fallback.
+    #[inline]
+    #[must_use]
+    pub(crate) fn reserve(&mut self) -> WriteReserved<'_> {
+        debug_assert!(
+            self.inner.is_empty(),
+            "WriteBuf::reserve must be called on a freshly-cleared buffer: \
+             MAX_OWNED_SEND_LEN is const-asserted ≥ every builder's max \
+             message size, but only when the buffer starts empty.",
+        );
+        WriteReserved { buf: self }
+    }
 }
 
 impl Default for WriteBuf {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// DEF-154 (A) — proof-of-capacity token for `build_*_message` calls.
+///
+/// Constructed via [`WriteBuf::reserve`]; holds a mutable borrow of
+/// the underlying buffer. The type's `push_*` methods shield the
+/// architecturally-dead overflow branch of the underlying
+/// `WriteBuf::push_*` (which return `Result<(), WriteBufFull>`) via
+/// `debug_assert`, producing an infallible API for builder bodies.
+///
+/// Builders take `&mut WriteReserved<'_>` and return `NonEmptyRange`
+/// directly — no `Result` return, no dead `Err` propagation at call
+/// sites. The capacity guarantee is type-level: `WriteReserved` can
+/// only exist where `WriteBuf::reserve` succeeded, which requires
+/// an empty buffer, which combined with the
+/// `MAX_OWNED_SEND_LEN >= max_{kind}_message_size()` const-asserts
+/// in this module proves every push inside a single builder
+/// succeeds.
+///
+/// # Forbid-bundle note
+///
+/// The underlying `WriteBuf::push_*` methods still return
+/// `Result<(), WriteBufFull>` — those are the public API for
+/// ordinary callers (including users of the crate that hand-build
+/// outbound frames, e.g., in tests). `WriteReserved` wraps them
+/// for the INTERNAL builder path where the capacity invariant
+/// holds. The `debug_assert` on the `Err` arm catches any future
+/// refactor that would break the const-assert without introducing
+/// `panic!` in release (banned by `forbid(clippy::panic)`).
+pub(crate) struct WriteReserved<'a> {
+    buf: &'a mut WriteBuf,
+}
+
+impl<'a> WriteReserved<'a> {
+    /// Current buffer length.
+    #[inline]
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Access the underlying buffer by shared reference. Used by
+    /// builders at the end, after all pushes, to construct the
+    /// resulting [`crate::action::NonEmptyRange`] against the
+    /// written span. The `&WriteBuf` borrow ensures no further
+    /// mutation while the range is being computed.
+    #[inline]
+    #[must_use]
+    pub(crate) fn as_write_buf(&self) -> &WriteBuf {
+        self.buf
+    }
+
+    /// DEF-154 (A) escape hatch — access underlying buffer mutably
+    /// for APIs that pre-date DEF-154 and take `&mut WriteBuf`
+    /// directly (e.g. `ParamsWriter::write_params` in the
+    /// `build_bind_message` path). Caller is responsible for
+    /// invoking the pre-DEF-154 API and shielding any `Result`
+    /// return via `debug_assert!`.
+    ///
+    /// The escape is safe because `WriteReserved` itself was
+    /// capacity-asserted at construction; operations on the
+    /// underlying buffer stay within the reserved budget iff every
+    /// builder follows its `max_{kind}_message_size()` const-
+    /// asserted worst-case. A builder that calls `as_write_buf_mut`
+    /// to push unreserved amounts breaks the capacity invariant —
+    /// `debug_assert` on the `Err` branch catches drift.
+    #[inline]
+    #[must_use]
+    pub(crate) fn as_write_buf_mut(&mut self) -> &mut WriteBuf {
+        self.buf
+    }
+
+    /// Infallible [`WriteBuf::push_u8`] — capacity reserved at
+    /// construction makes the `Err` branch architecturally dead.
+    #[inline]
+    pub(crate) fn push_u8(&mut self, byte: u8) {
+        match self.buf.push_u8(byte) {
+            Ok(()) => {}
+            Err(_) => debug_assert!(
+                false,
+                "WriteReserved::push_u8 overflowed — MAX_OWNED_SEND_LEN \
+                 const-assert drifted or reserve() was called on a \
+                 non-empty buffer.",
+            ),
+        }
+    }
+
+    /// Infallible [`WriteBuf::push_u16_be`].
+    #[inline]
+    pub(crate) fn push_u16_be(&mut self, val: u16) {
+        match self.buf.push_u16_be(val) {
+            Ok(()) => {}
+            Err(_) => debug_assert!(false, "WriteReserved::push_u16_be overflow"),
+        }
+    }
+
+    /// Infallible [`WriteBuf::push_i16_be`].
+    #[inline]
+    pub(crate) fn push_i16_be(&mut self, val: i16) {
+        match self.buf.push_i16_be(val) {
+            Ok(()) => {}
+            Err(_) => debug_assert!(false, "WriteReserved::push_i16_be overflow"),
+        }
+    }
+
+    /// Infallible [`WriteBuf::push_u32_be`].
+    #[inline]
+    pub(crate) fn push_u32_be(&mut self, val: u32) {
+        match self.buf.push_u32_be(val) {
+            Ok(()) => {}
+            Err(_) => debug_assert!(false, "WriteReserved::push_u32_be overflow"),
+        }
+    }
+
+    /// Infallible [`WriteBuf::push_i32_be`].
+    #[inline]
+    pub(crate) fn push_i32_be(&mut self, val: i32) {
+        match self.buf.push_i32_be(val) {
+            Ok(()) => {}
+            Err(_) => debug_assert!(false, "WriteReserved::push_i32_be overflow"),
+        }
+    }
+
+    /// Infallible [`WriteBuf::push_nul_terminated`].
+    #[inline]
+    pub(crate) fn push_nul_terminated(&mut self, data: &[u8]) {
+        match self.buf.push_nul_terminated(data) {
+            Ok(()) => {}
+            Err(_) => debug_assert!(false, "WriteReserved::push_nul_terminated overflow"),
+        }
+    }
+
+    /// Infallible [`WriteBuf::with_length_prefix`] — body closure
+    /// takes `&mut WriteReserved`, so the body uses infallible push
+    /// methods.
+    #[inline]
+    pub(crate) fn with_length_prefix<F>(&mut self, body_fn: F)
+    where
+        F: FnOnce(&mut WriteReserved<'_>),
+    {
+        let r = self.buf.with_length_prefix(|inner_buf| {
+            let mut inner_reserved = WriteReserved { buf: inner_buf };
+            body_fn(&mut inner_reserved);
+            Ok(())
+        });
+        debug_assert!(
+            r.is_ok(),
+            "WriteReserved::with_length_prefix overflow — capacity invariant broken",
+        );
+    }
+
 }
 
 impl fmt::Debug for WriteBuf {

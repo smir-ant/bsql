@@ -183,6 +183,29 @@ impl NonEmptyRange {
         Self::new(start, write_buf.len(), write_buf.len())
     }
 
+    /// DEF-154 (A) — architecturally-dead fallback.
+    ///
+    /// A valid minimum NonEmptyRange (start=0, len=1) used as the
+    /// `unwrap_or` fallback in `build_*_message` builders after
+    /// calling [`from_write_span_infallible`]. The fallback is
+    /// reached ONLY if a builder produces a zero-length span, which
+    /// is architecturally impossible for every PG wire frame (every
+    /// builder emits ≥ tag + length_prefix + body = ≥ 5 bytes).
+    /// Debug builds fire `debug_assert!` first; this const exists
+    /// to satisfy the forbid-bundle-compliant single-level fallback
+    /// pattern without the nested `unwrap_or_else` mess.
+    ///
+    /// `NonZeroU16::new(1)` in const context uses `match` (the
+    /// `unwrap_or` pattern is NOT yet const-stable, RU-01 in
+    /// deferred.md watchlist).
+    pub(crate) const DEAD_FALLBACK: Self = Self {
+        start: 0,
+        len: match NonZeroU16::new(1) {
+            Some(n) => n,
+            None => NonZeroU16::MIN,
+        },
+    };
+
     /// Resolve the range against a buffer, returning the slice or
     /// `None` on bounds mismatch.
     ///

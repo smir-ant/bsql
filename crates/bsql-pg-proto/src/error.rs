@@ -523,16 +523,6 @@ pub enum ProtocolError {
 /// expanding the top-level [`ProtocolError`] enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CrateBugLocus {
-    /// [`crate::write_buf::WriteBuf`]'s frame-builder returned Err
-    /// despite the `MAX_OWNED_SEND_LEN >= max_<kind>_message_size()`
-    /// const-assert pinning non-overflow. Pre-DEF-150: the
-    /// `OutboundFrameBuildUnreachable { stage }` top-level variant.
-    OutboundFrameBuild {
-        /// Which builder failed (diagnostic only — all are
-        /// architecturally dead in intact const-assert regime).
-        stage: FrameBuildStage,
-    },
-
     /// [`crate::buf::ReadBuf::advance`] returned Err after
     /// `parse_header` successfully validated
     /// `total_len <= populated.len()`. The two checks happen in
@@ -587,9 +577,6 @@ impl fmt::Display for CrateBugLocus {
     /// operator logs without tripping the test.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OutboundFrameBuild { stage } => {
-                write!(f, "outbound-frame-build:{stage:?}")
-            }
             Self::ReadCursorAdvance => f.write_str("read-cursor-advance"),
             Self::RowRangeConstruction => f.write_str("row-range-construction"),
             Self::SchemaArenaAllocFull => f.write_str("schema-arena-alloc-full"),
@@ -653,55 +640,12 @@ mod crate_bug_locus_display_tests {
         );
     }
 
-    #[test]
-    fn outbound_frame_build_display_per_stage() {
-        for stage in [
-            FrameBuildStage::Startup,
-            FrameBuildStage::Query,
-            FrameBuildStage::Parse,
-            FrameBuildStage::Bind,
-            FrameBuildStage::Execute,
-            FrameBuildStage::Describe,
-        ] {
-            let locus = CrateBugLocus::OutboundFrameBuild { stage };
-            let e = ProtocolError::InternalCrateBug { locus };
-            // Debug rendering of stage is its variant name (derived
-            // Debug on simple enum) — pinned here so a Debug-derive
-            // change would trip this test.
-            let expected = format!(
-                "internal bsql-pg-proto bug at locus outbound-frame-build:{stage:?}",
-            );
-            assert_eq!(format!("{e}"), expected, "OutboundFrameBuild stage={stage:?}");
-        }
-    }
-}
-
-/// Which outbound frame builder failed in the const-assert-dead path.
-/// Carried by [`CrateBugLocus::OutboundFrameBuild`] for
-/// diagnostic — emission of any variant indicates a crate-internal
-/// bug (const assert drift), not a wire-level issue.
-///
-/// F6: typed discriminant added 2026-04-21.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum FrameBuildStage {
-    /// [`crate::protocol::build_startup_message`] — const-pinned by
-    /// `MAX_OWNED_SEND_LEN >= max_startup_message_size()`.
-    Startup = 0,
-    /// [`crate::protocol::build_query_message`] — const-pinned by
-    /// `MAX_OWNED_SEND_LEN >= max_simple_query_message_size()`.
-    Query = 1,
-    /// [`crate::protocol::build_parse_message`] — const-pinned by
-    /// `MAX_OWNED_SEND_LEN >= max_parse_message_size()`.
-    Parse = 2,
-    /// [`crate::protocol::build_bind_message`] — const-pinned by
-    /// `MAX_OWNED_SEND_LEN >= max_bind_message_size() + max_execute_message_size() + 5`.
-    Bind = 3,
-    /// [`crate::protocol::build_execute_message`] — const-pinned with Bind.
-    Execute = 4,
-    /// [`crate::protocol::build_describe_message`] — const-pinned by
-    /// `MAX_OWNED_SEND_LEN >= max_describe_message_size()`. 1c-3c.
-    Describe = 5,
+    // DEF-154 (A): `outbound_frame_build_display_per_stage` test and
+    // the `FrameBuildStage` enum it exercised were DELETED alongside
+    // `CrateBugLocus::OutboundFrameBuild` variant — builders are now
+    // infallible via the `WriteReserved` capacity witness, so the
+    // locus variant + its stage-discriminator + the pin test all
+    // became dead code. See `crate::protocol::build_*_message`.
 }
 
 /// Compact 1-byte classification of a [`ProtocolError`], stored in
