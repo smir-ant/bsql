@@ -324,6 +324,15 @@ impl<'w, 'r> OutActions<'w, 'r> {
     /// Borrow the populated prefix as a slice.
     #[inline]
     pub fn as_slice(&self) -> &[Action<'w, 'r>] {
+        // DEF-178 (audit2 A023): debug_assert pins the
+        // architecturally-dead unwrap_or(&[]) fallback. len() is
+        // invariant-bounded to `MAX_ACTIONS_PER_CALL == items.len()`
+        // by the push() capacity check. Sibling pattern to
+        // `FixedStr::as_bytes` (pass-#8 F-061).
+        debug_assert!(
+            self.len() <= self.items.len(),
+            "DEF-178: OutActions.len exceeds item capacity — invariant break",
+        );
         self.items.get(..self.len()).unwrap_or(&[])
     }
 
@@ -461,7 +470,7 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, MAX_ACTIONS_PER_CALL
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; DEF-119 shrunk DeliverReply's Reply<'r> payload from ~312 B to ~88 B — FailReply.cause (ProtocolError ~312 B) is now the dominant variant. FailReply is emitted only on protocol failure (cold path), never in the hot streaming path.")]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable. DeliverReply's Reply<'r> payload is small post-DEF-119 arena externalisation; the FailReply.cause (ProtocolError) is the dominant variant (see lib.rs::action::Action size budget for current exact bounds). FailReply is cold-path (emitted only on protocol failure), so the large variant's footprint is acceptable.")]
 pub enum Action<'w, 'r> {
     /// Send these bytes verbatim to the server.
     ///
@@ -602,7 +611,7 @@ pub enum Action<'w, 'r> {
 ///   materialiser emits the static ref directly (zero write, zero
 ///   copy — `Sync` bypasses `write_buf` entirely).
 #[derive(Debug)]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; DEF-119 shrunk StagedAction::DeliverReply's StagedReply payload from ~312 B to ~80 B — FailReply.cause (ProtocolError ~312 B) is now the dominant variant. FailReply is emitted only on protocol failure (cold path), never in the hot streaming path. Mirrors the `Action<'w, 'r>` rationale.")]
+#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable. Mirrors the `Action<'w, 'r>` rationale above — DEF-119 shrunk the DeliverReply payload; FailReply.cause (ProtocolError) dominates. FailReply is cold-path.")]
 pub(crate) enum StagedAction {
     /// Bytes live at the range `[start..start+len]` inside the
     /// emission-time `write_buf`. Typed as [`NonEmptyRange`] —

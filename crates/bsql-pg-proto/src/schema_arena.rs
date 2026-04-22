@@ -220,16 +220,24 @@ impl SchemaRef {
     /// `schema_ref: SchemaRef`.
     #[cfg(test)]
     #[inline]
-    pub(crate) fn dead_for_test() -> Self {
-        // NonZeroU8::MIN = 1 is the lowest valid slot index
-        // (encoding slot_idx=0). `.unwrap_or(NonZeroU8::MIN)` is a
-        // tautology on `NonZeroU8::new(1)` — the unwrap_or branch is
-        // dead under `NonZeroU8::new(1).is_some() == true`. Keeps
-        // the forbid-bundle happy without requiring a const.
-        Self {
-            slot: NonZeroU8::new(1).unwrap_or(NonZeroU8::MIN),
-            generation: 0,
-        }
+    #[must_use]
+    pub(crate) const fn dead_for_test() -> Self {
+        // DEF-178 (audit2 A039) — `const fn` promotion.
+        // `Option::unwrap_or` is NOT yet const-stable
+        // (tracking: rust-lang/rust#143874, RU-01 in deferred.md
+        // § Rust-unstable watchlist). Use explicit `match` instead —
+        // `NonZeroU8::new` is const; `match` over Option is const;
+        // `NonZeroU8::MIN` is const. Together they produce a
+        // const-evaluable factory.
+        //
+        // Enables `const DEAD: SchemaRef = SchemaRef::dead_for_test();`
+        // bindings in test code. `NonZeroU8::new(1)` always returns
+        // Some so the `_` branch is architecturally dead.
+        let slot = match NonZeroU8::new(1) {
+            Some(nz) => nz,
+            None => NonZeroU8::MIN,
+        };
+        Self { slot, generation: 0 }
     }
 }
 
@@ -282,24 +290,25 @@ impl SchemaSlab {
     #[inline]
     #[must_use]
     pub(crate) fn alloc(&mut self, desc: RowDesc) -> Option<SchemaRef> {
-        for (idx, slot) in self.slots.iter_mut().enumerate() {
+        // DEF-178 (audit2 A019): paired iter eliminates the redundant
+        // `generations.get(idx).copied().unwrap_or(0)` lookup on the
+        // proven-valid idx. slots and generations have equal length
+        // by struct construction.
+        for ((idx, slot), generation) in self
+            .slots
+            .iter_mut()
+            .enumerate()
+            .zip(self.generations.iter().copied())
+        {
             if slot.is_none() {
                 *slot = Some(desc);
                 // `idx < MAX_ARENA_SLOTS ≤ 254` (const-asserted
                 // above) so `idx + 1` fits u8 unconditionally.
-                // Explicit match + saturating fallback satisfies
-                // the forbid bundle's ban on `as` conversions and
-                // `arithmetic_side_effects`; LLVM elides the dead
-                // Err / None under any optimisation level.
-                let Ok(idx_u8) = u8::try_from(idx) else {
-                    return None;
-                };
-                let slot_plus_one = idx_u8.saturating_add(1);
-                let slot_nz = NonZeroU8::new(slot_plus_one)?;
-                // Read the current generation for this slot. `.get()`
-                // is bounds-safe (idx in range by for-loop + slots
-                // length equals generations length by construction).
-                let generation = self.generations.get(idx).copied().unwrap_or(0);
+                // Explicit try_from satisfies the forbid bundle's
+                // ban on `as` conversions; LLVM elides the dead
+                // Err branch.
+                let idx_u8 = u8::try_from(idx).ok()?;
+                let slot_nz = NonZeroU8::new(idx_u8.saturating_add(1))?;
                 return Some(SchemaRef {
                     slot: slot_nz,
                     generation,
@@ -343,6 +352,16 @@ impl SchemaSlab {
         // Collapsed `if let ... if ...` per clippy::collapsible_if.
         // Rust 2024 reserves `gen` — use `gen_slot` for the per-slot
         // generation counter alias.
+        //
+        // DEF-178 (audit2 A009) — LOAD-BEARING guard: the
+        // `&& slot.is_some()` ties the generation bump to the
+        // physical slot transition (occupied → free). Without it,
+        // double-free would bump the generation twice, invalidating
+        // refs that the user might still be holding from the last
+        // alloc. Do NOT split this into two sequential `if let`s in
+        // a future refactor — the coupling is what makes
+        // double-free idempotent per
+        // `double_free_is_idempotent` test.
         if let Some(slot) = self.slots.get_mut(idx)
             && slot.is_some()
         {

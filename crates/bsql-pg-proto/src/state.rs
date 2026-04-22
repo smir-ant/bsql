@@ -594,6 +594,14 @@ impl ProtoState {
     ///
     /// Exhaustive match over every `ProtoState` variant — adding a
     /// variant without classifying it is a build error.
+    ///
+    /// # DEF-178 (audit2 A038) — `#[inline]` hint
+    ///
+    /// 7 hot call sites (compute_push_*) with a monomorphic ~25-line
+    /// match body. `#[inline]` signals the inliner without forcing
+    /// it; LLVM usually inlines anyway, but the hint helps with
+    /// build-unit crossings when the crate becomes a dep.
+    #[inline]
     #[must_use]
     pub(crate) const fn push_class(&self) -> StatePushClass {
         match self {
@@ -639,6 +647,22 @@ impl ProtoState {
 /// Exhaustive variants — no `Other` / catch-all. Adding a new
 /// `ProtoState` variant requires classifying it inside
 /// [`ProtoState::push_class`] (build error if forgotten).
+///
+/// # DEF-178 (audit2 A005) — classifier carries a payload asymmetry
+///
+/// `Errored(StateErrorKind)` is the one variant carrying a payload;
+/// the other four (Idle / Connecting / PingAwaiting / BusyQuery)
+/// are ZST-discriminators. The payload flows the `prior_kind`
+/// through to `ConnectionAlreadyClosed` emission WITHOUT a second
+/// state match.
+///
+/// A future refactor that "cleans up" the asymmetry (making
+/// StatePushClass a pure discriminator, re-matching state inside
+/// each arm to extract prior_kind) would REGRESS the tier: the
+/// re-match would need `if let Err = state { ... }` shape, which is
+/// not exhaustive at the match level — a new Errored-like variant
+/// could silently slip through. The current design is an
+/// intentional tier-1 consolidation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatePushClass {
     /// Connection ready to accept new commands.
