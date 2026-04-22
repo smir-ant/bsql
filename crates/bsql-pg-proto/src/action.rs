@@ -177,21 +177,22 @@ impl NonEmptyRange {
     // with buffer-identity proof); no remaining caller needed the
     // raw-buffer unbranded form.
 
-    /// DEF-154 (A) — architecturally-dead fallback.
+    /// DEF-154 (A) — test-only fallback (post-P0-2 gated).
     ///
-    /// A valid minimum NonEmptyRange (start=0, len=1) used as the
-    /// `unwrap_or` fallback in `build_*_message` builders after
-    /// calling [`from_write_span_infallible`]. The fallback is
-    /// reached ONLY if a builder produces a zero-length span, which
-    /// is architecturally impossible for every PG wire frame (every
-    /// builder emits ≥ tag + length_prefix + body = ≥ 5 bytes).
-    /// Debug builds fire `debug_assert!` first; this const exists
-    /// to satisfy the forbid-bundle-compliant single-level fallback
-    /// pattern without the nested `unwrap_or_else` mess.
+    /// A valid minimum `NonEmptyRange (start=0, len=1)`. Originally
+    /// the `unwrap_or` fallback inside
+    /// `WriteRange::from_branded_write_span`; deleted from
+    /// production by DEF-154 (B) Phase B4-W P0-2 fix (architect
+    /// audit) because it silently produced zero-length
+    /// `Action::SendBytes` frames in release on builder drift —
+    /// post-P0-2 the None branch classifies as
+    /// `CrateBugLocus::EmptyWriteRange` and routes through
+    /// `compute_push_*` → `FailReply + CloseSocket`.
     ///
-    /// `NonZeroU16::new(1)` in const context uses `match` (the
-    /// `unwrap_or` pattern is NOT yet const-stable, RU-01 in
-    /// deferred.md watchlist).
+    /// Retained under `#[cfg(test)]` for test fixtures that
+    /// construct concrete `NonEmptyRange` values without going
+    /// through `new`'s Option + explicit shield.
+    #[cfg(test)]
     pub(crate) const DEAD_FALLBACK: Self = Self {
         start: 0,
         len: match NonZeroU16::new(1) {
@@ -328,36 +329,58 @@ impl<'brand> WriteRange<'brand> {
     /// `'brand` from the reserved — so it applies only to
     /// `BrandedBytes<'brand>` from the SAME branded scope.
     ///
-    /// Replaces the pre-DEF-154 (B) `from_write_span_infallible` +
-    /// `NonEmptyRange::DEAD_FALLBACK` pair: the branded reserved's
-    /// capacity invariant + builder's non-zero emission worst-case
-    /// (≥ 5 bytes per PG wire frame) together guarantee a valid
-    /// non-empty range, so the `unwrap_or(DEAD_FALLBACK)` shim
-    /// below is architecturally dead.
+    /// # Err / tier classification (P0-2 fix from architect audit)
+    ///
+    /// Returns `Err(InternalCrateBug { locus: EmptyWriteRange })`
+    /// if `reserved.len() <= start` (i.e. builder emitted zero
+    /// bytes since `start`). Architecturally dead under intact
+    /// builders (every PG wire frame ≥ 5 bytes); emission
+    /// indicates a builder bug or const-assert drift.
+    ///
+    /// Pre-fix, the None branch fell back silently to
+    /// `NonEmptyRange::DEAD_FALLBACK = (0, 1)`, producing a
+    /// 0-byte `Action::SendBytes` in materialise (handshake hang
+    /// at the wire — tier-4 silent corruption). Tier-3 classified
+    /// now: the `Err` propagates up through the builder return →
+    /// `compute_push_*` → `FailReply + CloseSocket`.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Err carries ProtocolError (~300 B, large_enum_variant \
+                  already accepted on ProtocolError). Architecturally \
+                  cold path (builder bug / const-drift); by-value \
+                  matches dispatch's DispatchOutcome::Errored surface."
+    )]
     #[inline]
-    #[must_use]
     pub(crate) fn from_branded_write_span(
         start: usize,
         reserved: &crate::write_buf::BrandedWriteReserved<'brand, '_>,
-    ) -> Self {
-        let raw = NonEmptyRange::new(start, reserved.len(), reserved.len())
-            .unwrap_or(NonEmptyRange::DEAD_FALLBACK);
-        Self::from_raw(raw)
+    ) -> Result<Self, crate::error::ProtocolError> {
+        match NonEmptyRange::new(start, reserved.len(), reserved.len()) {
+            Some(raw) => Ok(Self::from_raw(raw)),
+            None => Err(crate::error::ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::EmptyWriteRange,
+            }),
+        }
     }
 
-    /// Apply the range to same-branded bytes — **infallible**.
+    /// Apply the range to same-branded bytes — **infallible at the
+    /// type level**, tier-2 shielded at the body level.
     ///
     /// The same brand `'brand` on both operands, combined with the
     /// `BrandedWriteBuf`'s API narrow (no truncating ops reachable
     /// inside the branded scope) and the construction-time bounds
     /// check on `inner`, guarantees `bytes.as_slice().get(start..end)`
-    /// is `Some`.
+    /// is `Some` under intact invariants.
     ///
-    /// The `unwrap_or(&[])` below is architecturally-dead fallback
-    /// to satisfy the forbid-bundle's ban on `panic!` in release;
-    /// debug builds fire `debug_assert!` if the invariant is ever
-    /// violated (which would indicate a crate bug in the brand
-    /// scaffolding, not a user error).
+    /// The `debug_assert!` + `unwrap_or(&[])` pair below is the
+    /// tier-2 body shield — debug builds fire loud on any
+    /// invariant break (same pattern as DEF-170 / DEF-182); release
+    /// preserves the `&[]` fallback (forbid-bundle bans `panic!`).
+    ///
+    /// Full tier-1 body closure requires `NonEmptyRange::apply`
+    /// totality proof — deferred to a future refactor (would
+    /// replace the Option-returning `apply` with a trusted
+    /// typestate constructor).
     #[inline]
     #[must_use]
     pub(crate) fn apply<'a>(&self, bytes: crate::write_buf::BrandedBytes<'brand, 'a>) -> &'a [u8] {
@@ -365,9 +388,8 @@ impl<'brand> WriteRange<'brand> {
         debug_assert!(
             slice.is_some(),
             "WriteRange<'brand>::apply None — brand invariant broken. \
-             See action.rs Phase B3 block comment for the tier-1 \
-             soundness argument; a `None` here is a crate bug in the \
-             brand scaffolding, not a usage error.",
+             Crate bug in the brand scaffolding (construction-bounds or \
+             buffer non-shrink), not a usage error.",
         );
         slice.unwrap_or(&[])
     }

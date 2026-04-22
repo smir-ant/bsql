@@ -555,6 +555,42 @@ pub enum CrateBugLocus {
     /// diagnostic consumers see a stable enum shape when DEF-154
     /// lands.
     StaleSchemaRef,
+
+    /// DEF-154 (B) Phase B4-W P0-3: a `ParamsWriter::write_params`
+    /// impl returned `Err(WriteBufFull)` while the `Bind` frame was
+    /// being built. `ParamsWriter` is a `pub` sealed trait —
+    /// user impls of arity 0..=16 exist via derive/macro. A
+    /// well-behaved impl never triggers this: the crate's
+    /// `MAX_OWNED_SEND_LEN` is const-asserted against the worst-
+    /// case `max_bind_message_size()` sum. Emission indicates
+    /// either a drift between `MAX_PARAMS_DATA_TOTAL` and the
+    /// builder's size budget, or an adversarial/buggy user impl
+    /// that writes past its advertised bound. Pre-B4-W P0-3 fix,
+    /// this Err was silently discarded with a `debug_assert!(false)`,
+    /// shipping a truncated Bind frame with miscomputed length
+    /// prefix — tier-4 silent corruption. Tier-3 classified now.
+    ParamsWriterOverflow,
+
+    /// DEF-154 (B) Phase B4-W P0-2: a `build_*_message` branded
+    /// builder produced a zero-length span when
+    /// `WriteRange::from_branded_write_span` invoked
+    /// `NonEmptyRange::new(start, reserved.len(), reserved.len())`
+    /// and got `None`.
+    ///
+    /// Architecturally dead under intact builders: every PG wire
+    /// builder emits ≥ 5 bytes (tag + 4-byte length prefix + body),
+    /// so `reserved.len() > start` holds post-build. Emission
+    /// indicates a builder bug (missed push) or const-assert drift
+    /// on `MAX_OWNED_SEND_LEN`.
+    ///
+    /// Pre-P0-2 fix, the None case silently fell back to
+    /// `NonEmptyRange::DEAD_FALLBACK = (start=0, len=1)` — applied
+    /// against an empty buffer in materialise, produced a 0-byte
+    /// `Action::SendBytes`, handshake hangs at the wire (tier-4
+    /// silent corruption). Tier-3 classified now: builders return
+    /// `Result<WriteRange, ProtocolError>`; `compute_push_*`
+    /// routes `Err` through `FailReply + CloseSocket`.
+    EmptyWriteRange,
 }
 
 impl fmt::Display for CrateBugLocus {
@@ -581,6 +617,8 @@ impl fmt::Display for CrateBugLocus {
             Self::RowRangeConstruction => f.write_str("row-range-construction"),
             Self::SchemaArenaAllocFull => f.write_str("schema-arena-alloc-full"),
             Self::StaleSchemaRef => f.write_str("stale-schema-ref"),
+            Self::ParamsWriterOverflow => f.write_str("params-writer-overflow"),
+            Self::EmptyWriteRange => f.write_str("empty-write-range"),
         }
     }
 }
@@ -637,6 +675,28 @@ mod crate_bug_locus_display_tests {
         assert_eq!(
             format!("{e}"),
             "internal bsql-pg-proto bug at locus stale-schema-ref",
+        );
+    }
+
+    #[test]
+    fn params_writer_overflow_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::ParamsWriterOverflow,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus params-writer-overflow",
+        );
+    }
+
+    #[test]
+    fn empty_write_range_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::EmptyWriteRange,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus empty-write-range",
         );
     }
 

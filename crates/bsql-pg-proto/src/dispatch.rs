@@ -1296,7 +1296,11 @@ fn build_sasl_initial_response<'wb>(
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     let client_nonce_b64 = crate::ident::PodBytes::try_from_slice(&client_nonce_vec)
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
-    let range = crate::action::WriteRange::from_branded_write_span(start, reserved);
+    // DEF-154 (B) P0-2: `from_branded_write_span` returns Result;
+    // `?` propagates up through the function's own Result return
+    // type. Err here classifies as `EmptyWriteRange` — dead under
+    // intact SCRAM invariants.
+    let range = crate::action::WriteRange::from_branded_write_span(start, reserved)?;
     Ok((range, client_first_bare, client_nonce_b64))
 }
 
@@ -1420,7 +1424,15 @@ fn dispatch_auth_sasl_continue<'wb>(
             return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
         }
     }
-    let range = crate::action::WriteRange::from_branded_write_span(start, reserved);
+    // DEF-154 (B) P0-2: `from_branded_write_span` returns Result.
+    // Err is architecturally dead here — the SASL_RESPONSE frame
+    // body always has the 1-byte tag + 4-byte length prefix + the
+    // client-final-message which is non-empty by SCRAM protocol.
+    // Classified as `EmptyWriteRange` if triggered.
+    let range = match crate::action::WriteRange::from_branded_write_span(start, reserved) {
+        Ok(r) => r,
+        Err(cause) => return errored(Some(reply.consume()), cause),
+    };
 
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::ConnectingScramAwaitingServerFinal {

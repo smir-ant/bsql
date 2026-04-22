@@ -131,6 +131,47 @@ macro_rules! emit_actions {
     }};
 }
 
+/// DEF-154 (B) Phase B4-W P0-2 + P0-3 fix helper.
+///
+/// Every `build_*_message` returns `Result<WriteRange<'brand>,
+/// ProtocolError>` post-audit. The Err path is architecturally
+/// cold (builder bug / const-drift / user ParamsWriter overflow)
+/// but classified — `compute_push_*` handles it via `FailReply +
+/// CloseSocket + Errored` state transition.
+///
+/// This macro centralises that handling. Each `compute_push_*`
+/// Idle arm uses `let range = try_builder!(build_X(...), reply,
+/// staged);`. On `Err(cause)`: derive `StateErrorKind` via
+/// `cause.state_kind()` (DEF-175/176 pattern), emit the FailReply
+/// and CloseSocket into `staged`, and early-return
+/// `ProtoState::Errored(state_kind)` from the enclosing
+/// `compute_push_*` function.
+///
+/// The macro early-returns, so it must be used in a position
+/// where `return ProtoState::Errored(...)` is legal.
+macro_rules! try_builder {
+    ($result:expr, $reply:expr, $staged:expr) => {
+        match $result {
+            Ok(r) => r,
+            Err(cause) => {
+                let state_kind = cause.state_kind().unwrap_or_else(|| {
+                    debug_assert!(
+                        false,
+                        "DEF-175: builder Err produced unclassifiable \
+                         StateErrorKind — InternalCrateBug variants always map.",
+                    );
+                    crate::error::StateErrorKind::INTERNAL_FALLBACK
+                });
+                emit_actions!($staged, budget: 2, [
+                    StagedAction::FailReply { id: $reply.consume(), cause },
+                    StagedAction::CloseSocket,
+                ]);
+                return ProtoState::Errored(state_kind);
+            }
+        }
+    };
+}
+
 /// Maximum number of [`Action`]s a single entry-point call may emit.
 ///
 /// # Two-level guarantee
@@ -782,12 +823,26 @@ impl PgProtocol {
                             }
                             break;
                         }
-                        // DEF-154 (B) Phase B4: _Phantom is never
-                        // constructed (it's a lifetime anchor — see
-                        // the DispatchOutcome enum doc). Handled as
-                        // a silent no-op here for exhaustive-match
-                        // compliance; no state change, no action.
-                        DispatchOutcome::_Phantom(_) => {}
+                        // DEF-154 (B) Phase B4 — _Phantom is never
+                        // constructed (lifetime anchor; see
+                        // DispatchOutcome enum doc). An empty `{}`
+                        // arm here would HANG the dispatch loop
+                        // (no advance, no break) if the invariant
+                        // ever drifted — architect audit P0-1
+                        // flagged this class. `break` + debug_assert
+                        // closes the hang class structurally: in
+                        // debug the drift fires loud; in release
+                        // the loop terminates cleanly and the
+                        // caller sees empty staged (no corruption).
+                        DispatchOutcome::_Phantom(_) => {
+                            debug_assert!(
+                                false,
+                                "DEF-154 (B) Phase B4: DispatchOutcome::_Phantom \
+                                 constructed — crate bug; see enum doc for the \
+                                 never-construct contract.",
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -1179,12 +1234,17 @@ fn compute_push_startup<'wb>(
 ) -> ProtoState {
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (B): infallible + branded builder.
-            let range = build_startup_message(
-                &user,
-                database.as_ref(),
-                app_name.as_ref(),
-                reserved,
+            // DEF-154 (B) P0-2: builder returns Result; Err →
+            // FailReply + CloseSocket + Errored via `try_builder!`.
+            let range = try_builder!(
+                build_startup_message(
+                    &user,
+                    database.as_ref(),
+                    app_name.as_ref(),
+                    reserved,
+                ),
+                reply,
+                staged
             );
             emit_actions!(staged, budget: 1, [
                 StagedAction::SendBytesRange(range),
@@ -1263,8 +1323,8 @@ fn compute_push_simple_query<'wb>(
     // StartupAlreadyInProgress).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (B): infallible + branded builder.
-            let range = build_query_message(sql, reserved);
+            // DEF-154 (B) P0-2: builder returns Result.
+            let range = try_builder!(build_query_message(sql, reserved), reply, staged);
             emit_actions!(staged, budget: 1, [
                 StagedAction::SendBytesRange(range),
             ]);
@@ -1313,18 +1373,20 @@ fn compute_push_simple_query<'wb>(
 /// - Tag: `'Q'` (1 byte)
 /// - Length: u32 BE including itself
 /// - Query string: NUL-terminated
+#[expect(clippy::result_large_err, reason = "Err carries ProtocolError (~312 B). Architecturally cold (builder bug / const-drift); by-value mirrors DispatchOutcome::Errored classification surface.")]
 fn build_query_message<'brand>(
     sql: &crate::ident::Sql,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
-) -> crate::action::WriteRange<'brand> {
+) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_QUERY.byte());
     reserved.with_length_prefix(|w| {
         w.push_nul_terminated(sql.as_bytes());
     });
-    // DEF-154 (B): 'Q' frame is ≥ 6 bytes (tag + length + NUL), so
-    // `from_branded_write_span` always validates Some. The internal
-    // DEAD_FALLBACK shields the architecturally-dead zero-span branch.
+    // DEF-154 (B) Phase B4-W P0-2: `from_branded_write_span` returns
+    // `Result` post-audit. 'Q' frame is ≥ 6 bytes so Err is
+    // architecturally dead; classified upstream as
+    // `EmptyWriteRange` if ever triggered.
     crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
@@ -1335,11 +1397,12 @@ fn build_query_message<'brand>(
 /// NUL-terminated SQL text, then an `i16` BE parameter-type count
 /// (always zero in 1c-3a — no parameter-type hints; 1c-3b adds
 /// per-parameter OID hints and widens this field).
+#[expect(clippy::result_large_err, reason = "Err carries ProtocolError; same trade-off as build_query_message.")]
 fn build_parse_message<'brand>(
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
-) -> crate::action::WriteRange<'brand> {
+) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_PARSE.byte());
     reserved.with_length_prefix(|w| {
@@ -1378,10 +1441,10 @@ fn compute_push_parse<'wb>(
     staged: &mut StagedActions<'wb>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
-    // DEF-146: classifier dispatch. DEF-154 (B): infallible + branded builder.
+    // DEF-146: classifier dispatch. DEF-154 (B) P0-2: builder returns Result.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            let range = build_parse_message(stmt_name, sql, reserved);
+            let range = try_builder!(build_parse_message(stmt_name, sql, reserved), reply, staged);
             // Emit Parse frame (range into write_buf) + bundled Sync
             // (static const). Both needed for PG to flush ParseComplete
             // (without Sync the server buffers forever).
@@ -1450,11 +1513,12 @@ fn compute_push_parse<'wb>(
 /// writes, and two call sites (`compute_push_describe_statement` /
 /// `..._portal`) invoke it per push — small enough to fold in.
 #[inline]
+#[expect(clippy::result_large_err, reason = "Err carries ProtocolError; same trade-off as build_query_message.")]
 fn build_describe_message<'brand, N: crate::ident::DescribeName>(
     target: crate::wire::DescribeTargetByte,
     name: &N,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
-) -> crate::action::WriteRange<'brand> {
+) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_DESCRIBE.byte());
     reserved.with_length_prefix(|w| {
@@ -1493,11 +1557,15 @@ fn compute_push_describe_statement<'wb>(
     // DEF-146: classifier dispatch (standard pattern).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (B): infallible + branded builder.
-            let range = build_describe_message(
-                crate::wire::DescribeTargetByte::Statement,
-                stmt_name,
-                reserved,
+            // DEF-154 (B) P0-2: builder returns Result.
+            let range = try_builder!(
+                build_describe_message(
+                    crate::wire::DescribeTargetByte::Statement,
+                    stmt_name,
+                    reserved,
+                ),
+                reply,
+                staged
             );
             // Describe + Sync bundle. Sync is required — without it
             // PG buffers Extended Query responses and never ships
@@ -1560,11 +1628,15 @@ fn compute_push_describe_portal<'wb>(
     // DEF-146: classifier dispatch (standard pattern).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (B): infallible + branded builder.
-            let range = build_describe_message(
-                crate::wire::DescribeTargetByte::Portal,
-                portal_name,
-                reserved,
+            // DEF-154 (B) P0-2: builder returns Result.
+            let range = try_builder!(
+                build_describe_message(
+                    crate::wire::DescribeTargetByte::Portal,
+                    portal_name,
+                    reserved,
+                ),
+                reply,
+                staged
             );
             emit_actions!(staged, budget: 2, [
                 StagedAction::SendBytesRange(range),
@@ -1624,41 +1696,57 @@ fn compute_push_describe_portal<'wb>(
 /// Zero-alloc: params are streamed directly from the tuple into
 /// `write_buf` via [`crate::params::ParamsWriter::write_params`];
 /// no intermediate buffer.
+#[expect(
+    clippy::result_large_err,
+    reason = "ProtocolError carries the full BoundedStr-backed ServerErrorResponse \
+              payload in some variants — ~312 B. Boxing is not an option (no_alloc \
+              crate, no heap). The Err path here is architecturally cold (user \
+              ParamsWriter impl overflowing its budget); the by-value return \
+              mirrors the rest of the dispatch classification surface \
+              (DispatchOutcome::Errored { cause: ProtocolError }) where the same \
+              large_enum_variant trade-off is already made."
+)]
 fn build_bind_message<'brand, P: crate::params::ParamsWriter>(
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
     params: &P,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
-) -> crate::action::WriteRange<'brand> {
+) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
+    // Builder fns all return Result post-B4-W P0-2+P0-3 fix.
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_BIND.byte());
+    // DEF-154 (B4-W + P0-3 fix from architect audit):
+    // `params.write_params` can return Err from a user-impl that
+    // overflows its advertised budget OR from a drift between
+    // MAX_PARAMS_DATA_TOTAL and MAX_OWNED_SEND_LEN. Pre-fix, the
+    // `Err` was silently discarded with a `debug_assert!(false, …)`,
+    // which in release produced a truncated Bind frame with a
+    // miscomputed length prefix — tier-4 silent corruption at the
+    // wire.
+    //
+    // Fix: carry `Err` out via the `with_length_prefix` closure
+    // into an outer slot, then propagate up through the builder's
+    // new `Result<WriteRange<'brand>, ProtocolError>` return. The
+    // enclosing `compute_push_bind_execute` classifies the Err as
+    // `CrateBugLocus::OutboundFrameBuild { stage: Bind }` →
+    // `FailReply + CloseSocket`. Tier-4 → tier-3 (classifiable
+    // runtime error at a stable locus).
+    let mut params_err: Option<ProtocolError> = None;
     reserved.with_length_prefix(|w| {
         w.push_nul_terminated(portal_name.as_bytes());
         w.push_nul_terminated(stmt_name.as_bytes());
-        // n_param_formats = COUNT, followed by COUNT × Binary (wire
-        // value 1). The `ParamEncoder` seal guarantees every param
-        // ships in binary format — no Text path to dispatch, just
-        // write the wire value `1` directly COUNT times. Eliminates
-        // the per-element `match format { ... }` of the initial
-        // 1c-3b draft — fewer branches in the hot bind path.
         w.push_u16_be(P::COUNT);
         for _ in 0..P::COUNT {
             w.push_u16_be(1);
         }
         w.push_u16_be(P::COUNT);
-        // DEF-154 (A+B) escape hatch: ParamsWriter is a pub trait
-        // predating the witness pattern; it takes &mut WriteBuf.
-        // The branded BrandedWriteReserved exposes as_write_buf_mut()
-        // for this one case — the brand is preserved by the scope
-        // (no brand-bearing return value crosses the escape).
-        match params.write_params(w.as_write_buf_mut()) {
-            Ok(()) => {}
-            Err(_) => debug_assert!(
-                false,
-                "DEF-154: params.write_params overflowed — capacity \
-                 invariant broken or ParamsWriter impl wrote past \
-                 max_bind_message_size bound",
-            ),
+        // Escape hatch: ParamsWriter takes &mut WriteBuf (pub trait
+        // predating the witness pattern). Brand identity preserved
+        // by the enclosing BrandedWriteReserved.
+        if params.write_params(w.as_write_buf_mut()).is_err() {
+            params_err = Some(ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ParamsWriterOverflow,
+            });
         }
         // n_result_formats = 0 → server default (all text). 1c-3b
         // does not negotiate per-column result formats; the user
@@ -1666,6 +1754,9 @@ fn build_bind_message<'brand, P: crate::params::ParamsWriter>(
         // `ColumnDesc::format_code` in the provided row_desc.
         w.push_u16_be(0);
     });
+    if let Some(err) = params_err {
+        return Err(err);
+    }
     crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
@@ -1681,11 +1772,12 @@ fn build_bind_message<'brand, P: crate::params::ParamsWriter>(
 /// 1c-3b scope produces `0` (fetch all). F83: the enum narrows the
 /// API to only variants the sub-phase supports, turning tier-3 docs
 /// into tier-1 compile.
+#[expect(clippy::result_large_err, reason = "Err carries ProtocolError; same trade-off as build_query_message.")]
 fn build_execute_message<'brand>(
     portal_name: &crate::ident::PortalName,
     fetch: crate::command::FetchRows,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
-) -> crate::action::WriteRange<'brand> {
+) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_EXECUTE.byte());
     reserved.with_length_prefix(|w| {
@@ -1728,12 +1820,28 @@ fn compute_push_bind_execute<'wb, P: crate::params::ParamsWriter>(
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
             // DEF-154 (B): both Bind and Execute run against the
-            // same BrandedWriteReserved. MAX_OWNED_SEND_LEN is
-            // const-asserted ≥ bind + execute + sync bundle, so
-            // both builders are infallible; the brand ties both
+            // same BrandedWriteReserved. The brand ties both
             // ranges to the buffer they materialise against.
-            let bind_range = build_bind_message(portal_name, stmt_name, params, reserved);
-            let execute_range = build_execute_message(portal_name, fetch, reserved);
+            // `build_execute_message` is infallible (no user-data
+            // overflow path); `build_bind_message` returns Result
+            // post-B4-W-P0-3 fix — ParamsWriter overflow (user
+            // sealed trait) classifies as
+            // `CrateBugLocus::ParamsWriterOverflow` and degrades
+            // gracefully to FailReply + CloseSocket.
+            // DEF-154 (B) P0-2+P0-3: both builders return Result;
+            // Err → FailReply + CloseSocket + Errored via
+            // `try_builder!`. bind covers ParamsWriterOverflow and
+            // EmptyWriteRange; execute covers EmptyWriteRange only.
+            let bind_range = try_builder!(
+                build_bind_message(portal_name, stmt_name, params, reserved),
+                reply,
+                staged
+            );
+            let execute_range = try_builder!(
+                build_execute_message(portal_name, fetch, reserved),
+                reply,
+                staged
+            );
             emit_actions!(staged, budget: 3, [
                 StagedAction::SendBytesRange(bind_range),
                 StagedAction::SendBytesRange(execute_range),
@@ -1918,12 +2026,13 @@ fn record_param_status(
 /// - 4 bytes: protocol version (196608 = 3.0)
 /// - key-value pairs, each NUL-terminated
 /// - trailing empty key NUL
+#[expect(clippy::result_large_err, reason = "Err carries ProtocolError; same trade-off as build_query_message.")]
 fn build_startup_message<'brand>(
     user: &Ident,
     database: Option<&DatabaseName>,
     app_name: Option<&ApplicationName>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
-) -> crate::action::WriteRange<'brand> {
+) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     // DEF-094: write in-place into the caller-owned `write_buf`.
     // DEF-100: return a typed non-empty range — length invariant.
     // DEF-154 (A): infallible via capacity witness.
