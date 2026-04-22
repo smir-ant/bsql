@@ -840,16 +840,13 @@ pub enum ErrorKind {
 pub struct StateErrorKind(ErrorKind);
 
 impl StateErrorKind {
-    /// Const-evaluable fallback for the architecturally-dead branch
-    /// in `fail_inflight_and_close` where `try_from_kind` would
-    /// otherwise return `None`. Maps to `ErrorKind::Internal` —
-    /// the honest classification of "crate bug: a code path that
-    /// shouldn't be reachable fired."
-    ///
-    /// Never used in production traffic; exists solely so the
-    /// `unwrap_or_else` fallback in `fail_inflight_and_close` can
-    /// resolve to a concrete `StateErrorKind` without panic.
-    pub const INTERNAL_FALLBACK: Self = Self(ErrorKind::Internal);
+    // DEF-154 (I): `INTERNAL_FALLBACK` const DELETED — it was
+    // exposed publicly only to supply the `unwrap_or_else` landing
+    // pad for three `state_kind().unwrap_or_else(|| { debug_assert!(false, ...); INTERNAL_FALLBACK })`
+    // call sites, which are now replaced by a total
+    // `state_kind() -> StateErrorKind` projection. The internal
+    // `Self(ErrorKind::Internal)` sentinel lives on inside
+    // `from_kind_or_internal`.
 
     /// Construct from a full [`ErrorKind`]. Returns `None` when
     /// passed [`ErrorKind::AlreadyClosed`] — that variant is the
@@ -880,22 +877,20 @@ impl StateErrorKind {
     /// implies a crate bug, which is precisely what `Internal`
     /// classifies).
     ///
-    /// # When to use
-    ///
-    /// Production code should prefer [`Self::try_from_kind`] paired
-    /// with `.unwrap_or(Self::INTERNAL_FALLBACK)` at THE single
-    /// architecturally-dead call site in `fail_inflight_and_close`
-    /// — explicit fallback documents the intent.
-    ///
-    /// Tests and fixture code use `from_kind_or_internal(X)` to
-    /// produce a `StateErrorKind` from a known-valid literal
-    /// without Option ceremony.
+    /// DEF-154 (I): this is the sole infallible path production now.
+    /// `ProtocolError::state_kind()` is implemented on top of this.
+    /// Tests and fixture code use it to produce a `StateErrorKind`
+    /// from a known-valid literal without Option ceremony.
     #[inline]
     #[must_use]
     pub const fn from_kind_or_internal(k: ErrorKind) -> Self {
         match Self::try_from_kind(k) {
             Some(s) => s,
-            None => Self::INTERNAL_FALLBACK,
+            // DEF-154 (I): inline the Internal sentinel instead of a
+            // separate `INTERNAL_FALLBACK` const. Architecturally
+            // dead: AlreadyClosed never reaches the state-install
+            // paths (DEF-142 seal); call-site classification.
+            None => Self(ErrorKind::Internal),
         }
     }
 
@@ -972,23 +967,35 @@ impl ProtocolError {
         }
     }
 
-    /// DEF-176 (audit2 A016): the [`StateErrorKind`] projection of
-    /// this error's kind, or `None` if the kind is not storable in
-    /// [`crate::state::ProtoState::Errored`] (only
-    /// [`ErrorKind::AlreadyClosed`] fails this check, per DEF-142's
-    /// state-storability seal).
+    /// DEF-176 (audit2 A016) + DEF-154 (I): total projection from
+    /// [`ProtocolError`] to the [`StateErrorKind`] subset storable
+    /// in [`crate::state::ProtoState::Errored`].
     ///
-    /// Composition shortcut for the pre-DEF-176 pattern
-    ///     `StateErrorKind::try_from_kind(cause.kind())`
-    /// which required naming both APIs. The helper closes the
-    /// kind/try_from pair as "one authoritative match (kind),
-    /// projection to state-storable subset." Callers use
-    /// `cause.state_kind().unwrap_or_else(|| { debug_assert!(false,
-    /// ...); INTERNAL_FALLBACK })` (see DEF-175).
+    /// `ErrorKind::AlreadyClosed` is the only kind that isn't
+    /// state-storable in principle (per DEF-142's seal); it only
+    /// arises in reply-only contexts (push_command /
+    /// push_bind_execute emitting `FailReply { cause: ConnectionAlreadyClosed }`
+    /// when the user invokes on an already-Errored state). The
+    /// dispatch + feed_bytes + builder paths NEVER see it as a
+    /// cause — architectural invariant per DEF-142.
+    ///
+    /// Pre-(I), this method returned `Option<StateErrorKind>` and
+    /// three call sites open-coded
+    /// `state_kind().unwrap_or_else(|| { debug_assert!(false, ...); INTERNAL_FALLBACK })`
+    /// — the exact "release silent + debug loud" pattern the user
+    /// has banned (
+    /// "никаких потенциальных паник и прочих атрибутов хрупкой и
+    /// стеклянной структуры").
+    ///
+    /// Post-(I), the projection is total: `AlreadyClosed → Internal`.
+    /// That IS an honest classification ("something went wrong at
+    /// the crate level") — not silent corruption. Architecturally
+    /// dead under DEF-142 seal; preserved as behavioural fallback
+    /// rather than a panic + silent-release split.
     #[inline]
     #[must_use]
-    pub const fn state_kind(&self) -> Option<StateErrorKind> {
-        StateErrorKind::try_from_kind(self.kind())
+    pub const fn state_kind(&self) -> StateErrorKind {
+        StateErrorKind::from_kind_or_internal(self.kind())
     }
 }
 

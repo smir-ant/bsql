@@ -154,14 +154,11 @@ macro_rules! try_builder {
         match $result {
             Ok(r) => r,
             Err(cause) => {
-                let state_kind = cause.state_kind().unwrap_or_else(|| {
-                    debug_assert!(
-                        false,
-                        "DEF-175: builder Err produced unclassifiable \
-                         StateErrorKind — InternalCrateBug variants always map.",
-                    );
-                    crate::error::StateErrorKind::INTERNAL_FALLBACK
-                });
+                // DEF-154 (I): state_kind is total — no unwrap_or_else
+                // + debug_assert dance. Builders never return
+                // AlreadyClosed; the total projection fills any
+                // hypothetical AlreadyClosed with Internal honestly.
+                let state_kind = cause.state_kind();
                 emit_actions!($staged, budget: 2, [
                     StagedAction::FailReply { id: $reply.consume(), cause },
                     StagedAction::CloseSocket,
@@ -763,14 +760,9 @@ impl PgProtocol {
                                 ]);
                             }
                             DispatchOutcome::Errored { reply_id, cause } => {
-                                let state_kind = cause.state_kind().unwrap_or_else(|| {
-                                    debug_assert!(
-                                        false,
-                                        "DEF-175: AlreadyClosed reached dispatch-Errored — \
-                                         impossible per DEF-142 seal.",
-                                    );
-                                    crate::error::StateErrorKind::INTERNAL_FALLBACK
-                                });
+                                // DEF-154 (I): total state_kind — no
+                                // unwrap_or_else + debug_assert dance.
+                                let state_kind = cause.state_kind();
                                 *state = ProtoState::Errored(state_kind);
                                 match reply_id {
                                     Some(id) => {
@@ -894,14 +886,8 @@ fn fail_inflight_no_readbuf<'wb, 'rb>(
     if matches!(state, ProtoState::Errored(_)) {
         return;
     }
-    let state_kind = cause.state_kind().unwrap_or_else(|| {
-        debug_assert!(
-            false,
-            "DEF-175: AlreadyClosed reached fail_inflight_no_readbuf — \
-             impossible per DEF-142 seal.",
-        );
-        crate::error::StateErrorKind::INTERNAL_FALLBACK
-    });
+    // DEF-154 (I): total state_kind — no unwrap_or_else + debug_assert.
+    let state_kind = cause.state_kind();
     let prev = core::mem::replace(state, ProtoState::Errored(state_kind));
     let raw_id = prev.take_inflight_reply_raw_id();
     match raw_id {
