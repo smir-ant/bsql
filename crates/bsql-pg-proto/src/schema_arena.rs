@@ -26,10 +26,18 @@
 //! structural reason, not silent substitution). The `NonZeroU8`
 //! slot eliminates the test-fixture `ZERO` sentinel class (a slot
 //! index of 0 is physically impossible — the value 0 IS the
-//! `Option<SchemaRef>::None` niche). The arena also gains a
-//! `has_any: bool` fast-path: a `clear()` call on an already-empty
-//! slab (the common case on the Ping-loop hot path) returns
-//! immediately without walking the 528 B slots.
+//! `Option<SchemaRef>::None` niche).
+//!
+//! DEF-171 (audit2 A002) follow-up: the initial DEF-148 design
+//! carried a `has_any: bool` fast-path field on `SchemaSlab` to
+//! short-circuit `clear()` on the Ping-loop hot case. DEF-171
+//! deletes that field — it was a derived-state fallback with 6
+//! mutation sites, no cross-check test, and a silent-corruption
+//! failure mode (has_any=false while occupied). Post-DEF-171
+//! `clear()` walks the 2-slot array directly; the Ping-loop hot
+//! case (all slots free) hits the `is_some` check at each slot
+//! and branches over — effectively a no-op, equivalent machine
+//! code to the pre-DEF-171 bool-load.
 //!
 //! # Size impact
 //!
@@ -42,9 +50,10 @@
 //! | `SchemaRef` | n/a | 1 B | 2 B |
 //! | `Option<SchemaRef>` | n/a | 2 B | 2 B (niche) |
 //!
-//! Arena cost: 2 × (~264 B slot) + 2 × 1 B (generations) + 1 B
-//! (has_any) + padding ≈ 536 B on `PgProtocol`. Paid once per
-//! connection; amortised across all queries that connection services.
+//! Arena cost: 2 × (~264 B slot) + 2 × 1 B (generations) + padding
+//! ≈ 530 B on `PgProtocol` (DEF-171 dropped 1 B has_any + alignment
+//! pad vs DEF-148's ~536 B). Paid once per connection; amortised
+//! across all queries that connection services.
 //!
 //! # Slot count
 //!
@@ -73,9 +82,12 @@
 //!   `schema_arena` again. `clear()` bumps per-slot generations so
 //!   any stale `SchemaRef` built before the clear resolves to
 //!   `None` via generation mismatch.
-//! - **Fast-path**: `clear()` early-returns when `has_any` is false
-//!   (A007) — the Ping-loop hot path never carries a schema, so no
-//!   528 B memset per iteration.
+//! - **Fast-path (Ping-loop hot case)**: `clear()` walks the 2
+//!   slots; each `is_some()` check branches over a free slot
+//!   without storing. Under LLVM the branch is one cycle per slot,
+//!   effectively a no-op — equivalent to the pre-DEF-171
+//!   `has_any: bool` fast-path but without the derived-field
+//!   invariant surface.
 //!
 //! Why `clear()` rather than per-ref `free()`: the 2-slot arena
 //! serves at most one inflight query at a time (single-inflight
@@ -246,23 +258,16 @@ pub(crate) struct SchemaSlab {
     /// window is architecturally dead. If 1c-5 pipelining reveals
     /// a real collision path, promote to `u16`.
     generations: [u8; MAX_ARENA_SLOTS],
-    /// `true` iff any slot is occupied. DEF-148 fast-path: a
-    /// `clear()` on an already-empty slab returns immediately
-    /// without walking the slots, saving ~528 B of `None`-write
-    /// memset per Ping-loop iteration (A007).
-    has_any: bool,
 }
 
 impl SchemaSlab {
-    /// Construct an empty slab (all slots free, all generations 0,
-    /// has_any = false).
+    /// Construct an empty slab (all slots free, all generations 0).
     #[inline]
     #[must_use]
     pub(crate) const fn new() -> Self {
         Self {
             slots: [None; MAX_ARENA_SLOTS],
             generations: [0_u8; MAX_ARENA_SLOTS],
-            has_any: false,
         }
     }
 
@@ -280,7 +285,6 @@ impl SchemaSlab {
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(desc);
-                self.has_any = true;
                 // `idx < MAX_ARENA_SLOTS ≤ 254` (const-asserted
                 // above) so `idx + 1` fits u8 unconditionally.
                 // Explicit match + saturating fallback satisfies
@@ -347,36 +351,43 @@ impl SchemaSlab {
                 *gen_slot = gen_slot.wrapping_add(1);
             }
         }
-        // Recompute has_any — cheap O(N=2) walk.
-        self.has_any = self.slots.iter().any(Option::is_some);
     }
 
     /// Clear all slots. Called at entry of the next protocol
     /// interaction when the prior state is `Idle` or `Errored` —
     /// reclaims any schemas carried across the previous cycle.
     ///
-    /// DEF-148 fast-path: early-return when `!has_any` — the
-    /// Ping-loop hot path never carries a schema, so no 528 B
-    /// memset per iteration.
+    /// DEF-171 (audit2 A002): the pre-DEF-171 `has_any: bool` fast-
+    /// path was DELETED as a "fallback-with-shadow-correctness"
+    /// pattern — 6 mutation sites had to preserve the invariant
+    /// `has_any == slots.iter().any(is_some)` with no cross-check
+    /// test, and the has_any=false-while-occupied failure mode
+    /// would silently survive a stale schema across clears. The
+    /// post-DEF-171 form walks the slots directly; on the 2-slot
+    /// arena the walk is 2 load+compare ops — indistinguishable
+    /// from the pre-DEF-171 byte-load under LLVM opt, and the
+    /// Ping-loop hot case (slots all None) still hits the fast
+    /// path (the for-loop skips every slot with the is_some check,
+    /// NO memset). Net: same perf, one derived field eliminated,
+    /// 6 mutation-site invariant closed structurally.
     ///
-    /// DEF-148 generation semantics: each occupied slot has its
-    /// generation bumped, invalidating any pre-clear `SchemaRef`
-    /// via generation-mismatch at `get()`.
+    /// DEF-148 generation semantics preserved: each occupied slot
+    /// has its generation bumped, invalidating any pre-clear
+    /// `SchemaRef` via generation-mismatch at `get()`.
     #[inline]
     pub(crate) fn clear(&mut self) {
-        if !self.has_any {
-            return;
-        }
         // Walk occupied slots: clear each, bump its generation.
         // Free slots stay at their current generation (no ref
-        // outstanding to invalidate).
+        // outstanding to invalidate). On the Ping-loop hot case
+        // (all slots free) this is two is_some() branches, no
+        // stores — effectively a no-op, same as the deleted
+        // has_any fast-path.
         for (slot, gen_slot) in self.slots.iter_mut().zip(self.generations.iter_mut()) {
             if slot.is_some() {
                 *slot = None;
                 *gen_slot = gen_slot.wrapping_add(1);
             }
         }
-        self.has_any = false;
     }
 
     /// Count occupied slots. Debug-only — production code doesn't
@@ -406,19 +417,18 @@ impl Default for SchemaSlab {
     }
 }
 
-// DEF-151 drift pin: total slab size. 2 slots × ~264 B each +
-// generations (2 × u8) + has_any (bool) + padding.
-// Measured post-DEF-148: ~520 B on aarch64-apple-darwin (padding is
-// tight because Option<RowDesc>'s discriminant fits in the slot's
-// trailing padding, so the arena slots end at a natural boundary
-// where the generations + has_any fit into the same alignment).
-// Range [512, 544] tolerates cross-platform alignment.
+// DEF-151 + DEF-171 drift pin: total slab size. 2 slots × ~264 B
+// each + generations (2 × u8) + padding. Post-DEF-171 (has_any
+// deleted): slab shrinks by 1 B + alignment pad. Actual ~520 B on
+// aarch64-apple-darwin; range [512, 544] tolerates cross-platform
+// alignment.
 const _: () = assert!(
     core::mem::size_of::<SchemaSlab>() >= 512
         && core::mem::size_of::<SchemaSlab>() <= 544,
-    "SchemaSlab size drift — post-DEF-148 actual ~520 B. Range [512, 544] \
-     tolerates cross-platform alignment. If MAX_ARENA_SLOTS grows, update \
-     PgProtocol size budget in lib.rs in lockstep.",
+    "SchemaSlab size drift — post-DEF-171 actual ~520 B (has_any \
+     deleted). Range [512, 544] tolerates cross-platform alignment. \
+     If MAX_ARENA_SLOTS grows, update PgProtocol size budget in \
+     lib.rs in lockstep.",
 );
 
 // Drift pin: SchemaRef is 2 bytes (NonZeroU8 slot + u8 generation).
@@ -461,7 +471,6 @@ mod tests {
     fn fresh_slab_is_empty() {
         let slab = SchemaSlab::new();
         assert_eq!(slab.occupied_count(), 0);
-        assert!(!slab.has_any);
     }
 
     /// Invariant (spec): alloc uses slots in order, returns slot
@@ -476,7 +485,6 @@ mod tests {
         assert_eq!(r0.slot_idx(), 0);
         assert_eq!(r0.generation(), 0);
         assert_eq!(slab.occupied_count(), 1);
-        assert!(slab.has_any);
 
         let r1 = must_alloc(&mut slab, desc);
         assert_eq!(r1.slot_idx(), 1);
@@ -502,7 +510,6 @@ mod tests {
         // Post-free: ref is stale (generation bumped). get() returns None.
         assert!(slab.get(r).is_none());
         assert_eq!(slab.occupied_count(), 0);
-        assert!(!slab.has_any);
 
         // Slot 0 free → next alloc reuses it, but with a BUMPED
         // generation. Old r still resolves to None.
@@ -550,26 +557,26 @@ mod tests {
         assert!(slab.get(first).is_some());
         assert!(slab.get(second).is_some());
         assert_eq!(slab.occupied_count(), 2);
-        assert!(slab.has_any);
 
         slab.clear();
         assert_eq!(slab.occupied_count(), 0);
-        assert!(!slab.has_any);
         // Both pre-clear refs are now stale.
         assert!(slab.get(first).is_none());
         assert!(slab.get(second).is_none());
     }
 
-    /// DEF-148 fast-path: clear() on already-empty slab doesn't
+    /// DEF-148 semantics: clear() on already-empty slab doesn't
     /// bump any generation (no occupied slots to invalidate).
+    /// Post-DEF-171 (has_any removed): the walk still skips all
+    /// empty slots without storing — behaviour preserved.
     #[test]
     fn clear_on_empty_slab_is_noop() {
         let mut slab = SchemaSlab::new();
-        assert!(!slab.has_any);
+        assert_eq!(slab.occupied_count(), 0);
         let gens_before: [u8; MAX_ARENA_SLOTS] = slab.generations;
         slab.clear();
         assert_eq!(slab.generations, gens_before, "clear on empty must not bump generations");
-        assert!(!slab.has_any);
+        assert_eq!(slab.occupied_count(), 0);
     }
 
     /// DEF-148 generational invalidation: a ref built BEFORE clear
