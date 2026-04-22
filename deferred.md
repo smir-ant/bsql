@@ -2967,7 +2967,97 @@ Scheduled after (B). Combines buffer-witness + arena-witness
 (C shipped) to make stale SchemaRef detection compile-time (upgrade
 DEF-170 debug_asserts from runtime-check to type-system-impossible).
 
-### DEF-154 (B) Phase B4 — attempt + deferred retry
+### DEF-154 (B) Phase B4-W — SHIPPED
+
+**Shipped** 2026-04-22. Scope: **write-side tier-1** (read-side
+deferred to DEF-154 (E) — logical-cursor refactor).
+
+**Mechanism.** Brand-lifetime generics threaded through
+`StagedAction<'wb>`, `StagedActions<'wb>`, `DispatchOutcome<'wb>`,
+all of `dispatch` + its sub-fns, all 6 builders + 5 `compute_push_*`
+helpers, all 3 entry points (`push_command`, `push_bind_execute`,
+`feed_bytes`). `materialise` signature becomes
+`materialise<'w, 'r, 'wb>(StagedActions<'wb>, BrandedBytes<'wb, 'w>,
+&'r [u8], ArenaReader<'r>) -> OutActions<'w, 'r>` — write-side
+bytes are `BrandedBytes`; read-side stays unbranded `&[u8]`
+(B4-W scope).
+
+**Tier-1 wins** (DEF-182 shield elimination):
+- Site 2 (`SendBytesRange(range).apply(write_buf)`) → **STRUCTURALLY CLOSED**.
+  `WriteRange<'wb>::apply(BrandedBytes<'wb, 'w>) -> &'w [u8]` is
+  infallible by the brand-identity + construction-bounds + API-narrow
+  three-step argument.
+- Site 1 (payload extraction) + Site 3 (`StreamRowRange.apply(read_buf)`):
+  **retained** as DEF-182 tier-2 shields; lift to DEF-154 (E).
+
+**Key design decisions** (from architect design spec):
+- `_Phantom(PhantomData<fn(&'wb ()) -> &'wb ()>)` variant on
+  `StagedAction` + `DispatchOutcome` to anchor `'wb` without
+  phantom-per-variant noise. `#[doc(hidden)]`; never constructed.
+  Match arms handle as neutral no-op (forbid-bundle bans
+  `unreachable!`).
+- `with_branded<'w, R, F>(&'w mut self, f: F)` — explicit `'w`
+  propagation; elided `&mut self` would clip the brand's slice
+  lifetime to the method-call reborrow scope (< `'w`).
+- `into_bytes_branded(self) -> BrandedBytes<'brand, 'a>` — consuming
+  form that yields the full outer `'a` lifetime. Required so
+  `&'a [u8]` slices from `range.apply` escape the branded closure
+  as `&'w [u8]` in `Action::SendBytes`.
+- `BrandedBytes: Copy + Clone` — required for multi-iteration
+  materialise loop (phantom + `&[u8]` = trivially Copy).
+- SCRAM auth + `ParamsWriter` retain the `as_write_buf_mut`
+  escape hatch. Migrating `scram::wire` across the module boundary
+  produces zero tier win; branded `WriteRange<'wb>` wrapping at
+  the enclosing scope preserves brand identity via
+  `from_branded_write_span` post-push.
+- Test observation via `StagedObs` (brand-free enum). Discovered
+  mid-implementation: `ProtocolError` is `Copy + Clone`
+  (error.rs:231), so `FailReply.cause` preserves full variant.
+  `StagedObs::SendBytesRange` is a unit variant — tests only
+  discriminate on kind, not range contents.
+- Legacy `WriteReserved` + `WriteBuf::reserve()` + `NonEmptyRange::from_write_span`
+  + `from_write_span_infallible` helper — DELETED (all paths go
+  through branded form).
+- `BrandedReadBuf` + `ReadRange::{new, apply, from_raw, inner}` +
+  `BrandedBytes::{empty, from_slice_branded}` + `as_bytes_branded`
+  — re-gated `#[cfg(test)]` pending DEF-154 (E).
+
+**Verification:**
+- `cargo check -p bsql-pg-proto --all-targets`: clean.
+- `cargo clippy -p bsql-pg-proto --all-targets -- -D warnings`: clean.
+- `cargo build -p bsql-pg-proto --release`: clean.
+- `cargo test -p bsql-pg-proto`: 219 passed (unchanged from B3).
+
+**Zero-cost perf.** Brand phantoms are ZST
+(`PhantomData<fn(&'wb ()) -> &'wb ()>`); `with_branded` closures
+are `#[inline]` and LLVM collapses to direct mutable-borrow pass.
+Expected zero instruction-count delta vs pre-B4; systematic
+verification deferred to DEF-143 (bench harness).
+
+### DEF-154 (E) — read-side tier-1 via dispatch-loop logical cursor
+
+Registered during Phase B4-W. The dispatch loop currently calls
+`self.read_buf.advance(total_len)` mid-loop; a branded shared
+borrow (`BrandedReadBuf`) conflicts with the mutating advance.
+The fix is structural: convert physical `advance` to a logical
+cursor (`frames_consumed: usize`) inside the branded scope,
+apply the cumulative advance after the scope exits.
+
+Complexity: ~+100 LoC in `feed_bytes`, interactions with
+`ReadBufFull`-path + `Errored`-path early returns, plus the
+`OutActions<'r>` borrow-checker constraint on when the advance
+can legally run.
+
+Scope gate: read-side tier-1 closure (DEF-182 sites 1 + 3) —
+payload extraction + `StreamRowRange.apply` — becomes
+structurally impossible via
+`ReadRange<'rb>::apply(BrandedBytes<'rb, 'r>) -> &'r [u8]`.
+
+Already-present scaffolding: `BrandedReadBuf` + `ReadBuf::with_branded`
+(both `#[cfg(test)]`-gated in Phase B4-W), `ReadRange<'brand>::apply`
+(cfg(test)).
+
+### DEF-154 (B) Phase B4 — previous attempt (rolled back)
 
 **Status.** Attempted 2026-04-22 same session as B1–B3 shipped.
 Implementation ~500 LoC across action.rs / buf.rs / dispatch.rs /

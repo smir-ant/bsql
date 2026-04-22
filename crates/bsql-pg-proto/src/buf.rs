@@ -26,9 +26,8 @@
 
 use crate::frame::READ_BUF_CAP;
 use core::fmt;
-// `PhantomData` used only by the Phase B2 branded types below,
-// all of which are `#[cfg(test)]`-gated until Phase B3/B4 wire
-// them into production. Gate the import to match.
+// DEF-154 (B) Phase B4: `PhantomData` used only by the `BrandedReadBuf`
+// scaffolding below, which is `#[cfg(test)]`-gated pending DEF-154 (E).
 #[cfg(test)]
 use core::marker::PhantomData;
 use heapless::{CapacityError, Vec};
@@ -404,42 +403,32 @@ pub(crate) struct BrandedReadBuf<'brand, 'a> {
 }
 
 #[cfg(test)]
-impl<'brand> BrandedReadBuf<'brand, '_> {
-    /// Branded view of the full populated region (including bytes
-    /// consumed past the cursor). Matches [`ReadBuf::populated`]
-    /// in semantics.
+impl<'brand, 'a> BrandedReadBuf<'brand, 'a> {
+    /// Branded view of the full populated region — shared borrow.
+    /// Used by the dispatch loop (Phase B4) as the witness for
+    /// [`crate::action::ReadRange::new`] construction (bounds
+    /// validation against same-brand bytes).
     ///
-    /// Used by `StreamRowRange` materialise (Phase B4): the row's
-    /// absolute-position range was built during dispatch against
-    /// this same populated region; the brand-identity proof makes
-    /// `ReadRange<'brand>::apply(bytes)` return `&[u8]` instead
-    /// of `Option<&[u8]>`.
+    /// Short-lived (`'_` tied to `&self`). For the final
+    /// materialise-boundary consumption that yields slices with the
+    /// full outer `'a` lifetime, use
+    /// [`Self::into_populated_branded`].
     #[inline]
     #[must_use]
     pub(crate) fn populated_branded(&self) -> crate::write_buf::BrandedBytes<'brand, '_> {
-        // NB: the construction goes through the shared Phase B1
-        // `BrandedBytes` type. A later refactor may extract both
-        // sides' `BrandedBytes` and branded views into a dedicated
-        // `crate::brand` module; for now the factory is on
-        // `BrandedWriteBuf` and on `BrandedReadBuf` independently,
-        // both producing compatible values (the brand is existential
-        // per HRTB, so call-site identity is preserved).
         crate::write_buf::BrandedBytes::from_slice_branded(self.buf.populated())
     }
 
     /// Branded view of the unread (unconsumed) region. Matches
     /// [`ReadBuf::unread`] in semantics.
-    ///
-    /// Used by the payload-extract site in `feed_bytes` (Phase B4):
-    /// after `parse_header` succeeds, the payload slice
-    /// `unread()[HEADER_LEN..total_len]` is carved — branded, so
-    /// any future typed range into this view carries the same
-    /// brand and the extraction becomes infallible.
     #[inline]
     #[must_use]
     pub(crate) fn unread_branded(&self) -> crate::write_buf::BrandedBytes<'brand, '_> {
         crate::write_buf::BrandedBytes::from_slice_branded(self.buf.unread())
     }
+
+    // DEF-154 (B) Phase B4: `into_populated_branded` consuming
+    // form deferred to DEF-154 (E). See parent-module comment.
 }
 
 #[cfg(test)]

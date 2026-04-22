@@ -311,18 +311,31 @@ impl PgProtocol {
         // 1c-1a: push never produces `StreamRow` (rows arrive via
         // server responses, handled in `feed_bytes`). The `'r`
         // lifetime parameter on `OutActions<'w, 'r>` is phantom on
-        // this path — unifying it to `'static` gives the caller
+        // this path — unifying it to `'s` here gives the caller
         // freedom over what they pair the result with later.
         write_buf.clear();
 
         // DEF-172: centralised entry-point arena reclamation.
         self.clear_arena_if_idle_or_errored();
-        let prev = core::mem::take(&mut self.state);
-        let (new_state, staged) = compute_push(cmd, prev, write_buf);
-        self.state = new_state;
-        // DEF-154 (C): materialise sees a narrowed reader witness,
-        // not the full `&SchemaSlab`. Arena access here is get-only.
-        materialise(staged, write_buf.as_bytes(), &[], self.schema_arena.as_reader())
+
+        // DEF-154 (B): write-side branded scope for tier-1 apply;
+        // read-side uses unbranded &[u8] (push paths don't emit
+        // ReadRange so read-branding would be phantom; a future
+        // DEF-154 (E) brings read-side into tier-1 too).
+        write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
+            let prev = core::mem::take(&mut self.state);
+            let (new_state, staged) = {
+                let mut reserved = wb.reserve();
+                compute_push(cmd, prev, &mut reserved)
+            };
+            self.state = new_state;
+            materialise(
+                staged,
+                wb.into_bytes_branded(),
+                &[],
+                self.schema_arena.as_reader(),
+            )
+        })
     }
 
     /// Extended Query "Bind + Execute + Sync" pipeline — send a
@@ -391,39 +404,44 @@ impl PgProtocol {
         self.clear_arena_if_idle_or_errored();
         // DEF-119: if the user supplied a row_desc, allocate it into
         // the arena NOW and thread the resulting SchemaRef into the
-        // state machine. The owned RowDesc goes into the arena slab;
-        // state + actions carry 1-byte handles. `None` means DML
-        // path (no schema) → no alloc.
+        // state machine.
         //
         // DEF-183 (P1-A from Senior audit): routed through
         // `as_writer()` witness for consistency with dispatch()'s
-        // alloc path. Same narrowed API — `alloc` only, no `get`/
-        // `clear`/`free` — so a future refactor that moves this
-        // logic into a helper inherits the tier-2 narrowing
-        // automatically. The writer borrow ends at the last use
-        // (this assignment) under NLL; subsequent
-        // `core::mem::take(&mut self.state)` sees an un-borrowed
-        // self.schema_arena.
+        // alloc path. NLL ends the writer borrow at the last use.
         let schema_ref = match row_desc {
             Some(desc) => self.schema_arena.as_writer().alloc(desc),
             None => None,
         };
-        let mut staged = StagedActions::new();
-        let prev = core::mem::take(&mut self.state);
-        let new_state = compute_push_bind_execute(
-            prev,
-            portal_name,
-            stmt_name,
-            params,
-            schema_ref,
-            fetch,
-            reply,
-            &mut staged,
-            write_buf,
-        );
-        self.state = new_state;
-        // DEF-154 (C): reader witness — see push_command for rationale.
-        materialise(staged, write_buf.as_bytes(), &[], self.schema_arena.as_reader())
+
+        // DEF-154 (B) write-side branded scope — see push_command
+        // for rationale. Push paths don't emit ReadRange; read-side
+        // materialise input is an empty `&[]`.
+        write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
+            let prev = core::mem::take(&mut self.state);
+            let mut staged = StagedActions::new();
+            let new_state = {
+                let mut reserved = wb.reserve();
+                compute_push_bind_execute(
+                    prev,
+                    portal_name,
+                    stmt_name,
+                    params,
+                    schema_ref,
+                    fetch,
+                    reply,
+                    &mut staged,
+                    &mut reserved,
+                )
+            };
+            self.state = new_state;
+            materialise(
+                staged,
+                wb.into_bytes_branded(),
+                &[],
+                self.schema_arena.as_reader(),
+            )
+        })
     }
 
     /// Feed inbound wire bytes.
@@ -446,7 +464,6 @@ impl PgProtocol {
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 'r> {
         write_buf.clear();
-        let staged = StagedActions::new();
 
         // DEF-119 arena cleanup — any prior OutActions<'_, 'r_prev>
         // has drained (borrow checker enforces it before this
@@ -455,29 +472,19 @@ impl PgProtocol {
 
         // F66 (pass #6 audit): if the connection is already Errored,
         // drop the incoming bytes and return an empty OutActions.
-        // Rationale:
-        //   1. The caller already received `CloseSocket` at the
-        //      original fail point; the socket is being torn down.
-        //   2. The Errored dispatch arm would consume bytes frame-by-
-        //      frame with `AdvancedSilent` — wasted CPU on each byte
-        //      from a connection that's already dead.
-        //   3. An adversarial server flooding a post-close socket
-        //      can't force useless parse work: we skip the loop
-        //      entirely.
-        // Also clear `read_buf` — post-Close bytes are wire-garbage
-        // from a dead connection; keeping them wastes memory.
+        // Also clear `read_buf` — post-Close bytes are wire-garbage.
         if matches!(self.state, ProtoState::Errored(_)) {
             self.read_buf.clear();
-            // DEF-154 (C): reader witness, get-only access.
-            return materialise(
-                staged,
-                write_buf.as_bytes(),
-                self.read_buf.populated(),
-                self.schema_arena.as_reader(),
-            );
+            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+                let staged: StagedActions<'_> = StagedActions::new();
+                materialise(
+                    staged,
+                    wb.into_bytes_branded(),
+                    self.read_buf.populated(),
+                    self.schema_arena.as_reader(),
+                )
+            });
         }
-
-        let mut staged = staged;
 
         // Append into the bounded buffer. Overflow → fatal.
         if let Err(ReadBufFull {
@@ -485,20 +492,56 @@ impl PgProtocol {
             available,
         }) = self.read_buf.append(bytes)
         {
-            self.fail_inflight_and_close(
-                ProtocolError::ReadBufferFull {
-                    attempted,
-                    available,
-                },
-                &mut staged,
-            );
-            return materialise(
+            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+                let mut staged: StagedActions<'_> = StagedActions::new();
+                self.fail_inflight_and_close(
+                    ProtocolError::ReadBufferFull {
+                        attempted,
+                        available,
+                    },
+                    &mut staged,
+                );
+                materialise(
+                    staged,
+                    wb.into_bytes_branded(),
+                    self.read_buf.populated(),
+                    self.schema_arena.as_reader(),
+                )
+            });
+        }
+
+        // DEF-154 (B): main branded scope — dispatch loop uses
+        // &mut reserved for write-side tier-1 WriteRange production;
+        // materialise at the end consumes wb for infallible apply.
+        write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
+            let mut staged: StagedActions<'_> = StagedActions::new();
+            {
+                let mut reserved = wb.reserve();
+                Self::dispatch_loop(self, &mut reserved, &mut staged);
+            }
+            materialise(
                 staged,
-                write_buf.as_bytes(),
+                wb.into_bytes_branded(),
                 self.read_buf.populated(),
                 self.schema_arena.as_reader(),
-            );
-        }
+            )
+        })
+    }
+
+    /// DEF-154 (B) Phase B4 — dispatch loop factored out of
+    /// `feed_bytes` to live inside the branded `write_buf` scope.
+    ///
+    /// The `reserved: &mut BrandedWriteReserved<'wb, '_>` parameter
+    /// carries the write-side brand into `dispatch()`; dispatch-
+    /// emitted SendBytesRange actions carry a `WriteRange<'wb>`
+    /// tied to this reserved, enabling the infallible-apply at
+    /// materialise time.
+    #[inline]
+    fn dispatch_loop<'wb>(
+        &mut self,
+        reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
+        staged: &mut StagedActions<'wb>,
+    ) {
 
         // Drain as many complete frames as possible. Bounded by
         // (a) `MAX_ACTIONS_PER_CALL` (emit_actions! budget overflow
@@ -511,14 +554,14 @@ impl PgProtocol {
                 HeaderParse::MalformedLength { declared } => {
                     self.fail_inflight_and_close(
                         ProtocolError::MalformedFrameLength { declared },
-                        &mut staged,
+                        staged,
                     );
                     break;
                 }
                 HeaderParse::FrameTooLarge { declared } => {
                     self.fail_inflight_and_close(
                         ProtocolError::FrameTooLarge { declared },
-                        &mut staged,
+                        staged,
                     );
                     break;
                 }
@@ -567,7 +610,7 @@ impl PgProtocol {
                             }
                         }
                         let Ok(()) = self.read_buf.advance(total_len) else {
-                            self.fail_read_cursor_advance(&mut staged);
+                            self.fail_read_cursor_advance(staged);
                             break;
                         };
                         continue;
@@ -583,7 +626,7 @@ impl PgProtocol {
                     // wrapper wants visibility.
                     if tag == crate::wire::TAG_NOTICE_RESPONSE {
                         let Ok(()) = self.read_buf.advance(total_len) else {
-                            self.fail_read_cursor_advance(&mut staged);
+                            self.fail_read_cursor_advance(staged);
                             break;
                         };
                         continue;
@@ -653,7 +696,7 @@ impl PgProtocol {
                         prev,
                         tag,
                         payload,
-                        write_buf,
+                        reserved,
                         &mut arena_writer,
                         FrameCoords::new(frame_start, frame_len, populated),
                     );
@@ -661,17 +704,17 @@ impl PgProtocol {
                         DispatchOutcome::AdvancedSilent { new_state } => {
                             self.state = new_state;
                             let Ok(()) = self.read_buf.advance(total_len) else {
-                                self.fail_read_cursor_advance(&mut staged);
+                                self.fail_read_cursor_advance(staged);
                                 break;
                             };
                         }
                         DispatchOutcome::AdvancedWithAction { new_state, action } => {
                             self.state = new_state;
                             let Ok(()) = self.read_buf.advance(total_len) else {
-                                self.fail_read_cursor_advance(&mut staged);
+                                self.fail_read_cursor_advance(staged);
                                 break;
                             };
-                            emit_actions!(&mut staged, budget: 1, on_overflow: break, [
+                            emit_actions!(staged, budget: 1, on_overflow: break, [
                                 action,
                             ]);
                         }
@@ -726,46 +769,29 @@ impl PgProtocol {
                                 // `Option<NonZeroU64>` — already
                                 // consumed by the dispatcher.
                                 Some(id) => {
-                                    emit_actions!(&mut staged, budget: 2, on_overflow: break, [
+                                    emit_actions!(staged, budget: 2, on_overflow: break, [
                                         StagedAction::FailReply { id, cause },
                                         StagedAction::CloseSocket,
                                     ]);
                                 }
                                 None => {
-                                    emit_actions!(&mut staged, budget: 1, on_overflow: break, [
+                                    emit_actions!(staged, budget: 1, on_overflow: break, [
                                         StagedAction::CloseSocket,
                                     ]);
                                 }
                             }
                             break;
                         }
+                        // DEF-154 (B) Phase B4: _Phantom is never
+                        // constructed (it's a lifetime anchor — see
+                        // the DispatchOutcome enum doc). Handled as
+                        // a silent no-op here for exhaustive-match
+                        // compliance; no state change, no action.
+                        DispatchOutcome::_Phantom(_) => {}
                     }
                 }
             }
         }
-
-        // 1c-1b: `populated()` — the full buffer contents including
-        // bytes advanced past the cursor during this loop — so that
-        // `StreamRowRange` slices resolve correctly. The bytes
-        // remain valid until the next `append` triggers lazy
-        // compaction, which the borrow checker forbids while
-        // `OutActions<'_, 'r>` is alive (`'r = &'r mut self`).
-        //
-        // DEF-119: `StreamRow` actions carry a `SchemaRef` handle;
-        // materialise resolves to `&'r RowDesc` via `self.schema_arena`.
-        // The `'r` lifetime on OutActions ties the arena borrow to the
-        // `&'r mut self` parameter — the next `&mut self` call can only
-        // run after the caller drops OutActions, at which point
-        // feed_bytes entry-cleanup will reclaim the arena slot.
-        // DEF-154 (C): reader witness. After the dispatch loop, any
-        // ArenaWriter created per-iteration has been dropped, so
-        // `self.schema_arena` is freely borrowable for the reader.
-        materialise(
-            staged,
-            write_buf.as_bytes(),
-            self.read_buf.populated(),
-            self.schema_arena.as_reader(),
-        )
     }
 
     /// DEF-177 — cold helper for the 4 ReadCursorAdvance failure
@@ -788,7 +814,7 @@ impl PgProtocol {
     /// Post-DEF-177 each site is a one-liner cold call. Audit2 A014.
     #[cold]
     #[inline]
-    fn fail_read_cursor_advance(&mut self, staged: &mut StagedActions) {
+    fn fail_read_cursor_advance<'wb>(&mut self, staged: &mut StagedActions<'wb>) {
         self.fail_inflight_and_close(
             ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::ReadCursorAdvance,
@@ -905,10 +931,10 @@ impl PgProtocol {
     /// alongside `take_inflight_reply_raw_id` (see A029 marker in
     /// state.rs). Revisit per H021 witness-guard session.
     #[cold]
-    fn fail_inflight_and_close(
+    fn fail_inflight_and_close<'wb>(
         &mut self,
         cause: ProtocolError,
-        staged: &mut StagedActions,
+        staged: &mut StagedActions<'wb>,
     ) {
         // Already terminal: skip re-fire. The wrapper saw the full
         // cause on the first fatal; a repeat CloseSocket would be
@@ -1003,11 +1029,11 @@ impl PgProtocol {
 /// ([`compute_push_ping`], [`compute_push_startup`]); `compute_push`
 /// dispatches on the command variant. Adding a new `PgCommand` variant
 /// fails the build here until a matching helper is wired up.
-fn compute_push(
+fn compute_push<'wb>(
     cmd: PgCommand,
     state: ProtoState,
-    write_buf: &mut WriteBuf,
-) -> (ProtoState, StagedActions) {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
+) -> (ProtoState, StagedActions<'wb>) {
     let mut staged = StagedActions::new();
     let new_state = match cmd {
         PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
@@ -1025,21 +1051,21 @@ fn compute_push(
             credentials,
             reply,
             &mut staged,
-            write_buf,
+            reserved,
         ),
         PgCommand::SimpleQuery { sql, reply } => {
-            compute_push_simple_query(state, &sql, reply, &mut staged, write_buf)
+            compute_push_simple_query(state, &sql, reply, &mut staged, reserved)
         }
         PgCommand::Parse {
             stmt_name,
             sql,
             reply,
-        } => compute_push_parse(state, &stmt_name, &sql, reply, &mut staged, write_buf),
+        } => compute_push_parse(state, &stmt_name, &sql, reply, &mut staged, reserved),
         PgCommand::DescribeStatement { stmt_name, reply } => {
-            compute_push_describe_statement(state, &stmt_name, reply, &mut staged, write_buf)
+            compute_push_describe_statement(state, &stmt_name, reply, &mut staged, reserved)
         }
         PgCommand::DescribePortal { portal_name, reply } => {
-            compute_push_describe_portal(state, &portal_name, reply, &mut staged, write_buf)
+            compute_push_describe_portal(state, &portal_name, reply, &mut staged, reserved)
         }
     };
     (new_state, staged)
@@ -1062,10 +1088,10 @@ fn compute_push(
 /// The `compute_push_tests` module below pins this table via a
 /// per-variant assertion, closing the structural seam where two arm
 /// bodies could be swapped without a compile error.
-fn compute_push_ping(
+fn compute_push_ping<'wb>(
     state: ProtoState,
     reply: ReplyId<crate::reply_id::PingKind>,
-    staged: &mut StagedActions,
+    staged: &mut StagedActions<'wb>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch. Pre-DEF-146 this function had 5
     // arms over explicit state variants (with 18-way or-patterns for
@@ -1141,31 +1167,24 @@ fn compute_push_ping(
 /// `MAX_OWNED_SEND_LEN` classifies as a typed reply failure instead of
 /// silent truncation.
 #[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
-fn compute_push_startup(
+fn compute_push_startup<'wb>(
     state: ProtoState,
     user: Ident,
     database: Option<DatabaseName>,
     app_name: Option<ApplicationName>,
     credentials: Credentials,
     reply: ReplyId<crate::reply_id::StartupKind>,
-    staged: &mut StagedActions,
-    write_buf: &mut WriteBuf,
+    staged: &mut StagedActions<'wb>,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
-    // DEF-146: single-level classifier dispatch. Startup is the one
-    // helper where PingAwaiting groups with Connecting →
-    // StartupAlreadyInProgress (not CommandInProgress as in the
-    // other 6 helpers). Test:
-    // `startup_from_non_idle_non_errored_fails_with_startup_in_progress`
-    // (PingAwaitingRfq sub-case) pins this.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (A): infallible builder via WriteReserved.
-            let mut reserved = write_buf.reserve();
+            // DEF-154 (B): infallible + branded builder.
             let range = build_startup_message(
                 &user,
                 database.as_ref(),
                 app_name.as_ref(),
-                &mut reserved,
+                reserved,
             );
             emit_actions!(staged, budget: 1, [
                 StagedAction::SendBytesRange(range),
@@ -1232,23 +1251,20 @@ fn compute_push_startup(
 /// | any `Connecting*`            | `FailReply(StartupAlreadyInProgress)`| same state preserved                |
 /// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
 /// | any `SimpleQuery*`           | `FailReply(CommandInProgress)`      | same                                 |
-fn compute_push_simple_query(
+fn compute_push_simple_query<'wb>(
     state: ProtoState,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::QueryKind>,
-    staged: &mut StagedActions,
-    write_buf: &mut WriteBuf,
+    staged: &mut StagedActions<'wb>,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: single-level classifier dispatch (standard pattern —
     // Ping + BusyQuery → CommandInProgress, Connecting →
     // StartupAlreadyInProgress).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (A): capacity witness. Builder is infallible —
-            // the pre-DEF-154 `Err(WriteBufFull)` arm is eliminated
-            // at the type level.
-            let mut reserved = write_buf.reserve();
-            let range = build_query_message(sql, &mut reserved);
+            // DEF-154 (B): infallible + branded builder.
+            let range = build_query_message(sql, reserved);
             emit_actions!(staged, budget: 1, [
                 StagedAction::SendBytesRange(range),
             ]);
@@ -1285,34 +1301,10 @@ fn compute_push_simple_query(
     }
 }
 
-/// DEF-154 (A) — infallible counterpart of
-/// [`crate::action::NonEmptyRange::from_write_span`].
-///
-/// Every PG wire builder in this crate (`build_{query,parse,bind,
-/// execute,describe,startup}_message`) emits ≥ 5 bytes (tag +
-/// length prefix + body). `from_write_span` therefore always returns
-/// `Some` — `debug_assert!` shields the architecturally-dead `None`
-/// branch. Single-level fallback to
-/// [`crate::action::NonEmptyRange::DEAD_FALLBACK`] keeps the
-/// forbid-bundle happy without nested `unwrap_or_else` sprawl.
-#[inline]
-fn from_write_span_infallible(
-    start: usize,
-    reserved: &crate::write_buf::WriteReserved<'_>,
-) -> crate::action::NonEmptyRange {
-    match crate::action::NonEmptyRange::from_write_span(start, reserved.as_write_buf()) {
-        Some(r) => r,
-        None => {
-            debug_assert!(
-                false,
-                "DEF-154: build_*_message produced zero-length span — every \
-                 PG wire frame is ≥ 5 bytes; const-assert on \
-                 MAX_OWNED_SEND_LEN or a missing push_*() would cause this.",
-            );
-            crate::action::NonEmptyRange::DEAD_FALLBACK
-        }
-    }
-}
+// DEF-154 (B) Phase B4: `from_write_span_infallible` deleted.
+// Branded builders now use
+// [`crate::action::WriteRange::from_branded_write_span`] directly —
+// identical shield logic, plus brand-identity binding.
 
 /// Build a PostgreSQL simple-query frame: `'Q'` + 4-byte length +
 /// NUL-terminated SQL.
@@ -1321,19 +1313,19 @@ fn from_write_span_infallible(
 /// - Tag: `'Q'` (1 byte)
 /// - Length: u32 BE including itself
 /// - Query string: NUL-terminated
-fn build_query_message(
+fn build_query_message<'brand>(
     sql: &crate::ident::Sql,
-    reserved: &mut crate::write_buf::WriteReserved<'_>,
-) -> crate::action::NonEmptyRange {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
+) -> crate::action::WriteRange<'brand> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_QUERY.byte());
     reserved.with_length_prefix(|w| {
         w.push_nul_terminated(sql.as_bytes());
     });
-    // DEF-154 (A): 'Q' frame is ≥ 6 bytes (tag + length + NUL), so
-    // `from_write_span` always returns Some. `DEAD_FALLBACK` shields
-    // the architecturally-dead zero-span branch.
-    from_write_span_infallible(start, reserved)
+    // DEF-154 (B): 'Q' frame is ≥ 6 bytes (tag + length + NUL), so
+    // `from_branded_write_span` always validates Some. The internal
+    // DEAD_FALLBACK shields the architecturally-dead zero-span branch.
+    crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
 /// Build a PostgreSQL Extended Query `Parse` frame (PG §55.7).
@@ -1343,11 +1335,11 @@ fn build_query_message(
 /// NUL-terminated SQL text, then an `i16` BE parameter-type count
 /// (always zero in 1c-3a — no parameter-type hints; 1c-3b adds
 /// per-parameter OID hints and widens this field).
-fn build_parse_message(
+fn build_parse_message<'brand>(
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
-    reserved: &mut crate::write_buf::WriteReserved<'_>,
-) -> crate::action::NonEmptyRange {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
+) -> crate::action::WriteRange<'brand> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_PARSE.byte());
     reserved.with_length_prefix(|w| {
@@ -1356,7 +1348,7 @@ fn build_parse_message(
         // n_param_types = 0; 1c-3b will widen to push actual OIDs here.
         w.push_i16_be(0);
     });
-    from_write_span_infallible(start, reserved)
+    crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
 /// Compute the transition for [`PgCommand::Parse`] against the
@@ -1378,19 +1370,18 @@ fn build_parse_message(
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                |
 /// | `Awaiting*` / `SimpleQuery*` | `FailReply(CommandInProgress)`      | same                                 |
 /// | `Parse*`                     | `FailReply(CommandInProgress)`      | same                                 |
-fn compute_push_parse(
+fn compute_push_parse<'wb>(
     state: ProtoState,
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::ParseKind>,
-    staged: &mut StagedActions,
-    write_buf: &mut WriteBuf,
+    staged: &mut StagedActions<'wb>,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
-    // DEF-146: classifier dispatch. DEF-154 (A): infallible builder.
+    // DEF-146: classifier dispatch. DEF-154 (B): infallible + branded builder.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            let mut reserved = write_buf.reserve();
-            let range = build_parse_message(stmt_name, sql, &mut reserved);
+            let range = build_parse_message(stmt_name, sql, reserved);
             // Emit Parse frame (range into write_buf) + bundled Sync
             // (static const). Both needed for PG to flush ParseComplete
             // (without Sync the server buffers forever).
@@ -1459,18 +1450,18 @@ fn compute_push_parse(
 /// writes, and two call sites (`compute_push_describe_statement` /
 /// `..._portal`) invoke it per push — small enough to fold in.
 #[inline]
-fn build_describe_message<N: crate::ident::DescribeName>(
+fn build_describe_message<'brand, N: crate::ident::DescribeName>(
     target: crate::wire::DescribeTargetByte,
     name: &N,
-    reserved: &mut crate::write_buf::WriteReserved<'_>,
-) -> crate::action::NonEmptyRange {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
+) -> crate::action::WriteRange<'brand> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_DESCRIBE.byte());
     reserved.with_length_prefix(|w| {
         w.push_u8(target.byte());
         w.push_nul_terminated(name.as_describe_name_bytes());
     });
-    from_write_span_infallible(start, reserved)
+    crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
 /// Compute the transition for [`PgCommand::DescribeStatement`]
@@ -1492,22 +1483,21 @@ fn build_describe_message<N: crate::ident::DescribeName>(
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved                   |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                       |
 /// | any other in-flight          | `FailReply(CommandInProgress)`      | same                                        |
-fn compute_push_describe_statement(
+fn compute_push_describe_statement<'wb>(
     state: ProtoState,
     stmt_name: &crate::ident::StmtName,
     reply: ReplyId<crate::reply_id::DescribeStatementKind>,
-    staged: &mut StagedActions,
-    write_buf: &mut WriteBuf,
+    staged: &mut StagedActions<'wb>,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (A): infallible builder via WriteReserved.
-            let mut reserved = write_buf.reserve();
+            // DEF-154 (B): infallible + branded builder.
             let range = build_describe_message(
                 crate::wire::DescribeTargetByte::Statement,
                 stmt_name,
-                &mut reserved,
+                reserved,
             );
             // Describe + Sync bundle. Sync is required — without it
             // PG buffers Extended Query responses and never ships
@@ -1560,22 +1550,21 @@ fn compute_push_describe_statement(
 ///
 /// Same decision table as statement-describe; see that function's
 /// docstring.
-fn compute_push_describe_portal(
+fn compute_push_describe_portal<'wb>(
     state: ProtoState,
     portal_name: &crate::ident::PortalName,
     reply: ReplyId<crate::reply_id::DescribePortalKind>,
-    staged: &mut StagedActions,
-    write_buf: &mut WriteBuf,
+    staged: &mut StagedActions<'wb>,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (A): infallible builder via WriteReserved.
-            let mut reserved = write_buf.reserve();
+            // DEF-154 (B): infallible + branded builder.
             let range = build_describe_message(
                 crate::wire::DescribeTargetByte::Portal,
                 portal_name,
-                &mut reserved,
+                reserved,
             );
             emit_actions!(staged, budget: 2, [
                 StagedAction::SendBytesRange(range),
@@ -1635,12 +1624,12 @@ fn compute_push_describe_portal(
 /// Zero-alloc: params are streamed directly from the tuple into
 /// `write_buf` via [`crate::params::ParamsWriter::write_params`];
 /// no intermediate buffer.
-fn build_bind_message<P: crate::params::ParamsWriter>(
+fn build_bind_message<'brand, P: crate::params::ParamsWriter>(
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
     params: &P,
-    reserved: &mut crate::write_buf::WriteReserved<'_>,
-) -> crate::action::NonEmptyRange {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
+) -> crate::action::WriteRange<'brand> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_BIND.byte());
     reserved.with_length_prefix(|w| {
@@ -1657,12 +1646,11 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
             w.push_u16_be(1);
         }
         w.push_u16_be(P::COUNT);
-        // DEF-154 (A) escape hatch: ParamsWriter is a pub trait
+        // DEF-154 (A+B) escape hatch: ParamsWriter is a pub trait
         // predating the witness pattern; it takes &mut WriteBuf.
-        // Use as_write_buf_mut() + debug_assert on the dead Err
-        // branch. ParamsWriter impls are const-asserted safe under
-        // MAX_OWNED_SEND_LEN; the Err branch is architecturally
-        // dead under that invariant.
+        // The branded BrandedWriteReserved exposes as_write_buf_mut()
+        // for this one case — the brand is preserved by the scope
+        // (no brand-bearing return value crosses the escape).
         match params.write_params(w.as_write_buf_mut()) {
             Ok(()) => {}
             Err(_) => debug_assert!(
@@ -1678,7 +1666,7 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
         // `ColumnDesc::format_code` in the provided row_desc.
         w.push_u16_be(0);
     });
-    from_write_span_infallible(start, reserved)
+    crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
 /// Build a PostgreSQL `Execute` (`'E'`) frame into `write_buf`.
@@ -1693,18 +1681,18 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
 /// 1c-3b scope produces `0` (fetch all). F83: the enum narrows the
 /// API to only variants the sub-phase supports, turning tier-3 docs
 /// into tier-1 compile.
-fn build_execute_message(
+fn build_execute_message<'brand>(
     portal_name: &crate::ident::PortalName,
     fetch: crate::command::FetchRows,
-    reserved: &mut crate::write_buf::WriteReserved<'_>,
-) -> crate::action::NonEmptyRange {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
+) -> crate::action::WriteRange<'brand> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_EXECUTE.byte());
     reserved.with_length_prefix(|w| {
         w.push_nul_terminated(portal_name.as_bytes());
         w.push_i32_be(fetch.as_wire_i32());
     });
-    from_write_span_infallible(start, reserved)
+    crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
 /// Compute the transition for `push_bind_execute` against the
@@ -1724,8 +1712,8 @@ fn build_execute_message(
 /// | `Errored(kind)`           | `FailReply(ConnectionAlreadyClosed)`     | `Errored(kind)` preserved                   |
 /// | any `Connecting*`         | `FailReply(StartupAlreadyInProgress)`    | same state preserved                        |
 /// | any in-flight             | `FailReply(CommandInProgress)`           | same state preserved                        |
-#[expect(clippy::too_many_arguments, reason = "compute_push_bind_execute is an internal helper; its arg count matches `push_bind_execute`'s parameter surface + the accumulator + write_buf. Splitting into a struct-arg would obscure the pure-compute framing.")]
-fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
+#[expect(clippy::too_many_arguments, reason = "compute_push_bind_execute is an internal helper; its arg count matches `push_bind_execute`'s parameter surface + the accumulator + reserved. Splitting into a struct-arg would obscure the pure-compute framing.")]
+fn compute_push_bind_execute<'wb, P: crate::params::ParamsWriter>(
     state: ProtoState,
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
@@ -1733,19 +1721,19 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
     schema_ref: Option<crate::schema_arena::SchemaRef>,
     fetch: crate::command::FetchRows,
     reply: ReplyId<crate::reply_id::QueryKind>,
-    staged: &mut StagedActions,
-    write_buf: &mut WriteBuf,
+    staged: &mut StagedActions<'wb>,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (A): both Bind and Execute run against the
-            // same WriteReserved. MAX_OWNED_SEND_LEN is const-
-            // asserted ≥ bind + execute + sync bundle, so both
-            // builders are infallible.
-            let mut reserved = write_buf.reserve();
-            let bind_range = build_bind_message(portal_name, stmt_name, params, &mut reserved);
-            let execute_range = build_execute_message(portal_name, fetch, &mut reserved);
+            // DEF-154 (B): both Bind and Execute run against the
+            // same BrandedWriteReserved. MAX_OWNED_SEND_LEN is
+            // const-asserted ≥ bind + execute + sync bundle, so
+            // both builders are infallible; the brand ties both
+            // ranges to the buffer they materialise against.
+            let bind_range = build_bind_message(portal_name, stmt_name, params, reserved);
+            let execute_range = build_execute_message(portal_name, fetch, reserved);
             emit_actions!(staged, budget: 3, [
                 StagedAction::SendBytesRange(bind_range),
                 StagedAction::SendBytesRange(execute_range),
@@ -1930,18 +1918,18 @@ fn record_param_status(
 /// - 4 bytes: protocol version (196608 = 3.0)
 /// - key-value pairs, each NUL-terminated
 /// - trailing empty key NUL
-fn build_startup_message(
+fn build_startup_message<'brand>(
     user: &Ident,
     database: Option<&DatabaseName>,
     app_name: Option<&ApplicationName>,
-    reserved: &mut crate::write_buf::WriteReserved<'_>,
-) -> crate::action::NonEmptyRange {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
+) -> crate::action::WriteRange<'brand> {
     // DEF-094: write in-place into the caller-owned `write_buf`.
-    // DEF-100: return a typed `NonEmptyRange` instead of `(start,
-    // end)` — non-zero length is a type invariant, materialise's
-    // silent-empty fallback closes from tier-3 (audit) to tier-2
-    // (type-checked construction).
-    // DEF-154 (A): infallible via WriteReserved capacity witness.
+    // DEF-100: return a typed non-empty range — length invariant.
+    // DEF-154 (A): infallible via capacity witness.
+    // DEF-154 (B): branded → `WriteRange<'brand>` ties the range
+    // to the same buffer `reserved` writes into, enabling infallible
+    // apply at materialise time.
     let start = reserved.len();
     reserved.with_length_prefix(|w| {
         // Protocol version 3.0 = 196608
@@ -1962,7 +1950,7 @@ fn build_startup_message(
         // Trailing empty key NUL
         w.push_u8(0);
     });
-    from_write_span_infallible(start, reserved)
+    crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
 /// Phase-2 materialiser: convert the write-phase's
@@ -1976,41 +1964,28 @@ fn build_startup_message(
 /// refuses any `&mut WriteBuf` re-borrow while the returned
 /// `OutActions<'w, 'r>` is alive, and any `&mut self` re-borrow
 /// on `PgProtocol` (thus `feed_bytes`) while `'r` is alive.
-fn materialise<'w, 'r>(
-    staged: StagedActions,
-    write_buf_bytes: &'w [u8],
-    read_buf_bytes: &'r [u8],
+fn materialise<'w, 'r, 'wb>(
+    staged: StagedActions<'wb>,
+    write_bytes: crate::write_buf::BrandedBytes<'wb, 'w>,
+    read_bytes: &'r [u8],
     arena: crate::schema_arena::ArenaReader<'r>,
 ) -> OutActions<'w, 'r> {
     let mut out = OutActions::new();
     for sa in staged {
         let a: Action<'w, 'r> = match sa {
             StagedAction::SendBytesRange(range) => {
-                // DEF-100: `range: NonEmptyRange` was constructor-
-                // validated at emission. `apply(write_buf_bytes)`
-                // can only be None if the buffer is shorter than
-                // emission-time — architecturally the same buffer.
-                //
-                // DEF-182 (symmetric with DEF-170): the None branch
-                // is architecturally dead but the unshielded
-                // `unwrap_or(&[])` silently degraded to an empty
-                // frame — a wire-level correctness break: the
-                // caller would send a 0-byte SendBytes action where
-                // a multi-byte PG frame was expected, producing a
-                // malformed protocol exchange downstream. Debug
-                // build now fires loud on the dead branch; release
-                // preserves the `&[]` fallback (forbid-bundle bans
-                // panic). DEF-154 (B) buffer-witness-with-brand
-                // will eliminate the class structurally.
-                let applied = range.apply(write_buf_bytes);
-                debug_assert!(
-                    applied.is_some(),
-                    "DEF-182: NonEmptyRange.apply(write_buf) None — crate \
-                     bug (range was constructed from this buffer at \
-                     emission). DEF-154 (B) witness-with-brand will \
-                     eliminate the class structurally.",
-                );
-                Action::SendBytes(applied.unwrap_or(&[]))
+                // DEF-154 (B): WriteRange<'wb>::apply takes
+                // BrandedBytes<'wb, 'w> and returns &'w [u8]
+                // **INFALLIBLY**. The `'wb` brand on both operands
+                // is the same (generative closure scope), and
+                // `WriteRange::from_branded_write_span` validated
+                // `start + len <= buf.len()` at construction —
+                // combined with BrandedWriteBuf's API narrow
+                // (no truncating ops reachable inside the branded
+                // scope), the bounds hold at apply time. No
+                // debug_assert shield needed — the class is
+                // closed at the type level.
+                Action::SendBytes(range.apply(write_bytes))
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
             // DEF-112 + DEF-119: `DeliverReplyEntry` carries a
@@ -2048,32 +2023,28 @@ fn materialise<'w, 'r>(
             // falls back to `RowDesc::EMPTY` — forbid-bundle bans
             // `panic!` so this is the tightest non-witness closure.
             StagedAction::StreamRowRange { id, row_range, schema_ref } => {
+                // DEF-170 shield on stale SchemaRef; DEF-154 (D)
+                // arena-brand will eliminate that class.
                 let desc_opt = arena.get(schema_ref);
                 debug_assert!(
                     desc_opt.is_some(),
                     "DEF-170: stale SchemaRef at materialise (StreamRowRange) — \
-                     crate bug; DEF-154 witness-pattern will eliminate \
+                     crate bug; DEF-154 (D) arena-brand will eliminate \
                      this class structurally.",
                 );
-                // DEF-182 (symmetric with DEF-170): the
-                // `row_range.apply(read_buf_bytes)` None branch is
-                // architecturally dead — the row_range was
-                // constructed from this read buffer at the same
-                // `feed_bytes` call, and the `'r` borrow on
-                // OutActions blocks buffer mutation until the
-                // caller drops the returned actions. Unshielded
-                // `unwrap_or(&[])` silently degraded to an empty
-                // row — user-boundary correctness break (caller
-                // sees a zero-column DataRow where a multi-column
-                // row was on the wire). Debug loud; release
-                // preserves the `&[]` fallback.
-                let row_bytes_opt = row_range.apply(read_buf_bytes);
+                // DEF-182 shield on row_range.apply None. Phase B4
+                // retained this shield on the read-side because
+                // wrapping the dispatch loop in a branded scope
+                // requires converting physical advance to a logical
+                // cursor — deferred to DEF-154 (E). Write-side got
+                // the tier-1 lift via brand (see SendBytesRange
+                // above); read-side stays tier-2 until (E).
+                let row_bytes_opt = row_range.apply(read_bytes);
                 debug_assert!(
                     row_bytes_opt.is_some(),
                     "DEF-182: NonEmptyRange.apply(read_buf) None at \
-                     StreamRowRange — crate bug (range was constructed \
-                     from this buffer this call). DEF-154 (B) witness-\
-                     with-brand will eliminate the class structurally.",
+                     StreamRowRange — crate bug (range built this call). \
+                     DEF-154 (E) will brand the read-side.",
                 );
                 Action::StreamRow {
                     id,
@@ -2082,6 +2053,10 @@ fn materialise<'w, 'r>(
                 }
             }
             StagedAction::CloseSocket => Action::CloseSocket,
+            // DEF-154 (B) Phase B4: _Phantom is never constructed
+            // (brand anchor — see StagedAction enum doc). Handled
+            // as a continue (skip) for exhaustive-match compliance.
+            StagedAction::_Phantom(_) => continue,
         };
         // `staged` and `out` share `MAX_ACTIONS_PER_CALL` as their
         // bound — staged's length is ≤ out's capacity, so push never
@@ -2404,13 +2379,90 @@ mod compute_push_tests {
         Ident::try_from_str("u").ok()
     }
 
-    /// Test helper — run [`compute_push`] with a fresh [`WriteBuf`] and
-    /// return (state, staged). DEF-094 made compute_push take
-    /// `&mut WriteBuf`; this wrapper keeps the test-body callsites
-    /// terse.
-    fn compute_staged(cmd: PgCommand, state: ProtoState) -> (ProtoState, StagedActions) {
+    /// Test-only observation of a [`StagedAction`] — brand stripped,
+    /// range carried as `NonEmptyRange`. Tests compare against this
+    /// instead of `StagedAction<'wb>` directly because `'wb` is
+    /// HRTB-fresh per call site (DEF-154 (B)) and cannot be named
+    /// outside the branded closure that produced it.
+    ///
+    /// `ProtocolError` is `Copy + Clone` (error.rs:231) so
+    /// `FailReply`'s full cause variant is preserved — tests match
+    /// specific causes like
+    /// `cause: ProtocolError::ConnectionAlreadyClosed { prior_kind }`.
+    ///
+    /// Variants covered are those `compute_push` produces.
+    /// `StreamRowRange` (only from `feed_bytes` DATA_ROW arm) and
+    /// `DeliverReply` payload internals are out of scope for this
+    /// test module; those arms map to `CloseSocket` / `DeliverReply`
+    /// (payload-dropped) in `from_staged` — exhaustive-match
+    /// compliance without exposing unused fields.
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "test-only observation type; FailReply.cause dominates \
+                  at ~312 B (same as StagedAction). Boxing for test \
+                  observability has no functional win and the enum \
+                  is Copy (ProtocolError: Copy)."
+    )]
+    #[derive(Debug, Clone, Copy)]
+    enum StagedObs {
+        /// Unit variant — tests discriminate on variant kind, not
+        /// range contents. The underlying `NonEmptyRange` is
+        /// available via dispatch tests that exercise feed_bytes
+        /// separately; compute_push_tests only verify variant
+        /// presence.
+        SendBytesRange,
+        SendBytesStatic(&'static [u8]),
+        DeliverReply,
+        FailReply {
+            id: core::num::NonZeroU64,
+            cause: crate::error::ProtocolError,
+        },
+        CloseSocket,
+    }
+
+    impl StagedObs {
+        fn from_staged(sa: &StagedAction<'_>) -> Self {
+            match sa {
+                StagedAction::SendBytesRange(_) => Self::SendBytesRange,
+                StagedAction::SendBytesStatic(s) => Self::SendBytesStatic(s),
+                StagedAction::DeliverReply(_) => Self::DeliverReply,
+                StagedAction::FailReply { id, cause } => {
+                    Self::FailReply { id: *id, cause: *cause }
+                }
+                // StreamRowRange is only from feed_bytes DATA_ROW arm;
+                // not produced by compute_push. Map to CloseSocket
+                // for exhaustive-match compliance (never observed here).
+                StagedAction::StreamRowRange { .. } => Self::CloseSocket,
+                StagedAction::CloseSocket => Self::CloseSocket,
+                // DEF-154 (B) Phase B4 brand anchor — never
+                // constructed. Handle as CloseSocket-equivalent
+                // neutral sentinel (forbid-bundle bans
+                // `unreachable!()`).
+                StagedAction::_Phantom(_) => Self::CloseSocket,
+            }
+        }
+    }
+
+    /// Test helper — run [`compute_push`] inside a branded scope,
+    /// observe the staged actions as brand-free [`StagedObs`] items
+    /// (returned as a heapless::Vec for asserting `.len()` and
+    /// `.first()` / iteration). Returns `(new_state, obs_vec)`.
+    fn compute_staged(
+        cmd: PgCommand,
+        state: ProtoState,
+    ) -> (ProtoState, heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL>) {
         let mut wb = WriteBuf::new();
-        compute_push(cmd, state, &mut wb)
+        wb.with_branded(|mut wb| {
+            let mut reserved = wb.reserve();
+            let (new_state, staged) = compute_push(cmd, state, &mut reserved);
+            let mut obs: heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL> = heapless::Vec::new();
+            for a in &staged {
+                obs.push(StagedObs::from_staged(a)).unwrap_or_else(|_| {
+                    debug_assert!(false, "MAX_ACTIONS_PER_CALL overflow in test");
+                });
+            }
+            (new_state, obs)
+        })
     }
 
     // -----------------------------------------------------------------
@@ -2429,7 +2481,7 @@ mod compute_push_tests {
         assert!(
             matches!(
                 staged.first(),
-                Some(StagedAction::SendBytesStatic(s)) if *s == SYNC_WIRE_BYTES.as_slice()
+                Some(StagedObs::SendBytesStatic(s)) if *s == SYNC_WIRE_BYTES.as_slice()
             ),
             "expected SendBytesStatic(SYNC)",
         );
@@ -2459,7 +2511,7 @@ mod compute_push_tests {
         assert!(
             matches!(
                 staged.first(),
-                Some(StagedAction::FailReply {
+                Some(StagedObs::FailReply {
                     id,
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
                 }) if *id == raw_id && *pk == prior_kind
@@ -2492,7 +2544,7 @@ mod compute_push_tests {
         assert!(
             matches!(
                 staged.first(),
-                Some(StagedAction::FailReply {
+                Some(StagedObs::FailReply {
                     id,
                     cause: ProtocolError::CommandInProgress,
                 }) if *id == raw_new
@@ -2526,7 +2578,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2552,7 +2604,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2580,7 +2632,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2608,7 +2660,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2633,7 +2685,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2658,7 +2710,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2687,7 +2739,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2726,7 +2778,7 @@ mod compute_push_tests {
         // alone is sufficient — no explicit `end > start` check.
         assert_eq!(staged.len(), 1);
         assert!(
-            matches!(staged.first(), Some(StagedAction::SendBytesRange(_))),
+            matches!(staged.first(), Some(StagedObs::SendBytesRange)),
             "expected SendBytesRange into write_buf",
         );
 
@@ -2757,7 +2809,7 @@ mod compute_push_tests {
         assert!(
             matches!(
                 staged.first(),
-                Some(StagedAction::FailReply {
+                Some(StagedObs::FailReply {
                     id,
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
                 }) if *id == raw_id && *pk == prior_kind
@@ -2799,7 +2851,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2822,7 +2874,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2847,7 +2899,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2874,7 +2926,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2901,7 +2953,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2925,7 +2977,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2949,7 +3001,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new
@@ -2977,7 +3029,7 @@ mod compute_push_tests {
             assert!(
                 matches!(
                     staged.first(),
-                    Some(StagedAction::FailReply {
+                    Some(StagedObs::FailReply {
                         id,
                         cause: ProtocolError::StartupAlreadyInProgress,
                     }) if *id == raw_new

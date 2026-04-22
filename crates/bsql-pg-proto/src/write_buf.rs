@@ -20,10 +20,6 @@
 //! SASL frame sizes have analogous drift-guards in `scram::wire`.
 
 use core::fmt;
-// `PhantomData` is used only by the Phase B1 branded types below,
-// all of which are `#[cfg(test)]`-gated until Phase B3 wires them
-// into production. Gate the import to match.
-#[cfg(test)]
 use core::marker::PhantomData;
 
 /// Maximum byte capacity for an owned outbound frame.
@@ -502,44 +498,6 @@ impl WriteBuf {
         &self.inner
     }
 
-    /// DEF-154 (A) — capacity-proof token constructor.
-    ///
-    /// Returns a [`WriteReserved`] wrapping this buffer. The token's
-    /// push methods are infallible by construction: the buffer is
-    /// required to be empty at reserve-time (debug-asserted), and
-    /// `MAX_OWNED_SEND_LEN` is const-asserted to be ≥ every
-    /// `max_{kind}_message_size()` worst-case (see module-level
-    /// drift guards). So any single `build_*_message` that runs
-    /// against a reserved buffer has enough room for all its writes.
-    ///
-    /// Pre-DEF-154 builders returned
-    /// `Result<NonEmptyRange, WriteBufFull>` — the `Err` arm was
-    /// architecturally dead (const-assert-proven) but had to be
-    /// named, classified as `CrateBugLocus::OutboundFrameBuild`,
-    /// and propagated to callers who routed it through
-    /// `frame_build_unreachable`. DEF-154 (A) eliminates the entire
-    /// dead-path chain at the type level.
-    ///
-    /// # Tier
-    ///
-    /// Tier-3 const-assert-proven dead `Err` at 6 builder call
-    /// sites → tier-2 structural (capacity witness). Builder bodies
-    /// retain `debug_assert` shields inside
-    /// [`WriteReserved::push_u8`] etc. to fire loudly if the
-    /// const-assert is ever broken by a refactor; release keeps the
-    /// underlying `Result`-returning pushes as a forbid-bundle-
-    /// compliant fallback.
-    #[inline]
-    #[must_use]
-    pub(crate) fn reserve(&mut self) -> WriteReserved<'_> {
-        debug_assert!(
-            self.inner.is_empty(),
-            "WriteBuf::reserve must be called on a freshly-cleared buffer: \
-             MAX_OWNED_SEND_LEN is const-asserted ≥ every builder's max \
-             message size, but only when the buffer starts empty.",
-        );
-        WriteReserved { buf: self }
-    }
 }
 
 impl Default for WriteBuf {
@@ -548,156 +506,12 @@ impl Default for WriteBuf {
     }
 }
 
-/// DEF-154 (A) — proof-of-capacity token for `build_*_message` calls.
-///
-/// Constructed via [`WriteBuf::reserve`]; holds a mutable borrow of
-/// the underlying buffer. The type's `push_*` methods shield the
-/// architecturally-dead overflow branch of the underlying
-/// `WriteBuf::push_*` (which return `Result<(), WriteBufFull>`) via
-/// `debug_assert`, producing an infallible API for builder bodies.
-///
-/// Builders take `&mut WriteReserved<'_>` and return `NonEmptyRange`
-/// directly — no `Result` return, no dead `Err` propagation at call
-/// sites. The capacity guarantee is type-level: `WriteReserved` can
-/// only exist where `WriteBuf::reserve` succeeded, which requires
-/// an empty buffer, which combined with the
-/// `MAX_OWNED_SEND_LEN >= max_{kind}_message_size()` const-asserts
-/// in this module proves every push inside a single builder
-/// succeeds.
-///
-/// # Forbid-bundle note
-///
-/// The underlying `WriteBuf::push_*` methods still return
-/// `Result<(), WriteBufFull>` — those are the public API for
-/// ordinary callers (including users of the crate that hand-build
-/// outbound frames, e.g., in tests). `WriteReserved` wraps them
-/// for the INTERNAL builder path where the capacity invariant
-/// holds. The `debug_assert` on the `Err` arm catches any future
-/// refactor that would break the const-assert without introducing
-/// `panic!` in release (banned by `forbid(clippy::panic)`).
-pub(crate) struct WriteReserved<'a> {
-    buf: &'a mut WriteBuf,
-}
-
-impl<'a> WriteReserved<'a> {
-    /// Current buffer length.
-    #[inline]
-    #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// Access the underlying buffer by shared reference. Used by
-    /// builders at the end, after all pushes, to construct the
-    /// resulting [`crate::action::NonEmptyRange`] against the
-    /// written span. The `&WriteBuf` borrow ensures no further
-    /// mutation while the range is being computed.
-    #[inline]
-    #[must_use]
-    pub(crate) fn as_write_buf(&self) -> &WriteBuf {
-        self.buf
-    }
-
-    /// DEF-154 (A) escape hatch — access underlying buffer mutably
-    /// for APIs that pre-date DEF-154 and take `&mut WriteBuf`
-    /// directly (e.g. `ParamsWriter::write_params` in the
-    /// `build_bind_message` path). Caller is responsible for
-    /// invoking the pre-DEF-154 API and shielding any `Result`
-    /// return via `debug_assert!`.
-    ///
-    /// The escape is safe because `WriteReserved` itself was
-    /// capacity-asserted at construction; operations on the
-    /// underlying buffer stay within the reserved budget iff every
-    /// builder follows its `max_{kind}_message_size()` const-
-    /// asserted worst-case. A builder that calls `as_write_buf_mut`
-    /// to push unreserved amounts breaks the capacity invariant —
-    /// `debug_assert` on the `Err` branch catches drift.
-    #[inline]
-    #[must_use]
-    pub(crate) fn as_write_buf_mut(&mut self) -> &mut WriteBuf {
-        self.buf
-    }
-
-    /// Infallible [`WriteBuf::push_u8`] — capacity reserved at
-    /// construction makes the `Err` branch architecturally dead.
-    #[inline]
-    pub(crate) fn push_u8(&mut self, byte: u8) {
-        match self.buf.push_u8(byte) {
-            Ok(()) => {}
-            Err(_) => debug_assert!(
-                false,
-                "WriteReserved::push_u8 overflowed — MAX_OWNED_SEND_LEN \
-                 const-assert drifted or reserve() was called on a \
-                 non-empty buffer.",
-            ),
-        }
-    }
-
-    /// Infallible [`WriteBuf::push_u16_be`].
-    #[inline]
-    pub(crate) fn push_u16_be(&mut self, val: u16) {
-        match self.buf.push_u16_be(val) {
-            Ok(()) => {}
-            Err(_) => debug_assert!(false, "WriteReserved::push_u16_be overflow"),
-        }
-    }
-
-    /// Infallible [`WriteBuf::push_i16_be`].
-    #[inline]
-    pub(crate) fn push_i16_be(&mut self, val: i16) {
-        match self.buf.push_i16_be(val) {
-            Ok(()) => {}
-            Err(_) => debug_assert!(false, "WriteReserved::push_i16_be overflow"),
-        }
-    }
-
-    /// Infallible [`WriteBuf::push_u32_be`].
-    #[inline]
-    pub(crate) fn push_u32_be(&mut self, val: u32) {
-        match self.buf.push_u32_be(val) {
-            Ok(()) => {}
-            Err(_) => debug_assert!(false, "WriteReserved::push_u32_be overflow"),
-        }
-    }
-
-    /// Infallible [`WriteBuf::push_i32_be`].
-    #[inline]
-    pub(crate) fn push_i32_be(&mut self, val: i32) {
-        match self.buf.push_i32_be(val) {
-            Ok(()) => {}
-            Err(_) => debug_assert!(false, "WriteReserved::push_i32_be overflow"),
-        }
-    }
-
-    /// Infallible [`WriteBuf::push_nul_terminated`].
-    #[inline]
-    pub(crate) fn push_nul_terminated(&mut self, data: &[u8]) {
-        match self.buf.push_nul_terminated(data) {
-            Ok(()) => {}
-            Err(_) => debug_assert!(false, "WriteReserved::push_nul_terminated overflow"),
-        }
-    }
-
-    /// Infallible [`WriteBuf::with_length_prefix`] — body closure
-    /// takes `&mut WriteReserved`, so the body uses infallible push
-    /// methods.
-    #[inline]
-    pub(crate) fn with_length_prefix<F>(&mut self, body_fn: F)
-    where
-        F: FnOnce(&mut WriteReserved<'_>),
-    {
-        let r = self.buf.with_length_prefix(|inner_buf| {
-            let mut inner_reserved = WriteReserved { buf: inner_buf };
-            body_fn(&mut inner_reserved);
-            Ok(())
-        });
-        debug_assert!(
-            r.is_ok(),
-            "WriteReserved::with_length_prefix overflow — capacity invariant broken",
-        );
-    }
-
-}
+// DEF-154 (B) Phase B4: legacy unbranded `WriteReserved` +
+// `WriteBuf::reserve()` were deleted. Production flow goes through
+// `WriteBuf::with_branded(|wb| wb.reserve() -> BrandedWriteReserved)`
+// — the branded path carries both the capacity witness (DEF-154 (A))
+// and the buffer-identity brand (DEF-154 (B)), so the legacy
+// unbranded reserve path was never used post-migration.
 
 impl fmt::Debug for WriteBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -785,7 +599,7 @@ impl fmt::Debug for WriteBuf {
 /// been applied, the resulting slice is "unbranded" and can flow
 /// into `Action::SendBytes(&'w [u8])` without infecting the public
 /// types with a third lifetime parameter.
-#[cfg(test)]
+#[derive(Clone, Copy)]
 pub(crate) struct BrandedBytes<'brand, 'a> {
     /// Underlying slice — lifetime `'a` propagates through
     /// [`Self::as_slice`] for the unbranding boundary.
@@ -794,7 +608,6 @@ pub(crate) struct BrandedBytes<'brand, 'a> {
     _brand: PhantomData<fn(&'brand ()) -> &'brand ()>,
 }
 
-#[cfg(test)]
 impl<'a> BrandedBytes<'_, 'a> {
     /// Discharge the brand — return the underlying slice.
     ///
@@ -808,7 +621,9 @@ impl<'a> BrandedBytes<'_, 'a> {
         self.bytes
     }
 
-    /// Length of the underlying slice.
+    /// Length of the underlying slice. Test-only accessor;
+    /// production path consumes `as_slice` after `range.apply`.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) const fn len(&self) -> usize {
@@ -818,11 +633,10 @@ impl<'a> BrandedBytes<'_, 'a> {
 
 #[cfg(test)]
 impl<'brand> BrandedBytes<'brand, 'static> {
-    /// Empty branded slice (`&'static []`) — placeholder for
-    /// push-path materialise calls where no read buffer is in
-    /// scope (`push_command` / `push_bind_execute`). Phase B4 uses
-    /// this to keep the `materialise(..., read_bytes)` parameter
-    /// signature uniform between feed and push entry points.
+    /// Empty branded slice (`&'static []`) — test helper for
+    /// constructing zero-length branded views. Phase B4's entry
+    /// points use the unbranded `&[]` literal directly for the
+    /// read-side materialise input.
     #[inline]
     #[must_use]
     pub(crate) const fn empty() -> Self {
@@ -833,25 +647,18 @@ impl<'brand> BrandedBytes<'brand, 'static> {
     }
 }
 
-#[cfg(test)]
 impl<'brand, 'a> BrandedBytes<'brand, 'a> {
     /// Crate-internal factory: wrap a raw `&'a [u8]` with brand
     /// `'brand`. Used by the symmetric `BrandedReadBuf` in `buf.rs`
     /// (Phase B2) so both sides can produce [`BrandedBytes`] without
     /// duplicating the struct field layout across modules.
     ///
-    /// # Not escape-hatchable
-    ///
-    /// This constructor is `pub(crate)`. In PRODUCTION call sites
-    /// (Phase B3+) it is reached only from inside a `with_branded`
-    /// closure — where `'brand` is HRTB-fresh. The generative
-    /// contract is preserved because callers have no way to name
-    /// `'brand` from outside the closure, so they cannot construct
-    /// a `BrandedBytes<'wrong_brand, '_>` on a buffer of a
-    /// different brand.
-    ///
-    /// Phase B3 may relocate this to a dedicated `crate::brand`
-    /// module alongside `BrandedRange` / `WriteRange` / `ReadRange`.
+    /// DEF-154 (B) Phase B4: currently only the test-gated
+    /// `BrandedReadBuf::populated_branded` + sibling methods use
+    /// this factory. Production `BrandedWriteBuf::into_bytes_branded`
+    /// constructs via direct struct literal. Gated `#[cfg(test)]`
+    /// until Phase B4-E wires production read-side callers.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) const fn from_slice_branded(bytes: &'a [u8]) -> Self {
@@ -862,7 +669,6 @@ impl<'brand, 'a> BrandedBytes<'brand, 'a> {
     }
 }
 
-#[cfg(test)]
 impl fmt::Debug for BrandedBytes<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BrandedBytes")
@@ -882,7 +688,6 @@ impl fmt::Debug for BrandedBytes<'_, '_> {
 ///
 /// See module-level "Invariance mechanism" and "Generativity via
 /// HRTB" for the soundness argument.
-#[cfg(test)]
 pub(crate) struct BrandedWriteBuf<'brand, 'a> {
     /// Underlying mutable WriteBuf borrow. Access via
     /// [`Self::reserve`] → [`BrandedWriteReserved`] for builder
@@ -893,14 +698,34 @@ pub(crate) struct BrandedWriteBuf<'brand, 'a> {
     _brand: PhantomData<fn(&'brand ()) -> &'brand ()>,
 }
 
-#[cfg(test)]
 impl<'brand, 'a> BrandedWriteBuf<'brand, 'a> {
     /// Reserve the buffer for a builder, producing a capacity +
     /// brand witness. Mirrors [`WriteBuf::reserve`] (DEF-154 (A))
     /// with the added brand binding.
+    ///
+    /// # Why `&mut self` (not `self`)
+    ///
+    /// Phase B4 uses the "build then apply in same scope" pattern:
+    ///
+    /// ```ignore
+    /// wb.with_branded(|mut wb| {
+    ///     let range = {
+    ///         let mut reserved = wb.reserve();        // &mut wb
+    ///         build_query_message(&mut reserved)       // → WriteRange<'brand>
+    ///         // reserved drops; &mut wb borrow ends
+    ///     };
+    ///     let bytes = wb.as_bytes_branded();           // & wb — now re-accessible
+    ///     range.apply(bytes)                           // &[u8] — infallible
+    /// })
+    /// ```
+    ///
+    /// A consuming `self` version would make `wb` unusable after
+    /// `reserve()` — the apply step requires `as_bytes_branded()`
+    /// after the build, so reserve takes `&mut self` and returns
+    /// a reserved with a shorter lifetime.
     #[inline]
     #[must_use]
-    pub(crate) fn reserve(self) -> BrandedWriteReserved<'brand, 'a> {
+    pub(crate) fn reserve(&mut self) -> BrandedWriteReserved<'brand, '_> {
         debug_assert!(
             self.buf.is_empty(),
             "BrandedWriteBuf::reserve must be called on a freshly-cleared buffer \
@@ -912,13 +737,13 @@ impl<'brand, 'a> BrandedWriteBuf<'brand, 'a> {
         }
     }
 
-    /// Branded view of the underlying bytes.
+    /// Branded view of the underlying bytes — shared borrow.
     ///
-    /// Used at materialise time (Phase B4) to produce a
-    /// [`BrandedBytes<'brand, '_>`] that [`crate::action::NonEmptyRange::apply`]
-    /// (Phase B3 branded variant) accepts. The `'brand` matches
-    /// the one carried by ranges produced from this buffer, so
-    /// `apply` returns `&[u8]` infallibly.
+    /// Short-lived (`'_` tied to `&self`). Used by tests only.
+    /// Production materialise consumption uses
+    /// [`Self::into_bytes_branded`] (consuming, yields full outer
+    /// `'a` lifetime).
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) fn as_bytes_branded(&self) -> BrandedBytes<'brand, '_> {
@@ -927,9 +752,27 @@ impl<'brand, 'a> BrandedWriteBuf<'brand, 'a> {
             _brand: PhantomData,
         }
     }
+
+    /// Consume the branded write buf and yield its bytes with the
+    /// full `'a` lifetime — the Phase B4 materialise-boundary
+    /// operation.
+    ///
+    /// The slice's lifetime matches the `'a` parameter the wrapper
+    /// was instantiated with (i.e., the caller's `&'a mut WriteBuf`
+    /// borrow). `BrandedBytes<'brand, 'a>` produced here can be
+    /// passed into [`crate::action::WriteRange::apply`] returning
+    /// `&'a [u8]` — which becomes the `&'w [u8]` in
+    /// `Action::SendBytes` on the outer caller's return type.
+    #[inline]
+    #[must_use]
+    pub(crate) fn into_bytes_branded(self) -> BrandedBytes<'brand, 'a> {
+        BrandedBytes {
+            bytes: self.buf.as_bytes(),
+            _brand: PhantomData,
+        }
+    }
 }
 
-#[cfg(test)]
 impl fmt::Debug for BrandedWriteBuf<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BrandedWriteBuf")
@@ -947,7 +790,6 @@ impl fmt::Debug for BrandedWriteBuf<'_, '_> {
 /// [`WriteReserved`] (const-asserted ≥ every builder's max message
 /// size) plus the brand-identity binding to the source
 /// [`BrandedWriteBuf`].
-#[cfg(test)]
 pub(crate) struct BrandedWriteReserved<'brand, 'a> {
     /// Underlying buffer — shares the pre-existing WriteBuf type
     /// so Phase B3 builder migration can reuse `push_*` logic by
@@ -958,7 +800,6 @@ pub(crate) struct BrandedWriteReserved<'brand, 'a> {
     _brand: PhantomData<fn(&'brand ()) -> &'brand ()>,
 }
 
-#[cfg(test)]
 impl<'brand> BrandedWriteReserved<'brand, '_> {
     /// Current buffer length. Used by builder bodies to compute
     /// emission-time range endpoints (the same pattern as
@@ -969,25 +810,123 @@ impl<'brand> BrandedWriteReserved<'brand, '_> {
         self.buf.len()
     }
 
+    /// Mutable access to underlying WriteBuf for branded push ops
+    /// (see `push_*` methods below). Kept private — callers use the
+    /// typed push methods that forward through this.
+    #[inline]
+    fn buf_mut(&mut self) -> &mut WriteBuf {
+        self.buf
+    }
+
+    /// Push a single byte — branded mirror of [`WriteReserved::push_u8`].
+    #[inline]
+    pub(crate) fn push_u8(&mut self, byte: u8) {
+        let r = self.buf_mut().push_u8(byte);
+        debug_assert!(
+            r.is_ok(),
+            "BrandedWriteReserved::push_u8 overflow — capacity invariant broken",
+        );
+    }
+
+    /// Push big-endian u16 — branded mirror of [`WriteReserved::push_u16_be`].
+    #[inline]
+    pub(crate) fn push_u16_be(&mut self, val: u16) {
+        let r = self.buf_mut().push_u16_be(val);
+        debug_assert!(
+            r.is_ok(),
+            "BrandedWriteReserved::push_u16_be overflow — capacity invariant broken",
+        );
+    }
+
+    /// Push big-endian i16 — branded mirror of [`WriteReserved::push_i16_be`].
+    #[inline]
+    pub(crate) fn push_i16_be(&mut self, val: i16) {
+        let r = self.buf_mut().push_i16_be(val);
+        debug_assert!(
+            r.is_ok(),
+            "BrandedWriteReserved::push_i16_be overflow — capacity invariant broken",
+        );
+    }
+
+    /// Push big-endian u32 — branded mirror of [`WriteReserved::push_u32_be`].
+    #[inline]
+    pub(crate) fn push_u32_be(&mut self, val: u32) {
+        let r = self.buf_mut().push_u32_be(val);
+        debug_assert!(
+            r.is_ok(),
+            "BrandedWriteReserved::push_u32_be overflow — capacity invariant broken",
+        );
+    }
+
+    /// Push big-endian i32 — branded mirror of [`WriteReserved::push_i32_be`].
+    #[inline]
+    pub(crate) fn push_i32_be(&mut self, val: i32) {
+        let r = self.buf_mut().push_i32_be(val);
+        debug_assert!(
+            r.is_ok(),
+            "BrandedWriteReserved::push_i32_be overflow — capacity invariant broken",
+        );
+    }
+
+    /// Push NUL-terminated bytes — branded mirror of [`WriteReserved::push_nul_terminated`].
+    #[inline]
+    pub(crate) fn push_nul_terminated(&mut self, data: &[u8]) {
+        let r = self.buf_mut().push_nul_terminated(data);
+        debug_assert!(
+            r.is_ok(),
+            "BrandedWriteReserved::push_nul_terminated overflow — capacity invariant broken",
+        );
+    }
+
+    /// Write a PG length-prefixed body via a nested branded closure.
+    /// Branded mirror of [`WriteReserved::with_length_prefix`].
+    ///
+    /// The inner closure receives a short-lived branded reserved
+    /// with the SAME `'brand` as the outer — the brand is captured
+    /// from `self`'s `'brand` parameter, so ranges produced inside
+    /// the closure (via subsequent builders) are compatible with
+    /// the outer scope.
+    #[inline]
+    pub(crate) fn with_length_prefix<F>(&mut self, body_fn: F)
+    where
+        F: FnOnce(&mut BrandedWriteReserved<'brand, '_>),
+    {
+        let r = self.buf_mut().with_length_prefix(|inner_buf| {
+            let mut inner_reserved = BrandedWriteReserved {
+                buf: inner_buf,
+                _brand: PhantomData,
+            };
+            body_fn(&mut inner_reserved);
+            Ok(())
+        });
+        debug_assert!(
+            r.is_ok(),
+            "BrandedWriteReserved::with_length_prefix overflow — capacity invariant broken",
+        );
+    }
+
+    /// DEF-154 (B) Phase B4 escape hatch — access underlying buffer
+    /// mutably for APIs predating the brand (e.g.
+    /// `ParamsWriter::write_params` in `build_bind_message`). Mirrors
+    /// [`WriteReserved::as_write_buf_mut`]. Caller is responsible
+    /// for shielding any `Result` return via `debug_assert!`.
+    ///
+    /// Safe because the branded scope's capacity invariant still
+    /// holds iff builders follow their `max_{kind}_message_size()`
+    /// const-asserted worst-case.
+    #[inline]
+    pub(crate) fn as_write_buf_mut(&mut self) -> &mut WriteBuf {
+        self.buf
+    }
+
     /// Branded view of the underlying bytes — shared borrow.
     ///
-    /// Enables the "build then apply in same branded scope" pattern
-    /// (Phase B4):
-    ///
-    /// ```ignore
-    /// buf.with_branded(|wb| {
-    ///     let reserved = wb.reserve();
-    ///     let range = build_query_message(&mut reserved, &cmd);  // WriteRange<'brand>
-    ///     let bytes = reserved.as_bytes_branded();                // BrandedBytes<'brand, '_>
-    ///     range.apply(bytes)                                      // infallible &[u8]
-    /// })
-    /// ```
-    ///
-    /// The brand `'brand` on the returned [`BrandedBytes`] matches
-    /// the brand carried by ranges produced from this reserved
-    /// buffer; [`WriteRange::apply`] (Phase B3, action.rs) returns
-    /// `&[u8]` — no `Option`, no `unwrap_or(&[])` fallback, no
-    /// DEF-182 debug_assert needed.
+    /// Test-only accessor; DEF-154 (B) Phase B4 production path
+    /// consumes [`BrandedWriteBuf::into_bytes_branded`] at the
+    /// materialise boundary instead (which yields the full outer
+    /// `'a` lifetime, required for the returned `Action::SendBytes`
+    /// slice to escape the branded closure scope).
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) fn as_bytes_branded(&self) -> BrandedBytes<'brand, '_> {
@@ -995,7 +934,6 @@ impl<'brand> BrandedWriteReserved<'brand, '_> {
     }
 }
 
-#[cfg(test)]
 impl fmt::Debug for BrandedWriteReserved<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BrandedWriteReserved")
@@ -1004,7 +942,6 @@ impl fmt::Debug for BrandedWriteReserved<'_, '_> {
     }
 }
 
-#[cfg(test)]
 impl WriteBuf {
     /// Enter a generatively-branded scope.
     ///
@@ -1041,9 +978,9 @@ impl WriteBuf {
     /// brand X cannot be applied to bytes branded under Y — a
     /// compile error, not a runtime check.
     #[inline]
-    pub(crate) fn with_branded<R, F>(&mut self, f: F) -> R
+    pub(crate) fn with_branded<'w, R, F>(&'w mut self, f: F) -> R
     where
-        F: for<'brand> FnOnce(BrandedWriteBuf<'brand, '_>) -> R,
+        F: for<'brand> FnOnce(BrandedWriteBuf<'brand, 'w>) -> R,
     {
         f(BrandedWriteBuf {
             buf: self,
@@ -1098,7 +1035,7 @@ mod phase_b1_tests {
     #[test]
     fn branded_reserve_preserves_len() {
         let mut buf = WriteBuf::new();
-        let reserved_len = buf.with_branded(|wb| wb.reserve().len());
+        let reserved_len = buf.with_branded(|mut wb| wb.reserve().len());
         assert_eq!(reserved_len, 0);
     }
 
@@ -1111,7 +1048,7 @@ mod phase_b1_tests {
     #[test]
     fn branded_reserve_as_bytes_branded_len_mirrors_buf() {
         let mut buf = WriteBuf::new();
-        let (reserved_bytes_len, reserved_len) = buf.with_branded(|wb| {
+        let (reserved_bytes_len, reserved_len) = buf.with_branded(|mut wb| {
             let reserved = wb.reserve();
             (reserved.as_bytes_branded().len(), reserved.len())
         });

@@ -171,17 +171,11 @@ impl NonEmptyRange {
         Some(Self { start: start_u16, len })
     }
 
-    /// Construct from a write operation into `write_buf`: capture
-    /// `start` before the writes; after the writes, `write_buf.len()`
-    /// is the post-state end. Returns `None` if no bytes were
-    /// written since `start`.
-    ///
-    /// This is the primary constructor at emission sites — it ties
-    /// the range's validity to the `write_buf` state at emission.
-    #[inline]
-    pub(crate) fn from_write_span(start: usize, write_buf: &crate::write_buf::WriteBuf) -> Option<Self> {
-        Self::new(start, write_buf.len(), write_buf.len())
-    }
+    // DEF-154 (B) Phase B4: `from_write_span` unbranded helper
+    // deleted. Production builders use
+    // `WriteRange::from_branded_write_span` (branded equivalent
+    // with buffer-identity proof); no remaining caller needed the
+    // raw-buffer unbranded form.
 
     /// DEF-154 (A) — architecturally-dead fallback.
     ///
@@ -298,7 +292,6 @@ const _: () = assert!(
 /// Wraps [`NonEmptyRange`] by composition — storage layout is
 /// `u16 + NonZeroU16 + ZST phantom = 4 B` (same as NonEmptyRange);
 /// the brand is zero-cost at runtime.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WriteRange<'brand> {
     /// Underlying non-empty range — carries the validated
@@ -310,7 +303,6 @@ pub(crate) struct WriteRange<'brand> {
     _brand: core::marker::PhantomData<fn(&'brand ()) -> &'brand ()>,
 }
 
-#[cfg(test)]
 impl<'brand> WriteRange<'brand> {
     /// Brand a raw [`NonEmptyRange`] — crate-internal factory.
     ///
@@ -327,6 +319,30 @@ impl<'brand> WriteRange<'brand> {
             inner,
             _brand: core::marker::PhantomData,
         }
+    }
+
+    /// DEF-154 (B) — build a branded write range from the current
+    /// span of a branded reserved. The `start` is captured before
+    /// builder writes; after writes, `reserved.len()` gives the
+    /// post-state end. The returned `WriteRange<'brand>` inherits
+    /// `'brand` from the reserved — so it applies only to
+    /// `BrandedBytes<'brand>` from the SAME branded scope.
+    ///
+    /// Replaces the pre-DEF-154 (B) `from_write_span_infallible` +
+    /// `NonEmptyRange::DEAD_FALLBACK` pair: the branded reserved's
+    /// capacity invariant + builder's non-zero emission worst-case
+    /// (≥ 5 bytes per PG wire frame) together guarantee a valid
+    /// non-empty range, so the `unwrap_or(DEAD_FALLBACK)` shim
+    /// below is architecturally dead.
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_branded_write_span(
+        start: usize,
+        reserved: &crate::write_buf::BrandedWriteReserved<'brand, '_>,
+    ) -> Self {
+        let raw = NonEmptyRange::new(start, reserved.len(), reserved.len())
+            .unwrap_or(NonEmptyRange::DEAD_FALLBACK);
+        Self::from_raw(raw)
     }
 
     /// Apply the range to same-branded bytes — **infallible**.
@@ -356,9 +372,10 @@ impl<'brand> WriteRange<'brand> {
         slice.unwrap_or(&[])
     }
 
-    /// Access the underlying [`NonEmptyRange`] — for debug output
-    /// and drift tests only. Production code works through the
-    /// branded type.
+    /// Access the underlying [`NonEmptyRange`] — for debug output,
+    /// drift tests, and `StagedObs::from_staged` unbrand observation.
+    /// Production code works through the branded type.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) const fn inner(&self) -> NonEmptyRange {
@@ -369,9 +386,9 @@ impl<'brand> WriteRange<'brand> {
 /// Generatively-branded range into an inbound [`crate::buf::ReadBuf`].
 ///
 /// Symmetric partner to [`WriteRange<'brand>`] on the read side.
-/// Constructed by Phase B3+ branded dispatch arms from
-/// `FrameCoords` during `feed_bytes`; applied at Phase B4
-/// materialise time against `BrandedReadBuf::populated_branded()`.
+/// DEF-154 (B) Phase B4: scaffolding retained under `#[cfg(test)]`
+/// pending DEF-154 (E) — the dispatch-loop logical-cursor refactor
+/// required to lift read-side to tier-1.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReadRange<'brand> {
@@ -386,7 +403,9 @@ impl<'brand> ReadRange<'brand> {
     /// Brand a raw [`NonEmptyRange`] — crate-internal factory.
     ///
     /// Same mechanics as [`WriteRange::from_raw`] but for the read
-    /// side.
+    /// side. Used internally by `new` after construction-bounds
+    /// validation; direct callers should prefer [`Self::new`]
+    /// which threads the brand through the bounds-check witness.
     #[inline]
     #[must_use]
     pub(crate) const fn from_raw(inner: NonEmptyRange) -> Self {
@@ -395,6 +414,11 @@ impl<'brand> ReadRange<'brand> {
             _brand: core::marker::PhantomData,
         }
     }
+
+    // DEF-154 (B) Phase B4: `ReadRange::new(start, end, witness)`
+    // tier-1 constructor deferred to DEF-154 (E) — the dispatch-
+    // loop logical-cursor refactor that unblocks read-side
+    // branding. The scaffolding stays as test-only infrastructure.
 
     /// Apply the range to same-branded bytes — **infallible**.
     ///
@@ -426,7 +450,6 @@ impl<'brand> ReadRange<'brand> {
 
 // Phase B3 drift pins: branded ranges must stay the same size as
 // the underlying `NonEmptyRange` (phantom is ZST).
-#[cfg(test)]
 const _: () = assert!(
     core::mem::size_of::<WriteRange<'_>>() == core::mem::size_of::<NonEmptyRange>(),
     "WriteRange<'brand> size regression — brand phantom must be ZST (4 B total).",
@@ -762,7 +785,7 @@ impl<'w, 'r> Iterator for OutActionsIter<'w, 'r> {
 /// than POD, smaller surface than `unsafe`, same memory footprint.
 /// Future "consistency" refactors must address all three points
 /// before proposing the change.
-pub(crate) type StagedActions = heapless::Vec<StagedAction, MAX_ACTIONS_PER_CALL>;
+pub(crate) type StagedActions<'wb> = heapless::Vec<StagedAction<'wb>, MAX_ACTIONS_PER_CALL>;
 
 /// A directive from the protocol to its host.
 ///
@@ -936,11 +959,12 @@ pub enum Action<'w, 'r> {
 ///   copy — `Sync` bypasses `write_buf` entirely).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable. Mirrors the `Action<'w, 'r>` rationale above — DEF-119 shrunk the DeliverReply payload; FailReply.cause (ProtocolError) dominates. FailReply is cold-path.")]
-pub(crate) enum StagedAction {
+pub(crate) enum StagedAction<'wb> {
     /// Bytes live at the range `[start..start+len]` inside the
-    /// emission-time `write_buf`. Typed as [`NonEmptyRange`] —
-    /// non-zero length is a type invariant (DEF-100).
-    SendBytesRange(NonEmptyRange),
+    /// emission-time branded `write_buf` (brand `'wb`). Typed as
+    /// [`WriteRange<'wb>`] — brand proves buffer-identity +
+    /// non-zero length (DEF-100 + DEF-154 (B)).
+    SendBytesRange(WriteRange<'wb>),
     /// Bytes are a static compile-time constant. Materialiser passes
     /// through directly — no write, no copy.
     SendBytesStatic(&'static [u8]),
@@ -978,6 +1002,12 @@ pub(crate) enum StagedAction {
         /// `CommandComplete`).
         id: NonZeroU64,
         /// Absolute range into the read buffer's populated region.
+        /// NonEmptyRange (unbranded) — the read side retains
+        /// DEF-182 tier-2 debug_assert shielding in Phase B4
+        /// because migrating the dispatch loop to a logical-cursor
+        /// shape inside a branded scope is a separate, larger
+        /// refactor. A future phase (provisionally DEF-154 (E))
+        /// addresses it.
         row_range: NonEmptyRange,
         /// Schema arena handle (copy from StreamingRows state).
         ///
@@ -989,6 +1019,30 @@ pub(crate) enum StagedAction {
     },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,
+    /// DEF-154 (B) Phase B4 brand-lifetime anchor.
+    ///
+    /// `'wb` is carried by [`Self::SendBytesRange`] via
+    /// [`WriteRange<'wb>`]. This variant ensures `'wb` is *always*
+    /// used at the enum level, preventing `unused_lifetime` lints
+    /// when a downstream author constructs only non-branded
+    /// variants in a scope.
+    ///
+    /// # NEVER CONSTRUCT THIS VARIANT
+    ///
+    /// It is a phantom marker. Rust's exhaustive-match checking
+    /// requires handling it in every `match`; handle it as a
+    /// no-op (e.g. `continue` in loops, return a neutral `Ok(())`
+    /// in fallible functions). `_Phantom` uses the invariant
+    /// phantom-fn pointer (see
+    /// [`crate::write_buf::BrandedWriteBuf`] block comment) so the
+    /// brand cannot be subtyped away.
+    ///
+    /// Construction would be a crate bug; no observable effect
+    /// because it carries no data — but a test that constructs it
+    /// would break the "never happens" contract that the
+    /// downstream match arms rely on.
+    #[doc(hidden)]
+    _Phantom(core::marker::PhantomData<fn(&'wb ()) -> &'wb ()>),
 }
 
 /// Internal lifetime-free counterpart to the public [`Reply<'r>`].
@@ -1306,10 +1360,10 @@ pub(crate) use deliver_entry_priv::DeliverReplyEntry;
 /// `ReplyKind::StagedPayload`.
 #[inline]
 #[must_use]
-pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
+pub(crate) fn deliver<'wb, K: crate::reply_id::ReplyKind>(
     id: crate::reply_id::ReplyId<K>,
     payload: K::StagedPayload,
-) -> StagedAction {
+) -> StagedAction<'wb> {
     StagedAction::DeliverReply(DeliverReplyEntry::new(id.consume(), payload.into()))
 }
 

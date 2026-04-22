@@ -25,7 +25,8 @@ use crate::wire::{
     TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NO_DATA, TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE,
     TAG_PORTAL_SUSPENDED, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
-use crate::write_buf::WriteBuf;
+// DEF-154 (B) Phase B4: `WriteBuf` import no longer needed here —
+// dispatch takes `&mut BrandedWriteReserved<'wb, '_>` post-migration.
 
 // ════════════════════════════════════════════════════════════════════
 // Typed constructor arguments for `FrameCoords` — each offset has
@@ -242,7 +243,7 @@ const _: () = assert!(
 /// (`AdvancedWithAction` requires the field, `AdvancedSilent` does not).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant, reason = "no_alloc: Box unavailable; DispatchOutcome is a one-shot return, not stored. FailReply.cause (ProtocolError ~280 bytes) dominates.")]
-pub(crate) enum DispatchOutcome {
+pub(crate) enum DispatchOutcome<'wb> {
     /// Frame consumed; transition to `new_state`. No action emitted.
     /// Used by ParameterStatus, BackendKeyData, AuthenticationOk,
     /// SASLFinal — frames that advance state without user-visible
@@ -259,7 +260,7 @@ pub(crate) enum DispatchOutcome {
         /// The state to transition to.
         new_state: ProtoState,
         /// The single side-effect to push — range-based, ref-free.
-        action: StagedAction,
+        action: StagedAction<'wb>,
     },
     /// Frame rejected; connection irrecoverable. Caller tears down.
     ///
@@ -277,6 +278,16 @@ pub(crate) enum DispatchOutcome {
         reply_id: Option<core::num::NonZeroU64>,
         cause: ProtocolError,
     },
+    /// DEF-154 (B) Phase B4 brand anchor. See
+    /// [`StagedAction::_Phantom`] for the full rationale — same
+    /// mechanism: ensure `'wb` is used at the enum level so
+    /// variants like `AdvancedSilent` / `Errored` that don't carry
+    /// branded data still fix the lifetime parameter.
+    ///
+    /// NEVER CONSTRUCTED. Match arms must handle it (e.g. in
+    /// `feed_bytes`) with a no-op.
+    #[doc(hidden)]
+    _Phantom(core::marker::PhantomData<fn(&'wb ()) -> &'wb ()>),
 }
 
 /// DEF-103: `#[cold] #[inline]` helper centralising every
@@ -291,10 +302,10 @@ pub(crate) enum DispatchOutcome {
 /// value) per DEF-112's pre-consume convention.
 #[cold]
 #[inline]
-const fn errored(
+const fn errored<'wb>(
     reply_id: Option<core::num::NonZeroU64>,
     cause: ProtocolError,
-) -> DispatchOutcome {
+) -> DispatchOutcome<'wb> {
     DispatchOutcome::Errored { reply_id, cause }
 }
 
@@ -308,10 +319,10 @@ const fn errored(
 /// Audit2 A014.
 #[cold]
 #[inline]
-const fn internal_bug(
+const fn internal_bug<'wb>(
     reply_id: Option<core::num::NonZeroU64>,
     locus: crate::error::CrateBugLocus,
-) -> DispatchOutcome {
+) -> DispatchOutcome<'wb> {
     errored(reply_id, ProtocolError::InternalCrateBug { locus })
 }
 
@@ -340,14 +351,14 @@ const fn internal_bug(
 /// not expose those methods. Tier-2 structural closure of the "only
 /// alloc in dispatch" invariant that was previously tier-3
 /// code-review discipline.
-pub(crate) fn dispatch(
+pub(crate) fn dispatch<'wb>(
     prev: ProtoState,
     tag: crate::wire::InboundTag,
     payload: &[u8],
-    write_buf: &mut WriteBuf,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
     arena: &mut crate::schema_arena::ArenaWriter<'_>,
     coords: FrameCoords,
-) -> DispatchOutcome {
+) -> DispatchOutcome<'wb> {
     match (prev, tag) {
         // =============================================================
         // Ping flow (Phase 1a, carried forward)
@@ -407,7 +418,7 @@ pub(crate) fn dispatch(
         // mismatch worth surfacing.)
         // =============================================================
         (ProtoState::ConnectingStartupScram { reply, scram }, TAG_AUTHENTICATION) => {
-            dispatch_auth_in_startup_scram(reply, scram, payload, write_buf)
+            dispatch_auth_in_startup_scram(reply, scram, payload, reserved)
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
@@ -430,7 +441,7 @@ pub(crate) fn dispatch(
             },
             TAG_AUTHENTICATION,
         ) => {
-            dispatch_auth_sasl_continue(reply, scram, client_first_bare, client_nonce_b64, payload, write_buf)
+            dispatch_auth_sasl_continue(reply, scram, client_first_bare, client_nonce_b64, payload, reserved)
         }
         (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload);
@@ -1102,7 +1113,7 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
 /// cannot reach this arm with SCRAM payloads already buffered,
 /// because the Scram variant of the state has its own handler —
 /// this separation is the tier-1 compile guarantee DEF-097 buys.
-fn dispatch_auth_in_startup_trust(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome {
+fn dispatch_auth_in_startup_trust<'wb>(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome<'wb> {
     let (code, _rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1134,12 +1145,12 @@ fn dispatch_auth_in_startup_trust(reply: ReplyId<crate::reply_id::StartupKind>, 
 /// Only `AUTH_SASL` is acceptable here; the server taking `AUTH_OK`
 /// without asking for the password is an auth-method mismatch on
 /// the server side (client expected SCRAM).
-fn dispatch_auth_in_startup_scram(
+fn dispatch_auth_in_startup_scram<'wb>(
     reply: ReplyId<crate::reply_id::StartupKind>,
     scram: crate::scram::session::ScramSession,
     payload: &[u8],
-    write_buf: &mut WriteBuf,
-) -> DispatchOutcome {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
+) -> DispatchOutcome<'wb> {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1157,7 +1168,7 @@ fn dispatch_auth_in_startup_scram(
             // DEF-094: write directly into the caller-owned `write_buf`
             // and record the range; materialise at the entry-point
             // boundary after the mutable write phase releases.
-            match build_sasl_initial_response(&scram, write_buf) {
+            match build_sasl_initial_response(&scram, reserved) {
                 Ok((range, client_first_bare, client_nonce_b64)) => {
                     DispatchOutcome::AdvancedWithAction {
                         new_state: ProtoState::ConnectingScramAwaitingServerFirst {
@@ -1230,19 +1241,14 @@ fn mechanism_list_contains_scram(data: &[u8]) -> bool {
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
 #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
-fn build_sasl_initial_response(
+fn build_sasl_initial_response<'wb>(
     _: &crate::scram::session::ScramSession,
-    write_buf: &mut WriteBuf,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> Result<
     (
-        // DEF-100: typed non-empty range into write_buf (replaces
-        // raw `(start, end): (usize, usize)`). Non-zero length is
-        // a type invariant; silent-empty fallback in `materialise`
-        // closes from tier-3 audit to tier-2 structural.
-        crate::action::NonEmptyRange,
-        // DEF-099: POD state-bound buffers instead of heapless::Vec.
-        // Copy-capable, Drop-free — no `Vec::drop` propagation into
-        // ProtoState.
+        // DEF-154 (B): typed branded range — brand ties to `reserved`
+        // scope. Apply at materialise time is infallible.
+        crate::action::WriteRange<'wb>,
         crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
         crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     ),
@@ -1250,9 +1256,6 @@ fn build_sasl_initial_response(
 > {
     use crate::scram::wire;
 
-    // SCRAM client-first uses the username in "n=<user>".
-    // PostgreSQL already has the username from the StartupMessage;
-    // an empty "n=" field is accepted per RFC 5802.
     let user_bytes: &[u8] = b"";
 
     let client_nonce_vec = wire::generate_client_nonce().map_err(ProtocolError::Scram)?;
@@ -1263,46 +1266,37 @@ fn build_sasl_initial_response(
     let client_first_msg =
         wire::build_client_first_message(user_bytes, &client_nonce_vec).map_err(ProtocolError::Scram)?;
 
-    // Build SASLInitialResponse frame in-place in the caller-owned
-    // `write_buf`. DEF-094: the entry-point materialises the
-    // `(start, end)` range into a `&'buf [u8]` ref after the write
-    // phase releases — zero-copy SendBytes.
-    let start = write_buf.len();
-    write_buf
-        .push_u8(crate::wire::TAG_SASL_RESPONSE.byte())
+    // DEF-154 (B) escape hatch: SCRAM auth is a cold handshake path
+    // that predates the branded push_* helpers. The scram::wire
+    // builders hand back owned heapless::Vec; we push those bytes
+    // into the branded reserved via `as_write_buf_mut()`. The brand
+    // is preserved by the enclosing `reserved: &mut BrandedWriteReserved<'wb>` —
+    // `as_write_buf_mut` returns &mut WriteBuf without a brand, and
+    // the pushed range is wrapped via `WriteRange::from_branded_write_span`
+    // below against the same reserved.
+    let start = reserved.len();
+    let buf = reserved.as_write_buf_mut();
+    buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte())
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
-    write_buf
-        .with_length_prefix(|w| {
-            // Mechanism name NUL-terminated.
-            w.push_bytes(SCRAM_SHA_256_MECHANISM)
-                .map_err(|_| crate::write_buf::WriteBufFull)?;
-            w.push_u8(0).map_err(|_| crate::write_buf::WriteBufFull)?;
-            // Body length as i32.
-            let body_len =
-                i32::try_from(client_first_msg.len()).map_err(|_| crate::write_buf::WriteBufFull)?;
-            w.push_i32_be(body_len)
-                .map_err(|_| crate::write_buf::WriteBufFull)?;
-            // Body = client-first-message.
-            w.push_bytes(&client_first_msg)
-                .map_err(|_| crate::write_buf::WriteBufFull)?;
-            Ok(())
-        })
-        .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
-    let end = write_buf.len();
+    buf.with_length_prefix(|w| {
+        w.push_bytes(SCRAM_SHA_256_MECHANISM)
+            .map_err(|_| crate::write_buf::WriteBufFull)?;
+        w.push_u8(0).map_err(|_| crate::write_buf::WriteBufFull)?;
+        let body_len =
+            i32::try_from(client_first_msg.len()).map_err(|_| crate::write_buf::WriteBufFull)?;
+        w.push_i32_be(body_len)
+            .map_err(|_| crate::write_buf::WriteBufFull)?;
+        w.push_bytes(&client_first_msg)
+            .map_err(|_| crate::write_buf::WriteBufFull)?;
+        Ok(())
+    })
+    .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
 
-    // DEF-099: convert heapless::Vec output of the scram::wire
-    // builders into POD PodBytes for state storage. One extra copy
-    // on the cold SCRAM handshake path; structural win is that the
-    // state variant becomes `Vec::drop`-free.
     let client_first_bare = crate::ident::PodBytes::try_from_slice(&client_first_bare_vec)
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     let client_nonce_b64 = crate::ident::PodBytes::try_from_slice(&client_nonce_vec)
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
-    // DEF-100: typed NonEmptyRange. The SASLInitialResponse frame
-    // always writes ≥1 byte (the tag byte), so the `from_write_span`
-    // None-branch is architecturally unreachable.
-    let range = crate::action::NonEmptyRange::new(start, end, write_buf.len())
-        .ok_or(ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
+    let range = crate::action::WriteRange::from_branded_write_span(start, reserved);
     Ok((range, client_first_bare, client_nonce_b64))
 }
 
@@ -1318,14 +1312,14 @@ fn build_sasl_initial_response(
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
 /// [`ScramSession::try_from_credentials`]: crate::scram::session::ScramSession::try_from_credentials
-fn dispatch_auth_sasl_continue(
+fn dispatch_auth_sasl_continue<'wb>(
     reply: ReplyId<crate::reply_id::StartupKind>,
     scram: crate::scram::session::ScramSession,
     client_first_bare: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
     client_nonce_b64: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     payload: &[u8],
-    write_buf: &mut WriteBuf,
-) -> DispatchOutcome {
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
+) -> DispatchOutcome<'wb> {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1411,23 +1405,22 @@ fn dispatch_auth_sasl_continue(
         }
     };
 
-    // Build SASLResponse frame directly in the caller-owned
-    // `write_buf`. DEF-094 — materialises to `&'buf [u8]` at the
-    // entry-point boundary (zero-copy SendBytes).
-    let start = write_buf.len();
-    if write_buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte()).is_err()
-        || write_buf
-            .with_length_prefix(|w| w.push_bytes(&client_final_msg))
-            .is_err()
+    // DEF-154 (B): build SASLResponse frame via the branded reserved.
+    // Escape hatch as_write_buf_mut() for the pre-DEF-154 (B)
+    // Result-returning push path; WriteRange<'wb> wraps the span
+    // at the end via `from_branded_write_span`.
+    let start = reserved.len();
     {
-        return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
+        let buf = reserved.as_write_buf_mut();
+        if buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte()).is_err()
+            || buf
+                .with_length_prefix(|w| w.push_bytes(&client_final_msg))
+                .is_err()
+        {
+            return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
+        }
     }
-    // DEF-100: typed NonEmptyRange. The SASLResponse frame always
-    // includes the 1-byte tag, so `from_write_span` cannot yield
-    // None under a successful write path.
-    let Some(range) = crate::action::NonEmptyRange::from_write_span(start, write_buf) else {
-        return errored(Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
-    };
+    let range = crate::action::WriteRange::from_branded_write_span(start, reserved);
 
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::ConnectingScramAwaitingServerFinal {
@@ -1439,11 +1432,11 @@ fn dispatch_auth_sasl_continue(
 }
 
 /// Dispatch AuthenticationSASLFinal (server-final-message).
-fn dispatch_auth_sasl_final(
+fn dispatch_auth_sasl_final<'wb>(
     reply: ReplyId<crate::reply_id::StartupKind>,
     expected_server_sig: crate::scram::types::SecretDigest,
     payload: &[u8],
-) -> DispatchOutcome {
+) -> DispatchOutcome<'wb> {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1475,7 +1468,7 @@ fn dispatch_auth_sasl_final(
 }
 
 /// Dispatch AuthenticationOk after SCRAM verification.
-fn dispatch_auth_ok_after_scram(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome {
+fn dispatch_auth_ok_after_scram<'wb>(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome<'wb> {
     // AuthOk has no trailing data; destructure with anonymous `_`
     // pattern (pattern-discard, not a `_`-prefixed identifier —
     // allowed by the `no underscore vars` discipline).
@@ -1629,11 +1622,11 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 /// Centralises the "`CommandComplete` → AwaitingRfq" invariant in one
 /// place — an arm-body edit in only one of the two call sites
 /// would diverge silently; the helper makes the transition atomic.
-fn advance_to_awaiting_rfq(
+fn advance_to_awaiting_rfq<'wb>(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
     schema_ref: Option<crate::schema_arena::SchemaRef>,
-) -> DispatchOutcome {
+) -> DispatchOutcome<'wb> {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::SimpleQueryAwaitingRfq {
@@ -1653,11 +1646,11 @@ fn advance_to_awaiting_rfq(
 ///
 /// The DML path's 'C' transition is inlined directly in the dispatch
 /// arm (one call-site only) and doesn't need a helper.
-fn advance_to_bindexecute_awaiting_rfq_select(
+fn advance_to_bindexecute_awaiting_rfq_select<'wb>(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
     schema_ref: crate::schema_arena::SchemaRef,
-) -> DispatchOutcome {
+) -> DispatchOutcome<'wb> {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::BindExecuteAwaitingRfqSelect {
@@ -1696,10 +1689,10 @@ fn advance_to_bindexecute_awaiting_rfq_select(
 /// register pressure permits. Same treatment as `errored()` above.
 #[cold]
 #[inline]
-fn advance_to_drain_after_error(
+fn advance_to_drain_after_error<'wb>(
     raw_id: core::num::NonZeroU64,
     payload: &[u8],
-) -> DispatchOutcome {
+) -> DispatchOutcome<'wb> {
     let cause = parse_error_response(payload);
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::DrainRfqAfterError,
@@ -1760,11 +1753,11 @@ fn parse_rfq_payload(
 /// branch is architecturally unreachable when `parse_header` has
 /// already validated frame bounds, but surfacing it as a classified
 /// error (vs a panic) preserves the crate-root panic ban.
-fn stream_row_or_errored(
+fn stream_row_or_errored<'wb>(
     reply: ReplyId<crate::reply_id::QueryKind>,
     schema_ref: crate::schema_arena::SchemaRef,
     coords: FrameCoords,
-) -> DispatchOutcome {
+) -> DispatchOutcome<'wb> {
     match crate::action::NonEmptyRange::new(
         coords.payload_start(),
         coords.payload_end(),
