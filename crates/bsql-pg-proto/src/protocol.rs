@@ -308,25 +308,8 @@ impl PgProtocol {
         // freedom over what they pair the result with later.
         write_buf.clear();
 
-        // F19: no slot-clear needed. Schema lives in state variants
-        // (`SimpleQueryStreamingRows` / `SimpleQueryAwaitingRfq`)
-        // which are consumed by Z → Idle on query completion. A new
-        // `SimpleQuery` push from Idle has no prior schema to carry
-        // over; the state variants don't exist outside their query.
-        // DEF-119: arena cleanup at push entry (mirrors feed_bytes).
-        // DEF-148: clear() has a has_any fast-path — no memset when
-        // arena already empty (Ping-loop hot path benefit).
-        // DEF-152 probe: pin "clear() leaves arena empty" as a
-        // debug-time invariant to catch future regressions where
-        // has_any bookkeeping drifts.
-        if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
-            self.schema_arena.clear();
-            debug_assert_eq!(
-                self.schema_arena.occupied_count(),
-                0,
-                "DEF-152: clear() must leave arena empty",
-            );
-        }
+        // DEF-172: centralised entry-point arena reclamation.
+        self.clear_arena_if_idle_or_errored();
         let prev = core::mem::take(&mut self.state);
         let (new_state, staged) = compute_push(cmd, prev, write_buf);
         self.state = new_state;
@@ -395,20 +378,8 @@ impl PgProtocol {
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 's> {
         write_buf.clear();
-        // DEF-119: arena cleanup at push entry (mirrors feed_bytes).
-        // When state is Idle/Errored, prior query's schema (if any)
-        // is stale — safely reusable now that previous OutActions
-        // borrow has ended. DEF-148: clear() is has_any-guarded (no
-        // memset on already-empty slab). DEF-152 probe pins the
-        // post-clear invariant in debug builds.
-        if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
-            self.schema_arena.clear();
-            debug_assert_eq!(
-                self.schema_arena.occupied_count(),
-                0,
-                "DEF-152: clear() must leave arena empty",
-            );
-        }
+        // DEF-172: centralised entry-point arena reclamation.
+        self.clear_arena_if_idle_or_errored();
         // DEF-119: if the user supplied a row_desc, allocate it into
         // the arena NOW and thread the resulting SchemaRef into the
         // state machine. The owned RowDesc goes into the arena slab;
@@ -459,20 +430,8 @@ impl PgProtocol {
 
         // DEF-119 arena cleanup — any prior OutActions<'_, 'r_prev>
         // has drained (borrow checker enforces it before this
-        // `&'r mut self` call), so any arena slots left from the
-        // prior query are now safely reusable. When state is Idle
-        // (command completed cleanly) or Errored (terminal — no
-        // further alloc), clear all slots to start fresh.
-        // DEF-148: clear() has_any fast-path — no memset on Ping-loop.
-        // DEF-152 probe pins the post-clear invariant in debug.
-        if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
-            self.schema_arena.clear();
-            debug_assert_eq!(
-                self.schema_arena.occupied_count(),
-                0,
-                "DEF-152: clear() must leave arena empty",
-            );
-        }
+        // `&'r mut self` call). DEF-172: centralised via helper.
+        self.clear_arena_if_idle_or_errored();
 
         // F66 (pass #6 audit): if the connection is already Errored,
         // drop the incoming bytes and return an empty OutActions.
@@ -772,6 +731,35 @@ impl PgProtocol {
             self.read_buf.populated(),
             &self.schema_arena,
         )
+    }
+
+    /// DEF-172 — entry-point arena reclamation.
+    ///
+    /// If the connection state is `Idle` or `Errored`, clear the
+    /// schema arena (reclaims any schemas carried over from the
+    /// previous query cycle) and pin the post-clear invariant
+    /// (`occupied_count() == 0`) in debug builds.
+    ///
+    /// Called from all three user-facing entry points: `push_command`,
+    /// `push_bind_execute`, `feed_bytes`. Pre-DEF-172, each of the
+    /// three sites open-coded the 8-line match+clear+debug_assert
+    /// pattern — drift surface (audit2 A007) since adding a fourth
+    /// entry point (e.g., a future `push_close_statement` in 1c-3d)
+    /// would need to remember the ritual. Post-DEF-172 the discipline
+    /// lives in one place.
+    ///
+    /// DEF-148 / DEF-171: clear() is cheap on the Ping-loop hot case
+    /// (2-slot is_some walk, no stores).
+    #[inline]
+    fn clear_arena_if_idle_or_errored(&mut self) {
+        if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
+            self.schema_arena.clear();
+            debug_assert_eq!(
+                self.schema_arena.occupied_count(),
+                0,
+                "DEF-152: clear() must leave arena empty",
+            );
+        }
     }
 
     /// DEF-149 — atomic state-terminus transition.
