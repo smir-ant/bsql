@@ -69,14 +69,19 @@ impl AbsFrameStart {
         Self(u16::try_from(v).unwrap_or(u16::MAX))
     }
 
-    /// Widen to `usize` for caller-side arithmetic. Infallible via
-    /// `usize::from(u16)` (all platforms have ≥ 16-bit pointers).
-    /// Non-const: `From` trait impls aren't const yet (MSRV 1.95);
-    /// widening at usage time is free-of-cost under optimisation.
+    /// DEF-174 (audit2 A004): crate-internal u16 accessor — no
+    /// widening. The only caller is [`FrameCoords::new`] for
+    /// identity-move field construction. Pre-DEF-174 the newtype
+    /// also had a `.get() -> usize` widening accessor, deleted
+    /// because (a) it was unused post-DEF-174, and (b) user's
+    /// audit directive says no dead code.
+    ///
+    /// Callers that need a `usize` should widen explicitly via
+    /// `usize::from(nt.get_u16())`.
     #[inline]
     #[must_use]
-    pub(crate) fn get(self) -> usize {
-        usize::from(self.0)
+    pub(crate) const fn get_u16(self) -> u16 {
+        self.0
     }
 }
 
@@ -96,10 +101,12 @@ impl FrameTotalLen {
     pub(crate) fn new(v: usize) -> Self {
         Self(u16::try_from(v).unwrap_or(u16::MAX))
     }
+    /// DEF-174: see [`AbsFrameStart::get_u16`]. No `.get() -> usize`
+    /// accessor — unused post-DEF-174, deleted per no-dead-code.
     #[inline]
     #[must_use]
-    pub(crate) fn get(self) -> usize {
-        usize::from(self.0)
+    pub(crate) const fn get_u16(self) -> u16 {
+        self.0
     }
 }
 
@@ -119,10 +126,12 @@ impl PopulatedLen {
     pub(crate) fn new(v: usize) -> Self {
         Self(u16::try_from(v).unwrap_or(u16::MAX))
     }
+    /// DEF-174: see [`AbsFrameStart::get_u16`]. No `.get() -> usize`
+    /// accessor — unused post-DEF-174, deleted per no-dead-code.
     #[inline]
     #[must_use]
-    pub(crate) fn get(self) -> usize {
-        usize::from(self.0)
+    pub(crate) const fn get_u16(self) -> u16 {
+        self.0
     }
 }
 
@@ -159,27 +168,27 @@ impl FrameCoords {
     /// Typed constructor. Swap any two arguments → build error.
     ///
     /// DEF-147: the pre-narrowed value from each newtype is
-    /// stored directly — the newtypes already hold `u16`. Skipping
-    /// the explicit `u16::try_from` at this site preserves the
-    /// tier-1 shield: only `{AbsFrameStart, FrameTotalLen,
-    /// PopulatedLen}::new` gate a `usize` input; every other path
-    /// through the system is u16-typed.
+    /// stored directly — the newtypes already hold `u16`.
+    ///
+    /// DEF-174 (audit2 A004): use each newtype's `get_u16()`
+    /// accessor to extract the stored `u16` without a round-trip
+    /// through `usize`. Pre-DEF-174 this was
+    /// `u16::try_from(x.get()).unwrap_or(u16::MAX)` — an
+    /// architecturally-identity widen+narrow with a dead fallback.
+    /// Post-DEF-174: pure field moves, no dead branches, shorter
+    /// IR (helps inliner decisions). Tier-3 dead-fallback →
+    /// absent.
     #[inline]
     #[must_use]
-    pub(crate) fn new(
+    pub(crate) const fn new(
         frame_start: AbsFrameStart,
         total_len: FrameTotalLen,
         populated_len: PopulatedLen,
     ) -> Self {
         Self {
-            // Re-narrow via the newtype's own `get()` (widens to
-            // usize) then `try_from(usize) -> u16` — architecturally
-            // identity when the newtype was built correctly.
-            // Fallback to u16::MAX matches the newtype's own
-            // fallback, staying consistent.
-            frame_start: u16::try_from(frame_start.get()).unwrap_or(u16::MAX),
-            total_len: u16::try_from(total_len.get()).unwrap_or(u16::MAX),
-            populated_len: u16::try_from(populated_len.get()).unwrap_or(u16::MAX),
+            frame_start: frame_start.get_u16(),
+            total_len: total_len.get_u16(),
+            populated_len: populated_len.get_u16(),
         }
     }
 
