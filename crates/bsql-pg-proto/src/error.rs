@@ -571,6 +571,17 @@ pub enum CrateBugLocus {
     /// prefix — tier-4 silent corruption. Tier-3 classified now.
     ParamsWriterOverflow,
 
+    /// DEF-154 (E): read-side counterpart of `EmptyWriteRange`.
+    /// `ReadRange::new(start, end, witness)` received `None` from
+    /// `NonEmptyRange::new(start, end, witness.as_slice().len())` —
+    /// meaning dispatch's `stream_row_or_errored` computed
+    /// `payload_start..payload_end` bounds that don't fit the
+    /// current populated region. Architecturally dead under intact
+    /// `FrameCoords` math + `parse_header` pre-validation; emission
+    /// indicates a `FrameCoords` construction bug or a cursor-math
+    /// drift. Tier-3 classified.
+    EmptyReadRange,
+
     /// DEF-154 (B) Phase B4-W P0-2: a `build_*_message` branded
     /// builder produced a zero-length span when
     /// `WriteRange::from_branded_write_span` invoked
@@ -619,6 +630,7 @@ impl fmt::Display for CrateBugLocus {
             Self::StaleSchemaRef => f.write_str("stale-schema-ref"),
             Self::ParamsWriterOverflow => f.write_str("params-writer-overflow"),
             Self::EmptyWriteRange => f.write_str("empty-write-range"),
+            Self::EmptyReadRange => f.write_str("empty-read-range"),
         }
     }
 }
@@ -697,6 +709,17 @@ mod crate_bug_locus_display_tests {
         assert_eq!(
             format!("{e}"),
             "internal bsql-pg-proto bug at locus empty-write-range",
+        );
+    }
+
+    #[test]
+    fn empty_read_range_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::EmptyReadRange,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus empty-read-range",
         );
     }
 

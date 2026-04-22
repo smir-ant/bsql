@@ -653,11 +653,14 @@ impl<'brand, 'a> BrandedBytes<'brand, 'a> {
     /// (Phase B2) so both sides can produce [`BrandedBytes`] without
     /// duplicating the struct field layout across modules.
     ///
-    /// DEF-154 (B) Phase B4: currently only the test-gated
-    /// `BrandedReadBuf::populated_branded` + sibling methods use
-    /// this factory. Production `BrandedWriteBuf::into_bytes_branded`
-    /// constructs via direct struct literal. Gated `#[cfg(test)]`
-    /// until Phase B4-E wires production read-side callers.
+    /// DEF-154 (B+E): factory used by `BrandedReadBuf`'s production
+    /// accessors (post-E) + Phase B3 tests. Production
+    /// `BrandedWriteBuf::into_bytes_branded` constructs via direct
+    /// struct literal instead.
+    ///
+    /// Currently `#[cfg(test)]`-gated — callers are the cfg(test)
+    /// `BrandedReadBuf` scaffolding pending DEF-154 (E) production
+    /// un-gating. Will be un-gated in the full DEF-154 (E) refactor.
     #[cfg(test)]
     #[inline]
     #[must_use]

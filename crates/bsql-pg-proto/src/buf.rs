@@ -26,8 +26,9 @@
 
 use crate::frame::READ_BUF_CAP;
 use core::fmt;
-// DEF-154 (B) Phase B4: `PhantomData` used only by the `BrandedReadBuf`
-// scaffolding below, which is `#[cfg(test)]`-gated pending DEF-154 (E).
+// DEF-154 (E) Spike 1: `PhantomData` used by cfg(test)-gated
+// `BrandedReadBuf` scaffolding. Full DEF-154 (E) refactor
+// (deferred) un-gates the whole read-branded family for production.
 #[cfg(test)]
 use core::marker::PhantomData;
 use heapless::{CapacityError, Vec};
@@ -392,11 +393,26 @@ impl fmt::Display for AdvancePastEnd {
 /// and after the branded materialise phase respectively).
 #[cfg(test)]
 pub(crate) struct BrandedReadBuf<'brand, 'a> {
-    /// Underlying shared borrow. Phase B4 materialise consumes
-    /// the branded view via [`Self::populated_branded`] inside
-    /// the `ReadBuf::with_branded` closure; the brand keeps
-    /// `ReadRange<'brand>::apply` (Phase B3) infallible.
-    buf: &'a ReadBuf,
+    /// Underlying mutable borrow (DEF-154 (E) Spike 1).
+    ///
+    /// Holding `&'a mut ReadBuf` lets the type expose both
+    /// read-only branded views (`populated_branded`,
+    /// `unread_branded`) AND scope-local mutations
+    /// (`advance_scope_local`, `clear_scope_local`) — mirroring
+    /// the write side's `BrandedWriteBuf::reserve()` +
+    /// `as_bytes_branded()` split. Read-only access through
+    /// `&self` reborrows the mutable borrow as shared at the
+    /// access site; scope-local mutations require `&mut self`
+    /// and fire only after NLL has released prior `&self` views.
+    ///
+    /// Pre-Spike-1 the field was `&'a ReadBuf` (shared), which
+    /// forced `self.read_buf.advance(n)` to live OUTSIDE the
+    /// branded scope — and that placement conflicted with
+    /// `OutActions<'_, 'r>`'s slice borrows from `populated()`,
+    /// making the full DEF-154 (E) read-side tier-1 closure
+    /// unreachable. Mutable borrow with disciplined API is the
+    /// architect-recommended resolution.
+    buf: &'a mut ReadBuf,
     /// Invariant phantom — see `write_buf.rs` Phase B1 block
     /// comment for the variance reasoning.
     _brand: PhantomData<fn(&'brand ()) -> &'brand ()>,
@@ -405,7 +421,7 @@ pub(crate) struct BrandedReadBuf<'brand, 'a> {
 #[cfg(test)]
 impl<'brand, 'a> BrandedReadBuf<'brand, 'a> {
     /// Branded view of the full populated region — shared borrow.
-    /// Used by the dispatch loop (Phase B4) as the witness for
+    /// Used by the dispatch loop as the witness for
     /// [`crate::action::ReadRange::new`] construction (bounds
     /// validation against same-brand bytes).
     ///
@@ -427,8 +443,56 @@ impl<'brand, 'a> BrandedReadBuf<'brand, 'a> {
         crate::write_buf::BrandedBytes::from_slice_branded(self.buf.unread())
     }
 
-    // DEF-154 (B) Phase B4: `into_populated_branded` consuming
-    // form deferred to DEF-154 (E). See parent-module comment.
+    /// DEF-154 (E) Spike 1: consuming branded view of the full
+    /// populated region with the outer `'a` lifetime.
+    ///
+    /// Mirrors [`crate::write_buf::BrandedWriteBuf::into_bytes_branded`].
+    /// Used at the materialise boundary to produce slices that
+    /// flow into `Action::StreamRow { row_bytes: &'r [u8] }` with
+    /// the outer caller's `'r` lifetime.
+    #[inline]
+    #[must_use]
+    pub(crate) fn into_populated_branded(self) -> crate::write_buf::BrandedBytes<'brand, 'a> {
+        crate::write_buf::BrandedBytes::from_slice_branded(self.buf.populated())
+    }
+
+    /// DEF-154 (E) Spike 1: apply a logical-cursor advance to the
+    /// underlying `ReadBuf` while the branded scope is still open.
+    ///
+    /// Mirrors the write side's pattern where
+    /// `BrandedWriteBuf::reserve()` takes `&mut self` to produce a
+    /// `BrandedWriteReserved` — the `&mut self` fires AFTER all
+    /// prior `&self` views (via `populated_branded` etc.) have
+    /// been dropped under NLL.
+    ///
+    /// This method is the critical mechanism for closing the
+    /// DEF-154 (E) brand-vs-advance borrow conflict: previously
+    /// the advance had to live outside the branded scope, but
+    /// then the two scopes (dispatch vs materialise) had distinct
+    /// brands and `ReadRange<'rb_dispatch>` could not apply to
+    /// `BrandedBytes<'rb_materialise>`. Consolidating both into
+    /// ONE branded scope with `advance_scope_local` as a gated
+    /// mutation resolves the mismatch.
+    #[inline]
+    pub(crate) fn advance_scope_local(
+        &mut self,
+        n: usize,
+    ) -> Result<(), AdvancePastEnd> {
+        self.buf.advance(n)
+    }
+
+    /// DEF-154 (E) Spike 1: scope-local clear of the underlying
+    /// `ReadBuf` — mirror of the fatal-path
+    /// `replace_state_errored_and_drain` read-buf clear, lifted
+    /// into the branded scope so that the clear fires BEFORE
+    /// the `into_populated_branded` consumption at materialise
+    /// time. Empty populated is the correct read-side view for
+    /// the Errored fatal path (any residual buffered bytes are
+    /// wire-garbage from a dead connection).
+    #[inline]
+    pub(crate) fn clear_scope_local(&mut self) {
+        self.buf.clear();
+    }
 }
 
 #[cfg(test)]
@@ -469,9 +533,9 @@ impl ReadBuf {
     /// })
     /// ```
     #[inline]
-    pub(crate) fn with_branded<R, F>(&self, f: F) -> R
+    pub(crate) fn with_branded<'r, R, F>(&'r mut self, f: F) -> R
     where
-        F: for<'brand> FnOnce(BrandedReadBuf<'brand, '_>) -> R,
+        F: for<'brand> FnOnce(BrandedReadBuf<'brand, 'r>) -> R,
     {
         f(BrandedReadBuf {
             buf: self,
@@ -497,7 +561,8 @@ mod phase_b2_tests {
     /// and the branded-slice unbranding boundary.
     #[test]
     fn read_with_branded_round_trip_empty() {
-        let buf = ReadBuf::new();
+        // Post DEF-154 (E) Spike 1: with_branded takes &mut self.
+        let mut buf = ReadBuf::new();
         let (populated_len, slice_len) = buf.with_branded(|rb| {
             let branded = rb.populated_branded();
             (branded.len(), branded.as_slice().len())
@@ -547,7 +612,8 @@ mod phase_b2_tests {
     fn nested_write_read_branded_scopes_type_check() {
         use crate::write_buf::WriteBuf;
         let mut wbuf = WriteBuf::new();
-        let rbuf = ReadBuf::new();
+        // Post DEF-154 (E) Spike 1: ReadBuf::with_branded takes &mut self.
+        let mut rbuf = ReadBuf::new();
         // If 'wbrand and 'rbrand accidentally unified, the closure
         // body's call to `populated_branded()` returning a
         // `BrandedBytes<'rbrand, '_>` could be used where a
@@ -560,5 +626,58 @@ mod phase_b2_tests {
         });
         assert_eq!(wlen, 0);
         assert_eq!(rlen, 0);
+    }
+
+    /// DEF-154 (E) Spike 1: the critical soundness check — a
+    /// branded scope can issue shared `populated_branded` views
+    /// AND fire `advance_scope_local` (mutation) within the same
+    /// scope, as long as NLL releases the prior view's borrow
+    /// before the mut call. Matches the write-side pattern where
+    /// `BrandedWriteBuf::reserve()` (&mut) and
+    /// `as_bytes_branded(&self)` coexist under NLL.
+    ///
+    /// If this test fails to compile, the full DEF-154 (E) refactor
+    /// is blocked and we need an alternative (see architect design
+    /// §5.3 fallback options).
+    #[test]
+    fn branded_mut_allows_shared_view_then_scope_local_advance() {
+        let mut rbuf = ReadBuf::new();
+        let append_ok = rbuf.append(&[1, 2, 3, 4]);
+        assert!(append_ok.is_ok(), "append must succeed on fresh buffer");
+        let (populated_len_before_advance, unread_len_after_advance) = rbuf.with_branded(|mut rb| {
+            // Phase 1: shared view — populated_branded holds &rb.
+            let len_before = rb.populated_branded().len();
+            // NLL releases the shared borrow after this expression.
+            // Phase 2: scope-local mutation — advance via &mut rb.
+            let advance_res = rb.advance_scope_local(2);
+            assert!(advance_res.is_ok(), "advance within bounds must succeed");
+            // Phase 3: another shared view — unread_branded holds &rb,
+            // fine because the advance mut-borrow has ended.
+            let unread_len_after = rb.unread_branded().len();
+            (len_before, unread_len_after)
+        });
+        assert_eq!(populated_len_before_advance, 4);
+        assert_eq!(
+            unread_len_after_advance, 2,
+            "advance_scope_local(2) bumps the cursor, leaving 2 unread bytes",
+        );
+    }
+
+    /// DEF-154 (E) Spike 1 continuation: exercise
+    /// `clear_scope_local` + `into_populated_branded` (consuming).
+    /// The clear wipes the buffer; the consuming discharge yields
+    /// an empty branded view with the outer `'a` lifetime.
+    #[test]
+    fn branded_mut_clear_then_consume_populated() {
+        let mut rbuf = ReadBuf::new();
+        let append_ok = rbuf.append(&[9, 9, 9]);
+        assert!(append_ok.is_ok());
+        let post_consume_len = rbuf.with_branded(|mut rb| {
+            rb.clear_scope_local();
+            // After clear, populated region is empty.
+            let branded: crate::write_buf::BrandedBytes<'_, '_> = rb.into_populated_branded();
+            branded.as_slice().len()
+        });
+        assert_eq!(post_consume_len, 0, "clear_scope_local empties the buffer");
     }
 }
