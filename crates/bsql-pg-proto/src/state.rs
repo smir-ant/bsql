@@ -524,6 +524,16 @@ impl ProtoState {
     /// failure. Centralises the "every in-flight reply has exactly
     /// one consume-site on the tear-down path" rule in one place —
     /// previously open-coded inside `fail_inflight_and_close`.
+    ///
+    /// # 1c-5 blocker (audit2 A029)
+    ///
+    /// The `Option<NonZeroU64>` return carries AT MOST ONE
+    /// correlator. Single-inflight invariant holds today — every
+    /// non-Idle variant carries exactly one `ReplyId<K>`. Pipelining
+    /// introduces multi-correlator states (multiple concurrent
+    /// replies over one connection): the return type must widen to
+    /// `heapless::Vec<NonZeroU64, N_INFLIGHT>` at 1c-5 time. Revisit
+    /// per H021 witness-guard session.
     #[must_use]
     pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
         match self {

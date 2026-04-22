@@ -184,6 +184,13 @@ pub const MAX_ACTIONS_PER_CALL: usize = 8;
 /// Current worst case: [`DispatchOutcome::Errored`] with `Some(reply_id)`
 /// emits `FailReply + CloseSocket` = 2. Bumping this to 3 would require
 /// a new 3-action dispatch outcome.
+///
+/// 1c-5 blocker (audit2 A028): pipelining changes the topology — a
+/// single feed_bytes iteration might resolve multiple concurrent
+/// inflight replies (e.g., DataRow for query A + CommandComplete
+/// for query B). Worst case becomes ≥3; WORST_CASE_PER_DISPATCH and
+/// MAX_ACTIONS_PER_CALL both revisit at 1c-5 implementation time
+/// per H021 witness-guard session.
 const WORST_CASE_PER_DISPATCH: usize = 2;
 
 // Sanity asserts — the budget audit above demands at least
@@ -760,6 +767,14 @@ impl PgProtocol {
     ///
     /// DEF-148 / DEF-171: clear() is cheap on the Ping-loop hot case
     /// (2-slot is_some walk, no stores).
+    ///
+    /// 1c-5 blocker (audit2 A027): pipelining breaks the blanket-
+    /// clear model — concurrent inflight queries each hold a live
+    /// SchemaRef; clear()ing all slots at an entry point would
+    /// invalidate refs that are still legitimately in-flight. At
+    /// 1c-5 time this helper becomes per-ref `free()` calls keyed
+    /// on which query's borrow is ending. Revisit per H021
+    /// witness-guard session.
     #[inline]
     fn clear_arena_if_idle_or_errored(&mut self) {
         if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
@@ -834,6 +849,14 @@ impl PgProtocol {
     /// broken invariant). `#[cold]` hints LLVM to lay out the caller's
     /// hot path contiguously — this body is reachable only on the
     /// protocol-error branch.
+    ///
+    /// # 1c-5 blocker (audit2 A030)
+    ///
+    /// The budget `2` (FailReply + CloseSocket) assumes at most one
+    /// inflight reply. Pipelining: a fatal error must fail ALL N
+    /// concurrent replies — budget becomes `1 + N`. Helper widens
+    /// alongside `take_inflight_reply_raw_id` (see A029 marker in
+    /// state.rs). Revisit per H021 witness-guard session.
     #[cold]
     fn fail_inflight_and_close(
         &mut self,
