@@ -2966,3 +2966,54 @@ release-unused call. Same release-mode cost, compiles cleanly.
 Scheduled after (B). Combines buffer-witness + arena-witness
 (C shipped) to make stale SchemaRef detection compile-time (upgrade
 DEF-170 debug_asserts from runtime-check to type-system-impossible).
+
+### DEF-182 — symmetric silent-fallback shields at NonEmptyRange.apply + payload extraction — SHIPPED
+
+**Shipped** 2026-04-22 (same session as DEF-154 (C)).
+
+**Context.** DEF-170 (audit2 A010) shielded 3 stale-SchemaRef
+materialise sites with `debug_assert!(desc_opt.is_some())` before
+their `unwrap_or(&RowDesc::EMPTY)` fallback — debug build fires
+loud, release preserves the fallback (forbid-bundle bans `panic!`).
+
+The pattern was asymmetrically applied — the `NonEmptyRange.apply`
+and wire-payload `.get(HEADER_LEN..total_len)` call sites on the
+SAME materialise/feed_bytes code paths retained unshielded
+`unwrap_or(&[])` silent fallbacks. A drift discovered during the
+DEF-154 (C) self-audit.
+
+**Closed seams (3 sites):**
+
+1. `protocol.rs:524` — payload extraction from `read_buf.unread()`.
+   The preceding length-check + `parse_header` invariants prove
+   the range `HEADER_LEN..total_len` valid. Unshielded
+   `unwrap_or(&[])` would silently feed an empty payload to
+   dispatch arms, misclassifying (empty DataRow → NoColumns, empty
+   ErrorResponse → treated as OK).
+
+2. `protocol.rs:1963` — `SendBytesRange(range).apply(write_buf)`.
+   Range was constructor-validated at emission against THIS write
+   buffer. Unshielded fallback would send a 0-byte frame where a
+   multi-byte PG frame was required — malformed protocol
+   downstream.
+
+3. `protocol.rs:2010` — `StreamRowRange.row_range.apply(read_buf)`.
+   Row range constructed from THIS read buffer this call; the `'r`
+   borrow on OutActions blocks buffer mutation. Unshielded
+   fallback would emit an empty row where a multi-column row was
+   on the wire — user-boundary correctness break.
+
+**Tier classification.** Tier-2 structural runtime. `debug_assert!`
+panics in debug / tests (fires loud on the dead branch) and
+compiles to nothing in release — the `unwrap_or(&[])` fallback
+stays in release as the silent-but-typechecked closure. The
+forbid-bundle's `panic` ban targets user-written `panic!` macros;
+stdlib-internal panics via `debug_assert!` are allowed and
+broadly used in the crate (DEF-170 is the prior precedent).
+Full tier-1 compile-time closure of this class lands with
+DEF-154 (B) buffer-witness-with-brand.
+
+**Along-the-way fix.** Stale `has_any` references in `lib.rs`
+comments (DEF-171 deleted the field but two size-bucket comments
+still mentioned it). Corrected to reflect post-DEF-171 reality
+(SchemaSlab ~520 B, PgProtocol ~6272 B DEF-119 baseline preserved).

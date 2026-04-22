@@ -517,11 +517,31 @@ impl PgProtocol {
                         // Body not yet fully buffered.
                         break;
                     }
-                    let payload = self
+                    // DEF-182: the `.get(HEADER_LEN..total_len)`
+                    // None branch is architecturally dead — the
+                    // preceding length check proves
+                    // `unread().len() >= total_len`, and
+                    // `parse_header` returns `Ok` only when
+                    // `total_len >= HEADER_LEN` (encoded by the
+                    // wire-length field). Unshielded `unwrap_or(&[])`
+                    // silently degraded to an empty payload — the
+                    // downstream dispatch arms would then misclassify
+                    // (e.g. empty DataRow parsed as NoColumns, empty
+                    // ErrorResponse parsed as OK). Debug loud;
+                    // release preserves the `&[]` fallback.
+                    let payload_opt = self
                         .read_buf
                         .unread()
-                        .get(HEADER_LEN..total_len)
-                        .unwrap_or(&[]);
+                        .get(HEADER_LEN..total_len);
+                    debug_assert!(
+                        payload_opt.is_some(),
+                        "DEF-182: payload slice .get(HEADER_LEN..total_len) \
+                         None — crate bug (length check + parse_header \
+                         invariant prove the range valid). DEF-154 (B) \
+                         witness-with-brand will eliminate the class \
+                         structurally.",
+                    );
+                    let payload = payload_opt.unwrap_or(&[]);
                     if tag == crate::wire::TAG_PARAMETER_STATUS
                         && allows_unsolicited_param_status(&self.state)
                     {
@@ -1960,7 +1980,27 @@ fn materialise<'w, 'r>(
                 // validated at emission. `apply(write_buf_bytes)`
                 // can only be None if the buffer is shorter than
                 // emission-time — architecturally the same buffer.
-                Action::SendBytes(range.apply(write_buf_bytes).unwrap_or(&[]))
+                //
+                // DEF-182 (symmetric with DEF-170): the None branch
+                // is architecturally dead but the unshielded
+                // `unwrap_or(&[])` silently degraded to an empty
+                // frame — a wire-level correctness break: the
+                // caller would send a 0-byte SendBytes action where
+                // a multi-byte PG frame was expected, producing a
+                // malformed protocol exchange downstream. Debug
+                // build now fires loud on the dead branch; release
+                // preserves the `&[]` fallback (forbid-bundle bans
+                // panic). DEF-154 (B) buffer-witness-with-brand
+                // will eliminate the class structurally.
+                let applied = range.apply(write_buf_bytes);
+                debug_assert!(
+                    applied.is_some(),
+                    "DEF-182: NonEmptyRange.apply(write_buf) None — crate \
+                     bug (range was constructed from this buffer at \
+                     emission). DEF-154 (B) witness-with-brand will \
+                     eliminate the class structurally.",
+                );
+                Action::SendBytes(applied.unwrap_or(&[]))
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
             // DEF-112 + DEF-119: `DeliverReplyEntry` carries a
@@ -2005,9 +2045,29 @@ fn materialise<'w, 'r>(
                      crate bug; DEF-154 witness-pattern will eliminate \
                      this class structurally.",
                 );
+                // DEF-182 (symmetric with DEF-170): the
+                // `row_range.apply(read_buf_bytes)` None branch is
+                // architecturally dead — the row_range was
+                // constructed from this read buffer at the same
+                // `feed_bytes` call, and the `'r` borrow on
+                // OutActions blocks buffer mutation until the
+                // caller drops the returned actions. Unshielded
+                // `unwrap_or(&[])` silently degraded to an empty
+                // row — user-boundary correctness break (caller
+                // sees a zero-column DataRow where a multi-column
+                // row was on the wire). Debug loud; release
+                // preserves the `&[]` fallback.
+                let row_bytes_opt = row_range.apply(read_buf_bytes);
+                debug_assert!(
+                    row_bytes_opt.is_some(),
+                    "DEF-182: NonEmptyRange.apply(read_buf) None at \
+                     StreamRowRange — crate bug (range was constructed \
+                     from this buffer this call). DEF-154 (B) witness-\
+                     with-brand will eliminate the class structurally.",
+                );
                 Action::StreamRow {
                     id,
-                    row_bytes: row_range.apply(read_buf_bytes).unwrap_or(&[]),
+                    row_bytes: row_bytes_opt.unwrap_or(&[]),
                     desc: desc_opt.unwrap_or(&crate::decode::RowDesc::EMPTY),
                 }
             }

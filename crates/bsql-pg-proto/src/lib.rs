@@ -259,8 +259,8 @@ const _: fn() = || {
 //   ProtoState:     1224  (unchanged — SCRAM dominant, still 1224)
 //   PgProtocol:     6272  (added 528 B arena, other shrinkage offset net)
 // Post-DEF-148 measurements (aarch64-apple-darwin, 2026-04-22):
-//   SchemaSlab size grew ~528 → ~536 B (+8: generations array + has_any).
-//   PgProtocol:     6280  (+8 absorbed in the arena slot).
+//   SchemaSlab: ~520 B (post-DEF-171 has_any deleted; 528 B → ~520 B).
+//   PgProtocol:     6272  (DEF-119 baseline preserved after DEF-171 drop).
 //   Other types unchanged (SchemaRef grew 1 → 2 B but lived inside
 //   Option<SchemaRef> which was already 2 B; state-variant padding absorbs).
 // ---------------------------------------------------------------------
@@ -315,11 +315,10 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() >= 6272
         && core::mem::size_of::<protocol::PgProtocol>() <= 6288,
-    "PgProtocol size drift — post-DEF-148 actual is 6280 B (DEF-119 \
-     baseline 6272 + 8 B SchemaSlab generations/has_any). Range \
-     [6272, 6288] catches regressions in both directions. Budget: \
-     ReadBuf 4096 + state ~1224 + session_params ~420 + schema_arena \
-     ~536 + padding.",
+    "PgProtocol size drift — post-DEF-171 (has_any deleted) actual \
+     is ~6272 B, matching the DEF-119 baseline. Range [6272, 6288] \
+     catches regressions in both directions. Budget: ReadBuf 4096 + \
+     state ~1224 + session_params ~420 + schema_arena ~520 + padding.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static, 'static>>() >= 2496
