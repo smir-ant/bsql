@@ -2967,6 +2967,87 @@ Scheduled after (B). Combines buffer-witness + arena-witness
 (C shipped) to make stale SchemaRef detection compile-time (upgrade
 DEF-170 debug_asserts from runtime-check to type-system-impossible).
 
+### DEF-154 (B) Phase B4 — attempt + deferred retry
+
+**Status.** Attempted 2026-04-22 same session as B1–B3 shipped.
+Implementation ~500 LoC across action.rs / buf.rs / dispatch.rs /
+protocol.rs / write_buf.rs. Reached "library compiles; tests don't"
+state. Rolled back via `git stash` — stash message "Phase B4 attempt
+— incomplete; revisit with architect redesign". Main branch remains
+at Phase B3 scaffolding (219 tests, clean).
+
+**Lessons learned (material for architect redesign):**
+
+1. **Read-side branding requires a dispatch-loop logical cursor.**
+   `feed_bytes` calls `self.read_buf.advance(total_len)` mid-loop;
+   shared `BrandedReadBuf` borrow inside `with_branded` makes the
+   `&mut` advance a borrow-checker conflict. The fix is to convert
+   the physical advance to a logical cursor, applying the cumulative
+   advance after the branded scope exits. This is a separate +100 LoC
+   refactor. Scoping B4 to write-side-only + keeping read-side on
+   DEF-182 tier-2 is the pragmatic split.
+
+2. **`with_branded` must take `&'w mut self` (explicit `'w`), not
+   `&mut self`.** The elided `&mut self` lifetime is ephemeral to
+   the method call and shorter than the caller's `'w`. Slices
+   derived from the branded buffer inside the closure cannot
+   escape as `&'w [u8]` unless `'w` is explicitly propagated. Fix:
+   sig = `fn with_branded<'w, R, F>(&'w mut self, f: F) -> R where
+   F: for<'brand> FnOnce(BrandedWriteBuf<'brand, 'w>) -> R`.
+
+3. **`into_bytes_branded(self) -> BrandedBytes<'brand, 'a>`
+   needed alongside `as_bytes_branded(&self) -> BrandedBytes<'brand,
+   '_>`.** The consuming form yields the full `'a` lifetime for
+   materialise's unbranding boundary (where slices must be `&'w
+   [u8]`); the borrowing form is kept for tests + multi-access in
+   the same branded scope.
+
+4. **`StagedAction` must gain a `<'wb>` brand parameter.** Every
+   variant's construction site must thread the brand; `StagedActions`
+   (alias) inherits it; `compute_push_*` all become
+   `<'wb, 'rb>`-generic (or `<'wb>`-only for write-side-only B4).
+
+5. **Dispatch + sub-functions + `DispatchOutcome` all become
+   `<'wb>`-generic.** ~10 functions in dispatch.rs sign with `'wb`:
+   `dispatch`, `errored`, `internal_bug`,
+   `dispatch_auth_in_startup_{trust,scram}`,
+   `dispatch_auth_sasl_{continue,final,ok_after_scram}`,
+   `advance_to_{awaiting_rfq, bindexecute_awaiting_rfq_select,
+   drain_after_error}`, `stream_row_or_errored`, plus
+   `build_sasl_initial_response`. SCRAM auth builders migrate via
+   the `as_write_buf_mut()` escape hatch (same pattern as
+   `ParamsWriter` in `build_bind_message`).
+
+6. **Test observation mechanism required — `StagedAction<'wb>`
+   cannot leak out of its branded scope.** Options:
+   - (a) `StagedObs` brand-free observation type that copies the
+     visible data; requires `ProtocolError: Clone` or a kind-only
+     discriminant for `FailReply`.
+   - (b) Closure-based `compute_staged(cmd, state, |new_state,
+     &staged| { /* assertions */ })` — ~20 test call sites
+     rewrite.
+   Option (b) is cleaner but larger surgery.
+
+7. **`deliver<K>(id, payload) -> StagedAction<'_>` needs a
+   phantom `'wb`** since none of its variants carry the brand but
+   the enum does.
+
+**Retry plan.**
+- [ ] `architect` design pass covering (1)–(7) with concrete
+      signatures before code work resumes.
+- [ ] Accept write-side-only tier-1 scope for Phase B4; register a
+      separate DEF-154 (E) for the dispatch-loop logical-cursor
+      refactor that unblocks read-side tier-1.
+- [ ] Pick test observation mechanism (a vs b) with architect
+      guidance.
+- [ ] Single atomic B4 commit once all pieces compile together.
+
+**Stash preserved:**
+`git stash list | grep "Phase B4 attempt"` recovers the
+in-progress code. Don't try to un-stash onto main without the
+design pass — the incremental path landed a half-migration that
+the stashed work completed to a compiling lib but broken tests.
+
 ### DEF-182 — symmetric silent-fallback shields at NonEmptyRange.apply + payload extraction — SHIPPED
 
 **Shipped** 2026-04-22 (same session as DEF-154 (C)).
