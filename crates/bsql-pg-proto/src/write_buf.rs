@@ -834,6 +834,35 @@ impl<'brand> BrandedBytes<'brand, 'static> {
 }
 
 #[cfg(test)]
+impl<'brand, 'a> BrandedBytes<'brand, 'a> {
+    /// Crate-internal factory: wrap a raw `&'a [u8]` with brand
+    /// `'brand`. Used by the symmetric `BrandedReadBuf` in `buf.rs`
+    /// (Phase B2) so both sides can produce [`BrandedBytes`] without
+    /// duplicating the struct field layout across modules.
+    ///
+    /// # Not escape-hatchable
+    ///
+    /// This constructor is `pub(crate)`. In PRODUCTION call sites
+    /// (Phase B3+) it is reached only from inside a `with_branded`
+    /// closure — where `'brand` is HRTB-fresh. The generative
+    /// contract is preserved because callers have no way to name
+    /// `'brand` from outside the closure, so they cannot construct
+    /// a `BrandedBytes<'wrong_brand, '_>` on a buffer of a
+    /// different brand.
+    ///
+    /// Phase B3 may relocate this to a dedicated `crate::brand`
+    /// module alongside `BrandedRange` / `WriteRange` / `ReadRange`.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_slice_branded(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            _brand: PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
 impl fmt::Debug for BrandedBytes<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BrandedBytes")
