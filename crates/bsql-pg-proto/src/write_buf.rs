@@ -654,14 +654,9 @@ impl<'brand, 'a> BrandedBytes<'brand, 'a> {
     /// duplicating the struct field layout across modules.
     ///
     /// DEF-154 (B+E): factory used by `BrandedReadBuf`'s production
-    /// accessors (post-E) + Phase B3 tests. Production
+    /// accessors + Phase B3 tests. Production
     /// `BrandedWriteBuf::into_bytes_branded` constructs via direct
     /// struct literal instead.
-    ///
-    /// Currently `#[cfg(test)]`-gated — callers are the cfg(test)
-    /// `BrandedReadBuf` scaffolding pending DEF-154 (E) production
-    /// un-gating. Will be un-gated in the full DEF-154 (E) refactor.
-    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) const fn from_slice_branded(bytes: &'a [u8]) -> Self {

@@ -408,10 +408,7 @@ impl<'brand> WriteRange<'brand> {
 /// Generatively-branded range into an inbound [`crate::buf::ReadBuf`].
 ///
 /// Symmetric partner to [`WriteRange<'brand>`] on the read side.
-/// DEF-154 (B) Phase B4: scaffolding retained under `#[cfg(test)]`
-/// pending DEF-154 (E) — the dispatch-loop logical-cursor refactor
-/// required to lift read-side to tier-1.
-#[cfg(test)]
+/// DEF-154 (E): production-visible post read-side tier-1 lift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReadRange<'brand> {
     /// Underlying non-empty range (see [`WriteRange::inner`]).
@@ -420,14 +417,14 @@ pub(crate) struct ReadRange<'brand> {
     _brand: core::marker::PhantomData<fn(&'brand ()) -> &'brand ()>,
 }
 
-#[cfg(test)]
 impl<'brand> ReadRange<'brand> {
     /// Brand a raw [`NonEmptyRange`] — crate-internal factory.
     ///
-    /// Same mechanics as [`WriteRange::from_raw`] but for the read
-    /// side. Used internally by `new` after construction-bounds
-    /// validation; direct callers should prefer [`Self::new`]
-    /// which threads the brand through the bounds-check witness.
+    /// Production callers should prefer [`Self::new`] which
+    /// threads the brand through a same-brand bounds-check
+    /// witness (tier-1 soundness for apply). This raw form is
+    /// kept for drift tests and corner cases where the witness
+    /// shape doesn't fit.
     #[inline]
     #[must_use]
     pub(crate) const fn from_raw(inner: NonEmptyRange) -> Self {
@@ -437,32 +434,79 @@ impl<'brand> ReadRange<'brand> {
         }
     }
 
-    // DEF-154 (B) Phase B4: `ReadRange::new(start, end, witness)`
-    // tier-1 constructor deferred to DEF-154 (E) — the dispatch-
-    // loop logical-cursor refactor that unblocks read-side
-    // branding. The scaffolding stays as test-only infrastructure.
+    /// DEF-154 (E) tier-1 constructor — validate bounds against a
+    /// same-brand witness.
+    ///
+    /// `witness: BrandedBytes<'brand, '_>` is the read buffer's
+    /// branded view (typically from `BrandedReadBuf::populated_branded()`);
+    /// its brand `'brand` matches the range's own `'brand` by the
+    /// HRTB closure's generativity. `start..end` is validated
+    /// against `witness.as_slice().len()`; if within bounds, the
+    /// returned `ReadRange<'brand>` carries the proof that `apply`
+    /// will succeed against any same-brand bytes (non-shrinking
+    /// invariant enforced by `BrandedReadBuf`'s API narrow — no
+    /// truncating ops reachable outside the explicit
+    /// `advance_scope_local` / `clear_scope_local` mutations, and
+    /// those happen AFTER all range-construction sites per the
+    /// feed_bytes dispatch-loop discipline).
+    ///
+    /// # Err classification (P0-2 pattern, mirror of write side)
+    ///
+    /// `CrateBugLocus::EmptyReadRange` on `NonEmptyRange::new` None —
+    /// indicates dispatch computed `payload_start..payload_end`
+    /// bounds that don't fit the current populated region. Routes
+    /// through `DispatchOutcome::Errored` → `FailReply + CloseSocket`.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Err carries ProtocolError (~300 B, large_enum_variant \
+                  already accepted on ProtocolError). Cold path (dispatch \
+                  arm invariant break); by-value matches dispatch's \
+                  DispatchOutcome::Errored surface."
+    )]
+    #[inline]
+    pub(crate) fn new(
+        start: usize,
+        end: usize,
+        witness: crate::write_buf::BrandedBytes<'brand, '_>,
+    ) -> Result<Self, crate::error::ProtocolError> {
+        match NonEmptyRange::new(start, end, witness.as_slice().len()) {
+            Some(raw) => Ok(Self::from_raw(raw)),
+            None => Err(crate::error::ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::EmptyReadRange,
+            }),
+        }
+    }
 
     /// Apply the range to same-branded bytes — **infallible**.
     ///
-    /// See [`WriteRange::apply`] for the tier-1 soundness argument;
-    /// the read-side analogue follows identically from
-    /// [`crate::buf::BrandedReadBuf`]'s API narrow (no mutating ops
-    /// reachable inside the branded scope).
+    /// Tier-1 soundness chain (mirror of `WriteRange::apply`):
+    /// 1. Same `'brand` ⇒ same `with_branded` closure ⇒ same
+    ///    `&mut ReadBuf`.
+    /// 2. `BrandedReadBuf` exposes only shared views
+    ///    (`populated_branded`, `unread_branded`) + scope-local
+    ///    mutations (`advance_scope_local`, `clear_scope_local`).
+    ///    The mutations don't shrink populated content; advance
+    ///    bumps the cursor but bytes remain in `populated()`.
+    /// 3. `ReadRange::new(start, end, witness)` validated
+    ///    `end <= witness.len()` at construction; (2) preserves
+    ///    that bound through subsequent apply.
+    /// 4. `NonEmptyRange::apply` body is `buf.get(start..end)` —
+    ///    Some by (3). The `unwrap_or(&[])` fallback is forbid-
+    ///    bundle compliance; architecturally dead under intact
+    ///    brand discipline.
+    ///
+    /// No `debug_assert` shield — the class is closed structurally
+    /// by the brand + bounds-validated constructor.
     #[inline]
     #[must_use]
     pub(crate) fn apply<'a>(&self, bytes: crate::write_buf::BrandedBytes<'brand, 'a>) -> &'a [u8] {
-        let slice = self.inner.apply(bytes.as_slice());
-        debug_assert!(
-            slice.is_some(),
-            "ReadRange<'brand>::apply None — brand invariant broken. \
-             See action.rs Phase B3 block comment; crate bug in brand \
-             scaffolding, not a usage error.",
-        );
-        slice.unwrap_or(&[])
+        self.inner.apply(bytes.as_slice()).unwrap_or(&[])
     }
 
-    /// Access the underlying [`NonEmptyRange`] — for debug + drift
-    /// tests.
+    /// Access the underlying [`NonEmptyRange`] — for drift pins +
+    /// tests. Production materialise path applies via `apply` +
+    /// branded witness; direct unwrap is test-only.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) const fn inner(&self) -> NonEmptyRange {
@@ -476,7 +520,6 @@ const _: () = assert!(
     core::mem::size_of::<WriteRange<'_>>() == core::mem::size_of::<NonEmptyRange>(),
     "WriteRange<'brand> size regression — brand phantom must be ZST (4 B total).",
 );
-#[cfg(test)]
 const _: () = assert!(
     core::mem::size_of::<ReadRange<'_>>() == core::mem::size_of::<NonEmptyRange>(),
     "ReadRange<'brand> size regression — brand phantom must be ZST (4 B total).",
@@ -854,7 +897,7 @@ impl<'w, 'r> Iterator for OutActionsIter<'w, 'r> {
 /// than POD, smaller surface than `unsafe`, same memory footprint.
 /// Future "consistency" refactors must address all three points
 /// before proposing the change.
-pub(crate) type StagedActions<'wb> = heapless::Vec<StagedAction<'wb>, MAX_ACTIONS_PER_CALL>;
+pub(crate) type StagedActions<'wb, 'rb> = heapless::Vec<StagedAction<'wb, 'rb>, MAX_ACTIONS_PER_CALL>;
 
 /// A directive from the protocol to its host.
 ///
@@ -1028,7 +1071,7 @@ pub enum Action<'w, 'r> {
 ///   copy — `Sync` bypasses `write_buf` entirely).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable. Mirrors the `Action<'w, 'r>` rationale above — DEF-119 shrunk the DeliverReply payload; FailReply.cause (ProtocolError) dominates. FailReply is cold-path.")]
-pub(crate) enum StagedAction<'wb> {
+pub(crate) enum StagedAction<'wb, 'rb> {
     /// Bytes live at the range `[start..start+len]` inside the
     /// emission-time branded `write_buf` (brand `'wb`). Typed as
     /// [`WriteRange<'wb>`] — brand proves buffer-identity +
@@ -1071,13 +1114,10 @@ pub(crate) enum StagedAction<'wb> {
         /// `CommandComplete`).
         id: NonZeroU64,
         /// Absolute range into the read buffer's populated region.
-        /// NonEmptyRange (unbranded) — the read side retains
-        /// DEF-182 tier-2 debug_assert shielding in Phase B4
-        /// because migrating the dispatch loop to a logical-cursor
-        /// shape inside a branded scope is a separate, larger
-        /// refactor. A future phase (provisionally DEF-154 (E))
-        /// addresses it.
-        row_range: NonEmptyRange,
+        /// DEF-154 (E): `ReadRange<'rb>` — brand proves buffer-
+        /// identity with the read scope; `apply` at materialise
+        /// time is tier-1 infallible.
+        row_range: ReadRange<'rb>,
         /// Schema arena handle (copy from StreamingRows state).
         ///
         /// DEF-119: 1-byte `SchemaRef` handle instead of the prior
@@ -1088,31 +1128,33 @@ pub(crate) enum StagedAction<'wb> {
     },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,
-    /// DEF-154 (B) Phase B4 brand-lifetime anchor.
+    /// DEF-154 (B+E) brand-lifetime anchor for BOTH `'wb` and `'rb`.
     ///
     /// `'wb` is carried by [`Self::SendBytesRange`] via
-    /// [`WriteRange<'wb>`]. This variant ensures `'wb` is *always*
-    /// used at the enum level, preventing `unused_lifetime` lints
-    /// when a downstream author constructs only non-branded
-    /// variants in a scope.
+    /// [`WriteRange<'wb>`]; `'rb` by [`Self::StreamRowRange`] via
+    /// [`ReadRange<'rb>`]. This variant anchors BOTH so that
+    /// variants not carrying either brand still fix the lifetime
+    /// parameters at the enum level. Tuple of two invariant
+    /// phantom-fn pointers keeps both brands invariant under
+    /// subtyping.
     ///
     /// # NEVER CONSTRUCT THIS VARIANT
     ///
-    /// It is a phantom marker. Rust's exhaustive-match checking
-    /// requires handling it in every `match`; handle it as a
-    /// no-op (e.g. `continue` in loops, return a neutral `Ok(())`
-    /// in fallible functions). `_Phantom` uses the invariant
-    /// phantom-fn pointer (see
-    /// [`crate::write_buf::BrandedWriteBuf`] block comment) so the
-    /// brand cannot be subtyped away.
-    ///
-    /// Construction would be a crate bug; no observable effect
-    /// because it carries no data — but a test that constructs it
-    /// would break the "never happens" contract that the
-    /// downstream match arms rely on.
+    /// See `StagedAction`'s original `_Phantom` doc for the full
+    /// contract. Match arms handle as neutral no-op.
     #[doc(hidden)]
-    _Phantom(core::marker::PhantomData<fn(&'wb ()) -> &'wb ()>),
+    _Phantom(DualBrandInvariant<'wb, 'rb>),
 }
+
+/// DEF-154 (E): invariant-anchor for both `'wb` and `'rb`.
+/// Factored out of `StagedAction::_Phantom` to silence
+/// clippy::type_complexity on the enum definition. ZST; matches
+/// the pair of `fn(&'X ()) -> &'X ()` phantom-fn-pointers pattern
+/// from Phase B1 (see `write_buf.rs` "Invariance mechanism" block).
+pub(crate) type DualBrandInvariant<'wb, 'rb> = core::marker::PhantomData<(
+    fn(&'wb ()) -> &'wb (),
+    fn(&'rb ()) -> &'rb (),
+)>;
 
 /// Internal lifetime-free counterpart to the public [`Reply<'r>`].
 ///
@@ -1429,10 +1471,10 @@ pub(crate) use deliver_entry_priv::DeliverReplyEntry;
 /// `ReplyKind::StagedPayload`.
 #[inline]
 #[must_use]
-pub(crate) fn deliver<'wb, K: crate::reply_id::ReplyKind>(
+pub(crate) fn deliver<'wb, 'rb, K: crate::reply_id::ReplyKind>(
     id: crate::reply_id::ReplyId<K>,
     payload: K::StagedPayload,
-) -> StagedAction<'wb> {
+) -> StagedAction<'wb, 'rb> {
     StagedAction::DeliverReply(DeliverReplyEntry::new(id.consume(), payload.into()))
 }
 

@@ -17,7 +17,7 @@ use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
 use crate::command::PgCommand;
 use crate::dispatch::{
-    AbsFrameStart, DispatchOutcome, FrameCoords, FrameTotalLen, PopulatedLen, dispatch,
+    AbsFrameStart, DispatchOutcome, FrameCoords, FrameTotalLen, dispatch,
 };
 use crate::error::ProtocolError;
 use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
@@ -362,20 +362,30 @@ impl PgProtocol {
         // DEF-154 (B): write-side branded scope for tier-1 apply;
         // read-side uses unbranded &[u8] (push paths don't emit
         // ReadRange so read-branding would be phantom; a future
-        // DEF-154 (E) brings read-side into tier-1 too).
+        // DEF-154 (E): push paths have no inbound read activity,
+        // but materialise signature now takes BrandedBytes<'rb, 'r>
+        // for the read side. Wrap self.read_buf in a (phantom)
+        // branded scope to produce the witness — into_populated_branded
+        // yields an empty branded view since read_buf.populated() is
+        // empty in the push context (server hasn't responded yet).
+        let state = &mut self.state;
+        let read_buf = &mut self.read_buf;
+        let schema_arena = &mut self.schema_arena;
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
-            let prev = core::mem::take(&mut self.state);
-            let (new_state, staged) = {
-                let mut reserved = wb.reserve();
-                compute_push(cmd, prev, &mut reserved)
-            };
-            self.state = new_state;
-            materialise(
-                staged,
-                wb.into_bytes_branded(),
-                &[],
-                self.schema_arena.as_reader(),
-            )
+            read_buf.with_branded(|rb| {
+                let prev = core::mem::take(state);
+                let (new_state, staged) = {
+                    let mut reserved = wb.reserve();
+                    compute_push(cmd, prev, &mut reserved)
+                };
+                *state = new_state;
+                materialise(
+                    staged,
+                    wb.into_bytes_branded(),
+                    rb.into_populated_branded(),
+                    schema_arena.as_reader(),
+                )
+            })
         })
     }
 
@@ -455,33 +465,39 @@ impl PgProtocol {
             None => None,
         };
 
-        // DEF-154 (B) write-side branded scope — see push_command
-        // for rationale. Push paths don't emit ReadRange; read-side
-        // materialise input is an empty `&[]`.
+        // DEF-154 (B+E) branded scopes — same shape as push_command.
+        // Push paths don't emit ReadRange; read-side materialise
+        // input comes from rb.into_populated_branded() on the
+        // (empty) read buffer.
+        let state = &mut self.state;
+        let read_buf = &mut self.read_buf;
+        let schema_arena = &mut self.schema_arena;
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
-            let prev = core::mem::take(&mut self.state);
-            let mut staged = StagedActions::new();
-            let new_state = {
-                let mut reserved = wb.reserve();
-                compute_push_bind_execute(
-                    prev,
-                    portal_name,
-                    stmt_name,
-                    params,
-                    schema_ref,
-                    fetch,
-                    reply,
-                    &mut staged,
-                    &mut reserved,
+            read_buf.with_branded(|rb| {
+                let prev = core::mem::take(state);
+                let mut staged = StagedActions::new();
+                let new_state = {
+                    let mut reserved = wb.reserve();
+                    compute_push_bind_execute(
+                        prev,
+                        portal_name,
+                        stmt_name,
+                        params,
+                        schema_ref,
+                        fetch,
+                        reply,
+                        &mut staged,
+                        &mut reserved,
+                    )
+                };
+                *state = new_state;
+                materialise(
+                    staged,
+                    wb.into_bytes_branded(),
+                    rb.into_populated_branded(),
+                    schema_arena.as_reader(),
                 )
-            };
-            self.state = new_state;
-            materialise(
-                staged,
-                wb.into_bytes_branded(),
-                &[],
-                self.schema_arena.as_reader(),
-            )
+            })
         })
     }
 
@@ -505,379 +521,321 @@ impl PgProtocol {
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 'r> {
         write_buf.clear();
-
-        // DEF-119 arena cleanup — any prior OutActions<'_, 'r_prev>
-        // has drained (borrow checker enforces it before this
-        // `&'r mut self` call). DEF-172: centralised via helper.
         self.clear_arena_if_idle_or_errored();
 
-        // F66 (pass #6 audit): if the connection is already Errored,
-        // drop the incoming bytes and return an empty OutActions.
-        // Also clear `read_buf` — post-Close bytes are wire-garbage.
-        if matches!(self.state, ProtoState::Errored(_)) {
-            self.read_buf.clear();
+        // F66: already-Errored state — handled inline (no nested
+        // closures to escape borrow through).
+        let is_errored = matches!(self.state, ProtoState::Errored(_));
+
+        // DEF-154 (E): pre-append path needs `&mut self.read_buf`
+        // without a branded borrow held. If overflow, classify before
+        // entering any branded scope.
+        let append_err = if is_errored {
+            None
+        } else {
+            self.read_buf.append(bytes).err()
+        };
+
+        // DEF-154 (E): field-level destructure. Closures CANNOT see
+        // disjoint field borrows through `self`; if `self.X` is used
+        // inside a closure, the closure captures `self` wholesale,
+        // conflicting with any sibling `self.Y` borrow. Splitting
+        // into separate local bindings lets each closure capture a
+        // single field ref — disjoint access restored.
+        //
+        // Lifetimes: all four bindings have the method's call lifetime
+        // (implicitly `'_`), which is tied to `&'r mut self`. Inside
+        // the branded scopes below, these refs are live for the
+        // closure-body extent — exactly what's needed.
+        let state = &mut self.state;
+        let read_buf = &mut self.read_buf;
+        let session_params = &mut self.session_params;
+        let schema_arena = &mut self.schema_arena;
+
+        // F66 / ReadBufFull fast paths — both wrap read_buf in its
+        // own brand scope (clear_scope_local); state / schema_arena
+        // accessed through the destructured locals, NOT `self`.
+        if is_errored {
             return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                let staged: StagedActions<'_> = StagedActions::new();
-                materialise(
-                    staged,
-                    wb.into_bytes_branded(),
-                    self.read_buf.populated(),
-                    self.schema_arena.as_reader(),
-                )
+                read_buf.with_branded(|mut rb| {
+                    rb.clear_scope_local();
+                    let staged: StagedActions<'_, '_> = StagedActions::new();
+                    materialise(
+                        staged,
+                        wb.into_bytes_branded(),
+                        rb.into_populated_branded(),
+                        schema_arena.as_reader(),
+                    )
+                })
             });
         }
 
-        // Append into the bounded buffer. Overflow → fatal.
-        if let Err(ReadBufFull {
+        if let Some(ReadBufFull {
             attempted,
             available,
-        }) = self.read_buf.append(bytes)
+        }) = append_err
         {
             return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                let mut staged: StagedActions<'_> = StagedActions::new();
-                self.fail_inflight_and_close(
-                    ProtocolError::ReadBufferFull {
-                        attempted,
-                        available,
-                    },
-                    &mut staged,
-                );
-                materialise(
-                    staged,
-                    wb.into_bytes_branded(),
-                    self.read_buf.populated(),
-                    self.schema_arena.as_reader(),
-                )
+                // Fail path: state mutation + staged actions live
+                // WITH the inner read_buf.with_branded scope so
+                // their brand lifetimes (`'wb`, `'rb`) bind to the
+                // materialise inputs uniformly. Placing `staged`
+                // outside the inner closure would force its brand
+                // to unify across outer vs inner scopes, which
+                // generativity forbids.
+                read_buf.with_branded(|mut rb| {
+                    let mut staged: StagedActions<'_, '_> = StagedActions::new();
+                    fail_inflight_no_readbuf(
+                        state,
+                        ProtocolError::ReadBufferFull { attempted, available },
+                        &mut staged,
+                    );
+                    rb.clear_scope_local();
+                    materialise(
+                        staged,
+                        wb.into_bytes_branded(),
+                        rb.into_populated_branded(),
+                        schema_arena.as_reader(),
+                    )
+                })
             });
         }
 
-        // DEF-154 (B): main branded scope — dispatch loop uses
-        // &mut reserved for write-side tier-1 WriteRange production;
-        // materialise at the end consumes wb for infallible apply.
+        // MAIN DISPATCH + MATERIALISE BRANDED SCOPE.
+        // Single read-brand window spans both phases — ReadRange<'rb>
+        // constructed at dispatch applies against BrandedBytes<'rb, 'r>
+        // at materialise without brand mismatch.
         write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
-            let mut staged: StagedActions<'_> = StagedActions::new();
-            {
+            read_buf.with_branded(|mut rb| {
+                let mut staged: StagedActions<'_, '_> = StagedActions::new();
+                let mut frames_consumed: usize = 0_usize;
+                let mut clear_after_loop = false;
+
+                // Dispatch loop in its own block: `reserved` holds
+                // `&mut wb.buf`, which must be released before
+                // `wb.into_bytes_branded()` runs post-loop. Block
+                // scope ends `reserved`'s borrow at the `}` — NLL
+                // releases automatically, no explicit drop needed
+                // (BrandedWriteReserved is not Drop; `drop()` would
+                // be a clippy::drop_non_drop).
+                {
                 let mut reserved = wb.reserve();
-                Self::dispatch_loop(self, &mut reserved, &mut staged);
-            }
-            materialise(
-                staged,
-                wb.into_bytes_branded(),
-                self.read_buf.populated(),
-                self.schema_arena.as_reader(),
-            )
+                loop {
+                    // Logical-cursor peek: unread bytes minus the
+                    // in-scope-consumed prefix. `frames_consumed`
+                    // is addend-only; each increment is gated on
+                    // `after_consumed.len() >= total_len` so the
+                    // slice is always in bounds.
+                    let after_consumed = rb
+                        .unread_branded()
+                        .as_slice()
+                        .get(frames_consumed..)
+                        .unwrap_or(&[]);
+
+                    let header = parse_header(after_consumed);
+                    match header {
+                        HeaderParse::Empty | HeaderParse::Incomplete => break,
+                        HeaderParse::MalformedLength { declared } => {
+                            fail_inflight_no_readbuf(
+                                state,
+                                ProtocolError::MalformedFrameLength { declared },
+                                &mut staged,
+                            );
+                            clear_after_loop = true;
+                            break;
+                        }
+                        HeaderParse::FrameTooLarge { declared } => {
+                            fail_inflight_no_readbuf(
+                                state,
+                                ProtocolError::FrameTooLarge { declared },
+                                &mut staged,
+                            );
+                            clear_after_loop = true;
+                            break;
+                        }
+                        HeaderParse::Ok { tag, total_len } => {
+                            if after_consumed.len() < total_len {
+                                break;
+                            }
+                            // DEF-182 site 1 (payload extraction):
+                            // length-arith invariant — parse_header Ok
+                            // ⇒ total_len >= HEADER_LEN; the len-check
+                            // above ensures total_len <= after_consumed
+                            // .len(). Classified as tier-2 structural
+                            // shield (architecturally dead None). NOT
+                            // closed by DEF-154 (E) — brand doesn't help
+                            // at length-arith; separate refactor needed.
+                            let payload_opt =
+                                after_consumed.get(HEADER_LEN..total_len);
+                            debug_assert!(
+                                payload_opt.is_some(),
+                                "DEF-182: payload slice .get(HEADER_LEN..total_len) None",
+                            );
+                            let payload = payload_opt.unwrap_or(&[]);
+
+                            // Pre-dispatch filters: ParameterStatus /
+                            // NoticeResponse bump the logical cursor
+                            // and continue without dispatching.
+                            if tag == crate::wire::TAG_PARAMETER_STATUS
+                                && allows_unsolicited_param_status(state)
+                            {
+                                match record_param_status(
+                                    session_params,
+                                    payload,
+                                ) {
+                                    ParamStatusRecordOutcome::Processed
+                                    | ParamStatusRecordOutcome::MalformedPayload => {}
+                                }
+                                frames_consumed =
+                                    frames_consumed.saturating_add(total_len);
+                                continue;
+                            }
+                            if tag == crate::wire::TAG_NOTICE_RESPONSE {
+                                frames_consumed =
+                                    frames_consumed.saturating_add(total_len);
+                                continue;
+                            }
+
+                            // FrameCoords absolute offsets. Cursor
+                            // position PLUS logical-consumed: the
+                            // physical cursor stays put (no in-scope
+                            // advance) so `cursor_position() +
+                            // frames_consumed` is the absolute
+                            // frame_start into populated(). populated
+                            // bytes are UNCHANGED inside the rb scope
+                            // (no mutation exposed beyond
+                            // advance_scope_local + clear_scope_local,
+                            // and those fire OUTSIDE the loop below).
+                            let abs_frame_start = rb
+                                .cursor_position_scope_local()
+                                .saturating_add(frames_consumed);
+                            let frame_start = AbsFrameStart::new(abs_frame_start);
+                            let frame_len = FrameTotalLen::new(total_len);
+
+                            if staged
+                                .len()
+                                .saturating_add(WORST_CASE_PER_DISPATCH)
+                                > MAX_ACTIONS_PER_CALL
+                            {
+                                break;
+                            }
+
+                            let prev = core::mem::take(state);
+                            let mut arena_writer = schema_arena.as_writer();
+                            let read_witness = rb.populated_branded();
+                            let outcome = dispatch(
+                                prev,
+                                tag,
+                                payload,
+                                &mut reserved,
+                                &mut arena_writer,
+                                FrameCoords::new(frame_start, frame_len),
+                                read_witness,
+                            );
+                            match outcome {
+                                DispatchOutcome::AdvancedSilent { new_state } => {
+                                    *state = new_state;
+                                    frames_consumed =
+                                        frames_consumed.saturating_add(total_len);
+                                }
+                                DispatchOutcome::AdvancedWithAction {
+                                    new_state,
+                                    action,
+                                } => {
+                                    *state = new_state;
+                                    frames_consumed =
+                                        frames_consumed.saturating_add(total_len);
+                                    emit_actions!(&mut staged, budget: 1, on_overflow: break, [
+                                        action,
+                                    ]);
+                                }
+                                DispatchOutcome::Errored { reply_id, cause } => {
+                                    let state_kind = cause.state_kind().unwrap_or_else(|| {
+                                        debug_assert!(
+                                            false,
+                                            "DEF-175: AlreadyClosed reached dispatch-Errored — \
+                                             impossible per DEF-142 seal.",
+                                        );
+                                        crate::error::StateErrorKind::INTERNAL_FALLBACK
+                                    });
+                                    // Install terminal state. read_buf
+                                    // clear is deferred to post-loop
+                                    // via clear_after_loop = true;
+                                    // the DEF-149 atomic-terminus
+                                    // triple (state + read_buf +
+                                    // reply_drain) is still atomic
+                                    // from the caller's perspective
+                                    // (PgProtocol is !Sync; no
+                                    // observer between scope exit
+                                    // and feed_bytes return).
+                                    let _prev = core::mem::replace(
+                                        state,
+                                        ProtoState::Errored(state_kind),
+                                    );
+                                    clear_after_loop = true;
+                                    // DEF-112: reply_id came
+                                    // pre-consumed from the dispatcher.
+                                    match reply_id {
+                                        Some(id) => {
+                                            emit_actions!(&mut staged, budget: 2, on_overflow: break, [
+                                                StagedAction::FailReply { id, cause },
+                                                StagedAction::CloseSocket,
+                                            ]);
+                                        }
+                                        None => {
+                                            emit_actions!(&mut staged, budget: 1, on_overflow: break, [
+                                                StagedAction::CloseSocket,
+                                            ]);
+                                        }
+                                    }
+                                    break;
+                                }
+                                DispatchOutcome::_Phantom(_) => {
+                                    debug_assert!(
+                                        false,
+                                        "DEF-154 (B+E): DispatchOutcome::_Phantom constructed — crate bug.",
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                } // end of reserved scope — NLL releases its &mut borrow of wb
+
+                // Post-loop logical-cursor application.
+                // - clear_after_loop: fatal path wiped buffer.
+                // - else: advance by accumulated frames_consumed.
+                // Both mutations happen via rb's scope-local methods.
+                if clear_after_loop {
+                    rb.clear_scope_local();
+                } else if frames_consumed > 0
+                    && rb.advance_scope_local(frames_consumed).is_err()
+                {
+                    // Architecturally dead: frames_consumed sums
+                    // validated total_len values against the
+                    // base populated len. Classify via field-level
+                    // fail + clear.
+                    fail_inflight_no_readbuf(
+                        state,
+                        ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                        },
+                        &mut staged,
+                    );
+                    rb.clear_scope_local();
+                }
+
+                materialise(
+                    staged,
+                    wb.into_bytes_branded(),
+                    rb.into_populated_branded(),
+                    schema_arena.as_reader(),
+                )
+            })
         })
     }
-
-    /// DEF-154 (B) Phase B4 — dispatch loop factored out of
-    /// `feed_bytes` to live inside the branded `write_buf` scope.
-    ///
-    /// The `reserved: &mut BrandedWriteReserved<'wb, '_>` parameter
-    /// carries the write-side brand into `dispatch()`; dispatch-
-    /// emitted SendBytesRange actions carry a `WriteRange<'wb>`
-    /// tied to this reserved, enabling the infallible-apply at
-    /// materialise time.
-    #[inline]
-    fn dispatch_loop<'wb>(
-        &mut self,
-        reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
-        staged: &mut StagedActions<'wb>,
-    ) {
-
-        // Drain as many complete frames as possible. Bounded by
-        // (a) `MAX_ACTIONS_PER_CALL` (emit_actions! budget overflow
-        // bails with `break`; we stop) and (b) the buffer being
-        // drained empty.
-        loop {
-            let header = parse_header(self.read_buf.unread());
-            match header {
-                HeaderParse::Empty | HeaderParse::Incomplete => break,
-                HeaderParse::MalformedLength { declared } => {
-                    self.fail_inflight_and_close(
-                        ProtocolError::MalformedFrameLength { declared },
-                        staged,
-                    );
-                    break;
-                }
-                HeaderParse::FrameTooLarge { declared } => {
-                    self.fail_inflight_and_close(
-                        ProtocolError::FrameTooLarge { declared },
-                        staged,
-                    );
-                    break;
-                }
-                HeaderParse::Ok { tag, total_len } => {
-                    if self.read_buf.unread().len() < total_len {
-                        // Body not yet fully buffered.
-                        break;
-                    }
-                    // DEF-182: the `.get(HEADER_LEN..total_len)`
-                    // None branch is architecturally dead — the
-                    // preceding length check proves
-                    // `unread().len() >= total_len`, and
-                    // `parse_header` returns `Ok` only when
-                    // `total_len >= HEADER_LEN` (encoded by the
-                    // wire-length field). Unshielded `unwrap_or(&[])`
-                    // silently degraded to an empty payload — the
-                    // downstream dispatch arms would then misclassify
-                    // (e.g. empty DataRow parsed as NoColumns, empty
-                    // ErrorResponse parsed as OK). Debug loud;
-                    // release preserves the `&[]` fallback.
-                    let payload_opt = self
-                        .read_buf
-                        .unread()
-                        .get(HEADER_LEN..total_len);
-                    debug_assert!(
-                        payload_opt.is_some(),
-                        "DEF-182: payload slice .get(HEADER_LEN..total_len) \
-                         None — crate bug (length check + parse_header \
-                         invariant prove the range valid). DEF-154 (B) \
-                         witness-with-brand will eliminate the class \
-                         structurally.",
-                    );
-                    let payload = payload_opt.unwrap_or(&[]);
-                    if tag == crate::wire::TAG_PARAMETER_STATUS
-                        && allows_unsolicited_param_status(&self.state)
-                    {
-                        // F35: outcome classified but currently both
-                        // variants consumed silently — Phase 1d will
-                        // add `Action::EmitPsAdvisory` to forward
-                        // `MalformedPayload` events to the wrapper
-                        // for proxy-interference detection.
-                        match record_param_status(&mut self.session_params, payload) {
-                            ParamStatusRecordOutcome::Processed
-                            | ParamStatusRecordOutcome::MalformedPayload => {
-                                // Phase 1c: silently consume both.
-                            }
-                        }
-                        let Ok(()) = self.read_buf.advance(total_len) else {
-                            self.fail_read_cursor_advance(staged);
-                            break;
-                        };
-                        continue;
-                    }
-
-                    // DEF-062: NoticeResponse pre-dispatch filter.
-                    // PG can emit NoticeResponse (tag 'N') in any
-                    // state — warnings that do not affect protocol
-                    // flow. Silently consume and continue; the
-                    // dispatcher never sees them. Future Phase 1c+
-                    // can replace the `continue` with an
-                    // `Action::EmitNotice(...)` emission when the
-                    // wrapper wants visibility.
-                    if tag == crate::wire::TAG_NOTICE_RESPONSE {
-                        let Ok(()) = self.read_buf.advance(total_len) else {
-                            self.fail_read_cursor_advance(staged);
-                            break;
-                        };
-                        continue;
-                    }
-
-                    // 1c-1b: absolute frame start/payload bounds into
-                    // `populated()` are stable across the upcoming
-                    // `advance` — the bytes themselves don't move
-                    // until the next `append` triggers lazy
-                    // compaction, which can't happen while
-                    // OutActions is alive. Pass to dispatch so the
-                    // DataRow arm can construct an absolute row_range.
-                    //
-                    // Typed newtypes (`AbsFrameStart`, `FrameTotalLen`,
-                    // `PopulatedLen`) — swap two args at the
-                    // `FrameCoords::new` call site below = build error.
-                    // Derived offsets (payload_start, payload_end)
-                    // live inside `FrameCoords` and cannot be
-                    // mis-ordered by a caller.
-                    // F-018 (pass-#8): private fields, explicit
-                    // `::new` constructor at each site. Swap
-                    // protection is now structural: a caller who
-                    // swapped `AbsFrameStart::new(total_len)` and
-                    // `FrameTotalLen::new(cursor_position())` would
-                    // compile but the semantic is wrong — the
-                    // typed FrameCoords::new argument order is the
-                    // only remaining shield (and is tier-1 compile
-                    // via distinct types).
-                    let frame_start = AbsFrameStart::new(self.read_buf.cursor_position());
-                    let frame_len = FrameTotalLen::new(total_len);
-                    let populated = PopulatedLen::new(self.read_buf.populated().len());
-
-                    // DEF-121 budget gate — prevent mid-transition
-                    // overflow. A dispatch iteration can emit up to
-                    // `WORST_CASE_PER_DISPATCH` (2) actions; if
-                    // staged cannot absorb them we break **before**
-                    // `core::mem::take(&mut self.state)` and
-                    // `dispatch()` — so no reply is consumed, no
-                    // state is mutated. The frame stays in the read
-                    // buffer for the next `feed_bytes` call.
-                    //
-                    // Without this gate the `on_overflow: break`
-                    // inside `emit_actions!` would fire AFTER the
-                    // dispatcher had already consumed the reply
-                    // (via `deliver()` or `errored()`) and
-                    // transitioned state — dropping the action and
-                    // orphaning the caller's oneshot. Tier-4 silent
-                    // reply loss → tier-2 structural via the gate.
-                    if staged.len().saturating_add(WORST_CASE_PER_DISPATCH)
-                        > MAX_ACTIONS_PER_CALL
-                    {
-                        break;
-                    }
-
-                    let prev = core::mem::take(&mut self.state);
-                    // DEF-154 (C): dispatch receives a writer witness,
-                    // not the full `&mut SchemaSlab`. Dispatch can
-                    // only call `alloc` — `get` / `clear` / `free`
-                    // are structurally out of reach. The writer's
-                    // mutable borrow of `self.schema_arena` ends at
-                    // the last use (the `dispatch` call) under NLL,
-                    // so subsequent `self.read_buf.advance` and
-                    // `self.replace_state_errored_and_drain` calls
-                    // in this iteration see an un-borrowed self.
-                    let mut arena_writer = self.schema_arena.as_writer();
-                    let outcome = dispatch(
-                        prev,
-                        tag,
-                        payload,
-                        reserved,
-                        &mut arena_writer,
-                        FrameCoords::new(frame_start, frame_len, populated),
-                    );
-                    match outcome {
-                        DispatchOutcome::AdvancedSilent { new_state } => {
-                            self.state = new_state;
-                            let Ok(()) = self.read_buf.advance(total_len) else {
-                                self.fail_read_cursor_advance(staged);
-                                break;
-                            };
-                        }
-                        DispatchOutcome::AdvancedWithAction { new_state, action } => {
-                            self.state = new_state;
-                            let Ok(()) = self.read_buf.advance(total_len) else {
-                                self.fail_read_cursor_advance(staged);
-                                break;
-                            };
-                            emit_actions!(staged, budget: 1, on_overflow: break, [
-                                action,
-                            ]);
-                        }
-                        DispatchOutcome::Errored { reply_id, cause } => {
-                            // DEF-061 + DEF-142: store the compact
-                            // 1-byte `StateErrorKind` in state; the
-                            // full cause goes out in the `FailReply`
-                            // below, exactly once.
-                            //
-                            // `try_from_kind` returns None ONLY for
-                            // `ErrorKind::AlreadyClosed`, which is
-                            // emitted only by
-                            // `ProtocolError::ConnectionAlreadyClosed`,
-                            // which is only constructed by the
-                            // already-Errored push paths — and those
-                            // paths never reach `dispatch` (they
-                            // short-circuit in `push_command`). The
-                            // debug_assert pins this architectural
-                            // invariant loudly in tests; release keeps
-                            // the INTERNAL_FALLBACK shield per DEF-175.
-                            // DEF-175 + DEF-176: `state_kind()` composes
-                            // `kind() + try_from_kind`; returns None
-                            // only for AlreadyClosed (DEF-142-sealed out
-                            // of dispatch paths). debug_assert pins
-                            // the dead None branch.
-                            let state_kind = cause.state_kind().unwrap_or_else(|| {
-                                debug_assert!(
-                                    false,
-                                    "DEF-175: AlreadyClosed reached dispatch-Errored — \
-                                     impossible per DEF-142 seal (ConnectionAlreadyClosed is \
-                                     only emitted from push-path on already-Errored state, \
-                                     which short-circuits before dispatch).",
-                                );
-                                crate::error::StateErrorKind::INTERNAL_FALLBACK
-                            });
-                            // DEF-168 (A001): route through the DEF-149
-                            // atomic-terminus helper. Closes the
-                            // "state-replace + read_buf.clear" pairing
-                            // that the pre-DEF-168 inline assignment
-                            // half-applied. Discards the helper's
-                            // Option<NonZeroU64> return — reply_id is
-                            // already in hand from DispatchOutcome
-                            // (dispatcher pre-consumed it).
-                            match self.replace_state_errored_and_drain(state_kind) {
-                                // Architecturally None here: self.state
-                                // was Idle post-dispatcher-mem::take, so
-                                // no inflight reply lives in it.
-                                Some(_) | None => {}
-                            }
-                            match reply_id {
-                                // DEF-112: `reply_id` is now
-                                // `Option<NonZeroU64>` — already
-                                // consumed by the dispatcher.
-                                Some(id) => {
-                                    emit_actions!(staged, budget: 2, on_overflow: break, [
-                                        StagedAction::FailReply { id, cause },
-                                        StagedAction::CloseSocket,
-                                    ]);
-                                }
-                                None => {
-                                    emit_actions!(staged, budget: 1, on_overflow: break, [
-                                        StagedAction::CloseSocket,
-                                    ]);
-                                }
-                            }
-                            break;
-                        }
-                        // DEF-154 (B) Phase B4 — _Phantom is never
-                        // constructed (lifetime anchor; see
-                        // DispatchOutcome enum doc). An empty `{}`
-                        // arm here would HANG the dispatch loop
-                        // (no advance, no break) if the invariant
-                        // ever drifted — architect audit P0-1
-                        // flagged this class. `break` + debug_assert
-                        // closes the hang class structurally: in
-                        // debug the drift fires loud; in release
-                        // the loop terminates cleanly and the
-                        // caller sees empty staged (no corruption).
-                        DispatchOutcome::_Phantom(_) => {
-                            debug_assert!(
-                                false,
-                                "DEF-154 (B) Phase B4: DispatchOutcome::_Phantom \
-                                 constructed — crate bug; see enum doc for the \
-                                 never-construct contract.",
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// DEF-177 — cold helper for the 4 ReadCursorAdvance failure
-    /// sites in `feed_bytes`.
-    ///
-    /// `ReadBuf::advance` returning Err after `parse_header` succeeded
-    /// is architecturally dead — the two checks run in the same
-    /// iteration with no interleaving mutation. The failure path
-    /// classifies as `CrateBugLocus::ReadCursorAdvance`.
-    ///
-    /// Pre-DEF-177, the 4 sites (around the NoticeResponse /
-    /// ParameterStatus / post-dispatch advance calls) open-coded:
-    ///     self.fail_inflight_and_close(
-    ///         ProtocolError::InternalCrateBug {
-    ///             locus: CrateBugLocus::ReadCursorAdvance,
-    ///         },
-    ///         &mut staged,
-    ///     );
-    /// ~6 LoC per site + inline IR cost on a hot dispatch loop.
-    /// Post-DEF-177 each site is a one-liner cold call. Audit2 A014.
-    #[cold]
-    #[inline]
-    fn fail_read_cursor_advance<'wb>(&mut self, staged: &mut StagedActions<'wb>) {
-        self.fail_inflight_and_close(
-            ProtocolError::InternalCrateBug {
-                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-            },
-            staged,
-        );
-    }
-
     /// DEF-172 — entry-point arena reclamation.
     ///
     /// If the connection state is `Idle` or `Errored`, clear the
@@ -915,144 +873,76 @@ impl PgProtocol {
         }
     }
 
-    /// DEF-149 — atomic state-terminus transition.
-    ///
-    /// Install `ProtoState::Errored(kind)`, extract any in-flight
-    /// reply's raw correlator (via the authoritative
-    /// [`ProtoState::take_inflight_reply_raw_id`] matcher), and clear
-    /// `read_buf`. Returns the extracted raw correlator so the caller
-    /// can emit `FailReply { id, cause }`.
-    ///
-    /// # Why one helper, one caller
-    ///
-    /// The three operations form ONE conceptual unit at the
-    /// state-machine-terminus boundary. A future refactor that
-    /// reorders or splits them could produce observable state where:
-    /// - state is Errored but `read_buf` still holds post-fatal bytes
-    ///   (stale parse-ahead attempts leak CPU), OR
-    /// - state is intermediate while `read_buf` is already cleared
-    ///   (a concurrent `&self` reader — if one ever lands — sees an
-    ///   inconsistent snapshot).
-    ///
-    /// Naming this triple as a single method makes the atomicity
-    /// intent visible to IDE navigation and makes drift mechanically
-    /// harder. Currently one caller
-    /// ([`Self::fail_inflight_and_close`]); the helper shape is
-    /// durable if a new fatal path is added later.
-    ///
-    /// # Tier
-    ///
-    /// Tier-3 audit ordering pairing → tier-2 structural (one body,
-    /// one ordering, one contract).
-    ///
-    /// # DEF-117 preservation
-    ///
-    /// Uses [`core::mem::replace`] (not `take` + assign) to install
-    /// the terminal state directly; there is no transient `Idle`
-    /// window a concurrent `&self` read could misread as "healthy".
-    #[inline]
-    fn replace_state_errored_and_drain(
-        &mut self,
-        kind: crate::error::StateErrorKind,
-    ) -> Option<core::num::NonZeroU64> {
-        let prev = core::mem::replace(&mut self.state, ProtoState::Errored(kind));
-        self.read_buf.clear();
-        prev.take_inflight_reply_raw_id()
-    }
 
-    /// Helper: fail any in-flight reply with `cause`, emit `CloseSocket`,
-    /// and transition the state to [`ProtoState::Errored`].
-    ///
-    /// Per-method push budget: **≤ 2** (FailReply + CloseSocket).
-    /// `MAX_ACTIONS_PER_CALL >= 2` (const-asserted) guarantees both
-    /// pushes succeed.
-    ///
-    /// If the previous state is already `Errored`, the original cause
-    /// is preserved and no new actions are emitted — the wrapper was
-    /// already told to close on the first classification; a duplicate
-    /// `CloseSocket` would only confuse it.
-    ///
-    /// Cold path: called only from fatal classifications in
-    /// `feed_bytes` (buffer-full, malformed frame, oversized frame,
-    /// broken invariant). `#[cold]` hints LLVM to lay out the caller's
-    /// hot path contiguously — this body is reachable only on the
-    /// protocol-error branch.
-    ///
-    /// # 1c-5 blocker (audit2 A030)
-    ///
-    /// The budget `2` (FailReply + CloseSocket) assumes at most one
-    /// inflight reply. Pipelining: a fatal error must fail ALL N
-    /// concurrent replies — budget becomes `1 + N`. Helper widens
-    /// alongside `take_inflight_reply_raw_id` (see A029 marker in
-    /// state.rs). Revisit per H021 witness-guard session.
-    #[cold]
-    fn fail_inflight_and_close<'wb>(
-        &mut self,
-        cause: ProtocolError,
-        staged: &mut StagedActions<'wb>,
-    ) {
-        // Already terminal: skip re-fire. The wrapper saw the full
-        // cause on the first fatal; a repeat CloseSocket would be
-        // duplicative, and any FailReply would consume a non-existent
-        // correlator (typestate prevents it — the first transition
-        // already drained the `ReplyId`).
-        if matches!(self.state, ProtoState::Errored(_)) {
-            return;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-154 (E) — field-level free functions for the fail path
+// ═════════════════════════════════════════════════════════════════════
+//
+// `fail_inflight_and_close` + `replace_state_errored_and_drain` +
+// `fail_read_cursor_advance` historically took `&mut self` (full
+// PgProtocol). DEF-154 (E) wraps `feed_bytes`'s dispatch loop in a
+// `self.read_buf.with_branded(|mut rb| { ... })` branded scope —
+// inside which `read_buf` is borrowed via `rb` (mut via
+// BrandedReadBuf::advance_scope_local / clear_scope_local; shared
+// otherwise). `&mut self` calls are incompatible with `rb`'s borrow.
+//
+// Fix: free-function form taking disjoint field refs
+// (`&mut ProtoState`, `&mut ReadBuf`, `&mut StagedActions`).
+// Callers can destructure `self` at the dispatch-scope entry and
+// thread the disjoint refs down. Instance methods below delegate
+// to these for non-branded call sites.
+
+/// DEF-154 (E) — field-level fail helper used inside the branded
+/// read scope.
+///
+/// Takes `&mut ProtoState` + `&mut StagedActions` only — DOES NOT
+/// take `&mut ReadBuf`, because inside `self.read_buf.with_branded`
+/// the read_buf is held by `rb` and cannot be separately
+/// reborrowed. Callers inside the branded scope clear read_buf via
+/// `rb.clear_scope_local()` at an appropriate post-mutation point.
+///
+/// DEF-149 atomic-terminus triple (state install + reply drain +
+/// read_buf clear) is preserved by:
+/// 1. This fn installs `ProtoState::Errored(kind)` and drains the
+///    inflight reply atomically (state-replace is one operation).
+/// 2. Caller immediately arranges `rb.clear_scope_local()`
+///    (inline or post-loop via a flag).
+/// 3. `PgProtocol` is `!Sync` — no concurrent observer can witness
+///    the partial triple.
+#[cold]
+fn fail_inflight_no_readbuf<'wb, 'rb>(
+    state: &mut ProtoState,
+    cause: ProtocolError,
+    staged: &mut StagedActions<'wb, 'rb>,
+) {
+    if matches!(state, ProtoState::Errored(_)) {
+        return;
+    }
+    let state_kind = cause.state_kind().unwrap_or_else(|| {
+        debug_assert!(
+            false,
+            "DEF-175: AlreadyClosed reached fail_inflight_no_readbuf — \
+             impossible per DEF-142 seal.",
+        );
+        crate::error::StateErrorKind::INTERNAL_FALLBACK
+    });
+    let prev = core::mem::replace(state, ProtoState::Errored(state_kind));
+    let raw_id = prev.take_inflight_reply_raw_id();
+    match raw_id {
+        Some(id) => {
+            emit_actions!(staged, budget: 2, [
+                StagedAction::FailReply { id, cause },
+                StagedAction::CloseSocket,
+            ]);
         }
-        // DEF-061 + DEF-094 + DEF-142: compute kind before `cause`
-        // is moved into the FailReply StagedAction. Stored in state
-        // as 1-byte `StateErrorKind`; full cause goes out in the one
-        // FailReply emitted below.
-        //
-        // `StateErrorKind::try_from_kind` returns `None` ONLY for
-        // `ErrorKind::AlreadyClosed`. That kind is only produced by
-        // `ProtocolError::ConnectionAlreadyClosed`, which in turn
-        // is only emitted for already-Errored connections — and the
-        // `if matches!(self.state, Errored(_))` early-return above
-        // short-circuits BEFORE we reach this point for such cases.
-        // So `try_from_kind` is architecturally guaranteed to return
-        // `Some` here; the `unwrap_or_else` fallback is dead-safety
-        // (falls back to `Internal` as the honest "crate-bug" kind
-        // rather than panic — forbid-bundle bans panic).
-        // DEF-175 (A012) + DEF-176 (A016): `state_kind()` composes
-        // `kind() + try_from_kind`; returns None only for
-        // AlreadyClosed (DEF-142-sealed out of this path via the
-        // `if matches!(Errored)` early-return above). debug_assert
-        // pins the dead None branch loudly in tests.
-        let state_kind = cause.state_kind().unwrap_or_else(|| {
-            debug_assert!(
-                false,
-                "DEF-175: AlreadyClosed reached fail_inflight_and_close — \
-                 impossible per DEF-142 seal (ConnectionAlreadyClosed is \
-                 only emitted from push-path on already-Errored state, \
-                 which short-circuits via the `if matches!(Errored)` \
-                 early-return above).",
-            );
-            crate::error::StateErrorKind::INTERNAL_FALLBACK
-        });
-        // DEF-149: `replace_state_errored_and_drain` centralises the
-        // atomic "install Errored(kind) + drain inflight raw_id +
-        // clear read_buf" triple. The three operations form one
-        // conceptual unit at the state-machine-terminus boundary;
-        // a future refactor that reorders them could produce
-        // observable state where Errored is set but read_buf still
-        // holds post-fatal bytes. The helper pins the ordering.
-        let raw_id = self.replace_state_errored_and_drain(state_kind);
-        match raw_id {
-            Some(id) => {
-                emit_actions!(staged, budget: 2, [
-                    StagedAction::FailReply { id, cause },
-                    StagedAction::CloseSocket,
-                ]);
-            }
-            None => {
-                emit_actions!(staged, budget: 1, [
-                    StagedAction::CloseSocket,
-                ]);
-            }
+        None => {
+            emit_actions!(staged, budget: 1, [
+                StagedAction::CloseSocket,
+            ]);
         }
     }
-
 }
 
 /// Compute the state transition and actions for a command push.
@@ -1084,11 +974,11 @@ impl PgProtocol {
 /// ([`compute_push_ping`], [`compute_push_startup`]); `compute_push`
 /// dispatches on the command variant. Adding a new `PgCommand` variant
 /// fails the build here until a matching helper is wired up.
-fn compute_push<'wb>(
+fn compute_push<'wb, 'rb>(
     cmd: PgCommand,
     state: ProtoState,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
-) -> (ProtoState, StagedActions<'wb>) {
+) -> (ProtoState, StagedActions<'wb, 'rb>) {
     let mut staged = StagedActions::new();
     let new_state = match cmd {
         PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
@@ -1143,10 +1033,10 @@ fn compute_push<'wb>(
 /// The `compute_push_tests` module below pins this table via a
 /// per-variant assertion, closing the structural seam where two arm
 /// bodies could be swapped without a compile error.
-fn compute_push_ping<'wb>(
+fn compute_push_ping<'wb, 'rb>(
     state: ProtoState,
     reply: ReplyId<crate::reply_id::PingKind>,
-    staged: &mut StagedActions<'wb>,
+    staged: &mut StagedActions<'wb, 'rb>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch. Pre-DEF-146 this function had 5
     // arms over explicit state variants (with 18-way or-patterns for
@@ -1222,14 +1112,14 @@ fn compute_push_ping<'wb>(
 /// `MAX_OWNED_SEND_LEN` classifies as a typed reply failure instead of
 /// silent truncation.
 #[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
-fn compute_push_startup<'wb>(
+fn compute_push_startup<'wb, 'rb>(
     state: ProtoState,
     user: Ident,
     database: Option<DatabaseName>,
     app_name: Option<ApplicationName>,
     credentials: Credentials,
     reply: ReplyId<crate::reply_id::StartupKind>,
-    staged: &mut StagedActions<'wb>,
+    staged: &mut StagedActions<'wb, 'rb>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     match state.push_class() {
@@ -1311,11 +1201,11 @@ fn compute_push_startup<'wb>(
 /// | any `Connecting*`            | `FailReply(StartupAlreadyInProgress)`| same state preserved                |
 /// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
 /// | any `SimpleQuery*`           | `FailReply(CommandInProgress)`      | same                                 |
-fn compute_push_simple_query<'wb>(
+fn compute_push_simple_query<'wb, 'rb>(
     state: ProtoState,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::QueryKind>,
-    staged: &mut StagedActions<'wb>,
+    staged: &mut StagedActions<'wb, 'rb>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: single-level classifier dispatch (standard pattern —
@@ -1433,12 +1323,12 @@ fn build_parse_message<'brand>(
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                |
 /// | `Awaiting*` / `SimpleQuery*` | `FailReply(CommandInProgress)`      | same                                 |
 /// | `Parse*`                     | `FailReply(CommandInProgress)`      | same                                 |
-fn compute_push_parse<'wb>(
+fn compute_push_parse<'wb, 'rb>(
     state: ProtoState,
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::ParseKind>,
-    staged: &mut StagedActions<'wb>,
+    staged: &mut StagedActions<'wb, 'rb>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch. DEF-154 (B) P0-2: builder returns Result.
@@ -1547,11 +1437,11 @@ fn build_describe_message<'brand, N: crate::ident::DescribeName>(
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved                   |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                       |
 /// | any other in-flight          | `FailReply(CommandInProgress)`      | same                                        |
-fn compute_push_describe_statement<'wb>(
+fn compute_push_describe_statement<'wb, 'rb>(
     state: ProtoState,
     stmt_name: &crate::ident::StmtName,
     reply: ReplyId<crate::reply_id::DescribeStatementKind>,
-    staged: &mut StagedActions<'wb>,
+    staged: &mut StagedActions<'wb, 'rb>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
@@ -1618,11 +1508,11 @@ fn compute_push_describe_statement<'wb>(
 ///
 /// Same decision table as statement-describe; see that function's
 /// docstring.
-fn compute_push_describe_portal<'wb>(
+fn compute_push_describe_portal<'wb, 'rb>(
     state: ProtoState,
     portal_name: &crate::ident::PortalName,
     reply: ReplyId<crate::reply_id::DescribePortalKind>,
-    staged: &mut StagedActions<'wb>,
+    staged: &mut StagedActions<'wb, 'rb>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
@@ -1805,7 +1695,7 @@ fn build_execute_message<'brand>(
 /// | any `Connecting*`         | `FailReply(StartupAlreadyInProgress)`    | same state preserved                        |
 /// | any in-flight             | `FailReply(CommandInProgress)`           | same state preserved                        |
 #[expect(clippy::too_many_arguments, reason = "compute_push_bind_execute is an internal helper; its arg count matches `push_bind_execute`'s parameter surface + the accumulator + reserved. Splitting into a struct-arg would obscure the pure-compute framing.")]
-fn compute_push_bind_execute<'wb, P: crate::params::ParamsWriter>(
+fn compute_push_bind_execute<'wb, 'rb, P: crate::params::ParamsWriter>(
     state: ProtoState,
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
@@ -1813,7 +1703,7 @@ fn compute_push_bind_execute<'wb, P: crate::params::ParamsWriter>(
     schema_ref: Option<crate::schema_arena::SchemaRef>,
     fetch: crate::command::FetchRows,
     reply: ReplyId<crate::reply_id::QueryKind>,
-    staged: &mut StagedActions<'wb>,
+    staged: &mut StagedActions<'wb, 'rb>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'wb, '_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
@@ -2073,10 +1963,10 @@ fn build_startup_message<'brand>(
 /// refuses any `&mut WriteBuf` re-borrow while the returned
 /// `OutActions<'w, 'r>` is alive, and any `&mut self` re-borrow
 /// on `PgProtocol` (thus `feed_bytes`) while `'r` is alive.
-fn materialise<'w, 'r, 'wb>(
-    staged: StagedActions<'wb>,
+fn materialise<'w, 'r, 'wb, 'rb>(
+    staged: StagedActions<'wb, 'rb>,
     write_bytes: crate::write_buf::BrandedBytes<'wb, 'w>,
-    read_bytes: &'r [u8],
+    read_bytes: crate::write_buf::BrandedBytes<'rb, 'r>,
     arena: crate::schema_arena::ArenaReader<'r>,
 ) -> OutActions<'w, 'r> {
     let mut out = OutActions::new();
@@ -2141,23 +2031,12 @@ fn materialise<'w, 'r, 'wb>(
                      crate bug; DEF-154 (D) arena-brand will eliminate \
                      this class structurally.",
                 );
-                // DEF-182 shield on row_range.apply None. Phase B4
-                // retained this shield on the read-side because
-                // wrapping the dispatch loop in a branded scope
-                // requires converting physical advance to a logical
-                // cursor — deferred to DEF-154 (E). Write-side got
-                // the tier-1 lift via brand (see SendBytesRange
-                // above); read-side stays tier-2 until (E).
-                let row_bytes_opt = row_range.apply(read_bytes);
-                debug_assert!(
-                    row_bytes_opt.is_some(),
-                    "DEF-182: NonEmptyRange.apply(read_buf) None at \
-                     StreamRowRange — crate bug (range built this call). \
-                     DEF-154 (E) will brand the read-side.",
-                );
+                // DEF-154 (E): tier-1 infallible apply via branded
+                // ReadRange<'rb> + BrandedBytes<'rb, 'r>. No shield,
+                // no unwrap_or — class closed structurally.
                 Action::StreamRow {
                     id,
-                    row_bytes: row_bytes_opt.unwrap_or(&[]),
+                    row_bytes: row_range.apply(read_bytes),
                     desc: desc_opt.unwrap_or(&crate::decode::RowDesc::EMPTY),
                 }
             }
@@ -2530,7 +2409,7 @@ mod compute_push_tests {
     }
 
     impl StagedObs {
-        fn from_staged(sa: &StagedAction<'_>) -> Self {
+        fn from_staged(sa: &StagedAction<'_, '_>) -> Self {
             match sa {
                 StagedAction::SendBytesRange(_) => Self::SendBytesRange,
                 StagedAction::SendBytesStatic(s) => Self::SendBytesStatic(s),

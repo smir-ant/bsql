@@ -26,10 +26,6 @@
 
 use crate::frame::READ_BUF_CAP;
 use core::fmt;
-// DEF-154 (E) Spike 1: `PhantomData` used by cfg(test)-gated
-// `BrandedReadBuf` scaffolding. Full DEF-154 (E) refactor
-// (deferred) un-gates the whole read-branded family for production.
-#[cfg(test)]
 use core::marker::PhantomData;
 use heapless::{CapacityError, Vec};
 
@@ -391,7 +387,6 @@ impl fmt::Display for AdvancePastEnd {
 /// Phase B4 entry-point closure handles the mutable-append and
 /// mutable-advance paths OUTSIDE the brand (they happen before
 /// and after the branded materialise phase respectively).
-#[cfg(test)]
 pub(crate) struct BrandedReadBuf<'brand, 'a> {
     /// Underlying mutable borrow (DEF-154 (E) Spike 1).
     ///
@@ -418,7 +413,6 @@ pub(crate) struct BrandedReadBuf<'brand, 'a> {
     _brand: PhantomData<fn(&'brand ()) -> &'brand ()>,
 }
 
-#[cfg(test)]
 impl<'brand, 'a> BrandedReadBuf<'brand, 'a> {
     /// Branded view of the full populated region — shared borrow.
     /// Used by the dispatch loop as the witness for
@@ -481,6 +475,18 @@ impl<'brand, 'a> BrandedReadBuf<'brand, 'a> {
         self.buf.advance(n)
     }
 
+    /// DEF-154 (E): scope-local cursor-position read. Needed by
+    /// the dispatch loop's `FrameCoords::abs_frame_start`
+    /// computation (absolute offset = cursor + frames_consumed).
+    /// Inside the branded scope, the underlying `&mut ReadBuf`
+    /// is held by `rb`; this method is the brand-compatible
+    /// accessor.
+    #[inline]
+    #[must_use]
+    pub(crate) fn cursor_position_scope_local(&self) -> usize {
+        self.buf.cursor_position()
+    }
+
     /// DEF-154 (E) Spike 1: scope-local clear of the underlying
     /// `ReadBuf` — mirror of the fatal-path
     /// `replace_state_errored_and_drain` read-buf clear, lifted
@@ -495,7 +501,6 @@ impl<'brand, 'a> BrandedReadBuf<'brand, 'a> {
     }
 }
 
-#[cfg(test)]
 impl fmt::Debug for BrandedReadBuf<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BrandedReadBuf")
@@ -504,7 +509,6 @@ impl fmt::Debug for BrandedReadBuf<'_, '_> {
     }
 }
 
-#[cfg(test)]
 impl ReadBuf {
     /// Enter a generatively-branded scope.
     ///
