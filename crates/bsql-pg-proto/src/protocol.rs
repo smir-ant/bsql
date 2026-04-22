@@ -320,7 +320,9 @@ impl PgProtocol {
         let prev = core::mem::take(&mut self.state);
         let (new_state, staged) = compute_push(cmd, prev, write_buf);
         self.state = new_state;
-        materialise(staged, write_buf.as_bytes(), &[], &self.schema_arena)
+        // DEF-154 (C): materialise sees a narrowed reader witness,
+        // not the full `&SchemaSlab`. Arena access here is get-only.
+        materialise(staged, write_buf.as_bytes(), &[], self.schema_arena.as_reader())
     }
 
     /// Extended Query "Bind + Execute + Sync" pipeline — send a
@@ -410,7 +412,8 @@ impl PgProtocol {
             write_buf,
         );
         self.state = new_state;
-        materialise(staged, write_buf.as_bytes(), &[], &self.schema_arena)
+        // DEF-154 (C): reader witness — see push_command for rationale.
+        materialise(staged, write_buf.as_bytes(), &[], self.schema_arena.as_reader())
     }
 
     /// Feed inbound wire bytes.
@@ -455,11 +458,12 @@ impl PgProtocol {
         // from a dead connection; keeping them wastes memory.
         if matches!(self.state, ProtoState::Errored(_)) {
             self.read_buf.clear();
+            // DEF-154 (C): reader witness, get-only access.
             return materialise(
                 staged,
                 write_buf.as_bytes(),
                 self.read_buf.populated(),
-                &self.schema_arena,
+                self.schema_arena.as_reader(),
             );
         }
 
@@ -482,7 +486,7 @@ impl PgProtocol {
                 staged,
                 write_buf.as_bytes(),
                 self.read_buf.populated(),
-                &self.schema_arena,
+                self.schema_arena.as_reader(),
             );
         }
 
@@ -605,12 +609,22 @@ impl PgProtocol {
                     }
 
                     let prev = core::mem::take(&mut self.state);
+                    // DEF-154 (C): dispatch receives a writer witness,
+                    // not the full `&mut SchemaSlab`. Dispatch can
+                    // only call `alloc` — `get` / `clear` / `free`
+                    // are structurally out of reach. The writer's
+                    // mutable borrow of `self.schema_arena` ends at
+                    // the last use (the `dispatch` call) under NLL,
+                    // so subsequent `self.read_buf.advance` and
+                    // `self.replace_state_errored_and_drain` calls
+                    // in this iteration see an un-borrowed self.
+                    let mut arena_writer = self.schema_arena.as_writer();
                     let outcome = dispatch(
                         prev,
                         tag,
                         payload,
                         write_buf,
-                        &mut self.schema_arena,
+                        &mut arena_writer,
                         FrameCoords::new(frame_start, frame_len, populated),
                     );
                     match outcome {
@@ -713,11 +727,14 @@ impl PgProtocol {
         // `&'r mut self` parameter — the next `&mut self` call can only
         // run after the caller drops OutActions, at which point
         // feed_bytes entry-cleanup will reclaim the arena slot.
+        // DEF-154 (C): reader witness. After the dispatch loop, any
+        // ArenaWriter created per-iteration has been dropped, so
+        // `self.schema_arena` is freely borrowable for the reader.
         materialise(
             staged,
             write_buf.as_bytes(),
             self.read_buf.populated(),
-            &self.schema_arena,
+            self.schema_arena.as_reader(),
         )
     }
 
@@ -1933,7 +1950,7 @@ fn materialise<'w, 'r>(
     staged: StagedActions,
     write_buf_bytes: &'w [u8],
     read_buf_bytes: &'r [u8],
-    arena: &'r crate::schema_arena::SchemaSlab,
+    arena: crate::schema_arena::ArenaReader<'r>,
 ) -> OutActions<'w, 'r> {
     let mut out = OutActions::new();
     for sa in staged {

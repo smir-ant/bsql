@@ -431,13 +431,22 @@ impl SchemaSlab {
         }
     }
 
-    /// Count occupied slots. Debug-only — production code doesn't
-    /// need runtime occupancy checks because the dispatch-layer
-    /// alloc-on-schema and entry-point-clear discipline is tier-2
-    /// structural (see module docs). DEF-152 uses this as a
-    /// `debug_assert_eq!` probe at each clear() call site to pin
-    /// "clear() must leave arena empty" against future drift.
-    #[cfg(debug_assertions)]
+    /// Count occupied slots. Used as a `debug_assert_eq!` probe at
+    /// each `clear()` call site (DEF-152) to pin "clear() must leave
+    /// arena empty" against future drift, and in tests for slot-
+    /// occupancy invariants.
+    ///
+    /// # Cfg footprint
+    ///
+    /// The pre-DEF-154 (C) form gated this `#[cfg(debug_assertions)]`,
+    /// which released builds type-check-failed because `debug_assert_eq!`
+    /// expands to `if cfg!(debug_assertions) { assert_eq!(args) }` —
+    /// the `args` still need to typecheck in release, and a cfg-gated-
+    /// out method is not in scope. Post-DEF-154 (C) the fn is always
+    /// present; LLVM's dead-code elimination removes the single
+    /// release-unused call site (the DEF-152 debug_assert_eq probe
+    /// optimises to nothing, so the counted result is unused → call
+    /// is DCE'd). Net: same release-mode cost, compiles cleanly.
     #[inline]
     #[must_use]
     pub(crate) fn occupied_count(&self) -> u8 {
@@ -448,6 +457,108 @@ impl SchemaSlab {
             }
         }
         n
+    }
+
+    /// Construct a read-only view for a materialise-phase caller.
+    ///
+    /// DEF-154 (C) witness-pattern: materialise only needs to
+    /// resolve `SchemaRef → &'r RowDesc`. Exposing the full
+    /// `&'r SchemaSlab` there would grant access to internals
+    /// `get()` transitively reveals (nothing in the current API
+    /// surface, but a future refactor could add a `slot_is_empty`
+    /// or similar that drifts into the materialise path). The
+    /// [`ArenaReader<'r>`] wrapper narrows the API to `get()`
+    /// alone — tier-2 structural: materialise can no longer call
+    /// `alloc` / `clear` / `free`, even accidentally, because the
+    /// type simply does not expose them.
+    #[inline]
+    #[must_use]
+    pub(crate) fn as_reader(&self) -> ArenaReader<'_> {
+        ArenaReader { slab: self }
+    }
+
+    /// Construct a write-only view for a dispatch-phase caller.
+    ///
+    /// DEF-154 (C) witness-pattern counterpart to [`Self::as_reader`].
+    /// Dispatch only needs to allocate schemas on RowDescription
+    /// success; it never needs to `get`, `clear`, or `free`.
+    /// [`ArenaWriter<'a>`] narrows the API to `alloc()` alone —
+    /// tier-2 structural: dispatch can no longer accidentally read
+    /// or reclaim slots, even through a future refactor, because
+    /// the type simply does not expose those methods.
+    ///
+    /// # Rationale over `&mut SchemaSlab`
+    ///
+    /// The direct borrow grants the full surface (`alloc` + `get` +
+    /// `clear` + `free`) to dispatch. The only operation dispatch
+    /// performs is `alloc`. Narrowing via the writer witness turns
+    /// "we discipline ourselves to only call alloc" from a tier-3
+    /// code-review invariant into a tier-2 type-system one.
+    #[inline]
+    #[must_use]
+    pub(crate) fn as_writer(&mut self) -> ArenaWriter<'_> {
+        ArenaWriter { slab: self }
+    }
+}
+
+/// Materialise-phase view of the [`SchemaSlab`] — read-only.
+///
+/// DEF-154 (C) witness-pattern. Wraps `&'r SchemaSlab` and exposes
+/// only the `get` operation, narrowing the materialise call site's
+/// access to the one method it actually uses.
+///
+/// # Copy
+///
+/// `Copy` is intentional: the underlying `&'r SchemaSlab` is `Copy`
+/// (all shared references are), so [`ArenaReader<'r>`] is
+/// zero-cost-copyable. Materialise passes the reader to
+/// sub-resolvers (`StagedReply::into_public`,
+/// `described_rows_ref_into_public`) by value without explicit
+/// cloning.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArenaReader<'r> {
+    slab: &'r SchemaSlab,
+}
+
+impl<'r> ArenaReader<'r> {
+    /// Resolve a [`SchemaRef`] to its `&'r RowDesc` borrow, or
+    /// `None` for a stale / out-of-range / unoccupied handle.
+    ///
+    /// See [`SchemaSlab::get`] for the generation-match semantics.
+    /// The returned borrow inherits `'r` from the wrapped slab
+    /// reference — callers can propagate it into `OutActions<'w, 'r>`
+    /// payloads as before (same lifetime, narrower API surface).
+    #[inline]
+    #[must_use]
+    pub(crate) fn get(&self, r: SchemaRef) -> Option<&'r RowDesc> {
+        // `self.slab: &'r SchemaSlab` — `&` is `Copy`, so field
+        // access through `&self` projects out the full `'r`
+        // lifetime. Calling `.get(r)` on the resulting `&'r`
+        // reference returns `Option<&'r RowDesc>` (method signature
+        // elided lifetime ties to the receiver's lifetime).
+        self.slab.get(r)
+    }
+}
+
+/// Dispatch-phase view of the [`SchemaSlab`] — alloc-only.
+///
+/// DEF-154 (C) witness-pattern. Wraps `&'a mut SchemaSlab` and
+/// exposes only the `alloc` operation, preventing the dispatch
+/// path from accidentally reading, clearing, or freeing slots.
+#[derive(Debug)]
+pub(crate) struct ArenaWriter<'a> {
+    slab: &'a mut SchemaSlab,
+}
+
+impl ArenaWriter<'_> {
+    /// Allocate a slot for `desc`, returning a handle.
+    ///
+    /// See [`SchemaSlab::alloc`] for the full semantics (slot order,
+    /// generation capture, `None` on full arena).
+    #[inline]
+    #[must_use]
+    pub(crate) fn alloc(&mut self, desc: RowDesc) -> Option<SchemaRef> {
+        self.slab.alloc(desc)
     }
 }
 
@@ -484,6 +595,23 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::size_of::<Option<SchemaRef>>() == 2,
     "Option<SchemaRef> must stay 2 bytes (NonZeroU8 niche on slot field).",
+);
+
+// DEF-154 (C) drift pins: the witness wrappers must stay
+// pointer-sized. `ArenaReader<'r>` wraps `&'r SchemaSlab` (a thin
+// reference — SchemaSlab is not a DST); `ArenaWriter<'a>` wraps
+// `&'a mut SchemaSlab`. On all supported targets both collapse to
+// one usize. A future refactor that adds generation / brand fields
+// to either wrapper would trip these pins — at which point the
+// materialise / dispatch call sites need perf-impact review before
+// lifting the bound.
+const _: () = assert!(
+    core::mem::size_of::<ArenaReader<'_>>() == core::mem::size_of::<usize>(),
+    "ArenaReader must stay pointer-sized (thin &SchemaSlab wrapper).",
+);
+const _: () = assert!(
+    core::mem::size_of::<ArenaWriter<'_>>() == core::mem::size_of::<usize>(),
+    "ArenaWriter must stay pointer-sized (thin &mut SchemaSlab wrapper).",
 );
 
 #[cfg(test)]
@@ -639,6 +767,75 @@ mod tests {
         assert!(slab.get(r_before).is_none(), "stale ref must not alias a fresh alloc");
         // r_after is live.
         assert!(slab.get(r_after).is_some());
+    }
+
+    /// DEF-154 (C): writer witness forwards alloc to the slab,
+    /// preserving slot-order + generation capture semantics.
+    /// Pins the forwarding contract against future drift (e.g., a
+    /// refactor that accidentally filters or retries alloc at the
+    /// wrapper layer).
+    #[test]
+    fn writer_witness_alloc_matches_direct_alloc() {
+        let mut slab_a = SchemaSlab::new();
+        let mut slab_b = SchemaSlab::new();
+        let desc = RowDesc::EMPTY;
+
+        // Direct-alloc reference trace.
+        let direct = must_alloc(&mut slab_a, desc);
+
+        // Writer-path alloc.
+        let witness = {
+            let mut writer = slab_b.as_writer();
+            writer.alloc(desc).unwrap_or_else(SchemaRef::dead_for_test)
+        };
+
+        assert_eq!(direct.slot_idx(), witness.slot_idx(), "writer must follow same slot order");
+        assert_eq!(direct.generation(), witness.generation(), "writer must capture same generation");
+        assert_eq!(slab_a.occupied_count(), slab_b.occupied_count());
+    }
+
+    /// DEF-154 (C): reader witness forwards get with the full
+    /// `'r` lifetime of the wrapped slab — propagating the borrow
+    /// correctly for OutActions payloads.
+    #[test]
+    fn reader_witness_get_yields_live_desc() {
+        let mut slab = SchemaSlab::new();
+        let r = must_alloc(&mut slab, RowDesc::EMPTY);
+        let reader = slab.as_reader();
+        assert!(reader.get(r).is_some(), "live ref must resolve through reader");
+    }
+
+    /// DEF-154 (C): reader returns `None` for stale refs (generation
+    /// mismatch after clear), matching the underlying SchemaSlab::get
+    /// contract.
+    #[test]
+    fn reader_witness_stale_ref_returns_none() {
+        let mut slab = SchemaSlab::new();
+        let stale = must_alloc(&mut slab, RowDesc::EMPTY);
+        slab.clear();
+        // Fresh alloc re-uses slot 0 with bumped generation — asserted
+        // so the test fails loudly if the arena's slot-reuse contract
+        // regresses. The result itself is unused beyond the assert.
+        let fresh = must_alloc(&mut slab, RowDesc::EMPTY);
+        assert_eq!(fresh.slot_idx(), stale.slot_idx(), "fresh must reuse same physical slot");
+        let reader = slab.as_reader();
+        assert!(reader.get(stale).is_none(), "reader must surface stale-ref None");
+        assert!(reader.get(fresh).is_some(), "fresh ref must resolve through reader");
+    }
+
+    /// DEF-154 (C): reader is Copy — callers can pass by value to
+    /// sub-resolvers (StagedReply::into_public,
+    /// described_rows_ref_into_public) without explicit cloning.
+    /// Pins the Copy derive against accidental removal.
+    #[test]
+    fn reader_witness_is_copy() {
+        let mut slab = SchemaSlab::new();
+        let r = must_alloc(&mut slab, RowDesc::EMPTY);
+        let reader_a = slab.as_reader();
+        // Copy, not move — `reader_a` stays usable after the bind.
+        let reader_b = reader_a;
+        assert!(reader_a.get(r).is_some(), "reader_a stays usable after Copy");
+        assert!(reader_b.get(r).is_some(), "reader_b is a valid copy");
     }
 
     // DEF-180: the pre-DEF-180 `generation_wraps_around_at_256_cycles`

@@ -827,7 +827,7 @@ impl StagedReply {
     #[inline]
     pub(crate) fn into_public<'r>(
         self,
-        arena: &'r crate::schema_arena::SchemaSlab,
+        arena: crate::schema_arena::ArenaReader<'r>,
     ) -> Reply<'r> {
         match self {
             Self::Pong(p) => Reply::Pong(p),
@@ -891,7 +891,7 @@ impl StagedReply {
 #[inline]
 fn described_rows_ref_into_public<'r>(
     r: crate::state::DescribedRowsRef,
-    arena: &'r crate::schema_arena::SchemaSlab,
+    arena: crate::schema_arena::ArenaReader<'r>,
 ) -> DescribedRows<'r> {
     match r {
         crate::state::DescribedRowsRef::Rows(s) => match arena.get(s) {
@@ -946,7 +946,8 @@ mod deliver_entry_priv {
     /// DEF-119: carries [`StagedReply`] (lifetime-free) rather than
     /// the public [`super::Reply`] (which now has a `'r` lifetime
     /// tied to the arena). Materialise converts staged → public via
-    /// `StagedReply::into_public(&arena)`.
+    /// `StagedReply::into_public(reader)` where `reader` is the
+    /// DEF-154 (C) [`crate::schema_arena::ArenaReader<'r>`] witness.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct DeliverReplyEntry {
         id: NonZeroU64,

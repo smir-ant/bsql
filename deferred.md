@@ -2906,14 +2906,63 @@ buffer's lifetime; `apply(buf)` becomes infallible via the
 lifetime proving the buffer match. Closes A008, A009 arch side,
 C015.
 
-### DEF-154 (C) — ArenaReader / ArenaWriter witness tokens
+### DEF-154 (C) — ArenaReader / ArenaWriter witness tokens — SHIPPED
 
-Scheduled after (A) + (B). Tokens tie dispatch's alloc permission
-and materialise's read permission to separate types. C005 arena
-discipline tier lift.
+**Shipped** 2026-04-22. Chosen before (B) because (C) is self-
+contained; (B) requires deeper lifetime design around generative
+lifetimes (simple `&'buf` binding does not prove compile-time
+buffer-identity).
+
+**Goal.** Narrow the `&mut SchemaSlab` / `&SchemaSlab` borrows that
+cross module boundaries (`dispatch(...)` / `materialise(...)`) to
+witness types that expose only the method each actually uses.
+
+**Mechanism.** Two thin wrappers on `SchemaSlab`:
+
+- `ArenaReader<'r>(&'r SchemaSlab)` — exposes `get(SchemaRef) ->
+  Option<&'r RowDesc>`. Nothing else. `Copy` for ergonomic value
+  threading through sub-resolvers (`StagedReply::into_public`,
+  `described_rows_ref_into_public`).
+- `ArenaWriter<'a>(&'a mut SchemaSlab)` — exposes `alloc(RowDesc)
+  -> Option<SchemaRef>`. Nothing else.
+
+Constructed via `SchemaSlab::as_reader()` / `as_writer()`. Drift-
+pinned at pointer size.
+
+**Tier lift (C005).** The "dispatch only allocs; materialise only
+reads" discipline was tier-3 code-review-enforced; post-(C) it is
+tier-2 type-system-enforced. Dispatch cannot call `get` / `clear`
+/ `free` because the type simply does not expose them; materialise
+cannot call `alloc` / `clear` / `free` symmetrically.
+
+**Closed seams:**
+- Dispatch cannot accidentally read the arena (`get`) — closes a
+  future-refactor drift surface.
+- Dispatch cannot accidentally `clear()` mid-frame — closes a
+  silent-correctness failure mode (clearing mid-query would
+  invalidate the just-allocated ref that the new state variant
+  carries).
+- Materialise cannot accidentally `alloc()` — closes a future-
+  refactor drift surface where a new StagedAction variant might
+  need schema storage and be tempted to alloc in materialise.
+
+**Tests added (4):**
+- `writer_witness_alloc_matches_direct_alloc` — forwarding contract.
+- `reader_witness_get_yields_live_desc` — reader forwarding.
+- `reader_witness_stale_ref_returns_none` — generation-match preserved.
+- `reader_witness_is_copy` — pins `Copy` derive against accidental removal.
+
+**Along-the-way fix: DEF-181.** The pre-(C) release build was
+silently broken: `SchemaSlab::occupied_count` was gated
+`#[cfg(debug_assertions)]`, but its single caller `debug_assert_eq!`
+expands to `if cfg!(debug_assertions) { assert_eq!(args) }` — the
+`args` still type-check in release, and a cfg-gated-out method is
+not in scope. Exposed when `(C)`'s verification ran `cargo build
+--release` and errored. Fix: drop the cfg; LLVM DCEs the single
+release-unused call. Same release-mode cost, compiles cleanly.
 
 ### DEF-154 (D) — stale-ref compile elimination
 
-Scheduled after (B) + (C). Combines buffer-witness + arena-witness
-to make stale SchemaRef detection compile-time (upgrade DEF-170
-debug_asserts from runtime-check to type-system-impossible).
+Scheduled after (B). Combines buffer-witness + arena-witness
+(C shipped) to make stale SchemaRef detection compile-time (upgrade
+DEF-170 debug_asserts from runtime-check to type-system-impossible).

@@ -325,19 +325,27 @@ const fn internal_bug(
 /// entry-point call and materialising the ranges into `&'buf [u8]`
 /// slices after the write-phase mutable borrow completes.
 ///
-/// # DEF-119 — `arena: &mut SchemaSlab`
+/// # DEF-119 + DEF-154 (C) — `arena: &mut ArenaWriter<'_>`
 ///
 /// The schema arena is threaded in mutably so the `'T' arm can
 /// allocate a `SchemaRef` on `parse_row_description` success and
 /// carry it into the new state variant. Arena frees happen at
 /// entry-point cleanup (`feed_bytes` / `push_command` top) — see
 /// [`crate::schema_arena`] for the alloc/free discipline.
+///
+/// DEF-154 (C) witness-pattern: the arena is threaded through a
+/// narrowed [`crate::schema_arena::ArenaWriter`] that exposes only
+/// `alloc` — dispatch cannot accidentally call `get` / `clear` /
+/// `free`, even via a future refactor, because the type simply does
+/// not expose those methods. Tier-2 structural closure of the "only
+/// alloc in dispatch" invariant that was previously tier-3
+/// code-review discipline.
 pub(crate) fn dispatch(
     prev: ProtoState,
     tag: crate::wire::InboundTag,
     payload: &[u8],
     write_buf: &mut WriteBuf,
-    arena: &mut crate::schema_arena::SchemaSlab,
+    arena: &mut crate::schema_arena::ArenaWriter<'_>,
     coords: FrameCoords,
 ) -> DispatchOutcome {
     match (prev, tag) {
