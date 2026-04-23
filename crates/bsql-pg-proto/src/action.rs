@@ -204,29 +204,19 @@ impl NonEmptyRange {
     /// Resolve the range against a buffer, returning the slice or
     /// `None` on bounds mismatch.
     ///
-    /// The None branch is architecturally unreachable when `buf` is
-    /// the same `write_buf` used at construction — the constructor
-    /// already proved `start + len ≤ bounds` and we use the same
-    /// buffer at `materialise` time.
+    /// DEF-154 (N): `debug_assert!(slice.is_some(), ...)` REMOVED.
+    /// The assert was the "debug loud + release silent" pattern
+    /// user banned. Callers (`WriteRange::apply`) now propagate the
+    /// None via their own Option return and materialise classifies
+    /// the mismatch via `CloseSocket` emission (no silent `&[]`,
+    /// no debug panic target).
     #[inline]
     pub(crate) fn apply<'a>(&self, buf: &'a [u8]) -> Option<&'a [u8]> {
-        // F-007 (pass-#8): the None path is architecturally dead when
-        // `buf` is the same buffer used at NonEmptyRange::new construction
-        // (materialise's invariant — see protocol.rs::materialise). The
-        // Option-returning shape is retained for forbid-bundle safety,
-        // but debug-builds actively assert the invariant so a wiring
-        // regression fails the test suite loudly instead of silently
-        // producing `&[]`.
         // DEF-147: widen u16 → usize via infallible usize::from before
         // slice indexing.
         let start = usize::from(self.start);
         let end = start.checked_add(usize::from(self.len.get()))?;
-        let slice = buf.get(start..end);
-        debug_assert!(
-            slice.is_some(),
-            "NonEmptyRange::apply: buf shorter than emission-time bounds — check materialise wiring",
-        );
-        slice
+        buf.get(start..end)
     }
 }
 
@@ -363,35 +353,51 @@ impl<'brand> WriteRange<'brand> {
         }
     }
 
-    /// Apply the range to same-branded bytes — **infallible at the
-    /// type level**, tier-2 shielded at the body level.
+    /// Apply the range to same-branded bytes — returns `None` on
+    /// bounds mismatch (architecturally unreachable under intact
+    /// brand invariants; classified by materialise via
+    /// `CloseSocket` emission, not silently discarded).
     ///
-    /// The same brand `'brand` on both operands, combined with the
-    /// `BrandedWriteBuf`'s API narrow (no truncating ops reachable
-    /// inside the branded scope) and the construction-time bounds
-    /// check on `inner`, guarantees `bytes.as_slice().get(start..end)`
-    /// is `Some` under intact invariants.
+    /// # DEF-154 (N) P0-4
     ///
-    /// The `debug_assert!` + `unwrap_or(&[])` pair below is the
-    /// tier-2 body shield — debug builds fire loud on any
-    /// invariant break (same pattern as DEF-170 / DEF-182); release
-    /// preserves the `&[]` fallback (forbid-bundle bans `panic!`).
+    /// Pre-(N): `apply -> &'a [u8]` with a `debug_assert! +
+    /// .unwrap_or(&[])` body shield — exactly the "release silent,
+    /// debug loud" pattern the user banned ("хрупкая и стеклянная
+    /// структура"). A stale bounds mismatch at apply time silently
+    /// produced a zero-byte `Action::SendBytes`, corrupting the
+    /// wire stream.
     ///
-    /// Full tier-1 body closure requires `NonEmptyRange::apply`
-    /// totality proof — deferred to a future refactor (would
-    /// replace the Option-returning `apply` with a trusted
-    /// typestate constructor).
+    /// Post-(N): `apply -> Option<&'a [u8]>`. Materialise's
+    /// `SendBytesRange` arm matches on Some/None; None routes to
+    /// an explicit `CloseSocket` emission + state-Errored
+    /// transition (handled at the feed_bytes / push_* layer via
+    /// the apply-failed classification). No silent fallback; no
+    /// debug_assert panic target.
+    ///
+    /// Soundness argument (why None is architecturally unreachable):
+    ///
+    /// 1. Same `'brand` ⇒ same generative `with_branded` scope ⇒
+    ///    same `BrandedWriteBuf`.
+    /// 2. `BrandedWriteBuf` exposes only `reserve()` + `as_bytes_branded()`
+    ///    — no truncating ops. Buffer cannot shrink between
+    ///    `from_branded_write_span` (construction) and
+    ///    `into_bytes_branded` (materialise consumption).
+    /// 3. Construction validated `start + len ≤ reserved.len()`.
+    /// 4. At apply time, `bytes.as_slice().len() ≥ reserved.len()
+    ///    (at construction) ≥ start + len`, so
+    ///    `bytes.get(start..start+len)` is `Some`.
+    ///
+    /// The None-arm exists for compile-time totality under
+    /// `#![forbid(unsafe_code)]` (no raw-slice access); it is
+    /// architecturally dead under intact invariants, but
+    /// materialise classifies it if it ever fires.
     #[inline]
     #[must_use]
-    pub(crate) fn apply<'a>(&self, bytes: crate::write_buf::BrandedBytes<'brand, 'a>) -> &'a [u8] {
-        let slice = self.inner.apply(bytes.as_slice());
-        debug_assert!(
-            slice.is_some(),
-            "WriteRange<'brand>::apply None — brand invariant broken. \
-             Crate bug in the brand scaffolding (construction-bounds or \
-             buffer non-shrink), not a usage error.",
-        );
-        slice.unwrap_or(&[])
+    pub(crate) fn apply<'a>(
+        &self,
+        bytes: crate::write_buf::BrandedBytes<'brand, 'a>,
+    ) -> Option<&'a [u8]> {
+        self.inner.apply(bytes.as_slice())
     }
 
     /// Access the underlying [`NonEmptyRange`] — for debug output,
@@ -481,10 +487,11 @@ mod phase_b3_tests {
             // the 1-byte buffer — validated by NonEmptyRange::new.
             let raw = NonEmptyRange::new(0, 1, 1).unwrap_or(NonEmptyRange::DEAD_FALLBACK);
             let range = WriteRange::from_raw(raw);
-            // The `apply` return type is `&[u8]`, NOT
-            // `Option<&[u8]>` — that's the tier-1 lift. No
-            // unwrap_or at this call site.
-            let slice: &[u8] = range.apply(bytes);
+            // DEF-154 (N) P0-4: apply returns Option<&[u8]>; None is
+            // architecturally unreachable under intact invariants
+            // (see WriteRange::apply doc). Test unwraps explicitly
+            // because the fixture is self-consistent.
+            let slice: &[u8] = range.apply(bytes).unwrap_or(&[]);
             slice.first().copied().unwrap_or(0)
         });
         assert_eq!(byte, 0x42, "branded WriteRange apply round-trips the pushed byte");

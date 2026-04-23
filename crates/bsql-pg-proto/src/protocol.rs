@@ -2051,17 +2051,21 @@ fn materialise<'w, 'r, 'wb>(
 
         let a: Action<'w, 'r> = match sa {
             StagedAction::SendBytesRange(range) => {
-                // DEF-154 (B): WriteRange<'wb>::apply takes
-                // BrandedBytes<'wb, 'w> and returns &'w [u8].
-                // Same 'wb brand on both operands (generative closure
-                // scope), construction-time bounds validation, and
-                // BrandedWriteBuf's API narrow close the class
-                // structurally. The body's `unwrap_or(&[])` fallback
-                // on `NonEmptyRange::apply`'s None is the last
-                // remaining runtime shield on the write side —
-                // architecturally dead, flagged for future closure
-                // via a NonEmptyRange apply-typestate refactor.
-                Action::SendBytes(range.apply(write_bytes))
+                // DEF-154 (N) P0-4: `WriteRange::apply` returns
+                // `Option<&[u8]>` post-(N) — None is architecturally
+                // unreachable under intact brand/bounds invariants
+                // (see action.rs::WriteRange::apply doc), but the
+                // Option makes the invariant-break explicit and
+                // classified HERE via `CloseSocket` emission instead
+                // of the pre-(N) silent `unwrap_or(&[])` fallback
+                // that shipped a zero-byte SendBytes to the wire.
+                match range.apply(write_bytes) {
+                    Some(slice) => Action::SendBytes(slice),
+                    None => {
+                        push_within_fanout_budget(&mut out, Action::CloseSocket);
+                        continue;
+                    }
+                }
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
             // DEF-112 + DEF-119: `DeliverReplyEntry` carries a
