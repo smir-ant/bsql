@@ -161,24 +161,106 @@ zero-cost perf. Время — тем более.**
 
 ## §7 Edge-case discipline
 
-Для каждой правки — пройти check-list:
+**Принцип:** "Лучше рассмотреть поглубже и понять что это не про
+это, чем не рассмотрев потом упереться в эту проблему."
 
-- [ ] Пустой вход (empty buffer, zero rows, empty query)
-- [ ] Максимальный вход (capacity-1, capacity, capacity+1)
-- [ ] Split вход (split across feed() calls, split mid-frame,
-      split mid-header)
-- [ ] Malformed (garbage bytes, length mismatch, missing
-      terminator, wrong tag)
-- [ ] Stale reference (arena gen mismatch, post-free access)
-- [ ] Concurrent access (if applicable)
-- [ ] Drop mid-operation (panic safety, reply cancellation)
-- [ ] Allocation pressure (bounded buffer full, read-buf full)
-- [ ] Integer overflow / narrowing (checked arithmetic, const-assert
-      caps)
-- [ ] Platform (endianness, alignment, target_pointer_width)
+Для каждой non-trivial правки — **обязательно прокрутить в уме
+все оси**. Не каждая ось будет применима (например async/параллелизм
+не везде), НО:
 
-Не один отсутствующий пункт — **not "по умолчанию ок"**. Надо
-**обосновать** почему конкретно тут этот edge case исключён.
+- Пройти по каждой оси — **обязательно**, не по "релевантным на
+  первый взгляд".
+- Решение "ось не применима" — **явно обосновать** (комментарий
+  в коде / PR-description / deferred.md). "Async не применим т.к.
+  функция синхронная по контракту" — ок. **Тишина** типа "просто не
+  подумал" — нарушение §7.
+
+### Оси рассмотрения
+
+**1. Cardinality (много/мало/ноль):**
+- Пустой вход (empty buffer, zero rows, empty query, 0 columns)
+- Один (single frame, single column, single row)
+- Типичный (few — 2-10)
+- Много (at-capacity, stream density max, MAX_COLUMNS)
+- Превышение (capacity+1, MAX+1 overflow, width-overflow)
+
+**2. Presence (одновременно/отсутствует/дублируется):**
+- Все ожидаемые поля присутствуют
+- Все ожидаемые поля отсутствуют
+- Частичная presence (некоторые есть, некоторые нет)
+- Дубликат (field прислан дважды — что побеждает?)
+- Unexpected presence (что-то пришло чего не ждали)
+
+**3. Concurrency (параллельно/отдельно):**
+- Single-threaded sequential (no concurrency) — default для sans-IO
+- Multi-threaded shared — требования Send/Sync; есть ли `PhantomData<Cell<()>>` для `!Sync`?
+- Async task boundaries — cancellation-safety, Drop-in-flight future, pinning
+- Reentrancy — call into self during callback / closure / drop
+- Signal / preemption (на embedded target'ах)
+
+**4. Temporal (прервано/задержки/split):**
+- Полная последовательность за один вызов (happy path)
+- Split через feed() calls — mid-frame, mid-header, byte-by-byte
+- Mid-transition drop / panic / cancellation (user future dropped)
+- Timeout / stale reference (generation mismatch в arena)
+- Reorder (frames пришли в другом порядке — возможно ли?)
+- Повторный вызов / повторное потребление (re-entry)
+
+**5. Trust level (доверенный/атакующий):**
+- Internal-only (trusted invariants по конструкции)
+- Semi-trusted (authenticated server после handshake)
+- Untrusted (pre-auth, arbitrary bytes)
+- Malformed (wire-valid по форме но semantically wrong)
+- Adversarial (specifically crafted для обхода парсера)
+
+**6. Size (нулевой/средний/максимум/переполнение):**
+- Zero bytes / empty slice
+- Максимум (capacity-1, capacity, capacity+1)
+- Integer width overflow (u8/u16/u32 narrowing)
+- Variable-width payload с declared length != actual length
+
+**7. State lifecycle (начало/середина/конец):**
+- Pre-init / fresh state
+- Mid-operation (partial state)
+- Terminal (drained / completed)
+- Errored recovery path (после fail_inflight)
+- Post-drop (use-after-free — Rust предотвращает, но проверить
+  arena-gen-ref семантику)
+
+**8. Resource pressure (ресурсы):**
+- Bounded buffer slack (есть место)
+- At-capacity (bounded full — graceful?)
+- Over-capacity (classified refuse, не silent drop)
+- Arena slot exhaustion (stale-gen-ref handling)
+- Stack pressure (large enum variants, deep recursion)
+
+**9. Platform (endianness/alignment/pointer width):**
+- Little-endian vs big-endian (protocol — BE, host — LE обычно)
+- Alignment (4/8-byte bounds, `#[repr(C)]` vs `#[repr(Rust)]`)
+- `target_pointer_width` (32 vs 64 bit — u16/usize интеракции)
+- Platform-specific behaviour (panic=abort vs unwind)
+
+**10. Failure composition (как ошибки складываются):**
+- Single error class — один `Result::Err`
+- Cascading (ошибка → другая ошибка → третья)
+- Партиальная реализация (часть succeeded, часть failed)
+- Recovery path (error → recover → retry) — допустим ли?
+- Fatal vs recoverable classification — кто тэгает?
+
+### Применимость
+
+Не всё релевантно всегда. Пример: `bsql-pg-proto` — sync sans-IO,
+ось Concurrency (async/parallel) большей частью "не применимо — код
+синхронный, `!Sync` gated". Но: Drop-in-flight всё равно применимо
+(user future может быть dropped mid-feed_bytes, wrapper должен быть
+cancellation-safe). Так что ось **не выкидываем целиком**, а
+проходим по подпунктам.
+
+### Правило
+
+Для каждой non-trivial правки в PR / коммит / deferred.md
+отметить — явно или неявно через assurance — что по всем 10 осям
+прошли. Неосмотренная ось = drift surface = latent bug class.
 
 ---
 
