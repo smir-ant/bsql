@@ -135,6 +135,9 @@ zero-cost perf. Время — тем более.**
 | "Это уже достаточно хорошо" | Достаточно = теоретически возможный максимум. До тех пор — **недостаточно**. |
 | "Начнём с low-risk чтобы проверить паттерн" | Паттерны проверяются **архитектурно** (в уме, в документе), не через safer-but-smaller shipping. Если уверены в паттерне — сразу cascade. Если нет — сначала **больше думать**, не меньше делать. |
 | "Half-measure — потом доделаем" | Half-measure в safety/tier-1 — запрещён. Либо полный tier-1 shield, либо классифицированный tier-2 с ясным audit-trail. |
+| "Здесь утечки architecturally быть не может" | Не аргумент. Проверяется **структурой** (arena-gen-ref lifetime cascade, typestate, Drop instrumentation). Слова — не доказательство. §7 ось 11 — memory-leak невидима и страшнее crash'а. |
+| "Fallback — это безопаснее чем возвращать error" | Нет. Fallback без классификации = silent corruption = tier-4 = §1 нарушение. Явный `Result::Err(classified)` **всегда** безопаснее чем тихий default. §7 ось 12. |
+| "Default value тут правильный fallback" | Проверить: почему именно этот default? Если ответ "потому что не знаю что ещё вернуть" — это **костыль**, не recovery. Лечи invariant выше. |
 
 ---
 
@@ -247,19 +250,77 @@ zero-cost perf. Время — тем более.**
 - Recovery path (error → recover → retry) — допустим ли?
 - Fatal vs recoverable classification — кто тэгает?
 
+**11. Memory-leak / ownership (утечка / владение):**
+- Утечка памяти невидима. В long-running connection'е может
+  копиться гигабайтами без единого crash'а — страшнее чем panic,
+  потому что не сигналит. При **каждой** правке думать: "где тут
+  может что-то не освободиться?"
+- **Arena slot** — после использования освобождается? Generational
+  ref защищает от use-after-free, но от un-free ничего не спасает,
+  только дисциплина.
+- **Bounded buffer** — при обрыве mid-operation `clear()` вызывается?
+  Иначе — "utility" но invisible leak в stale data.
+- **Reply-correlator slot** — после delivery / fail освобождается
+  чтобы не стакать `ReplyId` бесконечно?
+- **Pending-advance / other state bits** — очищаются при Errored
+  transition? Иначе — zombie state.
+- **Sensitive data** (пароли, SCRAM proofs, session tokens) —
+  `zeroize` при drop? Утечка приватных данных в memory dump — CVE-class.
+- **FFI-owned pointer** (если появится) — кто owns, кто frees?
+- **Thread-local / task-local state** — очищается после task drop?
+- **Circular Arc refs** (если `std` появится) — loop'ы detected?
+- Borrow-checker проверяет Drop timing, но НЕ проверяет что drop
+  действительно пригласился для arena-managed objects. Arena
+  invariants — manual.
+
+**12. Fallback / recovery path (fallback-поведение):**
+- **Fallback — путь к костылям.** Если функция требует fallback
+  chain — часто это признак что invariant выше по стеку сломан и
+  лечится неправильно, а fallback — workaround.
+- **Классификация fallback'а по tier'у:**
+  - Fallback → `Result::Err(classified)` = tier-3, приемлем.
+  - Fallback → `Result::Err(generic "internal error")` = tier-3 но
+    слабее; диагностика страдает.
+  - Fallback → default value без классификации = **tier-4, silent
+    corruption**, запрещён §1.
+  - Fallback → panic = tier-3 структурно-максимум но runtime cost +
+    ломает "no panics" goal.
+- **Вопросы:**
+  - Есть ли fallback? Если да — почему?
+  - Fallback создаёт костыль — чинит ли он симптом, скрывая
+    баг в invariant'е выше?
+  - Fallback diverges от happy-path semantics — observable ли
+    разница caller'у? Если да — это **расхождение** (поломка
+    API-контракта), не recovery.
+  - Fallback retry — finite? Infinite-loop possible?
+  - Fallback transitions state — preserves ли target-state
+    invariants?
+  - "Default" value как fallback — а этот default реально correct
+    для контекста, или "nothing better to return"?
+- **Правило:** если при code review видишь fallback — прежде чем
+  принять, спросить "а можно без него?" Часто можно — через
+  tier-upgrade (tier-3 → tier-2 через typestate / bounded
+  container) или пересмотр invariant'а.
+
 ### Применимость
 
-Не всё релевантно всегда. Пример: `bsql-pg-proto` — sync sans-IO,
+Не всё релевантно всегда. Пример: pg-proto crate какой-нибудь — sync sans-IO,
 ось Concurrency (async/parallel) большей частью "не применимо — код
 синхронный, `!Sync` gated". Но: Drop-in-flight всё равно применимо
 (user future может быть dropped mid-feed_bytes, wrapper должен быть
 cancellation-safe). Так что ось **не выкидываем целиком**, а
 проходим по подпунктам.
 
+Memory-leak (ось 11) и Fallback (ось 12) — **почти всегда
+применимы**. Утечка памяти возможна везде где есть владение
+ресурсом; fallback применим везде где есть branching на ошибки. Это
+две оси которые особенно важно проходить осознанно, а не "по
+умолчанию нет".
+
 ### Правило
 
 Для каждой non-trivial правки в PR / коммит / deferred.md
-отметить — явно или неявно через assurance — что по всем 10 осям
+отметить — явно или неявно через assurance — что по всем 12 осям
 прошли. Неосмотренная ось = drift surface = latent bug class.
 
 ---
@@ -337,6 +398,14 @@ wire-level input, tier-1 невозможно по природе") — **нар
   потенциальная находка.
 - **Zero-branch** — на горячем пути branch'и минимизировать. LUT,
   bitwise, branchless arithmetic — welcome.
+- **Zero-leak** — НИ ОДНОГО пути где ресурс может не освободиться.
+  Владение доказывается **структурно** (Drop, arena-gen-ref с
+  явным `free`, RAII guards). Long-running connection — тест на
+  leak'и обязателен. См. §7 ось 11.
+- **Zero-fallback** — fallback-path ≠ recovery. Любой "default
+  value" в качестве fallback'а — проверить: это действительно
+  recovery, или костыль вокруг сломанного invariant'а уровнем
+  выше? См. §7 ось 12.
 - **Const propagation** — любое runtime-вычисление значения, которое
   могло бы быть const — flag. Const-fn rollout — welcome.
 - **Arena > pool > alloc** — когда есть выбор: arena-with-gen-ref

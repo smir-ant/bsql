@@ -3612,3 +3612,176 @@ as historical context (e.g. in `schema_arena.rs`, `buf.rs`,
 a reader looking up current behaviour. A documentation sweep
 to annotate these with "DEF-154 (Y): deleted — see row_stream"
 or rewrite them entirely is a future polish pass.
+
+### DEF-155 — post-(Y) двойной audit merge (audit #1 + #2 + crazy) — OPEN
+
+**Статус:** план, готовый к батчевому исполнению. **Ничего не
+отбрасывается.** CREDO §5 запрещает отсев по "низкий риск / не
+bottleneck / сложно / отложим". Принято к работе полностью.
+
+**Источник:** 2 прохода architect-subagent'а. #1 нашёл A1-A20 (6
+reconfirmed DONE, 14 findings). #2 (с CREDO на руках) falsified 3
+"DONE", нашёл 29 новых (B1-B29) + 6 crazy-architectural (C1-C6).
+Истинно уникальных (post-dedup) ~32 + 5 research-spike'ов.
+
+**Dedup пары (одна находка в двух audit'ах):**
+- A2 ≡ B1 ≡ B8 — `OutActions` POD → `heapless::Vec`
+- A4 ≡ B16 — cache-line-aware `PgProtocol` layout
+- A5 ≡ B10 — branchless ColumnsIter decode
+- A6 ≡ B13 — ASCII-int parser без `from_utf8`
+- A10 ≡ B22 — SCRAM hot/cold split
+- A19 ≡ B6 — `feed_bytes` gate split (dead overhead на production)
+- A20 ⊂ B1 + B3 — materialise fanout
+- B21 ≡ C6 — `dispatch()` by-ref vs by-val (712 MB memcpy/1M rows)
+- A11 ⊂ C4 — SIMD column batch
+
+**Финальная очередь — 10 батчей по dependency-ordering:**
+
+#### Batch 1 — tiny low-coupling cleanup (debt closure)
+
+Принцип: несвязанные друг с другом маленькие правки. Делаются
+параллельно в один commit-set. Каждая сама по себе проверяется.
+
+- **B2** — 4 публичных `len()` → `const fn`. Закрывает stale MSRV
+  citation (`usize::from(u16)` const-stable с 1.87, MSRV 1.95). 8
+  LoC, tier-2→tier-1 elevation.
+- **B5** — narrow `pub` → `pub(crate)` там где можно (20% API
+  surface reduction). 30 LoC.
+- **B7** — `#[inline(always)]` на `push_within_fanout_budget`. 1
+  LoC.
+- **B18** — lint bundle расширить: `clippy::cast_possible_truncation`,
+  `clippy::cast_sign_loss`, `clippy::cast_possible_wrap`,
+  `clippy::float_cmp`. 4 LoC.
+- **B20** — `#[inline]` на `row_stream` fast-path methods. 3 LoC.
+
+#### Batch 2 — classifier hygiene + const derivation
+
+- **B24** — `apply_pending_advance` `let _ = result` silent
+  discard → classify via `ProtoState::Errored`. 10 LoC.
+- **B25** — `fast_path_data_row` `let _ = read_buf_advance` →
+  тот же паттерн. 10 LoC.
+- **B23** — `CrateBugLocus` `#[repr(u8)]` + `Option<CrateBugLocus>`
+  niche const-assert. 5 LoC.
+- **B26** — `OutActions::as_slice` const-fold path. 5 LoC.
+- **B28** — `SHA256_PROOF_B64_LEN` const-derive from base64-len
+  формулы. 10 LoC.
+
+#### Batch 3 — micro-perf полезности
+
+- **B9** — `AuthSubCodeClass::Unknown(u32)` → `NonZeroU32` niche.
+  5 LoC.
+- **B17** — `record_param_status` inline hint. 5 LoC.
+- **B15** — `with_length_prefix` patch через `as_chunks_mut::<4>()`.
+  10 LoC.
+- **B12** — SCRAM mechanism-list fast-path (`starts_with` перед
+  linear scan). 5 LoC.
+- **A8** — continuation `usize → u16/u8` narrowing sweep по всем
+  hot-path сайтам (найти через audit сессию). 100 LoC.
+
+#### Batch 4 — hot-path foundation: OutActions reshape
+
+- **A2 / B1 / B8** — `OutActions` `[Action; 16]` → `heapless::Vec
+  <Action, 16>`. **5 KB zero-fill → 32 B per entry-point call.**
+  40 LoC. Low risk (тот же паттерн что `StagedActions`).
+- **A15** — `MAX_ACTIONS_PER_CALL` 16 → 9 (right-size из реального
+  fanout analysis post-(Y)). 30 LoC.
+- **B3** — materialise `push_within_fanout_budget` → infallible
+  push через const-asserted bounds. 60 LoC.
+- **B6** — `feed_bytes_bounded` split: `pub fn feed_bytes`
+  (unbounded, production) + `pub(crate) fn feed_bytes_bounded`
+  (RowStream only). 20 LoC.
+
+#### Batch 5 — decode hot-path
+
+- **A5 / B10** — branchless ColumnsIter decode
+  (`wrapping_add(1)` трюк). **~2.5× per-column × 32 col × 1M rows.**
+  120 LoC.
+- **A6 / B13** — ASCII-digit int parser без `from_utf8 + str::parse`.
+  **~2× на int-heavy text rows.** 80 LoC.
+- **B4** — `parse_error_response` scan: O(N×fields) → линейный с
+  SIMD-friendly chunk-of-4. **~3× на ServerErrorResponse parsing.**
+  30 LoC.
+- **B11** — `ParamOids` `[u32; 16]` → `heapless::Vec<u32, 16>`. 25
+  LoC, consistent с B1 pattern.
+
+#### Batch 6 — encode optimization
+
+- **A14** — const-template Bind+Execute+Sync prefix (scylla-driver
+  pattern). **20-40% encode CPU на 1-3 param queries.** 150 LoC.
+
+#### Batch 7 — dispatch perf (depends on state shape)
+
+- **B21 / C6** — `dispatch(prev: ProtoState)` by-value → by-ref
+  `&mut ProtoState`. **712 B memcpy/iter × 1M frames = 712 MB.**
+  50 LoC, medium risk (test surface).
+- **A7** — const LUT `[Option<InboundTagClass>; 256]` на tag byte.
+  10-15 ns/frame. 150 LoC.
+- **A3** — two-stage fn-ptr LUT dispatch (post-A10). 300-400 LoC,
+  high risk. Benchmark-driven решение оставлять/оставить.
+
+#### Batch 8 — state machine restructure (BIG)
+
+- **A10 / B22** — SCRAM hot/cold split: `ProtoState` 712 B → ~48 B
+  через externalisation в `PgProtocol.scram_state: Option<ScramRef>`.
+  **Foundation для A3 + A4.** 400-600 LoC. HIGH risk.
+- **A4 / B16** — cache-line-aware `PgProtocol` layout с `#[repr(C)]`,
+  hot fields в первой cache line. 200-300 LoC. Post-A10 only.
+
+#### Batch 9 — крупнейший структурный каскад
+
+- **A1 + A13** — `ProtocolError` 312 B → ~32 B через `ErrorArena`
+  (bounded slab + generational ref для `ServerErrorResponse` payload).
+  **Cascade:** `Action` 312→48, `OutActions` 5008→784 (6.4×),
+  `StreamItem` 320→80 (4× per-row pull). 500-700 LoC. HIGH risk.
+- **B14** — HList recursion для `ParamsWriter` tuple impls,
+  удаляет 400+ LoC monomorphised binary code. 80 LoC new code.
+  HIGH risk (ergonomic rework).
+
+#### Batch 10 — research spikes + deferred
+
+- **A11 / C4** — SWAR/SIMD `ColumnsBatch<N>` decode. **~6× на 8-col
+  int-heavy rows.** Сначала bench #143 (DEF-143) baseline, тогда
+  реализация. 800+ LoC.
+- **C1** — Typestate-driven `PgProtocol<S: State>`. 28 вариантов →
+  28 type params. **Tier-3 audit shield → tier-1 trivial.**
+  Prototype first, full-conversion если удачен. Breaks public API.
+- **C2** — Restore generative brands если infallible apply реально
+  elimirует 6+ runtime check'ов. Revisit DEF-154 (W) decision with
+  CREDO lens. Prototype first.
+- **C3** — `OutActions` как `impl Iterator<Item = Action>`
+  (lazy production). Обобщение (X) на все actions. 5 KB → 0 B
+  init на ALL caller paths. Overlaps с A2; решать через A vs C3.
+- **C5** — Bitpacked `StateErrorKind` → 1 байт. 5 LoC.
+- **A12** — Schema arena 2-slot → 8-slot под `cfg(pipelining)`
+  feature. Deferred до 1c-5.
+
+#### FALSE POSITIVES (audited, не в plan):
+
+- **B19** — `ParamOids::EMPTY` all-zeros Eq: currently doc-safe per
+  существующему обоснованию (full-array compare is correct for POD
+  shape).
+- **B27** — three-trait OID symmetry: уже pin'нут at decode.rs:1053–1071,
+  comprehensive.
+- **B29** — `SchemaSlab::occupied_count` optimal per DEF-171.
+
+**CONFIRMED DONE (не троньем):** A16, A17, A18 + 11 null-result
+areas: Cargo profile (lto fat, cu1, opt3, panic abort, strip symbols —
+уже оптимально), `#![forbid(unsafe_code)]` compliance полная, MSRV
+1.95 / Edition 2024, tag distinctness invariants, frame parser,
+`#[must_use]` propagation (189 `#[inline*]` + 15 `#[cold]`
+проверены), endianness/alignment safe через `u32::from_be_bytes`,
+tests 215 post-(Y), `debug_assert!` sites checked (кроме B24/B25),
+`PgProtocol: !Sync` gate.
+
+**Bench baseline требование (DEF-143 dependency):**
+Batch 10 items A11, C3 требуют measured baseline для валидации
+claimed wins. DEF-143 (criterion harness) должен shipнуться до или
+рядом с Batch 10.
+
+**CREDO §7 edge-case discipline применение:** каждая правка в
+Batch'ах 1-9 проходится по 10 осям (cardinality, presence, concurrency,
+temporal, trust, size, lifecycle, resource pressure, platform,
+failure composition). Неосмотренная ось = drift surface.
+
+**Общая оценка:** ~2000-3000 LoC реальных правок + 800-1500 LoC
+research-spike. 10-15 сессий. Без компромиссов.
