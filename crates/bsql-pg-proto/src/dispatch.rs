@@ -200,14 +200,19 @@ impl FrameCoords {
     }
 }
 
-// DEF-147 drift pin: FrameCoords packs 3 × u16 into 6 B of data
-// + alignment padding. On aarch64-apple-darwin / x86_64-linux
-// the struct is 8 B (6 B data + 2 B padding). 16 B saved per
-// dispatched frame compared to pre-DEF-147 (24 B with 3 × usize).
+// DEF-147 + DEF-154 (V) drift pin: FrameCoords packs 2 × u16 = 4 B.
+// Pre-DEF-154 (E) the struct was 3 × u16 (6 B + 2 B padding = 8 B)
+// because `populated_len` was stored alongside frame_start +
+// total_len. DEF-154 (E) deleted that field (witness-based bounds
+// via ReadRange::new's BrandedBytes); post-(V) the pin tightens
+// from `<= 8` to `== 4` — the exact size is now tier-1 compile-
+// enforced, catching both regressions (re-adding a field) AND
+// drift (padding or layout changes).
 const _: () = assert!(
-    core::mem::size_of::<FrameCoords>() <= 8,
-    "FrameCoords size regression — DEF-147 narrowed storage to 3 × u16 \
-     = 6 B + padding. Stay ≤ 8 B.",
+    core::mem::size_of::<FrameCoords>() == 4,
+    "FrameCoords size regression — must stay 2 × u16 = 4 B post-DEF-154 (E). \
+     Adding a field re-pays the alignment padding cost + breaks the \
+     per-frame stack budget.",
 );
 
 /// What to do after dispatching a single frame.

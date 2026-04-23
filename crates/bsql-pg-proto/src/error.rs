@@ -59,8 +59,11 @@ impl Severity {
     /// Matches the PG-standard uppercase names. Case-sensitive (PG
     /// emits uppercase). Falls through to [`Severity::Unknown`] for
     /// anything else — never panics, never rejects.
+    ///
+    /// DEF-154 (V): `const fn` so the round-trip pin below can
+    /// const-assert `from_bytes(as_str(v).as_bytes()) == v`.
     #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
+    pub const fn from_bytes(bytes: &[u8]) -> Self {
         match bytes {
             b"ERROR" => Self::Error,
             b"FATAL" => Self::Fatal,
@@ -96,6 +99,28 @@ impl fmt::Display for Severity {
         f.write_str(self.as_str())
     }
 }
+
+// DEF-154 (V) P2-6: round-trip compile pin for Severity.
+// `from_bytes(as_str(v).as_bytes())` must equal v for every
+// variant. Catches body-swap drift between the 8 known variants'
+// literal mappings. `Unknown` is special — `as_str` returns
+// "UNKNOWN" which `from_bytes` does NOT recognize, falling through
+// to `Self::Unknown` correctly (round-trip preserved via fallthrough).
+//
+// `matches!` in const context (stable since Rust 1.46) avoids both
+// the `as u8` coercion (forbid-bundle bans) and the requirement for
+// a const `PartialEq` impl.
+const _: () = {
+    assert!(matches!(Severity::from_bytes(Severity::Error.as_str().as_bytes()), Severity::Error));
+    assert!(matches!(Severity::from_bytes(Severity::Fatal.as_str().as_bytes()), Severity::Fatal));
+    assert!(matches!(Severity::from_bytes(Severity::Panic.as_str().as_bytes()), Severity::Panic));
+    assert!(matches!(Severity::from_bytes(Severity::Warning.as_str().as_bytes()), Severity::Warning));
+    assert!(matches!(Severity::from_bytes(Severity::Notice.as_str().as_bytes()), Severity::Notice));
+    assert!(matches!(Severity::from_bytes(Severity::Debug.as_str().as_bytes()), Severity::Debug));
+    assert!(matches!(Severity::from_bytes(Severity::Info.as_str().as_bytes()), Severity::Info));
+    assert!(matches!(Severity::from_bytes(Severity::Log.as_str().as_bytes()), Severity::Log));
+    assert!(matches!(Severity::from_bytes(Severity::Unknown.as_str().as_bytes()), Severity::Unknown));
+};
 
 // F-054 (pass-#8): niche-pack invariant pin. `Severity` is `#[repr(u8)]`
 // with 9 variants occupying discriminants 0..=8; values 9..=255 are

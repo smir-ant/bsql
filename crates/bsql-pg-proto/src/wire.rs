@@ -465,6 +465,26 @@ impl AuthSubCode {
     }
 }
 
+// DEF-154 (V) P2-4: round-trip compile pin for AuthSubCode.
+const _: () = {
+    assert!(
+        matches!(AuthSubCode::try_from_u32(AuthSubCode::Ok.raw()), Ok(AuthSubCode::Ok)),
+        "AuthSubCode round-trip broken: Ok",
+    );
+    assert!(
+        matches!(AuthSubCode::try_from_u32(AuthSubCode::Sasl.raw()), Ok(AuthSubCode::Sasl)),
+        "AuthSubCode round-trip broken: Sasl",
+    );
+    assert!(
+        matches!(AuthSubCode::try_from_u32(AuthSubCode::SaslContinue.raw()), Ok(AuthSubCode::SaslContinue)),
+        "AuthSubCode round-trip broken: SaslContinue",
+    );
+    assert!(
+        matches!(AuthSubCode::try_from_u32(AuthSubCode::SaslFinal.raw()), Ok(AuthSubCode::SaslFinal)),
+        "AuthSubCode round-trip broken: SaslFinal",
+    );
+};
+
 /// The SCRAM-SHA-256 mechanism name as bytes.
 pub const SCRAM_SHA_256_MECHANISM: &[u8] = b"SCRAM-SHA-256";
 

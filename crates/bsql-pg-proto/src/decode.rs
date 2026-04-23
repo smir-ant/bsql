@@ -85,7 +85,32 @@ impl FormatCode {
             other => Err(other),
         }
     }
+
+    /// DEF-154 (V) P2-5 helper: the wire i16 representation.
+    /// Centralises the `self as i16` coercion in a match — matches
+    /// the `try_from_wire_i16` literals exactly. A body-swap drift
+    /// is caught by the round-trip const-assert below.
+    #[inline]
+    #[must_use]
+    pub const fn as_wire_i16(self) -> i16 {
+        match self {
+            Self::Text => 0,
+            Self::Binary => 1,
+        }
+    }
 }
+
+// DEF-154 (V) P2-5: round-trip compile pin for FormatCode.
+const _: () = {
+    assert!(
+        matches!(FormatCode::try_from_wire_i16(FormatCode::Text.as_wire_i16()), Ok(FormatCode::Text)),
+        "FormatCode round-trip broken: Text",
+    );
+    assert!(
+        matches!(FormatCode::try_from_wire_i16(FormatCode::Binary.as_wire_i16()), Ok(FormatCode::Binary)),
+        "FormatCode round-trip broken: Binary",
+    );
+};
 
 /// Per-column metadata from a `RowDescription` frame.
 ///

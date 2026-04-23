@@ -101,6 +101,26 @@ impl TxStatus {
     }
 }
 
+// DEF-154 (V) P2-3: round-trip compile pin for TxStatus.
+// `try_from_byte(byte(v)) == Ok(v)` must hold for every variant —
+// catches a body-swap drift (e.g. `Self::Idle => b'T'`) at build
+// time rather than in an integration test. Tier-3 audit → tier-1
+// compile.
+const _: () = {
+    assert!(
+        matches!(TxStatus::try_from_byte(TxStatus::Idle.byte()), Ok(TxStatus::Idle)),
+        "TxStatus round-trip broken: Idle",
+    );
+    assert!(
+        matches!(TxStatus::try_from_byte(TxStatus::InTransaction.byte()), Ok(TxStatus::InTransaction)),
+        "TxStatus round-trip broken: InTransaction",
+    );
+    assert!(
+        matches!(TxStatus::try_from_byte(TxStatus::Failed.byte()), Ok(TxStatus::Failed)),
+        "TxStatus round-trip broken: Failed",
+    );
+};
+
 /// Typed non-empty range into a write buffer, replacing the raw
 /// `(start, end): (usize, usize)` pair on [`StagedAction::SendBytesRange`].
 /// DEF-100.

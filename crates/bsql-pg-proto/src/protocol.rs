@@ -308,7 +308,7 @@ pub struct PgProtocol {
     /// `Action::StreamRow` drops from ~280 B → ~32 B;
     /// per-row DataRow emission saves ~260 B (hot path on SELECT).
     schema_arena: crate::schema_arena::SchemaSlab,
-    /// DEF-154 (H): deferred `read_buf` cursor advance — bytes to
+    /// DEF-154 (H+V): deferred `read_buf` cursor advance — bytes to
     /// skip at the start of the NEXT `feed_bytes` call before any
     /// new frame parsing.
     ///
@@ -319,15 +319,21 @@ pub struct PgProtocol {
     /// carries `&'r [u8]` slices of `read_buf.populated()` directly;
     /// Rust's borrow checker blocks any `&mut self.read_buf` call
     /// while OutActions holds those `'r` slices — so advance must
-    /// defer until OutActions drops (which happens before the next
-    /// feed_bytes call, per `&'r mut self` re-borrow rules).
+    /// defer until OutActions drops.
+    ///
+    /// DEF-154 (V) P1-2 (audit-2): typed as `Option<NonZeroU16>`
+    /// rather than `u16` with `0 = sentinel`. Niche-packs to same
+    /// 2 bytes (NonZeroU16 zero-niche is Option's None discriminant).
+    /// `None` IS the "no pending advance" state — previously a
+    /// zero-valued u16 was semantically the same but nothing at the
+    /// type level prevented a future edit from assigning 0 where a
+    /// legit non-zero was expected. Post-(V) the invariant is
+    /// tier-1 compile.
     ///
     /// `PgProtocol: !Sync`, so no external observer sees the interim
-    /// "not-yet-advanced" cursor state between calls.
-    ///
-    /// `u16` matches `read_buf.cursor` storage — any value fits by
-    /// the `READ_BUF_CAP <= u16::MAX` const-assert.
-    pending_advance: u16,
+    /// "not-yet-advanced" cursor state between calls. Value bounded
+    /// by `READ_BUF_CAP <= u16::MAX` const-assert.
+    pending_advance: Option<core::num::NonZeroU16>,
     /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
     /// Load-bearing: the crate-root ambiguous-impl gate verifies that
     /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
@@ -350,7 +356,7 @@ impl PgProtocol {
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
             schema_arena: crate::schema_arena::SchemaSlab::new(),
-            pending_advance: 0,
+            pending_advance: None,
             sync_marker: PhantomData,
         }
     }
@@ -400,7 +406,10 @@ impl PgProtocol {
     #[must_use]
     pub fn unread(&self) -> &[u8] {
         let raw = self.read_buf.unread();
-        let skip = usize::from(self.pending_advance);
+        let skip = match self.pending_advance {
+            Some(n) => usize::from(n.get()),
+            None => 0,
+        };
         // `split_at_checked(n) -> Option<(&[u8], &[u8])>`:
         // None iff n > raw.len(). Architecturally dead (see doc).
         match raw.split_at_checked(skip) {
@@ -613,15 +622,11 @@ impl PgProtocol {
         // we classify as InternalCrateBug and fall through to the
         // Errored fast-path below.
         let mut pending_advance_err = false;
-        if self.pending_advance > 0 {
-            if self
-                .read_buf
-                .advance(usize::from(self.pending_advance))
-                .is_err()
-            {
+        if let Some(n) = self.pending_advance {
+            if self.read_buf.advance(usize::from(n.get())).is_err() {
                 pending_advance_err = true;
             }
-            self.pending_advance = 0;
+            self.pending_advance = None;
         }
 
         let is_errored_or_recovering =
@@ -890,8 +895,14 @@ impl PgProtocol {
             // record pending_advance — next call's is_errored
             // fast-path will CLEAR the buffer anyway (pending advance
             // becomes moot).
-            if !matches!(state, ProtoState::Errored(_)) && frames_consumed > 0 {
-                *pending_advance = frames_consumed;
+            //
+            // DEF-154 (V): `pending_advance: Option<NonZeroU16>` —
+            // None means "no pending" (type-enforced, cannot
+            // accidentally assign 0). `NonZeroU16::new(frames_consumed)`
+            // returns None if frames_consumed == 0, naturally
+            // skipping the `frames_consumed > 0` condition.
+            if !matches!(state, ProtoState::Errored(_)) {
+                *pending_advance = core::num::NonZeroU16::new(frames_consumed);
             }
 
             materialise(staged, wb.into_bytes_branded(), schema_arena.as_reader())
