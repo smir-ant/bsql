@@ -1062,12 +1062,29 @@ impl PgProtocol {
     /// DEF-154 (X): apply any pending cursor advance from a prior
     /// feed_bytes call. RowStream calls this at `iter_rows()`
     /// construction to mirror `feed_bytes`'s entry semantics.
+    ///
+    /// DEF-184 (B24): Err was previously silently discarded via
+    /// `let _result = ...` — a tier-4 fallback violating CREDO §1.
+    /// `pending_advance` is recorded only from validated
+    /// `frames_consumed` sums (bounded by parse_header-checked
+    /// total_len additions), so Err is architecturally dead. But
+    /// "dead by audit" is tier-3 trust; elevating to tier-2
+    /// structural via explicit Errored classification closes the
+    /// drift surface at zero runtime cost (branch is cold-path
+    /// unreachable in practice, but now auditable).
     #[inline]
     pub(crate) fn apply_pending_advance(&mut self) {
         if let Some(n) = self.pending_advance {
-            // Err architecturally dead (pending_advance stored
-            // only via validated frames_consumed); ignore.
-            let _result = self.read_buf.advance(usize::from(n.get()));
+            if self.read_buf.advance(usize::from(n.get())).is_err() {
+                // Architecturally dead; drift-surface closure via
+                // classification. Matches the feed_bytes entry
+                // pattern in protocol.rs:~626 (pending_advance_err
+                // flag → InternalCrateBug emission).
+                let cause = ProtocolError::InternalCrateBug {
+                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                };
+                self.state = ProtoState::Errored(cause.state_kind());
+            }
             self.pending_advance = None;
         }
     }
@@ -1078,6 +1095,20 @@ impl PgProtocol {
     #[must_use]
     pub(crate) fn state_is_errored(&self) -> bool {
         matches!(self.state, ProtoState::Errored(_))
+    }
+
+    /// DEF-184 (B25): transition to `Errored(Internal)` for a
+    /// dead-branch read_buf advance Err. Used by RowStream's
+    /// fast-path when `read_buf_advance(total)` returns Err
+    /// — architecturally impossible (total pre-validated) but
+    /// tier-2 classification closes the drift surface at zero
+    /// runtime cost (branch is cold-path unreachable in practice).
+    #[inline]
+    pub(crate) fn install_errored_read_cursor_advance(&mut self) {
+        let cause = ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+        };
+        self.state = ProtoState::Errored(cause.state_kind());
     }
 
     /// DEF-154 (X): transition to `Errored(Framing)` for a
@@ -2291,7 +2322,12 @@ fn materialise<'w, 'r>(
 ///
 /// Replaces the pre-(L) `.unwrap_or(())` silent-drop pattern across
 /// 6 materialise sites.
-#[inline]
+///
+/// DEF-184 (B7): `#[inline(always)]` forces inlining at every
+/// 6 materialise call sites — each staged action pays a single
+/// `out.push(a)` + match, zero fn-call overhead. Cascades to
+/// removal once B3 makes push infallible structurally.
+#[inline(always)]
 fn push_within_fanout_budget<'w, 'r>(
     out: &mut OutActions<'w, 'r>,
     a: Action<'w, 'r>,

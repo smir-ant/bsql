@@ -629,18 +629,31 @@ impl<'w, 'r> OutActions<'w, 'r> {
     }
 
     /// Borrow the populated prefix as a slice.
+    ///
+    /// DEF-184 (B26): converted from `.get(..len).unwrap_or(&[])` —
+    /// silent-fallback pattern CREDO §5 bans — to explicit
+    /// `split_at_checked` match sibling-pattern to
+    /// `FixedStr::as_bytes` (ident.rs F-034 / DEF-154 S P1-1).
+    /// Semantics identical; readability of dead-branch decision
+    /// improved (emission is explicit empty-slice sentinel, not a
+    /// silent `.unwrap_or()`).
     #[inline]
     pub fn as_slice(&self) -> &[Action<'w, 'r>] {
         // DEF-178 (audit2 A023): debug_assert pins the
-        // architecturally-dead unwrap_or(&[]) fallback. len() is
+        // architecturally-dead None arm. `self.len()` is
         // invariant-bounded to `MAX_ACTIONS_PER_CALL == items.len()`
-        // by the push() capacity check. Sibling pattern to
-        // `FixedStr::as_bytes` (pass-#8 F-061).
+        // by the push() capacity check + const-assert below.
         debug_assert!(
             self.len() <= self.items.len(),
             "DEF-178: OutActions.len exceeds item capacity — invariant break",
         );
-        self.items.get(..self.len()).unwrap_or(&[])
+        match self.items.split_at_checked(self.len()) {
+            Some((head, _)) => head,
+            // Architecturally unreachable per the capacity-gated
+            // push invariant; empty-slice sentinel = same
+            // no-silent-op convention as FixedStr::as_bytes.
+            None => &[],
+        }
     }
 
     /// Return the first populated action (or `None` if empty).

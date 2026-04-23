@@ -163,10 +163,17 @@ impl RowDesc {
     ///
     /// F-034 (pass-#8) considered making this `const`, but `impl
     /// From<u16> for usize` is not yet stable as a const trait
-    /// (rust-lang issue #143874). Under the forbid-bundle we cannot
-    /// use `self.n_columns as usize`. When the const `From` impl
+    /// (rust-lang issue #143874 — still tracking as of Rust 1.95).
+    /// Under the forbid-bundle we cannot use
+    /// `self.n_columns as usize`. When the const `From` impl
     /// stabilises, this can flip to `const fn` without touching
     /// the call surface.
+    ///
+    /// DEF-184 (B2): audit #2 claimed const-stable since Rust 1.87
+    /// — **incorrect**. Verified 2026-04-23: compiler still rejects
+    /// `const fn` + `usize::from(u16)` with E0658 "From is not yet
+    /// stable as a const trait". Reverted. CREDO §3 skepticism
+    /// applied to audit claim proved correct.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {

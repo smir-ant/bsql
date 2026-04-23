@@ -67,13 +67,31 @@ pub const MAX_SALT_LEN: usize = 64;
 /// SHA-256 produces 32 bytes. Base64 encoding with padding is
 /// `ceil(N / 3) * 4`; for `N = 32` that is `ceil(32/3) * 4 = 11 * 4 = 44`.
 ///
-/// Named as a constant rather than computed via a `const fn`, because
-/// the crate's forbid-bundle bans `clippy::integer_division` even in
-/// const context — and `forbid` cannot be downgraded by `#[expect]`.
-/// The value is verified by the base64 crate's runtime encoding on the
-/// actual proof bytes in the RFC 7677 test vector (see
-/// `scram::crypto::tests`), which fails if the padding length drifts.
-const SHA256_PROOF_B64_LEN: usize = 44;
+/// DEF-184 (B28): derived via `usize::div_ceil` (which is method
+/// call, not `/` operator, so `clippy::integer_division` does not
+/// flag it). Formula: base64 encodes 3 bytes into 4 chars,
+/// unpadded length = `ceil(n/3) * 4`. For SHA-256 (32 bytes):
+/// `ceil(32/3) * 4 = 11 * 4 = 44` chars — matches the old hard-
+/// coded magic number. Drift pin: if `SHA256_DIGEST_LEN` ever
+/// changes (it won't — SHA-256 is forever 32 bytes per RFC 6234)
+/// or the formula is off, the static_assert below catches it.
+const SHA256_DIGEST_LEN: usize = 32;
+const SHA256_PROOF_B64_LEN: usize = SHA256_DIGEST_LEN
+    .div_ceil(3)
+    .saturating_mul(4);
+
+// Drift-pin: derived value must equal the wire-verified magic
+// number (44). `base64ct` runtime encoding in scram::crypto::tests
+// independently checks the proof's padding length on the RFC 7677
+// test vector; the const-assert here makes the formula → value
+// pairing explicit at compile time.
+const _: () = assert!(
+    SHA256_PROOF_B64_LEN == 44,
+    "SHA256_PROOF_B64_LEN drift — base64(sha256_digest) is always \
+     44 chars for 32-byte input (RFC 4648 §4). If this assert \
+     trips, either SHA256_DIGEST_LEN changed (unlikely per \
+     RFC 6234) or the div_ceil-based formula is wrong.",
+);
 
 /// Byte size of a SASL `Initial Response` frame sent by the client.
 ///

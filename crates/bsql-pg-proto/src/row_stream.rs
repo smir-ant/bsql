@@ -226,6 +226,13 @@ impl<'p, 'w> RowStream<'p, 'w> {
     ///    `feed_bytes_bounded([], wb, 1)` call, emit the first
     ///    resulting Action. Terminal action sets
     ///    `flush_pending`.
+    ///
+    /// DEF-184 (B20): `#[inline]` — caller loops `while let
+    /// StreamItem::Row { .. } = stream.next_event() { ... }` on
+    /// the row hot path. Inlining collapses the state-peek header
+    /// parse into the caller's loop body; LLVM folds the flush /
+    /// errored short-circuits into hoisted compare chains.
+    #[inline]
     pub fn next_event(&mut self) -> StreamItem<'_> {
         if self.drained {
             return StreamItem::NeedMore;
@@ -295,6 +302,18 @@ impl<'p, 'w> RowStream<'p, 'w> {
 
     /// Fast path: extract the DataRow body inline + emit
     /// [`StreamItem::Row`] without OutActions allocation.
+    ///
+    /// DEF-184 (B25): `read_buf_advance(total)` Err paths
+    /// previously silently discarded via `let _ = ...` — tier-4
+    /// fallback violating CREDO §1. `total` is parse_header-
+    /// validated against `after_cursor.len()` in [`next_event`]
+    /// before calling into this fast-path, so advance is
+    /// architecturally infallible here. Elevated tier-3 trust to
+    /// tier-2 structural via classified `InternalCrateBug` emission
+    /// on the dead Err branch.
+    ///
+    /// DEF-184 (B20): `#[inline]` — hot path per-DataRow emission.
+    #[inline]
     fn fast_path_data_row(
         &mut self,
         id: NonZeroU64,
@@ -309,7 +328,18 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // framing desync: total_len == HEADER_LEN).
             self.drained = true;
             self.proto.install_errored_malformed_data_row();
-            let _ = self.proto.read_buf_advance(total);
+            // Advance Err architecturally dead (total was validated
+            // against populated slice length by caller); on dead-
+            // branch trip we're already Errored, so classified
+            // InternalCrateBug would be double-tagging the same
+            // connection-terminal state. Swallow is safe HERE
+            // because state is ALREADY Errored — but for audit
+            // discipline, verify advance result and replace the
+            // cause if it trips (most-recent wins — framing
+            // classification preserved above).
+            if self.proto.read_buf_advance(total).is_err() {
+                self.proto.install_errored_read_cursor_advance();
+            }
             return StreamItem::FailReply {
                 id,
                 cause: ProtocolError::MalformedDataRow { total_len: total },
@@ -317,8 +347,19 @@ impl<'p, 'w> RowStream<'p, 'w> {
         }
 
         // Advance cursor past the frame — captures indices
-        // remain valid while populated is borrowed.
-        let _ = self.proto.read_buf_advance(total);
+        // remain valid while populated is borrowed. Err is
+        // architecturally dead (total pre-validated); classify
+        // into Errored + FailReply instead of silent-skip.
+        if self.proto.read_buf_advance(total).is_err() {
+            self.drained = true;
+            self.proto.install_errored_read_cursor_advance();
+            return StreamItem::FailReply {
+                id,
+                cause: ProtocolError::InternalCrateBug {
+                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                },
+            };
+        }
 
         let populated = self.proto.read_buf_populated();
         let row_bytes = populated.get(row_start..row_end).unwrap_or(&[]);
@@ -358,6 +399,11 @@ impl<'p, 'w> RowStream<'p, 'w> {
     /// `self.next_event()`, the action's borrow of `self.proto`
     /// would extend across the recursion's `&mut self.proto`
     /// and fail to compile.
+    ///
+    /// DEF-184 (B20): `#[inline]` — next_event delegates here on
+    /// every non-DataRow slow frame (T, C, Z, E); inlining folds
+    /// the bounded-feed_bytes setup into caller.
+    #[inline]
     fn slow_path_once(&mut self) -> StreamItem<'_> {
         let actions = self.proto.feed_bytes_bounded(&[], self.write_buf, 1);
         let first_opt = actions.as_slice().first().copied();

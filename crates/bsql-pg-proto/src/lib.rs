@@ -71,7 +71,15 @@
     clippy::as_conversions,
     clippy::arithmetic_side_effects,
     clippy::float_arithmetic,
-    clippy::integer_division
+    clippy::integer_division,
+    // DEF-184 (B18): even with `as` cast banned, infallible
+    // `From`/`try_from` can be subtly wrong if a narrowing happens
+    // at the type level (e.g. `i32 → u32` sign loss, `u64 → usize`
+    // on 32-bit targets). Tier-1 compile guard catches these.
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::float_cmp
 )]
 #![deny(
     unused_must_use,

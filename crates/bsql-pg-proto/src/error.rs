@@ -578,7 +578,13 @@ pub enum ProtocolError {
 /// Additive: as new dead-paths are identified (e.g. DEF-154's
 /// buffer-witness stale-ref detection), variants grow WITHOUT
 /// expanding the top-level [`ProtocolError`] enum.
+///
+/// DEF-184 (B23): `#[repr(u8)]` makes the discriminant explicit
+/// 1-byte. `Option<CrateBugLocus>` niche-packs in the same byte —
+/// const-asserted below to catch drift if a future variant with
+/// payload lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum CrateBugLocus {
     /// [`crate::buf::ReadBuf::advance`] returned Err after
     /// `parse_header` successfully validated
@@ -670,6 +676,23 @@ pub enum CrateBugLocus {
     /// routes `Err` through `FailReply + CloseSocket`.
     EmptyWriteRange,
 }
+
+// DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
+// since all variants are C-like + `#[repr(u8)]`. Drift pin catches
+// any future variant that adds a payload (would bump size to ≥ 2B
+// and break the niche).
+const _: () = assert!(
+    core::mem::size_of::<CrateBugLocus>() == 1,
+    "CrateBugLocus must stay 1-byte (repr(u8), C-like variants) — \
+     adding a payload variant regresses Option<CrateBugLocus> \
+     niche packing.",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<CrateBugLocus>>() == 1,
+    "Option<CrateBugLocus> must niche-pack into 1 byte — \
+     repr(u8) + C-like enum leaves 256 - 7 = 249 unused \
+     discriminant slots for the None sentinel.",
+);
 
 impl fmt::Display for CrateBugLocus {
     /// DEF-173 (audit2 A006 + A031): dedicated Display impl for
