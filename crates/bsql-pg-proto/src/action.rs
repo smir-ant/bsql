@@ -778,7 +778,9 @@ impl<'w, 'r> Iterator for OutActionsIter<'w, 'r> {
 /// than POD, smaller surface than `unsafe`, same memory footprint.
 /// Future "consistency" refactors must address all three points
 /// before proposing the change.
-pub(crate) type StagedActions<'wb, 'r> = heapless::Vec<StagedAction<'wb, 'r>, MAX_ACTIONS_PER_CALL>;
+// DEF-154 (L): staged container uses `MAX_STAGED_PER_CALL`
+// (dispatch-side cap); output uses `MAX_ACTIONS_PER_CALL` (fan-out).
+pub(crate) type StagedActions<'wb, 'r> = heapless::Vec<StagedAction<'wb, 'r>, { crate::protocol::MAX_STAGED_PER_CALL }>;
 
 /// A directive from the protocol to its host.
 ///

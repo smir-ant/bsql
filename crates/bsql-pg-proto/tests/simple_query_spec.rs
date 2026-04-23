@@ -798,13 +798,18 @@ fn rows_across_multiple_feed_bytes_calls() {
 /// `errored()` have already consumed the reply, silently dropping
 /// the action and orphaning the caller's oneshot.
 ///
-/// Construction: push SimpleQuery, feed 10 DataRow frames + C + Z
-/// in ONE chunk. `MAX_ACTIONS_PER_CALL=8`, `WORST_CASE_PER_DISPATCH=2`
-/// — so the first call emits ≤ 7 StreamRows and leaves the rest in
-/// the buffer. The second call (empty bytes) drains the remainder
-/// and the terminal DeliverReply.
+/// Construction: push SimpleQuery, feed enough DataRow frames to
+/// exceed `MAX_ACTIONS_PER_CALL` in ONE chunk. DEF-154 (L) split
+/// the staged (dispatch-side) cap from the output (user-side) cap —
+/// the dispatch gate still breaks on `MAX_STAGED_PER_CALL`, but
+/// output fits up to `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL *
+/// MAX_FANOUT_PER_STAGED = 16` actions. To force backpressure
+/// across calls, we feed `MAX_STAGED_PER_CALL + 3` DataRow frames +
+/// C + Z. The first call emits ≤ MAX_STAGED_PER_CALL (happy-path
+/// 1-action staging); the remainder drains on subsequent calls.
 #[test]
 fn overflow_backpressure_preserves_delivery_across_calls() {
+    use bsql_pg_proto::{MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL};
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let q_raw = raw(200);
@@ -812,13 +817,14 @@ fn overflow_backpressure_preserves_delivery_across_calls() {
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&row_description_frame(1));
-    let row_count = 10usize;
+    // Force backpressure: need more rows than one dispatch call can stage.
+    let row_count = MAX_STAGED_PER_CALL.saturating_add(3);
     for i in 0..row_count {
         let Ok(digit) = u8::try_from(i) else { unreachable!() };
         let payload = [b'r', digit.saturating_add(b'0')];
         bytes.extend_from_slice(&data_row_frame(&payload));
     }
-    bytes.extend_from_slice(&command_complete_frame(b"SELECT 10"));
+    bytes.extend_from_slice(&command_complete_frame(b"SELECT 12"));
     bytes.extend_from_slice(&rfq_frame(b'I'));
 
     // First call: gate caps emission under MAX_ACTIONS_PER_CALL.
@@ -826,8 +832,8 @@ fn overflow_backpressure_preserves_delivery_across_calls() {
     let mut saw_deliver = false;
     let first = proto.feed_bytes(&bytes, &mut wb);
     assert!(
-        first.len() <= 8,
-        "first call must not exceed MAX_ACTIONS_PER_CALL=8",
+        first.len() <= MAX_ACTIONS_PER_CALL,
+        "first call must not exceed MAX_ACTIONS_PER_CALL (={MAX_ACTIONS_PER_CALL})",
     );
     for a in first.as_slice() {
         match a {
@@ -854,7 +860,7 @@ fn overflow_backpressure_preserves_delivery_across_calls() {
     // Subsequent calls drain the remaining frames.
     while !saw_deliver {
         let out = proto.feed_bytes(&[], &mut wb);
-        assert!(out.len() <= 8);
+        assert!(out.len() <= MAX_ACTIONS_PER_CALL);
         for a in out.as_slice() {
             match a {
                 Action::StreamRow { id: sid, .. } => {

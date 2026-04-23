@@ -123,7 +123,7 @@ pub use ident::{
     ApplicationName, DatabaseName, Ident, IdentError, PortalName, Sql, StmtName,
 };
 pub use password::{Credentials, Password, PasswordError};
-pub use protocol::{MAX_ACTIONS_PER_CALL, PgProtocol};
+pub use protocol::{MAX_ACTIONS_PER_CALL, MAX_FANOUT_PER_STAGED, MAX_STAGED_PER_CALL, PgProtocol};
 pub use reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,
     ReplyId, ReplyKind, StartupKind,
@@ -321,11 +321,17 @@ const _: () = assert!(
      state ~1224 + session_params ~420 + schema_arena ~520 + padding.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() >= 2496
-        && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2560,
-    "OutActions<'_, '_> size drift — post-DEF-119 actual is 2504 B. \
-     Range [2496, 2560] catches regressions. 8 × sizeof(Action) (312 B) \
-     + u8 len + padding ≈ 2504.",
+    core::mem::size_of::<action::OutActions<'static, 'static>>() >= 4992
+        && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 5120,
+    "OutActions<'_, '_> size drift — post-DEF-154 (L) expected ~5008 B. \
+     Range [4992, 5120] catches regressions. 16 × sizeof(Action) (312 B) \
+     + u8 len + padding ≈ 5008. The 8→16 slot bump is driven by the \
+     MAX_STAGED_PER_CALL × MAX_FANOUT_PER_STAGED split: materialise's \
+     stale-ref fan-out (2 actions per staged entry) is now architecturally \
+     contained via `const _: () = assert!(MAX_ACTIONS_PER_CALL >= \
+     MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED)` in protocol.rs. \
+     If the budget grows further (e.g. new 3-action fan-out variant), \
+     update MAX_FANOUT_PER_STAGED + this range together.",
 );
 
 // ---------------------------------------------------------------------

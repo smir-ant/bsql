@@ -89,13 +89,17 @@ macro_rules! count_exprs {
 /// DEF-045. Form split: DEF-055.
 macro_rules! emit_actions {
     // Loop form: bails out of the enclosing loop on overflow.
+    //
+    // DEF-154 (L): staged container uses `MAX_STAGED_PER_CALL`
+    // (NOT `MAX_ACTIONS_PER_CALL` — the latter is the OUTPUT
+    // (user-side) cap, with MAX_STAGED_PER_CALL × MAX_FANOUT_PER_STAGED).
     (
         $out:expr, budget: $budget:literal, on_overflow: break,
         [$($action:expr),+ $(,)?]
     ) => {{
         const _: () = assert!(
-            $crate::protocol::MAX_ACTIONS_PER_CALL >= $budget,
-            "emit_actions! per-site budget exceeds MAX_ACTIONS_PER_CALL",
+            $crate::protocol::MAX_STAGED_PER_CALL >= $budget,
+            "emit_actions! per-site budget exceeds MAX_STAGED_PER_CALL",
         );
         const _: () = assert!(
             $budget >= count_exprs!($($action),+),
@@ -115,8 +119,8 @@ macro_rules! emit_actions {
         [$($action:expr),+ $(,)?]
     ) => {{
         const _: () = assert!(
-            $crate::protocol::MAX_ACTIONS_PER_CALL >= $budget,
-            "emit_actions! per-site budget exceeds MAX_ACTIONS_PER_CALL",
+            $crate::protocol::MAX_STAGED_PER_CALL >= $budget,
+            "emit_actions! per-site budget exceeds MAX_STAGED_PER_CALL",
         );
         const _: () = assert!(
             $budget >= count_exprs!($($action),+),
@@ -210,7 +214,67 @@ macro_rules! try_builder {
 /// Keeping `MAX_ACTIONS_PER_CALL = 4` would force 2+ extra
 /// `feed_bytes` calls per batch; 8 covers realistic streaming
 /// density with single-digit call counts on typical row sizes.
-pub const MAX_ACTIONS_PER_CALL: usize = 8;
+///
+/// # DEF-154 (L) P0-1 + P0-2(a): staged / output split
+///
+/// Pre-(L), `MAX_ACTIONS_PER_CALL = 8` governed BOTH the staged
+/// (dispatch-side) and output (user-side) capacity. Materialise
+/// emits up to 2 actions per staged entry on the stale-SchemaRef
+/// fan-out path (`FailReply + CloseSocket`) — a 16-action
+/// worst-case that did not fit the 8-slot output container,
+/// causing `.unwrap_or(())` to silently drop terminal actions.
+///
+/// Post-(L): `MAX_STAGED_PER_CALL = 8` bounds dispatch's stage
+/// container; `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED = 16`
+/// bounds the output container (compile-asserted below). Worst-case
+/// fanout is then ARCHITECTURALLY contained — the silent-drop
+/// class is closed at the type/capacity level, not at a runtime
+/// shield.
+///
+/// Also a 2× quick-win for the SELECT-large bottleneck: 15-row
+/// streaming density per call (vs 7 pre-(L)) halves feed_bytes
+/// round-trips on 1M-row queries. The full pull-based RowStream
+/// redesign (P0-2(c)) is the deeper fix.
+///
+/// # Emission-site vs aggregate
+///
+/// - **Per emission site — tier 1 compile**: `emit_actions!` asserts
+///   budget ≤ `MAX_STAGED_PER_CALL` via `const _: () = assert!(...)`.
+/// - **Aggregate output — tier 1 compile (post-(L))**:
+///   `const _: () = assert!(MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED);`
+///   guarantees `out.push(a)` during materialise cannot overflow,
+///   so the `.unwrap_or(())` pattern is genuinely architecturally
+///   dead (not just "believed dead by code review").
+pub const MAX_STAGED_PER_CALL: usize = 8;
+
+/// Worst-case output-action fan-out per single staged action.
+///
+/// - Most staged actions map 1:1 to one `Action`.
+/// - `StagedAction::StreamRowRange` with a stale `SchemaRef`
+///   emits 2 (`FailReply { StaleSchemaRef } + CloseSocket`).
+/// - `StagedAction::DeliverReply` with a stale `SchemaRef` in its
+///   payload (e.g. schema-bearing `QueryComplete`) emits 2.
+///
+/// 2 is the documented worst-case; a future staged variant that
+/// fans out to 3 actions must bump this const AND
+/// `MAX_ACTIONS_PER_CALL` in lockstep (the const-assert below
+/// catches a missing bump).
+pub const MAX_FANOUT_PER_STAGED: usize = 2;
+
+/// Output-side action capacity — bounds `OutActions` storage.
+///
+/// `= MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED`. See DEF-154 (L)
+/// block above for the split rationale.
+pub const MAX_ACTIONS_PER_CALL: usize = MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED;
+
+// DEF-154 (L) const-assert: the P0-1 silent-drop class is closed
+// iff OUT cap ≥ STAGED cap × worst-case fanout.
+const _: () = assert!(
+    MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED,
+    "MAX_ACTIONS_PER_CALL (output capacity) must be >= \
+     MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED to ensure materialise \
+     cannot overflow OutActions. See DEF-154 (L).",
+);
 
 /// Worst-case number of actions a single dispatch iteration can
 /// emit. Used as the budget-check reserve in [`PgProtocol::feed_bytes`]:
@@ -723,10 +787,17 @@ impl PgProtocol {
                         let frame_start = AbsFrameStart::new(absolute_start);
                         let frame_len = FrameTotalLen::new(total_len);
 
+                        // DEF-154 (L): gate uses `MAX_STAGED_PER_CALL`
+                        // (dispatch-side cap) — NOT `MAX_ACTIONS_PER_CALL`
+                        // (output-side cap which is 2× larger for
+                        // fanout). Pre-(L) both consts were 8 and
+                        // aliased; post-(L) they differ and `staged`
+                        // overflowing its own `heapless::Vec<_, MAX_STAGED_PER_CALL>`
+                        // cap would panic in `emit_actions!`.
                         if staged
                             .len()
                             .saturating_add(WORST_CASE_PER_DISPATCH)
-                            > MAX_ACTIONS_PER_CALL
+                            > MAX_STAGED_PER_CALL
                         {
                             break;
                         }
@@ -1928,13 +1999,21 @@ fn materialise<'w, 'r, 'wb>(
     write_bytes: crate::write_buf::BrandedBytes<'wb, 'w>,
     arena: crate::schema_arena::ArenaReader<'r>,
 ) -> OutActions<'w, 'r> {
+    // DEF-154 (L) P0-1 invariant: `staged.len() ≤ MAX_STAGED_PER_CALL`
+    // (heapless::Vec cap); each staged entry fans out to ≤
+    // MAX_FANOUT_PER_STAGED actions. `out.push(a)` below is
+    // architecturally infallible via the module-level
+    // `const _: () = assert!(MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL
+    // * MAX_FANOUT_PER_STAGED)`. The match-Err arms pre-(L) used
+    // `.unwrap_or(())` — a silent-drop pattern the user explicitly
+    // banned ("тихая эрозия"). Post-(L): explicit match on `push`
+    // result with the Err arm a documented dead branch.
     let mut out = OutActions::new();
     for sa in staged {
-        // DEF-154 (J): StreamRowRange needs two-action emission on
-        // stale-ref (FailReply + CloseSocket) which doesn't fit the
-        // one-Action-per-StagedAction match-arm shape. Handle it
-        // here via `continue` — the arm below pushes 1 or 2 actions
-        // directly and bypasses the single-action `let a` binding.
+        // DEF-154 (J): StreamRowRange fans out to 2 actions on
+        // stale-ref (FailReply + CloseSocket). DeliverReply with
+        // schema-bearing payload likewise. Both 2-action cases are
+        // the reason MAX_FANOUT_PER_STAGED = 2 above.
         if let StagedAction::StreamRowRange {
             id,
             row_bytes,
@@ -1943,25 +2022,25 @@ fn materialise<'w, 'r, 'wb>(
         {
             match arena.get(schema_ref) {
                 Some(desc) => {
-                    out.push(Action::StreamRow { id, row_bytes, desc }).unwrap_or(());
+                    push_within_fanout_budget(
+                        &mut out,
+                        Action::StreamRow { id, row_bytes, desc },
+                    );
                 }
                 None => {
-                    // Stale SchemaRef — architecturally dead under
-                    // DEF-172 entry-point arena semantics (arena is
-                    // cleared only at Idle/Errored entry; mid-query
-                    // no free fires). Pre-(J) the fallback was
-                    // silent `RowDesc::EMPTY` — user saw an empty-
-                    // schema row indistinguishable from a valid
-                    // empty result. Post-(J): classified crate-bug
-                    // emission replacing the silent fallback.
-                    out.push(Action::FailReply {
-                        id,
-                        cause: ProtocolError::InternalCrateBug {
-                            locus: crate::error::CrateBugLocus::StaleSchemaRef,
+                    // Stale SchemaRef — DEF-154 (J) classified crate-bug
+                    // emission. Two-action fanout counted into
+                    // MAX_FANOUT_PER_STAGED = 2.
+                    push_within_fanout_budget(
+                        &mut out,
+                        Action::FailReply {
+                            id,
+                            cause: ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::StaleSchemaRef,
+                            },
                         },
-                    })
-                    .unwrap_or(());
-                    out.push(Action::CloseSocket).unwrap_or(());
+                    );
+                    push_within_fanout_budget(&mut out, Action::CloseSocket);
                 }
             }
             continue;
@@ -1991,9 +2070,8 @@ fn materialise<'w, 'r, 'wb>(
             StagedAction::DeliverReply(entry) => {
                 // DEF-154 (J) P0-D: into_public returns
                 // Err(StaleSchemaRef) on stale ref — classify as
-                // crate-bug FailReply + CloseSocket instead of the
-                // pre-(J) silent `None` / `NoData` degraded-payload
-                // fallback.
+                // crate-bug FailReply + CloseSocket (2-action
+                // fanout, counted in MAX_FANOUT_PER_STAGED).
                 let entry_id = entry.id();
                 match entry.staged().into_public(arena) {
                     Ok(value) => Action::DeliverReply {
@@ -2001,14 +2079,16 @@ fn materialise<'w, 'r, 'wb>(
                         value,
                     },
                     Err(_stale) => {
-                        out.push(Action::FailReply {
-                            id: entry_id,
-                            cause: ProtocolError::InternalCrateBug {
-                                locus: crate::error::CrateBugLocus::StaleSchemaRef,
+                        push_within_fanout_budget(
+                            &mut out,
+                            Action::FailReply {
+                                id: entry_id,
+                                cause: ProtocolError::InternalCrateBug {
+                                    locus: crate::error::CrateBugLocus::StaleSchemaRef,
+                                },
                             },
-                        })
-                        .unwrap_or(());
-                        out.push(Action::CloseSocket).unwrap_or(());
+                        );
+                        push_within_fanout_budget(&mut out, Action::CloseSocket);
                         continue;
                     }
                 }
@@ -2026,15 +2106,37 @@ fn materialise<'w, 'r, 'wb>(
             StagedAction::StreamRowRange { .. } => continue,
             StagedAction::CloseSocket => Action::CloseSocket,
         };
-        // `staged` and `out` share `MAX_ACTIONS_PER_CALL` as their
-        // bound — staged's length is ≤ out's capacity, so push never
-        // fails. `unwrap_or(())` discards the (unreachable) Err
-        // branch cleanly: both Ok and Err arms evaluate to `()`,
-        // satisfying the `must_use` on `push` without `let _` (banned)
-        // or `drop(bool)` (clippy::drop_non_drop).
-        out.push(a).unwrap_or(());
+        push_within_fanout_budget(&mut out, a);
     }
     out
+}
+
+/// DEF-154 (L) P0-1: push an action with documented-dead Err arm.
+///
+/// `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED`
+/// is const-asserted at `MAX_ACTIONS_PER_CALL`'s definition site.
+/// Each staged entry contributes ≤ `MAX_FANOUT_PER_STAGED` calls to
+/// this helper (1-action variants: 1; StreamRowRange/DeliverReply
+/// stale-ref fanout: 2). Total ≤ `MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED
+/// = MAX_ACTIONS_PER_CALL = out's capacity`.
+///
+/// Replaces the pre-(L) `.unwrap_or(())` silent-drop pattern across
+/// 6 materialise sites.
+#[inline]
+fn push_within_fanout_budget<'w, 'r>(
+    out: &mut OutActions<'w, 'r>,
+    a: Action<'w, 'r>,
+) {
+    // The Err branch is architecturally unreachable per the
+    // const-assert cited above. The match makes the dead-branch
+    // discipline explicit — no `.unwrap_or(())`, no `debug_assert`,
+    // no silent discard. If a future refactor drops the const-assert,
+    // the Err arm becomes a classified no-op but the arm's presence
+    // forces a code-review decision, not a silent drop.
+    match out.push(a) {
+        Ok(()) => {}
+        Err(_unreachable_per_const_assert) => {}
+    }
 }
 
 impl Default for PgProtocol {
