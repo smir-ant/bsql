@@ -297,13 +297,13 @@ const _: () = assert!(
      delivered + padding. Did a bookkeeping field get added?",
 );
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() >= 1216
-        && core::mem::size_of::<state::ProtoState>() <= 1248,
-    "ProtoState size drift — post-DEF-099/DEF-148 actual is ~1224 B. \
-     Range [1216, 1248] tolerates alignment variance. Dominated by \
-     SCRAM path (ConnectingScramAwaitingServerFirst ≈ 1224 B); Trust \
-     path is just ~24 B. DEF-148's generational SchemaRef fits within \
-     padding of Option<SchemaRef> carriers — no net impact.",
+    core::mem::size_of::<state::ProtoState>() >= 704
+        && core::mem::size_of::<state::ProtoState>() <= 736,
+    "ProtoState size drift — post-DEF-154 (O) actual is ~712 B. \
+     Range [704, 736] tolerates alignment variance. Dominated by \
+     SCRAM path (ConnectingScramAwaitingServerFirst ≈ 712 B post-O); \
+     Trust path is just ~24 B. (O) shrunk MAX_PASSWORD_LEN 1024→512, \
+     cutting Password/Credentials by 512 B and ProtoState by the same.",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
@@ -313,12 +313,12 @@ const _: () = assert!(
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() >= 6272
-        && core::mem::size_of::<protocol::PgProtocol>() <= 6288,
-    "PgProtocol size drift — post-DEF-171 (has_any deleted) actual \
-     is ~6272 B, matching the DEF-119 baseline. Range [6272, 6288] \
-     catches regressions in both directions. Budget: ReadBuf 4096 + \
-     state ~1224 + session_params ~420 + schema_arena ~520 + padding.",
+    core::mem::size_of::<protocol::PgProtocol>() >= 5760
+        && core::mem::size_of::<protocol::PgProtocol>() <= 5776,
+    "PgProtocol size drift — post-DEF-154 (O) actual is ~5760 B \
+     (pre-(O) was ~6272 B; (O) shrunk MAX_PASSWORD_LEN 1024→512). \
+     Range [5760, 5776] catches regressions. Budget: ReadBuf 4096 + \
+     state ~712 + session_params ~420 + schema_arena ~520 + padding.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static, 'static>>() >= 4992

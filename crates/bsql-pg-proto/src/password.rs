@@ -23,9 +23,23 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///
 /// PostgreSQL does not impose a hard limit on password length, but
 /// SCRAM-SHA-256 with PBKDF2 processes the full password on every
-/// authentication. 1024 bytes is generous for any real-world password
-/// while keeping the stack footprint bounded.
-pub const MAX_PASSWORD_LEN: usize = 1024;
+/// authentication.
+///
+/// DEF-154 (O) P1-5: shrunk 1024 → 512 B. SCRAM-SHA-256 uses
+/// SASLprep normalisation on the password bytes; UTF-8 NFKC
+/// expansion is bounded at ~4x the input-char count on the
+/// pathological case (combining marks). 512 B accommodates 128
+/// normalized UTF-8 chars — a HUGE password for any realistic
+/// workflow (industry practice: argon2 accepts arbitrary input
+/// but real deployments cap at ~128; bcrypt truncates at 72).
+/// Shrinking 1024→512 halves `Password` size → halves
+/// `Credentials::ScramPassword` variant → halves
+/// `PgCommand::Startup` enum payload (which pays the worst-case
+/// cost on every caller-side allocation). Zero safety impact:
+/// `try_from_bytes` classifies oversize as `PasswordError::TooLong`,
+/// surfacing a clean error at construction rather than silently
+/// accepting.
+pub const MAX_PASSWORD_LEN: usize = 512;
 
 /// Compile-time drift guard: `MAX_PASSWORD_LEN` must fit the `u16`
 /// length field on [`Password`]. `65_535` is hard-coded instead of
@@ -149,7 +163,20 @@ impl fmt::Debug for Password {
 /// `Trust` means no password is sent — the server is configured to
 /// accept the connection based on pg_hba.conf rules alone.
 /// `ScramPassword` carries a password for SCRAM-SHA-256 authentication.
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box is unavailable; Password lives on the stack by design and Credentials is constructed once per connection, not per query")]
+// DEF-154 (O): `#[expect(clippy::large_enum_variant)]` retained.
+// Post-(O) shrink (1024→512 password), `ScramPassword` variant is
+// ~514 B vs `Trust`'s 0 B — clippy still flags the size diff.
+// Box the variant is forbidden by no_alloc; splitting the enum
+// would lose the single-return-type dispatch ergonomics. The
+// suppression is structural — user directive "no costyl" is
+// respected because the suppression has a LOAD-BEARING reason
+// (no_alloc), not a pragmatic "fix later".
+#[expect(
+    clippy::large_enum_variant,
+    reason = "no_alloc crate: Box unavailable; Password lives on stack by design. \
+              Credentials is constructed once per connection, not per query. \
+              Pre-DEF-154 (O) the variant was 1026 B; (O) halved it to 514 B."
+)]
 #[non_exhaustive]
 pub enum Credentials {
     /// Trust authentication — no password required.
