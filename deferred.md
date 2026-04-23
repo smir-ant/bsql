@@ -3231,3 +3231,219 @@ No-action items: P2-C (DEF-182 site coverage complete — 3 hot-path
 sites shielded; `dispatch.rs:1572` + `decode.rs:621` reachable-by-
 design, not DEF-182 candidates) and P2-D (no codegen regression —
 release build passes, wrappers are `#[inline]` + single-field).
+
+### DEF-154 (F through V) — post-audit structural closure — SHIPPED
+
+Series of 18 commits (DEF-154 F..V, commits `9674507`..`a2a7f42`)
+closing all P0 silent-corruption findings identified by two
+`architect` agent audits + user-reported issues. Full breakdown:
+
+- **(F)** P0-1 use-after-clear on staged StreamRowRange after fatal
+  path clear — 9-byte silent row corruption reproduced on
+  `DataRow(valid) → CommandComplete(malformed)` sequence. Fix: remove
+  `clear_scope_local` from in-scope fatal path; defer buffer clear
+  to next `feed_bytes` via `is_errored` fast-path.
+- **(G)** u16 narrowing silent-clamp — `AbsFrameStart::new(v_usize).unwrap_or(u16::MAX)`
+  routed through classified `FrameTooLarge` at `parse_header` via
+  `HeaderParse::Ok.total_len: u16`. No silent narrowing on ingress.
+- **(H)** read-side brand `'rb` + `ReadRange<'brand>` + `BrandedReadBuf`
+  entirely deleted (−585 LoC net). `StagedAction::StreamRowRange`
+  carries `row_bytes: &'r [u8]` directly → tier-1 identity apply.
+  Deferred-advance via `PgProtocol.pending_advance` to resolve the
+  stage-time-borrow vs advance-time-mut conflict.
+- **(I)** `ProtocolError::state_kind()` changed from `Option<StateErrorKind>`
+  to total `StateErrorKind` via `from_kind_or_internal`. Deleted
+  `INTERNAL_FALLBACK` const + 3 `debug_assert!(false, ...) +
+  unwrap_or_else()` dead-branch shields.
+- **(J)** Stale-SchemaRef silent fallback at materialise (`RowDesc::EMPTY` /
+  `DescribedRows::NoData`) classified via `StagedReply::into_public`
+  returning `Result<Reply<'r>, StaleSchemaRef>`; materialise emits
+  `FailReply + CloseSocket` on Err instead of silent degraded payload.
+- **(K)** User-reported double-panic in
+  `zero_body_data_row_classified_as_malformed_data_row`: root causes
+  were (a) DEF-154 (H) refactor lost the non-empty DataRow body
+  check — `populated.get(5..5)` returns `Some(&[])` not `None`,
+  routing to `StreamRow { row_bytes: &[] }` silently; (b)
+  `ReplyId::drop` asserted delivery with `#[cfg(test)]` guard that
+  fails to activate in integration-test crates → double-panic
+  SIGABRT. Fixed by adding `start >= end` check in
+  `stream_row_or_errored` + deleting the panic-in-Drop entirely
+  (discipline enforced via `#[must_use]` + integration-test
+  observation).
+- **(L)** P0-1 materialise overflow via stale-ref fan-out: 6
+  `.unwrap_or(())` sites on `out.push()` could silently drop
+  terminal actions. Fix: split `MAX_ACTIONS_PER_CALL` into
+  `MAX_STAGED_PER_CALL = 8` (dispatch-side) and
+  `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED = 16`
+  (output-side), const-asserted. Materialise uses
+  `push_within_fanout_budget` helper with explicit documented-dead
+  Err arm. Also: 2× quick-win on SELECT-large (15 rows/call vs 7).
+- **(M)** P0-3 `BrandedWriteReserved::push_*` 7 methods: silent
+  `WriteBufFull` discard → `Result<(), WriteBufFull>` propagation
+  through builders + `From<WriteBufFull> for ProtocolError` →
+  `CrateBugLocus::BuilderCapacityOverflow` classification. Pre-(M)
+  was bit-junk on wire with correct-looking length prefix on
+  capacity drift.
+- **(N)** P0-4 `WriteRange::apply` signature: `-> &[u8]` with
+  debug_assert+unwrap_or silent fallback → `-> Option<&[u8]>`;
+  materialise SendBytesRange arm routes None to `CloseSocket`
+  emission (not silent empty SendBytes).
+- **(O)** P1-5 `MAX_PASSWORD_LEN` 1024 → 512 B. `Password`/
+  `Credentials::ScramPassword`/`ProtoState` SCRAM path shrink by
+  512 B; `PgProtocol` 6272 B → 5760 B per instance. Lint
+  suppression kept (Box forbidden by no_alloc; 514 B variant still
+  exceeds clippy's 200 B threshold).
+- **(P)** P0-5 `PgProtocol::unread()` `.unwrap_or(&[])` → explicit
+  `split_at_checked` match. P0-6 `StagedObs::from_staged` variant
+  collapse `StreamRowRange → CloseSocket` → distinct
+  `StagedObs::StreamRowRangeUnexpected` sentinel (test regression
+  signal).
+- **(Q)** P1-6 `emit_actions!(..., on_overflow: break, ...)` form
+  deleted. Dispatch gate already reserves slots; `break` on
+  overflow could silently drop terminal Errored-arm FailReply +
+  CloseSocket. Single infallible form remains with documented-
+  dead Err arm.
+- **(R)** P1-3 `rust,ignore` doc-tests: 1 converted to compile-
+  checked (`decode.rs` FromPgText example); 4 reclassified to
+  `text` prose (write_buf × 2, wire, ident — named crate-internal
+  types not pub, or pseudo-code patterns).
+- **(S)** P1-1 5 unshielded `unwrap_or(&[])` accessors:
+  `OtherEncoding::as_bytes`, `Password::as_bytes`, `PodBytes::as_slice`,
+  `ParamOids::oids`, + `DataRowRef::columns` → explicit
+  `split_at_checked` match with documented-dead None arm.
+- **(T)** P1-2 5 `u16::try_from(src.len()).unwrap_or(0)` narrowings
+  (ident.rs × 4 + session_params.rs × 1): introduced
+  `ident::narrow_len_u16(value, cap)` helper — Err arm saturates
+  to `cap` (not `0`), surfacing "full buffer" on invariant break
+  rather than "silently empty".
+- **(U)** P2/P3 `SqlStateCode::as_str` `from_utf8(..).unwrap_or("")`
+  → `if let Ok` form (escapes `clippy::manual_unwrap_or_default`
+  which would push us back to the banned pattern). `DataRowRef`
+  stores `body_after_count: &'a [u8]` directly (stripped at
+  `parse` via `split_first_chunk::<2>()`) → `columns()` is tier-1
+  identity field load.
+- **(V)** Second-audit quick wins: `FrameCoords` drift-pin
+  tightened `<= 8` → `== 4` (exact layout tier-1 compile);
+  `pending_advance: u16` → `Option<NonZeroU16>` (niche-same-size +
+  type-enforced "no pending" sentinel); round-trip compile-pins
+  for `TxStatus`/`AuthSubCode`/`FormatCode`/`Severity` classifier
+  pairs (body-swap drift caught at build time via
+  `const _: () = { assert!(matches!(try_from(v.as_()), Ok(v))); }`).
+
+Post-DEF-154 (V): 213 tests pass; all P0 silent-corruption classes
+closed; all `unwrap_or(&[])` / `unwrap_or(0)` / `unwrap_or("")` /
+`unwrap_or_else` production sites either deleted, restructured,
+or converted to explicit-match form with documented-dead Err arm.
+No debug_assert + silent-fallback pairs remain in production code.
+No panic-in-Drop. Every classifier has round-trip compile pin.
+
+### DEF-154 (W) — write-brand scaffolding deletion — IN PROGRESS
+
+**Trigger.** Architect second-pass audit (post DEF-154 V) found:
+DEF-154 (N) reverted `WriteRange::apply` to return
+`Option<&[u8]>`. The write-brand's *only* load-bearing property
+was "tier-1 infallible apply under buffer-identity proof" — that
+property was silently deleted by (N). Post-(N) the brand remains
+a 300+ LoC scaffolding (`WriteRange<'brand>`, `BrandedBytes<'brand, 'a>`,
+`BrandedWriteBuf<'brand, 'a>`, `BrandedWriteReserved<'brand, 'a>`,
+`with_branded` HRTB, 3× PhantomData<fn(&'brand ()) -> &'brand ()>`
+invariance) that produces ZERO tier-1 guarantee. Classified by
+the architect as "decorative tier-1" — fake compile check,
+exactly what user banned via directive "эта проверка при
+компиляции не была фейковой и про стеклянную архитектуру".
+
+**Design (architect Option A).** Delete the brand phantom
+across all 4 types (keep wrapper names for API-narrow tier-2:
+prevents builders from calling `.clear()` / truncating ops mid-
+scope). Strip `'brand` generic from ~188 occurrences across
+5 files (write_buf.rs, action.rs, dispatch.rs, protocol.rs,
+buf.rs). Delete `BrandedBytes` as a struct (replace with `&[u8]`
+in materialise + apply signatures — the type is a wrapper over
+`&[u8]` with phantom; without phantom it's pure aliasing
+overhead). HRTB `for<'brand> FnOnce(...)` closures collapse to
+plain `FnOnce(...)`.
+
+**Tier impact.** Before: decorative tier-1 (claimed infallible
+apply but delivers Option). After: honest tier-2 structural
+(API-narrow on wrapper types prevents wrong-method calls;
+classified runtime error on apply mismatch via the Option return
++ materialise's CloseSocket emission). Net: no safety regression;
+removal of fake compile check; ~300-500 LoC deletion.
+
+**Scope.** 188 `'brand` / `'wb` occurrences; 5 files; 500+ LoC
+of doc + type signatures + phantom-field removal. Wholesale sed
+is risky (a previous attempt this session created syntax artefacts
+via regex greed); pointwise Edit is the correct approach.
+
+**Verification.** 213 tests must still pass after the refactor.
+`cargo clippy -D warnings` clean. No public API change (all brand
+scaffolding is `pub(crate)`).
+
+### DEF-154 (X) — pull-based RowStream<'r> API — DEFERRED (post-W)
+
+**Trigger.** Architect second-pass audit identified `feed_bytes → OutActions<'w, 'r>`
+shape as the crate's dominant hot-path overhead: 5 008 B zero-fill
+per call × 125 000+ calls on SELECT 1M rows = 625 MB of stack
+traffic. Pull-based `RowStream<'r, 's>` with `StreamItem::Row(DataRowRef<'r>)`
+reduces to one 64-byte `StreamState` + 16 B `DataRowRef<'r>` per
+row = 2 MB total. **300× reduction on the dominant hot path.**
+User-visible 10-100× end-to-end throughput on large result sets.
+
+**Design (architect audit).**
+
+```rust
+pub struct RowStream<'r, 's> {
+    proto: &'s mut PgProtocol,
+    _r: PhantomData<&'r ()>,
+    state: StreamState,  // Parsing | AwaitingMore | Complete(Reply<'r>) | Errored(cause)
+}
+
+pub enum StreamItem<'r> {
+    Row(DataRowRef<'r>),
+    Complete(Reply<'r>),
+    NeedMore,
+    Err(ProtocolError),
+}
+
+impl<'r, 's> RowStream<'r, 's> {
+    pub fn next(&mut self) -> StreamItem<'r> { ... }
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), FeedError> { ... }
+}
+
+impl PgProtocol {
+    pub fn iter_rows<'s>(&'s mut self) -> RowStream<'_, 's> { ... }
+}
+```
+
+**Transition.** ADD `iter_rows()` as the pull path; keep
+`feed_bytes` for non-streaming (push, bind-execute setup) —
+those still emit 1-3 actions and benefit from the push shape.
+Delete `Action::StreamRow` once callers migrate. Row path stops
+being push; control-frames (RFQ, CommandComplete) stay push.
+
+**Budget.** ~550 LoC — the DataRow-dispatch arm moves from
+`dispatch.rs` to `RowStream::next`; the 4 streaming-state
+variants in `ProtoState` still exist as the state machine;
+`OutActions.init` disappears on the row path.
+
+**Edge cases.** Split frames across `feed()` calls → buffer
+partial in `read_buf` (existing logic), return `NeedMore`.
+Error mid-stream → `StreamItem::Err(cause)` + subsequent calls
+return `NeedMore`; caller tears down. Pipelining (1c-5) →
+per-correlator stream objects (post-P0-2c, separate phase).
+
+**Deferral reason.** Scheduled AFTER DEF-154 (W) closes the
+write-brand scaffolding — RowStream builds on top of the
+simplified post-W type surface. Starting (X) before (W) would
+force the RowStream design to interface with `BrandedWriteReserved<'brand, 'a>`
+for the write-side emission path (needed because some dispatch
+arms emit SendBytes alongside a row — e.g. reply delivery),
+embedding the decorative tier-1 into a new public type. Better
+order: (W) first (kills the fake tier), then (X) atop the
+honest tier-2 surface.
+
+**Verification.** Criterion benchmark harness (currently
+absent — see Rec P3-39 in architect audit) must show the 300×
+reduction; 213 tests must still pass through the dual-API
+surface; one new integration test exercising 1k-row `iter_rows`
+path.
