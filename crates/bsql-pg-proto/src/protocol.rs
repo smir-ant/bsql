@@ -405,6 +405,33 @@ pub struct PgProtocol {
     /// bounded (~88 B); `OutActions` 2808 → ~792 B (3.5×);
     /// `StreamItem` 320 → ~80 B (4×).
     error_arena: crate::error_arena::ErrorArena,
+    /// DEF-184 (A10/B22) SCRAM handshake data — externalised from
+    /// `ProtoState` SCRAM variants.
+    ///
+    /// Pre-(A10): `ScramSession` (512 B) + `client_first_bare`
+    /// (128 B) + `client_nonce_b64` (48 B) + `expected_server_sig`
+    /// (32 B) lived inline in 4 `ProtoState::ConnectingScram*`
+    /// variants. Rust enum sized by max variant → `ProtoState`
+    /// dominated at ~712 B by `ConnectingScramAwaitingServerFirst`.
+    ///
+    /// Post-(A10): heavy SCRAM data moves here; `ProtoState` SCRAM
+    /// variants become thin `{ reply: ReplyId<StartupKind> }`
+    /// shapes. `ProtoState` shrinks 712 B → **80 B exact** — every
+    /// `core::mem::replace(state, Idle)` inside `dispatch()` now
+    /// moves 80 B instead of 712 B (**632 B × N_dispatches** saved).
+    ///
+    /// Correlation invariant (tier-2 structural per CREDO §1):
+    /// `state is ConnectingScram*` ⇔ `scram_state is Some(..)`
+    /// with matching variant shape. A drift between the pair
+    /// classifies as [`crate::error::CrateBugLocus::ScramStateDrift`]
+    /// rather than silent take-from-None. See
+    /// [`crate::scram_state`] module docs for the full table.
+    ///
+    /// Cost: ~704 B on `PgProtocol` (dominated by `AwaitingFirst`
+    /// variant + `Option` disc). Lives `Some(_)` only during the
+    /// 3-4 SCRAM handshake frames; cleared at AuthOk or any
+    /// errored transition.
+    scram_state: Option<crate::scram_state::ScramHandshakeState>,
     /// DEF-154 (H+V): deferred `read_buf` cursor advance — bytes to
     /// skip at the start of the NEXT `feed_bytes` call before any
     /// new frame parsing.
@@ -439,6 +466,27 @@ pub struct PgProtocol {
     sync_marker: PhantomData<Cell<()>>,
 }
 
+#[cfg(test)]
+impl PgProtocol {
+    /// DEF-184 (A10/B22 audit P1-3): test-only forge hook. Lets
+    /// lib-internal unit tests construct drift states (e.g.
+    /// `ProtoState::ConnectingStartupScram { reply }` paired with
+    /// `scram_state = None`) to exercise
+    /// [`crate::error::CrateBugLocus::ScramStateDrift`] in dispatch.
+    pub(crate) fn test_force_scram_state(
+        &mut self,
+        scram: Option<crate::scram_state::ScramHandshakeState>,
+    ) {
+        self.scram_state = scram;
+    }
+
+    /// DEF-184 (A10/B22 audit P1-3): test-only forge hook for the
+    /// `state` field. See `test_force_scram_state`.
+    pub(crate) fn test_force_state(&mut self, new_state: crate::state::ProtoState) {
+        self.state = new_state;
+    }
+}
+
 impl PgProtocol {
     /// Construct a new protocol in [`ProtoState::Idle`].
     ///
@@ -454,6 +502,7 @@ impl PgProtocol {
             session_params: SessionParams::new(),
             schema_arena: crate::schema_arena::SchemaSlab::new(),
             error_arena: crate::error_arena::ErrorArena::new(),
+            scram_state: None,
             pending_advance: None,
             sync_marker: PhantomData,
         }
@@ -566,11 +615,12 @@ impl PgProtocol {
         // unused by materialise — pass no read slice).
         let state = &mut self.state;
         let schema_arena = &mut self.schema_arena;
+        let scram_state = &mut self.scram_state;
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
             let prev = core::mem::take(state);
             let (new_state, staged) = {
                 let mut reserved = wb.reserve();
-                compute_push(cmd, prev, &mut reserved)
+                compute_push(cmd, prev, &mut reserved, scram_state)
             };
             *state = new_state;
             materialise(staged, wb.into_bytes(), schema_arena.as_reader())
@@ -806,6 +856,7 @@ impl PgProtocol {
         let session_params = &mut self.session_params;
         let schema_arena = &mut self.schema_arena;
         let error_arena = &mut self.error_arena;
+        let scram_state = &mut self.scram_state;
         let pending_advance = &mut self.pending_advance;
 
         // Fast-path: already-Errored or pending_advance crate-bug
@@ -975,29 +1026,30 @@ impl PgProtocol {
                             break;
                         }
 
-                        let prev = core::mem::take(state);
+                        // DEF-184 (B21/C6): dispatch takes `&mut state`
+                        // and writes transitions directly. No
+                        // `mem::take` + `*state = new` round-trip —
+                        // one mutable borrow, one in-place store.
                         let mut arena_writer = schema_arena.as_writer();
                         let outcome = dispatch(
-                            prev,
+                            state,
                             tag,
                             payload,
                             &mut reserved,
                             &mut arena_writer,
                             error_arena,
+                            scram_state,
                         );
                         match outcome {
-                            DispatchOutcome::AdvancedSilent { new_state } => {
-                                *state = new_state;
+                            DispatchOutcome::AdvancedSilent => {
+                                // State already written by dispatch arm.
                                 frames_consumed =
                                     frames_consumed.saturating_add(total_len);
                                 dispatches_this_call =
                                     dispatches_this_call.saturating_add(1);
                             }
-                            DispatchOutcome::AdvancedWithAction {
-                                new_state,
-                                action,
-                            } => {
-                                *state = new_state;
+                            DispatchOutcome::AdvancedWithAction { action } => {
+                                // State already written by dispatch arm.
                                 frames_consumed =
                                     frames_consumed.saturating_add(total_len);
                                 dispatches_this_call =
@@ -1018,10 +1070,9 @@ impl PgProtocol {
                                 ]);
                             }
                             DispatchOutcome::Errored { reply_id, cause } => {
-                                // DEF-154 (I): total state_kind — no
-                                // unwrap_or_else + debug_assert dance.
-                                let state_kind = cause.state_kind();
-                                *state = ProtoState::Errored(state_kind);
+                                // State already written to
+                                // `ProtoState::Errored(_)` by the
+                                // install_errored helper inside dispatch.
                                 // DEF-154 (Q) P1-6: terminal
                                 // FailReply + CloseSocket MUST reach
                                 // the caller (reply promise
@@ -1127,8 +1178,22 @@ impl PgProtocol {
     /// .details_ref`) to the full `ErrorPayload` containing the
     /// server's message/detail/hint bounded strings.
     ///
-    /// Returns `None` if the ref is stale (arena has been cleared
-    /// since the ref was issued) or if the arena slot is empty.
+    /// # Return value
+    ///
+    /// DEF-184 (audit #3 A-06): tier-3 classified `Result`:
+    ///
+    /// - `Ok(&ErrorPayload)` — ref resolves cleanly; generation
+    ///   matches and slot is populated.
+    /// - `Err(ArenaError::Stale)` — expected "consumed" signal.
+    ///   The arena was cleared (at an entry-point boundary where
+    ///   prior state was Idle/Errored) or a subsequent `alloc` bumped
+    ///   the generation. The caller held the ref too long.
+    /// - `Err(ArenaError::Empty)` — architecturally unreachable
+    ///   outside of `unsafe`. `ErrorRef` construction is confined to
+    ///   `ErrorArena::alloc` which always populates the slot; a
+    ///   generation-match with empty slot indicates a crate bug.
+    ///   Classified as Err rather than silently producing a
+    ///   default payload (tier-4 banned per CREDO §5).
     ///
     /// # Usage pattern
     ///
@@ -1143,17 +1208,61 @@ impl PgProtocol {
     /// // Pattern (simplified):
     /// let err_ref = extract_from_out_actions(...);
     /// drop(out_actions);
-    /// if let Some(payload) = proto.get_server_error(err_ref) {
-    ///     log::warn!("server error: {}", payload.message.as_str());
+    /// match proto.get_server_error(err_ref) {
+    ///     Ok(payload) => log::warn!("server error: {}", payload.message.as_str()),
+    ///     Err(bsql_pg_proto::ArenaError::Stale) => {
+    ///         // Expected if resolution deferred past clear_arena boundary.
+    ///     }
+    ///     Err(bsql_pg_proto::ArenaError::Empty) => {
+    ///         // Architecturally unreachable — crate bug if seen.
+    ///     }
     /// }
     /// ```
     #[inline]
-    #[must_use]
     pub fn get_server_error(
         &self,
         r: crate::error_arena::ErrorRef,
-    ) -> Option<&crate::error_arena::ErrorPayload> {
+    ) -> Result<&crate::error_arena::ErrorPayload, crate::error_arena::ArenaError> {
         self.error_arena.get(r)
+    }
+
+    // DEF-184 (A10/B22 audit P1-3): test-only forge hooks live in
+    // `pub(crate)` methods below. They're gated by `#[cfg(test)]` at
+    // the crate level AND pub(crate) so integration tests in `tests/`
+    // cannot see them; only lib-internal unit tests in `#[cfg(test)]
+    // mod` blocks within `src/` can drive them. The drift-arm tests
+    // live in `src/scram_state.rs` test module.
+
+    /// DEF-184 (audit #3 A-02): Display adapter that resolves a
+    /// [`crate::error::ProtocolError`] with `ServerErrorResponse`-arena
+    /// strings inline.
+    ///
+    /// Pre-(A-02) the `Display` impl for
+    /// `ProtocolError::ServerErrorResponse` rendered `"[details in
+    /// ErrorArena]"` — the cascade-size win (288 B → 8 B) regressed
+    /// operator UX because `Display` has no access to the arena.
+    /// Post-(A-02) callers with a protocol handle wrap the error:
+    ///
+    /// ```text
+    /// // log the error with full message/detail/hint:
+    /// log::error!("{}", proto.display_error(&err));
+    /// ```
+    ///
+    /// The adapter's `Display` impl resolves the ref and prints
+    /// `"server error: ERROR (28P01) — <message>; detail: <detail>;
+    /// hint: <hint>"`. Arena-miss cases (Stale / Empty) fall through
+    /// to `"[arena ref unresolved: <ArenaError>]"` — explicit
+    /// diagnostic trail rather than silent empty-string fallback.
+    ///
+    /// For other `ProtocolError` variants the adapter delegates to
+    /// the built-in `Display` impl (no regression).
+    #[inline]
+    #[must_use]
+    pub fn display_error<'a>(
+        &'a self,
+        err: &'a crate::error::ProtocolError,
+    ) -> crate::error_arena::DisplayError<'a> {
+        crate::error_arena::DisplayError::new(err, &self.error_arena)
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -1415,6 +1524,7 @@ fn compute_push(
     cmd: PgCommand,
     state: ProtoState,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
 ) -> (ProtoState, StagedActions) {
     let mut staged = StagedActions::new();
     let new_state = match cmd {
@@ -1434,6 +1544,7 @@ fn compute_push(
             reply,
             &mut staged,
             reserved,
+            scram_state,
         ),
         PgCommand::SimpleQuery { sql, reply } => {
             compute_push_simple_query(state, &sql, reply, &mut staged, reserved)
@@ -1548,7 +1659,7 @@ fn compute_push_ping(
 /// — a future refactor that breaks the const drift-guard on
 /// `MAX_OWNED_SEND_LEN` classifies as a typed reply failure instead of
 /// silent truncation.
-#[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
+#[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator + scram_state slot. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
 fn compute_push_startup(
     state: ProtoState,
     user: Ident,
@@ -1558,6 +1669,7 @@ fn compute_push_startup(
     reply: ReplyId<crate::reply_id::StartupKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
 ) -> ProtoState {
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
@@ -1585,10 +1697,12 @@ fn compute_push_startup(
             match credentials {
                 Credentials::Trust => ProtoState::ConnectingStartupTrust { reply },
                 Credentials::ScramPassword(password) => {
-                    ProtoState::ConnectingStartupScram {
-                        reply,
-                        scram: crate::scram::session::ScramSession::from_password(password),
-                    }
+                    // DEF-184 (A10/B22): heavy SCRAM session moves off
+                    // state. Pair: thin state variant + scram_state
+                    // holding ScramSession. Set atomically.
+                    let session = crate::scram::session::ScramSession::from_password(password);
+                    *scram_state = Some(crate::scram_state::ScramHandshakeState::Session(session));
+                    ProtoState::ConnectingStartupScram { reply }
                 }
             }
         },
@@ -2605,10 +2719,7 @@ mod allows_unsolicited_param_status_tests {
     //! Category (1) per reforge.md §4.11.
 
     use super::*;
-    use crate::password::Password;
     use crate::reply_id::ReplyId;
-    use crate::scram::types::SecretDigest;
-    use crate::sensitive::Sensitive;
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
@@ -2693,37 +2804,25 @@ mod allows_unsolicited_param_status_tests {
         consume_state(startup_trust);
 
         // ConnectingStartupScram — DEF-097 typestate carrying a
-        // ScramSession. Constructor is infallible once we have a
-        // Password (try_from_bytes is the only Err surface here,
-        // architecturally unreachable for the fixture b"pw").
-        if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
-            let startup_scram = ProtoState::ConnectingStartupScram {
-                reply: ReplyId::from_raw(nz(4001)),
-                scram,
-            };
-            assert!(!allows_unsolicited_param_status(&startup_scram));
-            consume_state(startup_scram);
-        }
+        // DEF-184 (A10/B22): SCRAM state variants are thin post-refactor.
+        // Heavy data (ScramSession, client_first_bare, client_nonce_b64,
+        // expected_server_sig) lives on PgProtocol::scram_state now.
+        // These fixtures only need the thin state variant for the
+        // `allows_unsolicited_param_status` classification test.
+        let startup_scram = ProtoState::ConnectingStartupScram {
+            reply: ReplyId::from_raw(nz(4001)),
+        };
+        assert!(!allows_unsolicited_param_status(&startup_scram));
+        consume_state(startup_scram);
 
-        // ConnectingScramAwaitingServerFirst requires a Password *and* a
-        // ScramSession (audit A2 typestate). The Password err branch
-        // is architecturally unreachable for the fixture.
-        if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
-            let scram_first = ProtoState::ConnectingScramAwaitingServerFirst {
-                reply: ReplyId::from_raw(nz(5)),
-                scram,
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
-            };
-            assert!(!allows_unsolicited_param_status(&scram_first));
-            consume_state(scram_first);
-        }
+        let scram_first = ProtoState::ConnectingScramAwaitingServerFirst {
+            reply: ReplyId::from_raw(nz(5)),
+        };
+        assert!(!allows_unsolicited_param_status(&scram_first));
+        consume_state(scram_first);
 
         let scram_final = ProtoState::ConnectingScramAwaitingServerFinal {
             reply: ReplyId::from_raw(nz(6)),
-            expected_server_sig: SecretDigest::new([0u8; 32]),
         };
         assert!(!allows_unsolicited_param_status(&scram_final));
         consume_state(scram_final);
@@ -2806,10 +2905,8 @@ mod compute_push_tests {
     //! test calls [`compute_push`] directly on a synthesised
     //! `(cmd, state)` pair.
     use super::*;
-    use crate::password::{Credentials, Password};
+    use crate::password::Credentials;
     use crate::reply_id::ReplyId;
-    use crate::scram::types::SecretDigest;
-    use crate::sensitive::Sensitive;
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
@@ -2948,9 +3045,10 @@ mod compute_push_tests {
         state: ProtoState,
     ) -> (ProtoState, heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL>) {
         let mut wb = WriteBuf::new();
+        let mut scram_state = None;
         wb.with_branded(|mut wb| {
             let mut reserved = wb.reserve();
-            let (new_state, staged) = compute_push(cmd, state, &mut reserved);
+            let (new_state, staged) = compute_push(cmd, state, &mut reserved, &mut scram_state);
             let mut obs: heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL> = heapless::Vec::new();
             for a in &staged {
                 obs.push(StagedObs::from_staged(a)).unwrap_or_else(|_| {
@@ -3084,15 +3182,14 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingStartupScram — carries the ScramSession typestate
-        // (DEF-097). Constructed via ScramSession::from_password.
-        if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+        // ConnectingStartupScram — post-(A10/B22) the state variant is
+        // thin; ScramSession lives on PgProtocol::scram_state. Direct
+        // state construction just needs the reply id.
+        {
             let raw_prev = nz(201_050);
             let raw_new = nz(201_051);
             let prev = ProtoState::ConnectingStartupScram {
                 reply: ReplyId::from_raw(raw_prev),
-                scram,
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -3110,17 +3207,12 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingScramAwaitingServerFirst — needs a Password and
-        // ScramSession.
-        if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+        // ConnectingScramAwaitingServerFirst — thin state variant post-A10.
+        {
             let raw_prev = nz(203);
             let raw_new = nz(204);
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
-                scram,
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -3148,7 +3240,6 @@ mod compute_push_tests {
             let raw_new = nz(206);
             let prev = ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(raw_prev),
-                expected_server_sig: SecretDigest::new([0u8; 32]),
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -3380,15 +3471,12 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingStartupScram — the other half of the DEF-097
-        // credential split.
-        if let (Some(user), Ok(pw)) = (mk_user(), Password::try_from_bytes(b"pw")) {
-            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+        // ConnectingStartupScram — post-(A10/B22) thin variant.
+        if let Some(user) = mk_user() {
             let raw_prev = nz(405_100);
             let raw_new = nz(405_101);
             let prev = ProtoState::ConnectingStartupScram {
                 reply: ReplyId::from_raw(raw_prev),
-                scram,
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
@@ -3405,17 +3493,12 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingScramAwaitingServerFirst. Construction requires
-        // Password + ScramSession (audit A2 typestate).
-        if let (Some(user), Ok(pw)) = (mk_user(), Password::try_from_bytes(b"pw")) {
-            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
+        // ConnectingScramAwaitingServerFirst — post-(A10/B22) thin variant.
+        if let Some(user) = mk_user() {
             let raw_prev = nz(405);
             let raw_new = nz(406);
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
-                scram,
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
@@ -3442,7 +3525,6 @@ mod compute_push_tests {
             let raw_new = nz(408);
             let prev = ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(raw_prev),
-                expected_server_sig: SecretDigest::new([0u8; 32]),
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);

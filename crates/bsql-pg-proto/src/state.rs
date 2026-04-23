@@ -22,14 +22,14 @@
 use crate::action::ParamOids;
 use crate::error::BoundedStr;
 use crate::error::StateErrorKind;
-use crate::ident::PodBytes;
 use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
     StartupKind,
 };
 use crate::schema_arena::SchemaRef;
-use crate::scram::session::ScramSession;
-use crate::scram::types::SecretDigest;
+// DEF-184 (A10/B22): `PodBytes`, `ScramSession`, `SecretDigest` no longer used
+// directly by ProtoState variants — they live on `PgProtocol::scram_state`
+// as `ScramHandshakeState` fields. Import list shrinks accordingly.
 
 /// State-side counterpart to the public
 /// [`crate::action::DescribedRows<'r>`].
@@ -124,42 +124,50 @@ pub enum ProtoState {
     /// A `StartupMessage` was sent by a SCRAM-auth connection;
     /// awaiting `AuthenticationSASL` offering SCRAM-SHA-256.
     /// DEF-001 + DEF-097.
+    ///
+    /// # DEF-184 (A10/B22) — heavy data externalised
+    ///
+    /// Pre-(A10) this variant carried `scram: ScramSession`
+    /// (~512 B) inline. Post-(A10) `scram` lives on
+    /// `PgProtocol::scram_state` as
+    /// [`crate::scram_state::ScramHandshakeState::Session`]; this
+    /// variant is thin (`reply` only). Correlation invariant
+    /// (tier-2 structural): `state == ConnectingStartupScram ⇔
+    /// scram_state == Some(Session(_))`. See
+    /// [`crate::scram_state`] docs.
     ConnectingStartupScram {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
-        /// SCRAM session (the password the user provided). Tier-1
-        /// typestate via [`ScramSession`] — `Credentials::Trust`
-        /// cannot reach this variant by construction.
-        scram: ScramSession,
     },
 
     /// SCRAM step 1 complete (client-first sent); awaiting
     /// `AuthenticationSASLContinue` (server-first-message). DEF-002.
+    ///
+    /// # DEF-184 (A10/B22) — heavy data externalised
+    ///
+    /// Pre-(A10) carried `scram` (512 B) + `client_first_bare`
+    /// (128 B) + `client_nonce_b64` (48 B) inline = ~688 B. These
+    /// dominated ProtoState's enum sizing. Post-(A10) they live
+    /// on `PgProtocol::scram_state` as
+    /// [`crate::scram_state::ScramHandshakeState::AwaitingFirst`];
+    /// this variant is thin.
     ConnectingScramAwaitingServerFirst {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
-        /// SCRAM session (password bundle). Tier-1 typestate via
-        /// [`ScramSession`] — the `Credentials::Trust` variant
-        /// cannot appear here by construction (audit A2).
-        scram: ScramSession,
-        /// The `client-first-message-bare` (saved for AuthMessage).
-        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN`]
-        /// (DEF-095 const-generic drift guard). POD buffer — no
-        /// `heapless::Vec` Drop propagation into the state enum
-        /// (DEF-099).
-        client_first_bare: PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
-        /// The client nonce (base64-encoded, for prefix validation).
-        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN`].
-        client_nonce_b64: PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     },
 
     /// SCRAM step 2 complete (client-final sent); awaiting
     /// `AuthenticationSASLFinal` (server-final-message). DEF-002.
+    ///
+    /// # DEF-184 (A10/B22) — heavy data externalised
+    ///
+    /// Pre-(A10) carried `expected_server_sig: SecretDigest`
+    /// (32 B) inline. Post-(A10) lives on
+    /// `PgProtocol::scram_state` as
+    /// [`crate::scram_state::ScramHandshakeState::AwaitingFinal`].
     ConnectingScramAwaitingServerFinal {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
-        /// Expected server signature for constant-time comparison.
-        expected_server_sig: SecretDigest,
     },
 
     /// SCRAM step 3 complete (server signature verified); awaiting
@@ -832,10 +840,7 @@ mod push_class_tests {
 
     use super::*;
     use crate::error::{BoundedStr, ErrorKind};
-    use crate::password::Password;
     use crate::reply_id::ReplyId;
-    use crate::scram::types::SecretDigest;
-    use crate::sensitive::Sensitive;
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
@@ -884,32 +889,24 @@ mod push_class_tests {
             },
             StatePushClass::Connecting,
         );
-        if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
-            pin(
-                ProtoState::ConnectingStartupScram {
-                    reply: ReplyId::from_raw(nz(2_002)),
-                    scram,
-                },
-                StatePushClass::Connecting,
-            );
-        }
-        if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = crate::scram::session::ScramSession::from_password(Sensitive::new(pw));
-            pin(
-                ProtoState::ConnectingScramAwaitingServerFirst {
-                    reply: ReplyId::from_raw(nz(2_003)),
-                    scram,
-                    client_first_bare: crate::ident::PodBytes::new(),
-                    client_nonce_b64: crate::ident::PodBytes::new(),
-                },
-                StatePushClass::Connecting,
-            );
-        }
+        // DEF-184 (A10/B22): SCRAM variants are thin post-refactor.
+        // Heavy data (ScramSession, client bits, server sig) lives on
+        // PgProtocol::scram_state, not in ProtoState.
+        pin(
+            ProtoState::ConnectingStartupScram {
+                reply: ReplyId::from_raw(nz(2_002)),
+            },
+            StatePushClass::Connecting,
+        );
+        pin(
+            ProtoState::ConnectingScramAwaitingServerFirst {
+                reply: ReplyId::from_raw(nz(2_003)),
+            },
+            StatePushClass::Connecting,
+        );
         pin(
             ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(nz(2_004)),
-                expected_server_sig: SecretDigest::new([0_u8; 32]),
             },
             StatePushClass::Connecting,
         );

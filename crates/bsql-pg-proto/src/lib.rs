@@ -100,7 +100,7 @@ pub mod decode;
 mod dispatch;
 pub mod error;
 pub(crate) mod error_arena;
-pub use error_arena::{ErrorPayload, ErrorRef};
+pub use error_arena::{ArenaError, DisplayError, ErrorPayload, ErrorRef};
 pub mod frame;
 pub mod ident;
 pub mod params;
@@ -109,6 +109,7 @@ pub mod protocol;
 pub mod row_stream;
 pub mod reply_id;
 pub mod scram;
+pub(crate) mod scram_state;
 mod schema_arena;
 pub mod sensitive;
 pub mod session_params;
@@ -316,13 +317,23 @@ const _: () = assert!(
      delivered + padding. Did a bookkeeping field get added?",
 );
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() >= 704
-        && core::mem::size_of::<state::ProtoState>() <= 736,
-    "ProtoState size drift — post-DEF-154 (O) actual is ~712 B. \
-     Range [704, 736] tolerates alignment variance. Dominated by \
-     SCRAM path (ConnectingScramAwaitingServerFirst ≈ 712 B post-O); \
-     Trust path is just ~24 B. (O) shrunk MAX_PASSWORD_LEN 1024→512, \
-     cutting Password/Credentials by 512 B and ProtoState by the same.",
+    core::mem::size_of::<state::ProtoState>() == 80,
+    "ProtoState size post-(A10/B22) == 80 B. \
+     Pre-(A10): ~712 B dominated by SCRAM variants carrying inline \
+     ScramSession (~512 B) + client_first_bare (128 B) + \
+     client_nonce_b64 (48 B). Post-(A10): heavy SCRAM data moved to \
+     `PgProtocol::scram_state: Option<ScramHandshakeState>`; \
+     ProtoState variants are thin, enum size now dominated by \
+     `SimpleQueryAwaitingRfq` / `DescribeStatementAwaitingRfq` \
+     which carry `BoundedStr<32> command_tag` + discriminant + \
+     padding (~80 B). \
+     \
+     Win: **632 B × N_dispatches** (712 − 80) eliminated from every \
+     `core::mem::replace(state, Idle)` inside dispatch(). \
+     \
+     If this trips: either a heavy field was re-added inline to \
+     a variant (regress A10), or a new variant with large payload \
+     landed — consider externalising same way.",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
@@ -333,15 +344,39 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() >= 6032
-        && core::mem::size_of::<protocol::PgProtocol>() <= 6096,
-    "PgProtocol size post-(A1+A13) in range [6032, 6096] B. \
-     Budget: ReadBuf 4096 + state ~712 + session_params ~420 + \
-     schema_arena ~520 + error_arena ~290 + padding. \
-     Pre-(184): 5760 B (no error_arena). The +288 B one-time \
-     connection-level growth is dwarfed by per-call savings: \
-     OutActions 2808 → 800 B (2 KB × N calls). Break-even after \
-     ~1 slow-path call per connection.",
+        && core::mem::size_of::<protocol::PgProtocol>() <= 6200,
+    "PgProtocol size post-(A1+A13 + A10/B22) in range [6032, 6200] B. \
+     Budget: ReadBuf 4096 + state ~48 + session_params ~420 + \
+     schema_arena ~520 + error_arena ~290 + scram_state ~712 + \
+     padding. \
+     Pre-(A10): state carried ~712 B SCRAM inline, scram_state \
+     didn't exist. Net PgProtocol change: ~0 (state shrank -664 B, \
+     scram_state grew +712 B, near-wash). The WIN is per-dispatch: \
+     ProtoState's `mem::replace(state, Idle)` inside dispatch() now \
+     moves 48 B instead of 712 B (~664 B saved × N dispatches).",
 );
+// DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B
+// post-`new_state` extraction. Pre-(B21/C6) each Advanced variant
+// carried a `ProtoState` payload (712 B); the total enum was dominated
+// by the Advanced variants at ~800 B. Post-(B21/C6) dispatch writes
+// state directly via `&mut ProtoState`, and DispatchOutcome carries
+// only the side-effect signal (StagedAction 88 B for WithAction,
+// reply_id + ProtocolError 72 B for Errored).
+const _: () = assert!(
+    core::mem::size_of::<dispatch::DispatchOutcome>() == 88,
+    "DispatchOutcome exact size — 88 B post-(B21/C6). \
+     Dominated by AdvancedWithAction(StagedAction 88 B); the \
+     discriminant + Errored variant payload fold into StagedAction's \
+     alignment + niches. \
+     \
+     Pre-(B21/C6) was ~800 B dominated by the Advanced variants' \
+     `new_state: ProtoState` payload. If this trips, either (a) a \
+     new ProtocolError variant inflated the Errored payload, (b) \
+     StagedAction grew (cascade into Action / OutActions), or (c) \
+     `new_state` was re-added to an Advanced variant — regression \
+     vs the B21/C6 refactor.",
+);
+
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static, 'static>>() == 800,
     "OutActions<'_, '_> exact size drift — 800 B post-(A1+A13). \

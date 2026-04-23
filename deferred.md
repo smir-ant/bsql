@@ -3669,7 +3669,7 @@ Shipped commits post-catalog:
 | ~~9a~~ | ~~A1+A13 ErrorArena cascade~~ | ~~500~~ | **SHIPPED 51ed3d8** |
 | 7 dispatch | B21/C6 (712 MB/1M-rows), A7 tag LUT, A3 fn-ptr LUT | 500 | M/H |
 | 8 state | A10/B22 SCRAM split (664 MB/1M-rows), A4/B16 layout | 700 | H/M |
-| 9 crown | **A1+A13 ErrorArena cascade (6.4× OutActions)**, B14 HList | 800 | H |
+| 9 crown | ~~A1+A13 ErrorArena cascade~~, ~~B14 HList~~ (blocked → DEF-185) | 800 | H |
 | 10 spikes | A11/C4 SIMD, C1 typestate, C2 brands, C3 iterator, C5 bitpack | 2000+ | H |
 | stragglers | B5 API narrow, A8 usize sweep | 130 | L |
 | deferred | A12 arena sizing → 1c-5 pipelining | 20 | L |
@@ -3683,7 +3683,59 @@ Shipped commits post-catalog:
 - `install_errored_read_cursor_advance` helper for B25 fast-path
   parallel to existing `install_errored_malformed_data_row`.
 
-**Test count trajectory:** 215 pre-(184) → 216 post-session.
+**Test count trajectory:** 215 pre-(184) → 216 post-ErrorArena →
+235 post-session-2026-04-24 (B21/C6 + A10/B22 + audit cascades +
+shield tests — 10 new arena unit tests + 1 Errored-kind re-entry
+pin + 1 scram-push-state pin + 3 drift-arm pins).
+
+**Session 2026-04-24 additions (post-ErrorArena):**
+- `51ed3d8` **A1+A13 CROWN** — ErrorArena cascade (previously).
+- **13 audit fixes on A1+A13** (2 rounds of architect review):
+  A-02 (DisplayError adapter), A-03 (test helper loud), A-04 (gen
+  u32), A-06 (Result + ArenaError), A-07 (must_use), A-09 (dead
+  code), A-11 (ParsedServerError), A-12 (size pin at error.rs),
+  A-13 (unconditional gen bump), A-14 (doc sync), A-15 (delete
+  empty/Default), P0-1 (Display stub LOUD advisory), P0-2
+  (Option<ErrorRef> exact pin), P1-3 (clear unconditional bump),
+  P1-4 (doc drift sweep), P1-6 (forge_for_test + Empty arm
+  coverage), P2 bundle (non-exhaustive/Copy-drop/must_use/Hash-drop).
+- **Batch 7 B21/C6 SHIPPED** — dispatch by-ref refactor.
+  `DispatchOutcome` 800 → 88 B (exact pin). `install_errored` /
+  `install_internal_bug` helpers install state atomically with
+  outcome. 31 match arm sites + 5 sub-dispatchers + 3 advance
+  helpers updated. Size pin in lib.rs. P2 shield test for
+  Errored re-entry preservation.
+- **Batch 8 A10/B22 SHIPPED** — SCRAM hot/cold split.
+  `ProtoState` 712 → **80 B exact** (pinned in lib.rs) — saves
+  **632 B per dispatch call** (`mem::replace(state, Idle)` moves
+  80 B now instead of 712 B). New `src/scram_state.rs` module +
+  `ScramHandshakeState` enum. 4 SCRAM `ProtoState` variants
+  stripped to thin `{ reply }`. `dispatch()` threads
+  `scram_state: &mut Option<...>` through signature; 4 SCRAM
+  arms load via `.take()`, drift classified as
+  `CrateBugLocus::ScramStateDrift` (tier-2 structural). Zeroize
+  hygiene: dispatch-level `scram_state = None` on Errored
+  transition (audit P0-1 fix). 3 drift shield tests via
+  `#[cfg(test)] pub(crate)` forge hooks (`test_force_state` /
+  `test_force_scram_state` on `PgProtocol`).
+- **B14 closed as DEF-185 blocker** — generic_const_exprs
+  unstable; stable-Rust HList form requires tier-1→tier-3 OID
+  regression (CREDO violation).
+- **A7 / A4/B16 deferred** — speculative perf without DEF-143
+  bench. Architecturally documented in DEF-187.
+
+**Honest win sizing (architect audit corrections 2026-04-24):**
+- **B21/C6:** claimed "712 MB/1M-rows" was miscalculated —
+  `dispatch()` runs ~3-6× per query, NOT per row (DataRow
+  bypasses dispatch via `row_stream::fast_path_data_row`). Real
+  saving: ~712 B × N_queries + **async-future frame reduction**
+  (the dominant win — every `feed_bytes` suspension point in
+  downstream async wrappers carries the 800 → 88 B delta).
+- **A10/B22:** `dispatch()` internal `mem::replace` saves **632 B
+  per call** (exact: 712 − 80). On 1K QPS × 4 dispatch/query
+  = ~2.47 MB/sec stack memcpy eliminated. PgProtocol size is
+  near-wash (state shrank −632 B, scram_state grew +712 B) — win
+  is on the hot `dispatch()` path, not on per-connection memory.
 
 **Источники:** audit #1 (без CREDO-context) и audit #2 (с CREDO
 на руках, task: falsify audit #1 DONE + найти blind spots +
@@ -4378,6 +4430,39 @@ Batch 10 (research spikes):
   - Will never unblock — forbid(unsafe) is permanent project
     policy.
 
+- **B14 HList `ParamsWriter` refactor** — blocked by
+  `feature(generic_const_exprs)` (RFC #2000, tracking #76560).
+  - **Finding (architect audit 2026-04-24):** stable-Rust HList
+    recursive impl cannot express `const FORMATS: &'static
+    [FormatCode] = &[Binary; 1 + T::COUNT]` at associated-const
+    level. Any stable form requires downgrading `FORMATS`/`OIDS`
+    from `&'static [_]` → runtime-filled `[_; MAX_PARAMS_ARITY]`
+    slots, which kills the Phase 2 `query!` macro's compile-time
+    cross-check of tuple OIDs against server's `ParameterDescription`.
+    That's a **tier-1 → tier-3 regression** per CREDO §1
+    (safety > tier-1 > perf > ergonomics).
+  - **A14 already defused half the premise:** post-A14
+    (commit `dfc3ee7`) the Bind-frame builder hard-codes
+    compact format-code block `[0,1,0,1]` and does NOT consume
+    `P::FORMATS`. Only `P::COUNT` is read at runtime. So the
+    "removes 400 LoC generated binary" claim is unverified —
+    LLVM already inlines+dedupes the 17 `write_params` bodies
+    via `#[inline]` + identical per-element patterns.
+  - **Gate for reopening:** measure actual binary delta via
+    `cargo asm --rust -p bsql-pg-proto --lib params` comparing
+    current 17-tuple-impl form vs a speculative HList form.
+    If delta < 200 B → close as won't-fix (macro-generated
+    source cost is already near-zero, 17 impls × ~3 LoC macro
+    body). If delta ≥ 2 KB → wait for `generic_const_exprs`
+    stabilisation rather than ship tier-downgraded form.
+  - Workaround (tier-preserving): **none in stable Rust**. The
+    macro-generated design IS the stable-optimal shape; HList
+    is a source-hygiene preference, not a perf win in 1.95.
+  - **Defer / close status:** closed as *measurement-gated
+    blocker* in DEF-184 backlog. Reopen IFF (a) `generic_const_exprs`
+    stabilises, OR (b) `cargo asm` measurement shows material
+    binary bloat in current form.
+
 - **C1 typestate `PgProtocol<S: State>`** — needs research-spike
   to determine if API-break cost < structural win. Not Rust-
   blocker per se, but blocked on design validation.
@@ -4489,13 +4574,21 @@ rationale для легкой reentry в следующей сессии.
     → safer implementation.
 
 - **A7** (tag byte LUT `[Option<InboundTagClass>; 256]`, 150 LoC,
-  L risk).
+  L risk) — **DEFERRED pending DEF-143 bench baseline** (2026-04-24).
   - **Expected win:** 10-15 ns/frame via single load + jump
     instead of ~12-arm compare chain inside dispatch().
   - **Scope:** new wire.rs const LUT, dispatch entry
     wrapper-match, coverage const-assert.
-  - **Why deferred:** needs B21 shipped first for cleanest
-    integration into dispatch() entry path.
+  - **Status:** B21/C6 shipped, unblocking integration. But A7 is
+    speculative perf — current `match (ProtoState, InboundTag)` is
+    already lowered by LLVM to a nested switch with jump tables
+    per state. A `[256]` LUT ahead of match adds one indirect load +
+    one more match — net win requires benchmark.
+  - **Gate for shipping:** DEF-143 criterion harness measuring
+    actual dispatch cycles pre- vs post-A7. Without that baseline,
+    risk of regressing LLVM's current sparse-switch optimisation
+    is non-zero. CREDO §3: "первая идея — редко лучшая"; don't
+    ship speculative perf without measurement.
 
 - **A3** (two-stage fn-ptr LUT dispatch, 300-400 LoC, H risk).
   - **Expected win:** 5-15% frame dispatch via single indexed
@@ -4504,14 +4597,57 @@ rationale для легкой reentry в следующей сессии.
     erasure; needs bench baseline (DEF-143) to justify vs simpler
     A7. Research-spike class.
 
-#### Batch 8 deferred — state refactor
+#### Batch 8 — state refactor
 
-- **A10/B22** (SCRAM hot/cold split, 400-600 LoC, H risk).
+- **A10/B22** (SCRAM hot/cold split) — **SHIPPED 2026-04-24.**
+  - `ProtoState` 712 B → **80 B exact** (pinned in lib.rs) —
+    632 B memcpy eliminated per `dispatch()` call.
+  - New `src/scram_state.rs` module; `ScramHandshakeState` enum;
+    `PgProtocol::scram_state: Option<ScramHandshakeState>` field.
+  - 4 SCRAM `ProtoState` variants stripped to thin `{ reply }`.
+  - `dispatch()` threads `scram_state: &mut Option<...>` through
+    signature; 4 SCRAM arms load via `.take()`, drift classified
+    as `CrateBugLocus::ScramStateDrift` (tier-2 structural).
+  - Zeroize hygiene: `dispatch()` clears `scram_state` on any
+    Errored transition (post-match helper) — password material
+    dropped at fatal-path entry, not at connection drop.
+  - 3 new drift shield tests in `src/scram_state.rs` test module
+    (uses `#[cfg(test)] pub(crate)` forge hooks on PgProtocol).
+  - 235 tests green, clippy -D warnings clean.
+  - **Honest sizing**: saves ~2.47 MB/sec stack memcpy on 1K QPS
+    × 4 dispatch/query workload (NOT 664 MB/1M-rows — DataRow
+    bypasses dispatch). Win dominated by async-future frame
+    reduction (ProtoState field shrinks 712→80 B on PgProtocol).
+
+- **Original deferred entry (superseded 2026-04-24):**
   - **Expected win:** `mem::take(state)` 712 B → 48 B = **664 MB
     memcpy saved on 1M-row SELECT**. Foundation for A3 + A4.
   - **Why deferred:** state-machine restructure touches every
     variant transition + SCRAM handshake path. Requires fresh
     focus; extensive test migration.
+  - **Refined design (2026-04-24 session planning):**
+    1. Add `scram_state: Option<ScramHandshakeState>` field on
+       `PgProtocol` — 664 B lives ONLY during 4-frame SCRAM
+       window (client_first → server_first → client_final →
+       server_final → AuthOk), freed at any terminal transition.
+    2. Collapse 4 SCRAM `ProtoState` variants to 1 compact
+       discriminator `ConnectingScram(ScramPhase)` (8-16 B).
+       Variant correspondence 1:1 with `ScramHandshakeState` —
+       keep `(state, scram_state)` correlation tier-2 structural
+       via entry/exit invariant: `state is ConnectingScram(_)
+       ⇔ scram_state is Some(_)` asserted at dispatch boundary.
+    3. Thread `scram_state: &mut Option<ScramHandshakeState>`
+       through `dispatch()` signature (same pattern as
+       `error_arena: &mut ErrorArena` post-(A1)).
+    4. Test migration: 24 startup_spec tests + ~10 protocol.rs
+       tests exercise SCRAM state variant shapes directly —
+       expect ~300 LoC of test fixture / pattern updates.
+    5. Shield gaps post-refactor: (a) state says SCRAM but pool
+       is None (classify as `InternalCrateBug` locus `ScramStateDrift`),
+       (b) pool has Some but state is non-SCRAM (clear on every
+       non-SCRAM state entry via helper).
+  - **Est. one-session scope:** 6-8 hours fresh focus. Do NOT
+    attempt as bundled batch with another refactor.
 
 - **A4/B16** (cache-line `PgProtocol` layout, 200-300 LoC, M
   risk).
@@ -4519,6 +4655,10 @@ rationale для легкой reentry в следующей сессии.
     2-4 currently. 3-5 ns/iter.
   - **Depends on:** A10 shipped (SCRAM extraction → hot state
     ≤ 64 B fits cache line).
+  - **Gate:** DEF-143 bench harness to measure actual L1 hit-rate
+    pre/post. CREDO "0.98× vs C is losing" requires measured
+    perf win; speculative reordering without bench risks
+    unrelated layout pessimisation (e.g. padding insertion).
 
 #### Batch 9 deferred — crown
 
@@ -4532,12 +4672,15 @@ rationale для легкой reentry в следующей сессии.
     through Reply → Action → StreamItem. Fresh session + careful
     migration plan.
 
-- **B14** (HList `ParamsWriter`, 80 LoC new + 400 LoC removed).
-  - **Expected win:** 400+ LoC generated binary code removed
-    via single recursive impl instead of 17 tuple-arity
-    monomorphisations.
-  - **Why deferred:** trait-level refactor of param binding API.
-    Requires careful ergonomic audit.
+- **B14** (HList `ParamsWriter`, 80 LoC new + 400 LoC removed) —
+  **CLOSED 2026-04-24 as measurement-gated DEF-185 blocker**
+  (see DEF-185 B14 entry for full rationale). Architect audit
+  found stable-Rust HList requires `FORMATS`/`OIDS` tier-1 →
+  tier-3 regression, violating CREDO §1 safety > tier-1 > perf.
+  A14 already nulled `FORMATS` consumption at Bind-frame builder
+  so "400 LoC binary removed" claim is unmeasured. Gate for
+  reopening: `cargo asm` confirmation OR `generic_const_exprs`
+  stabilisation.
 
 #### Batch 10 spikes — research-gated
 

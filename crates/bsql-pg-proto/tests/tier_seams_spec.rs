@@ -282,6 +282,104 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     );
 }
 
+/// DEF-184 (A10/B22): pin that `push_startup` with SCRAM credentials
+/// lands in `ProtoState::ConnectingStartupScram` (thin variant,
+/// post-A10). Pre-A10 the state carried the `ScramSession` inline;
+/// post-A10 it's on `PgProtocol::scram_state`. This test verifies
+/// the `push_startup` → thin-state transition path.
+///
+/// The companion ScramStateDrift classification arm (when state
+/// says SCRAM but scram_state is None/mismatched) is architecturally
+/// unreachable via public API. Exercising that arm requires a
+/// `#[cfg(test)]` forge hook on scram_state — documented as
+/// follow-up DEF, not blocking for A10 ship.
+#[test]
+fn scram_push_startup_lands_in_thin_scram_state_variant() {
+    use bsql_pg_proto::{PgCommand, PgProtocol, WriteBuf};
+    use bsql_pg_proto::ident::Ident;
+    use bsql_pg_proto::password::{Credentials, Password};
+    use bsql_pg_proto::sensitive::Sensitive;
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let Ok(user) = Ident::try_from_str("u") else {
+        panic!("user ident construction must succeed");
+    };
+    let Ok(pw) = Password::try_from_bytes(b"pw") else {
+        panic!("password construction must succeed");
+    };
+    _ = proto.push_command(
+        PgCommand::Startup {
+            user,
+            database: None,
+            app_name: None,
+            credentials: Credentials::ScramPassword(Sensitive::new(pw)),
+            reply: id(raw(42)),
+        },
+        &mut wb,
+    );
+    assert!(
+        matches!(proto.state(), ProtoState::ConnectingStartupScram { .. }),
+        "SCRAM push_startup must land in thin ConnectingStartupScram state, got {:?}",
+        proto.state(),
+    );
+}
+/// into an already-Errored state preserves the original error kind
+/// byte-exactly. The dispatcher's `(ProtoState::Errored(original), _)`
+/// arm does `*state = ProtoState::Errored(original)` after `mem::replace`
+/// captured the old value — a classic swap-and-restore pattern. A
+/// mutant that wrote `*state = ProtoState::Errored(StateErrorKind::from_kind_or_internal(ErrorKind::Internal))`
+/// would stay compile-green and pass `errored_cause_is_preserved_in_state_and_reply`
+/// (that test's second push trips ConnectionAlreadyClosed path, not
+/// the re-entry arm). This test exercises the re-entry arm directly.
+#[test]
+fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
+    use bsql_pg_proto::error::ErrorKind;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+
+    // Drive into Errored(ServerError) via a server ErrorResponse
+    // during a pending Ping (distinct kind from the Framing path
+    // exercised in the sibling test).
+    _ = proto.push_command(PgCommand::Ping { reply: id(raw(9001)) }, &mut wb);
+    // ErrorResponse frame: tag 'E' + length 5 (just the terminator
+    // NUL) — empty body is legal per PG spec (all fields optional).
+    let err_frame = [b'E', 0x00, 0x00, 0x00, 0x05, 0x00];
+    let out = proto.feed_bytes(&err_frame, &mut wb);
+    // FailReply + state → Errored(ServerError).
+    assert!(!out.as_slice().is_empty());
+    let initial_kind = match proto.state() {
+        ProtoState::Errored(k) => k.as_kind(),
+        other => panic!("expected Errored after E frame, got {other:?}"),
+    };
+    assert_eq!(
+        initial_kind,
+        ErrorKind::ServerError,
+        "Errored kind after server E must be ServerError",
+    );
+
+    // Now feed ANOTHER arbitrary byte sequence. The
+    // `(ProtoState::Errored(original), _)` arm fires — MUST
+    // preserve the original kind byte, not replace with Internal /
+    // Framing / anything else. Also: must produce AdvancedSilent
+    // (no spurious FailReply, no CloseSocket).
+    let arbitrary = [b'T', 0x00, 0x00, 0x00, 0x06, 0x00, 0x00];
+    let _ = proto.feed_bytes(&arbitrary, &mut wb);
+    let after_kind = match proto.state() {
+        ProtoState::Errored(k) => k.as_kind(),
+        other => panic!("expected Errored to persist after re-feed, got {other:?}"),
+    };
+    assert_eq!(
+        after_kind,
+        ErrorKind::ServerError,
+        "re-entry into Errored arm must preserve the original kind byte-exactly",
+    );
+    assert_eq!(
+        after_kind,
+        initial_kind,
+        "kind byte before and after re-feed must be byte-equal",
+    );
+}
+
 // =================================================================
 // DatabaseName / ApplicationName validation — mirror ident_validation
 // for the other two NUL-free newtypes (DEF-041).

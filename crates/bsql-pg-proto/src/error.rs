@@ -279,6 +279,32 @@ const _: () = assert!(
 // ProtocolError (below)
 // -----------------------------------------------------------------
 
+// DEF-184 (audit #3 A-12): colocated drift-pin.
+//
+// ProtocolError exact size must stay 72 B post-(A1+A13) ErrorArena
+// externalisation — a variant growth here cascades into
+// `Action<'w,'r>` (88 B), `OutActions = [Action; 9] + len` (800 B),
+// and `StreamItem<'a>` (~80 B). The cascade costs 1-2 KB of per-call
+// stack frame, so the pin catches:
+//
+//   • New payload field on any variant that exceeds the 72 B budget.
+//   • Refactor that re-inlines the 288 B bounded strings into
+//     `ServerErrorResponse` (defeating the A1+A13 goal).
+//   • Alignment-driven padding bumps from field ordering changes.
+//
+// The complementary `Action` / `OutActions` pins live in lib.rs
+// alongside the full cascade measurements; pin-in-error.rs catches
+// drift AT the variant-definition site (Fail-Fast locality) rather
+// than at first use.
+const _: () = assert!(
+    core::mem::size_of::<ProtocolError>() == 72,
+    "ProtocolError exact size — 72 B post-(A1+A13). \
+     Variant shape change detected. Run `cargo expand --test` and \
+     audit each variant payload: ServerErrorResponse should carry \
+     ErrorRef (8 B), not inline BoundedStr<N>. See lib.rs cascade \
+     pins (Action / OutActions) for downstream impact.",
+);
+
 
 /// A classified failure on the wire protocol.
 ///
@@ -356,16 +382,16 @@ pub enum ProtocolError {
 
     /// Server sent an `ErrorResponse` (tag `'E'`) during the startup
     /// handshake or mid-query. DEF-060 part 2: typed
-    /// [`Severity`] + [`SqlStateCode`] (5-byte SQLSTATE) + bounded
-    /// strings with explicit truncation via `BoundedStr`.
+    /// [`Severity`] + [`SqlStateCode`] (5-byte SQLSTATE); bounded
+    /// strings (message / detail / hint) live in
+    /// [`crate::PgProtocol`]'s `ErrorArena` post-(DEF-184).
     ///
-    /// Size: ~280 bytes (down from ~848 in the pre-DEF-060 form with
-    /// 5 × `heapless::String<256>`). The shrink landed alongside the
-    /// silent-truncation fix — previous code used
-    /// `heapless::String::try_from(s).unwrap_or_default()` which
-    /// silently collapsed oversized server messages to empty
-    /// (tier-4); now overflow appends an explicit `"…"` marker
-    /// (tier-2 structural — bounded, explicit).
+    /// Size: variant payload = `Severity` 1 B + `SqlStateCode` 5 B +
+    /// `ErrorRef` 8 B = 14 B. The enclosing `ProtocolError` pins at
+    /// 72 B exact (A-12 const-assert in error.rs) — down from 312 B
+    /// pre-DEF-184 where the three bounded strings (288 B) were
+    /// inline. That shrink cascades: `Action<'w,'r>` 312 → 88 B,
+    /// `OutActions = [Action; 9]` 2808 → 800 B per feed_bytes call.
     ServerErrorResponse {
         /// Severity classification (enum, 1 byte). Unknown server
         /// severities map to [`Severity::Unknown`] rather than silently
@@ -381,11 +407,18 @@ pub enum ProtocolError {
         /// `OutActions = [Action; 9]` (2808 B stack frame) →
         /// `StreamItem::FailReply.cause` (320 B per-pull).
         ///
-        /// Post-(184) carries 2 bytes (`ErrorRef`: NonZeroU8 slot +
-        /// u8 gen). Resolve via
-        /// [`crate::PgProtocol::get_server_error`] to get the
-        /// `&ErrorPayload` with full strings. The ref is `Copy` —
-        /// callers can stash it, drop `OutActions` / the Action /
+        /// Post-(184) carries 8 bytes: NonZeroU8 slot + u32
+        /// generation + 3 B struct padding (see `error_arena.rs`
+        /// size pin). A-04 widened gen u8→u32 for wrap-safety on
+        /// long-running connections; A-06 elevated the resolve API
+        /// to `Result<&ErrorPayload, ArenaError>` with classified
+        /// `Empty` / `Stale` variants.
+        ///
+        /// Resolve via [`crate::PgProtocol::get_server_error`] or
+        /// format the full error (severity + code + message +
+        /// detail + hint) via
+        /// [`crate::PgProtocol::display_error`]. The ref is `Copy`
+        /// — callers can stash it, drop `OutActions` / the Action /
         /// StreamItem, then resolve on the freed protocol borrow.
         details_ref: crate::error_arena::ErrorRef,
     },
@@ -714,6 +747,27 @@ pub enum CrateBugLocus {
     /// the dead arm that would otherwise require either silent
     /// fallback (tier-4, CREDO §5) or new-variant-with-payload.
     AuthSubCodeZeroInErr,
+
+    /// DEF-184 (A10/B22): `ProtoState` is in a SCRAM phase variant
+    /// (`ConnectingStartupScram` / `ConnectingScramAwaitingServerFirst`
+    /// / `ConnectingScramAwaitingServerFinal`) but the companion
+    /// `PgProtocol::scram_state: Option<ScramHandshakeState>` is
+    /// `None` or carries a mismatched shape for the variant.
+    ///
+    /// The correlation between `ProtoState` SCRAM variants and
+    /// `scram_state` variants is a **tier-2 structural invariant**
+    /// (classified, not compile-time enforced) — post-A10 the heavy
+    /// SCRAM data moved off state to shrink `ProtoState` from ~712 B
+    /// to ~48 B. The type system cannot see that `state is
+    /// AwaitingServerFirst ⇔ scram_state is Some(AwaitingFirst{..})`,
+    /// so a refactor that breaks the invariant would produce a
+    /// classified `InternalCrateBug` via this locus rather than
+    /// silent take-from-None or wrong-variant-data usage.
+    ///
+    /// Architecturally unreachable under correct transitions; every
+    /// `*state = ProtoState::Scram*` assignment is paired with a
+    /// `scram_state = Some(...)` store at the same site.
+    ScramStateDrift,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -760,6 +814,7 @@ impl fmt::Display for CrateBugLocus {
             Self::ParamsWriterOverflow => f.write_str("params-writer-overflow"),
             Self::EmptyWriteRange => f.write_str("empty-write-range"),
             Self::AuthSubCodeZeroInErr => f.write_str("auth-sub-code-zero-in-err"),
+            Self::ScramStateDrift => f.write_str("scram-state-drift"),
             Self::BuilderCapacityOverflow => f.write_str("builder-capacity-overflow"),
         }
     }
@@ -1173,21 +1228,33 @@ impl fmt::Display for ProtocolError {
             Self::ServerErrorResponse {
                 severity,
                 code,
-                details_ref: _,
+                ..
             } => {
-                // DEF-184 (A1+A13): severity + code are inline;
-                // message / detail / hint live in `PgProtocol`'s
-                // ErrorArena (resolved via
-                // `PgProtocol::get_server_error(details_ref)`).
-                // Display cannot access arena here — caller-side
-                // diagnostic formatting should combine this output
-                // with the resolved `ErrorPayload` via
-                // `write!(f, "{err}; {}", proto.get_server_error(r)
-                // .map(|p| p.message).unwrap_or(""))` or similar.
-                // Pre-(184) Display included full message/detail/
-                // hint inline via F-053 (pass-#8); post-(184) that
-                // goes through the resolve API.
-                write!(f, "server error: {severity} ({code}) [details in ErrorArena]")
+                // DEF-184 (A1+A13 + audit #3 A-02 + audit #4 P0-1):
+                // severity + code are inline; message / detail / hint
+                // live in `PgProtocol`'s ErrorArena. Built-in `Display`
+                // here cannot access the arena, so it prints ONLY the
+                // inline fields and a LOUD advisory tag pointing at
+                // `PgProtocol::display_error(&err)` for full text.
+                //
+                // Pre-(P0-1) this emitted `"[details in ErrorArena]"`
+                // — mimicking content while silently losing diagnostic
+                // (tier-4 silent-degradation on non-adapter format
+                // sites: `format!("{err}")`, `log::error!("{err}")`,
+                // `err.to_string()`, panic via `{err:?}` + Display,
+                // `thiserror` source-chaining, etc.).
+                //
+                // Post-(P0-1): the explicit `[use PgProtocol::display_error
+                // for message/detail/hint]` advisory (a) renders the same
+                // regardless of whether arena resolved or not (no
+                // fabricated "details" content), (b) is grep-able in
+                // production logs, and (c) directs operators to the
+                // adapter API instead of silently hiding the regression.
+                write!(
+                    f,
+                    "server error: {severity} ({code}) \
+                     [use PgProtocol::display_error for message/detail/hint]",
+                )
             },
             // Typed Severity + SqlStateCode + BoundedStr all impl
             // Display — no extra plumbing needed.

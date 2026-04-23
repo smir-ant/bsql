@@ -15,13 +15,15 @@
 //!
 //! Post-(184): the three bounded strings move into a single-slot
 //! [`ErrorArena`] on `PgProtocol`. The `ServerErrorResponse` variant
-//! carries an [`ErrorRef`] handle (~3 B) instead of inline strings;
-//! callers resolve via [`crate::PgProtocol::get_server_error`] to
-//! get `&ErrorPayload`.
+//! carries an [`ErrorRef`] handle (8 B post-(audit #3 A-04)) instead
+//! of inline strings; callers resolve via
+//! [`crate::PgProtocol::get_server_error`] to get
+//! `Result<&ErrorPayload, ArenaError>` (A-06 tier-3 elevation).
 //!
-//! **Cascade result:** `ProtocolError` shrinks 312 B → ~32 B;
-//! `Action` shrinks ~5-8× (now Reply-bounded); `OutActions` stack
-//! frame shrinks ~3.5-4×; `StreamItem` shrinks ~4×.
+//! **Cascade result:** `ProtocolError` shrinks 312 B → 72 B (A-12
+//! exact pin); `Action` shrinks 312 B → 88 B (Reply-bounded);
+//! `OutActions = [Action; 9]` shrinks 2808 B → 800 B; `StreamItem`
+//! shrinks ~4×.
 //!
 //! # Single-slot design
 //!
@@ -33,11 +35,12 @@
 //!    client (the state machine transitions to `Errored` on first
 //!    ErrorResponse frame, blocking further dispatch). One slot
 //!    suffices.
-//! 2. **Simpler stale-ref model.** One `u8 gen` counter; alloc bumps
-//!    gen + overwrites slot; get compares gen.
-//! 3. **Smaller PgProtocol footprint.** One slot = ~288 B + 1 B gen.
-//!    Multi-slot slab of size 2 would be ~576 B. Defer multi-slot
-//!    until 1c-5 pipelining actually needs it.
+//! 2. **Simpler stale-ref model.** One `u32 gen` counter (A-04:
+//!    widened u8→u32 for wrap-safety on long-running connections);
+//!    alloc bumps gen + overwrites slot; get compares gen.
+//! 3. **Smaller PgProtocol footprint.** One slot approx 289 B + 4 B
+//!    gen + padding. Multi-slot slab of size 2 would be approx 576 B.
+//!    Defer multi-slot until 1c-5 pipelining actually needs it.
 //!
 //! # Alloc / clear discipline (mirror of schema_arena.rs)
 //!
@@ -53,12 +56,28 @@
 //!
 //! # Staleness classification
 //!
-//! [`ErrorArena::get`] returns `None` on gen mismatch (stale ref).
-//! Per CREDO §1 tier elevation: stale is tier-2 structural (bounded
-//! detection via typed generation counter), not tier-4 silent.
-//! Callers (tests / wrapper crate) that see `None` from
-//! `get_server_error` distinguish "no server error payload" (never
-//! happened) from "stale ref" (consumed or cleared) by context.
+//! [`ErrorArena::get`] returns `Result<&ErrorPayload, ArenaError>`
+//! with two classified error variants:
+//!
+//! - [`ArenaError::Empty`] — arena was never populated for this
+//!   generation. Happens when a caller holds an `ErrorRef` forged
+//!   or corrupted into `{slot=OCCUPIED, generation=current}` but
+//!   the slot is `None` (architecturally unreachable under
+//!   `#[forbid(unsafe_code)]` since `ErrorRef` construction is
+//!   confined to `ErrorArena::alloc` which always populates the
+//!   slot — but classified explicitly here rather than left as
+//!   a silent tier-4 fallback).
+//! - [`ArenaError::Stale`] — generation mismatch. The `ErrorRef`
+//!   was issued in an earlier allocation cycle; the arena has
+//!   since been cleared or a fresh payload was alloc'd that bumped
+//!   generation. This is the expected "consumed" signal for
+//!   callers who deferred resolution past an entry-point boundary.
+//!
+//! Pre-(audit #3 A-06) this was `Option<&ErrorPayload>` with the
+//! two failure modes collapsed into `None`. Tier-3 elevation via
+//! Result classifies the two cases so callers (tests, wrapper
+//! crate, operator diagnostics) can distinguish "I held the ref
+//! too long" (Stale) from "crate bug, shouldn't happen" (Empty).
 
 use crate::ident::BoundedStr;
 
@@ -82,13 +101,33 @@ pub struct ErrorPayload {
     pub hint: BoundedStr<64>,
 }
 
+// DEF-184 (audit #3 A-15): `ErrorPayload::empty()` and its `Default`
+// impl DELETED. Post-A-06 `get()` returns `Result<&ErrorPayload,
+// ArenaError>` with classified `Empty` / `Stale` variants; the
+// "empty payload" PRODUCTION sentinel no longer has a call site
+// (was previously used by the test helper `parse_and_resolve` via
+// `.copied().unwrap_or_default()` — the exact silent-fallback
+// pattern banned per CREDO §5 + user feedback_no_underscore_vars.md).
+//
+// A test-only named fallback `ErrorPayload::dead_for_test()` is
+// provided below — mirror of `SchemaRef::dead_for_test` in
+// schema_arena.rs. The name makes intent explicit: only exists to
+// satisfy the `assert!(is_ok) + unwrap_or(fallback)` idiom demanded
+// by the crate's `#[forbid(clippy::unwrap_used, clippy::panic)]`
+// bundle. Production code `match`es the Result exhaustively.
+
+#[cfg(test)]
 impl ErrorPayload {
-    /// Construct an empty payload (all three strings empty). Used
-    /// as the arena's uninitialised-slot sentinel and as the
-    /// fallback for stale-ref resolution in the wrapper crate.
-    #[inline]
+    /// Test-only dead-code fallback. Used exclusively inside
+    /// `assert!(r.is_ok(), ...) + r.unwrap_or(dead_for_test())`
+    /// — the assert fires loudly if the precondition breaks; the
+    /// fallback is defensive dead code keeping the helper compiling
+    /// under the crate-root `#[forbid(clippy::panic, ...)]` bundle.
+    ///
+    /// Mirrors `SchemaRef::dead_for_test` in schema_arena.rs.
+    /// NOT production code — explicitly-named, `#[cfg(test)]`-gated.
     #[must_use]
-    pub const fn empty() -> Self {
+    pub(crate) const fn dead_for_test() -> Self {
         Self {
             message: BoundedStr::<128>::new(),
             detail: BoundedStr::<96>::new(),
@@ -97,16 +136,9 @@ impl ErrorPayload {
     }
 }
 
-impl Default for ErrorPayload {
-    #[inline]
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-/// Opaque handle into [`ErrorArena`]. 2 bytes (u8 slot-marker +
-/// u8 generation), niche-packed for `Option<ErrorRef>` at the same
-/// size.
+/// Opaque handle into [`ErrorArena`]. 8 bytes (u8 slot-marker +
+/// u32 generation + padding), niche-packed for `Option<ErrorRef>`
+/// at the same size.
 ///
 /// # Invariants
 ///
@@ -118,15 +150,130 @@ impl Default for ErrorPayload {
 /// # Niche note
 ///
 /// `slot: core::num::NonZeroU8` ensures `Option<ErrorRef>` niches to
-/// 2 bytes via the 0 byte-pattern of the outer `None`. Single-slot
+/// 8 bytes via the 0 byte-pattern of the outer `None`. Single-slot
 /// design doesn't need multi-slot indexing, but the NonZeroU8 field
 /// preserves the niche invariant for `Option<ErrorRef>` storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// # Generation width (DEF-184 A1+A13, audit #3 A-04)
+///
+/// `generation: u32` (not `u8`) — the u8 would wrap after 256
+/// alloc/clear cycles, risking a stashed `ErrorRef` collision with
+/// a new-alloc payload in a long-running connection (architect
+/// audit A-04 — "silent wrong-payload read" class).
+///
+/// u32 pushes the wrap to 2³² (~4.3 G cycles) — architecturally
+/// unreachable under any realistic connection lifetime. Cost:
+/// `ErrorRef` grows from 2 B to 8 B (with padding), but `ErrorRef`
+/// only lives inside `ProtocolError::ServerErrorResponse` (72 B
+/// total), so the 6 B growth is absorbed by the existing
+/// ProtocolError discriminant padding.
+///
+/// # `#[must_use]` (audit #3 A-07)
+///
+/// An `ErrorRef` obtained from a pattern destructure must either
+/// be resolved (via `PgProtocol::get_server_error`) or explicitly
+/// discarded with `let _ =`. Silent drop loses the only handle to
+/// server message/detail/hint.
+// DEF-184 (audit #4 P2-11): `Hash` removed. Pre-(P2-11) it was
+// present via copy-paste from multi-slot SchemaRef where hashing
+// matters for dedup sets. ErrorRef is single-slot and never used as
+// a HashMap key internally or externally. Re-add on demand — with
+// a concrete consumer landing in the same commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "ErrorRef is the sole handle to server error message/detail/hint; \
+              resolve via PgProtocol::get_server_error before drop, or discard \
+              explicitly with `let _ = ref;`"]
 pub struct ErrorRef {
     /// Fixed marker = 1 (single slot). `NonZeroU8` for niche.
     slot: core::num::NonZeroU8,
     /// Arena generation at alloc time. Mismatch = stale.
-    generation: u8,
+    ///
+    /// DEF-184 (audit #3 A-04): widened u8 → u32 to eliminate
+    /// 256-cycle wrap collision risk in long-running connections.
+    generation: u32,
+}
+
+/// Classified failure from [`ErrorArena::get`] / [`crate::PgProtocol::get_server_error`].
+///
+/// DEF-184 (audit #3 A-06): tier-3 elevation over the pre-audit
+/// `Option<&ErrorPayload>` return. The two failure modes — empty
+/// slot vs stale generation — were previously collapsed into
+/// `None`; callers receiving `None` had no signal to distinguish
+/// "I deferred resolution too long" (Stale, expected) from "arena
+/// state is inconsistent" (Empty, architecturally unreachable
+/// outside of `unsafe`).
+///
+/// # Variant shape
+///
+/// `#[non_exhaustive]` reserved for future failure classes (e.g.
+/// poisoning on a multi-slot refactor). Users must carry a `_ =>`
+/// catch-all in match expressions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum ArenaError {
+    /// Arena's slot is `None` while the ref's generation matches the
+    /// arena's current generation. Architecturally unreachable under
+    /// `#[forbid(unsafe_code)]` because `ErrorRef` construction is
+    /// confined to `ErrorArena::alloc` which always sets
+    /// `slot = Some(payload)`. Classified explicitly rather than
+    /// silently papered over.
+    Empty = 0,
+    /// `ErrorRef.generation != ErrorArena.generation` — the ref was
+    /// issued in an earlier cycle. Expected signal for callers that
+    /// deferred resolution past an entry-point boundary (post-
+    /// `clear_arena_if_idle_or_errored`) or past a subsequent `alloc`
+    /// in a refactor that violates single-inflight invariant.
+    Stale = 1,
+}
+
+impl core::fmt::Display for ArenaError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("error arena slot is empty (architecturally unreachable)"),
+            Self::Stale => f.write_str("error arena ref is stale (generation mismatch — arena cleared or reallocated)"),
+        }
+    }
+}
+
+// Niche-pack pin: Option<ArenaError> stays 1 byte via the 254 unused
+// u8 discriminants (`#[repr(u8)]` with 2 C-like variants).
+const _: () = assert!(
+    core::mem::size_of::<ArenaError>() == 1,
+    "ArenaError must stay 1 byte (#[repr(u8)] + C-like variants). \
+     If a future variant carries a payload, Result<&T, ArenaError> \
+     layout changes cascade into the public get_server_error API \
+     surface — audit first.",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<ArenaError>>() == 1,
+    "Option<ArenaError> must niche-pack via unused discriminant range",
+);
+
+#[cfg(test)]
+impl ErrorRef {
+    /// DEF-184 (audit #4 P1-6): test-only forgery hook.
+    ///
+    /// Constructs an `ErrorRef` with an arbitrary generation and
+    /// the SLOT_OCCUPIED_MARKER slot — exclusively for exercising
+    /// the [`ArenaError::Empty`] arm in [`ErrorArena::get`], which
+    /// is architecturally unreachable via public API (alloc() is
+    /// the only constructor and always populates `slot`).
+    ///
+    /// Without this hook, the `Empty` arm has zero arm-body shield
+    /// coverage — a swap `None => Err(ArenaError::Stale)` for
+    /// `None => Err(ArenaError::Empty)` compiles silent, and
+    /// operators wondering why their arena says "Stale" when the
+    /// gen matches would have no test pinning the classification.
+    ///
+    /// Return type `ErrorRef` already carries `#[must_use]` at the
+    /// type level (A-07) — no redundant fn-level attribute needed.
+    pub(crate) const fn forge_for_test(generation: u32) -> Self {
+        Self {
+            slot: SLOT_OCCUPIED_MARKER,
+            generation,
+        }
+    }
 }
 
 /// Fixed marker for the single-slot arena. Used as the `slot` field
@@ -142,19 +289,26 @@ const SLOT_OCCUPIED_MARKER: core::num::NonZeroU8 = core::num::NonZeroU8::MIN;
 /// Single-slot error-payload arena on `PgProtocol`.
 ///
 /// See module docstring for full design. One `Option<ErrorPayload>`
-/// slot + one `u8 gen` counter = ~289 B per arena. Cleared at each
+/// slot + one `u32 gen` counter + padding ≈ 293 B per arena. Cleared at each
 /// entry-point when state is Idle/Errored.
 #[derive(Debug)]
 pub(crate) struct ErrorArena {
     /// `None` = free, `Some(payload)` = occupied. Populated only
     /// by [`alloc`]; reset to `None` by [`clear`].
     slot: Option<ErrorPayload>,
-    /// Bumped on [`alloc`] when overwriting a previously-occupied
-    /// slot, and on [`clear`] when the slot was occupied. `u8` is
-    /// safe in pre-1c-5 single-inflight (ErrorRef lives only while
-    /// the Action/StreamItem carrying it is alive, which cannot
-    /// survive across 256 clear cycles).
-    generation: u8,
+    /// Monotonically-bumped counter. Incremented on EVERY
+    /// [`alloc`] and on [`clear`] when the slot was occupied —
+    /// defence-in-depth (DEF-184 audit #3 A-13): even if a future
+    /// refactor accidentally violates the "at most one alloc per
+    /// feed_bytes" invariant maintained by the dispatch state
+    /// machine, any prior-issued `ErrorRef` resolves via
+    /// generation mismatch (tier-2 classified None) rather than
+    /// silent wrong-payload read.
+    ///
+    /// Width u32 (not u8, DEF-184 audit #3 A-04): wrap at 2³² is
+    /// architecturally unreachable under any realistic connection
+    /// lifetime.
+    generation: u32,
 }
 
 impl ErrorArena {
@@ -171,19 +325,24 @@ impl ErrorArena {
     /// Allocate the slot for `payload`, returning a handle capturing
     /// the current generation.
     ///
-    /// Overwrites any prior payload (single-slot design). If the
-    /// prior slot was occupied, the generation bumps so any
-    /// out-of-date [`ErrorRef`] resolves to `None` via mismatch.
+    /// DEF-184 (audit #3 A-13): bumps generation on EVERY call
+    /// (not just when replacing an occupied slot). Defence-in-
+    /// depth against any future dispatch refactor that might
+    /// accidentally fire `parse_error_response` twice in one
+    /// feed_bytes cycle — a prior-issued ErrorRef then resolves
+    /// to None via gen mismatch instead of matching the new
+    /// payload silently.
+    ///
+    /// `wrapping_add` permitted by forbid-bundle (no panic).
+    /// Width u32 (A-04) makes wrap at 2³² architecturally
+    /// unreachable under realistic connection lifetimes.
+    ///
+    /// Return type `ErrorRef` already carries `#[must_use = "..."]`
+    /// at the type level (audit #3 A-07) — no redundant fn-level
+    /// `#[must_use]` needed (clippy::double_must_use).
     #[inline]
-    #[must_use]
     pub(crate) fn alloc(&mut self, payload: ErrorPayload) -> ErrorRef {
-        if self.slot.is_some() {
-            // Generation bump is only needed when we're REPLACING an
-            // existing payload — an outstanding ErrorRef into the old
-            // payload would otherwise match the new payload's gen.
-            // `wrapping_add` permitted by forbid-bundle (no panic).
-            self.generation = self.generation.wrapping_add(1);
-        }
+        self.generation = self.generation.wrapping_add(1);
         self.slot = Some(payload);
         ErrorRef {
             slot: SLOT_OCCUPIED_MARKER,
@@ -191,45 +350,61 @@ impl ErrorArena {
         }
     }
 
-    /// Read the payload at `r`, or `None` if the slot is free /
-    /// the generation no longer matches (stale ref).
+    /// Read the payload at `r`.
+    ///
+    /// DEF-184 (audit #3 A-06): tier-3 classified Result replaces
+    /// the pre-audit `Option<&ErrorPayload>`.
+    ///
+    /// Returns:
+    /// - `Ok(&ErrorPayload)` — ref resolves; generation matches and
+    ///   slot is populated.
+    /// - `Err(ArenaError::Stale)` — ref was issued before a clear
+    ///   or a subsequent alloc bumped the generation.
+    /// - `Err(ArenaError::Empty)` — generation matches but slot is
+    ///   `None`. Architecturally unreachable outside of `unsafe`
+    ///   (ErrorRef construction requires a populated slot); surfaced
+    ///   explicitly so callers never silently fabricate a payload.
     #[inline]
-    #[must_use]
-    pub(crate) fn get(&self, r: ErrorRef) -> Option<&ErrorPayload> {
+    pub(crate) fn get(&self, r: ErrorRef) -> Result<&ErrorPayload, ArenaError> {
         if r.generation != self.generation {
-            return None;
+            return Err(ArenaError::Stale);
         }
-        self.slot.as_ref()
+        match self.slot.as_ref() {
+            Some(payload) => Ok(payload),
+            None => Err(ArenaError::Empty),
+        }
     }
 
-    /// Release the slot. Bumps generation if slot was occupied so
-    /// subsequent [`get`] on any outstanding ref returns `None`.
+    /// Release the slot. Bumps generation unconditionally so
+    /// subsequent [`get`] on any outstanding ref classifies as
+    /// [`ArenaError::Stale`].
     ///
     /// Called by [`crate::PgProtocol::clear_arena_if_idle_or_errored`]
     /// at entry-point boundaries when the prior state is Idle or
     /// Errored.
+    ///
+    /// DEF-184 (audit #4 P1-3): bump is unconditional for symmetry
+    /// with `alloc()` (A-13 defence-in-depth). Pre-(P1-3) the bump
+    /// was guarded by `if self.slot.is_some()` — a seam that a
+    /// future test-swap (`if self.slot.is_none()`) would silently
+    /// invert, letting a stashed ErrorRef resolve across a
+    /// no-op-clear boundary. Post-(P1-3) both alloc and clear bump
+    /// every call; the single `wrapping_add` on u32 is 1 cycle,
+    /// negligible on a cold error-entry-point path.
+    ///
+    /// `wrapping_add` permitted by forbid-bundle (no panic);
+    /// u32 wrap at 2³² (A-04) architecturally unreachable.
     #[inline]
     pub(crate) fn clear(&mut self) {
-        if self.slot.is_some() {
-            self.generation = self.generation.wrapping_add(1);
-        }
+        self.generation = self.generation.wrapping_add(1);
         self.slot = None;
     }
 
-    /// Whether the slot is currently occupied. Debug helper.
-    ///
-    /// Reserved for future diagnostic use (e.g. assertions in
-    /// `PgProtocol::get_server_error` that surface pre-Errored
-    /// ref issuance for wrapper-crate telemetry). Kept `pub(crate)`
-    /// but temporarily `#[expect(dead_code)]` until such a site
-    /// lands.
-    #[cfg(any(test, debug_assertions))]
-    #[inline]
-    #[must_use]
-    #[expect(dead_code, reason = "reserved for future diagnostic / telemetry use")]
-    pub(crate) fn is_occupied(&self) -> bool {
-        self.slot.is_some()
-    }
+    // DEF-184 (audit #3 A-09): `is_occupied` deleted — was dead
+    // code with deferred-justification `#[expect(dead_code)]`,
+    // banned per CREDO §5 "сделаем потом" + no-dead-code feedback.
+    // If a future diagnostic / telemetry site lands, reintroduce
+    // the method in the same commit as the caller.
 }
 
 impl Default for ErrorArena {
@@ -240,32 +415,150 @@ impl Default for ErrorArena {
 }
 
 // ---------------------------------------------------------------------
+// DEF-184 (audit #3 A-02) — Display-with-arena adapter.
+// ---------------------------------------------------------------------
+
+/// Display wrapper that resolves a [`ProtocolError::ServerErrorResponse`]'s
+/// arena-backed strings inline.
+///
+/// Constructed via [`crate::PgProtocol::display_error`]. The adapter
+/// borrows both the error and the arena; the borrow lifetime is the
+/// shorter of the two (always `&self` of `PgProtocol`).
+///
+/// # Rendering
+///
+/// - `ServerErrorResponse` with resolvable arena ref:
+///   `"server error: SEVERITY (SQLSTATE) — message; detail: <detail>;
+///   hint: <hint>"`. Empty detail/hint sections are suppressed.
+/// - `ServerErrorResponse` with unresolvable ref:
+///   `"server error: SEVERITY (SQLSTATE) [arena ref unresolved:
+///   <ArenaError>]"` — honest diagnostic over silent empty-string.
+/// - Other variants: delegates to [`ProtocolError`]'s built-in
+///   `Display` impl verbatim (no UX change).
+///
+/// # Lifetime budget
+///
+/// Single `'a` = `&self` of `PgProtocol`. The error pointer is
+/// separately borrowed but typically lives at the same scope
+/// (operator formats `proto.display_error(&err)` synchronously).
+///
+/// # DEF-184 (audit #4 P2-7, P2-8) shape choices
+///
+/// - `#[non_exhaustive]`: future fields (e.g. locale / tz /
+///   redaction flags) can land without a breaking change.
+/// - No `Clone` / `Copy`: single-use adapter — the intended pattern
+///   is `log::error!("{}", proto.display_error(&err));`. Allowing
+///   `Copy` would tempt stashing adapters that outlive the borrow
+///   (architecturally impossible here thanks to the `'a` lifetime,
+///   but removing the derive removes the temptation).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DisplayError<'a> {
+    err: &'a crate::error::ProtocolError,
+    arena: &'a ErrorArena,
+}
+
+impl<'a> DisplayError<'a> {
+    #[inline]
+    #[must_use]
+    pub(crate) fn new(err: &'a crate::error::ProtocolError, arena: &'a ErrorArena) -> Self {
+        Self { err, arena }
+    }
+}
+
+impl core::fmt::Display for DisplayError<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use crate::error::ProtocolError;
+        match self.err {
+            ProtocolError::ServerErrorResponse {
+                severity,
+                code,
+                details_ref,
+            } => {
+                write!(f, "server error: {severity} ({code})")?;
+                match self.arena.get(*details_ref) {
+                    Ok(payload) => {
+                        let message = payload.message.as_str();
+                        if !message.is_empty() {
+                            write!(f, " — {message}")?;
+                        }
+                        let detail = payload.detail.as_str();
+                        if !detail.is_empty() {
+                            write!(f, "; detail: {detail}")?;
+                        }
+                        let hint = payload.hint.as_str();
+                        if !hint.is_empty() {
+                            write!(f, "; hint: {hint}")?;
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Arena miss — classified diagnostic rather
+                        // than silent empty-string. Stale is
+                        // expected after clear_arena boundary; Empty
+                        // signals crate bug (architecturally
+                        // unreachable outside unsafe).
+                        write!(f, " [arena ref unresolved: {e}]")
+                    }
+                }
+            }
+            // Other variants: delegate verbatim to the built-in
+            // Display impl. No regression class here — only
+            // ServerErrorResponse had arena-backed strings.
+            other => core::fmt::Display::fmt(other, f),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Drift pins — DEF-184 A1 invariant guardrails.
 // ---------------------------------------------------------------------
 
-// Niche-pack invariant: Option<ErrorRef> must fit in the same byte
-// count as ErrorRef itself, via the NonZeroU8 slot field niche.
+// Size pin: ErrorRef is 8 bytes post-(audit #3 A-04): u32 generation +
+// NonZeroU8 slot marker + 3 B struct padding (u32 alignment).
+// Pre-audit was 2 B (NonZeroU8 + u8); widened for wrap-safety.
 const _: () = assert!(
-    core::mem::size_of::<Option<ErrorRef>>()
-        == core::mem::size_of::<ErrorRef>(),
-    "Option<ErrorRef> must niche-pack into ErrorRef's size via the \
-     NonZeroU8 slot niche. If this trips, a field was added to ErrorRef \
-     that broke the niche; restore single-NonZero or add explicit \
-     repr(C) + manual discriminant.",
+    core::mem::size_of::<ErrorRef>() == 8,
+    "ErrorRef should be 8 bytes (NonZeroU8 slot + u32 generation + \
+     padding). If changed, update ServerErrorResponse.details_ref \
+     budget + PgProtocol.error_arena footprint estimate in \
+     error_arena.rs docs.",
 );
 
-// Size pin: ErrorRef is 2 bytes (NonZeroU8 + u8). Bumping to u16
-// generation or multi-slot u8 index would double this; the drift-pin
-// forces a deliberate review.
+// DEF-184 (audit #4 P0-2): exact-equality pin on Option<ErrorRef>.
+//
+// Pre-(P0-2) this was a relative pin (`size_of::<Option<ErrorRef>>()
+// == size_of::<ErrorRef>()`), which is a weak shield — a non-niche
+// field added to ErrorRef can coincidentally keep the relation while
+// regressing footprint (both sides grow in lockstep). Exact pin
+// catches absolute-size drift independent of the relative invariant.
+//
+// The two pins together shield:
+//   • Absolute size drift on ErrorRef itself (pin above): 8 B exact.
+//   • Absolute size drift on Option<ErrorRef>: 8 B exact (this pin).
+//   • Niche collapse (if Option ever stops niche-packing, this would
+//     trip via the 8 vs 16 byte budget — Option<{u32,u8,padding}>
+//     without niche would be 12..16 B).
 const _: () = assert!(
-    core::mem::size_of::<ErrorRef>() == 2,
-    "ErrorRef should be 2 bytes (NonZeroU8 slot + u8 generation). If \
-     changed, update ServerErrorResponse.details_ref size budget + \
-     PgProtocol.error_arena footprint estimate in error_arena.rs docs.",
+    core::mem::size_of::<Option<ErrorRef>>() == 8,
+    "Option<ErrorRef> must be exactly 8 bytes — niche-packed via the \
+     NonZeroU8 slot field. If this trips: (a) a non-niche field was \
+     added to ErrorRef and the Option discriminant no longer niches, \
+     or (b) the NonZeroU8 slot was converted to a plain u8. Restore \
+     single-NonZero or add explicit repr(C) + manual discriminant.",
 );
 
 #[cfg(test)]
 mod tests {
+    //! Forbid-bundle compliance: `panic!`, `.unwrap()`, `.expect()`,
+    //! `unreachable!()`, and `assert!(false)` are banned crate-wide
+    //! (including unit tests). Tests below use the
+    //! `assert!(is_ok/matches!, ...) + if-let-Ok` idiom or the
+    //! `.unwrap_or(ErrorPayload::dead_for_test())` fallback — the
+    //! `assert!` fires loudly if the precondition breaks; the
+    //! `if let` / `unwrap_or` landing pad is defensive dead code
+    //! keeping the test compiling. Same pattern as
+    //! `schema_arena::tests::must_alloc` + `decode::data_row_ref_tests`.
     use super::*;
 
     #[test]
@@ -278,19 +571,27 @@ mod tests {
         };
         let r = arena.alloc(payload);
         let got = arena.get(r);
-        assert!(got.is_some(), "alloc'd ref must resolve");
-        if let Some(got) = got {
-            assert_eq!(got.message.as_str(), "boom");
+        assert!(got.is_ok(), "alloc'd ref must resolve, got {got:?}");
+        if let Ok(payload_ref) = got {
+            assert_eq!(payload_ref.message.as_str(), "boom");
         }
     }
 
     #[test]
-    fn get_after_clear_returns_none_via_generation_mismatch() {
+    fn get_after_clear_classifies_as_stale() {
         let mut arena = ErrorArena::new();
-        let payload = ErrorPayload::empty();
+        let payload = ErrorPayload {
+            message: BoundedStr::<128>::new(),
+            detail: BoundedStr::<96>::new(),
+            hint: BoundedStr::<64>::new(),
+        };
         let r = arena.alloc(payload);
         arena.clear();
-        assert!(arena.get(r).is_none());
+        assert!(
+            matches!(arena.get(r), Err(ArenaError::Stale)),
+            "post-clear ref must classify as Stale, got {:?}",
+            arena.get(r),
+        );
     }
 
     #[test]
@@ -309,12 +610,110 @@ mod tests {
         };
         let r2 = arena.alloc(p2);
         // r1 should be stale (generation mismatch).
-        assert!(arena.get(r1).is_none(), "old ref must be stale");
+        assert!(
+            matches!(arena.get(r1), Err(ArenaError::Stale)),
+            "old ref must be Stale, got {:?}",
+            arena.get(r1),
+        );
         // r2 resolves the new payload.
-        assert!(arena.get(r2).is_some(), "fresh ref must resolve");
-        if let Some(got) = arena.get(r2) {
-            assert_eq!(got.message.as_str(), "second");
+        let got = arena.get(r2);
+        assert!(got.is_ok(), "fresh ref must resolve, got {got:?}");
+        if let Ok(payload_ref) = got {
+            assert_eq!(payload_ref.message.as_str(), "second");
         }
+    }
+
+    #[test]
+    fn clear_bumps_generation_unconditionally() {
+        // DEF-184 (audit #4 P1-3): clear() bumps generation whether
+        // or not the slot was occupied. Alloc + clear on a pristine
+        // arena reaches generation=2; a ref issued after the clear
+        // cycle is distinguishable from a ref issued before it.
+        //
+        // Without unconditional bump, a rare idle-clear sequence
+        // (clear without preceding alloc) leaves generation at 0,
+        // and a later alloc's ref (generation=1) could collide with
+        // a hypothetically-stashed ref issued during the crate's
+        // bootstrap. Zero-cost defence-in-depth.
+        let mut arena = ErrorArena::new();
+        // Empty clear — bumps to 1.
+        arena.clear();
+        let payload = ErrorPayload {
+            message: BoundedStr::<128>::from_str_truncating("after"),
+            detail: BoundedStr::<96>::new(),
+            hint: BoundedStr::<64>::new(),
+        };
+        // Alloc — bumps to 2.
+        let r = arena.alloc(payload);
+        // Second clear — bumps to 3.
+        arena.clear();
+        // r was issued at gen=2, arena now at gen=3: classify Stale.
+        assert!(
+            matches!(arena.get(r), Err(ArenaError::Stale)),
+            "post-clear ref must be Stale (unconditional bump), got {:?}",
+            arena.get(r),
+        );
+    }
+
+    #[test]
+    fn prior_arena_ref_classifies_as_stale_on_fresh_arena() {
+        // Cross-arena collision class: arena A emits ref at its
+        // generation; fresh arena B resolves the ref → Stale
+        // (gen mismatch), never Empty. Pins the gen-mismatch arm
+        // against a would-be body swap.
+        let mut a = ErrorArena::new();
+        let p = ErrorPayload {
+            message: BoundedStr::<128>::new(),
+            detail: BoundedStr::<96>::new(),
+            hint: BoundedStr::<64>::new(),
+        };
+        let r = a.alloc(p);
+        let b = ErrorArena::new();
+        // Fresh arena has generation=0; r has generation=1 — mismatch.
+        assert!(matches!(b.get(r), Err(ArenaError::Stale)));
+    }
+
+    #[test]
+    fn forged_ref_with_matching_gen_but_empty_slot_classifies_as_empty() {
+        // DEF-184 (audit #4 P1-6): exercise ArenaError::Empty arm
+        // directly. Without this test, swapping
+        //   `None => Err(ArenaError::Empty)` ↔ `None => Err(ArenaError::Stale)`
+        // in `get()` compiles silent and operators see "Stale" on a
+        // gen-match arena — misdirecting diagnostics to "I cleared
+        // this" when the actual condition is "slot was never populated".
+        //
+        // Forges an ErrorRef at the arena's current generation via
+        // the #[cfg(test)] hook `ErrorRef::forge_for_test`, then
+        // asserts the empty-slot path returns Err(Empty), not
+        // Err(Stale). Architecturally unreachable via public API
+        // (ErrorArena::alloc always populates slot); the forgery
+        // hook is the only way to reach the arm — same pattern as
+        // SchemaRef::dead_for_test in schema_arena.rs.
+        let arena = ErrorArena::new();
+        // Fresh arena: generation=0, slot=None. Forge a matching-
+        // generation ref pointing at the empty slot.
+        let r = ErrorRef::forge_for_test(0);
+        assert!(
+            matches!(arena.get(r), Err(ArenaError::Empty)),
+            "forged matching-gen ref on empty slot must classify Empty, got {:?}",
+            arena.get(r),
+        );
+    }
+
+    #[test]
+    fn forged_ref_with_stale_gen_classifies_stale_not_empty() {
+        // Symmetric shield: if slot is empty AND gen mismatches,
+        // the gen-mismatch check MUST precede the slot check.
+        // This pins the check order: `r.generation != self.generation`
+        // returns Stale before the `self.slot.as_ref()` path.
+        let arena = ErrorArena::new();
+        // Fresh arena: generation=0. Forge stale-gen ref.
+        let r = ErrorRef::forge_for_test(99);
+        assert!(
+            matches!(arena.get(r), Err(ArenaError::Stale)),
+            "forged stale-gen ref (even on empty slot) must classify Stale, got {:?}",
+            arena.get(r),
+        );
     }
 
     #[test]
@@ -323,5 +722,161 @@ mod tests {
             core::mem::size_of::<Option<ErrorRef>>(),
             core::mem::size_of::<ErrorRef>(),
         );
+    }
+
+    #[test]
+    fn arena_error_is_one_byte() {
+        // Colocated with const-assert above — runtime test gives a
+        // second witness in the test report.
+        assert_eq!(core::mem::size_of::<ArenaError>(), 1);
+        assert_eq!(core::mem::size_of::<Option<ArenaError>>(), 1);
+    }
+
+    // DEF-184 (audit #3 A-02): DisplayError adapter behavioural
+    // coverage. Closes the "Display arm order swap" shield gap:
+    // reversing message / detail / hint in the fmt body compiles
+    // silently and operators see the wrong field in logs.
+
+    extern crate alloc;
+    use alloc::format;
+
+    #[test]
+    fn display_error_renders_full_text_when_ref_resolves() {
+        use crate::error::{ProtocolError, Severity, SqlStateCode};
+        let mut arena = ErrorArena::new();
+        let details_ref = arena.alloc(ErrorPayload {
+            message: BoundedStr::<128>::from_str_truncating("password authentication failed"),
+            detail: BoundedStr::<96>::from_str_truncating("user 'alice' not found"),
+            hint: BoundedStr::<64>::from_str_truncating("check pg_hba.conf"),
+        });
+        let err = ProtocolError::ServerErrorResponse {
+            severity: Severity::Fatal,
+            code: SqlStateCode::from_bytes(b"28P01"),
+            details_ref,
+        };
+        let adapter = DisplayError::new(&err, &arena);
+        let rendered = format!("{adapter}");
+        assert_eq!(
+            rendered,
+            "server error: FATAL (28P01) — password authentication failed; \
+             detail: user 'alice' not found; hint: check pg_hba.conf",
+        );
+    }
+
+    #[test]
+    fn display_error_suppresses_empty_detail_and_hint() {
+        use crate::error::{ProtocolError, Severity, SqlStateCode};
+        let mut arena = ErrorArena::new();
+        let details_ref = arena.alloc(ErrorPayload {
+            message: BoundedStr::<128>::from_str_truncating("boom"),
+            detail: BoundedStr::<96>::new(),
+            hint: BoundedStr::<64>::new(),
+        });
+        let err = ProtocolError::ServerErrorResponse {
+            severity: Severity::Error,
+            code: SqlStateCode::from_bytes(b"42000"),
+            details_ref,
+        };
+        let adapter = DisplayError::new(&err, &arena);
+        let rendered = format!("{adapter}");
+        assert_eq!(rendered, "server error: ERROR (42000) — boom");
+    }
+
+    #[test]
+    fn display_error_emits_arena_miss_diagnostic_when_ref_stale() {
+        use crate::error::{ProtocolError, Severity, SqlStateCode};
+        let mut arena = ErrorArena::new();
+        let details_ref = arena.alloc(ErrorPayload {
+            message: BoundedStr::<128>::from_str_truncating("orig"),
+            detail: BoundedStr::<96>::new(),
+            hint: BoundedStr::<64>::new(),
+        });
+        // Clear the arena — ref becomes stale. (Operator scenario:
+        // deferred diagnostic log past an entry-point boundary.)
+        arena.clear();
+        let err = ProtocolError::ServerErrorResponse {
+            severity: Severity::Error,
+            code: SqlStateCode::from_bytes(b"XX000"),
+            details_ref,
+        };
+        let adapter = DisplayError::new(&err, &arena);
+        let rendered = format!("{adapter}");
+        assert!(
+            rendered.contains("server error: ERROR (XX000) [arena ref unresolved:"),
+            "stale ref must produce classified-miss diagnostic, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("stale"),
+            "miss diagnostic must identify Stale class, got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn built_in_display_advisory_points_to_adapter() {
+        // DEF-184 (audit #4 P0-1): the base `ProtocolError::Display`
+        // impl MUST emit the grep-able advisory tag pointing operators
+        // at `PgProtocol::display_error` — not silently emit an empty
+        // string or fake "details" content. This is the tier-2 shield
+        // for non-adapter log / panic / thiserror-source sites.
+        //
+        // Pre-(P0-1) Display emitted `"[details in ErrorArena]"`
+        // which mimicked presence of details while silently hiding
+        // them — tier-4 silent-degradation. Post-(P0-1) the advisory
+        // is explicit.
+        use crate::error::{ProtocolError, Severity, SqlStateCode};
+        let mut arena = ErrorArena::new();
+        let details_ref = arena.alloc(ErrorPayload {
+            message: BoundedStr::<128>::from_str_truncating("boom"),
+            detail: BoundedStr::<96>::new(),
+            hint: BoundedStr::<64>::new(),
+        });
+        let err = ProtocolError::ServerErrorResponse {
+            severity: Severity::Fatal,
+            code: SqlStateCode::from_bytes(b"28P01"),
+            details_ref,
+        };
+        // Built-in Display — deliberately NOT going through the
+        // adapter. Must contain severity, code, and advisory tag.
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("FATAL"),
+            "built-in Display must retain severity, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("28P01"),
+            "built-in Display must retain SQLSTATE, got: {rendered}",
+        );
+        assert!(
+            rendered.contains("PgProtocol::display_error"),
+            "built-in Display must advise operators to use the adapter for full text, \
+             got: {rendered}",
+        );
+        // Critically: must NOT contain the message — that's the
+        // adapter's job. If Display ever started resolving the arena
+        // inline, it would need the arena borrow which isn't available
+        // from `&self`.
+        assert!(
+            !rendered.contains("boom"),
+            "built-in Display must NOT resolve arena strings (no arena in scope), \
+             got: {rendered}",
+        );
+    }
+
+    #[test]
+    fn display_error_delegates_for_non_server_variants() {
+        use crate::error::{CrateBugLocus, ProtocolError};
+        // Any non-ServerErrorResponse variant exercises the
+        // fall-through branch. InternalCrateBug is convenient — its
+        // Display has a stable contract pinned in other tests.
+        let err = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::StaleSchemaRef,
+        };
+        let arena = ErrorArena::new();
+        let adapter = DisplayError::new(&err, &arena);
+        // Must match the plain Display exactly (no arena-specific
+        // prefix / suffix) — adapter is a no-op for non-server variants.
+        let rendered = format!("{adapter}");
+        let plain = format!("{err}");
+        assert_eq!(rendered, plain);
     }
 }

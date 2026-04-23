@@ -314,8 +314,13 @@ fn error_response_during_startup_is_classified() {
     // `out` is Copy-like (ManuallyDrop<heapless::Vec>); NLL
     // releases the &mut proto borrow at `out.as_slice()`'s last
     // use above. No explicit drop needed.
-    let Some(payload) = proto.get_server_error(details_ref) else {
-        panic!("server error payload must resolve via arena");
+    // DEF-184 (audit #3 A-06): Result-returning get_server_error.
+    // Err branch panics with the classified ArenaError for debuggability
+    // — architecturally unreachable here (parse allocated into arena,
+    // no intervening clear before this resolve).
+    let payload = match proto.get_server_error(details_ref) {
+        Ok(payload) => payload,
+        Err(e) => panic!("server error payload must resolve via arena, got ArenaError::{e:?}"),
     };
     assert_eq!(
         payload.message.as_str(),
