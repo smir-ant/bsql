@@ -333,15 +333,16 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static, 'static>>() >= 4992
         && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 5120,
-    "OutActions<'_, '_> size drift — post-DEF-154 (L) expected ~5008 B. \
-     Range [4992, 5120] catches regressions. 16 × sizeof(Action) (312 B) \
-     + u8 len + padding ≈ 5008. The 8→16 slot bump is driven by the \
-     MAX_STAGED_PER_CALL × MAX_FANOUT_PER_STAGED split: materialise's \
-     stale-ref fan-out (2 actions per staged entry) is now architecturally \
-     contained via `const _: () = assert!(MAX_ACTIONS_PER_CALL >= \
-     MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED)` in protocol.rs. \
-     If the budget grows further (e.g. new 3-action fan-out variant), \
-     update MAX_FANOUT_PER_STAGED + this range together.",
+    "OutActions<'_, '_> size drift. \
+     \
+     Stack reservation unchanged post-DEF-184 A2/B1/B8: \
+     ManuallyDrop<heapless::Vec<Action, 16>> occupies the same \
+     16 × 312 B = 4992 B of slot storage + usize length = ~5008 B. \
+     The WIN is in the per-call INIT COST (5008 B zero-fill → 0 B \
+     via heapless::Vec::new()), not in the stack frame size. \
+     \
+     Range [4992, 5120] catches regressions in slot count / Action \
+     size.",
 );
 
 // ---------------------------------------------------------------------
@@ -439,6 +440,12 @@ const _: () = assert!(
 );
 const _: () = assert!(
     !core::mem::needs_drop::<action::OutActions<'static, 'static>>(),
-    "OutActions<'_> must stay drop-free — custom POD array (not heapless::Vec); \
-     this is what lets NLL release borrows at last use (no `drop()` calls needed in tests).",
+    "OutActions<'_> must stay drop-free. Post-DEF-184 A2/B1/B8: \
+     inner heapless::Vec is wrapped in ManuallyDrop which inhibits \
+     the Vec's Drop impl. Since Action<'w, 'r> is Copy (POD refs + \
+     small payload), skipping inner Drop is sound (no-op body \
+     anyway). This preserves pre-(184) NLL last-use borrow-release \
+     semantics — the caller pattern `let out = proto.feed_bytes(..); \
+     match out.as_slice() {{ .. }}; proto.state()` compiles without \
+     explicit drop(out) between as_slice and next proto call.",
 );

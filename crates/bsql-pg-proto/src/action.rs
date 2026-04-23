@@ -556,40 +556,45 @@ mod phase_b3_tests {
 /// macro's `const _: () = assert!(MAX_ACTIONS_PER_CALL >= budget)`
 /// checks at every push site.
 ///
-/// # Stack-init cost and the no-unsafe tradeoff
+/// # DEF-184 (A2/B1/B8): `ManuallyDrop<heapless::Vec>` backing
 ///
-/// `OutActions::new()` writes a `CloseSocket` sentinel into all 8
-/// slots (3 KB under current `size_of::<Action>() ≈ 384 B`). Every
-/// `feed_bytes` / `push_command` call pays this init — even the
-/// typical 1-action Ping path walks the full array.
+/// Pre-(184) used `[Action; MAX_ACTIONS_PER_CALL]` + `u8 len`
+/// with `Action::CloseSocket` sentinel-fill — every
+/// `OutActions::new()` paid **5008 B zero-fill/call** (16 × 312 B +
+/// pad). Post-(184): `ManuallyDrop<heapless::Vec<Action, N>>` —
+/// zero init writes via `heapless::Vec::new()`, wrapper suppresses
+/// the Drop impl that would otherwise extend NLL borrows past
+/// last-use.
 ///
-/// The eager-init path is the **cost of `#![forbid(unsafe_code)]`**.
-/// Safe alternatives considered:
-/// - `[MaybeUninit<Action>; 8]` + `assume_init` on populated slots
-///   — requires `unsafe`, forbidden.
-/// - `[Option<Action>; 8]` — `Option<Action>` is 392 B (discriminant
-///   + pad), strictly WORSE than the sentinel-fill.
-/// - Drop the sentinel and only-initialise populated slots via
-///   `heapless::Vec<Action, 8>` — propagates `heapless::Vec<T>`'s
-///   Drop into `OutActions`, breaking the POD shape required for
-///   NLL last-use borrow-release (tests would need explicit
-///   `drop(out)` between calls).
+/// ## Why ManuallyDrop?
 ///
-/// Net: the 3 KB init cost is the Pareto-optimal choice under the
-/// forbid bundle. Shrinking `Action` itself shrinks this
-/// proportionally — DEF-119's schema-arena refactor (1c-5)
-/// externalises `RowDesc` out of `Reply::*Complete` payloads,
-/// dropping `Action` from ~384 B to ~128 B and `OutActions` init
-/// cost from 3 KB to ~1 KB.
-#[derive(Debug, Clone, Copy)]
+/// Plain `heapless::Vec<Action, N>` has `impl<T, const N: usize>
+/// Drop for Vec<T, N>` — `needs_drop::<heapless::Vec<_, _>>()`
+/// returns `true` even when `T: Copy`, extending borrow-check
+/// lifetime of a value holding `'r` (the read-buf borrow) to its
+/// scope's Drop point instead of last-use. Caller pattern
+/// `let out = proto.feed_bytes(...); match out.as_slice() {...};
+/// proto.state()` would then fail borrow-check (out's 'r-borrow
+/// of proto still live at the `proto.state()` call).
+///
+/// `ManuallyDrop<T>` inhibits the inner Drop unconditionally.
+/// Since `Action<'w, 'r>` is `Copy` (POD refs + small payloads),
+/// the inner Drop body is trivial anyway — skipping it is sound.
+///
+/// ## Win
+///
+/// 5008 B zero-fill per `feed_bytes` / `push_command` / `iter_rows
+/// .slow_path_once` → **0 B init**. Stack reservation size
+/// unchanged (`[MaybeUninit<Action>; N]` still allocates the
+/// slots), but the write bandwidth disappears.
+#[derive(Debug)]
 pub struct OutActions<'w, 'r> {
-    /// Fixed slot storage; slots past `len` hold the default
-    /// sentinel ([`Action::CloseSocket`]) from construction.
-    items: [Action<'w, 'r>; MAX_ACTIONS_PER_CALL],
-    /// Number of populated slots in `items[..len]`. `u8` suffices
-    /// since `MAX_ACTIONS_PER_CALL` is tiny (currently 8 post-1c-1b
-    /// bump from 4).
-    len: u8,
+    /// ManuallyDrop-wrapped heapless vec. `ManuallyDrop` makes the
+    /// wrapper Drop-free regardless of inner type, preserving
+    /// pre-(184) NLL last-use borrow-release semantics.
+    items: core::mem::ManuallyDrop<
+        heapless::Vec<Action<'w, 'r>, MAX_ACTIONS_PER_CALL>,
+    >,
 }
 
 impl Default for OutActions<'_, '_> {
@@ -600,14 +605,15 @@ impl Default for OutActions<'_, '_> {
 
 impl<'w, 'r> OutActions<'w, 'r> {
     /// Construct an empty `OutActions`.
+    ///
+    /// DEF-184 (A2/B1/B8): replaced `[Action::CloseSocket; N]`
+    /// eager fill (5008 B of writes) with `ManuallyDrop::new
+    /// (heapless::Vec::new())` (zero writes).
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
-        // Fill with the Copy `CloseSocket` sentinel; the `len`
-        // field tracks the actual occupancy.
         Self {
-            items: [Action::CloseSocket; MAX_ACTIONS_PER_CALL],
-            len: 0,
+            items: core::mem::ManuallyDrop::new(heapless::Vec::new()),
         }
     }
 
@@ -615,52 +621,27 @@ impl<'w, 'r> OutActions<'w, 'r> {
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        // `u8 → usize` via `From` impl (infallible, widening). `as`
-        // casts are banned by the crate forbid bundle; `usize::from`
-        // is the only accepted form.
-        usize::from(self.len)
+        self.items.len()
     }
 
     /// Whether no actions have been pushed.
     #[inline]
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
     }
 
     /// Borrow the populated prefix as a slice.
-    ///
-    /// DEF-184 (B26): converted from `.get(..len).unwrap_or(&[])` —
-    /// silent-fallback pattern CREDO §5 bans — to explicit
-    /// `split_at_checked` match sibling-pattern to
-    /// `FixedStr::as_bytes` (ident.rs F-034 / DEF-154 S P1-1).
-    /// Semantics identical; readability of dead-branch decision
-    /// improved (emission is explicit empty-slice sentinel, not a
-    /// silent `.unwrap_or()`).
     #[inline]
     pub fn as_slice(&self) -> &[Action<'w, 'r>] {
-        // DEF-178 (audit2 A023): debug_assert pins the
-        // architecturally-dead None arm. `self.len()` is
-        // invariant-bounded to `MAX_ACTIONS_PER_CALL == items.len()`
-        // by the push() capacity check + const-assert below.
-        debug_assert!(
-            self.len() <= self.items.len(),
-            "DEF-178: OutActions.len exceeds item capacity — invariant break",
-        );
-        match self.items.split_at_checked(self.len()) {
-            Some((head, _)) => head,
-            // Architecturally unreachable per the capacity-gated
-            // push invariant; empty-slice sentinel = same
-            // no-silent-op convention as FixedStr::as_bytes.
-            None => &[],
-        }
+        self.items.as_slice()
     }
 
     /// Return the first populated action (or `None` if empty).
     /// Convenience for test assertions.
     #[inline]
     pub fn first(&self) -> Option<&Action<'w, 'r>> {
-        self.as_slice().first()
+        self.items.first()
     }
 
     /// Push an action. Returns `Err(action)` (mirrors heapless's
@@ -668,61 +649,28 @@ impl<'w, 'r> OutActions<'w, 'r> {
     #[inline]
     #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; mirrors heapless::Vec::push API. Err is only hit under architecturally-bounded overflow (compile-time emit_actions! budget).")]
     pub fn push(&mut self, action: Action<'w, 'r>) -> Result<(), Action<'w, 'r>> {
-        let idx = self.len();
-        if idx >= MAX_ACTIONS_PER_CALL {
-            return Err(action);
-        }
-        let Some(slot) = self.items.get_mut(idx) else {
-            return Err(action);
-        };
-        *slot = action;
-        self.len = self.len.saturating_add(1);
-        Ok(())
+        self.items.push(action)
     }
 }
 
 impl<'w, 'r> IntoIterator for OutActions<'w, 'r> {
     type Item = Action<'w, 'r>;
-    type IntoIter = OutActionsIter<'w, 'r>;
+    type IntoIter = <heapless::Vec<Action<'w, 'r>, MAX_ACTIONS_PER_CALL> as IntoIterator>::IntoIter;
     fn into_iter(self) -> Self::IntoIter {
-        OutActionsIter { inner: self, pos: 0 }
+        // Unwrap ManuallyDrop to move inner vec; since `Action`
+        // is Copy the inner vec's Drop is a no-op anyway. This is
+        // sound per `ManuallyDrop::into_inner` safety contract
+        // (forgotten drop would be unsound only for drop-active T).
+        core::mem::ManuallyDrop::into_inner(self.items).into_iter()
     }
 }
 
 /// By-reference iteration — `for action in &out` yields `&Action`.
-///
-/// F-002 (pass-#8): callers who want to inspect actions without
-/// consuming the container previously had to reach for
-/// `out.as_slice().iter()`. This `IntoIterator for &OutActions` impl
-/// makes `for a in &out { ... }` do the right thing natively. Both
-/// by-value (`for a in out`) and by-reference (`for a in &out`) are
-/// supported with the same ergonomic shape.
 impl<'a, 'w, 'r> IntoIterator for &'a OutActions<'w, 'r> {
     type Item = &'a Action<'w, 'r>;
     type IntoIter = core::slice::Iter<'a, Action<'w, 'r>>;
     fn into_iter(self) -> Self::IntoIter {
-        self.as_slice().iter()
-    }
-}
-
-/// Move-iterator for [`OutActions`]. Produces each populated
-/// [`Action<'w, 'r>`] in insertion order, then ends.
-#[derive(Debug)]
-pub struct OutActionsIter<'w, 'r> {
-    inner: OutActions<'w, 'r>,
-    pos: u8,
-}
-
-impl<'w, 'r> Iterator for OutActionsIter<'w, 'r> {
-    type Item = Action<'w, 'r>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.inner.len {
-            return None;
-        }
-        let idx = usize::from(self.pos);
-        let item = *self.inner.items.get(idx)?;
-        self.pos = self.pos.saturating_add(1);
-        Some(item)
+        self.items.iter()
     }
 }
 
