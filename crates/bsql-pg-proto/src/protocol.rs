@@ -1300,10 +1300,11 @@ fn build_query_message<'brand>(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
 ) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     let start = reserved.len();
-    reserved.push_u8(crate::wire::TAG_QUERY.byte());
+    reserved.push_u8(crate::wire::TAG_QUERY.byte())?;
     reserved.with_length_prefix(|w| {
-        w.push_nul_terminated(sql.as_bytes());
-    });
+        w.push_nul_terminated(sql.as_bytes())?;
+        Ok(())
+    })?;
     // DEF-154 (B) Phase B4-W P0-2: `from_branded_write_span` returns
     // `Result` post-audit. 'Q' frame is ≥ 6 bytes so Err is
     // architecturally dead; classified upstream as
@@ -1325,13 +1326,14 @@ fn build_parse_message<'brand>(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
 ) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     let start = reserved.len();
-    reserved.push_u8(crate::wire::TAG_PARSE.byte());
+    reserved.push_u8(crate::wire::TAG_PARSE.byte())?;
     reserved.with_length_prefix(|w| {
-        w.push_nul_terminated(stmt_name.as_bytes());
-        w.push_nul_terminated(sql.as_bytes());
+        w.push_nul_terminated(stmt_name.as_bytes())?;
+        w.push_nul_terminated(sql.as_bytes())?;
         // n_param_types = 0; 1c-3b will widen to push actual OIDs here.
-        w.push_i16_be(0);
-    });
+        w.push_i16_be(0)?;
+        Ok(())
+    })?;
     crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
@@ -1441,11 +1443,12 @@ fn build_describe_message<'brand, N: crate::ident::DescribeName>(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
 ) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     let start = reserved.len();
-    reserved.push_u8(crate::wire::TAG_DESCRIBE.byte());
+    reserved.push_u8(crate::wire::TAG_DESCRIBE.byte())?;
     reserved.with_length_prefix(|w| {
-        w.push_u8(target.byte());
-        w.push_nul_terminated(name.as_describe_name_bytes());
-    });
+        w.push_u8(target.byte())?;
+        w.push_nul_terminated(name.as_describe_name_bytes())?;
+        Ok(())
+    })?;
     crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
@@ -1635,32 +1638,29 @@ fn build_bind_message<'brand, P: crate::params::ParamsWriter>(
 ) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     // Builder fns all return Result post-B4-W P0-2+P0-3 fix.
     let start = reserved.len();
-    reserved.push_u8(crate::wire::TAG_BIND.byte());
+    reserved.push_u8(crate::wire::TAG_BIND.byte())?;
     // DEF-154 (B4-W + P0-3 fix from architect audit):
     // `params.write_params` can return Err from a user-impl that
     // overflows its advertised budget OR from a drift between
-    // MAX_PARAMS_DATA_TOTAL and MAX_OWNED_SEND_LEN. Pre-fix, the
-    // `Err` was silently discarded with a `debug_assert!(false, …)`,
-    // which in release produced a truncated Bind frame with a
-    // miscomputed length prefix — tier-4 silent corruption at the
-    // wire.
+    // MAX_PARAMS_DATA_TOTAL and MAX_OWNED_SEND_LEN.
     //
-    // Fix: carry `Err` out via the `with_length_prefix` closure
-    // into an outer slot, then propagate up through the builder's
-    // new `Result<WriteRange<'brand>, ProtocolError>` return. The
-    // enclosing `compute_push_bind_execute` classifies the Err as
-    // `CrateBugLocus::OutboundFrameBuild { stage: Bind }` →
-    // `FailReply + CloseSocket`. Tier-4 → tier-3 (classifiable
-    // runtime error at a stable locus).
+    // DEF-154 (M): push_* now returns Result<(), WriteBufFull>;
+    // ? propagates through the closure's new
+    // `-> Result<(), WriteBufFull>` return, and through this
+    // builder's `Result<_, ProtocolError>` via `From<WriteBufFull>
+    // for ProtocolError` → `BuilderCapacityOverflow`. The
+    // params_err out-param handles the OTHER failure (user-impl
+    // overflow) which is still classified as
+    // `ParamsWriterOverflow`.
     let mut params_err: Option<ProtocolError> = None;
     reserved.with_length_prefix(|w| {
-        w.push_nul_terminated(portal_name.as_bytes());
-        w.push_nul_terminated(stmt_name.as_bytes());
-        w.push_u16_be(P::COUNT);
+        w.push_nul_terminated(portal_name.as_bytes())?;
+        w.push_nul_terminated(stmt_name.as_bytes())?;
+        w.push_u16_be(P::COUNT)?;
         for _ in 0..P::COUNT {
-            w.push_u16_be(1);
+            w.push_u16_be(1)?;
         }
-        w.push_u16_be(P::COUNT);
+        w.push_u16_be(P::COUNT)?;
         // Escape hatch: ParamsWriter takes &mut WriteBuf (pub trait
         // predating the witness pattern). Brand identity preserved
         // by the enclosing BrandedWriteReserved.
@@ -1673,8 +1673,9 @@ fn build_bind_message<'brand, P: crate::params::ParamsWriter>(
         // does not negotiate per-column result formats; the user
         // dispatches between text and binary decoders via the
         // `ColumnDesc::format_code` in the provided row_desc.
-        w.push_u16_be(0);
-    });
+        w.push_u16_be(0)?;
+        Ok(())
+    })?;
     if let Some(err) = params_err {
         return Err(err);
     }
@@ -1700,11 +1701,12 @@ fn build_execute_message<'brand>(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'brand, '_>,
 ) -> Result<crate::action::WriteRange<'brand>, ProtocolError> {
     let start = reserved.len();
-    reserved.push_u8(crate::wire::TAG_EXECUTE.byte());
+    reserved.push_u8(crate::wire::TAG_EXECUTE.byte())?;
     reserved.with_length_prefix(|w| {
-        w.push_nul_terminated(portal_name.as_bytes());
-        w.push_i32_be(fetch.as_wire_i32());
-    });
+        w.push_nul_terminated(portal_name.as_bytes())?;
+        w.push_i32_be(fetch.as_wire_i32())?;
+        Ok(())
+    })?;
     crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 
@@ -1963,23 +1965,24 @@ fn build_startup_message<'brand>(
     let start = reserved.len();
     reserved.with_length_prefix(|w| {
         // Protocol version 3.0 = 196608
-        w.push_u32_be(crate::wire::PROTOCOL_VERSION_3_0);
+        w.push_u32_be(crate::wire::PROTOCOL_VERSION_3_0)?;
         // user=<username>\0
-        w.push_nul_terminated(b"user");
-        w.push_nul_terminated(user.as_bytes());
+        w.push_nul_terminated(b"user")?;
+        w.push_nul_terminated(user.as_bytes())?;
         // database=<dbname>\0 (optional)
         if let Some(db) = database {
-            w.push_nul_terminated(b"database");
-            w.push_nul_terminated(db.as_bytes());
+            w.push_nul_terminated(b"database")?;
+            w.push_nul_terminated(db.as_bytes())?;
         }
         // application_name=<name>\0 (optional)
         if let Some(name) = app_name {
-            w.push_nul_terminated(b"application_name");
-            w.push_nul_terminated(name.as_bytes());
+            w.push_nul_terminated(b"application_name")?;
+            w.push_nul_terminated(name.as_bytes())?;
         }
         // Trailing empty key NUL
-        w.push_u8(0);
-    });
+        w.push_u8(0)?;
+        Ok(())
+    })?;
     crate::action::WriteRange::from_branded_write_span(start, reserved)
 }
 

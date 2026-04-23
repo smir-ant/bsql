@@ -804,64 +804,50 @@ impl<'brand> BrandedWriteReserved<'brand, '_> {
         self.buf
     }
 
+    // DEF-154 (M) P0-3: every `push_*` returns `Result<(), WriteBufFull>`.
+    // Pre-(M) these methods silently discarded Err under a
+    // `debug_assert!` shield — tier-4 silent corruption on capacity
+    // drift (frame header already written assuming body-bytes to
+    // follow; truncated body + correct-looking length prefix =
+    // server-side framing desync / bit-junk on wire). Post-(M)
+    // builders `?` propagate, Err classifies as
+    // `CrateBugLocus::BuilderCapacityOverflow` at the builder-return
+    // boundary.
+
     /// Push a single byte — branded mirror of [`WriteReserved::push_u8`].
     #[inline]
-    pub(crate) fn push_u8(&mut self, byte: u8) {
-        let r = self.buf_mut().push_u8(byte);
-        debug_assert!(
-            r.is_ok(),
-            "BrandedWriteReserved::push_u8 overflow — capacity invariant broken",
-        );
+    pub(crate) fn push_u8(&mut self, byte: u8) -> Result<(), WriteBufFull> {
+        self.buf_mut().push_u8(byte)
     }
 
     /// Push big-endian u16 — branded mirror of [`WriteReserved::push_u16_be`].
     #[inline]
-    pub(crate) fn push_u16_be(&mut self, val: u16) {
-        let r = self.buf_mut().push_u16_be(val);
-        debug_assert!(
-            r.is_ok(),
-            "BrandedWriteReserved::push_u16_be overflow — capacity invariant broken",
-        );
+    pub(crate) fn push_u16_be(&mut self, val: u16) -> Result<(), WriteBufFull> {
+        self.buf_mut().push_u16_be(val)
     }
 
     /// Push big-endian i16 — branded mirror of [`WriteReserved::push_i16_be`].
     #[inline]
-    pub(crate) fn push_i16_be(&mut self, val: i16) {
-        let r = self.buf_mut().push_i16_be(val);
-        debug_assert!(
-            r.is_ok(),
-            "BrandedWriteReserved::push_i16_be overflow — capacity invariant broken",
-        );
+    pub(crate) fn push_i16_be(&mut self, val: i16) -> Result<(), WriteBufFull> {
+        self.buf_mut().push_i16_be(val)
     }
 
     /// Push big-endian u32 — branded mirror of [`WriteReserved::push_u32_be`].
     #[inline]
-    pub(crate) fn push_u32_be(&mut self, val: u32) {
-        let r = self.buf_mut().push_u32_be(val);
-        debug_assert!(
-            r.is_ok(),
-            "BrandedWriteReserved::push_u32_be overflow — capacity invariant broken",
-        );
+    pub(crate) fn push_u32_be(&mut self, val: u32) -> Result<(), WriteBufFull> {
+        self.buf_mut().push_u32_be(val)
     }
 
     /// Push big-endian i32 — branded mirror of [`WriteReserved::push_i32_be`].
     #[inline]
-    pub(crate) fn push_i32_be(&mut self, val: i32) {
-        let r = self.buf_mut().push_i32_be(val);
-        debug_assert!(
-            r.is_ok(),
-            "BrandedWriteReserved::push_i32_be overflow — capacity invariant broken",
-        );
+    pub(crate) fn push_i32_be(&mut self, val: i32) -> Result<(), WriteBufFull> {
+        self.buf_mut().push_i32_be(val)
     }
 
     /// Push NUL-terminated bytes — branded mirror of [`WriteReserved::push_nul_terminated`].
     #[inline]
-    pub(crate) fn push_nul_terminated(&mut self, data: &[u8]) {
-        let r = self.buf_mut().push_nul_terminated(data);
-        debug_assert!(
-            r.is_ok(),
-            "BrandedWriteReserved::push_nul_terminated overflow — capacity invariant broken",
-        );
+    pub(crate) fn push_nul_terminated(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
+        self.buf_mut().push_nul_terminated(data)
     }
 
     /// Write a PG length-prefixed body via a nested branded closure.
@@ -872,23 +858,22 @@ impl<'brand> BrandedWriteReserved<'brand, '_> {
     /// from `self`'s `'brand` parameter, so ranges produced inside
     /// the closure (via subsequent builders) are compatible with
     /// the outer scope.
+    ///
+    /// DEF-154 (M): body_fn returns `Result<(), WriteBufFull>`;
+    /// outer returns same. Builders `?`-propagate both the outer
+    /// length-prefix emission and the inner body's push results.
     #[inline]
-    pub(crate) fn with_length_prefix<F>(&mut self, body_fn: F)
+    pub(crate) fn with_length_prefix<F>(&mut self, body_fn: F) -> Result<(), WriteBufFull>
     where
-        F: FnOnce(&mut BrandedWriteReserved<'brand, '_>),
+        F: FnOnce(&mut BrandedWriteReserved<'brand, '_>) -> Result<(), WriteBufFull>,
     {
-        let r = self.buf_mut().with_length_prefix(|inner_buf| {
+        self.buf_mut().with_length_prefix(|inner_buf| {
             let mut inner_reserved = BrandedWriteReserved {
                 buf: inner_buf,
                 _brand: PhantomData,
             };
-            body_fn(&mut inner_reserved);
-            Ok(())
-        });
-        debug_assert!(
-            r.is_ok(),
-            "BrandedWriteReserved::with_length_prefix overflow — capacity invariant broken",
-        );
+            body_fn(&mut inner_reserved)
+        })
     }
 
     /// DEF-154 (B) Phase B4 escape hatch — access underlying buffer

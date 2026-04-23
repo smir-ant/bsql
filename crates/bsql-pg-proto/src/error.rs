@@ -591,6 +591,27 @@ pub enum CrateBugLocus {
     /// prefix — tier-4 silent corruption. Tier-3 classified now.
     ParamsWriterOverflow,
 
+    /// DEF-154 (M) P0-3: a crate-internal frame builder
+    /// (`build_query_message`, `build_parse_message`, etc.) saw
+    /// `Err(WriteBufFull)` from a `BrandedWriteReserved::push_*`
+    /// call. Pre-(M), the 7 push_* methods accepted `WriteBufFull`
+    /// with `debug_assert! + silent discard` — release builds kept
+    /// writing a frame whose length-prefix had already been emitted
+    /// ASSUMING body bytes would follow, producing a
+    /// correct-looking-length `Action::SendBytes` with TRUNCATED
+    /// content (bit-junk on wire, PG server sees framing desync).
+    /// Post-(M): every push_* returns Result, builders `?`
+    /// propagate, builder-return Err classified as this locus and
+    /// routed through `FailReply + CloseSocket`.
+    ///
+    /// Architecturally dead under
+    /// `const _: () = assert!(MAX_OWNED_SEND_LEN >= max_*_message_size())`
+    /// in write_buf.rs — but the const-assert only catches
+    /// BUILDER-DECLARED max-size drift; a push site that violates
+    /// its declared budget (e.g. a new builder missing a length
+    /// cap) lands here rather than silently ships corrupt bytes.
+    BuilderCapacityOverflow,
+
     /// DEF-154 (B) Phase B4-W P0-2: a `build_*_message` branded
     /// builder produced a zero-length span when
     /// `WriteRange::from_branded_write_span` invoked
@@ -639,6 +660,7 @@ impl fmt::Display for CrateBugLocus {
             Self::StaleSchemaRef => f.write_str("stale-schema-ref"),
             Self::ParamsWriterOverflow => f.write_str("params-writer-overflow"),
             Self::EmptyWriteRange => f.write_str("empty-write-range"),
+            Self::BuilderCapacityOverflow => f.write_str("builder-capacity-overflow"),
         }
     }
 }
@@ -996,6 +1018,21 @@ impl ProtocolError {
     #[must_use]
     pub const fn state_kind(&self) -> StateErrorKind {
         StateErrorKind::from_kind_or_internal(self.kind())
+    }
+}
+
+/// DEF-154 (M) P0-3: convert `WriteBufFull` (write-side buffer
+/// overflow) to the crate-internal-bug classification
+/// `BuilderCapacityOverflow`. Enables `?`-propagation through
+/// builders that returned `Result<WriteRange, ProtocolError>`
+/// pre-(M) and whose push_* sites returned the raw
+/// `Result<(), WriteBufFull>` post-(M).
+impl From<crate::write_buf::WriteBufFull> for ProtocolError {
+    #[inline]
+    fn from(_: crate::write_buf::WriteBufFull) -> Self {
+        Self::InternalCrateBug {
+            locus: CrateBugLocus::BuilderCapacityOverflow,
+        }
     }
 }
 
