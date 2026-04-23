@@ -651,7 +651,7 @@ pub enum CrateBugLocus {
 
     /// DEF-154 (B) Phase B4-W P0-2: a `build_*_message` branded
     /// builder produced a zero-length span when
-    /// `WriteRange::from_branded_write_span` invoked
+    /// `WriteRange::from_write_span` invoked
     /// `NonEmptyRange::new(start, reserved.len(), reserved.len())`
     /// and got `None`.
     ///
