@@ -384,6 +384,27 @@ pub struct PgProtocol {
     /// `Action::StreamRow` drops from ~280 B → ~32 B;
     /// per-row DataRow emission saves ~260 B (hot path on SELECT).
     schema_arena: crate::schema_arena::SchemaSlab,
+    /// DEF-184 (A1+A13) error-payload arena — single-slot storage
+    /// for `ProtocolError::ServerErrorResponse` bounded strings.
+    ///
+    /// Pre-(184): inline `BoundedStr<128> + BoundedStr<96> +
+    /// BoundedStr<64>` in the `ServerErrorResponse` variant
+    /// cascaded through `Action::FailReply.cause: ProtocolError`
+    /// → `OutActions = [Action; 9]` → 9 × 312 B = 2808 B stack
+    /// frame. `StreamItem::FailReply.cause` similarly 320 B
+    /// per-pull return-by-value.
+    ///
+    /// Post-(184): variant carries `details_ref: ErrorRef` (~2 B);
+    /// full payload lives in this arena, resolved by callers via
+    /// [`Self::get_server_error`].
+    ///
+    /// Cost: ~290 B on `PgProtocol` (one `Option<ErrorPayload>`
+    /// plus u8 generation plus padding).
+    ///
+    /// Benefit: `ProtocolError` 312 → ~32 B; `Action` Reply-
+    /// bounded (~88 B); `OutActions` 2808 → ~792 B (3.5×);
+    /// `StreamItem` 320 → ~80 B (4×).
+    error_arena: crate::error_arena::ErrorArena,
     /// DEF-154 (H+V): deferred `read_buf` cursor advance — bytes to
     /// skip at the start of the NEXT `feed_bytes` call before any
     /// new frame parsing.
@@ -432,6 +453,7 @@ impl PgProtocol {
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
             schema_arena: crate::schema_arena::SchemaSlab::new(),
+            error_arena: crate::error_arena::ErrorArena::new(),
             pending_advance: None,
             sync_marker: PhantomData,
         }
@@ -783,6 +805,7 @@ impl PgProtocol {
         let read_buf = &mut self.read_buf;
         let session_params = &mut self.session_params;
         let schema_arena = &mut self.schema_arena;
+        let error_arena = &mut self.error_arena;
         let pending_advance = &mut self.pending_advance;
 
         // Fast-path: already-Errored or pending_advance crate-bug
@@ -960,6 +983,7 @@ impl PgProtocol {
                             payload,
                             &mut reserved,
                             &mut arena_writer,
+                            error_arena,
                         );
                         match outcome {
                             DispatchOutcome::AdvancedSilent { new_state } => {
@@ -1088,7 +1112,48 @@ impl PgProtocol {
                 0,
                 "DEF-152: clear() must leave arena empty",
             );
+            // DEF-184 (A1+A13): error_arena mirrors schema_arena
+            // lifecycle — cleared at entry-point boundaries when
+            // state is Idle/Errored. Any outstanding ErrorRef
+            // issued from the previous cycle resolves to `None`
+            // via generation mismatch post-clear (stale-ref
+            // classification per error_arena.rs docs).
+            self.error_arena.clear();
         }
+    }
+
+    /// DEF-184 (A1+A13): resolve an [`crate::error_arena::ErrorRef`]
+    /// handle (carried by `ProtocolError::ServerErrorResponse
+    /// .details_ref`) to the full `ErrorPayload` containing the
+    /// server's message/detail/hint bounded strings.
+    ///
+    /// Returns `None` if the ref is stale (arena has been cleared
+    /// since the ref was issued) or if the arena slot is empty.
+    ///
+    /// # Usage pattern
+    ///
+    /// The `ErrorRef` is `Copy`, so callers receiving an
+    /// `Action::FailReply { cause: ProtocolError::ServerErrorResponse
+    /// { details_ref, .. }, .. }` can stash the ref, drop the
+    /// `OutActions` (releasing the `&mut PgProtocol` borrow), then
+    /// call `proto.get_server_error(r)` on the now-free protocol
+    /// reference.
+    ///
+    /// ```text
+    /// // Pattern (simplified):
+    /// let err_ref = extract_from_out_actions(...);
+    /// drop(out_actions);
+    /// if let Some(payload) = proto.get_server_error(err_ref) {
+    ///     log::warn!("server error: {}", payload.message.as_str());
+    /// }
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn get_server_error(
+        &self,
+        r: crate::error_arena::ErrorRef,
+    ) -> Option<&crate::error_arena::ErrorPayload> {
+        self.error_arena.get(r)
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -1635,7 +1700,6 @@ fn compute_push_simple_query(
 /// - Tag: `'Q'` (1 byte)
 /// - Length: u32 BE including itself
 /// - Query string: NUL-terminated
-#[expect(clippy::result_large_err, reason = "Err carries ProtocolError (~312 B). Architecturally cold (builder bug / const-drift); by-value mirrors DispatchOutcome::Errored classification surface.")]
 fn build_query_message(
     sql: &crate::ident::Sql,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
@@ -1660,7 +1724,6 @@ fn build_query_message(
 /// NUL-terminated SQL text, then an `i16` BE parameter-type count
 /// (always zero in 1c-3a — no parameter-type hints; 1c-3b adds
 /// per-parameter OID hints and widens this field).
-#[expect(clippy::result_large_err, reason = "Err carries ProtocolError; same trade-off as build_query_message.")]
 fn build_parse_message(
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
@@ -1777,7 +1840,6 @@ fn compute_push_parse(
 /// writes, and two call sites (`compute_push_describe_statement` /
 /// `..._portal`) invoke it per push — small enough to fold in.
 #[inline]
-#[expect(clippy::result_large_err, reason = "Err carries ProtocolError; same trade-off as build_query_message.")]
 fn build_describe_message<N: crate::ident::DescribeName>(
     target: crate::wire::DescribeTargetByte,
     name: &N,
@@ -1961,16 +2023,9 @@ fn compute_push_describe_portal(
 /// Zero-alloc: params are streamed directly from the tuple into
 /// `write_buf` via [`crate::params::ParamsWriter::write_params`];
 /// no intermediate buffer.
-#[expect(
-    clippy::result_large_err,
-    reason = "ProtocolError carries the full BoundedStr-backed ServerErrorResponse \
-              payload in some variants — ~312 B. Boxing is not an option (no_alloc \
-              crate, no heap). The Err path here is architecturally cold (user \
-              ParamsWriter impl overflowing its budget); the by-value return \
-              mirrors the rest of the dispatch classification surface \
-              (DispatchOutcome::Errored { cause: ProtocolError }) where the same \
-              large_enum_variant trade-off is already made."
-)]
+// DEF-184 (A1+A13): ProtocolError shrunk 312 → ~72 B post-
+// ErrorArena externalisation; Err path below 128 B
+// result_large_err threshold.
 fn build_bind_message<P: crate::params::ParamsWriter>(
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
@@ -2056,7 +2111,6 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
 /// 1c-3b scope produces `0` (fetch all). F83: the enum narrows the
 /// API to only variants the sub-phase supports, turning tier-3 docs
 /// into tier-1 compile.
-#[expect(clippy::result_large_err, reason = "Err carries ProtocolError; same trade-off as build_query_message.")]
 fn build_execute_message(
     portal_name: &crate::ident::PortalName,
     fetch: crate::command::FetchRows,
@@ -2327,7 +2381,6 @@ fn record_param_status(
 /// - 4 bytes: protocol version (196608 = 3.0)
 /// - key-value pairs, each NUL-terminated
 /// - trailing empty key NUL
-#[expect(clippy::result_large_err, reason = "Err carries ProtocolError; same trade-off as build_query_message.")]
 fn build_startup_message(
     user: &Ident,
     database: Option<&DatabaseName>,
@@ -2853,13 +2906,8 @@ mod compute_push_tests {
     /// on `StagedObs` will SEE a distinct variant instead of a
     /// silent collapse to `CloseSocket` (pre-DEF-154 (P) behaviour
     /// flagged as P0-6 by architect audit).
-    #[expect(
-        clippy::large_enum_variant,
-        reason = "test-only observation type; FailReply.cause dominates \
-                  at ~312 B (same as StagedAction). Boxing for test \
-                  observability has no functional win and the enum \
-                  is Copy (ProtocolError: Copy)."
-    )]
+    // DEF-184 (A1+A13): ProtocolError ~72 B post-ErrorArena; no
+    // longer triggers large_enum_variant.
     #[derive(Debug, Clone, Copy)]
     enum StagedObs {
         /// Unit variant — tests discriminate on variant kind, not

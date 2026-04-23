@@ -36,8 +36,10 @@ use crate::wire::{
 /// and an arm-body drift that flipped `Some(act)` into `None`
 /// compiled silently — now such a drift is a compile error
 /// (`AdvancedWithAction` requires the field, `AdvancedSilent` does not).
+// DEF-184 (A1+A13): DispatchOutcome's Errored.cause ProtocolError
+// shrunk 312 → ~72 B via ErrorArena externalisation; no longer
+// trips `large_enum_variant`.
 #[derive(Debug)]
-#[expect(clippy::large_enum_variant, reason = "no_alloc: Box unavailable; DispatchOutcome is a one-shot return, not stored. FailReply.cause (ProtocolError ~280 bytes) dominates.")]
 pub(crate) enum DispatchOutcome {
     /// Frame consumed; transition to `new_state`. No action emitted.
     /// Used by ParameterStatus, BackendKeyData, AuthenticationOk,
@@ -146,6 +148,7 @@ pub(crate) fn dispatch(
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
     arena: &mut crate::schema_arena::ArenaWriter<'_>,
+    error_arena: &mut crate::error_arena::ErrorArena,
 ) -> DispatchOutcome {
     match (prev, tag) {
         // =============================================================
@@ -174,7 +177,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::PingAwaitingRfq(id), TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             errored(Some(id.consume()), cause)
         }
         (ProtoState::PingAwaitingRfq(id), other) => errored(Some(id.consume()), ProtocolError::UnexpectedFrame { tag: other }),
@@ -189,7 +192,7 @@ pub(crate) fn dispatch(
             dispatch_auth_in_startup_trust(reply, payload)
         }
         (ProtoState::ConnectingStartupTrust { reply }, TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingStartupTrust { reply }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
@@ -209,7 +212,7 @@ pub(crate) fn dispatch(
             dispatch_auth_in_startup_scram(reply, scram, payload, reserved)
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
@@ -232,7 +235,7 @@ pub(crate) fn dispatch(
             dispatch_auth_sasl_continue(reply, scram, client_first_bare, client_nonce_b64, payload, reserved)
         }
         (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, other) => {
@@ -250,7 +253,7 @@ pub(crate) fn dispatch(
             TAG_AUTHENTICATION,
         ) => dispatch_auth_sasl_final(reply, expected_server_sig, payload),
         (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, other) => {
@@ -264,7 +267,7 @@ pub(crate) fn dispatch(
             dispatch_auth_ok_after_scram(reply, payload)
         }
         (ProtoState::ConnectingScramAwaitingAuthOk(reply), TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitingAuthOk(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
@@ -289,7 +292,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::ConnectingPostAuthAwaitingKey(reply), TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingPostAuthAwaitingKey(reply), other) => errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
@@ -327,7 +330,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, TAG_ERROR_RESPONSE) => {
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, other) => {
@@ -399,7 +402,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -419,7 +422,7 @@ pub(crate) fn dispatch(
             advance_to_awaiting_rfq(reply, payload, Some(schema_ref))
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -491,7 +494,7 @@ pub(crate) fn dispatch(
             // drain it silently and return to Idle (reusing the
             // `DrainRfqAfterError` variant — both drain
             // the same trailing RFQ pattern).
-            let cause = parse_error_response(payload);
+            let cause = parse_error_response(payload, error_arena);
             DispatchOutcome::AdvancedWithAction {
                 new_state: ProtoState::DrainRfqAfterError,
                 action: StagedAction::FailReply {
@@ -560,7 +563,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -575,7 +578,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_PORTAL_SUSPENDED) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED })
@@ -616,7 +619,7 @@ pub(crate) fn dispatch(
             new_state: ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref },
         },
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -631,7 +634,7 @@ pub(crate) fn dispatch(
             TAG_COMMAND_COMPLETE,
         ) => advance_to_bindexecute_awaiting_rfq_select(reply, payload, schema_ref),
         (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. },
@@ -652,7 +655,7 @@ pub(crate) fn dispatch(
             advance_to_bindexecute_awaiting_rfq_select(reply, payload, schema_ref)
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_PORTAL_SUSPENDED) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED })
@@ -718,7 +721,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::DescribeStatementAwaitingParamDesc(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (ProtoState::DescribeStatementAwaitingParamDesc(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -760,7 +763,7 @@ pub(crate) fn dispatch(
         (
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. },
             TAG_ERROR_RESPONSE,
-        ) => advance_to_drain_after_error(reply.consume(), payload),
+        ) => advance_to_drain_after_error(reply.consume(), payload, error_arena),
         (ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. }, other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
@@ -823,7 +826,7 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(reply.consume(), payload)
+            advance_to_drain_after_error(reply.consume(), payload, error_arena)
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), other) => {
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
@@ -875,7 +878,6 @@ pub(crate) fn dispatch(
 /// forces every handler to decide how to treat it. Previously each
 /// handler's `_ =>` arm swallowed both "unknown" and "known-but-wrong"
 /// codes silently.
-#[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
 fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), ProtocolError> {
     match payload {
         [a, b, c, d, rest @ ..] => {
@@ -1059,7 +1061,6 @@ fn mechanism_list_contains_scram(data: &[u8]) -> bool {
 /// a `ScramSession`, not a `Credentials`.
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
-#[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
 fn build_sasl_initial_response(
     _: &crate::scram::session::ScramSession,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
@@ -1333,7 +1334,10 @@ fn dispatch_auth_ok_after_scram(reply: ReplyId<crate::reply_id::StartupKind>, pa
 /// frame (`'E'` tag). The `#[cold]` attribute tells LLVM to keep the
 /// body out of hot-path inlining scope.
 #[cold]
-fn parse_error_response(payload: &[u8]) -> ProtocolError {
+fn parse_error_response(
+    payload: &[u8],
+    error_arena: &mut crate::error_arena::ErrorArena,
+) -> ProtocolError {
     use crate::error::{BoundedStr, Severity, SqlStateCode};
     // DEF-060 part 2: typed fields. Severity → enum (1 byte);
     // code → SqlStateCode ([u8;5]); message/detail/hint →
@@ -1446,14 +1450,20 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
         }
     }
 
+    // DEF-184 (A1+A13): allocate the bounded strings into the
+    // caller-supplied error arena and emit the small ProtocolError
+    // carrying an ErrorRef (2 B) instead of 288 B inline strings.
+    let details_ref = error_arena.alloc(crate::error_arena::ErrorPayload {
+        message,
+        detail,
+        hint,
+    });
     ProtocolError::ServerErrorResponse {
         // No S or V field in payload → `Severity::Unknown` fallback
         // (public API preserves the pre-uplift shape).
         severity: severity.unwrap_or(Severity::Unknown),
         code,
-        message,
-        detail,
-        hint,
+        details_ref,
     }
 }
 
@@ -1539,8 +1549,9 @@ fn advance_to_bindexecute_awaiting_rfq_select(
 fn advance_to_drain_after_error(
     raw_id: core::num::NonZeroU64,
     payload: &[u8],
+    error_arena: &mut crate::error_arena::ErrorArena,
 ) -> DispatchOutcome {
-    let cause = parse_error_response(payload);
+    let cause = parse_error_response(payload, error_arena);
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::DrainRfqAfterError,
         action: StagedAction::FailReply {
@@ -1608,7 +1619,6 @@ fn parse_rfq_payload(
 /// Cold path: called once per completed command. Not on any
 /// per-row hot path.
 #[cold]
-#[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
 fn parse_command_tag(payload: &[u8]) -> Result<crate::error::BoundedStr<32>, ProtocolError> {
     use crate::error::BoundedStr;
     // Strip the trailing NUL terminator. Missing NUL → framing error.
@@ -1635,7 +1645,6 @@ fn parse_command_tag(payload: &[u8]) -> Result<crate::error::BoundedStr<32>, Pro
 /// Cold path: called once per connection at end of startup handshake.
 /// Not on any per-frame or per-query hot path.
 #[cold]
-#[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; error path only")]
 fn parse_backend_key_data(payload: &[u8]) -> Result<(i32, i32), ProtocolError> {
     match payload {
         [a, b, c, d, e, f, g, h] => {
@@ -1689,21 +1698,58 @@ mod parse_error_response_tests {
         body
     }
 
+    /// DEF-184 (A1+A13): post-refactor test-fixture tuple —
+    /// (Severity, SqlStateCode, ErrorPayload). Tests build expected
+    /// tuples and compare against parsed actual via `parse_and_resolve`.
+    type ExpectedErr = (
+        crate::error::Severity,
+        crate::error::SqlStateCode,
+        crate::error_arena::ErrorPayload,
+    );
+
     fn mk_err(
         severity: &str,
         code: &str,
         message: &str,
         detail: &str,
         hint: &str,
-    ) -> ProtocolError {
+    ) -> ExpectedErr {
         use crate::error::{BoundedStr, Severity, SqlStateCode};
-        ProtocolError::ServerErrorResponse {
-            severity: Severity::from_bytes(severity.as_bytes()),
-            code: SqlStateCode::from_bytes(code.as_bytes()),
-            message: BoundedStr::from_str_truncating(message),
-            detail: BoundedStr::from_str_truncating(detail),
-            hint: BoundedStr::from_str_truncating(hint),
-        }
+        (
+            Severity::from_bytes(severity.as_bytes()),
+            SqlStateCode::from_bytes(code.as_bytes()),
+            crate::error_arena::ErrorPayload {
+                message: BoundedStr::<128>::from_str_truncating(message),
+                detail: BoundedStr::<96>::from_str_truncating(detail),
+                hint: BoundedStr::<64>::from_str_truncating(hint),
+            },
+        )
+    }
+
+    /// DEF-184 (A1+A13): parse body using a fresh arena, resolve the
+    /// ErrorRef into full payload, and return the comparable tuple.
+    /// Other ProtocolError variants arm-match to empty-default payload
+    /// (parse_error_response always returns ServerErrorResponse by
+    /// construction for our test inputs).
+    fn parse_and_resolve(body: &[u8]) -> ExpectedErr {
+        let mut arena = crate::error_arena::ErrorArena::new();
+        let err = parse_error_response(body, &mut arena);
+        let ProtocolError::ServerErrorResponse {
+            severity,
+            code,
+            details_ref,
+        } = err
+        else {
+            // parse_error_response always returns ServerErrorResponse
+            // per its construction. Defensive fallback for audit clarity.
+            return (
+                crate::error::Severity::Unknown,
+                crate::error::SqlStateCode::from_bytes(b""),
+                crate::error_arena::ErrorPayload::empty(),
+            );
+        };
+        let payload = arena.get(details_ref).copied().unwrap_or_default();
+        (severity, code, payload)
     }
 
     /// Invariant (spec): each known field type routes to its dedicated
@@ -1718,7 +1764,7 @@ mod parse_error_response_tests {
             (b'D', b"user does not exist"),
             (b'H', b"check pg_hba.conf"),
         ]);
-        let actual = parse_error_response(&body);
+        let actual = parse_and_resolve(&body);
         let expected = mk_err(
             "FATAL",
             "28P01",
@@ -1734,7 +1780,7 @@ mod parse_error_response_tests {
     #[test]
     fn severity_v_used_when_s_absent() {
         let body = build_error_body(&[(b'V', b"ERROR")]);
-        let actual = parse_error_response(&body);
+        let actual = parse_and_resolve(&body);
         let expected = mk_err("ERROR", "", "", "", "");
         assert_eq!(actual, expected);
     }
@@ -1744,7 +1790,7 @@ mod parse_error_response_tests {
     #[test]
     fn severity_s_wins_over_later_v() {
         let body = build_error_body(&[(b'S', b"FATAL"), (b'V', b"ERROR")]);
-        let actual = parse_error_response(&body);
+        let actual = parse_and_resolve(&body);
         let expected = mk_err("FATAL", "", "", "", "");
         assert_eq!(actual, expected);
     }
@@ -1758,7 +1804,7 @@ mod parse_error_response_tests {
             (b'M', b"real message"),
             (b'Q', b"also irrelevant"),
         ]);
-        let actual = parse_error_response(&body);
+        let actual = parse_and_resolve(&body);
         let expected = mk_err("", "", "real message", "", "");
         assert_eq!(actual, expected);
     }
@@ -1769,7 +1815,7 @@ mod parse_error_response_tests {
     #[test]
     fn empty_payload_yields_empty_fields() {
         let body: alloc::vec::Vec<u8> = alloc::vec![0];
-        let actual = parse_error_response(&body);
+        let actual = parse_and_resolve(&body);
         let expected = mk_err("", "", "", "", "");
         assert_eq!(actual, expected);
     }
@@ -1784,7 +1830,7 @@ mod parse_error_response_tests {
     fn unterminated_final_field_does_not_panic() {
         // [S, 'A', 'B'] — no NUL after 'B', no terminator.
         let body: alloc::vec::Vec<u8> = alloc::vec![b'S', b'A', b'B'];
-        let actual = parse_error_response(&body);
+        let actual = parse_and_resolve(&body);
         // Whatever the parser recovered: must be a bounded string and
         // must not panic. Exact value of severity is an implementation
         // detail (parser reads to EOF as the value).
@@ -1800,7 +1846,7 @@ mod parse_error_response_tests {
     #[test]
     fn duplicate_code_second_wins() {
         let body = build_error_body(&[(b'C', b"FIRST"), (b'C', b"SECOND")]);
-        let actual = parse_error_response(&body);
+        let actual = parse_and_resolve(&body);
         let expected = mk_err("", "SECOND", "", "", "");
         assert_eq!(actual, expected);
     }
@@ -1819,18 +1865,11 @@ mod parse_error_response_tests {
     /// sees 94% of the original message.
     #[test]
     fn non_utf8_message_preserves_ascii_subset() {
-        use crate::error::{BoundedStr, Severity, SqlStateCode};
         // Latin-1 "Ungültige Eingabe" — the \xFC is ü in Latin-1,
         // invalid as a standalone UTF-8 byte.
         let body = build_error_body(&[(b'M', b"Ung\xFCltige Eingabe")]);
-        let actual = parse_error_response(&body);
-        let expected = ProtocolError::ServerErrorResponse {
-            severity: Severity::from_bytes(b""),
-            code: SqlStateCode::from_bytes(b""),
-            message: BoundedStr::from_str_truncating("Ung?ltige Eingabe"),
-            detail: BoundedStr::from_str_truncating(""),
-            hint: BoundedStr::from_str_truncating(""),
-        };
+        let actual = parse_and_resolve(&body);
+        let expected = mk_err("", "", "Ung?ltige Eingabe", "", "");
         assert_eq!(actual, expected);
     }
 
@@ -1838,17 +1877,10 @@ mod parse_error_response_tests {
     /// unchanged (fast path).
     #[test]
     fn valid_utf8_message_preserved_verbatim() {
-        use crate::error::{BoundedStr, Severity, SqlStateCode};
         // Proper UTF-8 "Ungültige Eingabe".
         let body = build_error_body(&[(b'M', "Ungültige Eingabe".as_bytes())]);
-        let actual = parse_error_response(&body);
-        let expected = ProtocolError::ServerErrorResponse {
-            severity: Severity::from_bytes(b""),
-            code: SqlStateCode::from_bytes(b""),
-            message: BoundedStr::from_str_truncating("Ungültige Eingabe"),
-            detail: BoundedStr::from_str_truncating(""),
-            hint: BoundedStr::from_str_truncating(""),
-        };
+        let actual = parse_and_resolve(&body);
+        let expected = mk_err("", "", "Ungültige Eingabe", "", "");
         assert_eq!(actual, expected);
     }
 
@@ -1863,18 +1895,11 @@ mod parse_error_response_tests {
     /// preserves valid UTF-8 verbatim including control bytes.)
     #[test]
     fn non_utf8_control_bytes_coerced_to_question_mark() {
-        use crate::error::{BoundedStr, Severity, SqlStateCode};
         // Mix: ASCII + 0x01 (valid UTF-8 SOH) + 0xFF (invalid UTF-8
         // high-bit lead) + 0x02 (SOT). The 0xFF forces slow path.
         let body = build_error_body(&[(b'M', b"A\x01B\xFFC\x02")]);
-        let actual = parse_error_response(&body);
-        let expected = ProtocolError::ServerErrorResponse {
-            severity: Severity::from_bytes(b""),
-            code: SqlStateCode::from_bytes(b""),
-            message: BoundedStr::from_str_truncating("A?B?C?"),
-            detail: BoundedStr::from_str_truncating(""),
-            hint: BoundedStr::from_str_truncating(""),
-        };
+        let actual = parse_and_resolve(&body);
+        let expected = mk_err("", "", "A?B?C?", "", "");
         assert_eq!(actual, expected);
     }
 }

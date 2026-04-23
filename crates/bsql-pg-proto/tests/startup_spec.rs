@@ -289,28 +289,38 @@ fn error_response_during_startup_is_classified() {
     let out = proto.feed_bytes(&err_frame, &mut wb);
 
     assert_eq!(out.len(), 2, "ErrorResponse → FailReply + CloseSocket");
-    match out.as_slice() {
+    // DEF-184 (A1+A13): ServerErrorResponse now carries
+    // `details_ref: ErrorRef`. Extract the ref (Copy), drop `out`
+    // to release the &mut proto borrow, then resolve via
+    // `proto.get_server_error(r)` for message/detail/hint.
+    let details_ref = match out.as_slice() {
         [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
             assert_eq!(failed_id, &startup_raw);
             match cause {
                 ProtocolError::ServerErrorResponse {
                     severity,
                     code,
-                    message,
-                    ..
+                    details_ref,
                 } => {
                     assert_eq!(severity.as_str(), "FATAL");
                     assert_eq!(code.as_str(), "28P01");
-                    assert_eq!(
-                        message.as_str(),
-                        "password authentication failed",
-                    );
+                    *details_ref
                 }
                 other => panic!("expected ServerErrorResponse, got {other:?}"),
             }
         }
         other => panic!("unexpected action sequence: {other:?}"),
-    }
+    };
+    // `out` is Copy-like (ManuallyDrop<heapless::Vec>); NLL
+    // releases the &mut proto borrow at `out.as_slice()`'s last
+    // use above. No explicit drop needed.
+    let Some(payload) = proto.get_server_error(details_ref) else {
+        panic!("server error payload must resolve via arena");
+    };
+    assert_eq!(
+        payload.message.as_str(),
+        "password authentication failed",
+    );
 }
 
 /// Invariant (spec): NegotiateProtocolVersion during startup →

@@ -338,13 +338,9 @@ impl WriteRange {
     /// taking `&BrandedWriteReserved<'_>`; the brand
     /// phantom added zero tier-1 (apply returned Option anyway per
     /// DEF-154 N). Renamed + unbranded post-(W).
-    #[expect(
-        clippy::result_large_err,
-        reason = "Err carries ProtocolError (~300 B, large_enum_variant \
-                  already accepted on ProtocolError). Architecturally \
-                  cold path (builder bug / const-drift); by-value \
-                  matches dispatch's DispatchOutcome::Errored surface."
-    )]
+    // DEF-184 (A1+A13): ProtocolError shrunk 312 → ~72 B, below
+    // the `result_large_err` 128 B threshold; no longer needs
+    // #[expect].
     #[inline]
     pub(crate) fn from_write_span(
         start: usize,
@@ -646,8 +642,9 @@ impl<'w, 'r> OutActions<'w, 'r> {
 
     /// Push an action. Returns `Err(action)` (mirrors heapless's
     /// convention) if the container is full.
+    // DEF-184 (A1+A13): Action shrunk Reply-bounded ~88 B; Err
+    // path no longer triggers `result_large_err`.
     #[inline]
-    #[expect(clippy::result_large_err, reason = "no_alloc: Box unavailable; mirrors heapless::Vec::push API. Err is only hit under architecturally-bounded overflow (compile-time emit_actions! budget).")]
     pub fn push(&mut self, action: Action<'w, 'r>) -> Result<(), Action<'w, 'r>> {
         self.items.push(action)
     }
@@ -740,7 +737,7 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, { crate::protocol::M
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable. DeliverReply's Reply<'r> payload is small post-DEF-119 arena externalisation; the FailReply.cause (ProtocolError) is the dominant variant (see lib.rs::action::Action size budget for current exact bounds). FailReply is cold-path (emitted only on protocol failure), so the large variant's footprint is acceptable.")]
+// DEF-184 (A1+A13): Action is no longer large-enum-variant-warn-worthy post-ErrorArena cascade; removed #[expect(large_enum_variant)].
 pub enum Action<'w, 'r> {
     /// Send these bytes verbatim to the server.
     ///
@@ -817,8 +814,10 @@ pub enum Action<'w, 'r> {
 ///   constant (e.g. the 5-byte `Sync` wire payload); the
 ///   materialiser emits the static ref directly (zero write, zero
 ///   copy — `Sync` bypasses `write_buf` entirely).
+// DEF-184 (A1+A13): StagedAction no longer triggers
+// `large_enum_variant` post-ErrorArena cascade (FailReply.cause
+// ProtocolError shrunk from 312 B to ~72 B).
 #[derive(Debug)]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable. Mirrors the `Action<'w, 'r>` rationale above — DEF-119 shrunk the DeliverReply payload; FailReply.cause (ProtocolError) dominates. FailReply is cold-path.")]
 pub(crate) enum StagedAction {
     /// Bytes live at the range `[start..start+len]` in the
     /// caller's `write_buf`. Non-zero length (DEF-100).

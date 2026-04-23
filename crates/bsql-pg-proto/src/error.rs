@@ -286,9 +286,11 @@ const _: () = assert!(
 /// async wrapper, not user-visible types — the wrapper translates them
 /// into its public `BackendError` (Phase 1e). Variants are kept narrow
 /// and self-describing; the wrapper never has to invent error context.
+// DEF-184 (A1+A13): ProtocolError shrunk 312 B → ~72 B post-
+// ServerErrorResponse arena externalisation; no longer triggers
+// `large_enum_variant` lint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable; ProtocolError is constructed on error paths only, never hot path. Now Copy-and-POD (DEF-060 part 2 + POD BoundedStr) — making Action<'buf> and OutActions<'buf> Drop-free so NLL releases borrows at last use without explicit drop().")]
 pub enum ProtocolError {
     /// The header's length-field is below the legal minimum (4).
     ///
@@ -372,13 +374,20 @@ pub enum ProtocolError {
         /// SQLSTATE code — always exactly 5 ASCII chars, packed as
         /// a `[u8; 5]` newtype. Space-padded if shorter; never empty.
         code: SqlStateCode,
-        /// Primary human-readable error message (up to 128 bytes,
-        /// explicit truncation marker on overflow).
-        message: BoundedStr<128>,
-        /// Optional detail string (up to 96 bytes).
-        detail: BoundedStr<96>,
-        /// Optional hint string (up to 64 bytes).
-        hint: BoundedStr<64>,
+        /// DEF-184 (A1+A13): handle into [`crate::PgProtocol`]'s
+        /// `ErrorArena` for the bounded strings (message / detail /
+        /// hint). Pre-(184) these were inline `BoundedStr<N>` fields
+        /// (~288 B), cascading through `Action::FailReply.cause` →
+        /// `OutActions = [Action; 9]` (2808 B stack frame) →
+        /// `StreamItem::FailReply.cause` (320 B per-pull).
+        ///
+        /// Post-(184) carries 2 bytes (`ErrorRef`: NonZeroU8 slot +
+        /// u8 gen). Resolve via
+        /// [`crate::PgProtocol::get_server_error`] to get the
+        /// `&ErrorPayload` with full strings. The ref is `Copy` —
+        /// callers can stash it, drop `OutActions` / the Action /
+        /// StreamItem, then resolve on the freed protocol borrow.
+        details_ref: crate::error_arena::ErrorRef,
     },
 
     /// Server sent an authentication method we do not support.
@@ -1164,22 +1173,21 @@ impl fmt::Display for ProtocolError {
             Self::ServerErrorResponse {
                 severity,
                 code,
-                message,
-                detail,
-                hint,
+                details_ref: _,
             } => {
-                // F-053 (pass-#8): include detail + hint when non-empty.
-                // Prior Display dropped both, losing operator-actionable
-                // context (e.g. "Key (id)=(42) already exists" detail
-                // and "Use ON CONFLICT..." hint).
-                write!(f, "server error: {severity} ({code}): {message}")?;
-                if !detail.as_str().is_empty() {
-                    write!(f, " — detail: {detail}")?;
-                }
-                if !hint.as_str().is_empty() {
-                    write!(f, " — hint: {hint}")?;
-                }
-                Ok(())
+                // DEF-184 (A1+A13): severity + code are inline;
+                // message / detail / hint live in `PgProtocol`'s
+                // ErrorArena (resolved via
+                // `PgProtocol::get_server_error(details_ref)`).
+                // Display cannot access arena here — caller-side
+                // diagnostic formatting should combine this output
+                // with the resolved `ErrorPayload` via
+                // `write!(f, "{err}; {}", proto.get_server_error(r)
+                // .map(|p| p.message).unwrap_or(""))` or similar.
+                // Pre-(184) Display included full message/detail/
+                // hint inline via F-053 (pass-#8); post-(184) that
+                // goes through the resolve API.
+                write!(f, "server error: {severity} ({code}) [details in ErrorArena]")
             },
             // Typed Severity + SqlStateCode + BoundedStr all impl
             // Display — no extra plumbing needed.

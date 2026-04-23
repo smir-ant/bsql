@@ -99,6 +99,8 @@ pub mod command;
 pub mod decode;
 mod dispatch;
 pub mod error;
+pub(crate) mod error_arena;
+pub use error_arena::{ErrorPayload, ErrorRef};
 pub mod frame;
 pub mod ident;
 pub mod params;
@@ -280,17 +282,24 @@ const _: fn() = || {
 // aarch64-apple-darwin the actual is exactly at the lower bound, on
 // other targets it may drift up to +8.
 const _: () = assert!(
-    core::mem::size_of::<error::ProtocolError>() <= 312,
-    "ProtocolError size regression — post-DEF-060/061/096 budget is 312 bytes. \
-     Did ServerErrorResponse.message/detail/hint bounds grow, or did a \
-     variant add a large inline buffer?",
+    core::mem::size_of::<error::ProtocolError>() <= 72,
+    "ProtocolError size budget. Post-DEF-184 (A1+A13): ≤72 B. \
+     Pre-(184): 312 B dominated by ServerErrorResponse's 3 inline \
+     BoundedStr<N> fields (288 B). Post-(184): ServerErrorResponse \
+     carries `details_ref: ErrorRef` (2 B); bounded strings live in \
+     PgProtocol::error_arena. Remaining ~72 B dominated by other \
+     large variants (e.g. Scram(ScramError), Malformed* with \
+     BoundedStr<32>). Cap catches (a) reintroduction of inline \
+     BoundedStrs, (b) new variant adding large payload.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action<'static, 'static>>() >= 304
-        && core::mem::size_of::<action::Action<'static, 'static>>() <= 320,
-    "Action<'_, '_> size drift — post-DEF-119 actual is 312 B. Range \
-     [304, 320] catches field additions AND accidental removals. Dominated \
-     by FailReply.cause (ProtocolError ~304 B) via `#[expect(large_enum_variant)]`.",
+    core::mem::size_of::<action::Action<'static, 'static>>() >= 40
+        && core::mem::size_of::<action::Action<'static, 'static>>() <= 96,
+    "Action<'_, '_> size drift. Post-DEF-184 (A1+A13) Reply-bounded. \
+     Pre-(184) was 312 B dominated by FailReply.cause ProtocolError; \
+     post-(184) ProtocolError shrinks to ≤48 B, so Action is bounded \
+     by Reply<'r> (DescribeStatementCompletePayload ~72 B + \
+     discriminant/padding). Range [40, 96] catches regressions.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Reply<'static>>() >= 72
@@ -323,27 +332,33 @@ const _: () = assert!(
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() >= 5760
-        && core::mem::size_of::<protocol::PgProtocol>() <= 5776,
-    "PgProtocol size drift — post-DEF-154 (O) actual is ~5760 B \
-     (pre-(O) was ~6272 B; (O) shrunk MAX_PASSWORD_LEN 1024→512). \
-     Range [5760, 5776] catches regressions. Budget: ReadBuf 4096 + \
-     state ~712 + session_params ~420 + schema_arena ~520 + padding.",
+    core::mem::size_of::<protocol::PgProtocol>() >= 6040
+        && core::mem::size_of::<protocol::PgProtocol>() <= 6080,
+    "PgProtocol size drift — post-DEF-184 (A1+A13) range is \
+     [6040, 6080] B. Budget: ReadBuf 4096 + state ~712 + \
+     session_params ~420 + schema_arena ~520 + error_arena ~290 + \
+     padding. Pre-(184) range was [5760, 5776] B (no error_arena). \
+     Full cascade savings come from OutActions / StreamItem / \
+     ProtocolError shrinks in Stage 3 of (A1+A13) refactor — \
+     per-call memory wins vastly dwarf the one-time PgProtocol \
+     growth per connection.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() >= 2800
-        && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2920,
+    core::mem::size_of::<action::OutActions<'static, 'static>>() >= 728
+        && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 880,
     "OutActions<'_, '_> size drift. \
      \
-     Post-DEF-184 A15: MAX_ACTIONS_PER_CALL 16 → 9 (tight bound \
-     derived from MAX_STAGED + MAX_FANOUT2_ENTRIES). \
-     Stack reservation = 9 × 312 B = 2808 B + usize length = \
-     ~2816 B. \
+     Post-DEF-184 (A1+A13) cascade: Action shrunk Reply-bounded \
+     (~72-96 B) via ProtocolError ErrorArena externalisation. \
+     Stack reservation = 9 × ~88 B ≈ 792 B + usize length. \
      \
-     Post-DEF-184 A2/B1/B8: ManuallyDrop<heapless::Vec<Action, 9>> \
-     — zero init writes per call (heapless::Vec::new). \
+     Pre-(A1): 9 × 312 = 2808 B (ProtocolError-dominated). \
      \
-     Range [2800, 2920] catches regressions in slot count / Action \
+     Post-(A15): MAX_ACTIONS_PER_CALL 16 → 9. \
+     Post-(A2/B1/B8): ManuallyDrop<heapless::Vec>, zero init. \
+     Post-(A1+A13): Action Reply-bounded. \
+     \
+     Range [728, 880] catches regressions in slot count / Action \
      size / alignment padding.",
 );
 

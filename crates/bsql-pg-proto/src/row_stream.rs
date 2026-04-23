@@ -93,13 +93,10 @@ use crate::write_buf::WriteBuf;
 /// and `Complete.value`) for the duration of the single
 /// `next_event` call — pattern-match and process before calling
 /// `next_event` again.
+// DEF-184 (A1+A13): StreamItem shrunk 320 → ~80 B post-ErrorArena
+// externalisation. Reply<'a> dominates now (~72 B); no longer
+// large_enum_variant worthy.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "no_alloc: Box unavailable. FailReply.cause (ProtocolError ~280 B) \
-              dominates; cold path (server error / framing desync). \
-              Complete's Reply<'a> is small post-DEF-119 arena."
-)]
 pub enum StreamItem<'a> {
     /// One `DataRow` frame arrived — fast-path emission.
     /// `row_bytes` is the raw body (post column-count header, per

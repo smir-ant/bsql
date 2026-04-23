@@ -276,11 +276,9 @@ impl fmt::Display for FormatCode {
 ///   storage).
 /// - [`crate::ProtocolError::UnexpectedFormatCode`] — wire value not in
 ///   `{0, 1}` (round-4 finding #5).
+// DEF-184 (A1+A13): Err is ProtocolError ~72 B, below 128 B
+// result_large_err threshold post-ErrorArena externalisation.
 #[cold]
-#[expect(
-    clippy::result_large_err,
-    reason = "no_alloc: Box unavailable; RowDescription parse is cold (once per result-set)"
-)]
 pub(crate) fn parse_row_description(
     payload: &[u8],
 ) -> Result<RowDesc, crate::error::ProtocolError> {
@@ -384,10 +382,8 @@ pub(crate) fn parse_row_description(
 ///
 /// Cold path — called once per statement-level Describe reply.
 #[cold]
-#[expect(
-    clippy::result_large_err,
-    reason = "no_alloc: Box unavailable; ParameterDescription parse is cold (once per Describe)"
-)]
+// DEF-184 (A1+A13): Err is ProtocolError ~72 B, below 128 B
+// result_large_err threshold post-ErrorArena externalisation.
 pub(crate) fn parse_parameter_description(
     payload: &[u8],
 ) -> Result<crate::action::ParamOids, crate::error::ProtocolError> {
