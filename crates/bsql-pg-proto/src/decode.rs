@@ -727,28 +727,38 @@ impl<'a> Iterator for ColumnsIter<'a> {
         };
         let len = i32::from_be_bytes(*len_bytes);
 
+        // DEF-184 (A5/B10): collapsed sign-path cascade.
+        //
+        // Pre-(184) had 3 sequential sign checks:
+        //   if len == -1 { NULL }
+        //   if len < 0 { NegativeColumnLength }
+        //   usize::try_from(len) { ... Err → NegativeColumnLength }
+        // Three comparisons per column × 32 max cols × 1M rows =
+        // ~96M redundant compares on row-heavy workloads.
+        //
+        // Post-(184): single NULL shortcut + fold the `< -1` case
+        // into `usize::try_from` Err branch (which also catches
+        // hypothetical i32→usize overflow on 16-bit targets, even
+        // though MSRV implicitly disallows those). Two compares:
+        // `len == -1` (null) and `usize::try_from` (non-negative).
+        // LLVM fuses the try_from sign check with the comparison.
         if len == -1 {
             // SQL NULL — no data bytes to consume.
             self.remaining = after_len;
             return Some(Ok(None));
         }
-
-        if len < 0 {
+        let Ok(len_usize) = usize::try_from(len) else {
+            // `len < -1` (wire violation) OR i32-that-doesn't-fit-
+            // usize (architecturally impossible on 32+-bit MSRV
+            // targets since i32 range ⊂ usize range). The audit's
+            // proposed `wrapping_add(1) as u32` trick is blocked
+            // by crate-wide `as_conversions` forbid — try_from is
+            // the accepted substitute with LLVM fusing the
+            // non-negative fast path.
             return self.fuse_and_error(DecodeError::NegativeColumnLength {
                 column_idx: idx,
                 length: len,
             });
-        }
-
-        // `len >= 0` ⟹ `try_from` infallible; defensive fallback.
-        let len_usize = match usize::try_from(len) {
-            Ok(v) => v,
-            Err(_) => {
-                return self.fuse_and_error(DecodeError::NegativeColumnLength {
-                    column_idx: idx,
-                    length: len,
-                });
-            }
         };
 
         match after_len.split_at_checked(len_usize) {
@@ -835,9 +845,14 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 ///
 /// # Error
 ///
-/// [`DecodeError::NonUtf8`] for non-UTF-8 bytes; type-specific
-/// parse errors:
-/// - integer types → [`DecodeError::IntParse`]
+/// [`DecodeError::NonUtf8`] for non-UTF-8 bytes on decoders that
+/// genuinely require UTF-8 validation (`&str`, `Vec<u8>`).
+/// Type-specific parse errors:
+/// - integer types → [`DecodeError::IntParse`] (DEF-184 A6/B13:
+///   single-pass ASCII-digit parser treats non-digit bytes
+///   uniformly; non-ASCII/non-UTF-8 input classifies as IntParse,
+///   NOT NonUtf8, because UTF-8 validation is skipped as redundant
+///   for strict-ASCII integer grammar).
 /// - `bool` → [`DecodeError::BoolParse`]
 ///
 /// # Binary format
@@ -862,30 +877,111 @@ pub trait FromPgText<'a>: Sized {
     fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError>;
 }
 
-// Integer decoders: ASCII digits (optionally leading `-`). Uses
-// stdlib `FromStr` which validates range + rejects trailing
-// garbage.
-macro_rules! impl_from_pg_text_int {
-    ($($t:ty = $oid:expr),+ $(,)?) => {
-        $(
-            impl FromPgText<'_> for $t {
-                const OID: u32 = $oid;
-                #[inline]
-                fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
-                    let s = core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)?;
-                    s.parse::<$t>().map_err(|_| DecodeError::IntParse)
-                }
+// DEF-184 (A6/B13): dedicated ASCII-digit integer parser.
+//
+// Pre-(184) used stdlib `core::str::from_utf8(bytes)?.parse::<T>()`
+// — two sequential walks over the bytes:
+// 1. `from_utf8` SSE2-scans for non-UTF8.
+// 2. `str::parse` re-scans, validates digits, accumulates.
+//
+// PG text-format integers are strictly `[-+]?[0-9]+` per PG §55.7 —
+// always ASCII. UTF-8 validation is redundant (a non-digit byte is
+// already an IntParse error; a non-ASCII byte is non-digit). Skip
+// it: one walk, one classification path. ~2× on int-heavy text
+// SELECT workloads (analytics default).
+//
+// Accumulates into correct-sign arm avoiding i*::MIN overflow (if
+// we accumulated as positive then negated, `-32768` on i16 would
+// trip). Each step uses `checked_mul` / `checked_add` / `checked_sub`
+// per `clippy::arithmetic_side_effects` forbid.
+
+/// Parse a signed ASCII-digit integer. Shared body for i16/i32/i64.
+macro_rules! parse_pg_int_signed {
+    ($bytes:expr, $t:ty) => {{
+        let (is_neg, digits) = match $bytes.split_first() {
+            Some((&b'-', rest)) => (true, rest),
+            Some((&b'+', rest)) => (false, rest),
+            Some(_) => (false, $bytes),
+            None => return Err(DecodeError::IntParse),
+        };
+        if digits.is_empty() {
+            return Err(DecodeError::IntParse);
+        }
+        let mut acc: $t = 0;
+        for &b in digits {
+            if !b.is_ascii_digit() {
+                return Err(DecodeError::IntParse);
             }
-        )+
-    };
+            // `b - b'0'` is 0..=9, always fits u8 → $t via From.
+            let d = <$t>::from(b.saturating_sub(b'0'));
+            acc = acc.checked_mul(10).ok_or(DecodeError::IntParse)?;
+            if is_neg {
+                acc = acc.checked_sub(d).ok_or(DecodeError::IntParse)?;
+            } else {
+                acc = acc.checked_add(d).ok_or(DecodeError::IntParse)?;
+            }
+        }
+        Ok(acc)
+    }};
 }
 
-impl_from_pg_text_int!(
-    i16 = oids::INT2,
-    i32 = oids::INT4,
-    i64 = oids::INT8,
-    u32 = oids::OID,
-);
+/// Parse an unsigned ASCII-digit integer. Used for u32 (PG OID).
+/// Rejects leading `-`; `+` prefix accepted as a no-op.
+macro_rules! parse_pg_int_unsigned {
+    ($bytes:expr, $t:ty) => {{
+        let digits = match $bytes.split_first() {
+            Some((&b'-', _)) => return Err(DecodeError::IntParse),
+            Some((&b'+', rest)) => rest,
+            Some(_) => $bytes,
+            None => return Err(DecodeError::IntParse),
+        };
+        if digits.is_empty() {
+            return Err(DecodeError::IntParse);
+        }
+        let mut acc: $t = 0;
+        for &b in digits {
+            if !b.is_ascii_digit() {
+                return Err(DecodeError::IntParse);
+            }
+            let d = <$t>::from(b.saturating_sub(b'0'));
+            acc = acc.checked_mul(10).ok_or(DecodeError::IntParse)?;
+            acc = acc.checked_add(d).ok_or(DecodeError::IntParse)?;
+        }
+        Ok(acc)
+    }};
+}
+
+impl FromPgText<'_> for i16 {
+    const OID: u32 = oids::INT2;
+    #[inline]
+    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+        parse_pg_int_signed!(bytes, i16)
+    }
+}
+
+impl FromPgText<'_> for i32 {
+    const OID: u32 = oids::INT4;
+    #[inline]
+    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+        parse_pg_int_signed!(bytes, i32)
+    }
+}
+
+impl FromPgText<'_> for i64 {
+    const OID: u32 = oids::INT8;
+    #[inline]
+    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+        parse_pg_int_signed!(bytes, i64)
+    }
+}
+
+impl FromPgText<'_> for u32 {
+    const OID: u32 = oids::OID;
+    #[inline]
+    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+        parse_pg_int_unsigned!(bytes, u32)
+    }
+}
 
 /// PG boolean text format: `"t"` = true, `"f"` = false. Anything
 /// else (including `"true"`, `"TRUE"`, `"1"`, `"0"`) classifies as
@@ -1725,15 +1821,24 @@ mod from_pg_text_tests {
 
     /// **One invariant, one test**: `i32::from_pg_text` correctly
     /// maps PG text representation into the Result<i32, DecodeError>
-    /// contract — happy paths, overflow, malformed digits, non-UTF-8.
+    /// contract — happy paths, overflow, malformed digits, non-ASCII.
     /// An arm-body swap in my impl (e.g., returning `NonUtf8` for
     /// overflow) fails this table.
+    ///
+    /// DEF-184 (A6/B13): non-ASCII/non-UTF-8 bytes now classify as
+    /// `IntParse` (not `NonUtf8`). Pre-(184) the decoder did a
+    /// redundant `from_utf8` walk before `str::parse`; post-(184)
+    /// the single-pass ASCII-digit parser treats ANY non-digit byte
+    /// uniformly as IntParse. The `NonUtf8` variant is preserved
+    /// for `&str` / `Vec<u8>` decoders that genuinely require
+    /// UTF-8 validation (arbitrary user text columns).
     #[test]
     fn i32_decoder_matrix() {
         // Happy paths.
         assert!(matches!(i32::from_pg_text(b"0"), Ok(0)));
         assert!(matches!(i32::from_pg_text(b"42"), Ok(42)));
         assert!(matches!(i32::from_pg_text(b"-17"), Ok(-17)));
+        assert!(matches!(i32::from_pg_text(b"+17"), Ok(17)));
         assert!(matches!(i32::from_pg_text(b"2147483647"), Ok(i32::MAX)));
         assert!(matches!(i32::from_pg_text(b"-2147483648"), Ok(i32::MIN)));
 
@@ -1747,9 +1852,11 @@ mod from_pg_text_tests {
         assert!(matches!(i32::from_pg_text(b"12a"), Err(DecodeError::IntParse)));
         assert!(matches!(i32::from_pg_text(b" 12"), Err(DecodeError::IntParse)));
 
-        // Non-UTF-8 → NonUtf8 (distinct from IntParse — classification
-        // tells the caller whether retry would help).
-        assert!(matches!(i32::from_pg_text(&[0xFF]), Err(DecodeError::NonUtf8)));
+        // DEF-184 (A6/B13): non-ASCII bytes → IntParse (single-pass
+        // ASCII-digit validator treats any non-digit byte uniformly).
+        // Pre-(184) this was NonUtf8 via upstream from_utf8 walk.
+        assert!(matches!(i32::from_pg_text(&[0xFF]), Err(DecodeError::IntParse)));
+        assert!(matches!(i32::from_pg_text(&[0xC3, 0x28]), Err(DecodeError::IntParse)));
     }
 
     /// **One invariant, one test**: parallel `i16` / `i64` / `u32`
