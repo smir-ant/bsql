@@ -1756,10 +1756,26 @@ fn stream_row_or_errored<'wb, 'r>(
     // classified stale-ref handling (see materialise's
     // StreamRowRange arm in protocol.rs).
     //
-    // None classifies as `MalformedDataRow` — server-side framing
-    // desync (DataRow with `total_len == HEADER_LEN`, i.e. empty
-    // body), NOT a crate bug.
-    match populated.get(coords.payload_start()..coords.payload_end()) {
+    // DEF-154 (K) bugfix: empty row-body (total_len == HEADER_LEN,
+    // payload_start == payload_end) routes through MalformedDataRow
+    // classification. Pre-(K), `populated.get(5..5)` returned
+    // `Some(&[])` (zero-length slice is in-bounds) — the dispatch
+    // fell through to `AdvancedWithAction` with `row_bytes: &[]`,
+    // producing a silently empty StreamRow at the user boundary
+    // (exactly the "тихая эрозия" pattern user banned). Pre-(H) the
+    // same check lived inside `NonEmptyRange::new` which rejected
+    // `end <= start`; the guarantee was LOST in the refactor.
+    let start = coords.payload_start();
+    let end = coords.payload_end();
+    if start >= end {
+        return DispatchOutcome::Errored {
+            reply_id: Some(reply.consume()),
+            cause: crate::error::ProtocolError::MalformedDataRow {
+                total_len: coords.total_len(),
+            },
+        };
+    }
+    match populated.get(start..end) {
         Some(row_bytes) => {
             let id = reply.get();
             DispatchOutcome::AdvancedWithAction {

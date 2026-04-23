@@ -351,11 +351,14 @@ const _: () = assert!(
     core::mem::needs_drop::<scram::types::SecretDigest>(),
     "SecretDigest must have Drop for zeroize-on-drop",
 );
+// DEF-154 (K): ReplyId<K> no longer has Drop. The panic-in-Drop
+// "consume-discipline guard" double-panicked under integration-test
+// unwind (SIGABRT masked original failure). Discipline enforced via
+// `#[must_use]` + integration tests observing Action content. See
+// `reply_id.rs` `// DEF-154 (K):` block for the full rationale.
 const _: () = assert!(
-    core::mem::needs_drop::<reply_id::ReplyId<reply_id::PingKind>>(),
-    "ReplyId<K> must have Drop for the consume-discipline guard (DEF-028 / \
-     DEF-101 — same guarantee, now per-kind after DEF-112's type \
-     parameterisation).",
+    !core::mem::needs_drop::<reply_id::ReplyId<reply_id::PingKind>>(),
+    "ReplyId<K> must stay drop-free — Drop was a footgun (see DEF-154 (K)).",
 );
 const _: () = assert!(
     !core::mem::needs_drop::<action::Reply<'static>>(),

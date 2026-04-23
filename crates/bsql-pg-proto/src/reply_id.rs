@@ -248,14 +248,15 @@ impl ReplyKind for DescribePortalKind {
 /// - **Tier 2 runtime** — Drop-guard asserts delivered on drop
 ///   (see DEF-101 analysis in deferred.md §16 for why this is the
 ///   stable-Rust ceiling, not tier-1).
-#[must_use = "a ReplyId must be consumed via `.consume()` into an Action — dropping it without delivery is a runtime error"]
+#[must_use = "a ReplyId should be consumed via `.consume()` into an Action — dropping it silently leaves the caller's receiver hanging (wrapper-layer timeout concern)"]
 pub struct ReplyId<K: ReplyKind> {
     /// The wire-level correlator value. Never changes after
     /// construction.
     value: NonZeroU64,
-    /// Whether [`ReplyId::consume`] was called before drop. The
-    /// Drop impl reads this to decide whether to panic.
-    delivered: bool,
+    // DEF-154 (K): `delivered: bool` field DELETED — it only
+    // supported the panic-in-Drop safety net (now removed).
+    // Discipline enforced via `#[must_use]` + integration-test
+    // observation on OutActions content.
     /// Phantom tag — zero-size, `fn() -> K` for unconditional
     /// autotraits. See [`crate::ident::FixedStr`] docstring for
     /// the full rationale of the `fn() -> K` phantom form.
@@ -275,29 +276,26 @@ impl<K: ReplyKind> ReplyId<K> {
     /// The standard wrapper (`bsql-driver-postgres`) uses an
     /// `AtomicU64` initialised to 1 with `fetch_add(1, Relaxed)`.
     ///
-    /// A fresh `ReplyId` starts with `delivered = false`; the
-    /// Drop-guard will fire if it is dropped before
-    /// [`ReplyId::consume`] is called.
+    /// DEF-154 (K): construct a fresh `ReplyId`. Pre-(K) carried a
+    /// `delivered: bool` field for Drop-time checking — now deleted
+    /// since the Drop panic is gone (footgun under integration-test
+    /// unwind; see Drop-impl deletion block above).
     #[inline]
     pub const fn from_raw(value: NonZeroU64) -> Self {
         Self {
             value,
-            delivered: false,
             _kind: PhantomData,
         }
     }
 
-    /// Extract the underlying counter value, consuming the handle
-    /// and marking the reply as delivered.
+    /// Extract the underlying counter value, consuming the handle.
     ///
     /// After calling `consume`, the `ReplyId<K>` is gone — the raw
     /// value travels inside an outgoing `Action`, which is not
     /// consume-tracked.
     #[inline]
-    pub fn consume(mut self) -> NonZeroU64 {
-        self.delivered = true;
+    pub fn consume(self) -> NonZeroU64 {
         self.value
-        // Drop runs here with `delivered = true` → no panic.
     }
 
     /// Peek at the underlying counter value without consuming the
@@ -313,34 +311,47 @@ impl<K: ReplyKind> ReplyId<K> {
     }
 }
 
-impl<K: ReplyKind> Drop for ReplyId<K> {
-    /// Tier-2 runtime consume-discipline guard (safety net).
-    ///
-    /// See the module-level docstring and DEF-101 analysis in
-    /// deferred.md §16 for why this is the stable-Rust ceiling on
-    /// "cannot drop unconsumed." Removing it would be a tier
-    /// regression, not an elevation.
-    ///
-    /// # DEF-052 close — unwind-safe guard
-    ///
-    /// During a test-time unwind (test panics for some *unrelated*
-    /// reason while a non-delivered ReplyId is alive), the guard
-    /// returns early instead of double-panicking and masking the
-    /// original failure with `SIGABRT`. Zero cost in production
-    /// (`panic = "abort"` never unwinds).
-    fn drop(&mut self) {
-        #[cfg(test)]
-        if std::thread::panicking() {
-            return;
-        }
-        assert!(
-            self.delivered,
-            "ReplyId<{}>({}) dropped without delivery — the caller's oneshot receiver will never resolve",
-            K::NAME,
-            self.value.get(),
-        );
-    }
-}
+// DEF-154 (K): `Drop for ReplyId<K>` DELETED.
+//
+// Pre-(K), Drop contained a `assert!(self.delivered, ...)` safety
+// net — intended as a tier-2 runtime guard against "caller forgot
+// to consume the reply." Two fatal flaws for the user directive
+// "никаких потенциальных паник":
+//
+// 1. **Double-panic SIGABRT in integration tests.** The `#[cfg(test)]`
+//    + `std::thread::panicking()` early-return guard was scoped to
+//    the LIB's own test mode only — `#[cfg(test)]` evaluates to
+//    false when the lib is compiled as a dependency of an
+//    integration test crate (in `tests/`). Integration test
+//    assertion failures unwound `PgProtocol` which held a
+//    non-delivered `ReplyId` in its state → Drop asserted →
+//    double-panic → SIGABRT masked the original test failure.
+//    User reproduced this on `zero_body_data_row_classified_as_malformed_data_row`.
+//
+// 2. **Panic-in-Drop is a maintenance footgun**, period. In
+//    `panic = "abort"` production profile it's a hard abort;
+//    in `panic = "unwind"` any unwind through a ReplyId alive on
+//    the stack double-panics. Neither is acceptable per user's
+//    "никаких потенциальных паник" directive.
+//
+// Discipline is now enforced COMPILE-TIME via:
+//
+//   - `#[must_use]` on `ReplyId<K>` (warns on unused binding).
+//   - Every dispatch path routes `ReplyId` through `.consume()`
+//     (into a NonZeroU64 for staging) or `.get()` (peek for
+//     staging into StagedAction variants). State variants that
+//     hold a `ReplyId` across calls are exhaustively classified
+//     by the `ProtoState` enum — dropping the state produces no
+//     in-flight reply by construction (terminal states transition
+//     to Idle/Errored at the moment the inflight reply is drained).
+//   - Integration tests observe delivery via the returned
+//     OutActions content (e.g. `matches!(a, Action::DeliverReply { .. })`).
+//
+// If a caller TRULY drops a non-delivered ReplyId (bypassing all
+// the dispatch machinery), the caller's oneshot-receiver hangs
+// silently — that's a wrapper-layer concern (host runtime decides
+// timeout / cancel semantics), not a protocol-crate-internal
+// panic target.
 
 // `PartialEq`, `Eq`, `Hash` are **deliberately NOT implemented** on
 // `ReplyId<K>` (DEF-088 tier raise, retained through DEF-112).
@@ -365,33 +376,14 @@ mod reply_id_semantics {
 
     use super::*;
 
-    /// Category (2) — tier-2 runtime invariant.
-    ///
-    /// Dropping a `ReplyId` without calling `.consume()` trips the
-    /// Drop-guard. This is the load-bearing mechanism against the
-    /// "silent reply loss" bug class.
-    #[test]
-    #[should_panic(expected = "dropped without delivery")]
-    fn undelivered_drop_panics() {
-        let raw = NonZeroU64::new(7).unwrap_or(NonZeroU64::MIN);
-        let id: ReplyId<PingKind> = ReplyId::from_raw(raw);
-        drop(id);
-    }
-
-    /// Category (2) — tier-2 runtime invariant (DEF-052 close).
-    ///
-    /// If a test panics for an *unrelated* reason while a
-    /// non-delivered `ReplyId` is alive, the Drop-guard's
-    /// `thread::panicking()` check returns early during unwinding,
-    /// letting the original panic propagate cleanly.
-    #[test]
-    #[should_panic(expected = "unrelated panic")]
-    fn unrelated_panic_while_reply_id_alive_surfaces_original_message() {
-        let raw = NonZeroU64::new(11).unwrap_or(NonZeroU64::MIN);
-        let id: ReplyId<PingKind> = ReplyId::from_raw(raw);
-        let actual = id.get().get();
-        assert_eq!(actual, 0, "unrelated panic (id was {actual})");
-    }
+    // DEF-154 (K): `undelivered_drop_panics` + per-kind siblings +
+    // `unrelated_panic_while_reply_id_alive_surfaces_original_message`
+    // — ALL DELETED. The panic-in-Drop guard was removed (it
+    // double-panicked under integration-test unwind, masking
+    // original failures with SIGABRT); the tests that pinned its
+    // behaviour no longer have a target to pin. Discipline is now
+    // `#[must_use]` on ReplyId + integration tests asserting
+    // delivery via OutActions content.
 
     /// Category (2) — DEF-112 tier-1 compile verification.
     ///
@@ -416,66 +408,9 @@ mod reply_id_semantics {
         startup.consume();
     }
 
-    // F-004 (pass-#8): per-kind Drop-guard regression pins.
-    //
-    // Pre-F-004 only `PingKind` had a `#[should_panic]` drop test.
-    // Every other kind shared the same generic Drop impl but had no
-    // dedicated bad-path pin. Per user directive "100% bad paths
-    // tested", each kind gets its own test so a refactor that
-    // accidentally specialises the Drop impl per-kind (or breaks
-    // one kind's panic message format) fails the test suite loudly.
-
-    /// Category (2) — StartupKind drop-panic pin.
-    #[test]
-    #[should_panic(expected = "ReplyId<Startup>")]
-    fn startup_undelivered_drop_panics() {
-        let raw = NonZeroU64::new(17).unwrap_or(NonZeroU64::MIN);
-        let id: ReplyId<StartupKind> = ReplyId::from_raw(raw);
-        drop(id);
-    }
-
-    /// Category (2) — QueryKind drop-panic pin.
-    #[test]
-    #[should_panic(expected = "ReplyId<Query>")]
-    fn query_undelivered_drop_panics() {
-        let raw = NonZeroU64::new(19).unwrap_or(NonZeroU64::MIN);
-        let id: ReplyId<QueryKind> = ReplyId::from_raw(raw);
-        drop(id);
-    }
-
-    /// Category (2) — ParseKind drop-panic pin.
-    #[test]
-    #[should_panic(expected = "ReplyId<Parse>")]
-    fn parse_undelivered_drop_panics() {
-        let raw = NonZeroU64::new(23).unwrap_or(NonZeroU64::MIN);
-        let id: ReplyId<ParseKind> = ReplyId::from_raw(raw);
-        drop(id);
-    }
-
-    /// Category (2) — CloseKind drop-panic pin.
-    #[test]
-    #[should_panic(expected = "ReplyId<Close>")]
-    fn close_undelivered_drop_panics() {
-        let raw = NonZeroU64::new(29).unwrap_or(NonZeroU64::MIN);
-        let id: ReplyId<CloseKind> = ReplyId::from_raw(raw);
-        drop(id);
-    }
-
-    /// Category (2) — DescribeStatementKind drop-panic pin.
-    #[test]
-    #[should_panic(expected = "ReplyId<DescribeStatement>")]
-    fn describe_statement_undelivered_drop_panics() {
-        let raw = NonZeroU64::new(31).unwrap_or(NonZeroU64::MIN);
-        let id: ReplyId<DescribeStatementKind> = ReplyId::from_raw(raw);
-        drop(id);
-    }
-
-    /// Category (2) — DescribePortalKind drop-panic pin.
-    #[test]
-    #[should_panic(expected = "ReplyId<DescribePortal>")]
-    fn describe_portal_undelivered_drop_panics() {
-        let raw = NonZeroU64::new(37).unwrap_or(NonZeroU64::MIN);
-        let id: ReplyId<DescribePortalKind> = ReplyId::from_raw(raw);
-        drop(id);
-    }
+    // DEF-154 (K): per-kind drop-panic pins (startup/query/parse/
+    // close/describe_statement/describe_portal) DELETED along with
+    // the Drop impl itself. Each kind is exercised through
+    // dispatch flow tests in `tests/*.rs` which assert delivery by
+    // matching on Action variants — the tier ABOVE Drop-guard.
 }
