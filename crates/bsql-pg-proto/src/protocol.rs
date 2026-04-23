@@ -245,16 +245,54 @@ pub const MAX_FANOUT_PER_STAGED: usize = 2;
 /// dispatch call. Post-DEF-154 (Y) `StreamRowRange` deletion, the
 /// only remaining fanout-2 staged variant is `DeliverReply` with
 /// stale-ref (architecturally dead — `CrateBugLocus::StaleSchemaRef`).
-/// `DeliverReply` happens at most 1× per dispatch call (single
-/// reply per query cycle, pre-1c-5-pipelining).
 ///
-/// Pre-DEF-184 `MAX_ACTIONS_PER_CALL = 16 = STAGED × FANOUT`
-/// overestimated: assumed EVERY staged entry could fan out to 2.
-/// That was correct when `StreamRowRange` existed (multiple staged
-/// rows could each stale-ref fanout), but post-(Y) the ONLY
-/// 2-fanout is the single DeliverReply. Tight formula:
-/// `MAX_STAGED + MAX_FANOUT2_ENTRIES × (FANOUT - 1)` =
-/// `8 + 1 × 1 = 9`.
+/// # Exhaustive case analysis — why `MAX_FANOUT2_ENTRIES = 1`
+///
+/// 1. **Which StagedAction variants fan out to 2 actions in
+///    materialise?** Grep `push_within_fanout_budget` call sites
+///    in `materialise`:
+///    - `StagedAction::SendBytesRange` on `None` apply: 1 action
+///      (`CloseSocket`) + continue. **Not fanout-2** (only 1
+///      action emitted before continue; the continue skips the
+///      normal SendBytes emission).
+///    - `StagedAction::DeliverReply` on stale-ref `Err(_stale)`:
+///      2 actions (`FailReply + CloseSocket`). **FANOUT-2**.
+///    - `StagedAction::SendBytesStatic`: 1 action.
+///    - `StagedAction::FailReply`: 1 action.
+///    - `StagedAction::CloseSocket`: 1 action.
+///    **Conclusion:** only `DeliverReply` stale-ref is fanout-2.
+///
+/// 2. **How many `DeliverReply` staged entries can a single
+///    dispatch call produce?** Grep `StagedAction::DeliverReply`
+///    in dispatch.rs — all construction sites use `action::deliver`
+///    which is called from `DispatchOutcome::AdvancedWithAction`.
+///    The dispatch loop emits ONE `AdvancedWithAction` per frame,
+///    and only terminal frames (RFQ, Z, CommandComplete,
+///    Authentication Ok/Final, ParseComplete, CloseComplete,
+///    BindComplete, etc.) emit a DeliverReply. For pre-1c-5
+///    single-inflight pattern, a single feed_bytes cycle
+///    processes one reply — at most ONE DeliverReply per call.
+///    **Conclusion:** `MAX_FANOUT2_ENTRIES ≤ 1` pre-pipelining.
+///
+/// 3. **Can the dispatch loop emit 2+ DeliverReply in one call?**
+///    No — state after DeliverReply transitions away from the
+///    waiting-for-reply state (back to Idle or an intermediate),
+///    blocking a second reply emission in the same feed_bytes
+///    iteration. Confirmed via state-machine audit (see
+///    `state.rs` transitions).
+///
+/// 4. **Regression trap — 1c-5 pipelining:** if pipelining adds
+///    batched replies (multiple DeliverReply per call), this const
+///    MUST bump. The const-assert below catches a stale
+///    `MAX_ACTIONS_PER_CALL` when the bump is forgotten.
+///
+/// # Why not leave `MAX_ACTIONS = STAGED × FANOUT = 16` safely?
+///
+/// Because stack reservation is proportional: 16 × 312 B = 4992 B
+/// vs 9 × 312 B = 2808 B. The -2184 B saving per call × per-
+/// connection × QPS is the perf win. Overestimating the cap
+/// leaves dead stack space that compiler can't optimise away
+/// (heapless::Vec reserves `[MaybeUninit<T>; N]` up front).
 const MAX_FANOUT2_ENTRIES_PER_CALL: usize = 1;
 
 /// Output-side action capacity — bounds `OutActions` storage.

@@ -3614,11 +3614,55 @@ to annotate these with "DEF-154 (Y): deleted — see row_stream"
 or rewrite them entirely is a future polish pass.
 
 
-### DEF-184 — post-(Y) двойной audit merge (A/B/C full catalog) — OPEN
+### DEF-184 — post-(Y) двойной audit merge (A/B/C full catalog) — IN PROGRESS
 
 **Статус:** каталог находок из 2-х architect-audit'ов pg-proto
 после shipping (Y). Готов к батчевому исполнению. **Ничего не
 отбрасывается** (CREDO §5).
+
+**Session 2026-04-23 progress (14 items shipped + 1 revert + 1 bonus):**
+
+Shipped (5 commits post-catalog):
+- `19d4426` Batch 1+2 — B7, B18, B20, B23, **B24**, **B25**, B26,
+  B28. **B24+B25 critical** — tier-4 silent Err discards elevated
+  to tier-2 structural (CREDO §1). B2 reverted after compile check
+  (audit claimed stale MSRV; verified still blocked by rust-lang
+  issue #143874).
+- `579dddd` Batch 3 — B9 (NonZeroU32 niche + new CrateBugLocus::
+  AuthSubCodeZeroInErr), B12 (SCRAM fast-path), B15 (first_chunk_mut
+  patch), B17 (inline + **bonus fallback catch**: ParamStatus
+  missing trailing NUL was silently absorbed, now classified
+  MalformedPayload; new test pins behaviour).
+- `cee0591` A2/B1/B8 — OutActions POD → ManuallyDrop<heapless::Vec>.
+  **5008 B zero-fill/call → 0 B init** (~150× reduction).
+- `ace874d` A15 — MAX_ACTIONS_PER_CALL 16 → 9 (right-size post-(Y)
+  via `MAX_FANOUT2_ENTRIES_PER_CALL = 1`). 2184 B saved per
+  OutActions stack frame.
+
+**Still OPEN (~20 items + spikes) — ordered by dependency:**
+
+| Batch | Items | LoC est | Risk |
+|-------|-------|---------|------|
+| 4 tail | B3 (materialise infallible push), B6 (feed_bytes_bounded split) | 80 | M/L |
+| 5 decode | A5/B10, A6/B13, B4, B11 | 255 | L/M |
+| 6 encode | A14 Bind+Execute template | 150 | L-M |
+| 7 dispatch | B21/C6 (712 MB/1M-rows), A7 tag LUT, A3 fn-ptr LUT | 500 | M/H |
+| 8 state | A10/B22 SCRAM split (664 MB/1M-rows), A4/B16 layout | 700 | H/M |
+| 9 crown | **A1+A13 ErrorArena cascade (6.4× OutActions)**, B14 HList | 800 | H |
+| 10 spikes | A11/C4 SIMD, C1 typestate, C2 brands, C3 iterator, C5 bitpack | 2000+ | H |
+| stragglers | B5 API narrow, A8 usize sweep | 130 | L |
+| deferred | A12 arena sizing → 1c-5 pipelining | 20 | L |
+
+**Bonus work added in session (not in original catalog):**
+- Fallback-catch: `record_param_status` silently-absorbed missing
+  trailing NUL — classified post-(184). New test
+  `param_status_missing_trailing_nul_classified_as_malformed`.
+- `CrateBugLocus::AuthSubCodeZeroInErr` new variant (dead-arm
+  classification for B9 NonZeroU32 conversion).
+- `install_errored_read_cursor_advance` helper for B25 fast-path
+  parallel to existing `install_errored_malformed_data_row`.
+
+**Test count trajectory:** 215 pre-(184) → 216 post-session.
 
 **Источники:** audit #1 (без CREDO-context) и audit #2 (с CREDO
 на руках, task: falsify audit #1 DONE + найти blind spots +

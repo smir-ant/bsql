@@ -274,9 +274,21 @@ zero-cost perf. Время — тем более.**
   invariants — manual.
 
 **12. Fallback / recovery path (fallback-поведение):**
-- **Fallback — путь к костылям.** Если функция требует fallback
-  chain — часто это признак что invariant выше по стеку сломан и
-  лечится неправильно, а fallback — workaround.
+- **Fallback — возможен, но не бездумно.** Fallback сам по себе НЕ
+  преступление — classified `Result::Err` есть fallback от
+  happy-path, это tier-3, ок. Преступление — **бездумный** /
+  **необоснованный** / **silent** fallback. Каждый fallback
+  должен иметь:
+  - **Классификацию** по tier'у (tier-3 через `Err(classified)` —
+    ОК; tier-4 через `unwrap_or` / silent default — запрещён).
+  - **Обоснование**: почему именно этот fallback, не другой? Не
+    "первый пришедший в голову".
+  - **Доказательство что это recovery, а не костыль**: если
+    fallback лечит симптом, а реальная проблема в invariant'е
+    уровнем выше — лечи invariant, не симптом.
+- **Fallback как путь к костылям:** если функция требует длинный
+  fallback chain — часто признак что invariant выше по стеку
+  сломан и лечится неправильно, а fallback — workaround.
 - **Классификация fallback'а по tier'у:**
   - Fallback → `Result::Err(classified)` = tier-3, приемлем.
   - Fallback → `Result::Err(generic "internal error")` = tier-3 но
@@ -451,7 +463,90 @@ CREDO'м**.
 
 ---
 
-## §11 Ссылки
+## §11 Safe-Rust idioms (не путать с unsafe)
+
+Некоторые конструкции **выглядят** как потенциальные угрозы / слабые
+места / костыли, но на самом деле идиоматичны и safe. Фиксирую чтобы
+при аудите не тратить время на false-positive.
+
+### `*var = value` — place-assignment через `&mut T`
+
+`*slot = bytes` где `slot: &mut [u8; 4]` — это НЕ pointer
+dereference в unsafe-смысле. Это **place expression**: пишем в
+место, на которое указывает `&mut T`. Единственный способ
+присвоения через mutable reference в safe Rust.
+
+- Для `&mut [u8; N]` (фиксированный массив) — `*slot = value`
+  оптимально: type-level size match, без runtime bounds-check.
+  LLVM → single machine-word store на aligned targets.
+- Для `&mut [u8]` (runtime-sized slice) — `.copy_from_slice(&src)`
+  (добавляет проверку `src.len() == dst.len()`).
+- Для `&mut T` generic — `*t = value` или `std::mem::replace`.
+
+**Не крутка и не угроза.** Альтернативы для fixed-array:
+`copy_from_slice` эквивалентно но теряет type-level size guarantee
+(компилятор добавляет ассерт). `*slot = arr` сильнее.
+
+### `*byte` в slice-pattern / closure
+
+```rust
+payload.iter().position(|b| *b == 0)  // b: &u8 → *b: u8
+```
+
+Deref `&u8` → `u8` для сравнения/копии Copy значения. Zero-cost.
+Pattern `[*a, *b, *c, *d]` в `[a, b, c, d, ..]` slice match —
+тот же deref для разбивки `&[u8]` на Copy-значения.
+
+### `core::mem::ManuallyDrop<T>` — вводит в заблуждение по имени
+
+Название SOUNDS like "вручную очищать из памяти". Это **неправда**.
+Точный смысл:
+
+- `ManuallyDrop<T>` — wrapper, который **отключает** автоматический
+  Drop внутреннего T.
+- Если T не имеет Drop-логики (Copy type / trivial Drop body),
+  skipping Drop полностью безопасен — нечего очищать.
+- Если T имеет важную Drop (zeroize / resource release), skipping
+  Drop = LEAK. Осторожно.
+- Назывался бы правильнее `SkipAutoDrop` или `NoDropOnScopeEnd`.
+  Историческое имя Rust.
+
+**В нашем коде** (`OutActions`): `T = heapless::Vec<Action, N>`.
+Action is Copy → Vec's Drop body trivial (walks over Copy elements,
+no-op each). Skipping Drop = 0 runtime cost, 0 leak risk. Чисто
+safe.
+
+Документируется в `lib.rs` const-assert `!needs_drop::<OutActions>`.
+
+### `unwrap_or(&[])` на architecturally-dead branch
+
+`.get(..n).unwrap_or(&[])` — **силайт-корлор tier-4**. Заменять
+на explicit match:
+```rust
+match items.split_at_checked(n) {
+    Some((head, _)) => head,
+    None => &[],  // классифицированно-мёртвый empty-sentinel
+}
+```
+Либо на `debug_assert!(...)` + documented-dead arm. Пример:
+`OutActions::as_slice` (DEF-184 B26).
+
+### `mem::take(&mut t)` + `*t = new`
+
+Pattern для state-machine transitions: временно вынуть значение,
+построить новое, записать на место. Safe Rust place-assignment.
+Не пугаться `*t = new`.
+
+### `heapless::Vec::new()`
+
+Constructor zero-writes (storage `[MaybeUninit<T>; N]` остается
+uninit для незаполненных слотов). Capacity reserved в stack
+frame, но байты init не платятся. В отличие от `[T; N]`
+literal-fill который eager-init'ит все N слотов.
+
+---
+
+## §12 Ссылки
 
 - `deferred.md` — живой ship log и список defer'ов. Каждый defer
   имеет срок / trigger / причину, соответствующую CREDO.
