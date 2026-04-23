@@ -74,6 +74,14 @@ zeroize = { version = "1", default-features = false, features = ["zeroize_derive
 # SystemTime-seeded. DEF-META-01 scope.
 getrandom = { version = "0.2", default-features = false }
 
+# `criterion` — DEF-143 benchmark harness. Dev-only dependency;
+# benches compile with std enabled (criterion requires std) while
+# the lib stays no_std. Provides statistical sampling (bootstrap
+# CI), outlier detection, and regression tracking across runs.
+# Pinned to 0.5 (last pre-1.0 with stable API); upgrade in lockstep
+# with criterion's semver.
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+
 # --- Build profiles ---
 #
 # Consumer profiles apply when bsql is used as a library. These

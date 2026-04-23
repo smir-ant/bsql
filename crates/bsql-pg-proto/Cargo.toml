@@ -45,3 +45,15 @@ getrandom = { workspace = true }
 # directly via this dev-only entry, closing the "pub for tests"
 # visibility anti-pattern.
 base64ct = { workspace = true }
+
+# `criterion` — DEF-143 bench harness. Dev-only; benches compile
+# with std, lib stays no_std. See workspace Cargo.toml.
+criterion = { workspace = true }
+
+# -- Bench targets --
+# `harness = false` disables the default libtest bench runner; we
+# use criterion's own main-function runner instead (generates HTML
+# reports + statistical analysis in target/criterion).
+[[bench]]
+name = "hot_paths"
+harness = false

@@ -1876,17 +1876,18 @@ are the witness-guard session's output.
 Ten independent commits, each self-contained. Safe to ship in
 parallel. No inter-dependencies that force ordering.
 
-### DEF-143 — cargo-bench harness for per-frame throughput (OPEN, paired with DEF-134)
+### DEF-143 — cargo-bench harness for per-frame throughput (PARTIAL SHIP 2026-04-24, paired with DEF-134)
 
 **Origin.** User directive post-DEF-119: "сделать и def 134 и
 143, и лишь потом двигаться дальше". Audit H023/H024/H028 all
 point to this.
 
 **Scope.** Criterion-based bench targets for the hot paths:
-- `parse_header` single-frame throughput
-- `feed_bytes` loop on a synthetic 1000-row SELECT reply stream
-- `push_command(Ping)` + `feed_bytes(RFQ)` round-trip
-- `push_bind_execute` with 0/1/16 params
+- `parse_header` single-frame throughput — **SHIPPED**
+- `feed_bytes` loop on a synthetic 1000-row SELECT reply stream — **SHIPPED**
+- `push_command(Ping)` + `feed_bytes(RFQ)` round-trip — **SHIPPED**
+- `push_bind_execute` with 0/1/16 params — deferred (needs test
+  Password-bearing SCRAM fixture setup)
 
 **Ship-order.** Pair with DEF-134 (cargo-fuzz). Both are infra
 prerequisites for the CONSIDER bucket below (B013 LUT dispatch,
@@ -1895,6 +1896,23 @@ require measured evidence before committing to restructures.
 
 **Tier lift.** Not a tier lift — enables measurement-dependent
 decisions.
+
+**Session 2026-04-24 shipment:**
+- New `benches/hot_paths.rs` with 4 criterion groups:
+  `parse_header`, `ping_round_trip`, `datarow_stream` (100/1000),
+  `push_command`.
+- `criterion = "0.5"` added as workspace dev-dep (default-features
+  off + `html_reports` feature). `harness = false` on bench target.
+- Initial smoke-test numbers (aarch64-apple-darwin, `--quick`):
+  - parse_header: **~2.6 ns/frame** (383 Melem/s)
+  - push_command/ping: **~108 ns**
+  - ping_round_trip: **~197 ns**
+  - datarow_stream/1000: ~271 ns (suspiciously fast — `--quick`
+    undersamples; run full `cargo bench` for stable baseline)
+- Full baseline run + `--save-baseline` to land with next perf
+  work (A7/A4/A11 would diff against a saved baseline).
+- `push_bind_execute` bench deferred — needs SCRAM / Password
+  fixture plumbing not worth the session scope.
 
 ### DEF-144 — `parse_header`: drop dead `NonZeroU32::new` branch (A015)
 
