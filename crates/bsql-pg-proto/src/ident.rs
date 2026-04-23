@@ -47,6 +47,37 @@
 use core::fmt;
 use core::marker::PhantomData;
 
+/// DEF-154 (T) P1-2: architecturally-infallible usize → u16 narrow
+/// with a NON-SILENT fallback on Err.
+///
+/// Callers upstream gate `value ≤ cap` and `cap ≤ u16::MAX`, making
+/// `u16::try_from(value)` infallible by construction. Pre-(T) the
+/// `.unwrap_or(0)` pattern silently mapped invariant-break to zero-
+/// length, producing an empty-looking string / slice at the caller.
+/// Post-(T) the fallback is `cap` narrowed to u16 (saturating to
+/// `u16::MAX` if `cap` itself exceeds u16, architecturally dead
+/// under caller-side const-asserts) — observable as "full buffer"
+/// on invariant break, not "empty".
+///
+/// Both Err arms are documented-dead; the helper lives here so
+/// every FixedStr / BoundedStr / OtherEncoding narrowing site shares
+/// the same structured dead-arm form rather than hand-rolling
+/// `unwrap_or(0)`.
+#[inline]
+#[must_use]
+pub(crate) fn narrow_len_u16(value: usize, cap: usize) -> u16 {
+    if let Ok(n) = u16::try_from(value) {
+        return n;
+    }
+    // Architecturally dead under caller-side const-asserts. Cap
+    // fallback is u16::MAX only if `cap` itself is > u16::MAX
+    // (impossible by static asserts at every caller site).
+    if let Ok(n) = u16::try_from(cap) {
+        return n;
+    }
+    u16::MAX
+}
+
 /// Maximum byte length for a PostgreSQL identifier (user / database).
 ///
 /// PostgreSQL `NAMEDATALEN = 64`; usable chars = 63.
@@ -882,7 +913,14 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
             if let Some(dst) = out.buf.get_mut(..src.len()) {
                 dst.copy_from_slice(src);
             }
-            out.len = u16::try_from(src.len()).unwrap_or(0);
+            // DEF-154 (T) P1-2: narrow via `narrow_len_u16` helper.
+            // Invariants: `src.len() ≤ N` (gate above); `N ≤ u16::MAX`
+            // (const-asserted at struct decl). Pre-(T) was
+            // `.unwrap_or(0)` — silent "zero-length string" on
+            // invariant break. Post-(T) Err-arm fallback is N (cap)
+            // not 0, surfacing "full buffer" rather than silently
+            // empty if both invariants somehow broke simultaneously.
+            out.len = narrow_len_u16(src.len(), N);
             return out;
         }
 
@@ -902,7 +940,8 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
         if let Some(dst) = out.buf.get_mut(fit_end..marker_end) {
             dst.copy_from_slice(Self::OVERFLOW_MARKER);
         }
-        out.len = u16::try_from(marker_end).unwrap_or(0);
+        // DEF-154 (T): narrow via helper; see `narrow_len_u16` docstring.
+        out.len = narrow_len_u16(marker_end, N);
         out
     }
 
@@ -966,9 +1005,10 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
             if let Some(dst) = out.buf.get_mut(written..marker_end) {
                 dst.copy_from_slice(Self::OVERFLOW_MARKER);
             }
-            out.len = u16::try_from(marker_end).unwrap_or(0);
+            // DEF-154 (T): see `narrow_len_u16` docstring.
+            out.len = narrow_len_u16(marker_end, N);
         } else {
-            out.len = u16::try_from(written).unwrap_or(0);
+            out.len = narrow_len_u16(written, N);
         }
         out
     }

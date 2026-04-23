@@ -213,7 +213,10 @@ impl OtherEncoding {
         if let Some(dst_marker) = out.buf.get_mut(budget..marker_end) {
             dst_marker.copy_from_slice(MARKER);
         }
-        out.len = u16::try_from(marker_end).unwrap_or(0);
+        // DEF-154 (T) P1-2: see `crate::ident::narrow_len_u16`
+        // docstring. `marker_end ≤ MAX_ENCODING_NAME_LEN ≤ u16::MAX`
+        // by construction; Err arms documented-dead.
+        out.len = crate::ident::narrow_len_u16(marker_end, MAX_ENCODING_NAME_LEN);
         out
     }
 
