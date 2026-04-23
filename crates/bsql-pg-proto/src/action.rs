@@ -1602,6 +1602,32 @@ impl ParamOids {
 // with 0 and never mutated; byte-equality of the arrays implies
 // logical equality of populated-prefix semantics). Same pattern as
 // `RowDesc` in decode.rs.
+//
+// DEF-184 (B11 REJECTED): audit #2 proposed swapping to
+// `heapless::Vec<u32, 16>` to save the 60 B zero-filled tail on
+// common 0-3-param DescribeStatement replies. Rejected under
+// closer analysis:
+// 1. **Copy cascade break.** `ParamOids: Copy` flows through
+//    `DescribeStatementCompletePayload` → `Reply` → `Action`. A
+//    heapless::Vec-backed ParamOids loses Copy; cascading Copy
+//    removal would ripple through the entire Action enum and
+//    require the DEF-184 A2/B1/B8 ManuallyDrop workaround at 3+
+//    more sites. Net code complexity > 60 B saved.
+// 2. **Hot-path not exercised.** Grep confirms `ParamOids::eq`
+//    is never called in hot paths; tests use `.oids()` slice view
+//    + `.len()`. The SIMD-wide Eq doc claim is future-proofing,
+//    not active optimisation.
+// 3. **Size win marginal.** DescribeStatementComplete fires once
+//    per Parse round-trip — not per-row. 60 B × N describes is
+//    negligible vs OutActions 5 KB × per-feed_bytes (already
+//    addressed by A2/B1/B8).
+// 4. **Audit #2 self-flagged uncertainty** ("conflicts with A16?").
+//    Audit #1 A16 CONFIRMED-DONE after analysis; B11 adds no new
+//    argument, just an alternative that breaks Copy.
+//
+// CREDO §11 closure: (a) already closed by A16-class equivalent
+// (POD with justified full-array Eq). NOT skipped per §5 — actively
+// rejected with written analysis.
 impl PartialEq for ParamOids {
     fn eq(&self, other: &Self) -> bool {
         self.n_params == other.n_params && self.oids == other.oids
