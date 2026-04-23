@@ -80,11 +80,17 @@ pub const MAX_PG_NAME_LEN: usize = 63;
 ///
 /// Without sealing, a downstream crate could introduce its own tag:
 ///
-/// ```rust,ignore
+/// ```text
 /// pub enum MyTag {}
 /// impl bsql_pg_proto::ident::FixedStrKind for MyTag { … }
 /// impl bsql_pg_proto::ident::Validated for MyTag {}
 /// ```
+///
+/// DEF-154 (R) P1-3: reclassified from `rust,ignore` to `text` —
+/// this is a NEGATIVE example (what the seal PREVENTS from
+/// compiling). A `compile_fail` trybuild harness would verify
+/// the seal is load-bearing; the docstring example is
+/// illustrative prose.
 ///
 /// and call the generic `try_from_str` with it. The set of tags was
 /// tier-4 in practice ("users happen not to") rather than tier-1

@@ -760,7 +760,14 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 /// code can adapt to its own error strategy (`?` into custom errors,
 /// slogged through a macro in Phase 2's `query!`, etc.).
 ///
-/// ```ignore
+/// DEF-154 (R) P1-3: the doc-test below is now COMPILE-CHECKED
+/// (pre-(R) was `rust,ignore` — pure prose that rotted silently on
+/// any signature change). If a future refactor alters
+/// `DataRowRef::parse`, `RowColumns::next`, `Action::StreamRow`,
+/// `FromPgText` trait shape, or `DecodeError` variants, this example
+/// fails to compile in CI.
+///
+/// ```rust
 /// use bsql_pg_proto::{Action, DataRowRef, DecodeError, FromPgText};
 ///
 /// fn example(action: Action<'_, '_>) -> Result<(), DecodeError> {

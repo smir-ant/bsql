@@ -691,9 +691,10 @@ impl<'brand, 'a> BrandedWriteBuf<'brand, 'a> {
     ///
     /// # Why `&mut self` (not `self`)
     ///
-    /// Phase B4 uses the "build then apply in same scope" pattern:
+    /// Phase B4 uses the "build then apply in same scope" pattern
+    /// (pseudo-code, reflecting crate-internal types):
     ///
-    /// ```ignore
+    /// ```text
     /// wb.with_branded(|mut wb| {
     ///     let range = {
     ///         let mut reserved = wb.reserve();        // &mut wb
@@ -701,9 +702,15 @@ impl<'brand, 'a> BrandedWriteBuf<'brand, 'a> {
     ///         // reserved drops; &mut wb borrow ends
     ///     };
     ///     let bytes = wb.as_bytes_branded();           // & wb — now re-accessible
-    ///     range.apply(bytes)                           // &[u8] — infallible
+    ///     range.apply(bytes)                           // Option<&[u8]> (DEF-154 N)
     /// })
     /// ```
+    ///
+    /// DEF-154 (R) P1-3: reclassified from `rust,ignore` to
+    /// `text` — the example names crate-internal types
+    /// (`BrandedWriteBuf`, `build_query_message`, `WriteRange`)
+    /// that aren't `pub`, so compile-checking requires crate-test
+    /// wiring. The pattern itself is illustrative prose.
     ///
     /// A consuming `self` version would make `wb` unusable after
     /// `reserve()` — the apply step requires `as_bytes_branded()`
@@ -931,15 +938,18 @@ impl WriteBuf {
     ///
     /// # Example (Phase B5 call site — illustrative)
     ///
-    /// ```ignore
+    /// ```text
     /// self.write_buf.with_branded(|wb| {
     ///     let mut reserved = wb.reserve();
     ///     let range = build_query_message(&mut reserved, &cmd);
     ///     // range: WriteRange<'brand>; wb.as_bytes_branded(): BrandedBytes<'brand, '_>
-    ///     let bytes = range.apply(wb.as_bytes_branded());
+    ///     let bytes = range.apply(wb.as_bytes_branded())?; // Option<&[u8]> (DEF-154 N)
     ///     Action::SendBytes(bytes)  // &[u8] is unbranded — escapes the closure
     /// })
     /// ```
+    ///
+    /// DEF-154 (R) P1-3: reclassified from `rust,ignore` to
+    /// `text` — the example names crate-internal types not `pub`.
     ///
     /// # Soundness argument
     ///

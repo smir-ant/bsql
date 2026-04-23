@@ -380,12 +380,17 @@ pub const AUTH_SASL_FINAL: u32 = 12;
 ///
 /// Dispatch handlers previously matched on raw `u32`:
 ///
-/// ```ignore
+/// ```text
 /// match code {
 ///     AUTH_SASL => ...,
 ///     _ => errored(..., UnsupportedAuthMethod { sub_code: code }),
 /// }
 /// ```
+///
+/// DEF-154 (R) P1-3: reclassified from `rust,ignore` to `text` —
+/// the snippet is historical pre-`AuthSubCode` pseudo-code, not
+/// a runnable example. `rust,ignore` left it compiler-unchecked
+/// and drift-prone.
 ///
 /// The `_` arm swallowed unknown codes alongside unhandled-but-known
 /// codes. Adding a new legitimate sub-code (e.g., future
