@@ -331,18 +331,20 @@ const _: () = assert!(
      state ~712 + session_params ~420 + schema_arena ~520 + padding.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() >= 4992
-        && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 5120,
+    core::mem::size_of::<action::OutActions<'static, 'static>>() >= 2800
+        && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 2920,
     "OutActions<'_, '_> size drift. \
      \
-     Stack reservation unchanged post-DEF-184 A2/B1/B8: \
-     ManuallyDrop<heapless::Vec<Action, 16>> occupies the same \
-     16 × 312 B = 4992 B of slot storage + usize length = ~5008 B. \
-     The WIN is in the per-call INIT COST (5008 B zero-fill → 0 B \
-     via heapless::Vec::new()), not in the stack frame size. \
+     Post-DEF-184 A15: MAX_ACTIONS_PER_CALL 16 → 9 (tight bound \
+     derived from MAX_STAGED + MAX_FANOUT2_ENTRIES). \
+     Stack reservation = 9 × 312 B = 2808 B + usize length = \
+     ~2816 B. \
      \
-     Range [4992, 5120] catches regressions in slot count / Action \
-     size.",
+     Post-DEF-184 A2/B1/B8: ManuallyDrop<heapless::Vec<Action, 9>> \
+     — zero init writes per call (heapless::Vec::new). \
+     \
+     Range [2800, 2920] catches regressions in slot count / Action \
+     size / alignment padding.",
 );
 
 // ---------------------------------------------------------------------

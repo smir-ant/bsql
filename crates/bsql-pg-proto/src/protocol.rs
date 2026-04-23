@@ -241,19 +241,53 @@ pub const MAX_STAGED_PER_CALL: usize = 8;
 /// catches a missing bump).
 pub const MAX_FANOUT_PER_STAGED: usize = 2;
 
+/// DEF-184 (A15): maximum number of fanout-2 staged entries per
+/// dispatch call. Post-DEF-154 (Y) `StreamRowRange` deletion, the
+/// only remaining fanout-2 staged variant is `DeliverReply` with
+/// stale-ref (architecturally dead — `CrateBugLocus::StaleSchemaRef`).
+/// `DeliverReply` happens at most 1× per dispatch call (single
+/// reply per query cycle, pre-1c-5-pipelining).
+///
+/// Pre-DEF-184 `MAX_ACTIONS_PER_CALL = 16 = STAGED × FANOUT`
+/// overestimated: assumed EVERY staged entry could fan out to 2.
+/// That was correct when `StreamRowRange` existed (multiple staged
+/// rows could each stale-ref fanout), but post-(Y) the ONLY
+/// 2-fanout is the single DeliverReply. Tight formula:
+/// `MAX_STAGED + MAX_FANOUT2_ENTRIES × (FANOUT - 1)` =
+/// `8 + 1 × 1 = 9`.
+const MAX_FANOUT2_ENTRIES_PER_CALL: usize = 1;
+
 /// Output-side action capacity — bounds `OutActions` storage.
 ///
-/// `= MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED`. See DEF-154 (L)
-/// block above for the split rationale.
-pub const MAX_ACTIONS_PER_CALL: usize = MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED;
+/// DEF-184 (A15): tightened from
+/// `MAX_STAGED * MAX_FANOUT = 8 × 2 = 16` down to
+/// `MAX_STAGED + MAX_FANOUT2_ENTRIES × (MAX_FANOUT − 1) =
+/// 8 + 1 × 1 = 9`. Reflects the post-(Y) reality that only one
+/// staged entry (DeliverReply) can fanout to 2 actions. 7 normal
+/// + 1 fanout-2 = 9 outputs maximum.
+///
+/// **Bench impact:** `OutActions` stack reservation drops from
+/// `16 × 312 B = 4992 B` to `9 × 312 B = 2808 B` — 2184 bytes
+/// saved per OutActions instance. Combined with DEF-184 A2/B1
+/// (ManuallyDrop<heapless::Vec>), init cost stays 0 B regardless
+/// of capacity; what shrinks now is the stack FRAME.
+pub const MAX_ACTIONS_PER_CALL: usize =
+    MAX_STAGED_PER_CALL + MAX_FANOUT2_ENTRIES_PER_CALL * (MAX_FANOUT_PER_STAGED - 1);
 
-// DEF-154 (L) const-assert: the P0-1 silent-drop class is closed
-// iff OUT cap ≥ STAGED cap × worst-case fanout.
+// DEF-184 (A15): tight upper bound. Any dispatch/materialise
+// path that produces more than 9 actions per call would overflow
+// OutActions. Const-assert below verifies:
+//   `9 ≥ 8 + 1 × (2 - 1) = 9` — exactly.
+// If a future refactor adds a SECOND fanout-2 staged variant (e.g.
+// a batched DeliverReply for pipelining in 1c-5), bump
+// MAX_FANOUT2_ENTRIES_PER_CALL accordingly.
 const _: () = assert!(
-    MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED,
+    MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL
+        + MAX_FANOUT2_ENTRIES_PER_CALL * (MAX_FANOUT_PER_STAGED - 1),
     "MAX_ACTIONS_PER_CALL (output capacity) must be >= \
-     MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED to ensure materialise \
-     cannot overflow OutActions. See DEF-154 (L).",
+     MAX_STAGED_PER_CALL + MAX_FANOUT2_ENTRIES × (MAX_FANOUT − 1). \
+     Post-DEF-184 A15: 9 = 8 + 1 × 1. If a second fanout-2 staged \
+     variant lands, bump MAX_FANOUT2_ENTRIES_PER_CALL.",
 );
 
 /// Worst-case number of actions a single dispatch iteration can
