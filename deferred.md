@@ -4448,3 +4448,121 @@ they don't get lost in commit history.
     server) depend on `std` when needed. `#![forbid(unsafe_code)]`
     — universal.
 
+
+### DEF-187 — DEF-184 Batch 7-9 + stragglers session boundary — OPEN
+
+**Why separated from DEF-184's main progress line:** items остались
+нетронутыми в session 2026-04-23 после ship'ленных Batches 1-6.
+Каждый требует фрешей focus-сессии для high-risk / high-scope
+работы. Не отбрасываются (CREDO §5) — откладываются с явным
+rationale для легкой reentry в следующей сессии.
+
+#### Batch 7 deferred — dispatch perf
+
+- **B21/C6** (dispatch by-ref vs by-val, 50 LoC, M risk).
+  - **Scope trace:** 33 `DispatchOutcome::AdvancedSilent/WithAction
+    { new_state: X }` sites + 2 helpers (`errored`, `internal_bug`)
+    + caller in `feed_bytes_impl`. Total ~40 mechanical edits.
+  - **Expected win:** eliminate `outcome.new_state: ProtoState`
+    round-trip (712 B per Advanced variant). On 1M dispatch
+    iterations: 712 MB stack traffic saved theoretically. Real
+    gain depends on current LLVM pass-by-ref optimisation (likely
+    partial) — bench-worth after ship.
+  - **Refactor plan documented inline:** DispatchOutcome loses
+    `new_state` field from Advanced variants; dispatch() takes
+    `state: &mut ProtoState`, internally `mem::take` + `*state =
+    X`; caller simplified (no state-update match arm).
+  - **Why deferred:** 33 mechanical edits requiring per-site
+    verification, context-heavy late in session. Fresh session
+    → safer implementation.
+
+- **A7** (tag byte LUT `[Option<InboundTagClass>; 256]`, 150 LoC,
+  L risk).
+  - **Expected win:** 10-15 ns/frame via single load + jump
+    instead of ~12-arm compare chain inside dispatch().
+  - **Scope:** new wire.rs const LUT, dispatch entry
+    wrapper-match, coverage const-assert.
+  - **Why deferred:** needs B21 shipped first for cleanest
+    integration into dispatch() entry path.
+
+- **A3** (two-stage fn-ptr LUT dispatch, 300-400 LoC, H risk).
+  - **Expected win:** 5-15% frame dispatch via single indexed
+    jump.
+  - **Why deferred:** requires fn-ptr-over-generic-lifetime
+    erasure; needs bench baseline (DEF-143) to justify vs simpler
+    A7. Research-spike class.
+
+#### Batch 8 deferred — state refactor
+
+- **A10/B22** (SCRAM hot/cold split, 400-600 LoC, H risk).
+  - **Expected win:** `mem::take(state)` 712 B → 48 B = **664 MB
+    memcpy saved on 1M-row SELECT**. Foundation for A3 + A4.
+  - **Why deferred:** state-machine restructure touches every
+    variant transition + SCRAM handshake path. Requires fresh
+    focus; extensive test migration.
+
+- **A4/B16** (cache-line `PgProtocol` layout, 200-300 LoC, M
+  risk).
+  - **Expected win:** 1 L1 fetch for hot dispatch state vs
+    2-4 currently. 3-5 ns/iter.
+  - **Depends on:** A10 shipped (SCRAM extraction → hot state
+    ≤ 64 B fits cache line).
+
+#### Batch 9 deferred — crown
+
+- **A1+A13** (`ProtocolError` → `ErrorArena`, 500-700 LoC, H risk).
+  - **Expected win:** `ProtocolError` 312 B → ~32 B. Cascade:
+    `Action` 312 → 48 B, `OutActions` 5008 → 784 B (**6.4×
+    slow-path reduction**), `StreamItem` 320 → 80 B (4× per-row
+    pull).
+  - **Why deferred:** biggest single structural win in crate;
+    requires arena-ownership discipline + API-break cascade
+    through Reply → Action → StreamItem. Fresh session + careful
+    migration plan.
+
+- **B14** (HList `ParamsWriter`, 80 LoC new + 400 LoC removed).
+  - **Expected win:** 400+ LoC generated binary code removed
+    via single recursive impl instead of 17 tuple-arity
+    monomorphisations.
+  - **Why deferred:** trait-level refactor of param binding API.
+    Requires careful ergonomic audit.
+
+#### Batch 10 spikes — research-gated
+
+- **A11/C4** (SIMD column batch, 800+ LoC) — blocked on DEF-143
+  criterion bench baseline + `std::simd` stability (see DEF-185).
+- **C1** typestate PgProtocol — prototype first, decision-gate.
+- **C2** generative brands restore — cost/bench evaluation first.
+- **C3** OutActions iterator — overlaps with A2/B1/B8 already
+  shipped; re-evaluate whether further win possible.
+- **C5** bitpacked StateErrorKind (20 LoC, L risk) — small,
+  mergeable with any future session.
+
+#### Stragglers deferred
+
+- **B5** (public API narrowing, 30 LoC, L risk).
+  - **Audit finding:** bsql-pg-proto is currently the only crate;
+    all `pub` is speculative-API awaiting `bsql-driver-postgres`
+    wrapper integration (1c-3d / Phase 1e).
+  - **Why deferred:** narrowing without knowing external consumer
+    shape is premature. Re-audit after driver lands to identify
+    truly-internal items.
+
+- **A8** (`usize` → `u16/u8` narrowing continuation, 100 LoC
+  dispersed, L risk).
+  - **Audit finding:** hot-path locals already narrowed in
+    earlier DEF-154 (G)/(V) work: `frames_consumed: u16`,
+    `dispatches_this_call: u16`, `ColumnsIter` state (u8 idx +
+    u8 columns_left), cursor positions (u16).
+  - **Remaining `usize` sites** (1 hot + several cold):
+    * `parse_error_response.pos: usize` (cold, called per
+      server error) — narrow-to-u16 possible but needs
+      `.into()` back to usize at `payload.get(pos)`. Marginal.
+    * `DecodeError::TruncatedColumnData.declared_len / .remaining`
+      — cold error-diagnostic fields.
+    * `n_columns_usize / n_params_usize` in decode.rs — used
+      for `array.iter_mut().take(N)` which needs usize.
+  - **Why deferred:** diminishing returns. Remaining sites are
+    either architecturally-usize (slice-index target) or cold-
+    path (no bench impact). Revisit if fuzz/bench reveals a
+    specific hot site.
