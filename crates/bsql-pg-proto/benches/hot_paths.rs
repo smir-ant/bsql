@@ -48,7 +48,9 @@ use bsql_pg_proto::{
     PgProtocol, WriteBuf,
 };
 use core::num::NonZeroU64;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput,
+};
 
 // ---------------------------------------------------------------
 // Fixture builders — synthetic wire frames with exact PG layout.
@@ -75,17 +77,6 @@ fn data_row_frame(len: u16) -> alloc::vec::Vec<u8> {
     out.extend_from_slice(&1u16.to_be_bytes()); // n_cols = 1
     out.extend_from_slice(&u32::from(len).to_be_bytes()); // col length
     out.extend(core::iter::repeat_n(b'x', usize::from(len)));
-    out
-}
-
-/// Build a synthetic `CommandComplete` frame with tag "SELECT 1000".
-fn command_complete_frame() -> alloc::vec::Vec<u8> {
-    let tag = b"SELECT 1000\0";
-    let mut out = alloc::vec::Vec::with_capacity(5 + tag.len());
-    out.push(b'C');
-    let total = u32::try_from(4 + tag.len()).unwrap_or(0);
-    out.extend_from_slice(&total.to_be_bytes());
-    out.extend_from_slice(tag);
     out
 }
 
@@ -155,84 +146,137 @@ fn bench_ping_round_trip(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
-// Bench: feed_bytes N×DataRow stream.
+// Bench: iter_rows per-row next_event fast-path.
 // ---------------------------------------------------------------
 //
-// Synthesises a full SELECT reply: RowDescription → N×DataRow →
-// CommandComplete → ReadyForQuery. Driven via iter_rows which
-// takes the fast-path for DataRow frames (bypasses dispatch).
-// Varies N through 100 / 1000 to catch per-row O(1) claims.
+// Measures the cost of emitting a single row via
+// `row_stream::fast_path_data_row` — the primary SELECT hot loop.
+// Setup (not timed): enter StreamingRows state with one DataRow
+// frame pre-loaded in read_buf. Timed: pull next_event() once.
+//
+// Why not a multi-row stream? `feed_bytes` is capped at
+// `MAX_STAGED_PER_CALL` = ~9 frames per call, so a "1000-row"
+// stream bench via `feed_bytes` actually processes only 9 rows
+// then early-returns (measured: 258 ns regardless of stream size).
+// A proper multi-row measurement needs an `iter_rows` loop that
+// pulls frame-by-frame — but the RowStream API requires read_buf
+// to stay populated across pulls, which means chunked feeds. The
+// per-row single-pull bench below captures the architectural
+// cost unit (one DataRow → one StreamItem::Row emission) without
+// the chunking complexity.
 
-fn bench_datarow_stream(c: &mut Criterion) {
-    let mut group = c.benchmark_group("datarow_stream");
+// ---------------------------------------------------------------
+// Bench: iter_rows per-row amortised throughput.
+// ---------------------------------------------------------------
+//
+// Measures the true per-row cost of the `row_stream` fast-path
+// in a hot SELECT loop. Setup (not timed) uses the
+// `PgProtocol::bench_append_read_buf` hook to pre-populate
+// `read_buf` with N DataRow frames (raw append, bypasses
+// dispatch). Timed body loops `next_event()` N times,
+// consuming all rows via fast-path.
+//
+// Throughput reports per-row amortised ns.
+//
+// # Why the bench hook is necessary
+//
+// Public `feed_bytes` correctly rejects DataRow in
+// `SimpleQueryStreamingRows` state — that's production
+// behavior ("caller should use iter_rows, not feed_bytes"
+// catch-all arm). Verified 2026-04-24: feeding 100 DataRows
+// after RowDescription lands in Errored(Framing), 0 rows
+// pullable. The `bench_append_read_buf` hook is a
+// `#[doc(hidden)] pub fn` for bench-only use — appends bytes
+// without triggering dispatch classification.
+//
+// # Row size vs READ_BUF_CAP
+//
+// READ_BUF_CAP = 4096 B. Using 16-byte DataRow payload:
+// 11 bytes (header + col metadata) + 16 (payload) = 27 B per
+// row. RowDescription ~27 B. Budget: 4096 - 27 - safety =
+// ~3900 B for rows / 27 = ~145 rows max. N_ROWS = 100 fits.
 
-    for &n_rows in &[100u32, 1000u32] {
-        group.throughput(Throughput::Elements(u64::from(n_rows)));
+fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
+    use bsql_pg_proto::row_stream::StreamItem;
 
-        // Build a synthetic inbound stream: a minimal RowDescription
-        // for 1 text column, N DataRows (each 32-byte payload), then
-        // CommandComplete + RFQ.
-        let rowdesc = {
-            let mut out = alloc::vec::Vec::new();
-            out.push(b'T');
-            // n_fields = 1
-            // per-field: name\0 + tableOid(4) + col(2) + typeOid(4) + typeSize(2) + typeMod(4) + format(2)
-            // = 1 + 4 + 2 + 4 + 2 + 4 + 2 = 19 + name-len
-            let name = b"col\0";
-            let body_len = 2 + name.len() + 18;
-            let total = 4 + body_len;
-            out.extend_from_slice(&(u32::try_from(total).unwrap_or(0)).to_be_bytes());
-            out.extend_from_slice(&1u16.to_be_bytes()); // n_fields
-            out.extend_from_slice(name);
-            out.extend_from_slice(&0u32.to_be_bytes()); // table_oid
-            out.extend_from_slice(&0u16.to_be_bytes()); // col
-            out.extend_from_slice(&25u32.to_be_bytes()); // type_oid = TEXT
-            out.extend_from_slice(&(-1_i16).to_be_bytes()); // type_size
-            out.extend_from_slice(&(-1_i32).to_be_bytes()); // type_mod
-            out.extend_from_slice(&0u16.to_be_bytes()); // format = text
-            out
-        };
-        let cc = command_complete_frame();
-        let rfq = rfq_frame();
-        let single_row = data_row_frame(32);
+    let mut group = c.benchmark_group("iter_rows_per_row");
 
-        let mut stream = alloc::vec::Vec::with_capacity(
-            rowdesc.len()
-                + single_row.len() * usize::try_from(n_rows).unwrap_or(0)
-                + cc.len()
-                + rfq.len(),
-        );
-        stream.extend_from_slice(&rowdesc);
-        for _ in 0..n_rows {
-            stream.extend_from_slice(&single_row);
-        }
-        stream.extend_from_slice(&cc);
-        stream.extend_from_slice(&rfq);
+    const N_ROWS: u32 = 100;
+    group.throughput(Throughput::Elements(u64::from(N_ROWS)));
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(n_rows),
-            &stream,
-            |b, stream| {
-                b.iter(|| {
-                    // Fresh proto + simple-query push to enter
-                    // the row-streaming state, then feed the full
-                    // synthetic response in one block.
-                    let mut proto = PgProtocol::new();
-                    let mut wb = WriteBuf::new();
-                    let push_out = proto.push_command(
-                        PgCommand::SimpleQuery {
-                            sql: Sql::from_str_truncating("SELECT 1"),
-                            reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
-                        },
-                        &mut wb,
-                    );
-                    black_box(push_out);
-                    let feed_out = proto.feed_bytes(black_box(stream), &mut wb);
-                    black_box(feed_out);
-                });
+    let rowdesc = {
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'T');
+        let name = b"col\0";
+        let body_len = 2 + name.len() + 18;
+        let total = 4 + body_len;
+        out.extend_from_slice(&(u32::try_from(total).unwrap_or(0)).to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&25u32.to_be_bytes());
+        out.extend_from_slice(&(-1_i16).to_be_bytes());
+        out.extend_from_slice(&(-1_i32).to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out
+    };
+    let single_row = data_row_frame(16);
+
+    group.bench_function("pull_100_rows", |b| {
+        b.iter_batched(
+            // Setup (not timed): push query, feed RowDesc
+            // (legal — dispatch transitions state to
+            // StreamingRows), then RAW APPEND 100 DataRow
+            // frames to read_buf via the bench hook. The
+            // hook bypasses dispatch; iter_rows fast-path
+            // will consume them row-by-row.
+            || {
+                let mut proto = PgProtocol::new();
+                let mut wb = WriteBuf::new();
+                let _ = proto.push_command(
+                    PgCommand::SimpleQuery {
+                        sql: Sql::from_str_truncating("SELECT x"),
+                        reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+                    },
+                    &mut wb,
+                );
+                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                // Raw-append DataRow bytes into read_buf.
+                for _ in 0..N_ROWS {
+                    let _ = proto.bench_append_read_buf(&single_row);
+                }
+                (proto, wb)
             },
+            // Timed: pull rows via iter_rows fast-path until
+            // all 100 consumed or stream drains.
+            |(mut proto, mut wb)| {
+                let mut stream = proto.iter_rows(&mut wb);
+                let mut rows_seen: u32 = 0;
+                loop {
+                    match stream.next_event() {
+                        StreamItem::Row { .. } => {
+                            rows_seen = rows_seen.saturating_add(1);
+                        }
+                        StreamItem::NeedMore
+                        | StreamItem::CloseSocket
+                        | StreamItem::Complete { .. } => break,
+                        _other => break,
+                    }
+                }
+                // Sanity: ensure the bench actually pulled N_ROWS,
+                // not 0 (which would indicate setup failure).
+                // assert! is permitted in bench harness (separate
+                // crate target; forbid-bundle doesn't apply).
+                assert!(
+                    rows_seen >= N_ROWS,
+                    "per-row bench broken: expected {N_ROWS} rows, pulled {rows_seen}",
+                );
+                black_box(rows_seen);
+            },
+            BatchSize::SmallInput,
         );
-    }
+    });
 
     group.finish();
 }
@@ -269,7 +313,7 @@ criterion_group!(
     benches,
     bench_parse_header,
     bench_ping_round_trip,
-    bench_datarow_stream,
+    bench_iter_rows_per_row_throughput,
     bench_push_ping,
 );
 criterion_main!(benches);

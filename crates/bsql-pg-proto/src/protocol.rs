@@ -539,7 +539,35 @@ impl PgProtocol {
     }
 }
 
+
 impl PgProtocol {
+    /// DEF-143 bench hook — raw append to `read_buf` without
+    /// invoking the dispatch state machine. Returns
+    /// `Err(ReadBufFull)` on capacity overflow.
+    ///
+    /// # NOT a production API
+    ///
+    /// `#[doc(hidden)]` to hide from rustdoc; `pub` because the
+    /// benchmark harness compiles as an external crate target
+    /// and cannot see `pub(crate)` items.
+    ///
+    /// Bypasses the dispatch state machine — the caller MUST
+    /// ensure the current state is compatible with the frame
+    /// bytes being appended (e.g. bytes must be DataRow frames
+    /// if state is `SimpleQueryStreamingRows`). Violating this
+    /// forges a state inconsistency that will trip classified
+    /// diagnostics (UnexpectedFrame / InternalCrateBug) on the
+    /// next `iter_rows` / `feed_bytes` call.
+    ///
+    /// Exists solely to enable per-row amortised throughput
+    /// measurement in `benches/hot_paths.rs` — see
+    /// `bench_iter_rows_per_row_throughput` for the single
+    /// legitimate caller.
+    #[doc(hidden)]
+    pub fn bench_append_read_buf(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
+        self.read_buf.append(bytes)
+    }
+
     /// Construct a new protocol in [`ProtoState::Idle`].
     ///
     /// **Note:** Phase 1a starts in `Idle` directly. The startup +

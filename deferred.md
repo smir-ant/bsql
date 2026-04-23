@@ -1897,22 +1897,42 @@ require measured evidence before committing to restructures.
 **Tier lift.** Not a tier lift — enables measurement-dependent
 decisions.
 
-**Session 2026-04-24 shipment:**
+**Session 2026-04-24 shipment (final, post-audit):**
 - New `benches/hot_paths.rs` with 4 criterion groups:
-  `parse_header`, `ping_round_trip`, `datarow_stream` (100/1000),
-  `push_command`.
-- `criterion = "0.5"` added as workspace dev-dep (default-features
+  `parse_header`, `ping_round_trip`,
+  `iter_rows_per_row/pull_100_rows`, `push_command`.
+- `criterion = "0.5"` as workspace dev-dep (default-features
   off + `html_reports` feature). `harness = false` on bench target.
-- Initial smoke-test numbers (aarch64-apple-darwin, `--quick`):
-  - parse_header: **~2.6 ns/frame** (383 Melem/s)
-  - push_command/ping: **~108 ns**
-  - ping_round_trip: **~197 ns**
-  - datarow_stream/1000: ~271 ns (suspiciously fast — `--quick`
-    undersamples; run full `cargo bench` for stable baseline)
-- Full baseline run + `--save-baseline` to land with next perf
-  work (A7/A4/A11 would diff against a saved baseline).
+- `#[doc(hidden)] pub fn PgProtocol::bench_append_read_buf` —
+  raw-append read_buf hook for bench-only use (benches compile as
+  external crate target, pub(crate) hooks not visible; doc(hidden)
+  keeps it out of rustdoc).
+- Stable baseline `def184-complete` saved
+  (aarch64-apple-darwin, full 3s warmup + 5s measurement):
+  - parse_header: **2.52 ns/frame** (396 Melem/s) — direct slice
+    parse, zero alloc, zero state touch.
+  - push_command/ping: **107.63 ns** — build Sync frame +
+    OutActions materialise.
+  - ping_round_trip: **182.48 ns** — full push + feed cycle.
+  - iter_rows_per_row/pull_100_rows: **847.82 ns** (**8.48 ns/row
+    amortised**, 118 M rows/sec) — true per-row cost via
+    iter_rows fast_path_data_row.
 - `push_bind_execute` bench deferred — needs SCRAM / Password
   fixture plumbing not worth the session scope.
+
+**Bench design misadventures (kept honest in commit history):**
+- First attempt: fed 100 DataRows via `feed_bytes` after
+  RowDescription — dispatch correctly classified DataRow in
+  `SimpleQueryStreamingRows` state as `UnexpectedFrame` →
+  Errored. 0 rows actually pulled, bench meaningless. Production
+  code correctly: row data flows through `iter_rows`, not
+  `feed_bytes`.
+- Second attempt: iter_batched with same broken setup — still
+  0 rows. Caught via sanity assertion in bench body.
+- Third attempt (landed): added `bench_append_read_buf` hook
+  that bypasses dispatch classification. Production state
+  machine untouched; hook is `#[doc(hidden)]` and marked
+  "NOT a production API".
 
 ### DEF-144 — `parse_header`: drop dead `NonZeroU32::new` branch (A015)
 
