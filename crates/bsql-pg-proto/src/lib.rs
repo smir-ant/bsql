@@ -96,6 +96,7 @@ pub mod ident;
 pub mod params;
 pub mod password;
 pub mod protocol;
+pub mod row_stream;
 pub mod reply_id;
 pub mod scram;
 mod schema_arena;
@@ -128,6 +129,7 @@ pub use reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,
     ReplyId, ReplyKind, StartupKind,
 };
+pub use row_stream::{RowStream, StreamItem};
 pub use sensitive::Sensitive;
 pub use session_params::{Encoding, OtherEncoding, SessionParams};
 pub use state::ProtoState;

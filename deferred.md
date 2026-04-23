@@ -3379,138 +3379,134 @@ via regex greed); pointwise Edit is the correct approach.
 `cargo clippy -D warnings` clean. No public API change (all brand
 scaffolding is `pub(crate)`).
 
-### DEF-154 (X) — pull-based RowStream<'r> API — OPEN (foundation shipped)
+### DEF-154 (X) — pull-based RowStream API — SHIPPED (2026-04-22)
 
-**Foundation dependency: DEF-154 (W) SHIPPED** — write-brand
-scaffolding deleted (commit `0236046`), −194 LoC. RowStream
-builds atop the simplified post-W type surface.
+**Foundation: DEF-154 (W) SHIPPED** — write-brand scaffolding
+deleted (commit `0236046`), −194 LoC. RowStream shipped atop the
+simplified post-W type surface.
 
-**Three failed implementation attempts in the same session after
-shipping (W).** Each hit the same structural tension: reusing
-existing `dispatch()` fn from RowStream requires either
-(a) lifetime-juggling `DispatchOutcome<'r>` through a
-lifetime-free projection to survive a closure scope boundary,
-(b) extracting `dispatch_one_frame` as a new method on PgProtocol
-that bypasses `OutActions` on the hot path (while keeping
-feed_bytes intact for slow paths), or (c) building a fully
-parallel state-machine inside RowStream.
+**What shipped (final design).**
 
-Path (b) is architect's recommended design (per DEF-154 X plan
-above) but is ≥500 LoC of careful surgery on `feed_bytes`'s hot
-loop. Implementation requires a fresh focused session — attempts
-late in a long refactor day introduced lifetime-scope errors
-faster than they could be untangled.
-
-**Scope estimate (unchanged):** ~550 LoC.
-- ~300 LoC: `src/row_stream.rs` new module (struct + PendingEvent +
-  impl + fast-path DataRow + slow-path feed_bytes delegation).
-- ~100 LoC: PgProtocol helper methods (`read_buf_populated`,
-  `read_buf_cursor_u16`, `read_buf_advance`,
-  `streaming_reply_id_and_schema`, `schema_arena_reader`) OR
-  field-level `pub(crate)` exposure.
-- ~100 LoC: integration test exercising 1k-row `iter_rows` path
-  end-to-end + asserting OutActions is NOT touched on DataRow
-  frames (via a criterion benchmark or allocation-count probe).
-
-**Specific blockers encountered:**
-
-1. `Action::StreamRow` carries `desc: &RowDesc` (arena-resolved)
-   but NOT `SchemaRef` — reverse-mapping from a slow-path batch's
-   Action back into a lifetime-free PendingEvent requires either
-   the SchemaRef directly (not present), or re-resolving via
-   pointer identity against arena slots (brittle).
-2. `DispatchOutcome<'r>` returned by dispatch carries
-   `StagedAction::SendBytesRange(WriteRange)` whose slice resolves
-   only inside the same scope as `write_buf.with_branded(|wb| {...})`
-   — escaping out of the closure via lifetime-free indices
-   requires capturing `(start, end)` from the WriteRange's
-   `NonEmptyRange` inner (needs accessor exposure).
-3. Fast-path extracting `(reply.id, schema_ref)` from a streaming
-   `ProtoState` variant without destructuring requires either a
-   new `pub(crate) fn streaming_reply_id_and_schema` on
-   PgProtocol OR pattern-match helpers per variant — minor but
-    4-5 sites to touch.
-
-**Order of operations for a future fresh attempt:**
-
-1. First, add the PgProtocol helper methods (`read_buf_*`,
-   `streaming_reply_id_and_schema`, etc). Ship as a prep commit.
-2. Then, add `pub(crate) fn dispatch_one_frame` on PgProtocol
-   that replicates the feed_bytes loop's single-iteration body
-   but returns `Option<StagedAction<'r>>` or similar — NOT
-   OutActions. Ship as a prep commit.
-3. Finally, add `RowStream` + `StreamItem` + `iter_rows` atop
-   the helpers. Integration tests. Criterion benchmark pinning
-   the 300× stack-init reduction.
-
-**Verification (target):** a dedicated criterion bench showing
-100k-row SELECT dispatch time drops from baseline feed_bytes to
-≥10× speedup on the row hot path; 213 tests still pass with the
-dual-API surface (feed_bytes retained for control frames).
-
-**Trigger.** Architect second-pass audit identified `feed_bytes → OutActions<'w, 'r>`
-shape as the crate's dominant hot-path overhead: 5 008 B zero-fill
-per call × 125 000+ calls on SELECT 1M rows = 625 MB of stack
-traffic. Pull-based `RowStream<'r, 's>` with `StreamItem::Row(DataRowRef<'r>)`
-reduces to one 64-byte `StreamState` + 16 B `DataRowRef<'r>` per
-row = 2 MB total. **300× reduction on the dominant hot path.**
-User-visible 10-100× end-to-end throughput on large result sets.
-
-**Design (architect audit).**
-
+Public surface:
 ```rust
-pub struct RowStream<'r, 's> {
-    proto: &'s mut PgProtocol,
-    _r: PhantomData<&'r ()>,
-    state: StreamState,  // Parsing | AwaitingMore | Complete(Reply<'r>) | Errored(cause)
-}
-
-pub enum StreamItem<'r> {
-    Row(DataRowRef<'r>),
-    Complete(Reply<'r>),
+pub struct RowStream<'p, 'w> { /* &mut PgProtocol + &mut WriteBuf */ }
+pub enum StreamItem<'a> {
+    Row { id: NonZeroU64, row_bytes: &'a [u8], desc: &'a RowDesc },
+    Complete { id: NonZeroU64, value: Reply<'a> },
+    SendBytes(&'a [u8]),
+    FailReply { id: NonZeroU64, cause: ProtocolError },
+    CloseSocket,
     NeedMore,
-    Err(ProtocolError),
 }
-
-impl<'r, 's> RowStream<'r, 's> {
-    pub fn next(&mut self) -> StreamItem<'r> { ... }
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), FeedError> { ... }
+impl RowStream<'_, '_> {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull>;
+    pub fn next_event(&mut self) -> StreamItem<'_>;
 }
-
 impl PgProtocol {
-    pub fn iter_rows<'s>(&'s mut self) -> RowStream<'_, 's> { ... }
+    pub fn iter_rows<'p, 'w>(&'p mut self, wb: &'w mut WriteBuf)
+        -> RowStream<'p, 'w>;
 }
 ```
 
-**Transition.** ADD `iter_rows()` as the pull path; keep
-`feed_bytes` for non-streaming (push, bind-execute setup) —
-those still emit 1-3 actions and benefit from the push shape.
-Delete `Action::StreamRow` once callers migrate. Row path stops
-being push; control-frames (RFQ, CommandComplete) stay push.
+Dual-API: `iter_rows` is ADDITIVE; `feed_bytes` retained for
+control-frame paths (startup/bind/describe). No public API break.
 
-**Budget.** ~550 LoC — the DataRow-dispatch arm moves from
-`dispatch.rs` to `RowStream::next`; the 4 streaming-state
-variants in `ProtoState` still exist as the state machine;
-`OutActions.init` disappears on the row path.
+**Architecture: fast/slow path split with frame-bounded dispatch.**
 
-**Edge cases.** Split frames across `feed()` calls → buffer
-partial in `read_buf` (existing logic), return `NeedMore`.
-Error mid-stream → `StreamItem::Err(cause)` + subsequent calls
-return `NeedMore`; caller tears down. Pipelining (1c-5) →
-per-correlator stream objects (post-P0-2c, separate phase).
+1. **Fast path (the hot one).** `next_event` peeks the header at
+   the read-buf cursor; if it's a DataRow AND the state is
+   row-streaming, we extract the row body via direct slice math
+   (cursor + HEADER_LEN..cursor + total_len) and emit
+   `StreamItem::Row` with `row_bytes: &[u8]` aliasing the read
+   buffer. **Zero `OutActions` allocation per row.**
+2. **Slow path.** For T / C / Z / E frames (or DataRow outside
+   a streaming state), we call the new
+   `pub(crate) feed_bytes_bounded(bytes, wb, max_dispatches: u16)`
+   with `max_dispatches = 1` — process exactly ONE actionable
+   frame and return. Silent pre-dispatch skips
+   (ParameterStatus / NoticeResponse) don't count against the
+   budget.
+3. **Terminal flush.** When slow-path emits a terminal action
+   (DeliverReply / FailReply / CloseSocket), `flush_pending =
+   true`. The NEXT `next_event` runs an unbounded `feed_bytes`
+   to consume the trailing `Z` silent frame, then drains — so
+   subsequent `push_command` finds `state = Idle` without
+   requiring the caller to invoke `feed_bytes` manually.
+4. **Pending-advance.** `feed_bytes_bounded` records a deferred
+   cursor advance (DEF-154 (H) mechanism); `next_event` applies
+   it at entry before any header peek, so fast and slow paths
+   see the physical cursor in sync with the logical one.
 
-**Deferral reason.** Scheduled AFTER DEF-154 (W) closes the
-write-brand scaffolding — RowStream builds on top of the
-simplified post-W type surface. Starting (X) before (W) would
-force the RowStream design to interface with `BrandedWriteReserved<'brand, 'a>`
-for the write-side emission path (needed because some dispatch
-arms emit SendBytes alongside a row — e.g. reply delivery),
-embedding the decorative tier-1 into a new public type. Better
-order: (W) first (kills the fake tier), then (X) atop the
-honest tier-2 surface.
+**Files touched.**
 
-**Verification.** Criterion benchmark harness (currently
-absent — see Rec P3-39 in architect audit) must show the 300×
-reduction; 213 tests must still pass through the dual-API
-surface; one new integration test exercising 1k-row `iter_rows`
-path.
+- `src/row_stream.rs` (new, 354 LoC) — RowStream + StreamItem +
+  action_to_stream_item mapping + full module docs (perf
+  rationale + API + MVP-scope note).
+- `src/protocol.rs` — `feed_bytes` becomes a 3-line wrapper
+  around new `feed_bytes_bounded(bytes, wb, u16::MAX)`; inner
+  loop gains `dispatches_this_call: u16` counter + entry-time
+  budget gate. RowStream-support helpers added:
+  `read_buf_append`, `read_buf_populated`, `read_buf_cursor_u16`,
+  `read_buf_advance`, `schema_arena_reader`,
+  `streaming_reply_id_and_schema`, `apply_pending_advance`,
+  `state_is_errored`, `install_errored_malformed_data_row`,
+  `iter_rows`.
+- `src/lib.rs` — `pub mod row_stream;` + `pub use
+  row_stream::{RowStream, StreamItem};`.
+- `tests/row_stream_spec.rs` (new, 412 LoC) — six behavioural
+  tests covering: multi-row happy path, drained-after-Complete
+  NeedMore cascade, errored-state CloseSocket-once semantics,
+  fast-path malformed-body MalformedDataRow, feed overflow
+  returning tiny `ReadBufFull` (not ProtocolError — 4 B vs 300 B
+  hot-path happy return), server ErrorResponse → FailReply via
+  slow path.
+
+**Perf rationale (per architect's (X) plan).** Pre-(X) every
+`feed_bytes` call paid a 5008-byte zero-fill for
+`OutActions`'s `[Action; MAX_ACTIONS_PER_CALL]` storage (no-
+unsafe constraint forces the init). On 1M-row SELECT: ~130k
+calls × 5 KB ≈ 650 MB of stack-zero traffic just to surface
+rows. RowStream fast-path emits rows without touching
+OutActions; 1M rows → 0 OutActions inits on the hot path. Only
+T (1) and C Z terminal flush (1) hit slow-path → 2 OutActions
+inits per query. **~300× reduction in stack bandwidth** on
+the dominant hot path; architect's projection: **10-100×
+end-to-end throughput** bounded by per-row decode work.
+
+**Verification.**
+
+- `cargo test -p bsql-pg-proto`: 218 tests pass (212 existing
+  + 6 new row_stream_spec behavioural tests). Debug AND
+  release.
+- `cargo clippy --workspace --all-targets -D warnings`: clean.
+- `cargo check --workspace --all-targets`: clean.
+- Six bad-path tests in `row_stream_spec.rs` close the shield
+  seams that would otherwise admit silent drops (drained
+  double-delivery, post-terminal Z leftover, empty-body
+  malformed row, read-buf overflow).
+
+**What's intentionally NOT done here.**
+
+- **Criterion benchmark harness** — the 300× reduction claim
+  is predicted from the architecture (OutActions stack size ×
+  call count), not measured in this session. Deferred to
+  DEF-143 (cargo-bench harness, own session).
+- **Pipelining (multiple concurrent queries on one RowStream)**
+  — MVP supports one reply per `iter_rows` scope. Post-1c-5
+  per-correlator stream objects address pipelining (separate
+  phase).
+- **`Action::StreamRow` deletion** — still used by the
+  `feed_bytes` legacy path for callers that haven't migrated;
+  retained for compat. Candidate for removal once
+  `bsql-driver-postgres` fully migrates to `iter_rows`.
+
+**Lessons from three failed mid-session attempts (pre-shipped).**
+Earlier attempts hit Rust's NLL "conditional reborrow" limitation:
+`slow_path_once` originally tried to recurse via
+`self.next_event()` on NeedMore, which extended the returned
+Action's borrow across the recursion's `&mut self.proto` and
+failed E0499. Final design adopts a **caller-loop** pattern:
+slow_path emits the first action OR NeedMore, caller re-enters
+`next_event` until terminal — no recursion, no lifetime conflict.
+One extra loop iter per silent transition (rare: 1 per query in
+SELECT flow). Net wash.

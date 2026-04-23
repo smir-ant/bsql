@@ -600,6 +600,32 @@ impl PgProtocol {
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 'r> {
+        // DEF-154 (X): unbounded dispatch — process every frame in
+        // read_buf that fits within `MAX_STAGED_PER_CALL`.
+        self.feed_bytes_bounded(bytes, write_buf, u16::MAX)
+    }
+
+    /// DEF-154 (X) P0-2(c): frame-bounded variant of [`feed_bytes`].
+    ///
+    /// Processes at most `max_dispatches` actionable dispatches
+    /// from the read buffer, then breaks the inner loop. Silent
+    /// pre-dispatch skips (`PARAMETER_STATUS`, `NOTICE_RESPONSE`)
+    /// do NOT count against the budget — they're transparent noise.
+    /// A malformed-length / oversized-frame classification counts
+    /// as one dispatch (the terminal `break` already limits it).
+    ///
+    /// Used by [`RowStream`](crate::RowStream)'s slow path to
+    /// process exactly one frame per call (ensures the fast-path
+    /// gets control back after a silent `RowDescription`). All
+    /// other callers invoke [`feed_bytes`] which supplies
+    /// `max_dispatches = u16::MAX` for unbounded behaviour
+    /// (bytewise-equivalent to pre-(X) semantics).
+    pub(crate) fn feed_bytes_bounded<'w, 'r>(
+        &'r mut self,
+        bytes: &[u8],
+        write_buf: &'w mut WriteBuf,
+        max_dispatches: u16,
+    ) -> OutActions<'w, 'r> {
         write_buf.clear();
         self.clear_arena_if_idle_or_errored();
 
@@ -712,6 +738,13 @@ impl PgProtocol {
             // bounded by `READ_BUF_CAP <= u16::MAX` const-assert in
             // buf.rs. No silent narrowing anywhere.
             let mut frames_consumed: u16 = 0_u16;
+            // DEF-154 (X): dispatch-count budget for RowStream's
+            // slow path. `feed_bytes` supplies `u16::MAX`
+            // (unbounded); `feed_bytes_bounded` from RowStream
+            // supplies `1` so silent-state-transition frames
+            // (e.g. `RowDescription`) return control to the
+            // fast-path loop after exactly one frame.
+            let mut dispatches_this_call: u16 = 0_u16;
 
             // Dispatch loop block: `reserved` holds `&mut wb.buf`
             // which must release before `wb.into_bytes()`
@@ -719,6 +752,14 @@ impl PgProtocol {
             {
             let mut reserved = wb.reserve();
             loop {
+                // DEF-154 (X): frame-budget gate. Transparent-skip
+                // frames (ParameterStatus / NoticeResponse) do NOT
+                // count — they're noise. Only
+                // AdvancedSilent / AdvancedWithAction / Errored
+                // increment `dispatches_this_call`.
+                if dispatches_this_call >= max_dispatches {
+                    break;
+                }
                 // Logical-cursor peek into unread: skip already-
                 // dispatched prefix. `frames_consumed` is
                 // addend-only; each increment is gated on
@@ -824,6 +865,8 @@ impl PgProtocol {
                                 *state = new_state;
                                 frames_consumed =
                                     frames_consumed.saturating_add(total_len);
+                                dispatches_this_call =
+                                    dispatches_this_call.saturating_add(1);
                             }
                             DispatchOutcome::AdvancedWithAction {
                                 new_state,
@@ -832,6 +875,8 @@ impl PgProtocol {
                                 *state = new_state;
                                 frames_consumed =
                                     frames_consumed.saturating_add(total_len);
+                                dispatches_this_call =
+                                    dispatches_this_call.saturating_add(1);
                                 // DEF-154 (Q) P1-6: use default
                                 // infallible emit (budget: 1, no
                                 // on_overflow) — the dispatch gate
@@ -945,7 +990,136 @@ impl PgProtocol {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // DEF-154 (X) P0-2(c): RowStream helpers
+    // ═════════════════════════════════════════════════════════════
+    //
+    // Thin crate-internal accessors exposing read_buf / schema_arena
+    // operations to the `row_stream` module without opening
+    // field-level `pub(crate)` on the field directly. Each is a
+    // single-line delegate — no logic added.
 
+    /// DEF-154 (X): append bytes to read_buf; Err on overflow.
+    #[inline]
+    pub(crate) fn read_buf_append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
+        self.read_buf.append(bytes)
+    }
+
+    /// DEF-154 (X): shared view of the populated read_buf region.
+    #[inline]
+    #[must_use]
+    pub(crate) fn read_buf_populated(&self) -> &[u8] {
+        self.read_buf.populated()
+    }
+
+    /// DEF-154 (X): current read cursor (u16 storage).
+    #[inline]
+    #[must_use]
+    pub(crate) fn read_buf_cursor_u16(&self) -> u16 {
+        self.read_buf.cursor_position_u16()
+    }
+
+    /// DEF-154 (X): advance the read cursor. Err architecturally
+    /// dead on RowStream paths (frames gated by `parse_header`
+    /// length-check before advance).
+    #[inline]
+    pub(crate) fn read_buf_advance(
+        &mut self,
+        n: usize,
+    ) -> Result<(), crate::buf::AdvancePastEnd> {
+        self.read_buf.advance(n)
+    }
+
+    /// DEF-154 (X): `ArenaReader<'_>` for slow-path
+    /// `StagedReply::into_public` or direct `.get(schema_ref)`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn schema_arena_reader(&self) -> crate::schema_arena::ArenaReader<'_> {
+        self.schema_arena.as_reader()
+    }
+
+    /// DEF-154 (X): if current state is a row-streaming variant,
+    /// return `(reply_id, schema_ref)`. Otherwise `None`.
+    ///
+    /// Covers: `SimpleQueryStreamingRows`, `BindExecuteStreamingRows`,
+    /// and `BindExecuteAwaitingDataOrCompleteSelect` (BindExecute's
+    /// SELECT path can receive DataRow before explicit transition
+    /// to StreamingRows).
+    #[inline]
+    #[must_use]
+    pub(crate) fn streaming_reply_id_and_schema(
+        &self,
+    ) -> Option<(core::num::NonZeroU64, crate::schema_arena::SchemaRef)> {
+        match &self.state {
+            ProtoState::SimpleQueryStreamingRows { reply, schema_ref } => {
+                Some((reply.get(), *schema_ref))
+            }
+            ProtoState::BindExecuteStreamingRows { reply, schema_ref } => {
+                Some((reply.get(), *schema_ref))
+            }
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref } => {
+                Some((reply.get(), *schema_ref))
+            }
+            _ => None,
+        }
+    }
+
+    /// DEF-154 (X): apply any pending cursor advance from a prior
+    /// feed_bytes call. RowStream calls this at `iter_rows()`
+    /// construction to mirror `feed_bytes`'s entry semantics.
+    #[inline]
+    pub(crate) fn apply_pending_advance(&mut self) {
+        if let Some(n) = self.pending_advance {
+            // Err architecturally dead (pending_advance stored
+            // only via validated frames_consumed); ignore.
+            let _result = self.read_buf.advance(usize::from(n.get()));
+            self.pending_advance = None;
+        }
+    }
+
+    /// DEF-154 (X): whether the state is currently Errored (for
+    /// RowStream fast-path state check).
+    #[inline]
+    #[must_use]
+    pub(crate) fn state_is_errored(&self) -> bool {
+        matches!(self.state, ProtoState::Errored(_))
+    }
+
+    /// DEF-154 (X): transition to `Errored(Framing)` for a
+    /// malformed DataRow (empty body, server-side desync). Used
+    /// by RowStream's fast-path when `start == end`.
+    #[inline]
+    pub(crate) fn install_errored_malformed_data_row(&mut self) {
+        let cause = ProtocolError::MalformedDataRow { total_len: 0 };
+        let state_kind = cause.state_kind();
+        self.state = ProtoState::Errored(state_kind);
+    }
+
+    /// DEF-154 (X) P0-2(c): construct a pull-based row stream
+    /// over this protocol + a caller-owned write buffer.
+    ///
+    /// Returns a [`crate::row_stream::RowStream`] that the caller
+    /// feeds inbound TCP bytes via `.feed()` and pulls events via
+    /// `.next_event()`. Fast-paths the DataRow frame (zero
+    /// `OutActions` allocation per row on the SELECT hot path);
+    /// slow-path (non-DataRow frames) delegates to `feed_bytes`.
+    ///
+    /// See `row_stream` module docs for perf rationale + API.
+    ///
+    /// The returned stream holds `&mut self` + `&mut write_buf`;
+    /// both refs are blocked from other uses until the stream
+    /// drops.
+    #[inline]
+    pub fn iter_rows<'p, 'w>(
+        &'p mut self,
+        write_buf: &'w mut WriteBuf,
+    ) -> crate::row_stream::RowStream<'p, 'w> {
+        // Entry-point housekeeping mirrors feed_bytes:
+        write_buf.clear();
+        self.clear_arena_if_idle_or_errored();
+        self.apply_pending_advance();
+        crate::row_stream::RowStream::new(self, write_buf)
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════
