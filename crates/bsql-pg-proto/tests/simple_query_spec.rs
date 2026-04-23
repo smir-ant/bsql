@@ -29,8 +29,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, DataRowRef, FormatCode, FromPgText, PgCommand, PgProtocol, ProtoState, ProtocolError,
-    QueryKind, Reply, ReplyId, RowDesc, Sql, WriteBuf, oids,
+    Action, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply, ReplyId, Sql,
+    WriteBuf,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
         TAG_QUERY, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
@@ -231,113 +231,13 @@ fn select_zero_rows_end_to_end() {
     assert!(matches!(proto.state(), ProtoState::Idle));
 }
 
-/// Invariant (spec): SELECT returning N rows emits one
-/// `Action::StreamRow` per DataRow, carrying the row's body bytes,
-/// followed by `DeliverReply(QueryComplete{..})` on terminal Z. The
-/// StreamRow correlator matches the in-flight reply id; the
-/// `ReplyId` is NOT consumed until the terminal Z.
-#[test]
-fn select_multiple_rows_stream_then_deliver() {
-    let mut proto = PgProtocol::new();
-    let mut wb = WriteBuf::new();
-    let q_raw = raw(101);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
-
-    // Build row values; 3 rows fits within MAX_ACTIONS_PER_CALL=4
-    // (3 StreamRow + 1 DeliverReply = 4 actions).
-    let row_values: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
-    let mut bytes = std::vec::Vec::new();
-    bytes.extend_from_slice(&row_description_frame(1));
-    for v in &row_values {
-        bytes.extend_from_slice(&data_row_frame(v));
-    }
-    bytes.extend_from_slice(&command_complete_frame(b"SELECT 3"));
-    bytes.extend_from_slice(&rfq_frame(b'I'));
-
-    let out = proto.feed_bytes(&bytes, &mut wb);
-    let actions = out.as_slice();
-    assert_eq!(actions.len(), 4, "3 rows + 1 DeliverReply = 4 actions");
-
-    // First three actions = StreamRow with matching id, schema, and row bytes.
-    // F19: RowDesc is carried BY VALUE in Action::StreamRow; store as
-    // owned `Option<RowDesc>` (Copy POD).
-    let mut first_desc: Option<RowDesc> = None;
-    for (i, expected_value) in row_values.iter().enumerate() {
-        match actions.get(i) {
-            Some(Action::StreamRow { id, row_bytes, desc }) => {
-                assert_eq!(*id, q_raw, "StreamRow id must match in-flight reply");
-                // 1c-2a: every StreamRow carries the same schema ref.
-                // Pin the schema shape: 1 column of TEXT (oid 25) in
-                // text format.
-                assert!(
-                    matches!(
-                        desc.get(0),
-                        Some(&bsql_pg_proto::ColumnDesc {
-                            type_oid: 25,
-                            format_code: FormatCode::Text,
-                        }),
-                    ) && desc.len() == 1,
-                    "expected 1-column TEXT/text RowDesc, got {desc:?}",
-                );
-                // F19 + DEF-119: `desc` is `&'r RowDesc` borrowed from
-                // the arena. All StreamRows in a stream resolve to
-                // ref-equal schemas (they point at the same arena
-                // slot). Deref to value and compare — byte-equal
-                // within the stream by construction.
-                match first_desc {
-                    None => first_desc = Some(**desc),
-                    Some(prev) => assert_eq!(
-                        prev, **desc,
-                        "StreamRow.desc must resolve to equal schema across the stream",
-                    ),
-                }
-
-                // Body = column-count (2 bytes BE) + len (4 bytes BE) + value.
-                assert_eq!(
-                    row_bytes.get(..2),
-                    Some(&1i16.to_be_bytes()[..]),
-                    "col count = 1",
-                );
-                let Ok(vlen) = i32::try_from(expected_value.len()) else { unreachable!() };
-                assert_eq!(
-                    row_bytes.get(2..6),
-                    Some(&vlen.to_be_bytes()[..]),
-                    "col len matches",
-                );
-                assert_eq!(
-                    row_bytes.get(6..),
-                    Some(*expected_value),
-                    "row bytes round-trip verbatim",
-                );
-            }
-            other => panic!("expected StreamRow at index {i}, got {other:?}"),
-        }
-    }
-
-    // Fourth = DeliverReply QueryComplete — schema also present.
-    match actions.get(3) {
-        Some(Action::DeliverReply {
-            id: delivered_id,
-            value: Reply::QueryComplete(p),
-        }) => {
-            assert_eq!(*delivered_id, q_raw);
-            assert_eq!(p.command_tag.as_str(), "SELECT 3");
-            assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
-            assert!(
-                matches!(
-                    p.row_desc,
-                    Some(desc) if desc.len() == 1 && matches!(
-                        desc.get(0),
-                        Some(&bsql_pg_proto::ColumnDesc { type_oid: 25, .. }),
-                    ),
-                ),
-                "SELECT with rows: row_desc must be Some(1-col TEXT), got {:?}", p.row_desc,
-            );
-        }
-        other => panic!("expected DeliverReply(QueryComplete), got {other:?}"),
-    }
-    assert!(matches!(proto.state(), ProtoState::Idle));
-}
+// DEF-154 (Y): `select_multiple_rows_stream_then_deliver` DELETED —
+// row-bearing SELECT is covered end-to-end by
+// `row_stream_spec::multi_row_select_end_to_end`. Post-(Y),
+// `Action::StreamRow` is deleted + DataRow via `feed_bytes` is
+// classified as `UnexpectedFrame`; feed_bytes is the control-path
+// API (no row streaming). Use `iter_rows` for row-bearing
+// responses.
 
 /// Invariant (spec): a DML statement (no rows) yields
 /// CommandComplete → ReadyForQuery directly, with no intermediate
@@ -449,59 +349,12 @@ fn query_error_emits_fail_reply_and_connection_survives() {
     );
 }
 
-/// Invariant (spec): error-in-stream variant — E arrives AFTER
-/// some rows have streamed. Rows still emit; FailReply replaces
-/// DeliverReply; Z drains; connection returns to Idle.
-#[test]
-fn error_after_some_rows_emits_stream_then_fail() {
-    let mut proto = PgProtocol::new();
-    let mut wb = WriteBuf::new();
-    let q_raw = raw(105);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
-
-    let mut bytes = std::vec::Vec::new();
-    bytes.extend_from_slice(&row_description_frame(1));
-    bytes.extend_from_slice(&data_row_frame(b"partial"));
-    bytes.extend_from_slice(&error_response_frame(b"division by zero"));
-    bytes.extend_from_slice(&rfq_frame(b'E'));
-
-    let out = proto.feed_bytes(&bytes, &mut wb);
-    let actions = out.as_slice();
-    assert_eq!(actions.len(), 2, "1 StreamRow + 1 FailReply = 2 actions");
-    // DEF-154 (F) P0-1 pin: pre-fix, fatal-path `clear_scope_local`
-    // wiped `populated()` BEFORE materialise applied the
-    // `StreamRowRange` from the preceding successful D iteration —
-    // resulting in `row_bytes: &[]` (silent empty-row corruption).
-    // Asserting full row contents proves the range applies against
-    // the unchanged populated region.
-    match actions.first() {
-        Some(Action::StreamRow { row_bytes, .. }) => {
-            // DataRow body = column-count(i16=1) + vlen(i32=7) +
-            // "partial" → 2 + 4 + 7 = 13 bytes.
-            assert_eq!(
-                row_bytes.len(),
-                13,
-                "StreamRow.row_bytes must carry the full DataRow body even \
-                 when a later frame in the same feed_bytes call triggers a \
-                 fatal transition — DEF-154 (F) P0-1 pin.",
-            );
-            // Last 7 bytes must be the literal `partial` value.
-            let Some(tail) = row_bytes.get(6..) else {
-                panic!("row_bytes too short: len={}", row_bytes.len());
-            };
-            assert_eq!(tail, b"partial");
-        }
-        other => panic!("expected StreamRow, got {other:?}"),
-    }
-    assert!(matches!(
-        actions.get(1),
-        Some(Action::FailReply {
-            cause: ProtocolError::ServerErrorResponse { .. },
-            ..
-        }),
-    ));
-    assert!(matches!(proto.state(), ProtoState::Idle));
-}
+// DEF-154 (Y): `error_after_some_rows_emits_stream_then_fail`
+// DELETED — migrated to `row_stream_spec::
+// rows_before_mid_stream_error_are_preserved`, which tests the
+// same invariant (server ErrorResponse after partial rows → rows
+// still emit, FailReply replaces DeliverReply) on the `iter_rows`
+// API (the only API supporting row streaming post-(Y)).
 
 // ==================================================================
 // (B) Tier-3 invariants — bad paths + push-state policy
@@ -588,109 +441,14 @@ fn simple_query_on_errored_state_fails() {
     }
 }
 
-/// DEF-154 (F) P0-1 pin: a malformed `CommandComplete` arriving
-/// AFTER one or more successful `DataRow` frames in the SAME
-/// `feed_bytes` call must still deliver the preceding rows with
-/// their full byte content. Pre-(F), the fatal-path
-/// `clear_scope_local` wiped `populated()` before materialise,
-/// causing the already-staged `StreamRowRange` to apply against
-/// an empty slice — `row_bytes: &[]` silent corruption.
-///
-/// This is distinct from `error_after_some_rows_emits_stream_then_fail`
-/// which exercises a server-sent `ErrorResponse` (graceful fail,
-/// state returns to Idle after Z). Here the fatal transition
-/// fires from `DispatchOutcome::Errored` due to WIRE MALFORMATION
-/// — no Z arrives, the connection closes.
-#[test]
-fn data_row_then_malformed_command_complete_preserves_row_bytes() {
-    let mut proto = PgProtocol::new();
-    let mut wb = WriteBuf::new();
-    let q_raw = raw(106);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
-
-    let mut bytes = std::vec::Vec::new();
-    bytes.extend_from_slice(&row_description_frame(1));
-    bytes.extend_from_slice(&data_row_frame(b"intact"));
-    // CommandComplete frame WITHOUT NUL terminator — framing desync.
-    bytes.extend_from_slice(&frame(TAG_COMMAND_COMPLETE.byte(), b"SELECT 1"));
-
-    let out = proto.feed_bytes(&bytes, &mut wb);
-    let actions = out.as_slice();
-    // Expect: StreamRow (preserved) + FailReply + CloseSocket.
-    match actions.first() {
-        Some(Action::StreamRow { row_bytes, .. }) => {
-            // Body = col-count(2) + vlen(4) + "intact"(6) = 12 bytes.
-            assert_eq!(
-                row_bytes.len(),
-                12,
-                "row_bytes must be the FULL pre-fatal DataRow body \
-                 (P0-1 pin: pre-fix was &[] due to in-scope clear_scope_local).",
-            );
-            let Some(tail) = row_bytes.get(6..) else {
-                panic!("row_bytes too short: len={}", row_bytes.len());
-            };
-            assert_eq!(tail, b"intact");
-        }
-        other => panic!("expected StreamRow as first action, got {other:?}"),
-    }
-    assert!(
-        actions.iter().any(|a| matches!(
-            a,
-            Action::FailReply {
-                cause: ProtocolError::MalformedCommandComplete { .. },
-                ..
-            }
-        )),
-        "expected FailReply(MalformedCommandComplete), got {actions:?}",
-    );
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::CloseSocket)),
-        "wire-framing desync must close the socket",
-    );
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
-}
-
-/// DEF-154 (F) P1-3 pin: a `DataRow` frame with `total_len == HEADER_LEN`
-/// (i.e. empty body — no column count, no payload) is server-side
-/// malformed, not a crate bug. Must classify as `MalformedDataRow`
-/// rather than `InternalCrateBug { locus: EmptyReadRange }` (the
-/// pre-(F) misclassification).
-#[test]
-fn zero_body_data_row_classified_as_malformed_data_row() {
-    let mut proto = PgProtocol::new();
-    let mut wb = WriteBuf::new();
-    let q_raw = raw(107);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
-
-    // Build a DataRow 'D' frame with length-prefix = 4 (just the
-    // 4-byte length field itself, zero body bytes). parse_header
-    // validates total_len >= HEADER_LEN (5), which holds for a
-    // length-field value of 4 → total_len = 1 + 4 = 5. Dispatch
-    // reaches `stream_row_or_errored` with `payload_start == payload_end == 5`.
-    let mut bytes = std::vec::Vec::new();
-    bytes.extend_from_slice(&row_description_frame(1));
-    bytes.push(TAG_DATA_ROW.byte());
-    bytes.extend_from_slice(&4i32.to_be_bytes());
-
-    let out = proto.feed_bytes(&bytes, &mut wb);
-    let actions = out.as_slice();
-    assert!(
-        actions.iter().any(|a| matches!(
-            a,
-            Action::FailReply {
-                cause: ProtocolError::MalformedDataRow { total_len: 5 },
-                ..
-            }
-        )),
-        "expected FailReply(MalformedDataRow {{ total_len: 5 }}) — \
-         server-side malformed, NOT an internal crate bug. \
-         Got: {actions:?}",
-    );
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::CloseSocket)),
-        "MalformedDataRow is a framing-desync; tear the socket down.",
-    );
-}
+// DEF-154 (Y): `data_row_then_malformed_command_complete_preserves_row_bytes`
+// DELETED — migrated to `row_stream_spec::
+// rows_preserved_when_command_complete_malformed`.
+//
+// DEF-154 (Y): `zero_body_data_row_classified_as_malformed_data_row`
+// DELETED — covered by `row_stream_spec::
+// fast_path_empty_data_row_body_is_malformed` (same classification
+// — `MalformedDataRow` — via `iter_rows` fast-path).
 
 /// Invariant: a `CommandComplete` with no NUL terminator is
 /// classified as `MalformedCommandComplete` and tears the
@@ -746,298 +504,22 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
 }
 
-/// Invariant: rows arriving across multiple feed_bytes calls stream
-/// correctly — the `StreamingRows` state persists across boundaries,
-/// each feed_bytes call emits the rows it observed, the terminal Z
-/// delivers the reply.
-#[test]
-fn rows_across_multiple_feed_bytes_calls() {
-    let mut proto = PgProtocol::new();
-    let mut wb = WriteBuf::new();
-    let q_raw = raw(150);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
-
-    // Batch 1: T + two D frames.
-    let mut batch1 = std::vec::Vec::new();
-    batch1.extend_from_slice(&row_description_frame(1));
-    batch1.extend_from_slice(&data_row_frame(b"r1"));
-    batch1.extend_from_slice(&data_row_frame(b"r2"));
-    {
-        let out1 = proto.feed_bytes(&batch1, &mut wb);
-        let actions1 = out1.as_slice();
-        assert_eq!(actions1.len(), 2, "two rows in batch 1");
-        assert!(actions1.iter().all(|a| matches!(a, Action::StreamRow { .. })));
-        // OutActions is Copy-POD; the scope close releases the
-        // `'r` borrow — no explicit `drop()` needed (clippy warns
-        // that dropping Copy types is a no-op).
-    }
-    assert!(matches!(proto.state(), ProtoState::SimpleQueryStreamingRows { .. }));
-
-    // Batch 2: one more D + C + Z.
-    let mut batch2 = std::vec::Vec::new();
-    batch2.extend_from_slice(&data_row_frame(b"r3"));
-    batch2.extend_from_slice(&command_complete_frame(b"SELECT 3"));
-    batch2.extend_from_slice(&rfq_frame(b'I'));
-    let out2 = proto.feed_bytes(&batch2, &mut wb);
-    let actions2 = out2.as_slice();
-    assert_eq!(actions2.len(), 2, "one row + DeliverReply");
-    assert!(matches!(actions2.first(), Some(Action::StreamRow { .. })));
-    assert!(matches!(
-        actions2.get(1),
-        Some(Action::DeliverReply { value: Reply::QueryComplete { .. }, .. }),
-    ));
-    assert!(matches!(proto.state(), ProtoState::Idle));
-}
-
-/// Invariant (DEF-121 backpressure gate): if an inbound chunk
-/// contains more actionable frames than `OutActions` can hold, the
-/// `feed_bytes` loop must break **before** consuming any reply /
-/// mutating state — leaving the overflowing frames in the read
-/// buffer for the next `feed_bytes` call. Without the gate, the
-/// in-macro `on_overflow: break` fires AFTER `deliver()` /
-/// `errored()` have already consumed the reply, silently dropping
-/// the action and orphaning the caller's oneshot.
-///
-/// Construction: push SimpleQuery, feed enough DataRow frames to
-/// exceed `MAX_ACTIONS_PER_CALL` in ONE chunk. DEF-154 (L) split
-/// the staged (dispatch-side) cap from the output (user-side) cap —
-/// the dispatch gate still breaks on `MAX_STAGED_PER_CALL`, but
-/// output fits up to `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL *
-/// MAX_FANOUT_PER_STAGED = 16` actions. To force backpressure
-/// across calls, we feed `MAX_STAGED_PER_CALL + 3` DataRow frames +
-/// C + Z. The first call emits ≤ MAX_STAGED_PER_CALL (happy-path
-/// 1-action staging); the remainder drains on subsequent calls.
-#[test]
-fn overflow_backpressure_preserves_delivery_across_calls() {
-    use bsql_pg_proto::{MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL};
-    let mut proto = PgProtocol::new();
-    let mut wb = WriteBuf::new();
-    let q_raw = raw(200);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
-
-    let mut bytes = std::vec::Vec::new();
-    bytes.extend_from_slice(&row_description_frame(1));
-    // Force backpressure: need more rows than one dispatch call can stage.
-    let row_count = MAX_STAGED_PER_CALL.saturating_add(3);
-    for i in 0..row_count {
-        let Ok(digit) = u8::try_from(i) else { unreachable!() };
-        let payload = [b'r', digit.saturating_add(b'0')];
-        bytes.extend_from_slice(&data_row_frame(&payload));
-    }
-    bytes.extend_from_slice(&command_complete_frame(b"SELECT 12"));
-    bytes.extend_from_slice(&rfq_frame(b'I'));
-
-    // First call: gate caps emission under MAX_ACTIONS_PER_CALL.
-    let mut total_rows = 0usize;
-    let mut saw_deliver = false;
-    let first = proto.feed_bytes(&bytes, &mut wb);
-    assert!(
-        first.len() <= MAX_ACTIONS_PER_CALL,
-        "first call must not exceed MAX_ACTIONS_PER_CALL (={MAX_ACTIONS_PER_CALL})",
-    );
-    for a in first.as_slice() {
-        match a {
-            Action::StreamRow { id: sid, .. } => {
-                assert_eq!(*sid, q_raw);
-                total_rows = total_rows.saturating_add(1);
-            }
-            Action::DeliverReply { .. } => saw_deliver = true,
-            other => panic!("unexpected action in first call: {other:?}"),
-        }
-    }
-    // State is still a simple-query state (not consumed to Idle).
-    let still_streaming = matches!(
-        proto.state(),
-        ProtoState::SimpleQueryStreamingRows { .. }
-            | ProtoState::SimpleQueryAwaitingRfq { .. }
-            | ProtoState::SimpleQueryAwaitingFirstResponse(_),
-    );
-    assert!(
-        still_streaming,
-        "state must stay in simple-query flow — reply not consumed mid-overflow",
-    );
-
-    // Subsequent calls drain the remaining frames.
-    while !saw_deliver {
-        let out = proto.feed_bytes(&[], &mut wb);
-        assert!(out.len() <= MAX_ACTIONS_PER_CALL);
-        for a in out.as_slice() {
-            match a {
-                Action::StreamRow { id: sid, .. } => {
-                    assert_eq!(*sid, q_raw);
-                    total_rows = total_rows.saturating_add(1);
-                }
-                Action::DeliverReply { .. } => saw_deliver = true,
-                other => panic!("unexpected action while draining: {other:?}"),
-            }
-        }
-    }
-    assert_eq!(total_rows, row_count, "every row delivered exactly once");
-    assert!(matches!(proto.state(), ProtoState::Idle));
-}
-
-/// Invariant (1c-2b): `DataRowRef::parse` + `columns()` decode the
-/// raw `Action::StreamRow::row_bytes` the protocol emitted — the
-/// full round-trip from wire bytes to per-column `&[u8]`, including
-/// SQL NULL handling (`length = -1` → `Ok(None)`).
-#[test]
-fn stream_row_bytes_decode_via_data_row_ref() {
-    let mut proto = PgProtocol::new();
-    let mut wb = WriteBuf::new();
-    let q_raw = raw(400);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
-
-    // Feed: T (2 cols) + D (val1, NULL) + C + Z.
-    let mut bytes = std::vec::Vec::new();
-    bytes.extend_from_slice(&row_description_frame(2));
-    // DataRow with 2 columns: "answer" and NULL.
-    let mut row_body = std::vec::Vec::new();
-    row_body.extend_from_slice(&2i16.to_be_bytes());
-    // col 0: "answer" (non-null)
-    let col0 = b"answer";
-    let Ok(col0_len) = i32::try_from(col0.len()) else { unreachable!() };
-    row_body.extend_from_slice(&col0_len.to_be_bytes());
-    row_body.extend_from_slice(col0);
-    // col 1: NULL
-    row_body.extend_from_slice(&(-1i32).to_be_bytes());
-    bytes.push(TAG_DATA_ROW.byte());
-    let Ok(row_framelen) = u32::try_from(row_body.len().saturating_add(4)) else {
-        unreachable!()
-    };
-    bytes.extend_from_slice(&row_framelen.to_be_bytes());
-    bytes.extend_from_slice(&row_body);
-    bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
-    bytes.extend_from_slice(&rfq_frame(b'I'));
-
-    let out = proto.feed_bytes(&bytes, &mut wb);
-    let mut saw_stream = false;
-    for a in out.as_slice() {
-        if let Action::StreamRow { row_bytes, .. } = a {
-            saw_stream = true;
-            // Round-trip: DataRowRef::parse + columns() yields
-            // Ok(Some(b"answer")) then Ok(None) for the NULL.
-            let Ok(row) = DataRowRef::parse(row_bytes) else {
-                panic!("DataRowRef::parse on StreamRow row_bytes should succeed");
-            };
-            assert_eq!(row.len(), 2);
-            let items: std::vec::Vec<_> = row.columns().collect();
-            assert_eq!(items.len(), 2);
-            assert!(
-                matches!(items.first(), Some(Ok(Some(b"answer")))),
-                "col 0 should decode to b\"answer\", got {:?}",
-                items.first(),
-            );
-            assert!(
-                matches!(items.get(1), Some(Ok(None))),
-                "col 1 should decode as SQL NULL, got {:?}",
-                items.get(1),
-            );
-        }
-    }
-    assert!(saw_stream, "test fixture must produce a StreamRow");
-}
-
-/// Invariant (1c-2c): full decode round-trip — push a SELECT,
-/// server replies with typed rows, caller uses `DataRowRef` +
-/// `FromPgText` to reconstruct Rust values. This is the end-to-end
-/// user-level API that Phase 2 macros will target.
-#[test]
-fn end_to_end_decode_typed_row() {
-    let mut proto = PgProtocol::new();
-    let mut wb = WriteBuf::new();
-    let q_raw = raw(500);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
-
-    // RowDescription: 2 cols — id INT4, name TEXT.
-    let mut rd_body = std::vec::Vec::new();
-    rd_body.extend_from_slice(&2i16.to_be_bytes());
-    for (name, oid) in [(&b"id"[..], oids::INT4), (&b"name"[..], oids::TEXT)] {
-        rd_body.extend_from_slice(name);
-        rd_body.push(0);
-        rd_body.extend_from_slice(&0i32.to_be_bytes()); // table_oid
-        rd_body.extend_from_slice(&0i16.to_be_bytes()); // attr_num
-        rd_body.extend_from_slice(&oid.to_be_bytes()); // type_oid
-        rd_body.extend_from_slice(&(-1i16).to_be_bytes()); // type_size
-        rd_body.extend_from_slice(&(-1i32).to_be_bytes()); // type_mod
-        rd_body.extend_from_slice(&0i16.to_be_bytes()); // format = text
-    }
-
-    // DataRow: id=42, name="alice".
-    let mut dr_body = std::vec::Vec::new();
-    dr_body.extend_from_slice(&2i16.to_be_bytes());
-    let id_text = b"42";
-    let Ok(id_len) = i32::try_from(id_text.len()) else { unreachable!() };
-    dr_body.extend_from_slice(&id_len.to_be_bytes());
-    dr_body.extend_from_slice(id_text);
-    let name_text = b"alice";
-    let Ok(name_len) = i32::try_from(name_text.len()) else { unreachable!() };
-    dr_body.extend_from_slice(&name_len.to_be_bytes());
-    dr_body.extend_from_slice(name_text);
-
-    let mut bytes = std::vec::Vec::new();
-    bytes.push(TAG_ROW_DESCRIPTION.byte());
-    let Ok(rd_len) = u32::try_from(rd_body.len().saturating_add(4)) else { unreachable!() };
-    bytes.extend_from_slice(&rd_len.to_be_bytes());
-    bytes.extend_from_slice(&rd_body);
-    bytes.push(TAG_DATA_ROW.byte());
-    let Ok(dr_len) = u32::try_from(dr_body.len().saturating_add(4)) else { unreachable!() };
-    bytes.extend_from_slice(&dr_len.to_be_bytes());
-    bytes.extend_from_slice(&dr_body);
-    bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
-    bytes.extend_from_slice(&rfq_frame(b'I'));
-
-    let out = proto.feed_bytes(&bytes, &mut wb);
-    let mut decoded_id: Option<i32> = None;
-    let mut decoded_name: Option<std::string::String> = None;
-
-    for a in out.as_slice() {
-        if let Action::StreamRow { row_bytes, desc, .. } = a {
-            // Sanity-check schema: 2 cols, INT4 + TEXT in text format.
-            assert!(
-                matches!(
-                    desc.get(0),
-                    Some(&bsql_pg_proto::ColumnDesc {
-                        type_oid: oids::INT4,
-                        format_code: FormatCode::Text,
-                    }),
-                ) && matches!(
-                    desc.get(1),
-                    Some(&bsql_pg_proto::ColumnDesc {
-                        type_oid: oids::TEXT,
-                        format_code: FormatCode::Text,
-                    }),
-                ) && desc.len() == 2,
-                "schema mismatch: {desc:?}",
-            );
-
-            // Decode row bytes.
-            let Ok(row) = DataRowRef::parse(row_bytes) else {
-                panic!("DataRowRef::parse should succeed");
-            };
-            let mut cols = row.columns();
-            // Column 0: INT4, non-NULL → i32.
-            match cols.next() {
-                Some(Ok(Some(bytes))) => match i32::from_pg_text(bytes) {
-                    Ok(v) => decoded_id = Some(v),
-                    Err(e) => panic!("i32 decode: {e:?}"),
-                },
-                other => panic!("col 0 unexpected: {other:?}"),
-            }
-            // Column 1: TEXT, non-NULL → &str.
-            match cols.next() {
-                Some(Ok(Some(bytes))) => match <&str>::from_pg_text(bytes) {
-                    Ok(s) => decoded_name = Some(std::string::String::from(s)),
-                    Err(e) => panic!("str decode: {e:?}"),
-                },
-                other => panic!("col 1 unexpected: {other:?}"),
-            }
-            assert!(cols.next().is_none(), "no more columns");
-        }
-    }
-
-    assert_eq!(decoded_id, Some(42));
-    assert_eq!(decoded_name.as_deref(), Some("alice"));
-}
+// DEF-154 (Y): `rows_across_multiple_feed_bytes_calls` DELETED —
+// migrated to `row_stream_spec::rows_across_multiple_feed_calls`
+// (iter_rows equivalent: `feed()` split across calls).
+//
+// DEF-154 (Y): `overflow_backpressure_preserves_delivery_across_calls`
+// DELETED — obsolete post-(Y). The test pinned the behaviour of
+// `MAX_STAGED_PER_CALL`-bounded backpressure on the `feed_bytes`
+// row path; `iter_rows` pulls one event per `next_event` call,
+// so there's no output-buffer overflow to backpressure against.
+// Row throughput is now bounded only by the caller's loop rate.
+//
+// DEF-154 (Y): `stream_row_bytes_decode_via_data_row_ref` DELETED —
+// migrated to `row_stream_spec::row_bytes_decode_via_data_row_ref`.
+//
+// DEF-154 (Y): `end_to_end_decode_typed_row` DELETED —
+// migrated to `row_stream_spec::end_to_end_decode_typed_row`.
 
 /// Invariant (1c-2a): a DML query following a SELECT must receive
 /// `Reply::QueryComplete { row_desc: None }` — NOT the prior
@@ -1065,6 +547,11 @@ fn dml_after_select_clears_row_desc() {
     // of the stream; transitions to AwaitingRfq { row_desc: Some(..) }
     // on `C`; consumed on `Z` into DeliverReply(QueryComplete).
     // Post-Q1 state = Idle (no residual schema anywhere).
+    //
+    // DEF-154 (Y): row-bearing Q1 drives through `iter_rows`
+    // (the sole row-streaming API post-(Y)). Drain the stream to
+    // the terminal Complete event; the inner `flush_pending`
+    // mechanism consumes the trailing Z so state returns to Idle.
     let q1_raw = raw(300);
     simple_query_setup(&mut proto, id(q1_raw), &mut wb);
     let mut q1_bytes = std::vec::Vec::new();
@@ -1073,16 +560,29 @@ fn dml_after_select_clears_row_desc() {
     q1_bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
     q1_bytes.extend_from_slice(&rfq_frame(b'I'));
     {
-        let out = proto.feed_bytes(&q1_bytes, &mut wb);
-        // Expect at least one StreamRow and one DeliverReply.
-        let mut saw_deliver = false;
-        for a in out.as_slice() {
-            if matches!(a, Action::DeliverReply { .. }) {
-                saw_deliver = true;
+        let mut stream = proto.iter_rows(&mut wb);
+        if let Err(err) = stream.feed(&q1_bytes) {
+            panic!("feed Q1 fits: {err:?}");
+        }
+        let mut saw_complete = false;
+        for _ in 0..16 {
+            match stream.next_event() {
+                bsql_pg_proto::StreamItem::Complete { .. } => {
+                    saw_complete = true;
+                    break;
+                }
+                bsql_pg_proto::StreamItem::Row { .. }
+                | bsql_pg_proto::StreamItem::NeedMore => continue,
+                other => panic!("unexpected event on Q1: {other:?}"),
             }
         }
-        assert!(saw_deliver, "query 1 must deliver");
+        assert!(saw_complete, "query 1 must deliver");
+        // Drain the trailing Z via one more next_event so the
+        // RowStream's flush_pending returns state to Idle before
+        // drop.
+        let _ = stream.next_event();
     }
+    assert!(matches!(proto.state(), ProtoState::Idle), "Q1 post-drain state must be Idle, got {:?}", proto.state());
 
     // Query 2: DML path. No `T` frame → AwaitingRfq never gets a
     // schema in its row_desc field. QueryComplete carries None.

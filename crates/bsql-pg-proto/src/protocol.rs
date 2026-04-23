@@ -16,9 +16,7 @@
 use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
 use crate::command::PgCommand;
-use crate::dispatch::{
-    AbsFrameStart, DispatchOutcome, FrameCoords, FrameTotalLen, dispatch,
-};
+use crate::dispatch::{DispatchOutcome, dispatch};
 use crate::error::ProtocolError;
 use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
 use crate::ident::{ApplicationName, DatabaseName, Ident};
@@ -227,10 +225,15 @@ pub const MAX_STAGED_PER_CALL: usize = 8;
 /// Worst-case output-action fan-out per single staged action.
 ///
 /// - Most staged actions map 1:1 to one `Action`.
-/// - `StagedAction::StreamRowRange` with a stale `SchemaRef`
-///   emits 2 (`FailReply { StaleSchemaRef } + CloseSocket`).
 /// - `StagedAction::DeliverReply` with a stale `SchemaRef` in its
-///   payload (e.g. schema-bearing `QueryComplete`) emits 2.
+///   payload (e.g. schema-bearing `QueryComplete`) emits 2
+///   (`FailReply { StaleSchemaRef } + CloseSocket`).
+///
+/// DEF-154 (Y): `StagedAction::StreamRowRange` with stale ref
+/// ALSO fanned to 2 actions; post-(Y) the variant is deleted —
+/// row-bearing responses flow through `iter_rows` exclusively,
+/// where stale-ref is classified inline in the fast-path. The
+/// 2-fanout worst case is now driven purely by `DeliverReply`.
 ///
 /// 2 is the documented worst-case; a future staged variant that
 /// fans out to 3 actions must bump this const AND
@@ -689,7 +692,7 @@ impl PgProtocol {
         if pending_advance_err {
             read_buf.clear();
             return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                let mut staged: StagedActions<'r> = StagedActions::new();
+                let mut staged: StagedActions = StagedActions::new();
                 fail_inflight_no_readbuf(
                     state,
                     ProtocolError::InternalCrateBug {
@@ -703,7 +706,7 @@ impl PgProtocol {
         if matches!(state, ProtoState::Errored(_)) {
             read_buf.clear();
             return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                let staged: StagedActions<'r> = StagedActions::new();
+                let staged: StagedActions = StagedActions::new();
                 materialise(staged, wb.into_bytes(), schema_arena.as_reader())
             });
         }
@@ -717,7 +720,7 @@ impl PgProtocol {
         {
             read_buf.clear();
             return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                let mut staged: StagedActions<'r> = StagedActions::new();
+                let mut staged: StagedActions = StagedActions::new();
                 fail_inflight_no_readbuf(
                     state,
                     ProtocolError::ReadBufferFull { attempted, available },
@@ -733,7 +736,7 @@ impl PgProtocol {
         let cursor: u16 = read_buf.cursor_position_u16();
 
         write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
-            let mut staged: StagedActions<'r> = StagedActions::new();
+            let mut staged: StagedActions = StagedActions::new();
             // DEF-154 (G): cursor math stays in u16 end-to-end,
             // bounded by `READ_BUF_CAP <= u16::MAX` const-assert in
             // buf.rs. No silent narrowing anywhere.
@@ -828,12 +831,6 @@ impl PgProtocol {
                             continue;
                         }
 
-                        // FrameCoords absolute offsets (relative to
-                        // populated(), which is the whole inner
-                        // buffer including pre-cursor bytes).
-                        let frame_start = AbsFrameStart::new(absolute_start);
-                        let frame_len = FrameTotalLen::new(total_len);
-
                         // DEF-154 (L): gate uses `MAX_STAGED_PER_CALL`
                         // (dispatch-side cap) — NOT `MAX_ACTIONS_PER_CALL`
                         // (output-side cap which is 2× larger for
@@ -857,8 +854,6 @@ impl PgProtocol {
                             payload,
                             &mut reserved,
                             &mut arena_writer,
-                            FrameCoords::new(frame_start, frame_len),
-                            populated,
                         );
                         match outcome {
                             DispatchOutcome::AdvancedSilent { new_state } => {
@@ -1158,10 +1153,10 @@ impl PgProtocol {
 /// 3. `PgProtocol` is `!Sync` — no concurrent observer can witness
 ///    the partial triple.
 #[cold]
-fn fail_inflight_no_readbuf<'rb>(
+fn fail_inflight_no_readbuf(
     state: &mut ProtoState,
     cause: ProtocolError,
-    staged: &mut StagedActions<'rb>,
+    staged: &mut StagedActions,
 ) {
     if matches!(state, ProtoState::Errored(_)) {
         return;
@@ -1214,11 +1209,11 @@ fn fail_inflight_no_readbuf<'rb>(
 /// ([`compute_push_ping`], [`compute_push_startup`]); `compute_push`
 /// dispatches on the command variant. Adding a new `PgCommand` variant
 /// fails the build here until a matching helper is wired up.
-fn compute_push<'rb>(
+fn compute_push(
     cmd: PgCommand,
     state: ProtoState,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> (ProtoState, StagedActions<'rb>) {
+) -> (ProtoState, StagedActions) {
     let mut staged = StagedActions::new();
     let new_state = match cmd {
         PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
@@ -1273,10 +1268,10 @@ fn compute_push<'rb>(
 /// The `compute_push_tests` module below pins this table via a
 /// per-variant assertion, closing the structural seam where two arm
 /// bodies could be swapped without a compile error.
-fn compute_push_ping<'rb>(
+fn compute_push_ping(
     state: ProtoState,
     reply: ReplyId<crate::reply_id::PingKind>,
-    staged: &mut StagedActions<'rb>,
+    staged: &mut StagedActions,
 ) -> ProtoState {
     // DEF-146: classifier dispatch. Pre-DEF-146 this function had 5
     // arms over explicit state variants (with 18-way or-patterns for
@@ -1352,14 +1347,14 @@ fn compute_push_ping<'rb>(
 /// `MAX_OWNED_SEND_LEN` classifies as a typed reply failure instead of
 /// silent truncation.
 #[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
-fn compute_push_startup<'rb>(
+fn compute_push_startup(
     state: ProtoState,
     user: Ident,
     database: Option<DatabaseName>,
     app_name: Option<ApplicationName>,
     credentials: Credentials,
     reply: ReplyId<crate::reply_id::StartupKind>,
-    staged: &mut StagedActions<'rb>,
+    staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> ProtoState {
     match state.push_class() {
@@ -1441,11 +1436,11 @@ fn compute_push_startup<'rb>(
 /// | any `Connecting*`            | `FailReply(StartupAlreadyInProgress)`| same state preserved                |
 /// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
 /// | any `SimpleQuery*`           | `FailReply(CommandInProgress)`      | same                                 |
-fn compute_push_simple_query<'rb>(
+fn compute_push_simple_query(
     state: ProtoState,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::QueryKind>,
-    staged: &mut StagedActions<'rb>,
+    staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> ProtoState {
     // DEF-146: single-level classifier dispatch (standard pattern —
@@ -1565,12 +1560,12 @@ fn build_parse_message(
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                |
 /// | `Awaiting*` / `SimpleQuery*` | `FailReply(CommandInProgress)`      | same                                 |
 /// | `Parse*`                     | `FailReply(CommandInProgress)`      | same                                 |
-fn compute_push_parse<'rb>(
+fn compute_push_parse(
     state: ProtoState,
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::ParseKind>,
-    staged: &mut StagedActions<'rb>,
+    staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch. DEF-154 (B) P0-2: builder returns Result.
@@ -1680,11 +1675,11 @@ fn build_describe_message<N: crate::ident::DescribeName>(
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved                   |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                       |
 /// | any other in-flight          | `FailReply(CommandInProgress)`      | same                                        |
-fn compute_push_describe_statement<'rb>(
+fn compute_push_describe_statement(
     state: ProtoState,
     stmt_name: &crate::ident::StmtName,
     reply: ReplyId<crate::reply_id::DescribeStatementKind>,
-    staged: &mut StagedActions<'rb>,
+    staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
@@ -1751,11 +1746,11 @@ fn compute_push_describe_statement<'rb>(
 ///
 /// Same decision table as statement-describe; see that function's
 /// docstring.
-fn compute_push_describe_portal<'rb>(
+fn compute_push_describe_portal(
     state: ProtoState,
     portal_name: &crate::ident::PortalName,
     reply: ReplyId<crate::reply_id::DescribePortalKind>,
-    staged: &mut StagedActions<'rb>,
+    staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
@@ -1937,7 +1932,7 @@ fn build_execute_message(
 /// | any `Connecting*`         | `FailReply(StartupAlreadyInProgress)`    | same state preserved                        |
 /// | any in-flight             | `FailReply(CommandInProgress)`           | same state preserved                        |
 #[expect(clippy::too_many_arguments, reason = "compute_push_bind_execute is an internal helper; its arg count matches `push_bind_execute`'s parameter surface + the accumulator + reserved. Splitting into a struct-arg would obscure the pure-compute framing.")]
-fn compute_push_bind_execute<'rb, P: crate::params::ParamsWriter>(
+fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
     state: ProtoState,
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
@@ -1945,7 +1940,7 @@ fn compute_push_bind_execute<'rb, P: crate::params::ParamsWriter>(
     schema_ref: Option<crate::schema_arena::SchemaRef>,
     fetch: crate::command::FetchRows,
     reply: ReplyId<crate::reply_id::QueryKind>,
-    staged: &mut StagedActions<'rb>,
+    staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> ProtoState {
     // DEF-146: classifier dispatch (standard pattern).
@@ -2207,7 +2202,7 @@ fn build_startup_message(
 /// `OutActions<'w, 'r>` is alive, and any `&mut self` re-borrow
 /// on `PgProtocol` (thus `feed_bytes`) while `'r` is alive.
 fn materialise<'w, 'r>(
-    staged: StagedActions<'r>,
+    staged: StagedActions,
     write_bytes: &'w [u8],
     arena: crate::schema_arena::ArenaReader<'r>,
 ) -> OutActions<'w, 'r> {
@@ -2222,42 +2217,10 @@ fn materialise<'w, 'r>(
     // result with the Err arm a documented dead branch.
     let mut out = OutActions::new();
     for sa in staged {
-        // DEF-154 (J): StreamRowRange fans out to 2 actions on
-        // stale-ref (FailReply + CloseSocket). DeliverReply with
-        // schema-bearing payload likewise. Both 2-action cases are
-        // the reason MAX_FANOUT_PER_STAGED = 2 above.
-        if let StagedAction::StreamRowRange {
-            id,
-            row_bytes,
-            schema_ref,
-        } = sa
-        {
-            match arena.get(schema_ref) {
-                Some(desc) => {
-                    push_within_fanout_budget(
-                        &mut out,
-                        Action::StreamRow { id, row_bytes, desc },
-                    );
-                }
-                None => {
-                    // Stale SchemaRef — DEF-154 (J) classified crate-bug
-                    // emission. Two-action fanout counted into
-                    // MAX_FANOUT_PER_STAGED = 2.
-                    push_within_fanout_budget(
-                        &mut out,
-                        Action::FailReply {
-                            id,
-                            cause: ProtocolError::InternalCrateBug {
-                                locus: crate::error::CrateBugLocus::StaleSchemaRef,
-                            },
-                        },
-                    );
-                    push_within_fanout_budget(&mut out, Action::CloseSocket);
-                }
-            }
-            continue;
-        }
-
+        // DEF-154 (Y): `StagedAction::StreamRowRange` deleted —
+        // DataRow flows via `iter_rows` fast-path (no staging).
+        // `DeliverReply` is the only remaining variant with
+        // fanout (stale-ref classified crate-bug).
         let a: Action<'w, 'r> = match sa {
             StagedAction::SendBytesRange(range) => {
                 // DEF-154 (N) P0-4: `WriteRange::apply` returns
@@ -2310,16 +2273,6 @@ fn materialise<'w, 'r>(
                 }
             }
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
-            // DEF-154 (H): `row_bytes: &'r [u8]` carried directly by
-            // the staged action — no range-apply dance. Tier-1
-            // infallible: the slice was validated at dispatch time
-            // (via `populated.get(start..end)` bounds check;
-            // out-of-bounds routed through `MalformedDataRow`) and
-            // the `'r` lifetime ties it to the read_buf borrow that
-            // blocks any `&mut self.read_buf` call until OutActions
-            // drops. Identity apply here.
-            // StreamRowRange handled in the early `if let` above.
-            StagedAction::StreamRowRange { .. } => continue,
             StagedAction::CloseSocket => Action::CloseSocket,
         };
         push_within_fanout_budget(&mut out, a);
@@ -2667,7 +2620,7 @@ mod compute_push_tests {
 
     /// Test-only observation of a [`StagedAction`] — brand stripped,
     /// range carried as `NonEmptyRange`. Tests compare against this
-    /// instead of `StagedAction<'wb>` directly because `'wb` is
+    /// instead of `StagedAction` directly because `'wb` is
     /// HRTB-fresh per call site (DEF-154 (B)) and cannot be named
     /// outside the branded closure that produced it.
     ///
@@ -2706,20 +2659,10 @@ mod compute_push_tests {
             cause: crate::error::ProtocolError,
         },
         CloseSocket,
-        /// DEF-154 (P) P0-6: sentinel variant that fires if
-        /// `compute_push` ever emits a `StreamRowRange` (it should
-        /// NOT — StreamRowRange is a `feed_bytes` DATA_ROW arm
-        /// signal only). Pre-(P) this collapsed silently to
-        /// `CloseSocket`, hiding the architectural invariant break
-        /// from tests. Post-(P): tests that `match sobs { ... }`
-        /// see this distinct variant and can assert via
-        /// `matches!(sobs, StagedObs::StreamRowRangeUnexpected)`
-        /// that the refactor regression was caught.
-        StreamRowRangeUnexpected,
     }
 
     impl StagedObs {
-        fn from_staged(sa: &StagedAction<'_>) -> Self {
+        fn from_staged(sa: &StagedAction) -> Self {
             match sa {
                 StagedAction::SendBytesRange(_) => Self::SendBytesRange,
                 StagedAction::SendBytesStatic(s) => Self::SendBytesStatic(s),
@@ -2727,9 +2670,6 @@ mod compute_push_tests {
                 StagedAction::FailReply { id, cause } => {
                     Self::FailReply { id: *id, cause: *cause }
                 }
-                // DEF-154 (P) P0-6: distinct variant instead of
-                // silent CloseSocket collapse.
-                StagedAction::StreamRowRange { .. } => Self::StreamRowRangeUnexpected,
                 StagedAction::CloseSocket => Self::CloseSocket,
             }
         }

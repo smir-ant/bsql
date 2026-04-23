@@ -41,8 +41,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply, ReplyId, Sql,
-    StreamItem, WriteBuf,
+    Action, ColumnDesc, DataRowRef, FormatCode, FromPgText, PgCommand, PgProtocol, ProtoState,
+    ProtocolError, QueryKind, Reply, ReplyId, Sql, StreamItem, WriteBuf, oids,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_ERROR_RESPONSE, TAG_QUERY, TAG_READY_FOR_QUERY,
         TAG_ROW_DESCRIPTION,
@@ -422,4 +422,369 @@ fn server_error_response_surfaces_as_fail_reply() {
         }
     }
     assert!(saw_fail, "FailReply must be emitted");
+}
+
+// ==================================================================
+// (H) Mid-stream server error — rows BEFORE the E frame are
+// preserved; FailReply replaces the Complete terminal.
+// ==================================================================
+
+/// Invariant (migrated DEF-154 (F) P0-1 pin from simple_query_spec):
+/// if server sends one or more rows then an ErrorResponse, every
+/// `Row` event that already emitted must carry the FULL DataRow
+/// body bytes (pre-(F) the fatal-path clear wiped populated()
+/// before materialise, producing silent empty rows). Post-(Y) the
+/// invariant lives exclusively on the iter_rows path.
+#[test]
+fn rows_before_mid_stream_error_are_preserved() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(206);
+    push_simple_query(&mut proto, id(q_raw), &mut wb);
+
+    let mut bytes = std::vec::Vec::new();
+    bytes.extend_from_slice(&row_description_frame(1));
+    bytes.extend_from_slice(&data_row_frame(b"partial"));
+    bytes.extend_from_slice(&error_response_frame(b"division by zero"));
+    bytes.extend_from_slice(&rfq_frame(b'E'));
+
+    let mut stream = proto.iter_rows(&mut wb);
+    if let Err(err) = stream.feed(&bytes) {
+        panic!("feed fits: {err:?}");
+    }
+
+    let mut row_seen = false;
+    let mut fail_seen = false;
+    for _ in 0..16 {
+        match stream.next_event() {
+            StreamItem::Row { id: row_id, row_bytes, .. } => {
+                assert_eq!(row_id, q_raw);
+                // col-count(2) + vlen(4) + "partial"(7) = 13 bytes.
+                assert_eq!(row_bytes.len(), 13, "full row body preserved");
+                let Some(tail) = row_bytes.get(6..) else {
+                    panic!("row_bytes too short: {}", row_bytes.len());
+                };
+                assert_eq!(tail, b"partial");
+                row_seen = true;
+            }
+            StreamItem::FailReply { id: fail_id, cause } => {
+                assert_eq!(fail_id, q_raw);
+                assert!(
+                    matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+                    "cause must be ServerErrorResponse, got {cause:?}",
+                );
+                fail_seen = true;
+                break;
+            }
+            StreamItem::NeedMore => continue,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(row_seen && fail_seen, "must see both Row and FailReply");
+}
+
+// ==================================================================
+// (I) Malformed CommandComplete mid-stream — rows preserved,
+// FailReply(MalformedCommandComplete) + CloseSocket emitted.
+// ==================================================================
+
+/// Invariant: rows streamed before a CommandComplete framing
+/// desync (missing NUL terminator) are preserved; the invariant
+/// moved from simple_query_spec's fatal-path pin to iter_rows
+/// post-(Y). Demonstrates that slow-path classification of
+/// malformed control-frames doesn't eat prior fast-path rows.
+#[test]
+fn rows_preserved_when_command_complete_malformed() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(207);
+    push_simple_query(&mut proto, id(q_raw), &mut wb);
+
+    let mut bytes = std::vec::Vec::new();
+    bytes.extend_from_slice(&row_description_frame(1));
+    bytes.extend_from_slice(&data_row_frame(b"intact"));
+    // CC frame WITHOUT NUL terminator — framing desync.
+    bytes.extend_from_slice(&frame(TAG_COMMAND_COMPLETE.byte(), b"SELECT 1"));
+
+    let mut stream = proto.iter_rows(&mut wb);
+    if let Err(err) = stream.feed(&bytes) {
+        panic!("feed fits: {err:?}");
+    }
+
+    let mut row_seen = false;
+    let mut fail_seen = false;
+    for _ in 0..16 {
+        match stream.next_event() {
+            StreamItem::Row { row_bytes, .. } => {
+                // col-count(2) + vlen(4) + "intact"(6) = 12 bytes.
+                assert_eq!(row_bytes.len(), 12);
+                let Some(tail) = row_bytes.get(6..) else {
+                    panic!("row_bytes too short: {}", row_bytes.len());
+                };
+                assert_eq!(tail, b"intact");
+                row_seen = true;
+            }
+            StreamItem::FailReply { cause, .. } => {
+                assert!(
+                    matches!(cause, ProtocolError::MalformedCommandComplete { .. }),
+                    "cause must be MalformedCommandComplete, got {cause:?}",
+                );
+                fail_seen = true;
+                break;
+            }
+            StreamItem::NeedMore => continue,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(row_seen && fail_seen, "must see both Row and FailReply");
+}
+
+// ==================================================================
+// (J) Split feed — rows across multiple `feed()` calls.
+// ==================================================================
+
+/// Invariant: the `StreamingRows` state persists across
+/// `feed()` call boundaries. Each `next_event` pull operates on
+/// whatever bytes have been `feed()`-ed so far; when the buffer
+/// empties mid-stream `next_event` returns `NeedMore`; subsequent
+/// `feed()` + `next_event` resume cleanly.
+#[test]
+fn rows_across_multiple_feed_calls() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(208);
+    push_simple_query(&mut proto, id(q_raw), &mut wb);
+
+    let mut batch1 = std::vec::Vec::new();
+    batch1.extend_from_slice(&row_description_frame(1));
+    batch1.extend_from_slice(&data_row_frame(b"r1"));
+    batch1.extend_from_slice(&data_row_frame(b"r2"));
+
+    let mut batch2 = std::vec::Vec::new();
+    batch2.extend_from_slice(&data_row_frame(b"r3"));
+    batch2.extend_from_slice(&command_complete_frame(b"SELECT 3"));
+    batch2.extend_from_slice(&rfq_frame(b'I'));
+
+    let mut stream = proto.iter_rows(&mut wb);
+
+    // Feed batch 1. Pull up to 2 rows + the trailing NeedMore
+    // (buffer empty). Silent T transition surfaces one extra
+    // NeedMore between the T frame and the first D; loop until
+    // we've seen the expected rows OR two consecutive NeedMores
+    // indicating the buffer truly empty.
+    if let Err(err) = stream.feed(&batch1) {
+        panic!("feed batch1: {err:?}");
+    }
+    let mut rows = 0usize;
+    let mut consecutive_need_more = 0usize;
+    let mut complete = false;
+    for _ in 0..16 {
+        match stream.next_event() {
+            StreamItem::Row { .. } => {
+                rows = rows.saturating_add(1);
+                consecutive_need_more = 0;
+            }
+            StreamItem::NeedMore => {
+                consecutive_need_more = consecutive_need_more.saturating_add(1);
+                if consecutive_need_more >= 2 {
+                    break;
+                }
+            }
+            StreamItem::Complete { .. } => {
+                complete = true;
+                break;
+            }
+            other => panic!("unexpected event in batch1: {other:?}"),
+        }
+    }
+    assert_eq!(rows, 2, "batch 1 yields 2 rows");
+    assert!(!complete, "batch 1 must not complete yet");
+
+    // Feed batch 2 — pull the remaining row + Complete.
+    if let Err(err) = stream.feed(&batch2) {
+        panic!("feed batch2: {err:?}");
+    }
+    for _ in 0..16 {
+        match stream.next_event() {
+            StreamItem::Row { .. } => rows = rows.saturating_add(1),
+            StreamItem::Complete { id: reply_id, .. } => {
+                assert_eq!(reply_id, q_raw);
+                complete = true;
+                break;
+            }
+            StreamItem::NeedMore => continue,
+            other => panic!("unexpected event in batch2: {other:?}"),
+        }
+    }
+    assert_eq!(rows, 3, "3 rows total across both feeds");
+    assert!(complete, "Complete must emit after the final feed");
+}
+
+// ==================================================================
+// (K) DataRowRef round-trip decode over iter_rows `row_bytes`.
+// ==================================================================
+
+/// Invariant (migrated from simple_query_spec's 1c-2b test):
+/// `DataRowRef::parse` + `columns()` decode the raw
+/// `StreamItem::Row::row_bytes` into per-column `Option<&[u8]>`,
+/// with the NULL sentinel (`len = -1`) round-tripping to `None`.
+#[test]
+fn row_bytes_decode_via_data_row_ref() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(209);
+    push_simple_query(&mut proto, id(q_raw), &mut wb);
+
+    // Build DataRow with 2 columns: "answer" and NULL.
+    let mut row_body = std::vec::Vec::new();
+    row_body.extend_from_slice(&2i16.to_be_bytes());
+    let col0 = b"answer";
+    let Ok(col0_len) = i32::try_from(col0.len()) else { unreachable!() };
+    row_body.extend_from_slice(&col0_len.to_be_bytes());
+    row_body.extend_from_slice(col0);
+    row_body.extend_from_slice(&(-1i32).to_be_bytes());
+
+    let mut bytes = std::vec::Vec::new();
+    bytes.extend_from_slice(&row_description_frame(2));
+    bytes.push(TAG_DATA_ROW.byte());
+    let Ok(framelen) = u32::try_from(row_body.len().saturating_add(4)) else { unreachable!() };
+    bytes.extend_from_slice(&framelen.to_be_bytes());
+    bytes.extend_from_slice(&row_body);
+    bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
+    bytes.extend_from_slice(&rfq_frame(b'I'));
+
+    let mut stream = proto.iter_rows(&mut wb);
+    if let Err(err) = stream.feed(&bytes) {
+        panic!("feed fits: {err:?}");
+    }
+
+    let mut decoded = false;
+    for _ in 0..16 {
+        match stream.next_event() {
+            StreamItem::Row { row_bytes, .. } => {
+                let Ok(row) = DataRowRef::parse(row_bytes) else {
+                    panic!("DataRowRef::parse must succeed");
+                };
+                assert_eq!(row.len(), 2);
+                let items: std::vec::Vec<_> = row.columns().collect();
+                assert_eq!(items.len(), 2);
+                assert!(
+                    matches!(items.first(), Some(Ok(Some(b"answer")))),
+                    "col 0 should decode to b\"answer\", got {:?}",
+                    items.first(),
+                );
+                assert!(
+                    matches!(items.get(1), Some(Ok(None))),
+                    "col 1 should decode as SQL NULL, got {:?}",
+                    items.get(1),
+                );
+                decoded = true;
+            }
+            StreamItem::Complete { .. } => break,
+            StreamItem::NeedMore => continue,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(decoded, "must have decoded the row");
+}
+
+// ==================================================================
+// (L) End-to-end typed-decode round-trip.
+// ==================================================================
+
+/// Invariant (migrated from simple_query_spec's 1c-2c test):
+/// full decode round-trip — push a SELECT, server replies with
+/// typed rows, caller uses `DataRowRef` + `FromPgText` to
+/// reconstruct Rust values. User-level API that Phase 2 macros
+/// target.
+#[test]
+fn end_to_end_decode_typed_row() {
+    let mut proto = PgProtocol::new();
+    let mut wb = WriteBuf::new();
+    let q_raw = raw(210);
+    push_simple_query(&mut proto, id(q_raw), &mut wb);
+
+    // RowDescription: 2 cols — id INT4, name TEXT.
+    let mut rd_body = std::vec::Vec::new();
+    rd_body.extend_from_slice(&2i16.to_be_bytes());
+    for (name, oid) in [(&b"id"[..], oids::INT4), (&b"name"[..], oids::TEXT)] {
+        rd_body.extend_from_slice(name);
+        rd_body.push(0);
+        rd_body.extend_from_slice(&0i32.to_be_bytes());
+        rd_body.extend_from_slice(&0i16.to_be_bytes());
+        rd_body.extend_from_slice(&oid.to_be_bytes());
+        rd_body.extend_from_slice(&(-1i16).to_be_bytes());
+        rd_body.extend_from_slice(&(-1i32).to_be_bytes());
+        rd_body.extend_from_slice(&0i16.to_be_bytes());
+    }
+    let mut dr_body = std::vec::Vec::new();
+    dr_body.extend_from_slice(&2i16.to_be_bytes());
+    let id_text = b"42";
+    let Ok(id_len) = i32::try_from(id_text.len()) else { unreachable!() };
+    dr_body.extend_from_slice(&id_len.to_be_bytes());
+    dr_body.extend_from_slice(id_text);
+    let name_text = b"alice";
+    let Ok(name_len) = i32::try_from(name_text.len()) else { unreachable!() };
+    dr_body.extend_from_slice(&name_len.to_be_bytes());
+    dr_body.extend_from_slice(name_text);
+
+    let mut bytes = std::vec::Vec::new();
+    bytes.push(TAG_ROW_DESCRIPTION.byte());
+    let Ok(rd_len) = u32::try_from(rd_body.len().saturating_add(4)) else { unreachable!() };
+    bytes.extend_from_slice(&rd_len.to_be_bytes());
+    bytes.extend_from_slice(&rd_body);
+    bytes.push(TAG_DATA_ROW.byte());
+    let Ok(dr_len) = u32::try_from(dr_body.len().saturating_add(4)) else { unreachable!() };
+    bytes.extend_from_slice(&dr_len.to_be_bytes());
+    bytes.extend_from_slice(&dr_body);
+    bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
+    bytes.extend_from_slice(&rfq_frame(b'I'));
+
+    let mut stream = proto.iter_rows(&mut wb);
+    if let Err(err) = stream.feed(&bytes) {
+        panic!("feed fits: {err:?}");
+    }
+
+    let mut decoded_id: Option<i32> = None;
+    let mut decoded_name: Option<std::string::String> = None;
+    for _ in 0..16 {
+        match stream.next_event() {
+            StreamItem::Row { row_bytes, desc, .. } => {
+                assert!(
+                    matches!(
+                        desc.get(0),
+                        Some(&ColumnDesc { type_oid: oids::INT4, format_code: FormatCode::Text }),
+                    ) && matches!(
+                        desc.get(1),
+                        Some(&ColumnDesc { type_oid: oids::TEXT, format_code: FormatCode::Text }),
+                    ) && desc.len() == 2,
+                    "schema mismatch: {desc:?}",
+                );
+                let Ok(row) = DataRowRef::parse(row_bytes) else {
+                    panic!("DataRowRef::parse must succeed");
+                };
+                let mut cols = row.columns();
+                match cols.next() {
+                    Some(Ok(Some(b))) => match i32::from_pg_text(b) {
+                        Ok(v) => decoded_id = Some(v),
+                        Err(e) => panic!("i32 decode: {e:?}"),
+                    },
+                    other => panic!("col 0: {other:?}"),
+                }
+                match cols.next() {
+                    Some(Ok(Some(b))) => match <&str>::from_pg_text(b) {
+                        Ok(s) => decoded_name = Some(std::string::String::from(s)),
+                        Err(e) => panic!("str decode: {e:?}"),
+                    },
+                    other => panic!("col 1: {other:?}"),
+                }
+                assert!(cols.next().is_none());
+            }
+            StreamItem::Complete { .. } => break,
+            StreamItem::NeedMore => continue,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!(decoded_id, Some(42));
+    assert_eq!(decoded_name.as_deref(), Some("alice"));
 }

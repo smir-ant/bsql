@@ -21,199 +21,12 @@ use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
-    TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
+    TAG_COMMAND_COMPLETE, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
     TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NO_DATA, TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE,
     TAG_PORTAL_SUSPENDED, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 // DEF-154 (B) Phase B4: `WriteBuf` import no longer needed here —
 // dispatch takes `&mut BrandedWriteReserved<'_>` post-migration.
-
-// ════════════════════════════════════════════════════════════════════
-// Typed constructor arguments for `FrameCoords` — each offset has
-// its own nominal type, so `FrameCoords::new` cannot receive swapped
-// arguments at a call site. Tier-1 compile on "don't confuse frame
-// start with total length with populated length".
-// ════════════════════════════════════════════════════════════════════
-
-/// Absolute position where a frame begins in
-/// [`crate::buf::ReadBuf::populated`]. Equals the read cursor at the
-/// moment `parse_header` consumed the frame's bytes.
-///
-/// F-018 (pass-#8): field is private; constructed only via
-/// [`Self::new`]. Prior `pub usize` let a caller destructure one
-/// newtype and re-wrap into another (`AbsFrameStart(other.0)`),
-/// weakening the typed-argument anti-swap shield. Private field +
-/// constructor makes the wrap explicit at the one valid call site.
-///
-/// DEF-147: storage narrowed from `usize` (8 B) to `u16` (2 B).
-/// `READ_BUF_CAP = 4096 ≤ u16::MAX = 65535` is const-asserted at
-/// `crate::buf::READ_BUF_CAP`; all values reaching this newtype
-/// originate in validated-bounded read-buffer offsets, so the
-/// `try_from` narrowing is architecturally infallible (the
-/// `unwrap_or(u16::MAX)` fallback is forbid-bundle-compliant dead
-/// code). Accessors widen back to `usize` on read via
-/// `usize::from` (infallible).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub(crate) struct AbsFrameStart(u16);
-
-impl AbsFrameStart {
-    /// Construct from a `u16` offset — tier-1 total. DEF-154 (G):
-    /// caller must prove `v` fits `u16` (bounded by
-    /// `READ_BUF_CAP = 4096 <= u16::MAX` via const-assert in `buf.rs`).
-    /// Pre-(G), the constructor did `u16::try_from(v_usize).unwrap_or(u16::MAX)`
-    /// — silent narrowing that collapsed any post-drift `usize`
-    /// value >65535 into a single `u16::MAX` slot without error
-    /// signal. Now narrowing is classified at the callsite.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn new(v: u16) -> Self {
-        Self(v)
-    }
-
-    /// DEF-174 (audit2 A004): crate-internal u16 accessor — no
-    /// widening. The only caller is [`FrameCoords::new`] for
-    /// identity-move field construction. Pre-DEF-174 the newtype
-    /// also had a `.get() -> usize` widening accessor, deleted
-    /// because (a) it was unused post-DEF-174, and (b) user's
-    /// audit directive says no dead code.
-    ///
-    /// Callers that need a `usize` should widen explicitly via
-    /// `usize::from(nt.get_u16())`.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn get_u16(self) -> u16 {
-        self.0
-    }
-}
-
-/// Total wire bytes the frame occupies — tag (1) + length-prefix
-/// (4) + body.
-///
-/// F-018: private field + constructor, see [`AbsFrameStart`].
-/// DEF-147: u16 storage, see [`AbsFrameStart`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub(crate) struct FrameTotalLen(u16);
-
-impl FrameTotalLen {
-    /// DEF-154 (G): see [`AbsFrameStart::new`] — tier-1 total.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn new(v: u16) -> Self {
-        Self(v)
-    }
-    /// DEF-174: see [`AbsFrameStart::get_u16`]. No `.get() -> usize`
-    /// accessor — unused post-DEF-174, deleted per no-dead-code.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn get_u16(self) -> u16 {
-        self.0
-    }
-}
-
-// DEF-154 (E): `PopulatedLen` typed newtype DELETED. The
-// `FrameCoords::new(..., populated_len: PopulatedLen)` parameter
-// was removed when `stream_row_or_errored` migrated from
-// `NonEmptyRange::new(start, end, populated_len)` to branded
-// `ReadRange::new(start, end, witness)`. The witness is
-// `BrandedBytes<'rb, '_>` from `rb.populated_branded()`; its
-// `.as_slice().len()` is the current populated extent — same
-// numeric value as the pre-E `populated_len`, now carried by a
-// brand-identity-proving type instead of a raw `u16` newtype.
-
-/// Absolute byte-coordinates of the frame being dispatched, resolved
-/// against [`crate::buf::ReadBuf::populated`]. 1c-1b.
-///
-/// The dispatcher uses these to construct
-/// [`StagedAction::StreamRowRange`] for `DataRow` frames — the
-/// `row_range` must survive the post-dispatch `ReadBuf::advance` call,
-/// which only moves the cursor (the bytes themselves stay in place
-/// until the next `append` triggers lazy compaction).
-///
-/// # Tier-1 construction
-///
-/// Internal fields are private; the only constructor is
-/// [`FrameCoords::new`] which takes three distinct newtypes
-/// ([`AbsFrameStart`], [`FrameTotalLen`], [`PopulatedLen`]). Swapping
-/// any two arguments at the call site is a compile error. `payload_start`
-/// and `payload_end` are derived from `frame_start + HEADER_LEN` and
-/// `frame_start + total_len` internally — no opportunity for a caller
-/// to pass a wrong offset into either slot.
-///
-/// DEF-147: storage narrowed from `3 × usize` (24 B) to
-/// `3 × u16` (6 B, padded to 8 on 64-bit). Saves 16 B per
-/// dispatched frame. Accessors widen back to `usize` on read.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct FrameCoords {
-    frame_start: u16,
-    total_len: u16,
-}
-
-impl FrameCoords {
-    /// Typed constructor. Swap any two arguments → build error.
-    ///
-    /// DEF-154 (E): `populated_len` parameter + field removed —
-    /// post-refactor, `stream_row_or_errored` validates bounds
-    /// via `ReadRange::new(start, end, witness: BrandedBytes<'rb>)`
-    /// where the witness's length is the current populated extent.
-    /// The witness-based check is tier-1 (brand proves buffer
-    /// identity); the populated_len field would be redundant and
-    /// a drift surface.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn new(
-        frame_start: AbsFrameStart,
-        total_len: FrameTotalLen,
-    ) -> Self {
-        Self {
-            frame_start: frame_start.get_u16(),
-            total_len: total_len.get_u16(),
-        }
-    }
-
-    /// Absolute offset where the frame payload begins — right after
-    /// the 5-byte header. Derived from `frame_start + HEADER_LEN`
-    /// (no direct field access, so no swap hazard with `payload_end`).
-    #[inline]
-    #[must_use]
-    pub(crate) fn payload_start(&self) -> usize {
-        usize::from(self.frame_start).saturating_add(crate::frame::HEADER_LEN)
-    }
-
-    /// Absolute offset one-past-last of the frame payload. Derived
-    /// from `frame_start + total_len`.
-    #[inline]
-    #[must_use]
-    pub(crate) fn payload_end(&self) -> usize {
-        usize::from(self.frame_start).saturating_add(usize::from(self.total_len))
-    }
-
-    /// Total frame length (header + body) in bytes. Used by
-    /// `stream_row_or_errored` to classify a malformed DataRow
-    /// (server sent `total_len == HEADER_LEN`, i.e. no body) via
-    /// `ProtocolError::MalformedDataRow { total_len }`.
-    #[inline]
-    #[must_use]
-    pub(crate) fn total_len(&self) -> usize {
-        usize::from(self.total_len)
-    }
-}
-
-// DEF-147 + DEF-154 (V) drift pin: FrameCoords packs 2 × u16 = 4 B.
-// Pre-DEF-154 (E) the struct was 3 × u16 (6 B + 2 B padding = 8 B)
-// because `populated_len` was stored alongside frame_start +
-// total_len. DEF-154 (E) deleted that field (witness-based bounds
-// via ReadRange::new's BrandedBytes); post-(V) the pin tightens
-// from `<= 8` to `== 4` — the exact size is now tier-1 compile-
-// enforced, catching both regressions (re-adding a field) AND
-// drift (padding or layout changes).
-const _: () = assert!(
-    core::mem::size_of::<FrameCoords>() == 4,
-    "FrameCoords size regression — must stay 2 × u16 = 4 B post-DEF-154 (E). \
-     Adding a field re-pays the alignment padding cost + breaks the \
-     per-frame stack budget.",
-);
 
 /// What to do after dispatching a single frame.
 ///
@@ -225,7 +38,7 @@ const _: () = assert!(
 /// (`AdvancedWithAction` requires the field, `AdvancedSilent` does not).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant, reason = "no_alloc: Box unavailable; DispatchOutcome is a one-shot return, not stored. FailReply.cause (ProtocolError ~280 bytes) dominates.")]
-pub(crate) enum DispatchOutcome<'r> {
+pub(crate) enum DispatchOutcome {
     /// Frame consumed; transition to `new_state`. No action emitted.
     /// Used by ParameterStatus, BackendKeyData, AuthenticationOk,
     /// SASLFinal — frames that advance state without user-visible
@@ -239,15 +52,14 @@ pub(crate) enum DispatchOutcome<'r> {
     /// entry-point materialises into a ref-bound `Action<'buf>`
     /// after the write phase releases.
     ///
-    /// DEF-154 (H): `'wb` is the write-buffer brand (preserved for
-    /// tier-1 WriteRange::apply); `'r` is the read-buffer borrow
-    /// lifetime (replaced the removed `'rb` brand). Both are
-    /// anchored here via `StagedAction`.
+    /// DEF-154 (Y): `'r` deleted post-StreamRowRange removal —
+    /// `StagedAction` no longer carries read-buf references (the
+    /// only lifetime'd field was `StreamRowRange::row_bytes`).
     AdvancedWithAction {
         /// The state to transition to.
         new_state: ProtoState,
         /// The single side-effect to push.
-        action: StagedAction<'r>,
+        action: StagedAction,
     },
     /// Frame rejected; connection irrecoverable. Caller tears down.
     ///
@@ -261,9 +73,6 @@ pub(crate) enum DispatchOutcome<'r> {
     /// payload). Pre-consuming at each dispatcher's Errored
     /// construction site keeps the DispatchOutcome kind-free and
     /// avoids forcing DispatchOutcome to be generic over K.
-    ///
-    /// DEF-154 (H): `_Phantom(DualBrandInvariant)` variant deleted
-    /// — `'wb` and `'r` are both anchored in `AdvancedWithAction`.
     Errored {
         reply_id: Option<core::num::NonZeroU64>,
         cause: ProtocolError,
@@ -282,10 +91,10 @@ pub(crate) enum DispatchOutcome<'r> {
 /// value) per DEF-112's pre-consume convention.
 #[cold]
 #[inline]
-const fn errored<'r>(
+const fn errored(
     reply_id: Option<core::num::NonZeroU64>,
     cause: ProtocolError,
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     DispatchOutcome::Errored { reply_id, cause }
 }
 
@@ -299,10 +108,10 @@ const fn errored<'r>(
 /// Audit2 A014.
 #[cold]
 #[inline]
-const fn internal_bug<'r>(
+const fn internal_bug(
     reply_id: Option<core::num::NonZeroU64>,
     locus: crate::error::CrateBugLocus,
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     errored(reply_id, ProtocolError::InternalCrateBug { locus })
 }
 
@@ -331,15 +140,13 @@ const fn internal_bug<'r>(
 /// not expose those methods. Tier-2 structural closure of the "only
 /// alloc in dispatch" invariant that was previously tier-3
 /// code-review discipline.
-pub(crate) fn dispatch<'r>(
+pub(crate) fn dispatch(
     prev: ProtoState,
     tag: crate::wire::InboundTag,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
     arena: &mut crate::schema_arena::ArenaWriter<'_>,
-    coords: FrameCoords,
-    populated: &'r [u8],
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     match (prev, tag) {
         // =============================================================
         // Ping flow (Phase 1a, carried forward)
@@ -598,10 +405,14 @@ pub(crate) fn dispatch<'r>(
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        // StreamingRows: D / C / E — any other tag is desync
-        (ProtoState::SimpleQueryStreamingRows { reply, schema_ref }, TAG_DATA_ROW) => {
-            stream_row_or_errored(reply, schema_ref, coords, populated)
-        }
+        // StreamingRows: C / E — any other tag (including DataRow
+        // via `feed_bytes`) is a desync. DataRow is handled
+        // exclusively by `iter_rows` fast-path; reaching dispatch
+        // with TAG_DATA_ROW in a row-streaming state means the
+        // caller used the `feed_bytes` API for a row-bearing
+        // response (API misuse). The catch-all arm below
+        // classifies as `UnexpectedFrame { tag: DataRow }` →
+        // FailReply + CloseSocket.
         (ProtoState::SimpleQueryStreamingRows { reply, schema_ref }, TAG_COMMAND_COMPLETE) => {
             // SELECT path terminates: preserve schema into AwaitingRfq
             // so the trailing RFQ's QueryComplete carries it.
@@ -811,10 +622,10 @@ pub(crate) fn dispatch<'r>(
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        (
-            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref },
-            TAG_DATA_ROW,
-        ) => stream_row_or_errored(reply, schema_ref, coords, populated),
+        // BindExecuteAwaitingDataOrCompleteSelect: DataRow via
+        // `feed_bytes` classifies as UnexpectedFrame in the
+        // catch-all arm below (see SimpleQueryStreamingRows for
+        // the full rationale).
         (
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref },
             TAG_COMMAND_COMPLETE,
@@ -833,9 +644,10 @@ pub(crate) fn dispatch<'r>(
             errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        (ProtoState::BindExecuteStreamingRows { reply, schema_ref }, TAG_DATA_ROW) => {
-            stream_row_or_errored(reply, schema_ref, coords, populated)
-        }
+        // BindExecuteStreamingRows: DataRow via `feed_bytes`
+        // classifies as UnexpectedFrame in the catch-all arm
+        // below (see SimpleQueryStreamingRows for the full
+        // rationale).
         (ProtoState::BindExecuteStreamingRows { reply, schema_ref }, TAG_COMMAND_COMPLETE) => {
             advance_to_bindexecute_awaiting_rfq_select(reply, payload, schema_ref)
         }
@@ -1094,7 +906,7 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
 /// cannot reach this arm with SCRAM payloads already buffered,
 /// because the Scram variant of the state has its own handler —
 /// this separation is the tier-1 compile guarantee DEF-097 buys.
-fn dispatch_auth_in_startup_trust<'r>(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome<'r> {
+fn dispatch_auth_in_startup_trust(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome {
     let (code, _rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1126,12 +938,12 @@ fn dispatch_auth_in_startup_trust<'r>(reply: ReplyId<crate::reply_id::StartupKin
 /// Only `AUTH_SASL` is acceptable here; the server taking `AUTH_OK`
 /// without asking for the password is an auth-method mismatch on
 /// the server side (client expected SCRAM).
-fn dispatch_auth_in_startup_scram<'r>(
+fn dispatch_auth_in_startup_scram(
     reply: ReplyId<crate::reply_id::StartupKind>,
     scram: crate::scram::session::ScramSession,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1297,14 +1109,14 @@ fn build_sasl_initial_response(
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
 /// [`ScramSession::try_from_credentials`]: crate::scram::session::ScramSession::try_from_credentials
-fn dispatch_auth_sasl_continue<'r>(
+fn dispatch_auth_sasl_continue(
     reply: ReplyId<crate::reply_id::StartupKind>,
     scram: crate::scram::session::ScramSession,
     client_first_bare: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
     client_nonce_b64: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1425,11 +1237,11 @@ fn dispatch_auth_sasl_continue<'r>(
 }
 
 /// Dispatch AuthenticationSASLFinal (server-final-message).
-fn dispatch_auth_sasl_final<'r>(
+fn dispatch_auth_sasl_final(
     reply: ReplyId<crate::reply_id::StartupKind>,
     expected_server_sig: crate::scram::types::SecretDigest,
     payload: &[u8],
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
@@ -1461,7 +1273,7 @@ fn dispatch_auth_sasl_final<'r>(
 }
 
 /// Dispatch AuthenticationOk after SCRAM verification.
-fn dispatch_auth_ok_after_scram<'r>(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome<'r> {
+fn dispatch_auth_ok_after_scram(reply: ReplyId<crate::reply_id::StartupKind>, payload: &[u8]) -> DispatchOutcome {
     // AuthOk has no trailing data; destructure with anonymous `_`
     // pattern (pattern-discard, not a `_`-prefixed identifier —
     // allowed by the `no underscore vars` discipline).
@@ -1615,11 +1427,11 @@ fn parse_error_response(payload: &[u8]) -> ProtocolError {
 /// Centralises the "`CommandComplete` → AwaitingRfq" invariant in one
 /// place — an arm-body edit in only one of the two call sites
 /// would diverge silently; the helper makes the transition atomic.
-fn advance_to_awaiting_rfq<'r>(
+fn advance_to_awaiting_rfq(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
     schema_ref: Option<crate::schema_arena::SchemaRef>,
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::SimpleQueryAwaitingRfq {
@@ -1639,11 +1451,11 @@ fn advance_to_awaiting_rfq<'r>(
 ///
 /// The DML path's 'C' transition is inlined directly in the dispatch
 /// arm (one call-site only) and doesn't need a helper.
-fn advance_to_bindexecute_awaiting_rfq_select<'r>(
+fn advance_to_bindexecute_awaiting_rfq_select(
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
     schema_ref: crate::schema_arena::SchemaRef,
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => DispatchOutcome::AdvancedSilent {
             new_state: ProtoState::BindExecuteAwaitingRfqSelect {
@@ -1682,10 +1494,10 @@ fn advance_to_bindexecute_awaiting_rfq_select<'r>(
 /// register pressure permits. Same treatment as `errored()` above.
 #[cold]
 #[inline]
-fn advance_to_drain_after_error<'r>(
+fn advance_to_drain_after_error(
     raw_id: core::num::NonZeroU64,
     payload: &[u8],
-) -> DispatchOutcome<'r> {
+) -> DispatchOutcome {
     let cause = parse_error_response(payload);
     DispatchOutcome::AdvancedWithAction {
         new_state: ProtoState::DrainRfqAfterError,
@@ -1734,66 +1546,6 @@ fn parse_rfq_payload(
         // field in the future, this map_err flips to pass it through.
         [tx_byte] => crate::action::TxStatus::try_from_byte(*tx_byte).map_err(|_| 1usize),
         other => Err(other.len()),
-    }
-}
-
-/// 1c-1b helper: build a `StreamRowRange` for a `DataRow` frame, or
-/// classify as `InternalCrateBug { locus: RowRangeConstruction }` on a malformed empty body.
-///
-/// `reply.get()` — not `.consume()` — rows are in-progress signals;
-/// the `ReplyId` commits on the terminal `CommandComplete` →
-/// `ReadyForQuery` pair. The `NonEmptyRange` constructor's `None`
-/// branch is architecturally unreachable when `parse_header` has
-/// already validated frame bounds, but surfacing it as a classified
-/// error (vs a panic) preserves the crate-root panic ban.
-fn stream_row_or_errored<'r>(
-    reply: ReplyId<crate::reply_id::QueryKind>,
-    schema_ref: crate::schema_arena::SchemaRef,
-    coords: FrameCoords,
-    populated: &'r [u8],
-) -> DispatchOutcome<'r> {
-    // DEF-154 (H): tier-1 apply — slice `populated` directly; the
-    // stored `&'r [u8]` is borrow-checked against the populated
-    // region's lifetime.
-    //
-    // DEF-154 (J): `schema_ref` is passed through as a handle;
-    // resolution to `&RowDesc` happens at materialise time with
-    // classified stale-ref handling (see materialise's
-    // StreamRowRange arm in protocol.rs).
-    //
-    // DEF-154 (K) bugfix: empty row-body (total_len == HEADER_LEN,
-    // payload_start == payload_end) routes through MalformedDataRow
-    // classification. Pre-(K), `populated.get(5..5)` returned
-    // `Some(&[])` (zero-length slice is in-bounds) — the dispatch
-    // fell through to `AdvancedWithAction` with `row_bytes: &[]`,
-    // producing a silently empty StreamRow at the user boundary
-    // (exactly the "тихая эрозия" pattern user banned). Pre-(H) the
-    // same check lived inside `NonEmptyRange::new` which rejected
-    // `end <= start`; the guarantee was LOST in the refactor.
-    let start = coords.payload_start();
-    let end = coords.payload_end();
-    if start >= end {
-        return DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: crate::error::ProtocolError::MalformedDataRow {
-                total_len: coords.total_len(),
-            },
-        };
-    }
-    match populated.get(start..end) {
-        Some(row_bytes) => {
-            let id = reply.get();
-            DispatchOutcome::AdvancedWithAction {
-                new_state: ProtoState::SimpleQueryStreamingRows { reply, schema_ref },
-                action: StagedAction::StreamRowRange { id, row_bytes, schema_ref },
-            }
-        }
-        None => DispatchOutcome::Errored {
-            reply_id: Some(reply.consume()),
-            cause: crate::error::ProtocolError::MalformedDataRow {
-                total_len: coords.total_len(),
-            },
-        },
     }
 }
 

@@ -381,13 +381,13 @@ impl<'p, 'w> RowStream<'p, 'w> {
 }
 
 /// DEF-154 (X): Action → StreamItem mapping for the slow-path
-/// emission. Both types carry Copy-POD payloads post-DEF-119
-/// (arena-externalised RowDesc); the mapping is a trivial enum
-/// re-pack.
+/// emission. Post-DEF-154 (Y) `Action::StreamRow` no longer
+/// exists (DataRow flows via `iter_rows` fast-path only);
+/// slow-path never observes a row action, so the match is over
+/// the four remaining variants.
 #[inline]
 fn action_to_stream_item<'a>(action: Action<'a, 'a>) -> StreamItem<'a> {
     match action {
-        Action::StreamRow { id, row_bytes, desc } => StreamItem::Row { id, row_bytes, desc },
         Action::DeliverReply { id, value } => StreamItem::Complete { id, value },
         Action::SendBytes(bytes) => StreamItem::SendBytes(bytes),
         Action::FailReply { id, cause } => StreamItem::FailReply { id, cause },

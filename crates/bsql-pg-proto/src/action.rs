@@ -747,7 +747,7 @@ impl<'w, 'r> Iterator for OutActionsIter<'w, 'r> {
 /// before proposing the change.
 // DEF-154 (L): staged container uses `MAX_STAGED_PER_CALL`
 // (dispatch-side cap); output uses `MAX_ACTIONS_PER_CALL` (fan-out).
-pub(crate) type StagedActions<'r> = heapless::Vec<StagedAction<'r>, { crate::protocol::MAX_STAGED_PER_CALL }>;
+pub(crate) type StagedActions = heapless::Vec<StagedAction, { crate::protocol::MAX_STAGED_PER_CALL }>;
 
 /// A directive from the protocol to its host.
 ///
@@ -830,69 +830,6 @@ pub enum Action<'w, 'r> {
         cause: ProtocolError,
     },
 
-    /// Stream one row of a query result to the wrapper.
-    ///
-    /// The `row_bytes` slice points into the protocol's `ReadBuf`
-    /// and is valid for the lifetime of the owning `OutActions<'_, 'r>`.
-    /// The wrapper copies / decodes the bytes before the next
-    /// `feed_bytes` call — architecturally enforced because that
-    /// call requires `&'r mut self` which blocks while the row
-    /// reference is alive. Zero-copy row delivery.
-    ///
-    /// The `id` matches the in-flight query's `ReplyId<QueryKind>`;
-    /// the `ReplyId` itself is NOT consumed here — rows are
-    /// "in-progress signals", the terminal `CommandComplete` consumes
-    /// the `ReplyId` into `DeliverReply { value: QueryComplete {…} }`.
-    ///
-    /// # 1c-2a: `desc` schema reference
-    ///
-    /// `desc` points to [`crate::RowDesc`] inside
-    /// [`crate::PgProtocol`], populated by the preceding
-    /// `RowDescription` frame. Its lifetime `'r` ties it to the
-    /// `&'r mut PgProtocol` borrow — the schema stays available
-    /// exactly as long as the row bytes. Pairing is tier-2
-    /// structural: a `StreamRow` action can't exist without a
-    /// matching schema because `SimpleQueryStreamingRows` state is
-    /// entered only via the 'T' dispatcher arm which populates the
-    /// schema before staging any row.
-    ///
-    /// Round-4 finding #1 / 1c-1a; row_desc wiring in 1c-2a.
-    ///
-    /// F19 (2026-04-21): `desc` is carried BY VALUE, not by reference.
-    /// Rationale: after F19 embedded `RowDesc` directly into the
-    /// `SimpleQueryStreamingRows { row_desc }` state variant (tier-3
-    /// audit-paired slot → tier-2 structural pairing), the schema's
-    /// lifetime is now bounded by the StreamingRows variant — which
-    /// may transition to `Idle` before `materialise` runs at the end
-    /// of `feed_bytes`. By-value avoids the self-referential lifetime
-    /// issue (Action would need to borrow from state, but state mutates
-    /// mid-loop). Cost: `Action::StreamRow` grows from ~32 bytes to
-    /// ~292 bytes, matching the existing `Action::DeliverReply`
-    /// envelope (which already carries a full `RowDesc` via
-    /// `QueryCompletePayload`). `OutActions` size bump is ~96 bytes
-    /// on the `feed_bytes` stack frame — acceptable for the tier win.
-    StreamRow {
-        /// Correlator of the in-flight query.
-        id: NonZeroU64,
-        /// Raw row bytes as delivered by PG (PG's `DataRow` body —
-        /// column-count prefix followed by per-column
-        /// length/bytes pairs). Parsing into typed columns happens
-        /// via [`crate::decode`] primitives (1c-2b).
-        row_bytes: &'r [u8],
-        /// Result-set schema — type OIDs + format codes per column.
-        /// Stable across the entire row stream.
-        ///
-        /// DEF-119: borrows from `PgProtocol`'s schema arena via `'r`.
-        /// Previously carried BY VALUE (260-byte copy per row);
-        /// now an 8-byte reference. On a 1000-row SELECT this saves
-        /// ~260 KB of per-row copy traffic. The arena slot is held
-        /// live by `SimpleQueryStreamingRows { schema_ref }` state
-        /// throughout the stream and freed at the terminal RFQ →
-        /// Idle transition (after the Reply's `&RowDesc` borrow
-        /// ended when `OutActions` dropped).
-        desc: &'r crate::decode::RowDesc,
-    },
-
     /// The socket is no longer safe to use; close it.
     ///
     /// Emitted alongside a failed reply when the connection is
@@ -921,7 +858,7 @@ pub enum Action<'w, 'r> {
 ///   copy — `Sync` bypasses `write_buf` entirely).
 #[derive(Debug)]
 #[expect(clippy::large_enum_variant, reason = "no_alloc crate: Box unavailable. Mirrors the `Action<'w, 'r>` rationale above — DEF-119 shrunk the DeliverReply payload; FailReply.cause (ProtocolError) dominates. FailReply is cold-path.")]
-pub(crate) enum StagedAction<'r> {
+pub(crate) enum StagedAction {
     /// Bytes live at the range `[start..start+len]` in the
     /// caller's `write_buf`. Non-zero length (DEF-100).
     ///
@@ -946,32 +883,6 @@ pub(crate) enum StagedAction<'r> {
         id: NonZeroU64,
         /// Why the protocol failed.
         cause: ProtocolError,
-    },
-    /// Map to [`Action::StreamRow`] at materialise time.
-    ///
-    /// DEF-154 (H): `row_bytes: &'r [u8]` borrowed at dispatch.
-    /// Schema resolution stays handle-based (SchemaRef → RowDesc
-    /// resolved at materialise via ArenaReader) — the alternative
-    /// (direct `&'r RowDesc` in StagedAction) conflicts with the
-    /// dispatch-loop mutation discipline: loop iter N's outcome
-    /// carrying `&'r RowDesc` would block iter N+1's
-    /// `schema_arena.alloc(...)` via Rust's shared-xor-mut rule.
-    ///
-    /// DEF-154 (J) P0-D: materialise now CLASSIFIES stale
-    /// SchemaRef as a crate-bug (`StaleSchemaRef` locus) via an
-    /// explicit `FailReply + CloseSocket` emission — replacing
-    /// the pre-(J) silent `RowDesc::EMPTY` fallback. Stale ref
-    /// remains architecturally dead under DEF-172 entry-point
-    /// arena semantics, but emission is classified not silent.
-    StreamRowRange {
-        /// Raw correlator (`reply.get()`; reply is NOT consumed here
-        /// — rows are in-progress, the reply commits on terminal
-        /// `CommandComplete`).
-        id: NonZeroU64,
-        /// Row-body slice. Borrows from `read_buf.populated()`.
-        row_bytes: &'r [u8],
-        /// Schema arena handle — resolved at materialise time.
-        schema_ref: crate::schema_arena::SchemaRef,
     },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,
@@ -1288,10 +1199,10 @@ pub(crate) use deliver_entry_priv::DeliverReplyEntry;
 /// `ReplyKind::StagedPayload`.
 #[inline]
 #[must_use]
-pub(crate) fn deliver<'r, K: crate::reply_id::ReplyKind>(
+pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
     id: crate::reply_id::ReplyId<K>,
     payload: K::StagedPayload,
-) -> StagedAction<'r> {
+) -> StagedAction {
     StagedAction::DeliverReply(DeliverReplyEntry::new(id.consume(), payload.into()))
 }
 

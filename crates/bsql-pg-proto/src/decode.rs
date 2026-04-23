@@ -798,16 +798,18 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 ///
 /// DEF-154 (R) P1-3: the doc-test below is now COMPILE-CHECKED
 /// (pre-(R) was `rust,ignore` — pure prose that rotted silently on
-/// any signature change). If a future refactor alters
-/// `DataRowRef::parse`, `RowColumns::next`, `Action::StreamRow`,
+/// any signature change). DEF-154 (Y): migrated from
+/// `Action::StreamRow` to `StreamItem::Row` (row-bearing path is
+/// now exclusively `iter_rows`). If a future refactor alters
+/// `DataRowRef::parse`, `RowColumns::next`, `StreamItem::Row`,
 /// `FromPgText` trait shape, or `DecodeError` variants, this example
 /// fails to compile in CI.
 ///
 /// ```rust
-/// use bsql_pg_proto::{Action, DataRowRef, DecodeError, FromPgText};
+/// use bsql_pg_proto::{DataRowRef, DecodeError, FromPgText, StreamItem};
 ///
-/// fn example(action: Action<'_, '_>) -> Result<(), DecodeError> {
-///     let Action::StreamRow { row_bytes, .. } = action else { return Ok(()) };
+/// fn example(item: StreamItem<'_>) -> Result<(), DecodeError> {
+///     let StreamItem::Row { row_bytes, .. } = item else { return Ok(()) };
 ///     let row = DataRowRef::parse(row_bytes)?;
 ///     let mut cols = row.columns();
 ///

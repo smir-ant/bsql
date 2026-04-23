@@ -3499,6 +3499,7 @@ end-to-end throughput** bounded by per-row decode work.
   `feed_bytes` legacy path for callers that haven't migrated;
   retained for compat. Candidate for removal once
   `bsql-driver-postgres` fully migrates to `iter_rows`.
+  **[CLOSED in DEF-154 (Y) — see below.]**
 
 **Lessons from three failed mid-session attempts (pre-shipped).**
 Earlier attempts hit Rust's NLL "conditional reborrow" limitation:
@@ -3510,3 +3511,104 @@ slow_path emits the first action OR NeedMore, caller re-enters
 `next_event` until terminal — no recursion, no lifetime conflict.
 One extra loop iter per silent transition (rare: 1 per query in
 SELECT flow). Net wash.
+
+### DEF-154 (Y) — `Action::StreamRow` full deletion — SHIPPED (2026-04-23)
+
+**What shipped.** Complete deletion of the pre-`iter_rows` row
+emission code path. Post-(Y), `feed_bytes` is strictly the
+**control-path** API (startup / bind / describe / push-command
+responses + DML `C Z`); all row-bearing responses MUST flow
+through `iter_rows` → `StreamItem::Row`.
+
+**Source-level deletions.**
+- `Action::StreamRow { id, row_bytes, desc }` variant (~60 LoC
+  + doc) from `action.rs`.
+- `StagedAction::StreamRowRange { id, row_bytes, schema_ref }`
+  variant (~25 LoC + doc) from `action.rs`. The `'r` lifetime
+  on `StagedAction<'r>` / `StagedActions<'r>` /
+  `DispatchOutcome<'r>` was the only consumer of `'r`; all
+  three types become lifetime-free.
+- `StagedObs::StreamRowRangeUnexpected` variant + its
+  `from_staged` arm (~30 LoC) in `protocol.rs` tests.
+- `stream_row_or_errored` helper (~60 LoC) in `dispatch.rs`.
+- Three `TAG_DATA_ROW` dispatch arms (SimpleQueryStreamingRows,
+  BindExecuteAwaitingDataOrCompleteSelect, BindExecuteStreamingRows)
+  that constructed `StreamRowRange`; DataRow via `feed_bytes`
+  now falls through the catch-all `other` arm → `UnexpectedFrame
+  { tag: DataRow }`.
+- `FrameCoords`, `AbsFrameStart`, `FrameTotalLen` newtypes +
+  drift pin (~150 LoC) in `dispatch.rs`. These existed ONLY to
+  pass frame coordinates into `stream_row_or_errored`; post-(Y)
+  `dispatch()` no longer needs them. Its signature loses
+  `coords: FrameCoords` and `populated: &'r [u8]` params.
+- `materialise` fanout branch for `StreamRowRange` (~40 LoC) in
+  `protocol.rs`. Only the `DeliverReply` stale-ref fanout
+  remains — still reason for `MAX_FANOUT_PER_STAGED = 2`.
+- The `'r` lifetime in several helper functions
+  (`errored<'r>`, `internal_bug<'r>`, 8 dispatch_auth_* helpers,
+  `compute_push_bind_execute<'rb>`) — all become bare fn.
+
+**Test-level changes.** `Action::StreamRow` pattern matches
+existed in 7 tests in `simple_query_spec.rs`:
+- DELETED (redundant / obsolete): `select_multiple_rows_stream_then_deliver`,
+  `zero_body_data_row_classified_as_malformed_data_row` (both
+  covered by `row_stream_spec` equivalents),
+  `overflow_backpressure_preserves_delivery_across_calls`
+  (obsolete — `iter_rows` pulls one event per call, no output
+  array overflow possible).
+- MIGRATED to `row_stream_spec.rs` with `StreamItem::Row`
+  pattern:
+  - `rows_before_mid_stream_error_are_preserved` (from
+    `error_after_some_rows_emits_stream_then_fail`).
+  - `rows_preserved_when_command_complete_malformed` (from
+    `data_row_then_malformed_command_complete_preserves_row_bytes`).
+  - `rows_across_multiple_feed_calls` (from
+    `rows_across_multiple_feed_bytes_calls`).
+  - `row_bytes_decode_via_data_row_ref` (from
+    `stream_row_bytes_decode_via_data_row_ref`).
+  - `end_to_end_decode_typed_row` (from same name).
+- `dml_after_select_clears_row_desc` retained — Q1 (SELECT
+  with rows) converted to `iter_rows`; Q2 (DML) still uses
+  `feed_bytes`.
+
+**Doc-tests.** `decode::FromPgText` doc-test migrated from
+`Action::StreamRow` to `StreamItem::Row` — compile-checked in
+CI so future API drift fails at build.
+
+**Why this is a real simplification, not a shuffle.**
+- `'r` lifetime cascade stripped from `StagedAction`,
+  `StagedActions`, `DispatchOutcome`, `dispatch()`, ~10 helper
+  fns. The read-buf lifetime threading was a massive complexity
+  source — post-(Y) it exists only in `Action<'w, 'r>` for
+  `DeliverReply`'s `Reply<'r>` payload (arena refs).
+- `materialise` loses its "early-if-let for fanout" branch —
+  the remaining loop is a single clean `match sa { ... }`.
+- `dispatch()` signature shrinks from 7 params to 5.
+- `FrameCoords` + its two newtype arguments + the tier-1
+  size drift-pin: 150 LoC of plumbing vanished. The typed-
+  argument anti-swap invariant was shield for `stream_row_or_errored`'s
+  coordinate handling; post-(Y) there's no coordinate handling.
+
+**Verification.**
+- `cargo test -p bsql-pg-proto`: 215 tests pass (218 pre-(Y)
+  − 3 net: deleted 7 feed_bytes row tests, added 5 iter_rows
+  equivalents + kept dml_after_select as hybrid).
+- `cargo clippy --workspace --all-targets -D warnings`: clean.
+- `cargo check --workspace --all-targets`: clean.
+- Release build: clean.
+
+**API contract change.** `feed_bytes` callers who send a row-
+bearing query (SELECT, BindExecute with result rows) now get
+`Action::FailReply { cause: UnexpectedFrame { tag: DataRow } }`
+on the first DataRow — classified as an API misuse, not a
+protocol desync. Callers MUST switch to `iter_rows`. In the
+`sasql` workspace this affects only tests (migrated as above);
+no external consumers.
+
+**Deferred to separate pass.** Many doc comments still
+reference `Action::StreamRow` / `StagedAction::StreamRowRange`
+as historical context (e.g. in `schema_arena.rs`, `buf.rs`,
+`reply_id.rs`). These don't block compile but read as stale to
+a reader looking up current behaviour. A documentation sweep
+to annotate these with "DEF-154 (Y): deleted — see row_stream"
+or rewrite them entirely is a future polish pass.
