@@ -3620,31 +3620,40 @@ or rewrite them entirely is a future polish pass.
 после shipping (Y). Готов к батчевому исполнению. **Ничего не
 отбрасывается** (CREDO §5).
 
-**Session 2026-04-23 progress (14 items shipped + 1 revert + 1 bonus):**
+**Session 2026-04-23 progress (17 shipped + 1 revert + 1 bonus catch + 1 rejection + 1 new test):**
 
-Shipped (5 commits post-catalog):
+Shipped commits post-catalog:
 - `19d4426` Batch 1+2 — B7, B18, B20, B23, **B24**, **B25**, B26,
   B28. **B24+B25 critical** — tier-4 silent Err discards elevated
-  to tier-2 structural (CREDO §1). B2 reverted after compile check
-  (audit claimed stale MSRV; verified still blocked by rust-lang
-  issue #143874).
-- `579dddd` Batch 3 — B9 (NonZeroU32 niche + new CrateBugLocus::
+  to tier-2 structural (CREDO §1). B2 reverted (audit stale MSRV).
+- `579dddd` Batch 3 — B9 (NonZeroU32 niche + CrateBugLocus::
   AuthSubCodeZeroInErr), B12 (SCRAM fast-path), B15 (first_chunk_mut
   patch), B17 (inline + **bonus fallback catch**: ParamStatus
-  missing trailing NUL was silently absorbed, now classified
-  MalformedPayload; new test pins behaviour).
+  missing trailing NUL was silently absorbed, now classified).
 - `cee0591` A2/B1/B8 — OutActions POD → ManuallyDrop<heapless::Vec>.
   **5008 B zero-fill/call → 0 B init** (~150× reduction).
 - `ace874d` A15 — MAX_ACTIONS_PER_CALL 16 → 9 (right-size post-(Y)
   via `MAX_FANOUT2_ENTRIES_PER_CALL = 1`). 2184 B saved per
   OutActions stack frame.
+- `e3581a7` docs — CREDO §11 safe-Rust idioms, §7 fallback nuance,
+  A15 proof. User-requested `*`-deref audit: 38+ sites, 0 crutches.
+- `ac3c3d9` Batch 4 tail — B6 const-generic `feed_bytes_impl<const
+  BOUNDED>` (production gate eliminated), B3 materialise dead-arm
+  classified with debug_assert + infallibility proof.
+- `fefce6e` Batch 5a — A5/B10 (ColumnsIter sign-path 5→3 branches),
+  A6/B13 (ASCII-digit int parser, skip redundant from_utf8 walk,
+  ~2× on int-heavy text SELECT).
+- `68a8d09` Batch 5b — B4 (parse_error_response O(N) vectorisable
+  via `iter().position`, ~3× on error parsing hot path). **B11
+  REJECTED** with written trade-off analysis: Copy-cascade break
+  outweighs 60 B × N-describes saving; A16 CONFIRMED-DONE stands.
 
-**Still OPEN (~20 items + spikes) — ordered by dependency:**
+**Still OPEN (~15 items + spikes) — ordered by dependency:**
 
 | Batch | Items | LoC est | Risk |
 |-------|-------|---------|------|
-| 4 tail | B3 (materialise infallible push), B6 (feed_bytes_bounded split) | 80 | M/L |
-| 5 decode | A5/B10, A6/B13, B4, B11 | 255 | L/M |
+| ~~4~~ | ~~B3, B6~~ | ~~80~~ | **SHIPPED ac3c3d9** |
+| ~~5~~ | ~~A5/B10, A6/B13, B4~~, B11-REJECT | ~~255~~ | **SHIPPED fefce6e/68a8d09** |
 | 6 encode | A14 Bind+Execute template | 150 | L-M |
 | 7 dispatch | B21/C6 (712 MB/1M-rows), A7 tag LUT, A3 fn-ptr LUT | 500 | M/H |
 | 8 state | A10/B22 SCRAM split (664 MB/1M-rows), A4/B16 layout | 700 | H/M |
