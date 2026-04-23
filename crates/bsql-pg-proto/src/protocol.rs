@@ -1997,9 +1997,30 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
     reserved.with_length_prefix(|w| {
         w.push_nul_terminated(portal_name.as_bytes())?;
         w.push_nul_terminated(stmt_name.as_bytes())?;
-        w.push_u16_be(P::COUNT)?;
-        for _ in 0..P::COUNT {
-            w.push_u16_be(1)?;
+        // DEF-184 (A14): compact format-code block.
+        //
+        // Pre-(184) sent `n_format_codes = P::COUNT` followed by
+        // `P::COUNT × u16_be(1)` — for N=16 that's 34 bytes of
+        // format codes + 2 bytes of count. Post-(184) uses the PG
+        // §55.7 Bind spec's compact form: "The number of parameter
+        // format codes can be zero (all default/text), or ONE
+        // (specified code applied to all parameters), or equal the
+        // actual number of parameters". For N ≥ 1 all params use
+        // binary uniformly → send `n_format_codes = 1, [1]` = 4
+        // bytes, independent of N. For N = 0 keep
+        // `n_format_codes = 0` (text-default, irrelevant with no
+        // params) — avoids server-side "1 format code but 0 params"
+        // edge case some PG forks might log.
+        //
+        // Wire-size saving: N=2 → 2 B, N=3 → 4 B, ..., N=16 → 30 B.
+        // Loop eliminated entirely (one push_bytes for N ≥ 1).
+        if P::COUNT == 0 {
+            w.push_u16_be(0)?;
+        } else {
+            // `[0, 1, 0, 1]` = u16_be(1) + u16_be(1) = n_format_codes=1
+            // + format[0]=Binary. Bulk push: LLVM compiles to one
+            // 32-bit store on aligned targets.
+            w.push_bytes(&[0, 1, 0, 1])?;
         }
         w.push_u16_be(P::COUNT)?;
         // Escape hatch: ParamsWriter takes &mut WriteBuf (pub trait

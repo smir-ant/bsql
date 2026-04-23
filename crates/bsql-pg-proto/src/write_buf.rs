@@ -785,6 +785,17 @@ impl BrandedWriteReserved<'_> {
         self.buf_mut().push_nul_terminated(data)
     }
 
+    /// Push raw bytes — branded mirror of [`WriteReserved::push_bytes`].
+    ///
+    /// DEF-184 (A14): used by `build_bind_message` for the compact
+    /// `[0, 1, 0, 1]` format-code block (n_format_codes=1 +
+    /// format[0]=Binary), one 4-byte bulk write replacing
+    /// `push_u16_be(1) + push_u16_be(1)` pair.
+    #[inline]
+    pub(crate) fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
+        self.buf_mut().push_bytes(data)
+    }
+
     /// Write a PG length-prefixed body via a nested branded closure.
     /// Branded mirror of [`WriteReserved::with_length_prefix`].
     ///

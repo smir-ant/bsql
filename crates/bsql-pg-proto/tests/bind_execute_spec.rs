@@ -629,23 +629,29 @@ fn bind_frame_optional_mixed_with_some_and_none() {
         [Action::SendBytes(bind), ..] => bind.to_vec(),
         other => panic!("expected SendBytes, got {other:?}"),
     };
-    // Expected:
-    //   tag + len + NUL + NUL + 0x0002 nf + 2×Binary(0x0001) +
+    // Expected (DEF-184 A14 compact format-code block):
+    //   tag + len + NUL + NUL + 0x0001 nf + 0x0001 Binary +
     //   0x0002 np + [0x00000004 + i32=42] + [0xFFFFFFFF NULL] +
     //   0x0000 nr
     // Length computation:
     //   4 (len_field) + 1 (portal NUL) + 1 (stmt NUL) +
-    //   2 (nf) + 2*2 (formats) + 2 (np) +
+    //   2 (nf=1) + 2 (format[0]=Binary; one format applies to all) + 2 (np=2) +
     //   4 (p0.len) + 4 (p0.body i32) + 4 (p1.len = -1) + 2 (nr)
-    //   = 28 bytes body; length field value = 28
-    //   Total frame = 1 (tag) + 28 = 29 bytes
+    //   = 26 bytes body; length field value = 26
+    //   Total frame = 1 (tag) + 26 = 27 bytes
+    //
+    // DEF-184 (A14): saves 2 B vs pre-(184) N=2 shape which sent
+    // `n_format_codes = 2, [1, 1]` — now sends `n_format_codes = 1,
+    // [1]` exploiting PG §55.7 Bind spec's "one format code applies
+    // to all parameters" compact form. Saving scales with N:
+    // 2 B for N=2, 4 B for N=3, ..., 30 B for N=16.
     assert_eq!(
         bind_bytes,
         vec![
-            b'B', 0, 0, 0, 28,        // tag + length=28
+            b'B', 0, 0, 0, 26,        // tag + length=26
             0, 0,                     // NUL-NUL (portal + stmt both empty)
-            0, 2,                     // n_param_formats = 2
-            0, 1, 0, 1,               // 2× Binary
+            0, 1,                     // n_param_formats = 1
+            0, 1,                     // format[0] = Binary (applies to all)
             0, 2,                     // n_params = 2
             0, 0, 0, 4, 0, 0, 0, 42,  // Some(42): len=4, i32=42 BE
             0xff, 0xff, 0xff, 0xff,   // None: len=-1
