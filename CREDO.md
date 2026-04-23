@@ -27,9 +27,24 @@ session, аудит — сверяется с CREDO. Никаких исключ
    data loss, скрытых панических путей, data races, необоснованных
    allocation failures. Железная надёжность. Устойчивость под любой
    нагрузкой и любым вредоносным вводом.
-2. **Tier-1 invariants** — compile-time доказательства. Если бок
-   возможен на уровне **типов** (лучше) или **const-assert** — он
-   должен быть закрыт там, а не в runtime-check'е или code review.
+2. **Tier elevation** — всегда повышать tier вверх:
+   - **Tier-4 (silent fallback) — запрещён ПОЛНОСТЬЮ.** Любое
+     появление = баг-класс, лечится немедленно. Повышаем хоть до
+     чего-нибудь > tier-4.
+   - **Tier-3 → Tier-2** при технической возможности. Runtime-check
+     с явным `Err` — лучше чем silent, но **structural invariant**
+     лучше чем runtime-check. Ищем упаковку в bounded container /
+     generational ref / typestate.
+   - **Tier-2 → Tier-1** при технической возможности. Structural
+     runtime — лучше чем classified error, но **compile-time proof**
+     лучше чем runtime anything. Ищем const-assert / typed newtype /
+     exhaustive match / forbid lint.
+   - **Tier-1** — золотой стандарт; любой инвариант закрытый
+     compile-time'ом = cost-free at runtime, catches drift at build
+     time.
+   - **Правило:** при каждой правке пройти по инвариантам, спросить
+     "можно ли поднять tier?" — если да, поднимаем. Отказ повышать
+     без структурной причины = нарушение §1.
 3. **Zero-cost / zero-alloc performance** — нулевая аллокация, агрессивнейшие
    оптимизации, каждая наносекунда на счету, каждый килобайт имеет
    вес. `no_std + no_alloc + #![forbid(unsafe_code)]` — жёсткая
@@ -37,8 +52,8 @@ session, аудит — сверяется с CREDO. Никаких исключ
 4. **Ergonomics / API surface** — чистый API, понятные типы.
 5. **Diff size / session budget** — размер коммита, время сессии.
 
-**Commit size НИКОГДА не побеждает safety или tier-1. Время — тем
-более.**
+**Commit size НИКОГДА не побеждает safety, tier elevation, или
+zero-cost perf. Время — тем более.**
 
 ---
 
@@ -154,7 +169,7 @@ session, аудит — сверяется с CREDO. Никаких исключ
 
 ---
 
-## §8 Tier-taxonomy (напоминание)
+## §8 Tier-taxonomy (напоминание + elevation policy)
 
 **Tier-1** — compile-time. Нарушение = build error. Пример: typed
 newtype, const-assert, exhaustive match, `forbid` lint.
@@ -170,10 +185,51 @@ error, server ErrorResponse.
 **Tier-4** — silent fallback. **ЗАПРЕЩЁН**. `unwrap_or(())`,
 `if let ... else { /* nothing */ }`, silent `u16::try_from(...)`
 с фоллбэком на константу — всё tier-4. Любое появление tier-4 —
-багрепорт-class.
+багрепорт-class, лечится немедленно.
 
-**Правило:** всегда стремиться к tier-1. Если невозможно — tier-2.
-Если невозможно — tier-3. Tier-4 ≠ tier. Tier-4 — баг.
+---
+
+### Elevation policy (ключевое)
+
+**Tier — не статус. Tier — это "куда мы хотим двигать этот
+инвариант дальше".**
+
+- **Tier-4 → любой tier > 4.** Приоритет #1. Никакого silent. Хоть
+  classified error (tier-3), хоть structural check (tier-2), хоть
+  compile-time (tier-1) — только не silent. Любое обнаружение tier-4
+  = рабочий ticket в очередь правок, не "сейчас неприоритетно".
+
+- **Tier-3 → Tier-2 когда структурно возможно.** Classified error
+  — честно, но runtime-check всё ещё стоит CPU и занимает место в
+  code. Если инвариант можно упаковать в bounded container, typed
+  newtype с validated constructor, generational ref — делаем.
+  Примеры: `ReadBuf.append` raw `Result<(), ReadBufFull>` → уже
+  tier-2 (bounded capacity проверяется внутри). `SqlStateCode` как
+  `FixedStr<5>` с `from_bytes_truncating` — tier-2 structural. Можно
+  бы было поднять до tier-1 const-validated если все значения
+  перечисляемы.
+
+- **Tier-2 → Tier-1 когда технически возможно.** Structural runtime
+  check всё равно стоит одну инструкцию сравнения. Compile-time
+  proof — 0 инструкций runtime. Примеры: `const _ = assert!(...)`
+  на размер enum'а. `repr(u8)` + `#[non_exhaustive]` + exhaustive
+  match — компилятор ловит недостающие arm'ы. Typed newtype с
+  private-field private-constructor — swap через `.0` невозможен.
+
+- **Tier-1 → better tier-1.** Даже внутри tier-1 есть спектр: const
+  round-trip pin < exhaustive match discriminant < typed newtype с
+  invariant-constructor < sealed trait via pub(crate). Всегда
+  выбирать сильнейшую форму.
+
+**Правило дня:** при каждой правке пройти по инвариантам:
+1. Есть ли где tier-4? → убрать немедленно.
+2. Есть ли tier-3 который можно переупаковать в tier-2? → попробовать.
+3. Есть ли tier-2 который можно перенести в tier-1? → попробовать.
+4. Есть ли tier-1 который можно сделать более сильным? → подумать.
+
+Отказ повышать tier без структурного обоснования (например, "это
+wire-level input, tier-1 невозможно по природе") — **нарушение §1
+пункт 2**.
 
 ---
 
