@@ -134,12 +134,22 @@ impl Password {
     }
 
     /// Borrow the password bytes.
+    ///
+    /// DEF-154 (S) P1-1: explicit `split_at_checked` match —
+    /// `self.len ≤ MAX_PASSWORD_LEN ≤ self.buf.len()` by construction
+    /// (see `try_from_bytes` bound check). None arm architecturally
+    /// unreachable; returns empty slice as no-silent-op sentinel
+    /// (matches semantically "no password bytes", same surface as
+    /// a zeroized post-drop). Pre-(S) was `self.buf.get(..len)
+    /// .unwrap_or(&[])` — silent fallback banned by user directive.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        // `self.len <= MAX_PASSWORD_LEN` by constructor invariant.
-        // `usize::from(u16)` is the forbid-bundle-safe widening.
-        self.buf.get(..usize::from(self.len)).unwrap_or(&[])
+        let n = usize::from(self.len);
+        match self.buf.split_at_checked(n) {
+            Some((head, _)) => head,
+            None => &[],
+        }
     }
 }
 

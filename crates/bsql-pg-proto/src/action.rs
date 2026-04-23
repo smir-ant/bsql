@@ -1718,10 +1718,21 @@ impl ParamOids {
 
     /// Borrow the populated OIDs as a slice — tail default-filled
     /// slots are not exposed.
+    ///
+    /// DEF-154 (S) P1-1: explicit `split_at_checked` match.
+    /// `self.n_params ≤ MAX_PG_PARAMS ≤ self.oids.len()` by
+    /// construction; None architecturally unreachable. Empty-slice
+    /// sentinel on the dead arm (same observable as "zero params",
+    /// no corruption vector). Pre-(S) was `.unwrap_or(&[])` —
+    /// silent fallback pattern.
     #[inline]
     #[must_use]
     pub fn oids(&self) -> &[u32] {
-        self.oids.get(..self.len()).unwrap_or(&[])
+        let n = self.len();
+        match self.oids.split_at_checked(n) {
+            Some((head, _)) => head,
+            None => &[],
+        }
     }
 
     /// Get one OID by index, or `None` if out of range.

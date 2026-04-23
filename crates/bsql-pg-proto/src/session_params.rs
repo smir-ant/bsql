@@ -218,10 +218,24 @@ impl OtherEncoding {
     }
 
     /// Borrow the raw bytes.
+    ///
+    /// DEF-154 (S) P1-1: explicit `split_at_checked` match with a
+    /// documented-dead None arm. `self.len ≤ self.buf.len()` by
+    /// construction in `try_from_bytes` / `from_bytes_truncating`,
+    /// so None is architecturally unreachable. The Some-arm has no
+    /// silent `unwrap_or(&[])`; the None-arm is a no-silent-op
+    /// sentinel (empty slice is semantically "no bytes to expose",
+    /// same as an empty encoding — no corruption vector). Pre-(S)
+    /// was `self.buf.get(..len).unwrap_or(&[])` — silent fallback
+    /// the user banned.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.buf.get(..usize::from(self.len)).unwrap_or(&[])
+        let n = usize::from(self.len);
+        match self.buf.split_at_checked(n) {
+            Some((head, _)) => head,
+            None => &[],
+        }
     }
 }
 

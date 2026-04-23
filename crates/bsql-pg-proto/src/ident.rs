@@ -571,13 +571,22 @@ impl<const N: usize> PodBytes<N> {
 
     /// Borrow the populated bytes.
     ///
-    /// See [`FixedStr::as_bytes`] for the rationale behind the
-    /// `.get(..n).unwrap_or(&[])` idiom — same forbid-bundle
-    /// constraints apply here.
+    /// DEF-154 (S) P1-1: explicit `split_at_checked` match with
+    /// documented-dead None arm. `self.len ≤ N = self.buf.len()`
+    /// by construction; None architecturally unreachable. Empty-
+    /// slice sentinel on the dead arm is a no-silent-op — the
+    /// emission surface carries no bytes, matching both the
+    /// "genuinely empty" case and the impossible-regression case
+    /// with the same semantics. Pre-(S) was `self.buf.get(..n)
+    /// .unwrap_or(&[])` — the forbidden silent-fallback pattern.
     #[inline]
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        self.buf.get(..self.len()).unwrap_or(&[])
+        let n = self.len();
+        match self.buf.split_at_checked(n) {
+            Some((head, _)) => head,
+            None => &[],
+        }
     }
 }
 
