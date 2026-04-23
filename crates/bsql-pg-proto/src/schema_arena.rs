@@ -634,8 +634,8 @@ const _: () = assert!(
 // would fail compilation here with a clear trait-bound error, not
 // a confusing move-after-use error at the behavioural test site.
 const _: fn() = || {
-    const fn _assert_copy<T: Copy>() {}
-    _assert_copy::<ArenaReader<'_>>();
+    const fn assert_copy<T: Copy>() {}
+    assert_copy::<ArenaReader<'_>>();
 };
 
 #[cfg(test)]

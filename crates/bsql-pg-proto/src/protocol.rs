@@ -379,6 +379,29 @@ pub struct PgProtocol {
     /// `Action::StreamRow::desc` resolve refs through the arena at
     /// materialise time.
     ///
+    /// # Placement rationale (DEF-184 audit-2 item-1)
+    ///
+    /// The arena lives on `PgProtocol` (not in a separate pool or
+    /// thread-through parameter) by design. `SchemaRef` values
+    /// embed in `ProtoState` variants (e.g. `StreamingRows { schema_ref }`)
+    /// and in staged Action/Reply payloads. Arena + ProtoState share
+    /// a single `&mut PgProtocol` borrow in `feed_bytes` /
+    /// `push_command`, so the ref-lifetime flow stays within one
+    /// scope and the arena cannot be mis-passed against a SchemaRef
+    /// minted by a different arena instance.
+    ///
+    /// SchemaRef staleness is classified independently via
+    /// generational counter (tier-2 structural — `Option<&RowDesc>`
+    /// returns `None` on gen mismatch). Arena co-location does NOT
+    /// supply a tier-1 compile guarantee on its own; it's a
+    /// borrow-scope convenience that keeps the tier-2 staleness
+    /// check simple. A future out-of-body pool (e.g. per-connection
+    /// pool with shared generation space) is architecturally
+    /// possible but would require an additional correlation
+    /// invariant (tier-2 classifier for "ref minted by a different
+    /// pool"), so the placement is load-bearing for the current
+    /// single-borrow invariant model.
+    ///
     /// Cost: ~528 B on `PgProtocol`, paid once per connection.
     /// Benefit: state drops from ~1224 B → ~300 B;
     /// `Action::StreamRow` drops from ~280 B → ~32 B;
@@ -404,6 +427,19 @@ pub struct PgProtocol {
     /// Benefit: `ProtocolError` 312 → ~32 B; `Action` Reply-
     /// bounded (~88 B); `OutActions` 2808 → ~792 B (3.5×);
     /// `StreamItem` 320 → ~80 B (4×).
+    ///
+    /// # Placement rationale (DEF-184 audit-2 item-1)
+    ///
+    /// Same single-borrow convenience as `schema_arena` above.
+    /// `ErrorRef` (carried by `ProtocolError::ServerErrorResponse`)
+    /// resolves via `&self` of `PgProtocol` — arena co-located with
+    /// state keeps the ref lifetime within a single borrow scope.
+    /// Staleness is tier-3 classified via
+    /// [`crate::error_arena::ArenaError::Stale`]; placement is a
+    /// load-bearing design decision for the current single-borrow
+    /// invariant, NOT a tier-1 compile-enforced guarantee. A future
+    /// refactor moving the arena out (e.g. per-worker pool) would
+    /// need an additional correlation invariant classifier.
     error_arena: crate::error_arena::ErrorArena,
     /// DEF-184 (A10/B22) SCRAM handshake data — externalised from
     /// `ProtoState` SCRAM variants.

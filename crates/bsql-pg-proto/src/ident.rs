@@ -752,12 +752,47 @@ impl<const N: usize, Tag: ValidUtf8> FixedStr<N, Tag> {
     /// Borrow the populated bytes as `&str`.
     ///
     /// **Validity:** every `ValidUtf8` tag's constructor guarantees
-    /// the stored bytes are valid UTF-8. `core::str::from_utf8` runs
-    /// an O(N) validation pass anyway because the crate's
+    /// the stored bytes are valid UTF-8. `core::str::from_utf8`
+    /// runs an O(N) validation pass anyway because the crate's
     /// `#![forbid(unsafe_code)]` rules out `from_utf8_unchecked`.
-    /// The `.unwrap_or("")` fallback is architecturally unreachable
-    /// — it surfaces a future construction-invariant break rather
-    /// than panicking.
+    ///
+    /// # `unwrap_or("")` classification (DEF-184 audit-2 item-2)
+    ///
+    /// The `.unwrap_or("")` fallback is NOT a tier-4 silent
+    /// fallback — the logical error (non-UTF-8 bytes) is rejected
+    /// at **construction** by every `ValidUtf8` tag's constructor
+    /// (`try_from_str` / `try_from_bytes` etc.) which returns
+    /// `Err` on invalid input. By the time `as_str` runs, the
+    /// bytes are guaranteed-valid-UTF-8 as a consequence of the
+    /// `ValidUtf8` trait-bound's contract.
+    ///
+    /// **Tier classification:**
+    /// - Tier-1 compile of "bytes are UTF-8" requires
+    ///   `unsafe { from_utf8_unchecked }` (banned).
+    /// - Tier-2 structural via type-system: `ValidUtf8` trait is
+    ///   sealed + constructor-validated — only valid bytes reach
+    ///   the stored slot.
+    /// - The runtime `from_utf8` re-check is the stable-Rust
+    ///   price of forbidding `unsafe`. Its Err branch is a
+    ///   **type-safe sink**: architecturally unreachable, zero
+    ///   corruption vector (empty `&str` surfaces as visible
+    ///   regression in any user-facing rendering rather than
+    ///   masquerading as truncated data).
+    /// - `debug_assert!` makes the invariant break LOUD in test
+    ///   builds — a future constructor bug that forgets UTF-8
+    ///   validation trips here immediately.
+    ///
+    /// **Alternatives rejected:**
+    /// - `Result<&str, Infallible>` — would force every hot-path
+    ///   caller through error-handling ceremony for an
+    ///   architecturally-dead arm.
+    /// - Store as `str` instead of `[u8; N]` — inflates POD size
+    ///   (fixed-len UTF-8 needs `str` slice metadata) and breaks
+    ///   the `FixedStr` zero-alloc Copy discipline.
+    ///
+    /// Net: empty `&str` on the dead arm is the minimum-overhead
+    /// way to satisfy the forbid-bundle without introducing any
+    /// silent-masquerade surface.
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {

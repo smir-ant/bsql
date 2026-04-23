@@ -243,9 +243,28 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // silent frames (e.g. `Z` after `C`) so the protocol
             // state returns to Idle ready for the next command.
             // Unbounded — silent-state-transition frames don't
-            // stage actions, so OutActions is empty; we just
-            // rely on the state-machine side-effect.
-            let _flush = self.proto.feed_bytes(&[], self.write_buf);
+            // stage actions, so OutActions is expected EMPTY; the
+            // state-machine side-effect is the sole purpose.
+            //
+            // DEF-184 (audit-2 item-3): pre-audit was `let _flush
+            // = ...` — a silent-drop surface (tier-4 potential if
+            // the `flush_pending`-gating invariant ever drifts).
+            // Post-audit: named binding + `debug_assert!` empty
+            // check — the invariant break lights loudly in debug
+            // builds; release path has zero runtime overhead
+            // (architecturally-dead Err branch), `flush_actions`
+            // drops naturally at end-of-scope.
+            let flush_actions = self.proto.feed_bytes(&[], self.write_buf);
+            debug_assert!(
+                flush_actions.as_slice().is_empty(),
+                "RowStream flush path produced unexpected action — \
+                 `flush_pending` gate promises trailing frames stage \
+                 no actions; a frame leaked through.",
+            );
+            // `flush_actions` (OutActions) is ManuallyDrop<heapless::Vec>
+            // of Copy payload — NLL releases the `&mut self.proto`
+            // borrow at the assertion's last use above; explicit
+            // drop would be a clippy::drop_non_drop warning.
             // Apply the advance this flush recorded; the stream
             // is now drained and no further peeks will happen,
             // but leaving the cursor out-of-sync would surprise
