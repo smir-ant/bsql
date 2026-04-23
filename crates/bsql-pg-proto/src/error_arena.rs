@@ -131,13 +131,13 @@ pub struct ErrorRef {
 
 /// Fixed marker for the single-slot arena. Used as the `slot` field
 /// value on every [`ErrorRef`] issued by this arena.
-const SLOT_OCCUPIED_MARKER: core::num::NonZeroU8 =
-    match core::num::NonZeroU8::new(1) {
-        Some(nz) => nz,
-        // Architecturally dead: `1 != 0` by arithmetic. Matches the
-        // schema_arena.rs `dead_for_test` const-fn pattern.
-        None => core::num::NonZeroU8::MIN,
-    };
+///
+/// `NonZeroU8::MIN == 1` by type definition — no match-fallback
+/// needed (contrast schema_arena.rs which uses `NonZeroU8::new(idx +
+/// 1)` for multi-slot indexing). Single-slot arena doesn't index
+/// by slot, so this constant is purely for niche preservation of
+/// `Option<ErrorRef>`.
+const SLOT_OCCUPIED_MARKER: core::num::NonZeroU8 = core::num::NonZeroU8::MIN;
 
 /// Single-slot error-payload arena on `PgProtocol`.
 ///

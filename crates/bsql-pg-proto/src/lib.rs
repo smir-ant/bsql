@@ -282,24 +282,24 @@ const _: fn() = || {
 // aarch64-apple-darwin the actual is exactly at the lower bound, on
 // other targets it may drift up to +8.
 const _: () = assert!(
-    core::mem::size_of::<error::ProtocolError>() <= 72,
-    "ProtocolError size budget. Post-DEF-184 (A1+A13): ≤72 B. \
+    core::mem::size_of::<error::ProtocolError>() == 72,
+    "ProtocolError exact size — 72 B post-(A1+A13). \
      Pre-(184): 312 B dominated by ServerErrorResponse's 3 inline \
      BoundedStr<N> fields (288 B). Post-(184): ServerErrorResponse \
      carries `details_ref: ErrorRef` (2 B); bounded strings live in \
-     PgProtocol::error_arena. Remaining ~72 B dominated by other \
+     PgProtocol::error_arena. Remaining 72 B dominated by other \
      large variants (e.g. Scram(ScramError), Malformed* with \
-     BoundedStr<32>). Cap catches (a) reintroduction of inline \
-     BoundedStrs, (b) new variant adding large payload.",
+     BoundedStr<32>). \
+     \
+     Exact pin catches any variant growth / layout drift.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action<'static, 'static>>() >= 40
-        && core::mem::size_of::<action::Action<'static, 'static>>() <= 96,
-    "Action<'_, '_> size drift. Post-DEF-184 (A1+A13) Reply-bounded. \
+    core::mem::size_of::<action::Action<'static, 'static>>() == 88,
+    "Action<'_, '_> exact size — 88 B post-(A1+A13). \
      Pre-(184) was 312 B dominated by FailReply.cause ProtocolError; \
-     post-(184) ProtocolError shrinks to ≤48 B, so Action is bounded \
-     by Reply<'r> (DescribeStatementCompletePayload ~72 B + \
-     discriminant/padding). Range [40, 96] catches regressions.",
+     post-(184) ProtocolError 72 B, so Action bounded by \
+     max(Reply 72, FailReply 72) + discriminant + padding = 88 B. \
+     Exact pin catches any variant growth.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Reply<'static>>() >= 72
@@ -332,34 +332,32 @@ const _: () = assert!(
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() >= 6040
-        && core::mem::size_of::<protocol::PgProtocol>() <= 6080,
-    "PgProtocol size drift — post-DEF-184 (A1+A13) range is \
-     [6040, 6080] B. Budget: ReadBuf 4096 + state ~712 + \
-     session_params ~420 + schema_arena ~520 + error_arena ~290 + \
-     padding. Pre-(184) range was [5760, 5776] B (no error_arena). \
-     Full cascade savings come from OutActions / StreamItem / \
-     ProtocolError shrinks in Stage 3 of (A1+A13) refactor — \
-     per-call memory wins vastly dwarf the one-time PgProtocol \
-     growth per connection.",
+    core::mem::size_of::<protocol::PgProtocol>() >= 6032
+        && core::mem::size_of::<protocol::PgProtocol>() <= 6096,
+    "PgProtocol size post-(A1+A13) in range [6032, 6096] B. \
+     Budget: ReadBuf 4096 + state ~712 + session_params ~420 + \
+     schema_arena ~520 + error_arena ~290 + padding. \
+     Pre-(184): 5760 B (no error_arena). The +288 B one-time \
+     connection-level growth is dwarfed by per-call savings: \
+     OutActions 2808 → 800 B (2 KB × N calls). Break-even after \
+     ~1 slow-path call per connection.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() >= 728
-        && core::mem::size_of::<action::OutActions<'static, 'static>>() <= 880,
-    "OutActions<'_, '_> size drift. \
+    core::mem::size_of::<action::OutActions<'static, 'static>>() == 800,
+    "OutActions<'_, '_> exact size drift — 800 B post-(A1+A13). \
      \
-     Post-DEF-184 (A1+A13) cascade: Action shrunk Reply-bounded \
-     (~72-96 B) via ProtocolError ErrorArena externalisation. \
-     Stack reservation = 9 × ~88 B ≈ 792 B + usize length. \
+     = 9 (MAX_ACTIONS_PER_CALL) × 88 (Action) + 8 (usize len) = \
+     800 B. \
      \
      Pre-(A1): 9 × 312 = 2808 B (ProtocolError-dominated). \
      \
-     Post-(A15): MAX_ACTIONS_PER_CALL 16 → 9. \
-     Post-(A2/B1/B8): ManuallyDrop<heapless::Vec>, zero init. \
-     Post-(A1+A13): Action Reply-bounded. \
+     History: Post-(A15) MAX_ACTIONS_PER_CALL 16 → 9; \
+     Post-(A2/B1/B8) ManuallyDrop<heapless::Vec>, zero init; \
+     Post-(A1+A13) Action Reply-bounded via ErrorArena. \
      \
-     Range [728, 880] catches regressions in slot count / Action \
-     size / alignment padding.",
+     Exact pin catches ANY layout drift. Change is decision-point \
+     (not silent regression): audit Action size, OutActions cap, \
+     ManuallyDrop shape.",
 );
 
 // ---------------------------------------------------------------------
