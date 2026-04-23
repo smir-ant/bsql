@@ -3647,14 +3647,26 @@ Shipped commits post-catalog:
   via `iter().position`, ~3× on error parsing hot path). **B11
   REJECTED** with written trade-off analysis: Copy-cascade break
   outweighs 60 B × N-describes saving; A16 CONFIRMED-DONE stands.
+- `dfc3ee7` Batch 6 — A14 (Bind frame compact format-code
+  encoding, -2 to -30 B per frame for N=2..16 params).
+- `3a0bc1c` DEF-187 session boundary deferrals catalog.
+- `71a4720` DEF-185 (unstable Rust blockers) + DEF-186 (session
+  bonus findings).
+- `51ed3d8` **A1+A13 CROWN — ErrorArena cascade.**
+  `ProtocolError` 312 → ~72 B (4.3×). `Action` 312 → ~88 B
+  (Reply-bounded). `OutActions` 2808 → ~792 B (3.5×).
+  `StreamItem` 320 → ~80 B (4×). 13 `#[expect(...)]` lint
+  annotations retired post-cascade. +4 new arena unit tests →
+  **220 tests total**.
 
-**Still OPEN (~15 items + spikes) — ordered by dependency:**
+**Still OPEN (~14 items + spikes) — ordered by dependency:**
 
 | Batch | Items | LoC est | Risk |
 |-------|-------|---------|------|
 | ~~4~~ | ~~B3, B6~~ | ~~80~~ | **SHIPPED ac3c3d9** |
 | ~~5~~ | ~~A5/B10, A6/B13, B4~~, B11-REJECT | ~~255~~ | **SHIPPED fefce6e/68a8d09** |
-| 6 encode | A14 Bind+Execute template | 150 | L-M |
+| ~~6~~ | ~~A14 Bind compact format-codes~~ | ~~150~~ | **SHIPPED dfc3ee7** |
+| ~~9a~~ | ~~A1+A13 ErrorArena cascade~~ | ~~500~~ | **SHIPPED 51ed3d8** |
 | 7 dispatch | B21/C6 (712 MB/1M-rows), A7 tag LUT, A3 fn-ptr LUT | 500 | M/H |
 | 8 state | A10/B22 SCRAM split (664 MB/1M-rows), A4/B16 layout | 700 | H/M |
 | 9 crown | **A1+A13 ErrorArena cascade (6.4× OutActions)**, B14 HList | 800 | H |
