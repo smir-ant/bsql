@@ -406,13 +406,37 @@ impl PgProtocol {
     /// state; post-(H), advance defers to the NEXT feed_bytes
     /// call's entry, but external observers (tests, introspection
     /// hosts) still see the dispatched frames as "consumed".
+    ///
+    /// DEF-154 (P) P0-5: replaced `.unwrap_or(&[])` with an
+    /// explicit `split_at_checked` match. Pre-(P) the silent
+    /// fallback would have masked a `pending_advance >
+    /// unread().len()` invariant break (architecturally dead —
+    /// `pending_advance` accumulates validated `total_len` values
+    /// per parse_header, and between calls only `append` can
+    /// grow unread — but the silent form violated user's "no
+    /// silent fallback" directive). Post-(P): the None arm is
+    /// tier-2 structural-invariant proof; returning `&[]` is
+    /// semantically correct ("cursor past end" = "no bytes left
+    /// to observe"), match makes the dead-branch decision
+    /// explicit instead of hiding behind `unwrap_or`.
     #[inline]
     #[must_use]
     pub fn unread(&self) -> &[u8] {
-        self.read_buf
-            .unread()
-            .get(usize::from(self.pending_advance)..)
-            .unwrap_or(&[])
+        let raw = self.read_buf.unread();
+        let skip = usize::from(self.pending_advance);
+        // `split_at_checked(n) -> Option<(&[u8], &[u8])>`:
+        // None iff n > raw.len(). Architecturally dead (see doc).
+        match raw.split_at_checked(skip) {
+            Some((_already_advanced, rest)) => rest,
+            None => {
+                // Invariant-break: cursor past end. Return empty
+                // ("no observable bytes"); caller sees same result
+                // as a genuinely-drained buffer. Production-safe
+                // because `unread()` is a read-only observer —
+                // no corruption vector. Documented-dead branch.
+                &[]
+            }
+        }
     }
 
     /// Push a user command.
@@ -2468,11 +2492,13 @@ mod compute_push_tests {
     /// `cause: ProtocolError::ConnectionAlreadyClosed { prior_kind }`.
     ///
     /// Variants covered are those `compute_push` produces.
-    /// `StreamRowRange` (only from `feed_bytes` DATA_ROW arm) and
-    /// `DeliverReply` payload internals are out of scope for this
-    /// test module; those arms map to `CloseSocket` / `DeliverReply`
-    /// (payload-dropped) in `from_staged` — exhaustive-match
-    /// compliance without exposing unused fields.
+    /// `StreamRowRange` (only from `feed_bytes` DATA_ROW arm) is
+    /// represented as a distinct `StreamRowRangeUnexpected` variant
+    /// — if a future refactor ever makes compute_push emit a
+    /// StreamRowRange (an architectural bug), tests pattern-matching
+    /// on `StagedObs` will SEE a distinct variant instead of a
+    /// silent collapse to `CloseSocket` (pre-DEF-154 (P) behaviour
+    /// flagged as P0-6 by architect audit).
     #[expect(
         clippy::large_enum_variant,
         reason = "test-only observation type; FailReply.cause dominates \
@@ -2495,6 +2521,16 @@ mod compute_push_tests {
             cause: crate::error::ProtocolError,
         },
         CloseSocket,
+        /// DEF-154 (P) P0-6: sentinel variant that fires if
+        /// `compute_push` ever emits a `StreamRowRange` (it should
+        /// NOT — StreamRowRange is a `feed_bytes` DATA_ROW arm
+        /// signal only). Pre-(P) this collapsed silently to
+        /// `CloseSocket`, hiding the architectural invariant break
+        /// from tests. Post-(P): tests that `match sobs { ... }`
+        /// see this distinct variant and can assert via
+        /// `matches!(sobs, StagedObs::StreamRowRangeUnexpected)`
+        /// that the refactor regression was caught.
+        StreamRowRangeUnexpected,
     }
 
     impl StagedObs {
@@ -2506,10 +2542,9 @@ mod compute_push_tests {
                 StagedAction::FailReply { id, cause } => {
                     Self::FailReply { id: *id, cause: *cause }
                 }
-                // StreamRowRange is only from feed_bytes DATA_ROW arm;
-                // not produced by compute_push. Map to CloseSocket
-                // for exhaustive-match compliance (never observed here).
-                StagedAction::StreamRowRange { .. } => Self::CloseSocket,
+                // DEF-154 (P) P0-6: distinct variant instead of
+                // silent CloseSocket collapse.
+                StagedAction::StreamRowRange { .. } => Self::StreamRowRangeUnexpected,
                 StagedAction::CloseSocket => Self::CloseSocket,
             }
         }
