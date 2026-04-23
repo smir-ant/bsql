@@ -260,6 +260,7 @@ pub const MAX_FANOUT_PER_STAGED: usize = 2;
 ///    - `StagedAction::SendBytesStatic`: 1 action.
 ///    - `StagedAction::FailReply`: 1 action.
 ///    - `StagedAction::CloseSocket`: 1 action.
+///
 ///    **Conclusion:** only `DeliverReply` stale-ref is fanout-2.
 ///
 /// 2. **How many `DeliverReply` staged entries can a single
@@ -675,9 +676,14 @@ impl PgProtocol {
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 'r> {
-        // DEF-154 (X): unbounded dispatch — process every frame in
-        // read_buf that fits within `MAX_STAGED_PER_CALL`.
-        self.feed_bytes_bounded(bytes, write_buf, u16::MAX)
+        // DEF-184 (B6): `const BOUNDED = false` specialisation —
+        // monomorphised body with the per-iter bound check
+        // eliminated at compile time. Production hot path no longer
+        // pays `if dispatches_this_call >= max_dispatches` every
+        // frame (the pre-(184) shape supplied u16::MAX, which LLVM
+        // sometimes optimised away but only via inlining — not
+        // guaranteed on large functions).
+        self.feed_bytes_impl::<false>(bytes, write_buf, 0)
     }
 
     /// DEF-154 (X) P0-2(c): frame-bounded variant of [`feed_bytes`].
@@ -691,11 +697,33 @@ impl PgProtocol {
     ///
     /// Used by [`RowStream`](crate::RowStream)'s slow path to
     /// process exactly one frame per call (ensures the fast-path
-    /// gets control back after a silent `RowDescription`). All
-    /// other callers invoke [`feed_bytes`] which supplies
-    /// `max_dispatches = u16::MAX` for unbounded behaviour
-    /// (bytewise-equivalent to pre-(X) semantics).
+    /// gets control back after a silent `RowDescription`). The
+    /// production [`feed_bytes`] entry takes the `BOUNDED=false`
+    /// specialisation, eliminating the gate entirely at compile
+    /// time.
+    #[inline]
     pub(crate) fn feed_bytes_bounded<'w, 'r>(
+        &'r mut self,
+        bytes: &[u8],
+        write_buf: &'w mut WriteBuf,
+        max_dispatches: u16,
+    ) -> OutActions<'w, 'r> {
+        self.feed_bytes_impl::<true>(bytes, write_buf, max_dispatches)
+    }
+
+    /// DEF-184 (B6): const-generic dispatch loop body.
+    ///
+    /// `const BOUNDED: bool` selects between the bounded
+    /// (RowStream slow-path, one-frame-per-call) and unbounded
+    /// (`feed_bytes` default) monomorphisations. LLVM eliminates
+    /// the gate branch in the `BOUNDED = false` specialisation.
+    ///
+    /// Cost: two monomorphised copies of the loop in the binary
+    /// (approximately 1 KB of extra LLVM IR pre-optimisation;
+    /// release profile has LTO fat + codegen-units=1 which
+    /// further de-duplicates common sub-expressions, so actual
+    /// text-segment growth is smaller).
+    fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
         &'r mut self,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
@@ -832,7 +860,13 @@ impl PgProtocol {
                 // count — they're noise. Only
                 // AdvancedSilent / AdvancedWithAction / Errored
                 // increment `dispatches_this_call`.
-                if dispatches_this_call >= max_dispatches {
+                //
+                // DEF-184 (B6): `const BOUNDED: bool` specialisation
+                // — in the `BOUNDED=false` monomorphisation the
+                // short-circuit `BOUNDED &&` evaluates at compile
+                // time; LLVM eliminates the entire gate. Production
+                // `feed_bytes` no longer pays the per-iter check.
+                if BOUNDED && dispatches_this_call >= max_dispatches {
                     break;
                 }
                 // Logical-cursor peek into unread: skip already-
@@ -2399,36 +2433,73 @@ fn materialise<'w, 'r>(
     out
 }
 
-/// DEF-154 (L) P0-1: push an action with documented-dead Err arm.
+/// DEF-154 (L) P0-1 + DEF-184 (B3): push an action with
+/// classified dead-arm.
 ///
-/// `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED`
-/// is const-asserted at `MAX_ACTIONS_PER_CALL`'s definition site.
-/// Each staged entry contributes ≤ `MAX_FANOUT_PER_STAGED` calls to
-/// this helper (1-action variants: 1; StreamRowRange/DeliverReply
-/// stale-ref fanout: 2). Total ≤ `MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED
-/// = MAX_ACTIONS_PER_CALL = out's capacity`.
+/// ## Infallibility proof (post-DEF-184 A15)
 ///
-/// Replaces the pre-(L) `.unwrap_or(())` silent-drop pattern across
-/// 6 materialise sites.
+/// `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL +
+/// MAX_FANOUT2_ENTRIES_PER_CALL × (MAX_FANOUT_PER_STAGED − 1)
+/// = 8 + 1 × 1 = 9` (const-asserted at MAX_ACTIONS_PER_CALL).
 ///
-/// DEF-184 (B7): `#[inline(always)]` forces inlining at every
-/// 6 materialise call sites — each staged action pays a single
-/// `out.push(a)` + match, zero fn-call overhead. Cascades to
-/// removal once B3 makes push infallible structurally.
+/// Each staged entry contributes ≤ `MAX_FANOUT_PER_STAGED = 2`
+/// calls to this helper (1-action variants: 1; DeliverReply
+/// stale-ref fanout: 2). With `MAX_FANOUT2_ENTRIES = 1` (at most
+/// one DeliverReply per call, per pre-1c-5 single-inflight
+/// invariant — see A15 proof), total calls ≤ 9 = out's capacity.
+///
+/// **Conclusion:** `out.push(a)` is architecturally infallible
+/// in the post-A15 capacity regime. The Err arm is dead.
+///
+/// ## Why not truly tier-1 infallible?
+///
+/// True type-level infallibility (tier-1) would require either:
+/// - `unsafe push_unchecked` in the push impl (forbidden by
+///   crate-wide `#![forbid(unsafe_code)]`);
+/// - const-generic capacity witness on `OutActions` that proves
+///   `len + 1 ≤ MAX` at type level (not expressible in stable
+///   Rust without `#![feature(generic_const_exprs)]`).
+///
+/// We settle for tier-2 structural via const-asserted invariant
+/// plus classified dead-arm: the `debug_assert!(false, ...)` in
+/// the Err branch fires in dev/test builds, release silently
+/// accepts (safe because invariant proof holds structurally).
+///
+/// ## Why the wrapper vs inline match?
+///
+/// The function call is `#[inline(always)]` + const-folded in
+/// release, so zero runtime overhead. Source-level wrapper
+/// centralises the debug-assert pattern across 6 materialise
+/// sites, avoiding drift (a future 7th site would inherit the
+/// correct dead-arm discipline automatically).
 #[inline(always)]
 fn push_within_fanout_budget<'w, 'r>(
     out: &mut OutActions<'w, 'r>,
     a: Action<'w, 'r>,
 ) {
-    // The Err branch is architecturally unreachable per the
-    // const-assert cited above. The match makes the dead-branch
-    // discipline explicit — no `.unwrap_or(())`, no `debug_assert`,
-    // no silent discard. If a future refactor drops the const-assert,
-    // the Err arm becomes a classified no-op but the arm's presence
-    // forces a code-review decision, not a silent drop.
     match out.push(a) {
         Ok(()) => {}
-        Err(_unreachable_per_const_assert) => {}
+        Err(_architecturally_dead) => {
+            // DEF-184 (B3): elevate the pre-(184) silent empty arm
+            // to a debug-classified dead-arm sentinel. Dev/test
+            // panics LOUDLY if invariant ever breaks (a future
+            // refactor drops MAX_FANOUT2_ENTRIES or adds a new
+            // fanout-3 staged variant without updating const). In
+            // release the silent no-op is the safe fallback — the
+            // structural invariant guarantees this is unreachable.
+            debug_assert!(
+                false,
+                "push_within_fanout_budget: OutActions overflow. \
+                 Architecturally impossible per const-assert \
+                 MAX_ACTIONS_PER_CALL >= MAX_STAGED + MAX_FANOUT2 \
+                 × (MAX_FANOUT - 1) = 9 post-DEF-184 A15. \
+                 If this fires, either a new fanout-2 StagedAction \
+                 variant landed without bumping MAX_FANOUT2_ENTRIES, \
+                 or 1c-5 pipelining introduced batched DeliverReply \
+                 emissions. Update MAX_FANOUT2_ENTRIES_PER_CALL and \
+                 MAX_ACTIONS_PER_CALL in lockstep.",
+            );
+        }
     }
 }
 
