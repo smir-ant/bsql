@@ -553,8 +553,16 @@ impl fmt::Display for DecodeError {
 /// copying, no allocation.
 #[derive(Debug, Clone, Copy)]
 pub struct DataRowRef<'a> {
-    /// Full body, including the 2-byte count header.
-    body: &'a [u8],
+    /// Body bytes AFTER the 2-byte column-count header.
+    ///
+    /// DEF-154 (U) P2/P3: store the post-header slice directly
+    /// (stripped at `parse` time via `split_first_chunk::<2>()`).
+    /// Pre-(U) the full body was stored and `columns()` re-stripped
+    /// the header via `self.body.get(2..).unwrap_or(&[])` — silent
+    /// fallback pattern user banned. Post-(U) the column iterator
+    /// starts from the stored slice directly — tier-1 infallible,
+    /// no Option, no fallback.
+    body_after_count: &'a [u8],
     /// Parsed column count.
     n_columns: u16,
 }
@@ -570,7 +578,8 @@ impl<'a> DataRowRef<'a> {
     ///   or the count header decodes to a negative `i16` (invalid).
     #[inline]
     pub fn parse(body: &'a [u8]) -> Result<Self, DecodeError> {
-        let (count_bytes, _) = body.split_first_chunk::<2>().ok_or(DecodeError::TruncatedRow)?;
+        let (count_bytes, body_after_count) =
+            body.split_first_chunk::<2>().ok_or(DecodeError::TruncatedRow)?;
         let n_columns_i16 = i16::from_be_bytes(*count_bytes);
         if n_columns_i16 < 0 {
             // Pass-#8 F-041: distinguish "body too short" (TruncatedRow)
@@ -586,7 +595,7 @@ impl<'a> DataRowRef<'a> {
         // output instead of "empty row with no error". Tier-3 audit
         // → tier-2 structural: misfire classifies, does not mask.
         let n_columns = u16::try_from(n_columns_i16).map_err(|_| DecodeError::TruncatedRow)?;
-        Ok(Self { body, n_columns })
+        Ok(Self { body_after_count, n_columns })
     }
 
     /// Declared column count.
@@ -618,9 +627,11 @@ impl<'a> DataRowRef<'a> {
     #[inline]
     #[must_use]
     pub fn columns(&self) -> ColumnsIter<'a> {
-        let remaining = self.body.get(2..).unwrap_or(&[]);
+        // DEF-154 (U): tier-1 — `body_after_count` is the
+        // post-header slice stored at parse time. No runtime
+        // `.get(2..).unwrap_or(&[])` fallback.
         ColumnsIter {
-            remaining,
+            remaining: self.body_after_count,
             columns_left: self.n_columns,
             column_idx: 0u8,
         }
@@ -1481,7 +1492,7 @@ mod data_row_tests {
             "fixture parse should succeed, got {result:?}",
         );
         result.unwrap_or(DataRowRef {
-            body: &[],
+            body_after_count: &[],
             n_columns: 0,
         })
     }

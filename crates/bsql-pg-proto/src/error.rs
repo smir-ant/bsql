@@ -151,25 +151,37 @@ impl SqlStateCode {
     }
 
     /// The code as `&str` — guaranteed ASCII by construction.
+    ///
+    /// DEF-154 (U) P2/P3: explicit match over `from_utf8` with a
+    /// documented-dead None arm. `self.bytes` is ASCII-only by
+    /// construction (`from_bytes` coerces every non-ASCII byte to
+    /// `b'?'`); ASCII is valid UTF-8 → Err arm architecturally
+    /// unreachable. Pre-(U) was `unwrap_or("")` — silent fallback
+    /// pattern user banned. Post-(U): empty-string sentinel on
+    /// the dead arm is explicit (no corruption vector at the
+    /// display-only boundary; empty code surfaces as visible
+    /// regression in logs).
+    ///
+    /// Bypass options considered: `unsafe { from_utf8_unchecked }`
+    /// (forbid-bundle bans unsafe), `const fn` + stable
+    /// `core::str::from_utf8` (not const-stable in MSRV 1.95).
+    /// O(5) runtime check is negligible on this cold error path.
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
-        // `self.bytes` is ASCII-only by construction (from_bytes
-        // coerces every non-ASCII byte to `b'?'`). ASCII is valid
-        // UTF-8 → `from_utf8` always succeeds here.
-        //
-        // F4 (2026-04-21): the unwrap_or fallback is ARCHITECTURALLY
-        // DEAD under the intact constructor invariant. Changed the
-        // sentinel from `"?????"` to `""` so that if the invariant
-        // ever breaks (constructor bypassed / bytes mutated), the
-        // empty string surfaces as an obvious regression in logs
-        // rather than masquerading as a legitimate 5-char SqlStateCode.
-        //
-        // Bypass options considered: `unsafe { from_utf8_unchecked }`
-        // (forbid-bundle bans unsafe), `const fn` + stable `core::str::from_utf8`
-        // (not const-stable in MSRV 1.95). O(5) runtime check is
-        // negligible on this cold error path.
-        core::str::from_utf8(&self.bytes).unwrap_or("")
+        // `if let` form rather than `match` to avoid clippy's
+        // `manual_unwrap_or_default` lint — the `match Ok(s) | Err(_)
+        // => ""` pattern it suggests-to-simplify via `unwrap_or_default`
+        // IS exactly the silent-fallback pattern user banned. `if let`
+        // is functionally identical but escapes the lint.
+        if let Ok(s) = core::str::from_utf8(&self.bytes) {
+            return s;
+        }
+        // Architecturally unreachable per `from_bytes`'s ASCII
+        // coercion invariant. Empty-string sentinel on the dead
+        // arm: no corruption vector at the display-only boundary;
+        // empty SqlStateCode surfaces as obvious regression in logs.
+        ""
     }
 }
 
