@@ -252,6 +252,16 @@ impl ReplyKind for DescribePortalKind {
 pub struct ReplyId<K: ReplyKind> {
     /// The wire-level correlator value. Never changes after
     /// construction.
+    ///
+    /// # DEF-163 A006 — NOT a secret, intentionally NOT zeroized
+    ///
+    /// The `value` is a monotonic correlator (matches commands to
+    /// replies over the wire). It carries NO user data, NO
+    /// credentials — just a sequence number. No `ZeroizeOnDrop` /
+    /// `Zeroize` derive: the field is left in memory on drop by
+    /// design, same as any POD sequence counter. Contrast with
+    /// [`crate::sensitive::Sensitive`] wrappers on password /
+    /// SCRAM-key material, which DO scrub on drop.
     value: NonZeroU64,
     // DEF-154 (K): `delivered: bool` field DELETED — it only
     // supported the panic-in-Drop safety net (now removed).

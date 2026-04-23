@@ -255,27 +255,58 @@ const _: fn() = || {
 // to leave room for ordinary evolution, tight enough to catch obvious
 // regression (2×, 4× blowups).
 //
-// Measurement baseline (x86_64 Linux, 2026-04-20):
-//   ProtocolError:   856  (five heapless::String<N>, N<=256)
-//   Action:          864  (SendBuf::Owned contains 512-byte vec)
-// Post-DEF-095/096/097 measurements (aarch64-apple-darwin):
-//   Ident:            66  (was 72 — heapless::Vec<u8,63>+usize → POD FixedStr)
-//   DatabaseName:     66
-//   ApplicationName: 130
-//   ProtocolError:   304  (DEF-060 typed variants + FixedStr tail)
-//   ReplyId:          16
-//   PgCommand:      2136  (Parse dominates: StmtName + Sql + ReplyId)
-// Post-DEF-119 measurements (aarch64-apple-darwin, 2026-04-21):
-//   Reply<'_>:        80  (was ~340 — RowDesc externalised to arena)
-//   Action<'_,'_>:   312  (was ~384 — FailReply.cause now dominant)
-//   OutActions:     2504  (was ~3072 — 8 × Action shrunk)
-//   ProtoState:     1224  (unchanged — SCRAM dominant, still 1224)
-//   PgProtocol:     6272  (added 528 B arena, other shrinkage offset net)
-// Post-DEF-148 measurements (aarch64-apple-darwin, 2026-04-22):
-//   SchemaSlab: ~520 B (post-DEF-171 has_any deleted; 528 B → ~520 B).
-//   PgProtocol:     6272  (DEF-119 baseline preserved after DEF-171 drop).
-//   Other types unchanged (SchemaRef grew 1 → 2 B but lived inside
-//   Option<SchemaRef> which was already 2 B; state-variant padding absorbs).
+// ═══════════════════════════════════════════════════════════════════
+// CURRENT (aarch64-apple-darwin, post-DEF-184 A10/B22, 2026-04-24)
+// ═══════════════════════════════════════════════════════════════════
+// The live size budget. All const_asserts below pin against THESE
+// values. Any future refactor that changes a size must update the
+// pin + shift the matching line here in the same commit.
+//
+//   Ident:             66  (FixedStr<63, IdentTag>)
+//   DatabaseName:      66
+//   ApplicationName:  130
+//   ProtocolError:     72  (DEF-184 A1+A13 — ErrorArena cascade)
+//   Action<'_,'_>:     88  (DEF-184 A1+A13 — Reply-bounded)
+//   OutActions:       800  (DEF-184 — 9 × Action + len)
+//   DispatchOutcome:   88  (DEF-184 B21/C6 — by-ref state)
+//   Reply<'_>:         80  (DEF-119 — RowDesc externalised)
+//   ReplyId:           16
+//   PgCommand:      ≤2176  (Parse dominates)
+//   ProtoState:        80  (DEF-184 A10/B22 — SCRAM externalised)
+//   SchemaArena:      ~520
+//   ErrorArena:      ~290
+//   ScramState:      ~712  (DEF-184 A10/B22 — Option<ScramHandshakeState>)
+//   PgProtocol:    [6032, 6200]  (range tolerates alignment)
+//
+// ═══════════════════════════════════════════════════════════════════
+// HISTORICAL (for context on why the budget looks the way it does)
+// ═══════════════════════════════════════════════════════════════════
+// Pre-DEF-060 (2026-04-20, x86_64 Linux):
+//   ProtocolError:    856  (five heapless::String<N>, N<=256)
+//   Action:           864  (SendBuf::Owned contains 512-byte vec)
+// Post-DEF-095/096/097 (aarch64-apple-darwin):
+//   Ident:             66  (was 72 — heapless::Vec<u8,63>+usize → POD FixedStr)
+//   ProtocolError:    304  (DEF-060 typed variants + FixedStr tail)
+//   PgCommand:       2136  (Parse dominates: StmtName + Sql + ReplyId)
+// Post-DEF-119 (2026-04-21):
+//   Reply<'_>:         80  (was ~340 — RowDesc externalised to arena)
+//   Action<'_,'_>:    312  (was ~384 — FailReply.cause now dominant)
+//   OutActions:      2504  (was ~3072 — 8 × Action shrunk)
+//   ProtoState:      1224  (unchanged — SCRAM dominant)
+//   PgProtocol:      6272  (added 528 B arena, other shrinkage offset net)
+// Post-DEF-148 (2026-04-22):
+//   SchemaArena:     ~520   (post-DEF-171 has_any deleted)
+//   PgProtocol:      6272  (DEF-119 baseline preserved)
+// Post-DEF-184 A1+A13 (2026-04-23):
+//   ProtocolError:     72  (was 312 — ErrorArena cascade)
+//   Action:            88  (was 312 — Reply-bounded via ErrorRef)
+//   OutActions:       800  (was 2808 — 9 × Action shrink)
+// Post-DEF-184 B21/C6 (2026-04-24):
+//   DispatchOutcome:   88  (was 800 — by-ref state removes new_state payload)
+// Post-DEF-184 A10/B22 (2026-04-24):
+//   ProtoState:        80  (was 712 — SCRAM split, heavy data → scram_state)
+//   ScramState NEW:   712  (lives on PgProtocol as Option, set-Some-only-
+//                           during-handshake so zeroize hygiene works)
 // ---------------------------------------------------------------------
 // DEF-151: tight-range size asserts. Bound BOTH directions to catch
 // field additions (upper) AND accidental field removals (lower). The

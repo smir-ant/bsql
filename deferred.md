@@ -2657,6 +2657,20 @@ Test suite unchanged.
 
 **Effort.** M (mechanical but broad).
 
+**Session 2026-04-24 partial shipment:**
+- ✅ **G002** — CURRENT vs HISTORICAL size baselines in lib.rs.
+- ✅ **G004** — rename `SchemaSlab` → `SchemaArena` (55 sites).
+- ✅ **G011** — rename `DescribedRowsRef` → `DescribedRowsStaged` (15 sites).
+- ✅ **G012** — PgProtocol struct-level size budget doc cross-ref.
+- ✅ **A006** — ReplyId.value "correlator, NOT a secret" note.
+- ✅ **A012** — dispatch.rs Errored arm "architecturally dead" note.
+- ✅ **B011** — `Action<'w, 'r>` dual-lifetime rationale.
+- ✅ **G007** — arena tier-claim honesty (handled by audit-2 item-1,
+  protocol.rs docstrings on schema_arena / error_arena fields).
+- ⏭ **G001, G008, G016, G017, G018, F001** — remaining items
+  (cross-refs, diagrams, doc sweeps). Deferred to next DEF-163
+  batch — session scope-limited.
+
 ### DEF-164 — `ReplyId.delivered` debug-assertions-gated (B008 sub-idea)
 
 **Schedule.** Later polish — only if release-build size
@@ -4285,14 +4299,29 @@ pin + 1 scram-push-state pin + 3 drift-arm pins).
 - **C4 — SWAR/SIMD `ColumnsBatch<N>`** — research spike (overlaps A11).
   - См. A11.
 
-- **C5 — Bitpacked `StateErrorKind`** — P2 trivial.
-  - File: `src/state.rs:ErrorKind`, `src/error.rs:StateErrorKind`.
-  - Current: 2 bytes (discriminant + kind byte).
-  - Proposed: bit-layout `[err_flag | kind_3bits | prior_gen_4bits]`
-    in `NonZero<u8>`. Single-byte Errored variant.
-  - Win: 1 B saved per connection. Compositional с B22.
-  - Tier: tier-2 structural.
-  - LoC: ~20. Risk: LOW.
+- **C5 — Bitpacked `StateErrorKind`** — **CLOSED 2026-04-24 as
+  factually-done via DEF-142 (pass-#8 F-056, 2026-04-21).**
+  - Pre-audit claim: "Current: 2 bytes (discriminant + kind byte)".
+    Factually FALSE as-of DEF-142 — `StateErrorKind` is
+    `#[repr(transparent)] pub struct StateErrorKind(ErrorKind)`
+    where `ErrorKind: #[repr(u8)]`. Size pinned at **1 byte
+    exact** in error.rs:1096-1103 (both `StateErrorKind` AND
+    `Option<StateErrorKind>` niche-pack to 1 B).
+  - Audit proposal "prior_gen_4bits" has no architectural consumer
+    — there's no generational counter on `ErrorKind` in the
+    current design; `prior_kind` discrimination (framing / auth /
+    server-error / etc.) carried in the 3-bit-sufficient discriminant
+    range alone.
+  - Further bit-packing into a sub-byte layout would require either
+    (a) packing with `ProtoState::Errored` variant discriminant —
+    but enum layout is compiler-controlled and fighting it needs
+    `#[repr]` gymnastics that complicate the DEF-142 type-level
+    seal on "never store AlreadyClosed in state", or (b) packing
+    with `PgProtocol` field neighbours — but `scram_state` /
+    `error_arena` / etc. are none-byte-sized and no shared layout
+    gain exists.
+  - **Verdict:** no architectural purpose in current design. Reopen
+    only if a concrete sub-byte consumer emerges.
 
 - **C6 — `dispatch()` by-ref** — SAME AS B21.
 

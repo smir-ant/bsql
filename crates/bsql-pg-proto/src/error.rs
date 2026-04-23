@@ -673,7 +673,7 @@ pub enum CrateBugLocus {
     /// — audit A001).
     SchemaArenaAllocFull,
 
-    /// DEF-154 reserved — [`crate::schema_arena::SchemaSlab::get`]
+    /// DEF-154 reserved — [`crate::schema_arena::SchemaArena::get`]
     /// returned None on a ref that should be live (post-successful
     /// dispatch, pre free/clear). Indicates generational drift in
     /// the arena's alloc/clear ordering. NOT YET WIRED — DEF-154

@@ -47,7 +47,7 @@ use crate::schema_arena::SchemaRef;
 /// Total: 2 B state-side vs 264 B pre-arena.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DescribedRowsRef {
+pub enum DescribedRowsStaged {
     /// Schema present at `SchemaRef` in the arena.
     #[doc(hidden)] Rows(SchemaRef),
     /// Server sent `NoData` (`'n'`) — no result columns.
@@ -459,7 +459,7 @@ pub enum ProtoState {
         /// Parameter OIDs captured at the `'t'` transition.
         param_oids: ParamOids,
         /// Rows-or-no-data captured at the `'T'` / `'n'` transition.
-        rows: DescribedRowsRef,
+        rows: DescribedRowsStaged,
     },
 
     // ─── Portal-describe path ───
@@ -478,7 +478,7 @@ pub enum ProtoState {
         /// Correlator for the Describe command.
         reply: ReplyId<DescribePortalKind>,
         /// Rows-or-no-data captured at the `'T'` / `'n'` transition.
-        rows: DescribedRowsRef,
+        rows: DescribedRowsStaged,
     },
 
     /// Terminal: the connection has been classified as unrecoverable.
@@ -1021,7 +1021,7 @@ mod push_class_tests {
             ProtoState::DescribeStatementAwaitingRfq {
                 reply: ReplyId::from_raw(nz(6_003)),
                 param_oids: crate::action::ParamOids::EMPTY,
-                rows: DescribedRowsRef::NoData,
+                rows: DescribedRowsStaged::NoData,
             },
             StatePushClass::BusyQuery,
         );
@@ -1032,7 +1032,7 @@ mod push_class_tests {
         pin(
             ProtoState::DescribePortalAwaitingRfq {
                 reply: ReplyId::from_raw(nz(6_005)),
-                rows: DescribedRowsRef::NoData,
+                rows: DescribedRowsStaged::NoData,
             },
             StatePushClass::BusyQuery,
         );

@@ -29,7 +29,7 @@
 //! `Option<SchemaRef>::None` niche).
 //!
 //! DEF-171 (audit2 A002) follow-up: the initial DEF-148 design
-//! carried a `has_any: bool` fast-path field on `SchemaSlab` to
+//! carried a `has_any: bool` fast-path field on `SchemaArena` to
 //! short-circuit `clear()` on the Ping-loop hot case. DEF-171
 //! deletes that field — it was a derived-state fallback with 6
 //! mutation sites, no cross-check test, and a silent-corruption
@@ -130,7 +130,7 @@ const _: () = assert!(
     "MAX_ARENA_SLOTS must be ≤ 254 — SchemaRef::slot is NonZeroU8 encoding (slot_idx + 1).",
 );
 
-/// Handle into [`SchemaSlab`]. Two bytes: niche-packed slot index +
+/// Handle into [`SchemaArena`]. Two bytes: niche-packed slot index +
 /// generation counter. `Copy`, `PartialEq`.
 ///
 /// # Shape
@@ -154,14 +154,14 @@ const _: () = assert!(
 /// out independently.
 ///
 /// The arena borrow is instead bound at the **dereferencing** site:
-/// [`SchemaSlab::get`] returns `Option<&'arena RowDesc>`. Stale
+/// [`SchemaArena::get`] returns `Option<&'arena RowDesc>`. Stale
 /// refs (generation mismatch after `clear`) return `None` — see
 /// module-level "Stale-ref classification" for DEF-150's diagnostic
 /// treatment.
 ///
 /// # Invariants maintained by construction
 ///
-/// A `SchemaRef` is **only** constructed via [`SchemaSlab::alloc`];
+/// A `SchemaRef` is **only** constructed via [`SchemaArena::alloc`];
 /// its `slot` is guaranteed in range `1..=MAX_ARENA_SLOTS` and its
 /// `generation` matches the slab's counter for that slot at the
 /// moment of allocation.
@@ -172,8 +172,8 @@ pub struct SchemaRef {
     /// `1..=MAX_ARENA_SLOTS`. The `0` value is reserved for
     /// `Option<SchemaRef>::None` via the `NonZeroU8` niche.
     slot: NonZeroU8,
-    /// Slab generation captured at [`SchemaSlab::alloc`] time.
-    /// A mismatch at [`SchemaSlab::get`] time means the slot was
+    /// Slab generation captured at [`SchemaArena::alloc`] time.
+    /// A mismatch at [`SchemaArena::get`] time means the slot was
     /// cleared or freed since this ref was issued (stale ref).
     generation: u8,
 }
@@ -193,10 +193,10 @@ impl SchemaRef {
         self.slot.get().saturating_sub(1)
     }
 
-    /// Generation captured at alloc. Used by [`SchemaSlab::get`]
+    /// Generation captured at alloc. Used by [`SchemaArena::get`]
     /// for stale-ref detection (internal, via field access) and by
     /// tests for generation-invariant pinning. Production code
-    /// doesn't need the accessor — `SchemaSlab::get` encapsulates
+    /// doesn't need the accessor — `SchemaArena::get` encapsulates
     /// the check. DEF-150 may promote to crate-wide usage for
     /// stale-ref diagnostic classification.
     #[cfg(test)]
@@ -206,7 +206,7 @@ impl SchemaRef {
     }
 
     /// Test-only "dead" SchemaRef — valid shape (NonZeroU8 slot,
-    /// u8 generation) but not issued by any live [`SchemaSlab`].
+    /// u8 generation) but not issued by any live [`SchemaArena`].
     /// Intended solely as the `unwrap_or` fallback in
     /// `assert!(alloc.is_some()) + unwrap_or(dead_for_test)` test
     /// fixtures; a `get()` on any real slab with this ref returns
@@ -246,7 +246,7 @@ impl SchemaRef {
 /// See [module-level](self) docstring for full design and
 /// alloc/clear discipline.
 #[derive(Debug)]
-pub(crate) struct SchemaSlab {
+pub(crate) struct SchemaArena {
     /// `None` = free slot, `Some(desc)` = occupied.
     ///
     /// `Option<RowDesc>` here is fine: `RowDesc` doesn't niche-pack,
@@ -290,7 +290,7 @@ pub(crate) struct SchemaSlab {
     generations: [u8; MAX_ARENA_SLOTS],
 }
 
-impl SchemaSlab {
+impl SchemaArena {
     /// Construct an empty slab (all slots free, all generations 0).
     #[inline]
     #[must_use]
@@ -472,7 +472,7 @@ impl SchemaSlab {
     ///
     /// DEF-154 (C) witness-pattern: materialise only needs to
     /// resolve `SchemaRef → &'r RowDesc`. Exposing the full
-    /// `&'r SchemaSlab` there would grant access to internals
+    /// `&'r SchemaArena` there would grant access to internals
     /// `get()` transitively reveals (nothing in the current API
     /// surface, but a future refactor could add a `slot_is_empty`
     /// or similar that drifts into the materialise path). The
@@ -496,7 +496,7 @@ impl SchemaSlab {
     /// or reclaim slots, even through a future refactor, because
     /// the type simply does not expose those methods.
     ///
-    /// # Rationale over `&mut SchemaSlab`
+    /// # Rationale over `&mut SchemaArena`
     ///
     /// The direct borrow grants the full surface (`alloc` + `get` +
     /// `clear` + `free`) to dispatch. The only operation dispatch
@@ -510,15 +510,15 @@ impl SchemaSlab {
     }
 }
 
-/// Materialise-phase view of the [`SchemaSlab`] — read-only.
+/// Materialise-phase view of the [`SchemaArena`] — read-only.
 ///
-/// DEF-154 (C) witness-pattern. Wraps `&'r SchemaSlab` and exposes
+/// DEF-154 (C) witness-pattern. Wraps `&'r SchemaArena` and exposes
 /// only the `get` operation, narrowing the materialise call site's
 /// access to the one method it actually uses.
 ///
 /// # Copy
 ///
-/// `Copy` is intentional: the underlying `&'r SchemaSlab` is `Copy`
+/// `Copy` is intentional: the underlying `&'r SchemaArena` is `Copy`
 /// (all shared references are), so [`ArenaReader<'r>`] is
 /// zero-cost-copyable. Materialise passes the reader to
 /// sub-resolvers (`StagedReply::into_public`,
@@ -526,21 +526,21 @@ impl SchemaSlab {
 /// cloning.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ArenaReader<'r> {
-    slab: &'r SchemaSlab,
+    slab: &'r SchemaArena,
 }
 
 impl<'r> ArenaReader<'r> {
     /// Resolve a [`SchemaRef`] to its `&'r RowDesc` borrow, or
     /// `None` for a stale / out-of-range / unoccupied handle.
     ///
-    /// See [`SchemaSlab::get`] for the generation-match semantics.
+    /// See [`SchemaArena::get`] for the generation-match semantics.
     /// The returned borrow inherits `'r` from the wrapped slab
     /// reference — callers can propagate it into `OutActions<'w, 'r>`
     /// payloads as before (same lifetime, narrower API surface).
     #[inline]
     #[must_use]
     pub(crate) fn get(&self, r: SchemaRef) -> Option<&'r RowDesc> {
-        // `self.slab: &'r SchemaSlab` — `&` is `Copy`, so field
+        // `self.slab: &'r SchemaArena` — `&` is `Copy`, so field
         // access through `&self` projects out the full `'r`
         // lifetime. Calling `.get(r)` on the resulting `&'r`
         // reference returns `Option<&'r RowDesc>` (method signature
@@ -549,20 +549,20 @@ impl<'r> ArenaReader<'r> {
     }
 }
 
-/// Dispatch-phase view of the [`SchemaSlab`] — alloc-only.
+/// Dispatch-phase view of the [`SchemaArena`] — alloc-only.
 ///
-/// DEF-154 (C) witness-pattern. Wraps `&'a mut SchemaSlab` and
+/// DEF-154 (C) witness-pattern. Wraps `&'a mut SchemaArena` and
 /// exposes only the `alloc` operation, preventing the dispatch
 /// path from accidentally reading, clearing, or freeing slots.
 #[derive(Debug)]
 pub(crate) struct ArenaWriter<'a> {
-    slab: &'a mut SchemaSlab,
+    slab: &'a mut SchemaArena,
 }
 
 impl ArenaWriter<'_> {
     /// Allocate a slot for `desc`, returning a handle.
     ///
-    /// See [`SchemaSlab::alloc`] for the full semantics (slot order,
+    /// See [`SchemaArena::alloc`] for the full semantics (slot order,
     /// generation capture, `None` on full arena).
     #[inline]
     #[must_use]
@@ -571,7 +571,7 @@ impl ArenaWriter<'_> {
     }
 }
 
-impl Default for SchemaSlab {
+impl Default for SchemaArena {
     #[inline]
     fn default() -> Self {
         Self::new()
@@ -584,9 +584,9 @@ impl Default for SchemaSlab {
 // aarch64-apple-darwin; range [512, 544] tolerates cross-platform
 // alignment.
 const _: () = assert!(
-    core::mem::size_of::<SchemaSlab>() >= 512
-        && core::mem::size_of::<SchemaSlab>() <= 544,
-    "SchemaSlab size drift — post-DEF-171 actual ~520 B (has_any \
+    core::mem::size_of::<SchemaArena>() >= 512
+        && core::mem::size_of::<SchemaArena>() <= 544,
+    "SchemaArena size drift — post-DEF-171 actual ~520 B (has_any \
      deleted). Range [512, 544] tolerates cross-platform alignment. \
      If MAX_ARENA_SLOTS grows, update PgProtocol size budget in \
      lib.rs in lockstep.",
@@ -607,10 +607,10 @@ const _: () = assert!(
 );
 
 // DEF-154 (C) drift pins: the witness wrappers must stay
-// pointer-sized. `ArenaReader<'r>` wraps `&'r SchemaSlab` (a thin
-// reference — `SchemaSlab` is `Sized`, so the reference has no
+// pointer-sized. `ArenaReader<'r>` wraps `&'r SchemaArena` (a thin
+// reference — `SchemaArena` is `Sized`, so the reference has no
 // metadata on any supported target); `ArenaWriter<'a>` wraps
-// `&'a mut SchemaSlab` (also thin for the same reason). On all
+// `&'a mut SchemaArena` (also thin for the same reason). On all
 // supported targets both collapse to one usize. A future refactor
 // that adds generation / brand fields — or (hypothetically)
 // switches to `dyn Trait` storage that would force a fat reference
@@ -618,11 +618,11 @@ const _: () = assert!(
 // the materialise / dispatch call sites before lifting.
 const _: () = assert!(
     core::mem::size_of::<ArenaReader<'_>>() == core::mem::size_of::<usize>(),
-    "ArenaReader must stay pointer-sized (thin &SchemaSlab wrapper; SchemaSlab is Sized).",
+    "ArenaReader must stay pointer-sized (thin &SchemaArena wrapper; SchemaArena is Sized).",
 );
 const _: () = assert!(
     core::mem::size_of::<ArenaWriter<'_>>() == core::mem::size_of::<usize>(),
-    "ArenaWriter must stay pointer-sized (thin &mut SchemaSlab wrapper; SchemaSlab is Sized).",
+    "ArenaWriter must stay pointer-sized (thin &mut SchemaArena wrapper; SchemaArena is Sized).",
 );
 
 // DEF-183 (P1-B from Senior audit): compile-time Copy pin for
@@ -653,7 +653,7 @@ mod tests {
     /// Alloc on `slab` and return the handle. Fails the test via
     /// `assert!` if alloc returns `None` — the fallback
     /// [`SchemaRef::dead_for_test`] is unreachable in correct tests.
-    fn must_alloc(slab: &mut SchemaSlab, desc: RowDesc) -> SchemaRef {
+    fn must_alloc(slab: &mut SchemaArena, desc: RowDesc) -> SchemaRef {
         let r = slab.alloc(desc);
         assert!(r.is_some(), "alloc must succeed on slab with free slot, got {r:?}");
         r.unwrap_or_else(SchemaRef::dead_for_test)
@@ -662,7 +662,7 @@ mod tests {
     /// Invariant (spec): fresh slab has zero occupied slots.
     #[test]
     fn fresh_slab_is_empty() {
-        let slab = SchemaSlab::new();
+        let slab = SchemaArena::new();
         assert_eq!(slab.occupied_count(), 0);
     }
 
@@ -671,7 +671,7 @@ mod tests {
     /// on a fresh slab.
     #[test]
     fn alloc_fills_in_order_then_returns_none() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         let desc = RowDesc::EMPTY;
 
         let r0 = must_alloc(&mut slab, desc);
@@ -693,7 +693,7 @@ mod tests {
     /// ref; `free` invalidates the ref via generation bump.
     #[test]
     fn alloc_get_free_round_trip() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         let desc = RowDesc::EMPTY;
 
         let r = must_alloc(&mut slab, desc);
@@ -717,7 +717,7 @@ mod tests {
     /// additional generation bump on already-free slot).
     #[test]
     fn double_free_is_idempotent() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         let r = must_alloc(&mut slab, RowDesc::EMPTY);
         slab.free(r);
         let gen_after_first_free = slab
@@ -743,7 +743,7 @@ mod tests {
     /// stale.
     #[test]
     fn clear_empties_all_slots_and_invalidates_refs() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         let first = must_alloc(&mut slab, RowDesc::EMPTY);
         let second = must_alloc(&mut slab, RowDesc::EMPTY);
         assert_ne!(first.slot_idx(), second.slot_idx());
@@ -764,7 +764,7 @@ mod tests {
     /// empty slots without storing — behaviour preserved.
     #[test]
     fn clear_on_empty_slab_is_noop() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         assert_eq!(slab.occupied_count(), 0);
         let gens_before: [u8; MAX_ARENA_SLOTS] = slab.generations;
         slab.clear();
@@ -777,7 +777,7 @@ mod tests {
     /// when the fresh alloc lands in the same physical slot.
     #[test]
     fn stale_ref_across_clear_resolves_to_none() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         let desc = RowDesc::EMPTY;
         let r_before = must_alloc(&mut slab, desc);
         slab.clear();
@@ -800,8 +800,8 @@ mod tests {
     /// wrapper layer).
     #[test]
     fn writer_witness_alloc_matches_direct_alloc() {
-        let mut slab_a = SchemaSlab::new();
-        let mut slab_b = SchemaSlab::new();
+        let mut slab_a = SchemaArena::new();
+        let mut slab_b = SchemaArena::new();
         let desc = RowDesc::EMPTY;
 
         // Direct-alloc reference trace.
@@ -823,18 +823,18 @@ mod tests {
     /// correctly for OutActions payloads.
     #[test]
     fn reader_witness_get_yields_live_desc() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         let r = must_alloc(&mut slab, RowDesc::EMPTY);
         let reader = slab.as_reader();
         assert!(reader.get(r).is_some(), "live ref must resolve through reader");
     }
 
     /// DEF-154 (C): reader returns `None` for stale refs (generation
-    /// mismatch after clear), matching the underlying SchemaSlab::get
+    /// mismatch after clear), matching the underlying SchemaArena::get
     /// contract.
     #[test]
     fn reader_witness_stale_ref_returns_none() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         let stale = must_alloc(&mut slab, RowDesc::EMPTY);
         slab.clear();
         // Fresh alloc re-uses slot 0 with bumped generation — asserted
@@ -853,7 +853,7 @@ mod tests {
     /// Pins the Copy derive against accidental removal.
     #[test]
     fn reader_witness_is_copy() {
-        let mut slab = SchemaSlab::new();
+        let mut slab = SchemaArena::new();
         let r = must_alloc(&mut slab, RowDesc::EMPTY);
         let reader_a = slab.as_reader();
         // Copy, not move — `reader_a` stays usable after the bind.

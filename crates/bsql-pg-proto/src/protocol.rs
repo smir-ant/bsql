@@ -364,6 +364,22 @@ const _: () = assert!(MAX_ACTIONS_PER_CALL >= 4, "practical batching needs ≥4 
 ///
 /// `!Sync` by construction (`PhantomData<Cell<()>>` field). Concurrent
 /// access is impossible; a `&mut PgProtocol` is the only handle.
+///
+/// # Size budget (DEF-184 post-A10/B22)
+///
+/// `size_of::<PgProtocol>()` is pinned in `lib.rs` at range
+/// `[6032, 6200]` bytes. Budget composition:
+/// - `ReadBuf`       ~4096 B  (I/O staging, READ_BUF_CAP)
+/// - `state`           80 B   (ProtoState, post-A10 SCRAM split)
+/// - `session_params` ~420 B
+/// - `schema_arena`   ~520 B  (DEF-119 two-slot slab)
+/// - `error_arena`    ~290 B  (DEF-184 A1+A13 single-slot)
+/// - `scram_state`    ~712 B  (post-A10 externalised SCRAM data)
+/// - padding + flags  varies
+///
+/// Any field addition or size growth must update the pin in
+/// `lib.rs` alongside the code change. See DEF-163 G012 for
+/// this cross-reference discipline.
 pub struct PgProtocol {
     state: ProtoState,
     read_buf: ReadBuf,
@@ -406,7 +422,7 @@ pub struct PgProtocol {
     /// Benefit: state drops from ~1224 B → ~300 B;
     /// `Action::StreamRow` drops from ~280 B → ~32 B;
     /// per-row DataRow emission saves ~260 B (hot path on SELECT).
-    schema_arena: crate::schema_arena::SchemaSlab,
+    schema_arena: crate::schema_arena::SchemaArena,
     /// DEF-184 (A1+A13) error-payload arena — single-slot storage
     /// for `ProtocolError::ServerErrorResponse` bounded strings.
     ///
@@ -536,7 +552,7 @@ impl PgProtocol {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
-            schema_arena: crate::schema_arena::SchemaSlab::new(),
+            schema_arena: crate::schema_arena::SchemaArena::new(),
             error_arena: crate::error_arena::ErrorArena::new(),
             scram_state: None,
             pending_advance: None,
@@ -2895,7 +2911,7 @@ mod allows_unsolicited_param_status_tests {
         // well-typed `SchemaRef`. DEF-148 added `SchemaRef::dead_for_test`
         // as the test-only sentinel replacing the pre-DEF-148 `ZERO`
         // (`ZERO` could no longer exist — NonZeroU8 forbids 0).
-        let mut arena = crate::schema_arena::SchemaSlab::new();
+        let mut arena = crate::schema_arena::SchemaArena::new();
         let alloc_result = arena.alloc(crate::decode::RowDesc::EMPTY);
         assert!(alloc_result.is_some(), "alloc on fresh slab must succeed");
         let sr = alloc_result.unwrap_or_else(crate::schema_arena::SchemaRef::dead_for_test);

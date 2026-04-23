@@ -28,7 +28,7 @@
 //! # Single-slot design
 //!
 //! The arena holds a **single** `Option<ErrorPayload>` — not a multi-
-//! slot slab like [`crate::schema_arena::SchemaSlab`]. Rationale:
+//! slot slab like [`crate::schema_arena::SchemaArena`]. Rationale:
 //!
 //! 1. **Single-inflight semantics (pre-1c-5).** Per feed_bytes /
 //!    push_command cycle, at most ONE server error can reach the
@@ -49,7 +49,7 @@
 //!   get stored in the arena; the returned [`ErrorRef`] threads into
 //!   `ProtocolError::ServerErrorResponse { details_ref, ... }`.
 //! - **Clear** happens at entry-point boundaries when prior state is
-//!   `Idle` or `Errored` — alongside `SchemaSlab::clear()` in
+//!   `Idle` or `Errored` — alongside `SchemaArena::clear()` in
 //!   [`crate::PgProtocol::clear_arena_if_idle_or_errored`]. The next
 //!   feed_bytes call starts with a fresh arena; any ErrorRef held
 //!   past that boundary becomes stale (classified via generation).

@@ -734,6 +734,35 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, { crate::protocol::M
 /// `#[non_exhaustive]` because more variants land with later
 /// sub-phases. Internal `match` over `Action` is *not*
 /// `non_exhaustive`.
+///
+/// # DEF-163 B011: why two lifetimes (`'w` + `'r`)?
+///
+/// The two lifetimes are NOT cosmetic — they are load-bearing:
+/// - `'w` borrows `write_buf` on the **push path**. Entry-points
+///   `push_command` / `push_bind_execute` build outbound frames
+///   into `WriteBuf`; `SendBytes(&'w [u8])` references the staged
+///   bytes. The host writes them to the socket and drops the
+///   Action, releasing `'w`.
+/// - `'r` borrows `read_buf` + `schema_arena` on the **feed
+///   path**. `feed_bytes` parses inbound frames into `read_buf`;
+///   row-streaming actions like `StreamRow { desc: &'r RowDesc,
+///   row_bytes: &'r [u8] }` borrow directly from the populated
+///   region (zero-copy). Host reads + drops the Action, releasing
+///   `'r`.
+///
+/// **Why can't we unify `'w = 'r`?** On the push path, produced
+/// `Action`s are all either `'static` (compile-time constant
+/// frames like `Sync`) or `'w` (freshly-built frames). On the
+/// feed path, `Action`s are `'r` (row bodies borrowed from
+/// `read_buf`). Forcing `'w = 'r` would require every push-path
+/// action to satisfy `'r` — but `'r` is `&'r mut self` of
+/// `PgProtocol` from `feed_bytes`'s signature. Push-path actions
+/// exit without a `&mut self` borrow, so `'r` is unbound there,
+/// and the compiler would infer `'r = 'static` on push, breaking
+/// the feed-path zero-copy guarantee (StreamRow needs actual-`'r`,
+/// not static). Two distinct lifetimes prove zero-copy on both
+/// paths; unification would force either staging copies or an
+/// API split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
@@ -907,7 +936,7 @@ pub struct StagedQueryCompletePayload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribeStatementCompletePayload {
     #[doc(hidden)] pub param_oids: ParamOids,
-    #[doc(hidden)] pub rows: crate::state::DescribedRowsRef,
+    #[doc(hidden)] pub rows: crate::state::DescribedRowsStaged,
     #[doc(hidden)] pub tx_status: TxStatus,
 }
 
@@ -916,7 +945,7 @@ pub struct StagedDescribeStatementCompletePayload {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribePortalCompletePayload {
-    #[doc(hidden)] pub rows: crate::state::DescribedRowsRef,
+    #[doc(hidden)] pub rows: crate::state::DescribedRowsStaged,
     #[doc(hidden)] pub tx_status: TxStatus,
 }
 
@@ -1037,7 +1066,7 @@ impl StagedReply {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StaleSchemaRef;
 
-/// Convert state-side [`crate::state::DescribedRowsRef`] to the
+/// Convert state-side [`crate::state::DescribedRowsStaged`] to the
 /// public [`DescribedRows<'r>`] by resolving any `SchemaRef` into a
 /// borrow.
 ///
@@ -1055,11 +1084,11 @@ pub(crate) struct StaleSchemaRef;
 /// `arena.get(s)` resolution arm explicit.
 #[inline]
 fn described_rows_ref_into_public<'r>(
-    r: crate::state::DescribedRowsRef,
+    r: crate::state::DescribedRowsStaged,
     arena: crate::schema_arena::ArenaReader<'r>,
 ) -> Result<DescribedRows<'r>, StaleSchemaRef> {
     match r {
-        crate::state::DescribedRowsRef::Rows(s) => match arena.get(s) {
+        crate::state::DescribedRowsStaged::Rows(s) => match arena.get(s) {
             Some(desc) => Ok(DescribedRows::from_row_desc(desc)),
             // DEF-154 (J): stale ref classification — Err propagates
             // through `into_public` → materialise emits classified
@@ -1068,7 +1097,7 @@ fn described_rows_ref_into_public<'r>(
             // no-schema Describe result.
             None => Err(StaleSchemaRef),
         },
-        crate::state::DescribedRowsRef::NoData => Ok(DescribedRows::no_data()),
+        crate::state::DescribedRowsStaged::NoData => Ok(DescribedRows::no_data()),
     }
 }
 
@@ -1182,7 +1211,7 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// Schema-bearing payloads (`QueryComplete`, `DescribeStatementComplete`,
 /// `DescribePortalComplete`) previously owned a 260-byte `RowDesc`
 /// inline. DEF-119 externalises the schema into `PgProtocol`'s
-/// [`crate::schema_arena::SchemaSlab`]; payloads now borrow
+/// [`crate::schema_arena::SchemaArena`]; payloads now borrow
 /// `&'r RowDesc` from the arena. The `'r` lifetime ties the borrow
 /// to the `&'r mut PgProtocol` that produced the reply — same
 /// lifetime as [`Action::StreamRow::row_bytes`], so both row bytes

@@ -844,7 +844,7 @@ pub(crate) fn dispatch(
                     *state = ProtoState::DescribeStatementAwaitingRfq {
                         reply,
                         param_oids,
-                        rows: crate::state::DescribedRowsRef::Rows(schema_ref),
+                        rows: crate::state::DescribedRowsStaged::Rows(schema_ref),
                     };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -865,7 +865,7 @@ pub(crate) fn dispatch(
             *state = ProtoState::DescribeStatementAwaitingRfq {
                 reply,
                 param_oids,
-                rows: crate::state::DescribedRowsRef::NoData,
+                rows: crate::state::DescribedRowsStaged::NoData,
             };
             DispatchOutcome::AdvancedSilent
         }
@@ -915,7 +915,7 @@ pub(crate) fn dispatch(
                     Some(schema_ref) => {
                         *state = ProtoState::DescribePortalAwaitingRfq {
                             reply,
-                            rows: crate::state::DescribedRowsRef::Rows(schema_ref),
+                            rows: crate::state::DescribedRowsStaged::Rows(schema_ref),
                         };
                         DispatchOutcome::AdvancedSilent
                     }
@@ -932,7 +932,7 @@ pub(crate) fn dispatch(
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_NO_DATA) => {
             *state = ProtoState::DescribePortalAwaitingRfq {
                 reply,
-                rows: crate::state::DescribedRowsRef::NoData,
+                rows: crate::state::DescribedRowsStaged::NoData,
             };
             DispatchOutcome::AdvancedSilent
         }
@@ -970,6 +970,16 @@ pub(crate) fn dispatch(
 
         // =============================================================
         // Errored — terminal sink (Phase 1a pattern carried forward)
+        //
+        // DEF-163 A012: architecturally dead under current flow.
+        // `feed_bytes` short-circuits on `ProtoState::Errored(_)`
+        // via the is-errored-or-recovering fast-path check (see
+        // `protocol.rs` — `is_errored_or_recovering` → clear
+        // read_buf + return empty OutActions, dispatch is NEVER
+        // entered). Arm retained for exhaustive `(ProtoState, tag)`
+        // coverage — a future API that bypasses the early-return
+        // would still land here classified, not UB. Missing arm
+        // would be a compile error by match exhaustiveness.
         // =============================================================
         (ProtoState::Errored(original), _) => {
             *state = ProtoState::Errored(original);
