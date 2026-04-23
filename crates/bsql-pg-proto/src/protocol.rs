@@ -50,70 +50,42 @@ macro_rules! count_exprs {
     ($one:expr, $two:expr, $three:expr, $four:expr) => { 4_usize };
 }
 
-/// Push 1..=N actions into `out`, with compile-time enforcement of
-/// both the per-site budget and the global `MAX_ACTIONS_PER_CALL` cap.
+/// Push 1..=N actions into `staged`, with compile-time enforcement
+/// of the per-site budget.
 ///
-/// Two forms:
+/// # DEF-154 (Q) P1-6: infallible-only form
 ///
-/// - **Loop form** (`on_overflow: break`) — for callers inside a loop
-///   who must bail out of the loop if the vector fills. Used by the
-///   `feed_bytes` drain loop.
-/// - **No-bail form** (no `on_overflow:` argument) — for callers where
-///   the compile-time `const _: () = assert!(...)` already proves the
-///   push cannot fail (the vector starts empty and the budget fits).
-///   Used by `push_command` handlers and `fail_inflight_and_close`.
-///   The Err arm is dead under the assert but explicit so the
-///   compiler sees every `Result` handled.
+/// Pre-(Q), `emit_actions!` had two forms: `on_overflow: break`
+/// (loop form — bailed the enclosing loop on Err) and no-bail
+/// (const-assert-proven fit). The former looked safe (gate
+/// reserved `WORST_CASE_PER_DISPATCH` slots before loop entry) but
+/// was a silent-loss footgun: if the gate ever drifted, terminal
+/// `FailReply + CloseSocket` could be dropped while state had
+/// ALREADY transitioned to `Errored` — caller sees state_errored
+/// but no Action delivery, orphaned oneshot receiver.
+///
+/// Post-(Q) only the no-bail infallible form remains. The dispatch
+/// gate at feed_bytes reserves `WORST_CASE_PER_DISPATCH = 2` slots
+/// before entering any arm, so the Errored arm's 2-action emission
+/// always fits the staged cap. `match Ok(()) | Err(_) => {}` is
+/// explicit dead-arm handling (no `.unwrap_or(())` silent
+/// fallback, no debug_assert panic target).
 ///
 /// ```text
-/// // Loop caller:
-/// emit_actions!(out, budget: 2, on_overflow: break, [
-///     Action::FailReply { id: id.consume(), cause },
-///     Action::CloseSocket,
-/// ]);
-///
-/// // Non-loop caller:
-/// emit_actions!(out, budget: 1, [
+/// emit_actions!(staged, budget: 1, [
 ///     Action::SendBytes(SendBuf::from_slice(&SYNC_WIRE_BYTES)?),
 /// ]);
 /// ```
 ///
-/// Compile-time checks (both are `const _: () = assert!(…)` — failure
-/// is a build error, not a runtime branch):
+/// Compile-time checks (both are `const _: () = assert!(…)`):
 ///
-/// 1. `MAX_ACTIONS_PER_CALL >= budget` — the site's declared budget
-///    fits within the global cap.
-/// 2. `budget >= count(actions)` — the site does not push more actions
-///    than it declared.
+/// 1. `MAX_STAGED_PER_CALL >= budget` — site's declared budget
+///    fits within the staged cap.
+/// 2. `budget >= count(actions)` — site does not push more than
+///    its declared budget.
 ///
-/// DEF-045. Form split: DEF-055.
+/// DEF-045. Form split + merge: DEF-055 + DEF-154 (Q).
 macro_rules! emit_actions {
-    // Loop form: bails out of the enclosing loop on overflow.
-    //
-    // DEF-154 (L): staged container uses `MAX_STAGED_PER_CALL`
-    // (NOT `MAX_ACTIONS_PER_CALL` — the latter is the OUTPUT
-    // (user-side) cap, with MAX_STAGED_PER_CALL × MAX_FANOUT_PER_STAGED).
-    (
-        $out:expr, budget: $budget:literal, on_overflow: break,
-        [$($action:expr),+ $(,)?]
-    ) => {{
-        const _: () = assert!(
-            $crate::protocol::MAX_STAGED_PER_CALL >= $budget,
-            "emit_actions! per-site budget exceeds MAX_STAGED_PER_CALL",
-        );
-        const _: () = assert!(
-            $budget >= count_exprs!($($action),+),
-            "emit_actions! site pushes more actions than its declared budget",
-        );
-        $(
-            if $out.push($action).is_err() {
-                break;
-            }
-        )+
-    }};
-
-    // No-bail form: const_assert guarantees the push fits; Err arm is
-    // dead but explicit to honor `heapless::Vec::push`'s must-use.
     (
         $out:expr, budget: $budget:literal,
         [$($action:expr),+ $(,)?]
@@ -129,7 +101,12 @@ macro_rules! emit_actions {
         $(
             match $out.push($action) {
                 Ok(()) => {}
-                Err(_) => {}
+                Err(_) => {
+                    // Architecturally unreachable: the dispatch gate
+                    // at feed_bytes (protocol.rs) reserves
+                    // WORST_CASE_PER_DISPATCH slots before arm entry.
+                    // Dead-arm explicit, no silent fallback.
+                }
             }
         )+
     }};
@@ -850,7 +827,18 @@ impl PgProtocol {
                                 *state = new_state;
                                 frames_consumed =
                                     frames_consumed.saturating_add(total_len);
-                                emit_actions!(&mut staged, budget: 1, on_overflow: break, [
+                                // DEF-154 (Q) P1-6: use default
+                                // infallible emit (budget: 1, no
+                                // on_overflow) — the dispatch gate
+                                // above reserves WORST_CASE_PER_DISPATCH
+                                // = 2 slots before entry, so
+                                // staged.len() + 1 ≤ MAX_STAGED_PER_CALL
+                                // is guaranteed. Pre-(Q) the
+                                // `on_overflow: break` form was
+                                // architecturally dead but had a
+                                // silent-loss footgun if the gate ever
+                                // drifted.
+                                emit_actions!(&mut staged, budget: 1, [
                                     action,
                                 ]);
                             }
@@ -859,15 +847,27 @@ impl PgProtocol {
                                 // unwrap_or_else + debug_assert dance.
                                 let state_kind = cause.state_kind();
                                 *state = ProtoState::Errored(state_kind);
+                                // DEF-154 (Q) P1-6: terminal
+                                // FailReply + CloseSocket MUST reach
+                                // the caller (reply promise
+                                // resolution, socket teardown signal).
+                                // Pre-(Q) the `on_overflow: break`
+                                // form could silently drop these if
+                                // staged was near-full — state is
+                                // Errored but caller sees no
+                                // FailReply, no CloseSocket, orphaned
+                                // oneshot receiver. Post-(Q) infallible
+                                // emit: dispatch gate reserves 2 slots,
+                                // push always fits.
                                 match reply_id {
                                     Some(id) => {
-                                        emit_actions!(&mut staged, budget: 2, on_overflow: break, [
+                                        emit_actions!(&mut staged, budget: 2, [
                                             StagedAction::FailReply { id, cause },
                                             StagedAction::CloseSocket,
                                         ]);
                                     }
                                     None => {
-                                        emit_actions!(&mut staged, budget: 1, on_overflow: break, [
+                                        emit_actions!(&mut staged, budget: 1, [
                                             StagedAction::CloseSocket,
                                         ]);
                                     }
