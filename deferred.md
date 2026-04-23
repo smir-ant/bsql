@@ -3379,7 +3379,74 @@ via regex greed); pointwise Edit is the correct approach.
 `cargo clippy -D warnings` clean. No public API change (all brand
 scaffolding is `pub(crate)`).
 
-### DEF-154 (X) — pull-based RowStream<'r> API — DEFERRED (post-W)
+### DEF-154 (X) — pull-based RowStream<'r> API — OPEN (foundation shipped)
+
+**Foundation dependency: DEF-154 (W) SHIPPED** — write-brand
+scaffolding deleted (commit `0236046`), −194 LoC. RowStream
+builds atop the simplified post-W type surface.
+
+**Three failed implementation attempts in the same session after
+shipping (W).** Each hit the same structural tension: reusing
+existing `dispatch()` fn from RowStream requires either
+(a) lifetime-juggling `DispatchOutcome<'r>` through a
+lifetime-free projection to survive a closure scope boundary,
+(b) extracting `dispatch_one_frame` as a new method on PgProtocol
+that bypasses `OutActions` on the hot path (while keeping
+feed_bytes intact for slow paths), or (c) building a fully
+parallel state-machine inside RowStream.
+
+Path (b) is architect's recommended design (per DEF-154 X plan
+above) but is ≥500 LoC of careful surgery on `feed_bytes`'s hot
+loop. Implementation requires a fresh focused session — attempts
+late in a long refactor day introduced lifetime-scope errors
+faster than they could be untangled.
+
+**Scope estimate (unchanged):** ~550 LoC.
+- ~300 LoC: `src/row_stream.rs` new module (struct + PendingEvent +
+  impl + fast-path DataRow + slow-path feed_bytes delegation).
+- ~100 LoC: PgProtocol helper methods (`read_buf_populated`,
+  `read_buf_cursor_u16`, `read_buf_advance`,
+  `streaming_reply_id_and_schema`, `schema_arena_reader`) OR
+  field-level `pub(crate)` exposure.
+- ~100 LoC: integration test exercising 1k-row `iter_rows` path
+  end-to-end + asserting OutActions is NOT touched on DataRow
+  frames (via a criterion benchmark or allocation-count probe).
+
+**Specific blockers encountered:**
+
+1. `Action::StreamRow` carries `desc: &RowDesc` (arena-resolved)
+   but NOT `SchemaRef` — reverse-mapping from a slow-path batch's
+   Action back into a lifetime-free PendingEvent requires either
+   the SchemaRef directly (not present), or re-resolving via
+   pointer identity against arena slots (brittle).
+2. `DispatchOutcome<'r>` returned by dispatch carries
+   `StagedAction::SendBytesRange(WriteRange)` whose slice resolves
+   only inside the same scope as `write_buf.with_branded(|wb| {...})`
+   — escaping out of the closure via lifetime-free indices
+   requires capturing `(start, end)` from the WriteRange's
+   `NonEmptyRange` inner (needs accessor exposure).
+3. Fast-path extracting `(reply.id, schema_ref)` from a streaming
+   `ProtoState` variant without destructuring requires either a
+   new `pub(crate) fn streaming_reply_id_and_schema` on
+   PgProtocol OR pattern-match helpers per variant — minor but
+    4-5 sites to touch.
+
+**Order of operations for a future fresh attempt:**
+
+1. First, add the PgProtocol helper methods (`read_buf_*`,
+   `streaming_reply_id_and_schema`, etc). Ship as a prep commit.
+2. Then, add `pub(crate) fn dispatch_one_frame` on PgProtocol
+   that replicates the feed_bytes loop's single-iteration body
+   but returns `Option<StagedAction<'r>>` or similar — NOT
+   OutActions. Ship as a prep commit.
+3. Finally, add `RowStream` + `StreamItem` + `iter_rows` atop
+   the helpers. Integration tests. Criterion benchmark pinning
+   the 300× stack-init reduction.
+
+**Verification (target):** a dedicated criterion bench showing
+100k-row SELECT dispatch time drops from baseline feed_bytes to
+≥10× speedup on the row hot path; 213 tests still pass with the
+dual-API surface (feed_bytes retained for control frames).
 
 **Trigger.** Architect second-pass audit identified `feed_bytes → OutActions<'w, 'r>`
 shape as the crate's dominant hot-path overhead: 5 008 B zero-fill
