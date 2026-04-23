@@ -2151,10 +2151,24 @@ pub(crate) enum ParamStatusRecordOutcome {
 
 /// Parse a ParameterStatus payload and record it in session_params.
 ///
-/// Payload format: `key\0value\0`. Compressed with `let-else` to
-/// five short lines (DEF-095). `[T]::split_once` with a predicate
-/// is still unstable (#112811); the `iter().position` idiom is the
-/// stable-library equivalent.
+/// Payload format per PG §55.7: `key\0value\0` — two NUL-terminated
+/// C-strings. `[T]::split_once` with a predicate is still unstable
+/// (#112811); the `iter().position` idiom is the stable-library
+/// equivalent.
+///
+/// DEF-184 (B17): `#[inline(always)]` — called in the pre-dispatch
+/// filter of the main dispatch loop on every ParameterStatus frame;
+/// inlining saves a call frame per frame.
+///
+/// DEF-184 fallback-hygiene catch: pre-(184) the `value_region
+/// .strip_suffix(b"\0").unwrap_or(value_region)` silently accepted
+/// payload missing the trailing NUL (wire-spec violation per
+/// §55.7). CREDO §7 ось 12 — fallback как костыль: silently
+/// tolerated malformed input, ParameterStatus with missing
+/// trailing NUL recorded the value with potential trailing garbage.
+/// Post-(184): explicit `strip_suffix` Result — missing NUL =
+/// MalformedPayload, classified not silently absorbed.
+#[inline(always)]
 #[must_use]
 fn record_param_status(
     params: &mut SessionParams,
@@ -2172,7 +2186,9 @@ fn record_param_status(
     let Some(value_region) = payload.get(value_start..) else {
         return ParamStatusRecordOutcome::MalformedPayload;
     };
-    let value = value_region.strip_suffix(b"\0").unwrap_or(value_region);
+    let Some(value) = value_region.strip_suffix(b"\0") else {
+        return ParamStatusRecordOutcome::MalformedPayload;
+    };
     params.set(key, value);
     ParamStatusRecordOutcome::Processed
 }

@@ -398,18 +398,30 @@ impl WriteBuf {
         //
         // F61 (pass #6 audit): explicit Err on the architecturally-dead
         // None branch. The `push_u32_be(0)` above guarantees
-        // `inner.len() >= start + 4` — so `get_mut(start..start+4)`
-        // cannot return None unless a future refactor removes or
-        // reorders the placeholder push. Converting the former silent
-        // no-op (`if let Some(slot)`) into an explicit Err means the
-        // refactor fails with a classified `WriteBufFull` at the
-        // first test run, rather than producing wire frames with a
-        // length field of `0` that the server would reject as
-        // `MalformedFrameLength`.
-        let Some(slot) = self.inner.get_mut(start..start.saturating_add(4)) else {
+        // `inner.len() >= start + 4` — so `get_mut(start..)` + chunk
+        // extraction cannot return None unless a future refactor
+        // removes or reorders the placeholder push. Converting the
+        // former silent no-op (`if let Some(slot)`) into an explicit
+        // Err means the refactor fails with a classified
+        // `WriteBufFull` at the first test run, rather than producing
+        // wire frames with a length field of `0` that the server would
+        // reject as `MalformedFrameLength`.
+        //
+        // DEF-184 (B15): `first_chunk_mut::<4>()` returns
+        // `Option<&mut [u8; 4]>` — direct array assignment `*slot
+        // = len_bytes` compiles to a single 32-bit store on aligned
+        // targets, vs the pre-(184) `copy_from_slice(&len_bytes)`
+        // which internally bounds-checks src.len() == dst.len().
+        // Both bounds checks (get_mut range + copy_from_slice) fold
+        // into one `first_chunk_mut` check.
+        let Some(slot) = self
+            .inner
+            .get_mut(start..)
+            .and_then(|s| s.first_chunk_mut::<4>())
+        else {
             return Err(WriteBufFull);
         };
-        slot.copy_from_slice(&len_bytes);
+        *slot = len_bytes;
         Ok(())
     }
 
@@ -446,13 +458,17 @@ impl WriteBuf {
         // removes the placeholder push would fail with a typed error
         // at build-time tests instead of silently producing frames
         // with bogus length fields.
+        //
+        // DEF-184 (B15): same `first_chunk_mut::<4>()` → single
+        // 32-bit store as `with_length_prefix`.
         let Some(slot) = self
             .inner
-            .get_mut(len_offset..len_offset.saturating_add(4))
+            .get_mut(len_offset..)
+            .and_then(|s| s.first_chunk_mut::<4>())
         else {
             return Err(WriteBufFull);
         };
-        slot.copy_from_slice(&bytes);
+        *slot = bytes;
         Ok(())
     }
 

@@ -233,7 +233,13 @@ pub use crate::ident::BoundedStr;
 pub enum AuthSubCodeClass {
     /// A sub-code outside the 4 PG-defined values (0/10/11/12).
     /// Carries the raw u32 for forensic logging.
-    Unknown(u32),
+    ///
+    /// DEF-184 (B9): `NonZeroU32` (not `u32`) — tier-1 structural
+    /// proof that server sent a value other than 0 (AUTH_OK = 0 is
+    /// a known sub-code, classified via `KnownButWrong(AuthSubCode::Ok)`
+    /// if seen in wrong state, never in `Unknown`). Niche optimises
+    /// `Option<AuthSubCodeClass>` and other nested options.
+    Unknown(core::num::NonZeroU32),
     /// A recognised sub-code that's legal on the wire but wrong
     /// for the current state (e.g., server returned `Sasl` while
     /// the client is in Trust auth with no SCRAM credentials).
@@ -253,6 +259,21 @@ impl fmt::Display for AuthSubCodeClass {
         }
     }
 }
+
+// DEF-184 (B9): drift-pin — `Unknown(NonZeroU32)` must niche into
+// the same 8 bytes as `KnownButWrong(AuthSubCode)`. Pre-(184) was
+// `Unknown(u32)` — 8 bytes incl. discriminant + 4-byte padding.
+// Post-(184) NonZeroU32 carries the non-zero invariant at type
+// level; `Option<AuthSubCodeClass>` niche-optimises via the
+// 0-u32-bit-pattern slot.
+const _: () = assert!(
+    core::mem::size_of::<AuthSubCodeClass>() == 8,
+    "AuthSubCodeClass: 4-byte discriminant + 4-byte NonZeroU32 payload",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<AuthSubCodeClass>>() == 8,
+    "Option<AuthSubCodeClass>: niche-packed via NonZeroU32 = 8 B",
+);
 
 // -----------------------------------------------------------------
 // ProtocolError (below)
@@ -675,6 +696,15 @@ pub enum CrateBugLocus {
     /// `Result<WriteRange, ProtocolError>`; `compute_push_*`
     /// routes `Err` through `FailReply + CloseSocket`.
     EmptyWriteRange,
+
+    /// DEF-184 (B9): `AuthSubCode::try_from_u32` returned Err
+    /// carrying raw value 0 — architecturally impossible because
+    /// `AUTH_OK = 0` is the first match arm and returns Ok. The
+    /// `AuthSubCodeClass::Unknown(NonZeroU32)` niche-packed variant
+    /// rejects zero values at the type level; this locus classifies
+    /// the dead arm that would otherwise require either silent
+    /// fallback (tier-4, CREDO §5) or new-variant-with-payload.
+    AuthSubCodeZeroInErr,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -720,6 +750,7 @@ impl fmt::Display for CrateBugLocus {
             Self::StaleSchemaRef => f.write_str("stale-schema-ref"),
             Self::ParamsWriterOverflow => f.write_str("params-writer-overflow"),
             Self::EmptyWriteRange => f.write_str("empty-write-range"),
+            Self::AuthSubCodeZeroInErr => f.write_str("auth-sub-code-zero-in-err"),
             Self::BuilderCapacityOverflow => f.write_str("builder-capacity-overflow"),
         }
     }

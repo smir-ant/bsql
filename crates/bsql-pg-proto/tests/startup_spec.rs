@@ -353,12 +353,19 @@ fn unknown_auth_subcode_is_rejected() {
     assert_eq!(out.len(), 2);
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
+            // DEF-184 (B9): Unknown carries NonZeroU32 (type-level
+            // proof that server sent ≠ 0; AUTH_OK = 0 is classified
+            // as KnownButWrong(AuthSubCode::Ok)).
+            let expected_99 = match core::num::NonZeroU32::new(99) {
+                Some(nz) => nz,
+                None => panic!("99 is non-zero, NonZeroU32::new infallible"),
+            };
             assert!(
                 matches!(
                     cause,
                     ProtocolError::UnsupportedAuthMethod {
-                        sub_code: bsql_pg_proto::error::AuthSubCodeClass::Unknown(99),
-                    },
+                        sub_code: bsql_pg_proto::error::AuthSubCodeClass::Unknown(nz),
+                    } if *nz == expected_99,
                 ),
                 "expected UnsupportedAuthMethod(Unknown(99)), got {cause:?}",
             );
@@ -1329,4 +1336,63 @@ fn param_status_during_pre_auth_is_unexpected() {
         other => panic!("unexpected sequence: {other:?}"),
     }
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
+}
+
+/// DEF-184 (B17 fallback-hygiene catch): ParameterStatus with
+/// missing trailing NUL (wire-spec §55.7 violation) must be
+/// classified as MalformedPayload and silently dropped — NOT
+/// silently absorbed with the wrong value. Pre-(184)
+/// `strip_suffix(b"\0").unwrap_or(value_region)` silently accepted
+/// malformed payload; post-(184) explicit Option match routes
+/// missing-NUL to MalformedPayload.
+///
+/// Observable surface: the key is NOT recorded in SessionParams
+/// (server_version stays None). Additionally the connection stays
+/// in a normal post-auth state — ParameterStatus classification
+/// failures don't tear down the connection (they're forward-compat
+/// tolerant per PG §55.7 unsolicited-message semantics).
+#[test]
+fn param_status_missing_trailing_nul_classified_as_malformed() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(400);
+    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
+
+    // Complete handshake: AuthOk → BackendKeyData → RFQ → Idle.
+    let _ = proto.feed_bytes(&auth_ok_frame(), &mut wb);
+    let _ = proto.feed_bytes(&backend_key_data_frame(12345, 67890), &mut wb);
+    let _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
+    assert!(
+        matches!(proto.state(), ProtoState::Idle),
+        "handshake must complete to Idle — got {:?}",
+        proto.state(),
+    );
+
+    // Build a malformed ParameterStatus: key\0value (NO trailing
+    // NUL on value). Wire: 'S' + len + "server_version\017.2".
+    // Body: "server_version" (14) + NUL (1) + "17.2" (4) = 19.
+    // Length field: 19 + 4 = 23.
+    let mut frame = Vec::new();
+    frame.push(b'S');
+    frame.extend_from_slice(&23u32.to_be_bytes());
+    frame.extend_from_slice(b"server_version");
+    frame.push(0);
+    frame.extend_from_slice(b"17.2");
+    // NO trailing NUL.
+
+    let out = proto.feed_bytes(&frame, &mut wb);
+    // Classified silent-skip — no action emitted, state unchanged.
+    assert_eq!(out.len(), 0, "malformed PS is silently dropped, not an action");
+    assert!(
+        matches!(proto.state(), ProtoState::Idle),
+        "state preserved through malformed PS",
+    );
+    // Critical: server_version must remain None. Pre-(184) the
+    // fallback `unwrap_or(value_region)` would have set it to
+    // some garbage byte slice.
+    assert!(
+        proto.session_params().server_version.is_none(),
+        "malformed PS must NOT set server_version — {:?}",
+        proto.session_params().server_version,
+    );
 }

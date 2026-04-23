@@ -884,8 +884,19 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
             // (not `Option<Self>`) — forward the rejected raw u32 via
             // `map_err`, no separate `.ok_or(..raw)` layer needed.
             let code = crate::wire::AuthSubCode::try_from_u32(raw).map_err(|unknown| {
-                ProtocolError::UnsupportedAuthMethod {
-                    sub_code: crate::error::AuthSubCodeClass::Unknown(unknown),
+                // DEF-184 (B9): `unknown ≠ 0` structurally — AUTH_OK
+                // = 0 is matched to Ok(AuthSubCode::Ok) by
+                // try_from_u32 above, so `Err(0)` is architecturally
+                // impossible. `AuthSubCodeClass::Unknown(NonZeroU32)`
+                // carries the tier-1 type-level proof; dead None
+                // arm classified as AuthSubCodeZeroInErr crate-bug.
+                match core::num::NonZeroU32::new(unknown) {
+                    Some(nz) => ProtocolError::UnsupportedAuthMethod {
+                        sub_code: crate::error::AuthSubCodeClass::Unknown(nz),
+                    },
+                    None => ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::AuthSubCodeZeroInErr,
+                    },
                 }
             })?;
             Ok((code, rest))
@@ -986,9 +997,24 @@ fn dispatch_auth_in_startup_scram(
 }
 
 /// Check if the SASL mechanism list contains SCRAM-SHA-256.
+///
+/// DEF-184 (B12): happy-path fast-check — most servers announce
+/// `"SCRAM-SHA-256\0\0"` as the only mechanism (or first), so a
+/// single `starts_with` covers the common case in one compare
+/// instead of a full NUL-split loop. Falls through to the generic
+/// scan for the multi-mechanism case (rare — PG typically sends
+/// only SCRAM-SHA-256, sometimes with `SCRAM-SHA-256-PLUS`).
+#[inline]
 fn mechanism_list_contains_scram(data: &[u8]) -> bool {
-    // Mechanism names are NUL-separated, with an extra NUL terminator.
-    // e.g.: b"SCRAM-SHA-256\0\0"
+    // Fast path: first mechanism is SCRAM-SHA-256 followed by
+    // the NUL separator. Covers ≥95% of real-world servers.
+    if let Some(rest) = data.strip_prefix(SCRAM_SHA_256_MECHANISM)
+        && let Some(&0) = rest.first()
+    {
+        return true;
+    }
+    // Slow path: walk NUL-separated names. e.g. server offering
+    // ["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"] lands here.
     for name in data.split(|b| *b == 0) {
         if name == SCRAM_SHA_256_MECHANISM {
             return true;
