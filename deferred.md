@@ -4288,3 +4288,163 @@ Batch 10 (research spikes):
 ---
 
 **Origin:** 2 architect subagent runs 2026-04-23.
+
+### DEF-185 — Unstable Rust blockers (DEF-184 side-file) — OPEN
+
+**Purpose:** отслеживать находки из DEF-184 audit'ов + session work,
+которые **заблокированы unstable Rust features**. При bump MSRV
+или стабилизации feature — ревизитать этот список чтобы сразу
+поднять tier.
+
+**Blocker check procedure:** после каждого `rustup update`:
+1. `rustc --version` — новый стабильный.
+2. Каждый пункт ниже — попробовать compile с убранным workaround'ом.
+3. Если compile'ится — шипить как tier elevation + удалить пункт
+   отсюда.
+
+#### Blocked items
+
+- **B2 (const-fn rollout для 4 `len()` методов)** — blocked by
+  `impl const From<u16> for usize`.
+  - Tracking: rust-lang issue #143874 (как в существующем F-034
+    citation).
+  - Workaround: non-const `pub fn len(&self) -> usize {
+    usize::from(self.n_params) }`.
+  - Когда stable: convert на `const fn`, удалить "Why not `const
+    fn`" doc-block, добавить round-trip compile pin.
+  - **Check history**: audit #2 (2026-04-23) claimed stable
+    since Rust 1.87 — **FALSE**. Verified reverted. Compiler
+    emits E0658 на attempted convert.
+
+- **B3 crown case (tier-1 infallible `OutActions::push`)** —
+  blocked by `feature(generic_const_exprs)` for type-level
+  capacity witness (e.g. `[(); N - LEN]: Sized` bound).
+  - Tracking: rust-lang issue #76560.
+  - Workaround: tier-2 structural via const-assert
+    `MAX_ACTIONS_PER_CALL >= MAX_STAGED + MAX_FANOUT2 × (MAX_FANOUT-1)`
+    + classified dead-arm `debug_assert!(false, "...")` на Err
+    branch in `push_within_fanout_budget`.
+  - Когда stable: rewrite `OutActions::push<const LEN: usize>`
+    with compile-time capacity proof, remove debug_assert trap.
+
+- **A5/B10 branchless sign-path (`wrapping_add(1) as u32`
+  trick)** — blocked by crate's `clippy::as_conversions` forbid
+  (self-imposed), not stable Rust per se. Also: `i32::cast_unsigned`
+  nightly-only.
+  - Tracking: rust-lang issue #125882 (`integer_sign_cast`).
+  - Workaround: `usize::try_from(i32)` — LLVM fuses non-negative
+    fast path. 3 branches per column (was 5).
+  - Когда stable + we lift `as_conversions` forbid: 2-branch
+    version possible. **NOT planning to lift forbid** (CREDO §1
+    tier-1 forbid is value); keep try_from path as permanent
+    solution.
+
+- **A11 / C4 SIMD column batch decode** — blocked by `std::simd`
+  stabilisation.
+  - Tracking: rust-lang issue #86656.
+  - Workaround: SWAR via `u64` arithmetic (stable) — partial
+    gains, not full SIMD.
+  - Current plan: defer до DEF-143 criterion bench + Rust stable
+    `std::simd`.
+
+- **B2/F-034 const arithmetic in forbid-bundle** — blocked by
+  `clippy::integer_division` forbid (self-imposed) preventing
+  `/` operator in const fn.
+  - Tracking: rust-lang issue #88581 (`div_ceil` const).
+  - Workaround DEF-184 (B28): `usize::div_ceil` is method call,
+    not `/` operator, so `clippy::integer_division` doesn't flag.
+    Used in `SHA256_PROOF_B64_LEN = SHA256_DIGEST_LEN.div_ceil(3)
+    .saturating_mul(4)`.
+  - `usize::div_ceil` const-stable since Rust 1.73 (well within
+    MSRV 1.95). No further action needed.
+
+- **heapless::Vec infallible `push_unchecked`** — blocked by
+  `#![forbid(unsafe_code)]` (self-imposed, not torgable per
+  CREDO §4).
+  - Workaround: fallible `push()` + classified dead-arm. See
+    B3 entry.
+  - Will never unblock — forbid(unsafe) is permanent project
+    policy.
+
+- **C1 typestate `PgProtocol<S: State>`** — needs research-spike
+  to determine if API-break cost < structural win. Not Rust-
+  blocker per se, but blocked on design validation.
+
+- **C2 generative brands restore** — soundness via ghost-cell
+  paper (Yanovski et al. 2021) requires HRTB closures — stable.
+  Blocked on cost/benefit bench vs current tier-3 classified
+  shield.
+
+#### Shipped-despite-workaround (worth noting)
+
+- **B9 (AuthSubCodeClass::Unknown(NonZeroU32))** — required new
+  `CrateBugLocus::AuthSubCodeZeroInErr` variant because Rust's
+  type system can't see that `unknown != 0` in the `try_from_u32`
+  Err arm. Needed explicit match + classified dead-None branch.
+  Won't unblock without dependent types.
+
+---
+
+### DEF-186 — DEF-184 session bonus findings (2026-04-23) — catalog
+
+Bonus work found / done during DEF-184 batch execution (beyond
+the A/B/C audit catalog). Documented here for provenance and so
+they don't get lost in commit history.
+
+1. **ParamStatus missing trailing NUL** — silently absorbed by
+   `strip_suffix(b"\0").unwrap_or(value_region)` in
+   `record_param_status` (protocol.rs). Tier-4 silent-fallback
+   violation. Fixed in commit `579dddd` (part of B17 path) —
+   classified as `ParamStatusRecordOutcome::MalformedPayload`.
+   Test `param_status_missing_trailing_nul_classified_as_malformed`
+   pins the behaviour.
+
+2. **`*` deref audit** — user-requested systematic check (CREDO
+   §3 skepticism). 38+ sites across `src/*.rs`. **All 0 are
+   crutches** — standard place-assignment through `&mut T` /
+   Copy-read through `&T`. Documented in CREDO §11 as
+   false-positive-candidate for future audits.
+
+3. **`MAX_FANOUT2_ENTRIES_PER_CALL = 1`** — new invariant pinned
+   via exhaustive case analysis (commit `ace874d`, docs in
+   `e3581a7`). Captures "at most 1 DeliverReply per dispatch
+   call, pre-1c-5 single-inflight pattern" as a compile-time
+   assertion trap for future pipelining refactor.
+
+4. **`CrateBugLocus::AuthSubCodeZeroInErr`** — new variant
+   introduced for B9's dead-arm classification (commit
+   `579dddd`). Architecturally-unreachable "try_from_u32(0)
+   somehow returned Err" path.
+
+5. **`install_errored_read_cursor_advance`** — new helper method
+   on `PgProtocol` parallel to existing
+   `install_errored_malformed_data_row`. Used by B25 fast-path
+   `read_buf_advance` Err classification (commit `19d4426`).
+
+6. **`record_param_status` `#[inline(always)]`** — B17 marker,
+   hot on pre-dispatch filter every PG ParameterStatus frame.
+
+7. **CREDO.md expansion** — §11 Safe-Rust Idioms section added
+   in commit `e3581a7` documenting `*slot = value`,
+   `ManuallyDrop`, `unwrap_or(&[])` classification, `mem::take`
+   pattern, `heapless::Vec::new()` zero-fill savings. Reduces
+   future audit false-positive noise.
+
+8. **§7 Edge-case discipline — axes 11 + 12** — memory-leak &
+   fallback axes added (commit `aad6fb0`). User-requested: "утечка
+   памяти невидима, страшнее crash'а" + "fallback возможен, но не
+   бездумно". Applied to §9 perf-дисциплина as `zero-leak`
+   + `zero-fallback` principles.
+
+9. **CREDO §1 tier elevation policy** — user clarified 2026-04-23
+   that priority is not only "Tier-1 invariants" но и САМ
+   процесс tier elevation. Applied as 4-step rule: tier-4 →
+   any>4, tier-3 → tier-2, tier-2 → tier-1, tier-1 → stronger
+   tier-1.
+
+10. **CREDO §4 no_std per-crate** — user clarified 2026-04-23
+    that `no_std` applies only where архитектурно оправдано
+    (sans-IO cores, embedded). User-land crates (driver, CLI,
+    server) depend on `std` when needed. `#![forbid(unsafe_code)]`
+    — universal.
+
