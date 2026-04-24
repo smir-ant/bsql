@@ -257,111 +257,56 @@ macro_rules! try_builder {
 ///   dead (not just "believed dead by code review").
 pub const MAX_STAGED_PER_CALL: usize = 8;
 
-/// Worst-case output-action fan-out per single staged action.
-///
-/// - Most staged actions map 1:1 to one `Action`.
-/// - `StagedAction::DeliverReply` with a stale `SchemaRef` in its
-///   payload (e.g. schema-bearing `QueryComplete`) emits 2
-///   (`FailReply { StaleSchemaRef } + CloseSocket`).
-///
-/// DEF-154 (Y): `StagedAction::StreamRowRange` with stale ref
-/// ALSO fanned to 2 actions; post-(Y) the variant is deleted —
-/// row-bearing responses flow through `iter_rows` exclusively,
-/// where stale-ref is classified inline in the fast-path. The
-/// 2-fanout worst case is now driven purely by `DeliverReply`.
-///
-/// 2 is the documented worst-case; a future staged variant that
-/// fans out to 3 actions must bump this const AND
-/// `MAX_ACTIONS_PER_CALL` in lockstep (the const-assert below
-/// catches a missing bump).
-pub const MAX_FANOUT_PER_STAGED: usize = 2;
-
-/// DEF-184 (A15): maximum number of fanout-2 staged entries per
-/// dispatch call. Post-DEF-154 (Y) `StreamRowRange` deletion, the
-/// only remaining fanout-2 staged variant is `DeliverReply` with
-/// stale-ref (architecturally dead — `CrateBugLocus::StaleSchemaRef`).
-///
-/// # Exhaustive case analysis — why `MAX_FANOUT2_ENTRIES = 1`
-///
-/// 1. **Which StagedAction variants fan out to 2 actions in
-///    materialise?** Grep `push_within_fanout_budget` call sites
-///    in `materialise`:
-///    - `StagedAction::SendBytesRange` on `None` apply: 1 action
-///      (`CloseSocket`) + continue. **Not fanout-2** (only 1
-///      action emitted before continue; the continue skips the
-///      normal SendBytes emission).
-///    - `StagedAction::DeliverReply` on stale-ref `Err(_stale)`:
-///      2 actions (`FailReply + CloseSocket`). **FANOUT-2**.
-///    - `StagedAction::SendBytesStatic`: 1 action.
-///    - `StagedAction::FailReply`: 1 action.
-///    - `StagedAction::CloseSocket`: 1 action.
-///
-///    **Conclusion:** only `DeliverReply` stale-ref is fanout-2.
-///
-/// 2. **How many `DeliverReply` staged entries can a single
-///    dispatch call produce?** Grep `StagedAction::DeliverReply`
-///    in dispatch.rs — all construction sites use `action::deliver`
-///    which is called from `DispatchOutcome::AdvancedWithAction`.
-///    The dispatch loop emits ONE `AdvancedWithAction` per frame,
-///    and only terminal frames (RFQ, Z, CommandComplete,
-///    Authentication Ok/Final, ParseComplete, CloseComplete,
-///    BindComplete, etc.) emit a DeliverReply. For pre-1c-5
-///    single-inflight pattern, a single feed_bytes cycle
-///    processes one reply — at most ONE DeliverReply per call.
-///    **Conclusion:** `MAX_FANOUT2_ENTRIES ≤ 1` pre-pipelining.
-///
-/// 3. **Can the dispatch loop emit 2+ DeliverReply in one call?**
-///    No — state after DeliverReply transitions away from the
-///    waiting-for-reply state (back to Idle or an intermediate),
-///    blocking a second reply emission in the same feed_bytes
-///    iteration. Confirmed via state-machine audit (see
-///    `state.rs` transitions).
-///
-/// 4. **Regression trap — 1c-5 pipelining:** if pipelining adds
-///    batched replies (multiple DeliverReply per call), this const
-///    MUST bump. The const-assert below catches a stale
-///    `MAX_ACTIONS_PER_CALL` when the bump is forgotten.
-///
-/// # Why not leave `MAX_ACTIONS = STAGED × FANOUT = 16` safely?
-///
-/// Because stack reservation is proportional: 16 × 312 B = 4992 B
-/// vs 9 × 312 B = 2808 B. The -2184 B saving per call × per-
-/// connection × QPS is the perf win. Overestimating the cap
-/// leaves dead stack space that compiler can't optimise away
-/// (heapless::Vec reserves `[MaybeUninit<T>; N]` up front).
-const MAX_FANOUT2_ENTRIES_PER_CALL: usize = 1;
-
 /// Output-side action capacity — bounds `OutActions` storage.
 ///
-/// DEF-184 (A15): tightened from
-/// `MAX_STAGED * MAX_FANOUT = 8 × 2 = 16` down to
-/// `MAX_STAGED + MAX_FANOUT2_ENTRIES × (MAX_FANOUT − 1) =
-/// 8 + 1 × 1 = 9`. Reflects the post-(Y) reality that only one
-/// staged entry (DeliverReply) can fanout to 2 actions. 7 normal
-/// + 1 fanout-2 = 9 outputs maximum.
+/// # Budget derivation
 ///
-/// **Bench impact:** `OutActions` stack reservation drops from
-/// `16 × 312 B = 4992 B` to `9 × 312 B = 2808 B` — 2184 bytes
-/// saved per OutActions instance. Combined with DEF-184 A2/B1
-/// (ManuallyDrop<heapless::Vec>), init cost stays 0 B regardless
-/// of capacity; what shrinks now is the stack FRAME.
-pub const MAX_ACTIONS_PER_CALL: usize =
-    MAX_STAGED_PER_CALL + MAX_FANOUT2_ENTRIES_PER_CALL * (MAX_FANOUT_PER_STAGED - 1);
+/// `MAX_STAGED_PER_CALL (8) + 1 = 9`. The `+1` is the single
+/// fanout-2 worst case: `StagedAction::DeliverReply` with a stale
+/// `SchemaRef` payload emits `FailReply + CloseSocket` (2 actions
+/// from 1 staged entry). Every other StagedAction variant maps
+/// 1:1 to Action.
+///
+/// # Why `+1` and not `× 2`?
+///
+/// State-machine audit: at most ONE `DeliverReply` can fire per
+/// dispatch call pre-pipelining. Terminal frames (RFQ/Z/CommandComplete/
+/// AuthOk/ParseComplete/BindComplete/CloseComplete/NoData) transition
+/// the state AWAY from the waiting-for-reply state, blocking a
+/// second reply in the same feed_bytes iteration. Therefore:
+/// 7 non-fanout staged + 1 fanout-2 staged = 7 + 2 = 9 actions.
+///
+/// # 1c-5 pipelining regression trap
+///
+/// If a future pipelining refactor emits 2+ DeliverReply per
+/// dispatch call (batched replies), bump the `+1` literal to match
+/// the max number of simultaneous fanout-2 staged entries.
+///
+/// # DEF-184 audit (2026-04-24, architect finding)
+///
+/// Pre-simplification: 3-const formula (`MAX_FANOUT_PER_STAGED=2`,
+/// `MAX_FANOUT2_ENTRIES_PER_CALL=1`, `MAX_STAGED + FANOUT2 × (FANOUT−1)`).
+/// Collapsed to direct `MAX_STAGED + 1` — same value (9), same
+/// regression protection (future pipelining bumps the literal),
+/// half the cognitive load, zero runtime cost difference.
+///
+/// # Bench impact (preserved through simplification)
+///
+/// `OutActions` stack reservation: `9 × 88 B = 792 B` vs the
+/// naive `MAX_STAGED × 2 = 16 × 88 B = 1408 B`. Saves 616 B per
+/// OutActions. Combined with A2/B1 `ManuallyDrop<heapless::Vec>`
+/// (0 B zero-fill), OutActions is a lean stack frame.
+pub const MAX_ACTIONS_PER_CALL: usize = MAX_STAGED_PER_CALL + 1;
 
-// DEF-184 (A15): tight upper bound. Any dispatch/materialise
-// path that produces more than 9 actions per call would overflow
-// OutActions. Const-assert below verifies:
-//   `9 ≥ 8 + 1 × (2 - 1) = 9` — exactly.
-// If a future refactor adds a SECOND fanout-2 staged variant (e.g.
-// a batched DeliverReply for pipelining in 1c-5), bump
-// MAX_FANOUT2_ENTRIES_PER_CALL accordingly.
+// Drift pin: formula sanity — if a refactor changes the formula
+// accidentally (e.g. to MAX_STAGED_PER_CALL without +1), this
+// trips. Intentional bumps (1c-5 pipelining) update both the
+// const and this assertion in lockstep.
 const _: () = assert!(
-    MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL
-        + MAX_FANOUT2_ENTRIES_PER_CALL * (MAX_FANOUT_PER_STAGED - 1),
-    "MAX_ACTIONS_PER_CALL (output capacity) must be >= \
-     MAX_STAGED_PER_CALL + MAX_FANOUT2_ENTRIES × (MAX_FANOUT − 1). \
-     Post-DEF-184 A15: 9 = 8 + 1 × 1. If a second fanout-2 staged \
-     variant lands, bump MAX_FANOUT2_ENTRIES_PER_CALL.",
+    MAX_ACTIONS_PER_CALL == MAX_STAGED_PER_CALL + 1,
+    "MAX_ACTIONS_PER_CALL budget: MAX_STAGED + 1 (for the single \
+     fanout-2 DeliverReply stale-ref case). If 1c-5 pipelining \
+     lands, bump literal and update docstring in lockstep.",
 );
 
 /// Worst-case number of actions a single dispatch iteration can

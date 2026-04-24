@@ -135,7 +135,7 @@ pub use ident::{
     ApplicationName, DatabaseName, Ident, IdentError, PortalName, Sql, StmtName,
 };
 pub use password::{Credentials, Password, PasswordError};
-pub use protocol::{MAX_ACTIONS_PER_CALL, MAX_FANOUT_PER_STAGED, MAX_STAGED_PER_CALL, PgProtocol};
+pub use protocol::{MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL, PgProtocol};
 pub use reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,
     ReplyId, ReplyKind, StartupKind,
