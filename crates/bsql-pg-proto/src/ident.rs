@@ -2,6 +2,58 @@
 //! `FixedStr<N, Tag>` parameterised by a phantom-tag for nominal
 //! typing. DEF-096.
 //!
+//! # Trait hierarchy overview (DEF-163 G016)
+//!
+//! ```text
+//!                    ┌─────────────────────────┐
+//!                    │     FixedStrKind        │  sealed — supertrait
+//!                    │   (sealed base trait)   │  for phantom tags
+//!                    └─────────────────────────┘
+//!                         ▲          ▲
+//!                         │          │
+//!               ┌─────────┤          ├───────────┐
+//!               │         │          │           │
+//!               │         │          │           │
+//!          ┌────┴───┐ ┌───┴────┐ ┌───┴─────┐ ┌───┴──────┐
+//!          │Validated│ │Truncat.│ │ValidUtf8│ │ ... (future) │
+//!          │(sealed) │ │(sealed)│ │(sealed) │ │              │
+//!          └────┬────┘ └───┬────┘ └────┬────┘ └──────────────┘
+//!               │          │           │
+//!         (`try_*`   (`from_str_      (`as_str()` — runtime
+//!         constructor   truncating`    UTF-8 check dead-arm
+//!         returns      constructor    per §4.12 `unwrap_or("")`
+//!         Result)      infallible)    type-safe sink)
+//!               │          │           │
+//!               └──────┬───┴───────────┘
+//!                      │
+//!                      │  (tags opt INTO the capability markers
+//!                      │   they satisfy; no bypass is possible
+//!                      │   via sealed-seal invariant)
+//!                      │
+//!          ┌───────────┴──────────────┬────────────────┬──────────────┐
+//!          ▼                          ▼                ▼              ▼
+//!     IdentTag                DatabaseNameTag  ApplicationNameTag  BoundedStrTag
+//!     (impls Validated+       (impls          (impls             (impls
+//!      Truncating+            Validated+       Validated+          Truncating+
+//!      ValidUtf8)             Truncating+      Truncating+         ValidUtf8)
+//!                             ValidUtf8)       ValidUtf8)
+//! ```
+//!
+//! - `FixedStrKind` — supertrait sealed by `sealed::FixedStrKindSealed`.
+//!   The only legitimate tag types are the four crate-internal ones
+//!   above; external crates cannot define new tags.
+//! - `Validated` — tags whose constructor validates input (e.g. PG
+//!   ident / database-name rules). Exposes `FixedStr::try_from_*`.
+//! - `Truncating` — tags whose constructor accepts any input and
+//!   truncates to N bytes (with `"…"` marker on overflow). Exposes
+//!   `FixedStr::from_*_truncating`.
+//! - `ValidUtf8` — tags whose stored bytes are guaranteed valid UTF-8.
+//!   Exposes `FixedStr::as_str()` (runtime `from_utf8` check is a
+//!   type-safe sink per §4.12 — dead-arm `unwrap_or("")` documented).
+//!
+//! Concrete public aliases live at the module bottom:
+//! `pub type Ident = FixedStr<63, IdentTag>;` etc.
+//!
 //! # Why one generic type
 //!
 //! Before DEF-096 this module defined three near-identical newtypes

@@ -12,6 +12,41 @@
 //! `heapless::Vec` whose capacity is the const [`MAX_ACTIONS_PER_CALL`].
 //! Per-call-site `const _: () = assert!(MAX_ACTIONS_PER_CALL >= …)`
 //! makes overflow impossible at build time.
+//!
+//! # Naming convention — `compute_push_*` vs `dispatch`
+//!
+//! The crate splits the two sides of the state machine into
+//! functions with **deliberately different name prefixes**:
+//!
+//! - **`compute_push_*`** — pure functions on the PUSH path
+//!   (`compute_push`, `compute_push_ping`, `compute_push_startup`,
+//!   `compute_push_simple_query`, etc.). Take `(cmd, state, ...)`
+//!   and return `(new_state, staged_actions)`. No I/O, no inbound
+//!   bytes — only side effect is building outbound frames into
+//!   `write_buf`. DEF-059 framing: push-side state transitions are
+//!   **pure compute over (current state × command)**.
+//!
+//! - **`dispatch`** — single entry point on the FEED path
+//!   (`dispatch::dispatch` in `dispatch.rs`). Takes
+//!   `(state, tag, payload, ...)` and returns `DispatchOutcome`.
+//!   Classifies inbound frames against the current state and
+//!   drives transitions / action emission. Sub-helpers
+//!   (`dispatch_auth_in_startup_trust`, `dispatch_auth_sasl_continue`,
+//!   `advance_to_awaiting_rfq`, etc.) share the `dispatch_` /
+//!   `advance_to_` prefixes to mark them feed-path
+//!   state-machine members.
+//!
+//! **Why the split matters:** push-path is CLIENT-DRIVEN (user
+//! decides when to command), feed-path is NETWORK-DRIVEN (server
+//! decides when to respond). The two timelines are orthogonal in
+//! an async wrapper — the prefix tells a reader (and a grep) which
+//! side of the state machine they're touching. A function named
+//! `compute_push_foo` never parses wire bytes; a function named
+//! `dispatch_*` never builds outbound frames.
+//!
+//! Entry points themselves follow the split:
+//! `push_command` → calls `compute_push` tree.
+//! `feed_bytes` → calls `dispatch` tree per frame.
 
 use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
@@ -960,6 +995,7 @@ impl PgProtocol {
                 let mut staged: StagedActions = StagedActions::new();
                 fail_inflight_no_readbuf(
                     state,
+                    scram_state,
                     ProtocolError::InternalCrateBug {
                         locus: crate::error::CrateBugLocus::ReadCursorAdvance,
                     },
@@ -988,6 +1024,7 @@ impl PgProtocol {
                 let mut staged: StagedActions = StagedActions::new();
                 fail_inflight_no_readbuf(
                     state,
+                    scram_state,
                     ProtocolError::ReadBufferFull { attempted, available },
                     &mut staged,
                 );
@@ -1050,6 +1087,7 @@ impl PgProtocol {
                     HeaderParse::MalformedLength { declared } => {
                         fail_inflight_no_readbuf(
                             state,
+                            scram_state,
                             ProtocolError::MalformedFrameLength { declared },
                             &mut staged,
                         );
@@ -1058,6 +1096,7 @@ impl PgProtocol {
                     HeaderParse::FrameTooLarge { declared } => {
                         fail_inflight_no_readbuf(
                             state,
+                            scram_state,
                             ProtocolError::FrameTooLarge { declared },
                             &mut staged,
                         );
@@ -1557,16 +1596,43 @@ impl PgProtocol {
 #[cold]
 fn fail_inflight_no_readbuf(
     state: &mut ProtoState,
+    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
     cause: ProtocolError,
     staged: &mut StagedActions,
 ) {
     if matches!(state, ProtoState::Errored(_)) {
+        // Already terminal. Still clear scram_state defensively —
+        // a path that re-enters with Errored state but non-None
+        // scram_state is a prior invariant violation; clearing is
+        // zeroize hygiene regardless.
+        *scram_state = None;
         return;
     }
     // DEF-154 (I): total state_kind — no unwrap_or_else + debug_assert.
     let state_kind = cause.state_kind();
     let prev = core::mem::replace(state, ProtoState::Errored(state_kind));
     let raw_id = prev.take_inflight_reply_raw_id();
+    // DEF-184 (audit-P0, 2026-04-24): zeroize hygiene — clear
+    // scram_state atomically with the Errored transition.
+    //
+    // Pre-fix: this function only set state = Errored; if we entered
+    // from a SCRAM phase (ConnectingStartupScram / AwaitingServerFirst
+    // / AwaitingServerFinal) via one of the fast-path fail triggers
+    // (pending_advance_err, ReadBufFull, etc.), `scram_state` would
+    // linger as `Some(Session/AwaitingFirst/AwaitingFinal { .. })`
+    // holding password HMAC material until next `push_startup`
+    // overwrote the slot OR `PgProtocol` itself dropped. On a
+    // long-lived terminal-Errored connection (pool discarding
+    // post-SCRAM-error entries lazily) the password could linger
+    // for seconds. CVE-class per CREDO §7 axis 11 (secret-lifetime
+    // discipline).
+    //
+    // Post-fix: unconditional clear on Errored transition. Drop
+    // invokes `ScramSession`'s `ZeroizeOnDrop` — password bytes
+    // scrubbed immediately. `#[cold]` Errored path absorbs the
+    // Option::take (one store on None → None; one drop call + store
+    // on Some → None). Zero hot-path impact.
+    *scram_state = None;
     match raw_id {
         Some(id) => {
             emit_actions!(staged, budget: 2, [
