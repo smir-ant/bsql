@@ -83,6 +83,29 @@ Commit history carries the failed attempt + revert. Reopening
 requires a new DEF entry with measurement evidence refuting the
 prior result.
 
+**Meta-observation:** each row below is a confirmed piece of
+knowledge about the crate. "Tried X, measured Y, why: Z." The
+discipline of bench-first + revert-on-regression turns audit
+proposals into factual data instead of speculation.
+
+### Verified load-bearing (architect's concern falsified)
+
+- **B6 `const BOUNDED` specialisation** — VERIFIED load-bearing
+  2026-04-24. Architect suspected 2-monomorph compile bloat
+  without runtime benefit. `cargo asm` showed LLVM inlines both
+  call sites (single shared closure body in emitted asm),
+  suggesting no compile-bloat harm. But **empirical removal
+  experiment** (replaced `const BOUNDED: bool` gate with runtime
+  check against `u16::MAX` sentinel) regressed ALL benches:
+  parse_header +18.3%, ping_round_trip +9.2%, iter_rows +7.7%,
+  push_command +11.3%, all p<0.05. Reverted clean.
+  **Mechanism:** specialisation delivers gate-elimination via
+  per-inline-site const-prop — the apparent "single body" in asm
+  is post-inlining; at each call site (feed_bytes vs
+  feed_bytes_bounded), LLVM emits specialized code with or
+  without the gate. KEEP as-is; architect's "no benefit" concern
+  falsified empirically.
+
 | DEF / Audit ID | Item | Disposition | Commit |
 |----------------|------|-------------|--------|
 | **A7** | Tag byte LUT via `InboundTagClass` enum + `classify` fn | **MEASURED REGRESSION** — all 4 bench groups regressed (+2.6% to +8.2%, p<0.05). LLVM's sparse-byte switch beats dense-enum form; classify step adds indirection not foldable. Hypothesis "dense discriminant jump table wins" falsified on modern LLVM. | `1a762ca` (2026-04-24) |
