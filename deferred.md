@@ -40,9 +40,14 @@ to git history. Keep this file a live work queue, NOT a diary.
 
 | DEF | Item | Size | Priority |
 |-----|------|------|----------|
-| DEF-134 | cargo-fuzz harness (wire-frame parse) | Medium | Pairs with DEF-143, complementary robustness |
 | DEF-143 | criterion bench harness | **PARTIAL SHIPPED** — 4 groups live, `push_bind_execute` bench still pending | Low (works) |
 | DEF-167 | Split `action.rs` / `dispatch.rs` into submodules | Large | Cosmetic; deferred after phase 1c fully lands |
+
+**DEF-134 closed 2026-04-24** (`1fde5d1`) — pragmatic stable-Rust
+property-test harness instead of nightly `cargo-fuzz`: 4 tests,
+120K random-input iterations total, asserts parse_header /
+feed_bytes / push+feed / progressive-feed all classify without
+panic / infinite loops / torn state. See §D closed index.
 
 ### Docs (DEF-163 remainder)
 
@@ -162,7 +167,7 @@ Full detail in git log; this is just a navigation aid.
 - DEF-094..DEF-102: staged actions, credential typestate, DEF-102 base64ct swap
 - DEF-108: SCRAM SIMD (BLOCKED on RU-04)
 - DEF-115, DEF-119: schema arena externalisation
-- DEF-134: cargo-fuzz (OPEN — see §A)
+- DEF-134: fuzz/stress harness — SHIPPED `1fde5d1` (property tests, stable Rust instead of cargo-fuzz)
 - DEF-138..DEF-142: pass-#8 audit cleanups + DEF-142 StateErrorKind newtype
 - DEF-143: criterion bench harness (PARTIAL — see §A)
 
