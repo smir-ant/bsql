@@ -4640,22 +4640,41 @@ rationale для легкой reentry в следующей сессии.
     verification, context-heavy late in session. Fresh session
     → safer implementation.
 
-- **A7** (tag byte LUT `[Option<InboundTagClass>; 256]`, 150 LoC,
-  L risk) — **DEFERRED pending DEF-143 bench baseline** (2026-04-24).
-  - **Expected win:** 10-15 ns/frame via single load + jump
-    instead of ~12-arm compare chain inside dispatch().
-  - **Scope:** new wire.rs const LUT, dispatch entry
-    wrapper-match, coverage const-assert.
-  - **Status:** B21/C6 shipped, unblocking integration. But A7 is
-    speculative perf — current `match (ProtoState, InboundTag)` is
-    already lowered by LLVM to a nested switch with jump tables
-    per state. A `[256]` LUT ahead of match adds one indirect load +
-    one more match — net win requires benchmark.
-  - **Gate for shipping:** DEF-143 criterion harness measuring
-    actual dispatch cycles pre- vs post-A7. Without that baseline,
-    risk of regressing LLVM's current sparse-switch optimisation
-    is non-zero. CREDO §3: "первая идея — редко лучшая"; don't
-    ship speculative perf without measurement.
+- **A7** (tag byte LUT, classify → `InboundTagClass` enum, 150 LoC,
+  L risk) — **CLOSED 2026-04-24 as MEASURED REGRESSION.**
+  - Implemented: `InboundTagClass` enum (17 dense variants) +
+    `classify_inbound_tag(InboundTag) -> InboundTagClass` const fn
+    + dispatch signature takes `tag_class` + match arms rewritten
+    to `(ProtoState, InboundTagClass)`. ~40 TAG_X → InboundTagClass::X
+    sed replacements in arm patterns.
+  - **Measured against `def184-complete` baseline** (criterion,
+    full 3s warmup + 5s measurement, aarch64-apple-darwin):
+
+    | Bench | Baseline | A7 | Delta | Significance |
+    |-------|----------|----|----|----|
+    | parse_header | 2.52 ns | 2.68 ns | **+5.1%** | p < 0.05 |
+    | ping_round_trip | 182.5 ns | 194.1 ns | **+8.2%** | p < 0.05 |
+    | iter_rows_per_row | 847.8 ns | 890.0 ns | **+4.6%** | p < 0.05 |
+    | push_command/ping | 107.6 ns | 111.0 ns | **+2.6%** | p < 0.05 |
+
+    **Every bench regressed, every regression statistically
+    significant.** A7 hypothesis "dense discriminant jump table
+    beats sparse ASCII switch" was wrong on modern LLVM.
+  - **Root cause** (post-mortem): LLVM's tag-byte sparse switch
+    codegen is already compact (cmp-and-branch chain CSEs across
+    arms, cache-friendly). A7 adds (a) classify() call site (even
+    when inlined, enum discriminant construction), (b) extra
+    `InboundTagClass::Unknown` catch-all branch that the pre-A7
+    match's `other @` pattern didn't need, (c) LLVM can't fold
+    the extra step into the match's lowering. Net: +3-8% regression.
+  - **Reverted.** Code restored to pre-A7 `match (ProtoState,
+    InboundTag)`. DEF-143 baseline preserved the right choice.
+    This IS a CREDO win — measurement caught a wrong audit
+    speculation before shipping. Closing A7 permanently as
+    "measured, rejected."
+  - **Lesson:** "architect said +10 ns win" was speculation
+    without measurement. DEF-143 is load-bearing for such
+    decisions.
 
 - **A3** (two-stage fn-ptr LUT dispatch, 300-400 LoC, H risk).
   - **Expected win:** 5-15% frame dispatch via single indexed
