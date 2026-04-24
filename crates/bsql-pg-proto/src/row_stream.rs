@@ -265,22 +265,24 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // of Copy payload — NLL releases the `&mut self.proto`
             // borrow at the assertion's last use above; explicit
             // drop would be a clippy::drop_non_drop warning.
-            // Apply the advance this flush recorded; the stream
-            // is now drained and no further peeks will happen,
-            // but leaving the cursor out-of-sync would surprise
-            // the next user of `self.proto` (e.g. iter_rows
-            // again) — so normalise here.
-            self.proto.apply_pending_advance();
+            //
+            // DEF-184 audit (2026-04-24): `apply_pending_advance`
+            // calls DELETED — the deferred-advance mechanism is
+            // gone (post-DEF-154 Y StreamRowRange delete, cursor
+            // advance happens in-scope inside feed_bytes itself).
+            // The flush_pending path is the only place where we
+            // previously had to "catch up" the cursor from the
+            // slow-path feed; now feed_bytes_bounded(1) advances
+            // the cursor in-scope, so there's nothing to catch up.
             self.flush_pending = false;
             self.drained = true;
             return StreamItem::NeedMore;
         }
 
-        // DEF-154 (X): apply any pending cursor advance recorded
-        // by the PREVIOUS slow-path `feed_bytes_bounded` call
-        // before peeking — otherwise the header peek sees the
-        // frame that was already logically consumed.
-        self.proto.apply_pending_advance();
+        // DEF-184 audit: no `apply_pending_advance` needed before
+        // peek — the slow-path `feed_bytes_bounded` already
+        // advances read_buf in-scope via feed_bytes_impl's
+        // post-loop advance call.
 
         // Peek header at current cursor.
         let populated = self.proto.read_buf_populated();

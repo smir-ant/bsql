@@ -519,32 +519,26 @@ pub struct PgProtocol {
     /// 3-4 SCRAM handshake frames; cleared at AuthOk or any
     /// errored transition.
     scram_state: Option<crate::scram_state::ScramHandshakeState>,
-    /// DEF-154 (H+V): deferred `read_buf` cursor advance — bytes to
-    /// skip at the start of the NEXT `feed_bytes` call before any
-    /// new frame parsing.
-    ///
-    /// Pre-(H), the advance fired in-scope via
-    /// `BrandedReadBuf::advance_scope_local` so that staged
-    /// `ReadRange<'rb>` (start/len pair + phantom brand) could stay
-    /// unaffected by the cursor move. Post-(H), `StreamRowRange`
-    /// carries `&'r [u8]` slices of `read_buf.populated()` directly;
-    /// Rust's borrow checker blocks any `&mut self.read_buf` call
-    /// while OutActions holds those `'r` slices — so advance must
-    /// defer until OutActions drops.
-    ///
-    /// DEF-154 (V) P1-2 (audit-2): typed as `Option<NonZeroU16>`
-    /// rather than `u16` with `0 = sentinel`. Niche-packs to same
-    /// 2 bytes (NonZeroU16 zero-niche is Option's None discriminant).
-    /// `None` IS the "no pending advance" state — previously a
-    /// zero-valued u16 was semantically the same but nothing at the
-    /// type level prevented a future edit from assigning 0 where a
-    /// legit non-zero was expected. Post-(V) the invariant is
-    /// tier-1 compile.
-    ///
-    /// `PgProtocol: !Sync`, so no external observer sees the interim
-    /// "not-yet-advanced" cursor state between calls. Value bounded
-    /// by `READ_BUF_CAP <= u16::MAX` const-assert.
-    pending_advance: Option<core::num::NonZeroU16>,
+    // DEF-154 (H+V) `pending_advance` DELETED 2026-04-24 (architect
+    // audit finding): was a 2-byte deferred cursor-advance slot +
+    // ~25 lines of plumbing + 3 architecturally-dead Err classifier
+    // sites. Purpose: postpone `read_buf.advance()` past the return
+    // of OutActions because `StagedAction::StreamRowRange` carried
+    // `row_bytes: &'r [u8]` into read_buf — advance while that
+    // borrow was alive = borrow-check conflict. DEF-154 (Y) DELETED
+    // `StreamRowRange` entirely (RowStream fast-path emits
+    // `StreamItem::Row` directly from `iter_rows`, NOT staged).
+    //
+    // Post-(Y): no staged action carries a read_buf borrow.
+    // `Action<'w, 'r>.'r` is tied to `schema_arena` (RowDesc refs),
+    // NOT `read_buf`. Cursor advance can safely happen IN-SCOPE
+    // within `feed_bytes` before materialising OutActions — no
+    // borrow conflict exists to defer around.
+    //
+    // Old plumbing removed: field + `apply_pending_advance` method
+    // + `pending_advance_err` fast-path + row_stream callers.
+    // advance now happens inside the dispatch loop via
+    // `read_buf.advance(total_len)` right after frame consumption.
     /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
     /// Load-bearing: the crate-root ambiguous-impl gate verifies that
     /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
@@ -629,7 +623,6 @@ impl PgProtocol {
             schema_arena: crate::schema_arena::SchemaArena::new(),
             error_arena: crate::error_arena::ErrorArena::new(),
             scram_state: None,
-            pending_advance: None,
             sync_marker: PhantomData,
         }
     }
@@ -655,47 +648,17 @@ impl PgProtocol {
     ///
     /// Useful for tests; production hosts have no need.
     ///
-    /// DEF-154 (H): returns the EFFECTIVE unread region — raw
-    /// `read_buf.unread()` with the deferred `pending_advance`
-    /// prefix skipped. Pre-(H), `feed_bytes` applied the advance
-    /// in-scope so `unread()` never showed a not-yet-advanced
-    /// state; post-(H), advance defers to the NEXT feed_bytes
-    /// call's entry, but external observers (tests, introspection
-    /// hosts) still see the dispatched frames as "consumed".
+    /// Returns the unread region of the read buffer.
     ///
-    /// DEF-154 (P) P0-5: replaced `.unwrap_or(&[])` with an
-    /// explicit `split_at_checked` match. Pre-(P) the silent
-    /// fallback would have masked a `pending_advance >
-    /// unread().len()` invariant break (architecturally dead —
-    /// `pending_advance` accumulates validated `total_len` values
-    /// per parse_header, and between calls only `append` can
-    /// grow unread — but the silent form violated user's "no
-    /// silent fallback" directive). Post-(P): the None arm is
-    /// tier-2 structural-invariant proof; returning `&[]` is
-    /// semantically correct ("cursor past end" = "no bytes left
-    /// to observe"), match makes the dead-branch decision
-    /// explicit instead of hiding behind `unwrap_or`.
+    /// Post-(DEF-154 H+V delete 2026-04-24): pending_advance logic
+    /// removed (dead after DEF-154 Y deleted StreamRowRange).
+    /// Cursor advance now happens in-scope inside `feed_bytes`, so
+    /// this method simply forwards to `ReadBuf::unread()` — the
+    /// caller always sees the current cursor state.
     #[inline]
     #[must_use]
     pub fn unread(&self) -> &[u8] {
-        let raw = self.read_buf.unread();
-        let skip = match self.pending_advance {
-            Some(n) => usize::from(n.get()),
-            None => 0,
-        };
-        // `split_at_checked(n) -> Option<(&[u8], &[u8])>`:
-        // None iff n > raw.len(). Architecturally dead (see doc).
-        match raw.split_at_checked(skip) {
-            Some((_already_advanced, rest)) => rest,
-            None => {
-                // Invariant-break: cursor past end. Return empty
-                // ("no observable bytes"); caller sees same result
-                // as a genuinely-drained buffer. Production-safe
-                // because `unread()` is a read-only observer —
-                // no corruption vector. Documented-dead branch.
-                &[]
-            }
-        }
+        self.read_buf.unread()
     }
 
     /// Push a user command.
@@ -930,80 +893,37 @@ impl PgProtocol {
         write_buf.clear();
         self.clear_arena_if_idle_or_errored();
 
-        // DEF-154 (H): apply any pending cursor advance from the
-        // PREVIOUS feed_bytes call. Previously, advance fired
-        // in-scope via `BrandedReadBuf::advance_scope_local` so that
-        // staged `ReadRange<'rb>` could stay unaffected by the cursor
-        // move — a brand-magic requirement. Post-(H), StreamRowRange
-        // carries `&'r [u8]` slices directly, so the stage-time
-        // borrow blocks any &mut on read_buf until OutActions drops.
-        // Deferring advance to the next call's entry breaks the
-        // conflict at zero extra state cost: one u16 field. See
-        // DEF-149 preservation note on StagedAction::StreamRowRange.
-        //
-        // Err branch is architecturally dead (pending_advance was
-        // computed as `sum(total_len)` from validated parse_header
-        // frames against the call-time populated length; between
-        // calls, only append occurs, which only grows inner). On
-        // actual Err (e.g. a hypothetical regression in cursor math)
-        // we classify as InternalCrateBug and fall through to the
-        // Errored fast-path below.
-        let mut pending_advance_err = false;
-        if let Some(n) = self.pending_advance {
-            if self.read_buf.advance(usize::from(n.get())).is_err() {
-                pending_advance_err = true;
-            }
-            self.pending_advance = None;
-        }
+        // DEF-154 (H+V) pending_advance DELETED 2026-04-24: the
+        // deferred-advance slot existed because `StagedAction::StreamRowRange`
+        // once carried `row_bytes: &'r [u8]` into read_buf — cursor
+        // advance while that borrow was alive = borrow-check
+        // conflict. DEF-154 (Y) DELETED `StreamRowRange` entirely.
+        // Post-(Y) no StagedAction variant carries a read_buf borrow,
+        // so cursor advance can fire IN-SCOPE inside the dispatch
+        // loop with no conflict. See struct docstring field
+        // comment for full post-mortem.
 
-        let is_errored_or_recovering =
-            pending_advance_err || matches!(self.state, ProtoState::Errored(_));
-
-        // DEF-154 (H): append BEFORE destructure (append takes
-        // `&mut self.read_buf`; destructure holds it as a
-        // field-level &mut borrow and would conflict).
-        let append_err = if is_errored_or_recovering {
+        let append_err = if matches!(self.state, ProtoState::Errored(_)) {
             None
         } else {
             self.read_buf.append(bytes).err()
         };
 
-        // DEF-154 (E) + (H): field-level destructure. Closures cannot
-        // see disjoint field borrows through `self`; splitting into
+        // DEF-154 (E): field-level destructure. Closures cannot see
+        // disjoint field borrows through `self`; splitting into
         // separate `&mut` bindings gives each consumer a single-field
-        // borrow. `state` + `pending_advance` + `read_buf` are held
-        // DISJOINTLY — the main dispatch loop takes a shared view of
-        // `populated` from `read_buf` while `state` is separately
-        // `&mut` for state transitions and `pending_advance` is
-        // separately `&mut` for the post-loop deferred-advance
-        // record.
+        // borrow. `state` + `read_buf` are held DISJOINTLY — the
+        // dispatch loop reads `populated` / `cursor_position` from
+        // `read_buf` while `state` is separately `&mut` for
+        // transitions, AND advances `read_buf` cursor in-scope
+        // after each frame is consumed.
         let state = &mut self.state;
         let read_buf = &mut self.read_buf;
         let session_params = &mut self.session_params;
         let schema_arena = &mut self.schema_arena;
         let error_arena = &mut self.error_arena;
         let scram_state = &mut self.scram_state;
-        let pending_advance = &mut self.pending_advance;
 
-        // Fast-path: already-Errored or pending_advance crate-bug
-        // recovery. Clear read_buf to reset to consistent state;
-        // return empty action list (or crate-bug classified if
-        // pending_advance failed).
-        if pending_advance_err {
-            read_buf.clear();
-            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                let mut staged: StagedActions = StagedActions::new();
-                fail_inflight_no_readbuf(
-                    state,
-                    scram_state,
-                    ProtocolError::InternalCrateBug {
-                        locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                    },
-                    &mut staged,
-                );
-                materialise(staged, wb.into_bytes(), schema_arena.as_reader())
-            });
-        }
         if matches!(state, ProtoState::Errored(_)) {
             read_buf.clear();
             return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
@@ -1034,11 +954,15 @@ impl PgProtocol {
 
         // Main dispatch. Take shared borrow of populated + cursor
         // (both via immutable reborrow of read_buf's &mut).
-        let populated: &'r [u8] = read_buf.populated();
-        let cursor: u16 = read_buf.cursor_position_u16();
-
         write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
             let mut staged: StagedActions = StagedActions::new();
+            // DEF-184 audit (2026-04-24): `populated` + `cursor`
+            // bindings moved INSIDE the closure (post-DEF-154 Y
+            // no staged action borrows from read_buf). The shared
+            // borrow drops at end of loop body via NLL, unblocking
+            // `read_buf.advance()` in-scope after the loop.
+            let populated: &[u8] = read_buf.populated();
+            let cursor: u16 = read_buf.cursor_position_u16();
             // DEF-154 (G): cursor math stays in u16 end-to-end,
             // bounded by `READ_BUF_CAP <= u16::MAX` const-assert in
             // buf.rs. No silent narrowing anywhere.
@@ -1236,24 +1160,38 @@ impl PgProtocol {
             }
             } // end of reserved scope
 
-            // DEF-154 (H) P0-1 preservation: record pending_advance
-            // INSTEAD of applying it in-scope. Staged StreamRowRange
-            // holds `&'r [u8]` slices of populated — we cannot &mut
-            // read_buf while they're alive. Next feed_bytes call
-            // applies the advance at entry before any new dispatch.
+            // DEF-184 audit (2026-04-24) — advance IN-SCOPE.
             //
-            // If state transitioned to Errored this call, DON'T
-            // record pending_advance — next call's is_errored
-            // fast-path will CLEAR the buffer anyway (pending advance
-            // becomes moot).
+            // Pre: recorded `pending_advance` for next call's entry,
+            // because `StagedAction::StreamRowRange` held `&'r [u8]`
+            // into populated. Post-DEF-154 (Y) deletion of that
+            // variant + the dispatch loop's narrow `populated: &[u8]`
+            // (which drops at end of loop body via NLL), we can now
+            // call `read_buf.advance()` right here.
             //
-            // DEF-154 (V): `pending_advance: Option<NonZeroU16>` —
-            // None means "no pending" (type-enforced, cannot
-            // accidentally assign 0). `NonZeroU16::new(frames_consumed)`
-            // returns None if frames_consumed == 0, naturally
-            // skipping the `frames_consumed > 0` condition.
-            if !matches!(state, ProtoState::Errored(_)) {
-                *pending_advance = core::num::NonZeroU16::new(frames_consumed);
+            // Skip advance on Errored transition — `clear_arena_if_idle_or_errored`
+            // on the NEXT entry call clears the read_buf anyway, so
+            // any partial-frame remnant doesn't matter.
+            //
+            // `advance()` returns `Result<(), AdvancePastEnd>` —
+            // architecturally dead post-validated frames_consumed
+            // sum, but we classify via InternalCrateBug locus
+            // `ReadCursorAdvance` if it ever fires.
+            if !matches!(state, ProtoState::Errored(_))
+                && frames_consumed > 0
+                && read_buf.advance(usize::from(frames_consumed)).is_err()
+            {
+                // Classified dead-arm — a regression in cursor math
+                // would land here. Transition to Errored and emit
+                // FailReply via fail_inflight.
+                fail_inflight_no_readbuf(
+                    state,
+                    scram_state,
+                    ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                    },
+                    &mut staged,
+                );
             }
 
             materialise(staged, wb.into_bytes(), schema_arena.as_reader())
@@ -1469,35 +1407,12 @@ impl PgProtocol {
         }
     }
 
-    /// DEF-154 (X): apply any pending cursor advance from a prior
-    /// feed_bytes call. RowStream calls this at `iter_rows()`
-    /// construction to mirror `feed_bytes`'s entry semantics.
-    ///
-    /// DEF-184 (B24): Err was previously silently discarded via
-    /// `let _result = ...` — a tier-4 fallback violating CREDO §1.
-    /// `pending_advance` is recorded only from validated
-    /// `frames_consumed` sums (bounded by parse_header-checked
-    /// total_len additions), so Err is architecturally dead. But
-    /// "dead by audit" is tier-3 trust; elevating to tier-2
-    /// structural via explicit Errored classification closes the
-    /// drift surface at zero runtime cost (branch is cold-path
-    /// unreachable in practice, but now auditable).
-    #[inline]
-    pub(crate) fn apply_pending_advance(&mut self) {
-        if let Some(n) = self.pending_advance {
-            if self.read_buf.advance(usize::from(n.get())).is_err() {
-                // Architecturally dead; drift-surface closure via
-                // classification. Matches the feed_bytes entry
-                // pattern in protocol.rs:~626 (pending_advance_err
-                // flag → InternalCrateBug emission).
-                let cause = ProtocolError::InternalCrateBug {
-                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                };
-                self.state = ProtoState::Errored(cause.state_kind());
-            }
-            self.pending_advance = None;
-        }
-    }
+    // DEF-184 audit (2026-04-24): `apply_pending_advance` DELETED —
+    // the deferred-advance mechanism was legacy from
+    // `StagedAction::StreamRowRange` (deleted in DEF-154 Y). Cursor
+    // advance now happens in-scope inside `feed_bytes_impl` right
+    // after the dispatch loop drops its `populated` borrow. See
+    // struct docstring for the pending_advance post-mortem.
 
     /// DEF-154 (X): whether the state is currently Errored (for
     /// RowStream fast-path state check).
@@ -1553,7 +1468,10 @@ impl PgProtocol {
         // Entry-point housekeeping mirrors feed_bytes:
         write_buf.clear();
         self.clear_arena_if_idle_or_errored();
-        self.apply_pending_advance();
+        // DEF-184 audit (2026-04-24): `apply_pending_advance`
+        // DELETED — the deferred mechanism is gone (post-DEF-154 Y
+        // StreamRowRange delete, cursor advance happens in-scope
+        // inside feed_bytes_impl). Nothing to catch up.
         crate::row_stream::RowStream::new(self, write_buf)
     }
 }
