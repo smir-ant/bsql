@@ -300,6 +300,40 @@ Tier-1 щит — не монолит. У него есть **узкие швы*
 
 Решение должно быть **устойчивым**, не хрупким. Хрупкость — это когда один литерал сдвигает поведение на класс ошибок, компилятор этого не видит, и некому об этом сказать.
 
+### §4.12. Measurement-gated performance work
+
+Любой **perf-рефакторинг** (не тот, что чинит класс ошибок — чисто скорость/размер/footprint) проходит через обязательный замер. Правило:
+
+1. **Baseline.** Зафиксировать текущие числа через criterion bench harness (DEF-143). `cargo bench --features bench-hooks -- --save-baseline <name>`. Хранится в `target/criterion/`.
+2. **Change.** Реализовать рефакторинг.
+3. **Measure.** `cargo bench --features bench-hooks -- --baseline <name>`. Criterion покажет diff с bootstrap confidence intervals (95%).
+4. **Decision:**
+   - **p < 0.05 improvement** → ship с цифрами в commit message.
+   - **p < 0.05 regression** → **revert clean**, документировать в `deferred.md §B` (measurement-rejected) с post-mortem о том, почему гипотеза провалилась.
+   - **No significant change (p >= 0.05)** → revert (цена сложности без выигрыша не оправдана) **или** ship если изменение улучшает читаемость/tier без regressions.
+
+**Запрещено:**
+- Ship perf-рефакторинга без baseline. «Я думаю будет быстрее» или «architect сказал +10 ns» — это гипотеза, не результат.
+- Ship perf-рефакторинга с p >= 0.05 с обоснованием «даже если не быстрее, код чище». Perf work платит сложностью; без win сложность чистый debt.
+- Удаление `deferred.md §B` записи без новой measurement evidence. Отказанная гипотеза остаётся отказанной — reopen требует replicate + refute.
+
+**Failure case study (2026-04-24).** DEF-184 A7 — предложенный tag byte LUT с compact `InboundTagClass` enum. Audit hypothesis: «dense discriminant jump table даст +10-15 ns/frame vs sparse ASCII-byte switch». Реализовано (~300 LoC + 40 arm updates), измерено против `def184-complete` baseline:
+
+| Bench | Baseline | A7 | Δ |
+|-------|---------|----|---|
+| parse_header | 2.52 ns | 2.68 ns | +5.1% (p<0.05) |
+| ping_round_trip | 182.5 ns | 194.1 ns | +8.2% (p<0.05) |
+| iter_rows_per_row | 847.8 ns | 890.0 ns | +4.6% (p<0.05) |
+| push_command/ping | 107.6 ns | 111.0 ns | +2.6% (p<0.05) |
+
+**Каждый bench regressed, каждая регрессия statistically significant.** Root cause (post-mortem): современный LLVM оптимизирует sparse byte switch в compact cmp-and-branch chain; A7 ввёл indirection (classify() call + enum discriminant construct + extra `Unknown` catch-all branch) который LLVM не может fold out в single lowered jump. Hypothesis фальсифицирована.
+
+**Действие:** clean revert (`git checkout --` на dispatch.rs + wire.rs). Записано в `deferred.md §B` как `measured, rejected`. **Без DEF-143 harness** A7 был бы ship'нут по audit recommendation + code-review intuition, silently замедлив every dispatch на 5-8%. Bench harness — load-bearing для CREDO §3 skepticism.
+
+**Обобщение:** perf-work имеет **низкий hit-rate** на уже-оптимизированном коде. Модерный LLVM + well-typed Rust отбирают ~60-80% предполагаемых «очевидных» win'ов через existing optimization passes. Бенч harness — защита от шипить-то-что-не-проверено.
+
+Список rejected гипотез — `deferred.md §B`. Перед попыткой повторить любой item оттуда нужно предоставить **новую measurement evidence** refuting prior result.
+
 ---
 
 # Часть II — Архитектура

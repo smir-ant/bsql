@@ -14,6 +14,27 @@
 //! `total_len - 5`. Every arm that needs to inspect bytes uses a slice
 //! pattern (`[b0]`, `[b0, b1, ..]`, etc.) so the compiler enforces the
 //! length / presence check.
+//!
+//! # DEF-184 A7 (2026-04-24) — tag LUT path rejected, DO NOT retry
+//!
+//! A tempting refactor is to replace `match (prev, tag: InboundTag)`
+//! with a compact `InboundTagClass` enum (17 dense variants + classify
+//! step) under the hypothesis "dense-discriminant jump table beats
+//! sparse-ASCII-byte switch". **This was implemented, measured, and
+//! rejected** — commit `1a762ca` (reverted).
+//!
+//! Measured result (criterion against `def184-complete` baseline,
+//! aarch64-apple-darwin): all 4 hot-path benches regressed
+//! (+2.6% to +8.2%, p<0.05). Modern LLVM already lowers the byte
+//! switch into a compact cmp-and-branch chain that CSEs across arms;
+//! the extra classify() call + `InboundTagClass::Unknown` catch-all
+//! branch add indirection LLVM cannot fold out. Hypothesis falsified.
+//!
+//! If you are tempted to reopen A7: first produce a NEW criterion
+//! measurement refuting the 2026-04-24 result (different machine,
+//! different LLVM, or architectural change in the dispatch loop).
+//! See `reforge.md §4.12` (measurement-gated perf) and
+//! `deferred.md §B` (measurement-rejected items) before touching.
 
 use crate::action::StagedAction;
 use crate::error::ProtocolError;
