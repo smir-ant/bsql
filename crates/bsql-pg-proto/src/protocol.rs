@@ -545,11 +545,21 @@ impl PgProtocol {
     /// invoking the dispatch state machine. Returns
     /// `Err(ReadBufFull)` on capacity overflow.
     ///
-    /// # NOT a production API
+    /// # Feature-gated: `bench-hooks`
     ///
-    /// `#[doc(hidden)]` to hide from rustdoc; `pub` because the
-    /// benchmark harness compiles as an external crate target
-    /// and cannot see `pub(crate)` items.
+    /// This method exists ONLY when compiling with
+    /// `--features bench-hooks`. Default builds (cargo build /
+    /// cargo test / downstream releases) don't compile it at all
+    /// — zero public-API bloat, zero binary impact, zero risk of
+    /// accidental production use.
+    ///
+    /// The benchmark target
+    /// (`benches/hot_paths.rs`) declares
+    /// `required-features = ["bench-hooks"]` so `cargo bench`
+    /// without the flag fails fast with a clear error rather than
+    /// masking the setup bug.
+    ///
+    /// # NOT a production API
     ///
     /// Bypasses the dispatch state machine — the caller MUST
     /// ensure the current state is compatible with the frame
@@ -563,6 +573,7 @@ impl PgProtocol {
     /// measurement in `benches/hot_paths.rs` — see
     /// `bench_iter_rows_per_row_throughput` for the single
     /// legitimate caller.
+    #[cfg(feature = "bench-hooks")]
     #[doc(hidden)]
     pub fn bench_append_read_buf(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
         self.read_buf.append(bytes)

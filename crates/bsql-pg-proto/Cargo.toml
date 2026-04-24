@@ -15,6 +15,27 @@ categories = ["database", "no-std", "parser-implementations"]
 # inside the proc-macro online client (Phase 2), or inside a
 # blocking ad-hoc test — identically. See reforge.md §7.1, §13.
 
+[features]
+default = []
+
+# `bench-hooks` — DEF-143 bench-only public surface.
+#
+# Enables `PgProtocol::bench_append_read_buf` — a raw read_buf
+# append used by `benches/hot_paths.rs` to pre-populate DataRow
+# frames without triggering dispatch classification (production
+# feed_bytes correctly rejects DataRow in SimpleQueryStreamingRows
+# state — the hook bypasses that to measure per-row throughput).
+#
+# Default-off. Enabling adds one 2-line `pub fn` to the lib's
+# public API. Downstream users MUST NOT enable this in production
+# builds — the function bypasses the dispatch state machine and can
+# forge state inconsistencies.
+#
+# Invocation: `cargo bench --features bench-hooks`. The benchmark
+# target declares `required-features = ["bench-hooks"]`; without it
+# the bench fails to compile cleanly (by design).
+bench-hooks = []
+
 [dependencies]
 heapless = { workspace = true }
 sha2 = { workspace = true }
@@ -54,6 +75,12 @@ criterion = { workspace = true }
 # `harness = false` disables the default libtest bench runner; we
 # use criterion's own main-function runner instead (generates HTML
 # reports + statistical analysis in target/criterion).
+#
+# `required-features` — the bench uses `PgProtocol::bench_append_read_buf`
+# (a feature-gated hook). Without `bench-hooks` enabled the bench
+# won't compile (cargo skips this target by design). Run with
+# `cargo bench --features bench-hooks`.
 [[bench]]
 name = "hot_paths"
 harness = false
+required-features = ["bench-hooks"]
