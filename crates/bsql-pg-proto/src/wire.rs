@@ -220,7 +220,22 @@ pub const TAG_BIND_COMPLETE: InboundTag = InboundTag::from_byte(b'2');
 ///
 /// Sent after a successful `Close` of a prepared statement or
 /// portal. Contains no body.
-pub const TAG_CLOSE_COMPLETE: InboundTag = InboundTag::from_byte(b'3');
+///
+/// # DEF-185 P1-F (audit 2026-04-24): deferred to sub-phase 1c-6
+///
+/// Visibility narrowed to `pub(crate)`. `PgCommand::CloseStatement` /
+/// `PgCommand::ClosePortal` are not yet implemented — the client
+/// never sends `Close` frames, so the server should not emit
+/// `CloseComplete`. Any server-sent `'3'` today falls through to the
+/// catch-all `UnexpectedFrame` dispatch arm → teardown (correct
+/// defensive behaviour: protocol desync → fatal).
+///
+/// Keeping it `pub` previously advertised a surface the dispatcher
+/// did not support — confusing for downstream consumers introspecting
+/// `InboundTag`. Narrowed to `pub(crate)` + drift-pinned below;
+/// widened back to `pub` + wired into dispatch when 1c-6 lands
+/// explicit Close-frame support.
+pub(crate) const TAG_CLOSE_COMPLETE: InboundTag = InboundTag::from_byte(b'3');
 
 /// Backend `ParameterDescription` message tag (`'t'`).
 ///

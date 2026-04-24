@@ -419,6 +419,20 @@ impl ValidUtf8 for PortalNameTag {}
 pub struct FixedStr<const N: usize, Tag> {
     buf: [u8; N],
     len: u16,
+    /// DEF-185 P2-D (audit 2026-04-24): flag indicating that
+    /// `from_bytes_lossy` coerced at least one non-ASCII-printable
+    /// byte to `b'?'`. Callers can query via [`Self::was_lossy`]
+    /// to distinguish legitimate `?` characters in server text
+    /// from our lossy fallback. False on every non-lossy
+    /// constructor (`new`, `from_str_truncating`, `Default`).
+    ///
+    /// Stored as `u8` (1 byte) rather than `bool` to keep the
+    /// `#[repr(C)]` layout portable across platforms — Rust's
+    /// `bool` ABI is stable on all tier-1 targets but the zeroize
+    /// derive macros use `u8`-based reflection on repr(C) structs,
+    /// matching here keeps the Zeroize bounds if a future refactor
+    /// makes FixedStr `Zeroize`-aware.
+    was_lossy_flag: u8,
     _tag: PhantomData<fn() -> Tag>,
 }
 
@@ -738,6 +752,7 @@ impl<const N: usize, Tag> FixedStr<N, Tag> {
         Self {
             buf: [0u8; N],
             len: 0,
+            was_lossy_flag: 0,
             _tag: PhantomData,
         }
     }
@@ -1071,6 +1086,13 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
         let mut out = Self::new();
         let budget = N.saturating_sub(Self::OVERFLOW_MARKER.len());
         let mut written = 0usize;
+        // DEF-185 P2-D (audit 2026-04-24): track whether any lossy
+        // coercion actually happened. Entering the slow path means
+        // input had non-UTF-8 bytes SOMEWHERE, but individual byte-
+        // level ASCII-acceptability may preserve much of the content
+        // verbatim. `any_coerced` is true iff at least one byte was
+        // replaced with `b'?'`.
+        let mut any_coerced = false;
         for &b in source.iter() {
             if written >= budget {
                 break;
@@ -1080,6 +1102,7 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
             let out_byte = if matches!(b, 0x20..=0x7e | b'\t' | b'\n' | b'\r') {
                 b
             } else {
+                any_coerced = true;
                 b'?'
             };
             if let Some(dst) = out.buf.get_mut(written) {
@@ -1097,6 +1120,27 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
         } else {
             out.len = narrow_len_u16(written, N);
         }
+        // DEF-185 P2-D: surface the lossy flag.
+        if any_coerced {
+            out.was_lossy_flag = 1;
+        }
         out
+    }
+
+    /// DEF-185 P2-D (audit 2026-04-24): `true` iff this value was
+    /// constructed via [`Self::from_bytes_lossy`] AND at least one
+    /// byte was coerced to `b'?'` (non-ASCII-printable, non-whitespace).
+    ///
+    /// Lets operators distinguish legitimate `?` characters in server
+    /// text from our lossy coercion. Useful when investigating
+    /// mis-encoded server error messages, proxy corruption, or
+    /// client_encoding mismatch.
+    ///
+    /// Returns `false` for values constructed via any other path
+    /// (`new`, `Default`, `from_str_truncating`, `try_from_*`).
+    #[inline]
+    #[must_use]
+    pub const fn was_lossy(&self) -> bool {
+        self.was_lossy_flag != 0
     }
 }

@@ -22,14 +22,14 @@
 use crate::action::ParamOids;
 use crate::error::BoundedStr;
 use crate::error::StateErrorKind;
+use crate::ident::PodBytes;
 use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
     StartupKind,
 };
 use crate::schema_arena::SchemaRef;
-// DEF-184 (A10/B22): `PodBytes`, `ScramSession`, `SecretDigest` no longer used
-// directly by ProtoState variants — they live on `PgProtocol::scram_state`
-// as `ScramHandshakeState` fields. Import list shrinks accordingly.
+use crate::scram::session::ScramSession;
+use crate::scram::types::SecretDigest;
 
 /// State-side counterpart to the public
 /// [`crate::action::DescribedRows<'r>`].
@@ -125,49 +125,68 @@ pub enum ProtoState {
     /// awaiting `AuthenticationSASL` offering SCRAM-SHA-256.
     /// DEF-001 + DEF-097.
     ///
-    /// # DEF-184 (A10/B22) — heavy data externalised
+    /// # Tier-1 compile — variant carries its data
     ///
-    /// Pre-(A10) this variant carried `scram: ScramSession`
-    /// (~512 B) inline. Post-(A10) `scram` lives on
-    /// `PgProtocol::scram_state` as
-    /// [`crate::scram_state::ScramHandshakeState::Session`]; this
-    /// variant is thin (`reply` only). Correlation invariant
-    /// (tier-2 structural): `state == ConnectingStartupScram ⇔
-    /// scram_state == Some(Session(_))`. See
-    /// [`crate::scram_state`] docs.
+    /// `scram: ScramSession` lives INSIDE this variant. The
+    /// correlation "SCRAM-state has SCRAM data" is enforced
+    /// structurally by Rust's type system — a future refactor
+    /// cannot have `ConnectingStartupScram` without a valid
+    /// `ScramSession`. `ZeroizeOnDrop` on `ScramSession` fires
+    /// automatically when the variant drops, at EVERY exit path:
+    ///
+    /// - happy progression: `core::mem::replace(state, ProtoState::Idle)`
+    ///   inside `dispatch()` moves the variant into the match
+    ///   scrutinee; arm bodies either consume `scram` (passing to
+    ///   the next dispatcher) or destructure `{ reply, .. }` which
+    ///   drops the unbound `scram` at arm-body scope end;
+    /// - fatal teardown: `core::mem::replace(state, Errored(kind))`
+    ///   inside `fail_inflight_no_readbuf` drops the `prev` SCRAM
+    ///   variant at function-return via RAII;
+    /// - entry-point reshuffle: `core::mem::take(state)` inside
+    ///   `push_command` moves into `compute_push` by value; if the
+    ///   incoming state was NOT SCRAM the next state is reassigned
+    ///   and the prev dropped; if it WAS SCRAM the classifier keeps
+    ///   it (no transition), so no drop fires.
+    ///
+    /// Password material scrubbed immediately on transition — no
+    /// separate "clear on Errored" step needed and none possible
+    /// since there is no out-of-variant slot to clear.
     ConnectingStartupScram {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
+        /// SCRAM session (the password the user provided).
+        /// Tier-1 typestate via [`ScramSession`] — `Credentials::Trust`
+        /// cannot reach this variant by construction.
+        scram: ScramSession,
     },
 
     /// SCRAM step 1 complete (client-first sent); awaiting
     /// `AuthenticationSASLContinue` (server-first-message). DEF-002.
-    ///
-    /// # DEF-184 (A10/B22) — heavy data externalised
-    ///
-    /// Pre-(A10) carried `scram` (512 B) + `client_first_bare`
-    /// (128 B) + `client_nonce_b64` (48 B) inline = ~688 B. These
-    /// dominated ProtoState's enum sizing. Post-(A10) they live
-    /// on `PgProtocol::scram_state` as
-    /// [`crate::scram_state::ScramHandshakeState::AwaitingFirst`];
-    /// this variant is thin.
     ConnectingScramAwaitingServerFirst {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
+        /// SCRAM session (password bundle). Tier-1 typestate via
+        /// [`ScramSession`] — the `Credentials::Trust` variant
+        /// cannot appear here by construction (audit A2).
+        scram: ScramSession,
+        /// The `client-first-message-bare` (saved for AuthMessage).
+        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN`]
+        /// (DEF-095 const-generic drift guard). POD buffer — no
+        /// `heapless::Vec` Drop propagation into the state enum
+        /// (DEF-099).
+        client_first_bare: PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
+        /// The client nonce (base64-encoded, for prefix validation).
+        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN`].
+        client_nonce_b64: PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     },
 
     /// SCRAM step 2 complete (client-final sent); awaiting
     /// `AuthenticationSASLFinal` (server-final-message). DEF-002.
-    ///
-    /// # DEF-184 (A10/B22) — heavy data externalised
-    ///
-    /// Pre-(A10) carried `expected_server_sig: SecretDigest`
-    /// (32 B) inline. Post-(A10) lives on
-    /// `PgProtocol::scram_state` as
-    /// [`crate::scram_state::ScramHandshakeState::AwaitingFinal`].
     ConnectingScramAwaitingServerFinal {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
+        /// Expected server signature for constant-time comparison.
+        expected_server_sig: SecretDigest,
     },
 
     /// SCRAM step 3 complete (server signature verified); awaiting
@@ -184,6 +203,34 @@ pub enum ProtoState {
     /// `BackendKeyData` received; waiting for `ReadyForQuery`. DEF-004.
     ///
     /// Additional `ParameterStatus` messages may arrive before RFQ.
+    ///
+    /// # DEF-185 P2-C (audit 2026-04-24): secret_key lifetime
+    ///
+    /// `secret_key: i32` is the PG backend's CancelRequest
+    /// authenticator — a capability token valid for the entire
+    /// connection lifetime (until the backend process terminates).
+    /// It lingers in this variant's memory between BackendKeyData
+    /// receipt and the final `ReadyForQuery` transition, then is
+    /// delivered to the wrapper via `StartupCompletePayload`
+    /// (which has manual Debug redaction per P1-C).
+    ///
+    /// This is NOT password-class — a leaked secret_key only enables
+    /// query cancellation on the same backend process (impersonation-
+    /// within-session). The PG protocol's design places the entire
+    /// session's cancel authority on this 32-bit value; wrapping in
+    /// `Sensitive<i32>` would add ZeroizeOnDrop Drop semantics but
+    /// also bars `Copy` / match-pattern destructure which propagate
+    /// through Action / Reply chains. Current stance: accept the
+    /// inline `i32` with documented lifetime trade-off; defense-in-
+    /// depth comes from (a) manual Debug redaction on
+    /// `StartupCompletePayload` (P1-C) and (b) ReadBuf/WriteBuf
+    /// zeroize on clear (P0-B/C) preventing wire-level exposure
+    /// persistence.
+    ///
+    /// A future breaking-API revision could migrate to
+    /// `Sensitive<i32>` alongside a `cancel_request()` method on
+    /// `PgProtocol` that consumes the token internally — would
+    /// close the residue. Flagged for follow-up DEF.
     ConnectingPostAuthHaveKey {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
@@ -840,7 +887,11 @@ mod push_class_tests {
 
     use super::*;
     use crate::error::{BoundedStr, ErrorKind};
+    use crate::password::Password;
     use crate::reply_id::ReplyId;
+    use crate::scram::session::ScramSession;
+    use crate::scram::types::SecretDigest;
+    use crate::sensitive::Sensitive;
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
@@ -889,24 +940,34 @@ mod push_class_tests {
             },
             StatePushClass::Connecting,
         );
-        // DEF-184 (A10/B22): SCRAM variants are thin post-refactor.
-        // Heavy data (ScramSession, client bits, server sig) lives on
-        // PgProtocol::scram_state, not in ProtoState.
-        pin(
-            ProtoState::ConnectingStartupScram {
-                reply: ReplyId::from_raw(nz(2_002)),
-            },
-            StatePushClass::Connecting,
-        );
-        pin(
-            ProtoState::ConnectingScramAwaitingServerFirst {
-                reply: ReplyId::from_raw(nz(2_003)),
-            },
-            StatePushClass::Connecting,
-        );
+        // A10/B22 revert 2026-04-24: SCRAM variants carry inline
+        // data (tier-1 variant-carries-field restoration).
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = ScramSession::from_password(Sensitive::new(pw));
+            pin(
+                ProtoState::ConnectingStartupScram {
+                    reply: ReplyId::from_raw(nz(2_002)),
+                    scram,
+                },
+                StatePushClass::Connecting,
+            );
+        }
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = ScramSession::from_password(Sensitive::new(pw));
+            pin(
+                ProtoState::ConnectingScramAwaitingServerFirst {
+                    reply: ReplyId::from_raw(nz(2_003)),
+                    scram,
+                    client_first_bare: crate::ident::PodBytes::new(),
+                    client_nonce_b64: crate::ident::PodBytes::new(),
+                },
+                StatePushClass::Connecting,
+            );
+        }
         pin(
             ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(nz(2_004)),
+                expected_server_sig: SecretDigest::new([0_u8; 32]),
             },
             StatePushClass::Connecting,
         );

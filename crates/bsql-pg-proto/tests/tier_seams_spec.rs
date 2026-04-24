@@ -282,19 +282,16 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     );
 }
 
-/// DEF-184 (A10/B22): pin that `push_startup` with SCRAM credentials
-/// lands in `ProtoState::ConnectingStartupScram` (thin variant,
-/// post-A10). Pre-A10 the state carried the `ScramSession` inline;
-/// post-A10 it's on `PgProtocol::scram_state`. This test verifies
-/// the `push_startup` → thin-state transition path.
+/// DEF-184 (A10/B22 revert 2026-04-24): pin that `push_startup` with
+/// SCRAM credentials lands in `ProtoState::ConnectingStartupScram`
+/// with the `ScramSession` carried INLINE in the variant — tier-1
+/// variant-carries-field invariant (CREDO §1: safety > tier-1 > perf).
 ///
-/// The companion ScramStateDrift classification arm (when state
-/// says SCRAM but scram_state is None/mismatched) is architecturally
-/// unreachable via public API. Exercising that arm requires a
-/// `#[cfg(test)]` forge hook on scram_state — documented as
-/// follow-up DEF, not blocking for A10 ship.
+/// Post-revert the variant cannot exist without SCRAM data: a future
+/// refactor that accidentally elided the `scram` field would fail the
+/// build at the variant-construction site. No classifier needed.
 #[test]
-fn scram_push_startup_lands_in_thin_scram_state_variant() {
+fn scram_push_startup_carries_scram_session_inline() {
     use bsql_pg_proto::{PgCommand, PgProtocol, WriteBuf};
     use bsql_pg_proto::ident::Ident;
     use bsql_pg_proto::password::{Credentials, Password};
@@ -319,7 +316,7 @@ fn scram_push_startup_lands_in_thin_scram_state_variant() {
     );
     assert!(
         matches!(proto.state(), ProtoState::ConnectingStartupScram { .. }),
-        "SCRAM push_startup must land in thin ConnectingStartupScram state, got {:?}",
+        "SCRAM push_startup must land in ConnectingStartupScram carrying inline scram, got {:?}",
         proto.state(),
     );
 }

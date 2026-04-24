@@ -530,12 +530,21 @@ fn password_validation() {
         Err(PasswordError::Empty),
     ));
 
-    // Over-length (> 1024)
-    let long = "a".repeat(1025);
+    // DEF-185 P2-E (audit 2026-04-24): symbolic + 1-over-cap boundary.
+    // Pre-fix literal `1025` happened to exceed the true cap (512
+    // post-DEF-154 O) by a generous margin, but did not pin the
+    // exact boundary. Post-fix uses `MAX_PASSWORD_LEN + 1` so any
+    // future cap bump keeps the boundary test honest without manual
+    // sync.
+    let over_cap = "a".repeat(bsql_pg_proto::password::MAX_PASSWORD_LEN.saturating_add(1));
     assert!(matches!(
-        Password::try_from_str(&long),
+        Password::try_from_str(&over_cap),
         Err(PasswordError::TooLong { .. }),
     ));
+
+    // Exact-cap boundary: MAX_PASSWORD_LEN bytes should succeed.
+    let at_cap = "a".repeat(bsql_pg_proto::password::MAX_PASSWORD_LEN);
+    assert!(Password::try_from_str(&at_cap).is_ok());
 }
 
 /// Invariant (spec): StartupMessage serialised byte-for-byte correctly.

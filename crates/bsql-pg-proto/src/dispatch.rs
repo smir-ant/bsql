@@ -237,7 +237,6 @@ pub(crate) fn dispatch(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
     arena: &mut crate::schema_arena::ArenaWriter<'_>,
     error_arena: &mut crate::error_arena::ErrorArena,
-    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
 ) -> DispatchOutcome {
     // DEF-184 (B21/C6): snap owned prev for pattern matching; state
     // slot holds the explicit `ProtoState::Idle` placeholder during
@@ -310,14 +309,13 @@ pub(crate) fn dispatch(
         // challenge while the user supplied a password, a PG policy
         // mismatch worth surfacing.)
         // =============================================================
-        (ProtoState::ConnectingStartupScram { reply }, TAG_AUTHENTICATION) => {
-            // DEF-184 (A10/B22): heavy `scram: ScramSession` lives in
-            // `scram_state`. Take it out; drift classifies as
-            // InternalCrateBug locus `ScramStateDrift`.
-            let Some(crate::scram_state::ScramHandshakeState::Session(scram)) = scram_state.take() else {
-                return install_internal_bug(state, Some(reply.consume()), crate::error::CrateBugLocus::ScramStateDrift);
-            };
-            dispatch_auth_in_startup_scram(state, reply, scram, payload, reserved, scram_state)
+        (ProtoState::ConnectingStartupScram { reply, scram }, TAG_AUTHENTICATION) => {
+            // DEF-184 (A10/B22 revert 2026-04-24): `scram: ScramSession`
+            // is destructured DIRECTLY from the variant — variant-
+            // carries-field is tier-1 compile (CREDO §1). No drift
+            // classifier needed: the variant cannot exist without its
+            // SCRAM session.
+            dispatch_auth_in_startup_scram(state, reply, scram, payload, reserved)
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, error_arena).into_protocol_error();
@@ -332,19 +330,26 @@ pub(crate) fn dispatch(
         // SCRAM: awaiting server-first-message
         // =============================================================
         (
-            ProtoState::ConnectingScramAwaitingServerFirst { reply },
-            TAG_AUTHENTICATION,
-        ) => {
-            // DEF-184 (A10/B22): heavy SCRAM bits live in scram_state.
-            let Some(crate::scram_state::ScramHandshakeState::AwaitingFirst {
-                session: scram,
+            ProtoState::ConnectingScramAwaitingServerFirst {
+                reply,
+                scram,
                 client_first_bare,
                 client_nonce_b64,
-            }) = scram_state.take()
-            else {
-                return install_internal_bug(state, Some(reply.consume()), crate::error::CrateBugLocus::ScramStateDrift);
-            };
-            dispatch_auth_sasl_continue(state, reply, scram, client_first_bare, client_nonce_b64, payload, reserved, scram_state)
+            },
+            TAG_AUTHENTICATION,
+        ) => {
+            // DEF-184 (A10/B22 revert 2026-04-24): heavy SCRAM fields
+            // destructured inline from the variant — tier-1 invariant
+            // (CREDO §1: variant-carries-field). No drift path.
+            dispatch_auth_sasl_continue(
+                state,
+                reply,
+                scram,
+                client_first_bare,
+                client_nonce_b64,
+                payload,
+                reserved,
+            )
         }
         (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, error_arena).into_protocol_error();
@@ -358,13 +363,14 @@ pub(crate) fn dispatch(
         // SCRAM: awaiting server-final-message
         // =============================================================
         (
-            ProtoState::ConnectingScramAwaitingServerFinal { reply },
+            ProtoState::ConnectingScramAwaitingServerFinal {
+                reply,
+                expected_server_sig,
+            },
             TAG_AUTHENTICATION,
         ) => {
-            // DEF-184 (A10/B22): expected_server_sig lives in scram_state.
-            let Some(crate::scram_state::ScramHandshakeState::AwaitingFinal { expected_server_sig }) = scram_state.take() else {
-                return install_internal_bug(state, Some(reply.consume()), crate::error::CrateBugLocus::ScramStateDrift);
-            };
+            // DEF-184 (A10/B22 revert 2026-04-24): `expected_server_sig`
+            // destructured inline — tier-1 variant-carries-field.
             dispatch_auth_sasl_final(state, reply, expected_server_sig, payload)
         }
         (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
@@ -511,13 +517,28 @@ pub(crate) fn dispatch(
             advance_to_awaiting_rfq(state, reply, payload, None)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
-            // Empty-query path: no schema to preserve.
-            *state = ProtoState::SimpleQueryAwaitingRfq {
-                reply,
-                command_tag: crate::error::BoundedStr::default(),
-                schema_ref: None,
-            };
-            DispatchOutcome::AdvancedSilent
+            // DEF-185 P0-F (audit 2026-04-24): PG §55.7 specifies
+            // EmptyQueryResponse has a zero-byte body. Enforce tier-2
+            // structural — non-empty body classifies as
+            // UnexpectedFrameBody. Pre-fix: payload was ignored entirely.
+            match payload {
+                [] => {
+                    *state = ProtoState::SimpleQueryAwaitingRfq {
+                        reply,
+                        command_tag: crate::error::BoundedStr::default(),
+                        schema_ref: None,
+                    };
+                    DispatchOutcome::AdvancedSilent
+                }
+                other => install_errored(
+                    state,
+                    Some(reply.consume()),
+                    ProtocolError::UnexpectedFrameBody {
+                        tag: TAG_EMPTY_QUERY_RESPONSE,
+                        payload_len: other.len(),
+                    },
+                ),
+            }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, error_arena)
@@ -572,18 +593,33 @@ pub(crate) fn dispatch(
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        // DrainRfqAfterError: silent consume of Z → Idle
+        // DrainRfqAfterError: consume Z → Idle, with full tx_status validation.
+        //
+        // DEF-185 P1-G (audit 2026-04-24): delegate to parse_rfq_payload
+        // for uniform validation. Pre-fix: accepted any 1-byte payload
+        // via `[_]` slice-pattern without validating the byte is one of
+        // `{I, T, E}`. Every OTHER RFQ arm (`PingAwaitingRfq`,
+        // `ParseAwaitingRfq`, `SimpleQueryAwaitingRfq`, etc.) used
+        // `parse_rfq_payload`; this one was an asymmetry — `drained`
+        // still succeeded but a malformed byte got silently accepted.
+        // Semantically low-stakes (we reach Idle either way), but tier-4
+        // uniformity drift nonetheless. Post-fix: consistent classification.
         (ProtoState::DrainRfqAfterError, TAG_READY_FOR_QUERY) => {
-            match payload {
-                [_] => {
+            // tx_status is unused on the drain path — we're returning
+            // to Idle after a query-level error; the pre-error query's
+            // consumer already received FailReply via `advance_to_drain_after_error`.
+            // Nobody consumes the drain's tx_status. Pattern-bind `_`
+            // in Ok arm to validate-and-discard (not a `let _` — that
+            // form is user-banned per no-underscore-vars feedback).
+            match parse_rfq_payload(payload) {
+                Ok(_) => {
                     *state = ProtoState::Idle;
                     DispatchOutcome::AdvancedSilent
                 }
-                other => install_errored(state,
+                Err(payload_len) => install_errored(
+                    state,
                     None,
-                    ProtocolError::MalformedReadyForQuery {
-                        payload_len: other.len(),
-                    },
+                    ProtocolError::MalformedReadyForQuery { payload_len },
                 ),
             }
         }
@@ -606,8 +642,22 @@ pub(crate) fn dispatch(
         // =============================================================
 
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_PARSE_COMPLETE) => {
-            *state = ProtoState::ParseAwaitingRfq(reply);
-            DispatchOutcome::AdvancedSilent
+            // DEF-185 P0-F: ParseComplete body must be empty per
+            // PG §55.7.
+            match payload {
+                [] => {
+                    *state = ProtoState::ParseAwaitingRfq(reply);
+                    DispatchOutcome::AdvancedSilent
+                }
+                other => install_errored(
+                    state,
+                    Some(reply.consume()),
+                    ProtocolError::UnexpectedFrameBody {
+                        tag: TAG_PARSE_COMPLETE,
+                        payload_len: other.len(),
+                    },
+                ),
+            }
         }
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_ERROR_RESPONSE) => {
             // Recoverable parse error — PG spec sends Z after E, so
@@ -680,8 +730,22 @@ pub(crate) fn dispatch(
         // ─── DML path ───
 
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_BIND_COMPLETE) => {
-            *state = ProtoState::BindExecuteAwaitingCommandCompleteDml(reply);
-            DispatchOutcome::AdvancedSilent
+            // DEF-185 P0-F: BindComplete body must be empty per
+            // PG §55.7.
+            match payload {
+                [] => {
+                    *state = ProtoState::BindExecuteAwaitingCommandCompleteDml(reply);
+                    DispatchOutcome::AdvancedSilent
+                }
+                other => install_errored(
+                    state,
+                    Some(reply.consume()),
+                    ProtocolError::UnexpectedFrameBody {
+                        tag: TAG_BIND_COMPLETE,
+                        payload_len: other.len(),
+                    },
+                ),
+            }
         }
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, error_arena)
@@ -740,8 +804,23 @@ pub(crate) fn dispatch(
             ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, schema_ref },
             TAG_BIND_COMPLETE,
         ) => {
-            *state = ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref };
-            DispatchOutcome::AdvancedSilent
+            // DEF-185 P0-F: BindComplete body must be empty per
+            // PG §55.7.
+            match payload {
+                [] => {
+                    *state =
+                        ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref };
+                    DispatchOutcome::AdvancedSilent
+                }
+                other => install_errored(
+                    state,
+                    Some(reply.consume()),
+                    ProtocolError::UnexpectedFrameBody {
+                        tag: TAG_BIND_COMPLETE,
+                        payload_len: other.len(),
+                    },
+                ),
+            }
         }
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, error_arena)
@@ -883,12 +962,25 @@ pub(crate) fn dispatch(
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, param_oids },
             TAG_NO_DATA,
         ) => {
-            *state = ProtoState::DescribeStatementAwaitingRfq {
-                reply,
-                param_oids,
-                rows: crate::state::DescribedRowsStaged::NoData,
-            };
-            DispatchOutcome::AdvancedSilent
+            // DEF-185 P0-F: NoData body must be empty per PG §55.7.
+            match payload {
+                [] => {
+                    *state = ProtoState::DescribeStatementAwaitingRfq {
+                        reply,
+                        param_oids,
+                        rows: crate::state::DescribedRowsStaged::NoData,
+                    };
+                    DispatchOutcome::AdvancedSilent
+                }
+                other => install_errored(
+                    state,
+                    Some(reply.consume()),
+                    ProtocolError::UnexpectedFrameBody {
+                        tag: TAG_NO_DATA,
+                        payload_len: other.len(),
+                    },
+                ),
+            }
         }
         (
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. },
@@ -951,11 +1043,24 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_NO_DATA) => {
-            *state = ProtoState::DescribePortalAwaitingRfq {
-                reply,
-                rows: crate::state::DescribedRowsStaged::NoData,
-            };
-            DispatchOutcome::AdvancedSilent
+            // DEF-185 P0-F: NoData body must be empty per PG §55.7.
+            match payload {
+                [] => {
+                    *state = ProtoState::DescribePortalAwaitingRfq {
+                        reply,
+                        rows: crate::state::DescribedRowsStaged::NoData,
+                    };
+                    DispatchOutcome::AdvancedSilent
+                }
+                other => install_errored(
+                    state,
+                    Some(reply.consume()),
+                    ProtocolError::UnexpectedFrameBody {
+                        tag: TAG_NO_DATA,
+                        payload_len: other.len(),
+                    },
+                ),
+            }
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, error_arena)
@@ -1008,31 +1113,13 @@ pub(crate) fn dispatch(
         }
     };
 
-    // DEF-184 (A10/B22 audit P0-1): zeroize hygiene.
-    //
-    // If we entered Errored mid-SCRAM (e.g. server sent ErrorResponse
-    // during AwaitingServerFirst), `scram_state` could linger as
-    // `Some(Session { .. })` holding the password's HMAC material.
-    // Clear it on Errored transition — the connection is terminal, no
-    // one will consume the SCRAM data; dropping here invokes
-    // `ScramSession`'s `ZeroizeOnDrop` impl and scrubs password bytes
-    // immediately.
-    //
-    // Pre-(P0-1): password bytes lingered in memory until the next
-    // `push_startup` overwrote scram_state OR until `PgProtocol` itself
-    // dropped — potentially many seconds on a connection-pool reuse
-    // path. Secret-lifetime regression vs the pre-A10 tier-1
-    // guarantee (heavy data dropped with consumed ProtoState variant).
-    //
-    // Cost: one `Option::take` (drop-call if Some, 2 instructions if
-    // None). `#[cold]` Errored path absorbs the check; no hot-path
-    // impact. `happy path via dispatch_auth_sasl_final` already clears
-    // scram_state via the `.take()` pattern when advancing to
-    // AwaitingAuthOk, so this cleanup fires only on actual fatal paths.
-    if matches!(state, ProtoState::Errored(_)) {
-        *scram_state = None;
-    }
-
+    // DEF-184 (A10/B22 revert 2026-04-24): no scram_state cleanup needed.
+    // `mem::replace(state, ProtoState::Idle)` above consumed the SCRAM
+    // variant by value; if the arm ended in Errored the variant is
+    // already dropped — `ScramSession::Drop` impl (`ZeroizeOnDrop`)
+    // scrubbed password bytes inside the match. Variant-carries-field
+    // invariant (CREDO §1) makes this automatic: there is no separate
+    // slot that could linger past the state transition.
     outcome
 }
 
@@ -1134,7 +1221,6 @@ fn dispatch_auth_in_startup_scram(
     scram: crate::scram::session::ScramSession,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
 ) -> DispatchOutcome {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
@@ -1155,15 +1241,17 @@ fn dispatch_auth_in_startup_scram(
             // boundary after the mutable write phase releases.
             match build_sasl_initial_response(&scram, reserved) {
                 Ok((range, client_first_bare, client_nonce_b64)) => {
-                    // DEF-184 (A10/B22): update state + scram_state pair
-                    // atomically.  Thin state variant + heavy handshake
-                    // data paired via correlation invariant.
-                    *state = ProtoState::ConnectingScramAwaitingServerFirst { reply };
-                    *scram_state = Some(crate::scram_state::ScramHandshakeState::AwaitingFirst {
-                        session: scram,
+                    // DEF-184 (A10/B22 revert 2026-04-24): variant-
+                    // carries-field — `scram`, `client_first_bare`,
+                    // `client_nonce_b64` move INTO the new variant.
+                    // Tier-1 compile (CREDO §1): construction demands
+                    // every field; drift impossible.
+                    *state = ProtoState::ConnectingScramAwaitingServerFirst {
+                        reply,
+                        scram,
                         client_first_bare,
                         client_nonce_b64,
-                    });
+                    };
                     DispatchOutcome::AdvancedWithAction {
                         action: StagedAction::SendBytesRange(range),
                     }
@@ -1258,6 +1346,22 @@ fn build_sasl_initial_response(
 > {
     use crate::scram::wire;
 
+    // DEF-185 P2-F (audit 2026-04-24): PG convention — the SCRAM
+    // `n=<user>` field is hard-coded empty because the real user
+    // name travelled in the StartupMessage's `user` parameter. PG's
+    // SCRAM implementation explicitly ignores the SASL-level user
+    // (see PG src/backend/libpq/auth-scram.c — the `user` from
+    // client-first is never consulted; authentication is bound to
+    // the startup user).
+    //
+    // RFC 5802 §5.1 allows an empty `saslname` per RFC 4013 SASLprep.
+    // PG-specific clients set `n=` verbatim; non-PG SCRAM servers
+    // (MongoDB, Kafka) REQUIRE a non-empty `n=` and this code path
+    // would fail against those. `bsql-pg-proto` is PG-only by design;
+    // interop with other SCRAM servers is out of scope.
+    //
+    // If a future phase adds non-PG SCRAM server support, plumb the
+    // user identifier through as a `Sensitive<...>` argument here.
     let user_bytes: &[u8] = b"";
 
     let client_nonce_vec = wire::generate_client_nonce().map_err(ProtocolError::Scram)?;
@@ -1318,7 +1422,8 @@ fn build_sasl_initial_response(
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
 /// [`ScramSession::try_from_credentials`]: crate::scram::session::ScramSession::try_from_credentials
-#[expect(clippy::too_many_arguments, reason = "SCRAM SASL-continue dispatcher threads 8 distinct inputs from caller scope: state + reply + 3 handshake artefacts (session, client_first_bare, client_nonce_b64) + payload + write reserved + scram_state slot. Each is a distinct SCRAM protocol input; struct-arg would obscure the SASL wire-format mapping 1:1.")]
+// DEF-184 (A10/B22 revert 2026-04-24): 7-arg function — within
+// clippy::too_many_arguments default threshold. No `#[expect]` needed.
 fn dispatch_auth_sasl_continue(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
@@ -1327,7 +1432,6 @@ fn dispatch_auth_sasl_continue(
     client_nonce_b64: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
 ) -> DispatchOutcome {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
@@ -1388,9 +1492,16 @@ fn dispatch_auth_sasl_continue(
     };
 
     // Base64-encode proof.
-    let mut proof_b64_buf = [0u8; 64];
+    //
+    // DEF-185 P1-A (audit 2026-04-24): stack buffer holds base64
+    // ClientProof — password-correlated via `SHA-256(ClientKey) =
+    // StoredKey`, and `proof = ClientKey XOR HMAC(StoredKey, AuthMessage)`.
+    // A core-dump attacker with the base64-decoded proof + AuthMessage
+    // can derive StoredKey and replay the handshake. Wrap in
+    // `zeroize::Zeroizing` so the 64-byte buffer scrubs on scope exit.
+    let mut proof_b64_buf: zeroize::Zeroizing<[u8; 64]> = zeroize::Zeroizing::new([0_u8; 64]);
     let proof_b64_len =
-        match crate::scram::wire::base64_encode_to_buf(proof.as_ref(), &mut proof_b64_buf) {
+        match crate::scram::wire::base64_encode_to_buf(proof.as_ref(), proof_b64_buf.as_mut()) {
             Ok(n) => n,
             Err(_) => {
                 return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))
@@ -1404,7 +1515,17 @@ fn dispatch_auth_sasl_continue(
     };
 
     // Build client-final-message.
-    let client_final_msg = match crate::scram::wire::build_client_final_message(
+    //
+    // DEF-185 P1-A (audit 2026-04-24): `client_final_msg` contains the
+    // embedded `p=<proof_b64>` payload — password-correlated via the
+    // same StoredKey algebra as proof_b64_buf. The `heapless::Vec` it
+    // lives in does NOT implement `Zeroize` (upstream crate), so we
+    // cannot wrap in `Zeroizing`. Instead, after the value has been
+    // copied into the write buffer (push_bytes call below), zeroize
+    // the heapless::Vec's backing bytes in-place via
+    // `Zeroize::zeroize()` on the mut slice (slice impl exists
+    // upstream). Done just before the Vec drops at function scope end.
+    let mut client_final_msg = match crate::scram::wire::build_client_final_message(
         server_first.server_nonce.as_bytes(),
         proof_b64,
     ) {
@@ -1426,9 +1547,22 @@ fn dispatch_auth_sasl_continue(
                 .with_length_prefix(|w| w.push_bytes(&client_final_msg))
                 .is_err()
         {
+            // DEF-185 P1-A: scrub client_final_msg before early-return
+            // classification. The buffer's bytes may contain partial
+            // `p=<proof_b64>` payload depending on when the push failed.
+            use zeroize::Zeroize;
+            client_final_msg.as_mut_slice().zeroize();
             return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
         }
     }
+    // DEF-185 P1-A: scrub the password-correlated client_final_msg
+    // contents now that it has been copied into the write buffer.
+    // The write buffer itself is zeroed on `WriteBuf::clear()` per
+    // P0-B separately. Without this step the 384-byte heapless::Vec
+    // backing array would hold `p=<proof_b64>` until this function's
+    // stack frame gets overwritten by a subsequent call.
+    use zeroize::Zeroize;
+    client_final_msg.as_mut_slice().zeroize();
     // DEF-154 (B) P0-2: `from_branded_write_span` returns Result.
     // Err is architecturally dead here — the SASL_RESPONSE frame
     // body always has the 1-byte tag + 4-byte length prefix + the
@@ -1439,10 +1573,16 @@ fn dispatch_auth_sasl_continue(
         Err(cause) => return install_errored(state, Some(reply.consume()), cause),
     };
 
-    // DEF-184 (A10/B22): atomic pair update — thin state + heavy
-    // SCRAM data. expected_server_sig moves to scram_state.
-    *state = ProtoState::ConnectingScramAwaitingServerFinal { reply };
-    *scram_state = Some(crate::scram_state::ScramHandshakeState::AwaitingFinal { expected_server_sig });
+    // DEF-184 (A10/B22 revert 2026-04-24): `expected_server_sig` moves
+    // INTO the variant — tier-1 compile (CREDO §1: variant-carries-field).
+    // The `scram` ScramSession consumed here (moved into this function)
+    // is NOT needed by the next state; its drop here fires
+    // `ZeroizeOnDrop` — password material scrubbed exactly when the
+    // handshake no longer needs it.
+    *state = ProtoState::ConnectingScramAwaitingServerFinal {
+        reply,
+        expected_server_sig,
+    };
     DispatchOutcome::AdvancedWithAction {
         action: StagedAction::SendBytesRange(range),
     }
@@ -1873,6 +2013,23 @@ fn parse_command_tag(payload: &[u8]) -> Result<crate::error::BoundedStr<32>, Pro
             payload_len: payload.len(),
         });
     };
+    // DEF-185 P2-7 (audit 2026-04-24): embedded NUL validation.
+    //
+    // Pre-fix: PG CommandComplete body `SELECT\x00 5\x00` — strip_suffix
+    // removed the trailing NUL, leaving `SELECT\x00 5` with embedded
+    // NUL that `from_bytes_lossy` passed through verbatim (UTF-8
+    // validator accepts NUL as a valid codepoint). User saw
+    // `command_tag` with embedded NUL — weird but not exploitable.
+    //
+    // Post-fix: reject bodies containing embedded NUL as
+    // `MalformedCommandComplete`. PG's CommandComplete is NUL-terminated
+    // per §55.7 with the NUL strictly at the END; an interior NUL is a
+    // wire violation.
+    if body.contains(&0u8) {
+        return Err(ProtocolError::MalformedCommandComplete {
+            payload_len: payload.len(),
+        });
+    }
     // F-045 (pass-#8): use `from_bytes_lossy` — preserves ASCII subset,
     // coerces non-ASCII / invalid UTF-8 to `?`. Prior
     // `core::str::from_utf8(body).unwrap_or("")` silently dropped the

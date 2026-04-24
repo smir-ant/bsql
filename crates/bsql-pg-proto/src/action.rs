@@ -1305,14 +1305,41 @@ impl<'r> From<PongPayload> for Reply<'r> {
 /// Delivered on the final `ReadyForQuery` that closes the startup
 /// handshake. Carries the backend process ID / secret key (for
 /// cancel requests) and the transaction-status byte.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// # DEF-185 P1-C (audit 2026-04-24): manual Debug redaction
+///
+/// `secret_key` is the backend's **CancelRequest authenticator** —
+/// PG's cancel protocol (`pg_cancel_backend` server-side is gated by
+/// pg_hba.conf, but the client-side `CancelRequest` frame over TCP
+/// uses `(pid, secret_key)` as the only auth). A leaked `secret_key`
+/// in debug logs allows an attacker with network access to inject
+/// cancel-requests impersonating the client — capability-token-class
+/// leak, not password-class, but still worth redacting.
+///
+/// Pre-fix: `#[derive(Debug)]` printed `StartupCompletePayload {
+/// pid: 12345, secret_key: 67890, tx_status: Idle }` — operators
+/// logging `OutActions` for diagnostics would expose secret_key.
+/// Post-fix: manual `Debug` prints `<REDACTED>` for `secret_key`.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StartupCompletePayload {
     /// Backend process ID from the `BackendKeyData` frame.
     pub pid: i32,
     /// Backend secret key (for cancel requests).
+    ///
+    /// Logged as `<REDACTED>` via manual Debug impl (DEF-185 P1-C).
     pub secret_key: i32,
     /// Transaction status from the final `ReadyForQuery`.
     pub tx_status: TxStatus,
+}
+
+impl core::fmt::Debug for StartupCompletePayload {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StartupCompletePayload")
+            .field("pid", &self.pid)
+            .field("secret_key", &"<REDACTED>")
+            .field("tx_status", &self.tx_status)
+            .finish()
+    }
 }
 
 impl<'r> From<StartupCompletePayload> for Reply<'r> {

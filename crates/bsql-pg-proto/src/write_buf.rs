@@ -494,16 +494,33 @@ impl WriteBuf {
     /// issued `&[u8]` borrows into this buffer are invalidated — the
     /// borrow checker enforces that no such borrows exist at the
     /// point of `clear()` via the `&mut self` receiver.
+    ///
+    /// # DEF-185 P0-B (audit 2026-04-24): zero-on-clear discipline
+    ///
+    /// `heapless::Vec::clear()` by itself only resets the length to 0 —
+    /// the backing bytes persist in the 2176-byte array until a later
+    /// `push_*` call overwrites them. This left **password-correlated
+    /// SCRAM SASLResponse frames** (including the base64-encoded
+    /// ClientProof) physically in RAM between SCRAM dispatch and the
+    /// next `feed_bytes()` / `push_command()` call. Core-dump attackers
+    /// on a long-lived connection would also find plaintext SQL from
+    /// prior queries (e.g. `UPDATE users SET password='...'`) sitting
+    /// in this buffer.
+    ///
+    /// Post-fix: overwrite the occupied prefix with zeros before
+    /// truncating the length. Unoccupied bytes don't need scrubbing —
+    /// they were either zero-initialised (fresh buffer) or already
+    /// zeroed by a previous clear. Cost: O(len) memset on the hot path,
+    /// which is L1-cache resident (≤ 2 KiB) and negligible relative to
+    /// the write system call that typically follows.
+    ///
+    /// Pairs with `ZeroizeOnDrop` below: the `clear()` path handles
+    /// reuse; `Drop` handles stack-frame teardown.
     #[inline]
     pub fn clear(&mut self) {
+        use zeroize::Zeroize;
+        self.inner.as_mut_slice().zeroize();
         self.inner.clear();
-    }
-
-    /// Consume the builder, returning the underlying `heapless::Vec`.
-    #[inline]
-    #[must_use]
-    pub fn into_inner(self) -> heapless::Vec<u8, MAX_OWNED_SEND_LEN> {
-        self.inner
     }
 
     /// Borrow the written bytes.
@@ -518,6 +535,30 @@ impl WriteBuf {
 impl Default for WriteBuf {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// DEF-185 P0-B (audit 2026-04-24): manual Drop impl zeroizes the
+/// occupied prefix on scope teardown.
+///
+/// Rationale: `heapless::Vec` does NOT implement `zeroize::Zeroize`
+/// (the upstream crate bounds `Zeroize` on `Default + Copy`, which Vec
+/// does not satisfy). We scrub manually via `Zeroize` on the mut slice
+/// (impl'd for `[u8]`). Ensures that on normal Drop — e.g. when a
+/// wrapper's connection handle goes out of scope — any residual
+/// password-correlated bytes (SASLResponse ClientProof) are scrubbed.
+///
+/// Caveat per DEF-185 P0-A: under `panic = "abort"` in the release
+/// profile, Drop does NOT run on panic paths. The zeroize claim here
+/// is "best-effort on normal control flow"; hard memory hygiene under
+/// panic requires either `panic = "unwind"` or `mlock`+manual scrub.
+/// Current stance: accept abort's fail-fast benefits; document the
+/// limitation honestly; prefer explicit `Zeroizing<T>` wrappers on
+/// stack locals within secret-bearing call frames for defense-in-depth.
+impl Drop for WriteBuf {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.inner.as_mut_slice().zeroize();
     }
 }
 

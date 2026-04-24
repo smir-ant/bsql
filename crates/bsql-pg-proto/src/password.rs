@@ -63,10 +63,19 @@ const _: () = assert!(
 /// in `lib.rs` enforces this invariant structurally.
 ///
 /// `len` is a `u16` (not `usize`) because `MAX_PASSWORD_LEN`
-/// (1024) trivially fits; the narrower type saves 6 bytes per
-/// `Password` instance which compounds through `Sensitive<Password>` →
-/// `Credentials::ScramPassword` → `PgCommand::Startup` →
-/// `ProtoState::ConnectingStartup`. (DEF-095)
+/// (512 — DEF-154 (O) P1-5) trivially fits; the narrower type saves
+/// 6 bytes per `Password` instance which compounds through
+/// `Sensitive<Password>` → `Credentials::ScramPassword` →
+/// `PgCommand::Startup` → `ProtoState::ConnectingStartup`. (DEF-095)
+///
+/// # DEF-185 P2-E (audit 2026-04-24): doc sync
+///
+/// Pre-fix: this comment said `(1024)` — drift from the actual 512
+/// after DEF-154 (O) P1-5 shrunk the const. Comment vs source had
+/// been out of step for ~3 weeks. Pairs with the startup_spec test
+/// boundary which uses `"a".repeat(1025)` and happens to pass
+/// (1025 > 512) but not at the exact +1-over-cap boundary; that
+/// test should assert at `MAX_PASSWORD_LEN + 1` symbolically.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Password {
     /// Fixed-size backing store. The full array is zeroed on drop,

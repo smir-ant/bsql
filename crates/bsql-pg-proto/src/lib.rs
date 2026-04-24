@@ -109,7 +109,6 @@ pub mod protocol;
 pub mod row_stream;
 pub mod reply_id;
 pub mod scram;
-pub(crate) mod scram_state;
 mod schema_arena;
 pub mod sensitive;
 pub mod session_params;
@@ -272,11 +271,11 @@ const _: fn() = || {
 //   Reply<'_>:         80  (DEF-119 — RowDesc externalised)
 //   ReplyId:           16
 //   PgCommand:      ≤2176  (Parse dominates)
-//   ProtoState:        80  (DEF-184 A10/B22 — SCRAM externalised)
+//   ProtoState:      ~712  (SCRAM inline — tier-1 variant-carries-field;
+//                            DEF-184 A10/B22 REVERTED 2026-04-24 per CREDO §1)
 //   SchemaArena:      ~520
 //   ErrorArena:      ~290
-//   ScramState:      ~712  (DEF-184 A10/B22 — Option<ScramHandshakeState>)
-//   PgProtocol:    [6032, 6200]  (range tolerates alignment)
+//   PgProtocol:    [6000, 6200]  (range tolerates alignment)
 //
 // ═══════════════════════════════════════════════════════════════════
 // HISTORICAL (for context on why the budget looks the way it does)
@@ -303,10 +302,13 @@ const _: fn() = || {
 //   OutActions:       800  (was 2808 — 9 × Action shrink)
 // Post-DEF-184 B21/C6 (2026-04-24):
 //   DispatchOutcome:   88  (was 800 — by-ref state removes new_state payload)
-// Post-DEF-184 A10/B22 (2026-04-24):
-//   ProtoState:        80  (was 712 — SCRAM split, heavy data → scram_state)
-//   ScramState NEW:   712  (lives on PgProtocol as Option, set-Some-only-
-//                           during-handshake so zeroize hygiene works)
+// Post-DEF-184 A10/B22 REVERTED (2026-04-24):
+//   ProtoState:       ~712  (SCRAM session restored INLINE in variant
+//                            per CREDO §1 tier-1 variant-carries-field;
+//                            safety > tier-1 > perf)
+//   scram_state field: REMOVED (no correlation invariant to maintain,
+//                            ZeroizeOnDrop fires on state transition
+//                            automatically via variant drop glue)
 // ---------------------------------------------------------------------
 // DEF-151: tight-range size asserts. Bound BOTH directions to catch
 // field additions (upper) AND accidental field removals (lower). The
@@ -347,24 +349,42 @@ const _: () = assert!(
      tag is zero-size; ReplyId's footprint is u64 value + bool \
      delivered + padding. Did a bookkeeping field get added?",
 );
+// F1 (architect audit 2026-04-24): tight ±8 B platform-alignment
+// slack only. Actual on aarch64-apple-darwin is 704 B; x86_64-linux
+// typically +0–8 B. A single extra `NonZeroU8` field addition would
+// bump to 712 and still pass, 720 trips the upper bound.
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() == 80,
-    "ProtoState size post-(A10/B22) == 80 B. \
-     Pre-(A10): ~712 B dominated by SCRAM variants carrying inline \
-     ScramSession (~512 B) + client_first_bare (128 B) + \
-     client_nonce_b64 (48 B). Post-(A10): heavy SCRAM data moved to \
-     `PgProtocol::scram_state: Option<ScramHandshakeState>`; \
-     ProtoState variants are thin, enum size now dominated by \
-     `SimpleQueryAwaitingRfq` / `DescribeStatementAwaitingRfq` \
-     which carry `BoundedStr<32> command_tag` + discriminant + \
-     padding (~80 B). \
+    core::mem::size_of::<state::ProtoState>() >= 696
+        && core::mem::size_of::<state::ProtoState>() <= 712,
+    "ProtoState size post-(A10/B22 REVERT 2026-04-24) in range \
+     [696, 712] B — SCRAM variants carry their session data INLINE. \
+     Dominating variant: `ConnectingScramAwaitingServerFirst` with \
+     `scram: ScramSession` (~500 B) + `client_first_bare` (128 B) + \
+     `client_nonce_b64` (48 B) + reply + padding. \
      \
-     Win: **632 B × N_dispatches** (712 − 80) eliminated from every \
-     `core::mem::replace(state, Idle)` inside dispatch(). \
+     Rationale for the revert: CREDO §1 ranks safety > tier-1 > perf. \
+     Pre-revert (A10 split) achieved ProtoState=80 B by externalising \
+     SCRAM to `PgProtocol::scram_state`, but that split demoted the \
+     variant-carries-field invariant from **tier-1 compile** \
+     (ScramAwaitingServerFirst cannot exist without ScramSession, \
+     period — Rust type system enforces) to **tier-2 structural** \
+     (classified runtime `ScramStateDrift` crate-bug locus if the \
+     correlation between state variant and companion `scram_state` \
+     slot was broken by a future refactor). The split also introduced \
+     a zeroize-hygiene gap: password bytes could linger on the \
+     non-dispatch fail path (fail_inflight_no_readbuf) until the next \
+     push_startup overwrote scram_state. Restoring inline fields puts \
+     ZeroizeOnDrop back on the variant's drop glue — scrubbed \
+     automatically on every state transition, no special-case cleanup. \
      \
-     If this trips: either a heavy field was re-added inline to \
-     a variant (regress A10), or a new variant with large payload \
-     landed — consider externalising same way.",
+     Cost accepted: ~632 B per `core::mem::replace(state, Idle)` \
+     during dispatch (only on SCRAM handshake — 2-3 frames per \
+     connection). Moving 700 B instead of 80 B is a memcpy — \
+     measurable but below audit-sensitivity threshold. \
+     \
+     If this trips above 760 B: a new heavy field landed on a SCRAM \
+     variant, or ScramSession grew. Investigate individual field \
+     sizes before bumping the range.",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
@@ -373,18 +393,22 @@ const _: () = assert!(
      (16) + discriminant + padding. Bumping MAX_SQL_LEN or \
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
+// F1 (architect audit 2026-04-24) + DEF-185 P2-9: tight platform-
+// alignment slack. Measured 6064 B pre-P2-9; +2 B for
+// `malformed_frame_count: u16` + potential alignment padding brings
+// new baseline to 6064–6080 B. Range allows ±16 B cross-target drift;
+// a new field addition trips the upper bound.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() >= 6032
-        && core::mem::size_of::<protocol::PgProtocol>() <= 6200,
-    "PgProtocol size post-(A1+A13 + A10/B22) in range [6032, 6200] B. \
-     Budget: ReadBuf 4096 + state ~48 + session_params ~420 + \
-     schema_arena ~520 + error_arena ~290 + scram_state ~712 + \
-     padding. \
-     Pre-(A10): state carried ~712 B SCRAM inline, scram_state \
-     didn't exist. Net PgProtocol change: ~0 (state shrank -664 B, \
-     scram_state grew +712 B, near-wash). The WIN is per-dispatch: \
-     ProtoState's `mem::replace(state, Idle)` inside dispatch() now \
-     moves 48 B instead of 712 B (~664 B saved × N dispatches).",
+    core::mem::size_of::<protocol::PgProtocol>() >= 6048
+        && core::mem::size_of::<protocol::PgProtocol>() <= 6088,
+    "PgProtocol size post-(A1+A13, A10/B22 REVERT, P2-9 counter) in \
+     range [6048, 6088] B. \
+     Budget: ReadBuf 4096 + state ~712 (SCRAM inline per tier-1 \
+     variant-carries-field invariant) + session_params ~420 + \
+     schema_arena ~520 + error_arena ~290 + malformed_frame_count 2 + \
+     padding. No separate `scram_state` field — heavy SCRAM data \
+     lives in the variant with automatic `ZeroizeOnDrop` on \
+     transition.",
 );
 // DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B
 // post-`new_state` extraction. Pre-(B21/C6) each Advanced variant

@@ -334,6 +334,23 @@ const WORST_CASE_PER_DISPATCH: usize = 2;
 const _: () = assert!(MAX_ACTIONS_PER_CALL >= WORST_CASE_PER_DISPATCH);
 const _: () = assert!(MAX_ACTIONS_PER_CALL >= 4, "practical batching needs ≥4 slots");
 
+// DEF-185 P1-H (audit 2026-04-24): drift pin coupling
+// `READ_BUF_CAP` to the `frames_consumed: u16` counter used in
+// `feed_bytes_impl`. `frames_consumed` accumulates `total_len` per
+// dispatched frame; each `total_len ≤ READ_BUF_CAP`. If
+// `READ_BUF_CAP` ever grew past `u16::MAX`, the counter would
+// silently saturate at 65535, breaking the subsequent
+// `read_buf.advance(usize::from(frames_consumed))` math. The
+// corresponding pin in `buf.rs` couples `READ_BUF_CAP` to
+// `ReadBuf::cursor: u16`; this one couples the OTHER u16 consumer
+// (the protocol dispatch loop) to the same cap — both pins must
+// stay in lockstep with the field type choices.
+const _: () = assert!(
+    crate::frame::READ_BUF_CAP <= 65_535,
+    "READ_BUF_CAP must fit frames_consumed: u16 in protocol::feed_bytes_impl. \
+     Widen that counter type alongside any READ_BUF_CAP bump above u16::MAX.",
+);
+
 /// PostgreSQL wire-protocol state machine.
 ///
 /// **Phase 1a scope:** ships only the Ping flow. The protocol starts
@@ -345,16 +362,17 @@ const _: () = assert!(MAX_ACTIONS_PER_CALL >= 4, "practical batching needs ≥4 
 /// `!Sync` by construction (`PhantomData<Cell<()>>` field). Concurrent
 /// access is impossible; a `&mut PgProtocol` is the only handle.
 ///
-/// # Size budget (DEF-184 post-A10/B22)
+/// # Size budget (DEF-184 post-A10/B22 revert 2026-04-24)
 ///
-/// `size_of::<PgProtocol>()` is pinned in `lib.rs` at range
-/// `[6032, 6200]` bytes. Budget composition:
+/// `size_of::<PgProtocol>()` is pinned in `lib.rs` at a range
+/// accommodating the inline SCRAM session. Budget composition:
 /// - `ReadBuf`       ~4096 B  (I/O staging, READ_BUF_CAP)
-/// - `state`           80 B   (ProtoState, post-A10 SCRAM split)
+/// - `state`          ~712 B  (ProtoState — SCRAM session carried
+///   inline in `ConnectingScramAwaitingServerFirst` per tier-1
+///   variant-carries-field invariant; CREDO §1)
 /// - `session_params` ~420 B
 /// - `schema_arena`   ~520 B  (DEF-119 two-slot slab)
 /// - `error_arena`    ~290 B  (DEF-184 A1+A13 single-slot)
-/// - `scram_state`    ~712 B  (post-A10 externalised SCRAM data)
 /// - padding + flags  varies
 ///
 /// Any field addition or size growth must update the pin in
@@ -437,33 +455,22 @@ pub struct PgProtocol {
     /// refactor moving the arena out (e.g. per-worker pool) would
     /// need an additional correlation invariant classifier.
     error_arena: crate::error_arena::ErrorArena,
-    /// DEF-184 (A10/B22) SCRAM handshake data — externalised from
-    /// `ProtoState` SCRAM variants.
-    ///
-    /// Pre-(A10): `ScramSession` (512 B) + `client_first_bare`
-    /// (128 B) + `client_nonce_b64` (48 B) + `expected_server_sig`
-    /// (32 B) lived inline in 4 `ProtoState::ConnectingScram*`
-    /// variants. Rust enum sized by max variant → `ProtoState`
-    /// dominated at ~712 B by `ConnectingScramAwaitingServerFirst`.
-    ///
-    /// Post-(A10): heavy SCRAM data moves here; `ProtoState` SCRAM
-    /// variants become thin `{ reply: ReplyId<StartupKind> }`
-    /// shapes. `ProtoState` shrinks 712 B → **80 B exact** — every
-    /// `core::mem::replace(state, Idle)` inside `dispatch()` now
-    /// moves 80 B instead of 712 B (**632 B × N_dispatches** saved).
-    ///
-    /// Correlation invariant (tier-2 structural per CREDO §1):
-    /// `state is ConnectingScram*` ⇔ `scram_state is Some(..)`
-    /// with matching variant shape. A drift between the pair
-    /// classifies as [`crate::error::CrateBugLocus::ScramStateDrift`]
-    /// rather than silent take-from-None. See
-    /// [`crate::scram_state`] module docs for the full table.
-    ///
-    /// Cost: ~704 B on `PgProtocol` (dominated by `AwaitingFirst`
-    /// variant + `Option` disc). Lives `Some(_)` only during the
-    /// 3-4 SCRAM handshake frames; cleared at AuthOk or any
-    /// errored transition.
-    scram_state: Option<crate::scram_state::ScramHandshakeState>,
+    // DEF-184 (A10/B22) SCRAM externalisation REVERTED 2026-04-24:
+    // tier-1 restored (CREDO §1: safety > tier-1 > perf). SCRAM
+    // data (ScramSession, client_first_bare, client_nonce_b64,
+    // expected_server_sig) now lives INLINE in ProtoState SCRAM
+    // variants. Variant drop on state transition invokes
+    // ScramSession's ZeroizeOnDrop automatically — no scram_state
+    // field, no correlation invariant to maintain, no drift
+    // classifier needed. ProtoState size returns to ~712 B
+    // (dominated by ConnectingScramAwaitingServerFirst), but the
+    // variant-carries-field invariant is tier-1 compile — a
+    // future refactor cannot physically create a SCRAM state
+    // without SCRAM data. Perf cost: ~632 B per
+    // `mem::replace(state, Idle)` × 3-6 dispatches per query. On
+    // typical workloads this is 2-4 KB/query memcpy cost — well
+    // below audit sensitivity threshold, worth the tier uplift
+    // per user directive.
     // DEF-154 (H+V) `pending_advance` DELETED 2026-04-24 (architect
     // audit finding): was a 2-byte deferred cursor-advance slot +
     // ~25 lines of plumbing + 3 architecturally-dead Err classifier
@@ -484,6 +491,22 @@ pub struct PgProtocol {
     // + `pending_advance_err` fast-path + row_stream callers.
     // advance now happens inside the dispatch loop via
     // `read_buf.advance(total_len)` right after frame consumption.
+    /// DEF-185 P2-9 (audit 2026-04-24): counter of malformed-frame
+    /// events that tripped `fail_inflight_no_readbuf`.
+    ///
+    /// Bumped on every invocation of `fail_inflight_no_readbuf` —
+    /// i.e., every time a frame was classified as malformed
+    /// (`MalformedFrameLength`, `FrameTooLarge`, `ReadBufferFull`,
+    /// `InternalCrateBug{ReadCursorAdvance}`). Exposed via public
+    /// accessor `malformed_frame_count()`.
+    ///
+    /// Use case: operators investigating connection-health can
+    /// distinguish "connection died after one malformed frame"
+    /// (bug / transient) from "server kept sending malformed frames
+    /// until tear-down" (adversarial / misconfigured proxy).
+    ///
+    /// Saturating `u16` — overflows stay pinned at `u16::MAX`.
+    malformed_frame_count: u16,
     /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
     /// Load-bearing: the crate-root ambiguous-impl gate verifies that
     /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
@@ -491,28 +514,6 @@ pub struct PgProtocol {
     /// fields is forbidden per user-feedback memory).
     sync_marker: PhantomData<Cell<()>>,
 }
-
-#[cfg(test)]
-impl PgProtocol {
-    /// DEF-184 (A10/B22 audit P1-3): test-only forge hook. Lets
-    /// lib-internal unit tests construct drift states (e.g.
-    /// `ProtoState::ConnectingStartupScram { reply }` paired with
-    /// `scram_state = None`) to exercise
-    /// [`crate::error::CrateBugLocus::ScramStateDrift`] in dispatch.
-    pub(crate) fn test_force_scram_state(
-        &mut self,
-        scram: Option<crate::scram_state::ScramHandshakeState>,
-    ) {
-        self.scram_state = scram;
-    }
-
-    /// DEF-184 (A10/B22 audit P1-3): test-only forge hook for the
-    /// `state` field. See `test_force_scram_state`.
-    pub(crate) fn test_force_state(&mut self, new_state: crate::state::ProtoState) {
-        self.state = new_state;
-    }
-}
-
 
 impl PgProtocol {
     /// DEF-143 bench hook — raw append to `read_buf` without
@@ -567,9 +568,29 @@ impl PgProtocol {
             session_params: SessionParams::new(),
             schema_arena: crate::schema_arena::SchemaArena::new(),
             error_arena: crate::error_arena::ErrorArena::new(),
-            scram_state: None,
+            malformed_frame_count: 0,
             sync_marker: PhantomData,
         }
+    }
+
+    /// DEF-185 P2-9 (audit 2026-04-24): count of malformed-frame
+    /// events that triggered connection teardown.
+    ///
+    /// Every invocation of the internal `fail_inflight_no_readbuf`
+    /// helper bumps this counter — once per fatal wire-level error
+    /// (malformed header length, oversized frame, read-buffer
+    /// overflow, or internal cursor-advance bug).
+    ///
+    /// Zero on a healthy connection; non-zero indicates (a) a single
+    /// protocol desync that triggered teardown, or (b) repeated
+    /// adversarial / buggy frames until teardown. Operators can use
+    /// the value to distinguish these cases.
+    ///
+    /// Saturates at `u16::MAX` (no wrap). Per connection lifetime.
+    #[inline]
+    #[must_use]
+    pub const fn malformed_frame_count(&self) -> u16 {
+        self.malformed_frame_count
     }
 
     /// Borrow the current state. Read-only inspection.
@@ -649,12 +670,11 @@ impl PgProtocol {
         // unused by materialise — pass no read slice).
         let state = &mut self.state;
         let schema_arena = &mut self.schema_arena;
-        let scram_state = &mut self.scram_state;
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
             let prev = core::mem::take(state);
             let (new_state, staged) = {
                 let mut reserved = wb.reserve();
-                compute_push(cmd, prev, &mut reserved, scram_state)
+                compute_push(cmd, prev, &mut reserved)
             };
             *state = new_state;
             materialise(staged, wb.into_bytes(), schema_arena.as_reader())
@@ -848,10 +868,45 @@ impl PgProtocol {
         // loop with no conflict. See struct docstring field
         // comment for full post-mortem.
 
-        let append_err = if matches!(self.state, ProtoState::Errored(_)) {
-            None
+        // DEF-185 P1-6 (audit 2026-04-24): consolidated control flow.
+        //
+        // Pre-fix: scattered state checks at lines 871-875 (decide
+        // whether to append), 892-898 (short-circuit if Errored), and
+        // 902-918 (handle append_err). Logically identical but the
+        // borrow-checker constraints forced the append to fire before
+        // split-borrows, creating a visual disconnect between the
+        // first Errored check and the subsequent handler. A future
+        // refactor touching any single site could easily break the
+        // invariant (e.g. swapping the first check's Some/None
+        // polarity).
+        //
+        // Post-fix: single point of classification. The
+        // `IngressClassification` enum enumerates every legal entry
+        // condition (Errored / AppendFailed / Ok) so the dispatcher
+        // match is tier-1 exhaustive. Each arm has one canonical
+        // handler path.
+        #[derive(Debug)]
+        enum IngressClassification {
+            /// State was already Errored before this call. Skip append,
+            /// clear read_buf, return empty OutActions.
+            AlreadyErrored,
+            /// Append overflowed the read buffer. Clear + FailReply +
+            /// CloseSocket.
+            AppendFailed { attempted: usize, available: usize },
+            /// Append succeeded (or was a no-op for empty bytes). Normal
+            /// dispatch loop.
+            Ok,
+        }
+
+        let classification = if matches!(self.state, ProtoState::Errored(_)) {
+            IngressClassification::AlreadyErrored
         } else {
-            self.read_buf.append(bytes).err()
+            match self.read_buf.append(bytes) {
+                Ok(()) => IngressClassification::Ok,
+                Err(ReadBufFull { attempted, available }) => {
+                    IngressClassification::AppendFailed { attempted, available }
+                }
+            }
         };
 
         // DEF-154 (E): field-level destructure. Closures cannot see
@@ -867,34 +922,35 @@ impl PgProtocol {
         let session_params = &mut self.session_params;
         let schema_arena = &mut self.schema_arena;
         let error_arena = &mut self.error_arena;
-        let scram_state = &mut self.scram_state;
+        let malformed_counter = &mut self.malformed_frame_count;
 
-        if matches!(state, ProtoState::Errored(_)) {
-            read_buf.clear();
-            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                let staged: StagedActions = StagedActions::new();
-                materialise(staged, wb.into_bytes(), schema_arena.as_reader())
-            });
-        }
-
-        // Fast-path: ReadBufFull. Clear read_buf + stage FailReply +
-        // CloseSocket + transition state to Errored.
-        if let Some(ReadBufFull {
-            attempted,
-            available,
-        }) = append_err
-        {
-            read_buf.clear();
-            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                let mut staged: StagedActions = StagedActions::new();
-                fail_inflight_no_readbuf(
-                    state,
-                    scram_state,
-                    ProtocolError::ReadBufferFull { attempted, available },
-                    &mut staged,
-                );
-                materialise(staged, wb.into_bytes(), schema_arena.as_reader())
-            });
+        // DEF-185 P1-6: single classification-driven dispatch.
+        // Exhaustive match on `IngressClassification` — adding a new
+        // variant fails the build here until handler exists.
+        match classification {
+            IngressClassification::AlreadyErrored => {
+                read_buf.clear();
+                return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+                    let staged: StagedActions = StagedActions::new();
+                    materialise(staged, wb.into_bytes(), schema_arena.as_reader())
+                });
+            }
+            IngressClassification::AppendFailed { attempted, available } => {
+                read_buf.clear();
+                return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+                    let mut staged: StagedActions = StagedActions::new();
+                    fail_inflight_no_readbuf(
+                        state,
+                        ProtocolError::ReadBufferFull { attempted, available },
+                        &mut staged,
+                        malformed_counter,
+                    );
+                    materialise(staged, wb.into_bytes(), schema_arena.as_reader())
+                });
+            }
+            IngressClassification::Ok => {
+                // Fall through to main dispatch.
+            }
         }
 
         // Main dispatch. Take shared borrow of populated + cursor
@@ -956,18 +1012,18 @@ impl PgProtocol {
                     HeaderParse::MalformedLength { declared } => {
                         fail_inflight_no_readbuf(
                             state,
-                            scram_state,
                             ProtocolError::MalformedFrameLength { declared },
                             &mut staged,
+                            malformed_counter,
                         );
                         break;
                     }
                     HeaderParse::FrameTooLarge { declared } => {
                         fail_inflight_no_readbuf(
                             state,
-                            scram_state,
                             ProtocolError::FrameTooLarge { declared },
                             &mut staged,
+                            malformed_counter,
                         );
                         break;
                     }
@@ -996,15 +1052,36 @@ impl PgProtocol {
                         if tag == crate::wire::TAG_PARAMETER_STATUS
                             && allows_unsolicited_param_status(state)
                         {
+                            // DEF-185 P2-B (audit 2026-04-24): surface
+                            // MalformedPayload via counter. Pre-fix
+                            // `{}` silently collapsed the outcome;
+                            // post-fix mirrors `n_malformed_bool_dropped`
+                            // for ops diagnostic visibility.
                             match record_param_status(session_params, payload) {
-                                ParamStatusRecordOutcome::Processed
-                                | ParamStatusRecordOutcome::MalformedPayload => {}
+                                ParamStatusRecordOutcome::Processed => {}
+                                ParamStatusRecordOutcome::MalformedPayload => {
+                                    session_params.bump_malformed_param_status();
+                                }
                             }
                             frames_consumed =
                                 frames_consumed.saturating_add(total_len);
                             continue;
                         }
-                        if tag == crate::wire::TAG_NOTICE_RESPONSE {
+                        // DEF-185 P1-E (audit 2026-04-24): NoticeResponse
+                        // filter gated by exhaustive per-variant classifier
+                        // `allows_unsolicited_notice_response`. Pre-auth
+                        // states reject the notice (fall through to the
+                        // dispatch arm which classifies as UnexpectedFrame
+                        // + teardown) — prevents pre-auth attacker-
+                        // controlled text from landing in wrapper logs.
+                        //
+                        // DEF-185 P2-3 (audit 2026-04-24): bump counter
+                        // for operator visibility (adversarial notice
+                        // flood detection).
+                        if tag == crate::wire::TAG_NOTICE_RESPONSE
+                            && allows_unsolicited_notice_response(state)
+                        {
+                            session_params.bump_notice_response();
                             frames_consumed =
                                 frames_consumed.saturating_add(total_len);
                             continue;
@@ -1037,7 +1114,6 @@ impl PgProtocol {
                             &mut reserved,
                             &mut arena_writer,
                             error_arena,
-                            scram_state,
                         );
                         match outcome {
                             DispatchOutcome::AdvancedSilent => {
@@ -1131,11 +1207,11 @@ impl PgProtocol {
                 // FailReply via fail_inflight.
                 fail_inflight_no_readbuf(
                     state,
-                    scram_state,
                     ProtocolError::InternalCrateBug {
                         locus: crate::error::CrateBugLocus::ReadCursorAdvance,
                     },
                     &mut staged,
+                    malformed_counter,
                 );
             }
 
@@ -1239,12 +1315,32 @@ impl PgProtocol {
         self.error_arena.get(r)
     }
 
-    // DEF-184 (A10/B22 audit P1-3): test-only forge hooks live in
-    // `pub(crate)` methods below. They're gated by `#[cfg(test)]` at
-    // the crate level AND pub(crate) so integration tests in `tests/`
-    // cannot see them; only lib-internal unit tests in `#[cfg(test)]
-    // mod` blocks within `src/` can drive them. The drift-arm tests
-    // live in `src/scram_state.rs` test module.
+    /// DEF-185 P2-G (audit 2026-04-24): operator-facing canary for
+    /// ErrorArena slot-overwrite events.
+    ///
+    /// Returns the number of times `parse_error_response` has alloc'd
+    /// into the arena while the slot was already occupied — an
+    /// architecturally-dead event under the current single-inflight
+    /// state machine (the dispatch layer clears the arena at each
+    /// entry-point when state is Idle/Errored, before the next cycle
+    /// can trigger another error-response parse).
+    ///
+    /// A non-zero value on a live connection indicates a protocol-
+    /// layer invariant break — wrappers surfacing this in their
+    /// health checks get an early-warning signal for pipelining /
+    /// dispatch-refactor regressions. 1c-5 pipelining support is
+    /// expected to replace the single-slot arena with a slab; this
+    /// canary stays meaningful until that refactor lands.
+    #[inline]
+    #[must_use]
+    pub fn error_arena_overwrite_count(&self) -> u16 {
+        self.error_arena.overwrite_count()
+    }
+
+    // DEF-184 (A10/B22 revert 2026-04-24): no test-only forge hooks.
+    // Post-revert the variant-carries-field invariant is tier-1 compile,
+    // so drift states simply cannot be constructed — tests exercise
+    // SCRAM flow via real wire bytes through the public API.
 
     /// DEF-184 (audit #3 A-02): Display adapter that resolves a
     /// [`crate::error::ProtocolError`] with `ServerErrorResponse`-arena
@@ -1326,6 +1422,25 @@ impl PgProtocol {
         self.schema_arena.as_reader()
     }
 
+    /// DEF-185 P0-E: check if a SchemaRef currently resolves in the
+    /// schema arena, WITHOUT returning a borrow into the arena.
+    ///
+    /// Used by `row_stream::RowStream::fast_path_data_row` to split
+    /// the stale-ref check from the `Row` emission: the check happens
+    /// via a `bool` return (no lifetime propagation), freeing the
+    /// arm's `else` branch to take `&mut self.proto` for the
+    /// `install_errored_stale_schema_ref` transition.
+    ///
+    /// Returning the full `Option<&RowDesc>` as the arena reader
+    /// does ties the caller's control-flow lifetime into the match
+    /// expression's unified return type, preventing the else arm's
+    /// `&mut` re-borrow.
+    #[inline]
+    #[must_use]
+    pub(crate) fn schema_arena_has(&self, r: crate::schema_arena::SchemaRef) -> bool {
+        self.schema_arena.as_reader().get(r).is_some()
+    }
+
     /// DEF-154 (X): if current state is a row-streaming variant,
     /// return `(reply_id, schema_ref)`. Otherwise `None`.
     ///
@@ -1389,6 +1504,35 @@ impl PgProtocol {
         let cause = ProtocolError::MalformedDataRow { total_len: 0 };
         let state_kind = cause.state_kind();
         self.state = ProtoState::Errored(state_kind);
+    }
+
+    /// DEF-185 P0-E (audit 2026-04-24): transition to `Errored(Internal)`
+    /// for a stale SchemaRef detected in the RowStream fast-path.
+    ///
+    /// Pre-fix: `fast_path_data_row` set `self.drained = true` and
+    /// emitted `StreamItem::FailReply { locus: StaleSchemaRef }` WITHOUT
+    /// transitioning state. The caller saw FailReply but `ProtoState`
+    /// stayed `SimpleQueryStreamingRows` — next `push_command` would
+    /// classify as CommandInProgress, and the connection effectively
+    /// became zombie without `CloseSocket` signal. Wrapper had no
+    /// reliable way to notice teardown was required.
+    ///
+    /// Post-fix: this helper transitions state to Errored before
+    /// returning the FailReply; subsequent `feed_bytes` sees Errored
+    /// state and short-circuits the dispatch loop, the next user
+    /// command returns ConnectionAlreadyClosed instead of the
+    /// wrong CommandInProgress. Caller receives FailReply + can drop
+    /// the protocol to release the socket.
+    ///
+    /// Arm is architecturally dead under correct arena lifecycle
+    /// (clear_arena_if_idle_or_errored + generational refs), but tier-2
+    /// classified via InternalCrateBug::StaleSchemaRef locus.
+    #[inline]
+    pub(crate) fn install_errored_stale_schema_ref(&mut self) {
+        let cause = ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::StaleSchemaRef,
+        };
+        self.state = ProtoState::Errored(cause.state_kind());
     }
 
     /// DEF-154 (X) P0-2(c): construct a pull-based row stream
@@ -1459,43 +1603,29 @@ impl PgProtocol {
 #[cold]
 fn fail_inflight_no_readbuf(
     state: &mut ProtoState,
-    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
     cause: ProtocolError,
     staged: &mut StagedActions,
+    malformed_counter: &mut u16,
 ) {
     if matches!(state, ProtoState::Errored(_)) {
-        // Already terminal. Still clear scram_state defensively —
-        // a path that re-enters with Errored state but non-None
-        // scram_state is a prior invariant violation; clearing is
-        // zeroize hygiene regardless.
-        *scram_state = None;
         return;
     }
+    // DEF-185 P2-9 (audit 2026-04-24): bump counter before transitioning.
+    // This fires on every classified fatal wire event — operator-facing
+    // canary (exposed via `PgProtocol::malformed_frame_count`). Saturating
+    // add keeps the counter pinned at u16::MAX on extreme flood.
+    *malformed_counter = malformed_counter.saturating_add(1);
     // DEF-154 (I): total state_kind — no unwrap_or_else + debug_assert.
     let state_kind = cause.state_kind();
+    // DEF-184 (A10/B22 revert 2026-04-24): `mem::replace` drops the
+    // previous state, which may be a SCRAM variant carrying
+    // `ScramSession`. `ScramSession`'s `ZeroizeOnDrop` fires here
+    // automatically — password bytes scrubbed in the drop path of
+    // `prev`. No explicit `scram_state = None` step needed post-revert
+    // because there IS no separate scram_state field — SCRAM data
+    // lives inline in the state variant and rides the drop glue.
     let prev = core::mem::replace(state, ProtoState::Errored(state_kind));
     let raw_id = prev.take_inflight_reply_raw_id();
-    // DEF-184 (audit-P0, 2026-04-24): zeroize hygiene — clear
-    // scram_state atomically with the Errored transition.
-    //
-    // Pre-fix: this function only set state = Errored; if we entered
-    // from a SCRAM phase (ConnectingStartupScram / AwaitingServerFirst
-    // / AwaitingServerFinal) via one of the fast-path fail triggers
-    // (pending_advance_err, ReadBufFull, etc.), `scram_state` would
-    // linger as `Some(Session/AwaitingFirst/AwaitingFinal { .. })`
-    // holding password HMAC material until next `push_startup`
-    // overwrote the slot OR `PgProtocol` itself dropped. On a
-    // long-lived terminal-Errored connection (pool discarding
-    // post-SCRAM-error entries lazily) the password could linger
-    // for seconds. CVE-class per CREDO §7 axis 11 (secret-lifetime
-    // discipline).
-    //
-    // Post-fix: unconditional clear on Errored transition. Drop
-    // invokes `ScramSession`'s `ZeroizeOnDrop` — password bytes
-    // scrubbed immediately. `#[cold]` Errored path absorbs the
-    // Option::take (one store on None → None; one drop call + store
-    // on Some → None). Zero hot-path impact.
-    *scram_state = None;
     match raw_id {
         Some(id) => {
             emit_actions!(staged, budget: 2, [
@@ -1544,7 +1674,6 @@ fn compute_push(
     cmd: PgCommand,
     state: ProtoState,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
 ) -> (ProtoState, StagedActions) {
     let mut staged = StagedActions::new();
     let new_state = match cmd {
@@ -1564,7 +1693,6 @@ fn compute_push(
             reply,
             &mut staged,
             reserved,
-            scram_state,
         ),
         PgCommand::SimpleQuery { sql, reply } => {
             compute_push_simple_query(state, &sql, reply, &mut staged, reserved)
@@ -1679,7 +1807,7 @@ fn compute_push_ping(
 /// — a future refactor that breaks the const drift-guard on
 /// `MAX_OWNED_SEND_LEN` classifies as a typed reply failure instead of
 /// silent truncation.
-#[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator + scram_state slot. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
+#[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
 fn compute_push_startup(
     state: ProtoState,
     user: Ident,
@@ -1689,7 +1817,6 @@ fn compute_push_startup(
     reply: ReplyId<crate::reply_id::StartupKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    scram_state: &mut Option<crate::scram_state::ScramHandshakeState>,
 ) -> ProtoState {
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
@@ -1717,12 +1844,18 @@ fn compute_push_startup(
             match credentials {
                 Credentials::Trust => ProtoState::ConnectingStartupTrust { reply },
                 Credentials::ScramPassword(password) => {
-                    // DEF-184 (A10/B22): heavy SCRAM session moves off
-                    // state. Pair: thin state variant + scram_state
-                    // holding ScramSession. Set atomically.
-                    let session = crate::scram::session::ScramSession::from_password(password);
-                    *scram_state = Some(crate::scram_state::ScramHandshakeState::Session(session));
-                    ProtoState::ConnectingStartupScram { reply }
+                    // DEF-184 (A10/B22 revert 2026-04-24): tier-1
+                    // restored — ScramSession lives INSIDE the
+                    // variant. Variant-carries-field invariant is
+                    // compile-enforced: a future refactor cannot
+                    // construct ConnectingStartupScram without a
+                    // ScramSession (CREDO §1: safety > tier-1 > perf).
+                    // ZeroizeOnDrop on ScramSession fires on
+                    // mem::replace / mem::take in fail_inflight_no_readbuf
+                    // and subsequent state transitions.
+                    let scram =
+                        crate::scram::session::ScramSession::from_password(password);
+                    ProtoState::ConnectingStartupScram { reply, scram }
                 }
             }
         },
@@ -2438,6 +2571,66 @@ const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
     }
 }
 
+/// DEF-185 P1-E (audit 2026-04-24): exhaustive classifier for
+/// `NoticeResponse` frame acceptance, mirroring
+/// [`allows_unsolicited_param_status`].
+///
+/// Pre-fix: `feed_bytes_impl`'s pre-dispatch filter unconditionally
+/// skipped any `TAG_NOTICE_RESPONSE` frame regardless of state. The
+/// catch-all allowed a malicious or buggy server to send notices
+/// during pre-auth SCRAM states — silently consumed, no classification.
+/// If a future ProtoState variant needs to reject notices (raw-passthrough
+/// mode, perhaps), the unconditional filter would silently swallow
+/// them without a compile-fail signal.
+///
+/// Post-fix: filter uses this per-variant exhaustive classifier. Adding
+/// a new ProtoState variant fails the build here until the contributor
+/// decides how that state handles unsolicited notices.
+///
+/// PG server behaviour (§48.5 "Asynchronous Operations"): NoticeResponse
+/// may arrive at any time after connection start, BUT our client
+/// enforces a stricter client-side invariant: notices are only accepted
+/// in states where they would be delivered to the wrapper's async
+/// logging channel. Pre-auth states (Connecting*) reject notices to
+/// ensure nothing from the server is trusted before authentication
+/// completes — a pre-auth MITM-injected notice could carry
+/// attacker-controlled text that ends up in operator logs.
+const fn allows_unsolicited_notice_response(state: &ProtoState) -> bool {
+    match state {
+        ProtoState::Idle
+        | ProtoState::PingAwaitingRfq(_)
+        | ProtoState::ConnectingPostAuthAwaitingKey(_)
+        | ProtoState::ConnectingPostAuthHaveKey { .. }
+        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
+        | ProtoState::SimpleQueryStreamingRows { .. }
+        | ProtoState::SimpleQueryAwaitingRfq { .. }
+        | ProtoState::DrainRfqAfterError
+        | ProtoState::ParseAwaitingParseComplete(_)
+        | ProtoState::ParseAwaitingRfq(_)
+        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
+        | ProtoState::BindExecuteAwaitingRfqDml { .. }
+        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
+        | ProtoState::BindExecuteStreamingRows { .. }
+        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
+        | ProtoState::DescribeStatementAwaitingParamDesc(_)
+        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
+        | ProtoState::DescribeStatementAwaitingRfq { .. }
+        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
+        | ProtoState::DescribePortalAwaitingRfq { .. } => true,
+        // Pre-auth: reject notices to avoid operator-log contamination
+        // by pre-auth attacker-controlled text (§48.5 permissive-but-
+        // client-tightened policy).
+        ProtoState::ConnectingStartupTrust { .. }
+        | ProtoState::ConnectingStartupScram { .. }
+        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        | ProtoState::ConnectingScramAwaitingAuthOk(_)
+        | ProtoState::Errored(_) => false,
+    }
+}
+
 /// Classification of a `record_param_status` call's outcome.
 ///
 /// F35 (2026-04-21): pre-F35 the function returned `()` and
@@ -2823,26 +3016,41 @@ mod allows_unsolicited_param_status_tests {
         assert!(!allows_unsolicited_param_status(&startup_trust));
         consume_state(startup_trust);
 
-        // ConnectingStartupScram — DEF-097 typestate carrying a
-        // DEF-184 (A10/B22): SCRAM state variants are thin post-refactor.
-        // Heavy data (ScramSession, client_first_bare, client_nonce_b64,
-        // expected_server_sig) lives on PgProtocol::scram_state now.
-        // These fixtures only need the thin state variant for the
-        // `allows_unsolicited_param_status` classification test.
-        let startup_scram = ProtoState::ConnectingStartupScram {
-            reply: ReplyId::from_raw(nz(4001)),
-        };
-        assert!(!allows_unsolicited_param_status(&startup_scram));
-        consume_state(startup_scram);
+        // ConnectingStartupScram — DEF-097 typestate carrying
+        // ScramSession inline (DEF-184 A10/B22 revert 2026-04-24:
+        // tier-1 variant-carries-field restoration). The classification
+        // test only reads the variant tag, but the variant cannot be
+        // constructed without its required SCRAM data — that is the
+        // tier-1 invariant under test.
+        if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
+            let scram = crate::scram::session::ScramSession::from_password(
+                crate::sensitive::Sensitive::new(pw),
+            );
+            let startup_scram = ProtoState::ConnectingStartupScram {
+                reply: ReplyId::from_raw(nz(4001)),
+                scram,
+            };
+            assert!(!allows_unsolicited_param_status(&startup_scram));
+            consume_state(startup_scram);
+        }
 
-        let scram_first = ProtoState::ConnectingScramAwaitingServerFirst {
-            reply: ReplyId::from_raw(nz(5)),
-        };
-        assert!(!allows_unsolicited_param_status(&scram_first));
-        consume_state(scram_first);
+        if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
+            let scram = crate::scram::session::ScramSession::from_password(
+                crate::sensitive::Sensitive::new(pw),
+            );
+            let scram_first = ProtoState::ConnectingScramAwaitingServerFirst {
+                reply: ReplyId::from_raw(nz(5)),
+                scram,
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
+            };
+            assert!(!allows_unsolicited_param_status(&scram_first));
+            consume_state(scram_first);
+        }
 
         let scram_final = ProtoState::ConnectingScramAwaitingServerFinal {
             reply: ReplyId::from_raw(nz(6)),
+            expected_server_sig: crate::scram::types::SecretDigest::new([0_u8; 32]),
         };
         assert!(!allows_unsolicited_param_status(&scram_final));
         consume_state(scram_final);
@@ -3065,10 +3273,9 @@ mod compute_push_tests {
         state: ProtoState,
     ) -> (ProtoState, heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL>) {
         let mut wb = WriteBuf::new();
-        let mut scram_state = None;
         wb.with_branded(|mut wb| {
             let mut reserved = wb.reserve();
-            let (new_state, staged) = compute_push(cmd, state, &mut reserved, &mut scram_state);
+            let (new_state, staged) = compute_push(cmd, state, &mut reserved);
             let mut obs: heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL> = heapless::Vec::new();
             for a in &staged {
                 obs.push(StagedObs::from_staged(a)).unwrap_or_else(|_| {
@@ -3202,14 +3409,19 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingStartupScram — post-(A10/B22) the state variant is
-        // thin; ScramSession lives on PgProtocol::scram_state. Direct
-        // state construction just needs the reply id.
-        {
+        // ConnectingStartupScram — DEF-184 A10/B22 revert 2026-04-24:
+        // tier-1 variant-carries-field restored. `scram: ScramSession`
+        // lives INSIDE this variant — the variant cannot be constructed
+        // without it.
+        if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
             let raw_prev = nz(201_050);
             let raw_new = nz(201_051);
+            let scram = crate::scram::session::ScramSession::from_password(
+                crate::sensitive::Sensitive::new(pw),
+            );
             let prev = ProtoState::ConnectingStartupScram {
                 reply: ReplyId::from_raw(raw_prev),
+                scram,
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -3227,12 +3439,20 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingScramAwaitingServerFirst — thin state variant post-A10.
-        {
+        // ConnectingScramAwaitingServerFirst — variant carries
+        // `scram: ScramSession` + `client_first_bare` + `client_nonce_b64`
+        // inline per tier-1 invariant.
+        if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
             let raw_prev = nz(203);
             let raw_new = nz(204);
+            let scram = crate::scram::session::ScramSession::from_password(
+                crate::sensitive::Sensitive::new(pw),
+            );
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
+                scram,
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -3254,12 +3474,14 @@ mod compute_push_tests {
             consume_state(new_state);
         }
 
-        // ConnectingScramAwaitingServerFinal.
+        // ConnectingScramAwaitingServerFinal — variant carries
+        // `expected_server_sig: SecretDigest` inline per tier-1 invariant.
         {
             let raw_prev = nz(205);
             let raw_new = nz(206);
             let prev = ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(raw_prev),
+                expected_server_sig: crate::scram::types::SecretDigest::new([0_u8; 32]),
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -3491,12 +3713,20 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingStartupScram — post-(A10/B22) thin variant.
-        if let Some(user) = mk_user() {
+        // ConnectingStartupScram — DEF-184 A10/B22 revert 2026-04-24:
+        // variant carries `scram: ScramSession` inline per tier-1
+        // invariant. Construction requires SCRAM data.
+        if let Some(user) = mk_user()
+            && let Ok(pw) = crate::password::Password::try_from_bytes(b"pw")
+        {
             let raw_prev = nz(405_100);
             let raw_new = nz(405_101);
+            let scram = crate::scram::session::ScramSession::from_password(
+                crate::sensitive::Sensitive::new(pw),
+            );
             let prev = ProtoState::ConnectingStartupScram {
                 reply: ReplyId::from_raw(raw_prev),
+                scram,
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
@@ -3513,12 +3743,20 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingScramAwaitingServerFirst — post-(A10/B22) thin variant.
-        if let Some(user) = mk_user() {
+        // ConnectingScramAwaitingServerFirst — tier-1 variant-carries-field.
+        if let Some(user) = mk_user()
+            && let Ok(pw) = crate::password::Password::try_from_bytes(b"pw")
+        {
             let raw_prev = nz(405);
             let raw_new = nz(406);
+            let scram = crate::scram::session::ScramSession::from_password(
+                crate::sensitive::Sensitive::new(pw),
+            );
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
+                scram,
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
@@ -3539,12 +3777,13 @@ mod compute_push_tests {
             consume_state(new_state);
         }
 
-        // ConnectingScramAwaitingServerFinal.
+        // ConnectingScramAwaitingServerFinal — `expected_server_sig` inline.
         if let Some(user) = mk_user() {
             let raw_prev = nz(407);
             let raw_new = nz(408);
             let prev = ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(raw_prev),
+                expected_server_sig: crate::scram::types::SecretDigest::new([0_u8; 32]),
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);

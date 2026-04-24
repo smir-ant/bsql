@@ -213,13 +213,131 @@ Shipped batches (commit-anchored):
 - **DEF-143 bench harness** — `04df157`, `8df975f` (per-row throughput), `1ff4076` (feature-gate hook)
 - **A7 — MEASURED REJECTED** — `1a762ca`
 
-### DEF-185 (unstable-Rust blockers — see §C)
+### DEF-184 A10/B22 REVERTED (2026-04-24)
+- **Reverted:** SCRAM hot/cold split — restored tier-1 variant-carries-field
+  per CREDO §1 (safety > tier-1 > perf). Pre-revert split demoted the
+  correlation invariant to tier-2 classified `ScramStateDrift` +
+  introduced zeroize-hygiene gap on non-dispatch fail paths. Post-revert
+  `ProtoState` grew 80 → ~712 B but variant-carries-field is compile-
+  enforced + `ZeroizeOnDrop` fires automatically on every state
+  transition via variant drop glue. `src/scram_state.rs` deleted (577
+  lines), `CrateBugLocus::ScramStateDrift` removed, `PgProtocol::scram_state`
+  field removed. Architect audit confirmed tier-1 genuine + hygiene
+  correct on every exit path.
+- **Cost:** ~632 B × N dispatches memcpy (2-3 frames/SCRAM handshake);
+  below audit-sensitivity threshold.
+- **Architect findings:** 2 cosmetic (tight size pins + docstring
+  clarification), both implemented.
+
+### DEF-185 (security hardening — tripled architect audit, 2026-04-24)
+Post-A10/B22-revert comprehensive audit via 3 parallel architect agents
+(runtime safety, crypto/secrets, protocol/DoS). **All 33 actionable
+findings closed** — 6 P0 + 14 P1 + 13 P2/P3.
+
+**P0 (safety-critical, ship-blockers):**
+- **P0-A** `panic = "abort"` vs `ZeroizeOnDrop` trade-off documented in
+  `Cargo.toml` with 3-option design space (unwind / mlock / pre-abort
+  hook). Current stance: keep abort + honest docs + Zeroizing scope
+  guards for defense-in-depth.
+- **P0-B** `WriteBuf::clear()` zeroizes backing bytes + `Drop` impl;
+  SASL ClientProof / SQL history no longer lingers.
+- **P0-C** Same for `ReadBuf::clear()` + `Drop`; server signatures /
+  query history scrubbed.
+- **P0-D** `compute_client_proof` — `stored_key` + `client_signature`
+  wrapped in `Zeroizing<[u8; 32]>`; `hmac_sha256` / `hmac_auth_message`
+  return `Zeroizing` typed.
+- **P0-E** `install_errored_stale_schema_ref` helper — StaleSchemaRef
+  now transitions state to Errored + emits CloseSocket (pre-fix: zombie
+  connection with no teardown signal).
+- **P0-F** 5 zero-body frames (`EmptyQueryResponse` / `ParseComplete` /
+  `BindComplete` / `NoData` / `CloseComplete`) strict slice-pattern `[]`
+  validation; new `ProtocolError::UnexpectedFrameBody` variant closes
+  tier-4 spec drift.
+
+**P1 (tier uplifts + docs):**
+- **P1-A** `proof_b64_buf` / `client_final_msg` — Zeroizing + explicit
+  post-use `zeroize()` call (heapless::Vec doesn't impl Zeroize).
+- **P1-B** `parse_server_final` — `<[u8; 32]>::try_from` replaces
+  dead-arm silent `SecretDigest::new([0; 32])` fallback.
+- **P1-C** `StartupCompletePayload::Debug` manual redact for
+  `secret_key` (CancelRequest capability token leak class).
+- **P1-D** SCRAM `parse_server_first` / `parse_server_final` accept
+  RFC 5802 extensions (PgBouncer/proxy interop).
+- **P1-E** `allows_unsolicited_notice_response` exhaustive classifier —
+  pre-auth states reject notices (avoids attacker-controlled text in
+  operator logs).
+- **P1-F** `TAG_CLOSE_COMPLETE` narrowed to `pub(crate)` until
+  1c-6 Close-frame support.
+- **P1-G** `DrainRfqAfterError` uses `parse_rfq_payload` for uniform
+  tx_status validation.
+- **P1-H** `const_assert!(READ_BUF_CAP <= u16::MAX)` drift pin in
+  `protocol.rs` couples to `frames_consumed: u16`.
+- **P1-I** `ScopedTestNonce` RAII guard — panic-safe cleanup.
+- **P1-3** Fast-path DataRow rejects `body_len < 2` (can't carry
+  column-count header) via MalformedDataRow.
+- **P1-6** `IngressClassification` enum consolidates scattered
+  control flow in `feed_bytes_impl` into exhaustive match.
+
+**P2 (hygiene + diagnostics):**
+- **P2-A** `MAX_SCRAM_ITERATIONS: 10M → 100K` — DoS surface closed
+  (pre-fix allowed ~2s PBKDF2/connection attempt).
+- **P2-B** `n_malformed_param_status_dropped` counter in SessionParams.
+- **P2-C** `BackendKeyData.secret_key` trade-off documented (inline i32
+  vs `Sensitive<i32>` — ergonomic cost vs zeroize discipline).
+- **P2-D** `FixedStr::was_lossy()` accessor + `was_lossy_flag` bit
+  (distinguish legitimate `?` chars from lossy UTF-8 coercion).
+- **P2-E** `MAX_PASSWORD_LEN` docs synced (1024 → 512) + symbolic
+  boundary test (`MAX_PASSWORD_LEN + 1`).
+- **P2-F** SCRAM `n=""` PG-convention documented at call site.
+- **P2-G** `ErrorArena::overwrite_count()` canary + public
+  `PgProtocol::error_arena_overwrite_count()` accessor.
+- **P2-H** base64 strict RFC 4648 stance documented (no whitespace
+  relax per CREDO §1 safety > interop).
+- **P2-3** `n_notice_response_dropped` counter in SessionParams.
+- **P2-9** `PgProtocol::malformed_frame_count()` accessor — operator
+  canary for repeated adversarial framing.
+- **P2-7** `parse_command_tag` rejects embedded NUL as malformed.
+- **P2-4/6/8/10** explicit boundary coverage tests for ErrorResponse
+  max-fields / RowDescription max-cap / ParameterDescription n=0 /
+  DataRow short-body.
+
+**P3 (coverage gaps):**
+- **P3-1** Memory-probe tests (pointer read post-drop) verify
+  `ZeroizeOnDrop` actually scrubs backing buffer; `#[ignore]` by
+  default, Miri-compatible.
+- **P3-4** `ScopedForceRngFailure` test-only RAII guard exercises
+  `ScramError::RandomnessUnavailable` path.
+- **P3-5** 3 structured fuzz tests × 5K iterations each (deterministic
+  xorshift) on SCRAM parsers — no panic / silent desync in 15K random
+  inputs.
+- **P3-B/C/F/G/H** + misc via 12 tests in new `audit_coverage_spec.rs`.
+
+**Test growth:** 235 → 254 passing + 2 memory-probe `#[ignore]` that
+pass via `--ignored`. Total 256 test outcomes green.
+
 ### DEF-186 (DEF-184 session bonus findings — folded into main commits)
 ### DEF-187 (DEF-184 batch 7-9 stragglers — individually dispositioned)
 
 ---
 
 ## §E. Session log — last 3 sessions (compact)
+
+### 2026-04-24 — DEF-184 A10/B22 revert + DEF-185 security audit
+- A10/B22 SCRAM externalisation REVERTED — tier-1 variant-carries-field
+  restored per CREDO §1 (safety > tier-1 > perf). `src/scram_state.rs`
+  deleted (577 lines); `CrateBugLocus::ScramStateDrift` + field removed.
+  Architect audit confirmed tier-1 genuine + zeroize hygiene correct.
+- DEF-185 three-angle architect audit: 33 actionable findings closed
+  (6 P0 + 14 P1 + 13 P2/P3). Key items: ReadBuf/WriteBuf zero-on-clear,
+  Zeroizing<[u8;32]> cascade in crypto.rs, UnexpectedFrameBody variant
+  for 5 zero-body frames, StaleSchemaRef teardown fix, RFC 5802
+  extensions, SCRAM iteration cap 10M→100K.
+- Coverage expansion: `audit_coverage_spec.rs` (12 tests),
+  `scram_fuzz_spec.rs` (3 tests × 5K iters = 15K fuzz inputs),
+  `scram_zeroize_miri_spec.rs` (memory-probe tests via unsafe
+  pointer read under `tests/` lint-allowance).
+- Test count 235 → 254 passing + 2 `#[ignore]` memory probes.
+- `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ### 2026-04-24 — DEF-143 bench harness + A7 measurement
 - DEF-163 partial (`252ed6b`): 7 sub-items — size baselines split,

@@ -352,6 +352,42 @@ pub struct SessionParams {
     /// Saturating `u16` — overflows stay pinned at `u16::MAX` rather
     /// than wrapping.
     pub n_malformed_bool_dropped: u16,
+    /// Number of `ParameterStatus` frames with malformed payload
+    /// (e.g. missing NUL separator between key and value, or missing
+    /// trailing NUL) the protocol layer consumed without surfacing.
+    ///
+    /// # DEF-185 P2-B (audit 2026-04-24)
+    ///
+    /// Pre-fix: [`crate::record_param_status`]'s
+    /// `ParamStatusRecordOutcome::MalformedPayload` outcome was
+    /// silently collapsed into `{}` at the dispatch filter site
+    /// (`protocol.rs` pre-dispatch filter). No visibility for
+    /// operators investigating proxy-injection / wire-corruption
+    /// incidents. Post-fix: this counter increments on each malformed
+    /// payload — mirrors the existing `n_unknown_dropped` /
+    /// `n_malformed_bool_dropped` pattern for ops diagnostic parity.
+    ///
+    /// Saturating `u16` — overflows stay pinned at `u16::MAX`.
+    pub n_malformed_param_status_dropped: u16,
+    /// Number of `NoticeResponse` frames the protocol silently consumed.
+    ///
+    /// # DEF-185 P2-3 (audit 2026-04-24)
+    ///
+    /// Pre-fix: `NoticeResponse` was unconditionally skipped by the
+    /// pre-dispatch filter with no visibility. A server flooding the
+    /// client with notices (adversarial or mis-configured) burned
+    /// bandwidth silently. Post-DEF-185 P1-E the filter gates by state,
+    /// and now this counter surfaces the count for operator
+    /// diagnostics — parallel to `n_unknown_dropped` /
+    /// `n_malformed_bool_dropped` / `n_malformed_param_status_dropped`.
+    ///
+    /// A non-zero value signals the server is emitting notices that
+    /// bsql-pg-proto is discarding at the protocol layer (Phase 1d
+    /// will route these to an `Action::EmitNotice` stream; for now
+    /// the counter lets ops detect the pattern).
+    ///
+    /// Saturating `u16` — overflows stay pinned at `u16::MAX`.
+    pub n_notice_response_dropped: u16,
 }
 
 impl SessionParams {
@@ -371,7 +407,27 @@ impl SessionParams {
             time_zone: None,
             n_unknown_dropped: 0,
             n_malformed_bool_dropped: 0,
+            n_malformed_param_status_dropped: 0,
+            n_notice_response_dropped: 0,
         }
+    }
+
+    /// DEF-185 P2-B: bump the `n_malformed_param_status_dropped`
+    /// counter. Called from `protocol.rs`'s pre-dispatch filter when
+    /// `record_param_status` returns `MalformedPayload` outcome.
+    #[inline]
+    pub fn bump_malformed_param_status(&mut self) {
+        self.n_malformed_param_status_dropped =
+            self.n_malformed_param_status_dropped.saturating_add(1);
+    }
+
+    /// DEF-185 P2-3: bump the `n_notice_response_dropped` counter.
+    /// Called from `protocol.rs`'s pre-dispatch filter when a
+    /// NoticeResponse is silently consumed.
+    #[inline]
+    pub fn bump_notice_response(&mut self) {
+        self.n_notice_response_dropped =
+            self.n_notice_response_dropped.saturating_add(1);
     }
 
     /// Record a parameter from the server.

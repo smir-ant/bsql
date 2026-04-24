@@ -230,8 +230,34 @@ impl ReadBuf {
     /// Reset the buffer to empty.
     ///
     /// Used on connection teardown / errored state transitions.
+    ///
+    /// # DEF-185 P0-C (audit 2026-04-24): zero-on-clear discipline
+    ///
+    /// `heapless::Vec::clear()` by itself only resets length to 0 —
+    /// the backing bytes persist in the 4096-byte array until a later
+    /// `append()` overwrites them. For SCRAM handshakes this kept the
+    /// server-final message on the connection's stack: the bytes
+    /// `"v=<base64_signature>"` where `signature = HMAC(ServerKey,
+    /// AuthMessage)` and `ServerKey = HMAC(SaltedPassword, "Server Key")`
+    /// are **password-correlated** (though a passive wire attacker
+    /// already sees them, a core-dump attacker reads them directly
+    /// from client memory with one less network hop). More importantly,
+    /// long-lived connections accumulate arbitrary SQL statement
+    /// history — `INSERT INTO users (password) VALUES ('...')`,
+    /// `SELECT secret FROM vault WHERE id=...`, session tokens, API
+    /// keys — all in the backing array.
+    ///
+    /// Post-fix: overwrite the occupied prefix with zeros before
+    /// truncating the length. Cost: O(len) memset; on READ_BUF_CAP =
+    /// 4 KiB and L1-cache resident, negligible vs. the typical syscall
+    /// that preceded the clear.
+    ///
+    /// Pairs with manual `Drop` below: clear() handles reuse;
+    /// `Drop` handles stack-frame teardown.
     #[inline]
     pub fn clear(&mut self) {
+        use zeroize::Zeroize;
+        self.inner.as_mut_slice().zeroize();
         self.inner.clear();
         self.cursor = 0;
     }
@@ -265,6 +291,28 @@ impl ReadBuf {
         // never panics, only shortens.
         self.inner.truncate(unread_len);
         self.cursor = 0;
+    }
+}
+
+/// DEF-185 P0-C (audit 2026-04-24): manual Drop impl zeroizes the
+/// occupied prefix on scope teardown.
+///
+/// Rationale: `heapless::Vec` does NOT implement `zeroize::Zeroize`
+/// (upstream bound requires `Default + Copy` which Vec lacks). Scrub
+/// manually via `Zeroize` on the mut slice (impl'd on `[u8]`). When a
+/// wrapper's connection handle goes out of scope the backing 4096-byte
+/// array is scrubbed — protocol-level SCRAM signatures and any SQL
+/// history from prior frames vanish from memory.
+///
+/// Caveat per DEF-185 P0-A: under `panic = "abort"` Drop does NOT run
+/// on panic paths. This claim holds for the normal-control-flow path
+/// only; true memory hygiene under panic requires either `panic =
+/// "unwind"` or `mlock`+explicit scrub — flagged for separate design
+/// discussion.
+impl Drop for ReadBuf {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.inner.as_mut_slice().zeroize();
     }
 }
 

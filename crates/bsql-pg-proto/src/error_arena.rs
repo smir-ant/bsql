@@ -293,6 +293,22 @@ const SLOT_OCCUPIED_MARKER: core::num::NonZeroU8 = core::num::NonZeroU8::MIN;
 /// entry-point when state is Idle/Errored.
 #[derive(Debug)]
 pub(crate) struct ErrorArena {
+    /// DEF-185 P2-G (audit 2026-04-24): counter of
+    /// `alloc_while_occupied` events — incremented each time `alloc`
+    /// overwrites a previously-occupied slot. Architecturally dead
+    /// under current single-inflight state machine (`parse_error_response`
+    /// fires at most once per feed_bytes call, and the
+    /// arena is cleared at entry-point boundaries before the next
+    /// cycle). Documented 1c-5 blocker for pipelining support.
+    ///
+    /// Until pipelining lands this counter is monotonically zero;
+    /// operators investigating anomalies can use a non-zero value as
+    /// a protocol-layer canary. `saturating_add` keeps the counter at
+    /// `u16::MAX` rather than wrapping. `u16` rather than `u32`
+    /// because overflow would require 65k+ classified-dead events per
+    /// connection — a clear protocol break not diluted by pin
+    /// widening.
+    overwrite_count: u16,
     /// `None` = free, `Some(payload)` = occupied. Populated only
     /// by [`alloc`]; reset to `None` by [`clear`].
     slot: Option<ErrorPayload>,
@@ -319,7 +335,22 @@ impl ErrorArena {
         Self {
             slot: None,
             generation: 0,
+            overwrite_count: 0,
         }
+    }
+
+    /// DEF-185 P2-G: count of architecturally-dead "alloc while slot
+    /// was occupied" events. Zero under correct dispatch-layer
+    /// invariants (single-inflight state machine clears the arena
+    /// before each new cycle). A non-zero value signals a protocol-
+    /// layer invariant break — operator-facing canary.
+    ///
+    /// Surfaced via [`crate::PgProtocol::error_arena_overwrite_count`]
+    /// so wrappers can expose the canary in their health checks.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn overwrite_count(&self) -> u16 {
+        self.overwrite_count
     }
 
     /// Allocate the slot for `payload`, returning a handle capturing
@@ -342,6 +373,12 @@ impl ErrorArena {
     /// `#[must_use]` needed (clippy::double_must_use).
     #[inline]
     pub(crate) fn alloc(&mut self, payload: ErrorPayload) -> ErrorRef {
+        // DEF-185 P2-G (audit 2026-04-24): bump overwrite_count if
+        // slot was occupied. Architecturally dead under current
+        // single-inflight invariants, but surface as canary.
+        if self.slot.is_some() {
+            self.overwrite_count = self.overwrite_count.saturating_add(1);
+        }
         self.generation = self.generation.wrapping_add(1);
         self.slot = Some(payload);
         ErrorRef {
@@ -592,6 +629,51 @@ mod tests {
             "post-clear ref must classify as Stale, got {:?}",
             arena.get(r),
         );
+    }
+
+    #[test]
+    fn overwrite_count_tracks_double_alloc() {
+        // DEF-185 P2-G (audit 2026-04-24): the `overwrite_count`
+        // canary counts "alloc while slot was occupied" events.
+        // Architecturally dead under single-inflight invariants; a
+        // non-zero value in production would signal a dispatch-layer
+        // break.
+        let mut arena = ErrorArena::new();
+        assert_eq!(arena.overwrite_count(), 0, "pristine arena starts at zero");
+
+        let p1 = ErrorPayload {
+            message: BoundedStr::<128>::from_str_truncating("first"),
+            detail: BoundedStr::<96>::new(),
+            hint: BoundedStr::<64>::new(),
+        };
+        let r1 = arena.alloc(p1);
+        // Validate the ref resolves before the second alloc.
+        assert!(arena.get(r1).is_ok(), "r1 must resolve on fresh alloc");
+        assert_eq!(
+            arena.overwrite_count(),
+            0,
+            "first alloc on empty slot must not bump overwrite_count",
+        );
+
+        let p2 = ErrorPayload {
+            message: BoundedStr::<128>::from_str_truncating("second"),
+            detail: BoundedStr::<96>::new(),
+            hint: BoundedStr::<64>::new(),
+        };
+        let r2 = arena.alloc(p2);
+        // r1 is now stale (generation bumped); r2 resolves.
+        assert!(arena.get(r1).is_err(), "r1 must be Stale after r2 alloc");
+        assert!(arena.get(r2).is_ok(), "r2 must resolve on post-overwrite alloc");
+        assert_eq!(
+            arena.overwrite_count(),
+            1,
+            "second alloc while slot occupied must bump overwrite_count to 1",
+        );
+
+        // Return-type pin: accessor is u16 (not usize / u32) — keeps
+        // the canary at single-byte ABI after niche packing.
+        let count: u16 = arena.overwrite_count();
+        assert_eq!(count, 1, "second read must still return 1");
     }
 
     #[test]

@@ -366,6 +366,33 @@ pub enum ProtocolError {
         payload_len: usize,
     },
 
+    /// A server frame that PG §55.7 specifies MUST have a zero-byte
+    /// body arrived with non-zero body. Examples:
+    /// - `EmptyQueryResponse` (`'I'`) — body is always empty per spec
+    /// - `ParseComplete` (`'1'`) — body is always empty
+    /// - `BindComplete` (`'2'`) — body is always empty
+    /// - `NoData` (`'n'`) — body is always empty
+    /// - `CloseComplete` (`'3'`) — body is always empty
+    ///
+    /// # DEF-185 P0-F (audit 2026-04-24)
+    ///
+    /// Pre-fix: the dispatch arms for these frames ignored the
+    /// `payload` parameter entirely — a server sending 500 bytes of
+    /// body on `EmptyQueryResponse` was silently accepted, the bytes
+    /// consumed, state transitioned, no error emitted. **Tier-4 silent
+    /// spec drift.** A future PG version that legitimately added a
+    /// body field to one of these frames would be silently accepted
+    /// instead of classified — masking the protocol break.
+    ///
+    /// Post-fix: every zero-body arm explicitly slice-pattern matches
+    /// `[]` and classifies any other body as `UnexpectedFrameBody`.
+    UnexpectedFrameBody {
+        /// The offending tag.
+        tag: crate::wire::InboundTag,
+        /// The observed body length (should be 0 per spec).
+        payload_len: usize,
+    },
+
     /// The bounded read buffer overflowed while appending inbound bytes.
     ///
     /// This only fires when the caller tries to feed a chunk whose size
@@ -748,26 +775,6 @@ pub enum CrateBugLocus {
     /// fallback (tier-4, CREDO §5) or new-variant-with-payload.
     AuthSubCodeZeroInErr,
 
-    /// DEF-184 (A10/B22): `ProtoState` is in a SCRAM phase variant
-    /// (`ConnectingStartupScram` / `ConnectingScramAwaitingServerFirst`
-    /// / `ConnectingScramAwaitingServerFinal`) but the companion
-    /// `PgProtocol::scram_state: Option<ScramHandshakeState>` is
-    /// `None` or carries a mismatched shape for the variant.
-    ///
-    /// The correlation between `ProtoState` SCRAM variants and
-    /// `scram_state` variants is a **tier-2 structural invariant**
-    /// (classified, not compile-time enforced) — post-A10 the heavy
-    /// SCRAM data moved off state to shrink `ProtoState` from ~712 B
-    /// to ~48 B. The type system cannot see that `state is
-    /// AwaitingServerFirst ⇔ scram_state is Some(AwaitingFirst{..})`,
-    /// so a refactor that breaks the invariant would produce a
-    /// classified `InternalCrateBug` via this locus rather than
-    /// silent take-from-None or wrong-variant-data usage.
-    ///
-    /// Architecturally unreachable under correct transitions; every
-    /// `*state = ProtoState::Scram*` assignment is paired with a
-    /// `scram_state = Some(...)` store at the same site.
-    ScramStateDrift,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -814,7 +821,6 @@ impl fmt::Display for CrateBugLocus {
             Self::ParamsWriterOverflow => f.write_str("params-writer-overflow"),
             Self::EmptyWriteRange => f.write_str("empty-write-range"),
             Self::AuthSubCodeZeroInErr => f.write_str("auth-sub-code-zero-in-err"),
-            Self::ScramStateDrift => f.write_str("scram-state-drift"),
             Self::BuilderCapacityOverflow => f.write_str("builder-capacity-overflow"),
         }
     }
@@ -1118,6 +1124,7 @@ impl ProtocolError {
             Self::MalformedFrameLength { .. }
             | Self::FrameTooLarge { .. }
             | Self::UnexpectedFrame { .. }
+            | Self::UnexpectedFrameBody { .. }
             | Self::MalformedReadyForQuery { .. }
             | Self::MalformedBackendKeyData { .. }
             | Self::MalformedAuthentication { .. } => ErrorKind::Framing,
@@ -1218,6 +1225,23 @@ impl fmt::Display for ProtocolError {
                 f,
                 "ReadyForQuery payload length {payload_len} (expected 1)",
             ),
+            Self::UnexpectedFrameBody { tag, payload_len } => {
+                let b = tag.byte();
+                if matches!(b, 0x20..=0x7e) {
+                    write!(
+                        f,
+                        "frame '{}' ({b:#04x}) has non-zero body ({payload_len} bytes); \
+                         PG spec requires zero body for this tag",
+                        char::from(b),
+                    )
+                } else {
+                    write!(
+                        f,
+                        "frame {b:#04x} has non-zero body ({payload_len} bytes); \
+                         PG spec requires zero body for this tag",
+                    )
+                }
+            }
             Self::ReadBufferFull {
                 attempted,
                 available,

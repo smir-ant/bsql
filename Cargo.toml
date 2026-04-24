@@ -94,5 +94,58 @@ incremental = true
 codegen-units = 1
 lto = "fat"
 opt-level = 3
+# DEF-185 P0-A (audit 2026-04-24): panic = "abort" vs "unwind"
+# architectural decision.
+#
+# CONSEQUENCE for secret-bearing types (Password, ScramSession,
+# SecretDigest, Sensitive<T>):
+#   - `ZeroizeOnDrop` IS the primary zeroize mechanism in this crate.
+#   - Under `panic = "abort"`, Drop does NOT run on panic paths — the
+#     process aborts immediately, bypassing unwinding. Any secret sitting
+#     in a stack frame at abort time persists in the abort-frozen process
+#     memory until kernel reap.
+#   - `panic = "unwind"` would run Drop on every panic, closing this
+#     gap. The cost: larger binary size (unwind tables), slight runtime
+#     overhead per function with destructors, more complex cancellation
+#     semantics in async contexts, and cross-language FFI panic-safety
+#     concerns (Rust panics unwinding into C++/Obj-C code is UB).
+#
+# CURRENT STANCE:
+#   Accept `panic = "abort"` for the crash-safety + binary-size +
+#   FFI-safety benefits. Defense-in-depth for secrets:
+#     (a) `Zeroizing<T>` scope-guards on every secret-bearing local
+#         binding in SCRAM crypto composition (DEF-185 P0-D, P1-A) —
+#         these drop on normal scope exit which happens BEFORE the
+#         function can panic past the compute point.
+#     (b) `WriteBuf::clear()` / `ReadBuf::clear()` zero-on-clear +
+#         Drop impls (DEF-185 P0-B, P0-C) scrub wire-level secret
+#         residue on normal reuse/teardown paths.
+#     (c) `Password` / `ScramSession` / `SecretDigest` Drop impls fire
+#         on every state transition via `mem::replace` / `mem::take`
+#         (normal control flow).
+#
+# What PANIC = ABORT can leak:
+#   - Password/signature bytes sitting in a function's stack frame at
+#     the INSTANT of an abort. Rare in practice because:
+#       * Most crypto ops don't panic (forbid-bundle enforces: no
+#         unwrap/expect/panic/indexing/arithmetic in crate code).
+#       * Third-party crypto deps (sha2, hmac, pbkdf2, base64ct) are
+#         documented infallible or return Result — no panics.
+#     But theoretically: an OOM in heapless Vec extend could panic,
+#     the abort would freeze that stack frame with secret bytes.
+#
+# ALTERNATIVE (future design discussion):
+#   Option 1: switch to `panic = "unwind"` in release (accept size/FFI
+#             trade-off).
+#   Option 2: keep abort + add `mlock(2)` + `madvise(MADV_DONTDUMP)`
+#             for secret-bearing memory pages (requires std-level OS
+#             hook, not no_std-clean).
+#   Option 3: keep abort + add a pre-abort hook via `std::panic::set_hook`
+#             that walks known-secret regions and zeroes them before
+#             calling `abort()`. Complex, foot-gun-heavy.
+#
+# Option 1 is the cleanest fix; option 2 is best-in-class but requires
+# std. For now: keep abort, document the limitation honestly, trust
+# the defense-in-depth of explicit Zeroizing scope guards.
 panic = "abort"
 strip = "symbols"

@@ -101,10 +101,27 @@ pub enum StreamItem<'a> {
     /// One `DataRow` frame arrived — fast-path emission.
     /// `row_bytes` is the raw body (post column-count header, per
     /// DEF-154 H); decode via [`crate::decode::DataRowRef::parse`].
+    ///
+    /// # DEF-185 P1-3 (audit 2026-04-24): protocol-level row validation
+    ///
+    /// Pre-fix: any frame body size reached this arm, including
+    /// declared_len=5 (1 body byte — structurally impossible to
+    /// carry a 2-byte column-count header). User saw `TruncatedRow`
+    /// via `DataRowRef::parse` but protocol stayed live; the next
+    /// DataRow kept dispatching. Tier-3 silent pass-through at the
+    /// protocol layer.
+    ///
+    /// Post-fix: fast-path rejects `row_bytes.len() < 2` (cannot
+    /// carry column-count header) with
+    /// [`StreamItem::FailReply`] / MalformedDataRow. Body ≥ 2 bytes
+    /// reaches user; per-column decode errors are still surfaced
+    /// via `DataRowRef::parse -> Result`.
     Row {
         /// Correlator of the in-flight SELECT / BindExecute reply.
         id: NonZeroU64,
         /// Raw row body, borrowed from `read_buf.populated()`.
+        /// Guaranteed ≥ 2 bytes (column-count header present) per
+        /// DEF-185 P1-3 post-audit fast-path pre-validation.
         row_bytes: &'a [u8],
         /// Schema arena ref for this row.
         desc: &'a RowDesc,
@@ -341,20 +358,23 @@ impl<'p, 'w> RowStream<'p, 'w> {
     ) -> StreamItem<'_> {
         let row_start = cursor.saturating_add(HEADER_LEN);
         let row_end = cursor.saturating_add(total);
-        if row_start >= row_end {
-            // Empty body — malformed per DEF-154 K (server-side
-            // framing desync: total_len == HEADER_LEN).
+        let row_body_len = row_end.saturating_sub(row_start);
+        // DEF-185 P1-3 (audit 2026-04-24): protocol-level row-size
+        // validation. PG DataRow body layout = 2-byte n_columns header
+        // + per-column fields. A body < 2 bytes cannot carry the
+        // column-count header — structurally malformed regardless of
+        // the RowDesc's column count. Pre-fix these were passed to
+        // user who saw `TruncatedRow` via `DataRowRef::parse`, but the
+        // protocol stayed live and kept dispatching rows. Post-fix
+        // rejects at protocol layer via `MalformedDataRow`, triggering
+        // teardown. Row bodies >= 2 bytes continue to user (the column-
+        // count header parses; individual column decode errors remain
+        // user-handled via `DataRowRef::parse -> Result`).
+        if row_body_len < 2 {
+            // Body empty or too-short-for-column-count. Classify as
+            // MalformedDataRow framing desync.
             self.drained = true;
             self.proto.install_errored_malformed_data_row();
-            // Advance Err architecturally dead (total was validated
-            // against populated slice length by caller); on dead-
-            // branch trip we're already Errored, so classified
-            // InternalCrateBug would be double-tagging the same
-            // connection-terminal state. Swallow is safe HERE
-            // because state is ALREADY Errored — but for audit
-            // discipline, verify advance result and replace the
-            // cause if it trips (most-recent wins — framing
-            // classification preserved above).
             if self.proto.read_buf_advance(total).is_err() {
                 self.proto.install_errored_read_cursor_advance();
             }
@@ -379,9 +399,48 @@ impl<'p, 'w> RowStream<'p, 'w> {
             };
         }
 
+        // DEF-185 P0-E (audit 2026-04-24): split the stale-ref check
+        // from the Row emission so we can re-borrow `&mut self.proto`
+        // in the legitimate stale-ref path.
+        //
+        // `schema_arena_has` returns a plain `bool` — no lifetime
+        // propagation. If the ref is stale we take the &mut path to
+        // install Errored state (teardown signal for the wrapper),
+        // then return FailReply. Otherwise we re-enter the arena
+        // reader + populated read-buf borrow for the Row emission;
+        // the second arena.get is guaranteed Some because under
+        // `&mut self` no concurrent arena mutation is possible
+        // between the two checks.
+        //
+        // Pre-fix (pre-P0-E): only set drained=true + emitted FailReply,
+        // leaving ProtoState as SimpleQueryStreamingRows — next
+        // push_command would mis-classify as CommandInProgress, creating
+        // a zombie connection with no CloseSocket signal. Post-fix
+        // transitions state to Errored so the wrapper learns teardown
+        // is required. Arm stays architecturally dead under correct
+        // arena lifecycle; tier-2 classified via StaleSchemaRef.
+        if !self.proto.schema_arena_has(schema_ref) {
+            self.drained = true;
+            self.proto.install_errored_stale_schema_ref();
+            return StreamItem::FailReply {
+                id,
+                cause: ProtocolError::InternalCrateBug {
+                    locus: crate::error::CrateBugLocus::StaleSchemaRef,
+                },
+            };
+        }
         let populated = self.proto.read_buf_populated();
         let row_bytes = populated.get(row_start..row_end).unwrap_or(&[]);
         let arena = self.proto.schema_arena_reader();
+        // Dead-arm: `arena.get None` here means arena mutation since
+        // `schema_arena_has` returned true — impossible under &mut
+        // self aliasing. Defense-in-depth: set `drained = true`
+        // (direct field write — no self.proto borrow) + return
+        // FailReply without &mut call (already held immutably by
+        // arena). Legitimate stale case is handled by the early
+        // branch above which DOES install Errored. This dead-arm
+        // surface only trips if a future refactor breaks the &mut
+        // aliasing invariant.
         match arena.get(schema_ref) {
             Some(desc) => StreamItem::Row { id, row_bytes, desc },
             None => {
