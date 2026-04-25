@@ -229,6 +229,37 @@ Shipped batches (commit-anchored):
 - **Architect findings:** 2 cosmetic (tight size pins + docstring
   clarification), both implemented.
 
+### DEF-186 (perf-recovery partial — 2026-04-24)
+
+Bench-replay против `def184-complete` baseline после A10/B22 revert
+выявил регрессии:
+- ping_round_trip +30.7%, push_command +28.5%, iter_rows_per_row +108%
+- (parse_header no change — pure function, не aфектится)
+
+Корень — ProtoState 80→712 B + новые zero-on-clear/Drop impls + двойной
+arena lookup в P0-E (zombie-prevention safety fix).
+
+**Применённые исправления:**
+- **compute_push_* → `&mut ProtoState`** (signature refactor 7 функций):
+  push_command +28.5% → **-5.1% улучшение** (экономит 1424 B memcpy на
+  каждом push: `mem::take` убран + write-back через прямой
+  `*state = ...` только при реальном переходе).
+- ping_round_trip частично восстановлен: +30.7% → +4.1%
+
+**Структурно недостижимо без архитектурных изменений:**
+- iter_rows_per_row остаётся +108% (8.48 → 17.55 ns/row): fast_path_data_row
+  делает 2 arena lookups (P0-E zombie-prevention) + cache-locality эффекты
+  от увеличенного PgProtocol. Альтернатива через unsafe pointer или
+  alloc/Box — оба нарушают `forbid(unsafe_code)` и `no_std + no alloc`.
+  CREDO §1: safety > perf принят.
+- ping_round_trip residual +4.1% — dispatch.rs `mem::replace(state, Idle)`
+  per dispatch (712 B). Refactor требует pattern-match alternative для
+  SCRAM variants's field moves; multi-session работа.
+
+Записать как principled accepted regression: revert восстановил tier-1
+SCRAM safety (CREDO §1), приняли cost. Recovery `compute_push_*` refactor
+unlocked 5% improvement vs pre-revert push_command baseline.
+
 ### DEF-185 (security hardening — tripled architect audit, 2026-04-24)
 Post-A10/B22-revert comprehensive audit via 3 parallel architect agents
 (runtime safety, crypto/secrets, protocol/DoS). **All 33 actionable
@@ -321,6 +352,18 @@ pass via `--ignored`. Total 256 test outcomes green.
 ---
 
 ## §E. Session log — last 3 sessions (compact)
+
+### 2026-04-24 — DEF-186 perf-recovery
+- Bench-replay против `def184-complete` baseline выявил регрессии
+  (push_command +28.5%, ping_round_trip +30.7%, iter_rows +108%) после
+  ProtoState 80→712 B revert.
+- compute_push_* → `&mut ProtoState` refactor (7 функций) — экономит
+  1424 B memcpy per push. push_command +28.5% → **-5.1% улучшение**
+  относительно pre-revert baseline (102.3 ns vs 107.6 ns).
+- ping_round_trip частично восстановлен +30.7% → +4.1%.
+- iter_rows +108% structurally accepted (P0-E zombie-prevention требует
+  2× arena lookup; refactor через unsafe / alloc нарушает forbid /
+  no_std). CREDO §1: safety > perf.
 
 ### 2026-04-24 — DEF-184 A10/B22 revert + DEF-185 security audit
 - A10/B22 SCRAM externalisation REVERTED — tier-1 variant-carries-field

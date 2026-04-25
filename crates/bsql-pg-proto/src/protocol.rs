@@ -164,7 +164,7 @@ macro_rules! emit_actions {
 /// The macro early-returns, so it must be used in a position
 /// where `return ProtoState::Errored(...)` is legal.
 macro_rules! try_builder {
-    ($result:expr, $reply:expr, $staged:expr) => {
+    ($result:expr, $state:expr, $reply:expr, $staged:expr) => {
         match $result {
             Ok(r) => r,
             Err(cause) => {
@@ -172,12 +172,18 @@ macro_rules! try_builder {
                 // + debug_assert dance. Builders never return
                 // AlreadyClosed; the total projection fills any
                 // hypothetical AlreadyClosed with Internal honestly.
+                //
+                // DEF-186 perf-recovery 2026-04-24: macro now writes
+                // *$state = Errored(...) instead of returning the
+                // state by value (compute_push_* signatures changed
+                // to &mut state with `()` return).
                 let state_kind = cause.state_kind();
                 emit_actions!($staged, budget: 2, [
                     StagedAction::FailReply { id: $reply.consume(), cause },
                     StagedAction::CloseSocket,
                 ]);
-                return ProtoState::Errored(state_kind);
+                *$state = ProtoState::Errored(state_kind);
+                return;
             }
         }
     };
@@ -671,12 +677,17 @@ impl PgProtocol {
         let state = &mut self.state;
         let schema_arena = &mut self.schema_arena;
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
-            let prev = core::mem::take(state);
-            let (new_state, staged) = {
+            // DEF-186 perf-recovery 2026-04-24: compute_push refactored
+            // to take `&mut ProtoState` (was: by-value with `mem::take`
+            // + write-back). Saves 2× ProtoState size memcpy per push
+            // (~1424 B at post-revert ProtoState=712 B). Each
+            // compute_push_* helper now writes `*state = new_state`
+            // only when an actual transition occurs; preserve cases
+            // (Errored, in-flight) leave state untouched.
+            let staged = {
                 let mut reserved = wb.reserve();
-                compute_push(cmd, prev, &mut reserved)
+                compute_push(cmd, state, &mut reserved)
             };
-            *state = new_state;
             materialise(staged, wb.into_bytes(), schema_arena.as_reader())
         })
     }
@@ -759,15 +770,16 @@ impl PgProtocol {
 
         // DEF-154 (B+H): write-brand only. Push paths emit no
         // StreamRowRange; materialise doesn't need a read view.
+        // DEF-186 perf-recovery 2026-04-24: compute_push_bind_execute
+        // takes &mut state — saves 2× ProtoState size memcpy per call.
         let state = &mut self.state;
         let schema_arena = &mut self.schema_arena;
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
-            let prev = core::mem::take(state);
             let mut staged = StagedActions::new();
-            let new_state = {
+            {
                 let mut reserved = wb.reserve();
                 compute_push_bind_execute(
-                    prev,
+                    state,
                     portal_name,
                     stmt_name,
                     params,
@@ -776,9 +788,8 @@ impl PgProtocol {
                     reply,
                     &mut staged,
                     &mut reserved,
-                )
-            };
-            *state = new_state;
+                );
+            }
             materialise(staged, wb.into_bytes(), schema_arena.as_reader())
         })
     }
@@ -1672,11 +1683,11 @@ fn fail_inflight_no_readbuf(
 /// fails the build here until a matching helper is wired up.
 fn compute_push(
     cmd: PgCommand,
-    state: ProtoState,
+    state: &mut ProtoState,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> (ProtoState, StagedActions) {
+) -> StagedActions {
     let mut staged = StagedActions::new();
-    let new_state = match cmd {
+    match cmd {
         PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
         PgCommand::Startup {
             user,
@@ -1708,8 +1719,8 @@ fn compute_push(
         PgCommand::DescribePortal { portal_name, reply } => {
             compute_push_describe_portal(state, &portal_name, reply, &mut staged, reserved)
         }
-    };
-    (new_state, staged)
+    }
+    staged
 }
 
 /// Compute the transition for [`PgCommand::Ping`] against the current
@@ -1730,10 +1741,16 @@ fn compute_push(
 /// per-variant assertion, closing the structural seam where two arm
 /// bodies could be swapped without a compile error.
 fn compute_push_ping(
-    state: ProtoState,
+    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::PingKind>,
     staged: &mut StagedActions,
-) -> ProtoState {
+) {
+    // DEF-186 perf-recovery 2026-04-24: signature changed from
+    // by-value `state: ProtoState` to `&mut ProtoState`. Idle arm
+    // writes new state via `*state = ...`; preserve arms (Errored,
+    // PingAwaiting, BusyQuery, Connecting) leave state untouched —
+    // saves the 712 B mem::take + 712 B write-back per non-Idle push.
+    //
     // DEF-146: classifier dispatch. Pre-DEF-146 this function had 5
     // arms over explicit state variants (with 18-way or-patterns for
     // the tail catch-alls). Post-DEF-146, the enumeration lives once
@@ -1749,19 +1766,19 @@ fn compute_push_ping(
             emit_actions!(staged, budget: 1, [
                 StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES),
             ]);
-            ProtoState::PingAwaitingRfq(reply)
+            *state = ProtoState::PingAwaitingRfq(reply);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             // Preserve the stored cause; emit ConnectionAlreadyClosed
             // so the wrapper sees "connection terminal" rather than
-            // a generic in-flight error.
+            // a generic in-flight error. State unchanged (already
+            // Errored(prior_kind)).
             emit_actions!(staged, budget: 1, [
                 StagedAction::FailReply {
                     id: reply.consume(),
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(prior_kind)
         }
         // Ping-specific: a pending Ping ("a command is in flight")
         // classifies as CommandInProgress (not StartupAlreadyInProgress)
@@ -1775,7 +1792,6 @@ fn compute_push_ping(
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            state
         }
         // Any Connecting* variant — startup handshake in progress.
         crate::state::StatePushClass::Connecting => {
@@ -1785,7 +1801,6 @@ fn compute_push_ping(
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            state
         }
     }
 }
@@ -1809,7 +1824,7 @@ fn compute_push_ping(
 /// silent truncation.
 #[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
 fn compute_push_startup(
-    state: ProtoState,
+    state: &mut ProtoState,
     user: Ident,
     database: Option<DatabaseName>,
     app_name: Option<ApplicationName>,
@@ -1817,7 +1832,11 @@ fn compute_push_startup(
     reply: ReplyId<crate::reply_id::StartupKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> ProtoState {
+) {
+    // DEF-186 perf-recovery 2026-04-24: signature changed to
+    // `&mut ProtoState` with `()` return. Idle arm writes new state
+    // via `*state = ...`; preserve arms (Errored / Connecting /
+    // PingAwaiting / BusyQuery) leave state untouched.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
             // DEF-154 (B) P0-2: builder returns Result; Err →
@@ -1829,6 +1848,7 @@ fn compute_push_startup(
                     app_name.as_ref(),
                     reserved,
                 ),
+                state,
                 reply,
                 staged
             );
@@ -1838,26 +1858,19 @@ fn compute_push_startup(
             // DEF-097: discriminate Trust vs Scram *here* — the
             // post-push state carries only what its auth method
             // needs. Trust: 24 bytes. Scram: 24 + ScramSession
-            // (~1040). The "server sent AUTH_SASL on a Trust
-            // connection" case is now a per-variant dispatcher
-            // arm instead of a runtime classification.
-            match credentials {
+            // (~1040).
+            *state = match credentials {
                 Credentials::Trust => ProtoState::ConnectingStartupTrust { reply },
                 Credentials::ScramPassword(password) => {
                     // DEF-184 (A10/B22 revert 2026-04-24): tier-1
                     // restored — ScramSession lives INSIDE the
                     // variant. Variant-carries-field invariant is
-                    // compile-enforced: a future refactor cannot
-                    // construct ConnectingStartupScram without a
-                    // ScramSession (CREDO §1: safety > tier-1 > perf).
-                    // ZeroizeOnDrop on ScramSession fires on
-                    // mem::replace / mem::take in fail_inflight_no_readbuf
-                    // and subsequent state transitions.
+                    // compile-enforced (CREDO §1: safety > tier-1 > perf).
                     let scram =
                         crate::scram::session::ScramSession::from_password(password);
                     ProtoState::ConnectingStartupScram { reply, scram }
                 }
-            }
+            };
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1866,7 +1879,6 @@ fn compute_push_startup(
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(prior_kind)
         }
         // Startup-specific: PingAwaiting groups with Connecting
         // (both imply "startup sequence cannot be re-initiated").
@@ -1878,7 +1890,6 @@ fn compute_push_startup(
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            state
         }
         crate::state::StatePushClass::BusyQuery => {
             emit_actions!(staged, budget: 1, [
@@ -1887,7 +1898,6 @@ fn compute_push_startup(
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            state
         }
     }
 }
@@ -1906,23 +1916,20 @@ fn compute_push_startup(
 /// | `PingAwaitingRfq(prev)`    | `FailReply(CommandInProgress)`      | same                                 |
 /// | any `SimpleQuery*`           | `FailReply(CommandInProgress)`      | same                                 |
 fn compute_push_simple_query(
-    state: ProtoState,
+    state: &mut ProtoState,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::QueryKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> ProtoState {
-    // DEF-146: single-level classifier dispatch (standard pattern —
-    // Ping + BusyQuery → CommandInProgress, Connecting →
-    // StartupAlreadyInProgress).
+) {
+    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (B) P0-2: builder returns Result.
-            let range = try_builder!(build_query_message(sql, reserved), reply, staged);
+            let range = try_builder!(build_query_message(sql, reserved), state, reply, staged);
             emit_actions!(staged, budget: 1, [
                 StagedAction::SendBytesRange(range),
             ]);
-            ProtoState::SimpleQueryAwaitingFirstResponse(reply)
+            *state = ProtoState::SimpleQueryAwaitingFirstResponse(reply);
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -1931,7 +1938,6 @@ fn compute_push_simple_query(
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(prior_kind)
         }
         crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
@@ -1940,7 +1946,6 @@ fn compute_push_simple_query(
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            state
         }
         crate::state::StatePushClass::PingAwaiting
         | crate::state::StatePushClass::BusyQuery => {
@@ -1950,7 +1955,6 @@ fn compute_push_simple_query(
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            state
         }
     }
 }
@@ -2028,25 +2032,22 @@ fn build_parse_message(
 /// | `Awaiting*` / `SimpleQuery*` | `FailReply(CommandInProgress)`      | same                                 |
 /// | `Parse*`                     | `FailReply(CommandInProgress)`      | same                                 |
 fn compute_push_parse(
-    state: ProtoState,
+    state: &mut ProtoState,
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::ParseKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> ProtoState {
-    // DEF-146: classifier dispatch. DEF-154 (B) P0-2: builder returns Result.
+) {
+    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            let range = try_builder!(build_parse_message(stmt_name, sql, reserved), reply, staged);
-            // Emit Parse frame (range into write_buf) + bundled Sync
-            // (static const). Both needed for PG to flush ParseComplete
-            // (without Sync the server buffers forever).
+            let range = try_builder!(build_parse_message(stmt_name, sql, reserved), state, reply, staged);
             emit_actions!(staged, budget: 2, [
                 StagedAction::SendBytesRange(range),
                 StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
             ]);
-            ProtoState::ParseAwaitingParseComplete(reply)
+            *state = ProtoState::ParseAwaitingParseComplete(reply);
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -2055,7 +2056,6 @@ fn compute_push_parse(
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(prior_kind)
         }
         crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
@@ -2064,7 +2064,6 @@ fn compute_push_parse(
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            state
         }
         crate::state::StatePushClass::PingAwaiting
         | crate::state::StatePushClass::BusyQuery => {
@@ -2074,7 +2073,6 @@ fn compute_push_parse(
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            state
         }
     }
 }
@@ -2142,33 +2140,30 @@ fn build_describe_message<N: crate::ident::DescribeName>(
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                       |
 /// | any other in-flight          | `FailReply(CommandInProgress)`      | same                                        |
 fn compute_push_describe_statement(
-    state: ProtoState,
+    state: &mut ProtoState,
     stmt_name: &crate::ident::StmtName,
     reply: ReplyId<crate::reply_id::DescribeStatementKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> ProtoState {
-    // DEF-146: classifier dispatch (standard pattern).
+) {
+    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (B) P0-2: builder returns Result.
             let range = try_builder!(
                 build_describe_message(
                     crate::wire::DescribeTargetByte::Statement,
                     stmt_name,
                     reserved,
                 ),
+                state,
                 reply,
                 staged
             );
-            // Describe + Sync bundle. Sync is required — without it
-            // PG buffers Extended Query responses and never ships
-            // back the `'t'` / `'T'` / `'n'` / `'Z'` sequence.
             emit_actions!(staged, budget: 2, [
                 StagedAction::SendBytesRange(range),
                 StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
             ]);
-            ProtoState::DescribeStatementAwaitingParamDesc(reply)
+            *state = ProtoState::DescribeStatementAwaitingParamDesc(reply);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -2177,7 +2172,6 @@ fn compute_push_describe_statement(
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(prior_kind)
         }
         crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
@@ -2186,7 +2180,6 @@ fn compute_push_describe_statement(
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            state
         }
         crate::state::StatePushClass::PingAwaiting
         | crate::state::StatePushClass::BusyQuery => {
@@ -2196,7 +2189,6 @@ fn compute_push_describe_statement(
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            state
         }
     }
 }
@@ -2213,22 +2205,22 @@ fn compute_push_describe_statement(
 /// Same decision table as statement-describe; see that function's
 /// docstring.
 fn compute_push_describe_portal(
-    state: ProtoState,
+    state: &mut ProtoState,
     portal_name: &crate::ident::PortalName,
     reply: ReplyId<crate::reply_id::DescribePortalKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> ProtoState {
-    // DEF-146: classifier dispatch (standard pattern).
+) {
+    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (B) P0-2: builder returns Result.
             let range = try_builder!(
                 build_describe_message(
                     crate::wire::DescribeTargetByte::Portal,
                     portal_name,
                     reserved,
                 ),
+                state,
                 reply,
                 staged
             );
@@ -2236,7 +2228,7 @@ fn compute_push_describe_portal(
                 StagedAction::SendBytesRange(range),
                 StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
             ]);
-            ProtoState::DescribePortalAwaitingRowDescOrNoData(reply)
+            *state = ProtoState::DescribePortalAwaitingRowDescOrNoData(reply);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -2245,7 +2237,6 @@ fn compute_push_describe_portal(
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(prior_kind)
         }
         crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
@@ -2254,7 +2245,6 @@ fn compute_push_describe_portal(
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            state
         }
         crate::state::StatePushClass::PingAwaiting
         | crate::state::StatePushClass::BusyQuery => {
@@ -2264,7 +2254,6 @@ fn compute_push_describe_portal(
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            state
         }
     }
 }
@@ -2412,7 +2401,7 @@ fn build_execute_message(
 /// | any in-flight             | `FailReply(CommandInProgress)`           | same state preserved                        |
 #[expect(clippy::too_many_arguments, reason = "compute_push_bind_execute is an internal helper; its arg count matches `push_bind_execute`'s parameter surface + the accumulator + reserved. Splitting into a struct-arg would obscure the pure-compute framing.")]
 fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
-    state: ProtoState,
+    state: &mut ProtoState,
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
     params: &P,
@@ -2421,30 +2410,19 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
     reply: ReplyId<crate::reply_id::QueryKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> ProtoState {
-    // DEF-146: classifier dispatch (standard pattern).
+) {
+    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-154 (B): both Bind and Execute run against the
-            // same BrandedWriteReserved. The brand ties both
-            // ranges to the buffer they materialise against.
-            // `build_execute_message` is infallible (no user-data
-            // overflow path); `build_bind_message` returns Result
-            // post-B4-W-P0-3 fix — ParamsWriter overflow (user
-            // sealed trait) classifies as
-            // `CrateBugLocus::ParamsWriterOverflow` and degrades
-            // gracefully to FailReply + CloseSocket.
-            // DEF-154 (B) P0-2+P0-3: both builders return Result;
-            // Err → FailReply + CloseSocket + Errored via
-            // `try_builder!`. bind covers ParamsWriterOverflow and
-            // EmptyWriteRange; execute covers EmptyWriteRange only.
             let bind_range = try_builder!(
                 build_bind_message(portal_name, stmt_name, params, reserved),
+                state,
                 reply,
                 staged
             );
             let execute_range = try_builder!(
                 build_execute_message(portal_name, fetch, reserved),
+                state,
                 reply,
                 staged
             );
@@ -2453,17 +2431,13 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                 StagedAction::SendBytesRange(execute_range),
                 StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
             ]);
-            // Tier-1 structural dispatch: decide the schema-less
-            // DML vs schema-bearing SELECT path ONCE, here at push
-            // time. Downstream dispatch arms match on the specific
-            // variant — no runtime `match row_desc` at the 'D' arm.
-            match schema_ref {
+            *state = match schema_ref {
                 Some(sr) => ProtoState::BindExecuteAwaitingBindCompleteSelect {
                     reply,
                     schema_ref: sr,
                 },
                 None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
-            }
+            };
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -2472,7 +2446,6 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                     cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
                 },
             ]);
-            ProtoState::Errored(prior_kind)
         }
         crate::state::StatePushClass::Connecting => {
             emit_actions!(staged, budget: 1, [
@@ -2481,7 +2454,6 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                     cause: ProtocolError::StartupAlreadyInProgress,
                 },
             ]);
-            state
         }
         crate::state::StatePushClass::PingAwaiting
         | crate::state::StatePushClass::BusyQuery => {
@@ -2491,7 +2463,6 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                     cause: ProtocolError::CommandInProgress,
                 },
             ]);
-            state
         }
     }
 }
@@ -3272,18 +3243,24 @@ mod compute_push_tests {
         cmd: PgCommand,
         state: ProtoState,
     ) -> (ProtoState, heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL>) {
+        // DEF-186 perf-recovery: compute_push takes &mut state now.
+        // Closure captures &mut state_var to mutate in place; returns
+        // the obs vec. After closure, state_var holds the post-push
+        // state.
         let mut wb = WriteBuf::new();
-        wb.with_branded(|mut wb| {
+        let mut state_var = state;
+        let obs = wb.with_branded(|mut wb| {
             let mut reserved = wb.reserve();
-            let (new_state, staged) = compute_push(cmd, state, &mut reserved);
+            let staged = compute_push(cmd, &mut state_var, &mut reserved);
             let mut obs: heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL> = heapless::Vec::new();
             for a in &staged {
                 obs.push(StagedObs::from_staged(a)).unwrap_or_else(|_| {
                     debug_assert!(false, "MAX_ACTIONS_PER_CALL overflow in test");
                 });
             }
-            (new_state, obs)
-        })
+            obs
+        });
+        (state_var, obs)
     }
 
     // -----------------------------------------------------------------

@@ -401,24 +401,24 @@ impl<'p, 'w> RowStream<'p, 'w> {
 
         // DEF-185 P0-E (audit 2026-04-24): split the stale-ref check
         // from the Row emission so we can re-borrow `&mut self.proto`
-        // in the legitimate stale-ref path.
+        // in the legitimate stale-ref path. Pre-P0-E: only set
+        // drained=true + emitted FailReply, leaving state as
+        // SimpleQueryStreamingRows — next push_command mis-classified
+        // as CommandInProgress (zombie connection).
         //
-        // `schema_arena_has` returns a plain `bool` — no lifetime
-        // propagation. If the ref is stale we take the &mut path to
-        // install Errored state (teardown signal for the wrapper),
-        // then return FailReply. Otherwise we re-enter the arena
-        // reader + populated read-buf borrow for the Row emission;
-        // the second arena.get is guaranteed Some because under
-        // `&mut self` no concurrent arena mutation is possible
-        // between the two checks.
+        // Cost: 1 extra ArenaReader::get per row vs single-lookup
+        // form (~+5 ns/row at 8 ns baseline). Borrow-checker requires
+        // two passes here — `Option<&'r RowDesc>` from arena.get
+        // ties desc lifetime to arena which ties to self.proto, so a
+        // None branch with `&mut self.proto.install_errored_*`
+        // conflicts with desc's outlived lifetime in the unified
+        // match's return type.
         //
-        // Pre-fix (pre-P0-E): only set drained=true + emitted FailReply,
-        // leaving ProtoState as SimpleQueryStreamingRows — next
-        // push_command would mis-classify as CommandInProgress, creating
-        // a zombie connection with no CloseSocket signal. Post-fix
-        // transitions state to Errored so the wrapper learns teardown
-        // is required. Arm stays architecturally dead under correct
-        // arena lifecycle; tier-2 classified via StaleSchemaRef.
+        // Verified DEF-186 perf hunt: any single-lookup restructure
+        // (inner-scope early return, drop(arena)+rebind, `let arena_ptr`
+        // unsafe) either fails to compile or requires unsafe. Accept
+        // the per-row cost — zombie-prevention safety > perf per
+        // CREDO §1.
         if !self.proto.schema_arena_has(schema_ref) {
             self.drained = true;
             self.proto.install_errored_stale_schema_ref();
@@ -434,13 +434,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
         let arena = self.proto.schema_arena_reader();
         // Dead-arm: `arena.get None` here means arena mutation since
         // `schema_arena_has` returned true — impossible under &mut
-        // self aliasing. Defense-in-depth: set `drained = true`
-        // (direct field write — no self.proto borrow) + return
-        // FailReply without &mut call (already held immutably by
-        // arena). Legitimate stale case is handled by the early
-        // branch above which DOES install Errored. This dead-arm
-        // surface only trips if a future refactor breaks the &mut
-        // aliasing invariant.
+        // self aliasing.
         match arena.get(schema_ref) {
             Some(desc) => StreamItem::Row { id, row_bytes, desc },
             None => {
