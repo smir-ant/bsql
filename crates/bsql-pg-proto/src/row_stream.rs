@@ -374,7 +374,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // Body empty or too-short-for-column-count. Classify as
             // MalformedDataRow framing desync.
             self.drained = true;
-            self.proto.install_errored_malformed_data_row();
+            self.proto.install_errored_malformed_data_row(total);
             if self.proto.read_buf_advance(total).is_err() {
                 self.proto.install_errored_read_cursor_advance();
             }

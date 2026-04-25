@@ -177,6 +177,23 @@ macro_rules! try_builder {
                 // *$state = Errored(...) instead of returning the
                 // state by value (compute_push_* signatures changed
                 // to &mut state with `()` return).
+                //
+                // DEF-186 P1-3 (audit 2026-04-24): pin Idle-only
+                // contract. The macro overwrites $state with
+                // Errored(...) without consulting any embedded
+                // inflight ReplyId — safe ONLY when caller's prev
+                // state is Idle (no embedded inflight reply to leak).
+                // All current call sites are inside `Idle` arms of
+                // compute_push_*; debug_assert catches any future
+                // misplacement that would silently leak an embedded
+                // ReplyId<_>'s correlator (zombie-class regression
+                // mirroring P0-E).
+                debug_assert!(
+                    matches!(*$state, ProtoState::Idle),
+                    "try_builder! invoked outside Idle arm — would leak embedded \
+                     inflight ReplyId by overwriting state. Caller must call \
+                     fail_inflight_no_readbuf or take_inflight_reply_raw_id first.",
+                );
                 let state_kind = cause.state_kind();
                 emit_actions!($staged, budget: 2, [
                     StagedAction::FailReply { id: $reply.consume(), cause },
@@ -497,8 +514,9 @@ pub struct PgProtocol {
     // + `pending_advance_err` fast-path + row_stream callers.
     // advance now happens inside the dispatch loop via
     // `read_buf.advance(total_len)` right after frame consumption.
-    /// DEF-185 P2-9 (audit 2026-04-24): counter of malformed-frame
-    /// events that tripped `fail_inflight_no_readbuf`.
+    /// DEF-185 P2-9 (audit 2026-04-24) + DEF-186 P1-5 widening
+    /// (audit 2026-04-24): counter of malformed-frame events that
+    /// tripped `fail_inflight_no_readbuf`.
     ///
     /// Bumped on every invocation of `fail_inflight_no_readbuf` —
     /// i.e., every time a frame was classified as malformed
@@ -511,8 +529,13 @@ pub struct PgProtocol {
     /// (bug / transient) from "server kept sending malformed frames
     /// until tear-down" (adversarial / misconfigured proxy).
     ///
-    /// Saturating `u16` — overflows stay pinned at `u16::MAX`.
-    malformed_frame_count: u16,
+    /// `u32` (was `u16` pre-DEF-186 P1-5): u16 saturation at 65535
+    /// collapsed adversarial-flood diagnostics for connections that
+    /// stay open across high event counts (CREDO §7 ось 5
+    /// adversarial-trust class). u32 saturation at 4 billion is
+    /// architecturally distant under realistic connection lifetimes.
+    /// Cost: +2 B per `PgProtocol`.
+    malformed_frame_count: u32,
     /// `!Sync` marker — `Cell<T>: !Sync`, so the whole struct inherits.
     /// Load-bearing: the crate-root ambiguous-impl gate verifies that
     /// `PgProtocol: !Sync` compile-time. Renamed from the earlier
@@ -592,10 +615,11 @@ impl PgProtocol {
     /// adversarial / buggy frames until teardown. Operators can use
     /// the value to distinguish these cases.
     ///
-    /// Saturates at `u16::MAX` (no wrap). Per connection lifetime.
+    /// Saturates at `u32::MAX` (no wrap). Per connection lifetime.
+    /// DEF-186 P1-5 widened from u16 — see field doc.
     #[inline]
     #[must_use]
-    pub const fn malformed_frame_count(&self) -> u16 {
+    pub const fn malformed_frame_count(&self) -> u32 {
         self.malformed_frame_count
     }
 
@@ -947,6 +971,19 @@ impl PgProtocol {
                 });
             }
             IngressClassification::AppendFailed { attempted, available } => {
+                // DEF-186 P1-4 ordering invariant (audit 2026-04-24):
+                // `read_buf.clear()` MUST precede `fail_inflight_no_readbuf`
+                // here. The clear() zero-on-clear path (P0-C) scrubs any
+                // residual SCRAM server-frame bytes (server-first /
+                // server-final containing password-correlated material)
+                // BEFORE the state transition consumes the SCRAM variant.
+                // If a future refactor reorders these two calls, the
+                // residue window opens — partial inbound bytes survive
+                // into the post-Errored phase until the wrapper drops
+                // the connection.
+                //
+                // Bundled-helper-style refactor (single fn that does
+                // both) deferred to keep call-site ordering grep-able.
                 read_buf.clear();
                 return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
                     let mut staged: StagedActions = StagedActions::new();
@@ -1510,9 +1547,20 @@ impl PgProtocol {
     /// DEF-154 (X): transition to `Errored(Framing)` for a
     /// malformed DataRow (empty body, server-side desync). Used
     /// by RowStream's fast-path when `start == end`.
+    ///
+    /// # DEF-186 P1-1 (audit 2026-04-24)
+    ///
+    /// Takes `total_len: usize` matching the caller's
+    /// `ProtocolError::MalformedDataRow { total_len }` payload.
+    /// Pre-fix hardcoded `total_len: 0` for the state-kind derivation,
+    /// relying on the discriminator being payload-independent — correct
+    /// today but tier-4 fragility if a future `state_kind()` ever folds
+    /// on `total_len` (e.g. distinct kind for "0-byte body" vs other
+    /// malformed lengths). Pass-through closes the "mismatched twin
+    /// payloads" drift.
     #[inline]
-    pub(crate) fn install_errored_malformed_data_row(&mut self) {
-        let cause = ProtocolError::MalformedDataRow { total_len: 0 };
+    pub(crate) fn install_errored_malformed_data_row(&mut self, total_len: usize) {
+        let cause = ProtocolError::MalformedDataRow { total_len };
         let state_kind = cause.state_kind();
         self.state = ProtoState::Errored(state_kind);
     }
@@ -1616,7 +1664,7 @@ fn fail_inflight_no_readbuf(
     state: &mut ProtoState,
     cause: ProtocolError,
     staged: &mut StagedActions,
-    malformed_counter: &mut u16,
+    malformed_counter: &mut u32,
 ) {
     if matches!(state, ProtoState::Errored(_)) {
         return;
@@ -3947,5 +3995,124 @@ mod compute_push_tests {
              not a recoverable preserved-state path. Got: {:?}",
             proto.state(),
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // DEF-186 P1-2 (audit 2026-04-24): pin tests for all 5 remaining
+    // compute_push_* Idle-arm transitions.
+    //
+    // Pre-DEF-186 the by-value `compute_push_*` signatures forced
+    // every arm to RETURN a ProtoState — a missing transition was a
+    // build error (tier-1 compile). Post-DEF-186 the `&mut state`
+    // signature only requires that the Idle arm WRITE *state =
+    // <next>; preserve arms simply leave state untouched. Adding a
+    // 6th compute_push_* helper that forgets `*state = ...` in the
+    // Idle arm would compile, leaving state unchanged. These pin
+    // tests catch that omission via runtime assertion on the
+    // post-Idle state's variant.
+    //
+    // Ping + Startup already covered by tests above; these 5 close
+    // the rest of the surface.
+    // ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn simple_query_from_idle_pins_post_state_transition() {
+        let raw_id = nz(186_001);
+        let cmd = PgCommand::SimpleQuery {
+            sql: crate::ident::Sql::from_str_truncating("SELECT 1"),
+            reply: ReplyId::from_raw(raw_id),
+        };
+        let (new_state, _staged) = compute_staged(cmd, ProtoState::Idle);
+        assert!(
+            matches!(&new_state, ProtoState::SimpleQueryAwaitingFirstResponse(_)),
+            "compute_push_simple_query Idle arm must write SimpleQueryAwaitingFirstResponse, got {new_state:?}",
+        );
+        consume_state(new_state);
+    }
+
+    #[test]
+    fn parse_from_idle_pins_post_state_transition() {
+        let raw_id = nz(186_002);
+        let stmt_name = match crate::ident::StmtName::try_from_str("s") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let cmd = PgCommand::Parse {
+            stmt_name,
+            sql: crate::ident::Sql::from_str_truncating("SELECT 1"),
+            reply: ReplyId::from_raw(raw_id),
+        };
+        let (new_state, _staged) = compute_staged(cmd, ProtoState::Idle);
+        assert!(
+            matches!(&new_state, ProtoState::ParseAwaitingParseComplete(_)),
+            "compute_push_parse Idle arm must write ParseAwaitingParseComplete, got {new_state:?}",
+        );
+        consume_state(new_state);
+    }
+
+    #[test]
+    fn describe_statement_from_idle_pins_post_state_transition() {
+        let raw_id = nz(186_003);
+        let stmt_name = match crate::ident::StmtName::try_from_str("s") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let cmd = PgCommand::DescribeStatement {
+            stmt_name,
+            reply: ReplyId::from_raw(raw_id),
+        };
+        let (new_state, _staged) = compute_staged(cmd, ProtoState::Idle);
+        assert!(
+            matches!(&new_state, ProtoState::DescribeStatementAwaitingParamDesc(_)),
+            "compute_push_describe_statement Idle arm must write DescribeStatementAwaitingParamDesc, got {new_state:?}",
+        );
+        consume_state(new_state);
+    }
+
+    #[test]
+    fn describe_portal_from_idle_pins_post_state_transition() {
+        let raw_id = nz(186_004);
+        let portal_name = match crate::ident::PortalName::try_from_str("p") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let cmd = PgCommand::DescribePortal {
+            portal_name,
+            reply: ReplyId::from_raw(raw_id),
+        };
+        let (new_state, _staged) = compute_staged(cmd, ProtoState::Idle);
+        assert!(
+            matches!(&new_state, ProtoState::DescribePortalAwaitingRowDescOrNoData(_)),
+            "compute_push_describe_portal Idle arm must write DescribePortalAwaitingRowDescOrNoData, got {new_state:?}",
+        );
+        consume_state(new_state);
+    }
+
+    #[test]
+    fn preserve_arms_leave_state_untouched_simple_query() {
+        // DEF-186 P1-2: Errored / preserve arms MUST NOT write *state.
+        // Trip a SimpleQuery against Errored — state must remain at the
+        // EXACT same Errored(prior_kind) it was before.
+        use crate::error::{ErrorKind, StateErrorKind};
+        let prior_kind = StateErrorKind::from_kind_or_internal(ErrorKind::Framing);
+        let raw_id = nz(186_005);
+        let cmd = PgCommand::SimpleQuery {
+            sql: crate::ident::Sql::from_str_truncating("SELECT 1"),
+            reply: ReplyId::from_raw(raw_id),
+        };
+        let (new_state, _staged) = compute_staged(cmd, ProtoState::Errored(prior_kind));
+        // Pin via matches! + extracting ErrorKind separately. `panic!`
+        // banned by forbid-bundle even in tests.
+        assert!(
+            matches!(&new_state, ProtoState::Errored(_)),
+            "expected preserved Errored, got {new_state:?}",
+        );
+        if let ProtoState::Errored(observed) = new_state {
+            assert_eq!(
+                observed.as_kind(),
+                ErrorKind::Framing,
+                "Errored kind preserved byte-exactly across non-Idle push",
+            );
+        }
     }
 }

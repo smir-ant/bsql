@@ -368,7 +368,7 @@ pub struct SessionParams {
     /// `n_malformed_bool_dropped` pattern for ops diagnostic parity.
     ///
     /// Saturating `u16` — overflows stay pinned at `u16::MAX`.
-    pub n_malformed_param_status_dropped: u16,
+    pub n_malformed_param_status_dropped: u32,
     /// Number of `NoticeResponse` frames the protocol silently consumed.
     ///
     /// # DEF-185 P2-3 (audit 2026-04-24)
@@ -386,8 +386,10 @@ pub struct SessionParams {
     /// will route these to an `Action::EmitNotice` stream; for now
     /// the counter lets ops detect the pattern).
     ///
-    /// Saturating `u16` — overflows stay pinned at `u16::MAX`.
-    pub n_notice_response_dropped: u16,
+    /// Saturating `u32` (DEF-186 P1-5 widened from u16) — overflows
+    /// stay pinned at `u32::MAX` rather than collapsing diagnostic
+    /// fidelity at 65k events on long-lived adversarial-flood paths.
+    pub n_notice_response_dropped: u32,
 }
 
 impl SessionParams {

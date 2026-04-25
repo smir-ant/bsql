@@ -591,6 +591,15 @@ impl ProtoState {
     /// per H021 witness-guard session.
     #[must_use]
     pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
+        // DEF-186 P1-6 (audit 2026-04-24): the `Errored(_) => None` arm
+        // is correct under single-inflight: an Errored variant carries
+        // only the StateErrorKind discriminator byte, no `ReplyId<K>`.
+        // At 1c-5 pipelining the return type widens to a Vec of
+        // correlators, and the Errored arm must enumerate any
+        // post-error in-flight replies that survived the transition.
+        // Until then this `None` is correct (no embedded reply to
+        // surface), but the trigger to re-audit is the type widening
+        // itself — H021 witness-guard session.
         match self {
             Self::Idle | Self::DrainRfqAfterError | Self::Errored(_) => None,
             Self::PingAwaitingRfq(id) => Some(id.consume()),

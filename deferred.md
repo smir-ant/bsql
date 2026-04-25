@@ -229,6 +229,46 @@ Shipped batches (commit-anchored):
 - **Architect findings:** 2 cosmetic (tight size pins + docstring
   clarification), both implemented.
 
+### DEF-186 perf-recovery + 6 P1 closures (2026-04-24)
+
+Pre-DEF-186 architect re-audit identified 6 P1 + 3 P2 findings on the
+post-A10/B22-revert + DEF-185 codebase. All P1 closed:
+
+- **P1-1**: `install_errored_malformed_data_row` now takes `total_len: usize`
+  param (was hardcoded 0); aligns FailReply payload with state-kind input.
+- **P1-2**: 5 pin tests added (`simple_query/parse/describe_statement/
+  describe_portal/preserve_arms_simple_query`) covering all `compute_push_*`
+  Idle-arm transitions + non-Idle preserve invariant. Closes the
+  "&mut state refactor lost build-time guarantee that Idle arm writes
+  *state" tier-3 seam (now tier-3 covered by tests vs tier-1 of pre-refactor).
+- **P1-3**: `try_builder!` macro `debug_assert!(matches!(*state, Idle))`
+  pin — catches future misplacement that would silently leak embedded
+  inflight ReplyId.
+- **P1-4**: `read_buf.clear()` → `fail_inflight_no_readbuf` ordering
+  invariant documented inline in `IngressClassification::AppendFailed`
+  arm (zero-on-clear scrubs SCRAM bytes BEFORE state transition consumes
+  variant).
+- **P1-5**: `malformed_frame_count` + `n_malformed_param_status_dropped` +
+  `n_notice_response_dropped` widened from `u16` → `u32`. Pre-fix
+  saturation at 65535 collapsed adversarial-flood diagnostics on long-
+  lived connections; u32 saturation at 4B is architecturally distant.
+  Cost: +6 B aggregate.
+- **P1-6**: `take_inflight_reply_raw_id` `Errored(_) => None` arm
+  documented as 1c-5 pipelining trigger (today single-inflight makes
+  None correct, but pipelining will widen the return type).
+
+P2 findings:
+- **P2-1**: Bind/Execute partial-frame scrub on Execute build failure —
+  deferred (window is short; WriteBuf::clear at next entry-point scrubs).
+- **P2-2/P2-3**: cosmetic, no action needed.
+
+Architect re-audit conclusion: **no P0 regressions**, safe 1-lookup
+alternative for fast_path_data_row is **structurally impossible** under
+forbid(unsafe_code) + tier-2 arena gen-ref + tier-1 cursor borrow —
+the 2× arena lookup is the minimum-cost safe shape. Path to recover
+iter_rows_per_row beyond accepting +110% is API restructure
+(peek_row/consume_row split — public-API churn deferred to 1c-5).
+
 ### DEF-186 (perf-recovery partial — 2026-04-24)
 
 Bench-replay против `def184-complete` baseline после A10/B22 revert
