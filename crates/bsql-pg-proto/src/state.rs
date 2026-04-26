@@ -20,6 +20,7 @@
 //! become true no-ops instead of silent mis-advances).
 
 use crate::action::ParamOids;
+use crate::decode::RowDesc;
 use crate::error::BoundedStr;
 use crate::error::StateErrorKind;
 use crate::ident::PodBytes;
@@ -27,29 +28,50 @@ use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
     StartupKind,
 };
-use crate::schema_arena::SchemaRef;
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
 
 /// State-side counterpart to the public
 /// [`crate::action::DescribedRows<'r>`].
 ///
-/// DEF-119: state variants cannot carry a lifetime (they're owned
-/// by `PgProtocol`, not borrowed), so the state-storable form holds
-/// a [`SchemaRef`] handle into the arena. Materialise converts this
-/// to the lifetime-bound public form.
+/// # Post-DEF-188 (architect 2026-04-25): inline RowDesc
+///
+/// State variants cannot carry a lifetime (they're owned by
+/// `PgProtocol`, not borrowed), so they store the schema by value.
+/// `RowDesc` is `Copy`, ~264 B. Materialise produces the public
+/// `DescribedRows<'r>` by borrowing into `PgProtocol`'s
+/// `terminal_row_desc` slot, which the dispatch Z arm parks the
+/// `RowDesc` into right before transitioning to `Idle`.
 ///
 /// | Variant | State-side | Public `DescribedRows<'r>` |
 /// |---|---|---|
-/// | Rows | `Rows(SchemaRef)` (1 B) | `Rows(&'r RowDesc)` (8 B) |
+/// | Rows | `Rows(RowDesc)` (~264 B) | `Rows(&'r RowDesc)` (8 B) |
 /// | NoData | `NoData` (ZST) | `NoData` (ZST) |
 ///
-/// Total: 2 B state-side vs 264 B pre-arena.
+/// Pre-DEF-188 was 2 B (`SchemaRef` handle) state-side via DEF-119
+/// arena indirection. The arena was deleted in DEF-188 to recover
+/// the iter_rows hot-path regression — per-row `&self.state.row_desc`
+/// projection beats double-arena-lookup. Trade-off: state grows by
+/// ~264 B max, arena's 520 B PgProtocol footprint goes away (net
+/// PgProtocol ~unchanged). Tier uplift: `StaleSchemaRef` becomes
+/// architecturally impossible (no handle, no generation drift).
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "DEF-188: Rows(RowDesc) intentionally inlines the ~264 B \
+              schema. Boxing would force a heap allocation per Describe \
+              flow on the cold path, and the state variants holding \
+              `DescribedRowsStaged` (DescribeStatementAwaitingRfq, \
+              DescribePortalAwaitingRfq) already carry RowDesc-sized \
+              payloads, so the `Rows`-vs-NoData asymmetry doesn't enlarge \
+              the dominant ProtoState variant. The arena-handle \
+              alternative was deleted with the schema arena (DEF-188 \
+              core mandate)."
+)]
 pub enum DescribedRowsStaged {
-    /// Schema present at `SchemaRef` in the arena.
-    #[doc(hidden)] Rows(SchemaRef),
+    /// Schema present — full inline `RowDesc`.
+    #[doc(hidden)] Rows(RowDesc),
     /// Server sent `NoData` (`'n'`) — no result columns.
     #[doc(hidden)] NoData,
 }
@@ -154,10 +176,21 @@ pub enum ProtoState {
     ConnectingStartupScram {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
-        /// SCRAM session (the password the user provided).
-        /// Tier-1 typestate via [`ScramSession`] — `Credentials::Trust`
-        /// cannot reach this variant by construction.
-        scram: ScramSession,
+        /// SCRAM session (the password the user provided), heap-boxed.
+        ///
+        /// # DEF-187 (architect 2026-04-26): boxed
+        ///
+        /// Pre-DEF-187 the `ScramSession` (~520 B with full Password)
+        /// lived inline in the variant, dominating `ProtoState` size at
+        /// ~712 B and causing cache-locality damage on the per-row hot
+        /// path (iter_rows_per_row +110% regression vs pre-A10/B22).
+        ///
+        /// Post-DEF-187: `Box<ScramSession>` reduces variant footprint
+        /// to 8 + 16 = 24 B. Tier-1 preserved — Box can't be None,
+        /// Box's Drop fires `ScramSession::Drop` (ZeroizeOnDrop) on
+        /// every exit path. Cost: one heap alloc per SCRAM connection
+        /// (cold path, once per connection lifetime).
+        scram: alloc::boxed::Box<ScramSession>,
     },
 
     /// SCRAM step 1 complete (client-first sent); awaiting
@@ -165,19 +198,17 @@ pub enum ProtoState {
     ConnectingScramAwaitingServerFirst {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
-        /// SCRAM session (password bundle). Tier-1 typestate via
-        /// [`ScramSession`] — the `Credentials::Trust` variant
-        /// cannot appear here by construction (audit A2).
-        scram: ScramSession,
+        /// SCRAM session (heap-boxed, see [`Self::ConnectingStartupScram`]).
+        scram: alloc::boxed::Box<ScramSession>,
         /// The `client-first-message-bare` (saved for AuthMessage).
-        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN`]
-        /// (DEF-095 const-generic drift guard). POD buffer — no
-        /// `heapless::Vec` Drop propagation into the state enum
-        /// (DEF-099).
-        client_first_bare: PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
+        /// Heap-boxed per DEF-187 to keep the variant compact —
+        /// boxed `PodBytes<128>` = 8 B in the variant vs 130 B inline.
+        client_first_bare:
+            alloc::boxed::Box<PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>>,
         /// The client nonce (base64-encoded, for prefix validation).
-        /// Capacity pinned to [`crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN`].
-        client_nonce_b64: PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
+        /// Heap-boxed per DEF-187.
+        client_nonce_b64:
+            alloc::boxed::Box<PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>>,
     },
 
     /// SCRAM step 2 complete (client-final sent); awaiting
@@ -256,27 +287,27 @@ pub enum ProtoState {
     SimpleQueryAwaitingFirstResponse(ReplyId<QueryKind>),
 
     /// `RowDescription` received; now streaming `DataRow` frames.
-    /// Terminal transitions: `DataRow` → emit `Action::StreamRow`,
+    /// Terminal transitions: `DataRow` → fast-path `StreamItem::Row`,
     /// stay here; `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`]
     /// with the parsed command tag.
     ///
-    /// F19: carries the parsed `RowDesc` inline. Entering this variant
-    /// ONLY via the 'T' dispatcher arm (which parses `RowDescription`)
-    /// makes "StreamingRows implies schema" a tier-2 structural
-    /// invariant — the variant shape itself requires a schema. Prior
-    /// design held the schema in a separate `PgProtocol.row_desc` slot,
-    /// leaving state-and-slot as two parallel facts that could drift
-    /// (tier-3 audit pairing).
+    /// F19 + DEF-188: carries the parsed `RowDesc` inline. Entering
+    /// this variant ONLY via the 'T' dispatcher arm (which parses
+    /// `RowDescription`) makes "StreamingRows implies schema" a
+    /// tier-1 structural invariant — the variant shape itself requires
+    /// a schema. The per-row hot-path reads
+    /// `&self.proto.state.row_desc` directly (one field projection,
+    /// zero arena lookups).
     SimpleQueryStreamingRows {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
-        /// Schema arena handle. DEF-119: was inline `row_desc: RowDesc`
-        /// (260 B), now 1-byte `SchemaRef`. Arena slot allocated at the
-        /// `TAG_ROW_DESCRIPTION` dispatch; each staged `StreamRowRange`
-        /// copies the handle (1 B) instead of the schema (260 B);
-        /// threaded into `AwaitingRfq` on `CommandComplete`; slot freed
-        /// at the terminal RFQ → Idle transition.
-        schema_ref: SchemaRef,
+        /// Result-set schema. DEF-188: inline `RowDesc` (~264 B).
+        /// Pre-DEF-188 was a 2-byte `SchemaRef` handle into a 2-slot
+        /// arena; the arena was deleted to recover the iter_rows
+        /// hot-path regression — per-row state-projection beats
+        /// double-arena-lookup. RowDesc is `Copy`, moves between
+        /// transitions without heap traffic.
+        row_desc: RowDesc,
     },
 
     /// `CommandComplete` or `EmptyQueryResponse` received; awaiting
@@ -284,13 +315,13 @@ pub enum ProtoState {
     /// (empty for `EmptyQueryResponse`) ships in the final
     /// [`crate::Reply::QueryComplete`] payload.
     ///
-    /// F19: carries `row_desc: Option<RowDesc>` — `Some(desc)` when
-    /// entered from `SimpleQueryStreamingRows` (SELECT path, schema
-    /// preserved through terminal transitions), `None` when entered
-    /// from `SimpleQueryAwaitingFirstResponse` via `CommandComplete`
-    /// (DML path: no RowDescription was received) or
-    /// `EmptyQueryResponse` (empty query: ditto). Preserves the
-    /// public-API distinction "0-row SELECT (Some(empty)) vs DML (None)".
+    /// F19 + DEF-188: carries `row_desc: Option<RowDesc>` inline —
+    /// `Some(desc)` when entered from `SimpleQueryStreamingRows`
+    /// (SELECT path, schema preserved through terminal transitions),
+    /// `None` when entered from `SimpleQueryAwaitingFirstResponse`
+    /// via `CommandComplete` (DML path) or `EmptyQueryResponse`
+    /// (empty query). Preserves the public-API distinction "0-row
+    /// SELECT (Some(empty)) vs DML (None)".
     SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
@@ -299,11 +330,15 @@ pub enum ProtoState {
         /// PG's documented tag shapes (the longest standard tag,
         /// `"INSERT <oid> <n>"` with 10-digit values, is ~23 bytes).
         command_tag: BoundedStr<32>,
-        /// Schema handle from the SELECT path (`Some(ref)` into
-        /// the arena) or absence marker (`None`) from DML /
-        /// empty-query paths. DEF-119: was inline
-        /// `Option<RowDesc>` (264 B), now `Option<SchemaRef>` (2 B).
-        schema_ref: Option<SchemaRef>,
+        /// Inline schema from the SELECT path (`Some(desc)`) or
+        /// absence marker (`None`) from DML / empty-query paths.
+        /// DEF-188: was 2-byte `Option<SchemaRef>`, now full
+        /// `Option<RowDesc>` (~264 B with niche). The arena was
+        /// deleted; the dispatch Z arm parks the desc into
+        /// `PgProtocol::terminal_row_desc` before transitioning
+        /// to `Idle`, so the public `Reply::QueryComplete` borrow
+        /// finds a valid memory location.
+        row_desc: Option<RowDesc>,
     },
 
     /// `ErrorResponse` received mid-query; `FailReply` already
@@ -399,9 +434,11 @@ pub enum ProtoState {
     BindExecuteAwaitingBindCompleteSelect {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
-        /// User-supplied schema, required (variant shape guarantees
-        /// its presence — tier-1 structural).
-        schema_ref: SchemaRef,
+        /// User-supplied inline schema, required (variant shape
+        /// guarantees its presence — tier-1 structural). DEF-188:
+        /// inline `RowDesc` (~264 B); pre-DEF-188 was 2-byte
+        /// `SchemaRef`.
+        row_desc: RowDesc,
     },
 
     /// `BindComplete` received on the schema-bearing path; awaiting
@@ -411,18 +448,19 @@ pub enum ProtoState {
     BindExecuteAwaitingDataOrCompleteSelect {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
-        /// Schema (guaranteed present by variant shape — tier-1).
-        schema_ref: SchemaRef,
+        /// Inline schema (guaranteed present by variant shape — tier-1).
+        row_desc: RowDesc,
     },
 
     /// Streaming `DataRow` frames on the schema-bearing path.
     /// Mirrors [`Self::SimpleQueryStreamingRows`] — schema required
-    /// by variant shape.
+    /// by variant shape. The per-row hot-path reads
+    /// `&self.proto.state.row_desc` directly.
     BindExecuteStreamingRows {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
-        /// Schema (guaranteed present by variant shape).
-        schema_ref: SchemaRef,
+        /// Inline schema (guaranteed present by variant shape).
+        row_desc: RowDesc,
     },
 
     /// `CommandComplete` received on the schema-bearing path;
@@ -433,8 +471,11 @@ pub enum ProtoState {
         reply: ReplyId<QueryKind>,
         /// Command tag parsed from the `C` frame body.
         command_tag: BoundedStr<32>,
-        /// Schema to ship in the terminal `QueryComplete` reply.
-        schema_ref: SchemaRef,
+        /// Inline schema to park in `terminal_row_desc` at the
+        /// final RFQ → Idle transition (so the public
+        /// `Reply::QueryComplete` borrow stays valid through
+        /// materialise).
+        row_desc: RowDesc,
     },
 
     // ---------------------------------------------------------------
@@ -796,11 +837,11 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("SimpleQueryStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::SimpleQueryAwaitingRfq { reply, command_tag, schema_ref } => f
+            Self::SimpleQueryAwaitingRfq { reply, command_tag, row_desc } => f
                 .debug_struct("SimpleQueryAwaitingRfq")
                 .field("reply", reply)
                 .field("command_tag", command_tag)
-                .field("schema_ref_is_some", &schema_ref.is_some())
+                .field("row_desc_is_some", &row_desc.is_some())
                 .finish(),
             Self::BindExecuteAwaitingBindCompleteDml(id) => {
                 write!(f, "BindExecuteAwaitingBindCompleteDml({id:?})")
@@ -883,8 +924,8 @@ mod push_class_tests {
     //! `panic!`, `unwrap()`, `expect()`, `unreachable!()` all banned
     //! crate-wide. Fixture construction uses the `assert!(is_some) +
     //! unwrap_or(fallback)` idiom where needed; `nz()` asserts on
-    //! `0` before falling back to `MIN`. SchemaRef fixtures use
-    //! `SchemaRef::dead_for_test()` as the test-only sentinel.
+    //! `0` before falling back to `MIN`. RowDesc fixtures use
+    //! `RowDesc::EMPTY` as the test-only zero-column sentinel.
     //!
     //! # Coverage
     //!
@@ -952,7 +993,7 @@ mod push_class_tests {
         // A10/B22 revert 2026-04-24: SCRAM variants carry inline
         // data (tier-1 variant-carries-field restoration).
         if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = ScramSession::from_password(Sensitive::new(pw));
+            let scram = alloc::boxed::Box::new(ScramSession::from_password(Sensitive::new(pw)));
             pin(
                 ProtoState::ConnectingStartupScram {
                     reply: ReplyId::from_raw(nz(2_002)),
@@ -962,13 +1003,13 @@ mod push_class_tests {
             );
         }
         if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = ScramSession::from_password(Sensitive::new(pw));
+            let scram = alloc::boxed::Box::new(ScramSession::from_password(Sensitive::new(pw)));
             pin(
                 ProtoState::ConnectingScramAwaitingServerFirst {
                     reply: ReplyId::from_raw(nz(2_003)),
                     scram,
-                    client_first_bare: crate::ident::PodBytes::new(),
-                    client_nonce_b64: crate::ident::PodBytes::new(),
+                    client_first_bare: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
+                    client_nonce_b64: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
                 },
                 StatePushClass::Connecting,
             );
@@ -1005,7 +1046,7 @@ mod push_class_tests {
         pin(
             ProtoState::SimpleQueryStreamingRows {
                 reply: ReplyId::from_raw(nz(3_002)),
-                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );
@@ -1013,7 +1054,7 @@ mod push_class_tests {
             ProtoState::SimpleQueryAwaitingRfq {
                 reply: ReplyId::from_raw(nz(3_003)),
                 command_tag: BoundedStr::default(),
-                schema_ref: None,
+                row_desc: None,
             },
             StatePushClass::BusyQuery,
         );
@@ -1048,21 +1089,21 @@ mod push_class_tests {
         pin(
             ProtoState::BindExecuteAwaitingBindCompleteSelect {
                 reply: ReplyId::from_raw(nz(5_004)),
-                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );
         pin(
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect {
                 reply: ReplyId::from_raw(nz(5_005)),
-                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );
         pin(
             ProtoState::BindExecuteStreamingRows {
                 reply: ReplyId::from_raw(nz(5_006)),
-                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );
@@ -1070,7 +1111,7 @@ mod push_class_tests {
             ProtoState::BindExecuteAwaitingRfqSelect {
                 reply: ReplyId::from_raw(nz(5_007)),
                 command_tag: BoundedStr::default(),
-                schema_ref: crate::schema_arena::SchemaRef::dead_for_test(),
+                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );

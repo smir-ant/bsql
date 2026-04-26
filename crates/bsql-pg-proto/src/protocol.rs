@@ -252,10 +252,11 @@ macro_rules! try_builder {
 ///
 /// Pre-(L), `MAX_ACTIONS_PER_CALL = 8` governed BOTH the staged
 /// (dispatch-side) and output (user-side) capacity. Materialise
-/// emits up to 2 actions per staged entry on the stale-SchemaRef
-/// fan-out path (`FailReply + CloseSocket`) — a 16-action
-/// worst-case that did not fit the 8-slot output container,
-/// causing `.unwrap_or(())` to silently drop terminal actions.
+/// could emit up to 2 actions per staged entry on the
+/// `SendBytesRange.apply == None` fan-out path (`CloseSocket`) —
+/// a 16-action worst-case that did not fit the 8-slot output
+/// container, causing `.unwrap_or(())` to silently drop terminal
+/// actions.
 ///
 /// Post-(L): `MAX_STAGED_PER_CALL = 8` bounds dispatch's stage
 /// container; `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED = 16`
@@ -285,10 +286,17 @@ pub const MAX_STAGED_PER_CALL: usize = 8;
 /// # Budget derivation
 ///
 /// `MAX_STAGED_PER_CALL (8) + 1 = 9`. The `+1` is the single
-/// fanout-2 worst case: `StagedAction::DeliverReply` with a stale
-/// `SchemaRef` payload emits `FailReply + CloseSocket` (2 actions
-/// from 1 staged entry). Every other StagedAction variant maps
-/// 1:1 to Action.
+/// fanout-2 worst case: `StagedAction::SendBytesRange` whose
+/// `WriteRange::apply` returns `None` (architecturally dead —
+/// classified-via-CloseSocket sentinel, see `materialise`). Every
+/// other StagedAction variant maps 1:1 to Action.
+///
+/// Post-DEF-188: the prior fanout-2 case was
+/// `StagedAction::DeliverReply` with a stale `SchemaRef` payload
+/// (`FailReply + CloseSocket`). DEF-188 deleted the schema arena
+/// and the stale-ref class entirely; the only remaining fanout-2
+/// site is `SendBytesRange.apply == None`, which inherits the same
+/// budget reservation.
 ///
 /// # Why `+1` and not `× 2`?
 ///
@@ -385,18 +393,16 @@ const _: () = assert!(
 /// `!Sync` by construction (`PhantomData<Cell<()>>` field). Concurrent
 /// access is impossible; a `&mut PgProtocol` is the only handle.
 ///
-/// # Size budget (DEF-184 post-A10/B22 revert 2026-04-24)
+/// # Size budget (DEF-188 post-arena-deletion 2026-04-25)
 ///
-/// `size_of::<PgProtocol>()` is pinned in `lib.rs` at a range
-/// accommodating the inline SCRAM session. Budget composition:
-/// - `ReadBuf`       ~4096 B  (I/O staging, READ_BUF_CAP)
-/// - `state`          ~712 B  (ProtoState — SCRAM session carried
-///   inline in `ConnectingScramAwaitingServerFirst` per tier-1
-///   variant-carries-field invariant; CREDO §1)
-/// - `session_params` ~420 B
-/// - `schema_arena`   ~520 B  (DEF-119 two-slot slab)
-/// - `error_arena`    ~290 B  (DEF-184 A1+A13 single-slot)
-/// - padding + flags  varies
+/// `size_of::<PgProtocol>()` is pinned in `lib.rs`. Budget composition:
+/// - `ReadBuf`            ~4096 B  (I/O staging, READ_BUF_CAP)
+/// - `state`              ~320 B  (ProtoState — RowDesc inline in
+///   streaming/AwaitingRfq variants per DEF-188; SCRAM Boxed per DEF-187)
+/// - `session_params`     ~420 B
+/// - `terminal_row_desc`  ~268 B  (DEF-188 single-slot Option<RowDesc>)
+/// - `error_arena`        ~290 B  (DEF-184 A1+A13 single-slot)
+/// - padding + flags      varies
 ///
 /// Any field addition or size growth must update the pin in
 /// `lib.rs` alongside the code change. See DEF-163 G012 for
@@ -408,42 +414,50 @@ pub struct PgProtocol {
     /// during startup from ParameterStatus messages. Read-only after
     /// startup completes (accessible via `session_params()`).
     session_params: SessionParams,
-    /// DEF-119 schema arena — externalised `RowDesc` storage.
+    /// DEF-188 terminal-RowDesc parking slot.
     ///
-    /// Two-slot slab (see [`crate::schema_arena`] module docs).
-    /// State variants / staged actions / staged reply payloads
-    /// carry 1-byte `SchemaRef` handles; public `Reply<'r>` and
-    /// `Action::StreamRow::desc` resolve refs through the arena at
-    /// materialise time.
+    /// At the dispatch Z arm of a SELECT-bearing flow (SimpleQuery
+    /// or BindExecute SELECT path) and at Describe Z arms with
+    /// `Rows`, the inline `RowDesc` from the consumed state variant
+    /// is moved into this slot RIGHT BEFORE state transitions to
+    /// `Idle`. Materialise then borrows `&self.terminal_row_desc`
+    /// to construct the public `Reply<'r>::QueryComplete { row_desc:
+    /// Option<&'r RowDesc> }` payload.
     ///
-    /// # Placement rationale (DEF-184 audit-2 item-1)
+    /// # Why a slot
     ///
-    /// The arena lives on `PgProtocol` (not in a separate pool or
-    /// thread-through parameter) by design. `SchemaRef` values
-    /// embed in `ProtoState` variants (e.g. `StreamingRows { schema_ref }`)
-    /// and in staged Action/Reply payloads. Arena + ProtoState share
-    /// a single `&mut PgProtocol` borrow in `feed_bytes` /
-    /// `push_command`, so the ref-lifetime flow stays within one
-    /// scope and the arena cannot be mis-passed against a SchemaRef
-    /// minted by a different arena instance.
+    /// State holds the inline `RowDesc` during the streaming /
+    /// AwaitingRfq window (per-row hot path reads
+    /// `&self.state.row_desc` directly — DEF-188 win). At the
+    /// terminal Z transition, state must become `Idle` (no
+    /// in-flight reply) but the public Reply still needs a
+    /// `&'r RowDesc` borrow that survives until OutActions drops.
+    /// Parking into this slot keeps the address stable through
+    /// materialise; the next entry-point's
+    /// `clear_terminal_row_desc_if_idle_or_errored` clears it.
     ///
-    /// SchemaRef staleness is classified independently via
-    /// generational counter (tier-2 structural — `Option<&RowDesc>`
-    /// returns `None` on gen mismatch). Arena co-location does NOT
-    /// supply a tier-1 compile guarantee on its own; it's a
-    /// borrow-scope convenience that keeps the tier-2 staleness
-    /// check simple. A future out-of-body pool (e.g. per-connection
-    /// pool with shared generation space) is architecturally
-    /// possible but would require an additional correlation
-    /// invariant (tier-2 classifier for "ref minted by a different
-    /// pool"), so the placement is load-bearing for the current
-    /// single-borrow invariant model.
+    /// # Pre-DEF-188 design (deleted)
     ///
-    /// Cost: ~528 B on `PgProtocol`, paid once per connection.
-    /// Benefit: state drops from ~1224 B → ~300 B;
-    /// `Action::StreamRow` drops from ~280 B → ~32 B;
-    /// per-row DataRow emission saves ~260 B (hot path on SELECT).
-    schema_arena: crate::schema_arena::SchemaArena,
+    /// Pre-188 was `schema_arena: SchemaArena` — a 2-slot slab with
+    /// generational tracking and `SchemaRef` handles in state
+    /// variants. The arena cost ~520 B and required dual `arena.get`
+    /// calls per row in the hot fast-path. DEF-188 deletes the
+    /// arena: state inlines `RowDesc`, terminal materialise borrows
+    /// from this single slot, `StaleSchemaRef` becomes
+    /// architecturally impossible (no handle, no generation drift).
+    ///
+    /// Cost: ~268 B on `PgProtocol` (Option<RowDesc> + niche +
+    /// padding). Per connection lifetime.
+    ///
+    /// Lifecycle:
+    /// - **Park** at dispatch Z arm: `*self.terminal_row_desc =
+    ///   Some(desc)` before state = Idle.
+    /// - **Borrow** at materialise: `Option<&'r RowDesc>` view
+    ///   passed to `StagedReply::into_public`.
+    /// - **Clear** at next entry-point's
+    ///   `clear_terminal_row_desc_if_idle_or_errored` (mirror of
+    ///   pre-188 arena-clear discipline).
+    terminal_row_desc: Option<crate::decode::RowDesc>,
     /// DEF-184 (A1+A13) error-payload arena — single-slot storage
     /// for `ProtocolError::ServerErrorResponse` bounded strings.
     ///
@@ -467,7 +481,7 @@ pub struct PgProtocol {
     ///
     /// # Placement rationale (DEF-184 audit-2 item-1)
     ///
-    /// Same single-borrow convenience as `schema_arena` above.
+    /// Same single-borrow convenience as `terminal_row_desc` above.
     /// `ErrorRef` (carried by `ProtocolError::ServerErrorResponse`)
     /// resolves via `&self` of `PgProtocol` — arena co-located with
     /// state keeps the ref lifetime within a single borrow scope.
@@ -505,8 +519,9 @@ pub struct PgProtocol {
     // `StreamItem::Row` directly from `iter_rows`, NOT staged).
     //
     // Post-(Y): no staged action carries a read_buf borrow.
-    // `Action<'w, 'r>.'r` is tied to `schema_arena` (RowDesc refs),
-    // NOT `read_buf`. Cursor advance can safely happen IN-SCOPE
+    // `Action<'w, 'r>.'r` is tied to `terminal_row_desc` (RowDesc
+    // refs from the parking slot post-DEF-188), NOT `read_buf`.
+    // Cursor advance can safely happen IN-SCOPE
     // within `feed_bytes` before materialising OutActions — no
     // borrow conflict exists to defer around.
     //
@@ -595,7 +610,7 @@ impl PgProtocol {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
             session_params: SessionParams::new(),
-            schema_arena: crate::schema_arena::SchemaArena::new(),
+            terminal_row_desc: None,
             error_arena: crate::error_arena::ErrorArena::new(),
             malformed_frame_count: 0,
             sync_marker: PhantomData,
@@ -691,15 +706,16 @@ impl PgProtocol {
         // freedom over what they pair the result with later.
         write_buf.clear();
 
-        // DEF-172: centralised entry-point arena reclamation.
-        self.clear_arena_if_idle_or_errored();
+        // DEF-188: centralised entry-point terminal-row-desc reclamation.
+        self.clear_terminal_row_desc_if_idle_or_errored();
 
         // DEF-154 (B+H): write-side keeps its brand (`'wb`) for
         // tier-1 `WriteRange::apply`; read side is unbranded (push
         // paths never emit StreamRowRange so the read-buf view is
         // unused by materialise — pass no read slice).
         let state = &mut self.state;
-        let schema_arena = &mut self.schema_arena;
+        let terminal_row_desc_ref: Option<&crate::decode::RowDesc> =
+            self.terminal_row_desc.as_ref();
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
             // DEF-186 perf-recovery 2026-04-24: compute_push refactored
             // to take `&mut ProtoState` (was: by-value with `mem::take`
@@ -712,7 +728,7 @@ impl PgProtocol {
                 let mut reserved = wb.reserve();
                 compute_push(cmd, state, &mut reserved)
             };
-            materialise(staged, wb.into_bytes(), schema_arena.as_reader())
+            materialise(staged, wb.into_bytes(), terminal_row_desc_ref)
         })
     }
 
@@ -778,26 +794,16 @@ impl PgProtocol {
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 's> {
         write_buf.clear();
-        // DEF-172: centralised entry-point arena reclamation.
-        self.clear_arena_if_idle_or_errored();
-        // DEF-119: if the user supplied a row_desc, allocate it into
-        // the arena NOW and thread the resulting SchemaRef into the
-        // state machine.
-        //
-        // DEF-183 (P1-A from Senior audit): routed through
-        // `as_writer()` witness for consistency with dispatch()'s
-        // alloc path. NLL ends the writer borrow at the last use.
-        let schema_ref = match row_desc {
-            Some(desc) => self.schema_arena.as_writer().alloc(desc),
-            None => None,
-        };
+        // DEF-188: centralised entry-point terminal-row-desc reclamation.
+        self.clear_terminal_row_desc_if_idle_or_errored();
 
         // DEF-154 (B+H): write-brand only. Push paths emit no
         // StreamRowRange; materialise doesn't need a read view.
         // DEF-186 perf-recovery 2026-04-24: compute_push_bind_execute
         // takes &mut state — saves 2× ProtoState size memcpy per call.
         let state = &mut self.state;
-        let schema_arena = &mut self.schema_arena;
+        let terminal_row_desc_ref: Option<&crate::decode::RowDesc> =
+            self.terminal_row_desc.as_ref();
         write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
             let mut staged = StagedActions::new();
             {
@@ -807,14 +813,14 @@ impl PgProtocol {
                     portal_name,
                     stmt_name,
                     params,
-                    schema_ref,
+                    row_desc,
                     fetch,
                     reply,
                     &mut staged,
                     &mut reserved,
                 );
             }
-            materialise(staged, wb.into_bytes(), schema_arena.as_reader())
+            materialise(staged, wb.into_bytes(), terminal_row_desc_ref)
         })
     }
 
@@ -891,7 +897,7 @@ impl PgProtocol {
         max_dispatches: u16,
     ) -> OutActions<'w, 'r> {
         write_buf.clear();
-        self.clear_arena_if_idle_or_errored();
+        self.clear_terminal_row_desc_if_idle_or_errored();
 
         // DEF-154 (H+V) pending_advance DELETED 2026-04-24: the
         // deferred-advance slot existed because `StagedAction::StreamRowRange`
@@ -955,7 +961,7 @@ impl PgProtocol {
         let state = &mut self.state;
         let read_buf = &mut self.read_buf;
         let session_params = &mut self.session_params;
-        let schema_arena = &mut self.schema_arena;
+        let terminal_row_desc = &mut self.terminal_row_desc;
         let error_arena = &mut self.error_arena;
         let malformed_counter = &mut self.malformed_frame_count;
 
@@ -965,9 +971,15 @@ impl PgProtocol {
         match classification {
             IngressClassification::AlreadyErrored => {
                 read_buf.clear();
+                // DEF-188: materialise needs an immutable view of
+                // terminal_row_desc. NLL collapses the prior `&mut`
+                // binding at the last use; reborrow here as `&Option<_>`
+                // for the duration of the closure.
+                let terminal_ref: Option<&crate::decode::RowDesc> =
+                    (*terminal_row_desc).as_ref();
                 return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
                     let staged: StagedActions = StagedActions::new();
-                    materialise(staged, wb.into_bytes(), schema_arena.as_reader())
+                    materialise(staged, wb.into_bytes(), terminal_ref)
                 });
             }
             IngressClassification::AppendFailed { attempted, available } => {
@@ -993,7 +1005,13 @@ impl PgProtocol {
                         &mut staged,
                         malformed_counter,
                     );
-                    materialise(staged, wb.into_bytes(), schema_arena.as_reader())
+                    // DEF-188: fail_inflight_no_readbuf doesn't touch
+                    // terminal_row_desc; reborrow as immutable for
+                    // materialise here. NLL ends the outer `&mut`
+                    // binding at fail_inflight's return.
+                    let terminal_ref: Option<&crate::decode::RowDesc> =
+                        (*terminal_row_desc).as_ref();
+                    materialise(staged, wb.into_bytes(), terminal_ref)
                 });
             }
             IngressClassification::Ok => {
@@ -1154,13 +1172,14 @@ impl PgProtocol {
                         // and writes transitions directly. No
                         // `mem::take` + `*state = new` round-trip —
                         // one mutable borrow, one in-place store.
-                        let mut arena_writer = schema_arena.as_writer();
+                        // DEF-188: terminal_row_desc threaded through
+                        // for the Z arms to park the in-flight schema.
                         let outcome = dispatch(
                             state,
                             tag,
                             payload,
                             &mut reserved,
-                            &mut arena_writer,
+                            terminal_row_desc,
                             error_arena,
                         );
                         match outcome {
@@ -1238,7 +1257,7 @@ impl PgProtocol {
             // (which drops at end of loop body via NLL), we can now
             // call `read_buf.advance()` right here.
             //
-            // Skip advance on Errored transition — `clear_arena_if_idle_or_errored`
+            // Skip advance on Errored transition — `clear_terminal_row_desc_if_idle_or_errored`
             // on the NEXT entry call clears the read_buf anyway, so
             // any partial-frame remnant doesn't matter.
             //
@@ -1263,49 +1282,54 @@ impl PgProtocol {
                 );
             }
 
-            materialise(staged, wb.into_bytes(), schema_arena.as_reader())
+            // DEF-188: dispatch may have written to `terminal_row_desc`
+            // during the loop (Z arms park schemas). NLL ends the
+            // dispatch loop's `&mut` reborrow at the loop close brace
+            // above; reborrow as immutable here for materialise.
+            let terminal_ref: Option<&crate::decode::RowDesc> =
+                (*terminal_row_desc).as_ref();
+            materialise(staged, wb.into_bytes(), terminal_ref)
         })
     }
-    /// DEF-172 — entry-point arena reclamation.
+    /// DEF-188 — entry-point terminal-row-desc reclamation.
     ///
     /// If the connection state is `Idle` or `Errored`, clear the
-    /// schema arena (reclaims any schemas carried over from the
-    /// previous query cycle) and pin the post-clear invariant
-    /// (`occupied_count() == 0`) in debug builds.
+    /// terminal-row-desc parking slot (reclaims any schema carried
+    /// over from the previous query cycle's terminal materialise)
+    /// and the error_arena.
     ///
-    /// Called from all three user-facing entry points: `push_command`,
-    /// `push_bind_execute`, `feed_bytes`. Pre-DEF-172, each of the
-    /// three sites open-coded the 8-line match+clear+debug_assert
-    /// pattern — drift surface (audit2 A007) since adding a fourth
-    /// entry point (e.g., a future `push_close_statement` in 1c-3d)
-    /// would need to remember the ritual. Post-DEF-172 the discipline
-    /// lives in one place.
+    /// Called from all four user-facing entry points: `push_command`,
+    /// `push_bind_execute`, `feed_bytes`, `iter_rows`. Pre-DEF-172,
+    /// each site open-coded the match+clear pattern — drift surface
+    /// (audit2 A007) since adding a fifth entry point would need to
+    /// remember the ritual. Post-DEF-172 the discipline lives in one
+    /// place.
     ///
-    /// DEF-148 / DEF-171: clear() is cheap on the Ping-loop hot case
-    /// (2-slot is_some walk, no stores).
+    /// # Lifecycle correctness
     ///
-    /// 1c-5 blocker (audit2 A027): pipelining breaks the blanket-
-    /// clear model — concurrent inflight queries each hold a live
-    /// SchemaRef; clear()ing all slots at an entry point would
-    /// invalidate refs that are still legitimately in-flight. At
-    /// 1c-5 time this helper becomes per-ref `free()` calls keyed
-    /// on which query's borrow is ending. Revisit per H021
-    /// witness-guard session.
+    /// The slot is parked at dispatch's terminal Z arm (state goes
+    /// to Idle); the public `Reply::QueryComplete<'r>` borrow is
+    /// then handed to the user via `OutActions<'w, 'r>`. The user
+    /// holds OutActions until they decide to drop it — they cannot
+    /// re-call any `&mut self` method on PgProtocol while OutActions
+    /// is alive (NLL on `'r`). When OutActions drops, `'r` ends; the
+    /// next entry-point method call observes state ∈ {Idle, Errored}
+    /// (post-Z transition) and clears the slot here. Tier-2
+    /// structural: no caller can peek into the slot after the borrow
+    /// outlives, because the borrow checker forbids the cross.
+    ///
+    /// Pre-DEF-188 this was the 2-slot arena's `clear()` with
+    /// generation-bump (`SchemaRef` staleness classification).
+    /// Post-188: single-slot `Option::None` reset.
     #[inline]
-    fn clear_arena_if_idle_or_errored(&mut self) {
+    fn clear_terminal_row_desc_if_idle_or_errored(&mut self) {
         if matches!(self.state, ProtoState::Idle | ProtoState::Errored(_)) {
-            self.schema_arena.clear();
-            debug_assert_eq!(
-                self.schema_arena.occupied_count(),
-                0,
-                "DEF-152: clear() must leave arena empty",
-            );
-            // DEF-184 (A1+A13): error_arena mirrors schema_arena
-            // lifecycle — cleared at entry-point boundaries when
+            self.terminal_row_desc = None;
+            // DEF-184 (A1+A13): error_arena mirrors the same
+            // entry-point lifecycle — cleared at boundaries when
             // state is Idle/Errored. Any outstanding ErrorRef
             // issued from the previous cycle resolves to `None`
-            // via generation mismatch post-clear (stale-ref
-            // classification per error_arena.rs docs).
+            // via generation mismatch post-clear.
             self.error_arena.clear();
         }
     }
@@ -1426,7 +1450,7 @@ impl PgProtocol {
     // DEF-154 (X) P0-2(c): RowStream helpers
     // ═════════════════════════════════════════════════════════════
     //
-    // Thin crate-internal accessors exposing read_buf / schema_arena
+    // Thin crate-internal accessors exposing read_buf / state
     // operations to the `row_stream` module without opening
     // field-level `pub(crate)` on the field directly. Each is a
     // single-line delegate — no logic added.
@@ -1462,54 +1486,61 @@ impl PgProtocol {
         self.read_buf.advance(n)
     }
 
-    /// DEF-154 (X): `ArenaReader<'_>` for slow-path
-    /// `StagedReply::into_public` or direct `.get(schema_ref)`.
-    #[inline]
-    #[must_use]
-    pub(crate) fn schema_arena_reader(&self) -> crate::schema_arena::ArenaReader<'_> {
-        self.schema_arena.as_reader()
-    }
-
-    /// DEF-185 P0-E: check if a SchemaRef currently resolves in the
-    /// schema arena, WITHOUT returning a borrow into the arena.
-    ///
-    /// Used by `row_stream::RowStream::fast_path_data_row` to split
-    /// the stale-ref check from the `Row` emission: the check happens
-    /// via a `bool` return (no lifetime propagation), freeing the
-    /// arm's `else` branch to take `&mut self.proto` for the
-    /// `install_errored_stale_schema_ref` transition.
-    ///
-    /// Returning the full `Option<&RowDesc>` as the arena reader
-    /// does ties the caller's control-flow lifetime into the match
-    /// expression's unified return type, preventing the else arm's
-    /// `&mut` re-borrow.
-    #[inline]
-    #[must_use]
-    pub(crate) fn schema_arena_has(&self, r: crate::schema_arena::SchemaRef) -> bool {
-        self.schema_arena.as_reader().get(r).is_some()
-    }
-
-    /// DEF-154 (X): if current state is a row-streaming variant,
-    /// return `(reply_id, schema_ref)`. Otherwise `None`.
+    /// DEF-188: if current state is a row-streaming variant, return
+    /// `(reply_id, &row_desc)` — the inline `RowDesc` projection
+    /// from the state field.
     ///
     /// Covers: `SimpleQueryStreamingRows`, `BindExecuteStreamingRows`,
     /// and `BindExecuteAwaitingDataOrCompleteSelect` (BindExecute's
     /// SELECT path can receive DataRow before explicit transition
     /// to StreamingRows).
+    ///
+    /// # Per-row hot-path win
+    ///
+    /// Pre-DEF-188 the equivalent accessor returned
+    /// `(NonZeroU64, SchemaRef)` (Copy) and the row_stream
+    /// fast-path then performed two arena lookups
+    /// (`schema_arena_has` for stale-ref check + `arena.get` for
+    /// the Row emission's desc). Post-188: one direct field
+    /// projection, zero arena lookups, zero stale-ref class
+    /// (architecturally impossible without a handle).
+    ///
+    /// The returned `&'a RowDesc` ties to `&'a self.proto`. Callers
+    /// must take this borrow AFTER any `&mut self.proto` operations
+    /// (e.g. `read_buf_advance`) — the borrow extends until the
+    /// returned `StreamItem::Row` drops.
     #[inline]
     #[must_use]
-    pub(crate) fn streaming_reply_id_and_schema(
+    pub(crate) fn streaming_state_id_and_desc(
         &self,
-    ) -> Option<(core::num::NonZeroU64, crate::schema_arena::SchemaRef)> {
+    ) -> Option<(core::num::NonZeroU64, &crate::decode::RowDesc)> {
         match &self.state {
-            ProtoState::SimpleQueryStreamingRows { reply, schema_ref } => {
-                Some((reply.get(), *schema_ref))
+            ProtoState::SimpleQueryStreamingRows { reply, row_desc }
+            | ProtoState::BindExecuteStreamingRows { reply, row_desc }
+            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc } => {
+                Some((reply.get(), row_desc))
             }
-            ProtoState::BindExecuteStreamingRows { reply, schema_ref } => {
-                Some((reply.get(), *schema_ref))
-            }
-            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, schema_ref } => {
-                Some((reply.get(), *schema_ref))
+            _ => None,
+        }
+    }
+
+    /// DEF-188: cheap `&self` check whether the current state is a
+    /// row-streaming variant. Used by `iter_rows` fast-path to
+    /// decide which path before any `&mut self` operations.
+    ///
+    /// Returns `Some(reply_id)` (Copy, no lifetime) so the caller
+    /// can release the `&self` borrow before calling
+    /// `&mut self.read_buf.advance()`. The desc projection happens
+    /// later via [`Self::streaming_state_id_and_desc`] under a
+    /// fresh `&self` borrow.
+    #[inline]
+    #[must_use]
+    pub(crate) fn streaming_reply_id(&self) -> Option<core::num::NonZeroU64> {
+        match &self.state {
+            ProtoState::SimpleQueryStreamingRows { reply, .. }
+            | ProtoState::BindExecuteStreamingRows { reply, .. }
+            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. } => {
+                Some(reply.get())
             }
             _ => None,
         }
@@ -1565,34 +1596,11 @@ impl PgProtocol {
         self.state = ProtoState::Errored(state_kind);
     }
 
-    /// DEF-185 P0-E (audit 2026-04-24): transition to `Errored(Internal)`
-    /// for a stale SchemaRef detected in the RowStream fast-path.
-    ///
-    /// Pre-fix: `fast_path_data_row` set `self.drained = true` and
-    /// emitted `StreamItem::FailReply { locus: StaleSchemaRef }` WITHOUT
-    /// transitioning state. The caller saw FailReply but `ProtoState`
-    /// stayed `SimpleQueryStreamingRows` — next `push_command` would
-    /// classify as CommandInProgress, and the connection effectively
-    /// became zombie without `CloseSocket` signal. Wrapper had no
-    /// reliable way to notice teardown was required.
-    ///
-    /// Post-fix: this helper transitions state to Errored before
-    /// returning the FailReply; subsequent `feed_bytes` sees Errored
-    /// state and short-circuits the dispatch loop, the next user
-    /// command returns ConnectionAlreadyClosed instead of the
-    /// wrong CommandInProgress. Caller receives FailReply + can drop
-    /// the protocol to release the socket.
-    ///
-    /// Arm is architecturally dead under correct arena lifecycle
-    /// (clear_arena_if_idle_or_errored + generational refs), but tier-2
-    /// classified via InternalCrateBug::StaleSchemaRef locus.
-    #[inline]
-    pub(crate) fn install_errored_stale_schema_ref(&mut self) {
-        let cause = ProtocolError::InternalCrateBug {
-            locus: crate::error::CrateBugLocus::StaleSchemaRef,
-        };
-        self.state = ProtoState::Errored(cause.state_kind());
-    }
+    // DEF-188: install_errored_stale_schema_ref DELETED — there is
+    // no longer a SchemaRef type or generation drift class. State
+    // variants carry RowDesc inline; the fast-path reads
+    // `&self.state.row_desc` directly. The "stale ref" bug class is
+    // architecturally impossible (no handle to be stale).
 
     /// DEF-154 (X) P0-2(c): construct a pull-based row stream
     /// over this protocol + a caller-owned write buffer.
@@ -1615,7 +1623,7 @@ impl PgProtocol {
     ) -> crate::row_stream::RowStream<'p, 'w> {
         // Entry-point housekeeping mirrors feed_bytes:
         write_buf.clear();
-        self.clear_arena_if_idle_or_errored();
+        self.clear_terminal_row_desc_if_idle_or_errored();
         // DEF-184 audit (2026-04-24): `apply_pending_advance`
         // DELETED — the deferred mechanism is gone (post-DEF-154 Y
         // StreamRowRange delete, cursor advance happens in-scope
@@ -1914,8 +1922,9 @@ fn compute_push_startup(
                     // restored — ScramSession lives INSIDE the
                     // variant. Variant-carries-field invariant is
                     // compile-enforced (CREDO §1: safety > tier-1 > perf).
-                    let scram =
-                        crate::scram::session::ScramSession::from_password(password);
+                    let scram = alloc::boxed::Box::new(
+                        crate::scram::session::ScramSession::from_password(password),
+                    );
                     ProtoState::ConnectingStartupScram { reply, scram }
                 }
             };
@@ -2453,7 +2462,7 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
     params: &P,
-    schema_ref: Option<crate::schema_arena::SchemaRef>,
+    row_desc: Option<crate::decode::RowDesc>,
     fetch: crate::command::FetchRows,
     reply: ReplyId<crate::reply_id::QueryKind>,
     staged: &mut StagedActions,
@@ -2479,10 +2488,13 @@ fn compute_push_bind_execute<P: crate::params::ParamsWriter>(
                 StagedAction::SendBytesRange(execute_range),
                 StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
             ]);
-            *state = match schema_ref {
-                Some(sr) => ProtoState::BindExecuteAwaitingBindCompleteSelect {
+            // DEF-188: inline RowDesc directly into the state variant
+            // (no arena allocation). Caller's Option<RowDesc> selects
+            // SELECT vs DML path at the variant level — tier-1 structural.
+            *state = match row_desc {
+                Some(desc) => ProtoState::BindExecuteAwaitingBindCompleteSelect {
                     reply,
-                    schema_ref: sr,
+                    row_desc: desc,
                 },
                 None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
             };
@@ -2765,19 +2777,18 @@ fn build_startup_message(
 
 /// Phase-2 materialiser: convert the write-phase's
 /// [`StagedActions`] into [`OutActions<'w, 'r>`] with references
-/// into `write_buf_bytes` (`'w` — range variants, static constants)
-/// or `read_buf_bytes` (`'r` — StreamRow variants once 1c-1b wires
-/// row emission).
+/// into `write_buf_bytes` (`'w`) or `terminal_row_desc` (`'r`).
 ///
-/// DEF-094 + 1c-1a lifetime plumbing: `write_buf_bytes` supplies
-/// `'w`; `read_buf_bytes` supplies `'r`. The borrow checker
+/// DEF-094 + 1c-1a + DEF-188 lifetime plumbing: `write_buf_bytes`
+/// supplies `'w`; `terminal_row_desc: Option<&'r RowDesc>` supplies
+/// `'r` (the parking slot on `PgProtocol`). The borrow checker
 /// refuses any `&mut WriteBuf` re-borrow while the returned
 /// `OutActions<'w, 'r>` is alive, and any `&mut self` re-borrow
-/// on `PgProtocol` (thus `feed_bytes`) while `'r` is alive.
+/// on `PgProtocol` while `'r` is alive.
 fn materialise<'w, 'r>(
     staged: StagedActions,
     write_bytes: &'w [u8],
-    arena: crate::schema_arena::ArenaReader<'r>,
+    terminal_row_desc: Option<&'r crate::decode::RowDesc>,
 ) -> OutActions<'w, 'r> {
     // DEF-154 (L) P0-1 invariant: `staged.len() ≤ MAX_STAGED_PER_CALL`
     // (heapless::Vec cap); each staged entry fans out to ≤
@@ -2792,8 +2803,8 @@ fn materialise<'w, 'r>(
     for sa in staged {
         // DEF-154 (Y): `StagedAction::StreamRowRange` deleted —
         // DataRow flows via `iter_rows` fast-path (no staging).
-        // `DeliverReply` is the only remaining variant with
-        // fanout (stale-ref classified crate-bug).
+        // DEF-188: stale-ref class deleted — into_public is
+        // infallible.
         let a: Action<'w, 'r> = match sa {
             StagedAction::SendBytesRange(range) => {
                 // DEF-154 (N) P0-4: `WriteRange::apply` returns
@@ -2813,36 +2824,18 @@ fn materialise<'w, 'r>(
                 }
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
-            // DEF-112 + DEF-119: `DeliverReplyEntry` carries a
+            // DEF-112 + DEF-188: `DeliverReplyEntry` carries a
             // lifetime-free `StagedReply`. Materialise resolves any
-            // `SchemaRef` handles into `&'r RowDesc` borrows via the
-            // arena, producing the public `Reply<'r>`. The entry was
-            // constructed by the typed `action::deliver` path —
-            // kind-payload pairing was enforced at dispatch time.
+            // `schema_present` flags / `DescribedRowsStagedSlim::Rows`
+            // markers into `&'r RowDesc` borrows from
+            // `terminal_row_desc`, producing the public `Reply<'r>`.
+            // The entry was constructed by the typed `action::deliver`
+            // path — kind-payload pairing was enforced at dispatch time.
             StagedAction::DeliverReply(entry) => {
-                // DEF-154 (J) P0-D: into_public returns
-                // Err(StaleSchemaRef) on stale ref — classify as
-                // crate-bug FailReply + CloseSocket (2-action
-                // fanout, counted in MAX_FANOUT_PER_STAGED).
                 let entry_id = entry.id();
-                match entry.staged().into_public(arena) {
-                    Ok(value) => Action::DeliverReply {
-                        id: entry_id,
-                        value,
-                    },
-                    Err(_stale) => {
-                        push_within_fanout_budget(
-                            &mut out,
-                            Action::FailReply {
-                                id: entry_id,
-                                cause: ProtocolError::InternalCrateBug {
-                                    locus: crate::error::CrateBugLocus::StaleSchemaRef,
-                                },
-                            },
-                        );
-                        push_within_fanout_budget(&mut out, Action::CloseSocket);
-                        continue;
-                    }
+                Action::DeliverReply {
+                    id: entry_id,
+                    value: entry.staged().into_public(terminal_row_desc),
                 }
             }
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
@@ -3042,8 +3035,10 @@ mod allows_unsolicited_param_status_tests {
         // constructed without its required SCRAM data — that is the
         // tier-1 invariant under test.
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
-            let scram = crate::scram::session::ScramSession::from_password(
-                crate::sensitive::Sensitive::new(pw),
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
+                    crate::sensitive::Sensitive::new(pw),
+                ),
             );
             let startup_scram = ProtoState::ConnectingStartupScram {
                 reply: ReplyId::from_raw(nz(4001)),
@@ -3054,14 +3049,16 @@ mod allows_unsolicited_param_status_tests {
         }
 
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
-            let scram = crate::scram::session::ScramSession::from_password(
-                crate::sensitive::Sensitive::new(pw),
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
+                    crate::sensitive::Sensitive::new(pw),
+                ),
             );
             let scram_first = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(nz(5)),
                 scram,
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
+                client_first_bare: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
+                client_nonce_b64: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
             };
             assert!(!allows_unsolicited_param_status(&scram_first));
             consume_state(scram_first);
@@ -3093,26 +3090,14 @@ mod allows_unsolicited_param_status_tests {
         assert!(allows_unsolicited_param_status(&q_first));
         consume_state(q_first);
 
-        // DEF-119 + DEF-148: state carries `schema_ref: SchemaRef`
-        // (2 bytes: NonZeroU8 slot + u8 generation). Test fixture
-        // allocates an empty schema into a local arena slab to obtain
-        // a valid SchemaRef handle; the handle carries no lifetime.
-        //
-        // Forbid-bundle note: `panic!`, `.unwrap()`, `.expect()`,
-        // `unreachable!()` are all banned. The `assert!(is_some) +
-        // unwrap_or(fallback)` idiom fails loudly on precondition
-        // break (alloc on a fresh slab MUST succeed by spec); the
-        // fallback is architecturally dead but must still produce a
-        // well-typed `SchemaRef`. DEF-148 added `SchemaRef::dead_for_test`
-        // as the test-only sentinel replacing the pre-DEF-148 `ZERO`
-        // (`ZERO` could no longer exist — NonZeroU8 forbids 0).
-        let mut arena = crate::schema_arena::SchemaArena::new();
-        let alloc_result = arena.alloc(crate::decode::RowDesc::EMPTY);
-        assert!(alloc_result.is_some(), "alloc on fresh slab must succeed");
-        let sr = alloc_result.unwrap_or_else(crate::schema_arena::SchemaRef::dead_for_test);
+        // DEF-188: state carries `row_desc: RowDesc` inline (no arena).
+        // Test fixture uses `RowDesc::EMPTY` (zero-column sentinel) —
+        // any well-typed RowDesc satisfies the variant shape; the
+        // policy under test (`allows_unsolicited_param_status`) is
+        // schema-agnostic.
         let q_rows = ProtoState::SimpleQueryStreamingRows {
             reply: ReplyId::from_raw(nz(8002)),
-            schema_ref: sr,
+            row_desc: crate::decode::RowDesc::EMPTY,
         };
         assert!(allows_unsolicited_param_status(&q_rows));
         consume_state(q_rows);
@@ -3120,7 +3105,7 @@ mod allows_unsolicited_param_status_tests {
         let q_rfq = ProtoState::SimpleQueryAwaitingRfq {
             reply: ReplyId::from_raw(nz(8003)),
             command_tag: crate::error::BoundedStr::default(),
-            schema_ref: None,
+            row_desc: None,
         };
         assert!(allows_unsolicited_param_status(&q_rfq));
         consume_state(q_rfq);
@@ -3441,8 +3426,10 @@ mod compute_push_tests {
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
             let raw_prev = nz(201_050);
             let raw_new = nz(201_051);
-            let scram = crate::scram::session::ScramSession::from_password(
-                crate::sensitive::Sensitive::new(pw),
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
+                    crate::sensitive::Sensitive::new(pw),
+                ),
             );
             let prev = ProtoState::ConnectingStartupScram {
                 reply: ReplyId::from_raw(raw_prev),
@@ -3470,14 +3457,16 @@ mod compute_push_tests {
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
             let raw_prev = nz(203);
             let raw_new = nz(204);
-            let scram = crate::scram::session::ScramSession::from_password(
-                crate::sensitive::Sensitive::new(pw),
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
+                    crate::sensitive::Sensitive::new(pw),
+                ),
             );
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
                 scram,
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
+                client_first_bare: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
+                client_nonce_b64: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -3746,8 +3735,10 @@ mod compute_push_tests {
         {
             let raw_prev = nz(405_100);
             let raw_new = nz(405_101);
-            let scram = crate::scram::session::ScramSession::from_password(
-                crate::sensitive::Sensitive::new(pw),
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
+                    crate::sensitive::Sensitive::new(pw),
+                ),
             );
             let prev = ProtoState::ConnectingStartupScram {
                 reply: ReplyId::from_raw(raw_prev),
@@ -3774,14 +3765,16 @@ mod compute_push_tests {
         {
             let raw_prev = nz(405);
             let raw_new = nz(406);
-            let scram = crate::scram::session::ScramSession::from_password(
-                crate::sensitive::Sensitive::new(pw),
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
+                    crate::sensitive::Sensitive::new(pw),
+                ),
             );
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
                 scram,
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
+                client_first_bare: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
+                client_nonce_b64: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);

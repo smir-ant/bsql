@@ -87,15 +87,15 @@ pub trait ReplyKind: sealed::Sealed {
     /// The typed STAGED payload constructed at dispatch time. Must
     /// convert to the internal [`crate::action::StagedReply`] sum.
     ///
-    /// # DEF-119 — staged vs public payload split
+    /// # DEF-119 + DEF-188 — staged vs public payload split
     ///
     /// The dispatch site constructs the staged payload (with
-    /// `schema_ref: Option<SchemaRef>` fields where applicable);
+    /// `schema_present: bool` fields where applicable, post-DEF-188);
     /// materialise converts to the public `Reply<'r>` (with
-    /// `&'r RowDesc` refs). The DEF-112 kind-payload pairing is
-    /// preserved — `ReplyId<K>` still constrains what payload the
-    /// dispatcher can stage, and the `Into<StagedReply>` bound
-    /// keeps the seal one-way.
+    /// `&'r RowDesc` refs borrowed from `PgProtocol::terminal_row_desc`).
+    /// The DEF-112 kind-payload pairing is preserved — `ReplyId<K>`
+    /// still constrains what payload the dispatcher can stage, and
+    /// the `Into<StagedReply>` bound keeps the seal one-way.
     ///
     /// For schema-less kinds (Ping, Startup, Parse, Close),
     /// StagedPayload == PublicPayload (no schema to borrow). For

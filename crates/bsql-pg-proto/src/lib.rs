@@ -90,6 +90,22 @@
 )]
 #![warn(missing_debug_implementations, missing_copy_implementations)]
 
+// DEF-187 (architect 2026-04-26): committed `alloc` baseline.
+//
+// `bsql-pg-proto` is `no_std + alloc`. The crate uses `Box<T>` once
+// per connection during SCRAM-SHA-256 handshake to externalise
+// password-bearing session data; this enables a 9× reduction in
+// `ProtoState` size (712 → ~80 B) and corresponding hot-path latency
+// improvement on row streaming. Embedded targets without an
+// allocator should use Trust-auth (no Box allocated) or stay on a
+// pre-DEF-187 release.
+//
+// Trade-off documented per CREDO §4 (user-land крейты могут зависеть
+// от alloc, когда обоснованно). Feature-gating evaluated and rejected:
+// doubles test surface for the embedded-SCRAM use case which doesn't
+// exist in practice.
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 
@@ -109,7 +125,10 @@ pub mod protocol;
 pub mod row_stream;
 pub mod reply_id;
 pub mod scram;
-mod schema_arena;
+// DEF-188: schema_arena module DELETED — RowDesc lives inline in
+// state variants; terminal-reply schema parks into
+// PgProtocol::terminal_row_desc. See state.rs / protocol.rs for
+// the post-arena flow.
 pub mod sensitive;
 pub mod session_params;
 pub mod state;
@@ -349,42 +368,36 @@ const _: () = assert!(
      tag is zero-size; ReplyId's footprint is u64 value + bool \
      delivered + padding. Did a bookkeeping field get added?",
 );
-// F1 (architect audit 2026-04-24): tight ±8 B platform-alignment
-// slack only. Actual on aarch64-apple-darwin is 704 B; x86_64-linux
-// typically +0–8 B. A single extra `NonZeroU8` field addition would
-// bump to 712 and still pass, 720 trips the upper bound.
+// DEF-188 (architect 2026-04-25): RowDesc inlined into state
+// variants alongside SCRAM Box-externalisation (DEF-187).
+// Dominating variant is now SimpleQueryAwaitingRfq /
+// BindExecuteAwaitingRfqSelect (carry inline RowDesc + reply +
+// command_tag), or the BindExecute SELECT-path streaming variants
+// (inline RowDesc + reply). Range accommodates BoundedStr<32>
+// command_tag (32 B), ReplyId (16 B), RowDesc (~264 B), padding.
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() >= 696
-        && core::mem::size_of::<state::ProtoState>() <= 712,
-    "ProtoState size post-(A10/B22 REVERT 2026-04-24) in range \
-     [696, 712] B — SCRAM variants carry their session data INLINE. \
-     Dominating variant: `ConnectingScramAwaitingServerFirst` with \
-     `scram: ScramSession` (~500 B) + `client_first_bare` (128 B) + \
-     `client_nonce_b64` (48 B) + reply + padding. \
+    core::mem::size_of::<state::ProtoState>() >= 16
+        && core::mem::size_of::<state::ProtoState>() <= 360,
+    "ProtoState size post-DEF-188 (inline RowDesc, schema_arena \
+     deleted; SCRAM Boxed per DEF-187). \
      \
-     Rationale for the revert: CREDO §1 ranks safety > tier-1 > perf. \
-     Pre-revert (A10 split) achieved ProtoState=80 B by externalising \
-     SCRAM to `PgProtocol::scram_state`, but that split demoted the \
-     variant-carries-field invariant from **tier-1 compile** \
-     (ScramAwaitingServerFirst cannot exist without ScramSession, \
-     period — Rust type system enforces) to **tier-2 structural** \
-     (classified runtime `ScramStateDrift` crate-bug locus if the \
-     correlation between state variant and companion `scram_state` \
-     slot was broken by a future refactor). The split also introduced \
-     a zeroize-hygiene gap: password bytes could linger on the \
-     non-dispatch fail path (fail_inflight_no_readbuf) until the next \
-     push_startup overwrote scram_state. Restoring inline fields puts \
-     ZeroizeOnDrop back on the variant's drop glue — scrubbed \
-     automatically on every state transition, no special-case cleanup. \
+     Dominating variant likely: `SimpleQueryAwaitingRfq` carrying \
+     `Option<RowDesc>` (~264+8 B) + ReplyId (16 B) + BoundedStr<32> \
+     command_tag (32 B) + tag + padding ≈ 320 B. SCRAM variants are \
+     now ~24-32 B (Box pointers per DEF-187). Streaming variants \
+     carry inline RowDesc (~264 B) + reply ≈ 280 B. \
      \
-     Cost accepted: ~632 B per `core::mem::replace(state, Idle)` \
-     during dispatch (only on SCRAM handshake — 2-3 frames per \
-     connection). Moving 700 B instead of 80 B is a memcpy — \
-     measurable but below audit-sensitivity threshold. \
+     Rationale for inline RowDesc: per-row hot path reads \
+     `&self.state.row_desc` directly via `streaming_state_id_and_desc`. \
+     Pre-DEF-188 the equivalent was 2-byte SchemaRef into a 2-slot \
+     arena; per-row dispatch cost included `arena.has` + `arena.get` \
+     dual lookups. DEF-188 collapses to one field projection. \
+     `StaleSchemaRef` class architecturally impossible (no handle, \
+     no generation drift). \
      \
-     If this trips above 760 B: a new heavy field landed on a SCRAM \
-     variant, or ScramSession grew. Investigate individual field \
-     sizes before bumping the range.",
+     If this trips above 360 B: a new heavy field landed on a state \
+     variant, or RowDesc grew (MAX_ROW_COLUMNS bump). Investigate \
+     individual field sizes before bumping the range.",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
@@ -393,22 +406,26 @@ const _: () = assert!(
      (16) + discriminant + padding. Bumping MAX_SQL_LEN or \
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
-// F1 (architect audit 2026-04-24) + DEF-185 P2-9: tight platform-
-// alignment slack. Measured 6064 B pre-P2-9; +2 B for
-// `malformed_frame_count: u16` + potential alignment padding brings
-// new baseline to 6064–6080 B. Range allows ±16 B cross-target drift;
-// a new field addition trips the upper bound.
+// DEF-188 (architect 2026-04-25): schema_arena deleted (~520 B
+// removed); terminal_row_desc added (~268 B); state grew from ~80 B
+// (SCRAM Boxed) to ~320 B (inline RowDesc on AwaitingRfq dominant
+// variant). Net: PgProtocol holds roughly the same size — the
+// arena memory moved into state + a thin parking slot.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() >= 6048
-        && core::mem::size_of::<protocol::PgProtocol>() <= 6088,
-    "PgProtocol size post-(A1+A13, A10/B22 REVERT, P2-9 counter) in \
-     range [6048, 6088] B. \
-     Budget: ReadBuf 4096 + state ~712 (SCRAM inline per tier-1 \
-     variant-carries-field invariant) + session_params ~420 + \
-     schema_arena ~520 + error_arena ~290 + malformed_frame_count 2 + \
-     padding. No separate `scram_state` field — heavy SCRAM data \
-     lives in the variant with automatic `ZeroizeOnDrop` on \
-     transition.",
+    core::mem::size_of::<protocol::PgProtocol>() >= 5300
+        && core::mem::size_of::<protocol::PgProtocol>() <= 5800,
+    "PgProtocol size post-DEF-188 (schema_arena DELETED, RowDesc \
+     inlined into state, terminal_row_desc parking slot). \
+     \
+     Budget: ReadBuf 4096 + state ~320 (inline RowDesc on dominant \
+     variant; SCRAM Boxed per DEF-187) + session_params ~420 + \
+     terminal_row_desc ~268 (Option<RowDesc>) + error_arena ~290 + \
+     malformed_frame_count 4 + padding. \
+     \
+     Net change vs DEF-187: -520 (arena delete) +268 (terminal slot) \
+     +240 (state grew with inline RowDesc) ≈ 0 net. The trade is: \
+     simpler runtime structure, no generation tracking, per-row \
+     hot-path single-projection vs dual arena lookup.",
 );
 // DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B
 // post-`new_state` extraction. Pre-(B21/C6) each Advanced variant

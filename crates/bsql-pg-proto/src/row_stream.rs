@@ -72,8 +72,8 @@
 //! MVP supports `SimpleQuery` row streaming on the fast path and
 //! delegates to `feed_bytes` for terminal / error frames.
 //! `BindExecute` row streaming works too via the same state
-//! variants (the `streaming_reply_id_and_schema` helper covers
-//! all three variants; see below).
+//! variants (the `streaming_state_id_and_desc` helper covers
+//! all three streaming variants; see below).
 
 use core::num::NonZeroU64;
 
@@ -324,55 +324,53 @@ impl<'p, 'w> RowStream<'p, 'w> {
         }
 
         // Fast-path: DataRow in a row-streaming state.
+        //
+        // # DEF-188 — single state projection, in-scope advance
+        //
+        // Pre-DEF-185 baseline (def184-complete): ~8.3 ns/row.
+        // Post-DEF-185 (zombie dual-arena-lookup): ~17 ns/row
+        // (+105% regression).
+        // Post-DEF-188 (this work): single state pattern match,
+        // single in-scope advance, zero arena lookups
+        // (arena deleted). The desc borrow is acquired AFTER
+        // advance completes — NLL sees the &mut on read_buf end
+        // before the &self desc borrow begins, so they don't
+        // conflict.
         if tag == TAG_DATA_ROW
-            && let Some((id, schema_ref)) = self.proto.streaming_reply_id_and_schema()
+            && let Some(id) = self.proto.streaming_reply_id()
         {
-            return self.fast_path_data_row(id, schema_ref, cursor, total);
+            return self.fast_path_data_row(id, cursor, total);
         }
-
-        // Slow path: any other frame OR DataRow in non-streaming
-        // state (which dispatch will classify as UnexpectedFrame).
         self.slow_path_once()
     }
 
     /// Fast path: extract the DataRow body inline + emit
     /// [`StreamItem::Row`] without OutActions allocation.
     ///
-    /// DEF-184 (B25): `read_buf_advance(total)` Err paths
-    /// previously silently discarded via `let _ = ...` — tier-4
-    /// fallback violating CREDO §1. `total` is parse_header-
-    /// validated against `after_cursor.len()` in [`next_event`]
-    /// before calling into this fast-path, so advance is
-    /// architecturally infallible here. Elevated tier-3 trust to
-    /// tier-2 structural via classified `InternalCrateBug` emission
-    /// on the dead Err branch.
+    /// # DEF-188 — single state pattern match per row
     ///
-    /// DEF-184 (B20): `#[inline]` — hot path per-DataRow emission.
+    /// `parse_header` in [`Self::next_event`] validated
+    /// `total_len ≤ populated.len()` before calling here, so the
+    /// row body slice `populated[cursor + HEADER_LEN .. cursor +
+    /// total]` is in-bounds and the advance Err branch is
+    /// architecturally dead.
+    ///
+    /// Stale-ref class deleted (no SchemaRef handle exists post
+    /// DEF-188); state-as-data ensures the streaming variant
+    /// carries a valid `RowDesc` by construction.
     #[inline]
     fn fast_path_data_row(
         &mut self,
         id: NonZeroU64,
-        schema_ref: crate::schema_arena::SchemaRef,
         cursor: usize,
         total: usize,
     ) -> StreamItem<'_> {
         let row_start = cursor.saturating_add(HEADER_LEN);
         let row_end = cursor.saturating_add(total);
         let row_body_len = row_end.saturating_sub(row_start);
-        // DEF-185 P1-3 (audit 2026-04-24): protocol-level row-size
-        // validation. PG DataRow body layout = 2-byte n_columns header
-        // + per-column fields. A body < 2 bytes cannot carry the
-        // column-count header — structurally malformed regardless of
-        // the RowDesc's column count. Pre-fix these were passed to
-        // user who saw `TruncatedRow` via `DataRowRef::parse`, but the
-        // protocol stayed live and kept dispatching rows. Post-fix
-        // rejects at protocol layer via `MalformedDataRow`, triggering
-        // teardown. Row bodies >= 2 bytes continue to user (the column-
-        // count header parses; individual column decode errors remain
-        // user-handled via `DataRowRef::parse -> Result`).
+        // DEF-185 P1-3: protocol-level row-size validation. A
+        // body < 2 bytes cannot carry the column-count header.
         if row_body_len < 2 {
-            // Body empty or too-short-for-column-count. Classify as
-            // MalformedDataRow framing desync.
             self.drained = true;
             self.proto.install_errored_malformed_data_row(total);
             if self.proto.read_buf_advance(total).is_err() {
@@ -384,10 +382,12 @@ impl<'p, 'w> RowStream<'p, 'w> {
             };
         }
 
-        // Advance cursor past the frame — captures indices
-        // remain valid while populated is borrowed. Err is
-        // architecturally dead (total pre-validated); classify
-        // into Errored + FailReply instead of silent-skip.
+        // Advance cursor past the frame. Err is architecturally
+        // dead (parse_header pre-validated `total ≤
+        // populated.len()`). The advance only mutates
+        // `read_buf.cursor` (logical position); populated()
+        // content is unchanged, so the row body slice stays
+        // address-stable across the call.
         if self.proto.read_buf_advance(total).is_err() {
             self.drained = true;
             self.proto.install_errored_read_cursor_advance();
@@ -399,52 +399,30 @@ impl<'p, 'w> RowStream<'p, 'w> {
             };
         }
 
-        // DEF-185 P0-E (audit 2026-04-24): split the stale-ref check
-        // from the Row emission so we can re-borrow `&mut self.proto`
-        // in the legitimate stale-ref path. Pre-P0-E: only set
-        // drained=true + emitted FailReply, leaving state as
-        // SimpleQueryStreamingRows — next push_command mis-classified
-        // as CommandInProgress (zombie connection).
-        //
-        // Cost: 1 extra ArenaReader::get per row vs single-lookup
-        // form (~+5 ns/row at 8 ns baseline). Borrow-checker requires
-        // two passes here — `Option<&'r RowDesc>` from arena.get
-        // ties desc lifetime to arena which ties to self.proto, so a
-        // None branch with `&mut self.proto.install_errored_*`
-        // conflicts with desc's outlived lifetime in the unified
-        // match's return type.
-        //
-        // Verified DEF-186 perf hunt: any single-lookup restructure
-        // (inner-scope early return, drop(arena)+rebind, `let arena_ptr`
-        // unsafe) either fails to compile or requires unsafe. Accept
-        // the per-row cost — zombie-prevention safety > perf per
-        // CREDO §1.
-        if !self.proto.schema_arena_has(schema_ref) {
-            self.drained = true;
-            self.proto.install_errored_stale_schema_ref();
-            return StreamItem::FailReply {
-                id,
-                cause: ProtocolError::InternalCrateBug {
-                    locus: crate::error::CrateBugLocus::StaleSchemaRef,
-                },
-            };
-        }
-        let populated = self.proto.read_buf_populated();
-        let row_bytes = populated.get(row_start..row_end).unwrap_or(&[]);
-        let arena = self.proto.schema_arena_reader();
-        // Dead-arm: `arena.get None` here means arena mutation since
-        // `schema_arena_has` returned true — impossible under &mut
-        // self aliasing.
-        match arena.get(schema_ref) {
-            Some(desc) => StreamItem::Row { id, row_bytes, desc },
+        // Project state.row_desc directly. The desc lifetime
+        // ties to `&self.proto`; populated() also `&self.proto`
+        // — both immutable, both projected from disjoint fields
+        // (state, read_buf) of PgProtocol. NLL has released the
+        // earlier `&mut` advance borrow.
+        match self.proto.streaming_state_id_and_desc() {
+            Some((_id_now, desc)) => {
+                let populated = self.proto.read_buf_populated();
+                let row_bytes = populated.get(row_start..row_end).unwrap_or(&[]);
+                StreamItem::Row { id, row_bytes, desc }
+            }
             None => {
+                // Architecturally dead: caller `streaming_reply_id`
+                // pre-checked. Single-threaded `!Sync`-protected
+                // `&mut self` ⇒ no inter-call state mutation.
+                debug_assert!(
+                    false,
+                    "DEF-188: streaming_state_id_and_desc None post-advance — \
+                     state mutated between streaming_reply_id and here. \
+                     Architecturally impossible without intervening &mut self.state \
+                     in this scope (none exists).",
+                );
                 self.drained = true;
-                StreamItem::FailReply {
-                    id,
-                    cause: ProtocolError::InternalCrateBug {
-                        locus: crate::error::CrateBugLocus::StaleSchemaRef,
-                    },
-                }
+                StreamItem::CloseSocket
             }
         }
     }

@@ -615,11 +615,11 @@ pub enum ProtocolError {
     ///
     /// DEF-150: consolidates three pre-merge variants
     /// (OutboundFrameBuildUnreachable / ReadCursorAdvanceUnreachable
-    /// / RowRangeConstructionUnreachable) plus adds two new loci
-    /// (SchemaArenaAllocFull for DEF-148's arena-full path — A001
-    /// fix from previously-misclassifying as RowRangeConstruction;
-    /// StaleSchemaRef reserved for DEF-154's buffer-witness stale-
-    /// ref diagnostic). Classification is always
+    /// / RowRangeConstructionUnreachable). DEF-188: the
+    /// `StaleSchemaRef` and `SchemaArenaAllocFull` loci were
+    /// DELETED with the schema arena — without a `SchemaRef`
+    /// handle, generation drift cannot occur (architecturally
+    /// impossible). Classification is always
     /// [`ErrorKind::Internal`].
     ///
     /// F6 / DEF-150: uniform "internal crate bug" shape replaces
@@ -690,24 +690,6 @@ pub enum CrateBugLocus {
     /// emission indicates a [`crate::dispatch::FrameCoords`] math
     /// bug. Pre-DEF-150: `RowRangeConstructionUnreachable`.
     RowRangeConstruction,
-
-    /// DEF-148 schema arena's `alloc` returned None — arena full
-    /// in a flow that shouldn't carry more than
-    /// `MAX_ARENA_SLOTS` concurrent schemas. The pre-1c-5
-    /// single-inflight invariant guarantees at most one live
-    /// schema per query cycle. NEW in DEF-150 (pre-merge this
-    /// path was mis-classified as `RowRangeConstructionUnreachable`
-    /// — audit A001).
-    SchemaArenaAllocFull,
-
-    /// DEF-154 reserved — [`crate::schema_arena::SchemaArena::get`]
-    /// returned None on a ref that should be live (post-successful
-    /// dispatch, pre free/clear). Indicates generational drift in
-    /// the arena's alloc/clear ordering. NOT YET WIRED — DEF-154
-    /// adds the detection sites; this locus is reserved so
-    /// diagnostic consumers see a stable enum shape when DEF-154
-    /// lands.
-    StaleSchemaRef,
 
     /// DEF-154 (B) Phase B4-W P0-3: a `ParamsWriter::write_params`
     /// impl returned `Err(WriteBufFull)` while the `Bind` frame was
@@ -803,21 +785,23 @@ impl fmt::Display for CrateBugLocus {
     /// fragile to a future Debug derive change.
     ///
     /// This impl renders each locus as a stable kebab-case tag:
-    /// - `OutboundFrameBuild { stage }` → `"outbound-frame-build:{stage:?}"`
     /// - `ReadCursorAdvance` → `"read-cursor-advance"`
     /// - `RowRangeConstruction` → `"row-range-construction"`
-    /// - `SchemaArenaAllocFull` → `"schema-arena-alloc-full"`
-    /// - `StaleSchemaRef` → `"stale-schema-ref"`
+    /// - `ParamsWriterOverflow` → `"params-writer-overflow"`
+    /// - `EmptyWriteRange` → `"empty-write-range"`
+    /// - `AuthSubCodeZeroInErr` → `"auth-sub-code-zero-in-err"`
+    /// - `BuilderCapacityOverflow` → `"builder-capacity-overflow"`
     ///
     /// Test module `crate_bug_locus_display_tests` pins each string
     /// literal — a future variant rename cannot silently change
     /// operator logs without tripping the test.
+    ///
+    /// DEF-188: `SchemaArenaAllocFull` and `StaleSchemaRef` loci
+    /// removed alongside the schema arena's deletion.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReadCursorAdvance => f.write_str("read-cursor-advance"),
             Self::RowRangeConstruction => f.write_str("row-range-construction"),
-            Self::SchemaArenaAllocFull => f.write_str("schema-arena-alloc-full"),
-            Self::StaleSchemaRef => f.write_str("stale-schema-ref"),
             Self::ParamsWriterOverflow => f.write_str("params-writer-overflow"),
             Self::EmptyWriteRange => f.write_str("empty-write-range"),
             Self::AuthSubCodeZeroInErr => f.write_str("auth-sub-code-zero-in-err"),
@@ -859,27 +843,12 @@ mod crate_bug_locus_display_tests {
         );
     }
 
-    #[test]
-    fn schema_arena_alloc_full_display() {
-        let e = ProtocolError::InternalCrateBug {
-            locus: CrateBugLocus::SchemaArenaAllocFull,
-        };
-        assert_eq!(
-            format!("{e}"),
-            "internal bsql-pg-proto bug at locus schema-arena-alloc-full",
-        );
-    }
-
-    #[test]
-    fn stale_schema_ref_display() {
-        let e = ProtocolError::InternalCrateBug {
-            locus: CrateBugLocus::StaleSchemaRef,
-        };
-        assert_eq!(
-            format!("{e}"),
-            "internal bsql-pg-proto bug at locus stale-schema-ref",
-        );
-    }
+    // DEF-188: `schema_arena_alloc_full_display` and
+    // `stale_schema_ref_display` tests DELETED — `CrateBugLocus`
+    // variants `SchemaArenaAllocFull` and `StaleSchemaRef` removed
+    // alongside the schema arena. The ref-handle is gone; arena
+    // allocation no longer exists. No corresponding production
+    // emission site remains.
 
     #[test]
     fn params_writer_overflow_display() {
@@ -966,9 +935,11 @@ pub enum ErrorKind {
     Auth = 3,
     /// Internal invariant broken — bug in this crate. Covers
     /// [`ProtocolError::InternalCrateBug`] (DEF-150 merge of the
-    /// former three `*Unreachable` variants plus the new
-    /// `SchemaArenaAllocFull` and DEF-154-reserved
-    /// `StaleSchemaRef` loci).
+    /// former three `*Unreachable` variants plus the
+    /// builder/writer dead-arm loci. DEF-188 removed
+    /// `SchemaArenaAllocFull` and `StaleSchemaRef` along with the
+    /// schema arena — those classes are now structurally
+    /// impossible).
     Internal = 4,
     /// Pseudo-kind for a `ConnectionAlreadyClosed` meta-error. Only
     /// ever appears in `FailReply` replies, never in state (the state

@@ -743,12 +743,13 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, { crate::protocol::M
 ///   into `WriteBuf`; `SendBytes(&'w [u8])` references the staged
 ///   bytes. The host writes them to the socket and drops the
 ///   Action, releasing `'w`.
-/// - `'r` borrows `read_buf` + `schema_arena` on the **feed
+/// - `'r` borrows `read_buf` + `terminal_row_desc` on the **feed
 ///   path**. `feed_bytes` parses inbound frames into `read_buf`;
 ///   row-streaming actions like `StreamRow { desc: &'r RowDesc,
 ///   row_bytes: &'r [u8] }` borrow directly from the populated
-///   region (zero-copy). Host reads + drops the Action, releasing
-///   `'r`.
+///   region (zero-copy). Terminal `Reply::QueryComplete` payloads
+///   borrow the parked schema from `PgProtocol::terminal_row_desc`
+///   (DEF-188). Host reads + drops the Action, releasing `'r`.
 ///
 /// **Why can't we unify `'w = 'r`?** On the push path, produced
 /// `Action`s are all either `'static` (compile-time constant
@@ -879,18 +880,20 @@ pub(crate) enum StagedAction {
 
 /// Internal lifetime-free counterpart to the public [`Reply<'r>`].
 ///
-/// # DEF-119 rationale
+/// # DEF-188 rationale
 ///
 /// Dispatch runs BEFORE materialise. At dispatch time, the state
-/// machine holds `SchemaRef` arena handles (no borrowing lifetime).
-/// At materialise time, `PgProtocol.schema_arena` is borrowed for
-/// `'r` and handles resolve to `&'r RowDesc` refs for public
-/// `Reply<'r>`. `StagedReply` is the lifetime-free intermediate.
+/// machine carries `RowDesc` inline in its variants (post-DEF-188
+/// arena deletion). The dispatch Z arm parks the schema into
+/// `PgProtocol::terminal_row_desc` right before transitioning to
+/// `Idle`; materialise borrows from that slot to produce the
+/// lifetime-bound public `Reply<'r>`.
 ///
-/// Variants mirror `Reply<'r>` 1:1. Schema-bearing variants carry
-/// staged payload types (with `schema_ref` fields instead of
-/// `&'r RowDesc`); schema-less variants share payloads with the
-/// public side.
+/// `StagedReply` is the lifetime-free intermediate carried inside
+/// `StagedAction::DeliverReply(DeliverReplyEntry)`. Schema-bearing
+/// variants carry staged payload types (with `schema_present: bool`
+/// flags instead of `&'r RowDesc`); materialise consults the flag
+/// and projects from `terminal_row_desc` when set.
 ///
 /// # Visibility
 ///
@@ -917,9 +920,12 @@ pub enum StagedReply {
 
 /// Lifetime-free staged counterpart to [`QueryCompletePayload<'r>`].
 ///
-/// Holds `schema_ref: Option<SchemaRef>` instead of the public
-/// `Option<&'r RowDesc>`. Materialise converts via
-/// `arena.get(ref).map(|desc| ...)`.
+/// DEF-188: `schema_present: bool` replaces the pre-188
+/// `schema_ref: Option<SchemaRef>`. The dispatch Z arm parks the
+/// inline `RowDesc` from the post-Stream state variant into
+/// `PgProtocol::terminal_row_desc` and sets this flag; materialise
+/// projects `Some(&desc)` when the flag is set or `None` when
+/// the path was DML / empty-query.
 ///
 /// `#[doc(hidden)] pub` — see [`StagedReply`] for visibility rationale.
 #[doc(hidden)]
@@ -927,16 +933,22 @@ pub enum StagedReply {
 pub struct StagedQueryCompletePayload {
     #[doc(hidden)] pub command_tag: crate::ident::BoundedStr<32>,
     #[doc(hidden)] pub tx_status: TxStatus,
-    #[doc(hidden)] pub schema_ref: Option<crate::schema_arena::SchemaRef>,
+    /// `true` iff the dispatch Z arm parked a `RowDesc` into
+    /// `terminal_row_desc`. Materialise reads the slot when set.
+    #[doc(hidden)] pub schema_present: bool,
 }
 
 /// Lifetime-free staged counterpart to
 /// [`DescribeStatementCompletePayload<'r>`].
+///
+/// DEF-188: `rows: DescribedRowsStagedSlim` (ZST discriminator).
+/// The inline RowDesc, if any, was parked into
+/// `PgProtocol::terminal_row_desc` at the Z arm.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribeStatementCompletePayload {
     #[doc(hidden)] pub param_oids: ParamOids,
-    #[doc(hidden)] pub rows: crate::state::DescribedRowsStaged,
+    #[doc(hidden)] pub rows: DescribedRowsStagedSlim,
     #[doc(hidden)] pub tx_status: TxStatus,
 }
 
@@ -945,8 +957,27 @@ pub struct StagedDescribeStatementCompletePayload {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribePortalCompletePayload {
-    #[doc(hidden)] pub rows: crate::state::DescribedRowsStaged,
+    #[doc(hidden)] pub rows: DescribedRowsStagedSlim,
     #[doc(hidden)] pub tx_status: TxStatus,
+}
+
+/// Slim discriminator for staged Describe results — no payload.
+///
+/// DEF-188: distinguishes "schema parked in terminal_row_desc"
+/// (`Rows`) from "server sent NoData" (`NoData`). Materialise
+/// reads `PgProtocol::terminal_row_desc` only when `Rows`.
+///
+/// Mirrors [`crate::state::DescribedRowsStaged`] but without the
+/// inline `RowDesc` payload — that lives in `terminal_row_desc`
+/// post-park, not in the staged action.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribedRowsStagedSlim {
+    /// Schema was parked into `terminal_row_desc` — materialise
+    /// resolves via the borrow.
+    #[doc(hidden)] Rows,
+    /// Server sent `'n'` (NoData) — no schema.
+    #[doc(hidden)] NoData,
 }
 
 // From impls: schema-less payloads wrap directly; schema-bearing
@@ -997,107 +1028,118 @@ impl From<StagedDescribePortalCompletePayload> for StagedReply {
 
 impl StagedReply {
     /// Resolve this staged reply into the public [`Reply<'r>`] by
-    /// looking up any arena-borrowed schema via `arena.get(ref)`.
+    /// borrowing into the protocol's parked terminal RowDesc slot.
     ///
-    /// DEF-154 (J) P0-D: returns `Err(StaleSchemaRef)` if any
-    /// contained `SchemaRef` is stale in `arena`. Pre-(J) stale
-    /// refs silently mapped to `None` (QueryComplete.row_desc) or
-    /// `NoData` (DescribedRows) — invisible corruption at the user
-    /// boundary (debug_assert shield in debug, silent in release).
-    /// Post-(J) the caller (materialise) classifies and emits
-    /// `FailReply { StaleSchemaRef } + CloseSocket` instead of the
-    /// silently-degraded payload.
+    /// # DEF-188 (architect 2026-04-25): inline state, parked slot
     ///
-    /// Architecturally every `SchemaRef` here points to a live slot
-    /// — dispatch arms alloc the slot and the slot stays live
-    /// through materialise. A stale `schema_ref` is a crate bug;
-    /// Err propagation replaces the prior debug_assert + silent
-    /// fallback dyad.
+    /// Pre-DEF-188 `into_public` took `ArenaReader<'r>` and resolved
+    /// `SchemaRef` handles via `arena.get(ref)`. The arena was
+    /// deleted; state variants now carry `RowDesc` inline, and the
+    /// dispatch Z arm parks the schema into
+    /// `PgProtocol::terminal_row_desc` before transitioning to
+    /// `Idle`. This function takes `terminal_row_desc: Option<&'r
+    /// RowDesc>` directly — `Some(&desc)` if the parked slot is
+    /// populated, `None` if no schema was parked (DML / empty-query).
+    ///
+    /// # Tier-1 elevation: stale class architecturally impossible
+    ///
+    /// The `StaleSchemaRef` classified-error path is gone — there
+    /// is no handle that can become stale. Either the slot holds a
+    /// `RowDesc` (because the C → Z transition parked it) or it
+    /// doesn't (because the path was DML / NoData). Mismatch
+    /// between `staged.schema_present == true` and
+    /// `terminal_row_desc.is_none()` is structurally prevented:
+    /// dispatch sets the bool iff it parked the desc, in the same
+    /// arm body, atomically.
     #[inline]
     pub(crate) fn into_public<'r>(
         self,
-        arena: crate::schema_arena::ArenaReader<'r>,
-    ) -> Result<Reply<'r>, StaleSchemaRef> {
+        terminal_row_desc: Option<&'r crate::decode::RowDesc>,
+    ) -> Reply<'r> {
         match self {
-            Self::Pong(p) => Ok(Reply::Pong(p)),
-            Self::StartupComplete(p) => Ok(Reply::StartupComplete(p)),
+            Self::Pong(p) => Reply::Pong(p),
+            Self::StartupComplete(p) => Reply::StartupComplete(p),
             Self::QueryComplete(staged) => {
-                // `schema_ref: Option<SchemaRef>` — None is
-                // legitimate (DML with no schema). Some(ref) must
-                // resolve; stale → classified Err.
-                let row_desc = match staged.schema_ref {
-                    Some(r) => match arena.get(r) {
-                        Some(d) => Some(d),
-                        None => return Err(StaleSchemaRef),
-                    },
-                    None => None,
+                // `schema_present: bool` flag set iff the dispatch
+                // Z arm parked a desc. Materialise's caller
+                // (`materialise`) supplies the slot borrow.
+                let row_desc = if staged.schema_present {
+                    terminal_row_desc
+                } else {
+                    None
                 };
-                Ok(Reply::QueryComplete(QueryCompletePayload {
+                Reply::QueryComplete(QueryCompletePayload {
                     command_tag: staged.command_tag,
                     tx_status: staged.tx_status,
                     row_desc,
-                }))
+                })
             }
-            Self::ParseComplete(p) => Ok(Reply::ParseComplete(p)),
-            Self::CloseComplete(p) => Ok(Reply::CloseComplete(p)),
+            Self::ParseComplete(p) => Reply::ParseComplete(p),
+            Self::CloseComplete(p) => Reply::CloseComplete(p),
             Self::DescribeStatementComplete(staged) => {
-                let rows = described_rows_ref_into_public(staged.rows, arena)?;
-                Ok(Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
+                let rows = described_rows_slim_into_public(staged.rows, terminal_row_desc);
+                Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
                     param_oids: staged.param_oids,
                     rows,
                     tx_status: staged.tx_status,
-                }))
+                })
             }
             Self::DescribePortalComplete(staged) => {
-                let rows = described_rows_ref_into_public(staged.rows, arena)?;
-                Ok(Reply::DescribePortalComplete(DescribePortalCompletePayload {
+                let rows = described_rows_slim_into_public(staged.rows, terminal_row_desc);
+                Reply::DescribePortalComplete(DescribePortalCompletePayload {
                     rows,
                     tx_status: staged.tx_status,
-                }))
+                })
             }
         }
     }
 }
 
-/// DEF-154 (J): classified sentinel for stale-SchemaRef at
-/// materialise. Zero-sized; no payload needed — materialise
-/// constructs a `ProtocolError::InternalCrateBug { StaleSchemaRef }`
-/// when it sees this.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct StaleSchemaRef;
-
-/// Convert state-side [`crate::state::DescribedRowsStaged`] to the
-/// public [`DescribedRows<'r>`] by resolving any `SchemaRef` into a
-/// borrow.
+/// Convert staged [`DescribedRowsStagedSlim`] into the public
+/// [`DescribedRows<'r>`] by borrowing the parked terminal RowDesc.
 ///
-/// DEF-170 (audit2 A010): stale `Rows(ref)` → silent `NoData` was
-/// the pre-DEF-170 behaviour, corrupting schema-bearing describe
-/// results at the user boundary. Debug build now fires loud on
-/// stale refs; release preserves the `NoData` fallback
-/// (forbid-bundle bans panic). DEF-154 witness-pattern will
-/// eliminate the stale class structurally.
+/// DEF-188: `Rows` → borrow `terminal_row_desc` (must be `Some`
+/// when Rows is staged — dispatch Z arm parks it before deliver).
+/// `NoData` → public `no_data()` factory.
 ///
-/// F8 intent markers: uses [`DescribedRows::from_row_desc`] and
-/// [`DescribedRows::no_data`] factories rather than direct variant
-/// construction. Swapping the arm bodies still type-checks, but the
-/// factory names make the swap obvious on code review and the
-/// `arena.get(s)` resolution arm explicit.
+/// # Why infallible
+///
+/// Pre-DEF-188 the equivalent function was `Result<_, StaleSchemaRef>`
+/// because the arena's generation handle could go stale. Without
+/// the arena, the only possible drift is "Rows staged but
+/// terminal_row_desc is None" — an internal-helper mis-pairing.
+/// Since dispatch arms set both atomically (or neither), this is
+/// architecturally impossible. We classify the dead branch as
+/// `no_data()` (preserving the visible no-schema shape) rather
+/// than crashing — same fallback discipline as pre-DEF-188's
+/// release-build behaviour minus the silent corruption (the
+/// invariant break is now structurally prevented, not classified).
 #[inline]
-fn described_rows_ref_into_public<'r>(
-    r: crate::state::DescribedRowsStaged,
-    arena: crate::schema_arena::ArenaReader<'r>,
-) -> Result<DescribedRows<'r>, StaleSchemaRef> {
+fn described_rows_slim_into_public<'r>(
+    r: DescribedRowsStagedSlim,
+    terminal_row_desc: Option<&'r crate::decode::RowDesc>,
+) -> DescribedRows<'r> {
     match r {
-        crate::state::DescribedRowsStaged::Rows(s) => match arena.get(s) {
-            Some(desc) => Ok(DescribedRows::from_row_desc(desc)),
-            // DEF-154 (J): stale ref classification — Err propagates
-            // through `into_public` → materialise emits classified
-            // FailReply + CloseSocket. Pre-(J) the `NoData` fallback
-            // was silent and indistinguishable from a legitimate
-            // no-schema Describe result.
-            None => Err(StaleSchemaRef),
+        DescribedRowsStagedSlim::Rows => match terminal_row_desc {
+            Some(desc) => DescribedRows::from_row_desc(desc),
+            // Architecturally dead: dispatch parks the desc in the
+            // same arm that sets `Rows`. A None here means a future
+            // refactor desynchronised the two; debug_assert below
+            // catches it loudly. Release falls back to NoData
+            // (visible-correct: a missing schema with the staged
+            // marker was never the user's request, and no_data is
+            // the closest non-corrupting public shape).
+            None => {
+                debug_assert!(
+                    false,
+                    "DEF-188: DescribedRowsStagedSlim::Rows without parked terminal_row_desc — \
+                     dispatch arm desync. Both fields are set together at the Z arm; a None \
+                     here means a future refactor split the parking from the staged-flag set.",
+                );
+                DescribedRows::no_data()
+            }
         },
-        crate::state::DescribedRowsStaged::NoData => Ok(DescribedRows::no_data()),
+        DescribedRowsStagedSlim::NoData => DescribedRows::no_data(),
     }
 }
 
@@ -1134,11 +1176,12 @@ mod deliver_entry_priv {
     /// turn requires a typed [`crate::reply_id::ReplyId<K>`] and
     /// its matching `K::StagedPayload`. DEF-112 + DEF-119.
     ///
-    /// DEF-119: carries [`StagedReply`] (lifetime-free) rather than
-    /// the public [`super::Reply`] (which now has a `'r` lifetime
-    /// tied to the arena). Materialise converts staged → public via
-    /// `StagedReply::into_public(reader)` where `reader` is the
-    /// DEF-154 (C) [`crate::schema_arena::ArenaReader<'r>`] witness.
+    /// DEF-188: carries [`StagedReply`] (lifetime-free) rather than
+    /// the public [`super::Reply`] (which has a `'r` lifetime tied
+    /// to `PgProtocol::terminal_row_desc`). Materialise converts
+    /// staged → public via `StagedReply::into_public(slot)` where
+    /// `slot` is `Option<&'r RowDesc>` borrowed from the parked
+    /// terminal slot.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct DeliverReplyEntry {
         id: NonZeroU64,
@@ -1206,14 +1249,16 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// `#[non_exhaustive]` because more variants (`BindComplete`,
 /// `BackendKeyData`, …) land in later sub-phases.
 ///
-/// # DEF-119 — lifetime `'r`
+/// # DEF-119 + DEF-188 — lifetime `'r`
 ///
 /// Schema-bearing payloads (`QueryComplete`, `DescribeStatementComplete`,
 /// `DescribePortalComplete`) previously owned a 260-byte `RowDesc`
-/// inline. DEF-119 externalises the schema into `PgProtocol`'s
-/// [`crate::schema_arena::SchemaArena`]; payloads now borrow
-/// `&'r RowDesc` from the arena. The `'r` lifetime ties the borrow
-/// to the `&'r mut PgProtocol` that produced the reply — same
+/// inline. DEF-119 externalised the schema into a 2-slot arena;
+/// DEF-188 deleted the arena and inlined the `RowDesc` back into
+/// state variants while parking the terminal-reply schema into
+/// `PgProtocol::terminal_row_desc` for the materialise borrow.
+/// The `'r` lifetime ties the public payload's `&'r RowDesc` to
+/// the `&'r mut PgProtocol` that produced the reply — same
 /// lifetime as [`Action::StreamRow::row_bytes`], so both row bytes
 /// and row schema have identical validity windows.
 ///
@@ -1231,8 +1276,8 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 ///
 /// Pre-DEF-119: `Reply` ~340 B (dominated by DescribeStatementComplete's
 /// inline RowDesc + ParamOids).
-/// Post-DEF-119: `Reply<'r>` ~96 B (DescribeStatementComplete holds
-/// `&RowDesc` ref + ParamOids 68 + TxStatus = ~80 B).
+/// Post-DEF-119/DEF-188: `Reply<'r>` ~96 B (DescribeStatementComplete
+/// holds `&RowDesc` ref + ParamOids 68 + TxStatus = ~80 B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reply<'r> {

@@ -28,7 +28,8 @@
 //! # Single-slot design
 //!
 //! The arena holds a **single** `Option<ErrorPayload>` — not a multi-
-//! slot slab like [`crate::schema_arena::SchemaArena`]. Rationale:
+//! slot slab (mirror of the pre-DEF-188 `SchemaArena` design,
+//! deleted alongside the schema arena). Rationale:
 //!
 //! 1. **Single-inflight semantics (pre-1c-5).** Per feed_bytes /
 //!    push_command cycle, at most ONE server error can reach the
@@ -50,7 +51,7 @@
 //!   `ProtocolError::ServerErrorResponse { details_ref, ... }`.
 //! - **Clear** happens at entry-point boundaries when prior state is
 //!   `Idle` or `Errored` — alongside `SchemaArena::clear()` in
-//!   [`crate::PgProtocol::clear_arena_if_idle_or_errored`]. The next
+//!   [`crate::PgProtocol::clear_terminal_row_desc_if_idle_or_errored`]. The next
 //!   feed_bytes call starts with a fresh arena; any ErrorRef held
 //!   past that boundary becomes stale (classified via generation).
 //!
@@ -222,7 +223,7 @@ pub enum ArenaError {
     /// `ErrorRef.generation != ErrorArena.generation` — the ref was
     /// issued in an earlier cycle. Expected signal for callers that
     /// deferred resolution past an entry-point boundary (post-
-    /// `clear_arena_if_idle_or_errored`) or past a subsequent `alloc`
+    /// `clear_terminal_row_desc_if_idle_or_errored`) or past a subsequent `alloc`
     /// in a refactor that violates single-inflight invariant.
     Stale = 1,
 }
@@ -416,7 +417,7 @@ impl ErrorArena {
     /// subsequent [`get`] on any outstanding ref classifies as
     /// [`ArenaError::Stale`].
     ///
-    /// Called by [`crate::PgProtocol::clear_arena_if_idle_or_errored`]
+    /// Called by [`crate::PgProtocol::clear_terminal_row_desc_if_idle_or_errored`]
     /// at entry-point boundaries when the prior state is Idle or
     /// Errored.
     ///
@@ -950,8 +951,12 @@ mod tests {
         // Any non-ServerErrorResponse variant exercises the
         // fall-through branch. InternalCrateBug is convenient — its
         // Display has a stable contract pinned in other tests.
+        // DEF-188: switched from `StaleSchemaRef` (deleted with the
+        // schema arena) to `ReadCursorAdvance` (still extant). The
+        // test only exercises the fallthrough branch — locus identity
+        // is incidental.
         let err = ProtocolError::InternalCrateBug {
-            locus: CrateBugLocus::StaleSchemaRef,
+            locus: CrateBugLocus::ReadCursorAdvance,
         };
         let arena = ErrorArena::new();
         let adapter = DisplayError::new(&err, &arena);
