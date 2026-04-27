@@ -80,26 +80,45 @@
 //! crate, operator diagnostics) can distinguish "I held the ref
 //! too long" (Stale) from "crate bug, shouldn't happen" (Empty).
 
-use crate::ident::BoundedStr;
+use crate::ident::SecretBoundedStr;
 
 /// Full per-server-error payload — the three bounded strings that
 /// used to live inline in `ProtocolError::ServerErrorResponse`.
 ///
-/// Copy-POD: all fields are Copy; no heap indirection. The total
-/// size is approximately 288 B (three `BoundedStr<N>` instances).
+/// # DEF-205 (2026-04-27): tier-1 staleness closure
+///
+/// Pre-DEF-205 this struct was `#[derive(Copy)]` with `BoundedStr<N>`
+/// fields — `ErrorArena::clear` flipped `slot = None` which only
+/// changed the discriminant; the `Some(ErrorPayload)` data bytes
+/// physically persisted in the `Option`'s storage region (~288 B
+/// of server error message / detail / hint, possibly containing
+/// query details echoed in syntax errors with embedded password
+/// literals).
+///
+/// Post-DEF-205: fields use [`SecretBoundedStr<N>`] which is
+/// non-Copy with `Drop` that scrubs the buffer. By Rust language
+/// semantics, `slot = None` MUST drop the old `Some(ErrorPayload)`
+/// before flipping the discriminant, firing the Drop chain that
+/// scrubs each field's bytes. **Tier-1 by compiler-enforced Drop**
+/// — no audit dependency, no callsite to forget.
+///
+/// Trade-off: `ErrorPayload` is no longer `Copy`. Callers using by
+/// value still work (move semantics), but `Result::copied()` calls
+/// must change to `Result::cloned()`. Production cost: cold-path
+/// only (error frames are rare); cloning is one struct memcpy.
 ///
 /// Users access via [`crate::PgProtocol::get_server_error`] →
-/// `Option<&ErrorPayload>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Result<&ErrorPayload, ArenaError>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorPayload {
     /// Server-provided human-readable error message (M field per
     /// PG §55.7 ErrorResponse). Truncated at 128 bytes with `"…"`
     /// marker if longer.
-    pub message: BoundedStr<128>,
+    pub message: SecretBoundedStr<128>,
     /// Optional detail string (D field). Often empty.
-    pub detail: BoundedStr<96>,
+    pub detail: SecretBoundedStr<96>,
     /// Optional hint string (H field). Often empty.
-    pub hint: BoundedStr<64>,
+    pub hint: SecretBoundedStr<64>,
 }
 
 // DEF-184 (audit #3 A-15): `ErrorPayload::empty()` and its `Default`
@@ -128,11 +147,11 @@ impl ErrorPayload {
     /// Mirrors `SchemaRef::dead_for_test` in schema_arena.rs.
     /// NOT production code — explicitly-named, `#[cfg(test)]`-gated.
     #[must_use]
-    pub(crate) const fn dead_for_test() -> Self {
+    pub(crate) fn dead_for_test() -> Self {
         Self {
-            message: BoundedStr::<128>::new(),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::new(),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         }
     }
 }
@@ -603,9 +622,9 @@ mod tests {
     fn alloc_then_get_returns_payload() {
         let mut arena = ErrorArena::new();
         let payload = ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("boom"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("boom"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         };
         let r = arena.alloc(payload);
         let got = arena.get(r);
@@ -619,9 +638,9 @@ mod tests {
     fn get_after_clear_classifies_as_stale() {
         let mut arena = ErrorArena::new();
         let payload = ErrorPayload {
-            message: BoundedStr::<128>::new(),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::new(),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         };
         let r = arena.alloc(payload);
         arena.clear();
@@ -643,9 +662,9 @@ mod tests {
         assert_eq!(arena.overwrite_count(), 0, "pristine arena starts at zero");
 
         let p1 = ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("first"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("first"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         };
         let r1 = arena.alloc(p1);
         // Validate the ref resolves before the second alloc.
@@ -657,9 +676,9 @@ mod tests {
         );
 
         let p2 = ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("second"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("second"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         };
         let r2 = arena.alloc(p2);
         // r1 is now stale (generation bumped); r2 resolves.
@@ -681,15 +700,15 @@ mod tests {
     fn alloc_overwrites_previous_and_bumps_generation() {
         let mut arena = ErrorArena::new();
         let p1 = ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("first"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("first"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         };
         let r1 = arena.alloc(p1);
         let p2 = ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("second"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("second"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         };
         let r2 = arena.alloc(p2);
         // r1 should be stale (generation mismatch).
@@ -722,9 +741,9 @@ mod tests {
         // Empty clear — bumps to 1.
         arena.clear();
         let payload = ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("after"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("after"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         };
         // Alloc — bumps to 2.
         let r = arena.alloc(payload);
@@ -746,9 +765,9 @@ mod tests {
         // against a would-be body swap.
         let mut a = ErrorArena::new();
         let p = ErrorPayload {
-            message: BoundedStr::<128>::new(),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::new(),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         };
         let r = a.alloc(p);
         let b = ErrorArena::new();
@@ -828,9 +847,9 @@ mod tests {
         use crate::error::{ProtocolError, Severity, SqlStateCode};
         let mut arena = ErrorArena::new();
         let details_ref = arena.alloc(ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("password authentication failed"),
-            detail: BoundedStr::<96>::from_str_truncating("user 'alice' not found"),
-            hint: BoundedStr::<64>::from_str_truncating("check pg_hba.conf"),
+            message: SecretBoundedStr::<128>::from_str_truncating("password authentication failed"),
+            detail: SecretBoundedStr::<96>::from_str_truncating("user 'alice' not found"),
+            hint: SecretBoundedStr::<64>::from_str_truncating("check pg_hba.conf"),
         });
         let err = ProtocolError::ServerErrorResponse {
             severity: Severity::Fatal,
@@ -851,9 +870,9 @@ mod tests {
         use crate::error::{ProtocolError, Severity, SqlStateCode};
         let mut arena = ErrorArena::new();
         let details_ref = arena.alloc(ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("boom"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("boom"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         });
         let err = ProtocolError::ServerErrorResponse {
             severity: Severity::Error,
@@ -870,9 +889,9 @@ mod tests {
         use crate::error::{ProtocolError, Severity, SqlStateCode};
         let mut arena = ErrorArena::new();
         let details_ref = arena.alloc(ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("orig"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("orig"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         });
         // Clear the arena — ref becomes stale. (Operator scenario:
         // deferred diagnostic log past an entry-point boundary.)
@@ -909,9 +928,9 @@ mod tests {
         use crate::error::{ProtocolError, Severity, SqlStateCode};
         let mut arena = ErrorArena::new();
         let details_ref = arena.alloc(ErrorPayload {
-            message: BoundedStr::<128>::from_str_truncating("boom"),
-            detail: BoundedStr::<96>::new(),
-            hint: BoundedStr::<64>::new(),
+            message: SecretBoundedStr::<128>::from_str_truncating("boom"),
+            detail: SecretBoundedStr::<96>::new(),
+            hint: SecretBoundedStr::<64>::new(),
         });
         let err = ProtocolError::ServerErrorResponse {
             severity: Severity::Fatal,

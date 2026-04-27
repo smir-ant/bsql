@@ -1731,10 +1731,12 @@ fn parse_error_response(
     payload: &[u8],
     error_arena: &mut crate::error_arena::ErrorArena,
 ) -> ParsedServerError {
-    use crate::error::{BoundedStr, Severity, SqlStateCode};
+    use crate::error::{Severity, SqlStateCode};
+    use crate::ident::SecretBoundedStr;
     // DEF-060 part 2: typed fields. Severity → enum (1 byte);
     // code → SqlStateCode ([u8;5]); message/detail/hint →
-    // BoundedStr<N> with explicit truncation marker (no
+    // SecretBoundedStr<N> (DEF-205 — non-Copy, ZeroizeOnDrop) with
+    // explicit truncation marker (no
     // `.unwrap_or_default()` silent-truncation).
     //
     // Architect audit #3 (2026-04-21): `severity_set: bool` +
@@ -1747,9 +1749,9 @@ fn parse_error_response(
     // stays 1 byte (same as the prior `Severity` alone).
     let mut severity: Option<Severity> = None;
     let mut code = SqlStateCode::from_bytes(b"");
-    let mut message: BoundedStr<128> = BoundedStr::default();
-    let mut detail: BoundedStr<96> = BoundedStr::default();
-    let mut hint: BoundedStr<64> = BoundedStr::default();
+    let mut message: SecretBoundedStr<128> = SecretBoundedStr::default();
+    let mut detail: SecretBoundedStr<96> = SecretBoundedStr::default();
+    let mut hint: SecretBoundedStr<64> = SecretBoundedStr::default();
 
     // DEF-064: bounded-iteration DoS shield. PG's documented
     // ErrorResponse field set has ~18 tags total (S, V, C, M, D,
@@ -1831,13 +1833,13 @@ fn parse_error_response(
             // `from_utf8(..).unwrap_or("")` silently dropped the entire
             // field on any single invalid byte — tier-3 diagnostic loss.
             b'M' => {
-                message = BoundedStr::from_bytes_lossy(value_bytes);
+                message = SecretBoundedStr::from_bytes_lossy(value_bytes);
             }
             b'D' => {
-                detail = BoundedStr::from_bytes_lossy(value_bytes);
+                detail = SecretBoundedStr::from_bytes_lossy(value_bytes);
             }
             b'H' => {
-                hint = BoundedStr::from_bytes_lossy(value_bytes);
+                hint = SecretBoundedStr::from_bytes_lossy(value_bytes);
             }
             _ => {} // Unknown field type — skip.
         }
@@ -2155,14 +2157,15 @@ mod parse_error_response_tests {
         detail: &str,
         hint: &str,
     ) -> ExpectedErr {
-        use crate::error::{BoundedStr, Severity, SqlStateCode};
+        use crate::error::{Severity, SqlStateCode};
+        use crate::ident::SecretBoundedStr;
         (
             Severity::from_bytes(severity.as_bytes()),
             SqlStateCode::from_bytes(code.as_bytes()),
             crate::error_arena::ErrorPayload {
-                message: BoundedStr::<128>::from_str_truncating(message),
-                detail: BoundedStr::<96>::from_str_truncating(detail),
-                hint: BoundedStr::<64>::from_str_truncating(hint),
+                message: SecretBoundedStr::<128>::from_str_truncating(message),
+                detail: SecretBoundedStr::<96>::from_str_truncating(detail),
+                hint: SecretBoundedStr::<64>::from_str_truncating(hint),
             },
         )
     }
@@ -2199,7 +2202,15 @@ mod parse_error_response_tests {
             "parse_error_response + arena.get Err {r:?} — architecturally unreachable \
              (parse always allocates into the fresh arena, no intervening clear)",
         );
-        let payload = r.copied().unwrap_or(crate::error_arena::ErrorPayload::dead_for_test());
+        // DEF-205: ErrorPayload is no longer Copy (fields are
+        // SecretBoundedStr<N> which is non-Copy + ZeroizeOnDrop).
+        // `r.copied()` no longer compiles; `r.cloned()` requires
+        // Clone (still derived). Same defensive idiom — `assert!`
+        // fires loudly on the unexpected None path; `unwrap_or`
+        // keeps the test compiling under the crate's no-panic
+        // forbid bundle. Eager `dead_for_test()` evaluation is fine
+        // (test path, no perf concern).
+        let payload = r.cloned().unwrap_or(crate::error_arena::ErrorPayload::dead_for_test());
         (parsed.severity, parsed.code, payload)
     }
 
