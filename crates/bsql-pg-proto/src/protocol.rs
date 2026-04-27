@@ -440,17 +440,17 @@ const _: () = assert!(
 /// `PgProtocol`. Box is the simplest per-instance heap allocation
 /// consistent with DEF-187's already-accepted `extern crate alloc`
 /// baseline.
-struct ColdFields {
+pub(crate) struct ColdFields {
     /// Session parameters from the post-auth handshake. Populated
     /// during startup from ParameterStatus messages. Read-only
     /// after startup completes.
-    session_params: SessionParams,
+    pub(crate) session_params: SessionParams,
     /// DEF-184 (A1+A13) error-payload arena — single-slot storage
     /// for `ProtocolError::ServerErrorResponse` bounded strings.
-    error_arena: crate::error_arena::ErrorArena,
+    pub(crate) error_arena: crate::error_arena::ErrorArena,
     /// DEF-185 P2-9 + DEF-186 P1-5 — counter of malformed-frame
     /// events that triggered teardown. Saturating u32.
-    malformed_frame_count: u32,
+    pub(crate) malformed_frame_count: u32,
 }
 
 impl ColdFields {
@@ -459,13 +459,35 @@ impl ColdFields {
     /// default value.
     #[inline]
     #[must_use]
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             session_params: SessionParams::new(),
             error_arena: crate::error_arena::ErrorArena::new(),
             malformed_frame_count: 0,
         }
     }
+}
+
+/// DEF-196 follow-up (2026-04-28): lazy cold-init helper used at
+/// any callsite that needs a `&mut ColdFields` from a
+/// `&mut Option<Box<ColdFields>>`. Allocates the Box on first call;
+/// subsequent calls return the existing reference.
+///
+/// Pre-(this-helper): `feed_bytes_impl` pre-allocated the Box
+/// unconditionally at function entry — every fresh `PgProtocol`'s
+/// first `feed_bytes` paid the alloc cost even when the frame
+/// didn't write any cold field (Ping flow's RFQ frame for example).
+/// Post-(this-helper): the alloc fires only at the actual write
+/// site (ParameterStatus filter, NoticeResponse filter,
+/// ErrorResponse dispatch arm, malformed-frame failure path).
+///
+/// Used by `feed_bytes_impl` and by `dispatch.rs` for the
+/// `ErrorResponse` arm (the only dispatch arm that writes cold).
+#[inline]
+pub(crate) fn cold_or_init(
+    cold_slot: &mut Option<alloc::boxed::Box<ColdFields>>,
+) -> &mut ColdFields {
+    cold_slot.get_or_insert_with(|| alloc::boxed::Box::new(ColdFields::new()))
 }
 
 /// PostgreSQL wire-protocol state machine — pure sync, no I/O.
@@ -1170,15 +1192,17 @@ impl PgProtocol {
         let state = &mut self.state;
         let read_buf = &mut self.read_buf;
         let terminal_row_desc = &mut self.row_desc_slot;
-        // DEF-196: cold-fields lazy-allocated. `cold_or_init` reserves
-        // the heap allocation if not yet present (one-time per
-        // connection cost). Subsequent disjoint field borrows on the
-        // returned `&mut ColdFields` are sound (Rust permits
-        // mutable borrows of distinct struct fields).
-        let cold = self.cold.get_or_insert_with(|| alloc::boxed::Box::new(ColdFields::new()));
-        let session_params = &mut cold.session_params;
-        let error_arena = &mut cold.error_arena;
-        let malformed_counter = &mut cold.malformed_frame_count;
+        // DEF-196 follow-up (2026-04-28): cold-fields lazy-allocated
+        // ONLY at write sites. Pre-(follow-up) `cold_or_init` was
+        // called at function entry — every fresh `PgProtocol`'s first
+        // `feed_bytes` paid `Box::new(ColdFields::new())` (~80 ns on
+        // M1) even when the frame didn't write any cold field. Ping
+        // bench (`feed_bytes(rfq)`) showed +36% as a consequence.
+        // Post-(follow-up): `cold_slot` is just `&mut Option<Box<…>>`
+        // here; each downstream callsite that actually writes a cold
+        // field calls `cold_or_init(cold_slot)` inline, allocating
+        // exactly once on the first cold write across the connection.
+        let cold_slot = &mut self.cold;
 
         // DEF-185 P1-6: single classification-driven dispatch.
         // Exhaustive match on `IngressClassification` — adding a new
@@ -1212,6 +1236,8 @@ impl PgProtocol {
                 // Bundled-helper-style refactor (single fn that does
                 // both) deferred to keep call-site ordering grep-able.
                 read_buf.clear();
+                // DEF-196 follow-up: lazy-init cold for malformed counter.
+                let malformed_counter = &mut cold_or_init(cold_slot).malformed_frame_count;
                 return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
                     let mut staged: StagedActions = StagedActions::new();
                     fail_inflight_no_readbuf(
@@ -1291,6 +1317,8 @@ impl PgProtocol {
                 match header {
                     HeaderParse::Empty | HeaderParse::Incomplete => break,
                     HeaderParse::MalformedLength { declared } => {
+                        // DEF-196 follow-up: lazy-init cold for counter.
+                        let malformed_counter = &mut cold_or_init(cold_slot).malformed_frame_count;
                         fail_inflight_no_readbuf(
                             state,
                             ProtocolError::MalformedFrameLength { declared },
@@ -1300,6 +1328,8 @@ impl PgProtocol {
                         break;
                     }
                     HeaderParse::FrameTooLarge { declared } => {
+                        // DEF-196 follow-up: lazy-init cold for counter.
+                        let malformed_counter = &mut cold_or_init(cold_slot).malformed_frame_count;
                         fail_inflight_no_readbuf(
                             state,
                             ProtocolError::FrameTooLarge { declared },
@@ -1338,6 +1368,10 @@ impl PgProtocol {
                             // `{}` silently collapsed the outcome;
                             // post-fix mirrors `n_malformed_bool_dropped`
                             // for ops diagnostic visibility.
+                            //
+                            // DEF-196 follow-up: lazy-init cold for
+                            // session_params write.
+                            let session_params = &mut cold_or_init(cold_slot).session_params;
                             match record_param_status(session_params, payload) {
                                 ParamStatusRecordOutcome::Processed => {}
                                 ParamStatusRecordOutcome::MalformedPayload => {
@@ -1362,7 +1396,9 @@ impl PgProtocol {
                         if tag == crate::wire::TAG_NOTICE_RESPONSE
                             && allows_unsolicited_notice_response(state)
                         {
-                            session_params.bump_notice_response();
+                            // DEF-196 follow-up: lazy-init cold for
+                            // notice counter bump.
+                            cold_or_init(cold_slot).session_params.bump_notice_response();
                             frames_consumed =
                                 frames_consumed.saturating_add(total_len);
                             continue;
@@ -1389,13 +1425,16 @@ impl PgProtocol {
                         // one mutable borrow, one in-place store.
                         // DEF-188: terminal_row_desc threaded through
                         // for the Z arms to park the in-flight schema.
+                        // DEF-196 follow-up: cold_slot threaded;
+                        // dispatch arms lazy-init only when needed
+                        // (ErrorResponse arms).
                         let outcome = dispatch(
                             state,
                             tag,
                             payload,
                             &mut reserved,
                             terminal_row_desc,
-                            error_arena,
+                            cold_slot,
                         );
                         match outcome {
                             DispatchOutcome::AdvancedSilent => {
@@ -1487,6 +1526,8 @@ impl PgProtocol {
                 // Classified dead-arm — a regression in cursor math
                 // would land here. Transition to Errored and emit
                 // FailReply via fail_inflight.
+                // DEF-196 follow-up: lazy-init cold for malformed counter.
+                let malformed_counter = &mut cold_or_init(cold_slot).malformed_frame_count;
                 fail_inflight_no_readbuf(
                     state,
                     ProtocolError::InternalCrateBug {
