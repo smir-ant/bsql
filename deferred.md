@@ -94,18 +94,19 @@ per CREDO §4.12. NONE deferred without structural reason.**
 | DEF-201 | `PgCommand` per-kind monomorphisation: `trait PgCommandT { const TAG; type Payload }` + generic `push_command<C: PgCommandT>` | Tier-1 (typed dispatch) | Caller pays only HIS command size; current 2176 B per-command → real size | PROPOSED, **design discussion required** before impl |
 | DEF-202 | `simdutf8` dep + binary codec (`i32::from_be_bytes` vs `str::parse`) | Same tier (deps already RustCrypto-class) | Text validation 15-30× faster; binary i32 decode 15× faster than text | PROPOSED, pairs with DEF-197 |
 | DEF-203 | Exhaustive niche audit sweep (`OtherEncoding::len`, `FixedStr::len` narrowing, `BoundedStr<N>` cap-niche, `Option<BoundedU8<N>>` over public types) | Tier-2 (compile-rejected ranges) | Cumulative — each site 1-4 B + alignment shifts | PROPOSED |
-| DEF-204 | **Staleness leak in `ReadBuf::compact()`** — re-framed 2026-04-27 from initial misdiagnosis. **NOT** a perf issue (initial framing wrong: DEF-185 P0-B/P0-C zeroizes only populated `as_mut_slice()` = `0..len()` not full capacity — already O(populated_len), ~1 ns/clear for Ping). **REAL ISSUE**: `compact()` (`buf.rs:278`) calls `copy_within(cursor..len, 0)` + `truncate(unread_len)`, but bytes physically at positions `[unread_len..len_before)` (the abandoned source range) retain pre-compact content. Future `clear()` zeroizes only `[0..len)` = `[0..unread_len)`; stale tail bytes physically persist in the array until future pushes overwrite them. Possible leak vector: a 2 KB SCRAM frame compacted to 100 B leaves ~1.9 KB of secret-correlated bytes physically present. | Tier-3 by-audit ("future push will overwrite eventually") → **Tier-2 structural** via in-place zeroize of abandoned tail in compact() before truncate. | Security closure (not perf). Per-compact extra cost: O(stale_tail) zeroize on the cold compact path (only fires when `cursor > 0` AND append needs space). ~5 LoC fix in `compact()`. | PROPOSED |
 
-**Priority order (§1) — REVISED 2026-04-27 after DEF-204 reframing:**
+**Priority order (§1) — REVISED 2026-04-27 after DEF-204 ship:**
 1. **Architectural perf win — concrete magnitude:** DEF-196 (cold field externalization, exact −720 B per PgProtocol via `Option<Box<ColdFields>>`).
 2. **Measurement gap closure:** DEF-197 (no decoder + no decoder bench = unmeasured class — enables future ship-with-evidence on decoder optimisations).
-3. **Security closure:** DEF-204 (staleness leak in compact — small ~5 LoC fix, tier-3 → tier-2).
-4. **Tier elevation foundation:** DEF-198 (witness-guard typestate — pipelining tier-1).
-5. **Zero-cost micro-wins:** DEF-195 → DEF-203 (small scope; DEF-194 already shipped).
-6. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
-7. **Adjacent-shape re-attempts of measured-rejected forms:** DEF-200 (A7 was global LUT — A7-adjacent per-state buckets remain open).
-8. **Architectural enabler:** DEF-199 (READ_BUF_CAP const generic — enables socket I/O tuning).
-9. **Binary codec foundation:** DEF-202 lands when DEF-197 needs it.
+3. **Tier elevation foundation:** DEF-198 (witness-guard typestate — pipelining tier-1).
+4. **Zero-cost micro-wins:** DEF-195 → DEF-203 (small scope; DEF-194 already shipped).
+5. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
+6. **Adjacent-shape re-attempts of measured-rejected forms:** DEF-200 (A7 was global LUT — A7-adjacent per-state buckets remain open).
+7. **Architectural enabler:** DEF-199 (READ_BUF_CAP const generic — enables socket I/O tuning).
+8. **Binary codec foundation:** DEF-202 lands when DEF-197 needs it.
+
+(DEF-204 closed — security closure shipped 2026-04-27 in commit landing
+this row's deletion.)
 
 **Cross-platform CI matrix** (project-wide concern):
 
@@ -258,6 +259,7 @@ Full detail in git log; this is just a navigation aid.
 - DEF-154 (A-Y): buffer-witness pattern + branded write/read scopes + build-time infallibility + RowStream pull API + Action::StreamRow deletion. Full cascade across multiple sessions.
 - DEF-163..DEF-187: Phase α2, γ ship, deferred sub-phases. DEF-163 PARTIAL (see §A).
 - **DEF-194**: `RowDesc::format_codes` bit-pack `[FormatCode; 32]` → `FormatCodeSet(u32)`. RowDesc 164→136 B exact; Option<RowDesc> 168→140 B exact; PgProtocol 5108→5080 B exact (−28 B). 330+ tier-1 const-asserts (round-trip 32×5×2 + OOR field preservation 3×4 + raw_bits 7 patterns + boundary + independence + size pins). `Default` derive removed (tier-1 by elimination). 7 redundant runtime tests removed; 2 tier-3 retained with structural reason; 1 wide-row integration test added. Production push (amortised) = 64.5 ns. SHIPPED 2026-04-27.
+- **DEF-204**: `ReadBuf::compact()` staleness leak closure. Pre-fix `copy_within + truncate` left bytes physically at `[unread_len..pre_compact_len)` retaining pre-compact content (consumed prefix's content + source side of copy_within); secret-correlated bytes from prior frames persisted in the array. Post-fix: in-place zeroize of abandoned tail BEFORE truncate. Tier-3 by-audit → tier-2 structural. ~5 LoC change in `buf.rs::compact`. 2 memory-probe tests added (`tests/buf_compact_staleness_spec.rs`, `#[ignore]`-gated, Miri-validated): `def204_compact_zeroizes_abandoned_tail` + `def204_compact_no_op_when_cursor_zero_does_not_zero`. SHIPPED 2026-04-27.
 
 ### DEF-184 (post-Y comprehensive audit)
 Shipped batches (commit-anchored):

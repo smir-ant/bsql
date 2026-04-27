@@ -274,7 +274,42 @@ impl ReadBuf {
     /// Reclaim the consumed prefix `[0..cursor)`.
     ///
     /// Internal helper called from [`append`]. Cheap when `cursor == 0`
-    /// (no-op); otherwise a `copy_within` of the unread tail.
+    /// (no-op); otherwise a `copy_within` of the unread tail followed
+    /// by an in-place zeroize of the abandoned tail.
+    ///
+    /// # DEF-204 (2026-04-27): staleness leak closure
+    ///
+    /// Pre-(204) sequence was `copy_within → truncate`. After truncate,
+    /// `inner.len()` shrinks to `unread_len`, but bytes physically at
+    /// positions `[unread_len..len_before)` retain their pre-compact
+    /// content — `heapless::Vec::truncate` only adjusts the length
+    /// counter for `Copy` types, it does NOT scrub the abandoned
+    /// storage. Future `clear()`/`Drop` zeroize only
+    /// `[0..current_len)` (= `[0..unread_len)` post-compact), MISSING
+    /// the stale tail.
+    ///
+    /// Concrete leak vector (pre-fix): a 2 KB
+    /// `AuthenticationSASLContinue` frame containing server salt +
+    /// nonce reaches `ReadBuf`; the dispatcher consumes it
+    /// (`cursor → 2048`); a small `ReadyForQuery` arrives; `append()`
+    /// triggers `compact()` with `unread_len=0`; `truncate(0)` leaves
+    /// bytes `[0..2048)` physically present in the array — including
+    /// password-correlated salt + nonce bytes. The leak persists for
+    /// the connection lifetime until either a future response of
+    /// equal-or-larger size overwrites position-by-position OR `Drop`
+    /// fires (which only scrubs the post-compact `inner.len() = 0`,
+    /// missing the tail entirely).
+    ///
+    /// Post-(204): the abandoned range is zeroized in place BEFORE
+    /// truncate. `inner.as_mut_slice()` at that point still returns
+    /// `[0..len_before)`; the slice view starting at `unread_len`
+    /// covers exactly the abandoned bytes (the consumed prefix's
+    /// physical content + the source side of the `copy_within` above,
+    /// which `copy_within` does NOT zero on the source side).
+    ///
+    /// **Tier**: tier-3 by-audit ("future push overwrites eventually")
+    /// → **tier-2 structural** (every compact is a scrub by
+    /// construction; no audit dependency on call patterns).
     fn compact(&mut self) {
         if self.cursor == 0 {
             return;
@@ -287,6 +322,24 @@ impl ReadBuf {
         // `copy_within` accepts a Range; the source range is
         // `cursor..len` and dest is `0`. Both inside `len`.
         self.inner.copy_within(cursor..len, 0);
+        // DEF-204: zeroize the abandoned tail BEFORE truncate. The
+        // slice `[unread_len..len_before)` covers the bytes that
+        // (a) were the consumed prefix `[unread_len..cursor)` (if
+        // any), and (b) were the source-side of the copy_within
+        // `[cursor..len_before)`. Both ranges retain pre-compact
+        // physical content unless explicitly scrubbed here.
+        //
+        // The Some-arm always fires under the `cursor != 0` guard
+        // above (=> `unread_len < len_before`). The None-arm is
+        // architecturally dead but classified explicitly as a no-op
+        // rather than `unwrap_or` silent fallback (CREDO §5).
+        {
+            use zeroize::Zeroize;
+            let inner_mut = self.inner.as_mut_slice();
+            if let Some(stale_tail) = inner_mut.get_mut(unread_len..) {
+                stale_tail.zeroize();
+            }
+        }
         // truncate to the new (compacted) length; `Vec::truncate`
         // never panics, only shortens.
         self.inner.truncate(unread_len);
