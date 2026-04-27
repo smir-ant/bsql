@@ -417,26 +417,35 @@ const _: () = assert!(
 // etc., per-target cfg-gated pins land in the same commit that adds
 // the target — not via permissive ranges. CREDO §3 skepticism: drift
 // surface beats variance cushion every time.
-// DEF-196 (2026-04-28): cold-field externalization shrinks
-// PgProtocol 5080 B → 4344 B = **−736 B exact** (aarch64-apple-darwin).
-// Cold fields (session_params ~436 B + error_arena ~296 B +
-// malformed_frame_count 4 B = ~736 B) moved into a heap-boxed
-// `ColdFields` struct accessed via `Option<Box<ColdFields>>` (8 B
-// niche-packed pointer slot inline). Cold path pays one Box::new
-// allocation per connection (only if any cold field is ever
-// written — Trust auth + no errors + no malformed frames = zero
-// heap usage).
+// DEF-196 v2 (2026-04-28): three-field split. Per-field lazy alloc
+// eliminates the bundled `ColdFields` Box; each cold field gets its
+// own `Option<Box<X>>` (or inline u32 for malformed_counter). Wins:
+//   - Per-field alloc only on actual write — connections that
+//     never write a given field never allocate that Box.
+//   - Smaller per-Box heap allocation (Box<SessionParams> = 436 B
+//     vs Box<ColdFields> = 736 B). Save ~300 B heap per typical
+//     Startup-doing connection without errors.
+//   - malformed_frame_count goes inline (4 B): malformed paths
+//     incur ZERO heap allocations (was 1 Box::new in v1).
 //
-// Layout breakdown (post-DEF-196):
+// Layout breakdown (post-DEF-196 v2):
 //   ReadBuf:                4096 B (4 KiB)
 //   state:                    64 B (post-DEF-189 strip)
 //   row_desc_slot:           140 B (Option<RowDesc>)
-//   cold:                      8 B (Option<Box<ColdFields>> niche)
+//   session_params:            8 B (Option<Box<SessionParams>> niche)
+//   error_arena:               8 B (Option<Box<ErrorArena>> niche)
+//   malformed_frame_count:     4 B (inline u32)
 //   sync_marker:               0 B (PhantomData)
-//   alignment padding:        ~36 B (to align(8))
-//   total:                  4344 B
+//   alignment padding:        ~32 B (to align(8))
+//   total:                  4352 B
+//
+// vs DEF-196 v1: +8 B inline (3 slots vs 1) but eliminates v1's
+// always-bundled allocation. Net production: heap usage
+// significantly lower.
+//
+// vs pre-DEF-196 (5080 B): **−728 B inline** preserved.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 4344,
+    core::mem::size_of::<protocol::PgProtocol>() == 4352,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf 4096 + state ~64 + row_desc_slot 140 + \
