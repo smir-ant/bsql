@@ -1054,17 +1054,17 @@ impl StagedReply {
     #[inline]
     pub(crate) fn into_public<'r>(
         self,
-        terminal_row_desc: Option<&'r crate::decode::RowDesc>,
+        row_desc_slot: Option<&'r crate::decode::RowDesc>,
     ) -> Reply<'r> {
         match self {
             Self::Pong(p) => Reply::Pong(p),
             Self::StartupComplete(p) => Reply::StartupComplete(p),
             Self::QueryComplete(staged) => {
-                // `schema_present: bool` flag set iff the dispatch
-                // Z arm parked a desc. Materialise's caller
-                // (`materialise`) supplies the slot borrow.
+                // DEF-189: `schema_present: bool` flag set iff the slot
+                // is populated. Materialise's caller (`materialise`)
+                // supplies the slot borrow; we project to RowDescBorrow.
                 let row_desc = if staged.schema_present {
-                    terminal_row_desc
+                    row_desc_slot.map(crate::decode::RowDescBorrow::from_ref)
                 } else {
                     None
                 };
@@ -1077,7 +1077,7 @@ impl StagedReply {
             Self::ParseComplete(p) => Reply::ParseComplete(p),
             Self::CloseComplete(p) => Reply::CloseComplete(p),
             Self::DescribeStatementComplete(staged) => {
-                let rows = described_rows_slim_into_public(staged.rows, terminal_row_desc);
+                let rows = described_rows_slim_into_public(staged.rows, row_desc_slot);
                 Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
                     param_oids: staged.param_oids,
                     rows,
@@ -1085,7 +1085,7 @@ impl StagedReply {
                 })
             }
             Self::DescribePortalComplete(staged) => {
-                let rows = described_rows_slim_into_public(staged.rows, terminal_row_desc);
+                let rows = described_rows_slim_into_public(staged.rows, row_desc_slot);
                 Reply::DescribePortalComplete(DescribePortalCompletePayload {
                     rows,
                     tx_status: staged.tx_status,
@@ -1117,11 +1117,13 @@ impl StagedReply {
 #[inline]
 fn described_rows_slim_into_public<'r>(
     r: DescribedRowsStagedSlim,
-    terminal_row_desc: Option<&'r crate::decode::RowDesc>,
+    row_desc_slot: Option<&'r crate::decode::RowDesc>,
 ) -> DescribedRows<'r> {
     match r {
-        DescribedRowsStagedSlim::Rows => match terminal_row_desc {
-            Some(desc) => DescribedRows::from_row_desc(desc),
+        DescribedRowsStagedSlim::Rows => match row_desc_slot {
+            Some(desc) => DescribedRows::from_row_desc_borrow(
+                crate::decode::RowDescBorrow::from_ref(desc),
+            ),
             // Architecturally dead: dispatch parks the desc in the
             // same arm that sets `Rows`. A None here means a future
             // refactor desynchronised the two; debug_assert below
@@ -1132,9 +1134,10 @@ fn described_rows_slim_into_public<'r>(
             None => {
                 debug_assert!(
                     false,
-                    "DEF-188: DescribedRowsStagedSlim::Rows without parked terminal_row_desc — \
-                     dispatch arm desync. Both fields are set together at the Z arm; a None \
-                     here means a future refactor split the parking from the staged-flag set.",
+                    "DEF-189: DescribedRowsStagedSlim::Rows without populated \
+                     row_desc_slot — dispatch arm desync. Both fields are set \
+                     together at the 'T' arm; a None here means a future refactor \
+                     split the parking from the staged-flag set.",
                 );
                 DescribedRows::no_data()
             }
@@ -1417,10 +1420,12 @@ pub struct QueryCompletePayload<'r> {
     /// Result-set schema, if any. `Some` for SELECT (including
     /// 0-row SELECTs), `None` for DML / empty-query.
     ///
-    /// DEF-119: borrowed from the arena. Previously owned
-    /// (`Option<RowDesc>`, 260 B inline); now `Option<&'r RowDesc>`
-    /// (8 B ref).
-    pub row_desc: Option<&'r crate::decode::RowDesc>,
+    /// DEF-189: borrowed via [`crate::decode::RowDescBorrow`] from
+    /// `PgProtocol::row_desc_slot`. The borrow's `'r` lifetime
+    /// matches the owning `OutActions<'_, 'r>` — the next
+    /// `&mut PgProtocol` call is blocked while this borrow is live,
+    /// so the slot cannot be cleared underneath the user.
+    pub row_desc: Option<crate::decode::RowDescBorrow<'r>>,
 }
 
 impl<'r> From<QueryCompletePayload<'r>> for Reply<'r> {
@@ -1510,31 +1515,27 @@ impl<'r> From<CloseCompletePayload> for Reply<'r> {
 pub enum DescribedRows<'r> {
     /// Server sent a `RowDescription` (`'T'`) — the statement/portal
     /// produces result columns. The schema borrows from
-    /// `PgProtocol`'s schema arena; `'r` matches the containing
+    /// `PgProtocol::row_desc_slot` via the lifetime-bound
+    /// [`crate::decode::RowDescBorrow`]; `'r` matches the containing
     /// `Reply<'r>` / `Action<'_, 'r>` lifetime.
-    Rows(&'r crate::decode::RowDesc),
+    Rows(crate::decode::RowDescBorrow<'r>),
     /// Server sent `NoData` (`'n'`) — the statement/portal has no
     /// result columns. DML without `RETURNING` is the common case.
     NoData,
 }
 
 impl<'r> DescribedRows<'r> {
-    /// Construct from a parsed `RowDescription` (tag `'T'`, PG §55.7).
-    ///
-    /// F8 (pass-#7 audit): named constructors give the materialise
-    /// arm an intent-telling alias to pair with `TAG_ROW_DESCRIPTION`.
-    /// A swap at the arm body (`Rows(desc)` ↔ `NoData`) still
-    /// compiles but tests flag the mismatch; this factory marks
-    /// the construction site with human-readable intent that will
-    /// fail a code review if inverted.
+    /// Construct from a parsed `RowDescription` borrow (tag `'T'`,
+    /// PG §55.7). Used by the dispatch arm for `TAG_ROW_DESCRIPTION`.
     #[inline]
     #[must_use]
-    pub(crate) const fn from_row_desc(desc: &'r crate::decode::RowDesc) -> Self {
-        Self::Rows(desc)
+    pub(crate) const fn from_row_desc_borrow(borrow: crate::decode::RowDescBorrow<'r>) -> Self {
+        Self::Rows(borrow)
     }
 
-    /// Construct the no-data sentinel. Pair to [`Self::from_row_desc`]
-    /// — used in the dispatch arm for `TAG_NO_DATA` (`'n'`).
+    /// Construct the no-data sentinel. Pair to
+    /// [`Self::from_row_desc_borrow`] — used in the dispatch arm for
+    /// `TAG_NO_DATA` (`'n'`).
     #[inline]
     #[must_use]
     pub(crate) const fn no_data() -> Self {

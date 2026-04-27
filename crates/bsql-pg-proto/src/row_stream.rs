@@ -79,7 +79,7 @@ use core::num::NonZeroU64;
 
 use crate::action::Action;
 use crate::buf::ReadBufFull;
-use crate::decode::RowDesc;
+use crate::decode::RowDescBorrow;
 use crate::error::ProtocolError;
 use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
 use crate::protocol::PgProtocol;
@@ -123,8 +123,9 @@ pub enum StreamItem<'a> {
         /// Guaranteed ≥ 2 bytes (column-count header present) per
         /// DEF-185 P1-3 post-audit fast-path pre-validation.
         row_bytes: &'a [u8],
-        /// Schema arena ref for this row.
-        desc: &'a RowDesc,
+        /// Schema borrow for this row — DEF-189 lazy projection from
+        /// `PgProtocol::row_desc_slot`.
+        desc: RowDescBorrow<'a>,
     },
     /// Server completed the command — terminal event.
     Complete {
@@ -251,7 +252,16 @@ impl<'p, 'w> RowStream<'p, 'w> {
         if self.drained {
             return StreamItem::NeedMore;
         }
-        if self.proto.state_is_errored() {
+        // DEF-189 hot-path fusion: single `match &self.state`
+        // observation classifies (Errored | Streaming | Other),
+        // returns the streaming reply id by value (Copy NonZeroU64)
+        // so the &self borrow is released before the subsequent
+        // &mut read_buf advance. Pre-DEF-189 was separate
+        // `state_is_errored()` + `streaming_reply_id()` calls —
+        // two enum matches that the compiler did not reliably
+        // fuse across the intervening header-parse logic.
+        let class = self.proto.classify_for_iter_rows();
+        if matches!(class, crate::protocol::IterRowsClass::Errored) {
             self.drained = true;
             return StreamItem::CloseSocket;
         }
@@ -323,21 +333,23 @@ impl<'p, 'w> RowStream<'p, 'w> {
             return StreamItem::NeedMore;
         }
 
-        // Fast-path: DataRow in a row-streaming state.
+        // Fast-path: DataRow in a row-streaming state. The state was
+        // already classified above (`IterRowsClass`); reuse the
+        // pre-computed reply_id.
         //
-        // # DEF-188 — single state projection, in-scope advance
+        // # DEF-189 — single state match per row
         //
         // Pre-DEF-185 baseline (def184-complete): ~8.3 ns/row.
-        // Post-DEF-185 (zombie dual-arena-lookup): ~17 ns/row
-        // (+105% regression).
-        // Post-DEF-188 (this work): single state pattern match,
-        // single in-scope advance, zero arena lookups
-        // (arena deleted). The desc borrow is acquired AFTER
-        // advance completes — NLL sees the &mut on read_buf end
-        // before the &self desc borrow begins, so they don't
-        // conflict.
+        // Post-DEF-185 (zombie dual-arena-lookup): ~17 ns/row.
+        // Post-DEF-188 (terminal slot, dual variant match): ~17.5 ns/row.
+        // Post-DEF-189 (this work): ONE `match &self.state` total
+        // per `next_event` (the fused `classify_for_iter_rows` upfront)
+        // + ONE Option projection for the desc (`current_row_desc`).
+        // The desc field was stripped from state variants entirely;
+        // lookup is now a simple `Option::as_ref` on `row_desc_slot`
+        // rather than a second enum-match-and-project.
         if tag == TAG_DATA_ROW
-            && let Some(id) = self.proto.streaming_reply_id()
+            && let crate::protocol::IterRowsClass::Streaming(id) = class
         {
             return self.fast_path_data_row(id, cursor, total);
         }
@@ -347,17 +359,18 @@ impl<'p, 'w> RowStream<'p, 'w> {
     /// Fast path: extract the DataRow body inline + emit
     /// [`StreamItem::Row`] without OutActions allocation.
     ///
-    /// # DEF-188 — single state pattern match per row
+    /// # DEF-189 — single descriptor projection per row
     ///
     /// `parse_header` in [`Self::next_event`] validated
     /// `total_len ≤ populated.len()` before calling here, so the
-    /// row body slice `populated[cursor + HEADER_LEN .. cursor +
-    /// total]` is in-bounds and the advance Err branch is
+    /// row body slice is in-bounds and the advance Err branch is
     /// architecturally dead.
     ///
-    /// Stale-ref class deleted (no SchemaRef handle exists post
-    /// DEF-188); state-as-data ensures the streaming variant
-    /// carries a valid `RowDesc` by construction.
+    /// The descriptor projection happens AFTER advance via
+    /// [`crate::PgProtocol::current_row_desc`] — single Option
+    /// projection from `row_desc_slot`. No second state match;
+    /// the streaming-variant gate already verified state, and
+    /// the slot was populated atomically with the variant entry.
     #[inline]
     fn fast_path_data_row(
         &mut self,
@@ -399,27 +412,28 @@ impl<'p, 'w> RowStream<'p, 'w> {
             };
         }
 
-        // Project state.row_desc directly. The desc lifetime
-        // ties to `&self.proto`; populated() also `&self.proto`
-        // — both immutable, both projected from disjoint fields
-        // (state, read_buf) of PgProtocol. NLL has released the
-        // earlier `&mut` advance borrow.
-        match self.proto.streaming_state_id_and_desc() {
-            Some((_id_now, desc)) => {
+        // DEF-189: project row_desc_slot directly. Single Option
+        // borrow; the lifetime ties to `&self.proto`. NLL has
+        // released the earlier `&mut` advance borrow.
+        match self.proto.current_row_desc() {
+            Some(desc) => {
                 let populated = self.proto.read_buf_populated();
                 let row_bytes = populated.get(row_start..row_end).unwrap_or(&[]);
                 StreamItem::Row { id, row_bytes, desc }
             }
             None => {
-                // Architecturally dead: caller `streaming_reply_id`
-                // pre-checked. Single-threaded `!Sync`-protected
-                // `&mut self` ⇒ no inter-call state mutation.
+                // Architecturally dead: streaming variants are entered
+                // ONLY in arms that populate row_desc_slot atomically
+                // (the 'T' arm or push_bind_execute time). A None here
+                // means a future refactor split slot population from
+                // variant entry.
                 debug_assert!(
                     false,
-                    "DEF-188: streaming_state_id_and_desc None post-advance — \
-                     state mutated between streaming_reply_id and here. \
-                     Architecturally impossible without intervening &mut self.state \
-                     in this scope (none exists).",
+                    "DEF-189: current_row_desc None inside streaming variant — \
+                     row_desc_slot was not populated when the streaming variant \
+                     was entered. Architecturally impossible: streaming variants \
+                     are entered only in code paths that populate the slot in the \
+                     same arm.",
                 );
                 self.drained = true;
                 StreamItem::CloseSocket

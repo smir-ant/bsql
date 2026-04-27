@@ -414,6 +414,23 @@ impl SessionParams {
         }
     }
 
+    /// DEF-189 Q8-C3: reset all session parameters to their `new()`
+    /// state. Called from `clear_session_residue_if_idle_or_errored`
+    /// when state transitions to `Errored` — a tear-down forfeits all
+    /// session state.
+    ///
+    /// # Why a method, not `*self = Self::new()`
+    ///
+    /// Same observable effect, but a method keeps the discipline
+    /// explicit at the call site (grep `session_params.clear()` finds
+    /// every reset point) and avoids accidentally creating a new
+    /// `SessionParams` value with different defaults if `new()`
+    /// signature changes.
+    #[inline]
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+
     /// DEF-185 P2-B: bump the `n_malformed_param_status_dropped`
     /// counter. Called from `protocol.rs`'s pre-dispatch filter when
     /// `record_param_status` returns `MalformedPayload` outcome.

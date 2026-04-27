@@ -123,6 +123,15 @@ const _: () = {
 /// `type_mod`, column name. Names can be restored in 1c-6 if
 /// runtime-reflection tooling requires them; the macro layer (Phase 2)
 /// resolves names at compile time and does not need the runtime copy.
+///
+/// # DEF-189 — derived projection, not stored representation
+///
+/// Pre-DEF-189, [`RowDesc`] stored an inline `[ColumnDesc; 32]` array
+/// (8 B per slot, 256 B total + n_columns + padding = 264 B). Post-DEF-189,
+/// [`RowDesc`] uses a struct-of-arrays layout (`[u32; 32]` for OIDs,
+/// `[FormatCode; 32]` for format codes) — 162 B total, ~38% smaller.
+/// `ColumnDesc` is now produced on demand by [`RowDesc::get`] /
+/// [`RowDesc::columns`]; it is no longer the storage shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ColumnDesc {
     /// PostgreSQL type OID (e.g. `23` = `int4`, `25` = `text`). Match
@@ -134,27 +143,53 @@ pub struct ColumnDesc {
 
 /// Schema of a result-set's rows.
 ///
-/// POD layout: a `[ColumnDesc; MAX_ROW_COLUMNS]` + `u16` populated
-/// count. `Copy`, no `Drop`. Equality compares only the populated
-/// prefix — trailing slots are default-filled and semantically
-/// invisible.
+/// # DEF-189 — struct-of-arrays (SoA) layout
+///
+/// POD layout: parallel arrays of OIDs and format codes (one slot per
+/// column up to [`MAX_ROW_COLUMNS`]) plus a `u16` populated count.
+/// `Copy`, no `Drop`. Equality compares only the populated prefix —
+/// trailing slots are zero-filled and semantically invisible.
+///
+/// ```text
+/// n_columns:    u16              [2 B]
+/// (padding to align u32)         [2 B]
+/// type_oids:    [u32; 32]        [128 B]
+/// format_codes: [FormatCode; 32] [32 B]
+/// total:                         [164 B]
+/// ```
+///
+/// Pre-DEF-189 was an array of `(u32 + FormatCode)` rows = 8 B per slot
+/// = 264 B. SoA saves 100 B per descriptor and aligns better for
+/// SIMD-friendly per-column lookups (sequential `[u32; 32]` walks one
+/// L1 line per 16 columns; the AoS layout interleaves padding bytes
+/// between OID values).
+///
+/// # Per-row hot-path access
+///
+/// The streaming fast-path reads `desc.type_oid(i)` and
+/// `desc.format_code(i)` via the borrow returned by
+/// [`crate::PgProtocol::current_row_desc`]. Both are O(1) bounds-checked
+/// indexing into the SoA arrays; no `&ColumnDesc` reconstruction is
+/// needed for the hot path.
 #[derive(Debug, Clone, Copy)]
+#[repr(C, align(4))]
 pub struct RowDesc {
     n_columns: u16,
-    columns: [ColumnDesc; MAX_ROW_COLUMNS],
+    /// Padding so `type_oids` is 4-byte aligned.
+    /// Always zero (initialised by constructors).
+    _pad: [u8; 2],
+    type_oids: [u32; MAX_ROW_COLUMNS],
+    format_codes: [FormatCode; MAX_ROW_COLUMNS],
 }
 
 impl RowDesc {
-    /// Empty descriptor (0 columns). Used to populate the `row_desc`
-    /// field of `SimpleQueryAwaitingRfq` on the empty-query
-    /// ([`crate::wire::TAG_EMPTY_QUERY_RESPONSE`]) transition where
-    /// no `RowDescription` precedes — and as a test fixture.
+    /// Empty descriptor (0 columns). Used as a test fixture and as
+    /// the schema-less sentinel for empty-query / NoData paths.
     pub const EMPTY: Self = Self {
         n_columns: 0,
-        columns: [ColumnDesc {
-            type_oid: 0,
-            format_code: FormatCode::Text,
-        }; MAX_ROW_COLUMNS],
+        _pad: [0; 2],
+        type_oids: [0; MAX_ROW_COLUMNS],
+        format_codes: [FormatCode::Text; MAX_ROW_COLUMNS],
     };
 
     /// Number of populated columns.
@@ -165,21 +200,19 @@ impl RowDesc {
     /// From<u16> for usize` is not yet stable as a const trait
     /// (rust-lang issue #143874 — still tracking as of Rust 1.95).
     /// Under the forbid-bundle we cannot use
-    /// `self.n_columns as usize`. When the const `From` impl
-    /// stabilises, this can flip to `const fn` without touching
-    /// the call surface.
-    ///
-    /// DEF-184 (B2): audit #2 claimed const-stable since Rust 1.87
-    /// — **incorrect**. Verified 2026-04-23: compiler still rejects
-    /// `const fn` + `usize::from(u16)` with E0658 "From is not yet
-    /// stable as a const trait". Reverted. CREDO §3 skepticism
-    /// applied to audit claim proved correct.
+    /// `self.n_columns as usize`.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        // Infallible widening via `From` (bans on `as` casts per
-        // crate forbid-bundle).
         usize::from(self.n_columns)
+    }
+
+    /// Number of populated columns as a `u16` — matches the wire
+    /// representation and avoids the `usize::from` widening.
+    #[inline]
+    #[must_use]
+    pub const fn n_columns(&self) -> u16 {
+        self.n_columns
     }
 
     /// Whether the descriptor carries any columns.
@@ -189,56 +222,229 @@ impl RowDesc {
         self.n_columns == 0
     }
 
-    /// Borrow the populated columns as a slice.
+    /// PG type OID for column `idx`, or `None` if out of range.
+    ///
+    /// DEF-189: O(1) indexed lookup into `type_oids` SoA array. Hot-path
+    /// callers (per-column decode) get a single bounds-checked u32 read.
     #[inline]
     #[must_use]
-    pub fn columns(&self) -> &[ColumnDesc] {
-        // F-035 (pass-#8): invariant `self.n_columns <= MAX_ROW_COLUMNS`
-        // is maintained by `parse_row_description` (hard-caps declared
-        // count) and by `EMPTY` (zero). The `.get(..self.len())` None
-        // branch is architecturally dead; debug-builds assert so a
-        // future constructor that skipped the cap fails tests loudly.
-        debug_assert!(
-            self.len() <= self.columns.len(),
-            "RowDesc invariant: n_columns ({}) must not exceed MAX_ROW_COLUMNS ({})",
-            self.len(),
-            self.columns.len(),
-        );
-        self.columns.get(..self.len()).unwrap_or(&[])
-    }
-
-    /// Get a single column by index, or `None` if out of range.
-    #[inline]
-    #[must_use]
-    pub fn get(&self, idx: usize) -> Option<&ColumnDesc> {
+    pub fn type_oid(&self, idx: usize) -> Option<u32> {
         if idx >= self.len() {
             return None;
         }
-        self.columns.get(idx)
+        self.type_oids.get(idx).copied()
+    }
+
+    /// Format code for column `idx`, or `None` if out of range.
+    ///
+    /// DEF-189: O(1) indexed lookup into `format_codes` SoA array.
+    #[inline]
+    #[must_use]
+    pub fn format_code(&self, idx: usize) -> Option<FormatCode> {
+        if idx >= self.len() {
+            return None;
+        }
+        self.format_codes.get(idx).copied()
+    }
+
+    /// Construct a `ColumnDesc` for column `idx`, or `None` if out
+    /// of range. Reconstructs the AoS shape on demand from the SoA
+    /// storage.
+    ///
+    /// DEF-189: returns `Option<ColumnDesc>` (by value) instead of the
+    /// pre-DEF-189 `Option<&ColumnDesc>`. `ColumnDesc` is 8 B; on
+    /// 64-bit targets returning by value is identical in ABI cost to
+    /// returning by ref, with no pointer-stability surprise.
+    #[inline]
+    #[must_use]
+    pub fn get(&self, idx: usize) -> Option<ColumnDesc> {
+        Some(ColumnDesc {
+            type_oid: self.type_oid(idx)?,
+            format_code: self.format_code(idx)?,
+        })
+    }
+
+    /// Iterate over populated columns in declaration order.
+    ///
+    /// Each yielded item is a `ColumnDesc` reconstructed from the SoA
+    /// storage. For decode hot paths prefer the per-array accessors
+    /// ([`Self::type_oid`], [`Self::format_code`]) — they avoid the
+    /// per-step struct construction.
+    #[inline]
+    #[must_use]
+    pub fn columns_iter(&self) -> RowDescColumnsIter<'_> {
+        RowDescColumnsIter {
+            desc: self,
+            idx: 0,
+            len: self.len(),
+        }
     }
 }
 
-// RowDesc uses full-array Eq (tail ColumnDesc slots are default-filled
-// during construction and never mutated thereafter, so byte-equality of
-// the arrays implies logical equality of populated-prefix semantics).
+/// Iterator yielded by [`RowDesc::columns_iter`].
+#[derive(Debug, Clone)]
+pub struct RowDescColumnsIter<'a> {
+    desc: &'a RowDesc,
+    idx: usize,
+    len: usize,
+}
+
+impl Iterator for RowDescColumnsIter<'_> {
+    type Item = ColumnDesc;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.len {
+            return None;
+        }
+        let cd = self.desc.get(self.idx)?;
+        self.idx = self.idx.saturating_add(1);
+        Some(cd)
+    }
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.len.saturating_sub(self.idx);
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for RowDescColumnsIter<'_> {}
+impl core::iter::FusedIterator for RowDescColumnsIter<'_> {}
+
+// RowDesc uses full-array Eq (trailing slots are zero-filled by
+// constructors and never mutated thereafter, so byte-equality of the
+// SoA arrays implies logical equality of populated-prefix semantics).
 impl PartialEq for RowDesc {
     fn eq(&self, other: &Self) -> bool {
-        self.n_columns == other.n_columns && self.columns == other.columns
+        self.n_columns == other.n_columns
+            && self.type_oids == other.type_oids
+            && self.format_codes == other.format_codes
     }
 }
 impl Eq for RowDesc {}
 
-// F-037 (pass-#8): SIMD-wide Eq invariant pin. `[ColumnDesc; MAX_ROW_COLUMNS]`
-// is 32 × 8 = 256 bytes — fits 8 AVX2 register compares (32 B/reg
-// × 8 = 256 B). Branchless full-array `memcmp` is faster than a
-// populated-prefix length-dispatch + shortened compare for typical
-// column counts. If a future bump pushes MAX_ROW_COLUMNS past 32,
-// revisit eq strategy (populated-prefix may become cheaper). Mirrors
-// the ParamOids SIMD-width assertion in action.rs.
+// DEF-189 size pin: 164 B post-SoA layout (vs 264 B pre-189).
+// `MAX_ROW_COLUMNS = 32`: 4 (n_columns + pad) + 128 (type_oids) +
+// 32 (format_codes) = 164 B.
 const _: () = assert!(
-    core::mem::size_of::<[ColumnDesc; MAX_ROW_COLUMNS]>() <= 256,
-    "RowDesc eq is SIMD-wide (≤256 B = 8 AVX2 regs). \
-     Revisit populated-prefix eq if MAX_ROW_COLUMNS grows > 32.",
+    core::mem::size_of::<RowDesc>() == 164,
+    "RowDesc size pin: 164 B post-DEF-189 SoA layout. Pre-189 was 264 B \
+     (AoS [ColumnDesc; 32] + n_columns). If MAX_ROW_COLUMNS bumps from 32, \
+     update this pin: size = 4 + (4 + 1) * MAX_ROW_COLUMNS rounded for \
+     alignment.",
+);
+const _: () = assert!(
+    core::mem::align_of::<RowDesc>() == 4,
+    "RowDesc alignment must remain 4 (u32 type_oids force this). \
+     repr(C, align(4)) keeps the layout drift-pinned.",
+);
+
+/// DEF-189: lifetime-bound borrow of a [`RowDesc`] living inside
+/// [`crate::PgProtocol::row_desc_slot`].
+///
+/// `RowDescBorrow<'r>` is the public read-only handle the user receives
+/// for SELECT-bearing replies and per-row events. It is `Copy` (8 B —
+/// just a `&RowDesc` reference) and ties its validity to the
+/// `&'r mut PgProtocol` borrow chain that produced it.
+///
+/// # Lifetime contract
+///
+/// `'r` is the same lifetime as the `OutActions<'_, 'r>` /
+/// `StreamItem<'r>` that delivered the borrow. While the borrow is
+/// alive, the borrow checker blocks any `&mut PgProtocol` re-entry —
+/// in particular, the next `iter_rows` / `feed_bytes` / `push_command`
+/// call cannot fire until this borrow drops. This means `row_desc_slot`
+/// cannot be cleared, and the underlying `RowDesc` stays valid.
+///
+/// # Why a separate type vs `&'r RowDesc`
+///
+/// Three reasons:
+///
+/// 1. **API stability**: the internal storage layout (currently a
+///    direct `Option<RowDesc>` slot, possibly future per-column SoA
+///    arrays addressed by an external buffer) is hidden behind this
+///    borrow. Users access via `n_columns()` / `type_oid(i)` /
+///    `format_code(i)` and don't depend on field projections.
+/// 2. **Implementation flexibility**: future versions may back the
+///    borrow with byte-range descriptors into a dedicated buffer
+///    (per the architect's DEF-189 lazy-borrow design alternative),
+///    or with rkyv-style zero-copy archives — without breaking user
+///    code.
+/// 3. **Discoverability**: `RowDescBorrow::n_columns(&self)` chains
+///    fluently in user code; `(&'r RowDesc).len()` is less natural.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct RowDescBorrow<'r> {
+    inner: &'r RowDesc,
+}
+
+impl<'r> RowDescBorrow<'r> {
+    /// Construct from an immutable reference. Crate-internal — the
+    /// public path is via [`crate::PgProtocol::current_row_desc`].
+    #[inline]
+    #[must_use]
+    pub(crate) const fn from_ref(inner: &'r RowDesc) -> Self {
+        Self { inner }
+    }
+
+    /// Number of populated columns.
+    #[inline]
+    #[must_use]
+    pub const fn n_columns(&self) -> u16 {
+        self.inner.n_columns()
+    }
+
+    /// Number of populated columns as `usize`.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the descriptor carries any columns.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// PG type OID for column `idx`, or `None` if out of range.
+    ///
+    /// Single bounds-checked u32 read into the underlying SoA storage.
+    #[inline]
+    #[must_use]
+    pub fn type_oid(&self, idx: usize) -> Option<u32> {
+        self.inner.type_oid(idx)
+    }
+
+    /// Format code for column `idx`, or `None` if out of range.
+    #[inline]
+    #[must_use]
+    pub fn format_code(&self, idx: usize) -> Option<FormatCode> {
+        self.inner.format_code(idx)
+    }
+
+    /// Construct a [`ColumnDesc`] for column `idx`, or `None` if out
+    /// of range. Mirrors [`RowDesc::get`].
+    #[inline]
+    #[must_use]
+    pub fn get(&self, idx: usize) -> Option<ColumnDesc> {
+        self.inner.get(idx)
+    }
+
+    /// Iterate over populated columns as [`ColumnDesc`] tuples.
+    #[inline]
+    #[must_use]
+    pub fn columns_iter(&self) -> RowDescColumnsIter<'r> {
+        self.inner.columns_iter()
+    }
+}
+
+// RowDescBorrow size pin: 8 B (single reference on 64-bit, 4 B on
+// 32-bit targets). Ensures the borrow doesn't grow into a payload
+// — a future regression that inlined the descriptor would land here.
+const _: () = assert!(
+    core::mem::size_of::<RowDescBorrow<'_>>() == core::mem::size_of::<&RowDesc>(),
+    "RowDescBorrow must be the same size as &RowDesc — adding a payload \
+     defeats the lazy-projection design.",
 );
 
 impl fmt::Display for FormatCode {
@@ -307,10 +513,11 @@ pub(crate) fn parse_row_description(
         });
     }
 
-    // Per-column parse. `columns` starts as `[default; MAX]`; populated
-    // slots get overwritten with real values.
-    let mut columns = [ColumnDesc::default(); MAX_ROW_COLUMNS];
-    for slot in columns.iter_mut().take(n_columns_usize) {
+    // DEF-189: SoA per-column parse. Populated slots overwrite the
+    // zero-initialised arrays; trailing slots remain default.
+    let mut type_oids = [0u32; MAX_ROW_COLUMNS];
+    let mut format_codes = [FormatCode::Text; MAX_ROW_COLUMNS];
+    for idx in 0..n_columns_usize {
         // Name: cstring (NUL-terminated). We skip the bytes; round-4
         // finding #2 typed-newtypes already covers identifier discipline
         // elsewhere.
@@ -339,10 +546,14 @@ pub(crate) fn parse_row_description(
         let format_code = FormatCode::try_from_wire_i16(format_code_i16)
             .map_err(|code| ProtocolError::UnexpectedFormatCode { code })?;
 
-        *slot = ColumnDesc {
-            type_oid,
-            format_code,
-        };
+        // Bounds: idx < n_columns_usize ≤ MAX_ROW_COLUMNS, so both
+        // `get_mut(idx)` calls return Some. The architecturally-dead
+        // None branches classify as MalformedRowDescription rather
+        // than silently dropping the column (forbid-bundle).
+        let oid_slot = type_oids.get_mut(idx).ok_or_else(malformed)?;
+        *oid_slot = type_oid;
+        let fmt_slot = format_codes.get_mut(idx).ok_or_else(malformed)?;
+        *fmt_slot = format_code;
         rest = next_cursor;
     }
 
@@ -354,7 +565,9 @@ pub(crate) fn parse_row_description(
 
     Ok(RowDesc {
         n_columns,
-        columns,
+        _pad: [0; 2],
+        type_oids,
+        format_codes,
     })
 }
 
@@ -1417,7 +1630,7 @@ mod parse_tests {
     fn two_column_text_format_roundtrip() {
         let body = build(&[(b"id", 23, 0), (b"name", 25, 0)]);
         let result = parse_row_description(&body);
-        let expected = [
+        let expected: [ColumnDesc; 2] = [
             ColumnDesc {
                 type_oid: 23,
                 format_code: FormatCode::Text,
@@ -1427,11 +1640,14 @@ mod parse_tests {
                 format_code: FormatCode::Text,
             },
         ];
-        assert!(
-            matches!(
-                &result,
-                Ok(desc) if desc.columns() == expected.as_slice(),
-            ),
+        // DEF-189: SoA storage; reconstruct AoS view via columns_iter().
+        let actual: alloc::vec::Vec<ColumnDesc> = match &result {
+            Ok(desc) => desc.columns_iter().collect(),
+            Err(_) => alloc::vec::Vec::new(),
+        };
+        assert_eq!(
+            actual.as_slice(),
+            expected.as_slice(),
             "expected 2-column text parse, got {result:?}",
         );
     }
@@ -1446,7 +1662,7 @@ mod parse_tests {
                 &result,
                 Ok(desc) if matches!(
                     desc.get(0),
-                    Some(&ColumnDesc { format_code: FormatCode::Binary, .. }),
+                    Some(ColumnDesc { format_code: FormatCode::Binary, .. }),
                 ),
             ),
             "expected Binary format first column, got {result:?}",

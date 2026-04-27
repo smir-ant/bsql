@@ -957,6 +957,34 @@ pub enum ErrorKind {
     /// `ConnectionAlreadyClosed { prior_kind }` correctly identify
     /// the culprit. Pass-#8 F-052. 1 byte (repr(u8)).
     ClientOrdering = 6,
+    /// DEF-189 Q8-C4 — counter-storm classifier.
+    ///
+    /// Lifts the `malformed_frame_count` saturation event from tier-4
+    /// silent (the counter just clamps at u32::MAX) to tier-3 explicit:
+    /// when the per-connection malformed-frame counter crosses the
+    /// `MALFORMED_STORM_THRESHOLD` (10_000) inside
+    /// `fail_inflight_no_readbuf`, the resulting `Errored` transition
+    /// classifies as `MalformedStorm` instead of the underlying
+    /// per-frame cause.
+    ///
+    /// # Today: defensive classifier, architecturally hard-to-reach
+    ///
+    /// Under the current single-event-then-Errored semantics
+    /// (`fail_inflight_no_readbuf` early-returns when state is already
+    /// Errored, dispatch loop breaks on first malformed frame, post-
+    /// Errored feed_bytes short-circuits without dispatching), the
+    /// counter caps at 1 in practice. The threshold (10_000) is
+    /// unreachable with today's flow.
+    ///
+    /// The variant is retained as **defensive tier-3 classification**:
+    /// if a future flow change (e.g., soft-recovery, batched dispatch
+    /// with continue-on-error) lets the counter accumulate, the
+    /// classifier activates at the documented threshold without a
+    /// silent saturation surprise. Without the variant, an adversary
+    /// flooding a partially-tolerant flow with malformed frames would
+    /// see the counter pin at u32::MAX with **no diagnostic signal** —
+    /// pure tier-4.
+    MalformedStorm = 7,
 }
 
 /// Subset of [`ErrorKind`] that CAN be stored in
@@ -985,10 +1013,10 @@ pub enum ErrorKind {
 ///
 /// # Niche optimisation
 ///
-/// Wrapping `ErrorKind` (which is `#[repr(u8)]` with 7 variants
-/// 0..=6) preserves the 248 unused discriminant values as niches,
-/// so `Option<StateErrorKind>` is still 1 byte just like
-/// `Option<ErrorKind>`.
+/// Wrapping `ErrorKind` (which is `#[repr(u8)]` with 8 variants
+/// 0..=7 post-DEF-189) preserves 247 unused discriminant values
+/// as niches, so `Option<StateErrorKind>` is still 1 byte just
+/// like `Option<ErrorKind>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct StateErrorKind(ErrorKind);
@@ -1022,7 +1050,8 @@ impl StateErrorKind {
             | ErrorKind::ServerError
             | ErrorKind::Auth
             | ErrorKind::Internal
-            | ErrorKind::ClientOrdering => Some(Self(k)),
+            | ErrorKind::ClientOrdering
+            | ErrorKind::MalformedStorm => Some(Self(k)),
         }
     }
 
@@ -1076,7 +1105,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<Option<StateErrorKind>>() == 1,
-    "Option<StateErrorKind> must niche-pack to 1 byte (ErrorKind uses 7 of 256 u8 discriminants)",
+    "Option<StateErrorKind> must niche-pack to 1 byte (ErrorKind uses 8 of 256 u8 discriminants post-DEF-189)",
 );
 
 impl ProtocolError {

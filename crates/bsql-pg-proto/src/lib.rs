@@ -145,7 +145,7 @@ pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::{FetchRows, PgCommand};
 pub use decode::{
     ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, FromPgText, MAX_ROW_COLUMNS,
-    RowDesc, oids,
+    RowDesc, RowDescBorrow, RowDescColumnsIter, oids,
 };
 pub use error::{CrateBugLocus, ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
@@ -368,36 +368,31 @@ const _: () = assert!(
      tag is zero-size; ReplyId's footprint is u64 value + bool \
      delivered + padding. Did a bookkeeping field get added?",
 );
-// DEF-188 (architect 2026-04-25): RowDesc inlined into state
-// variants alongside SCRAM Box-externalisation (DEF-187).
-// Dominating variant is now SimpleQueryAwaitingRfq /
-// BindExecuteAwaitingRfqSelect (carry inline RowDesc + reply +
-// command_tag), or the BindExecute SELECT-path streaming variants
-// (inline RowDesc + reply). Range accommodates BoundedStr<32>
-// command_tag (32 B), ReplyId (16 B), RowDesc (~264 B), padding.
+// DEF-189 (architect 2026-04-25): RowDesc moved to PgProtocol single
+// slot; state variants no longer carry schema. Dominating variant is
+// `SimpleQueryAwaitingRfq` with `command_tag: BoundedStr<32>` + reply +
+// `schema_present: bool`, or `BindExecuteAwaitingRfqSelect` likewise.
+// Streaming variants carry only `reply: ReplyId<QueryKind>` (~16 B).
 const _: () = assert!(
     core::mem::size_of::<state::ProtoState>() >= 16
-        && core::mem::size_of::<state::ProtoState>() <= 360,
-    "ProtoState size post-DEF-188 (inline RowDesc, schema_arena \
-     deleted; SCRAM Boxed per DEF-187). \
+        && core::mem::size_of::<state::ProtoState>() <= 96,
+    "ProtoState size post-DEF-189 (RowDesc externalised to \
+     PgProtocol::row_desc_slot single slot; state variants strip \
+     row_desc fields entirely). \
      \
-     Dominating variant likely: `SimpleQueryAwaitingRfq` carrying \
-     `Option<RowDesc>` (~264+8 B) + ReplyId (16 B) + BoundedStr<32> \
-     command_tag (32 B) + tag + padding ≈ 320 B. SCRAM variants are \
-     now ~24-32 B (Box pointers per DEF-187). Streaming variants \
-     carry inline RowDesc (~264 B) + reply ≈ 280 B. \
+     Dominating variant likely: `SimpleQueryAwaitingRfq` \
+     carrying ReplyId (16 B) + BoundedStr<32> command_tag (32 B) + \
+     schema_present (1 B) + tag + padding ≈ 56-64 B. Streaming \
+     variants carry only ReplyId + tag ≈ 24 B. SCRAM variants \
+     remain ~24-32 B (Box pointers per DEF-187). \
      \
-     Rationale for inline RowDesc: per-row hot path reads \
-     `&self.state.row_desc` directly via `streaming_state_id_and_desc`. \
-     Pre-DEF-188 the equivalent was 2-byte SchemaRef into a 2-slot \
-     arena; per-row dispatch cost included `arena.has` + `arena.get` \
-     dual lookups. DEF-188 collapses to one field projection. \
-     `StaleSchemaRef` class architecturally impossible (no handle, \
-     no generation drift). \
+     Pre-DEF-189: ProtoState ~320 B (dominant variant carried inline \
+     RowDesc 264 B + reply + command_tag). \
      \
-     If this trips above 360 B: a new heavy field landed on a state \
-     variant, or RowDesc grew (MAX_ROW_COLUMNS bump). Investigate \
-     individual field sizes before bumping the range.",
+     Net win: per-row hot-path single state-projection retrieves \
+     just the reply id; the descriptor is fetched via the protocol's \
+     `current_row_desc` slot (one immutable borrow, no per-row state \
+     match for the desc field).",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
@@ -406,26 +401,26 @@ const _: () = assert!(
      (16) + discriminant + padding. Bumping MAX_SQL_LEN or \
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
-// DEF-188 (architect 2026-04-25): schema_arena deleted (~520 B
-// removed); terminal_row_desc added (~268 B); state grew from ~80 B
-// (SCRAM Boxed) to ~320 B (inline RowDesc on AwaitingRfq dominant
-// variant). Net: PgProtocol holds roughly the same size — the
-// arena memory moved into state + a thin parking slot.
+// DEF-189 (architect 2026-04-25): RowDesc moved to single slot;
+// state variants stripped of inline schema; SoA RowDesc layout 164 B
+// (was 264 B). Slot capacity = Option<RowDesc> = 168 B (164 + 1
+// discriminant + padding to alignment).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() >= 5300
-        && core::mem::size_of::<protocol::PgProtocol>() <= 5800,
-    "PgProtocol size post-DEF-188 (schema_arena DELETED, RowDesc \
-     inlined into state, terminal_row_desc parking slot). \
+    core::mem::size_of::<protocol::PgProtocol>() >= 5000
+        && core::mem::size_of::<protocol::PgProtocol>() <= 5400,
+    "PgProtocol size post-DEF-189 (single row_desc_slot, SoA RowDesc \
+     164 B). \
      \
-     Budget: ReadBuf 4096 + state ~320 (inline RowDesc on dominant \
-     variant; SCRAM Boxed per DEF-187) + session_params ~420 + \
-     terminal_row_desc ~268 (Option<RowDesc>) + error_arena ~290 + \
-     malformed_frame_count 4 + padding. \
+     Budget: ReadBuf 4096 + state ~64 (post-DEF-189 strip) + \
+     session_params ~420 + row_desc_slot ~168 (Option<SoA RowDesc>) + \
+     error_arena ~290 + malformed_frame_count 4 + padding. \
      \
-     Net change vs DEF-187: -520 (arena delete) +268 (terminal slot) \
-     +240 (state grew with inline RowDesc) ≈ 0 net. The trade is: \
-     simpler runtime structure, no generation tracking, per-row \
-     hot-path single-projection vs dual arena lookup.",
+     Net change vs DEF-188: -256 (state shrunk from ~320 to ~64), \
+     -100 (terminal_row_desc shrunk from ~268 to ~168 via SoA layout). \
+     Total ~-356 B. Per-row hot-path benefit: SoA layout means \
+     `type_oid(i)` is one u32 read into a sequential array, \
+     cache-friendly for short SELECTs. Wide SELECTs (32 cols) saw \
+     unnecessary 100 B of padding traffic on every state move.",
 );
 // DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B
 // post-`new_state` extraction. Pre-(B21/C6) each Advanced variant

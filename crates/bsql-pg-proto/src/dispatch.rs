@@ -225,7 +225,7 @@ pub(crate) fn dispatch(
     tag: crate::wire::InboundTag,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    terminal_row_desc: &mut Option<crate::decode::RowDesc>,
+    row_desc_slot: &mut Option<crate::decode::RowDesc>,
     error_arena: &mut crate::error_arena::ErrorArena,
 ) -> DispatchOutcome {
     // DEF-184 (B21/C6): snap owned prev for pattern matching; state
@@ -402,10 +402,13 @@ pub(crate) fn dispatch(
         (ProtoState::ConnectingPostAuthAwaitingKey(reply), TAG_BACKEND_KEY_DATA) => {
             match parse_backend_key_data(payload) {
                 Ok((pid, secret_key)) => {
+                    // DEF-189 Q8-C2: wrap the secret_key in Sensitive
+                    // so the variant's storage scrubs on drop (state
+                    // transition).
                     *state = ProtoState::ConnectingPostAuthHaveKey {
                         reply,
                         pid,
-                        secret_key,
+                        secret_key: crate::sensitive::Sensitive::new(secret_key),
                     };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -435,15 +438,24 @@ pub(crate) fn dispatch(
         ) => {
             // DEF-112: `reply: ReplyId<StartupKind>` — typed
             // `deliver` forces a `StartupCompletePayload` payload.
+            //
+            // DEF-189 Q8-C2: extract the inner i32 from
+            // `Sensitive<i32>` via `.get()` (returns &i32, copy-deref
+            // here). The Sensitive wrapper drops at end of arm scope,
+            // scrubbing the source slot. The plain `i32` in
+            // StartupCompletePayload then flows through the staged
+            // pipeline; that payload's manual Debug impl already
+            // redacts the field (P1-C).
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
+                    let secret_key_inner: i32 = *secret_key.get();
                     *state = ProtoState::Idle;
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::deliver(
                             reply,
                             crate::action::StartupCompletePayload {
                                 pid,
-                                secret_key,
+                                secret_key: secret_key_inner,
                                 tx_status,
                             },
                         ),
@@ -486,19 +498,21 @@ pub(crate) fn dispatch(
 
         // AwaitingFirstResponse: T / C / I / E — any other tag is desync
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
-            // F19 + DEF-188: parsed schema lands inline in the
-            // StreamingRows variant. No arena, no handle.
+            // DEF-189: parsed schema lands in PgProtocol::row_desc_slot.
+            // The variant transitions to StreamingRows (no inline payload).
+            // The slot lives across the entire stream (DataRows + Z).
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    *state = ProtoState::SimpleQueryStreamingRows { reply, row_desc };
+                    *row_desc_slot = Some(row_desc);
+                    *state = ProtoState::SimpleQueryStreamingRows { reply };
                     DispatchOutcome::AdvancedSilent
                 }
                 Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
-            // DML path: no RowDescription → AwaitingRfq with row_desc=None.
-            advance_to_awaiting_rfq(state, reply, payload, None)
+            // DML path: no RowDescription → AwaitingRfq with schema_present=false.
+            advance_to_awaiting_rfq(state, reply, payload, false)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
             // DEF-185 P0-F (audit 2026-04-24): PG §55.7 specifies
@@ -510,7 +524,7 @@ pub(crate) fn dispatch(
                     *state = ProtoState::SimpleQueryAwaitingRfq {
                         reply,
                         command_tag: crate::error::BoundedStr::default(),
-                        row_desc: None,
+                        schema_present: false,
                     };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -539,11 +553,10 @@ pub(crate) fn dispatch(
         // response (API misuse). The catch-all arm below
         // classifies as `UnexpectedFrame { tag: DataRow }` →
         // FailReply + CloseSocket.
-        (ProtoState::SimpleQueryStreamingRows { reply, row_desc }, TAG_COMMAND_COMPLETE) => {
-            // SELECT path terminates: preserve schema into AwaitingRfq
-            // so the trailing RFQ's QueryComplete can park it into
-            // terminal_row_desc.
-            advance_to_awaiting_rfq(state, reply, payload, Some(row_desc))
+        (ProtoState::SimpleQueryStreamingRows { reply }, TAG_COMMAND_COMPLETE) => {
+            // SELECT path terminates: schema lives in slot, signal
+            // schema_present=true. AwaitingRfq → Z → Idle.
+            advance_to_awaiting_rfq(state, reply, payload, true)
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, error_arena)
@@ -553,19 +566,15 @@ pub(crate) fn dispatch(
         }
 
         // AwaitingRfq: Z is the only legal frame
-        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag, row_desc }, TAG_READY_FOR_QUERY) => {
-            // DEF-188: park the inline RowDesc (if any) into
-            // PgProtocol::terminal_row_desc so the public
-            // QueryComplete reply's Option<&'r RowDesc> borrow
-            // finds a stable address that outlives the state's
-            // transition to Idle. The slot persists until the next
-            // entry-point's clear (mirrors pre-188 arena clear
-            // discipline, simpler — single slot, no generation).
+        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag, schema_present }, TAG_READY_FOR_QUERY) => {
+            // DEF-189: schema (if any) already lives in row_desc_slot
+            // (parked at the 'T' arm or pre-populated by push for
+            // BindExecute SELECT). State transitions to Idle; slot
+            // persists until next entry-point clear, so the public
+            // QueryComplete reply's RowDescBorrow stays valid.
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
                     *state = ProtoState::Idle;
-                    let schema_present = row_desc.is_some();
-                    *terminal_row_desc = row_desc;
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::deliver(
                             reply,
@@ -795,7 +804,7 @@ pub(crate) fn dispatch(
         // ─── SELECT path ───
 
         (
-            ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, row_desc },
+            ProtoState::BindExecuteAwaitingBindCompleteSelect { reply },
             TAG_BIND_COMPLETE,
         ) => {
             // DEF-185 P0-F: BindComplete body must be empty per
@@ -803,7 +812,7 @@ pub(crate) fn dispatch(
             match payload {
                 [] => {
                     *state =
-                        ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc };
+                        ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply };
                     DispatchOutcome::AdvancedSilent
                 }
                 other => install_errored(
@@ -828,16 +837,16 @@ pub(crate) fn dispatch(
         // catch-all arm below (see SimpleQueryStreamingRows for
         // the full rationale).
         (
-            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, row_desc },
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply },
             TAG_COMMAND_COMPLETE,
-        ) => advance_to_bindexecute_awaiting_rfq_select(state, reply, payload, row_desc),
+        ) => advance_to_bindexecute_awaiting_rfq_select(state, reply, payload),
         (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, error_arena)
         }
         (
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. },
             TAG_PORTAL_SUSPENDED,
-        ) => install_errored(state, 
+        ) => install_errored(state,
             Some(reply.consume()),
             ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED },
         ),
@@ -849,8 +858,8 @@ pub(crate) fn dispatch(
         // classifies as UnexpectedFrame in the catch-all arm
         // below (see SimpleQueryStreamingRows for the full
         // rationale).
-        (ProtoState::BindExecuteStreamingRows { reply, row_desc }, TAG_COMMAND_COMPLETE) => {
-            advance_to_bindexecute_awaiting_rfq_select(state, reply, payload, row_desc)
+        (ProtoState::BindExecuteStreamingRows { reply }, TAG_COMMAND_COMPLETE) => {
+            advance_to_bindexecute_awaiting_rfq_select(state, reply, payload)
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, error_arena)
@@ -863,17 +872,16 @@ pub(crate) fn dispatch(
         }
 
         (
-            ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag, row_desc },
+            ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag },
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
-                // DEF-188: park the SELECT path's inline RowDesc
-                // into terminal_row_desc so the public
-                // QueryComplete reply's borrow is valid through
-                // materialise (state goes to Idle here, but slot
-                // persists until next entry-point clear).
+                // DEF-189: schema (if any) lives in row_desc_slot,
+                // populated either by push_bind_execute (caller-supplied)
+                // or by a prior 'T' frame on the auto-describe path.
+                // State transitions to Idle; slot persists until next
+                // entry-point clear.
                 *state = ProtoState::Idle;
-                *terminal_row_desc = Some(row_desc);
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
@@ -940,12 +948,14 @@ pub(crate) fn dispatch(
             TAG_ROW_DESCRIPTION,
         ) => match crate::decode::parse_row_description(payload) {
             Ok(row_desc) => {
-                // DEF-188: parsed schema lands inline in the
-                // DescribedRowsStaged::Rows variant (no arena).
+                // DEF-189: parsed schema lands in PgProtocol::row_desc_slot.
+                // The state-side `Rows` variant is now a 1-byte discriminator
+                // (no inline payload). Atomic park + flag set in this arm.
+                *row_desc_slot = Some(row_desc);
                 *state = ProtoState::DescribeStatementAwaitingRfq {
                     reply,
                     param_oids,
-                    rows: crate::state::DescribedRowsStaged::Rows(row_desc),
+                    rows: crate::state::DescribedRowsStaged::Rows,
                 };
                 DispatchOutcome::AdvancedSilent
             }
@@ -996,7 +1006,7 @@ pub(crate) fn dispatch(
             Ok(tx_status) => {
                 // DEF-188: park inline RowDesc (if any) into
                 // terminal_row_desc and stage the slim discriminator.
-                let staged_rows = stage_described_rows(rows, terminal_row_desc);
+                let staged_rows = stage_described_rows(rows);
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
@@ -1019,12 +1029,13 @@ pub(crate) fn dispatch(
 
         // Stage 1: awaiting RowDescription or NoData (no ParamDesc).
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ROW_DESCRIPTION) => {
-            // DEF-188: parsed schema lands inline in DescribedRowsStaged::Rows.
+            // DEF-189: parsed schema lands in PgProtocol::row_desc_slot.
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
+                    *row_desc_slot = Some(row_desc);
                     *state = ProtoState::DescribePortalAwaitingRfq {
                         reply,
-                        rows: crate::state::DescribedRowsStaged::Rows(row_desc),
+                        rows: crate::state::DescribedRowsStaged::Rows,
                     };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -1064,7 +1075,7 @@ pub(crate) fn dispatch(
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
-                let staged_rows = stage_described_rows(rows, terminal_row_desc);
+                let staged_rows = stage_described_rows(rows);
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
@@ -1865,14 +1876,14 @@ fn advance_to_awaiting_rfq(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
-    row_desc: Option<crate::decode::RowDesc>,
+    schema_present: bool,
 ) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => {
             *state = ProtoState::SimpleQueryAwaitingRfq {
                 reply,
                 command_tag,
-                row_desc,
+                schema_present,
             };
             DispatchOutcome::AdvancedSilent
         }
@@ -1881,9 +1892,10 @@ fn advance_to_awaiting_rfq(
 }
 
 /// 1c-3b helper: `CommandComplete` on the schema-bearing (SELECT)
-/// path → `BindExecuteAwaitingRfqSelect`. The schema (`RowDesc`) is
-/// mandatory by the target variant's shape — caller pattern-matched
-/// it from `AwaitingDataOrCompleteSelect` or `StreamingRows`.
+/// path → `BindExecuteAwaitingRfqSelect`. DEF-189: the variant carries
+/// no row_desc field; the schema lives in `PgProtocol::row_desc_slot`
+/// (parked at push time by `push_bind_execute`). The variant name
+/// `Select` is the tier-1 signal that the slot is populated.
 ///
 /// The DML path's 'C' transition is inlined directly in the dispatch
 /// arm (one call-site only) and doesn't need a helper.
@@ -1891,14 +1903,12 @@ fn advance_to_bindexecute_awaiting_rfq_select(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
-    row_desc: crate::decode::RowDesc,
 ) -> DispatchOutcome {
     match parse_command_tag(payload) {
         Ok(command_tag) => {
             *state = ProtoState::BindExecuteAwaitingRfqSelect {
                 reply,
                 command_tag,
-                row_desc,
             };
             DispatchOutcome::AdvancedSilent
         }
@@ -1906,33 +1916,25 @@ fn advance_to_bindexecute_awaiting_rfq_select(
     }
 }
 
-/// DEF-188: park the inline `RowDesc` from a state-side
-/// [`crate::state::DescribedRowsStaged`] into the protocol's
-/// `terminal_row_desc` slot, returning the action-side
-/// [`crate::action::DescribedRowsStagedSlim`] discriminator.
-///
-/// Used by both DescribeStatement and DescribePortal Z arms — the
-/// only caller-visible difference is the staged payload type
-/// (`Staged{Statement,Portal}CompletePayload`), which both wrap
-/// the same `DescribedRowsStagedSlim` shape.
+/// DEF-189: convert the state-side [`crate::state::DescribedRowsStaged`]
+/// discriminator into the action-side
+/// [`crate::action::DescribedRowsStagedSlim`] discriminator. Both are
+/// 1-byte discriminators; the schema (when present) was already parked
+/// into `PgProtocol::row_desc_slot` at the `'T'` arm.
 ///
 /// # Why this helper
 ///
-/// The state-side `Rows(RowDesc)` carries 264 B inline; the
-/// action-side `Rows` is ZST (the schema lives in `terminal_row_desc`
-/// post-park). Centralising the conversion + park in one helper
-/// makes the "Rows + park atomic" invariant tier-2 structural —
-/// a future arm-body edit cannot stage `Rows` without parking
-/// without breaking compilation here. Both Z arms call this once;
-/// no drift between them.
+/// Pre-DEF-189, the state-side variant carried inline `RowDesc(264 B)`,
+/// requiring a "destructure + park" step at every Z arm. Post-DEF-189
+/// both sides are 1-byte discriminators; the helper is now a 1:1
+/// mapping. It stays in place to centralise the type bridge — a future
+/// renaming or asymmetry would land here.
 #[inline]
-fn stage_described_rows(
+const fn stage_described_rows(
     rows: crate::state::DescribedRowsStaged,
-    terminal_row_desc: &mut Option<crate::decode::RowDesc>,
 ) -> crate::action::DescribedRowsStagedSlim {
     match rows {
-        crate::state::DescribedRowsStaged::Rows(desc) => {
-            *terminal_row_desc = Some(desc);
+        crate::state::DescribedRowsStaged::Rows => {
             crate::action::DescribedRowsStagedSlim::Rows
         }
         crate::state::DescribedRowsStaged::NoData => {

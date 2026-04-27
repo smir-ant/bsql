@@ -20,7 +20,6 @@
 //! become true no-ops instead of silent mis-advances).
 
 use crate::action::ParamOids;
-use crate::decode::RowDesc;
 use crate::error::BoundedStr;
 use crate::error::StateErrorKind;
 use crate::ident::PodBytes;
@@ -34,44 +33,31 @@ use crate::scram::types::SecretDigest;
 /// State-side counterpart to the public
 /// [`crate::action::DescribedRows<'r>`].
 ///
-/// # Post-DEF-188 (architect 2026-04-25): inline RowDesc
+/// # Post-DEF-189 (architect 2026-04-25): externalised slot
 ///
-/// State variants cannot carry a lifetime (they're owned by
-/// `PgProtocol`, not borrowed), so they store the schema by value.
-/// `RowDesc` is `Copy`, ~264 B. Materialise produces the public
-/// `DescribedRows<'r>` by borrowing into `PgProtocol`'s
-/// `terminal_row_desc` slot, which the dispatch Z arm parks the
-/// `RowDesc` into right before transitioning to `Idle`.
+/// State variants do NOT carry a `RowDesc` payload. The schema, when
+/// present, lives in `PgProtocol::row_desc_slot` — populated by the
+/// `'T'` dispatch arm and read by terminal materialise via the
+/// protocol's `current_row_desc()` accessor. This enum is a slim
+/// 1-byte discriminator that distinguishes "schema parked" from
+/// "server sent NoData".
 ///
 /// | Variant | State-side | Public `DescribedRows<'r>` |
 /// |---|---|---|
-/// | Rows | `Rows(RowDesc)` (~264 B) | `Rows(&'r RowDesc)` (8 B) |
-/// | NoData | `NoData` (ZST) | `NoData` (ZST) |
+/// | Rows | `Rows` (1 B disc.) | `Rows(RowDescBorrow<'r>)` (8 B) |
+/// | NoData | `NoData` (1 B disc.) | `NoData` (ZST) |
 ///
-/// Pre-DEF-188 was 2 B (`SchemaRef` handle) state-side via DEF-119
-/// arena indirection. The arena was deleted in DEF-188 to recover
-/// the iter_rows hot-path regression — per-row `&self.state.row_desc`
-/// projection beats double-arena-lookup. Trade-off: state grows by
-/// ~264 B max, arena's 520 B PgProtocol footprint goes away (net
-/// PgProtocol ~unchanged). Tier uplift: `StaleSchemaRef` becomes
-/// architecturally impossible (no handle, no generation drift).
+/// Pre-DEF-189 was `Rows(RowDesc)` (~264 B state-side). DEF-189
+/// externalisation strips this to a discriminator + parks the
+/// descriptor in `PgProtocol::row_desc_slot`. Tier-2 structural —
+/// dispatch arms set `Rows` ONLY in the same code path that writes
+/// the descriptor into the slot.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "DEF-188: Rows(RowDesc) intentionally inlines the ~264 B \
-              schema. Boxing would force a heap allocation per Describe \
-              flow on the cold path, and the state variants holding \
-              `DescribedRowsStaged` (DescribeStatementAwaitingRfq, \
-              DescribePortalAwaitingRfq) already carry RowDesc-sized \
-              payloads, so the `Rows`-vs-NoData asymmetry doesn't enlarge \
-              the dominant ProtoState variant. The arena-handle \
-              alternative was deleted with the schema arena (DEF-188 \
-              core mandate)."
-)]
 pub enum DescribedRowsStaged {
-    /// Schema present — full inline `RowDesc`.
-    #[doc(hidden)] Rows(RowDesc),
+    /// Schema parked into `PgProtocol::row_desc_slot` by the `'T'`
+    /// dispatch arm. Materialise resolves via the protocol borrow.
+    #[doc(hidden)] Rows,
     /// Server sent `NoData` (`'n'`) — no result columns.
     #[doc(hidden)] NoData,
 }
@@ -235,40 +221,40 @@ pub enum ProtoState {
     ///
     /// Additional `ParameterStatus` messages may arrive before RFQ.
     ///
-    /// # DEF-185 P2-C (audit 2026-04-24): secret_key lifetime
+    /// # DEF-189 Q8-C2 — secret_key wrapped in Sensitive<i32>
     ///
-    /// `secret_key: i32` is the PG backend's CancelRequest
-    /// authenticator — a capability token valid for the entire
-    /// connection lifetime (until the backend process terminates).
-    /// It lingers in this variant's memory between BackendKeyData
-    /// receipt and the final `ReadyForQuery` transition, then is
-    /// delivered to the wrapper via `StartupCompletePayload`
-    /// (which has manual Debug redaction per P1-C).
+    /// `secret_key: Sensitive<i32>` — the PG backend's CancelRequest
+    /// authenticator. A leaked `secret_key` enables query cancellation
+    /// on the same backend process (impersonation-within-session).
+    /// `Sensitive<i32>` provides:
     ///
-    /// This is NOT password-class — a leaked secret_key only enables
-    /// query cancellation on the same backend process (impersonation-
-    /// within-session). The PG protocol's design places the entire
-    /// session's cancel authority on this 32-bit value; wrapping in
-    /// `Sensitive<i32>` would add ZeroizeOnDrop Drop semantics but
-    /// also bars `Copy` / match-pattern destructure which propagate
-    /// through Action / Reply chains. Current stance: accept the
-    /// inline `i32` with documented lifetime trade-off; defense-in-
-    /// depth comes from (a) manual Debug redaction on
-    /// `StartupCompletePayload` (P1-C) and (b) ReadBuf/WriteBuf
-    /// zeroize on clear (P0-B/C) preventing wire-level exposure
-    /// persistence.
+    /// - **Zero-on-drop**: when this variant transitions out (state
+    ///   moves to Idle on the trailing RFQ, or to Errored on a fatal
+    ///   frame), the inner `i32` is overwritten with zero before the
+    ///   memory is reused by the next variant. Defense in depth
+    ///   alongside ReadBuf/WriteBuf P0-B/C zeroize-on-clear.
+    /// - **Debug redaction**: any future Debug print of `ProtoState`
+    ///   prints `<REDACTED>` for the secret_key.
     ///
-    /// A future breaking-API revision could migrate to
-    /// `Sensitive<i32>` alongside a `cancel_request()` method on
-    /// `PgProtocol` that consumes the token internally — would
-    /// close the residue. Flagged for follow-up DEF.
+    /// Pre-DEF-189 (DEF-185 P2-C) was `secret_key: i32` (Copy); the
+    /// audit accepted the residue trade-off in exchange for the
+    /// `Sensitive` wrapper's `!Copy` cost cascading through
+    /// match-destructure in dispatch. DEF-189 commits to the wrapper:
+    /// the dispatch RFQ arm `match` extracts the inner via `.get()`
+    /// (returns `&i32`), then copy-derefs into the
+    /// `StartupCompletePayload` (which itself has manual Debug
+    /// redaction per P1-C). The wrapper drops at the
+    /// `mem::replace(state, Idle)` in dispatch, scrubbing the slot.
     ConnectingPostAuthHaveKey {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
         /// The backend process ID.
         pid: i32,
         /// The backend secret key (for cancel requests).
-        secret_key: i32,
+        ///
+        /// Wrapped in [`crate::sensitive::Sensitive`] for zero-on-drop
+        /// scrub on state transitions. See variant docstring.
+        secret_key: crate::sensitive::Sensitive<i32>,
     },
 
     // ---------------------------------------------------------------
@@ -291,23 +277,15 @@ pub enum ProtoState {
     /// stay here; `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`]
     /// with the parsed command tag.
     ///
-    /// F19 + DEF-188: carries the parsed `RowDesc` inline. Entering
-    /// this variant ONLY via the 'T' dispatcher arm (which parses
-    /// `RowDescription`) makes "StreamingRows implies schema" a
-    /// tier-1 structural invariant — the variant shape itself requires
-    /// a schema. The per-row hot-path reads
-    /// `&self.proto.state.row_desc` directly (one field projection,
-    /// zero arena lookups).
+    /// DEF-189: variant carries no schema field. The schema lives in
+    /// `PgProtocol::row_desc_slot` (populated by the `'T'` arm BEFORE
+    /// the transition into this variant). The per-row hot-path reads
+    /// the desc via `proto.current_row_desc()` (single immutable
+    /// borrow projection from the slot) — no per-variant payload,
+    /// no per-row state match.
     SimpleQueryStreamingRows {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
-        /// Result-set schema. DEF-188: inline `RowDesc` (~264 B).
-        /// Pre-DEF-188 was a 2-byte `SchemaRef` handle into a 2-slot
-        /// arena; the arena was deleted to recover the iter_rows
-        /// hot-path regression — per-row state-projection beats
-        /// double-arena-lookup. RowDesc is `Copy`, moves between
-        /// transitions without heap traffic.
-        row_desc: RowDesc,
     },
 
     /// `CommandComplete` or `EmptyQueryResponse` received; awaiting
@@ -315,13 +293,12 @@ pub enum ProtoState {
     /// (empty for `EmptyQueryResponse`) ships in the final
     /// [`crate::Reply::QueryComplete`] payload.
     ///
-    /// F19 + DEF-188: carries `row_desc: Option<RowDesc>` inline —
-    /// `Some(desc)` when entered from `SimpleQueryStreamingRows`
-    /// (SELECT path, schema preserved through terminal transitions),
-    /// `None` when entered from `SimpleQueryAwaitingFirstResponse`
-    /// via `CommandComplete` (DML path) or `EmptyQueryResponse`
-    /// (empty query). Preserves the public-API distinction "0-row
-    /// SELECT (Some(empty)) vs DML (None)".
+    /// DEF-189: `schema_present: bool` replaces the pre-189
+    /// `row_desc: Option<RowDesc>` (~264 B). The boolean signals
+    /// "the slot was populated when this variant was entered" —
+    /// terminal materialise then resolves via
+    /// `PgProtocol::current_row_desc()` if true. Preserves the
+    /// public-API distinction "0-row SELECT (Some(empty)) vs DML (None)".
     SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
@@ -330,15 +307,11 @@ pub enum ProtoState {
         /// PG's documented tag shapes (the longest standard tag,
         /// `"INSERT <oid> <n>"` with 10-digit values, is ~23 bytes).
         command_tag: BoundedStr<32>,
-        /// Inline schema from the SELECT path (`Some(desc)`) or
-        /// absence marker (`None`) from DML / empty-query paths.
-        /// DEF-188: was 2-byte `Option<SchemaRef>`, now full
-        /// `Option<RowDesc>` (~264 B with niche). The arena was
-        /// deleted; the dispatch Z arm parks the desc into
-        /// `PgProtocol::terminal_row_desc` before transitioning
-        /// to `Idle`, so the public `Reply::QueryComplete` borrow
-        /// finds a valid memory location.
-        row_desc: Option<RowDesc>,
+        /// `true` if the SELECT path entered with a parked schema in
+        /// `PgProtocol::row_desc_slot`; `false` for DML / empty-query
+        /// paths. Tier-2 structural — set by the same dispatch arm
+        /// that populates / clears the slot.
+        schema_present: bool,
     },
 
     /// `ErrorResponse` received mid-query; `FailReply` already
@@ -429,53 +402,40 @@ pub enum ProtoState {
 
     /// `Bind` + `Execute` + `Sync` bundle was sent; awaiting
     /// `BindComplete` (`'2'`). SELECT path — caller pre-provided
-    /// `row_desc`. The schema is threaded through to
-    /// [`Self::BindExecuteStreamingRows`] once `'2'` arrives.
+    /// the schema; it has been parked into `PgProtocol::row_desc_slot`
+    /// at push time. The variant name `Select` is itself the tier-1
+    /// signal that the slot is populated.
     BindExecuteAwaitingBindCompleteSelect {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
-        /// User-supplied inline schema, required (variant shape
-        /// guarantees its presence — tier-1 structural). DEF-188:
-        /// inline `RowDesc` (~264 B); pre-DEF-188 was 2-byte
-        /// `SchemaRef`.
-        row_desc: RowDesc,
     },
 
     /// `BindComplete` received on the schema-bearing path; awaiting
     /// either a `DataRow` (transition to [`Self::BindExecuteStreamingRows`])
     /// or `CommandComplete` (0-row SELECT, transition to
-    /// [`Self::BindExecuteAwaitingRfqSelect`]). Schema threads through.
+    /// [`Self::BindExecuteAwaitingRfqSelect`]). Schema lives in slot.
     BindExecuteAwaitingDataOrCompleteSelect {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
-        /// Inline schema (guaranteed present by variant shape — tier-1).
-        row_desc: RowDesc,
     },
 
     /// Streaming `DataRow` frames on the schema-bearing path.
-    /// Mirrors [`Self::SimpleQueryStreamingRows`] — schema required
-    /// by variant shape. The per-row hot-path reads
-    /// `&self.proto.state.row_desc` directly.
+    /// Mirrors [`Self::SimpleQueryStreamingRows`] — schema lives in
+    /// `PgProtocol::row_desc_slot`. The per-row hot-path reads the
+    /// desc via `proto.current_row_desc()`.
     BindExecuteStreamingRows {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
-        /// Inline schema (guaranteed present by variant shape).
-        row_desc: RowDesc,
     },
 
     /// `CommandComplete` received on the schema-bearing path;
     /// awaiting the trailing `ReadyForQuery`. Terminal reply
-    /// carries `row_desc: Some(schema)`.
+    /// carries `row_desc: Some(...)` resolved from the slot.
     BindExecuteAwaitingRfqSelect {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,
         /// Command tag parsed from the `C` frame body.
         command_tag: BoundedStr<32>,
-        /// Inline schema to park in `terminal_row_desc` at the
-        /// final RFQ → Idle transition (so the public
-        /// `Reply::QueryComplete` borrow stays valid through
-        /// materialise).
-        row_desc: RowDesc,
     },
 
     // ---------------------------------------------------------------
@@ -837,11 +797,11 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("SimpleQueryStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::SimpleQueryAwaitingRfq { reply, command_tag, row_desc } => f
+            Self::SimpleQueryAwaitingRfq { reply, command_tag, schema_present } => f
                 .debug_struct("SimpleQueryAwaitingRfq")
                 .field("reply", reply)
                 .field("command_tag", command_tag)
-                .field("row_desc_is_some", &row_desc.is_some())
+                .field("schema_present", schema_present)
                 .finish(),
             Self::BindExecuteAwaitingBindCompleteDml(id) => {
                 write!(f, "BindExecuteAwaitingBindCompleteDml({id:?})")
@@ -1033,7 +993,7 @@ mod push_class_tests {
             ProtoState::ConnectingPostAuthHaveKey {
                 reply: ReplyId::from_raw(nz(2_007)),
                 pid: 1,
-                secret_key: 1,
+                secret_key: crate::sensitive::Sensitive::new(1_i32),
             },
             StatePushClass::Connecting,
         );
@@ -1046,7 +1006,6 @@ mod push_class_tests {
         pin(
             ProtoState::SimpleQueryStreamingRows {
                 reply: ReplyId::from_raw(nz(3_002)),
-                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );
@@ -1054,7 +1013,7 @@ mod push_class_tests {
             ProtoState::SimpleQueryAwaitingRfq {
                 reply: ReplyId::from_raw(nz(3_003)),
                 command_tag: BoundedStr::default(),
-                row_desc: None,
+                schema_present: false,
             },
             StatePushClass::BusyQuery,
         );
@@ -1089,21 +1048,18 @@ mod push_class_tests {
         pin(
             ProtoState::BindExecuteAwaitingBindCompleteSelect {
                 reply: ReplyId::from_raw(nz(5_004)),
-                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );
         pin(
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect {
                 reply: ReplyId::from_raw(nz(5_005)),
-                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );
         pin(
             ProtoState::BindExecuteStreamingRows {
                 reply: ReplyId::from_raw(nz(5_006)),
-                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );
@@ -1111,7 +1067,6 @@ mod push_class_tests {
             ProtoState::BindExecuteAwaitingRfqSelect {
                 reply: ReplyId::from_raw(nz(5_007)),
                 command_tag: BoundedStr::default(),
-                row_desc: crate::decode::RowDesc::EMPTY,
             },
             StatePushClass::BusyQuery,
         );

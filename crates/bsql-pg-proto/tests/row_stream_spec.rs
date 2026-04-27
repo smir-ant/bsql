@@ -753,10 +753,10 @@ fn end_to_end_decode_typed_row() {
                 assert!(
                     matches!(
                         desc.get(0),
-                        Some(&ColumnDesc { type_oid: oids::INT4, format_code: FormatCode::Text }),
+                        Some(ColumnDesc { type_oid: oids::INT4, format_code: FormatCode::Text }),
                     ) && matches!(
                         desc.get(1),
-                        Some(&ColumnDesc { type_oid: oids::TEXT, format_code: FormatCode::Text }),
+                        Some(ColumnDesc { type_oid: oids::TEXT, format_code: FormatCode::Text }),
                     ) && desc.len() == 2,
                     "schema mismatch: {desc:?}",
                 );
