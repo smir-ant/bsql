@@ -4,8 +4,13 @@
 //! runtime safety, crypto hygiene, and protocol robustness. Each test
 //! pins a finding that the pre-audit suite did not cover.
 
-use bsql_pg_proto::{Action, PgCommand, PgProtocol, ProtoState, WriteBuf, error::ProtocolError};
+use bsql_pg_proto::{
+    Action, PgCommand, PgProtocol, ProtoState, WriteBuf, error::ProtocolError,
+};
 use core::num::NonZeroU64;
+
+mod common;
+use common::PushOrPanic;
 
 fn raw(n: u64) -> NonZeroU64 {
     assert!(n > 0, "raw(0) is a test bug — NonZeroU64 requires n > 0");
@@ -29,7 +34,7 @@ fn startup_id(raw: NonZeroU64) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto
 }
 
 fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf, raw_id: NonZeroU64) {
-    let out = proto.push_command(PgCommand::Ping { reply: ping_id(raw_id) }, wb);
+    let out = proto.push_or_panic(PgCommand::Ping { reply: ping_id(raw_id) }, wb);
     assert!(!out.as_slice().is_empty());
     // OutActions drops at end of scope naturally (no Drop on it).
 }
@@ -51,7 +56,7 @@ fn empty_query_response_with_non_zero_body_classifies() {
     // feed_bytes call re-borrows it.
     let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
     {
-        let push_out = proto.push_command(
+        let push_out = proto.push_or_panic(
             PgCommand::SimpleQuery { sql, reply: query_id(raw(9901)) },
             &mut wb,
         );
@@ -92,7 +97,7 @@ fn parse_complete_with_non_zero_body_classifies() {
     };
     let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
     {
-        let push_out = proto.push_command(
+        let push_out = proto.push_or_panic(
             PgCommand::Parse { stmt_name: stmt, sql, reply: parse_id(raw(9902)) },
             &mut wb,
         );
@@ -206,7 +211,7 @@ fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
         Err(_) => return,
     };
     {
-        let startup_out = proto.push_command(
+        let startup_out = proto.push_or_panic(
             PgCommand::Startup {
                 user,
                 database: None,

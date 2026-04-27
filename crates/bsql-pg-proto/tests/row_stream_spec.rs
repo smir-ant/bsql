@@ -50,6 +50,9 @@ use bsql_pg_proto::{
 };
 use core::num::NonZeroU64;
 
+mod common;
+use common::PushOrPanic;
+
 // ------------------------------------------------------------------
 // Frame builders — pure functions, mirror `simple_query_spec` shapes.
 // ------------------------------------------------------------------
@@ -131,7 +134,7 @@ fn sql(s: &str) -> Sql {
 /// frame tagged `'Q'`.
 #[track_caller]
 fn push_simple_query(proto: &mut PgProtocol, reply: ReplyId<QueryKind>, wb: &mut WriteBuf) {
-    let out = proto.push_command(
+    let out = proto.push_or_panic(
         PgCommand::SimpleQuery {
             sql: sql("SELECT 1"),
             reply,

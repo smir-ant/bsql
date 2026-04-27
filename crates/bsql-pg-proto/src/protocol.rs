@@ -824,7 +824,90 @@ impl PgProtocol {
         self.read_buf.unread()
     }
 
-    /// Push a user command.
+    // ═════════════════════════════════════════════════════════════════
+    // DEF-198 — witness-guard typestate for client-initiated push.
+    // ═════════════════════════════════════════════════════════════════
+
+    /// Acquire a [`crate::guard::ReadyGuard`] iff the protocol is in
+    /// `Idle` state (ready to accept a new command).
+    ///
+    /// The guard exclusively borrows `self` and is the only path to
+    /// [`crate::guard::ReadyGuard::push_command`] /
+    /// [`crate::guard::ReadyGuard::push_bind_execute`]. Returns `None`
+    /// when the protocol is busy (in-flight reply pending), handshaking
+    /// (startup/auth in progress), or terminal-errored.
+    ///
+    /// Use [`Self::connection_status`] in the `None` arm to distinguish
+    /// recoverable (`Busy`/`Handshaking`) from terminal (`Errored`).
+    ///
+    /// # Tier-1 closure
+    ///
+    /// Dispatches on [`crate::state::ProtoState::push_class`] (5-variant
+    /// exhaustive classifier). Adding a new state variant is a build
+    /// failure that forces classification (transitive: state → push_class
+    /// → as_ready). Pinned by `tests/def198_guard_closure_spec.rs`.
+    ///
+    /// # Zero-cost
+    ///
+    /// `ReadyGuard<'_>` is a `&mut PgProtocol` newtype; LLVM monomorphises
+    /// the indirection away in release builds.
+    #[inline]
+    #[must_use]
+    pub fn as_ready(&mut self) -> Option<crate::guard::ReadyGuard<'_>> {
+        match self.state.push_class() {
+            crate::state::StatePushClass::Idle => {
+                Some(crate::guard::ReadyGuard::new(self))
+            }
+            crate::state::StatePushClass::Errored(_)
+            | crate::state::StatePushClass::Connecting
+            | crate::state::StatePushClass::PingAwaiting
+            | crate::state::StatePushClass::BusyQuery => None,
+        }
+    }
+
+    /// Caller-facing fine-grained connection state classification.
+    ///
+    /// Maps the internal [`crate::state::StatePushClass`] to the
+    /// public-API [`crate::guard::ConnectionStatus`] (`PingAwaiting` and
+    /// `BusyQuery` collapse to `Busy` — caller recovery is identical:
+    /// drive `feed_bytes` until the in-flight reply arrives).
+    ///
+    /// # Tier-1 closure
+    ///
+    /// Exhaustive match over `StatePushClass`'s 5 variants — adding a
+    /// `StatePushClass` variant is a build failure here. Pinned by
+    /// `tests/def198_guard_closure_spec.rs`.
+    #[inline]
+    #[must_use]
+    pub fn connection_status(&self) -> crate::guard::ConnectionStatus {
+        use crate::guard::ConnectionStatus;
+        use crate::state::StatePushClass;
+        match self.state.push_class() {
+            StatePushClass::Idle => ConnectionStatus::Ready,
+            StatePushClass::Errored(kind) => ConnectionStatus::Errored(kind),
+            StatePushClass::PingAwaiting | StatePushClass::BusyQuery => {
+                ConnectionStatus::Busy
+            }
+            StatePushClass::Connecting => ConnectionStatus::Handshaking,
+        }
+    }
+
+    /// Push a user command — **internal entry point**.
+    ///
+    /// # DEF-198 visibility
+    ///
+    /// Pre-DEF-198 this was `pub fn push_command`. Post-DEF-198 the
+    /// public surface is [`crate::guard::ReadyGuard::push_command`],
+    /// reachable only via [`Self::as_ready`] (which returns `Some`
+    /// only for `state == Idle`). This function remains the
+    /// implementation core; callers outside the crate cannot reach it
+    /// directly, ensuring the `state == Idle` precondition is
+    /// compile-rejected on the public API surface.
+    ///
+    /// The function still defensively handles non-`Idle` states (emits
+    /// `FailReply` per `compute_push_*` decision tables) — those arms
+    /// are unreachable from the public API but remain as internal
+    /// safety nets per CREDO §0 (no `unreachable!()` panic surrogates).
     ///
     /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].
     /// Caller must execute every action in order.
@@ -846,7 +929,7 @@ impl PgProtocol {
     /// field) so no observer can witness the window; the split is
     /// safe even though the intermediate is not the terminal state.
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn push_command<'w, 's>(
+    pub(crate) fn push_command_internal<'w, 's>(
         &'s mut self,
         cmd: PgCommand,
         write_buf: &'w mut WriteBuf,
@@ -933,9 +1016,18 @@ impl PgProtocol {
     /// policy. Every non-`Idle` entry state emits a classified
     /// `FailReply` and preserves the prior state; the connection
     /// is not torn down.
+    ///
+    /// # DEF-198 visibility
+    ///
+    /// Pre-DEF-198 this was `pub fn push_bind_execute`. Post-DEF-198
+    /// the public surface is
+    /// [`crate::guard::ReadyGuard::push_bind_execute`]. The non-Idle
+    /// `FailReply` arms are unreachable from the public API but
+    /// remain as internal defensive code (no `unreachable!()` panic
+    /// surrogate per CREDO §0).
     #[expect(clippy::too_many_arguments, reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1 — each argument is a distinct wire-protocol input. Splitting into a struct-arg (BindExecuteRequest { ... }) trades arg-count for construction verbosity at every call site, no tier or safety win.")]
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn push_bind_execute<'w, 's, P: crate::params::ParamsWriter>(
+    pub(crate) fn push_bind_execute_internal<'w, 's, P: crate::params::ParamsWriter>(
         &'s mut self,
         portal_name: &crate::ident::PortalName,
         stmt_name: &crate::ident::StmtName,
@@ -4205,7 +4297,11 @@ mod compute_push_tests {
         // PgProtocol::new() and hits the Idle arm). No handshake
         // drive needed.
         let reply_raw = nz(999);
-        let out = proto.push_bind_execute(
+        // DEF-198: internal test calls `push_bind_execute_internal`
+        // directly. The public surface is `ReadyGuard::push_bind_execute`
+        // (only via `proto.as_ready`), but internal `compute_push_*`
+        // tests bypass the guard to exercise the dispatch logic.
+        let out = proto.push_bind_execute_internal(
             &crate::ident::PortalName::default(),
             &crate::ident::StmtName::default(),
             &OverflowParams,

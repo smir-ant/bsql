@@ -29,14 +29,17 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply, ReplyId, Sql,
-    WriteBuf,
+    Action, ConnectionStatus, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply,
+    ReplyId, Sql, WriteBuf,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
         TAG_QUERY, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
     },
 };
 use core::num::NonZeroU64;
+
+mod common;
+use common::PushOrPanic;
 
 // ------------------------------------------------------------------
 // Frame builders — pure functions, no protocol state. Each builder
@@ -158,7 +161,7 @@ fn simple_query_setup(
     reply: ReplyId<QueryKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
-    let out = proto.push_command(
+    let out = proto.push_or_panic(
         PgCommand::SimpleQuery {
             sql: sql("SELECT 1"),
             reply,
@@ -360,32 +363,25 @@ fn query_error_emits_fail_reply_and_connection_survives() {
 // (B) Tier-3 invariants — bad paths + push-state policy
 // ==================================================================
 
-/// Invariant: pushing SimpleQuery while another simple-query is in
-/// flight yields FailReply(CommandInProgress) for the new push, and
-/// the original in-flight state is preserved.
+/// DEF-198 invariant: SimpleQuery while another in flight is
+/// structurally blocked at the public API. The original in-flight
+/// state is preserved (caller must drive `feed_bytes` to drain).
 #[test]
-fn simple_query_while_in_flight_yields_command_in_progress() {
+fn def198_simple_query_while_in_flight_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let first_raw = raw(110);
     simple_query_setup(&mut proto, id(first_raw), &mut wb);
 
-    // Push a second SimpleQuery while the first is still waiting.
-    let second_raw = raw(111);
-    let out = proto.push_command(
-        PgCommand::SimpleQuery {
-            sql: sql("SELECT 2"),
-            reply: id(second_raw),
-        },
-        &mut wb,
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None during in-flight SimpleQuery",
     );
-    assert_eq!(out.len(), 1);
-    match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause: ProtocolError::CommandInProgress }] => {
-            assert_eq!(*failed_id, second_raw, "FailReply targets the NEW reply, not the in-flight one");
-        }
-        other => panic!("expected FailReply(CommandInProgress), got {other:?}"),
-    }
+    assert_eq!(
+        proto.connection_status(),
+        ConnectionStatus::Busy,
+        "in-flight SimpleQuery classifies as ConnectionStatus::Busy",
+    );
     // Original state preserved.
     assert!(matches!(
         proto.state(),
@@ -407,10 +403,10 @@ fn simple_query_while_in_flight_yields_command_in_progress() {
     ));
 }
 
-/// Invariant: pushing SimpleQuery after the connection was torn
-/// down (Errored state) yields FailReply(ConnectionAlreadyClosed).
+/// DEF-198 invariant: SimpleQuery on Errored is structurally blocked.
+/// `ConnectionStatus::Errored(kind)` exposes the underlying cause.
 #[test]
-fn simple_query_on_errored_state_fails() {
+fn def198_simple_query_on_errored_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
@@ -423,21 +419,13 @@ fn simple_query_on_errored_state_fails() {
     );
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
 
-    // Now push SimpleQuery.
-    let q_raw = raw(120);
-    let out = proto.push_command(
-        PgCommand::SimpleQuery {
-            sql: sql("SELECT 1"),
-            reply: id(q_raw),
-        },
-        &mut wb,
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None on Errored",
     );
-    assert_eq!(out.len(), 1);
-    match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause: ProtocolError::ConnectionAlreadyClosed { .. } }] => {
-            assert_eq!(*failed_id, q_raw);
-        }
-        other => panic!("expected FailReply(ConnectionAlreadyClosed), got {other:?}"),
+    match proto.connection_status() {
+        ConnectionStatus::Errored(_kind) => {}
+        other => panic!("expected ConnectionStatus::Errored(_), got {other:?}"),
     }
 }
 

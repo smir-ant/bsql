@@ -118,6 +118,7 @@ pub mod error;
 pub(crate) mod error_arena;
 pub use error_arena::{ArenaError, DisplayError, ErrorPayload, ErrorRef};
 pub mod frame;
+pub mod guard;
 pub mod ident;
 pub mod params;
 pub mod password;
@@ -149,6 +150,7 @@ pub use decode::{
 };
 pub use error::{CrateBugLocus, ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
+pub use guard::{ConnectionStatus, ReadyGuard};
 pub use ident::{
     ApplicationName, DatabaseName, Ident, IdentError, PortalName, SecretBoundedStr, Sql, StmtName,
 };
@@ -212,6 +214,12 @@ const _: fn() = || {
     assert_send::<ident::IdentError>();
     assert_send::<password::PasswordError>();
     assert_send::<frame::HeaderParse>();
+    // DEF-198: witness-guard typestate.
+    assert_send::<guard::ConnectionStatus>();
+    // ReadyGuard<'a> is `&'a mut PgProtocol` — Send for 'static implies
+    // Send for any shorter lifetime by covariance. Sync would defeat
+    // its exclusive-access purpose, so only Send is asserted.
+    assert_send::<guard::ReadyGuard<'static>>();
 };
 
 // ---------------------------------------------------------------------

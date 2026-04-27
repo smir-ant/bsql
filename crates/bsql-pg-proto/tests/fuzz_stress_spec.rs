@@ -50,6 +50,9 @@ use bsql_pg_proto::{
 };
 use core::num::NonZeroU64;
 
+mod common;
+use common::PushOrPanic;
+
 // ---------------------------------------------------------------
 // Deterministic xorshift RNG — reproducible random byte streams.
 // ---------------------------------------------------------------
@@ -285,7 +288,7 @@ fn push_ping_then_feed_random_bytes_terminates() {
         // OutActions is ManuallyDrop<heapless::Vec>, not Drop —
         // scope the binding to release the `&mut proto` borrow via NLL.
         {
-            let _push_actions = proto.push_command(
+            let _push_actions = proto.push_or_panic(
                 PgCommand::Ping {
                     reply: ping_id(u64::try_from(i.saturating_add(1)).unwrap_or(1)),
                 },

@@ -51,9 +51,9 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows, PgCommand,
-    PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, Sql, StmtName, TxStatus,
-    WriteBuf,
+    Action, ConnectionStatus, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows,
+    PgCommand, PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, Sql, StmtName,
+    TxStatus, WriteBuf,
     wire::{
         DescribeTargetByte, TAG_BIND_COMPLETE, TAG_DATA_ROW, TAG_DESCRIBE, TAG_ERROR_RESPONSE,
         TAG_NO_DATA, TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY,
@@ -61,6 +61,9 @@ use bsql_pg_proto::{
     },
 };
 use core::num::NonZeroU64;
+
+mod common;
+use common::PushOrPanic;
 
 fn raw(v: u64) -> NonZeroU64 {
     // DEF-145: raw(0) is a test bug; assert fires loud.
@@ -160,7 +163,7 @@ fn describe_stmt_setup(
     reply: ReplyId<DescribeStatementKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
-    let out = proto.push_command(
+    let out = proto.push_or_panic(
         PgCommand::DescribeStatement { stmt_name, reply },
         wb,
     );
@@ -190,7 +193,7 @@ fn describe_portal_setup(
     reply: ReplyId<DescribePortalKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
-    let out = proto.push_command(
+    let out = proto.push_or_panic(
         PgCommand::DescribePortal { portal_name, reply },
         wb,
     );
@@ -776,10 +779,11 @@ fn describe_statement_malformed_rfq_tears_down() {
 // (F) Push-state policy
 // ═════════════════════════════════════════════════════════════════
 
-/// Invariant: DescribeStatement pushed onto an Errored connection
-/// fails with `ConnectionAlreadyClosed`.
+/// DEF-198 invariant: DescribeStatement on Errored is structurally
+/// blocked at the public API. `ConnectionStatus::Errored(kind)`
+/// surfaces the underlying cause for caller recovery.
 #[test]
-fn describe_statement_on_errored_fails_with_connection_already_closed() {
+fn def198_describe_statement_on_errored_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
@@ -789,28 +793,20 @@ fn describe_statement_on_errored_fails_with_connection_already_closed() {
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
 
-    let reply_raw = raw(600);
-    let out = proto.push_command(
-        PgCommand::DescribeStatement {
-            stmt_name: stmt_unnamed(),
-            reply: stmt_id(reply_raw),
-        },
-        &mut wb,
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None on Errored",
     );
-    match out.as_slice() {
-        [Action::FailReply {
-            id: failed_id,
-            cause: ProtocolError::ConnectionAlreadyClosed { .. },
-        }] => {
-            assert_eq!(*failed_id, reply_raw);
-        }
-        other => panic!("expected FailReply(ConnectionAlreadyClosed), got {other:?}"),
+    match proto.connection_status() {
+        ConnectionStatus::Errored(_kind) => {}
+        other => panic!("expected ConnectionStatus::Errored(_), got {other:?}"),
     }
 }
 
-/// Invariant: DescribePortal on Errored → same `ConnectionAlreadyClosed`.
+/// DEF-198 invariant: DescribePortal on Errored is structurally
+/// blocked at the public API.
 #[test]
-fn describe_portal_on_errored_fails_with_connection_already_closed() {
+fn def198_describe_portal_on_errored_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
@@ -818,52 +814,35 @@ fn describe_portal_on_errored_fails_with_connection_already_closed() {
     let out = proto.feed_bytes(&unsolicited, &mut wb);
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
 
-    let reply_raw = raw(601);
-    let out = proto.push_command(
-        PgCommand::DescribePortal {
-            portal_name: portal_unnamed(),
-            reply: portal_id(reply_raw),
-        },
-        &mut wb,
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None on Errored",
     );
-    match out.as_slice() {
-        [Action::FailReply {
-            cause: ProtocolError::ConnectionAlreadyClosed { .. },
-            ..
-        }] => {}
-        other => panic!("expected FailReply(ConnectionAlreadyClosed), got {other:?}"),
+    match proto.connection_status() {
+        ConnectionStatus::Errored(_kind) => {}
+        other => panic!("expected ConnectionStatus::Errored(_), got {other:?}"),
     }
 }
 
-/// Invariant: pushing any other command while Describe is in flight
-/// fails with `CommandInProgress` and preserves the in-flight state.
+/// DEF-198 invariant: pushing any other command while Describe is in
+/// flight is structurally blocked. The in-flight state is preserved
+/// (caller must drive `feed_bytes` to drain).
 #[test]
-fn parse_while_describe_statement_in_flight_fails_with_command_in_progress() {
+fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let first_raw = raw(700);
     describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(first_raw), &mut wb);
 
-    // Try to push a Parse while Describe is in flight.
-    let second_raw = raw(701);
-    use bsql_pg_proto::ParseKind;
-    let out = proto.push_command(
-        PgCommand::Parse {
-            stmt_name: stmt_unnamed(),
-            sql: Sql::from_str_truncating("SELECT 1"),
-            reply: ReplyId::<ParseKind>::from_raw(second_raw),
-        },
-        &mut wb,
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None during in-flight Describe",
     );
-    match out.as_slice() {
-        [Action::FailReply {
-            id: failed_id,
-            cause: ProtocolError::CommandInProgress,
-        }] => {
-            assert_eq!(*failed_id, second_raw);
-        }
-        other => panic!("expected FailReply(CommandInProgress), got {other:?}"),
-    }
+    assert_eq!(
+        proto.connection_status(),
+        ConnectionStatus::Busy,
+        "in-flight Describe classifies as ConnectionStatus::Busy",
+    );
     assert!(matches!(
         proto.state(),
         ProtoState::DescribeStatementAwaitingParamDesc(_),
@@ -878,31 +857,25 @@ fn parse_while_describe_statement_in_flight_fails_with_command_in_progress() {
     assert!(matches!(drain_out.as_slice(), [Action::DeliverReply { .. }]));
 }
 
-/// Invariant: DescribeStatement while DescribePortal in flight →
-/// CommandInProgress. Two describe targets are mutually exclusive
-/// single-command shapes; pipelining lands in 1c-5.
+/// DEF-198 invariant: DescribeStatement while DescribePortal in flight
+/// is structurally blocked. Two describe targets are mutually
+/// exclusive single-command shapes; pipelining lands in 1c-5.
 #[test]
-fn describe_statement_while_describe_portal_in_flight_fails() {
+fn def198_describe_statement_while_describe_portal_in_flight_blocked() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let first_raw = raw(702);
     describe_portal_setup(&mut proto, portal_unnamed(), portal_id(first_raw), &mut wb);
 
-    let second_raw = raw(703);
-    let out = proto.push_command(
-        PgCommand::DescribeStatement {
-            stmt_name: stmt_unnamed(),
-            reply: stmt_id(second_raw),
-        },
-        &mut wb,
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None during in-flight DescribePortal",
     );
-    match out.as_slice() {
-        [Action::FailReply {
-            cause: ProtocolError::CommandInProgress,
-            ..
-        }] => {}
-        other => panic!("expected FailReply(CommandInProgress), got {other:?}"),
-    }
+    assert_eq!(
+        proto.connection_status(),
+        ConnectionStatus::Busy,
+        "in-flight Describe classifies as ConnectionStatus::Busy",
+    );
 
     // Drain.
     let mut drain = std::vec::Vec::new();
@@ -912,17 +885,17 @@ fn describe_statement_while_describe_portal_in_flight_fails() {
     assert!(matches!(drain_out.as_slice(), [Action::DeliverReply { .. }]));
 }
 
-/// Invariant: DescribeStatement while BindExecute (DML) in flight →
-/// CommandInProgress.
+/// DEF-198 invariant: DescribeStatement while BindExecute (DML) in
+/// flight is structurally blocked.
 #[test]
-fn describe_statement_while_bind_execute_in_flight_fails() {
+fn def198_describe_statement_while_bind_execute_in_flight_blocked() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
     // Start a BindExecute (DML path, row_desc=None).
     let be_raw = raw(800);
     use bsql_pg_proto::QueryKind as QK;
-    let be_out = proto.push_bind_execute(
+    let be_out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -933,22 +906,15 @@ fn describe_statement_while_bind_execute_in_flight_fails() {
     );
     assert_eq!(be_out.len(), 3, "Bind+Execute+Sync emits 3 SendBytes");
 
-    // Try to push describe.
-    let d_raw = raw(801);
-    let out = proto.push_command(
-        PgCommand::DescribeStatement {
-            stmt_name: stmt_unnamed(),
-            reply: stmt_id(d_raw),
-        },
-        &mut wb,
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None during in-flight Bind+Execute",
     );
-    match out.as_slice() {
-        [Action::FailReply {
-            cause: ProtocolError::CommandInProgress,
-            ..
-        }] => {}
-        other => panic!("expected FailReply(CommandInProgress), got {other:?}"),
-    }
+    assert_eq!(
+        proto.connection_status(),
+        ConnectionStatus::Busy,
+        "in-flight Bind+Execute classifies as ConnectionStatus::Busy",
+    );
 
     // Drain the BindExecute — and verify the in-flight id round-trips
     // to the terminal DeliverReply correlator. Closing the be_raw use
@@ -1008,7 +974,7 @@ fn describe_after_completed_parse_starts_clean() {
     // Run a Parse to completion.
     use bsql_pg_proto::ParseKind;
     let parse_raw = raw(900);
-    let out = proto.push_command(
+    let out = proto.push_or_panic(
         PgCommand::Parse {
             stmt_name: stmt_unnamed(),
             sql: Sql::from_str_truncating("SELECT 1"),

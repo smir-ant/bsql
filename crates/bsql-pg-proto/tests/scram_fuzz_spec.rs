@@ -33,6 +33,9 @@ use bsql_pg_proto::{
 };
 use core::num::NonZeroU64;
 
+mod common;
+use common::PushOrPanic;
+
 const SCRAM_FUZZ_ITERS: u32 = 5_000;
 
 // Deterministic xorshift PRNG — mirrors fuzz_stress_spec.rs pattern.
@@ -90,7 +93,7 @@ fn init_scram_protocol(seed: u64) -> Option<(PgProtocol, WriteBuf)> {
         NonZeroU64::new(seed.max(1)).unwrap_or(NonZeroU64::MIN),
     );
     {
-        let out = proto.push_command(
+        let out = proto.push_or_panic(
             PgCommand::Startup {
                 user,
                 database: None,

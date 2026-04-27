@@ -20,11 +20,14 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ParseKind, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply, ReplyId, Sql,
-    StmtName, WriteBuf,
+    Action, ConnectionStatus, ParseKind, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply,
+    ReplyId, Sql, StmtName, WriteBuf,
     wire::{TAG_ERROR_RESPONSE, TAG_PARSE, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY},
 };
 use core::num::NonZeroU64;
+
+mod common;
+use common::PushOrPanic;
 
 fn raw(v: u64) -> NonZeroU64 {
     // DEF-145: raw(0) is a test bug; assert fires loud.
@@ -87,7 +90,7 @@ fn parse_setup(
     reply: ReplyId<ParseKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
-    let out = proto.push_command(
+    let out = proto.push_or_panic(
         PgCommand::Parse {
             stmt_name,
             sql: sql(sql_text),
@@ -238,41 +241,46 @@ fn parse_frame_wire_format_with_named_statement() {
 // (B) Push-state policy
 // ==================================================================
 
-/// Invariant: pushing a second Parse while one is in flight returns
-/// `FailReply(CommandInProgress)` for the new id; the in-flight
-/// state is preserved.
+/// DEF-198 invariant: pushing a second Parse while one is in flight
+/// is **structurally impossible** at the public API surface.
+///
+/// Pre-DEF-198 this test verified that `proto.push_command(Parse)` from
+/// `ParseAwaitingParseComplete` returned `FailReply(CommandInProgress)`
+/// to the second reply id. Post-DEF-198 the public surface routes
+/// through [`PgProtocol::as_ready`], which returns `None` during the
+/// in-flight wait — the second push never happens.
+///
+/// The internal `compute_push_parse` non-Idle arm (which still emits
+/// `FailReply(CommandInProgress)` defensively) is exercised by the
+/// in-file `compute_push_tests` module; this integration test verifies
+/// only the public API contract.
 #[test]
-fn parse_while_parse_in_flight_fails_with_command_in_progress() {
+fn def198_parse_while_parse_in_flight_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let first_raw = raw(400);
     parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", id(first_raw), &mut wb);
 
-    let second_raw = raw(401);
-    let out = proto.push_command(
-        PgCommand::Parse {
-            stmt_name: stmt_unnamed(),
-            sql: sql("SELECT 2"),
-            reply: id(second_raw),
-        },
-        &mut wb,
+    // DEF-198: state is `ParseAwaitingParseComplete`. The public API
+    // (`as_ready`) returns `None` — caller cannot acquire a guard,
+    // therefore cannot push a second Parse.
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None during in-flight Parse",
     );
-    assert_eq!(out.len(), 1);
-    match out.as_slice() {
-        [Action::FailReply {
-            id: failed_id,
-            cause: ProtocolError::CommandInProgress,
-        }] => {
-            assert_eq!(*failed_id, second_raw, "FailReply targets NEW reply");
-        }
-        other => panic!("expected FailReply(CommandInProgress), got {other:?}"),
-    }
+    assert_eq!(
+        proto.connection_status(),
+        ConnectionStatus::Busy,
+        "in-flight Parse must classify as ConnectionStatus::Busy",
+    );
+
+    // First Parse correlator still pending (state preserved).
     assert!(matches!(
         proto.state(),
         ProtoState::ParseAwaitingParseComplete(_),
     ));
 
-    // Drain the first parse.
+    // Drain the first parse so its ReplyId is consumed before drop.
     let mut drain = std::vec::Vec::new();
     drain.extend_from_slice(&parse_complete_frame());
     drain.extend_from_slice(&rfq_frame(b'I'));
@@ -280,10 +288,17 @@ fn parse_while_parse_in_flight_fails_with_command_in_progress() {
     assert!(matches!(drain_out.as_slice(), [Action::DeliverReply { .. }]));
 }
 
-/// Invariant: Parse pushed onto an Errored connection fails with
-/// `ConnectionAlreadyClosed`.
+/// DEF-198 invariant: Parse on an `Errored` connection is structurally
+/// impossible at the public API surface.
+///
+/// Pre-DEF-198 this test verified that `push_command(Parse)` on Errored
+/// returned `FailReply(ConnectionAlreadyClosed)`. Post-DEF-198
+/// `as_ready` returns `None` and `connection_status` returns
+/// `ConnectionStatus::Errored(kind)` — caller has structured access
+/// to the underlying `StateErrorKind` for recovery decisions
+/// (typically: discard the connection, return to pool with disposal).
 #[test]
-fn parse_on_errored_fails_with_connection_already_closed() {
+fn def198_parse_on_errored_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
@@ -293,23 +308,25 @@ fn parse_on_errored_fails_with_connection_already_closed() {
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
 
-    let reply_raw = raw(500);
-    let out = proto.push_command(
-        PgCommand::Parse {
-            stmt_name: stmt_unnamed(),
-            sql: sql("SELECT 1"),
-            reply: id(reply_raw),
-        },
-        &mut wb,
+    // DEF-198: as_ready returns None on Errored.
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None on Errored state",
     );
-    match out.as_slice() {
-        [Action::FailReply {
-            id: failed_id,
-            cause: ProtocolError::ConnectionAlreadyClosed { .. },
-        }] => {
-            assert_eq!(*failed_id, reply_raw);
+
+    // connection_status exposes the underlying error kind for
+    // structured caller-side recovery (vs pre-DEF-198 buried in
+    // FailReply.cause field on a synthesised reply).
+    match proto.connection_status() {
+        ConnectionStatus::Errored(_kind) => {
+            // Caller can inspect _kind to decide recovery policy
+            // (discard vs retry). Test value: structured access to
+            // the tier-3 classified state error, exposed as a
+            // public-API enum variant.
         }
-        other => panic!("expected FailReply(ConnectionAlreadyClosed), got {other:?}"),
+        other => panic!(
+            "expected ConnectionStatus::Errored(_) on Errored state, got {other:?}",
+        ),
     }
 }
 

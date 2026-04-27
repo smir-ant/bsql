@@ -23,10 +23,13 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, Credentials, Ident, PgCommand, PgProtocol, Password, ProtoState, ProtocolError,
-    Reply, ReplyId, ReplyKind, Sensitive,
+    Action, ConnectionStatus, Credentials, Ident, PgCommand, PgProtocol, Password, ProtoState,
+    ProtocolError, Reply, ReplyId, ReplyKind, Sensitive,
 };
 use core::num::NonZeroU64;
+
+mod common;
+use common::PushOrPanic;
 
 fn raw(value: u64) -> NonZeroU64 {
     // DEF-145: raw(0) is a test bug; assert fires loud.
@@ -172,7 +175,7 @@ fn startup_trust<'a>(
     let database = db.map(|d| {
         bsql_pg_proto::DatabaseName::try_from_str(d).unwrap_or_else(|e| panic!("bad db: {e}"))
     });
-    proto.push_command(PgCommand::Startup {
+    proto.push_or_panic(PgCommand::Startup {
         user: user_ident,
         database,
         app_name: None,
@@ -389,38 +392,26 @@ fn unknown_auth_subcode_is_rejected() {
     }
 }
 
-/// Invariant (spec): pipelined Startup while one is in flight →
-/// classified StartupAlreadyInProgress.
+/// DEF-198 invariant: pipelined Startup while one is in flight is
+/// structurally blocked at the public API. `ConnectionStatus::Handshaking`
+/// classifies the in-flight startup state for caller-side recovery.
 #[test]
-fn pipelined_startup_is_rejected() {
+fn def198_pipelined_startup_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let first_raw = raw(10);
-    let second_raw = raw(11);
 
     startup_trust(&mut proto, &mut wb, "testuser", None, first_raw);
 
-    // Push a second Startup while the first is in ConnectingStartup.
-    let user = Ident::try_from_str("other").unwrap_or_else(|e| panic!("{e}"));
-    let out = proto.push_command(PgCommand::Startup {
-        user,
-        database: None,
-        app_name: None,
-        credentials: Credentials::Trust,
-        reply: id(second_raw),
-    }, &mut wb);
-
-    assert_eq!(out.len(), 1);
-    match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }] => {
-            assert_eq!(failed_id, &second_raw);
-            assert!(
-                matches!(cause, ProtocolError::StartupAlreadyInProgress),
-                "expected StartupAlreadyInProgress, got {cause:?}",
-            );
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None during in-flight Startup",
+    );
+    assert_eq!(
+        proto.connection_status(),
+        ConnectionStatus::Handshaking,
+        "in-flight Startup classifies as ConnectionStatus::Handshaking",
+    );
 
     // Drain the first startup to avoid Drop-guard panic.
     let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
@@ -431,10 +422,11 @@ fn pipelined_startup_is_rejected() {
     assert_eq!(out.len(), 1);
 }
 
-/// Invariant (spec): push_command(Startup) on Errored state → FailReply
-/// with stored cause.
+/// DEF-198 invariant: Startup on Errored state is structurally blocked
+/// at the public API. `ConnectionStatus::Errored(kind)` exposes the
+/// stored cause (here: ServerError from the fatal auth-failure).
 #[test]
-fn startup_on_errored_state_fails_with_stored_cause() {
+fn def198_startup_on_errored_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let first_raw = raw(20);
@@ -445,40 +437,21 @@ fn startup_on_errored_state_fails_with_stored_cause() {
     let out = proto.feed_bytes(&err, &mut wb);
     assert_eq!(out.len(), 2);
 
-    // Push Startup on Errored.
-    let second_raw = raw(21);
-    let user = Ident::try_from_str("x").unwrap_or_else(|e| panic!("{e}"));
-    let out = proto.push_command(PgCommand::Startup {
-        user,
-        database: None,
-        app_name: None,
-        credentials: Credentials::Trust,
-        reply: id(second_raw),
-    }, &mut wb);
+    use bsql_pg_proto::error::ErrorKind;
 
-    assert_eq!(out.len(), 1);
-    match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }] => {
-            use bsql_pg_proto::error::ErrorKind;
-            assert_eq!(failed_id, &second_raw);
-            // DEF-061 + DEF-142 (pass-#8): on push against Errored,
-            // cause is `ConnectionAlreadyClosed { prior_kind:
-            // StateErrorKind }`. We extract the kind via `.as_kind()`
-            // to compare against the ErrorKind value. Nested guard
-            // patterns are still experimental; outer `match` + inner
-            // `assert_eq` is the forbid-bundle-safe form.
-            match cause {
-                ProtocolError::ConnectionAlreadyClosed { prior_kind: pk } => {
-                    assert_eq!(
-                        pk.as_kind(),
-                        ErrorKind::ServerError,
-                        "cause must be ConnectionAlreadyClosed{{ServerError}}, got {cause:?}",
-                    );
-                }
-                other => panic!("cause must be ConnectionAlreadyClosed, got {other:?}"),
-            }
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None on Errored",
+    );
+    match proto.connection_status() {
+        ConnectionStatus::Errored(state_err_kind) => {
+            assert_eq!(
+                state_err_kind.as_kind(),
+                ErrorKind::ServerError,
+                "stored cause must be ServerError",
+            );
         }
-        other => panic!("unexpected: {other:?}"),
+        other => panic!("expected ConnectionStatus::Errored(ServerError), got {other:?}"),
     }
 }
 
@@ -670,7 +643,7 @@ fn startup_scram<'a>(
 ) -> bsql_pg_proto::OutActions<'a, 'a> {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
-    proto.push_command(PgCommand::Startup {
+    proto.push_or_panic(PgCommand::Startup {
         user: user_ident,
         database: None,
         app_name: None,
@@ -1238,7 +1211,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
 
     // Send a ping. State → PingAwaitingRfq.
     let ping_raw = raw(201);
-    let push_out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
+    let push_out = proto.push_or_panic(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
     match push_out.as_slice() {
         [Action::SendBytes(send_buf)] => {
             // F33: literal PG Sync wire layout — avoids tautology with

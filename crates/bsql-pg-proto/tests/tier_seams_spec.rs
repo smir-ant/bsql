@@ -38,10 +38,13 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ApplicationName, Credentials, DatabaseName, Ident, IdentError, PgCommand, PgProtocol,
-    ProtoState, ProtocolError, ReplyId, ReplyKind, SessionParams,
+    Action, ApplicationName, ConnectionStatus, Credentials, DatabaseName, Ident, IdentError,
+    PgCommand, PgProtocol, ProtoState, ProtocolError, ReplyId, ReplyKind, SessionParams,
 };
 use core::num::NonZeroU64;
+
+mod common;
+use common::PushOrPanic;
 
 fn raw(value: u64) -> NonZeroU64 {
     // DEF-145: raw(0) is a test bug; assert fires loud.
@@ -220,7 +223,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     let ping_raw = raw(7777);
     // Push ping and feed a FrameTooLarge frame. Setup-action list
     // discarded explicitly (`let _ = ...` is banned by user feedback).
-    _ = proto.push_command(PgCommand::Ping {
+    _ = proto.push_or_panic(PgCommand::Ping {
         reply: id(ping_raw),
     }, &mut wb);
     // Declared length = 0xDEAD (way above MAX_FRAME_LEN_FIELD=4095).
@@ -251,33 +254,31 @@ fn errored_cause_is_preserved_in_state_and_reply() {
         proto.state(),
     );
 
-    // Push a new Ping — DEF-061: state is compact-Errored(Framing),
-    // so the second FailReply is ConnectionAlreadyClosed{prior_kind:
-    // Framing}, NOT a duplicate of the original FrameTooLarge. The
-    // wrapper preserved the original diagnostic from the first
-    // FailReply; this reply just classifies "already closed".
-    let second_raw = raw(7778);
-    let out = proto.push_command(PgCommand::Ping {
-        reply: id(second_raw),
-    }, &mut wb);
-    assert_eq!(out.len(), 1);
-    match out.as_slice() {
-        [Action::FailReply {
-            cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
-            ..
-        }] => {
-            // DEF-142 (pass-#8): prior_kind is StateErrorKind newtype.
-            assert_eq!(prior_kind.as_kind(), ErrorKind::Framing,
-                "ConnectionAlreadyClosed must carry the prior_kind classification");
+    // DEF-198: subsequent push is structurally blocked at the public
+    // API. State is compact-Errored(Framing); ConnectionStatus exposes
+    // the kind for caller-side recovery. The wrapper preserved the
+    // original full cause (FrameTooLarge 0xDEAD) via the first
+    // FailReply emitted at transition-to-Errored.
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None on Errored",
+    );
+    match proto.connection_status() {
+        ConnectionStatus::Errored(state_err_kind) => {
+            assert_eq!(
+                state_err_kind.as_kind(),
+                ErrorKind::Framing,
+                "ConnectionStatus::Errored must carry the prior_kind classification (Framing)",
+            );
         }
         other => panic!(
-            "expected FailReply(ConnectionAlreadyClosed{{Framing}}), got {other:?}",
+            "expected ConnectionStatus::Errored(Framing), got {other:?}",
         ),
     }
-    // State preservation: still Errored(Framing) after the push.
+    // State preservation: still Errored(Framing) after as_ready check.
     assert!(
         matches!(proto.state(), ProtoState::Errored(k) if k.as_kind() == ErrorKind::Framing),
-        "state must stay Errored(Framing) after push, got {:?}",
+        "state must stay Errored(Framing), got {:?}",
         proto.state(),
     );
 }
@@ -304,7 +305,7 @@ fn scram_push_startup_carries_scram_session_inline() {
     let Ok(pw) = Password::try_from_bytes(b"pw") else {
         panic!("password construction must succeed");
     };
-    _ = proto.push_command(
+    _ = proto.push_or_panic(
         PgCommand::Startup {
             user,
             database: None,
@@ -337,7 +338,7 @@ fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
     // Drive into Errored(ServerError) via a server ErrorResponse
     // during a pending Ping (distinct kind from the Framing path
     // exercised in the sibling test).
-    _ = proto.push_command(PgCommand::Ping { reply: id(raw(9001)) }, &mut wb);
+    _ = proto.push_or_panic(PgCommand::Ping { reply: id(raw(9001)) }, &mut wb);
     // ErrorResponse frame: tag 'E' + length 5 (just the terminator
     // NUL) — empty body is legal per PG spec (all fields optional).
     let err_frame = [b'E', 0x00, 0x00, 0x00, 0x05, 0x00];
@@ -464,7 +465,7 @@ fn backend_key_data_wrong_payload_size_is_classified() {
     let startup_raw = raw(9000);
     // Setup: push Startup, feed AuthOk. Action lists are discarded
     // explicitly via `drop(...)` — `let _ = ...` is banned.
-    _ = proto.push_command(PgCommand::Startup {
+    _ = proto.push_or_panic(PgCommand::Startup {
         user: Ident::try_from_str("u").unwrap_or_else(|_| panic!("valid ident")),
         database: None,
         app_name: None,

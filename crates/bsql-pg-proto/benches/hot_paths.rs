@@ -45,12 +45,51 @@ use bsql_pg_proto::{
     frame::parse_header,
     ident::Sql,
     reply_id::{PingKind, QueryKind, ReplyId},
-    PgProtocol, WriteBuf,
+    OutActions, PgProtocol, WriteBuf,
 };
 use core::num::NonZeroU64;
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput,
 };
+
+// DEF-198 — bench-side extension trait for the witness-guard typestate.
+//
+// Pre-DEF-198 benches called `proto.bench_push_or_panic(cmd, wb)` directly,
+// returning OutActions. Post-DEF-198 the public path is
+// `proto.as_ready().push_command(cmd, wb)` (Option<ReadyGuard>).
+// Benches always start from a fresh `PgProtocol::new()` (Idle state)
+// or call `proto.reset_for_bench()` (also Idle), so the `None` arm is
+// unreachable in correctly-built benches — `panic!` on it surfaces a
+// fixture bug as a loud bench failure rather than silent wrong-data.
+//
+// Cost: one branch on `state.push_class()` per call. On Idle the
+// branch is well-predicted, ~1 ns added to the timed path. Same
+// overhead the production caller pays for the tier-1 closure check.
+trait BenchPushOrPanic {
+    fn bench_push_or_panic<'p, 'w>(
+        &'p mut self,
+        cmd: PgCommand,
+        wb: &'w mut WriteBuf,
+    ) -> OutActions<'w, 'p>;
+}
+
+impl BenchPushOrPanic for PgProtocol {
+    #[inline]
+    fn bench_push_or_panic<'p, 'w>(
+        &'p mut self,
+        cmd: PgCommand,
+        wb: &'w mut WriteBuf,
+    ) -> OutActions<'w, 'p> {
+        // Capture status BEFORE the mutable borrow `as_ready` takes —
+        // otherwise the panic-arm message would conflict with the
+        // mutable borrow's lifetime extending over the whole match.
+        let status = self.connection_status();
+        let Some(g) = self.as_ready() else {
+            panic!("bench fixture: proto must be Idle for push (status = {status:?})");
+        };
+        g.push_command(cmd, wb)
+    }
+}
 
 // ---------------------------------------------------------------
 // Fixture builders — synthetic wire frames with exact PG layout.
@@ -129,7 +168,7 @@ fn bench_ping_round_trip(c: &mut Criterion) {
             let mut proto = PgProtocol::new();
             let mut wb = WriteBuf::new();
             // Push Ping — emits Sync frame bytes into write_buf.
-            let push_out = proto.push_command(
+            let push_out = proto.bench_push_or_panic(
                 PgCommand::Ping {
                     reply: reply_id_ping(1),
                 },
@@ -234,7 +273,7 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let push_out = proto.push_command(
+                let push_out = proto.bench_push_or_panic(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
@@ -325,7 +364,7 @@ fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let push_out = proto.push_command(
+                let push_out = proto.bench_push_or_panic(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
@@ -402,7 +441,7 @@ fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let push_out = proto.push_command(
+                let push_out = proto.bench_push_or_panic(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
@@ -480,7 +519,7 @@ fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let push_out = proto.push_command(
+                let push_out = proto.bench_push_or_panic(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
@@ -569,7 +608,7 @@ fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let push_out = proto.push_command(
+                let push_out = proto.bench_push_or_panic(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
@@ -631,7 +670,7 @@ fn bench_push_ping(c: &mut Criterion) {
         b.iter(|| {
             let mut proto = PgProtocol::new();
             let mut wb = WriteBuf::new();
-            let out = proto.push_command(
+            let out = proto.bench_push_or_panic(
                 PgCommand::Ping {
                     reply: reply_id_ping(1),
                 },
@@ -664,7 +703,7 @@ fn bench_push_ping(c: &mut Criterion) {
         let mut proto = PgProtocol::new();
         let mut wb = WriteBuf::new();
         b.iter(|| {
-            let out = proto.push_command(
+            let out = proto.bench_push_or_panic(
                 PgCommand::Ping {
                     reply: reply_id_ping(1),
                 },

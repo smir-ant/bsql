@@ -38,10 +38,14 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, PgCommand, PgProtocol, PingKind, ProtoState, ProtocolError, Reply, ReplyId, ReplyKind,
+    Action, ConnectionStatus, PgCommand, PgProtocol, PingKind, ProtoState, ProtocolError, Reply,
+    ReplyId, ReplyKind,
     wire::{TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
 };
 use core::num::NonZeroU64;
+
+mod common;
+use common::PushOrPanic;
 
 /// Build a legal `ReadyForQuery` frame: tag `'Z'`, length 5 (self + 1
 /// payload byte), one byte of tx-status.
@@ -129,7 +133,7 @@ fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) 
 /// Push a Ping command and assert the single expected emission —
 /// one `SendBytes` action carrying the const `SYNC_WIRE_BYTES`.
 ///
-/// Using this helper instead of `let _ = proto.push_command(..., &mut wb)`
+/// Using this helper instead of `let _ = proto.push_or_panic(..., &mut wb)`
 /// verifies the setup is well-formed on every call site — any
 /// regression in the push path (wrong number of actions, wrong
 /// action kind, wrong bytes) is surfaced at the top of the test,
@@ -138,7 +142,7 @@ fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) 
 /// content assertion in each test's body.
 #[track_caller]
 fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg_proto::WriteBuf) {
-    let out = proto.push_command(PgCommand::Ping { reply }, wb);
+    let out = proto.push_or_panic(PgCommand::Ping { reply }, wb);
     assert_eq!(out.len(), 1, "Ping setup: push emits exactly 1 action");
     match out.as_slice() {
         [Action::SendBytes(send_buf)] => {
@@ -177,7 +181,7 @@ fn ping_from_idle_emits_sync_bytes() {
     assert!(matches!(proto.state(), ProtoState::Idle));
 
     let ping_raw = raw(1);
-    let out = proto.push_command(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
+    let out = proto.push_or_panic(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
 
     assert_eq!(out.len(), 1, "Phase 1a budget: push_command emits exactly 1 action");
     match out.as_slice() {
@@ -464,31 +468,35 @@ fn frame_too_large_is_rejected_pre_buffer() {
     }
 }
 
-/// Invariant (spec): a second Ping pushed while one is already in
-/// flight is refused without disturbing the first. The new command's
-/// reply gets `FailReply(UnexpectedFrame)`; the original in-flight
-/// Ping continues to wait for its RFQ.
+/// DEF-198 invariant: a second Ping while one is in flight is
+/// **structurally impossible** at the public API surface.
+///
+/// Pre-DEF-198 this test verified that `proto.push_command(Ping)` from
+/// `PingAwaitingRfq` returned `FailReply(CommandInProgress)` to the
+/// second reply id without disturbing the first. Post-DEF-198
+/// `proto.as_ready()` returns `None` while a Ping is in flight — the
+/// second push never happens.
+///
+/// The internal `compute_push_ping` non-Idle arms (still emit
+/// `FailReply` defensively) are unreachable from the public API and
+/// covered by `compute_push_tests` in protocol.rs.
 #[test]
-fn pipelined_ping_is_refused_without_disturbing_first() {
+fn def198_pipelined_ping_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let first_raw = raw(1);
-    let second_raw = raw(2);
     ping_setup(&mut proto, id(first_raw), &mut wb);
 
-    let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) }, &mut wb);
-
-    assert_eq!(out.len(), 1);
-    match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause: _ }] => {
-            assert_eq!(
-                failed_id,
-                &second_raw,
-                "second Ping's reply id fails, not the first",
-            );
-        }
-        _ => panic!("unexpected action sequence: {out:?}"),
-    }
+    // DEF-198: state is PingAwaitingRfq. Public API blocks second push.
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None during in-flight Ping",
+    );
+    assert_eq!(
+        proto.connection_status(),
+        ConnectionStatus::Busy,
+        "in-flight Ping classifies as ConnectionStatus::Busy",
+    );
     expect_awaiting_ping_reply(proto.state(), first_raw);
 
     // Drain the still-pending first-ping reply so its ReplyId is
@@ -658,18 +666,19 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     }
 }
 
-/// Invariant (spec): `push_command` on a protocol that has already
-/// reached `Errored` fails the new command with the **stored** cause
-/// — no new wire actions, no state transition, and the caller's
-/// `oneshot` is never left hanging.
+/// DEF-198 invariant: `push_command` on `Errored` is structurally
+/// impossible at the public API surface. The stored cause is exposed
+/// to the caller via [`PgProtocol::connection_status`] for recovery
+/// decisions.
 ///
-/// Pins the `handle_push_ping`'s `ProtoState::Errored(original) =>
-/// FailReply` arm. A future edit that (a) drops the arm (compile
-/// error via exhaustive match — good) or (b) replaces the cause with
-/// something else (e.g. `UnexpectedFrame { tag: b'P' }`) would
-/// silently shadow the root cause the wrapper is trying to diagnose.
+/// Pre-DEF-198 this test verified the `FailReply` for a second push
+/// carried `ConnectionAlreadyClosed{prior_kind: ServerError}`,
+/// preserving the diagnostic that triggered the Errored transition.
+/// Post-DEF-198 the diagnostic is exposed via
+/// `ConnectionStatus::Errored(StateErrorKind)` — direct access for
+/// caller-side recovery without synthesising a fake reply id.
 #[test]
-fn push_command_on_errored_state_fails_with_stored_cause() {
+fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let first_raw = raw(50);
@@ -679,41 +688,31 @@ fn push_command_on_errored_state_fails_with_stored_cause() {
     let err_out = proto.feed_bytes(&error_frame(), &mut wb);
     assert_eq!(err_out.len(), 2);
 
-    // Push a new Ping while Errored. DEF-061: the FailReply carries
-    // ConnectionAlreadyClosed{prior_kind: ServerError}; the full
-    // original diagnostic was surfaced in the first FailReply at
-    // transition-to-Errored (the wrapper has preserved it).
     use bsql_pg_proto::error::ErrorKind;
-    let second_raw = raw(51);
-    let out = proto.push_command(PgCommand::Ping { reply: id(second_raw) }, &mut wb);
 
-    assert_eq!(
-        out.len(),
-        1,
-        "post-terminal push_command emits exactly one FailReply, got {out:?}",
+    // DEF-198: as_ready returns None on Errored.
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None on Errored",
     );
-    match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }] => {
-            assert_eq!(failed_id, &second_raw, "fail correlates to the new command");
-            // DEF-142 (pass-#8): `prior_kind` is `StateErrorKind`,
-            // a newtype over `ErrorKind`. We pattern-match the outer
-            // variant then check `.as_kind()` via an outer guard —
-            // guard patterns inside patterns are still experimental.
-            match cause {
-                ProtocolError::ConnectionAlreadyClosed { prior_kind: pk } => {
-                    assert_eq!(
-                        pk.as_kind(),
-                        ErrorKind::ServerError,
-                        "cause must be ConnectionAlreadyClosed{{ServerError}}, got {cause:?}",
-                    );
-                }
-                other => panic!("cause must be ConnectionAlreadyClosed, got {other:?}"),
-            }
+
+    // ConnectionStatus exposes the underlying error kind for caller-side
+    // recovery (vs pre-DEF-198 buried inside FailReply.cause for a
+    // synthesised failure id).
+    match proto.connection_status() {
+        ConnectionStatus::Errored(state_err_kind) => {
+            assert_eq!(
+                state_err_kind.as_kind(),
+                ErrorKind::ServerError,
+                "stored cause must be ServerError",
+            );
         }
-        other => panic!("unexpected action shape: {other:?}"),
+        other => panic!(
+            "expected ConnectionStatus::Errored(ServerError), got {other:?}",
+        ),
     }
 
-    // State unchanged — kind preserved.
+    // State unchanged — kind preserved internally.
     match proto.state() {
         ProtoState::Errored(k) => {
             assert_eq!(k.as_kind(), ErrorKind::ServerError);

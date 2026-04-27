@@ -25,8 +25,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, FetchRows, PgProtocol, PortalName, ProtoState, ProtocolError, QueryKind, Reply, ReplyId, StmtName,
-    WriteBuf,
+    Action, ConnectionStatus, FetchRows, PgProtocol, PortalName, ProtoState, ProtocolError,
+    QueryKind, Reply, ReplyId, StmtName, WriteBuf,
     decode::RowDesc,
     wire::{
         TAG_BIND, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_ERROR_RESPONSE,
@@ -34,6 +34,9 @@ use bsql_pg_proto::{
     },
 };
 use core::num::NonZeroU64;
+
+mod common;
+use common::PushOrPanic;
 
 fn raw(v: u64) -> NonZeroU64 {
     // DEF-145: raw(0) is a test bug. Assert fires loud; the
@@ -127,7 +130,7 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(100);
 
-    let out = proto.push_bind_execute(
+    let out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -169,7 +172,7 @@ fn bind_execute_dml_full_round_trip() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(200);
 
-    let _push_out = proto.push_bind_execute(
+    let _push_out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(42i32,),
@@ -213,7 +216,7 @@ fn bind_execute_select_with_schema_streams_rows() {
     // generated at compile time from Parse+Describe fingerprint.
     let schema = RowDesc::EMPTY; // empty schema — 0-column "SELECT" case
 
-    let _push_out = proto.push_bind_execute(
+    let _push_out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -254,7 +257,7 @@ fn bind_error_is_recoverable() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(400);
 
-    let _ = proto.push_bind_execute(
+    let _ = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -302,7 +305,7 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(500);
 
-    let _ = proto.push_bind_execute(
+    let _ = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -342,7 +345,7 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(600);
 
-    let _ = proto.push_bind_execute(
+    let _ = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -378,13 +381,13 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
 // Push-state policy — in-flight / errored / wrong state
 // ═════════════════════════════════════════════════════════════════
 
-/// Invariant: BindExecute from Errored state → FailReply carrying
-/// `ConnectionAlreadyClosed { prior_kind }`. State preserved.
+/// DEF-198 invariant: BindExecute from Errored state is structurally
+/// blocked at the public API. `ConnectionStatus::Errored(kind)`
+/// exposes the underlying cause for caller recovery decisions.
 #[test]
-fn bind_execute_from_errored_is_connection_already_closed() {
+fn def198_bind_execute_from_errored_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(700);
 
     // Force Errored by feeding an unexpected frame at Idle.
     let bogus = frame(b'Z', b"I");
@@ -392,38 +395,29 @@ fn bind_execute_from_errored_is_connection_already_closed() {
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
 
-    let out = proto.push_bind_execute(
-        &portal_unnamed(),
-        &stmt_unnamed(),
-        &(),
-        None,
-        FetchRows::All,
-        id(reply_raw),
-        &mut wb,
+    // DEF-198: as_ready returns None on Errored.
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None on Errored state",
     );
-    match out.as_slice() {
-        [Action::FailReply { id: failed, cause }] => {
-            assert_eq!(*failed, reply_raw);
-            assert!(
-                matches!(cause, ProtocolError::ConnectionAlreadyClosed { .. }),
-                "expected ConnectionAlreadyClosed, got {cause:?}",
-            );
+    match proto.connection_status() {
+        ConnectionStatus::Errored(_kind) => {
+            // Caller has structured access to the kind for recovery.
         }
-        other => panic!("unexpected: {other:?}"),
+        other => panic!("expected ConnectionStatus::Errored(_), got {other:?}"),
     }
 }
 
-/// Invariant: BindExecute while another BindExecute in flight →
-/// FailReply carrying `CommandInProgress`. The in-flight state is
-/// preserved so the original reply can still be delivered when the
-/// server's response arrives.
+/// DEF-198 invariant: BindExecute while another BindExecute is in
+/// flight is structurally blocked at the public API. The in-flight
+/// state is preserved (caller must drive `feed_bytes` to drain).
 #[test]
-fn bind_execute_while_in_flight_is_command_in_progress() {
+fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
     let first = raw(801);
-    let _ = proto.push_bind_execute(
+    let _ = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -438,23 +432,16 @@ fn bind_execute_while_in_flight_is_command_in_progress() {
             | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
     ));
 
-    let second = raw(802);
-    let out = proto.push_bind_execute(
-        &portal_unnamed(),
-        &stmt_unnamed(),
-        &(),
-        None,
-        FetchRows::All,
-        id(second),
-        &mut wb,
+    // DEF-198: as_ready returns None during in-flight Bind+Execute.
+    assert!(
+        proto.as_ready().is_none(),
+        "DEF-198: as_ready must return None during in-flight Bind+Execute",
     );
-    match out.as_slice() {
-        [Action::FailReply { id: failed, cause }] => {
-            assert_eq!(*failed, second);
-            assert!(matches!(cause, ProtocolError::CommandInProgress));
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
+    assert_eq!(
+        proto.connection_status(),
+        ConnectionStatus::Busy,
+        "in-flight Bind+Execute classifies as ConnectionStatus::Busy",
+    );
     // First state preserved.
     assert!(matches!(
         proto.state(),
@@ -482,7 +469,7 @@ fn bind_frame_wire_layout_empty_params() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let out = proto.push_bind_execute(
+    let out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -526,7 +513,7 @@ fn execute_frame_wire_layout_unnamed_portal() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let out = proto.push_bind_execute(
+    let out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -568,7 +555,7 @@ fn bind_frame_null_param_wire_layout() {
     let mut wb = WriteBuf::new();
 
     let none_i32: Option<i32> = None;
-    let out = proto.push_bind_execute(
+    let out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(none_i32,),
@@ -616,7 +603,7 @@ fn bind_frame_optional_mixed_with_some_and_none() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let out = proto.push_bind_execute(
+    let out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(Some(42i32), None::<&str>),
@@ -674,7 +661,7 @@ fn bind_frame_wire_layout_one_i32_param() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let out = proto.push_bind_execute(
+    let out = proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(42i32,),
