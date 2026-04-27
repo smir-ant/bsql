@@ -199,7 +199,7 @@ fn bench_ping_round_trip(c: &mut Criterion) {
 fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
     use bsql_pg_proto::row_stream::StreamItem;
 
-    let mut group = c.benchmark_group("iter_rows_per_row");
+    let mut group = c.benchmark_group("iter_rows_via_next_event");
 
     const N_ROWS: u32 = 100;
     group.throughput(Throughput::Elements(u64::from(N_ROWS)));
@@ -287,7 +287,7 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
 // ---------------------------------------------------------------
 
 fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
-    let mut group = c.benchmark_group("iter_rows_per_row_v2");
+    let mut group = c.benchmark_group("iter_rows_via_next_row");
     const N_ROWS: u32 = 100;
     group.throughput(Throughput::Elements(u64::from(N_ROWS)));
 
@@ -353,7 +353,7 @@ fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
 // ---------------------------------------------------------------
 
 fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("iter_rows_per_row_v4");
+    let mut group = c.benchmark_group("iter_rows_via_next_row_bytes");
     const N_ROWS: u32 = 100;
     group.throughput(Throughput::Elements(u64::from(N_ROWS)));
 
@@ -420,7 +420,7 @@ fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
 // ---------------------------------------------------------------
 
 fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
-    let mut group = c.benchmark_group("iter_rows_per_row_v3");
+    let mut group = c.benchmark_group("iter_rows_via_for_each");
     const N_ROWS: u32 = 100;
     group.throughput(Throughput::Elements(u64::from(N_ROWS)));
 
