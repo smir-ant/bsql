@@ -229,6 +229,30 @@ Shipped batches (commit-anchored):
 - **Architect findings:** 2 cosmetic (tight size pins + docstring
   clarification), both implemented.
 
+### DEF-189 v1 — strip RowDesc from state, single slot (2026-04-26)
+
+Architect-driven breakthrough refactor (autonomous worktree agent).
+6 state variants stripped of `row_desc: RowDesc` field; single
+`row_desc_slot: Option<RowDesc>` on PgProtocol with single-inflight
+invariant. New tier-1 invariant via `RowDescBorrow<'r>` borrow type.
+
+**Wins vs def184-complete baseline:**
+- parse_header: -1.7%
+- ping_round_trip: **-5.7%** (172 ns vs 182.5 baseline)
+- push_command: **-7%** (98.6 ns vs 107.6 baseline)
+- iter_rows_per_row: +100% residual (structural)
+
+**Tier uplift:**
+- ProtoState 336 → ~64 B (RowDesc 264 B stripped)
+- IterRowsClass classifier — single state-match per next_event
+- Reply::QueryComplete::row_desc typed as Option<RowDescBorrow<'r>>
+- session_params auto-clear on Errored
+
+**iter_rows_per_row residual** structurally accepted (not from
+ProtoState size — proven by ping/push improvements with same
+architecture). Future paths: hot/cold state split, peek/consume API
+redesign, or accept.
+
 ### DEF-186 perf-recovery + 6 P1 closures (2026-04-24)
 
 Pre-DEF-186 architect re-audit identified 6 P1 + 3 P2 findings on the
