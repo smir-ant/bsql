@@ -67,7 +67,7 @@
 //! parameter appeared absent even though the server sent it).
 
 use core::fmt;
-use crate::ident::BoundedStr;
+use crate::ident::SecretBoundedStr;
 
 /// Maximum byte length for the raw bytes stored in
 /// [`Encoding::Other`]. Longest PG encoding name is
@@ -296,7 +296,7 @@ pub struct SessionParams {
     /// `"17.2 (Debian 17.2-1.pgdg120+1)"`). BoundedStr<32> — PG's
     /// version string is occasionally embellished with build
     /// provenance but stays under 32 bytes. DEF-106.
-    pub server_version: Option<BoundedStr<32>>,
+    pub server_version: Option<SecretBoundedStr<32>>,
     /// Server-side encoding, parsed to a typed enum. DEF-114.
     pub server_encoding: Option<Encoding>,
     /// Client-side encoding, parsed to a typed enum. DEF-114.
@@ -308,7 +308,7 @@ pub struct SessionParams {
     /// would truncate client-sent names in the 64..128 range with a
     /// `"…"` marker — a fidelity gap for long deployment-tagged
     /// names. DEF-106 + architect finding #66 (2026-04-21).
-    pub application_name: Option<BoundedStr<128>>,
+    pub application_name: Option<SecretBoundedStr<128>>,
     /// Whether the connected role is a superuser. DEF-114.
     /// `Some(true)` / `Some(false)` / `None` (server sent neither
     /// `"on"` nor `"off"`).
@@ -316,17 +316,17 @@ pub struct SessionParams {
     /// The authorised session user. BoundedStr<64> — role names
     /// are bounded like PG's `NAMEDATALEN` (63 usable chars).
     /// DEF-106.
-    pub session_authorization: Option<BoundedStr<64>>,
+    pub session_authorization: Option<SecretBoundedStr<64>>,
     /// DateStyle setting (e.g. `"ISO, MDY"`). BoundedStr<32> —
     /// the grammar is `"<format>, <order>"` with short
     /// components. DEF-106.
-    pub date_style: Option<BoundedStr<32>>,
+    pub date_style: Option<SecretBoundedStr<32>>,
     /// Whether integer datetimes are used. DEF-114.
     pub integer_datetimes: Option<bool>,
     /// Server timezone (e.g. `"UTC"`, `"America/New_York"`).
     /// BoundedStr<64> — longest documented IANA zone
     /// `"America/Argentina/Buenos_Aires"` = 33 bytes. DEF-106.
-    pub time_zone: Option<BoundedStr<64>>,
+    pub time_zone: Option<SecretBoundedStr<64>>,
     /// Number of unknown `ParameterStatus` keys the server sent that
     /// we couldn't classify.
     ///
@@ -501,19 +501,19 @@ impl SessionParams {
             // `?` placeholders, and guarantees valid UTF-8 output —
             // same F22 treatment used for ErrorResponse M/D/H fields.
             b"server_version" => {
-                self.server_version = Some(BoundedStr::<32>::from_bytes_lossy(value));
+                self.server_version = Some(SecretBoundedStr::<32>::from_bytes_lossy(value));
             }
             b"application_name" => {
-                self.application_name = Some(BoundedStr::<128>::from_bytes_lossy(value));
+                self.application_name = Some(SecretBoundedStr::<128>::from_bytes_lossy(value));
             }
             b"session_authorization" => {
-                self.session_authorization = Some(BoundedStr::<64>::from_bytes_lossy(value));
+                self.session_authorization = Some(SecretBoundedStr::<64>::from_bytes_lossy(value));
             }
             b"DateStyle" => {
-                self.date_style = Some(BoundedStr::<32>::from_bytes_lossy(value));
+                self.date_style = Some(SecretBoundedStr::<32>::from_bytes_lossy(value));
             }
             b"TimeZone" => {
-                self.time_zone = Some(BoundedStr::<64>::from_bytes_lossy(value));
+                self.time_zone = Some(SecretBoundedStr::<64>::from_bytes_lossy(value));
             }
             _ => {
                 // Unknown key — silently dropped (DEF-042).
