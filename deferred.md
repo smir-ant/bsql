@@ -94,15 +94,18 @@ per CREDO §4.12. NONE deferred without structural reason.**
 | DEF-201 | `PgCommand` per-kind monomorphisation: `trait PgCommandT { const TAG; type Payload }` + generic `push_command<C: PgCommandT>` | Tier-1 (typed dispatch) | Caller pays only HIS command size; current 2176 B per-command → real size | PROPOSED, **design discussion required** before impl |
 | DEF-202 | `simdutf8` dep + binary codec (`i32::from_be_bytes` vs `str::parse`) | Same tier (deps already RustCrypto-class) | Text validation 15-30× faster; binary i32 decode 15× faster than text | PROPOSED, pairs with DEF-197 |
 | DEF-203 | Exhaustive niche audit sweep (`OtherEncoding::len`, `FixedStr::len` narrowing, `BoundedStr<N>` cap-niche, `Option<BoundedU8<N>>` over public types) | Tier-2 (compile-rejected ranges) | Cumulative — each site 1-4 B + alignment shifts | PROPOSED |
-| DEF-204 | **Zero-cost zeroize redesign** — DEF-185 P0-B/P0-C currently zeroizes ReadBuf+WriteBuf full capacity (~8 KB) on every clear()/Drop. CREDO §4.1: "Если видится trade-off между safety и performance — дизайн неверен, искать альтернативу." Targeted-zeroize architecture: zero zeroize-on-Drop for non-secret paths; explicit zeroize ONLY at SCRAM dispatch points (server salt parse, server signature verify, client proof emit). Three approaches under consideration: (a) per-frame zeroize after consumption in dispatch.rs, (b) `had_secret: bool` flag on buffers gating the scrub, (c) dedicated `SecretBuf` type for SCRAM crypto. | Tier-2 structural via SCRAM-aware zeroize. | Per-query zeroize cost = 0 ns (hot path). Per-SCRAM-handshake zeroize ~30-150 B (vs current 8 KB always). bench harness `push_command/ping` will drop ~50 ns. | PROPOSED, **architectural design first** (≥3 alternatives, audit secret data flow, per architect.txt process) |
+| DEF-204 | **Staleness leak in `ReadBuf::compact()`** — re-framed 2026-04-27 from initial misdiagnosis. **NOT** a perf issue (initial framing wrong: DEF-185 P0-B/P0-C zeroizes only populated `as_mut_slice()` = `0..len()` not full capacity — already O(populated_len), ~1 ns/clear for Ping). **REAL ISSUE**: `compact()` (`buf.rs:278`) calls `copy_within(cursor..len, 0)` + `truncate(unread_len)`, but bytes physically at positions `[unread_len..len_before)` (the abandoned source range) retain pre-compact content. Future `clear()` zeroizes only `[0..len)` = `[0..unread_len)`; stale tail bytes physically persist in the array until future pushes overwrite them. Possible leak vector: a 2 KB SCRAM frame compacted to 100 B leaves ~1.9 KB of secret-correlated bytes physically present. | Tier-3 by-audit ("future push will overwrite eventually") → **Tier-2 structural** via in-place zeroize of abandoned tail in compact() before truncate. | Security closure (not perf). Per-compact extra cost: O(stale_tail) zeroize on the cold compact path (only fires when `cursor > 0` AND append needs space). ~5 LoC fix in `compact()`. | PROPOSED |
 
-**Priority order (§1):**
-1. **Safety / measurement gap closure first:** DEF-197 (no decoder + no decoder bench = unmeasured class).
-2. **Tier elevation:** DEF-198 (witness-guard typestate — pipelining tier-1 foundation).
-3. **Zero-cost wins:** DEF-194 → DEF-195 → DEF-196 → DEF-203 (smallest scope first to build measurement confidence; DEF-196 is the largest single hot-path footprint cut).
-4. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
-5. **Adjacent-shape re-attempts of measured-rejected forms:** DEF-200 (A7 was global LUT — A7-adjacent per-state buckets remain open).
-6. **Binary codec foundation:** DEF-202 lands when DEF-197 needs it.
+**Priority order (§1) — REVISED 2026-04-27 after DEF-204 reframing:**
+1. **Architectural perf win — concrete magnitude:** DEF-196 (cold field externalization, exact −720 B per PgProtocol via `Option<Box<ColdFields>>`).
+2. **Measurement gap closure:** DEF-197 (no decoder + no decoder bench = unmeasured class — enables future ship-with-evidence on decoder optimisations).
+3. **Security closure:** DEF-204 (staleness leak in compact — small ~5 LoC fix, tier-3 → tier-2).
+4. **Tier elevation foundation:** DEF-198 (witness-guard typestate — pipelining tier-1).
+5. **Zero-cost micro-wins:** DEF-195 → DEF-203 (small scope; DEF-194 already shipped).
+6. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
+7. **Adjacent-shape re-attempts of measured-rejected forms:** DEF-200 (A7 was global LUT — A7-adjacent per-state buckets remain open).
+8. **Architectural enabler:** DEF-199 (READ_BUF_CAP const generic — enables socket I/O tuning).
+9. **Binary codec foundation:** DEF-202 lands when DEF-197 needs it.
 
 **Cross-platform CI matrix** (project-wide concern):
 
@@ -523,21 +526,38 @@ tests removed** + **2 tier-3 retained with structural reason**
 integration test added**. 92 lib tests + 14 integration suites
 green; clippy clean.
 
-**DEF-204 registered (zero-cost zeroize redesign):**
+**DEF-204 registered → re-framed (initial misdiagnosis corrected):**
 
-User challenge ("нужен zero-cost вариант, я уверен что он тут
-доступен и возможен") flagged DEF-185 P0-B/P0-C as
-CREDO §4.1 violation: the always-on full-capacity zeroize on
-`ReadBuf` + `WriteBuf` `clear()` / `Drop` is a perf-vs-safety
-trade-off where the design IS a trade-off. Targeted-zeroize
-architecture — zero zeroize on non-secret paths, explicit zeroize
-ONLY at SCRAM dispatch points — closes the trade-off. Three
-alternatives registered for architectural design pass before code:
-(a) per-frame zeroize after SCRAM body consumption in dispatch.rs,
-(b) `had_secret: bool` flag on buffers gating the scrub, (c)
-dedicated `SecretBuf` type for SCRAM crypto. Per-query cost = 0 ns
-on hot path; per-SCRAM-handshake zeroize ~30-150 B (vs current
-8 KB always); bench harness `push_command/ping` will drop ~25 ns.
+Initial framing (WRONG): "DEF-185 P0-B/P0-C always-on full-capacity
+8 KB zeroize is overengineering / CREDO §4.1 violation". Reframing
+came from re-reading `clear()` and `Drop` impls in `write_buf.rs`
+and `buf.rs` — `as_mut_slice()` returns `&mut [u8]` of length
+`self.inner.len()` (populated bytes only), not full capacity.
+Actual current cost: O(populated_len) — ~1 ns per clear for Ping
+push (5 B Sync), ~50 B per SCRAM message. **Already zero-cost-ish.**
+
+The "+13% bench drift" attributed to DEF-185 was mis-attribution
+on my part: cumulative diffuse drift across DEF-186/187/188/189/
+190/191/194 (compute_push refactor, Box<ScramSession>, RowDesc
+strip, RowStream additions, bit-pack), not DEF-185 alone. Each
+small individually but accumulating. Production amortised path =
+64.5 ns is the production-relevant cost.
+
+**Real issue under DEF-204** (re-framed): `ReadBuf::compact()`
+(`buf.rs:278`) leaves stale tail bytes physically present after
+`copy_within` + `truncate`. Possible leak vector: a 2 KB SCRAM
+frame compacted to 100 B leaves ~1.9 KB of secret-correlated
+bytes physically in the array. Future `clear()` zeroizes only
+`[0..current_len)`; stale tail at `[current_len..pre_compact_len)`
+persists until future pushes overwrite. Tier-3 by-audit → tier-2
+structural via in-place zeroize of abandoned tail before truncate
+(~5 LoC fix in `compact()`).
+
+**Lesson:** future framing of work items requires reading the
+target code first, not relying on commit-message summaries. The
+initial DEF-204 framing in this session ascribed perf cost to the
+wrong site. Skepticism on one's own framing must precede skepticism
+on others'. CREDO §3 + §6 reaffirmed.
 
 **Bench methodology lessons:**
 
