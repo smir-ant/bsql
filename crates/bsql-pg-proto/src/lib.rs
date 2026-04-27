@@ -417,23 +417,39 @@ const _: () = assert!(
 // etc., per-target cfg-gated pins land in the same commit that adds
 // the target — not via permissive ranges. CREDO §3 skepticism: drift
 // surface beats variance cushion every time.
+// DEF-196 (2026-04-28): cold-field externalization shrinks
+// PgProtocol 5080 B → 4344 B = **−736 B exact** (aarch64-apple-darwin).
+// Cold fields (session_params ~436 B + error_arena ~296 B +
+// malformed_frame_count 4 B = ~736 B) moved into a heap-boxed
+// `ColdFields` struct accessed via `Option<Box<ColdFields>>` (8 B
+// niche-packed pointer slot inline). Cold path pays one Box::new
+// allocation per connection (only if any cold field is ever
+// written — Trust auth + no errors + no malformed frames = zero
+// heap usage).
+//
+// Layout breakdown (post-DEF-196):
+//   ReadBuf:                4096 B (4 KiB)
+//   state:                    64 B (post-DEF-189 strip)
+//   row_desc_slot:           140 B (Option<RowDesc>)
+//   cold:                      8 B (Option<Box<ColdFields>> niche)
+//   sync_marker:               0 B (PhantomData)
+//   alignment padding:        ~36 B (to align(8))
+//   total:                  4344 B
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 5080,
+    core::mem::size_of::<protocol::PgProtocol>() == 4344,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
-     Budget: ReadBuf 4096 + state ~64 (post-DEF-189 strip) + \
-     session_params ~420 + row_desc_slot 140 (Option<RowDesc> exact \
-     pin in decode.rs) + error_arena ~290 + malformed_frame_count 4 \
-     + padding to align(8) = 5080 B. \
+     Budget: ReadBuf 4096 + state ~64 + row_desc_slot 140 + \
+     cold (Option<Box<ColdFields>>) 8 + alignment to align(8) = 4344 B. \
      \
-     Pre-DEF-194 was 5108 B. -28 B win from FormatCodeSet bit-pack \
-     cascading through Option<RowDesc>. \
+     Pre-DEF-196 was 5080 B (cold fields inline). DEF-196 saves \
+     736 B per PgProtocol via heap-boxed cold storage. \
      \
-     Cross-platform: when CI matrix extends to x86_64-linux / riscv64 / \
-     wasm32 etc., either (a) every target lands at 5080 (most likely — \
-     all field types are alignment-stable), or (b) per-target \
-     cfg-gated pins land in the same commit. Permissive ranges are \
-     forbidden — drift surface > variance cushion (CREDO §3 + §4.12).",
+     Cross-platform: when CI matrix extends, either (a) every target \
+     lands at 4344 (most likely — alignment-stable types), or \
+     (b) per-target cfg-gated pins land in the same commit. \
+     Permissive ranges forbidden — drift surface > variance cushion \
+     (CREDO §3 + §4.12).",
 );
 // DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B
 // post-`new_state` extraction. Pre-(B21/C6) each Advanced variant
