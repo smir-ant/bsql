@@ -92,15 +92,29 @@ per CREDO §4.12. NONE deferred without structural reason.**
 | DEF-201 | `PgCommand` per-kind monomorphisation: `trait PgCommandT { const TAG; type Payload }` + generic `push_command<C: PgCommandT>` | Tier-1 (typed dispatch) | Caller pays only HIS command size; current 2176 B per-command → real size | PROPOSED, **design discussion required** before impl |
 | DEF-202 | `simdutf8` dep + binary codec (`i32::from_be_bytes` vs `str::parse`) | Same tier (deps already RustCrypto-class) | Text validation 15-30× faster; binary i32 decode 15× faster than text | PROPOSED, pairs with DEF-197 |
 | DEF-203 | Exhaustive niche audit sweep (`OtherEncoding::len`, `FixedStr::len` narrowing, `BoundedStr<N>` cap-niche, `Option<BoundedU8<N>>` over public types) | Tier-2 (compile-rejected ranges) | Cumulative — each site 1-4 B + alignment shifts | PROPOSED |
+| DEF-207 | **Branchless ASCII integer parse for text-format wire** — surfaced by DEF-197 baseline analysis. `<i32 as FromPgText>::from_pg_text` currently routes via `<&str>::from_pg_text` (`core::str::from_utf8` UTF-8 validate ~7.2 ns/col) → `str::parse::<i32>` (ASCII digit walk ~0.4 ns/col). The UTF-8 validate is wasted: PostgreSQL text-format integer wire bytes are spec-guaranteed ASCII (`-`, `0`-`9`). Implement `parse_i32_ascii(bytes: &[u8]) -> Result<i32, IntegerParseError>` directly: optional leading `-`, ASCII digit accumulate via `wrapping_mul(10).wrapping_add((b - b'0') as i32)`, overflow check via `checked_mul`/`checked_add` at boundary. Same pattern generalises to `i16`/`i64`/`u32`/`u64`. **Tier-1 closure**: exhaustive const-asserts on (a) all 10 single-digit values, (b) i32::MIN/i32::MAX/off-by-one of both, (c) leading `0`/`+`/`-` policy, (d) overflow detection for `2147483648`/`-2147483649`, (e) every non-digit byte 0..255 rejected, (f) empty / `-` only / `+` only edge inputs. ~150 LoC parser + ~80 LoC const-assert grid. Distinct from DEF-202 (simdutf8 covers text-format TEXT columns; DEF-207 covers text-format INTEGER columns; binary-format codec is a separate DEF-202 sub-item that requires server-side binary mode opt-in). | Same tier (text-format runtime parse → tier-3 by classified parse-error variant; tier-1 via const-assert grid for boundary correctness). | i32 decode 8.84 → ~1.5 ns/col (5-6×). Generalises to i16/i64/u32/u64 with same const-assert grid template. | PROPOSED, bench-gated by DEF-197 |
 | DEF-206 | **Box\<PodBytes\<N\>\> heap-scrub gap** — surfaced by DEF-205 step 4 audit. SCRAM state variants `ConnectingScramAwaitingServerFirst` carry `client_first_bare: Box<PodBytes<128>>` and `client_nonce_b64: Box<PodBytes<48>>`. `PodBytes<N>` is `Copy` POD without `Drop`, so when the `Box` deallocates, heap memory is freed but bytes are NOT scrubbed. Severity LOW — content is SCRAM `client-first-message` (username + client nonce), all sent unencrypted on the wire (not actual secrets). Fix: `SecretPodBytes<N>` type parallel to `PodBytes<N>` with `ZeroizeOnDrop` derive; SCRAM variants migrated. Tier-1 by Drop chain via Box's drop firing the SecretPodBytes Drop. Defer until handshake-state scope work (Phase 1c-5+ pipelining). | Tier-3 by-audit → tier-1 via SecretPodBytes wrapper. | Security closure (low severity) — heap bytes scrubbed before free. ~60-80 LoC: SecretPodBytes type + 2 state field migrations + memory-probe test. | PROPOSED, low priority (LOW severity) |
 
-**Priority order (§1) — REVISED 2026-04-28 after DEF-197 ship:**
-1. **Decoder perf wins (now bench-gated):** DEF-202 (simdutf8 text validate — ~7.2 ns/col UTF-8 walk is the hot bottleneck per DEF-197 baseline; simdutf8 5-10× on x86/aarch64) and/or DEF-200 (per-state dispatch LUT — A7 adjacent shape).
+**Priority order (§1) — REVISED 2026-04-28 after DEF-197 ship + DEF-207 register:**
+1. **Decoder perf wins (now bench-gated by DEF-197):**
+   - **DEF-207** — branchless ASCII i32 parse (text-format integer columns). Skip wasted UTF-8 validate (~7.2 ns/col → ~0.5 ns/col); estimated 5-6× on i32 decode. Highest-leverage of three: integer-id columns dominate OLTP SELECT cost.
+   - **DEF-202** — simdutf8 (text-format TEXT columns). 5-10× on UTF-8 validate path for variable-content strings; covers what DEF-207 doesn't (true text columns where bytes are NOT guaranteed ASCII).
+   - **DEF-200** — per-state dispatch LUT (A7 adjacent shape). Branch-predictor-friendly bucket split; orthogonal to DEF-207/DEF-202 (touches dispatch, not column decode).
 2. **Tier elevation foundation:** DEF-198 (witness-guard typestate — pipelining tier-1).
 3. **Architectural enabler:** DEF-199 (READ_BUF_CAP const generic — fewer syscalls on large frames).
 4. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
 5. **Zero-cost micro-wins:** DEF-195 / DEF-203 (small scope).
 6. **Low-severity heap scrub:** DEF-206 (Box<PodBytes> SCRAM client-message scrub — wire-public bytes, low priority).
+
+**DEF-197 baseline insights logged here for future reference** (so each insight has a tracked owner item, not just bench output):
+
+| # | Observation | Optimisation owner |
+|---|-------------|--------------------|
+| 1 | Per-row decode ~44 ns on typical 5-col SELECT row. Production scale: 1M rows × 5 cols = 44 ms decode-only — comparable to frame dispatch (14 ms / 1M frames). | Context for DEF-207 + DEF-202 (decoder perf), DEF-200 (dispatch perf). Not standalone DEF. |
+| 2 | `str::parse::<i32>` ~7.6 ns/col (~7.2 ns is wasted UTF-8 validate; ~0.4 ns is digit walk). | **DEF-207** (branchless ASCII i32). |
+| 3 | `<&str>::from_pg_text` ~7.2 ns/col — pure UTF-8 validation. | **DEF-202** (simdutf8 SIMD validate). |
+| 4 | NULL fast-path 0.6 ns/null. `col_len == -1` shortcut in `ColumnsIter` (DEF-184 A5/B10) confirmed working. | Confirmation, not opportunity. |
+| 5 | Pure header parse 1.10 ns. Sub-2-ns. | Confirmation, not bottleneck. |
 
 (DEF-194 + DEF-196 + DEF-197 + DEF-204 + DEF-205 all closed —
 bit-pack + cold field externalization + staleness via Drop chain

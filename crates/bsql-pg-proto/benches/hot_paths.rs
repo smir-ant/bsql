@@ -234,17 +234,27 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let _ = proto.push_command(
+                let push_out = proto.push_command(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
                     },
                     &mut wb,
                 );
-                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(push_out);
+                let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(feed_out);
                 // Raw-append DataRow bytes into read_buf.
+                // bench_append_read_buf returns Result<(), ReadBufFull>;
+                // assert on Ok so a setup misconfig (e.g., READ_BUF_CAP
+                // shrunk below N_ROWS × row_size) fails loud rather than
+                // producing silent garbage numbers. Setup is not timed.
                 for _ in 0..N_ROWS {
-                    let _ = proto.bench_append_read_buf(&single_row);
+                    let append_res = proto.bench_append_read_buf(&single_row);
+                    assert!(
+                        append_res.is_ok(),
+                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                    );
                 }
                 (proto, wb)
             },
@@ -315,16 +325,27 @@ fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let _ = proto.push_command(
+                let push_out = proto.push_command(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
                     },
                     &mut wb,
                 );
-                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(push_out);
+                let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    let _ = proto.bench_append_read_buf(&single_row);
+                    // bench_append_read_buf returns Result<(), ReadBufFull>.
+                    // Silent discard would mask setup misconfiguration
+                    // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
+                    // — assert success so bench breakage is loud, not
+                    // silent garbage numbers. Setup path is not timed.
+                    let append_res = proto.bench_append_read_buf(&single_row);
+                    assert!(
+                        append_res.is_ok(),
+                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                    );
                 }
                 (proto, wb)
             },
@@ -381,16 +402,27 @@ fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let _ = proto.push_command(
+                let push_out = proto.push_command(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
                     },
                     &mut wb,
                 );
-                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(push_out);
+                let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    let _ = proto.bench_append_read_buf(&single_row);
+                    // bench_append_read_buf returns Result<(), ReadBufFull>.
+                    // Silent discard would mask setup misconfiguration
+                    // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
+                    // — assert success so bench breakage is loud, not
+                    // silent garbage numbers. Setup path is not timed.
+                    let append_res = proto.bench_append_read_buf(&single_row);
+                    assert!(
+                        append_res.is_ok(),
+                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                    );
                 }
                 (proto, wb)
             },
@@ -448,16 +480,27 @@ fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let _ = proto.push_command(
+                let push_out = proto.push_command(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
                     },
                     &mut wb,
                 );
-                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(push_out);
+                let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    let _ = proto.bench_append_read_buf(&single_row);
+                    // bench_append_read_buf returns Result<(), ReadBufFull>.
+                    // Silent discard would mask setup misconfiguration
+                    // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
+                    // — assert success so bench breakage is loud, not
+                    // silent garbage numbers. Setup path is not timed.
+                    let append_res = proto.bench_append_read_buf(&single_row);
+                    assert!(
+                        append_res.is_ok(),
+                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                    );
                 }
                 (proto, wb)
             },
@@ -526,16 +569,27 @@ fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
-                let _ = proto.push_command(
+                let push_out = proto.push_command(
                     PgCommand::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
                         reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
                     },
                     &mut wb,
                 );
-                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(push_out);
+                let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    let _ = proto.bench_append_read_buf(&single_row);
+                    // bench_append_read_buf returns Result<(), ReadBufFull>.
+                    // Silent discard would mask setup misconfiguration
+                    // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
+                    // — assert success so bench breakage is loud, not
+                    // silent garbage numbers. Setup path is not timed.
+                    let append_res = proto.bench_append_read_buf(&single_row);
+                    assert!(
+                        append_res.is_ok(),
+                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                    );
                 }
                 (proto, wb)
             },
@@ -738,8 +792,20 @@ fn bench_data_row_parse(c: &mut Criterion) {
 
     group.bench_function("data_row_parse_5cols", |b| {
         b.iter(|| {
-            let row = DataRowRef::parse(black_box(&body));
-            let _ = black_box(row);
+            // Both arms `black_box`'d — measures the parse call path,
+            // not post-parse use. Fixture is well-formed (controlled
+            // by `data_row_body_int4`); the Err arm is dead in this
+            // bench but exists to satisfy `Result`'s `#[must_use]`
+            // without a silent `let _ =` discard (CREDO §0 — even in
+            // bench harness, no silent fallbacks).
+            match DataRowRef::parse(black_box(&body)) {
+                Ok(row) => {
+                    black_box(row);
+                }
+                Err(e) => {
+                    black_box(e);
+                }
+            }
         });
     });
 
@@ -798,10 +864,10 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
             };
             let mut sum: i64 = 0;
             for col in row.columns() {
-                if let Ok(Some(bytes)) = col {
-                    if let Ok(v) = i32::from_pg_text(bytes) {
-                        sum = sum.saturating_add(i64::from(v));
-                    }
+                if let Ok(Some(bytes)) = col
+                    && let Ok(v) = i32::from_pg_text(bytes)
+                {
+                    sum = sum.saturating_add(i64::from(v));
                 }
             }
             black_box(sum);
@@ -832,10 +898,10 @@ fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
             };
             let mut total_chars: usize = 0;
             for col in row.columns() {
-                if let Ok(Some(bytes)) = col {
-                    if let Ok(s) = <&str>::from_pg_text(bytes) {
-                        total_chars = total_chars.saturating_add(s.len());
-                    }
+                if let Ok(Some(bytes)) = col
+                    && let Ok(s) = <&str>::from_pg_text(bytes)
+                {
+                    total_chars = total_chars.saturating_add(s.len());
                 }
             }
             black_box(total_chars);
