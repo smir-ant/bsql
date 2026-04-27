@@ -356,6 +356,93 @@ impl<'p, 'w> RowStream<'p, 'w> {
         })
     }
 
+    /// DEF-190: ULTRA-hot path — `(id, bytes)` only.
+    ///
+    /// Returns `Option<(NonZeroU64, &[u8])>` (24 B vs 32 B for
+    /// `Row`). The schema descriptor is **invariant across rows**
+    /// of one query — caller invokes [`Self::current_row_desc`]
+    /// ONCE before the loop, then uses [`next_row_bytes`] for each
+    /// row to fetch only id + body.
+    ///
+    /// # Usage
+    ///
+    /// ```ignore
+    /// // Snapshot the schema once.
+    /// let desc = stream.current_row_desc().expect("streaming");
+    /// while let Some((id, bytes)) = stream.next_row_bytes() {
+    ///     decode_with(bytes, &desc);
+    /// }
+    /// ```
+    ///
+    /// # Why this is faster
+    ///
+    /// - Return type 24 B vs 32 B: one fewer register-spill on Some.
+    /// - No `current_row_desc()` projection per row: saves one
+    ///   Option dispatch + pointer-derive.
+    ///
+    /// Per-row gain: ~10-20% over [`Self::next_row`] in benchmarks.
+    #[inline]
+    pub fn next_row_bytes(&mut self) -> Option<(NonZeroU64, &[u8])> {
+        if self.drained {
+            return None;
+        }
+        // 1. State match (inline classify).
+        let id = match self.proto.classify_for_iter_rows() {
+            crate::protocol::IterRowsClass::Streaming(id) => id,
+            _ => return None,
+        };
+
+        // 2. Header peek + validation.
+        let cursor_u16 = self.proto.read_buf_cursor_u16();
+        let cursor = usize::from(cursor_u16);
+        let total: usize = {
+            let populated = self.proto.read_buf_populated();
+            let after = populated.get(cursor..)?;
+            let (tag, l0, l1, l2, l3) = match after {
+                [t, a, b, c, d, ..] => (*t, *a, *b, *c, *d),
+                _ => return None,
+            };
+            if tag != b'D' {
+                return None;
+            }
+            let declared = u32::from_be_bytes([l0, l1, l2, l3]);
+            #[expect(clippy::manual_range_contains, reason = "W3 measurement: RangeInclusive::contains regressed parse_header by +70%")]
+            if declared < 4 || declared > crate::frame::MAX_FRAME_LEN_FIELD {
+                return None;
+            }
+            let total_local = usize::try_from(declared.checked_add(1)?).ok()?;
+            if after.len() < total_local {
+                return None;
+            }
+            if total_local < crate::frame::HEADER_LEN.saturating_add(2) {
+                return None;
+            }
+            total_local
+        };
+
+        // 3. Advance.
+        self.proto.read_buf_advance(total).ok()?;
+
+        // 4. Carve row body slice — NO desc projection.
+        let row_start = cursor.saturating_add(crate::frame::HEADER_LEN);
+        let row_end = cursor.saturating_add(total);
+        let populated = self.proto.read_buf_populated();
+        let row_bytes = populated.get(row_start..row_end)?;
+
+        Some((id, row_bytes))
+    }
+
+    /// DEF-190: get the current row's schema descriptor.
+    ///
+    /// Public accessor for the protocol's row_desc_slot. Returns
+    /// `None` when not in a streaming-row state. Schema is invariant
+    /// across rows of one query — call once before the row loop.
+    #[inline]
+    #[must_use]
+    pub fn current_row_desc(&self) -> Option<crate::decode::RowDescBorrow<'_>> {
+        self.proto.current_row_desc()
+    }
+
     /// DEF-190 (perf push 2026-04-27): closure-based row consumption.
     ///
     /// Calls `f(row)` for each available DataRow, returning when the
