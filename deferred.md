@@ -94,19 +94,21 @@ per CREDO §4.12. NONE deferred without structural reason.**
 | DEF-201 | `PgCommand` per-kind monomorphisation: `trait PgCommandT { const TAG; type Payload }` + generic `push_command<C: PgCommandT>` | Tier-1 (typed dispatch) | Caller pays only HIS command size; current 2176 B per-command → real size | PROPOSED, **design discussion required** before impl |
 | DEF-202 | `simdutf8` dep + binary codec (`i32::from_be_bytes` vs `str::parse`) | Same tier (deps already RustCrypto-class) | Text validation 15-30× faster; binary i32 decode 15× faster than text | PROPOSED, pairs with DEF-197 |
 | DEF-203 | Exhaustive niche audit sweep (`OtherEncoding::len`, `FixedStr::len` narrowing, `BoundedStr<N>` cap-niche, `Option<BoundedU8<N>>` over public types) | Tier-2 (compile-rejected ranges) | Cumulative — each site 1-4 B + alignment shifts | PROPOSED |
+| DEF-205 | **Broader staleness pattern closure** — DEF-204 fixed `ReadBuf::compact()` only, but the same bug class exists in ≥3 more sites surfaced by user-driven follow-up audit 2026-04-27: (1) `ErrorArena::clear()` `self.slot = None` flips discriminant only, leaving `Some(ErrorPayload)` data bytes (~288 B server error M/D/H strings, may include query details with passwords) physically persistent; (2) `SessionParams::clear()` `*self = Self::new()` is field-by-field None assignment, the `Option<BoundedStr<N>>` data regions (~256 B server-echoed config) may not be scrubbed; (3) `mem::replace(state, Idle)` enum-variant assignment — compiler-dependent whether unused payload region is overwritten (SCRAM secrets handled via Drop chain on `Sensitive<T>` / `Box<ScramSession>`, but inline bytes uncertain). All three are same tier-3 by-audit pattern as compact() pre-DEF-204. Architectural alternatives: (a) manual zeroize per callsite — audit-prone; (b) `Zeroize` derive chain — `BoundedStr<N>` manual impl + `#[derive(Zeroize)]` on ErrorPayload/SessionParams + `Option<T>: Zeroize where T: Zeroize` from crate; (c) `SecretBuf<T>` wrapper type. Recommended (b) — tier-2 structural via derive. | Tier-3 by-audit → **Tier-2 structural** via Zeroize derive chain. | Security closure (not perf). Multi-site refactor: ~50-100 LoC across `ident.rs` (BoundedStr Zeroize impl), `error_arena.rs` (clear update), `session_params.rs` (clear update), audits of `mem::replace` callsites. Memory-probe tests per fix following DEF-185 P3-1 / DEF-204 prior art. | PROPOSED |
 
-**Priority order (§1) — REVISED 2026-04-27 after DEF-204 ship:**
-1. **Architectural perf win — concrete magnitude:** DEF-196 (cold field externalization, exact −720 B per PgProtocol via `Option<Box<ColdFields>>`).
-2. **Measurement gap closure:** DEF-197 (no decoder + no decoder bench = unmeasured class — enables future ship-with-evidence on decoder optimisations).
-3. **Tier elevation foundation:** DEF-198 (witness-guard typestate — pipelining tier-1).
-4. **Zero-cost micro-wins:** DEF-195 → DEF-203 (small scope; DEF-194 already shipped).
-5. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
-6. **Adjacent-shape re-attempts of measured-rejected forms:** DEF-200 (A7 was global LUT — A7-adjacent per-state buckets remain open).
-7. **Architectural enabler:** DEF-199 (READ_BUF_CAP const generic — enables socket I/O tuning).
-8. **Binary codec foundation:** DEF-202 lands when DEF-197 needs it.
+**Priority order (§1) — REVISED 2026-04-27 after DEF-205 surfaced:**
+1. **Security closure (broader pattern):** DEF-205 (staleness in ≥3 more sites — same bug class as DEF-204's compact, surfaced by user-driven follow-up audit). Tier-3 by-audit → tier-2 structural.
+2. **Architectural perf win — concrete magnitude:** DEF-196 (cold field externalization, exact −720 B per PgProtocol via `Option<Box<ColdFields>>`).
+3. **Measurement gap closure:** DEF-197 (no decoder + no decoder bench = unmeasured class — enables future ship-with-evidence on decoder optimisations).
+4. **Tier elevation foundation:** DEF-198 (witness-guard typestate — pipelining tier-1).
+5. **Zero-cost micro-wins:** DEF-195 → DEF-203 (small scope; DEF-194 already shipped).
+6. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
+7. **Adjacent-shape re-attempts of measured-rejected forms:** DEF-200 (A7 was global LUT — A7-adjacent per-state buckets remain open).
+8. **Architectural enabler:** DEF-199 (READ_BUF_CAP const generic — enables socket I/O tuning).
+9. **Binary codec foundation:** DEF-202 lands when DEF-197 needs it.
 
-(DEF-204 closed — security closure shipped 2026-04-27 in commit landing
-this row's deletion.)
+(DEF-204 closed for compact() specifically — broader pattern continues
+under DEF-205. Per CREDO §1: safety > perf, security closures come first.)
 
 **Cross-platform CI matrix** (project-wide concern):
 
