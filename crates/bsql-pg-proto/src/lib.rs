@@ -150,7 +150,7 @@ pub use decode::{
 pub use error::{CrateBugLocus, ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use ident::{
-    ApplicationName, DatabaseName, Ident, IdentError, PortalName, Sql, StmtName,
+    ApplicationName, DatabaseName, Ident, IdentError, PortalName, SecretBoundedStr, Sql, StmtName,
 };
 pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL, PgProtocol};

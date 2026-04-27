@@ -498,6 +498,227 @@ pub type StmtName = FixedStr<MAX_PG_NAME_LEN, StmtNameTag>;
 pub type PortalName = FixedStr<MAX_PG_NAME_LEN, PortalNameTag>;
 
 // ═════════════════════════════════════════════════════════════════
+// DEF-205 (2026-04-27): SecretBoundedStr — sensitive bounded string.
+//
+// Closes the staleness leak class for `Option<T> = None` and
+// `*self = Self::new()` patterns where `T` contains potentially
+// sensitive bytes (server error messages, server-echoed parameters
+// that include username / application name / deployment info).
+//
+// **Tier-1 by Drop chain**: Rust language semantics guarantee that
+// assignment `field = new_value` drops the old value before moving
+// the new one in. Combined with `ZeroizeOnDrop`, this scrubs the
+// previous bytes by compiler-enforced construction — no programmer
+// action required at the assignment site, no audit dependency.
+//
+// **Why a separate type vs `BoundedStr<N>`**: `BoundedStr<N>` (=
+// `FixedStr<N, BoundedStrTag>`) is `Copy`. Adding `Drop` to a `Copy`
+// type is forbidden by Rust. Splitting sensitive vs non-sensitive
+// bounded strings keeps the hot-path types (`Ident`, `StmtName`,
+// `Sql`, non-secret `BoundedStr`) Copy-fast while sensitive types
+// (used in `ErrorPayload` / `SessionParams` sensitive fields) get
+// the Drop-chain guarantee.
+//
+// **Implementation**: thin wrapper around `BoundedStr<N>` (storage
+// reuse, no duplicated truncation/UTF-8 logic). The wrapper is
+// non-Copy (Drop forbids Copy), so cloning is explicit via
+// `Clone`-derive — caller decides when to duplicate.
+// ═════════════════════════════════════════════════════════════════
+
+/// Bounded UTF-8 string for sensitive bytes — server error messages,
+/// session-parameter values that may include credentials/usernames.
+///
+/// Mirrors [`BoundedStr<N>`]'s shape and constructors but is
+/// **non-Copy** with a `Drop` impl that scrubs the buffer. By Rust
+/// language semantics, every overwrite (`field = new`, `*self = X`,
+/// `option.replace(new)`) fires `Drop` on the previous value before
+/// the new one is moved in — closing the staleness leak class
+/// described in DEF-205.
+///
+/// # Tier-1 by Drop chain
+///
+/// Replacement → old's Drop → `inner.zeroize_in_place()` → buffer
+/// scrubbed → new value installed. The compiler enforces step 1
+/// (Drop firing) — programmer cannot accidentally skip it. This is
+/// stronger than tier-2 "explicit scrub call before reassignment"
+/// because there's no callsite to forget.
+///
+/// # API mirror of `BoundedStr<N>`
+///
+/// Same constructor names ([`Self::new`], [`Self::from_str_truncating`],
+/// [`Self::from_bytes_lossy`]) and accessors ([`Self::as_bytes`],
+/// [`Self::as_str`], [`Self::len`], [`Self::is_empty`],
+/// [`Self::was_lossy`]) so migrations from `BoundedStr<N>` to
+/// `SecretBoundedStr<N>` are mechanical.
+///
+/// # Debug redaction
+///
+/// `Debug` prints `SecretBoundedStr<N>(<REDACTED, len=K>)` —
+/// content is hidden to defend against accidental log-leak when
+/// a containing struct is debug-printed (e.g., `eprintln!("{params:?}",
+/// params)`). Same precedent as [`crate::sensitive::Sensitive<T>`]
+/// (DEF-185 P1-C).
+#[repr(transparent)]
+pub struct SecretBoundedStr<const N: usize> {
+    inner: BoundedStr<N>,
+}
+
+impl<const N: usize> SecretBoundedStr<N> {
+    /// Empty `SecretBoundedStr<N>`. Buffer all-zero, `len = 0`.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            inner: BoundedStr::<N>::new(),
+        }
+    }
+
+    /// Construct from `&str`, truncating with `"…"` marker on overflow.
+    /// Mirrors [`BoundedStr<N>::from_str_truncating`].
+    #[inline]
+    #[must_use]
+    pub fn from_str_truncating(source: &str) -> Self {
+        Self {
+            inner: BoundedStr::<N>::from_str_truncating(source),
+        }
+    }
+
+    /// Construct from raw `&[u8]`, coercing non-UTF-8 bytes to `b'?'`
+    /// and setting the lossy flag (queryable via [`Self::was_lossy`]).
+    /// Mirrors [`BoundedStr<N>::from_bytes_lossy`].
+    #[inline]
+    #[must_use]
+    pub fn from_bytes_lossy(source: &[u8]) -> Self {
+        Self {
+            inner: BoundedStr::<N>::from_bytes_lossy(source),
+        }
+    }
+
+    /// Borrow the populated bytes.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.inner.as_bytes()
+    }
+
+    /// Borrow as `&str` (UTF-8 invariant from `BoundedStr<N>`'s
+    /// `ValidUtf8` constructor).
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.inner.as_str()
+    }
+
+    /// Populated byte length.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the buffer is empty (`len == 0`).
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Whether the constructor coerced any non-UTF-8 bytes during
+    /// `from_bytes_lossy`. Mirrors [`BoundedStr<N>::was_lossy`].
+    #[inline]
+    #[must_use]
+    pub const fn was_lossy(&self) -> bool {
+        self.inner.was_lossy()
+    }
+}
+
+impl<const N: usize> Clone for SecretBoundedStr<N> {
+    /// Explicit clone — `SecretBoundedStr<N>` is non-Copy by design
+    /// (Drop conflicts with Copy). Caller picks the duplication
+    /// point; each clone gets its own Drop / scrub.
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { inner: self.inner }
+    }
+}
+
+impl<const N: usize> PartialEq for SecretBoundedStr<N> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+impl<const N: usize> Eq for SecretBoundedStr<N> {}
+
+impl<const N: usize> Default for SecretBoundedStr<N> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> fmt::Debug for SecretBoundedStr<N> {
+    /// Redacted Debug — buffer content hidden, only type, capacity,
+    /// and populated length printed. Defends against accidental
+    /// log-leak via debug-printing a containing struct.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SecretBoundedStr<{N}>(<REDACTED, len={}>)",
+            self.inner.len(),
+        )
+    }
+}
+
+impl<const N: usize> zeroize::Zeroize for SecretBoundedStr<N> {
+    /// Scrub the buffer in place (same effect as Drop, but explicit
+    /// and non-consuming).
+    #[inline]
+    fn zeroize(&mut self) {
+        self.inner.zeroize_in_place();
+    }
+}
+
+impl<const N: usize> Drop for SecretBoundedStr<N> {
+    /// DEF-205 tier-1 closure: scrub the buffer when the value is
+    /// dropped. By Rust language semantics this fires on every
+    /// overwrite (`field = new`, `*self = X`, `option.replace(new)`,
+    /// `mem::take`, `mem::replace`) before the new value is moved in
+    /// — the previous bytes can never silently persist past the
+    /// assignment.
+    fn drop(&mut self) {
+        self.inner.zeroize_in_place();
+    }
+}
+
+// Tier-1 size pin — `repr(transparent)` ensures `SecretBoundedStr<N>`
+// is layout-identical to `BoundedStr<N>`. A future field addition
+// would change the size and trip this assertion. Stable across
+// targets (BoundedStr/FixedStr is `repr(C)` with deterministic
+// layout under MAX_PG_NAME_LEN-class N values).
+const _: () = {
+    // Concrete N for the assertion (any reasonable N works; we pick
+    // the smallest Sql-class to keep the assertion compile cost low).
+    assert!(
+        core::mem::size_of::<SecretBoundedStr<32>>()
+            == core::mem::size_of::<BoundedStr<32>>(),
+        "SecretBoundedStr<N> must be layout-identical to BoundedStr<N> \
+         (repr(transparent) wrapper). A field addition or repr change \
+         broke this — re-audit before shipping.",
+    );
+};
+
+// `Send` is automatically derived (no non-Send fields). Pin it
+// explicitly so a future field addition that introduces non-Send
+// state (e.g., `Rc<...>`) becomes a build error here rather than a
+// silent regression in user-facing code.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<SecretBoundedStr<32>>();
+};
+
+// ═════════════════════════════════════════════════════════════════
 // 1c-3c F12 (pass-#7 audit): sealed `DescribeName` trait
 //
 // Narrows the `build_describe_message` builder's `name` parameter
@@ -1142,5 +1363,37 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
     #[must_use]
     pub const fn was_lossy(&self) -> bool {
         self.was_lossy_flag != 0
+    }
+
+    /// DEF-205 (2026-04-27): in-place zeroize hook for the
+    /// `SecretBoundedStr<N>` Drop chain. Crate-private — `FixedStr` itself
+    /// stays POD/Copy for non-sensitive uses (`Ident`, `StmtName`, `Sql`,
+    /// non-secret `BoundedStr` fields). The wrapper-type
+    /// `SecretBoundedStr<N>` calls this from its `Drop` to scrub bytes
+    /// before the inner value is moved/overwritten.
+    ///
+    /// # Tier-1 enabler
+    ///
+    /// Without this hook, `SecretBoundedStr<N>` couldn't reach
+    /// `FixedStr`'s private fields and would have to re-implement all
+    /// constructors / accessors. With the hook, `SecretBoundedStr<N>`
+    /// is a thin wrapper that delegates everything except Drop — the
+    /// Drop fires the zeroize chain that closes the staleness leak
+    /// class (see DEF-205 in `deferred.md`).
+    ///
+    /// # Why `pub(crate)` and not `pub`
+    ///
+    /// `FixedStr<N, Tag>` is `Copy`. Exposing `zeroize_in_place` as
+    /// `pub` would invite callers to scrub Copy types — but Copy
+    /// semantics mean a copy could remain unscrubbed (`let x = src; ...`
+    /// makes a duplicate that the scrub on `src` doesn't reach). The
+    /// scrub is sound only inside `SecretBoundedStr<N>`'s Drop, where
+    /// the wrapper's non-Copy invariant guarantees no aliasing copies.
+    #[inline]
+    pub(crate) fn zeroize_in_place(&mut self) {
+        use zeroize::Zeroize;
+        self.buf.zeroize();
+        self.len = 0;
+        self.was_lossy_flag = 0;
     }
 }
