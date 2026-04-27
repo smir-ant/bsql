@@ -153,6 +153,25 @@ pub enum StreamItem<'a> {
     NeedMore,
 }
 
+/// DEF-190: row-only result from [`RowStream::next_row`].
+///
+/// Compact 32-byte struct (vs 80-byte [`StreamItem`] enum) — half
+/// the move cost on the per-row hot path. Borrows from the
+/// stream's protocol state for the lifetime `'r`; caller must
+/// process or drop before calling `next_row` again (borrow
+/// checker enforces).
+#[derive(Debug)]
+pub struct Row<'r> {
+    /// Reply correlator for this in-flight query.
+    pub id: NonZeroU64,
+    /// Raw row body, post column-count header (≥ 2 bytes).
+    /// Decode via [`crate::decode::DataRowRef::parse`].
+    pub bytes: &'r [u8],
+    /// Schema descriptor for this row, projected from the
+    /// protocol's row_desc_slot.
+    pub desc: crate::decode::RowDescBorrow<'r>,
+}
+
 /// Pull-based row streamer. See module docs for perf rationale.
 ///
 /// Constructed via [`PgProtocol::iter_rows`]; holds `&mut self`
@@ -217,6 +236,124 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 Err(err)
             }
         }
+    }
+
+    /// DEF-190 (perf push 2026-04-27): hot-path-only row puller.
+    ///
+    /// Returns `Some(Row)` for each available `DataRow`; `None` to
+    /// pause the loop (any non-row condition: stream complete /
+    /// failed / awaiting more bytes / wrong state). Caller uses
+    /// `while let Some(row) = stream.next_row() { … }` to consume
+    /// rows with minimal overhead, then calls
+    /// [`Self::next_event`] (or [`Self::status`] in a future API)
+    /// to learn why the row stream paused.
+    ///
+    /// # Hot-path discipline
+    ///
+    /// This method is THE row hot path. It:
+    /// - takes `&mut self` (exclusive access)
+    /// - reads ProtoState with a single match
+    /// - inlines the 5-byte header parse (no `parse_header` call)
+    /// - validates length / row-body bounds
+    /// - advances `read_buf.cursor` once
+    /// - projects `row_desc_slot` once
+    /// - returns a 32-byte [`Row`] (vs 80-byte [`StreamItem`])
+    ///
+    /// All inside a single function body — no helper calls except
+    /// the field-read accessors (which are `#[inline]` and trivial).
+    /// LLVM has full visibility for register allocation across the
+    /// per-row body.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(Row)`: a DataRow was consumed; bytes carved from
+    ///   the still-populated read_buf (cursor advanced).
+    /// - `None`: pause the loop. Reasons (caller can disambiguate
+    ///   via [`Self::next_event`] subsequent call):
+    ///   - state not `Streaming*`
+    ///   - read_buf empty / fewer than 5 bytes since cursor
+    ///   - next frame is not `'D'` (CommandComplete / Z / E)
+    ///   - row body shorter than 2 bytes (column-count header)
+    ///   - row_desc_slot is None (architecturally dead while in
+    ///     a streaming variant — fail-closed)
+    ///
+    /// # Lifetime
+    ///
+    /// Returned `Row<'_>` borrows from `self.proto.read_buf` and
+    /// `self.proto.row_desc_slot`. Caller cannot call other
+    /// `&mut self.proto` methods while the Row is alive — the
+    /// borrow checker enforces this. The `Row` MUST be dropped
+    /// before the next `next_row` call.
+    #[inline]
+    pub fn next_row(&mut self) -> Option<Row<'_>> {
+        // Drained / errored → no rows.
+        if self.drained {
+            return None;
+        }
+
+        // 1. State check — extract reply id by Copy or bail.
+        // Single state match via the protocol's classifier.
+        let id = match self.proto.classify_for_iter_rows() {
+            crate::protocol::IterRowsClass::Streaming(id) => id,
+            crate::protocol::IterRowsClass::Errored
+            | crate::protocol::IterRowsClass::Other => return None,
+        };
+
+        // 2. Header peek + validation, scoped to drop the
+        // populated() borrow before the &mut advance.
+        let cursor_u16 = self.proto.read_buf_cursor_u16();
+        let cursor = usize::from(cursor_u16);
+        let total: usize = {
+            let populated = self.proto.read_buf_populated();
+            let after = populated.get(cursor..)?;
+            // Inline 5-byte header read. parse_header logic
+            // open-coded so LLVM can fold the slice-pattern match
+            // into the caller's body without a function-call
+            // boundary.
+            let (tag, l0, l1, l2, l3) = match after {
+                [t, a, b, c, d, ..] => (*t, *a, *b, *c, *d),
+                _ => return None, // < 5 bytes
+            };
+            // DataRow tag check — bail fast for any other tag.
+            if tag != b'D' {
+                return None;
+            }
+            let declared = u32::from_be_bytes([l0, l1, l2, l3]);
+            // DEF-190 / measurement W3 (deferred.md §B): explicit
+            // separate compares — `RangeInclusive::contains` was
+            // measured +70% slower on parse_header. The two
+            // compares LLVM lowers to optimal cmp+jcc chain;
+            // `contains` lowers to ucmp + extra branch.
+            #[expect(clippy::manual_range_contains, reason = "W3 measurement: RangeInclusive::contains regressed parse_header by +70%; separate compares are the proven-optimal lowering")]
+            if declared < 4 || declared > crate::frame::MAX_FRAME_LEN_FIELD {
+                return None;
+            }
+            let total_local = usize::try_from(declared.checked_add(1)?).ok()?;
+            if after.len() < total_local {
+                return None; // need more bytes
+            }
+            // Body must be ≥ 2 bytes (column-count header).
+            if total_local < crate::frame::HEADER_LEN.saturating_add(2) {
+                return None;
+            }
+            total_local
+        };
+
+        // 3. Mutable: advance the cursor.
+        self.proto.read_buf_advance(total).ok()?;
+
+        // 4. Project row body + desc.
+        let row_start = cursor.saturating_add(crate::frame::HEADER_LEN);
+        let row_end = cursor.saturating_add(total);
+        let populated = self.proto.read_buf_populated();
+        let row_bytes = populated.get(row_start..row_end)?;
+        let desc = self.proto.current_row_desc()?;
+
+        Some(Row {
+            id,
+            bytes: row_bytes,
+            desc,
+        })
     }
 
     /// Pull the next event.

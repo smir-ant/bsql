@@ -282,6 +282,72 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
+// DEF-190: per-row throughput via `next_row` API (compact Row
+// struct, no StreamItem enum allocation per row).
+// ---------------------------------------------------------------
+
+fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
+    let mut group = c.benchmark_group("iter_rows_per_row_v2");
+    const N_ROWS: u32 = 100;
+    group.throughput(Throughput::Elements(u64::from(N_ROWS)));
+
+    let rowdesc = {
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'T');
+        let name = b"col\0";
+        let body_len = 2 + name.len() + 18;
+        let total = 4 + body_len;
+        out.extend_from_slice(&(u32::try_from(total).unwrap_or(0)).to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&25u32.to_be_bytes());
+        out.extend_from_slice(&(-1_i16).to_be_bytes());
+        out.extend_from_slice(&(-1_i32).to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out
+    };
+    let single_row = data_row_frame(16);
+
+    group.bench_function("pull_100_rows_via_next_row", |b| {
+        b.iter_batched(
+            || {
+                let mut proto = PgProtocol::new();
+                let mut wb = WriteBuf::new();
+                let _ = proto.push_command(
+                    PgCommand::SimpleQuery {
+                        sql: Sql::from_str_truncating("SELECT x"),
+                        reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+                    },
+                    &mut wb,
+                );
+                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                for _ in 0..N_ROWS {
+                    let _ = proto.bench_append_read_buf(&single_row);
+                }
+                (proto, wb)
+            },
+            |(mut proto, mut wb)| {
+                let mut stream = proto.iter_rows(&mut wb);
+                let mut rows_seen: u32 = 0;
+                while let Some(_row) = stream.next_row() {
+                    rows_seen = rows_seen.saturating_add(1);
+                }
+                assert!(
+                    rows_seen >= N_ROWS,
+                    "next_row bench: expected {N_ROWS}, pulled {rows_seen}",
+                );
+                black_box(rows_seen);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------
 // Bench: push_command Ping isolated.
 // ---------------------------------------------------------------
 //
@@ -314,6 +380,7 @@ criterion_group!(
     bench_parse_header,
     bench_ping_round_trip,
     bench_iter_rows_per_row_throughput,
+    bench_iter_rows_per_row_via_next_row,
     bench_push_ping,
 );
 criterion_main!(benches);
