@@ -379,6 +379,157 @@ impl<'p, 'w> RowStream<'p, 'w> {
         })
     }
 
+    /// DEF-191 (batch consume — perf push 2026-04-27): consume up to
+    /// `N` rows in one call, single cursor advance amortized across
+    /// the batch.
+    ///
+    /// Returns `[Option<Row<'_>>; N]` — each `Some(row)` borrows from
+    /// the stream's protocol read_buf. All rows in a batch share the
+    /// SAME `&self.proto.read_buf` borrow (immutable, disjoint slices
+    /// per row). The borrow checker blocks `&mut self.proto` calls
+    /// while the batch is alive.
+    ///
+    /// # Why faster
+    ///
+    /// - **One cursor advance per batch** vs N (each Result return).
+    /// - **N validations done in tight loop** — LLVM pipelines.
+    /// - **Zero alloc** — stack array of compile-known size.
+    /// - **Zero copy** — each Row borrows directly from read_buf.
+    ///
+    /// # Usage
+    ///
+    /// ```ignore
+    /// loop {
+    ///     let batch: [Option<Row<'_>>; 8] = stream.consume_rows::<8>();
+    ///     let mut yielded = 0;
+    ///     for row in batch.iter().flatten() {
+    ///         process(row.bytes, &row.desc);
+    ///         yielded += 1;
+    ///     }
+    ///     if yielded == 0 { break; }
+    /// }
+    /// ```
+    ///
+    /// Trailing `None`s in the array signal pause (read_buf exhausted
+    /// or non-row frame next). Caller breaks loop on zero-yielded
+    /// batch and falls through to [`Self::next_event`] for terminal
+    /// classification.
+    ///
+    /// # Tier
+    ///
+    /// Tier-1 compile: `[Option<Row<'r>>; N]` where `'r` matches the
+    /// stream's borrow. No unsafe. No alloc. `N` is const-generic
+    /// — LLVM monomorphizes per-N for tight unrolled code.
+    #[inline]
+    pub fn consume_rows<const N: usize>(&mut self) -> [Option<Row<'_>>; N] {
+        // Zero-init array. None is the discriminant=0 of Option<T>;
+        // [None; N] compiles to a memset-zero in release mode.
+        let mut entries: [(u16, u16); N] = [(0, 0); N]; // (start_offset, len) per row
+        let mut yielded: usize = 0;
+
+        if self.drained {
+            return core::array::from_fn(|_| None);
+        }
+
+        // Cache id (set lazily in next_row; reuse here).
+        let id = match self.cached_reply_id {
+            Some(id) => id,
+            None => match self.proto.classify_for_iter_rows() {
+                crate::protocol::IterRowsClass::Streaming(id) => {
+                    self.cached_reply_id = Some(id);
+                    id
+                }
+                _ => return core::array::from_fn(|_| None),
+            },
+        };
+
+        // Phase 1: peek N frames in a tight loop. No mutation —
+        // populated() borrow held throughout.
+        let cursor_u16 = self.proto.read_buf_cursor_u16();
+        let mut consumed_total: u32 = 0;
+        {
+            let populated = self.proto.read_buf_populated();
+            let cursor = usize::from(cursor_u16);
+
+            for slot in entries.iter_mut().take(N) {
+                let absolute = cursor.saturating_add(usize::try_from(consumed_total).unwrap_or(usize::MAX));
+                let after = match populated.get(absolute..) {
+                    Some(s) => s,
+                    None => break,
+                };
+                let (tag, l0, l1, l2, l3) = match after {
+                    [t, a, b, c, d, ..] => (*t, *a, *b, *c, *d),
+                    _ => break,
+                };
+                if tag != b'D' {
+                    break;
+                }
+                let declared = u32::from_be_bytes([l0, l1, l2, l3]);
+                #[expect(clippy::manual_range_contains, reason = "W3 measurement: RangeInclusive::contains regressed parse_header by +70%")]
+                if declared < 4 || declared > crate::frame::MAX_FRAME_LEN_FIELD {
+                    break;
+                }
+                let total = match declared.checked_add(1) {
+                    Some(t) => t,
+                    None => break,
+                };
+                if usize::try_from(total).unwrap_or(usize::MAX) > after.len() {
+                    break;
+                }
+                if total < 7 {
+                    break;
+                }
+                // Body offset/len in u16 — fits READ_BUF_CAP cap.
+                let row_start_abs = match u16::try_from(absolute.saturating_add(crate::frame::HEADER_LEN)) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let body_len = match u16::try_from(usize::try_from(total).unwrap_or(usize::MAX).saturating_sub(crate::frame::HEADER_LEN)) {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                *slot = (row_start_abs, body_len);
+                yielded = yielded.saturating_add(1);
+                consumed_total = consumed_total.saturating_add(total);
+            }
+        } // populated borrow released here
+
+        if yielded == 0 {
+            return core::array::from_fn(|_| None);
+        }
+
+        // Phase 2: single advance for entire batch.
+        let consumed_usize = usize::try_from(consumed_total).unwrap_or(0);
+        if self.proto.read_buf_advance(consumed_usize).is_err() {
+            // Architecturally dead — phase-1 validated bounds.
+            self.drained = true;
+            return core::array::from_fn(|_| None);
+        }
+
+        // Phase 3: materialize Row borrows from now-still-stable populated.
+        // populated content unchanged by advance (only cursor moves).
+        let desc = match self.proto.current_row_desc() {
+            Some(d) => d,
+            None => {
+                self.drained = true;
+                return core::array::from_fn(|_| None);
+            }
+        };
+        let populated = self.proto.read_buf_populated();
+        core::array::from_fn(|i| {
+            if i >= yielded {
+                return None;
+            }
+            let (start, len) = match entries.get(i) {
+                Some(e) => *e,
+                None => return None,
+            };
+            let end = start.saturating_add(len);
+            let bytes = populated.get(usize::from(start)..usize::from(end))?;
+            Some(Row { id, bytes, desc })
+        })
+    }
+
     /// DEF-190: ULTRA-hot path — `(id, bytes)` only.
     ///
     /// Returns `Option<(NonZeroU64, &[u8])>` (24 B vs 32 B for

@@ -414,6 +414,84 @@ fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
+// DEF-191: per-row throughput via `consume_rows::<8>` batch API.
+// Single cursor advance amortized across 8 rows; LLVM unrolls the
+// validation loop. Stack array, zero alloc, zero copy.
+// ---------------------------------------------------------------
+
+fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("iter_rows_via_consume_batch");
+    const N_ROWS: u32 = 100;
+    group.throughput(Throughput::Elements(u64::from(N_ROWS)));
+
+    let rowdesc = {
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'T');
+        let name = b"col\0";
+        let body_len = 2 + name.len() + 18;
+        let total = 4 + body_len;
+        out.extend_from_slice(&(u32::try_from(total).unwrap_or(0)).to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&25u32.to_be_bytes());
+        out.extend_from_slice(&(-1_i16).to_be_bytes());
+        out.extend_from_slice(&(-1_i32).to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out
+    };
+    let single_row = data_row_frame(16);
+
+    group.bench_function("pull_100_rows_via_consume_batch_8", |b| {
+        b.iter_batched(
+            || {
+                let mut proto = PgProtocol::new();
+                let mut wb = WriteBuf::new();
+                let _ = proto.push_command(
+                    PgCommand::SimpleQuery {
+                        sql: Sql::from_str_truncating("SELECT x"),
+                        reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+                    },
+                    &mut wb,
+                );
+                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                for _ in 0..N_ROWS {
+                    let _ = proto.bench_append_read_buf(&single_row);
+                }
+                (proto, wb)
+            },
+            |(mut proto, mut wb)| {
+                let mut stream = proto.iter_rows(&mut wb);
+                let mut rows_seen: u32 = 0;
+                loop {
+                    let batch: [Option<bsql_pg_proto::row_stream::Row<'_>>; 8] =
+                        stream.consume_rows::<8>();
+                    let mut yielded = 0u32;
+                    for row in batch.iter() {
+                        if row.is_some() {
+                            yielded = yielded.saturating_add(1);
+                        }
+                    }
+                    if yielded == 0 {
+                        break;
+                    }
+                    rows_seen = rows_seen.saturating_add(yielded);
+                }
+                assert!(
+                    rows_seen >= N_ROWS,
+                    "consume_batch bench: expected {N_ROWS}, pulled {rows_seen}",
+                );
+                black_box(rows_seen);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------
 // DEF-190: per-row throughput via `for_each_row` closure API.
 // LLVM inlines the closure into the internal pull loop —
 // eliminates per-row function-call boundary.
@@ -515,6 +593,7 @@ criterion_group!(
     bench_iter_rows_per_row_throughput,
     bench_iter_rows_per_row_via_next_row,
     bench_iter_rows_per_row_via_next_row_bytes,
+    bench_iter_rows_via_consume_batch,
     bench_iter_rows_per_row_via_for_each,
     bench_push_ping,
 );
