@@ -144,8 +144,8 @@ pub use action::{
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::{FetchRows, PgCommand};
 pub use decode::{
-    ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, FromPgText, MAX_ROW_COLUMNS,
-    RowDesc, RowDescBorrow, RowDescColumnsIter, oids,
+    ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, FormatCodeSet, FromPgText,
+    MAX_ROW_COLUMNS, OutOfRange, RowDesc, RowDescBorrow, RowDescColumnsIter, oids,
 };
 pub use error::{CrateBugLocus, ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
@@ -402,25 +402,38 @@ const _: () = assert!(
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
 // DEF-189 (architect 2026-04-25): RowDesc moved to single slot;
-// state variants stripped of inline schema; SoA RowDesc layout 164 B
-// (was 264 B). Slot capacity = Option<RowDesc> = 168 B (164 + 1
-// discriminant + padding to alignment).
+// state variants stripped of inline schema. DEF-194 (2026-04-27):
+// bit-packed format_codes shrinks RowDesc 164 → 136 B; Option<RowDesc>
+// 168 → 140 B (exact pin in `decode.rs` const-assert).
+//
+// Cross-platform stance (2026-04-27): exact `==` pin consistent with
+// the rest of the crate (`ProtocolError == 72`, `Action == 88`,
+// `OutActions == 800`, `DispatchOutcome == 88`, `RowDesc == 136`,
+// etc.). Pre-DEF-194 follow-up I tried `5080 ±8 B` range under the
+// "cross-platform alignment cushion" framing — but that was
+// inconsistent with the project pattern AND permitted no-saving
+// regressions silently. Reference target: aarch64-apple-darwin (where
+// CI lives today). When CI matrix extends to x86_64-linux / riscv64 /
+// etc., per-target cfg-gated pins land in the same commit that adds
+// the target — not via permissive ranges. CREDO §3 skepticism: drift
+// surface beats variance cushion every time.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() >= 5000
-        && core::mem::size_of::<protocol::PgProtocol>() <= 5400,
-    "PgProtocol size post-DEF-189 (single row_desc_slot, SoA RowDesc \
-     164 B). \
+    core::mem::size_of::<protocol::PgProtocol>() == 5080,
+    "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf 4096 + state ~64 (post-DEF-189 strip) + \
-     session_params ~420 + row_desc_slot ~168 (Option<SoA RowDesc>) + \
-     error_arena ~290 + malformed_frame_count 4 + padding. \
+     session_params ~420 + row_desc_slot 140 (Option<RowDesc> exact \
+     pin in decode.rs) + error_arena ~290 + malformed_frame_count 4 \
+     + padding to align(8) = 5080 B. \
      \
-     Net change vs DEF-188: -256 (state shrunk from ~320 to ~64), \
-     -100 (terminal_row_desc shrunk from ~268 to ~168 via SoA layout). \
-     Total ~-356 B. Per-row hot-path benefit: SoA layout means \
-     `type_oid(i)` is one u32 read into a sequential array, \
-     cache-friendly for short SELECTs. Wide SELECTs (32 cols) saw \
-     unnecessary 100 B of padding traffic on every state move.",
+     Pre-DEF-194 was 5108 B. -28 B win from FormatCodeSet bit-pack \
+     cascading through Option<RowDesc>. \
+     \
+     Cross-platform: when CI matrix extends to x86_64-linux / riscv64 / \
+     wasm32 etc., either (a) every target lands at 5080 (most likely — \
+     all field types are alignment-stable), or (b) per-target \
+     cfg-gated pins land in the same commit. Permissive ranges are \
+     forbidden — drift surface > variance cushion (CREDO §3 + §4.12).",
 );
 // DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B
 // post-`new_state` extraction. Pre-(B21/C6) each Advanced variant

@@ -612,6 +612,42 @@ impl PgProtocol {
         self.read_buf.append(bytes)
     }
 
+    /// DEF-194 follow-up bench hook — minimal state reset for
+    /// amortised push-path benches. Snaps `state` to `Idle` without
+    /// firing zeroize-on-Drop on the buffers (push paths never
+    /// touch `read_buf`; `write_buf` is caller-owned and reset via
+    /// `WriteBuf::clear()` separately).
+    ///
+    /// # Feature-gated: `bench-hooks` (same surface gate as
+    /// [`Self::bench_append_read_buf`]).
+    ///
+    /// # NOT a production API
+    ///
+    /// Discards in-flight reply correlators (the previous state
+    /// variant's `ReplyId<K>`) without firing `FailReply` — production
+    /// would surface a classified error. Exists solely to amortise
+    /// the per-iter `PgProtocol::new()` + matched `Drop` cost (the
+    /// latter zeroizes 4 KB of `ReadBuf` + adjacent buffers under
+    /// DEF-185 P0-B/P0-C zeroize-on-Drop, which dominates bench
+    /// closures that re-create the protocol per iteration).
+    ///
+    /// Production hot-path economics: `PgProtocol` lives a connection
+    /// lifetime; Drop fires once at connection close, not per query.
+    /// This hook lets the bench measure the production-relevant
+    /// per-query cost without amortising-fixture artefacts.
+    #[cfg(feature = "bench-hooks")]
+    #[doc(hidden)]
+    pub fn reset_for_bench(&mut self) {
+        // Overwrite state in place. The dropped value is whatever
+        // variant was active (e.g. `PingAwaitingRfq(reply_id)`);
+        // ReplyId<K> is POD Copy with no Drop (DEF-154 K), so the
+        // implicit Drop on overwrite is a no-op.
+        self.state = ProtoState::Idle;
+        // read_buf intentionally NOT cleared — push paths never
+        // touch it, and clearing would zeroize 4 KB on each iter
+        // exit (defeating the amortisation purpose).
+    }
+
     /// Construct a new protocol in [`ProtoState::Idle`].
     ///
     /// **Note:** Phase 1a starts in `Idle` directly. The startup +

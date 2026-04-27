@@ -569,6 +569,10 @@ fn bench_push_ping(c: &mut Criterion) {
     let mut group = c.benchmark_group("push_command");
     group.throughput(Throughput::Elements(1));
 
+    // Original: full-cycle push (allocate proto + wb, push, drop).
+    // Includes zeroize-on-Drop cost from DEF-185 P0-B/P0-C
+    // (WriteBuf zeroize 4 KB + ReadBuf zeroize 4 KB on Drop).
+    // Production parallel: connection lifetime.
     group.bench_function("ping", |b| {
         b.iter(|| {
             let mut proto = PgProtocol::new();
@@ -580,6 +584,48 @@ fn bench_push_ping(c: &mut Criterion) {
                 &mut wb,
             );
             black_box(out);
+        });
+    });
+
+    // DEF-194 follow-up (2026-04-27): amortised push_command —
+    // measures the PUSH PATH ONLY, excluding PgProtocol::new() +
+    // WriteBuf::new() construction and the matched Drop sequence
+    // (which under DEF-185 P0-B/P0-C zeroize 8 KB of buffers on
+    // every iter exit — ~10-20 ns of pure memset cost on the
+    // measurement path that doesn't reflect production hot-path
+    // economics, where PgProtocol lives a connection lifetime).
+    //
+    // Setup (not timed): create one PgProtocol + WriteBuf.
+    // Timed: push_command + the matching state reset (write_buf
+    // clear + protocol reset to Idle) so subsequent iters start
+    // from a clean state. The reset is cheap (small clear + state
+    // overwrite); the dominating cost is the push path itself.
+    //
+    // Expected: ~98-105 ns (close to DEF-189 baseline 98.6 ns
+    // for push_command/ping post-DEF-189). Confirms whether
+    // perceived "+10% regression vs def184-complete" is
+    // (a) DEF-185 zeroize-on-Drop bench harness artefact, or
+    // (b) real push-path regression.
+    group.bench_function("ping_amortised", |b| {
+        let mut proto = PgProtocol::new();
+        let mut wb = WriteBuf::new();
+        b.iter(|| {
+            let out = proto.push_command(
+                PgCommand::Ping {
+                    reply: reply_id_ping(1),
+                },
+                &mut wb,
+            );
+            black_box(out);
+            // Reset between iters so push_command sees a clean
+            // Idle state. push_command on PingAwaitingRfq fails
+            // with FailReply — would skew the measurement.
+            // `reset_for_bench` is a `#[cfg(feature = "bench-hooks")]`
+            // helper that drops the in-flight state without firing
+            // FailReply (the bench is measuring the push path, not
+            // the failure path).
+            proto.reset_for_bench();
+            wb.clear();
         });
     });
 

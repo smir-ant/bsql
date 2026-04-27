@@ -74,6 +74,60 @@ done. Remaining:
 | DEF-165 | `ParamOids::n_params` u16→u8 | Trivial; bundle with future small-wins session |
 | DEF-166 | `PodBytes<N>` visibility `pub → pub(crate)` | Via state-field privatize; pairs with B5 |
 
+### Layout / perf wave (2026-04-27 audit)
+
+**Origin:** user-driven audit 2026-04-27 — confronted the DEF-190/191 RowStream
+wins with the observation that they're pre-decoder gains and don't address the
+real measurable hot-path (per-column decode), wire-I/O dominance on RTT, or
+the 720 B of cold-path inline footprint in `PgProtocol`. **All ten items below
+ship under §1 priority pyramid (safety → tier → perf), each measurement-gated
+per CREDO §4.12. NONE deferred without structural reason.**
+
+| DEF | Item | Tier delta | Expected win | Status |
+|-----|------|-----------|--------------|--------|
+| DEF-195 | `BoundedU8<MAX>` newtype + apply to `RowDesc::n_columns` (u16 → BoundedU8<32>) | Tier-2 (rejected at construct) → niche `Option<RowDesc>` | 1 B + alignment per Option | PROPOSED |
+| DEF-196 | `Box<ColdFields { session_params, error_arena }>` — externalise cold path | Tier-2 (`Option<Box>` niche) | Hot `PgProtocol` ~5400 → ~4680 B (−720 B) | PROPOSED |
+| DEF-197 | `DataRowRef::parse` MVP + per-column `column_decode_*` criterion benches | Tier-1 monomorph (sealed `PgDecode<T>`) | Closes largest measurement blind spot | PROPOSED |
+| DEF-198 | Witness-guard typestate (DEF-119 round-4): `proto.as_ready()` → `Option<ReadyGuard<'_>>`; `push_command` is method of guard | Tier-1 ("cannot push without phase proof") | Foundation for pipelining | PROPOSED |
+| DEF-199 | `READ_BUF_CAP` const generic (`PgProtocol<const N: usize = 4096>`) + bench 4 K vs 64 K vs 256 K | Tier-1 (caller chooses) | Fewer socket round-trips on large frames | PROPOSED |
+| DEF-200 | Per-state-bucket dispatch LUTs — A7 adjacent shape (split global tag dispatch into `[fn; 14]` per bucket) | Same tier | Branch-predictor learns smaller patterns | PROPOSED, measurement-gated |
+| DEF-201 | `PgCommand` per-kind monomorphisation: `trait PgCommandT { const TAG; type Payload }` + generic `push_command<C: PgCommandT>` | Tier-1 (typed dispatch) | Caller pays only HIS command size; current 2176 B per-command → real size | PROPOSED, **design discussion required** before impl |
+| DEF-202 | `simdutf8` dep + binary codec (`i32::from_be_bytes` vs `str::parse`) | Same tier (deps already RustCrypto-class) | Text validation 15-30× faster; binary i32 decode 15× faster than text | PROPOSED, pairs with DEF-197 |
+| DEF-203 | Exhaustive niche audit sweep (`OtherEncoding::len`, `FixedStr::len` narrowing, `BoundedStr<N>` cap-niche, `Option<BoundedU8<N>>` over public types) | Tier-2 (compile-rejected ranges) | Cumulative — each site 1-4 B + alignment shifts | PROPOSED |
+| DEF-204 | **Zero-cost zeroize redesign** — DEF-185 P0-B/P0-C currently zeroizes ReadBuf+WriteBuf full capacity (~8 KB) on every clear()/Drop. CREDO §4.1: "Если видится trade-off между safety и performance — дизайн неверен, искать альтернативу." Targeted-zeroize architecture: zero zeroize-on-Drop for non-secret paths; explicit zeroize ONLY at SCRAM dispatch points (server salt parse, server signature verify, client proof emit). Three approaches under consideration: (a) per-frame zeroize after consumption in dispatch.rs, (b) `had_secret: bool` flag on buffers gating the scrub, (c) dedicated `SecretBuf` type for SCRAM crypto. | Tier-2 structural via SCRAM-aware zeroize. | Per-query zeroize cost = 0 ns (hot path). Per-SCRAM-handshake zeroize ~30-150 B (vs current 8 KB always). bench harness `push_command/ping` will drop ~50 ns. | PROPOSED, **architectural design first** (≥3 alternatives, audit secret data flow, per architect.txt process) |
+
+**Priority order (§1):**
+1. **Safety / measurement gap closure first:** DEF-197 (no decoder + no decoder bench = unmeasured class).
+2. **Tier elevation:** DEF-198 (witness-guard typestate — pipelining tier-1 foundation).
+3. **Zero-cost wins:** DEF-194 → DEF-195 → DEF-196 → DEF-203 (smallest scope first to build measurement confidence; DEF-196 is the largest single hot-path footprint cut).
+4. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
+5. **Adjacent-shape re-attempts of measured-rejected forms:** DEF-200 (A7 was global LUT — A7-adjacent per-state buckets remain open).
+6. **Binary codec foundation:** DEF-202 lands when DEF-197 needs it.
+
+**Cross-platform CI matrix** (project-wide concern):
+
+All current size pins (`ProtocolError == 72`, `Action == 88`, `OutActions == 800`, `DispatchOutcome == 88`, `RowDesc == 136`, `Option<RowDesc> == 140`, `PgProtocol == 5080`, etc.) are **exact `==`** and reference target = **aarch64-apple-darwin**. The crate doesn't currently ship CI for x86_64-linux / riscv64 / wasm32 / windows / freebsd. When CI matrix extends, two outcomes are possible per pin:
+
+1. **All targets converge** — the field types are alignment-stable across the targets in scope, so a single `==` pin works everywhere (most likely for POD-only structs like RowDesc, ProtocolError).
+2. **Targets diverge** — per-target `#[cfg(target_pointer_width = "64")] const _: ...` blocks, set in the same commit that adds the target to CI.
+
+**Forbidden**: permissive range pins as a "cushion for variance we haven't measured". CREDO §3 + §4.12: drift surface > variance cushion; silent regression beats explicit per-target pin. If a single value works everywhere, single `==` is correct. If targets diverge, list them all explicitly.
+
+**Crazy / bold ideas pool** (not committed work — registered to prevent loss):
+
+- **Compile-time precomputed message bytes** for ALL parameterless commands (extend `SYNC_WIRE_BYTES` pattern to `TERMINATE_WIRE_BYTES`, `FLUSH_WIRE_BYTES`, default `DESCRIBE_PORTAL`). Tier-1 static dispatch.
+- **`ReadBuf` ringbuffer rewrite** (DEF-058): lazy-compaction `advance()` becomes wraparound. 3-10× win on large frames; complicates `&[u8]` → `(&[u8], &[u8])` slice surface. Spike via `[T]::as_chunks` API (stable 1.95+).
+- **`#[inline(always)]` audit on hot path** — verify all `feed_bytes` / `push_command` callees inline via `cargo asm`. May expose under-tuned hints.
+- **`core::hint::cold_path()` audit** — DEF-185 sprinkled cold hints; sweep for missed call sites in `if let Err(_) = …` patterns on hot path.
+- **`feed_bytes_into(&mut self, &[u8], &mut OutActions, &mut WriteBuf)`** — caller provides OutActions buffer, no allocation inside. DEF-190/191 partially via `RowStream`; extend to all hot paths. Saves 800 B stack zero-init per call.
+- **Stmt cache (DEF-035 prepared statement LRU)** — Phase 1c. Massive cache-hit win on repeated queries (compile-time stmt name → server-side cache key).
+- **Sub-frame prefetch hint** — `core::intrinsics::prefetch_read_data` is unstable + requires unsafe. Closed for stable + forbid(unsafe). Track if stable form lands.
+- **`MaybeUninit<T>` for cold fields** — skip `Default::default()` cost. Closed: requires `unsafe { assume_init_ref }`.
+- **Fanout-2 amortisation** — per-call OutActions cap is 9 (8 staged + 1 fanout). Reach for `MAX_FANOUT2 = 0` cap if no path needs > 1 action per arm. Audit each arm; potentially tighten cap → smaller OutActions footprint.
+- **Vectored write via `IoSlice<'a>`** — Phase 1e wrapper concern. Track for handoff.
+- **`PgProtocol<const ENABLE_DIAGNOSTICS: bool>`** — embedded targets compile diagnostic counters off (saturating drops, adversarial-flood guards). Production servers compile diagnostics on. Pair with DEF-199 const generic refactor.
+- **Pipelining via scope-bracket Drop** — `proto.pipeline(|p| { p.push_parse; p.push_bind; p.push_execute; })` auto-inserts Sync at scope end via Drop. Linear-style discipline through `#[must_use]` + RAII (paired with DEF-198 witness-guard).
+
 ---
 
 ## §B. Measurement-rejected (DO NOT retry without evidence)
@@ -200,6 +254,7 @@ Full detail in git log; this is just a navigation aid.
 - DEF-144..DEF-154: Phase α/β audit batch (parse_header, StatePushClass, FrameCoords narrow, SchemaRef shape, transition_to_errored, InternalCrateBug locus, size pins, SessionParams counter)
 - DEF-154 (A-Y): buffer-witness pattern + branded write/read scopes + build-time infallibility + RowStream pull API + Action::StreamRow deletion. Full cascade across multiple sessions.
 - DEF-163..DEF-187: Phase α2, γ ship, deferred sub-phases. DEF-163 PARTIAL (see §A).
+- **DEF-194**: `RowDesc::format_codes` bit-pack `[FormatCode; 32]` → `FormatCodeSet(u32)`. RowDesc 164→136 B exact; Option<RowDesc> 168→140 B exact; PgProtocol 5108→5080 B exact (−28 B). 330+ tier-1 const-asserts (round-trip 32×5×2 + OOR field preservation 3×4 + raw_bits 7 patterns + boundary + independence + size pins). `Default` derive removed (tier-1 by elimination). 7 redundant runtime tests removed; 2 tier-3 retained with structural reason; 1 wide-row integration test added. Production push (amortised) = 64.5 ns. SHIPPED 2026-04-27.
 
 ### DEF-184 (post-Y comprehensive audit)
 Shipped batches (commit-anchored):
@@ -416,6 +471,94 @@ pass via `--ignored`. Total 256 test outcomes green.
 ---
 
 ## §E. Session log — last 3 sessions (compact)
+
+### 2026-04-27 — Layout/perf wave registered + DEF-194 shipped + DEF-204 found
+
+User-driven audit confronted the DEF-190/191 wins as pre-decoder gains
+that don't address the real measurable hot-path. Outcome: **11 new DEF
+items registered** (DEF-194..DEF-204 — see §A "Layout / perf wave"
+subsection) + crazy-ideas pool kept inline so future sessions don't
+lose strategic options.
+
+**DEF-194 shipped end-to-end (multi-pass tier-1 audit + glass-arch closure):**
+
+Pass 1 — bit-pack: `[FormatCode; 32]` (32 B) → `FormatCodeSet(u32)`
+(4 B). RowDesc 164 → 136 B exact pin. Initial range pin
+`PgProtocol [4960, 5400]` shipped on first attempt.
+
+Pass 2 — tier elevation challenge from user ("посмотри может всё же
+можно что-то гарантировать"): `set` / `get` / `mask_for_const`
+promoted to `const fn` (Rust 1.83+ const_mut_refs; RU-01 worked
+around via repeated `wrapping_mul(2)` instead of non-const
+`u32::try_from(usize)` shift count). 320 round-trip + boundary +
+independence const-asserts pin every (idx ∈ 0..32, code ∈
+{Text, Binary}) combination at compile time.
+
+Pass 3 — glass-arch challenge from user ("стеклянная архитектура,
+теория работает, на деле паника"): exact size pins added for
+`Option<RowDesc> == 140` (was unpinned), tightened `PgProtocol`
+range → exact. Wide-row 32-column alternating-format integration
+test added (closes max-input edge: bit ordering, all 32 bits
+independent, bit-31 boundary).
+
+Pass 4 — second tier-1 challenge ("есть четкое ощущение что всё же
+возможно"): `Default` derive **removed** entirely (zero production
+consumers — tier-1 by elimination of `default()` surface). 2 more
+tier-3 tests removed by promotion: `OutOfRange.idx/.max` field
+preservation pin (3 cases × 4 properties) + `raw_bits` round-trip
+pin (7 patterns). Total 330+ const-asserted properties.
+
+Pass 5 — cross-platform challenge from user ("безусловно
+кроссплатформенным, что risc-v, что apple m, что x86_64, что
+windows"): `PgProtocol` range pin replaced with exact `== 5080`
+consistent with crate prior art (`ProtocolError == 72`, `Action ==
+88`, etc. — all exact). Cross-platform CI matrix policy
+documented as project-wide concern: per-target cfg-gated pins
+when CI extends, **not** permissive ranges.
+
+Net DEF-194: **−28 B per PgProtocol exact** (5108 → 5080); **330+
+tier-1 const-asserts** validated at compile; **7 redundant runtime
+tests removed** + **2 tier-3 retained with structural reason**
+(`fmt::Write` not const; parser uses heapless::Vec) + **1 wide-row
+integration test added**. 92 lib tests + 14 integration suites
+green; clippy clean.
+
+**DEF-204 registered (zero-cost zeroize redesign):**
+
+User challenge ("нужен zero-cost вариант, я уверен что он тут
+доступен и возможен") flagged DEF-185 P0-B/P0-C as
+CREDO §4.1 violation: the always-on full-capacity zeroize on
+`ReadBuf` + `WriteBuf` `clear()` / `Drop` is a perf-vs-safety
+trade-off where the design IS a trade-off. Targeted-zeroize
+architecture — zero zeroize on non-secret paths, explicit zeroize
+ONLY at SCRAM dispatch points — closes the trade-off. Three
+alternatives registered for architectural design pass before code:
+(a) per-frame zeroize after SCRAM body consumption in dispatch.rs,
+(b) `had_secret: bool` flag on buffers gating the scrub, (c)
+dedicated `SecretBuf` type for SCRAM crypto. Per-query cost = 0 ns
+on hot path; per-SCRAM-handshake zeroize ~30-150 B (vs current
+8 KB always); bench harness `push_command/ping` will drop ~25 ns.
+
+**Bench methodology lessons:**
+
+`b.iter(|| { let mut proto = PgProtocol::new(); ... })` measures
+**connection-lifecycle cost per iter**, not **per-query cost**.
+Production reuses one `PgProtocol` per connection across thousands
+of queries; Drop fires once at connection close. Added
+`push_command/ping_amortised` bench with `reset_for_bench()` hook
+(under `#[cfg(feature = "bench-hooks")]`) reusing `PgProtocol`
+across iters — gives accurate per-query number. Pattern: every
+hot-path bench should land in BOTH forms (full-cycle for
+connection-lifecycle cost, amortised for steady-state hot-path).
+
+**Cross-platform CI matrix:**
+
+Documented as project-wide concern. All current size pins are
+exact `==` referencing aarch64-apple-darwin. When CI extends to
+x86_64-linux / riscv64 / wasm32 / windows / freebsd, either single
+`==` works everywhere (most likely for POD-only structs) or
+per-target `cfg`-gated pins land in the same commit. Permissive
+ranges forbidden (drift surface > variance cushion).
 
 ### 2026-04-24 — DEF-186 perf-recovery
 - Bench-replay против `def184-complete` baseline выявил регрессии

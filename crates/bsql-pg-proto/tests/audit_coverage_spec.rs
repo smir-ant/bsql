@@ -397,3 +397,4 @@ fn data_row_too_short_for_column_count_is_rejected() {
     // The real rejection test would need a full RowStream setup;
     // the unit-level header-parse acceptance is documented.
 }
+
