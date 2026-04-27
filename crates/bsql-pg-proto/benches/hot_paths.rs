@@ -632,6 +632,261 @@ fn bench_push_ping(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------
+// DEF-197: per-column decode hot path.
+// ---------------------------------------------------------------
+//
+// Closes the largest measurement blind spot in the crate: the
+// per-column decode cost on row consumption. Pre-DEF-197 the bench
+// suite measured frame parse, dispatch, RowStream emission, and
+// `push_command` paths — but ZERO benches covered what happens
+// AFTER `RowStream::next_row_bytes` hands raw row bytes to the
+// caller: `DataRowRef::parse` (column-count header parse),
+// `ColumnsIter` per-column length-prefix walk, and
+// `FromPgText::from_pg_text` typed decoding.
+//
+// User context: real per-row latency on row-bearing responses is
+// dominated by per-column work (parse + iterate + decode), not
+// frame dispatch. DEF-197 lands the measurement infrastructure so
+// subsequent perf claims on decoder optimisations (DEF-200 LUT
+// dispatch, DEF-202 `simdutf8` text validation, DEF-203 niche
+// tightening) are evidence-backed per CREDO §4.12.
+//
+// # Bench shape
+//
+// Each bench parses a synthetic DataRow body (post-frame-header,
+// post-frame-length-prefix bytes) and walks all columns. Bodies are
+// pre-built in setup so the bench measures only the parse +
+// iteration + decode work, not the body-construction cost.
+//
+// Production analog: each iter measures the work the user pays per
+// row on a SELECT response. RowStream's frame-dispatch + emission
+// cost is covered by `iter_rows_via_next_row_bytes` (separate bench);
+// these benches focus on what happens AFTER `next_row_bytes` returns
+// raw bytes and the user calls `DataRowRef::parse(bytes)`.
+
+/// Build a synthetic DataRow body with `n_cols` columns of i32 values.
+///
+/// Wire shape (post-header, what `RowStream::next_row_bytes` returns):
+///   int16 n_cols (BE)
+///   for each col: int32 col_len (BE) + col_len bytes (text "value\0"
+///                 — actually no NUL, just the digits as ASCII)
+fn data_row_body_int4(n_cols: u16, value: i32) -> alloc::vec::Vec<u8> {
+    let value_str = alloc::format!("{value}");
+    let value_bytes = value_str.as_bytes();
+    let col_len: i32 = i32::try_from(value_bytes.len()).unwrap_or(0);
+    let mut body = alloc::vec::Vec::with_capacity(
+        2 + usize::from(n_cols) * (4 + value_bytes.len()),
+    );
+    body.extend_from_slice(&n_cols.to_be_bytes());
+    for _ in 0..n_cols {
+        body.extend_from_slice(&col_len.to_be_bytes());
+        body.extend_from_slice(value_bytes);
+    }
+    body
+}
+
+/// Build a synthetic DataRow body with `n_cols` columns of fixed-len text.
+fn data_row_body_text(n_cols: u16, text: &str) -> alloc::vec::Vec<u8> {
+    let bytes = text.as_bytes();
+    let col_len: i32 = i32::try_from(bytes.len()).unwrap_or(0);
+    let mut body = alloc::vec::Vec::with_capacity(
+        2 + usize::from(n_cols) * (4 + bytes.len()),
+    );
+    body.extend_from_slice(&n_cols.to_be_bytes());
+    for _ in 0..n_cols {
+        body.extend_from_slice(&col_len.to_be_bytes());
+        body.extend_from_slice(bytes);
+    }
+    body
+}
+
+/// Build a DataRow body alternating non-null and SQL NULL columns.
+/// `n_value_cols` value columns interleaved with `n_value_cols` NULL
+/// columns, totalling `2 * n_value_cols` columns. Tests the NULL
+/// fast-path in ColumnsIter (col_len = -1 signals NULL, no data
+/// bytes).
+fn data_row_body_alternating_null(n_value_cols: u16, value: i32) -> alloc::vec::Vec<u8> {
+    let value_str = alloc::format!("{value}");
+    let value_bytes = value_str.as_bytes();
+    let col_len: i32 = i32::try_from(value_bytes.len()).unwrap_or(0);
+    let total_cols: u16 = n_value_cols.saturating_mul(2);
+    let mut body = alloc::vec::Vec::with_capacity(
+        2 + usize::from(n_value_cols) * (4 + value_bytes.len()) + usize::from(n_value_cols) * 4,
+    );
+    body.extend_from_slice(&total_cols.to_be_bytes());
+    for _ in 0..n_value_cols {
+        // Value column
+        body.extend_from_slice(&col_len.to_be_bytes());
+        body.extend_from_slice(value_bytes);
+        // NULL column (col_len = -1, no data)
+        body.extend_from_slice(&(-1_i32).to_be_bytes());
+    }
+    body
+}
+
+/// Bench: pure `DataRowRef::parse` cost — parse the column-count
+/// header from the body bytes. No iteration, no decode. Lower bound
+/// on per-row parse cost.
+fn bench_data_row_parse(c: &mut Criterion) {
+    use bsql_pg_proto::decode::DataRowRef;
+
+    let mut group = c.benchmark_group("column_decode");
+    group.throughput(Throughput::Elements(1));
+
+    let body = data_row_body_int4(5, 42);
+
+    group.bench_function("data_row_parse_5cols", |b| {
+        b.iter(|| {
+            let row = DataRowRef::parse(black_box(&body));
+            let _ = black_box(row);
+        });
+    });
+
+    group.finish();
+}
+
+/// Bench: `DataRowRef::parse` + `ColumnsIter` walk WITHOUT typed
+/// decode. Measures the per-column length-prefix walk + slice
+/// returns. Subtract this from the typed-decode benches below to
+/// isolate the FromPgText decode cost.
+fn bench_iter_columns_raw(c: &mut Criterion) {
+    use bsql_pg_proto::decode::DataRowRef;
+
+    let mut group = c.benchmark_group("column_decode");
+    const N_COLS: u16 = 5;
+    group.throughput(Throughput::Elements(u64::from(N_COLS)));
+
+    let body = data_row_body_int4(N_COLS, 42);
+
+    group.bench_function("iter_5cols_raw_no_decode", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut sum_len: usize = 0;
+            for col in row.columns() {
+                if let Ok(Some(bytes)) = col {
+                    sum_len = sum_len.saturating_add(bytes.len());
+                }
+            }
+            black_box(sum_len);
+        });
+    });
+
+    group.finish();
+}
+
+/// Bench: full per-column decode for 5 i32 columns via
+/// `FromPgText`. Production-relevant cost on `SELECT id, ... FROM ...`
+/// queries with integer columns.
+fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
+    use bsql_pg_proto::decode::{DataRowRef, FromPgText};
+
+    let mut group = c.benchmark_group("column_decode");
+    const N_COLS: u16 = 5;
+    group.throughput(Throughput::Elements(u64::from(N_COLS)));
+
+    let body = data_row_body_int4(N_COLS, 42_000_000);
+
+    group.bench_function("iter_5cols_decode_i32", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut sum: i64 = 0;
+            for col in row.columns() {
+                if let Ok(Some(bytes)) = col {
+                    if let Ok(v) = i32::from_pg_text(bytes) {
+                        sum = sum.saturating_add(i64::from(v));
+                    }
+                }
+            }
+            black_box(sum);
+        });
+    });
+
+    group.finish();
+}
+
+/// Bench: per-column decode for 5 text columns. UTF-8 validation
+/// dominates — the production bottleneck future `simdutf8` (DEF-202)
+/// will target.
+fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
+    use bsql_pg_proto::decode::{DataRowRef, FromPgText};
+
+    let mut group = c.benchmark_group("column_decode");
+    const N_COLS: u16 = 5;
+    group.throughput(Throughput::Elements(u64::from(N_COLS)));
+
+    // Realistic-length text: typical name / short description.
+    let body = data_row_body_text(N_COLS, "alice@example.com");
+
+    group.bench_function("iter_5cols_decode_text", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut total_chars: usize = 0;
+            for col in row.columns() {
+                if let Ok(Some(bytes)) = col {
+                    if let Ok(s) = <&str>::from_pg_text(bytes) {
+                        total_chars = total_chars.saturating_add(s.len());
+                    }
+                }
+            }
+            black_box(total_chars);
+        });
+    });
+
+    group.finish();
+}
+
+/// Bench: alternating NULL / non-NULL columns. Exercises the
+/// `col_len == -1` shortcut path in `ColumnsIter::next` (DEF-184
+/// A5/B10 sign-path collapse).
+fn bench_iter_columns_with_nulls(c: &mut Criterion) {
+    use bsql_pg_proto::decode::{DataRowRef, FromPgText};
+
+    let mut group = c.benchmark_group("column_decode");
+    // 5 value cols + 5 null cols = 10 total
+    const N_VALUE: u16 = 5;
+    const N_TOTAL: u16 = N_VALUE * 2;
+    group.throughput(Throughput::Elements(u64::from(N_TOTAL)));
+
+    let body = data_row_body_alternating_null(N_VALUE, 42_000_000);
+
+    group.bench_function("iter_10cols_alternating_null_i32", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut sum: i64 = 0;
+            let mut nulls: u32 = 0;
+            for col in row.columns() {
+                match col {
+                    Ok(Some(bytes)) => {
+                        if let Ok(v) = i32::from_pg_text(bytes) {
+                            sum = sum.saturating_add(i64::from(v));
+                        }
+                    }
+                    Ok(None) => {
+                        nulls = nulls.saturating_add(1);
+                    }
+                    Err(_) => break,
+                }
+            }
+            black_box((sum, nulls));
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse_header,
@@ -642,6 +897,12 @@ criterion_group!(
     bench_iter_rows_via_consume_batch,
     bench_iter_rows_per_row_via_for_each,
     bench_push_ping,
+    // DEF-197: column decode measurement infra.
+    bench_data_row_parse,
+    bench_iter_columns_raw,
+    bench_iter_columns_5x_int4_decode,
+    bench_iter_columns_5x_text_decode,
+    bench_iter_columns_with_nulls,
 );
 criterion_main!(benches);
 
