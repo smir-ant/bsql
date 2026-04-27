@@ -86,7 +86,6 @@ per CREDO §4.12. NONE deferred without structural reason.**
 | DEF | Item | Tier delta | Expected win | Status |
 |-----|------|-----------|--------------|--------|
 | DEF-195 | `BoundedU8<MAX>` newtype + apply to `RowDesc::n_columns` (u16 → BoundedU8<32>) | Tier-2 (rejected at construct) → niche `Option<RowDesc>` | 1 B + alignment per Option | PROPOSED |
-| DEF-197 | `DataRowRef::parse` MVP + per-column `column_decode_*` criterion benches | Tier-1 monomorph (sealed `PgDecode<T>`) | Closes largest measurement blind spot | PROPOSED |
 | DEF-198 | Witness-guard typestate (DEF-119 round-4): `proto.as_ready()` → `Option<ReadyGuard<'_>>`; `push_command` is method of guard | Tier-1 ("cannot push without phase proof") | Foundation for pipelining | PROPOSED |
 | DEF-199 | `READ_BUF_CAP` const generic (`PgProtocol<const N: usize = 4096>`) + bench 4 K vs 64 K vs 256 K | Tier-1 (caller chooses) | Fewer socket round-trips on large frames | PROPOSED |
 | DEF-200 | Per-state-bucket dispatch LUTs — A7 adjacent shape (split global tag dispatch into `[fn; 14]` per bucket) | Same tier | Branch-predictor learns smaller patterns | PROPOSED, measurement-gated |
@@ -95,19 +94,18 @@ per CREDO §4.12. NONE deferred without structural reason.**
 | DEF-203 | Exhaustive niche audit sweep (`OtherEncoding::len`, `FixedStr::len` narrowing, `BoundedStr<N>` cap-niche, `Option<BoundedU8<N>>` over public types) | Tier-2 (compile-rejected ranges) | Cumulative — each site 1-4 B + alignment shifts | PROPOSED |
 | DEF-206 | **Box\<PodBytes\<N\>\> heap-scrub gap** — surfaced by DEF-205 step 4 audit. SCRAM state variants `ConnectingScramAwaitingServerFirst` carry `client_first_bare: Box<PodBytes<128>>` and `client_nonce_b64: Box<PodBytes<48>>`. `PodBytes<N>` is `Copy` POD without `Drop`, so when the `Box` deallocates, heap memory is freed but bytes are NOT scrubbed. Severity LOW — content is SCRAM `client-first-message` (username + client nonce), all sent unencrypted on the wire (not actual secrets). Fix: `SecretPodBytes<N>` type parallel to `PodBytes<N>` with `ZeroizeOnDrop` derive; SCRAM variants migrated. Tier-1 by Drop chain via Box's drop firing the SecretPodBytes Drop. Defer until handshake-state scope work (Phase 1c-5+ pipelining). | Tier-3 by-audit → tier-1 via SecretPodBytes wrapper. | Security closure (low severity) — heap bytes scrubbed before free. ~60-80 LoC: SecretPodBytes type + 2 state field migrations + memory-probe test. | PROPOSED, low priority (LOW severity) |
 
-**Priority order (§1) — REVISED 2026-04-28 after DEF-196 ship:**
-1. **Measurement gap closure:** DEF-197 (no decoder + no decoder bench = unmeasured class — enables future ship-with-evidence on decoder optimisations).
+**Priority order (§1) — REVISED 2026-04-28 after DEF-197 ship:**
+1. **Decoder perf wins (now bench-gated):** DEF-202 (simdutf8 text validate — ~7.2 ns/col UTF-8 walk is the hot bottleneck per DEF-197 baseline; simdutf8 5-10× on x86/aarch64) and/or DEF-200 (per-state dispatch LUT — A7 adjacent shape).
 2. **Tier elevation foundation:** DEF-198 (witness-guard typestate — pipelining tier-1).
-3. **Zero-cost micro-wins:** DEF-195 → DEF-203 (small scope; DEF-194/196 already shipped).
+3. **Architectural enabler:** DEF-199 (READ_BUF_CAP const generic — fewer syscalls on large frames).
 4. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
-5. **Adjacent-shape re-attempts of measured-rejected forms:** DEF-200 (A7 was global LUT — A7-adjacent per-state buckets remain open).
-6. **Architectural enabler:** DEF-199 (READ_BUF_CAP const generic — enables socket I/O tuning).
-7. **Binary codec foundation:** DEF-202 lands when DEF-197 needs it.
-8. **Low-severity heap scrub:** DEF-206 (Box<PodBytes> SCRAM client-message scrub — wire-public bytes, low priority).
+5. **Zero-cost micro-wins:** DEF-195 / DEF-203 (small scope).
+6. **Low-severity heap scrub:** DEF-206 (Box<PodBytes> SCRAM client-message scrub — wire-public bytes, low priority).
 
-(DEF-194 + DEF-196 + DEF-204 + DEF-205 all closed — bit-pack +
-cold field box + staleness pattern via Drop chain closure done.
-Per CREDO §1: safety > perf; security closures shipped first.)
+(DEF-194 + DEF-196 + DEF-197 + DEF-204 + DEF-205 all closed —
+bit-pack + cold field externalization + staleness via Drop chain
+closure + decoder bench infra. Per CREDO §1: safety > perf;
+security closures shipped first.)
 
 **Cross-platform CI matrix** (project-wide concern):
 
@@ -262,6 +260,7 @@ Full detail in git log; this is just a navigation aid.
 - **DEF-194**: `RowDesc::format_codes` bit-pack `[FormatCode; 32]` → `FormatCodeSet(u32)`. RowDesc 164→136 B exact; Option<RowDesc> 168→140 B exact; PgProtocol 5108→5080 B exact (−28 B). 330+ tier-1 const-asserts (round-trip 32×5×2 + OOR field preservation 3×4 + raw_bits 7 patterns + boundary + independence + size pins). `Default` derive removed (tier-1 by elimination). 7 redundant runtime tests removed; 2 tier-3 retained with structural reason; 1 wide-row integration test added. Production push (amortised) = 64.5 ns. SHIPPED 2026-04-27.
 - **DEF-205**: Broader staleness pattern closure via `SecretBoundedStr<N>` (non-Copy, ZeroizeOnDrop). Tier-1 by Drop chain (compiler-enforced) closes 2 sites: `ErrorArena::clear()` and `SessionParams::clear()` — old payload bytes scrubbed by Drop before discriminant flip / struct overwrite. 4 commits (e8934b0 foundation, 210890c ErrorPayload, 62df843 SessionParams, ebaff0d step-4 audit). Memory-probe tests per site (sister to DEF-185 P3-1 / DEF-204 prior art). Step 4 audit confirmed `mem::replace(state, ...)` SCRAM variant secret-bearing fields all heap-allocated with ZeroizeOnDrop chain (Box<ScramSession>, Sensitive<i32>, SecretDigest); padding bytes in state's storage region after `mem::replace` is compiler-dependent (documented gap, same class as `panic = "abort"` Cargo.toml limitation). Box<PodBytes<N>> heap-scrub gap registered as DEF-206 (LOW severity — username/nonce bytes, public-on-wire). SHIPPED 2026-04-27.
 - **DEF-196**: Cold-field externalization. Three independent lazy slots in `PgProtocol`: `session_params: Option<Box<SessionParams>>`, `error_arena: Option<Box<ErrorArena>>`, `malformed_frame_count: u32` (inline). PgProtocol **5080 B → 4352 B exact (−728 B inline)**. Each Box lazy-allocated only on actual write at its specific callsite (ParameterStatus filter, NoticeResponse filter, ErrorResponse arm); malformed paths zero-alloc (counter inline). Per-connection heap economics: Trust auth + no errors = 0 allocations; Startup + no errors = 1 alloc (436 B Box<SessionParams>); rare errors = 2 allocs (~732 B); malformed = 0. For typical Pool-served 10K connections: ~3 MB heap saved vs single-Box bundle approach. Bench `def196-v2`: push_command/ping_amortised **−14% per-query** (production hot path 64.5 → 55.7 ns), push_command/ping **−15%** full-cycle, parse_header **−1.5%**, ping_round_trip ±0% (no regression), iter_rows preserved. Cross-platform CI matrix policy: per-target cfg-gated pins when CI extends, no permissive ranges. Final commit 987cc29. SHIPPED 2026-04-28.
+- **DEF-197**: Column-decode bench infrastructure. Added 5 `column_decode/*` benches measuring `DataRowRef::parse`, `ColumnsIter` per-column walk, `FromPgText` typed decode (i32, &str), and NULL fast-path. Baseline `def197-decoder`: header parse 1.10 ns, raw iter 1.23 ns/col, i32 decode 8.84 ns/col (~7.6 ns is `str::parse`), text decode 8.42 ns/col (~7.2 ns is UTF-8 validate), NULL fast-path 0.6 ns/null. **Closes the largest measurement blind spot** — future decoder optimisations (DEF-200/202/203) now ship with evidence per CREDO §4.12. Per-row decode 44 ns × 1M rows = 44 ms on large SELECTs — comparable to frame dispatch cost. No production code change. Commit 0a14efa. SHIPPED 2026-04-28.
 - **DEF-204**: `ReadBuf::compact()` staleness leak closure. Pre-fix `copy_within + truncate` left bytes physically at `[unread_len..pre_compact_len)` retaining pre-compact content (consumed prefix's content + source side of copy_within); secret-correlated bytes from prior frames persisted in the array. Post-fix: in-place zeroize of abandoned tail BEFORE truncate. Tier-3 by-audit → tier-2 structural. ~5 LoC change in `buf.rs::compact`. 2 memory-probe tests added (`tests/buf_compact_staleness_spec.rs`, `#[ignore]`-gated, Miri-validated): `def204_compact_zeroizes_abandoned_tail` + `def204_compact_no_op_when_cursor_zero_does_not_zero`. SHIPPED 2026-04-27.
 
 ### DEF-184 (post-Y comprehensive audit)
