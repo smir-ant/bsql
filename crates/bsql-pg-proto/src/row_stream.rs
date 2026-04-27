@@ -356,6 +356,41 @@ impl<'p, 'w> RowStream<'p, 'w> {
         })
     }
 
+    /// DEF-190 (perf push 2026-04-27): closure-based row consumption.
+    ///
+    /// Calls `f(row)` for each available DataRow, returning when the
+    /// stream pauses (any non-row condition). The closure body is
+    /// inlined into the internal loop by LLVM — eliminates the
+    /// function-call boundary per row that `next_row` requires.
+    ///
+    /// # When to use
+    ///
+    /// Use `for_each_row` when the caller's per-row work is small
+    /// and inlinable (counter increment, simple decode + accumulate).
+    /// LLVM can fold the closure into the row hot path, hoisting
+    /// invariants out of the inner loop.
+    ///
+    /// Use `next_row` when the caller's work is opaque (extern call,
+    /// complex match) — the function-call boundary is amortized
+    /// over more work anyway.
+    ///
+    /// # Returns
+    ///
+    /// Number of rows consumed. After return, caller invokes
+    /// `next_event` (or future `status()`) to learn the pause cause.
+    #[inline]
+    pub fn for_each_row<F>(&mut self, mut f: F) -> u32
+    where
+        F: FnMut(Row<'_>),
+    {
+        let mut count: u32 = 0;
+        while let Some(row) = self.next_row() {
+            f(row);
+            count = count.saturating_add(1);
+        }
+        count
+    }
+
     /// Pull the next event.
     ///
     /// See [`StreamItem`] for the event set.
