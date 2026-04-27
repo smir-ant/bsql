@@ -226,13 +226,13 @@ pub(crate) fn dispatch(
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
     row_desc_slot: &mut Option<crate::decode::RowDesc>,
-    // DEF-196 v2 (2026-04-28): take `&mut Option<Box<ErrorArena>>`
-    // for the dispatch path's only cold-write target. Most dispatch
-    // arms don't write error_arena; the few that do (ErrorResponse
-    // arms) lazy-init via `error_arena_or_init(error_arena_slot)`
-    // inline. v1 took a single `Option<Box<ColdFields>>`; v2 splits
-    // into per-field slots so unrelated cold-writes don't share an
-    // alloc.
+    // DEF-196 (2026-04-28): `&mut Option<Box<ErrorArena>>` slot for
+    // the dispatch path's only cold-write target. Most dispatch arms
+    // don't write error_arena; the few that do (ErrorResponse arms)
+    // lazy-init via `error_arena_or_init(error_arena_slot)` inline,
+    // allocating exactly once on the first server error per
+    // connection. Frames that don't reach an ErrorResponse arm pay
+    // zero allocation cost.
     error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
 ) -> DispatchOutcome {
     // DEF-184 (B21/C6): snap owned prev for pattern matching; state

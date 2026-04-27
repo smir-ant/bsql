@@ -407,7 +407,7 @@ const _: () = assert!(
 /// Any field addition or size growth must update the pin in
 /// `lib.rs` alongside the code change. See DEF-163 G012 for
 /// this cross-reference discipline.
-/// DEF-196 v2: lazy-init helper for `Option<Box<SessionParams>>`.
+/// DEF-196: lazy-init helper for `Option<Box<SessionParams>>`.
 /// Called at the two pre-dispatch filter sites that write
 /// session_params (ParameterStatus + NoticeResponse).
 #[inline]
@@ -417,7 +417,7 @@ pub(crate) fn session_params_or_init(
     slot.get_or_insert_with(|| alloc::boxed::Box::new(SessionParams::new()))
 }
 
-/// DEF-196 v2: lazy-init helper for `Option<Box<ErrorArena>>`.
+/// DEF-196: lazy-init helper for `Option<Box<ErrorArena>>`.
 /// Called by `dispatch.rs` ErrorResponse arms when a server error
 /// payload needs to be parsed and stored.
 #[inline]
@@ -462,14 +462,14 @@ pub struct PgProtocol {
     /// field block (kept short here for layout-readability).
     row_desc_slot: Option<crate::decode::RowDesc>,
     read_buf: ReadBuf,
-    /// DEF-196 v2: session params from post-auth handshake. None
+    /// DEF-196: session params from post-auth handshake. None
     /// until first ParameterStatus / NoticeResponse write.
     /// `Option<Box<_>>` niches to 8 B inline.
     session_params: Option<alloc::boxed::Box<SessionParams>>,
-    /// DEF-196 v2: server-error payload arena. None until first
+    /// DEF-196: server-error payload arena. None until first
     /// ErrorResponse frame allocates an `ErrorPayload`. Niche-packed.
     error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-    /// DEF-196 v2: malformed-frame counter — INLINE u32 (no Box —
+    /// DEF-196: malformed-frame counter — INLINE u32 (no Box —
     /// 4 B is too small to amortise pointer indirection). Bumped
     /// on every fail_inflight_no_readbuf invocation. DEF-185 P2-9 +
     /// DEF-186 P1-5 widened to u32 for adversarial-flood resilience.
@@ -711,7 +711,7 @@ impl PgProtocol {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
             row_desc_slot: None,
-            // DEF-196 v2: three independent cold slots — none allocated
+            // DEF-196: three independent cold slots — none allocated
             // at construction. Trust auth + no errors + no malformed
             // frames + no notice/param frames = lifetime-zero heap.
             session_params: None,
@@ -721,7 +721,7 @@ impl PgProtocol {
         }
     }
 
-    // DEF-196 v2 (2026-04-28): three-field split. Each cold slot
+    // DEF-196 (2026-04-28): three-field split. Each cold slot
     // independently lazy-allocated; malformed_counter is inline
     // (4 B, no Box).
 
@@ -1118,7 +1118,7 @@ impl PgProtocol {
         let state = &mut self.state;
         let read_buf = &mut self.read_buf;
         let terminal_row_desc = &mut self.row_desc_slot;
-        // DEF-196 v2 (2026-04-28): three independent cold slots, each
+        // DEF-196 (2026-04-28): three independent cold slots, each
         // lazy-allocated only at its specific write site:
         //   - session_params slot: ParameterStatus + NoticeResponse filters.
         //   - error_arena slot:    ErrorResponse arms in dispatch.rs.
@@ -1159,7 +1159,7 @@ impl PgProtocol {
                 // Bundled-helper-style refactor (single fn that does
                 // both) deferred to keep call-site ordering grep-able.
                 read_buf.clear();
-                // DEF-196 v2: malformed_counter is inline u32, direct
+                // DEF-196: malformed_counter is inline u32, direct
                 // mutation — no Box, no lazy-init.
                 return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
                     let mut staged: StagedActions = StagedActions::new();
@@ -1240,7 +1240,7 @@ impl PgProtocol {
                 match header {
                     HeaderParse::Empty | HeaderParse::Incomplete => break,
                     HeaderParse::MalformedLength { declared } => {
-                        // DEF-196 v2: malformed_counter is inline; pass the
+                        // DEF-196: malformed_counter is inline; pass the
                         // top-of-fn binding directly — no Box, no lazy.
                         fail_inflight_no_readbuf(
                             state,
@@ -1290,7 +1290,7 @@ impl PgProtocol {
                             // post-fix mirrors `n_malformed_bool_dropped`
                             // for ops diagnostic visibility.
                             //
-                            // DEF-196 v2: lazy-init session_params Box only
+                            // DEF-196: lazy-init session_params Box only
                             // when actually writing (here).
                             let session_params = session_params_or_init(session_params_slot);
                             match record_param_status(session_params, payload) {
@@ -1317,7 +1317,7 @@ impl PgProtocol {
                         if tag == crate::wire::TAG_NOTICE_RESPONSE
                             && allows_unsolicited_notice_response(state)
                         {
-                            // DEF-196 v2: lazy-init session_params Box only
+                            // DEF-196: lazy-init session_params Box only
                             // when actually writing (here, bumping the
                             // notice counter).
                             session_params_or_init(session_params_slot).bump_notice_response();
@@ -1347,7 +1347,7 @@ impl PgProtocol {
                         // one mutable borrow, one in-place store.
                         // DEF-188: terminal_row_desc threaded through
                         // for the Z arms to park the in-flight schema.
-                        // DEF-196 v2: pass error_arena_slot only.
+                        // DEF-196: pass error_arena_slot only.
                         // Dispatch arms (ErrorResponse) lazy-init the
                         // Box<ErrorArena> when actually writing.
                         let outcome = dispatch(
@@ -1448,7 +1448,7 @@ impl PgProtocol {
                 // Classified dead-arm — a regression in cursor math
                 // would land here. Transition to Errored and emit
                 // FailReply via fail_inflight.
-                // DEF-196 v2: malformed_counter is inline u32, direct.
+                // DEF-196: malformed_counter is inline u32, direct.
                 fail_inflight_no_readbuf(
                     state,
                     ProtocolError::InternalCrateBug {
@@ -1513,7 +1513,7 @@ impl PgProtocol {
         match self.state {
             ProtoState::Idle => {
                 self.row_desc_slot = None;
-                // DEF-196 v2: only clear arena if it was ever allocated.
+                // DEF-196: only clear arena if it was ever allocated.
                 // Same observable behaviour as before — empty arena (None)
                 // resolves any forged ErrorRef as Stale via generation
                 // mismatch.

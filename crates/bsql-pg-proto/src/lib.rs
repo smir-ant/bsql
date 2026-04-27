@@ -417,33 +417,28 @@ const _: () = assert!(
 // etc., per-target cfg-gated pins land in the same commit that adds
 // the target — not via permissive ranges. CREDO §3 skepticism: drift
 // surface beats variance cushion every time.
-// DEF-196 v2 (2026-04-28): three-field split. Per-field lazy alloc
-// eliminates the bundled `ColdFields` Box; each cold field gets its
-// own `Option<Box<X>>` (or inline u32 for malformed_counter). Wins:
-//   - Per-field alloc only on actual write — connections that
-//     never write a given field never allocate that Box.
-//   - Smaller per-Box heap allocation (Box<SessionParams> = 436 B
-//     vs Box<ColdFields> = 736 B). Save ~300 B heap per typical
-//     Startup-doing connection without errors.
-//   - malformed_frame_count goes inline (4 B): malformed paths
-//     incur ZERO heap allocations (was 1 Box::new in v1).
+// DEF-196 (2026-04-28): cold-path fields externalised into three
+// independent lazy slots — each cold field allocates its Box
+// independently only on first write. Hot `PgProtocol` shrinks
+// 5080 B → 4352 B (−728 B inline).
 //
-// Layout breakdown (post-DEF-196 v2):
+// Layout breakdown:
 //   ReadBuf:                4096 B (4 KiB)
 //   state:                    64 B (post-DEF-189 strip)
 //   row_desc_slot:           140 B (Option<RowDesc>)
 //   session_params:            8 B (Option<Box<SessionParams>> niche)
 //   error_arena:               8 B (Option<Box<ErrorArena>> niche)
-//   malformed_frame_count:     4 B (inline u32)
+//   malformed_frame_count:     4 B (inline u32 — too small to amortise
+//                                   pointer indirection)
 //   sync_marker:               0 B (PhantomData)
 //   alignment padding:        ~32 B (to align(8))
 //   total:                  4352 B
 //
-// vs DEF-196 v1: +8 B inline (3 slots vs 1) but eliminates v1's
-// always-bundled allocation. Net production: heap usage
-// significantly lower.
-//
-// vs pre-DEF-196 (5080 B): **−728 B inline** preserved.
+// Heap economics per connection pattern:
+//   - Trust auth + no errors:        0 allocations.
+//   - Startup auth + no errors:      1 alloc (Box<SessionParams> 436 B).
+//   - Startup auth + errors:         2 allocs (~732 B total).
+//   - Malformed frame teardown:      0 allocations (counter inline).
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() == 4352,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
