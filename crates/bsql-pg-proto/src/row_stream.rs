@@ -200,6 +200,23 @@ pub struct RowStream<'p, 'w> {
     /// `push_command` without requiring the caller to invoke
     /// [`PgProtocol::feed_bytes`] manually.
     flush_pending: bool,
+    /// DEF-190: cached streaming reply correlator.
+    ///
+    /// Set lazily on first DataRow encounter via
+    /// [`PgProtocol::classify_for_iter_rows`]. Subsequent rows of
+    /// the same query share the cached id — skips the per-row
+    /// state-enum match (~1-2 ns per row).
+    ///
+    /// # Invariant
+    ///
+    /// `cached_reply_id == Some(id)` ⇒ proto.state is one of the
+    /// streaming variants AND its reply id equals `id`. The cache
+    /// is cleared on any non-row outcome (C/E/Z transitions
+    /// implicit when classify returns Other / Errored).
+    ///
+    /// Cleared at construction (None) and on any pause that takes
+    /// state out of streaming-row territory.
+    cached_reply_id: Option<NonZeroU64>,
 }
 
 impl<'p, 'w> RowStream<'p, 'w> {
@@ -213,6 +230,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             write_buf,
             drained: false,
             flush_pending: false,
+            cached_reply_id: None,
         }
     }
 
@@ -291,12 +309,17 @@ impl<'p, 'w> RowStream<'p, 'w> {
             return None;
         }
 
-        // 1. State check — extract reply id by Copy or bail.
-        // Single state match via the protocol's classifier.
-        let id = match self.proto.classify_for_iter_rows() {
-            crate::protocol::IterRowsClass::Streaming(id) => id,
-            crate::protocol::IterRowsClass::Errored
-            | crate::protocol::IterRowsClass::Other => return None,
+        // 1. Reply id — cached on first encounter, reused per row.
+        // DEF-190: hot loop skips classify after the first row.
+        let id = match self.cached_reply_id {
+            Some(id) => id,
+            None => match self.proto.classify_for_iter_rows() {
+                crate::protocol::IterRowsClass::Streaming(id) => {
+                    self.cached_reply_id = Some(id);
+                    id
+                }
+                _ => return None,
+            },
         };
 
         // 2. Header peek + validation, scoped to drop the
@@ -386,10 +409,16 @@ impl<'p, 'w> RowStream<'p, 'w> {
         if self.drained {
             return None;
         }
-        // 1. State match (inline classify).
-        let id = match self.proto.classify_for_iter_rows() {
-            crate::protocol::IterRowsClass::Streaming(id) => id,
-            _ => return None,
+        // 1. Reply id — cached on first encounter, reused per row.
+        let id = match self.cached_reply_id {
+            Some(id) => id,
+            None => match self.proto.classify_for_iter_rows() {
+                crate::protocol::IterRowsClass::Streaming(id) => {
+                    self.cached_reply_id = Some(id);
+                    id
+                }
+                _ => return None,
+            },
         };
 
         // 2. Header peek + validation.
