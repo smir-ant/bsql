@@ -51,10 +51,59 @@ impl<const MAX: u8> BoundedU8<MAX> {
     /// offset-by-one encoding.
     pub const ZERO: Self = Self(NonZeroU8::MIN);
 
-    /// Construct, returning `None` if `value > MAX`.
+    /// **Tier-1 compile-time construction.** `VAL > MAX` is a build
+    /// failure (const-block assertion fires at monomorphisation site).
     ///
-    /// `const fn` so consumers can build [`BoundedU8`] in const
-    /// contexts (e.g., array initialisers, static limits).
+    /// Use for compile-time-known values (literals, sentinels, test
+    /// fixtures). For runtime values use [`Self::try_new`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bsql_pg_proto::bounded::BoundedU8;
+    /// const FIVE: BoundedU8<32> = BoundedU8::<32>::new_const::<5>();
+    /// assert_eq!(FIVE.get(), 5);
+    /// ```
+    ///
+    /// Out-of-range values are compile-rejected:
+    ///
+    /// ```compile_fail
+    /// use bsql_pg_proto::bounded::BoundedU8;
+    /// // ERROR: VAL exceeds MAX (33 > 32) — build fails at this line.
+    /// const TOO_BIG: BoundedU8<32> = BoundedU8::<32>::new_const::<33>();
+    /// ```
+    #[inline]
+    #[must_use]
+    pub const fn new_const<const VAL: u8>() -> Self {
+        const {
+            assert!(
+                MAX < u8::MAX,
+                "BoundedU8<MAX>: MAX must be < 255 for the NonZeroU8 niche to work",
+            );
+            assert!(
+                VAL <= MAX,
+                "BoundedU8::<MAX>::new_const::<VAL>: VAL exceeds MAX (compile-time tier-1 enforced)",
+            );
+        }
+        // VAL <= MAX < 255, so VAL+1 in 1..=MAX+1 ⊆ 1..=255 (non-zero u8).
+        match NonZeroU8::new(VAL.wrapping_add(1)) {
+            Some(nz) => Self(nz),
+            // Dead per the `MAX < u8::MAX` and `VAL <= MAX` const-asserts
+            // above. Compiler can't fold without an `unsafe` hint; the
+            // sentinel keeps the type-system happy without panicking.
+            None => Self(NonZeroU8::MIN),
+        }
+    }
+
+    /// **Tier-3 runtime construction.** Returns `None` if `value > MAX`.
+    ///
+    /// Use for runtime-derived values (wire input, parsed bytes, etc).
+    /// For compile-time-known values prefer [`Self::new_const`] — its
+    /// out-of-range case is a build failure rather than a `None` to
+    /// handle at runtime.
+    ///
+    /// `const fn` so const-context consumers can fold the runtime check
+    /// at compile time when the input is itself const.
     #[inline]
     #[must_use]
     pub const fn try_new(value: u8) -> Option<Self> {
@@ -82,6 +131,32 @@ impl<const MAX: u8> BoundedU8<MAX> {
         // stored = value + 1; stored >= 1; stored - 1 = value, infallible.
         self.0.get().wrapping_sub(1)
     }
+}
+
+/// Tier-1 compile-time construction macro for [`BoundedU8`].
+///
+/// `bounded_u8!(MAX, VAL)` expands to `BoundedU8::<MAX>::new_const::<VAL>()`.
+/// Both `MAX` and `VAL` must be u8 literals; `VAL > MAX` is a build
+/// error.
+///
+/// # Examples
+///
+/// ```
+/// use bsql_pg_proto::bounded_u8;
+/// let five: bsql_pg_proto::bounded::BoundedU8<32> = bounded_u8!(32, 5);
+/// assert_eq!(five.get(), 5);
+/// ```
+///
+/// ```compile_fail
+/// use bsql_pg_proto::bounded_u8;
+/// // ERROR: 33 > 32 — caught at compile time.
+/// let too_big: bsql_pg_proto::bounded::BoundedU8<32> = bounded_u8!(32, 33);
+/// ```
+#[macro_export]
+macro_rules! bounded_u8 {
+    ($max:literal, $val:literal) => {
+        $crate::bounded::BoundedU8::<$max>::new_const::<$val>()
+    };
 }
 
 impl<const MAX: u8> core::fmt::Debug for BoundedU8<MAX> {
@@ -194,5 +269,36 @@ mod tests {
         let formatted = std::format!("{value:?}");
         assert!(formatted.contains("32"), "{formatted}");
         assert!(formatted.contains('7'), "{formatted}");
+    }
+
+    // ─── Tier-1 compile-time construction (DEF-195 ext) ────────────
+
+    /// Verifies `new_const` builds and round-trips for all valid VAL.
+    #[test]
+    fn new_const_round_trips_for_all_valid_values() {
+        const V0: BoundedU8<32> = BoundedU8::<32>::new_const::<0>();
+        const V1: BoundedU8<32> = BoundedU8::<32>::new_const::<1>();
+        const V16: BoundedU8<32> = BoundedU8::<32>::new_const::<16>();
+        const V31: BoundedU8<32> = BoundedU8::<32>::new_const::<31>();
+        const V32: BoundedU8<32> = BoundedU8::<32>::new_const::<32>();
+        assert_eq!(V0.get(), 0);
+        assert_eq!(V1.get(), 1);
+        assert_eq!(V16.get(), 16);
+        assert_eq!(V31.get(), 31);
+        assert_eq!(V32.get(), 32);
+    }
+
+    #[test]
+    fn new_const_zero_equals_zero_const() {
+        const V0: BoundedU8<32> = BoundedU8::<32>::new_const::<0>();
+        assert_eq!(V0, BoundedU8::<32>::ZERO);
+    }
+
+    #[test]
+    fn macro_expansion_round_trips() {
+        let v: BoundedU8<32> = crate::bounded_u8!(32, 5);
+        assert_eq!(v.get(), 5);
+        let v_max: BoundedU8<32> = crate::bounded_u8!(32, 32);
+        assert_eq!(v_max.get(), 32);
     }
 }
