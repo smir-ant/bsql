@@ -143,7 +143,7 @@ pub use action::{
     ParseCompletePayload, PongPayload, QueryCompletePayload, Reply,
     StartupCompletePayload, TxStatus,
 };
-pub use bounded::BoundedU8;
+pub use bounded::{BoundedLen, BoundedU8, BoundedU16};
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
 pub use command::{FetchRows, PgCommand};
 pub use decode::{

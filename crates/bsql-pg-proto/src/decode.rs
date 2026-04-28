@@ -595,7 +595,7 @@ pub struct RowDesc {
     /// constructing this field, so an out-of-bounds row descriptor
     /// cannot exist in safe code. The niche absorbs the discriminant
     /// of `Option<RowDesc>`, shrinking it from 140 → 136 B.
-    n_columns: crate::bounded::BoundedU8<{ MAX_ROW_COLUMNS_U8 }>,
+    n_columns: crate::bounded::BoundedU8<MAX_ROW_COLUMNS>,
     /// Padding so `type_oids` is 4-byte aligned. Always zero
     /// (initialised by constructors).
     _pad: [u8; 3],
@@ -605,23 +605,8 @@ pub struct RowDesc {
     format_codes: FormatCodeSet,
 }
 
-/// `MAX_ROW_COLUMNS` re-exposed as `u8` for the
-/// [`crate::bounded::BoundedU8`] type parameter on
-/// [`RowDesc::n_columns`]. Const-asserted equal to [`MAX_ROW_COLUMNS`]
-/// without using `as` casts (which the forbid bundle bans).
-const MAX_ROW_COLUMNS_U8: u8 = 32;
-const _: () = {
-    // Tier-1: forbid bundle bans `as` casts, so we can't write
-    // `MAX_ROW_COLUMNS_U8 as usize`. Compose a const-eq via the
-    // `from_le_bytes` round-trip — both are const-stable on Rust 1.44+.
-    let lhs_bytes = [MAX_ROW_COLUMNS_U8; 1];
-    let lhs = u8::from_le_bytes(lhs_bytes);
-    let rhs_truncated = MAX_ROW_COLUMNS.to_le_bytes()[0];
-    assert!(
-        lhs == rhs_truncated && MAX_ROW_COLUMNS == 32,
-        "MAX_ROW_COLUMNS_U8 must equal MAX_ROW_COLUMNS — bump both together",
-    );
-};
+// DEF-203 unified: BoundedU8 now takes `const MAX: usize` directly,
+// so `BoundedU8<MAX_ROW_COLUMNS>` works without a `_U8` helper const.
 
 impl RowDesc {
     /// Empty descriptor (0 columns). Used as a test fixture and as
@@ -1051,13 +1036,12 @@ pub(crate) fn parse_row_description(
         return Err(malformed());
     }
 
-    // DEF-195: convert validated `n_columns` (u16, range-checked above
-    // against MAX_ROW_COLUMNS) into the `BoundedU8<32>` niche-bearing
-    // type. The narrowing u16 → u8 is infallible here because the
-    // earlier `n_columns_usize > MAX_ROW_COLUMNS` guard rejects any
-    // value > 32.
-    let n_columns_u8 = u8::try_from(n_columns).map_err(|_| malformed())?;
-    let n_columns_bounded = crate::bounded::BoundedU8::<MAX_ROW_COLUMNS_U8>::try_new(n_columns_u8)
+    // DEF-195/DEF-203: convert validated `n_columns` (u16, range-checked
+    // above against MAX_ROW_COLUMNS) to the `BoundedU8<MAX_ROW_COLUMNS>`
+    // niche-bearing type. Both narrowings have architecturally-dead
+    // Err paths (the upstream guard rejects any value > 32).
+    let n_columns_bounded = <crate::bounded::BoundedU8<MAX_ROW_COLUMNS>
+        as crate::bounded::BoundedLen<MAX_ROW_COLUMNS>>::try_new_usize(n_columns_usize)
         .ok_or_else(malformed)?;
     Ok(RowDesc {
         n_columns: n_columns_bounded,

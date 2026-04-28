@@ -149,19 +149,6 @@ impl Encoding {
     }
 }
 
-/// `MAX_ENCODING_NAME_LEN` re-exposed as `u8` for the
-/// [`crate::bounded::BoundedU8`] type parameter on
-/// [`OtherEncoding::len`]. Const-asserted equal to
-/// [`MAX_ENCODING_NAME_LEN`].
-const MAX_ENCODING_NAME_LEN_U8: u8 = 32;
-const _: () = {
-    let lhs_truncated = MAX_ENCODING_NAME_LEN.to_le_bytes()[0];
-    assert!(
-        MAX_ENCODING_NAME_LEN_U8 == lhs_truncated && MAX_ENCODING_NAME_LEN == 32,
-        "MAX_ENCODING_NAME_LEN_U8 must equal MAX_ENCODING_NAME_LEN — bump both together",
-    );
-};
-
 /// Raw bytes of an unrecognised PG encoding name, bounded at
 /// [`MAX_ENCODING_NAME_LEN`]. Preserves the byte-exact spelling
 /// the server sent. DEF-114.
@@ -178,7 +165,7 @@ pub struct OtherEncoding {
     /// DEF-203: tier-2 by-construct (`BoundedU8::try_new` rejects
     /// `len > MAX_ENCODING_NAME_LEN`); tier-1 niche on
     /// `Option<OtherEncoding>`.
-    len: crate::bounded::BoundedU8<MAX_ENCODING_NAME_LEN_U8>,
+    len: crate::bounded::BoundedU8<MAX_ENCODING_NAME_LEN>,
 }
 
 impl OtherEncoding {
@@ -199,11 +186,11 @@ impl OtherEncoding {
         if src.len() > MAX_ENCODING_NAME_LEN {
             return None;
         }
-        // src.len() <= MAX_ENCODING_NAME_LEN = 32, so u8::try_from
-        // is infallible (Err arm dead). BoundedU8::try_new likewise
-        // succeeds since the value is range-validated above.
-        let len_u8 = u8::try_from(src.len()).ok()?;
-        let len = crate::bounded::BoundedU8::try_new(len_u8)?;
+        // src.len() <= MAX_ENCODING_NAME_LEN = 32; the BoundedLen
+        // try_new_usize encapsulates the usize → u8 → BoundedU8<32>
+        // narrowing chain (architecturally-dead Err arms upstream).
+        let len = <crate::bounded::BoundedU8<MAX_ENCODING_NAME_LEN>
+            as crate::bounded::BoundedLen<MAX_ENCODING_NAME_LEN>>::try_new_usize(src.len())?;
         let mut out = Self::empty();
         if let Some(dst) = out.buf.get_mut(..src.len()) {
             dst.copy_from_slice(src);
@@ -240,16 +227,12 @@ impl OtherEncoding {
         if let Some(dst_marker) = out.buf.get_mut(budget..marker_end) {
             dst_marker.copy_from_slice(MARKER);
         }
-        // DEF-203: `marker_end ≤ MAX_ENCODING_NAME_LEN = 32` by
-        // construction (`budget = MAX_ENCODING_NAME_LEN.saturating_sub
-        // (MARKER.len())`, then `marker_end = budget + MARKER.len()` —
-        // re-converges to MAX_ENCODING_NAME_LEN). Both narrowings
-        // (usize → u8 → BoundedU8<32>) have architecturally-dead Err
-        // arms; the empty-fallback below maintains the no-panic
-        // discipline if a future refactor ever broke the bound.
-        out.len = u8::try_from(marker_end)
-            .ok()
-            .and_then(crate::bounded::BoundedU8::try_new)
+        // DEF-203: marker_end ≤ MAX_ENCODING_NAME_LEN = 32 by construction.
+        // `BoundedLen::try_new_usize` encapsulates the narrowing chain;
+        // the empty-fallback below maintains no-panic discipline if a
+        // future refactor ever broke the bound.
+        out.len = <crate::bounded::BoundedU8<MAX_ENCODING_NAME_LEN>
+            as crate::bounded::BoundedLen<MAX_ENCODING_NAME_LEN>>::try_new_usize(marker_end)
             .unwrap_or(crate::bounded::BoundedU8::ZERO);
         out
     }
