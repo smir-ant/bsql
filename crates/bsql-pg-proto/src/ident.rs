@@ -826,11 +826,20 @@ impl DescribeName for PortalName {
 /// the blanket `Vec::drop` impl (empty body for `u8`, but
 /// `needs_drop = true`) propagated up into [`crate::state::ProtoState`]
 /// — DEF-099.
-#[derive(Clone, Copy, PartialEq, Eq)]
+// Clone/Copy/PartialEq/Eq are impl'd manually for the LenT-generic
+// form below — derives don't mix well with generic-over-LenT bounds
+// when the trait bound itself constrains the field type.
 #[repr(C)]
-pub struct PodBytes<const N: usize> {
+pub struct PodBytes<const N: usize, LenT = crate::bounded::BoundedU16<N>>
+where
+    LenT: crate::bounded::BoundedLen<N>,
+{
     buf: [u8; N],
-    len: u16,
+    /// DEF-203 ext: typed length-storage (parallel to FixedStr's
+    /// LenT migration). Default `BoundedU16<N>` covers any N up to
+    /// 65_534. **Tier-2 by-construct** — out-of-range len cannot
+    /// exist via `BoundedLen::try_new_usize`.
+    len: LenT,
 }
 
 /// Error from [`PodBytes::try_from_slice`] when input exceeds `N`.
@@ -852,23 +861,28 @@ impl fmt::Display for PodBytesOverflow {
     }
 }
 
-impl<const N: usize> PodBytes<N> {
-    /// Empty value. Compile-asserts `N ≤ u16::MAX` at monomorph time.
+// ─── Concrete `const fn new` for default LenT (DEF-203 ext) ─────────
+
+impl<const N: usize> PodBytes<N, crate::bounded::BoundedU16<N>> {
+    /// Empty value. Compile-asserts `N ≤ 65_534` (BoundedU16 niche).
+    /// Const-fn provided for the default LenT only; non-default LenT
+    /// users can use `Self::default()`.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
         const {
-            assert!(
-                N <= 65_535,
-                "PodBytes<N>: N must fit u16 length prefix (≤ 65_535)",
-            );
+            assert!(N <= 65_534, "PodBytes with BoundedU16 LenT requires N ≤ 65_534");
         }
         Self {
             buf: [0u8; N],
-            len: 0,
+            len: crate::bounded::BoundedU16::<N>::ZERO,
         }
     }
+}
 
+// ─── Generic methods over LenT ──────────────────────────────────────
+
+impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> PodBytes<N, LenT> {
     /// Construct from a byte slice. Rejects over-length inputs with
     /// [`PodBytesOverflow`].
     pub fn try_from_slice(src: &[u8]) -> Result<Self, PodBytesOverflow> {
@@ -878,22 +892,13 @@ impl<const N: usize> PodBytes<N> {
                 max: N,
             });
         }
-        // F-066 (pass-#8): after the `src.len() > N` guard above and
-        // `N <= 65_535` const-asserted at `Self::new()`, the
-        // `u16::try_from(src.len())` Err branch is architecturally
-        // dead. Debug-builds assert so a future refactor that drops
-        // the guard fails tests loudly; release builds fold the Err
-        // arm away under any non-zero opt level.
-        debug_assert!(
-            src.len() <= N && N <= usize::from(u16::MAX),
-            "PodBytes invariant: src.len ({}) must fit both N ({N}) and u16",
-            src.len(),
-        );
-        let len = u16::try_from(src.len()).map_err(|_| PodBytesOverflow {
+        // DEF-203 ext: tier-2 by-construct via BoundedLen::try_new_usize.
+        // Earlier `src.len() > N` guard makes this Err branch dead.
+        let len = LenT::try_new_usize(src.len()).ok_or(PodBytesOverflow {
             len: src.len(),
             max: N,
         })?;
-        let mut out = Self::new();
+        let mut out = Self::default();
         if let Some(dst) = out.buf.get_mut(..src.len()) {
             dst.copy_from_slice(src);
         }
@@ -905,26 +910,17 @@ impl<const N: usize> PodBytes<N> {
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        usize::from(self.len)
+        self.len.get_usize()
     }
 
     /// Whether no bytes have been stored.
     #[inline]
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.len.get_usize() == 0
     }
 
     /// Borrow the populated bytes.
-    ///
-    /// DEF-154 (S) P1-1: explicit `split_at_checked` match with
-    /// documented-dead None arm. `self.len ≤ N = self.buf.len()`
-    /// by construction; None architecturally unreachable. Empty-
-    /// slice sentinel on the dead arm is a no-silent-op — the
-    /// emission surface carries no bytes, matching both the
-    /// "genuinely empty" case and the impossible-regression case
-    /// with the same semantics. Pre-(S) was `self.buf.get(..n)
-    /// .unwrap_or(&[])` — the forbidden silent-fallback pattern.
     #[inline]
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
@@ -936,21 +932,39 @@ impl<const N: usize> PodBytes<N> {
     }
 }
 
-impl<const N: usize> Default for PodBytes<N> {
+impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> Default for PodBytes<N, LenT> {
     #[inline]
     fn default() -> Self {
-        Self::new()
+        Self {
+            buf: [0u8; N],
+            len: LenT::default(),
+        }
     }
 }
 
-impl<const N: usize> fmt::Debug for PodBytes<N> {
+impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> fmt::Debug for PodBytes<N, LenT> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Prints as a normal byte slice. Strings-pretending-to-be-bytes
-        // print as their ASCII equivalent where possible (the
-        // stdlib's Debug for &[u8] does this).
         f.debug_tuple("PodBytes").field(&self.as_slice()).finish()
     }
 }
+
+impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> Clone for PodBytes<N, LenT> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> Copy for PodBytes<N, LenT> {}
+
+impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> PartialEq for PodBytes<N, LenT> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.as_slice() == other.as_slice()
+    }
+}
+
+impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> Eq for PodBytes<N, LenT> {}
 
 /// Errors from validated-tag [`FixedStr`] construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -983,31 +997,16 @@ impl fmt::Display for IdentError {
 
 // ───────────────────────── Shared impl block ──────────────────────────
 
-// ─── Concrete `const fn new` per-LenT (DEF-203 ext) ─────────────────
+// ─── Concrete `const fn new` for default LenT (DEF-203 ext) ─────────
 //
 // Generic `Self::new` would need `LenT::ZERO` (trait associated const)
 // in const context, which requires `const_trait_impl` (unstable).
-// Workaround: provide CONCRETE const fn `new` for each LenT impl.
-// `BoundedU8` and `BoundedU16` are the only two LenT types (sealed
-// `BoundedLen` trait), so this covers all cases.
-
-impl<const N: usize, Tag> FixedStr<N, Tag, crate::bounded::BoundedU8<N>> {
-    /// Empty value. Compile-time asserts `N ≤ 254` (BoundedU8 niche
-    /// requirement) via const-block.
-    #[inline]
-    #[must_use]
-    pub const fn new() -> Self {
-        const {
-            assert!(N <= 254, "FixedStr with BoundedU8 LenT requires N ≤ 254");
-        }
-        Self {
-            buf: [0u8; N],
-            len: crate::bounded::BoundedU8::<N>::ZERO,
-            was_lossy_flag: 0,
-            _tag: PhantomData,
-        }
-    }
-}
+// Workaround: provide a const fn `new()` ONLY for the default
+// `BoundedU16<N>` LenT — `Self::new()` then resolves cleanly when
+// caller relies on the default. Type aliases that pick `BoundedU8<N>`
+// LenT (Ident, DatabaseName, etc.) use `Self::default()` (non-const,
+// trait method) — none of those types are needed in `static` context
+// in this crate.
 
 impl<const N: usize, Tag> FixedStr<N, Tag, crate::bounded::BoundedU16<N>> {
     /// Empty value. Compile-time asserts `N ≤ 65_534` (BoundedU16 niche
