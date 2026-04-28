@@ -589,15 +589,39 @@ pub struct ColumnDesc {
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(4))]
 pub struct RowDesc {
-    n_columns: u16,
-    /// Padding so `type_oids` is 4-byte aligned.
-    /// Always zero (initialised by constructors).
-    _pad: [u8; 2],
+    /// DEF-195: column count is `BoundedU8<MAX_ROW_COLUMNS>` (1 byte,
+    /// `NonZeroU8`-backed niche). Tier-2 by-construct: the parser
+    /// rejects any wire `n_columns > MAX_ROW_COLUMNS` before
+    /// constructing this field, so an out-of-bounds row descriptor
+    /// cannot exist in safe code. The niche absorbs the discriminant
+    /// of `Option<RowDesc>`, shrinking it from 140 → 136 B.
+    n_columns: crate::bounded::BoundedU8<{ MAX_ROW_COLUMNS_U8 }>,
+    /// Padding so `type_oids` is 4-byte aligned. Always zero
+    /// (initialised by constructors).
+    _pad: [u8; 3],
     type_oids: [u32; MAX_ROW_COLUMNS],
     /// DEF-194: bit-packed (1 bit per column). Replaces the
     /// pre-DEF-194 `[FormatCode; MAX_ROW_COLUMNS]` (32 B → 4 B).
     format_codes: FormatCodeSet,
 }
+
+/// `MAX_ROW_COLUMNS` re-exposed as `u8` for the
+/// [`crate::bounded::BoundedU8`] type parameter on
+/// [`RowDesc::n_columns`]. Const-asserted equal to [`MAX_ROW_COLUMNS`]
+/// without using `as` casts (which the forbid bundle bans).
+const MAX_ROW_COLUMNS_U8: u8 = 32;
+const _: () = {
+    // Tier-1: forbid bundle bans `as` casts, so we can't write
+    // `MAX_ROW_COLUMNS_U8 as usize`. Compose a const-eq via the
+    // `from_le_bytes` round-trip — both are const-stable on Rust 1.44+.
+    let lhs_bytes = [MAX_ROW_COLUMNS_U8; 1];
+    let lhs = u8::from_le_bytes(lhs_bytes);
+    let rhs_truncated = MAX_ROW_COLUMNS.to_le_bytes()[0];
+    assert!(
+        lhs == rhs_truncated && MAX_ROW_COLUMNS == 32,
+        "MAX_ROW_COLUMNS_U8 must equal MAX_ROW_COLUMNS — bump both together",
+    );
+};
 
 impl RowDesc {
     /// Empty descriptor (0 columns). Used as a test fixture and as
@@ -608,40 +632,39 @@ impl RowDesc {
     /// Semantically identical to the pre-DEF-194 array literal
     /// `[FormatCode::Text; 32]`.
     pub const EMPTY: Self = Self {
-        n_columns: 0,
-        _pad: [0; 2],
+        n_columns: crate::bounded::BoundedU8::ZERO,
+        _pad: [0; 3],
         type_oids: [0; MAX_ROW_COLUMNS],
         format_codes: FormatCodeSet::empty(),
     };
 
     /// Number of populated columns.
     ///
-    /// # Why not `const fn`
-    ///
-    /// F-034 (pass-#8) considered making this `const`, but `impl
-    /// From<u16> for usize` is not yet stable as a const trait
-    /// (rust-lang issue #143874 — still tracking as of Rust 1.95).
-    /// Under the forbid-bundle we cannot use
-    /// `self.n_columns as usize`.
+    /// Non-const: `From<u8> for usize` is not yet a const trait
+    /// on stable (RU-01 watch).
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        usize::from(self.n_columns)
+        usize::from(self.n_columns.get())
     }
 
     /// Number of populated columns as a `u16` — matches the wire
-    /// representation and avoids the `usize::from` widening.
+    /// representation. Returns `u16` for backward-compat with the
+    /// pre-DEF-195 public API; internally `BoundedU8<32>` enforces
+    /// the range invariant.
+    ///
+    /// Non-const for the same reason as [`Self::len`] (RU-01).
     #[inline]
     #[must_use]
-    pub const fn n_columns(&self) -> u16 {
-        self.n_columns
+    pub fn n_columns(&self) -> u16 {
+        u16::from(self.n_columns.get())
     }
 
     /// Whether the descriptor carries any columns.
     #[inline]
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.n_columns == 0
+        self.n_columns.get() == 0
     }
 
     /// PG type OID for column `idx`, or `None` if out of range.
@@ -785,13 +808,11 @@ const _: () = assert!(
 // the [u32; 32] aligned layout. Post-DEF-194: 140 B exactly; saving
 // **28 B per Option<RowDesc>** (cascading into PgProtocol::row_desc_slot).
 const _: () = assert!(
-    core::mem::size_of::<Option<RowDesc>>() == 140,
-    "Option<RowDesc> exact pin: 140 B post-DEF-194 (= 136 RowDesc + 1 \
-     discriminant + 3 alignment padding to align(4)). Pre-194 was 168 B. \
-     If this trips: (a) RowDesc grew via field addition (paired pin \
-     above catches), (b) a future Option-niche-friendly field was added \
-     and the discriminant collapsed (Option<RowDesc> would be 136 B — \
-     a WIN, update this pin), or (c) alignment changed (audit repr).",
+    core::mem::size_of::<Option<RowDesc>>() == 136,
+    "Option<RowDesc> exact pin: 136 B post-DEF-195 (= 136 RowDesc, niche \
+     absorbed via `BoundedU8<32>::NonZeroU8` in `n_columns` first field). \
+     Pre-195 was 140 B (= 136 + 1 discriminant + 3 align padding). Saving \
+     **4 B per Option<RowDesc>**, cascading into PgProtocol::row_desc_slot.",
 );
 
 /// DEF-189: lifetime-bound borrow of a [`RowDesc`] living inside
@@ -843,9 +864,12 @@ impl<'r> RowDescBorrow<'r> {
     }
 
     /// Number of populated columns.
+    ///
+    /// Non-const after DEF-195: `u16::from(u8)` is not const-trait
+    /// stable yet (RU-01).
     #[inline]
     #[must_use]
-    pub const fn n_columns(&self) -> u16 {
+    pub fn n_columns(&self) -> u16 {
         self.inner.n_columns()
     }
 
@@ -1027,9 +1051,17 @@ pub(crate) fn parse_row_description(
         return Err(malformed());
     }
 
+    // DEF-195: convert validated `n_columns` (u16, range-checked above
+    // against MAX_ROW_COLUMNS) into the `BoundedU8<32>` niche-bearing
+    // type. The narrowing u16 → u8 is infallible here because the
+    // earlier `n_columns_usize > MAX_ROW_COLUMNS` guard rejects any
+    // value > 32.
+    let n_columns_u8 = u8::try_from(n_columns).map_err(|_| malformed())?;
+    let n_columns_bounded = crate::bounded::BoundedU8::<MAX_ROW_COLUMNS_U8>::try_new(n_columns_u8)
+        .ok_or_else(malformed)?;
     Ok(RowDesc {
-        n_columns,
-        _pad: [0; 2],
+        n_columns: n_columns_bounded,
+        _pad: [0; 3],
         type_oids,
         format_codes,
     })
