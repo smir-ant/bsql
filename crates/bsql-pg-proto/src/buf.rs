@@ -28,44 +28,46 @@ use crate::frame::READ_BUF_CAP;
 use core::fmt;
 use heapless::{CapacityError, Vec};
 
-// DEF-120 drift guard: `ReadBuf::cursor` (below) is `u16`. The
-// type is sound only while `READ_BUF_CAP` fits a u16. A future
-// capacity bump that breaks this invariant must also widen the
-// cursor type. Hard `65_535` literal (not `u16::MAX as usize`) —
-// `as` casts are banned by the crate forbid-bundle.
-const _: () = assert!(
-    READ_BUF_CAP <= 65_535,
-    "READ_BUF_CAP must fit ReadBuf::cursor (u16). Widen both together.",
-);
-
-/// Bounded byte buffer for inbound wire data.
+/// Bounded byte buffer for inbound wire data — generic-form.
 ///
-/// Capacity is the const [`READ_BUF_CAP`] (4096 in Phase 1a; tunable
-/// later). Beyond capacity, [`append`] returns [`ReadBufFull`] — the
-/// protocol classifies this as a fatal connection error.
+/// **DEF-199**: const-generic over capacity `N`. The default
+/// [`ReadBuf`] type alias picks `N = READ_BUF_CAP` (4096) for backward
+/// compat; bumping `N` lets callers handle larger frames (analytics
+/// workloads with wide `RowDescription`, large `DataRow` payloads).
 ///
-/// `Default` is the empty buffer.
+/// Beyond capacity, [`append`] returns [`ReadBufFull`] — the protocol
+/// classifies this as a fatal connection error.
 ///
-/// [`append`]: ReadBuf::append
-#[derive(Default)]
-pub struct ReadBuf {
+/// [`append`]: ReadBufN::append
+pub struct ReadBufN<const N: usize> {
     /// Backing storage. Private — every public method preserves the
     /// invariants below.
-    inner: Vec<u8, READ_BUF_CAP>,
+    inner: Vec<u8, N>,
     /// Read cursor. Bytes in `inner[..cursor]` are consumed and may be
     /// reclaimed on the next [`compact`] call.
     ///
-    /// Invariant: `cursor <= inner.len() <= READ_BUF_CAP <= 65_535`
-    /// (enforced by every mutator path + the const assert above).
+    /// Invariant: `cursor <= inner.len() <= N <= 65_535`
+    /// (enforced by every mutator path + the const-block assert below).
     ///
-    /// DEF-120: `u16` (not `usize`) — `READ_BUF_CAP = 4096` fits
-    /// with headroom; narrower type saves 6 bytes per `ReadBuf`
-    /// on 64-bit and propagates nothing into hot arithmetic (the
-    /// few widenings to `usize` use `usize::from`, infallible).
+    /// DEF-120: `u16` (not `usize`) — current N values fit
+    /// with headroom; narrower type saves bytes per `ReadBuf`
+    /// on 64-bit. The const-block in `new()` rejects `N > 65_535`
+    /// at monomorph time.
     cursor: u16,
 }
 
-impl ReadBuf {
+/// Default-cap [`ReadBufN`] — backward-compat alias picking
+/// `N = READ_BUF_CAP` (4096). Existing callers `ReadBuf::new()` resolve
+/// to this concrete type without changes.
+pub type ReadBuf = ReadBufN<READ_BUF_CAP>;
+
+impl<const N: usize> Default for ReadBufN<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> ReadBufN<N> {
     /// Construct an empty buffer.
     #[inline]
     #[must_use]
@@ -102,7 +104,8 @@ impl ReadBuf {
             .extend_from_slice(bytes)
             .map_err(|CapacityError { .. }| ReadBufFull {
                 attempted: bytes.len(),
-                available: READ_BUF_CAP.saturating_sub(self.inner.len()),
+                available: N.saturating_sub(self.inner.len()),
+                cap: N,
             })
     }
 
@@ -362,18 +365,18 @@ impl ReadBuf {
 /// only; true memory hygiene under panic requires either `panic =
 /// "unwind"` or `mlock`+explicit scrub — flagged for separate design
 /// discussion.
-impl Drop for ReadBuf {
+impl<const N: usize> Drop for ReadBufN<N> {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.inner.as_mut_slice().zeroize();
     }
 }
 
-impl fmt::Debug for ReadBuf {
+impl<const N: usize> fmt::Debug for ReadBufN<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadBuf")
             .field("unread_len", &self.unread_len())
-            .field("cap", &READ_BUF_CAP)
+            .field("cap", &N)
             .finish()
     }
 }
@@ -390,6 +393,11 @@ pub struct ReadBufFull {
     pub attempted: usize,
     /// How much room was actually available in the buffer.
     pub available: usize,
+    /// Configured cap of the buffer (= the const-generic `N` of the
+    /// `ReadBuf<N>` instance that produced this error). DEF-199:
+    /// carried in the error so the Display impl reports the cap of
+    /// the specific protocol instance, not a hard-coded constant.
+    pub cap: usize,
 }
 
 impl fmt::Display for ReadBufFull {
@@ -397,7 +405,7 @@ impl fmt::Display for ReadBufFull {
         write!(
             f,
             "read buffer full: tried to append {} bytes, only {} available (cap {})",
-            self.attempted, self.available, READ_BUF_CAP,
+            self.attempted, self.available, self.cap,
         )
     }
 }

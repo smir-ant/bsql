@@ -151,6 +151,7 @@ fn append_overflow_is_classified_and_fail_atomic() {
         Err(ReadBufFull {
             attempted,
             available,
+            ..
         }) => {
             assert_eq!(attempted, 1);
             assert_eq!(available, 0, "buffer at cap has zero headroom");

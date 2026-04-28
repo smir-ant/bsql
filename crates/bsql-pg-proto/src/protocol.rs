@@ -1174,7 +1174,7 @@ impl PgProtocol {
         } else {
             match self.read_buf.append(bytes) {
                 Ok(()) => IngressClassification::Ok,
-                Err(ReadBufFull { attempted, available }) => {
+                Err(ReadBufFull { attempted, available, .. }) => {
                     IngressClassification::AppendFailed { attempted, available }
                 }
             }

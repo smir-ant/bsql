@@ -144,7 +144,7 @@ pub use action::{
     StartupCompletePayload, TxStatus,
 };
 pub use bounded::{BoundedLen, BoundedU8, BoundedU16};
-pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull};
+pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull, ReadBufN};
 pub use command::{FetchRows, PgCommand};
 pub use decode::{
     ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, FormatCodeSet, FromPgText,
