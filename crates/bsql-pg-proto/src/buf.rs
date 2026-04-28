@@ -69,9 +69,23 @@ impl<const N: usize> Default for ReadBufN<N> {
 
 impl<const N: usize> ReadBufN<N> {
     /// Construct an empty buffer.
+    ///
+    /// **Tier-1 cap invariant** (DEF-199): the const-block fires at
+    /// monomorphisation time. `ReadBufN<70_000>::new()` would compile
+    /// without this assertion but break the `cursor: u16` invariant
+    /// — any `advance()` past 65_535 bytes would trip a dead Err
+    /// branch silently. The assertion makes any `N > u16::MAX` a
+    /// **build failure**, not a runtime tier regression.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
+        const {
+            assert!(
+                N <= 65_535,
+                "ReadBufN<N>: N must be ≤ u16::MAX (cursor is u16). \
+                 Widen the cursor type before bumping N past 65_535.",
+            );
+        }
         Self {
             inner: Vec::new(),
             cursor: 0,
