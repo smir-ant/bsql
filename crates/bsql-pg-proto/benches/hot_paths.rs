@@ -916,9 +916,17 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
     group.finish();
 }
 
-/// Bench: per-column decode for 5 text columns. UTF-8 validation
-/// dominates — the production bottleneck future `simdutf8` (DEF-202)
-/// will target.
+/// Bench: per-column decode for 5 text columns of varying shapes.
+///
+/// Three shapes cover the realistic Postgres text-column distribution:
+///
+/// 1. **Short ASCII** (`alice@example.com`, 17 B) — typical OLTP
+///    columns: usernames, emails, short identifiers.
+/// 2. **Long ASCII** (~200 B) — descriptions, log lines, SQL queries.
+///    SIMD UTF-8 validators (DEF-202) win most clearly here.
+/// 3. **Multi-byte UTF-8** (Cyrillic, ~80 B) — non-ASCII real text.
+///    Forces the validator off the ASCII fast-path; SIMD vs scalar
+///    delta is largest on this shape.
 fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
     use bsql_pg_proto::decode::{DataRowRef, FromPgText};
 
@@ -926,12 +934,64 @@ fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
     const N_COLS: u16 = 5;
     group.throughput(Throughput::Elements(u64::from(N_COLS)));
 
-    // Realistic-length text: typical name / short description.
-    let body = data_row_body_text(N_COLS, "alice@example.com");
+    // Shape (1): short ASCII (17 B per col).
+    let body_short = data_row_body_text(N_COLS, "alice@example.com");
 
-    group.bench_function("iter_5cols_decode_text", |b| {
+    // Shape (2): long ASCII (~200 B per col) — typical
+    // log-line / description column.
+    let body_long_ascii = data_row_body_text(
+        N_COLS,
+        "the quick brown fox jumps over the lazy dog while the spectacled \
+         platypus paddles upstream past the misty mountains where ancient \
+         dragons coil amid silver birch trees and forgotten lore",
+    );
+
+    // Shape (3): multi-byte UTF-8 — Cyrillic, ~78 B per col,
+    // forces the validator off the ASCII fast-path.
+    let body_cyrillic = data_row_body_text(
+        N_COLS,
+        "Съешь же ещё этих мягких французских булок, да выпей чаю",
+    );
+
+    group.bench_function("iter_5cols_decode_text_short_ascii", |b| {
         b.iter(|| {
-            let row = match DataRowRef::parse(black_box(&body)) {
+            let row = match DataRowRef::parse(black_box(&body_short)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut total_chars: usize = 0;
+            for col in row.columns() {
+                if let Ok(Some(bytes)) = col
+                    && let Ok(s) = <&str>::from_pg_text(bytes)
+                {
+                    total_chars = total_chars.saturating_add(s.len());
+                }
+            }
+            black_box(total_chars);
+        });
+    });
+
+    group.bench_function("iter_5cols_decode_text_long_ascii", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body_long_ascii)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut total_chars: usize = 0;
+            for col in row.columns() {
+                if let Ok(Some(bytes)) = col
+                    && let Ok(s) = <&str>::from_pg_text(bytes)
+                {
+                    total_chars = total_chars.saturating_add(s.len());
+                }
+            }
+            black_box(total_chars);
+        });
+    });
+
+    group.bench_function("iter_5cols_decode_text_cyrillic", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body_cyrillic)) {
                 Ok(r) => r,
                 Err(_) => return,
             };

@@ -74,6 +74,24 @@ zeroize = { version = "1", default-features = false, features = ["zeroize_derive
 # SystemTime-seeded. DEF-META-01 scope.
 getrandom = { version = "0.2", default-features = false }
 
+# `simdutf8` — SIMD-accelerated UTF-8 validation (DEF-202). Drives
+# `<&str as FromPgText>::from_pg_text` for text-format column bytes
+# coming off the wire. `core::str::from_utf8` is scalar bytewise;
+# `simdutf8::basic::from_utf8` uses lane-wise vector shuffles +
+# masks (5-10× throughput improvement on aarch64 NEON; equivalent
+# scalar fast-path on no-SIMD targets). DEF-META-01 scope: SIMD
+# validators are expert-domain — `simdutf8` is the canonical
+# audited implementation (used by `serde_json`, `sonic-rs`,
+# `simd-json`). Bytewise behaviour parity with `core::str::from_utf8`
+# is documented + property-tested upstream.
+#
+# `default-features = false` for no_std. `aarch64_neon` opt-in
+# adds NEON path (mandatory in aarch64; no runtime detection
+# needed). x86 SIMD path requires `std` (cpuid detection via
+# `is_x86_feature_detected!`); in no_std we fall through to
+# simdutf8's scalar fast-path (still faster than `core::str::from_utf8`).
+simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon"] }
+
 # `criterion` — DEF-143 benchmark harness. Dev-only dependency;
 # benches compile with std enabled (criterion requires std) while
 # the lib stays no_std. Provides statistical sampling (bootstrap

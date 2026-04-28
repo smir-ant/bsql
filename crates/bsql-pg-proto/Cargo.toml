@@ -44,6 +44,7 @@ pbkdf2 = { workspace = true }
 base64ct = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true }
+simdutf8 = { workspace = true }
 
 # `getrandom` is a dev/test dependency for deterministic nonce
 # injection in tests. Production nonce generation uses it too, but

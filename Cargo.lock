@@ -55,6 +55,7 @@ dependencies = [
  "hmac",
  "pbkdf2",
  "sha2",
+ "simdutf8",
  "subtle",
  "zeroize",
 ]
@@ -449,6 +450,12 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
+
+[[package]]
+name = "simdutf8"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "stable_deref_trait"

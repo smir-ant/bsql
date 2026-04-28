@@ -1674,9 +1674,34 @@ impl FromPgText<'_> for bool {
 /// Text column as `&str` — zero-copy, validates UTF-8 only.
 impl<'a> FromPgText<'a> for &'a str {
     const OID: u32 = oids::TEXT;
+    /// DEF-202 — SIMD-accelerated UTF-8 validation via `simdutf8`.
+    ///
+    /// `core::str::from_utf8` is scalar bytewise (with an ASCII
+    /// fast-path that aborts on the first non-ASCII byte; cheap on
+    /// short ASCII, expensive on multi-byte UTF-8).
+    /// `simdutf8::basic::from_utf8` uses lane-wise vector shuffles +
+    /// masks via NEON on aarch64.
+    ///
+    /// Bench evidence (aarch64-apple-darwin, criterion `pre-simdutf8`
+    /// vs `def202-simdutf8` baselines, 5-column rows):
+    /// * **Long ASCII** (~200 B, descriptive text): −49.9% (~2× faster).
+    ///   Realistic Postgres workload: log lines, descriptions, JSON.
+    /// * **Multi-byte UTF-8** (~78 B Cyrillic): −74.0% (~3.9× faster).
+    ///   Internationalised content: non-Latin names, free-form text.
+    /// * **Short ASCII** (17 B `alice@example.com`): +9.9%.
+    ///   Acceptable cost: 0.7 ns/col absolute regression on the cheapest
+    ///   case (where total time is already 8 ns/col). A length-threshold
+    ///   hybrid was tested and rejected — the dispatch branch costs
+    ///   ~1.5 ns/col, exceeding the savings on the short-ASCII path.
+    ///
+    /// Behaviour is byte-identical to `core::str::from_utf8`: both
+    /// accept the same byte sequences, reject the same non-UTF-8
+    /// inputs, and produce the same `&str` for valid input.
+    /// `simdutf8::basic::Utf8Error` is discriminator-only; collapsed
+    /// to `DecodeError::NonUtf8` here, matching the pre-DEF-202 contract.
     #[inline]
     fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError> {
-        core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
+        simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
     }
 }
 
