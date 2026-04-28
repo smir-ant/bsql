@@ -884,9 +884,10 @@ pub(crate) enum StagedAction {
 ///
 /// `StagedReply` is the lifetime-free intermediate carried inside
 /// `StagedAction::DeliverReply(DeliverReplyEntry)`. Schema-bearing
-/// variants carry staged payload types (with `schema_present: bool`
-/// flags instead of `&'r RowDesc`); materialise consults the flag
-/// and projects from `terminal_row_desc` when set.
+/// variants once carried `schema_present: bool` flags as duplicates
+/// of `PgProtocol::row_desc_slot.is_some()`; DEF-210 SR-01 Path C
+/// (audit 2026-04-28) deleted those — materialise reads the slot
+/// directly via `into_public(row_desc_slot)`. Single source of truth.
 ///
 /// # Visibility
 ///
@@ -913,12 +914,18 @@ pub enum StagedReply {
 
 /// Lifetime-free staged counterpart to [`QueryCompletePayload<'r>`].
 ///
-/// DEF-188: `schema_present: bool` replaces the pre-188
-/// `schema_ref: Option<SchemaRef>`. The dispatch Z arm parks the
-/// inline `RowDesc` from the post-Stream state variant into
-/// `PgProtocol::terminal_row_desc` and sets this flag; materialise
-/// projects `Some(&desc)` when the flag is set or `None` when
-/// the path was DML / empty-query.
+/// # DEF-210 SR-01 Path C (audit 2026-04-28): `schema_present` deleted
+///
+/// Pre-Path-C: carried `schema_present: bool` set by the dispatch Z
+/// arm iff the slot was populated. Materialise read the flag and
+/// projected from `PgProtocol::row_desc_slot` only when set.
+/// **Tier-2 by-discipline** — silent corruption risk if a future
+/// dispatch refactor set the flag without populating the slot.
+///
+/// Post-Path-C: the flag is gone. Materialise reads
+/// `row_desc_slot.map(...)` directly. The slot's own `is_some()`
+/// is the single source of truth — there is no duplicate to drift
+/// from. **Tier-1 by-construction**.
 ///
 /// `#[doc(hidden)] pub` — see [`StagedReply`] for visibility rationale.
 #[doc(hidden)]
@@ -926,51 +933,39 @@ pub enum StagedReply {
 pub struct StagedQueryCompletePayload {
     #[doc(hidden)] pub command_tag: crate::ident::BoundedStr<32>,
     #[doc(hidden)] pub tx_status: TxStatus,
-    /// `true` iff the dispatch Z arm parked a `RowDesc` into
-    /// `terminal_row_desc`. Materialise reads the slot when set.
-    #[doc(hidden)] pub schema_present: bool,
 }
 
 /// Lifetime-free staged counterpart to
 /// [`DescribeStatementCompletePayload<'r>`].
 ///
-/// DEF-188: `rows: DescribedRowsStagedSlim` (ZST discriminator).
-/// The inline RowDesc, if any, was parked into
-/// `PgProtocol::terminal_row_desc` at the Z arm.
+/// # DEF-210 SR-01-D Path D (audit 2026-04-28)
+///
+/// Pre-Path-D this struct carried `rows: DescribedRowsStagedSlim`
+/// (a `Rows | NoData` discriminator). That discriminator was a
+/// duplicate of `PgProtocol::row_desc_slot.is_some()` — the dispatch
+/// arm parked the schema into the slot AND set `Rows` in the same
+/// arm body (atomic-pair discipline). Path D deletes the duplicate;
+/// materialise reads `row_desc_slot.map(...)` directly. The
+/// helper `described_rows_slim_into_public` (which had a
+/// `debug_assert!(false)` arm for the architecturally-impossible
+/// `Rows`-without-slot mismatch — CREDO §V banned defensive-for-
+/// impossible) was deleted in the same closure. Tier-1 by-construction.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribeStatementCompletePayload {
     #[doc(hidden)] pub param_oids: ParamOids,
-    #[doc(hidden)] pub rows: DescribedRowsStagedSlim,
     #[doc(hidden)] pub tx_status: TxStatus,
 }
 
 /// Lifetime-free staged counterpart to
 /// [`DescribePortalCompletePayload<'r>`].
+///
+/// DEF-210 SR-01-D Path D — see the
+/// [`StagedDescribeStatementCompletePayload`] docstring.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribePortalCompletePayload {
-    #[doc(hidden)] pub rows: DescribedRowsStagedSlim,
     #[doc(hidden)] pub tx_status: TxStatus,
-}
-
-/// Slim discriminator for staged Describe results — no payload.
-///
-/// DEF-188: distinguishes "schema parked in terminal_row_desc"
-/// (`Rows`) from "server sent NoData" (`NoData`). Materialise
-/// reads `PgProtocol::terminal_row_desc` only when `Rows`.
-///
-/// Mirrors [`crate::state::DescribedRowsStaged`] but without the
-/// inline `RowDesc` payload — that lives in `terminal_row_desc`
-/// post-park, not in the staged action.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DescribedRowsStagedSlim {
-    /// Schema was parked into `terminal_row_desc` — materialise
-    /// resolves via the borrow.
-    #[doc(hidden)] Rows,
-    /// Server sent `'n'` (NoData) — no schema.
-    #[doc(hidden)] NoData,
 }
 
 // From impls: schema-less payloads wrap directly; schema-bearing
@@ -1039,11 +1034,10 @@ impl StagedReply {
     /// The `StaleSchemaRef` classified-error path is gone — there
     /// is no handle that can become stale. Either the slot holds a
     /// `RowDesc` (because the C → Z transition parked it) or it
-    /// doesn't (because the path was DML / NoData). Mismatch
-    /// between `staged.schema_present == true` and
-    /// `terminal_row_desc.is_none()` is structurally prevented:
-    /// dispatch sets the bool iff it parked the desc, in the same
-    /// arm body, atomically.
+    /// doesn't (because the path was DML / NoData). DEF-210 SR-01
+    /// Path C: the slot's `is_some()` IS the schema-presence fact —
+    /// no separate flag, no atomic-pair discipline, no drift surface.
+    ///
     #[inline]
     pub(crate) fn into_public<'r>(
         self,
@@ -1053,14 +1047,12 @@ impl StagedReply {
             Self::Pong(p) => Reply::Pong(p),
             Self::StartupComplete(p) => Reply::StartupComplete(p),
             Self::QueryComplete(staged) => {
-                // DEF-189: `schema_present: bool` flag set iff the slot
-                // is populated. Materialise's caller (`materialise`)
-                // supplies the slot borrow; we project to RowDescBorrow.
-                let row_desc = if staged.schema_present {
-                    row_desc_slot.map(crate::decode::RowDescBorrow::from_ref)
-                } else {
-                    None
-                };
+                // DEF-210 SR-01 Path C: the slot is the single source
+                // of truth for schema presence. `Some` ⇒ project to
+                // RowDescBorrow (SELECT path); `None` ⇒ no schema
+                // (DML / empty-query path). No bool flag to keep in
+                // sync; the slot equals itself by identity.
+                let row_desc = row_desc_slot.map(crate::decode::RowDescBorrow::from_ref);
                 Reply::QueryComplete(QueryCompletePayload {
                     command_tag: staged.command_tag,
                     tx_status: staged.tx_status,
@@ -1070,72 +1062,71 @@ impl StagedReply {
             Self::ParseComplete(p) => Reply::ParseComplete(p),
             Self::CloseComplete(p) => Reply::CloseComplete(p),
             Self::DescribeStatementComplete(staged) => {
-                let rows = described_rows_slim_into_public(staged.rows, row_desc_slot);
-                Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
-                    param_oids: staged.param_oids,
-                    rows,
-                    tx_status: staged.tx_status,
-                })
+                describe_statement_complete_into_public(staged, row_desc_slot)
             }
             Self::DescribePortalComplete(staged) => {
-                let rows = described_rows_slim_into_public(staged.rows, row_desc_slot);
-                Reply::DescribePortalComplete(DescribePortalCompletePayload {
-                    rows,
-                    tx_status: staged.tx_status,
-                })
+                describe_portal_complete_into_public(staged, row_desc_slot)
             }
         }
     }
 }
 
-/// Convert staged [`DescribedRowsStagedSlim`] into the public
-/// [`DescribedRows<'r>`] by borrowing the parked terminal RowDesc.
+/// DEF-210 SR-01-D Path D + re-audit perf-fix (audit 2026-04-28):
+/// `#[inline(never)]` extraction of the Describe-arm materialise
+/// body. Path D rewrote `into_public`'s describe arms to read
+/// `row_desc_slot.map(...)` directly (replacing the prior
+/// `DescribedRowsStagedSlim::Rows | NoData` discriminator + helper
+/// with `debug_assert!(false)` defensive arm). The new inline
+/// shape pushed `into_public`'s LTO-inlined body in
+/// `materialise` past LLVM's register-allocator quality threshold:
+/// `push_command/ping_amortised` showed +13% regression vs the
+/// pre-DEF-210 baseline because LLVM was spilling values that
+/// previously stayed in registers (visible in asm as 6-7 reloads
+/// from the same `ParamOids` u32 stack slots — `[sp, #240]`,
+/// `[sp, #256]`, `[sp, #264]`, …).
 ///
-/// DEF-188: `Rows` → borrow `terminal_row_desc` (must be `Some`
-/// when Rows is staged — dispatch Z arm parks it before deliver).
-/// `NoData` → public `no_data()` factory.
-///
-/// # Why infallible
-///
-/// Pre-DEF-188 the equivalent function was `Result<_, StaleSchemaRef>`
-/// because the arena's generation handle could go stale. Without
-/// the arena, the only possible drift is "Rows staged but
-/// terminal_row_desc is None" — an internal-helper mis-pairing.
-/// Since dispatch arms set both atomically (or neither), this is
-/// architecturally impossible. We classify the dead branch as
-/// `no_data()` (preserving the visible no-schema shape) rather
-/// than crashing — same fallback discipline as pre-DEF-188's
-/// release-build behaviour minus the silent corruption (the
-/// invariant break is now structurally prevented, not classified).
+/// Splitting the Describe arms into out-of-line helpers shrinks
+/// `into_public`'s body so `materialise`'s inlined hot path
+/// (Pong / QueryComplete) gets the same register pressure profile
+/// as pre-DEF-210. The Describe paths pay a function call but they
+/// are NOT the hot path — describe completion runs once per
+/// statement preparation, not per row or per push.
+#[inline(never)]
+fn describe_statement_complete_into_public<'r>(
+    staged: StagedDescribeStatementCompletePayload,
+    row_desc_slot: Option<&'r crate::decode::RowDesc>,
+) -> Reply<'r> {
+    Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
+        param_oids: staged.param_oids,
+        rows: describe_rows_from_slot(row_desc_slot),
+        tx_status: staged.tx_status,
+    })
+}
+
+/// See [`describe_statement_complete_into_public`] for rationale.
+#[inline(never)]
+fn describe_portal_complete_into_public<'r>(
+    staged: StagedDescribePortalCompletePayload,
+    row_desc_slot: Option<&'r crate::decode::RowDesc>,
+) -> Reply<'r> {
+    Reply::DescribePortalComplete(DescribePortalCompletePayload {
+        rows: describe_rows_from_slot(row_desc_slot),
+        tx_status: staged.tx_status,
+    })
+}
+
+/// Shared slot-projection helper for the two Describe materialise
+/// arms. Inlined into the `#[inline(never)]` Describe wrappers so
+/// the projection cost stays at one site each.
 #[inline]
-fn described_rows_slim_into_public<'r>(
-    r: DescribedRowsStagedSlim,
+fn describe_rows_from_slot<'r>(
     row_desc_slot: Option<&'r crate::decode::RowDesc>,
 ) -> DescribedRows<'r> {
-    match r {
-        DescribedRowsStagedSlim::Rows => match row_desc_slot {
-            Some(desc) => DescribedRows::from_row_desc_borrow(
-                crate::decode::RowDescBorrow::from_ref(desc),
-            ),
-            // Architecturally dead: dispatch parks the desc in the
-            // same arm that sets `Rows`. A None here means a future
-            // refactor desynchronised the two; debug_assert below
-            // catches it loudly. Release falls back to NoData
-            // (visible-correct: a missing schema with the staged
-            // marker was never the user's request, and no_data is
-            // the closest non-corrupting public shape).
-            None => {
-                debug_assert!(
-                    false,
-                    "DEF-189: DescribedRowsStagedSlim::Rows without populated \
-                     row_desc_slot — dispatch arm desync. Both fields are set \
-                     together at the 'T' arm; a None here means a future refactor \
-                     split the parking from the staged-flag set.",
-                );
-                DescribedRows::no_data()
-            }
-        },
-        DescribedRowsStagedSlim::NoData => DescribedRows::no_data(),
+    match row_desc_slot {
+        Some(desc) => DescribedRows::from_row_desc_borrow(
+            crate::decode::RowDescBorrow::from_ref(desc),
+        ),
+        None => DescribedRows::no_data(),
     }
 }
 

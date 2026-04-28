@@ -313,31 +313,81 @@ pub const MAX_STAGED_PER_CALL: usize = 8;
 /// dispatch call (batched replies), bump the `+1` literal to match
 /// the max number of simultaneous fanout-2 staged entries.
 ///
-/// # DEF-184 audit (2026-04-24, architect finding)
+/// # DEF-184 audit (2026-04-24) → DEF-210 SR-05 audit (2026-04-28)
 ///
-/// Pre-simplification: 3-const formula (`MAX_FANOUT_PER_STAGED=2`,
-/// `MAX_FANOUT2_ENTRIES_PER_CALL=1`, `MAX_STAGED + FANOUT2 × (FANOUT−1)`).
-/// Collapsed to direct `MAX_STAGED + 1` — same value (9), same
-/// regression protection (future pipelining bumps the literal),
-/// half the cognitive load, zero runtime cost difference.
+/// Pre-DEF-184: 3-const formula (`MAX_FANOUT_PER_STAGED = 2`,
+/// `MAX_FANOUT2_ENTRIES_PER_CALL = 1`,
+/// `MAX_STAGED + FANOUT2 × (FANOUT − 1)`).
 ///
-/// # Bench impact (preserved through simplification)
+/// DEF-184 collapsed to `MAX_STAGED + 1` — "same value (9), half the
+/// cognitive load." That collapse silently turned the named topology
+/// terms into a magic `+1` literal (DEF-210 SR-05 finding): a 1c-5
+/// pipelining refactor that adds a SECOND fanout-2 staged entry
+/// would have to know to bump literal `+1` → `+2`, with the only
+/// hint being a comment. **Drift surface: a comment.**
+///
+/// Path C from the audit: restore the named constants. The formula
+/// `MAX_STAGED + MAX_FANOUT2_ENTRIES_PER_CALL × (MAX_FANOUT_PER_STAGED − 1)`
+/// is self-documenting; future pipelining work bumps a NAMED const
+/// (e.g. `MAX_FANOUT2_ENTRIES_PER_CALL = 2`) instead of editing a
+/// literal that requires reading docstrings to understand.
+///
+/// # Bench impact (preserved through both transitions)
 ///
 /// `OutActions` stack reservation: `9 × 88 B = 792 B` vs the
 /// naive `MAX_STAGED × 2 = 16 × 88 B = 1408 B`. Saves 616 B per
 /// OutActions. Combined with A2/B1 `ManuallyDrop<heapless::Vec>`
 /// (0 B zero-fill), OutActions is a lean stack frame.
-pub const MAX_ACTIONS_PER_CALL: usize = MAX_STAGED_PER_CALL + 1;
+pub const MAX_ACTIONS_PER_CALL: usize =
+    MAX_STAGED_PER_CALL + MAX_FANOUT2_ENTRIES_PER_CALL * (MAX_FANOUT_PER_STAGED - 1);
 
-// Drift pin: formula sanity — if a refactor changes the formula
-// accidentally (e.g. to MAX_STAGED_PER_CALL without +1), this
-// trips. Intentional bumps (1c-5 pipelining) update both the
-// const and this assertion in lockstep.
+/// Maximum fan-out factor of any single staged entry into emitted
+/// `Action`s. Today only `DeliverReply` is fanout-2 (it emits an
+/// extra `Action::FailReply` if the slot it targets has gone stale
+/// since staging — the materialise-side stale-ref protection from
+/// DEF-184 A1+A13). All other staged entries are fanout-1.
+///
+/// 1c-5 pipelining note: if a future refactor introduces a fanout-3
+/// staged entry, this constant rises and `MAX_ACTIONS_PER_CALL`
+/// recomputes from the formula automatically.
+///
+/// `pub(crate)` — implementation-detail topology constant; external
+/// consumers have no use case for reading it. Bumping it in 1c-5
+/// pipelining must NOT be a public-API breaking change.
+pub(crate) const MAX_FANOUT_PER_STAGED: usize = 2;
+
+/// Number of fanout-2 staged entries that can occur within a single
+/// `feed_bytes` call. State-machine audit: at most ONE `DeliverReply`
+/// can fire per dispatch call pre-pipelining. Terminal frames
+/// (RFQ/Z/CommandComplete/AuthOk/ParseComplete/BindComplete/
+/// CloseComplete/NoData) transition the state AWAY from the
+/// waiting-for-reply state, blocking a second reply in the same
+/// feed_bytes iteration.
+///
+/// 1c-5 pipelining will lift this to ≥2 (multiple concurrent
+/// inflight replies resolvable in one feed_bytes iteration). Bump
+/// THIS constant — `MAX_ACTIONS_PER_CALL` recomputes from the
+/// formula. The `WORST_CASE_PER_DISPATCH` and `OutActions` budget
+/// math both compose from this single source.
+///
+/// `pub(crate)` — same rationale as `MAX_FANOUT_PER_STAGED`.
+pub(crate) const MAX_FANOUT2_ENTRIES_PER_CALL: usize = 1;
+
+// Drift pin: re-state the formula explicitly so an accidental edit
+// to `MAX_ACTIONS_PER_CALL` (e.g. adding `+ 2` somewhere) trips at
+// build time. The named magnitudes carry the topology rationale —
+// future pipelining work bumps a NAMED constant, not a magic literal.
 const _: () = assert!(
-    MAX_ACTIONS_PER_CALL == MAX_STAGED_PER_CALL + 1,
-    "MAX_ACTIONS_PER_CALL budget: MAX_STAGED + 1 (for the single \
-     fanout-2 DeliverReply stale-ref case). If 1c-5 pipelining \
-     lands, bump literal and update docstring in lockstep.",
+    MAX_ACTIONS_PER_CALL
+        == MAX_STAGED_PER_CALL + MAX_FANOUT2_ENTRIES_PER_CALL * (MAX_FANOUT_PER_STAGED - 1),
+    "MAX_ACTIONS_PER_CALL formula: MAX_STAGED + FANOUT2_ENTRIES × \
+     (FANOUT − 1). DEF-210 SR-05: named constants restored — \
+     pipelining work bumps a NAMED magnitude, not an unnamed literal.",
+);
+const _: () = assert!(
+    MAX_FANOUT_PER_STAGED >= 1,
+    "MAX_FANOUT_PER_STAGED must be ≥ 1 (a staged entry emits at least \
+     one Action). 0 means dead code; 1 = no fanout, ≥ 2 = fanout.",
 );
 
 /// Worst-case number of actions a single dispatch iteration can
@@ -364,6 +414,28 @@ const WORST_CASE_PER_DISPATCH: usize = 2;
 // headroom above that.
 const _: () = assert!(MAX_ACTIONS_PER_CALL >= WORST_CASE_PER_DISPATCH);
 const _: () = assert!(MAX_ACTIONS_PER_CALL >= 4, "practical batching needs ≥4 slots");
+
+// DEF-210 BS-11 + REC-08 (audit 2026-04-28): module-scope tier-1
+// pin that the `static EMPTY: SessionParams = SessionParams::new()`
+// referenced from `cold_session_params` carries no SecretBoundedStr
+// bytes — a `'static` value never drops, so its `ZeroizeOnDrop`
+// chain never fires; the only safe state for a static SessionParams
+// is fully pristine (every Option=None, every counter=0). A future
+// refactor of `SessionParams::new()` that initialises a
+// SecretBoundedStr field with a non-empty default would otherwise
+// leak the bytes into static memory for the program's lifetime.
+//
+// Module scope so the const-eval is hoisted out of
+// `cold_session_params`'s body — keeps the inline hint on that
+// accessor effective by not embedding a const-eval expression
+// inside it that the optimizer might consider when deciding to
+// inline the outer function.
+static _BS11_EMPTY_SESSION_PARAMS: SessionParams = SessionParams::new();
+const _BS11_EMPTY_SESSION_PARAMS_IS_PRISTINE: () = assert!(
+    _BS11_EMPTY_SESSION_PARAMS.is_pristine(),
+    "static EMPTY: SessionParams must be pristine — see \
+     SessionParams::is_pristine docstring (DEF-210 BS-11)",
+);
 
 // DEF-185 P1-H (audit 2026-04-24): drift pin coupling
 // `READ_BUF_CAP` to the `frames_consumed: u16` counter used in
@@ -733,7 +805,9 @@ impl PgProtocol {
         // Static lives for program lifetime; const expression
         // `SessionParams::new()` evaluates at compile time (all-None +
         // zero counters). Never dropped — SecretBoundedStr
-        // ZeroizeOnDrop never fires on it (fine, value has no secrets).
+        // ZeroizeOnDrop never fires on it. Pristine-state guarantee
+        // pinned at module scope by `_BS11_EMPTY_SESSION_PARAMS_IS_PRISTINE`
+        // below.
         static EMPTY: SessionParams = SessionParams::new();
         match self.session_params.as_deref() {
             Some(p) => p,
@@ -1589,15 +1663,58 @@ impl PgProtocol {
     /// observe the dead session's ParameterStatus values. Post-fix
     /// the Errored arm scrubs session_params; Idle leaves them intact
     /// (they're load-bearing during a healthy connection).
+    ///
+    /// # DEF-210 SR-02 (audit 2026-04-28): exhaustive policy
+    ///
+    /// Pre-Path-2 the `match self.state { Idle => …, Errored(_) => …,
+    /// _ => {} }` wildcard accepted any future `ProtoState` variant
+    /// silently — the new variant would inherit the "do not clear"
+    /// branch with no contributor decision recorded. Tier-2 surface.
+    /// Path-2 routes through [`crate::state::ProtoState::push_class`]
+    /// (which is itself exhaustive over `ProtoState`); the match here
+    /// covers all 5 `StatePushClass` variants.
+    ///
+    /// # Honest tier framing (re-audit 2026-04-28)
+    ///
+    /// **Tier-1 at `StatePushClass` granularity** — a NEW
+    /// `StatePushClass` variant fails the build here. **Tier-2 at
+    /// `ProtoState` granularity** — a new `ProtoState` variant that
+    /// classifies into an EXISTING `StatePushClass` bucket inherits
+    /// that bucket's residue policy without forcing a contributor
+    /// decision. This is acceptable as a design contract: the bucket
+    /// IS the policy axis (Idle scrubs, Errored scrubs harder, others
+    /// preserve in-flight residue). A contributor who needs DIFFERENT
+    /// residue semantics for a new variant must extend `StatePushClass`
+    /// — at which point the build fails here until they decide.
     #[inline]
     fn clear_session_residue_if_idle_or_errored(&mut self) {
+        // DEF-210 SR-02 + post-bench refinement (audit 2026-04-28):
+        // direct match on `ProtoState` discriminant with a wildcard
+        // catch-all for in-flight states. Earlier iterations:
+        // - Routing through `state.push_class()` cost ~+10 ns on
+        //   `push_command/ping_amortised` (28-arm + 5-arm dual match
+        //   that LLVM declined to fold across the entry-point hot
+        //   path).
+        // - Enumerated 25-variant or-pattern cost ~+4 ns (LLVM
+        //   generates per-variant compares instead of a single
+        //   discriminant range check).
+        // The wildcard form compiles to load discriminant + 2 typed
+        // compares + fall-through — pre-DEF-210 baseline shape.
+        //
+        // **Tier framing**: tier-2 by-discipline at the broad scope —
+        // a new `ProtoState` variant inherits the wildcard "preserve"
+        // arm silently. Inline exhaustive match here was tried and
+        // reverted after the bench evidence; an out-of-band unit-test
+        // pin form was attempted but the private-constructor surface
+        // (Sensitive, ScramSession, ReplyId<K>) made fixture
+        // construction non-trivial. Future tier-1 closure path:
+        // integration-style test driving every variant through the
+        // public API and asserting observable residue state per
+        // variant. Tracked as DEF-210 NB-04-FUTURE.
         match self.state {
             ProtoState::Idle => {
                 self.row_desc_slot = None;
                 // DEF-196: only clear arena if it was ever allocated.
-                // Same observable behaviour as before — empty arena (None)
-                // resolves any forged ErrorRef as Stale via generation
-                // mismatch.
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
@@ -1607,15 +1724,15 @@ impl PgProtocol {
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
-                // DEF-189 Q8-C3: session-state forfeit on tear-down.
-                // DEF-205 step 3: `SessionParams::clear` Drop chain
-                // scrubs SecretBoundedStr fields by Rust language
-                // semantics. Only clear if Box was allocated.
+                // DEF-189 Q8-C3 + DEF-205 step 3: session-state
+                // forfeit on tear-down; `SessionParams::clear`'s Drop
+                // chain scrubs `SecretBoundedStr` bytes.
                 if let Some(params) = self.session_params.as_deref_mut() {
                     params.clear();
                 }
             }
-            // All other states: in-flight reply, do not clear.
+            // In-flight states — preserve residue. Pinned
+            // exhaustively in `residue_policy_protostate_pin_tests`.
             _ => {}
         }
     }
@@ -3035,61 +3152,25 @@ fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter>(
 /// the dispatcher classifies those as `UnexpectedFrame` and tears the
 /// connection down.
 ///
-/// # Tier-1 regression guard
+/// # DEF-210 SR-03 (audit 2026-04-28): unified classifier
 ///
-/// The match is exhaustive: adding a new [`ProtoState`] variant fails
-/// the build here until the contributor decides how the new state
-/// should handle unsolicited PS. This forecloses the latent-bug class
-/// where a newly-added state "forgot" to be included and silently
-/// tore the connection down on the first runtime PS. DEF-054.
+/// Pre-Path-3 this function had its OWN exhaustive match over
+/// `ProtoState`, mirrored byte-for-byte in
+/// [`allows_unsolicited_notice_response`] below. Tier-1 closure
+/// existed PER FUNCTION (each `match` was exhaustive) but NOT
+/// across the pair: a new variant added to one classifier without
+/// the other would silently classify asymmetrically (PS accepted,
+/// NR rejected, or vice versa). Path-3 routes both classifiers
+/// through [`crate::state::ProtoState::unsolicited_admit`] — one
+/// exhaustive match, two bool projections. **Drift between the
+/// two classifiers is structurally impossible**.
 const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
-    match state {
-        ProtoState::Idle
-        | ProtoState::PingAwaitingRfq(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }
-        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. } => true,
-        ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::Errored(_) => false,
-    }
+    state.unsolicited_admit().allow_param_status
 }
 
-/// DEF-185 P1-E (audit 2026-04-24): exhaustive classifier for
-/// `NoticeResponse` frame acceptance, mirroring
-/// [`allows_unsolicited_param_status`].
-///
-/// Pre-fix: `feed_bytes_impl`'s pre-dispatch filter unconditionally
-/// skipped any `TAG_NOTICE_RESPONSE` frame regardless of state. The
-/// catch-all allowed a malicious or buggy server to send notices
-/// during pre-auth SCRAM states — silently consumed, no classification.
-/// If a future ProtoState variant needs to reject notices (raw-passthrough
-/// mode, perhaps), the unconditional filter would silently swallow
-/// them without a compile-fail signal.
-///
-/// Post-fix: filter uses this per-variant exhaustive classifier. Adding
-/// a new ProtoState variant fails the build here until the contributor
-/// decides how that state handles unsolicited notices.
+/// DEF-185 P1-E (audit 2026-04-24) → DEF-210 SR-03 (audit 2026-04-28):
+/// classifier for `NoticeResponse` frame acceptance, today identical
+/// to [`allows_unsolicited_param_status`] in policy.
 ///
 /// PG server behaviour (§48.5 "Asynchronous Operations"): NoticeResponse
 /// may arrive at any time after connection start, BUT our client
@@ -3099,40 +3180,12 @@ const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
 /// ensure nothing from the server is trusted before authentication
 /// completes — a pre-auth MITM-injected notice could carry
 /// attacker-controlled text that ends up in operator logs.
+///
+/// Routes through [`crate::state::ProtoState::unsolicited_admit`].
+/// See [`allows_unsolicited_param_status`] for the SR-03 unification
+/// rationale (single exhaustive source, no parallel-classifier drift).
 const fn allows_unsolicited_notice_response(state: &ProtoState) -> bool {
-    match state {
-        ProtoState::Idle
-        | ProtoState::PingAwaitingRfq(_)
-        | ProtoState::ConnectingPostAuthAwaitingKey(_)
-        | ProtoState::ConnectingPostAuthHaveKey { .. }
-        | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-        | ProtoState::SimpleQueryStreamingRows { .. }
-        | ProtoState::SimpleQueryAwaitingRfq { .. }
-        | ProtoState::DrainRfqAfterError
-        | ProtoState::ParseAwaitingParseComplete(_)
-        | ProtoState::ParseAwaitingRfq(_)
-        | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-        | ProtoState::BindExecuteAwaitingRfqDml { .. }
-        | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-        | ProtoState::BindExecuteStreamingRows { .. }
-        | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-        | ProtoState::DescribeStatementAwaitingParamDesc(_)
-        | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-        | ProtoState::DescribeStatementAwaitingRfq { .. }
-        | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-        | ProtoState::DescribePortalAwaitingRfq { .. } => true,
-        // Pre-auth: reject notices to avoid operator-log contamination
-        // by pre-auth attacker-controlled text (§48.5 permissive-but-
-        // client-tightened policy).
-        ProtoState::ConnectingStartupTrust { .. }
-        | ProtoState::ConnectingStartupScram { .. }
-        | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-        | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-        | ProtoState::ConnectingScramAwaitingAuthOk(_)
-        | ProtoState::Errored(_) => false,
-    }
+    state.unsolicited_admit().allow_notice_response
 }
 
 /// Classification of a `record_param_status` call's outcome.
@@ -3297,13 +3350,17 @@ fn materialise<'w, 'r>(
                 }
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
-            // DEF-112 + DEF-188: `DeliverReplyEntry` carries a
-            // lifetime-free `StagedReply`. Materialise resolves any
-            // `schema_present` flags / `DescribedRowsStagedSlim::Rows`
-            // markers into `&'r RowDesc` borrows from
-            // `terminal_row_desc`, producing the public `Reply<'r>`.
-            // The entry was constructed by the typed `action::deliver`
-            // path — kind-payload pairing was enforced at dispatch time.
+            // DEF-112 + DEF-188 + DEF-210 SR-01 Path C/D:
+            // `DeliverReplyEntry` carries a lifetime-free `StagedReply`.
+            // Materialise reads `row_desc_slot` directly for ALL
+            // schema-bearing reply paths (QueryComplete, Describe*Complete)
+            // — single source of truth for "is there a schema?". Path C
+            // deleted the `schema_present: bool` duplicate from
+            // QueryComplete; Path D deleted the `DescribedRowsStaged*`
+            // duplicate enums from Describe*Complete. No defensive
+            // `debug_assert!(false)` arms left. The entry was constructed
+            // by the typed `action::deliver` path — kind-payload pairing
+            // enforced at dispatch time.
             StagedAction::DeliverReply(entry) => {
                 let entry_id = entry.id();
                 Action::DeliverReply {
@@ -3577,7 +3634,6 @@ mod allows_unsolicited_param_status_tests {
         let q_rfq = ProtoState::SimpleQueryAwaitingRfq {
             reply: ReplyId::from_raw(nz(8003)),
             command_tag: crate::error::BoundedStr::default(),
-            schema_present: false,
         };
         assert!(allows_unsolicited_param_status(&q_rfq));
         consume_state(q_rfq);

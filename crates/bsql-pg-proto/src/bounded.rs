@@ -63,6 +63,24 @@ use core::num::{NonZeroU8, NonZeroU16};
 /// Implemented for `BoundedU8<MAX>` and `BoundedU16<MAX>` via macro;
 /// the `sealed` mod ensures no out-of-crate impls so the trait
 /// remains a closed sum-type.
+///
+/// # DEF-210 CF-02 build-fail proof
+///
+/// Naming `<BoundedU8<MAX> as BoundedLen<MAX>>::MAX` for `MAX > 254`
+/// is a build error (the `const { assert!(MAX <= 254) }` block in
+/// the impl associated const fires at const-eval-time):
+///
+/// ```compile_fail
+/// use bsql_pg_proto::bounded::{BoundedLen, BoundedU8};
+/// const _: usize = <BoundedU8<300> as BoundedLen<300>>::MAX;
+/// ```
+///
+/// Same for `BoundedU16<MAX>` with `MAX > 65_534`:
+///
+/// ```compile_fail
+/// use bsql_pg_proto::bounded::{BoundedLen, BoundedU16};
+/// const _: usize = <BoundedU16<70_000> as BoundedLen<70_000>>::MAX;
+/// ```
 pub trait BoundedLen<const N: usize>:
     Sized + Copy + Default + PartialEq + Eq + core::fmt::Debug + sealed::Sealed
 {
@@ -95,12 +113,13 @@ pub struct BoundedU8<const MAX: usize>(NonZeroU8);
 impl<const MAX: usize> sealed::Sealed for BoundedU8<MAX> {}
 
 impl<const MAX: usize> BoundedU8<MAX> {
-    const _ASSERT_MAX_FITS_NICHE: () = assert!(
-        MAX <= 254,
-        "BoundedU8<MAX>: MAX must be ≤ 254 for the NonZeroU8 niche \
-         (offset-by-one stored value MAX+1 must fit u8 with 0 unused). \
-         Use BoundedU16 for MAX in 255..=65534.",
-    );
+    // Tier-1 enforcement of `MAX <= 254` lives inside every
+    // publicly-reachable monomorph site (`ZERO`, `new_const`,
+    // `try_new` — all have inline `const { assert!(MAX <= 254, …) }`
+    // blocks). A standalone `_ASSERT_MAX_FITS_NICHE` associated const
+    // would only fire when *referenced*, which never happens in
+    // practice — removed per DEF-210 ML-01 audit (eliminating
+    // confusion about which assert is load-bearing).
 
     /// The logical value `0` — always valid since `MAX ≥ 0`.
     /// Stored as `NonZeroU8::MIN == 1` (offset-by-one encoding).
@@ -180,7 +199,24 @@ impl<const MAX: usize> BoundedU8<MAX> {
 }
 
 impl<const MAX: usize> BoundedLen<MAX> for BoundedU8<MAX> {
-    const MAX: usize = MAX;
+    // DEF-210 CF-02 (audit 2026-04-28): when `<BoundedU8<MAX> as
+    // BoundedLen<MAX>>::MAX` is named at a callsite, the inline
+    // const-block fires at const-eval-time and asserts `MAX <= 254`.
+    // Pre-CF-02 the trait associated const was just `MAX` (no assert),
+    // so naming `::MAX` on a hypothetical `BoundedU8<300>` would have
+    // returned `300` instead of build-failing. CF-02 adds the assert
+    // at the trait-surface naming site to match the discipline of
+    // `ZERO` / `new_const` / `try_new` (each carries its own
+    // `const { assert!(MAX <= 254, …) }`). The associated `compile_fail`
+    // doctest on the `BoundedLen` trait docstring proves the fire.
+    const MAX: usize = const {
+        assert!(
+            MAX <= 254,
+            "BoundedU8<MAX>: MAX must be ≤ 254 (NonZeroU8 niche cap). \
+             Use BoundedU16 for MAX in 255..=65_534.",
+        );
+        MAX
+    };
 
     #[inline]
     fn try_new_usize(value: usize) -> Option<Self> {
@@ -222,10 +258,10 @@ pub struct BoundedU16<const MAX: usize>(NonZeroU16);
 impl<const MAX: usize> sealed::Sealed for BoundedU16<MAX> {}
 
 impl<const MAX: usize> BoundedU16<MAX> {
-    const _ASSERT_MAX_FITS_NICHE: () = assert!(
-        MAX <= 65_534,
-        "BoundedU16<MAX>: MAX must be ≤ 65_534 for the NonZeroU16 niche.",
-    );
+    // Tier-1 enforcement of `MAX <= 65_534` lives inside every
+    // publicly-reachable monomorph site (`ZERO`, `new_const`,
+    // `try_new`). See sister comment in the BoundedU8 impl block
+    // for the audit reasoning (DEF-210 ML-01).
 
     /// The logical value `0`. Stored as `NonZeroU16::MIN == 1`.
     pub const ZERO: Self = const {
@@ -288,7 +324,17 @@ impl<const MAX: usize> BoundedU16<MAX> {
 }
 
 impl<const MAX: usize> BoundedLen<MAX> for BoundedU16<MAX> {
-    const MAX: usize = MAX;
+    // DEF-210 CF-02: same shape as the BoundedU8 trait impl above —
+    // build-fail when `<BoundedU16<MAX> as BoundedLen<MAX>>::MAX` is
+    // named for `MAX > 65_534`, paired `compile_fail` doctest on the
+    // `BoundedLen` trait docstring.
+    const MAX: usize = const {
+        assert!(
+            MAX <= 65_534,
+            "BoundedU16<MAX>: MAX must be ≤ 65_534 (NonZeroU16 niche cap).",
+        );
+        MAX
+    };
 
     #[inline]
     fn try_new_usize(value: usize) -> Option<Self> {

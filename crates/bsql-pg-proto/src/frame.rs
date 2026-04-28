@@ -67,20 +67,23 @@ pub const MAX_FRAME_LEN_FIELD: u32 = 4095;
 pub const HEADER_LEN: usize = 5;
 
 // Tier-1 drift guard: `MAX_FRAME_LEN_FIELD` (u32) must correspond to
-// `READ_BUF_CAP - 1` (usize). A change to either without updating the
-// other fails the build here, because the arithmetic identity below
-// only holds for the *paired* values. Expressing the check as a
-// single `usize` equation avoids any `as` cast:
-//
-//   READ_BUF_CAP == (MAX_FRAME_LEN_FIELD + 1) projected to usize
-//
-// Since `MAX_FRAME_LEN_FIELD: u32`, the comparison needs a common
-// integer type. `u32::MAX` fits in `usize` on every target bsql
-// supports (≥ 32-bit); we express the right-hand side in `u32` space
-// and the left-hand side via its known literal.
+// `READ_BUF_CAP - 1` (usize). The two consts live in different
+// integer types — `usize` and `u32` — and stable Rust does not yet
+// expose `usize::try_from(u32)` in `const fn` context (RU-01,
+// pending-stabilisation in `crates/bsql-pg-proto/src/...`). The
+// `as` cast that would bridge them is forbidden by the workspace
+// clippy bundle (`cast_possible_truncation` etc.). So we PIN BOTH
+// VALUES exactly: a change to either without the matching change to
+// the other trips one of the two asserts. The arithmetic identity
+// `(MAX_FRAME_LEN_FIELD + 1) == READ_BUF_CAP` is preserved by the
+// pair-pin even though we cannot express it as a single equation
+// in stable const code. DEF-210 ML-03 audit (2026-04-28) confirmed
+// the prior third assert (`MAX_FRAME_LEN_FIELD.saturating_add(1)
+// == 4096`) was tautological — given asserts (1) and (2) plus the
+// math fact `4095 + 1 == 4096`, it carried no extra protection;
+// removed for signal-to-noise.
 const _: () = assert!(READ_BUF_CAP == 4096);
 const _: () = assert!(MAX_FRAME_LEN_FIELD == 4095);
-const _: () = assert!(MAX_FRAME_LEN_FIELD.saturating_add(1) == 4096);
 const _: () = assert!(HEADER_LEN == 5, "wire header = 1 byte tag + 4 bytes BE length field");
 
 // READ_BUF_CAP must be large enough to hold the smallest legal complete

@@ -87,12 +87,14 @@ pub trait ReplyKind: sealed::Sealed {
     /// The typed STAGED payload constructed at dispatch time. Must
     /// convert to the internal [`crate::action::StagedReply`] sum.
     ///
-    /// # DEF-119 + DEF-188 — staged vs public payload split
+    /// # DEF-119 + DEF-188 + DEF-210 SR-01 — staged vs public payload split
     ///
-    /// The dispatch site constructs the staged payload (with
-    /// `schema_present: bool` fields where applicable, post-DEF-188);
-    /// materialise converts to the public `Reply<'r>` (with
-    /// `&'r RowDesc` refs borrowed from `PgProtocol::terminal_row_desc`).
+    /// The dispatch site constructs the staged payload (lifetime-free,
+    /// no `&'r RowDesc` borrows); materialise converts to the public
+    /// `Reply<'r>` by borrowing `PgProtocol::row_desc_slot` directly.
+    /// DEF-210 SR-01 Path C deleted the prior `schema_present: bool`
+    /// duplicate flag — the slot's `is_some()` IS the schema-presence
+    /// fact (single source of truth, tier-1 by-construction).
     /// The DEF-112 kind-payload pairing is preserved — `ReplyId<K>`
     /// still constrains what payload the dispatcher can stage, and
     /// the `Into<StagedReply>` bound keeps the seal one-way.

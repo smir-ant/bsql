@@ -379,30 +379,57 @@ const _: () = assert!(
      delivered + padding. Did a bookkeeping field get added?",
 );
 // DEF-189 (architect 2026-04-25): RowDesc moved to PgProtocol single
-// slot; state variants no longer carry schema. Dominating variant is
-// `SimpleQueryAwaitingRfq` with `command_tag: BoundedStr<32>` + reply +
-// `schema_present: bool`, or `BindExecuteAwaitingRfqSelect` likewise.
-// Streaming variants carry only `reply: ReplyId<QueryKind>` (~16 B).
+// slot; state variants no longer carry schema.
+// DEF-210 SR-01 Path C/D (audit 2026-04-28): duplicate flags
+// (`schema_present: bool` for SimpleQuery, `DescribedRowsStaged`
+// enum for Describe paths) deleted — `PgProtocol::row_desc_slot.is_some()`
+// is the single source of truth across all schema-bearing reply paths
+// (tier-1 by-construction).
+// DEF-210 SR-04 + REC-02 (audit 2026-04-28): tightened the prior
+// `>= 16 && <= 96` range pin (80-byte slack window) into exact `==`
+// value pin. Drift surface narrowed to a single arithmetic identity.
+// Cross-platform note: pinned for reference target aarch64-apple-darwin;
+// per-target `#[cfg(...)]` blocks set in the same commit that adds
+// another target to CI per the §A "Cross-platform CI matrix" policy
+// in `deferred.md`.
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() >= 16
-        && core::mem::size_of::<state::ProtoState>() <= 96,
-    "ProtoState size post-DEF-189 (RowDesc externalised to \
-     PgProtocol::row_desc_slot single slot; state variants strip \
-     row_desc fields entirely). \
+    core::mem::size_of::<state::ProtoState>() == 80,
+    "ProtoState size post-DEF-189 (RowDesc externalised) + DEF-210 \
+     SR-01 Path C/D (schema-presence flags deleted; row_desc_slot is \
+     single source of truth) + DEF-210 SR-04 (range pin tightened to \
+     exact). \
      \
-     Dominating variant likely: `SimpleQueryAwaitingRfq` \
-     carrying ReplyId (16 B) + BoundedStr<32> command_tag (32 B) + \
-     schema_present (1 B) + tag + padding ≈ 56-64 B. Streaming \
-     variants carry only ReplyId + tag ≈ 24 B. SCRAM variants \
-     remain ~24-32 B (Box pointers per DEF-187). \
+     Layout on aarch64-apple-darwin: dominant variant is \
+     `DescribeStatementAwaitingRfq` — `ReplyId<DescribeStatementKind>` \
+     (8 B; NonZeroU64 + ZST PhantomData) + `ParamOids` (68 B; 4 B \
+     `n_params: u16` + 2 B padding + 16 × 4 B oid array) + 1 B variant \
+     discriminant + 3 B align(8) tail-pad → 80 B. \
+     \
+     Other notable variants: \
+     - SCRAM `ConnectingScramAwaitingServerFirst` — 3 × Box (24 B) + \
+       ReplyId (8 B) + discriminant + align-pad → ~40-48 B. \
+     - `SimpleQueryAwaitingRfq` — ReplyId (8 B) + BoundedStr<32> \
+       command_tag (~33 B) + discriminant + padding → ~48 B. \
+     - Streaming variants — ReplyId (8 B) + discriminant → ~16 B. \
      \
      Pre-DEF-189: ProtoState ~320 B (dominant variant carried inline \
-     RowDesc 264 B + reply + command_tag). \
+     RowDesc 264 B + reply + command_tag). Net cumulative win across \
+     DEF-188/189 + DEF-210 SR-01 Path C/D: ~75% reduction. \
      \
-     Net win: per-row hot-path single state-projection retrieves \
-     just the reply id; the descriptor is fetched via the protocol's \
-     `current_row_desc` slot (one immutable borrow, no per-row state \
-     match for the desc field).",
+     Per-row hot-path single state-projection retrieves just the \
+     reply id; the descriptor is fetched via the protocol's \
+     `current_row_desc` slot (one immutable borrow, no per-row \
+     state match for the desc field). \
+     \
+     **The dominant constraint is `ParamOids` (68 B), not SCRAM.** A \
+     refactor that wants to shrink ProtoState should target ParamOids \
+     (16-OID arity) or split DescribeStatement* into a heap-boxed \
+     payload variant (DEF-187 SCRAM precedent — but pay-vs-tier \
+     tradeoff per CREDO §1). \
+     \
+     If a refactor changes this number on aarch64-apple-darwin, \
+     update both the literal AND the layout comment above (drift-pin \
+     CREDO §3 discipline).",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,

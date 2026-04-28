@@ -451,6 +451,57 @@ impl SessionParams {
         }
     }
 
+    /// DEF-210 BS-11 + REC-08 (audit 2026-04-28): const-callable
+    /// pristine-state predicate.
+    ///
+    /// `crate::protocol::cold_session_params` falls back to a
+    /// `static EMPTY: SessionParams = SessionParams::new()` when the
+    /// boxed slot is unallocated. A `'static` value is **never
+    /// dropped** — `SecretBoundedStr`'s `ZeroizeOnDrop` impl never
+    /// fires on `EMPTY`. That is fine **iff** every `SecretBoundedStr`
+    /// field is `None` (no bytes to scrub).
+    ///
+    /// **What "pristine" means**: every Option field is `None` and
+    /// every counter is `0`. Equivalent to a freshly-constructed
+    /// instance from `Self::new`, modulo aliased identity.
+    ///
+    /// # Honest tier framing (re-audit 2026-04-28)
+    ///
+    /// **Narrow scope: tier-1 by compile-pin.** A future refactor that
+    /// changes any *currently-checked* field's default to non-pristine
+    /// (e.g. setting `application_name = Some(SecretBoundedStr::default())`
+    /// in [`Self::new`]) trips the build-time `const _: () =
+    /// assert!(EMPTY.is_pristine())` at the static site. The MOST
+    /// likely contributor mistake is in this scope.
+    ///
+    /// **Broad scope: tier-3 by-discipline.** Rust does not expose
+    /// reflective field iteration in const context. Adding a NEW
+    /// secret-bearing field that the contributor forgets to include
+    /// in `is_pristine` would let a non-pristine default through
+    /// — `EMPTY` would carry the bytes for the program's lifetime.
+    ///
+    /// Maintenance contract: when adding a field to [`SessionParams`],
+    /// extend BOTH [`Self::new`] (initializer) AND this predicate.
+    /// A `#[derive(Pristine)]` procmacro could lift the broad scope
+    /// to tier-1 — registered as DEF-210 CF-04-FUTURE.
+    #[inline]
+    #[must_use]
+    pub const fn is_pristine(&self) -> bool {
+        self.server_version.is_none()
+            && self.server_encoding.is_none()
+            && self.client_encoding.is_none()
+            && self.application_name.is_none()
+            && self.is_superuser.is_none()
+            && self.session_authorization.is_none()
+            && self.date_style.is_none()
+            && self.integer_datetimes.is_none()
+            && self.time_zone.is_none()
+            && self.n_unknown_dropped == 0
+            && self.n_malformed_bool_dropped == 0
+            && self.n_malformed_param_status_dropped == 0
+            && self.n_notice_response_dropped == 0
+    }
+
     /// DEF-189 Q8-C3: reset all session parameters to their `new()`
     /// state. Called from `clear_session_residue_if_idle_or_errored`
     /// when state transitions to `Errored` — a tear-down forfeits all

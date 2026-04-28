@@ -39,29 +39,6 @@ use crate::scram::types::SecretDigest;
 /// present, lives in `PgProtocol::row_desc_slot` — populated by the
 /// `'T'` dispatch arm and read by terminal materialise via the
 /// protocol's `current_row_desc()` accessor. This enum is a slim
-/// 1-byte discriminator that distinguishes "schema parked" from
-/// "server sent NoData".
-///
-/// | Variant | State-side | Public `DescribedRows<'r>` |
-/// |---|---|---|
-/// | Rows | `Rows` (1 B disc.) | `Rows(RowDescBorrow<'r>)` (8 B) |
-/// | NoData | `NoData` (1 B disc.) | `NoData` (ZST) |
-///
-/// Pre-DEF-189 was `Rows(RowDesc)` (~264 B state-side). DEF-189
-/// externalisation strips this to a discriminator + parks the
-/// descriptor in `PgProtocol::row_desc_slot`. Tier-2 structural —
-/// dispatch arms set `Rows` ONLY in the same code path that writes
-/// the descriptor into the slot.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DescribedRowsStaged {
-    /// Schema parked into `PgProtocol::row_desc_slot` by the `'T'`
-    /// dispatch arm. Materialise resolves via the protocol borrow.
-    #[doc(hidden)] Rows,
-    /// Server sent `NoData` (`'n'`) — no result columns.
-    #[doc(hidden)] NoData,
-}
-
 /// Where the protocol is right now.
 ///
 /// **Internal-use enum.** Not `#[non_exhaustive]`: exhaustive `match` in
@@ -174,8 +151,23 @@ pub enum ProtoState {
         /// Post-DEF-187: `Box<ScramSession>` reduces variant footprint
         /// to 8 + 16 = 24 B. Tier-1 preserved — Box can't be None,
         /// Box's Drop fires `ScramSession::Drop` (ZeroizeOnDrop) on
-        /// every exit path. Cost: one heap alloc per SCRAM connection
-        /// (cold path, once per connection lifetime).
+        /// every exit path. Cost in this variant: one heap alloc.
+        ///
+        /// **Per-handshake total — DEF-210 SR-07 doc-drift fix
+        /// (audit 2026-04-28).** Pre-audit text claimed *"one heap
+        /// alloc per SCRAM connection"*, which described the
+        /// Phase-1 constellation accurately but missed the
+        /// Phase-2 reality: the next variant
+        /// [`Self::ConnectingScramAwaitingServerFirst`] adds two
+        /// further `Box<PodBytes<…>>` fields (`client_first_bare`,
+        /// `client_nonce_b64`), so the worst-case live-variant
+        /// footprint during a handshake is **three** heap allocs,
+        /// not one. Drop chain (Box → contents) still scrubs
+        /// every secret-bearing byte on transition; tier
+        /// classification unchanged. Consolidation into a single
+        /// `Box<ScramHandshakeState>` is tracked under DEF-210
+        /// REC-06 (alloc-count win + docstring becomes literally
+        /// accurate again).
         scram: alloc::boxed::Box<ScramSession>,
     },
 
@@ -293,12 +285,24 @@ pub enum ProtoState {
     /// (empty for `EmptyQueryResponse`) ships in the final
     /// [`crate::Reply::QueryComplete`] payload.
     ///
-    /// DEF-189: `schema_present: bool` replaces the pre-189
-    /// `row_desc: Option<RowDesc>` (~264 B). The boolean signals
-    /// "the slot was populated when this variant was entered" —
-    /// terminal materialise then resolves via
-    /// `PgProtocol::current_row_desc()` if true. Preserves the
-    /// public-API distinction "0-row SELECT (Some(empty)) vs DML (None)".
+    /// # DEF-210 SR-01 Path C (audit 2026-04-28): `schema_present` deleted
+    ///
+    /// Pre-Path-C this variant carried `schema_present: bool` —
+    /// a duplicate of `PgProtocol::row_desc_slot.is_some()` kept
+    /// in lockstep by dispatch-arm discipline. The duplication was
+    /// **tier-2 structural** (same dispatch arm sets bool ↔
+    /// populates slot atomically) but architecturally fragile: a
+    /// future refactor that set `schema_present = true` without
+    /// populating the slot would silently produce
+    /// `Reply::QueryComplete.row_desc = None` for SELECTs ("DML
+    /// done" instead of rows — silent corruption).
+    ///
+    /// Path C eliminates the duplicate. The single source of truth
+    /// is `PgProtocol::row_desc_slot`; terminal materialise reads
+    /// the slot directly via `into_public`. A future Path C audit
+    /// can confirm: there is no second variable that can drift.
+    /// **Tier-1 by-construction** — the invariant is "the slot
+    /// equals itself", which is identity, not discipline.
     SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
@@ -307,11 +311,6 @@ pub enum ProtoState {
         /// PG's documented tag shapes (the longest standard tag,
         /// `"INSERT <oid> <n>"` with 10-digit values, is ~23 bytes).
         command_tag: BoundedStr<32>,
-        /// `true` if the SELECT path entered with a parked schema in
-        /// `PgProtocol::row_desc_slot`; `false` for DML / empty-query
-        /// paths. Tier-2 structural — set by the same dispatch arm
-        /// that populates / clears the slot.
-        schema_present: bool,
     },
 
     /// `ErrorResponse` received mid-query; `FailReply` already
@@ -501,13 +500,27 @@ pub enum ProtoState {
     /// `ReadyForQuery` that closes the Sync boundary. On `'Z'` →
     /// deliver [`crate::Reply::DescribeStatementComplete`] and
     /// transition to Idle.
+    ///
+    /// # DEF-210 SR-01-D Path D (audit 2026-04-28)
+    ///
+    /// Pre-Path-D this variant carried a `rows: DescribedRowsStaged`
+    /// discriminator — exactly the same architectural shape as the
+    /// `schema_present: bool` removed by Path C from
+    /// `SimpleQueryAwaitingRfq`. The discriminator was a duplicate
+    /// of `PgProtocol::row_desc_slot.is_some()` (the `'T'` arm
+    /// populated the slot AND set `Rows`; the `'n'` arm did neither).
+    /// Materialise read the discriminator and projected from the slot
+    /// — but if the discriminator and slot drifted, the projection
+    /// silently swallowed the schema (manifested as a tier-3
+    /// `debug_assert!(false)` arm in production code, CREDO §V banned
+    /// pattern). Path D deletes the discriminator; materialise reads
+    /// `row_desc_slot.map(...)` directly. **Tier-1 by-construction**:
+    /// the slot equals itself (identity, not discipline).
     DescribeStatementAwaitingRfq {
         /// Correlator for the Describe command.
         reply: ReplyId<DescribeStatementKind>,
         /// Parameter OIDs captured at the `'t'` transition.
         param_oids: ParamOids,
-        /// Rows-or-no-data captured at the `'T'` / `'n'` transition.
-        rows: DescribedRowsStaged,
     },
 
     // ─── Portal-describe path ───
@@ -522,11 +535,13 @@ pub enum ProtoState {
     /// Row-desc / no-data known; awaiting `ReadyForQuery`. On `'Z'`
     /// → deliver [`crate::Reply::DescribePortalComplete`] and
     /// transition to Idle.
+    ///
+    /// DEF-210 SR-01-D Path D: same as
+    /// [`Self::DescribeStatementAwaitingRfq`] — discriminator removed,
+    /// slot is the single source of truth.
     DescribePortalAwaitingRfq {
         /// Correlator for the Describe command.
         reply: ReplyId<DescribePortalKind>,
-        /// Rows-or-no-data captured at the `'T'` / `'n'` transition.
-        rows: DescribedRowsStaged,
     },
 
     /// Terminal: the connection has been classified as unrecoverable.
@@ -712,6 +727,92 @@ impl ProtoState {
     }
 }
 
+/// DEF-210 SR-03 (audit 2026-04-28): classifier output for
+/// [`ProtoState::unsolicited_admit`]. Single source of truth for
+/// "is this state allowed to accept an unsolicited `ParameterStatus`
+/// or `NoticeResponse` frame?" — replaces the prior pair of
+/// independent exhaustive matches in `protocol.rs`
+/// (`allows_unsolicited_param_status` / `..._notice_response`)
+/// which had identical state-lists but no compile-level guarantee
+/// of synchronisation. With this struct, both bools come from one
+/// match arm — drift between classifiers is structurally impossible.
+///
+/// Today the two bools always agree; the struct preserves the
+/// distinction so a future PG-spec divergence (e.g. allowing
+/// `NoticeResponse` in a pre-auth state but not `ParameterStatus`)
+/// can be expressed by editing one match arm without re-introducing
+/// the parallel-classifier drift surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnsolicitedAdmit {
+    /// `true` iff an unsolicited `ParameterStatus` frame in this
+    /// state should be silently consumed (current PG transactions
+    /// can carry late session-param updates) rather than classified
+    /// as `UnexpectedFrame`.
+    pub allow_param_status: bool,
+    /// `true` iff an unsolicited `NoticeResponse` frame in this
+    /// state should be silently consumed (notices flow through to
+    /// the wrapper's async logging channel) rather than classified
+    /// as `UnexpectedFrame`. Pre-auth states reject to avoid
+    /// operator-log contamination by attacker-controlled text.
+    pub allow_notice_response: bool,
+}
+
+impl ProtoState {
+    /// DEF-210 SR-03: single exhaustive classifier for unsolicited
+    /// `ParameterStatus` / `NoticeResponse` admittance, replacing the
+    /// pair of identical exhaustive matches in `protocol.rs`. Adding
+    /// a new `ProtoState` variant fails the build here until the
+    /// contributor decides both bools.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn unsolicited_admit(&self) -> UnsolicitedAdmit {
+        // Pre-auth `Connecting*` states + terminal `Errored` reject
+        // both PS and NR. NR rejection avoids operator-log contamination
+        // by attacker-controlled text (PG §48.5 permissive-but-client-
+        // tightened policy). PS rejection follows the same trust-only-
+        // post-auth principle.
+        //
+        // All post-startup states (Idle, Ping*, SimpleQuery*, Parse*,
+        // BindExecute*, Describe*, DrainRfqAfterError) accept both.
+        match self {
+            Self::Idle
+            | Self::PingAwaitingRfq(_)
+            | Self::ConnectingPostAuthAwaitingKey(_)
+            | Self::ConnectingPostAuthHaveKey { .. }
+            | Self::SimpleQueryAwaitingFirstResponse(_)
+            | Self::SimpleQueryStreamingRows { .. }
+            | Self::SimpleQueryAwaitingRfq { .. }
+            | Self::DrainRfqAfterError
+            | Self::ParseAwaitingParseComplete(_)
+            | Self::ParseAwaitingRfq(_)
+            | Self::BindExecuteAwaitingBindCompleteDml(_)
+            | Self::BindExecuteAwaitingCommandCompleteDml(_)
+            | Self::BindExecuteAwaitingRfqDml { .. }
+            | Self::BindExecuteAwaitingBindCompleteSelect { .. }
+            | Self::BindExecuteAwaitingDataOrCompleteSelect { .. }
+            | Self::BindExecuteStreamingRows { .. }
+            | Self::BindExecuteAwaitingRfqSelect { .. }
+            | Self::DescribeStatementAwaitingParamDesc(_)
+            | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
+            | Self::DescribeStatementAwaitingRfq { .. }
+            | Self::DescribePortalAwaitingRowDescOrNoData(_)
+            | Self::DescribePortalAwaitingRfq { .. } => UnsolicitedAdmit {
+                allow_param_status: true,
+                allow_notice_response: true,
+            },
+            Self::ConnectingStartupTrust { .. }
+            | Self::ConnectingStartupScram { .. }
+            | Self::ConnectingScramAwaitingServerFirst { .. }
+            | Self::ConnectingScramAwaitingServerFinal { .. }
+            | Self::ConnectingScramAwaitingAuthOk(_)
+            | Self::Errored(_) => UnsolicitedAdmit {
+                allow_param_status: false,
+                allow_notice_response: false,
+            },
+        }
+    }
+}
+
 /// DEF-146: classifier output for [`ProtoState::push_class`].
 ///
 /// Used by the 7 `compute_push_*` helpers in `protocol.rs` to decide
@@ -797,11 +898,10 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("SimpleQueryStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::SimpleQueryAwaitingRfq { reply, command_tag, schema_present } => f
+            Self::SimpleQueryAwaitingRfq { reply, command_tag } => f
                 .debug_struct("SimpleQueryAwaitingRfq")
                 .field("reply", reply)
                 .field("command_tag", command_tag)
-                .field("schema_present", schema_present)
                 .finish(),
             Self::BindExecuteAwaitingBindCompleteDml(id) => {
                 write!(f, "BindExecuteAwaitingBindCompleteDml({id:?})")
@@ -1013,7 +1113,6 @@ mod push_class_tests {
             ProtoState::SimpleQueryAwaitingRfq {
                 reply: ReplyId::from_raw(nz(3_003)),
                 command_tag: BoundedStr::default(),
-                schema_present: false,
             },
             StatePushClass::BusyQuery,
         );
@@ -1087,7 +1186,6 @@ mod push_class_tests {
             ProtoState::DescribeStatementAwaitingRfq {
                 reply: ReplyId::from_raw(nz(6_003)),
                 param_oids: crate::action::ParamOids::EMPTY,
-                rows: DescribedRowsStaged::NoData,
             },
             StatePushClass::BusyQuery,
         );
@@ -1098,7 +1196,6 @@ mod push_class_tests {
         pin(
             ProtoState::DescribePortalAwaitingRfq {
                 reply: ReplyId::from_raw(nz(6_005)),
-                rows: DescribedRowsStaged::NoData,
             },
             StatePushClass::BusyQuery,
         );
