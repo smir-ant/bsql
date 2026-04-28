@@ -63,7 +63,9 @@ use core::num::{NonZeroU8, NonZeroU16};
 /// Implemented for `BoundedU8<MAX>` and `BoundedU16<MAX>` via macro;
 /// the `sealed` mod ensures no out-of-crate impls so the trait
 /// remains a closed sum-type.
-pub trait BoundedLen<const N: usize>: Sized + Copy + Default + sealed::Sealed {
+pub trait BoundedLen<const N: usize>:
+    Sized + Copy + Default + PartialEq + Eq + core::fmt::Debug + sealed::Sealed
+{
     /// The compile-time bound `0 ≤ value ≤ MAX`.
     const MAX: usize;
 

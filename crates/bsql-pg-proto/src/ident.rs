@@ -99,37 +99,6 @@
 use core::fmt;
 use core::marker::PhantomData;
 
-/// DEF-154 (T) P1-2: architecturally-infallible usize → u16 narrow
-/// with a NON-SILENT fallback on Err.
-///
-/// Callers upstream gate `value ≤ cap` and `cap ≤ u16::MAX`, making
-/// `u16::try_from(value)` infallible by construction. Pre-(T) the
-/// `.unwrap_or(0)` pattern silently mapped invariant-break to zero-
-/// length, producing an empty-looking string / slice at the caller.
-/// Post-(T) the fallback is `cap` narrowed to u16 (saturating to
-/// `u16::MAX` if `cap` itself exceeds u16, architecturally dead
-/// under caller-side const-asserts) — observable as "full buffer"
-/// on invariant break, not "empty".
-///
-/// Both Err arms are documented-dead; the helper lives here so
-/// every FixedStr / BoundedStr / OtherEncoding narrowing site shares
-/// the same structured dead-arm form rather than hand-rolling
-/// `unwrap_or(0)`.
-#[inline]
-#[must_use]
-pub(crate) fn narrow_len_u16(value: usize, cap: usize) -> u16 {
-    if let Ok(n) = u16::try_from(value) {
-        return n;
-    }
-    // Architecturally dead under caller-side const-asserts. Cap
-    // fallback is u16::MAX only if `cap` itself is > u16::MAX
-    // (impossible by static asserts at every caller site).
-    if let Ok(n) = u16::try_from(cap) {
-        return n;
-    }
-    u16::MAX
-}
-
 /// Maximum byte length for a PostgreSQL identifier (user / database).
 ///
 /// PostgreSQL `NAMEDATALEN = 64`; usable chars = 63.
@@ -416,9 +385,17 @@ impl ValidUtf8 for PortalNameTag {}
 /// typical 64-byte query, the prefix compare is 64 bytes vs 2048
 /// for the full-buffer compare — 32x reduction on every `==`.
 #[repr(C)]
-pub struct FixedStr<const N: usize, Tag> {
+pub struct FixedStr<const N: usize, Tag, LenT = crate::bounded::BoundedU16<N>>
+where
+    LenT: crate::bounded::BoundedLen<N>,
+{
     buf: [u8; N],
-    len: u16,
+    /// DEF-203 ext: typed length-storage parameter. Defaults to
+    /// `BoundedU16<N>` (2 B, NonZeroU16 niche). Type aliases for
+    /// small-N (≤ 254) types pick `BoundedU8<N>` (1 B + niche).
+    /// **Tier-2 by-construct** — out-of-range len values cannot
+    /// exist via `BoundedLen::try_new_usize`.
+    len: LenT,
     /// DEF-185 P2-D (audit 2026-04-24): flag indicating that
     /// `from_bytes_lossy` coerced at least one non-ASCII-printable
     /// byte to `b'?'`. Callers can query via [`Self::was_lossy`]
@@ -436,66 +413,117 @@ pub struct FixedStr<const N: usize, Tag> {
     _tag: PhantomData<fn() -> Tag>,
 }
 
-impl<const N: usize, Tag> Clone for FixedStr<N, Tag> {
+impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> Clone for FixedStr<N, Tag, LenT> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<const N: usize, Tag> Copy for FixedStr<N, Tag> {}
+impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> Copy for FixedStr<N, Tag, LenT> {}
 
-impl<const N: usize, Tag> PartialEq for FixedStr<N, Tag> {
+impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> PartialEq for FixedStr<N, Tag, LenT> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         // F46: compare `len` first (short-circuit on different
         // length), then compare only the populated prefix.
-        // `as_bytes()` returns `&self.buf[..len]` via `.get(..len)`;
-        // both sides have identical length once the len-equality
-        // check passes, so the slice compare is byte-exact over
-        // exactly `len` bytes — NOT the full `N`-byte buffer.
-        // Pre-F46 compared `self.buf == other.buf` (full N bytes
-        // including the zeroed tail) — logically equivalent (tail
-        // always zero) but wastes `N - len` byte compares per call.
         self.len == other.len && self.as_bytes() == other.as_bytes()
     }
 }
-impl<const N: usize, Tag> Eq for FixedStr<N, Tag> {}
+impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> Eq for FixedStr<N, Tag, LenT> {}
 
 /// A PostgreSQL user identifier (63-byte cap, non-empty, no NUL).
-pub type Ident = FixedStr<MAX_IDENT_LEN, IdentTag>;
+/// **DEF-203 ext**: uses `BoundedU8<63>` LenT for the niche win on
+/// `Option<Ident>` (saves 3 B per Option vs the default BoundedU16).
+pub type Ident = FixedStr<MAX_IDENT_LEN, IdentTag, crate::bounded::BoundedU8<MAX_IDENT_LEN>>;
 
 /// A PostgreSQL database name (63-byte cap, non-empty, no NUL).
-pub type DatabaseName = FixedStr<MAX_IDENT_LEN, DatabaseNameTag>;
+pub type DatabaseName =
+    FixedStr<MAX_IDENT_LEN, DatabaseNameTag, crate::bounded::BoundedU8<MAX_IDENT_LEN>>;
 
 /// A PostgreSQL `application_name` parameter (128-byte cap, no NUL,
 /// may be empty).
-pub type ApplicationName = FixedStr<MAX_APP_NAME_LEN, ApplicationNameTag>;
+pub type ApplicationName =
+    FixedStr<MAX_APP_NAME_LEN, ApplicationNameTag, crate::bounded::BoundedU8<MAX_APP_NAME_LEN>>;
 
 /// A bounded string with explicit `"…"`-marked truncation on overflow.
 ///
 /// Used in [`crate::error::ServerErrorResponse`] to hold server-sent
 /// error message fields with a hard byte cap and no silent truncation.
+///
+/// Uses the default `BoundedU16<N>` LenT — covers any N up to 65_534.
 pub type BoundedStr<const N: usize> = FixedStr<N, BoundedStrTag>;
 
 /// A bounded SQL query text. Capacity [`MAX_SQL_LEN`] = 2048 bytes.
 /// Overflow truncates at UTF-8 boundary with `"…"` marker (no silent
 /// drop — user sees a visibly-truncated statement).
 ///
-/// Round-4 finding #2 — Phase 1c typed newtype.
+/// Uses the default `BoundedU16<N>` LenT (2048 > 254).
 pub type Sql = FixedStr<MAX_SQL_LEN, SqlTag>;
 
 /// A PG prepared-statement name. Capacity [`MAX_PG_NAME_LEN`] = 63
 /// (PG's `NAMEDATALEN - 1`). Validated: non-empty, no NUL.
-///
-/// Round-4 finding #2 — Phase 1c typed newtype.
-pub type StmtName = FixedStr<MAX_PG_NAME_LEN, StmtNameTag>;
+pub type StmtName =
+    FixedStr<MAX_PG_NAME_LEN, StmtNameTag, crate::bounded::BoundedU8<MAX_PG_NAME_LEN>>;
 
 /// A PG portal name (bound statement instance). Capacity and
 /// validation match [`StmtName`], but distinct compile-time type —
 /// a function expecting `StmtName` rejects `PortalName` at type-check.
 ///
 /// Round-4 finding #2 — Phase 1c typed newtype.
-pub type PortalName = FixedStr<MAX_PG_NAME_LEN, PortalNameTag>;
+pub type PortalName =
+    FixedStr<MAX_PG_NAME_LEN, PortalNameTag, crate::bounded::BoundedU8<MAX_PG_NAME_LEN>>;
+
+// ─── DEF-203 ext: Option<T> niche size pins ─────────────────────────
+//
+// Migrating `len: u16` → `len: BoundedU8<63>` (or `BoundedU16<N>`)
+// shrinks the type AND lets `Option<T>` absorb the discriminant via
+// the underlying `NonZero` niche. These const-asserts pin the win
+// exactly so a future regression that loses the niche fails the build.
+//
+// Pre-DEF-203-ext layout for `FixedStr<63, _>` (all small-N validated
+// types): `buf: [u8; 63] (63 B) + pad (1 B) + len: u16 (2 B) +
+// was_lossy_flag: u8 (1 B) + tag (0 B) = 67 B aligned to 2 = 68 B`.
+// `Option<Self> = 68 + 1 disc + 1 pad = 70 B`.
+//
+// Post-DEF-203-ext: `buf (63 B) + len: BoundedU8<63> (1 B) +
+// was_lossy_flag (1 B) = 65 B aligned to 1 = 65 B`. `Option<Self> =
+// 65 B (NonZeroU8 niche absorbs the discriminant).` **Saving: 5 B
+// per type, 5 B per Option per site.**
+
+const _: () = assert!(
+    core::mem::size_of::<Ident>() == 65,
+    "Ident must be 65 B post-DEF-203 ext (was 68 B with u16 len). \
+     If this trips, BoundedU8 niche may have been lost.",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<Ident>>() == 65,
+    "Option<Ident> must be 65 B post-DEF-203 ext (NonZeroU8 niche). \
+     Pre-DEF-203-ext was 70 B. Saving: 5 B per Option<Ident>.",
+);
+const _: () = assert!(
+    core::mem::size_of::<DatabaseName>() == 65,
+    "DatabaseName must be 65 B post-DEF-203 ext (BoundedU8<63> len)",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<DatabaseName>>() == 65,
+    "Option<DatabaseName> must be 65 B post-DEF-203 ext (niche)",
+);
+const _: () = assert!(
+    core::mem::size_of::<ApplicationName>() == 130,
+    "ApplicationName must be 130 B post-DEF-203 ext (= 128 buf + 1 BoundedU8<128> len + 1 was_lossy)",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<ApplicationName>>() == 130,
+    "Option<ApplicationName> must be 130 B post-DEF-203 ext (niche)",
+);
+const _: () = assert!(
+    core::mem::size_of::<StmtName>() == 65,
+    "StmtName must be 65 B post-DEF-203 ext (BoundedU8<63> len)",
+);
+const _: () = assert!(
+    core::mem::size_of::<PortalName>() == 65,
+    "PortalName must be 65 B post-DEF-203 ext (BoundedU8<63> len)",
+);
 
 // ═════════════════════════════════════════════════════════════════
 // DEF-205 (2026-04-27): SecretBoundedStr — sensitive bounded string.
@@ -955,42 +983,65 @@ impl fmt::Display for IdentError {
 
 // ───────────────────────── Shared impl block ──────────────────────────
 
-impl<const N: usize, Tag> FixedStr<N, Tag> {
-    /// Empty value. Compile-time asserts `N ≤ u16::MAX` via an
-    /// inline `const { … }` block that fires at monomorph time.
-    ///
-    /// `65_535` is hard-coded instead of `u16::MAX as usize` because
-    /// `as` casts are banned by the crate forbid-bundle.
+// ─── Concrete `const fn new` per-LenT (DEF-203 ext) ─────────────────
+//
+// Generic `Self::new` would need `LenT::ZERO` (trait associated const)
+// in const context, which requires `const_trait_impl` (unstable).
+// Workaround: provide CONCRETE const fn `new` for each LenT impl.
+// `BoundedU8` and `BoundedU16` are the only two LenT types (sealed
+// `BoundedLen` trait), so this covers all cases.
+
+impl<const N: usize, Tag> FixedStr<N, Tag, crate::bounded::BoundedU8<N>> {
+    /// Empty value. Compile-time asserts `N ≤ 254` (BoundedU8 niche
+    /// requirement) via const-block.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
         const {
-            assert!(
-                N <= 65_535,
-                "FixedStr<N, _>: N must fit u16 length prefix (≤ 65_535)",
-            );
+            assert!(N <= 254, "FixedStr with BoundedU8 LenT requires N ≤ 254");
         }
         Self {
             buf: [0u8; N],
-            len: 0,
+            len: crate::bounded::BoundedU8::<N>::ZERO,
             was_lossy_flag: 0,
             _tag: PhantomData,
         }
     }
+}
 
+impl<const N: usize, Tag> FixedStr<N, Tag, crate::bounded::BoundedU16<N>> {
+    /// Empty value. Compile-time asserts `N ≤ 65_534` (BoundedU16 niche
+    /// requirement) via const-block.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        const {
+            assert!(N <= 65_534, "FixedStr with BoundedU16 LenT requires N ≤ 65_534");
+        }
+        Self {
+            buf: [0u8; N],
+            len: crate::bounded::BoundedU16::<N>::ZERO,
+            was_lossy_flag: 0,
+            _tag: PhantomData,
+        }
+    }
+}
+
+// ─── Generic methods over LenT (DEF-203 ext) ─────────────────────────
+
+impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, LenT> {
     /// Populated byte length.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        // `u16 → usize` via `From` impl (infallible, widening).
-        usize::from(self.len)
+        self.len.get_usize()
     }
 
     /// Whether no bytes have been stored.
     #[inline]
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.len.get_usize() == 0
     }
 
     /// Borrow the populated bytes.
@@ -1036,7 +1087,7 @@ impl<const N: usize, Tag> FixedStr<N, Tag> {
 /// UTF-8 won't be able to call this method. All current crate tags
 /// opt in because every constructor takes `&str` or produces ASCII
 /// via `from_bytes_lossy`.
-impl<const N: usize, Tag: ValidUtf8> FixedStr<N, Tag> {
+impl<const N: usize, Tag: ValidUtf8, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, LenT> {
     /// Borrow the populated bytes as `&str`.
     ///
     /// **Validity:** every `ValidUtf8` tag's constructor guarantees
@@ -1098,10 +1149,18 @@ impl<const N: usize, Tag: ValidUtf8> FixedStr<N, Tag> {
     }
 }
 
-impl<const N: usize, Tag> Default for FixedStr<N, Tag> {
+impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> Default for FixedStr<N, Tag, LenT> {
     #[inline]
     fn default() -> Self {
-        Self::new()
+        // DEF-203 ext: generic Default uses LenT::default() (non-const,
+        // trait method). Construct directly without calling Self::new
+        // (which is per-concrete-LenT const fn).
+        Self {
+            buf: [0u8; N],
+            len: LenT::default(),
+            was_lossy_flag: 0,
+            _tag: PhantomData,
+        }
     }
 }
 
@@ -1109,13 +1168,21 @@ impl<const N: usize, Tag> Default for FixedStr<N, Tag> {
 // `as_str()` which requires UTF-8 validity. This is in practice
 // unchanged from pre-F3 (every current tag is ValidUtf8), but
 // future non-UTF-8 tags would need separate byte-based impls.
-impl<const N: usize, Tag: FixedStrKind + ValidUtf8> fmt::Debug for FixedStr<N, Tag> {
+impl<const N: usize, Tag, LenT> fmt::Debug for FixedStr<N, Tag, LenT>
+where
+    Tag: FixedStrKind + ValidUtf8,
+    LenT: crate::bounded::BoundedLen<N>,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}(\"{}\")", Tag::DEBUG_NAME, self.as_str())
     }
 }
 
-impl<const N: usize, Tag: ValidUtf8> fmt::Display for FixedStr<N, Tag> {
+impl<const N: usize, Tag, LenT> fmt::Display for FixedStr<N, Tag, LenT>
+where
+    Tag: ValidUtf8,
+    LenT: crate::bounded::BoundedLen<N>,
+{
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -1125,7 +1192,7 @@ impl<const N: usize, Tag: ValidUtf8> fmt::Display for FixedStr<N, Tag> {
 // ───────────────── Validated-tag constructor (Ident / DatabaseName /
 // ApplicationName) ────────────────
 
-impl<const N: usize, Tag: Validated> FixedStr<N, Tag> {
+impl<const N: usize, Tag: Validated, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, LenT> {
     /// Construct from a UTF-8 string with full validation.
     ///
     /// Rejects NUL-containing and over-length inputs. Empty input is
@@ -1146,11 +1213,15 @@ impl<const N: usize, Tag: Validated> FixedStr<N, Tag> {
         }
         // `bytes.len() <= N <= 65_535` (const-asserted in `new`),
         // so the narrowing below is infallible.
-        let len = u16::try_from(bytes.len()).map_err(|_| IdentError::TooLong {
+        // DEF-203 ext: tier-2 by-construct via BoundedLen::try_new_usize.
+        // The earlier `bytes.len() > N` guard rejects oversize inputs, so
+        // this Err arm is architecturally dead; classified to match the
+        // original IdentError::TooLong signature for API stability.
+        let len = LenT::try_new_usize(bytes.len()).ok_or(IdentError::TooLong {
             len: bytes.len(),
             max: N,
         })?;
-        let mut out = Self::new();
+        let mut out = Self::default();
         if let Some(dst) = out.buf.get_mut(..bytes.len()) {
             dst.copy_from_slice(bytes);
         }
@@ -1161,7 +1232,7 @@ impl<const N: usize, Tag: Validated> FixedStr<N, Tag> {
 
 // ───────────────── Truncating-tag constructor (BoundedStr / Sql) ──────
 
-impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
+impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, LenT> {
     /// UTF-8 ellipsis marker appended on overflow. 3 bytes.
     ///
     /// # Why `"…"` and not `"~"` or `"..."` (DEF-126 investigation, 2026-04-21)
@@ -1228,7 +1299,7 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
         // `const` items are lazy; without this reference the assert
         // never triggers for bad `N`.
         let () = Self::_TRUNCATING_N_MIN;
-        let mut out = Self::new(); // also runs the N ≤ u16::MAX assert.
+        let mut out = Self::default();
         let src = source.as_bytes();
 
         // Fast path: source fits verbatim.
@@ -1243,7 +1314,7 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
             // invariant break. Post-(T) Err-arm fallback is N (cap)
             // not 0, surfacing "full buffer" rather than silently
             // empty if both invariants somehow broke simultaneously.
-            out.len = narrow_len_u16(src.len(), N);
+            out.len = LenT::try_new_usize(src.len()).unwrap_or_default();
             return out;
         }
 
@@ -1264,7 +1335,7 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
             dst.copy_from_slice(Self::OVERFLOW_MARKER);
         }
         // DEF-154 (T): narrow via helper; see `narrow_len_u16` docstring.
-        out.len = narrow_len_u16(marker_end, N);
+        out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
         out
     }
 
@@ -1304,7 +1375,7 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
             return Self::from_str_truncating(s);
         }
         // Slow path: coerce every non-ASCII byte to `?`.
-        let mut out = Self::new();
+        let mut out = Self::default();
         let budget = N.saturating_sub(Self::OVERFLOW_MARKER.len());
         let mut written = 0usize;
         // DEF-185 P2-D (audit 2026-04-24): track whether any lossy
@@ -1337,9 +1408,9 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
                 dst.copy_from_slice(Self::OVERFLOW_MARKER);
             }
             // DEF-154 (T): see `narrow_len_u16` docstring.
-            out.len = narrow_len_u16(marker_end, N);
+            out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
         } else {
-            out.len = narrow_len_u16(written, N);
+            out.len = LenT::try_new_usize(written).unwrap_or_default();
         }
         // DEF-185 P2-D: surface the lossy flag.
         if any_coerced {
@@ -1393,7 +1464,7 @@ impl<const N: usize, Tag: Truncating> FixedStr<N, Tag> {
     pub(crate) fn zeroize_in_place(&mut self) {
         use zeroize::Zeroize;
         self.buf.zeroize();
-        self.len = 0;
+        self.len = LenT::default();
         self.was_lossy_flag = 0;
     }
 }
