@@ -917,6 +917,11 @@ impl PgProtocol {
         &'s mut self,
         cmd: PgCommand,
         write_buf: &'w mut WriteBuf,
+        // DEF-198 ext: tier-1 compile-time witness that state is Idle.
+        // Constructible only inside `mod guard`; reachable only via
+        // `ReadyGuard::push_command` which acquired the guard through
+        // `PgProtocol::as_ready`'s runtime classification.
+        _proof: crate::guard::IdleStateProof,
     ) -> OutActions<'w, 's> {
         // 1c-1a: push never produces `StreamRow` (rows arrive via
         // server responses, handled in `feed_bytes`). The `'r`
@@ -1011,6 +1016,9 @@ impl PgProtocol {
         fetch: crate::command::FetchRows,
         reply: ReplyId<crate::reply_id::QueryKind>,
         write_buf: &'w mut WriteBuf,
+        // DEF-198 ext: tier-1 compile-time Idle witness — see
+        // [`Self::push_command_internal`] for rationale.
+        _proof: crate::guard::IdleStateProof,
     ) -> OutActions<'w, 's> {
         write_buf.clear();
         // DEF-189: centralised entry-point session-residue reclamation.
@@ -4401,11 +4409,15 @@ mod compute_push_tests {
         // PgProtocol::new() and hits the Idle arm). No handshake
         // drive needed.
         let reply_raw = nz(999);
-        // DEF-198: internal test calls `push_bind_execute_internal`
-        // directly. The public surface is `ReadyGuard::push_bind_execute`
-        // (only via `proto.as_ready`), but internal `compute_push_*`
-        // tests bypass the guard to exercise the dispatch logic.
-        let out = proto.push_bind_execute_internal(
+        // DEF-198 ext: internal test now goes through `ReadyGuard`
+        // since `push_bind_execute_internal`'s signature requires the
+        // sealed `IdleStateProof` witness (constructible only inside
+        // `mod guard`). Production-equivalent path; fresh proto is
+        // in `Idle` state so `as_ready()` returns `Some`. The
+        // architecturally-dead `None` arm early-returns to satisfy
+        // the lib-level `clippy::panic` forbid bundle.
+        let Some(guard) = proto.as_ready() else { return };
+        let out = guard.push_bind_execute(
             &crate::ident::PortalName::default(),
             &crate::ident::StmtName::default(),
             &OverflowParams,

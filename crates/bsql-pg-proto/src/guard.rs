@@ -163,6 +163,50 @@ pub struct ReadyGuard<'a> {
     proto: &'a mut PgProtocol,
 }
 
+/// Tier-1 compile-time witness that `state == ProtoState::Idle`.
+///
+/// **Sealed, ZST, private-field constructor.** Only this module can
+/// construct an `IdleStateProof` (via the unit struct's private `()`
+/// field). Crate-internal API endpoints that require the Idle
+/// precondition take this witness as a parameter — the type system
+/// then guarantees the caller went through [`ReadyGuard`] (which is
+/// the only legitimate construction path).
+///
+/// # Why a ZST witness rather than just `debug_assert!`?
+///
+/// Pre-DEF-198 ext, `PgProtocol::push_command_internal` had a
+/// `debug_assert!(matches!(state, ProtoState::Idle))` at function
+/// entry. Release builds skip the assertion; a future internal
+/// caller could silently bypass [`ReadyGuard`] and call
+/// `push_command_internal` from a non-Idle state, getting
+/// **undefined behaviour at the protocol layer** (state corruption,
+/// lost reply correlator, etc.) without any compile-time signal.
+///
+/// Post-DEF-198 ext, `push_command_internal`'s signature requires
+/// an `IdleStateProof` parameter. Constructing one is impossible
+/// outside this module (private field). The only legitimate path
+/// to a proof is via [`ReadyGuard::push_command`] / `push_bind_execute`,
+/// which acquire the guard through `PgProtocol::as_ready` (runtime
+/// `state == Idle` check). **Result: tier-1 closure on the
+/// "push from Idle only" invariant for the internal API surface.**
+///
+/// Zero size, zero runtime cost — pure type-system enforcement.
+#[derive(Debug)]
+pub(crate) struct IdleStateProof(());
+
+impl IdleStateProof {
+    /// Sealed within `mod guard` — only `ReadyGuard::push_*` paths
+    /// reach this constructor (which itself is reachable only after
+    /// `PgProtocol::as_ready` verified the state is Idle).
+    ///
+    /// Crate-internal callers that need the proof MUST go through
+    /// `ReadyGuard`; there is no other path.
+    #[inline]
+    const fn new() -> Self {
+        Self(())
+    }
+}
+
 impl<'a> ReadyGuard<'a> {
     /// Construct internally — public callers acquire via
     /// [`PgProtocol::as_ready`].
@@ -198,7 +242,11 @@ impl<'a> ReadyGuard<'a> {
         cmd: PgCommand,
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 'a> {
-        self.proto.push_command_internal(cmd, write_buf)
+        // DEF-198 ext: synthesise the Idle-state witness here.
+        // `IdleStateProof::new()` is reachable only inside `mod guard`,
+        // and the guard's existence (acquired via `as_ready`) statically
+        // proves the precondition.
+        self.proto.push_command_internal(cmd, write_buf, IdleStateProof::new())
     }
 
     /// Extended-Query Bind+Execute pipeline.
@@ -229,6 +277,7 @@ impl<'a> ReadyGuard<'a> {
             fetch,
             reply,
             write_buf,
+            IdleStateProof::new(),
         )
     }
 }
