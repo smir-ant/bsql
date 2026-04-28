@@ -149,13 +149,36 @@ impl Encoding {
     }
 }
 
+/// `MAX_ENCODING_NAME_LEN` re-exposed as `u8` for the
+/// [`crate::bounded::BoundedU8`] type parameter on
+/// [`OtherEncoding::len`]. Const-asserted equal to
+/// [`MAX_ENCODING_NAME_LEN`].
+const MAX_ENCODING_NAME_LEN_U8: u8 = 32;
+const _: () = {
+    let lhs_truncated = MAX_ENCODING_NAME_LEN.to_le_bytes()[0];
+    assert!(
+        MAX_ENCODING_NAME_LEN_U8 == lhs_truncated && MAX_ENCODING_NAME_LEN == 32,
+        "MAX_ENCODING_NAME_LEN_U8 must equal MAX_ENCODING_NAME_LEN — bump both together",
+    );
+};
+
 /// Raw bytes of an unrecognised PG encoding name, bounded at
 /// [`MAX_ENCODING_NAME_LEN`]. Preserves the byte-exact spelling
 /// the server sent. DEF-114.
+///
+/// # DEF-203 narrowing
+///
+/// Pre-DEF-203 `len: u16` was 2 bytes. Post-DEF-203 `len:
+/// BoundedU8<32>` is 1 byte (NonZeroU8-backed offset-by-one
+/// niche), saving 1 B per `OtherEncoding` AND absorbing the
+/// `Option<OtherEncoding>` discriminant via the niche.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtherEncoding {
     buf: [u8; MAX_ENCODING_NAME_LEN],
-    len: u16,
+    /// DEF-203: tier-2 by-construct (`BoundedU8::try_new` rejects
+    /// `len > MAX_ENCODING_NAME_LEN`); tier-1 niche on
+    /// `Option<OtherEncoding>`.
+    len: crate::bounded::BoundedU8<MAX_ENCODING_NAME_LEN_U8>,
 }
 
 impl OtherEncoding {
@@ -166,7 +189,7 @@ impl OtherEncoding {
     pub const fn empty() -> Self {
         Self {
             buf: [0u8; MAX_ENCODING_NAME_LEN],
-            len: 0,
+            len: crate::bounded::BoundedU8::ZERO,
         }
     }
 
@@ -176,7 +199,11 @@ impl OtherEncoding {
         if src.len() > MAX_ENCODING_NAME_LEN {
             return None;
         }
-        let len = u16::try_from(src.len()).ok()?;
+        // src.len() <= MAX_ENCODING_NAME_LEN = 32, so u8::try_from
+        // is infallible (Err arm dead). BoundedU8::try_new likewise
+        // succeeds since the value is range-validated above.
+        let len_u8 = u8::try_from(src.len()).ok()?;
+        let len = crate::bounded::BoundedU8::try_new(len_u8)?;
         let mut out = Self::empty();
         if let Some(dst) = out.buf.get_mut(..src.len()) {
             dst.copy_from_slice(src);
@@ -213,10 +240,17 @@ impl OtherEncoding {
         if let Some(dst_marker) = out.buf.get_mut(budget..marker_end) {
             dst_marker.copy_from_slice(MARKER);
         }
-        // DEF-154 (T) P1-2: see `crate::ident::narrow_len_u16`
-        // docstring. `marker_end ≤ MAX_ENCODING_NAME_LEN ≤ u16::MAX`
-        // by construction; Err arms documented-dead.
-        out.len = crate::ident::narrow_len_u16(marker_end, MAX_ENCODING_NAME_LEN);
+        // DEF-203: `marker_end ≤ MAX_ENCODING_NAME_LEN = 32` by
+        // construction (`budget = MAX_ENCODING_NAME_LEN.saturating_sub
+        // (MARKER.len())`, then `marker_end = budget + MARKER.len()` —
+        // re-converges to MAX_ENCODING_NAME_LEN). Both narrowings
+        // (usize → u8 → BoundedU8<32>) have architecturally-dead Err
+        // arms; the empty-fallback below maintains the no-panic
+        // discipline if a future refactor ever broke the bound.
+        out.len = u8::try_from(marker_end)
+            .ok()
+            .and_then(crate::bounded::BoundedU8::try_new)
+            .unwrap_or(crate::bounded::BoundedU8::ZERO);
         out
     }
 
@@ -234,13 +268,33 @@ impl OtherEncoding {
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        let n = usize::from(self.len);
+        // DEF-203: `self.len.get()` returns u8 in 0..=32; widen to
+        // usize via infallible `From`. Same architectural-dead None
+        // semantics as pre-DEF-203 (cursor invariant).
+        let n = usize::from(self.len.get());
         match self.buf.split_at_checked(n) {
             Some((head, _)) => head,
             None => &[],
         }
     }
 }
+
+/// DEF-203 size pins. The `Option<OtherEncoding>` niche win is the
+/// motivating saving (3 B vs pre-DEF-203 layout); the `OtherEncoding`
+/// in-place saving (1 B) cascades into any container holding it.
+const _: () = assert!(
+    core::mem::size_of::<OtherEncoding>() == 33,
+    "OtherEncoding exact pin: 33 B post-DEF-203 (= 32 buf + 1 BoundedU8 \
+     len, no alignment padding since the struct is 1-byte aligned). \
+     Pre-DEF-203 was 34 B (= 32 buf + 2 u16 len). If this trips, the \
+     BoundedU8 niche may have been lost or alignment changed.",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<OtherEncoding>>() == 33,
+    "Option<OtherEncoding> exact pin: 33 B post-DEF-203 (NonZeroU8 niche \
+     in BoundedU8 absorbs the discriminant). Pre-DEF-203 was 36 B (34 \
+     OtherEncoding + 1 disc + 1 padding to align(2)). 3 B saved per Option.",
+);
 
 impl Default for OtherEncoding {
     #[inline]
