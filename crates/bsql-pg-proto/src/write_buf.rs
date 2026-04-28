@@ -562,13 +562,6 @@ impl Drop for WriteBuf {
     }
 }
 
-// DEF-154 (B) Phase B4: legacy unbranded `WriteReserved` +
-// `WriteBuf::reserve()` were deleted. Production flow goes through
-// `WriteBuf::with_branded(|wb| wb.reserve() -> BrandedWriteReserved)`
-// — the branded path carries both the capacity witness (DEF-154 (A))
-// and the buffer-identity brand (DEF-154 (B)), so the legacy
-// unbranded reserve path was never used post-migration.
-
 impl fmt::Debug for WriteBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WriteBuf")

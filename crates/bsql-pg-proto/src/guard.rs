@@ -47,13 +47,11 @@
 //! # Zero-cost
 //!
 //! `ReadyGuard<'a>` is a `&'a mut PgProtocol` newtype (8 bytes; LLVM
-//! monomorphises the indirection away). Push methods inline directly
-//! into the legacy `PgProtocol::push_*_internal` paths, which retain
-//! the full `compute_push_*` 5-arm dispatch — the non-`Idle` arms
-//! become unreachable from the public surface but stay as defensive
-//! tier-3 internal code (`debug_assert!` in `push_*_internal` pins
-//! the Idle invariant in development builds; release builds skip
-//! the assertion for zero overhead).
+//! monomorphises the indirection away). Push methods inline into the
+//! crate-internal `PgProtocol::push_*_internal` entries, which route
+//! through `compute_push_idle_only` (single Idle-arm dispatch with
+//! `debug_assert!` precondition; release builds skip the assertion for
+//! zero overhead).
 //!
 //! # Send / Sync
 //!

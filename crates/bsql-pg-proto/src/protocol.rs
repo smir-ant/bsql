@@ -892,42 +892,26 @@ impl PgProtocol {
         }
     }
 
-    /// Push a user command — **internal entry point**.
+    /// Crate-internal push entry point. Production callers reach
+    /// this only via [`crate::guard::ReadyGuard::push_command`],
+    /// which is in turn reachable only through [`Self::as_ready`]
+    /// (returns `Some` iff `state == Idle`). The `pub(crate)`
+    /// visibility plus the witness-guard type make "push from
+    /// non-Idle" compile-rejected on the public API surface.
     ///
-    /// # DEF-198 visibility
+    /// The body is a thin wiring layer: residue clear, branded
+    /// write-buf scope, dispatch via `compute_push_idle_only`,
+    /// materialise the staged actions. All per-command transition
+    /// logic lives in the `compute_push_<cmd>_idle_only` free
+    /// functions (testable directly, no `PgProtocol` construction
+    /// needed).
     ///
-    /// Pre-DEF-198 this was `pub fn push_command`. Post-DEF-198 the
-    /// public surface is [`crate::guard::ReadyGuard::push_command`],
-    /// reachable only via [`Self::as_ready`] (which returns `Some`
-    /// only for `state == Idle`). This function remains the
-    /// implementation core; callers outside the crate cannot reach it
-    /// directly, ensuring the `state == Idle` precondition is
-    /// compile-rejected on the public API surface.
-    ///
-    /// The function still defensively handles non-`Idle` states (emits
-    /// `FailReply` per `compute_push_*` decision tables) — those arms
-    /// are unreachable from the public API but remain as internal
-    /// safety nets per CREDO §0 (no `unreachable!()` panic surrogates).
+    /// `debug_assert!(matches!(self.state, ProtoState::Idle))` pins
+    /// the caller's invariant in development builds; release builds
+    /// skip the assertion for zero overhead.
     ///
     /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].
     /// Caller must execute every action in order.
-    ///
-    /// # Compute / apply split (DEF-059)
-    ///
-    /// The body is a three-line delegate: move the current state out,
-    /// hand it (with `cmd`) to the pure [`compute_push`] free function,
-    /// put the returned new state back. All push-path decision logic
-    /// — per-command match, per-state transitions, action emission —
-    /// lives in [`compute_push`] and its per-command helpers. Those
-    /// helpers are free functions taking [`ProtoState`] by value; they
-    /// are testable directly, with no `PgProtocol` construction needed
-    /// (see `compute_push_tests` at the bottom of this file).
-    ///
-    /// The `core::mem::take` here momentarily leaves `self.state` in
-    /// its `Default` (`Idle`) value for the duration of `compute_push`.
-    /// `PgProtocol` is `!Sync` (tier-1 compile, via the `PhantomData<Cell<()>>`
-    /// field) so no observer can witness the window; the split is
-    /// safe even though the intermediate is not the terminal state.
     #[must_use = "the returned actions carry side-effects that must be executed"]
     pub(crate) fn push_command_internal<'w, 's>(
         &'s mut self,
@@ -1013,21 +997,9 @@ impl PgProtocol {
     /// the Execute frame, and the 5-byte static `Sync`. The caller
     /// writes all three to the socket in order.
     ///
-    /// # Failure modes
-    ///
-    /// See `compute_push_bind_execute`'s decision table for per-state
-    /// policy. Every non-`Idle` entry state emits a classified
-    /// `FailReply` and preserves the prior state; the connection
-    /// is not torn down.
-    ///
-    /// # DEF-198 visibility
-    ///
-    /// Pre-DEF-198 this was `pub fn push_bind_execute`. Post-DEF-198
-    /// the public surface is
-    /// [`crate::guard::ReadyGuard::push_bind_execute`]. The non-Idle
-    /// `FailReply` arms are unreachable from the public API but
-    /// remain as internal defensive code (no `unreachable!()` panic
-    /// surrogate per CREDO §0).
+    /// Crate-internal entry; reachable from outside only through
+    /// [`crate::guard::ReadyGuard::push_bind_execute`] which guarantees
+    /// the `state == Idle` precondition.
     #[expect(clippy::too_many_arguments, reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1 — each argument is a distinct wire-protocol input. Splitting into a struct-arg (BindExecuteRequest { ... }) trades arg-count for construction verbosity at every call site, no tier or safety win.")]
     #[must_use = "the returned actions carry side-effects that must be executed"]
     pub(crate) fn push_bind_execute_internal<'w, 's, P: crate::params::ParamsWriter>(
@@ -1867,20 +1839,6 @@ impl PgProtocol {
             _ => IterRowsClass::Other,
         }
     }
-
-    // DEF-184 audit (2026-04-24): `apply_pending_advance` DELETED —
-    // the deferred-advance mechanism was legacy from
-    // `StagedAction::StreamRowRange` (deleted in DEF-154 Y). Cursor
-    // advance now happens in-scope inside `feed_bytes_impl` right
-    // after the dispatch loop drops its `populated` borrow. See
-    // struct docstring for the pending_advance post-mortem.
-
-    // DEF-189: `state_is_errored` and `streaming_reply_id` removed.
-    // `RowStream::next_event` now calls `classify_for_iter_rows`
-    // (fused state observation), which returns the
-    // `IterRowsClass` enum. The two pre-DEF-189 separate accessors
-    // duplicated `match &self.state` work that the compiler could
-    // not reliably fuse across the intervening header-parse logic.
 
     /// DEF-184 (B25): transition to `Errored(Internal)` for a
     /// dead-branch read_buf advance Err. Used by RowStream's
@@ -2988,18 +2946,7 @@ fn build_execute_message(
     crate::action::WriteRange::from_write_span(start, reserved)
 }
 
-// DEF-208 (2026-04-28): the legacy `compute_push_bind_execute<P>`
-// 5-arm dispatching version was DELETED. Pre-DEF-208 it existed for
-// historical symmetry with the `compute_push_<cmd>` family, but its
-// only caller (push_bind_execute_internal) routes directly to
-// `compute_push_bind_execute_idle_only` post-DEF-208 (caller proves
-// Idle via ReadyGuard's witness-guard typestate from DEF-198). No
-// internal callers exist; the non-Idle FailReply arms were dead code
-// per CREDO §0. The `bind_execute_params_overflow_routes_to_classified_failreply`
-// internal test (line 4495) uses `push_bind_execute_internal` directly,
-// not the pure compute helper, so deletion does not lose coverage.
-
-/// DEF-208 — Idle-only path for [`PgProtocol::push_bind_execute`].
+/// Idle-only push path for [`PgProtocol::push_bind_execute`].
 #[expect(clippy::too_many_arguments, reason = "mirrors compute_push_bind_execute signature 1:1")]
 #[inline]
 fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter>(

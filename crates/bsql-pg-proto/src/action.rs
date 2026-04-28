@@ -282,13 +282,6 @@ const _: () = assert!(
 // 4. Therefore `b.as_slice().get(start..start + len)` is `Some` —
 //    the brand-pattern closes the class structurally, and
 //    `apply` returns `&[u8]` with no Option.
-//
-// Phase B3 scope — `#[cfg(test)]` scaffolding:
-//   - Types and `apply` method defined and tested.
-//   - Not yet threaded through [`StagedAction`] or [`materialise`]
-//     (those land in B4).
-//   - Existing [`NonEmptyRange::apply`] retained for the legacy
-//     code path until B4 completes the migration.
 
 /// Range into an outbound [`crate::write_buf::WriteBuf`].
 ///
