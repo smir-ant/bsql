@@ -820,6 +820,103 @@ pub enum Action<'w, 'r> {
     CloseSocket,
 }
 
+/// DEF-212 (Alt Y', Phase 2, audit 2026-05-04): one-event-per-call
+/// feed signal.
+///
+/// Per-call `Result<(), ()>` return type alternative to the batched
+/// `OutActions<'w, 'r>` — used by [`crate::PgProtocol::advance_one_frame`]
+/// to drive the protocol in single-event steps. Forward-compat anchor
+/// for the 1c-5 pipelining work (where multiple in-flight replies may
+/// resolve in one call cycle and the caller wants explicit control
+/// over event consumption).
+///
+/// # Variants
+///
+/// - [`Self::Idle`] — state is `Idle` and read_buf is empty. No work
+///   to do; caller can push a next command.
+/// - [`Self::NeedMoreBytes`] — partial frame buffered (or empty buffer
+///   in a non-Idle state). Caller must feed more bytes via
+///   [`crate::PgProtocol::feed_inbound`] before the next call.
+/// - [`Self::StreamingRows`] — state entered the row-streaming
+///   territory (a `RowDescription` was parsed; the next inbound frames
+///   are `DataRow`s). Caller should switch to
+///   [`crate::PgProtocol::iter_rows`] for the per-row pull API.
+///   On stream completion (`CommandComplete` + `ReadyForQuery`) the
+///   protocol state returns to a non-streaming variant; subsequent
+///   `advance_one_frame` calls resume the normal flow.
+/// - [`Self::SendBytes`] — outbound bytes ready in the caller's
+///   `WriteBuf`. The slice borrows from `wb` (lifetime `'wb`). Caller
+///   drains the bytes to the socket BEFORE the next `advance_one_frame`
+///   call, since the next call may overwrite `wb`.
+/// - [`Self::Deliver`] — terminal reply for an in-flight command.
+///   Caller routes via `id` to the user's `oneshot::Sender` and
+///   forwards `value`.
+/// - [`Self::Fail`] — fatal failure for an in-flight command. Per M2
+///   (architect 2026-05-04): the variant **semantically implies socket
+///   close**. Caller MUST resolve the user's oneshot via `(id, cause)`
+///   AND close the socket. Connection is in `Errored` state post-event.
+/// - [`Self::Close`] — state→Errored without an in-flight reply (e.g.,
+///   adversarial frame in `Idle`, post-handshake fatal). Caller MUST
+///   close the socket.
+///
+/// # Lifetime contract (M3 — architect 2026-05-04)
+///
+/// Two lifetimes preserved (mirror of [`OutActions<'w, 'r>`]):
+///
+/// - `'wb` for [`Self::SendBytes`] which borrows the caller's
+///   [`crate::write_buf::WriteBuf`]. Collapsing to a single lifetime
+///   would force `'wb = 'r` at use sites — breaks composable patterns
+///   where push-side and feed-side lifetimes diverge.
+/// - `'r` for [`Self::Deliver`] which borrows from `PgProtocol`
+///   internals (specifically `row_desc_slot` for `Reply::QueryComplete`
+///   payloads). Tied to the `&'r mut self` of `advance_one_frame`.
+///
+/// # Size pin (M4 — Phase 3 follow-up)
+///
+/// Projected `size_of::<FeedEvent<'static, 'static>>() == 88` exact:
+/// max variant is [`Self::Deliver`] = `NonZeroU64` (8 B) +
+/// `Reply<'r>` (80 B) = 88 B; discriminant niche-optimised via the
+/// payload's NonZero niche where possible. The exact `==` pin lands
+/// in `lib.rs` as part of Commit 3 (DEF-212 Phase 3) per CREDO §III
+/// no-permissive-ranges policy. Until then, drift is possible if
+/// `Reply` widens past 80 B; pre-Phase-3 reviewers should validate.
+///
+/// # `#[must_use]` discipline
+///
+/// Variants encode side-effect contracts (drain bytes, route reply,
+/// close socket). The struct attribute pins the discipline against
+/// `let _ = proto.advance_one_frame(...)` accidental discards. The
+/// `clippy::let_underscore_must_use` lint (DEF-211 SAFE-05, in the
+/// forbid bundle) makes ignoring without explicit `match`/`?` a
+/// build failure.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+#[must_use = "FeedEvent variants carry side-effect contracts: \
+              SendBytes/Deliver MUST be processed; Fail/Close MUST \
+              trigger socket teardown"]
+pub enum FeedEvent<'wb, 'r> {
+    /// State is `Idle` and read_buf is empty — no work, caller can push.
+    Idle,
+    /// Partial frame buffered (or empty buffer non-Idle). Need more
+    /// bytes from network.
+    NeedMoreBytes,
+    /// State entered row-streaming. Caller switches to
+    /// [`crate::PgProtocol::iter_rows`] for per-row decoding.
+    StreamingRows,
+    /// Outbound bytes (e.g., SCRAM client-final). Drain to socket,
+    /// then continue. The slice borrows `wb` for `'wb`.
+    SendBytes(&'wb [u8]),
+    /// Terminal reply for an in-flight command. Route via `id` to the
+    /// user's `oneshot::Sender` and forward `value`.
+    Deliver(NonZeroU64, Reply<'r>),
+    /// Fatal failure for an in-flight command. **Implies socket close**
+    /// (M2). Caller resolves user's oneshot via `(id, cause)` AND
+    /// closes the socket. State is `Errored` post-event.
+    Fail(NonZeroU64, ProtocolError),
+    /// State→Errored without in-flight reply. Caller closes the socket.
+    Close,
+}
+
 /// DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04):
 /// classified push-side failure — the bytes-only push API
 /// (`ReadyGuard::push_<cmd>`) returns `Result<(), PushFailure>`.

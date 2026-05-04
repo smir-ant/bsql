@@ -1154,6 +1154,169 @@ impl PgProtocol {
         })
     }
 
+    /// Append inbound wire bytes into the read buffer **without
+    /// dispatching**. Forward-compat anchor for 1c-5 pipelining where
+    /// the caller decouples byte-feeding from event-pulling.
+    ///
+    /// # DEF-212 Phase 2 (Alt Y', audit 2026-05-04)
+    ///
+    /// Pre-(212) the only public path was [`Self::feed_bytes`] which
+    /// combined append + dispatch + materialise into one batched call.
+    /// `feed_inbound` exposes the append step as a separate operation
+    /// so callers can drive the protocol via [`Self::advance_one_frame`]
+    /// in a per-event loop:
+    ///
+    /// ```text
+    /// proto.feed_inbound(socket_chunk)?;
+    /// while let event = proto.advance_one_frame(&mut wb) {
+    ///     match event { … }
+    /// }
+    /// ```
+    ///
+    /// On `Err(ReadBufFull)` the buffer is unchanged (bounded
+    /// container's `extend_from_slice` is atomic-fail). Caller treats
+    /// the connection as fatally desynced and discards.
+    ///
+    /// # Errored-state semantics
+    ///
+    /// Calling on an `Errored` state silently no-ops (returns
+    /// `Ok(())` without appending). The protocol is terminal; further
+    /// inbound bytes are ignored. This matches the pre-(212)
+    /// `feed_bytes` shape (which routes Errored to the
+    /// `IngressClassification::AlreadyErrored` arm).
+    pub fn feed_inbound(&mut self, bytes: &[u8]) -> Result<(), crate::buf::ReadBufFull> {
+        if matches!(self.state, ProtoState::Errored(_)) {
+            // Silent no-op — terminal state, further bytes irrelevant.
+            // Caller learns of Errored via `connection_status()` /
+            // `advance_one_frame()` returning `FeedEvent::Close`.
+            return Ok(());
+        }
+        self.read_buf.append(bytes)
+    }
+
+    /// Process at most one user-observable event and return it.
+    ///
+    /// # DEF-212 Phase 2 (Alt Y', audit 2026-05-04)
+    ///
+    /// Per-event alternative to the batched [`Self::feed_bytes`].
+    /// Forward-compat anchor for 1c-5 pipelining (where multiple
+    /// concurrent in-flight replies may resolve in one cycle and the
+    /// caller wants explicit event-by-event control).
+    ///
+    /// The implementation reuses [`Self::feed_bytes_bounded`] with
+    /// `max_dispatches = 1` and an empty byte slice — single source
+    /// of truth for dispatch is preserved (Phase 2 is additive, not
+    /// a refactor of `feed_bytes`).
+    ///
+    /// # Returned event mapping
+    ///
+    /// - `state == Idle`, read_buf empty → [`FeedEvent::Idle`]
+    /// - `state` in row-streaming → [`FeedEvent::StreamingRows`]
+    ///   (caller switches to [`Self::iter_rows`] for per-row decoding)
+    /// - `state == Errored(_)` → [`FeedEvent::Close`]
+    /// - read_buf has partial frame, or empty in non-Idle non-streaming
+    ///   non-Errored state → [`FeedEvent::NeedMoreBytes`]
+    /// - One actionable frame consumed:
+    ///   - `Action::SendBytes(b)` → [`FeedEvent::SendBytes(b)`]
+    ///   - `Action::DeliverReply { id, value }` → [`FeedEvent::Deliver(id, value)`]
+    ///   - `Action::FailReply { id, cause }` (paired with implicit
+    ///     `Action::CloseSocket` per M2) → [`FeedEvent::Fail(id, cause)`]
+    ///   - `Action::CloseSocket` alone (no in-flight reply id) →
+    ///     [`FeedEvent::Close`]
+    ///
+    /// # Lifetime contract (M3)
+    ///
+    /// `FeedEvent<'wb, 'r>` carries two lifetimes:
+    ///   - `'wb` ties [`FeedEvent::SendBytes`] to the caller's `write_buf`.
+    ///   - `'r` ties [`FeedEvent::Deliver`]'s `Reply<'r>` to the
+    ///     `&'r mut self` borrow of this protocol.
+    ///
+    /// # `wb` lifecycle
+    ///
+    /// `advance_one_frame` calls `wb.clear()` at entry (mirroring
+    /// `feed_bytes` semantics). A [`FeedEvent::SendBytes`] slice is
+    /// valid until the next `&mut wb` call (typically the next
+    /// `advance_one_frame` iteration). Caller MUST drain the slice
+    /// to the socket before re-borrowing `wb`.
+    #[must_use = "FeedEvent variants carry side-effect contracts: \
+                  SendBytes/Deliver MUST be processed; Fail/Close MUST \
+                  trigger socket teardown"]
+    pub fn advance_one_frame<'w, 'r>(
+        &'r mut self,
+        write_buf: &'w mut WriteBuf,
+    ) -> crate::action::FeedEvent<'w, 'r> {
+        use crate::action::{Action, FeedEvent};
+
+        // Fast-path classifications BEFORE reusing feed_bytes_bounded
+        // (which calls write_buf.clear() unconditionally — we want to
+        // avoid that on these "no work" paths to preserve any caller
+        // residue in wb across spurious advance calls).
+        //
+        // Streaming-rows transition signal: the caller should use
+        // `iter_rows()` for per-row decoding while in this state. We
+        // detect BEFORE feed_bytes_bounded would consume DataRows in
+        // its dispatch loop (which is the wrong shape for the per-
+        // event API).
+        if matches!(
+            self.state,
+            ProtoState::SimpleQueryStreamingRows { .. }
+                | ProtoState::BindExecuteStreamingRows { .. }
+        ) {
+            return FeedEvent::StreamingRows;
+        }
+
+        // Errored terminal: the connection is dead. Caller closes.
+        if matches!(self.state, ProtoState::Errored(_)) {
+            return FeedEvent::Close;
+        }
+
+        // Idle + empty read_buf: nothing to process — caller can push.
+        if matches!(self.state, ProtoState::Idle) && self.read_buf.unread().is_empty() {
+            return FeedEvent::Idle;
+        }
+
+        // Drive the bounded dispatch loop with empty bytes (no append)
+        // and max_dispatches=1 (one actionable frame). The result is
+        // an OutActions with 0..=2 actions corresponding to one frame
+        // event.
+        let actions = self.feed_bytes_bounded(b"", write_buf, 1);
+
+        // Map actions → FeedEvent. The exhaustive match below is the
+        // tier-1 contract: any future Action variant addition fails
+        // the build until classified here.
+        match actions.as_slice() {
+            // No actionable frame in this cycle. Caller needs more
+            // bytes from network (state was non-Idle non-Errored, so
+            // a partial frame is buffered or none at all).
+            [] => FeedEvent::NeedMoreBytes,
+            // Single SendBytes — outbound message (e.g., SCRAM
+            // client-final). The slice borrows into the caller's wb.
+            [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
+            // Single DeliverReply — terminal happy reply.
+            [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
+            // FailReply [+ CloseSocket]: per M2, Fail implies close.
+            // Caller learns "close required" from the Fail variant
+            // documentation; no separate CloseSocket event needed.
+            // Pre-(212) feed_bytes returned a 2-Action slice; post-Phase-2
+            // the FeedEvent::Fail collapses both into one.
+            [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
+            // CloseSocket alone (no in-flight reply): adversarial
+            // frame in Idle, post-handshake fatal. Caller closes.
+            [Action::CloseSocket] => FeedEvent::Close,
+            // Architecturally unreachable: feed_bytes_bounded with
+            // max_dispatches=1 emits AT MOST 2 actions per cycle
+            // (FailReply+CloseSocket pair from install_errored). Any
+            // other shape indicates a regression in dispatch's
+            // emit-budget invariants.
+            //
+            // CREDO §V banned `debug_assert!(false, ...)` defensive-
+            // for-impossible — instead, classify to the conservative
+            // `Close` (forces caller to discard connection, avoiding
+            // any silent-state-corruption window).
+            _ => FeedEvent::Close,
+        }
+    }
+
     /// Feed inbound wire bytes.
     ///
     /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].
