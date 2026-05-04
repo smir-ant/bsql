@@ -63,6 +63,85 @@ use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Field, Fields, Type}
 /// `bsql_pg_proto::pristine::Pristine` trait impl plus an inherent
 /// `__pristine_const(&self) -> bool` const fn.
 ///
+/// # Compile-fail spec (negative coverage)
+///
+/// All examples below intentionally fail to compile. They pin the
+/// derive's tier-1 rejection contract — without these doctests, a
+/// future macro relaxation that silently accepts an unsupported
+/// shape would not be caught.
+///
+/// **Generic struct** — rejected at derive entry (would need
+/// generic impl shape, out of scope for v1.0):
+///
+/// ```compile_fail
+/// use bsql_pg_proto::Pristine;
+/// #[derive(Pristine)]
+/// struct WithGeneric<T> { x: T }
+/// ```
+///
+/// **Enum** — no canonical pristine semantic for sum types:
+///
+/// ```compile_fail
+/// use bsql_pg_proto::Pristine;
+/// #[derive(Pristine)]
+/// enum E { A, B }
+/// ```
+///
+/// **Union** — same rejection class as enum:
+///
+/// ```compile_fail
+/// use bsql_pg_proto::Pristine;
+/// #[derive(Pristine)]
+/// union U { a: u32, b: u32 }
+/// ```
+///
+/// **Tuple struct** — lacks named fields needed for per-field
+/// dispatch:
+///
+/// ```compile_fail
+/// use bsql_pg_proto::Pristine;
+/// #[derive(Pristine)]
+/// struct Tup(u32, bool);
+/// ```
+///
+/// **Unsupported field type — float** (forbid-bundle bans `float_cmp`
+/// at the derive's expansion site, plus floats have no clean
+/// "pristine" definition w/r/t NaN):
+///
+/// ```compile_fail
+/// use bsql_pg_proto::Pristine;
+/// #[derive(Pristine)]
+/// struct WithFloat { x: f32 }
+/// ```
+///
+/// **Unsupported field type — reference** (cannot inspect borrowed
+/// content for pristine):
+///
+/// ```compile_fail
+/// use bsql_pg_proto::Pristine;
+/// #[derive(Pristine)]
+/// struct WithRef<'a> { x: &'a u32 }
+/// ```
+///
+/// **Unsupported field type — tuple field** (no per-field
+/// inspection within tuples):
+///
+/// ```compile_fail
+/// use bsql_pg_proto::Pristine;
+/// #[derive(Pristine)]
+/// struct WithTuple { pair: (u32, bool) }
+/// ```
+///
+/// **Unsupported field type — `NonZeroU64`** (semantically never
+/// zero — pristine == 0 doesn't apply; caller must hand-roll):
+///
+/// ```compile_fail
+/// use bsql_pg_proto::Pristine;
+/// use core::num::NonZeroU64;
+/// #[derive(Pristine)]
+/// struct WithNonZero { x: NonZeroU64 }
+/// ```
+///
 /// # Generated code shape
 ///
 /// For a struct with named fields, generates:
@@ -248,13 +327,24 @@ fn synthesise_check(field: &Field) -> syn::Result<TokenStream2> {
         return Ok(quote! { self.#name == 0 });
     }
 
+    // PhantomData<T> is a ZST — no runtime data, always trivially
+    // pristine. Future-proofs the derive for state-machine types
+    // with phantom markers (e.g. `ReplyId<K>`'s
+    // `PhantomData<fn() -> K>` pattern). The `_field` binding
+    // suppresses unused-variable warnings on the generated body
+    // (the field still exists on `self`, but the check itself is
+    // a constant `true`).
+    if is_phantom_data(&field.ty) {
+        return Ok(quote! { { let _ = &self.#name; true } });
+    }
+
     Err(syn::Error::new_spanned(
         &field.ty,
         format!(
             "Pristine derive: field `{}` has unsupported type. \
              Supported: Option<T>, bool, integer (u8/u16/u32/u64/u128/usize, \
-             i8/i16/i32/i64/i128/isize). Hand-roll the trait impl for \
-             other shapes.",
+             i8/i16/i32/i64/i128/isize), PhantomData<T>. Hand-roll \
+             the trait impl for other shapes.",
             name,
         ),
     ))
@@ -297,6 +387,20 @@ fn is_integer(ty: &Type) -> bool {
             "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
             | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
         );
+    }
+    false
+}
+
+/// True iff the type is `PhantomData<T>` (any T) at the syntactic
+/// level. Same syntactic-only caveat as [`is_option`] — accepts
+/// `PhantomData<T>` / `core::marker::PhantomData<T>` /
+/// `std::marker::PhantomData<T>` regardless of namespace path,
+/// matches by last-segment ident only.
+fn is_phantom_data(ty: &Type) -> bool {
+    if let Type::Path(p) = ty
+        && let Some(seg) = p.path.segments.last()
+    {
+        return seg.ident == "PhantomData";
     }
     false
 }

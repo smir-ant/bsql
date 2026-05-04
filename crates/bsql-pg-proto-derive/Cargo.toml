@@ -28,6 +28,13 @@ syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
 
+[dev-dependencies]
+# Integration tests need the runtime `Pristine` trait (lives in
+# bsql-pg-proto). dev-dep avoids cycle: lib target only depends on
+# syn/quote/proc-macro2; test target additionally pulls in
+# bsql-pg-proto for trait-bound resolution of generated impls.
+bsql-pg-proto = { path = "../bsql-pg-proto" }
+
 # DEF-233 (created 2026-05-04): pair-crate with bsql-pg-proto.
 # Hosts:
 #   - #[derive(Pristine)] (DEF-211 INNO-01) — generates
