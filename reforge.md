@@ -474,7 +474,12 @@ Features stable в MSRV 1.95 (или earlier) которые bsql активно
 
 PG path:
   bsql-pg-proto  (sans-I/O, no_std, pure sync state machine)
-       │
+   │     ▲
+   │     │  proc-macro pair (DEF-211 INNO-01 / DEF-233)
+   │     │  Pristine and other invariant-discipline derives.
+   │     │  Mirror: serde / serde-derive, zeroize / zeroize-derive.
+   │  bsql-pg-proto-derive
+   │
        ├────────────────────────────────┐
        ▼                                ▼
   bsql-driver-postgres              bsql-driver-postgres-sync
@@ -504,8 +509,9 @@ Shared utilities:
 | `bsql-arena` | Bump allocator с thread-local recycling. Used by row decoders. | Yes, `no_std + alloc` | No |
 | `bsql-core` | Generic `Pool<B>`, `Transaction<'pool, B>`, `BsqlError`, `Sensitive<T>`, bounded types, listener. | No | Yes (`sync` + `rt`) |
 | `bsql-backend` | `Backend` trait (sealed), `BackendError` supertrait, `Client<B>`, `PingError<B>`. Channel-architecture skeleton. | No | Yes (`sync` + `rt`) |
-| `bsql-pg-proto` | Pure sync PostgreSQL wire-protocol state machine. Typestate, state-as-data, bounded buffers. | Yes (`no_std`, no `alloc`) | **No** |
-| `bsql-driver-postgres` | `PgBackend` impl. Async `run_io` wrapper. Auth (SCRAM). TLS (rustls). Binary codec. | No | Yes (full) |
+| `bsql-pg-proto` | Pure sync PostgreSQL wire-protocol state machine. Typestate, state-as-data, bounded buffers. | Yes (`no_std`, plus `alloc` post-DEF-187) | **No** |
+| `bsql-pg-proto-derive` | proc-macro pair-crate for `bsql-pg-proto`. `#[derive(Pristine)]` and future invariant-discipline derives. Standard Rust pair-crate convention (mirror `serde`/`serde-derive`). DEF-233. | N/A (proc-macro) | No |
+| `bsql-driver-postgres` | `PgBackend` impl. Async `run_io` wrapper. Auth (SCRAM, MD5, Cleartext per DEF-215/216/217). TLS (rustls; DEF-214). Binary codec (DEF-228). | No | Yes (full) |
 | `bsql-driver-sqlite` | `SqliteBackend` impl. FFI wrapper (`ffi.rs` the only unsafe). spawn_blocking async shim. | No | Yes (`rt`) |
 
 ### §6.3. Dep graph
@@ -516,8 +522,10 @@ bsql-macros    ───> syn, quote, proc-macro2, bitcode, sha2, rapidhash
                     (no bsql-* — macros read bitcode cache, write typed Rust)
 bsql-core      ───> bsql-backend, bsql-arena
 bsql-backend   ───> tokio (sync + rt)
-bsql-pg-proto  ───> heapless
-                    (Stage 2 adds: sha2, zeroize, subtle — когда пойдёт SCRAM)
+bsql-pg-proto  ───> heapless, sha2, hmac, pbkdf2, base64ct, subtle, zeroize,
+                    getrandom, simdutf8, bsql-pg-proto-derive (proc-macro)
+bsql-pg-proto-derive ───> syn, quote, proc-macro2 (proc-macro only —
+                    no runtime deps; no bsql-* deps)
 bsql-driver-postgres ───> bsql-pg-proto, bsql-backend, bsql-core, bsql-arena,
                            tokio (full), rustls, ring, webpki-roots, tokio-rustls,
                            rustls-pemfile, rapidhash
@@ -1010,9 +1018,75 @@ pub enum Action { SendBytes(SendBuf), DeliverReply, FailReply, CloseSocket }
 pub type OutActions = heapless::Vec<Action, MAX_ACTIONS_PER_CALL>;
 ```
 
-**Constraint:** `#![no_std]`, никаких `alloc`. Bounded storage. Единственная runtime dep — `heapless`.
+**Constraint:** `#![no_std]` + `extern crate alloc` (post-DEF-187 — `Box<ScramSession>` per-handshake externalisation enables 9× ProtoState shrink). Bounded storage on the read/write paths. Runtime deps: `heapless`, `sha2`, `hmac`, `pbkdf2`, `base64ct`, `subtle`, `zeroize`, `getrandom`, `simdutf8`, `bsql-pg-proto-derive` (proc-macro).
 
-**Size estimate:** ~2-3 KLOC после полного wire protocol (startup + SCRAM + query + streaming + COPY + listen).
+**Size estimate:** ~3-5 KLOC после полного wire protocol (startup + всех auth methods + query + streaming + COPY + listen + cancel + terminate). Текущий ~9 KLOC включая dispatch + tests.
+
+### §13.1. Feature coverage status (snapshot 2026-05-04, gap-analysis-driven)
+
+`bsql-pg-proto` is **NOT v1.0-ready** despite the solid foundation across Phase 1a/1b/most of 1c. Below is the explicit coverage matrix; remaining items tracked as DEF-NNN in `deferred.md` §A "Wire protocol coverage gaps".
+
+**Implemented (Phase 1a/1b/1c-partial)**:
+
+| Area | Status |
+|---|---|
+| Frame parser, ReadBuf/WriteBuf bounded sealed | ✅ |
+| Sans-I/O state machine, state-as-data | ✅ |
+| Ping flow (Sync ↔ ReadyForQuery) | ✅ |
+| StartupMessage, NegotiateProtocolVersion, BackendKeyData, ParameterStatus | ✅ |
+| Trust authentication | ✅ |
+| SCRAM-SHA-256 (raw password, no channel binding) | ✅ |
+| SimpleQuery (`Q` + DataRow stream + CommandComplete + recoverable ErrorResponse) | ✅ |
+| Extended Query: Parse + Sync, Bind + Execute + Sync, Describe (Statement / Portal) + Sync | ✅ |
+| RowStream pull-based row API, ErrorArena externalised diagnostics | ✅ |
+| Push-side bytes-only API (DEF-212): `ReadyGuard::push_*` returns `Result<(), PushFailure>` | ✅ |
+| Per-event feed API (DEF-212 Phase 2): `advance_one_frame -> FeedEvent` (1c-5 forward-compat anchor) | ✅ |
+
+**Missing — critical for production** (deferred.md DEF-214..218):
+
+| Area | DEF | Why |
+|---|---|---|
+| TLS / SSLRequest pre-startup state machine | DEF-214 | Block all cloud PG (RDS, Cloud SQL, etc.) |
+| Cleartext password auth (R/3) | DEF-215 | Block legacy on-prem |
+| MD5 password auth (R/5) | DEF-216 | Block enterprise on-prem |
+| SCRAM-SHA-256-PLUS channel binding | DEF-217 (closes DEF-053) | Block strict-mode PG ≥ 11 |
+| Buffer sizing (large rows / queries / params / columns) | DEF-218 | Block real-world data shapes |
+
+**Missing — important features** (deferred.md DEF-219..226):
+
+| Area | DEF |
+|---|---|
+| COPY protocol (CopyIn/CopyOut/CopyData/CopyDone/CopyFail) | DEF-219 |
+| LISTEN/NOTIFY + NotificationResponse delivery | DEF-220 |
+| CancelRequest send flow | DEF-221 |
+| Close (Statement/Portal) command + CloseComplete dispatch | DEF-222 |
+| Terminate ('X') graceful close | DEF-223 |
+| NoticeResponse delivery to user | DEF-224 |
+| PortalSuspended chunked fetch | DEF-225 |
+| Multi-statement SimpleQuery batch | DEF-226 |
+
+**Missing — encoding / decoding** (DEF-227..228):
+
+| Area | DEF |
+|---|---|
+| Non-UTF-8 `client_encoding` support | DEF-227 |
+| `FromPgBinary` trait + per-OID binary decoders | DEF-228 |
+
+**Missing — auth (lower priority, post-v1.0)** (DEF-229..230):
+
+| Area | DEF |
+|---|---|
+| GSSAPI / SSPI / Kerberos | DEF-229 |
+| GSSENCRequest pre-startup | DEF-230 |
+
+**Missing — corner cases** (DEF-231..232):
+
+| Area | DEF |
+|---|---|
+| `Flush` ('H') frontend message support | DEF-231 |
+| Cancellation-safety proptest verification (100K iter drop-injection) | DEF-232 |
+
+The above coverage matrix is the load-bearing scope contract for `bsql-pg-proto` before any Stage B (driver layer) crate is created. Per CREDO §10 "reforge ↔ code consistency" rule, this section updates ahead of any DEF closure that materially alters scope.
 
 ## §14. bsql-driver-postgres
 

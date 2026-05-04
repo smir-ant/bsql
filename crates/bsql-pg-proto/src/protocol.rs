@@ -431,10 +431,16 @@ const _: () = assert!(MAX_ACTIONS_PER_CALL >= 4, "practical batching needs ≥4 
 // inside it that the optimizer might consider when deciding to
 // inline the outer function.
 static _BS11_EMPTY_SESSION_PARAMS: SessionParams = SessionParams::new();
+// DEF-211 INNO-01 (2026-05-04): use the auto-derived
+// `__pristine_const` inherent fn (const-callable) instead of the
+// removed manual `is_pristine` const fn. Runtime polymorphic
+// `<SessionParams as Pristine>::is_pristine` cannot be const-called
+// (trait methods aren't const on stable Rust as of MSRV 1.95).
 const _BS11_EMPTY_SESSION_PARAMS_IS_PRISTINE: () = assert!(
-    _BS11_EMPTY_SESSION_PARAMS.is_pristine(),
+    _BS11_EMPTY_SESSION_PARAMS.__pristine_const(),
     "static EMPTY: SessionParams must be pristine — see \
-     SessionParams::is_pristine docstring (DEF-210 BS-11)",
+     `crate::pristine` module + `#[derive(Pristine)]` on SessionParams \
+     (DEF-210 BS-11 + DEF-211 INNO-01)",
 );
 
 // DEF-185 P1-H (audit 2026-04-24): drift pin coupling
@@ -4082,6 +4088,11 @@ mod residue_policy_per_class_tests {
     }
 
     fn session_params_is_pristine(proto: &PgProtocol) -> bool {
+        // DEF-211 INNO-01 (2026-05-04): trait method via `Pristine` import.
+        // Inherent `__pristine_const` would also work but trait dispatch
+        // here matches polymorphic intent (test helper takes any
+        // `SessionParams`-like thing).
+        use crate::pristine::Pristine as _;
         match proto.session_params.as_deref() {
             Some(p) => p.is_pristine(),
             None => true,

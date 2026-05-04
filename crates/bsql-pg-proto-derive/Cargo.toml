@@ -1,0 +1,45 @@
+[package]
+name = "bsql-pg-proto-derive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Procedural-macro pair-crate for bsql-pg-proto. Hosts internal-discipline derives (currently #[derive(Pristine)] for SessionParams). Mirror of the serde / serde-derive convention — runtime types live in bsql-pg-proto, derive macros live here."
+keywords = ["postgres", "postgresql", "wire", "protocol", "derive"]
+categories = ["database", "no-std", "rust-patterns"]
+
+# proc-macro = true makes this a procedural-macro crate. Cannot
+# export runtime types/values — only proc_macro / proc_macro_attribute /
+# proc_macro_derive functions. Imports of `bsql-pg-proto` are forbidden
+# (would create a cycle); generated code references `::bsql_pg_proto::*`
+# paths which resolve at the user's compile site.
+[lib]
+proc-macro = true
+
+[dependencies]
+# Standard proc-macro toolchain. All three are ecosystem-trusted
+# crates (1B+ downloads). They contain `unsafe` internally for
+# token-stream manipulation; this is an audit-trust class
+# "expert-domain ecosystem standard" per CREDO §11. Restricted to
+# the proc-macro pair-crate — runtime crate (`bsql-pg-proto`) does
+# NOT depend on syn/quote/proc-macro2 directly.
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+
+# DEF-233 (created 2026-05-04): pair-crate with bsql-pg-proto.
+# Hosts:
+#   - #[derive(Pristine)] (DEF-211 INNO-01) — generates
+#     is_pristine() check for invariant types like SessionParams.
+#     Lifts BS-11 broad-scope tier-3 ("contributor must remember to
+#     update is_pristine when adding fields") to tier-1
+#     by-construction (compiler emits the check; missed field is
+#     impossible).
+#
+# Future entries:
+#   - Other discipline-derives as needed by audit findings.
+#
+# This crate is intentionally minimal — proc-macro logic is
+# ergonomic-discipline, not runtime-perf code. Per CREDO §4.4,
+# every dep here is justified inline.

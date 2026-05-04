@@ -46,6 +46,15 @@ subtle = { workspace = true }
 zeroize = { workspace = true }
 simdutf8 = { workspace = true }
 
+# DEF-233 / DEF-211 INNO-01 (2026-05-04): pair-crate hosting
+# `#[derive(Pristine)]`. Standard Rust convention (mirror
+# `serde`/`serde-derive`, `zeroize`/`zeroize-derive`). The derive
+# crate is pulled in for proc-macro expansion only — its
+# transitive deps (`syn`/`quote`/`proc-macro2`) live in the
+# proc-macro pair-crate boundary and do NOT propagate to runtime
+# users of `bsql-pg-proto`.
+bsql-pg-proto-derive = { path = "../bsql-pg-proto-derive", version = "1.0.0-alpha.0" }
+
 # `getrandom` is a dev/test dependency for deterministic nonce
 # injection in tests. Production nonce generation uses it too, but
 # behind a cfg — the no_std, no_alloc contract is preserved because

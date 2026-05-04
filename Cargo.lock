@@ -49,6 +49,7 @@ name = "bsql-pg-proto"
 version = "1.0.0-alpha.0"
 dependencies = [
  "base64ct",
+ "bsql-pg-proto-derive",
  "criterion",
  "getrandom",
  "heapless",
@@ -58,6 +59,15 @@ dependencies = [
  "simdutf8",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "bsql-pg-proto-derive"
+version = "1.0.0-alpha.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

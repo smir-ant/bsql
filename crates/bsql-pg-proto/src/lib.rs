@@ -123,6 +123,14 @@
 // exist in practice.
 extern crate alloc;
 
+// DEF-233 (2026-05-04): self-alias enables generated code from
+// `bsql-pg-proto-derive` (e.g. `#[derive(Pristine)]`) to reference
+// `::bsql_pg_proto::pristine::Pristine` via its absolute path —
+// resolves the same way both inside this crate AND in downstream
+// user crates. Standard Rust derive-pair convention (mirror
+// `serde`'s `extern crate self as serde;` at its lib root).
+extern crate self as bsql_pg_proto;
+
 // DEF-211 SAFE-02 (audit 2026-05-04, 5th-pass architect-agent):
 // **transitive-`unsafe` audit-trust chain**.
 //
@@ -157,10 +165,32 @@ extern crate alloc;
 //    its declared `N`; we never construct `heapless::Vec` from
 //    raw pointers. The crate's own const-asserts (`MAX_ACTIONS_PER_CALL`
 //    >= per-site budgets) ensure the heapless capacity is
-//    sufficient under our usage patterns. DEF-211 SAFE-01 considered
-//    replacing with hand-rolled `BoundedVec` but the replacement
-//    itself would require crate-internal `unsafe` (MaybeUninit) —
-//    net worse than ecosystem-trusted heapless.
+//    sufficient under our usage patterns.
+//
+//    **DEF-211 SAFE-01 / SAFE-01' REJECTED 2026-05-04** — see
+//    `deferred.md §B "Verified load-bearing (architect's concern
+//    falsified)"` entry for the full pre-implementation post-mortem.
+//    Two structural blockers:
+//    (a) Per-call init cost catastrophic — `[T; N]` POD-array storage
+//        eagerly initialises all N slots at construction; for per-call
+//        types (`StagedActions = [StagedAction; 8]` ≈ 704 B,
+//        `OutActions = [Action; 9]` ≈ 792 B) this ships ~700 B memset
+//        per push_command/feed_bytes call → projected +30-50% on
+//        push_command/ping_amortised (10.28 → 13-15 ns), violates the
+//        Q2 bench gate (max +3% on existing benches).
+//    (b) `MaybeUninit`-based skip-init alternative requires
+//        crate-internal `unsafe { assume_init_read }` — breaks
+//        `#![forbid(unsafe_code)]` at the architectural-rule level
+//        (CREDO §1 absolute commit). Net-zero or worse safety win
+//        replacing ecosystem-trusted code (~1000 LoC well-audited
+//        embedded-Rust standard) with locally-audited equivalent.
+//
+//    The companion comment at `action.rs:672+` ("Why heapless::Vec,
+//    NOT the OutActions POD-array shape") covers the per-call type
+//    perf rationale in detail. Future audits raising SAFE-01 again
+//    require new measurement evidence per the deferred.md §B reopen
+//    contract — without it, the ecosystem-trusted heapless choice
+//    is the load-bearing decision.
 //
 // 3. RustCrypto: `sha2` + `hmac` + `pbkdf2` — SCRAM-SHA-256
 //    cryptographic primitives. Surface: const-time arithmetic,
@@ -242,6 +272,10 @@ pub mod scram;
 pub(crate) mod secret_zeroize;
 pub mod sensitive;
 pub mod session_params;
+// DEF-211 INNO-01 / DEF-233: Pristine trait paired with
+// `#[derive(Pristine)]` from `bsql-pg-proto-derive`. See module
+// docstring for the BS-11 broad-scope tier-3 → tier-1 closure.
+pub mod pristine;
 pub mod state;
 pub mod wire;
 pub mod write_buf;
@@ -274,6 +308,16 @@ pub use reply_id::{
 pub use row_stream::{RowStream, StreamItem};
 pub use sensitive::Sensitive;
 pub use session_params::{Encoding, OtherEncoding, SessionParams};
+// DEF-211 INNO-01: re-export the `Pristine` trait + matching derive
+// macro under one name. Rust trait and derive macro live in DIFFERENT
+// namespaces (type vs macro), so identical-name re-exports do NOT
+// collide — `use bsql_pg_proto::Pristine` brings BOTH into scope:
+// trait usage `impl Pristine for T` resolves to the type-namespace
+// item, `#[derive(Pristine)]` resolves to the macro-namespace item.
+// This mirrors `serde`'s `pub use serde_derive::{Serialize,
+// Deserialize}` + `pub trait Serialize { ... }` pattern.
+pub use bsql_pg_proto_derive::Pristine;
+pub use pristine::Pristine;
 pub use state::ProtoState;
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 

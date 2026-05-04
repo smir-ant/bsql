@@ -696,6 +696,17 @@ impl<'a, 'w, 'r> IntoIterator for &'a OutActions<'w, 'r> {
 /// than POD, smaller surface than `unsafe`, same memory footprint.
 /// Future "consistency" refactors must address all three points
 /// before proposing the change.
+///
+/// **DEF-211 SAFE-01 / SAFE-01' REJECTED 2026-05-04** — see
+/// `deferred.md §B "Verified load-bearing"` entry for the full
+/// pre-implementation post-mortem of the proposed `InlineArr<T, N, L>`
+/// safe replacement. The Pareto-optimal analysis above was the exact
+/// blocker that emerged in measurement projection (per-call types ship
+/// ~700 B memset on every entry-point call → +30-50% on
+/// push_command/ping_amortised, violates Q2 bench gate). Cross-ref
+/// also at `lib.rs:160+` (DEF-211 SAFE-02 transitive-unsafe audit-trust
+/// commentary). Future audit re-opening requires new measurement
+/// evidence per the deferred.md §B reopen contract.
 // DEF-154 (L): staged container uses `MAX_STAGED_PER_CALL`
 // (dispatch-side cap); output uses `MAX_ACTIONS_PER_CALL` (fan-out).
 pub(crate) type StagedActions = heapless::Vec<StagedAction, { crate::protocol::MAX_STAGED_PER_CALL }>;

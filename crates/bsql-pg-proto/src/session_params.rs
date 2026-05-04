@@ -327,7 +327,19 @@ fn parse_pg_bool(value: &[u8]) -> Option<bool> {
 /// A future refactor that adds a second writer path must either
 /// call through `set()` (preserving validation) or explicitly
 /// document why a raw assignment is correct.
-#[derive(Default)]
+// DEF-211 INNO-01 (2026-05-04): `#[derive(Pristine)]` lifts BS-11
+// broad-scope tier-3 (contributor must remember to update is_pristine
+// when adding fields) → tier-1 by-construction. The macro inspects
+// every declared field; missed-field is structurally impossible. See
+// `crates/bsql-pg-proto/src/pristine.rs` for the trait + design and
+// `crates/bsql-pg-proto-derive/src/lib.rs` for the macro.
+//
+// Generates BOTH:
+//   - `impl Pristine for SessionParams { fn is_pristine(&self) -> bool { ... } }`
+//     (runtime, polymorphic).
+//   - `impl SessionParams { pub const fn __pristine_const(&self) -> bool { ... } }`
+//     (compile-time, used in `const _: () = assert!(EMPTY.__pristine_const())`).
+#[derive(Default, ::bsql_pg_proto::Pristine)]
 pub struct SessionParams {
     /// PostgreSQL server version string (e.g. `"17.2"`,
     /// `"17.2 (Debian 17.2-1.pgdg120+1)"`). BoundedStr<32> — PG's
@@ -451,56 +463,31 @@ impl SessionParams {
         }
     }
 
-    /// DEF-210 BS-11 + REC-08 (audit 2026-04-28): const-callable
-    /// pristine-state predicate.
-    ///
-    /// `crate::protocol::cold_session_params` falls back to a
-    /// `static EMPTY: SessionParams = SessionParams::new()` when the
-    /// boxed slot is unallocated. A `'static` value is **never
-    /// dropped** — `SecretBoundedStr`'s `ZeroizeOnDrop` impl never
-    /// fires on `EMPTY`. That is fine **iff** every `SecretBoundedStr`
-    /// field is `None` (no bytes to scrub).
-    ///
-    /// **What "pristine" means**: every Option field is `None` and
-    /// every counter is `0`. Equivalent to a freshly-constructed
-    /// instance from `Self::new`, modulo aliased identity.
-    ///
-    /// # Honest tier framing (re-audit 2026-04-28)
-    ///
-    /// **Narrow scope: tier-1 by compile-pin.** A future refactor that
-    /// changes any *currently-checked* field's default to non-pristine
-    /// (e.g. setting `application_name = Some(SecretBoundedStr::default())`
-    /// in [`Self::new`]) trips the build-time `const _: () =
-    /// assert!(EMPTY.is_pristine())` at the static site. The MOST
-    /// likely contributor mistake is in this scope.
-    ///
-    /// **Broad scope: tier-3 by-discipline.** Rust does not expose
-    /// reflective field iteration in const context. Adding a NEW
-    /// secret-bearing field that the contributor forgets to include
-    /// in `is_pristine` would let a non-pristine default through
-    /// — `EMPTY` would carry the bytes for the program's lifetime.
-    ///
-    /// Maintenance contract: when adding a field to [`SessionParams`],
-    /// extend BOTH [`Self::new`] (initializer) AND this predicate.
-    /// A `#[derive(Pristine)]` procmacro could lift the broad scope
-    /// to tier-1 — registered as DEF-210 CF-04-FUTURE.
-    #[inline]
-    #[must_use]
-    pub const fn is_pristine(&self) -> bool {
-        self.server_version.is_none()
-            && self.server_encoding.is_none()
-            && self.client_encoding.is_none()
-            && self.application_name.is_none()
-            && self.is_superuser.is_none()
-            && self.session_authorization.is_none()
-            && self.date_style.is_none()
-            && self.integer_datetimes.is_none()
-            && self.time_zone.is_none()
-            && self.n_unknown_dropped == 0
-            && self.n_malformed_bool_dropped == 0
-            && self.n_malformed_param_status_dropped == 0
-            && self.n_notice_response_dropped == 0
-    }
+    // DEF-210 BS-11 + REC-08 (audit 2026-04-28) → DEF-211 INNO-01
+    // (2026-05-04, SHIPPED): pristine-state predicate.
+    //
+    // **Pre-INNO-01**: hand-rolled `pub const fn is_pristine(&self) ->
+    // bool { self.f1.is_none() && ... }` — tier-1 narrow (build-pin
+    // catches default-changes on currently-listed fields), tier-3
+    // broad (contributor must remember to extend the predicate when
+    // adding a new field; missing extension = silent leak of any
+    // secret-bearing default).
+    //
+    // **Post-INNO-01**: `#[derive(Pristine)]` on the struct generates
+    // BOTH `impl Pristine for SessionParams` (runtime, polymorphic)
+    // AND `pub const fn __pristine_const(&self) -> bool` (inherent,
+    // for compile-time pin contexts). The macro inspects every
+    // declared field via `syn::Fields::Named`; missing a new field
+    // is **structurally impossible**.
+    //
+    // Tier elevation: tier-3 broad-scope → **tier-1
+    // by-construction**. The maintenance contract is now
+    // self-enforcing.
+    //
+    // Compile-time call site (`protocol.rs` const-assert on
+    // `static EMPTY: SessionParams`) uses `__pristine_const()`.
+    // Runtime polymorphic dispatch uses the trait method
+    // `<SessionParams as Pristine>::is_pristine()`.
 
     /// DEF-189 Q8-C3: reset all session parameters to their `new()`
     /// state. Called from `clear_session_residue_if_idle_or_errored`

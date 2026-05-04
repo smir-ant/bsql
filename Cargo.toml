@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/bsql-pg-proto",
+    "crates/bsql-pg-proto-derive",
 ]
 
 [workspace.package]
@@ -99,6 +100,18 @@ simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neo
 # Pinned to 0.5 (last pre-1.0 with stable API); upgrade in lockstep
 # with criterion's semver.
 criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
+
+# DEF-233 (2026-05-04): proc-macro toolchain used ONLY by
+# `bsql-pg-proto-derive` (proc-macro pair-crate for `bsql-pg-proto`).
+# `bsql-pg-proto` itself never depends on these — they live entirely
+# behind the pair-crate boundary. Audit-trust class:
+# **expert-domain ecosystem standard** (1B+ downloads each, embedded
+# in Rust toolchain ecosystem; transitive `unsafe` for token-stream
+# manipulation is bounded and well-audited). Pinned majors per
+# CREDO §4.4.
+syn = { version = "2", default-features = false, features = ["proc-macro", "derive", "parsing", "printing"] }
+quote = { version = "1", default-features = false }
+proc-macro2 = { version = "1", default-features = false, features = ["proc-macro"] }
 
 # --- Build profiles ---
 #
