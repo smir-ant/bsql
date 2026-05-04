@@ -1005,7 +1005,12 @@ impl PgProtocol {
         write_buf.clear();
 
         // DEF-188: centralised entry-point terminal-row-desc reclamation.
-        self.clear_session_residue_if_idle_or_errored();
+        // DEF-211 FAKE-01: the `IdleStateProof` witness above guarantees
+        // `state == Idle`, so pass `StatePushClass::Idle` as a STATIC
+        // const argument — LLVM specialises the inlined
+        // `clear_session_residue_for_class` body to the Idle arm only,
+        // eliding the 5-arm dispatch entirely.
+        self.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
 
         // DEF-154 (B+H): write-side keeps its brand (`'wb`) for
         // tier-1 `WriteRange::apply`; read side is unbranded (push
@@ -1096,7 +1101,10 @@ impl PgProtocol {
     ) -> OutActions<'w, 's> {
         write_buf.clear();
         // DEF-189: centralised entry-point session-residue reclamation.
-        self.clear_session_residue_if_idle_or_errored();
+        // DEF-211 FAKE-01: same as `push_command_internal` — state is
+        // guaranteed Idle by `IdleStateProof`, so pass the class as
+        // static const for LLVM specialisation.
+        self.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
 
         // DEF-189: split &mut self into disjoint &mut state +
         // &mut row_desc_slot so compute_push_bind_execute can park
@@ -1209,7 +1217,14 @@ impl PgProtocol {
         max_dispatches: u16,
     ) -> OutActions<'w, 'r> {
         write_buf.clear();
-        self.clear_session_residue_if_idle_or_errored();
+        // DEF-211 FAKE-01: feed_bytes can be called in any state.
+        // Compute `push_class()` ONCE here and pass to the residue
+        // helper — pre-FAKE-01 the helper computed `push_class`
+        // internally (~+10 ns per call). Caching at the entry point
+        // amortises one classification across the full feed_bytes
+        // dispatch loop.
+        let entry_class = self.state.push_class();
+        self.clear_session_residue_for_class(entry_class);
 
         // DEF-154 (H+V) pending_advance DELETED 2026-04-24: the
         // deferred-advance slot existed because `StagedAction::StreamRowRange`
@@ -1687,39 +1702,47 @@ impl PgProtocol {
     /// residue semantics for a new variant must extend `StatePushClass`
     /// — at which point the build fails here until they decide.
     #[inline]
-    fn clear_session_residue_if_idle_or_errored(&mut self) {
-        // DEF-210 SR-02 + post-bench refinement (audit 2026-04-28):
-        // direct match on `ProtoState` discriminant with a wildcard
-        // catch-all for in-flight states. Earlier iterations:
-        // - Routing through `state.push_class()` cost ~+10 ns on
-        //   `push_command/ping_amortised` (28-arm + 5-arm dual match
-        //   that LLVM declined to fold across the entry-point hot
-        //   path).
-        // - Enumerated 25-variant or-pattern cost ~+4 ns (LLVM
-        //   generates per-variant compares instead of a single
-        //   discriminant range check).
-        // The wildcard form compiles to load discriminant + 2 typed
-        // compares + fall-through — pre-DEF-210 baseline shape.
+    fn clear_session_residue_for_class(
+        &mut self,
+        class: crate::state::StatePushClass,
+    ) {
+        // DEF-211 FAKE-01 (audit 2026-05-04, 5th-pass architect-agent):
+        // takes pre-computed `StatePushClass` rather than re-classifying
+        // here. Tier-1 closure of the wildcard `_ => {}` arm-body-swap
+        // surface: production callers compute `push_class()` ONCE at
+        // the entry point and pass it through. The 5-arm exhaustive
+        // match on `StatePushClass` below means a future variant added
+        // to `StatePushClass` (which is itself driven by an exhaustive
+        // match on every `ProtoState` variant in `state.rs::push_class`)
+        // forces an explicit residue policy decision here at build
+        // time. **No wildcard, no escape hatch** — tier-1 by-construction.
         //
-        // **Tier framing**: tier-2 by-discipline at the broad scope —
-        // a new `ProtoState` variant inherits the wildcard "preserve"
-        // arm silently. Inline exhaustive match here was tried and
-        // reverted after the bench evidence; an out-of-band unit-test
-        // pin form was attempted but the private-constructor surface
-        // (Sensitive, ScramSession, ReplyId<K>) made fixture
-        // construction non-trivial. Future tier-1 closure path:
-        // integration-style test driving every variant through the
-        // public API and asserting observable residue state per
-        // variant. Tracked as DEF-210 NB-04-FUTURE.
-        match self.state {
-            ProtoState::Idle => {
+        // Bench history of alternatives tried/rejected:
+        // - Routing through `state.push_class()` IN THIS function
+        //   (uncached): ~+10 ns on `push_command/ping_amortised`
+        //   (LLVM declined to fold the dual match across the
+        //   entry-point hot path).
+        // - Enumerated 25-variant or-pattern on `ProtoState`: ~+4 ns
+        //   (per-variant compares instead of single discriminant range
+        //   check).
+        // - Extracted `residue_policy(class) -> ResiduePolicy` helper:
+        //   ~+21 ns (LLVM's inline budget rejected the function call
+        //   despite `#[inline]`).
+        // - **Cached classification at entry point** (this form):
+        //   bench-neutral. push_command paths pass
+        //   `StatePushClass::Idle` as a STATIC const argument so LLVM
+        //   specialises to the Idle-only arm body. feed_bytes pays one
+        //   `push_class()` call (28-arm match) per call — amortised
+        //   over the full dispatch loop.
+        match class {
+            crate::state::StatePushClass::Idle => {
                 self.row_desc_slot = None;
                 // DEF-196: only clear arena if it was ever allocated.
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
             }
-            ProtoState::Errored(_) => {
+            crate::state::StatePushClass::Errored(_) => {
                 self.row_desc_slot = None;
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
@@ -1731,9 +1754,13 @@ impl PgProtocol {
                     params.clear();
                 }
             }
-            // In-flight states — preserve residue. Pinned
-            // exhaustively in `residue_policy_protostate_pin_tests`.
-            _ => {}
+            // In-flight states — preserve residue. The exhaustive
+            // match here is the load-bearing tier-1 closure: adding
+            // a new `StatePushClass` variant fails the build until
+            // its residue policy is decided.
+            crate::state::StatePushClass::Connecting
+            | crate::state::StatePushClass::PingAwaiting
+            | crate::state::StatePushClass::BusyQuery => {}
         }
     }
 
@@ -2027,7 +2054,10 @@ impl PgProtocol {
     ) -> crate::row_stream::RowStream<'p, 'w> {
         // Entry-point housekeeping mirrors feed_bytes:
         write_buf.clear();
-        self.clear_session_residue_if_idle_or_errored();
+        // DEF-211 FAKE-01: cached classification (see feed_bytes for
+        // rationale).
+        let entry_class = self.state.push_class();
+        self.clear_session_residue_for_class(entry_class);
         // DEF-184 audit (2026-04-24): `apply_pending_advance`
         // DELETED — the deferred mechanism is gone (post-DEF-154 Y
         // StreamRowRange delete, cursor advance happens in-scope
@@ -3727,7 +3757,7 @@ mod residue_policy_per_class_tests {
         let mut proto = PgProtocol::new();
         // Default state is `Idle` post-`new()`.
         populate_residue(&mut proto);
-        proto.clear_session_residue_if_idle_or_errored();
+        proto.clear_session_residue_for_class(proto.state.push_class());
 
         assert!(
             proto.row_desc_slot.is_none(),
@@ -3754,7 +3784,7 @@ mod residue_policy_per_class_tests {
             StateErrorKind::from_kind_or_internal(ErrorKind::Framing),
         );
         populate_residue(&mut proto);
-        proto.clear_session_residue_if_idle_or_errored();
+        proto.clear_session_residue_for_class(proto.state.push_class());
 
         assert!(
             proto.row_desc_slot.is_none(),
@@ -3780,7 +3810,7 @@ mod residue_policy_per_class_tests {
             reply: ReplyId::from_raw(nz(11)),
         };
         populate_residue(&mut proto);
-        proto.clear_session_residue_if_idle_or_errored();
+        proto.clear_session_residue_for_class(proto.state.push_class());
 
         assert!(
             proto.row_desc_slot.is_some(),
@@ -3806,7 +3836,7 @@ mod residue_policy_per_class_tests {
         let mut proto = PgProtocol::new();
         proto.state = ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
         populate_residue(&mut proto);
-        proto.clear_session_residue_if_idle_or_errored();
+        proto.clear_session_residue_for_class(proto.state.push_class());
 
         assert!(
             proto.row_desc_slot.is_some(),
@@ -3830,7 +3860,7 @@ mod residue_policy_per_class_tests {
             reply: ReplyId::from_raw(nz(13)),
         };
         populate_residue(&mut proto);
-        proto.clear_session_residue_if_idle_or_errored();
+        proto.clear_session_residue_for_class(proto.state.push_class());
 
         assert!(
             proto.row_desc_slot.is_some(),
