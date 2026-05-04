@@ -702,80 +702,50 @@ pub struct PgProtocol {
     sync_marker: PhantomData<Cell<()>>,
 }
 
-impl PgProtocol {
-    /// DEF-143 bench hook — raw append to `read_buf` without
-    /// invoking the dispatch state machine. Returns
-    /// `Err(ReadBufFull)` on capacity overflow.
-    ///
-    /// # Feature-gated: `bench-hooks`
-    ///
-    /// This method exists ONLY when compiling with
-    /// `--features bench-hooks`. Default builds (cargo build /
-    /// cargo test / downstream releases) don't compile it at all
-    /// — zero public-API bloat, zero binary impact, zero risk of
-    /// accidental production use.
-    ///
-    /// The benchmark target
-    /// (`benches/hot_paths.rs`) declares
-    /// `required-features = ["bench-hooks"]` so `cargo bench`
-    /// without the flag fails fast with a clear error rather than
-    /// masking the setup bug.
-    ///
-    /// # NOT a production API
-    ///
-    /// Bypasses the dispatch state machine — the caller MUST
-    /// ensure the current state is compatible with the frame
-    /// bytes being appended (e.g. bytes must be DataRow frames
-    /// if state is `SimpleQueryStreamingRows`). Violating this
-    /// forges a state inconsistency that will trip classified
-    /// diagnostics (UnexpectedFrame / InternalCrateBug) on the
-    /// next `iter_rows` / `feed_bytes` call.
-    ///
-    /// Exists solely to enable per-row amortised throughput
-    /// measurement in `benches/hot_paths.rs` — see
-    /// `bench_iter_rows_per_row_throughput` for the single
-    /// legitimate caller.
-    #[cfg(feature = "bench-hooks")]
-    #[doc(hidden)]
-    pub fn bench_append_read_buf(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
-        self.read_buf.append(bytes)
-    }
+// DEF-211 FAKE-19 (audit + ship 2026-05-04): bench-hooks feature
+// REMOVED ENTIRELY. Pre-FAKE-19 the crate exposed two `pub fn` hooks
+// gated `#[cfg(feature = "bench-hooks")]` + `#[doc(hidden)]`:
+//
+//   `bench_append_read_buf` — raw append into `read_buf` bypassing
+//                              dispatch (used by row-iter benches).
+//   `reset_for_bench`       — snap state to Idle bypassing Drop
+//                              (used by amortised push benches).
+//
+// Both hooks were tier-3 by-discipline: feature-gated + doc-hidden +
+// docstring warnings, but a downstream consumer who explicitly
+// enabled `bench-hooks` in their Cargo.toml would get the API in
+// production. CREDO §1 absolute-safety target = tier-1 closure.
+//
+// **Replacement is structural**:
+//
+// 1. `bench_append_read_buf` was a strict duplicate of the public
+//    `feed_inbound(bytes) -> Result<(), ReadBufFull>` shipped in
+//    DEF-212 Phase 2 (commit 201f86a). Benches now call
+//    `feed_inbound` directly — same byte-for-byte semantics, no
+//    duplication, public-API surface stays the same.
+//
+// 2. `reset_for_bench` was a bench-only `state = Idle` mutation that
+//    bypassed Drop scrub for amortised iter perf. criterion's
+//    `iter_batched(setup, routine, BatchSize)` is the idiomatic
+//    replacement: setup builds a fresh proto per iter (untimed),
+//    routine runs the timed measurement on it. Per-iter setup pays
+//    PgProtocol::new() init (~50 ns memset for 4 KB ReadBuf) but
+//    that cost is OUTSIDE the timed window — criterion reports the
+//    routine timing accurately. See `benches/hot_paths.rs` post-
+//    refactor patterns.
+//
+// **Tier closure**: feature physically gone → no leak surface →
+// tier-1 by-elimination. Cannot enable from anywhere; the hooks
+// don't exist. CREDO §1 absolute-safety satisfied without
+// discipline reliance.
+//
+// **Trade-off accepted**: amortised push benches now include
+// per-iter `PgProtocol::new()` cost in their wall time (longer to
+// reach criterion's sample budget) but the reported per-iter
+// timing is correct. Relative-to-baseline regression detection is
+// preserved.
 
-    /// DEF-194 follow-up bench hook — minimal state reset for
-    /// amortised push-path benches. Snaps `state` to `Idle` without
-    /// firing zeroize-on-Drop on the buffers (push paths never
-    /// touch `read_buf`; `write_buf` is caller-owned and reset via
-    /// `WriteBuf::clear()` separately).
-    ///
-    /// # Feature-gated: `bench-hooks` (same surface gate as
-    /// [`Self::bench_append_read_buf`]).
-    ///
-    /// # NOT a production API
-    ///
-    /// Discards in-flight reply correlators (the previous state
-    /// variant's `ReplyId<K>`) without firing `FailReply` — production
-    /// would surface a classified error. Exists solely to amortise
-    /// the per-iter `PgProtocol::new()` + matched `Drop` cost (the
-    /// latter zeroizes 4 KB of `ReadBuf` + adjacent buffers under
-    /// DEF-185 P0-B/P0-C zeroize-on-Drop, which dominates bench
-    /// closures that re-create the protocol per iteration).
-    ///
-    /// Production hot-path economics: `PgProtocol` lives a connection
-    /// lifetime; Drop fires once at connection close, not per query.
-    /// This hook lets the bench measure the production-relevant
-    /// per-query cost without amortising-fixture artefacts.
-    #[cfg(feature = "bench-hooks")]
-    #[doc(hidden)]
-    pub fn reset_for_bench(&mut self) {
-        // Overwrite state in place. The dropped value is whatever
-        // variant was active (e.g. `PingAwaitingRfq(reply_id)`);
-        // ReplyId<K> is POD Copy with no Drop (DEF-154 K), so the
-        // implicit Drop on overwrite is a no-op.
-        self.state = ProtoState::Idle;
-        // read_buf intentionally NOT cleared — push paths never
-        // touch it, and clearing would zeroize 4 KB on each iter
-        // exit (defeating the amortisation purpose).
-    }
+impl PgProtocol {
 
     /// Construct a new protocol in [`ProtoState::Idle`].
     ///

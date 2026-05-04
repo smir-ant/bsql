@@ -63,10 +63,14 @@ use criterion::{
 // guard-acquisition + Result discipline so the bench timing reflects the
 // production caller's cost.
 //
-// Benches always start from a fresh `PgProtocol::new()` (Idle state) or
-// call `proto.reset_for_bench()` (also Idle), so the `None` guard arm is
-// unreachable in correctly-built benches — `panic!` surfaces a fixture
-// bug as a loud bench failure rather than silent wrong-data.
+// Benches always start from a fresh `PgProtocol::new()` (Idle state)
+// — either via `iter_batched`-style setup-per-iter or before-loop
+// hoisting. Post-DEF-211 FAKE-19 (audit 2026-05-04) the
+// `reset_for_bench` shortcut was eliminated; criterion's
+// `iter_batched` is the idiomatic pattern for stateful per-iter
+// setup, so the `None` guard arm is unreachable in correctly-built
+// benches — `panic!` surfaces a fixture bug as a loud bench failure
+// rather than silent wrong-data.
 //
 // Cost: one branch on `state.push_class()` per call. On Idle the branch
 // is well-predicted, ~1 ns added to the timed path. Same overhead the
@@ -215,24 +219,28 @@ fn bench_ping_round_trip(c: &mut Criterion) {
 // ---------------------------------------------------------------
 //
 // Measures the true per-row cost of the `row_stream` fast-path
-// in a hot SELECT loop. Setup (not timed) uses the
-// `PgProtocol::bench_append_read_buf` hook to pre-populate
-// `read_buf` with N DataRow frames (raw append, bypasses
-// dispatch). Timed body loops `next_event()` N times,
-// consuming all rows via fast-path.
+// in a hot SELECT loop. Setup (not timed) uses the public
+// [`PgProtocol::feed_inbound`] API (DEF-212 Phase 2 commit
+// 201f86a) to pre-populate `read_buf` with N DataRow frames —
+// raw append, no dispatch. Timed body loops `next_event()` N
+// times, consuming all rows via fast-path.
 //
 // Throughput reports per-row amortised ns.
 //
-// # Why the bench hook is necessary
+// # Why feed_inbound is the right setup primitive
 //
 // Public `feed_bytes` correctly rejects DataRow in
 // `SimpleQueryStreamingRows` state — that's production
 // behavior ("caller should use iter_rows, not feed_bytes"
 // catch-all arm). Verified 2026-04-24: feeding 100 DataRows
-// after RowDescription lands in Errored(Framing), 0 rows
-// pullable. The `bench_append_read_buf` hook is a
-// `#[doc(hidden)] pub fn` for bench-only use — appends bytes
-// without triggering dispatch classification.
+// after RowDescription via `feed_bytes` lands in
+// Errored(Framing), 0 rows pullable. `feed_inbound` is the
+// dispatch-bypass primitive shipped with DEF-212 Phase 2 for
+// 1c-5 pipelining forward-compat — appends bytes without
+// triggering dispatch classification, exactly what bench setup
+// needs. Pre-DEF-211 FAKE-19 (audit + ship 2026-05-04) the
+// bench used a `bench_append_read_buf` hook that was a strict
+// duplicate of `feed_inbound` — replaced.
 //
 // # Row size vs READ_BUF_CAP
 //
@@ -290,15 +298,15 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 // Raw-append DataRow bytes into read_buf.
-                // bench_append_read_buf returns Result<(), ReadBufFull>;
+                // feed_inbound returns Result<(), ReadBufFull>;
                 // assert on Ok so a setup misconfig (e.g., READ_BUF_CAP
                 // shrunk below N_ROWS × row_size) fails loud rather than
                 // producing silent garbage numbers. Setup is not timed.
                 for _ in 0..N_ROWS {
-                    let append_res = proto.bench_append_read_buf(&single_row);
+                    let append_res = proto.feed_inbound(&single_row);
                     assert!(
                         append_res.is_ok(),
-                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
                     );
                 }
                 (proto, wb)
@@ -381,15 +389,15 @@ fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    // bench_append_read_buf returns Result<(), ReadBufFull>.
+                    // feed_inbound returns Result<(), ReadBufFull>.
                     // Silent discard would mask setup misconfiguration
                     // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
                     // — assert success so bench breakage is loud, not
                     // silent garbage numbers. Setup path is not timed.
-                    let append_res = proto.bench_append_read_buf(&single_row);
+                    let append_res = proto.feed_inbound(&single_row);
                     assert!(
                         append_res.is_ok(),
-                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
                     );
                 }
                 (proto, wb)
@@ -458,15 +466,15 @@ fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    // bench_append_read_buf returns Result<(), ReadBufFull>.
+                    // feed_inbound returns Result<(), ReadBufFull>.
                     // Silent discard would mask setup misconfiguration
                     // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
                     // — assert success so bench breakage is loud, not
                     // silent garbage numbers. Setup path is not timed.
-                    let append_res = proto.bench_append_read_buf(&single_row);
+                    let append_res = proto.feed_inbound(&single_row);
                     assert!(
                         append_res.is_ok(),
-                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
                     );
                 }
                 (proto, wb)
@@ -536,15 +544,15 @@ fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    // bench_append_read_buf returns Result<(), ReadBufFull>.
+                    // feed_inbound returns Result<(), ReadBufFull>.
                     // Silent discard would mask setup misconfiguration
                     // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
                     // — assert success so bench breakage is loud, not
                     // silent garbage numbers. Setup path is not timed.
-                    let append_res = proto.bench_append_read_buf(&single_row);
+                    let append_res = proto.feed_inbound(&single_row);
                     assert!(
                         append_res.is_ok(),
-                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
                     );
                 }
                 (proto, wb)
@@ -625,15 +633,15 @@ fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    // bench_append_read_buf returns Result<(), ReadBufFull>.
+                    // feed_inbound returns Result<(), ReadBufFull>.
                     // Silent discard would mask setup misconfiguration
                     // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
                     // — assert success so bench breakage is loud, not
                     // silent garbage numbers. Setup path is not timed.
-                    let append_res = proto.bench_append_read_buf(&single_row);
+                    let append_res = proto.feed_inbound(&single_row);
                     assert!(
                         append_res.is_ok(),
-                        "bench setup: bench_append_read_buf must succeed for N_ROWS={N_ROWS}",
+                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
                     );
                 }
                 (proto, wb)
@@ -705,27 +713,37 @@ fn bench_push_ping(c: &mut Criterion) {
     // perceived "+10% regression vs def184-complete" is
     // (a) DEF-185 zeroize-on-Drop bench harness artefact, or
     // (b) real push-path regression.
+    // DEF-211 FAKE-19 (2026-05-04): replaced `b.iter` + manual
+    // `reset_for_bench` (bench-hooks feature gate, ELIMINATED) with
+    // `b.iter_batched_ref(setup, routine, ...)`.
+    //
+    // Why `iter_batched_ref` (not `iter_batched`): the `_ref` variant
+    // passes `&mut I` to the routine — Drop of the input fires
+    // OUTSIDE the timed window. Plain `iter_batched` consumes by
+    // value; Drop fires inside the timed loop (PgProtocol's
+    // zeroize-on-Drop scrubs 4 KB of ReadBuf + 2 KB of WriteBuf
+    // ≈ 50-75 ns per iter — would dominate the ~10 ns push
+    // measurement). Production proto doesn't drop per-query (lives
+    // a connection lifetime); `_ref` is the methodologically
+    // correct shape.
+    //
+    // Per-iter setup (PgProtocol::new + WriteBuf::new) is criterion-
+    // untimed; the timed window is exactly the push call. Reported
+    // ns reflects production per-query push cost.
     group.bench_function("ping_amortised", |b| {
-        let mut proto = PgProtocol::new();
-        let mut wb = WriteBuf::new();
-        b.iter(|| {
-            let out = proto.bench_push_or_panic(
-                PgCommand::Ping {
-                    reply: reply_id_ping(1),
-                },
-                &mut wb,
-            );
-            let _ = black_box(out);
-            // Reset between iters so push_command sees a clean
-            // Idle state. push_command on PingAwaitingRfq fails
-            // with FailReply — would skew the measurement.
-            // `reset_for_bench` is a `#[cfg(feature = "bench-hooks")]`
-            // helper that drops the in-flight state without firing
-            // FailReply (the bench is measuring the push path, not
-            // the failure path).
-            proto.reset_for_bench();
-            wb.clear();
-        });
+        b.iter_batched_ref(
+            || (PgProtocol::new(), WriteBuf::new()),
+            |(proto, wb)| {
+                let out = proto.bench_push_or_panic(
+                    PgCommand::Ping {
+                        reply: reply_id_ping(1),
+                    },
+                    wb,
+                );
+                let _ = black_box(out);
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();
