@@ -123,6 +123,93 @@
 // exist in practice.
 extern crate alloc;
 
+// DEF-211 SAFE-02 (audit 2026-05-04, 5th-pass architect-agent):
+// **transitive-`unsafe` audit-trust chain**.
+//
+// `bsql-pg-proto` itself uses `#![forbid(unsafe_code)]` (line 61).
+// Every line of crate-internal Rust is `unsafe`-free by build-time
+// rejection — the crate's own surface contributes ZERO unsafe
+// boundaries.
+//
+// Direct (Cargo.toml) and transitive runtime dependencies that
+// contain `unsafe` blocks, ranked by audit-trust risk:
+//
+// 1. `simdutf8` (~v0.1) — SIMD-accelerated UTF-8 validation.
+//    Used by `<&str as FromPgText>::from_pg_text` (decode.rs).
+//    Surface: NEON / SSE intrinsic invocations + alignment-aware
+//    chunking. Audit-trust class: **ecosystem-tested** (1M+
+//    downloads/month, multiple production users including
+//    `simd-json`). Behaviour parity with `core::str::from_utf8`
+//    is property-tested upstream; we treat the validation
+//    boundary as authoritative. Bench (DEF-202): 2-4× speedup
+//    on Cyrillic / long-ASCII rows.
+//    **Scope of trust**: validate `simdutf8::basic::from_utf8`
+//    contract on every PG release. Failure mode: misclassified
+//    text → `DecodeError::NonUtf8` (tier-3, classified). Never
+//    UB on attacker-controlled bytes (per upstream property tests).
+//
+// 2. `heapless` (~v0.9) — bounded-capacity inline `Vec`/`String`.
+//    Used for `OutActions`, `StagedActions`, multiple wire-format
+//    builders. Surface: `MaybeUninit<[T; N]>` storage with
+//    manual init-tracking. Audit-trust class: **ecosystem-tested**
+//    (embedded-Rust standard, no_std staple).
+//    **Scope of trust**: bounded-cap Vec must never write past
+//    its declared `N`; we never construct `heapless::Vec` from
+//    raw pointers. The crate's own const-asserts (`MAX_ACTIONS_PER_CALL`
+//    >= per-site budgets) ensure the heapless capacity is
+//    sufficient under our usage patterns. DEF-211 SAFE-01 considered
+//    replacing with hand-rolled `BoundedVec` but the replacement
+//    itself would require crate-internal `unsafe` (MaybeUninit) —
+//    net worse than ecosystem-trusted heapless.
+//
+// 3. RustCrypto: `sha2` + `hmac` + `pbkdf2` — SCRAM-SHA-256
+//    cryptographic primitives. Surface: const-time arithmetic,
+//    inline assembly on aarch64 hardware-CRC paths. Audit-trust
+//    class: **expert-domain crypto** (CREDO §11 — never
+//    hand-rolled; trust the ecosystem implementation, not our own).
+//    **Scope of trust**: SHA-256 / HMAC-SHA-256 contract per
+//    NIST FIPS 180-4. Behaviour parity with `openssl` /
+//    `boringssl` reference is integration-tested.
+//
+// 4. `getrandom` — OS RNG bridge (`/dev/urandom`,
+//    `getrandom(2)`, `RtlGenRandom` etc.). Used by SCRAM
+//    client-nonce generator. Surface: per-platform syscalls.
+//    Audit-trust class: **expert-domain ecosystem standard**.
+//    **Scope of trust**: returns 16+ bytes of cryptographically
+//    secure random per call. Failure mode: kernel RNG init
+//    delay (rare) — bubbles up as `ScramError::ClientNonceUnavailable`,
+//    classified.
+//
+// 5. `subtle` — constant-time comparison + select primitives.
+//    Used in SCRAM server-signature verification.
+//    Surface: black-box-`asm!` to thwart compiler optimisation
+//    that would leak timing.
+//    Audit-trust class: **ecosystem-standard cryptographic
+//    primitive**, audited as part of RustCrypto governance.
+//
+// 6. `zeroize` — secret-bearing-type drop scrub. Trait + derive
+//    macro. Surface: macro-level `unsafe` for the inline-asm
+//    `compiler_fence` on the `Zeroize` impl for primitive types.
+//    Audit-trust class: **ecosystem-standard cryptographic
+//    hygiene primitive**. The `unsafe` block is a single-line
+//    `compiler_fence(Ordering::SeqCst)` to prevent dead-store
+//    elimination.
+//
+// **Audit-trust posture**: every transitive `unsafe` source is
+// either (a) ecosystem-standard (1M+ downloads), (b) expert-
+// domain (crypto / hardware), or (c) deliberately-tiny (zeroize
+// fence). The crate-internal surface is `unsafe`-free by
+// `#![forbid]`. CREDO §11 explicitly accepts this trust model
+// for crypto + ecosystem-standard primitives. Replacement of
+// any of these with hand-rolled equivalents would CREATE a new
+// `unsafe` audit boundary inside the crate — net worse per
+// CREDO §11.
+//
+// Per-PR requirement: when bumping any of these deps, audit
+// the changelog for `unsafe` boundary changes (new `unsafe`
+// blocks, new platform inline-asm). Today's audit (2026-05-04)
+// confirmed all six sources at known-good versions.
+
 #[cfg(test)]
 extern crate std;
 
@@ -148,6 +235,11 @@ pub mod scram;
 // state variants; terminal-reply schema parks into
 // PgProtocol::terminal_row_desc. See state.rs / protocol.rs for
 // the post-arena flow.
+// DEF-211 SAFE-06 (audit 2026-05-04): `SecretZeroize` trait —
+// driver-side panic-hook integration contract for closing the
+// `panic = "abort"` zeroize gap. See module docstring for the
+// full treatment.
+pub(crate) mod secret_zeroize;
 pub mod sensitive;
 pub mod session_params;
 pub mod state;

@@ -1,0 +1,65 @@
+# DEF-211 FAKE-14 (audit 2026-05-04, 5th-pass architect-agent): CI
+# matrix that includes `cargo test --doc` so every `compile_fail`
+# doctest is load-bearing — pre-FAKE-14 the crate had 10
+# `compile_fail` doctests proving build-rejection of various
+# tier-1 invariants (BoundedU{8,16}<MAX>::new_const out-of-range,
+# ReadyGuard misuse, etc.); without `cargo test --doc` running on
+# every PR, a regression that lets one of those doctests start
+# COMPILING (i.e., the tier-1 invariant breaks) would ship silently.
+# The doctest job below makes the doctests load-bearing.
+
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --lib --tests
+        run: cargo test --workspace --lib --tests --all-features
+
+  doctest:
+    name: cargo test --doc (DEF-211 FAKE-14 — load-bearing compile_fail doctests)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --doc
+        run: cargo test --workspace --doc --all-features
+
+  clippy:
+    name: cargo clippy (forbid bundle)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy --all-targets
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  fmt:
+    name: cargo fmt
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
