@@ -3579,16 +3579,14 @@ mod allows_unsolicited_param_status_tests {
         }
 
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
-            let handshake = alloc::boxed::Box::new(crate::state::ScramHandshakeState {
-                scram: crate::scram::session::ScramSession::from_password(
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
                     crate::sensitive::Sensitive::new(pw),
                 ),
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
-            });
+            );
             let scram_first = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(nz(5)),
-                handshake,
+                scram,
             };
             assert!(!allows_unsolicited_param_status(&scram_first));
             consume_state(scram_first);
@@ -4191,16 +4189,14 @@ mod compute_push_tests {
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
             let raw_prev = nz(203);
             let raw_new = nz(204);
-            let handshake = alloc::boxed::Box::new(crate::state::ScramHandshakeState {
-                scram: crate::scram::session::ScramSession::from_password(
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
                     crate::sensitive::Sensitive::new(pw),
                 ),
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
-            });
+            );
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
-                handshake,
+                scram,
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -4499,16 +4495,14 @@ mod compute_push_tests {
         {
             let raw_prev = nz(405);
             let raw_new = nz(406);
-            let handshake = alloc::boxed::Box::new(crate::state::ScramHandshakeState {
-                scram: crate::scram::session::ScramSession::from_password(
+            let scram = alloc::boxed::Box::new(
+                crate::scram::session::ScramSession::from_password(
                     crate::sensitive::Sensitive::new(pw),
                 ),
-                client_first_bare: crate::ident::PodBytes::new(),
-                client_nonce_b64: crate::ident::PodBytes::new(),
-            });
+            );
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
-                handshake,
+                scram,
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);

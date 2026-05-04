@@ -327,41 +327,30 @@ pub(crate) fn dispatch(
         // SCRAM: awaiting server-first-message
         // =============================================================
         (
-            ProtoState::ConnectingScramAwaitingServerFirst { reply, handshake },
+            ProtoState::ConnectingScramAwaitingServerFirst { reply, scram },
             TAG_AUTHENTICATION,
         ) => {
             // DEF-184 (A10/B22 revert 2026-04-24): heavy SCRAM fields
             // destructured inline from the variant — tier-1 invariant
             // (CREDO §1: variant-carries-field). No drift path.
             //
-            // DEF-210 REC-06 (audit 2026-04-28): the three SCRAM
-            // handshake fields previously each in their own Box are
-            // now consolidated inside `Box<ScramHandshakeState>` —
-            // one heap allocation instead of three. Deref-move
-            // (`*handshake`) extracts the inner struct by value for
-            // destructuring; the dispatch helper takes the three
-            // fields separately to preserve its existing signature
-            // (and to keep `ScramSession` Box-shaped since by-value
-            // would memcpy ~520 B onto the helper's stack frame).
-            let crate::state::ScramHandshakeState {
-                scram,
-                client_first_bare,
-                client_nonce_b64,
-            } = *handshake;
+            // DEF-210 REC-06 → PERF-02 (audits 2026-04-28 + 2026-05-04):
+            // the SCRAM handshake state is one `Box<ScramSession>`
+            // carrying password + `client_first_bare` + `client_nonce_b64`
+            // inline. The Box is moved here by the destructure (no
+            // allocator op); `dispatch_auth_sasl_continue` borrows
+            // `&scram` for HMAC composition + reads
+            // `scram.client_first_bare` / `scram.client_nonce_b64`
+            // through the same borrow. The Box drops at the end of
+            // this arm scope (1 free), firing `ScramSession::Drop`
+            // with `ZeroizeOnDrop` scrub of the password.
             dispatch_auth_sasl_continue(
                 state,
                 reply,
                 &scram,
-                client_first_bare,
-                client_nonce_b64,
                 payload,
                 reserved,
             )
-            // `scram` (ScramSession) drops here when this arm scope
-            // exits — `ZeroizeOnDrop` scrubs password / digest / nonce
-            // bytes. The `Box<ScramHandshakeState>` was already freed
-            // by the deref-move at `*handshake` above. Total drops on
-            // this arm: 1 Box-free + 1 ScramSession::drop with scrub.
         }
         (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
@@ -1236,7 +1225,7 @@ fn dispatch_auth_in_startup_trust(
 fn dispatch_auth_in_startup_scram(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
-    scram: alloc::boxed::Box<crate::scram::session::ScramSession>,
+    mut scram: alloc::boxed::Box<crate::scram::session::ScramSession>,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> DispatchOutcome {
@@ -1257,27 +1246,24 @@ fn dispatch_auth_in_startup_scram(
             // DEF-094: write directly into the caller-owned `write_buf`
             // and record the range; materialise at the entry-point
             // boundary after the mutable write phase releases.
-            match build_sasl_initial_response(&scram, reserved) {
-                Ok((range, client_first_bare, client_nonce_b64)) => {
-                    // DEF-184 (A10/B22 revert) + DEF-187 box transition
-                    // + DEF-210 REC-06 (audit 2026-04-28): tier-1
-                    // variant-carries-field; the three SCRAM handshake
-                    // fields are consolidated in a single
-                    // `Box<ScramHandshakeState>`. Move `scram` out of
-                    // its original `Box<ScramSession>` (deref-move
-                    // `*scram` frees the old Box and yields the inner
-                    // `ScramSession` by value) into the new
-                    // consolidated state, alongside `client_first_bare`
-                    // and `client_nonce_b64`. Net allocator delta: −1
-                    // alloc (was 2 separate PodBytes Boxes; now part
-                    // of one struct), −1 free at the next transition.
+            // DEF-210 PERF-02 (audit 2026-05-04): single-Box SCRAM.
+            // `build_sasl_initial_response` populates
+            // `scram.client_first_bare` + `scram.client_nonce_b64`
+            // IN PLACE through `&mut Box<ScramSession>`. The same
+            // `Box<ScramSession>` allocation is reused across the
+            // StartupScram → ServerFirst transition (zero allocator
+            // ops). Per-handshake total: 1 alloc (StartupScram
+            // construction) + 1 free (ServerFinal drop), zero
+            // transitions in between. Closes the principal's
+            // documented "one heap alloc per SCRAM connection"
+            // invariant to literal accuracy (REC-06 was a half-
+            // measure that still incurred 1 alloc + 1 free at the
+            // transition; PERF-02 closes the gap).
+            match build_sasl_initial_response(&mut scram, reserved) {
+                Ok(range) => {
                     *state = ProtoState::ConnectingScramAwaitingServerFirst {
                         reply,
-                        handshake: alloc::boxed::Box::new(crate::state::ScramHandshakeState {
-                            scram: *scram,
-                            client_first_bare,
-                            client_nonce_b64,
-                        }),
+                        scram,
                     };
                     DispatchOutcome::AdvancedWithAction {
                         action: StagedAction::SendBytesRange(range),
@@ -1358,19 +1344,15 @@ fn mechanism_list_contains_scram(data: &[u8]) -> bool {
 /// a `ScramSession`, not a `Credentials`.
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
+/// DEF-210 PERF-02 (audit 2026-05-04): writes `client_first_bare`
+/// and `client_nonce_b64` directly into the caller's
+/// `&mut ScramSession` (single source of truth for handshake
+/// state — see `ScramSession` struct docstring). Returns only
+/// the [`WriteRange`] for the wire bytes to send.
 fn build_sasl_initial_response(
-    _: &crate::scram::session::ScramSession,
+    scram: &mut crate::scram::session::ScramSession,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> Result<
-    (
-        // DEF-154 (B): typed branded range — brand ties to `reserved`
-        // scope. Apply at materialise time is infallible.
-        crate::action::WriteRange,
-        crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
-        crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
-    ),
-    ProtocolError,
-> {
+) -> Result<crate::action::WriteRange, ProtocolError> {
     use crate::scram::wire;
 
     // DEF-185 P2-F (audit 2026-04-24): PG convention — the SCRAM
@@ -1425,16 +1407,20 @@ fn build_sasl_initial_response(
     })
     .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
 
-    let client_first_bare = crate::ident::PodBytes::try_from_slice(&client_first_bare_vec)
+    // DEF-210 PERF-02: populate the SCRAM session's
+    // client_first_bare + client_nonce_b64 fields IN PLACE
+    // (vs. returning them by value to be re-Boxed). The caller's
+    // `Box<ScramSession>` is reused across the StartupScram →
+    // ServerFirst transition with zero allocator ops.
+    scram.client_first_bare = crate::ident::PodBytes::try_from_slice(&client_first_bare_vec)
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
-    let client_nonce_b64 = crate::ident::PodBytes::try_from_slice(&client_nonce_vec)
+    scram.client_nonce_b64 = crate::ident::PodBytes::try_from_slice(&client_nonce_vec)
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     // DEF-154 (B) P0-2: `from_branded_write_span` returns Result;
     // `?` propagates up through the function's own Result return
     // type. Err here classifies as `EmptyWriteRange` — dead under
     // intact SCRAM invariants.
-    let range = crate::action::WriteRange::from_write_span(start, reserved)?;
-    Ok((range, client_first_bare, client_nonce_b64))
+    crate::action::WriteRange::from_write_span(start, reserved)
 }
 
 /// Dispatch AuthenticationSASLContinue (server-first-message).
@@ -1471,8 +1457,6 @@ fn dispatch_auth_sasl_continue(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     scram: &crate::scram::session::ScramSession,
-    client_first_bare: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
-    client_nonce_b64: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> DispatchOutcome {
@@ -1489,7 +1473,7 @@ fn dispatch_auth_sasl_continue(
 
     // `rest` is the server-first-message body.
     let server_first =
-        match crate::scram::wire::parse_server_first(rest, client_nonce_b64.as_slice()) {
+        match crate::scram::wire::parse_server_first(rest, scram.client_nonce_b64.as_slice()) {
             Ok(sf) => sf,
             Err(e) => {
                 return install_errored(state, Some(reply.consume()), ProtocolError::Scram(e));
@@ -1526,7 +1510,7 @@ fn dispatch_auth_sasl_continue(
         password_bytes,
         &server_first.salt,
         server_first.iterations,
-        client_first_bare.as_slice(),
+        scram.client_first_bare.as_slice(),
         rest,
         &client_final_without_proof,
     ) {
