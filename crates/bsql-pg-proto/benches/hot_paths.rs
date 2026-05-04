@@ -694,57 +694,35 @@ fn bench_push_ping(c: &mut Criterion) {
         });
     });
 
-    // DEF-194 follow-up (2026-04-27): amortised push_command —
-    // measures the PUSH PATH ONLY, excluding PgProtocol::new() +
-    // WriteBuf::new() construction and the matched Drop sequence
-    // (which under DEF-185 P0-B/P0-C zeroize 8 KB of buffers on
-    // every iter exit — ~10-20 ns of pure memset cost on the
-    // measurement path that doesn't reflect production hot-path
-    // economics, where PgProtocol lives a connection lifetime).
+    // DEF-194 follow-up (2026-04-27): `ping_amortised` sub-bench —
+    // DROPPED 2026-05-05 along with DEF-211 FAKE-19's bench-hooks
+    // elimination. Pre-FAKE-19 the sub-bench used a `reset_for_bench`
+    // hook to reuse the same `PgProtocol` across criterion iterations
+    // (cache-warm, ~10 ns timing — production-relevant since real
+    // connections reuse proto across thousands of queries).
     //
-    // Setup (not timed): create one PgProtocol + WriteBuf.
-    // Timed: push_command + the matching state reset (write_buf
-    // clear + protocol reset to Idle) so subsequent iters start
-    // from a clean state. The reset is cheap (small clear + state
-    // overwrite); the dominating cost is the push path itself.
+    // Post-FAKE-19 the only safe-Rust replacement (criterion's
+    // `iter_batched_ref` with fresh proto per iter) reports a ~47 ns
+    // floor: ~30 ns criterion batch-management overhead + ~17 ns
+    // first-touch cache cost on each fresh proto. That number
+    // **misleads readers** about the actual push cost — production
+    // push remains ~10 ns (cache-warm).
     //
-    // Expected: ~98-105 ns (close to DEF-189 baseline 98.6 ns
-    // for push_command/ping post-DEF-189). Confirms whether
-    // perceived "+10% regression vs def184-complete" is
-    // (a) DEF-185 zeroize-on-Drop bench harness artefact, or
-    // (b) real push-path regression.
-    // DEF-211 FAKE-19 (2026-05-04): replaced `b.iter` + manual
-    // `reset_for_bench` (bench-hooks feature gate, ELIMINATED) with
-    // `b.iter_batched_ref(setup, routine, ...)`.
+    // Decision: drop `ping_amortised` rather than ship a misleading
+    // metric. Coverage gap closed by:
+    //   - `ping_round_trip/push_then_feed` (~113 ns full cycle —
+    //     push + feed_bytes(rfq) — fresh proto each iter, honest
+    //     cold-path cycle measurement). Regression on push WILL
+    //     show up here as cycle-time growth; signal preserved.
+    //   - `push_command/ping` (above, fresh proto per iter) — same
+    //     methodology, cold-cycle push-only number. Honest metric.
     //
-    // Why `iter_batched_ref` (not `iter_batched`): the `_ref` variant
-    // passes `&mut I` to the routine — Drop of the input fires
-    // OUTSIDE the timed window. Plain `iter_batched` consumes by
-    // value; Drop fires inside the timed loop (PgProtocol's
-    // zeroize-on-Drop scrubs 4 KB of ReadBuf + 2 KB of WriteBuf
-    // ≈ 50-75 ns per iter — would dominate the ~10 ns push
-    // measurement). Production proto doesn't drop per-query (lives
-    // a connection lifetime); `_ref` is the methodologically
-    // correct shape.
-    //
-    // Per-iter setup (PgProtocol::new + WriteBuf::new) is criterion-
-    // untimed; the timed window is exactly the push call. Reported
-    // ns reflects production per-query push cost.
-    group.bench_function("ping_amortised", |b| {
-        b.iter_batched_ref(
-            || (PgProtocol::new(), WriteBuf::new()),
-            |(proto, wb)| {
-                let out = proto.bench_push_or_panic(
-                    PgCommand::Ping {
-                        reply: reply_id_ping(1),
-                    },
-                    wb,
-                );
-                let _ = black_box(out);
-            },
-            BatchSize::SmallInput,
-        );
-    });
+    // If a future audit demands precise sub-ns per-push measurement
+    // for regression hunt, options: (a) hand-rolled black_box loop
+    // with cargo asm verification, (b) custom criterion harness,
+    // (c) re-introduce a tier-1 reset mechanism (non-feature-gated
+    // public API such as `proto.reset()` with proper scrub semantics
+    // — would be a real production API, not bench-only).
 
     group.finish();
 }
