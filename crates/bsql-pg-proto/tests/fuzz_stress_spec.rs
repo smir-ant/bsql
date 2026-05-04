@@ -285,16 +285,13 @@ fn push_ping_then_feed_random_bytes_terminates() {
         let mut proto = PgProtocol::new();
         let mut wb = WriteBuf::new();
         // Push Ping first — state transitions to PingAwaitingRfq.
-        // OutActions is ManuallyDrop<heapless::Vec>, not Drop —
-        // scope the binding to release the `&mut proto` borrow via NLL.
-        {
-            let _push_actions = proto.push_or_panic(
-                PgCommand::Ping {
-                    reply: ping_id(u64::try_from(i.saturating_add(1)).unwrap_or(1)),
-                },
-                &mut wb,
-            );
-        }
+        // DEF-212: bytes live in wb; helper returns ().
+        proto.push_or_panic(
+            PgCommand::Ping {
+                reply: ping_id(u64::try_from(i.saturating_add(1)).unwrap_or(1)),
+            },
+            &mut wb,
+        );
         assert!(
             matches!(proto.state(), ProtoState::PingAwaitingRfq(_)),
             "iter {i}: state after push_ping must be PingAwaitingRfq, got {:?}",

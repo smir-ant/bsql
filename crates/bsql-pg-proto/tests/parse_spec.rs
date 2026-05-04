@@ -80,8 +80,22 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
     frame(TAG_ERROR_RESPONSE.byte(), &body)
 }
 
-/// Push a Parse + assert two SendBytes actions emitted (P frame + Sync).
+/// Push a Parse + assert wire layout in `wb.as_bytes()`.
 /// Returns the P-frame bytes for wire-layout inspection.
+///
+/// # DEF-212 (Alt Y', audit 2026-05-04)
+///
+/// Pre-(212) `push_or_panic` returned an `OutActions` list containing
+/// `[Action::SendBytes(p), Action::SendBytes(sync)]` (800 B per call).
+/// Post-(212) the helper returns `()`; bytes live in the caller's
+/// `wb` as a single concatenation of the P frame followed by the
+/// trailing Sync wire bytes — the production I/O path drains them in
+/// one socket write.
+///
+/// Wire-layout assertion preserved exactly (tail = literal `[b'S', 0,
+/// 0, 0, 4]` per PG §55.2.4 — tag 'S' + BE u32 length=4 self-inclusive,
+/// zero body). F33 anti-tautology stance unchanged: the 5-byte literal
+/// here, not a reference to the internal `SYNC_WIRE_BYTES` const.
 #[track_caller]
 fn parse_setup(
     proto: &mut PgProtocol,
@@ -90,7 +104,7 @@ fn parse_setup(
     reply: ReplyId<ParseKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
-    let out = proto.push_or_panic(
+    proto.push_or_panic(
         PgCommand::Parse {
             stmt_name,
             sql: sql(sql_text),
@@ -98,24 +112,26 @@ fn parse_setup(
         },
         wb,
     );
-    assert_eq!(out.len(), 2, "Parse emits 2 actions: P frame + Sync");
-    match out.as_slice() {
-        [Action::SendBytes(p_frame), Action::SendBytes(sync_frame)] => {
-            assert_eq!(
-                p_frame.first(),
-                Some(&TAG_PARSE.byte()),
-                "first action must be 'P' frame",
-            );
-            // F33: assert literal PG Sync wire layout (tag 'S' + BE u32
-            // length=4). Avoids tautology with internal SYNC_WIRE_BYTES.
-            assert_eq!(
-                *sync_frame, &[b'S', 0, 0, 0, 4],
-                "second action must be the PG Sync wire bytes",
-            );
-            p_frame.to_vec()
-        }
-        other => panic!("expected 2 SendBytes actions, got {other:?}"),
-    }
+    let bytes = wb.as_bytes();
+    let total_len = bytes.len();
+    assert!(
+        total_len >= 5,
+        "Parse push must emit at least the trailing Sync (5 B); got {total_len} B",
+    );
+    let split = total_len.saturating_sub(5);
+    let Some((p_frame, sync_frame)) = bytes.split_at_checked(split) else {
+        panic!("wb split unreachable post-assert(total_len >= 5): split={split} total={total_len}");
+    };
+    assert_eq!(
+        sync_frame, &[b'S', 0u8, 0u8, 0u8, 4u8],
+        "tail must be the PG Sync wire bytes (tag 'S' + BE u32 length=4)",
+    );
+    assert_eq!(
+        p_frame.first(),
+        Some(&TAG_PARSE.byte()),
+        "head must start with the 'P' Parse tag",
+    );
+    p_frame.to_vec()
 }
 
 // ==================================================================

@@ -820,6 +820,106 @@ pub enum Action<'w, 'r> {
     CloseSocket,
 }
 
+/// DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04):
+/// classified push-side failure — the bytes-only push API
+/// (`ReadyGuard::push_<cmd>`) returns `Result<(), PushFailure>`.
+///
+/// # Pre-DEF-212 history
+///
+/// Pre-(212) push paths returned `OutActions<'w, 'a>` (800 B per call,
+/// `ManuallyDrop<heapless::Vec<Action, 9>>`). The caller iterated the
+/// action list to drive the I/O layer:
+///
+/// ```text
+/// let actions = ready.push_command(cmd, &mut wb);
+/// for a in actions.iter() {
+///     match a {
+///         Action::SendBytes(b) => socket.write(b),
+///         Action::FailReply { id, cause } => deliver_err(id, cause),
+///         Action::CloseSocket => socket.close(),
+///         Action::DeliverReply { .. } => unreachable!()  // never on push paths
+///     }
+/// }
+/// ```
+///
+/// Post-(212) bytes-only push: bytes are written directly into the
+/// caller's `WriteBuf` (caller drains via `wb.as_bytes()`); failure
+/// signals come back via `Result::Err(PushFailure)`. ~800 B → ~80 B
+/// per-call return frame.
+///
+/// # Caller contract on `Err(PushFailure)`
+///
+/// 1. **`wb`'s content is undefined.** Partial frame bytes may be
+///    present from a builder that started writing before failing.
+///    Caller MUST `wb.clear()` before the next push (note: the next
+///    push's `push_*_internal` body does this automatically at
+///    `protocol.rs:1005, 1102` — so the actual risk window is only
+///    between this `Err` and any user-side `wb.as_bytes()` access).
+///
+/// 2. **State has already transitioned to `Errored`** (via
+///    `install_errored` from inside the push internal). `as_ready()`
+///    will return `None` on subsequent calls.
+///
+/// 3. **Caller MUST resolve the user's oneshot using `id` + `cause`.**
+///    The `id` is the consumed correlator (post-`ReplyId::consume`);
+///    the `cause` carries the typed failure classification. Drop
+///    without resolving = silent leak of the user-visible reply.
+///
+/// 4. **Caller MUST close the socket.** Connection is in `Errored`;
+///    the socket is no longer usable. Discard the connection from any
+///    pool with the disposal flag set.
+///
+/// # `#[must_use]` discipline
+///
+/// The struct attribute below pins points 1-4 against accidental
+/// `let _ = ready.push_command(...);` discards. The
+/// `clippy::let_underscore_must_use` and `let_underscore_drop` lints
+/// (DEF-211 SAFE-05, in the forbid bundle) make ignoring `Result`
+/// without explicit `match`/`?` a build failure.
+///
+/// # Field privacy
+///
+/// `pub` fields per principal §12 Q1 decision (2026-05-04): `id` is a
+/// non-secret correlator (DEF-149 ReplyId discipline); `cause` is
+/// already a public `ProtocolError`. No encapsulation budget gained
+/// by accessor methods.
+///
+/// # Size pin (DEF-212 M4 — pending Commit 3)
+///
+/// Projected `size_of::<PushFailure>() == 80` exact: `NonZeroU64`
+/// (8 B) + `ProtocolError` (72 B). Const-assert pin lands in
+/// `lib.rs` as part of Commit 3 (DEF-212 Phase 3) per CREDO §III
+/// no-permissive-ranges policy. Until the pin lands, drift is
+/// possible if `ProtocolError`'s 72 B exact pin (already in
+/// `lib.rs`) widens — pre-commit-3 reviewers should validate
+/// `size_of::<PushFailure>()` matches the projection.
+///
+/// # Tier classification
+///
+/// Tier-1 by `Result::Err` arm exhaustive match (caller cannot ignore
+/// without `#[expect]`-or-`?`-or-explicit-discard, all of which signal
+/// intent). The `#[non_exhaustive]` marker reserves room for future
+/// fields (e.g., a `wb_drained_safe: bool` if the contract narrows).
+#[non_exhaustive]
+#[must_use = "PushFailure carries the consumed ReplyId and the failure cause; \
+              the caller MUST resolve the user's oneshot before discarding, \
+              MUST close the socket (connection is Errored), and MUST clear \
+              the WriteBuf if reusing it (its content is undefined post-Err)"]
+#[derive(Debug, Clone)]
+pub struct PushFailure {
+    /// Consumed correlator (post-`ReplyId::consume`) — used by the
+    /// caller's I/O layer to look up the user's oneshot sender and
+    /// deliver the error.
+    pub id: NonZeroU64,
+    /// Typed failure classification. Examples:
+    /// - `ProtocolError::ConnectionAlreadyClosed { prior_kind }` —
+    ///   push attempted on already-closed connection.
+    /// - `ProtocolError::InternalCrateBug { locus }` — builder
+    ///   capacity overflow or empty write range (architecturally-dead
+    ///   per const-asserts in `write_buf.rs`).
+    pub cause: ProtocolError,
+}
+
 /// Internal staging variant emitted by dispatchers during the
 /// write-phase loop.
 ///

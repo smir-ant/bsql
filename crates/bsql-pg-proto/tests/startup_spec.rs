@@ -163,25 +163,27 @@ fn negotiate_proto_version_frame() -> Vec<u8> {
     frame
 }
 
-/// Push a Startup command (trust auth) and return the actions.
-fn startup_trust<'a>(
-    proto: &'a mut PgProtocol,
-    wb: &'a mut bsql_pg_proto::WriteBuf,
+/// Push a Startup command (trust auth). DEF-212: bytes go to wb.
+fn startup_trust(
+    proto: &mut PgProtocol,
+    wb: &mut bsql_pg_proto::WriteBuf,
     user: &str,
     db: Option<&str>,
     reply_raw: NonZeroU64,
-) -> bsql_pg_proto::OutActions<'a, 'a> {
+) {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let database = db.map(|d| {
         bsql_pg_proto::DatabaseName::try_from_str(d).unwrap_or_else(|e| panic!("bad db: {e}"))
     });
+    // DEF-212 (Alt Y'): push_or_panic returns (); bytes live in wb.
+    // Caller drains via `wb.as_bytes()` for wire-layout assertions.
     proto.push_or_panic(PgCommand::Startup {
         user: user_ident,
         database,
         app_name: None,
         credentials: Credentials::Trust,
         reply: id(reply_raw),
-    }, wb)
+    }, wb);
 }
 
 // ------------------------------------------------------------------
@@ -197,24 +199,22 @@ fn trust_auth_handshake_end_to_end() {
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(1);
 
-    // Push Startup (trust).
-    let out = startup_trust(&mut proto, &mut wb, "testuser", Some("testdb"), startup_raw);
-    assert_eq!(out.len(), 1, "Startup emits exactly 1 action (SendBytes)");
-    match out.as_slice() {
-        [Action::SendBytes(send_buf)] => {
-            let bytes = send_buf;
-            // Verify the StartupMessage wire format.
-            // First 4 bytes: length (includes self).
-            // Next 4 bytes: protocol version 196608.
-            assert!(bytes.len() >= 8, "StartupMessage must be at least 8 bytes");
-            let version_bytes = bytes.get(4..8);
-            assert_eq!(
-                version_bytes,
-                Some([0, 3, 0, 0].as_slice()),
-                "protocol version must be 3.0 (196608)",
-            );
-        }
-        other => panic!("expected SendBytes(Owned), got {other:?}"),
+    // Push Startup (trust). DEF-212: bytes live in wb post-Ok.
+    startup_trust(&mut proto, &mut wb, "testuser", Some("testdb"), startup_raw);
+    {
+        // Scope the `&wb` borrow so subsequent feed_bytes calls can
+        // re-borrow `&mut wb` after the inspection.
+        let bytes = wb.as_bytes();
+        // Verify the StartupMessage wire format.
+        // First 4 bytes: length (includes self).
+        // Next 4 bytes: protocol version 196608.
+        assert!(bytes.len() >= 8, "StartupMessage must be at least 8 bytes");
+        let version_bytes = bytes.get(4..8);
+        assert_eq!(
+            version_bytes,
+            Some([0, 3, 0, 0].as_slice()),
+            "protocol version must be 3.0 (196608)",
+        );
     }
     assert!(matches!(
         proto.state(),
@@ -526,41 +526,40 @@ fn startup_message_wire_format() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(100);
-    let out = startup_trust(&mut proto, &mut wb, "alice", Some("mydb"), startup_raw);
+    startup_trust(&mut proto, &mut wb, "alice", Some("mydb"), startup_raw);
 
-    match out.as_slice() {
-        [Action::SendBytes(send_buf)] => {
-            let bytes = send_buf;
-            // Parse the length prefix.
-            let len_bytes = bytes.get(..4).unwrap_or(&[]);
-            let declared = u32::from_be_bytes([
-                *len_bytes.first().unwrap_or(&0),
-                *len_bytes.get(1).unwrap_or(&0),
-                *len_bytes.get(2).unwrap_or(&0),
-                *len_bytes.get(3).unwrap_or(&0),
-            ]);
-            assert_eq!(
-                usize::try_from(declared).unwrap_or(0),
-                bytes.len(),
-                "length prefix must equal total frame length",
-            );
+    // DEF-212: bytes live in wb. Scope the borrow so subsequent
+    // feed_bytes calls reacquire &mut wb cleanly.
+    {
+        let bytes = wb.as_bytes();
+        // Parse the length prefix.
+        let len_bytes = bytes.get(..4).unwrap_or(&[]);
+        let declared = u32::from_be_bytes([
+            *len_bytes.first().unwrap_or(&0),
+            *len_bytes.get(1).unwrap_or(&0),
+            *len_bytes.get(2).unwrap_or(&0),
+            *len_bytes.get(3).unwrap_or(&0),
+        ]);
+        assert_eq!(
+            usize::try_from(declared).unwrap_or(0),
+            bytes.len(),
+            "length prefix must equal total frame length",
+        );
 
-            // Protocol version at offset 4..8.
-            let version = bytes.get(4..8);
-            assert_eq!(version, Some([0, 3, 0, 0].as_slice()));
+        // Protocol version at offset 4..8.
+        let version = bytes.get(4..8);
+        assert_eq!(version, Some([0, 3, 0, 0].as_slice()));
 
-            // Check that "user" and "alice" appear in the payload.
-            let payload = bytes.get(8..).unwrap_or(&[]);
-            assert!(
-                contains_nul_terminated_pair(payload, b"user", b"alice"),
-                "StartupMessage must contain user=alice",
-            );
-            assert!(
-                contains_nul_terminated_pair(payload, b"database", b"mydb"),
-                "StartupMessage must contain database=mydb",
-            );
-        }
-        other => panic!("expected SendBytes(Owned), got {other:?}"),
+        // Check that "user" and "alice" appear in the payload.
+        let payload = bytes.get(8..).unwrap_or(&[]);
+        assert!(
+            contains_nul_terminated_pair(payload, b"user", b"alice"),
+            "StartupMessage must contain user=alice",
+        );
+        assert!(
+            contains_nul_terminated_pair(payload, b"database", b"mydb"),
+            "StartupMessage must contain database=mydb",
+        );
     }
 
     // Drain.
@@ -633,23 +632,24 @@ fn connecting_states_become_errored_on_bad_frame() {
 // (A) SCRAM-SHA-256 handshake end-to-end
 // ------------------------------------------------------------------
 
-/// Helper: push Startup with SCRAM password credentials.
-fn startup_scram<'a>(
-    proto: &'a mut PgProtocol,
-    wb: &'a mut bsql_pg_proto::WriteBuf,
+/// Helper: push Startup with SCRAM password credentials. DEF-212: bytes go to wb.
+fn startup_scram(
+    proto: &mut PgProtocol,
+    wb: &mut bsql_pg_proto::WriteBuf,
     user: &str,
     password: &str,
     reply_raw: NonZeroU64,
-) -> bsql_pg_proto::OutActions<'a, 'a> {
+) {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
+    // DEF-212 (Alt Y'): push_or_panic returns (); bytes live in wb.
     proto.push_or_panic(PgCommand::Startup {
         user: user_ident,
         database: None,
         app_name: None,
         credentials: Credentials::ScramPassword(Sensitive::new(pw)),
         reply: id(reply_raw),
-    }, wb)
+    }, wb);
 }
 
 /// Extract the client-first-message from a SASLInitialResponse frame.
@@ -706,21 +706,18 @@ fn scram_sha256_handshake_end_to_end() {
     let password = "pencil";
 
     // Step 1: Push Startup with SCRAM password.
-    let out = startup_scram(&mut proto, &mut wb, "user", password, startup_raw);
-    assert_eq!(out.len(), 1);
-    // StartupMessage has no tag byte; protocol version 3.0 (196608 =
-    // 0x00030000) occupies bytes [4..8] after the 4-byte length prefix.
-    match out.as_slice() {
-        [Action::SendBytes(send_buf)] => {
-            let bytes = send_buf;
-            assert!(bytes.len() >= 8, "StartupMessage must be >= 8 bytes");
-            assert_eq!(
-                bytes.get(4..8),
-                Some([0, 3, 0, 0].as_slice()),
-                "StartupMessage protocol version must be 3.0 (196608)",
-            );
-        }
-        other => panic!("expected SendBytes(StartupMessage), got {other:?}"),
+    startup_scram(&mut proto, &mut wb, "user", password, startup_raw);
+    // DEF-212: bytes live in wb. StartupMessage has no tag byte;
+    // protocol version 3.0 (196608 = 0x00030000) occupies bytes [4..8]
+    // after the 4-byte length prefix.
+    {
+        let bytes = wb.as_bytes();
+        assert!(bytes.len() >= 8, "StartupMessage must be >= 8 bytes");
+        assert_eq!(
+            bytes.get(4..8),
+            Some([0, 3, 0, 0].as_slice()),
+            "StartupMessage protocol version must be 3.0 (196608)",
+        );
     }
     assert!(matches!(proto.state(), ProtoState::ConnectingStartupScram { .. }));
 
@@ -1210,19 +1207,25 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
     // Send a ping. State → PingAwaitingRfq.
+    // DEF-212: feed_bytes calls above wrote the post-handshake bytes
+    // into wb; clear before pushing the new Ping so wb.as_bytes()
+    // contains ONLY the Sync. Production push_command_internal does
+    // wb.clear() at entry; the helper preserves that — but if a
+    // future caller drains feed_bytes between handshake and push
+    // (which we do above), they see leftover handshake bytes in
+    // wb until the next push wipes it. The helper test below
+    // verifies the post-Ping wb contents are exactly Sync.
     let ping_raw = raw(201);
-    let push_out = proto.push_or_panic(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
-    match push_out.as_slice() {
-        [Action::SendBytes(send_buf)] => {
-            // F33: literal PG Sync wire layout — avoids tautology with
-            // internal SYNC_WIRE_BYTES const (both sourced from same
-            // symbol would mirror any const-drift).
-            assert_eq!(
-                send_buf, &[b'S', 0, 0, 0, 4],
-                "Ping must emit PG Sync wire bytes: tag 'S' + BE u32 length=4",
-            );
-        }
-        other => panic!("expected SendBytes(SYNC), got {other:?}"),
+    proto.push_or_panic(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
+    {
+        // F33: literal PG Sync wire layout — avoids tautology with
+        // internal SYNC_WIRE_BYTES const (both sourced from same symbol
+        // would mirror any const-drift).
+        assert_eq!(
+            wb.as_bytes(),
+            &[b'S', 0u8, 0u8, 0u8, 4u8],
+            "Ping must emit PG Sync wire bytes: tag 'S' + BE u32 length=4",
+        );
     }
     assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
 

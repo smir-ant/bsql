@@ -153,34 +153,33 @@ fn sql(s: &str) -> Sql {
 }
 
 /// Push a SimpleQuery with the given SQL and correlator; assert the
-/// single `SendBytes` action carries a `'Q'`-prefixed frame and
-/// return the outbound bytes for further assertions.
+/// outbound bytes start with the `'Q'` tag and return them for
+/// further assertions.
+///
+/// DEF-212 (Alt Y'): post-Phase-1a `push_or_panic` returns `()`;
+/// bytes live in `wb`. SimpleQuery emits a single 'Q' frame (no
+/// trailing Sync — Q is self-syncing per PG §55.2.4).
 #[track_caller]
 fn simple_query_setup(
     proto: &mut PgProtocol,
     reply: ReplyId<QueryKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
-    let out = proto.push_or_panic(
+    proto.push_or_panic(
         PgCommand::SimpleQuery {
             sql: sql("SELECT 1"),
             reply,
         },
         wb,
     );
-    assert_eq!(out.len(), 1, "SimpleQuery push must emit exactly 1 action");
-    match out.as_slice() {
-        [Action::SendBytes(send_buf)] => {
-            assert!(!send_buf.is_empty(), "SendBytes payload must be non-empty");
-            assert_eq!(
-                send_buf.first(),
-                Some(&TAG_QUERY.byte()),
-                "first byte of outbound must be `'Q'` (simple-query tag)",
-            );
-            send_buf.to_vec()
-        }
-        other => panic!("expected a single Action::SendBytes, got {other:?}"),
-    }
+    let bytes = wb.as_bytes();
+    assert!(!bytes.is_empty(), "SimpleQuery push must emit a Q frame; wb is empty");
+    assert_eq!(
+        bytes.first(),
+        Some(&TAG_QUERY.byte()),
+        "first byte of outbound must be `'Q'` (simple-query tag)",
+    );
+    bytes.to_vec()
 }
 
 // ==================================================================

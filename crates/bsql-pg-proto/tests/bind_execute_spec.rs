@@ -36,7 +36,7 @@ use bsql_pg_proto::{
 use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
+use common::{PushOrPanic, split_bind_execute_sync};
 
 fn raw(v: u64) -> NonZeroU64 {
     // DEF-145: raw(0) is a test bug. Assert fires loud; the
@@ -130,7 +130,7 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(100);
 
-    let out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -140,15 +140,12 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
         &mut wb,
     );
 
-    assert_eq!(out.len(), 3, "Bind + Execute + Sync = 3 actions");
-    match out.as_slice() {
-        [Action::SendBytes(bind), Action::SendBytes(execute), Action::SendBytes(sync)] => {
-            assert_eq!(bind.first(), Some(&TAG_BIND.byte()), "first = 'B'");
-            assert_eq!(execute.first(), Some(&TAG_EXECUTE.byte()), "second = 'E'");
-            assert_eq!(*sync, &[b'S', 0, 0, 0, 4], "third = Sync const");
-        }
-        other => panic!("expected 3 SendBytes, got {other:?}"),
-    }
+    // DEF-212: bytes live in wb (single concatenation drained by I/O
+    // layer in one socket write). Verify wire layout via structural split.
+    let (bind, execute, sync) = split_bind_execute_sync(wb.as_bytes());
+    assert_eq!(bind.first(), Some(&TAG_BIND.byte()), "first frame tag = 'B'");
+    assert_eq!(execute.first(), Some(&TAG_EXECUTE.byte()), "second frame tag = 'E'");
+    assert_eq!(sync, &[b'S', 0u8, 0u8, 0u8, 4u8], "third = Sync wire bytes");
 
     assert!(matches!(
         proto.state(),
@@ -172,7 +169,7 @@ fn bind_execute_dml_full_round_trip() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(200);
 
-    let _push_out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(42i32,),
@@ -216,7 +213,7 @@ fn bind_execute_select_with_schema_streams_rows() {
     // generated at compile time from Parse+Describe fingerprint.
     let schema = RowDesc::EMPTY; // empty schema — 0-column "SELECT" case
 
-    let _push_out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -257,7 +254,7 @@ fn bind_error_is_recoverable() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(400);
 
-    let _ = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -305,7 +302,7 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(500);
 
-    let _ = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -345,7 +342,7 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
     let mut wb = WriteBuf::new();
     let reply_raw = raw(600);
 
-    let _ = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -417,7 +414,7 @@ fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
     let mut wb = WriteBuf::new();
 
     let first = raw(801);
-    let _ = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -469,7 +466,7 @@ fn bind_frame_wire_layout_empty_params() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -478,24 +475,21 @@ fn bind_frame_wire_layout_empty_params() {
         id(raw(900)),
         &mut wb,
     );
-    let bind_bytes = match out.as_slice() {
-        [Action::SendBytes(bind), ..] => bind.to_vec(),
-        other => panic!("expected SendBytes as first action, got {other:?}"),
-    };
+    let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
     // Expected shape:
     //   'B' | len(12) | '\0' portal | '\0' stmt | 0x0000 nf | 0x0000 np | 0x0000 nr
     //   = 1 + 4 + 1 + 1 + 2 + 2 + 2 = 13 bytes total
     // length field = 13 - 1 (tag excluded) = 12
     assert_eq!(
         bind_bytes,
-        vec![
+        &[
             b'B', 0, 0, 0, 12, // tag + length=12 (includes itself)
             0,    // empty portal + NUL
             0,    // empty stmt + NUL
             0, 0, // n_param_formats = 0
             0, 0, // n_params = 0
             0, 0, // n_result_formats = 0
-        ],
+        ][..],
     );
 
     // Drain so ReplyId's Drop-guard doesn't trip.
@@ -513,7 +507,7 @@ fn execute_frame_wire_layout_unnamed_portal() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -522,20 +516,17 @@ fn execute_frame_wire_layout_unnamed_portal() {
         id(raw(901)),
         &mut wb,
     );
-    let execute_bytes = match out.as_slice() {
-        [_, Action::SendBytes(execute), _] => execute.to_vec(),
-        other => panic!("expected 3 SendBytes, got {other:?}"),
-    };
+    let (_bind, execute_bytes, _sync) = split_bind_execute_sync(wb.as_bytes());
     // Expected:
     //   'E' | len(9) | '\0' portal | 0x00000000 max_rows
     //   total = 1 + 4 + 1 + 4 = 10; length field = 9
     assert_eq!(
         execute_bytes,
-        vec![
+        &[
             b'E', 0, 0, 0, 9, // tag + length=9
             0,    // empty portal + NUL
             0, 0, 0, 0, // max_rows = 0 (fetch all)
-        ],
+        ][..],
     );
 
     // Drain.
@@ -555,7 +546,7 @@ fn bind_frame_null_param_wire_layout() {
     let mut wb = WriteBuf::new();
 
     let none_i32: Option<i32> = None;
-    let out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(none_i32,),
@@ -564,10 +555,7 @@ fn bind_frame_null_param_wire_layout() {
         id(raw(903)),
         &mut wb,
     );
-    let bind_bytes = match out.as_slice() {
-        [Action::SendBytes(bind), ..] => bind.to_vec(),
-        other => panic!("expected SendBytes as first action, got {other:?}"),
-    };
+    let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
     // Expected:
     //   'B' | len | '\0' portal | '\0' stmt |
     //   0x0001 nf | 0x0001 Binary |
@@ -576,7 +564,7 @@ fn bind_frame_null_param_wire_layout() {
     // Total body = 4 + 2 + 2 + 2 + 2 + 4 + 2 = 18; length field = 18
     assert_eq!(
         bind_bytes,
-        vec![
+        &[
             b'B', 0, 0, 0, 18,       // tag + length
             0,                        // portal NUL
             0,                        // stmt NUL
@@ -585,7 +573,7 @@ fn bind_frame_null_param_wire_layout() {
             0, 1,                     // n_params = 1
             0xff, 0xff, 0xff, 0xff,   // param[0].length = -1 (NULL)
             0, 0,                     // n_result_formats = 0
-        ],
+        ][..],
     );
 
     // Drain.
@@ -603,7 +591,7 @@ fn bind_frame_optional_mixed_with_some_and_none() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(Some(42i32), None::<&str>),
@@ -612,10 +600,7 @@ fn bind_frame_optional_mixed_with_some_and_none() {
         id(raw(904)),
         &mut wb,
     );
-    let bind_bytes = match out.as_slice() {
-        [Action::SendBytes(bind), ..] => bind.to_vec(),
-        other => panic!("expected SendBytes, got {other:?}"),
-    };
+    let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
     // Expected (DEF-184 A14 compact format-code block):
     //   tag + len + NUL + NUL + 0x0001 nf + 0x0001 Binary +
     //   0x0002 np + [0x00000004 + i32=42] + [0xFFFFFFFF NULL] +
@@ -634,7 +619,7 @@ fn bind_frame_optional_mixed_with_some_and_none() {
     // 2 B for N=2, 4 B for N=3, ..., 30 B for N=16.
     assert_eq!(
         bind_bytes,
-        vec![
+        &[
             b'B', 0, 0, 0, 26,        // tag + length=26
             0, 0,                     // NUL-NUL (portal + stmt both empty)
             0, 1,                     // n_param_formats = 1
@@ -643,7 +628,7 @@ fn bind_frame_optional_mixed_with_some_and_none() {
             0, 0, 0, 4, 0, 0, 0, 42,  // Some(42): len=4, i32=42 BE
             0xff, 0xff, 0xff, 0xff,   // None: len=-1
             0, 0,                     // n_result_formats = 0
-        ],
+        ][..],
     );
 
     // Drain.
@@ -661,7 +646,7 @@ fn bind_frame_wire_layout_one_i32_param() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(42i32,),
@@ -670,10 +655,7 @@ fn bind_frame_wire_layout_one_i32_param() {
         id(raw(902)),
         &mut wb,
     );
-    let bind_bytes = match out.as_slice() {
-        [Action::SendBytes(bind), ..] => bind.to_vec(),
-        other => panic!("expected SendBytes as first action, got {other:?}"),
-    };
+    let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
     // Expected:
     //   'B' | len | '\0' portal | '\0' stmt |
     //   0x0001 nf | 0x0001 (Binary format) |
@@ -687,7 +669,7 @@ fn bind_frame_wire_layout_one_i32_param() {
     // length field excludes tag: 22
     assert_eq!(
         bind_bytes,
-        vec![
+        &[
             b'B', 0, 0, 0, 22, // tag + length
             0,    // portal NUL
             0,    // stmt NUL
@@ -697,7 +679,7 @@ fn bind_frame_wire_layout_one_i32_param() {
             0, 0, 0, 4, // param[0].length = 4
             0, 0, 0, 42, // param[0].value = 42 BE
             0, 0, // n_result_formats = 0
-        ],
+        ][..],
     );
 
     // Drain.

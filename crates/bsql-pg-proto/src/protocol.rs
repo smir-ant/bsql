@@ -975,33 +975,42 @@ impl PgProtocol {
     ///
     /// The body is a thin wiring layer: residue clear, branded
     /// write-buf scope, dispatch via `compute_push_idle_only`,
-    /// materialise the staged actions. All per-command transition
-    /// logic lives in the `compute_push_<cmd>_idle_only` free
-    /// functions (testable directly, no `PgProtocol` construction
-    /// needed).
+    /// materialise the staged actions via `materialise_push`. All
+    /// per-command transition logic lives in the
+    /// `compute_push_<cmd>_idle_only` free functions (testable
+    /// directly, no `PgProtocol` construction needed).
     ///
     /// `debug_assert!(matches!(self.state, ProtoState::Idle))` pins
     /// the caller's invariant in development builds; release builds
     /// skip the assertion for zero overhead.
     ///
-    /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].
-    /// Caller must execute every action in order.
-    #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub(crate) fn push_command_internal<'w, 's>(
-        &'s mut self,
+    /// # DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04)
+    ///
+    /// Pre-(212) returned `OutActions<'w, 's>` (800 B; caller iterated
+    /// `Action::SendBytes`/`SendBytesStatic`/`FailReply`/`CloseSocket`).
+    /// Post-(212) returns `Result<(), PushFailure>` (~80 B). On Ok,
+    /// bytes (frame + optional trailing Sync) live in the caller's
+    /// [`WriteBuf`]; caller drains `wb.as_bytes()` to socket in a
+    /// single write. On Err, state has already transitioned to
+    /// `Errored`; caller resolves user's oneshot via `failure.id` +
+    /// `failure.cause` and closes the socket per the
+    /// [`crate::PushFailure`] `#[must_use]` contract.
+    #[must_use = "the returned Result carries the bytes-in-wb success signal \
+                  or the consumed-correlator + cause failure signal; both must \
+                  be observed by the caller's I/O layer"]
+    pub(crate) fn push_command_internal(
+        &mut self,
         cmd: PgCommand,
-        write_buf: &'w mut WriteBuf,
+        write_buf: &mut WriteBuf,
         // DEF-198 ext: tier-1 compile-time witness that state is Idle.
         // Constructible only inside `mod guard`; reachable only via
         // `ReadyGuard::push_command` which acquired the guard through
         // `PgProtocol::as_ready`'s runtime classification.
         _proof: crate::guard::IdleStateProof,
-    ) -> OutActions<'w, 's> {
-        // 1c-1a: push never produces `StreamRow` (rows arrive via
-        // server responses, handled in `feed_bytes`). The `'r`
-        // lifetime parameter on `OutActions<'w, 'r>` is phantom on
-        // this path — unifying it to `'s` here gives the caller
-        // freedom over what they pair the result with later.
+    ) -> Result<(), crate::action::PushFailure> {
+        // DEF-212: bytes-only push contract — bytes live in caller's wb
+        // post-Ok (drained via `wb.as_bytes()`); no per-call action
+        // allocation (~800 B → ~80 B return frame).
         write_buf.clear();
 
         // DEF-188: centralised entry-point terminal-row-desc reclamation.
@@ -1013,28 +1022,25 @@ impl PgProtocol {
         self.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
 
         // DEF-154 (B+H): write-side keeps its brand (`'wb`) for
-        // tier-1 `WriteRange::apply`; read side is unbranded (push
-        // paths never emit StreamRowRange so the read-buf view is
-        // unused by materialise — pass no read slice).
+        // tier-1 `WriteRange::apply`; read side is unbranded.
         // DEF-208: caller is `ReadyGuard::push_command`, which proves
         // `state == Idle` via the witness-guard typestate (DEF-198).
-        // Production path skips the per-command 5-arm dispatch via
-        // `compute_push_idle_only` (Idle-arm body only, no defensive
-        // FailReply branches reachable). The non-Idle defensive arms
-        // remain in `compute_push` (used by internal tests).
+        // DEF-212: terminal_row_desc_ref removed — push paths never
+        // emit `DeliverReply` (replies come from feed_bytes), so the
+        // row_desc projection is unused on push side.
         debug_assert!(
             matches!(self.state, ProtoState::Idle),
             "push_command_internal: caller (ReadyGuard) must guarantee Idle state",
         );
         let state = &mut self.state;
-        let terminal_row_desc_ref: Option<&crate::decode::RowDesc> =
-            self.row_desc_slot.as_ref();
-        write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
-            let staged = {
-                let mut reserved = wb.reserve();
-                compute_push_idle_only(cmd, state, &mut reserved)
-            };
-            materialise(staged, wb.into_bytes(), terminal_row_desc_ref)
+        // DEF-212: reserved kept alive across compute_push and
+        // materialise_push (the latter appends static SYNC bytes).
+        // Restructured from pre-(212) inner-block pattern that dropped
+        // reserved before materialise consumed wb.into_bytes().
+        write_buf.with_branded(|mut wb| -> Result<(), crate::action::PushFailure> {
+            let mut reserved = wb.reserve();
+            let staged = compute_push_idle_only(cmd, state, &mut reserved);
+            materialise_push(staged, &mut reserved)
         })
     }
 
@@ -1075,30 +1081,39 @@ impl PgProtocol {
     ///   on success.
     /// - `write_buf` — caller-owned outbound staging buffer (DEF-094).
     ///
-    /// # Emitted actions (happy path)
+    /// # Emitted bytes (happy path)
     ///
-    /// Three [`crate::Action::SendBytes`] actions: the Bind frame,
-    /// the Execute frame, and the 5-byte static `Sync`. The caller
-    /// writes all three to the socket in order.
+    /// Three frames concatenated in `WriteBuf`: Bind frame, Execute
+    /// frame, 5-byte static `Sync`. Caller drains `wb.as_bytes()` to
+    /// socket in a single write.
     ///
     /// Crate-internal entry; reachable from outside only through
     /// [`crate::guard::ReadyGuard::push_bind_execute`] which guarantees
     /// the `state == Idle` precondition.
+    ///
+    /// # DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04)
+    ///
+    /// Returns `Result<(), PushFailure>` (~80 B) instead of pre-(212)
+    /// `OutActions<'w, 's>` (800 B). Same per-call shape as
+    /// [`Self::push_command_internal`] — see that doc for the full
+    /// caller contract.
     #[expect(clippy::too_many_arguments, reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1 — each argument is a distinct wire-protocol input. Splitting into a struct-arg (BindExecuteRequest { ... }) trades arg-count for construction verbosity at every call site, no tier or safety win.")]
-    #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub(crate) fn push_bind_execute_internal<'w, 's, P: crate::params::ParamsWriter>(
-        &'s mut self,
+    #[must_use = "the returned Result carries the bytes-in-wb success signal \
+                  or the consumed-correlator + cause failure signal; both must \
+                  be observed by the caller's I/O layer"]
+    pub(crate) fn push_bind_execute_internal<P: crate::params::ParamsWriter>(
+        &mut self,
         portal_name: &crate::ident::PortalName,
         stmt_name: &crate::ident::StmtName,
         params: &P,
         row_desc: Option<crate::decode::RowDesc>,
         fetch: crate::command::FetchRows,
         reply: ReplyId<crate::reply_id::QueryKind>,
-        write_buf: &'w mut WriteBuf,
+        write_buf: &mut WriteBuf,
         // DEF-198 ext: tier-1 compile-time Idle witness — see
         // [`Self::push_command_internal`] for rationale.
         _proof: crate::guard::IdleStateProof,
-    ) -> OutActions<'w, 's> {
+    ) -> Result<(), crate::action::PushFailure> {
         write_buf.clear();
         // DEF-189: centralised entry-point session-residue reclamation.
         // DEF-211 FAKE-01: same as `push_command_internal` — state is
@@ -1109,38 +1124,33 @@ impl PgProtocol {
         // DEF-189: split &mut self into disjoint &mut state +
         // &mut row_desc_slot so compute_push_bind_execute can park
         // the caller-supplied schema BEFORE the state transition.
-        // Materialise then reborrows row_desc_slot as immutable.
         // DEF-208: ReadyGuard::push_bind_execute proves Idle. Skip
         // the 5-arm dispatch via the _idle_only sibling.
+        // DEF-212: row_desc_slot park preserved (Bind+Execute may emit
+        // QueryComplete which projects from row_desc_slot via
+        // feed_bytes — push side never reads back).
         debug_assert!(
             matches!(self.state, ProtoState::Idle),
             "push_bind_execute_internal: caller (ReadyGuard) must guarantee Idle state",
         );
         let state = &mut self.state;
         let row_desc_slot_mut = &mut self.row_desc_slot;
-        write_buf.with_branded(|mut wb| -> OutActions<'w, 's> {
+        write_buf.with_branded(|mut wb| -> Result<(), crate::action::PushFailure> {
             let mut staged = StagedActions::new();
-            {
-                let mut reserved = wb.reserve();
-                compute_push_bind_execute_idle_only(
-                    state,
-                    row_desc_slot_mut,
-                    portal_name,
-                    stmt_name,
-                    params,
-                    row_desc,
-                    fetch,
-                    reply,
-                    &mut staged,
-                    &mut reserved,
-                );
-            }
-            // NLL ends the &mut row_desc_slot_mut borrow at the
-            // compute_push_bind_execute return; reborrow as immutable
-            // for materialise's StagedReply::into_public projection.
-            let row_desc_slot_ref: Option<&crate::decode::RowDesc> =
-                (*row_desc_slot_mut).as_ref();
-            materialise(staged, wb.into_bytes(), row_desc_slot_ref)
+            let mut reserved = wb.reserve();
+            compute_push_bind_execute_idle_only(
+                state,
+                row_desc_slot_mut,
+                portal_name,
+                stmt_name,
+                params,
+                row_desc,
+                fetch,
+                reply,
+                &mut staged,
+                &mut reserved,
+            );
+            materialise_push(staged, &mut reserved)
         })
     }
 
@@ -3331,6 +3341,169 @@ fn build_startup_message(
     crate::action::WriteRange::from_write_span(start, reserved)
 }
 
+/// DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04):
+/// push-path materialiser. Convert [`StagedActions`] into
+/// `Result<(), PushFailure>` while appending any [`StagedAction::SendBytesStatic`]
+/// bytes into the caller's `BrandedWriteReserved` (e.g., trailing
+/// `SYNC_WIRE_BYTES` post-Bind+Execute / post-Parse / post-Describe).
+///
+/// # Why a separate materialiser from [`materialise`]
+///
+/// [`materialise`] is FEED-side: it converts staged actions into
+/// `OutActions<'w, 'r>` which the caller iterates to drive I/O.
+/// [`materialise_push`] is PUSH-side: bytes already live in the
+/// caller's `WriteBuf` (compute_push_*_idle_only wrote them via the
+/// branded reserved); the caller drains `wb.as_bytes()` post-Ok to
+/// get the full outbound frame stream — the concatenation of all
+/// ranges with appended Sync. No `OutActions` allocation per push
+/// call — the per-call return frame shrinks 800 → ~80 B (DEF-212
+/// headline).
+///
+/// # Per-StagedAction semantics
+///
+/// - [`StagedAction::SendBytesRange`] — bytes already in
+///   `reserved.as_bytes()[range.start..range.start+range.len]` from
+///   the builder. M5 verification: `range.apply(reserved.as_bytes())`
+///   must resolve cleanly (`Some(_)`); the slice is unused (caller
+///   drains the entire `wb.as_bytes()` post-Ok), the call exists
+///   solely to detect brand/bounds invariant breaks. `apply == None`
+///   is architecturally unreachable per DEF-154 (N+W) brand
+///   discipline; classified `debug_assert!(false)` per architect M5.
+///
+/// - [`StagedAction::SendBytesStatic`] — append the static bytes
+///   (e.g., `SYNC_WIRE_BYTES` post-Bind+Execute) to `reserved` via
+///   `push_bytes`. Capacity is proven by const-asserts in
+///   `write_buf.rs`:
+///   - Bind+Execute+Sync (line 208-217 — pre-DEF-212)
+///   - Describe+Sync (line 247-251 — pre-DEF-212)
+///   - **Parse+Sync (DEF-212 M1, audit 2026-05-04)** — sibling pin,
+///     closes a pre-(212) tier-4 "happens to fit" gap to tier-1.
+///   - Ping=Sync alone (5 B trivially fits 2176 B empty wb).
+///
+///   `push_bytes` Err arm is architecturally-dead per the const-
+///   assert chain; classified `debug_assert!(false)` for dev-time
+///   loud signal, silent in release (the failure mode is "wire
+///   frame truncated → server detects malformed → server errors";
+///   not memory-unsafe).
+///
+/// - [`StagedAction::DeliverReply`] — UNREACHABLE on push paths.
+///   Push commands transition state to a "waiting for server reply"
+///   variant; the actual reply (`Pong`, `QueryComplete`, `ParseComplete`,
+///   `Describe*Complete`) is delivered later from a feed_bytes call
+///   processing the corresponding server frame. Any `DeliverReply`
+///   in push staged would indicate a compute_push refactor regression
+///   (or pipelining work without DEF-212 update). Classified
+///   `debug_assert!(false)` per architect M5.
+///
+/// - [`StagedAction::FailReply { id, cause }`] — the builder failed
+///   (`EmptyWriteRange`, `BuilderCapacityOverflow`,
+///   `ParamsWriterOverflow`) OR the public push API was reached
+///   without `state == Idle` (architecturally-dead via DEF-198
+///   ReadyGuard + IdleStateProof witness; classified upstream by
+///   `compute_push` non-Idle arms). Captured for `Result::Err` arm.
+///   Architecturally exactly one `FailReply` per push cycle (single
+///   builder error per command); the `if failure.is_none()` guard is
+///   defensive against future pipelining refactors that batch pushes.
+///
+/// - [`StagedAction::CloseSocket`] — paired with `FailReply` on push
+///   paths (`install_errored` emits both atomically). State has
+///   ALREADY transitioned to `Errored` via `install_errored` from
+///   inside the compute_push body. Caller learns to close the
+///   socket via the [`crate::PushFailure`] `#[must_use]` contract;
+///   no explicit signal needed in `materialise_push`.
+///
+/// # `BrandedWriteReserved` lifetime
+///
+/// The reserved is borrowed mutably for the whole materialise call.
+/// The caller (`push_command_internal`) holds the reserved across
+/// `compute_push_idle_only` (which writes the main frame) AND
+/// `materialise_push` (which appends Sync). Sequential mutable
+/// borrows; brand stays sealed inside the parent `with_branded`
+/// closure.
+///
+/// # Tier classification
+///
+/// - Push success: tier-2 structural (bytes-in-wb contract).
+/// - Push failure: tier-1 by `Result::Err` arm exhaustive match.
+/// - Dead arm classification: tier-2 structural (debug_assert in
+///   dev/test, architectural-impossibility-by-const-assert in release).
+fn materialise_push(
+    staged: StagedActions,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> Result<(), crate::action::PushFailure> {
+    let mut failure: Option<crate::action::PushFailure> = None;
+    for sa in staged {
+        match sa {
+            StagedAction::SendBytesRange(range) => {
+                // M5 verification: apply must resolve cleanly. Slice unused
+                // (caller drains entire wb.as_bytes() post-Ok).
+                match range.apply(reserved.as_bytes()) {
+                    Some(_slice) => {
+                        // OK; bytes are in wb at the verified range.
+                    }
+                    None => {
+                        debug_assert!(
+                            false,
+                            "DEF-212 M5: SendBytesRange.apply == None — \
+                             architecturally impossible per intact brand \
+                             discipline (DEF-154 N+W). Compiler bug or \
+                             memory corruption.",
+                        );
+                        // Release: silent no-op. Reaching this branch under
+                        // intact forbid_unsafe + brand discipline implies
+                        // external memory corruption; the wire frame may be
+                        // partially truncated (server detects malformed,
+                        // errors out — not memory-unsafe at protocol layer).
+                    }
+                }
+            }
+            StagedAction::SendBytesStatic(s) => {
+                // Append to wb. Const-asserts in write_buf.rs prove capacity
+                // (Bind+Execute+Sync line 208; Describe+Sync line 247;
+                // Parse+Sync DEF-212 M1; Ping=Sync trivially).
+                match reserved.push_bytes(s) {
+                    Ok(()) => {}
+                    Err(_) => {
+                        debug_assert!(
+                            false,
+                            "DEF-212 M5: SendBytesStatic append overflowed wb — \
+                             const-assert chain in write_buf.rs violated. If a \
+                             new push command emits Sync, ship a sibling \
+                             const-assert in the same commit.",
+                        );
+                        // Release: silent. Architecturally-dead per the
+                        // const-assert chain.
+                    }
+                }
+            }
+            StagedAction::DeliverReply(_) => {
+                debug_assert!(
+                    false,
+                    "DEF-212 M5: push paths must NEVER emit DeliverReply — \
+                     replies come from server via feed_bytes only. Reaching \
+                     this branch indicates a compute_push refactor regression \
+                     (or pipelining work without DEF-212 update).",
+                );
+            }
+            StagedAction::FailReply { id, cause } => {
+                // Capture for Err arm. Architecturally exactly one FailReply
+                // per push cycle (single builder error per command).
+                if failure.is_none() {
+                    failure = Some(crate::action::PushFailure { id, cause });
+                }
+            }
+            StagedAction::CloseSocket => {
+                // Paired with FailReply on push paths; state already Errored.
+                // Caller closes socket per PushFailure #[must_use] contract.
+            }
+        }
+    }
+    match failure {
+        None => Ok(()),
+        Some(f) => Err(f),
+    }
+}
+
 /// Phase-2 materialiser: convert the write-phase's
 /// [`StagedActions`] into [`OutActions<'w, 'r>`] with references
 /// into `write_buf_bytes` (`'w`) or `terminal_row_desc` (`'r`).
@@ -4678,7 +4851,6 @@ mod compute_push_tests {
     /// Bind/Execute/Sync triplet.
     #[test]
     fn bind_execute_params_overflow_routes_to_classified_failreply() {
-        use crate::action::Action;
         use crate::error::{CrateBugLocus, ProtocolError};
         use crate::params::OverflowParams;
 
@@ -4703,7 +4875,7 @@ mod compute_push_tests {
         // architecturally-dead `None` arm early-returns to satisfy
         // the lib-level `clippy::panic` forbid bundle.
         let Some(guard) = proto.as_ready() else { return };
-        let out = guard.push_bind_execute(
+        let result = guard.push_bind_execute(
             &crate::ident::PortalName::default(),
             &crate::ident::StmtName::default(),
             &OverflowParams,
@@ -4713,37 +4885,41 @@ mod compute_push_tests {
             &mut wb,
         );
 
-        // Classified Err routing expects exactly TWO actions:
-        // FailReply + CloseSocket. Pre-P0-3 this would have been
-        // THREE: Bind (truncated) + Execute + Sync.
-        assert_eq!(
-            out.len(),
-            2,
-            "ParamsWriter Err must route to FailReply + CloseSocket (2 actions), \
-             NOT the 3-action Bind+Execute+Sync bundle. Pre-P0-3 silent \
-             corruption would give the latter.",
+        // DEF-212 (Alt Y'): classified Err routes through
+        // `Result::Err(PushFailure)` instead of pre-(212)'s 2-Action
+        // FailReply+CloseSocket bundle. The atomic state transition
+        // to `Errored` happens inside `push_bind_execute_internal` via
+        // `install_errored`; the caller learns of the failure via the
+        // typed `PushFailure { id, cause }` (~80 B) — no `OutActions`
+        // 800 B return frame, no per-call action iteration.
+        //
+        // Pre-P0-3 silent corruption would have shipped a truncated
+        // Bind frame on the wire (3-action bundle with miscomputed
+        // length-prefix); the post-(212) contract surfaces the
+        // classified failure at the type-system level.
+        assert!(
+            result.is_err(),
+            "ParamsWriter Err must route to Result::Err(PushFailure); \
+             got Ok — pre-P0-3 silent-corruption regression?",
         );
+        // Architecturally dead via the assert above; `let-else { return }`
+        // is the forbid-bundle-clean dead-arm landing pad (no panic!,
+        // no unwrap!, no expect! on the success path).
+        let Err(failure) = result else { return };
 
-        // `matches!` with `if` guard — forbid-bundle bans
-        // `assert!(false, …)` / `panic!` in tests, so pattern
-        // matching is converted to a bool and asserted.
-        let matches_expected = matches!(
-            out.as_slice(),
-            [
-                Action::FailReply {
-                    id,
-                    cause: ProtocolError::InternalCrateBug {
-                        locus: CrateBugLocus::ParamsWriterOverflow,
-                    },
-                },
-                Action::CloseSocket,
-            ] if *id == reply_raw
+        assert_eq!(
+            failure.id, reply_raw,
+            "PushFailure.id must echo the consumed correlator (DEF-149 ReplyId discipline)",
         );
         assert!(
-            matches_expected,
-            "expected [FailReply(reply_raw, ParamsWriterOverflow), CloseSocket]; \
-             out = {:?}",
-            out.as_slice(),
+            matches!(
+                failure.cause,
+                ProtocolError::InternalCrateBug {
+                    locus: CrateBugLocus::ParamsWriterOverflow,
+                },
+            ),
+            "expected InternalCrateBug(ParamsWriterOverflow); got cause = {:?}",
+            failure.cause,
         );
 
         // State must have transitioned to Errored — the connection

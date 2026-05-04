@@ -34,9 +34,13 @@ fn startup_id(raw: NonZeroU64) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto
 }
 
 fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf, raw_id: NonZeroU64) {
-    let out = proto.push_or_panic(PgCommand::Ping { reply: ping_id(raw_id) }, wb);
-    assert!(!out.as_slice().is_empty());
-    // OutActions drops at end of scope naturally (no Drop on it).
+    proto.push_or_panic(PgCommand::Ping { reply: ping_id(raw_id) }, wb);
+    // DEF-212 (Alt Y'): bytes live in wb (Sync = 5 B for Ping). The
+    // helper's tier-1 invariant is "push succeeded" (Idle precondition
+    // already proved by `as_ready` inside push_or_panic); the
+    // non-empty assertion preserves the original tier-3 spec-conformance
+    // shield.
+    assert!(!wb.as_bytes().is_empty(), "Ping push must emit at least the 5 B Sync");
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -55,13 +59,13 @@ fn empty_query_response_with_non_zero_body_classifies() {
     // Scope block ends the OutActions borrow of wb before the next
     // feed_bytes call re-borrows it.
     let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
-    {
-        let push_out = proto.push_or_panic(
-            PgCommand::SimpleQuery { sql, reply: query_id(raw(9901)) },
-            &mut wb,
-        );
-        assert!(!push_out.as_slice().is_empty());
-    }
+    proto.push_or_panic(
+        PgCommand::SimpleQuery { sql, reply: query_id(raw(9901)) },
+        &mut wb,
+    );
+    // DEF-212: SimpleQuery emits a 'Q' frame; non-empty wb verifies
+    // the push wrote bytes.
+    assert!(!wb.as_bytes().is_empty(), "SimpleQuery push must emit Q frame");
 
     // Craft malformed EmptyQueryResponse: tag 'I' + length=5 + 1 body byte.
     let bad_frame = [b'I', 0x00, 0x00, 0x00, 0x05, 0xAB];
@@ -96,13 +100,12 @@ fn parse_complete_with_non_zero_body_classifies() {
         Err(_) => return,
     };
     let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
-    {
-        let push_out = proto.push_or_panic(
-            PgCommand::Parse { stmt_name: stmt, sql, reply: parse_id(raw(9902)) },
-            &mut wb,
-        );
-        assert!(!push_out.as_slice().is_empty());
-    }
+    proto.push_or_panic(
+        PgCommand::Parse { stmt_name: stmt, sql, reply: parse_id(raw(9902)) },
+        &mut wb,
+    );
+    // DEF-212: Parse emits 'P' frame + 5 B Sync; non-empty wb confirms.
+    assert!(!wb.as_bytes().is_empty(), "Parse push must emit P+Sync");
 
     // ParseComplete with 1-byte body: tag '1' + len=5 + 1 body byte.
     let bad_frame = [b'1', 0x00, 0x00, 0x00, 0x05, 0xCD];
@@ -210,19 +213,18 @@ fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
         Ok(p) => p,
         Err(_) => return,
     };
-    {
-        let startup_out = proto.push_or_panic(
-            PgCommand::Startup {
-                user,
-                database: None,
-                app_name: None,
-                credentials: Credentials::ScramPassword(Sensitive::new(pw)),
-                reply: startup_id(raw(42_000)),
-            },
-            &mut wb,
-        );
-        assert!(!startup_out.as_slice().is_empty());
-    }
+    proto.push_or_panic(
+        PgCommand::Startup {
+            user,
+            database: None,
+            app_name: None,
+            credentials: Credentials::ScramPassword(Sensitive::new(pw)),
+            reply: startup_id(raw(42_000)),
+        },
+        &mut wb,
+    );
+    // DEF-212: Startup emits StartupMessage frame; non-empty wb confirms.
+    assert!(!wb.as_bytes().is_empty(), "Startup push must emit StartupMessage frame");
     assert!(matches!(proto.state(), ProtoState::ConnectingStartupScram { .. }));
 
     // Drop proto — triggers Drop cascade including ScramSession

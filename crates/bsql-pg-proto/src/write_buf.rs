@@ -160,6 +160,28 @@ const _: () = assert!(
      in lockstep.",
 );
 
+/// DEF-212 (M1, audit 2026-05-04, architect-vetted impl plan): drift-pin
+/// for `push_parse` Parse+Sync bundle. Pre-DEF-212 `push_parse` emitted
+/// `[Action::SendBytes(parse_frame), Action::SendBytes(SYNC_WIRE_BYTES)]`
+/// — the static `SendBytesStatic` variant did not consume `WriteBuf`
+/// capacity. Post-DEF-212 (Alt Y' bytes-only push) the SYNC_WIRE_BYTES
+/// is APPENDED inline to `WriteBuf` after the Parse frame, so the
+/// caller's buffer must fit both simultaneously. Without this assert,
+/// bumping `MAX_PG_NAME_LEN`/`MAX_SQL_LEN` could allow a Parse frame
+/// that fills the buffer, leaving no room for the trailing 5-byte
+/// Sync — a tier-4 "happens to fit" gap. With this assert: tier-1
+/// build failure on drift.
+///
+/// Sibling to the existing Bind+Execute+Sync (line 208-217) and
+/// Describe+Sync (line 247-251) drift pins.
+const _: () = assert!(
+    MAX_OWNED_SEND_LEN >= max_parse_message_size().saturating_add(5),
+    "DEF-212 (M1): MAX_OWNED_SEND_LEN below worst-case Parse+Sync bundle. \
+     push_parse appends Sync inline post-DEF-212 (bytes-only push). \
+     Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN / MAX_SQL_LEN \
+     in lockstep. `5` here is `SYNC_WIRE_BYTES.len()`.",
+);
+
 /// Worst-case byte size of a PostgreSQL `Bind` (`'B'`) frame —
 /// tag + length prefix + portal name + stmt name + n_param_formats
 /// + format codes + n_params + per-param length+data + n_result_formats.
@@ -867,9 +889,16 @@ impl BrandedWriteReserved<'_> {
         self.buf
     }
 
-    /// DEF-154 (W): test-only view of buffer bytes. Pre-(W)
-    /// returned `BrandedBytes<'brand, '_>`; post-(W) plain `&[u8]`.
-    #[cfg(test)]
+    /// DEF-154 (W): view of buffer bytes. Pre-(W) returned
+    /// `BrandedBytes<'brand, '_>`; post-(W) plain `&[u8]`.
+    ///
+    /// DEF-212 (Alt Y', audit 2026-05-04): promoted from `#[cfg(test)]`
+    /// to non-test `pub(crate)` to support `materialise_push`'s M5
+    /// verification (`SendBytesRange::apply(reserved.as_bytes())` —
+    /// catches brand/bounds invariant breaks at the materialise
+    /// boundary). The exposure is read-only `&[u8]` of the
+    /// caller-owned WriteBuf — same data the caller already drains
+    /// post-Ok via `wb.as_bytes()`. No new escape surface.
     #[inline]
     #[must_use]
     pub(crate) fn as_bytes(&self) -> &[u8] {

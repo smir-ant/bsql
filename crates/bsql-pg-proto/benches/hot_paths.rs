@@ -45,41 +45,47 @@ use bsql_pg_proto::{
     frame::parse_header,
     ident::Sql,
     reply_id::{PingKind, QueryKind, ReplyId},
-    OutActions, PgProtocol, WriteBuf,
+    PgProtocol, PushFailure, WriteBuf,
 };
 use core::num::NonZeroU64;
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput,
 };
 
-// DEF-198 — bench-side extension trait for the witness-guard typestate.
+// DEF-198 + DEF-212 — bench-side extension trait for the witness-guard
+// typestate.
 //
-// Pre-DEF-198 benches called `proto.bench_push_or_panic(cmd, wb)` directly,
-// returning OutActions. Post-DEF-198 the public path is
-// `proto.as_ready().push_command(cmd, wb)` (Option<ReadyGuard>).
-// Benches always start from a fresh `PgProtocol::new()` (Idle state)
-// or call `proto.reset_for_bench()` (also Idle), so the `None` arm is
-// unreachable in correctly-built benches — `panic!` on it surfaces a
-// fixture bug as a loud bench failure rather than silent wrong-data.
+// Pre-DEF-198 benches called `proto.push_command(cmd, wb)` directly,
+// returning OutActions. DEF-198 routed via
+// `proto.as_ready().push_command(cmd, wb)` (Option<ReadyGuard>). DEF-212
+// (Alt Y') changed the typed-push return from `OutActions<'w, 'p>` (800 B)
+// to `Result<(), PushFailure>` (~80 B). The bench helper preserves both
+// guard-acquisition + Result discipline so the bench timing reflects the
+// production caller's cost.
 //
-// Cost: one branch on `state.push_class()` per call. On Idle the
-// branch is well-predicted, ~1 ns added to the timed path. Same
-// overhead the production caller pays for the tier-1 closure check.
+// Benches always start from a fresh `PgProtocol::new()` (Idle state) or
+// call `proto.reset_for_bench()` (also Idle), so the `None` guard arm is
+// unreachable in correctly-built benches — `panic!` surfaces a fixture
+// bug as a loud bench failure rather than silent wrong-data.
+//
+// Cost: one branch on `state.push_class()` per call. On Idle the branch
+// is well-predicted, ~1 ns added to the timed path. Same overhead the
+// production caller pays for the tier-1 closure check.
 trait BenchPushOrPanic {
-    fn bench_push_or_panic<'p, 'w>(
-        &'p mut self,
+    fn bench_push_or_panic(
+        &mut self,
         cmd: PgCommand,
-        wb: &'w mut WriteBuf,
-    ) -> OutActions<'w, 'p>;
+        wb: &mut WriteBuf,
+    ) -> Result<(), PushFailure>;
 }
 
 impl BenchPushOrPanic for PgProtocol {
     #[inline]
-    fn bench_push_or_panic<'p, 'w>(
-        &'p mut self,
+    fn bench_push_or_panic(
+        &mut self,
         cmd: PgCommand,
-        wb: &'w mut WriteBuf,
-    ) -> OutActions<'w, 'p> {
+        wb: &mut WriteBuf,
+    ) -> Result<(), PushFailure> {
         // Capture status BEFORE the mutable borrow `as_ready` takes —
         // otherwise the panic-arm message would conflict with the
         // mutable borrow's lifetime extending over the whole match.
@@ -174,7 +180,7 @@ fn bench_ping_round_trip(c: &mut Criterion) {
                 },
                 &mut wb,
             );
-            black_box(push_out);
+            let _ = black_box(push_out);
             // Feed RFQ — transitions PingAwaitingRfq → Idle + Pong.
             let feed_out = proto.feed_bytes(black_box(&rfq), &mut wb);
             black_box(feed_out);
@@ -280,7 +286,7 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
                     },
                     &mut wb,
                 );
-                black_box(push_out);
+                let _ = black_box(push_out);
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 // Raw-append DataRow bytes into read_buf.
@@ -371,7 +377,7 @@ fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
                     },
                     &mut wb,
                 );
-                black_box(push_out);
+                let _ = black_box(push_out);
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
@@ -448,7 +454,7 @@ fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
                     },
                     &mut wb,
                 );
-                black_box(push_out);
+                let _ = black_box(push_out);
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
@@ -526,7 +532,7 @@ fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
                     },
                     &mut wb,
                 );
-                black_box(push_out);
+                let _ = black_box(push_out);
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
@@ -615,7 +621,7 @@ fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
                     },
                     &mut wb,
                 );
-                black_box(push_out);
+                let _ = black_box(push_out);
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
@@ -676,7 +682,7 @@ fn bench_push_ping(c: &mut Criterion) {
                 },
                 &mut wb,
             );
-            black_box(out);
+            let _ = black_box(out);
         });
     });
 
@@ -709,7 +715,7 @@ fn bench_push_ping(c: &mut Criterion) {
                 },
                 &mut wb,
             );
-            black_box(out);
+            let _ = black_box(out);
             // Reset between iters so push_command sees a clean
             // Idle state. push_command on PingAwaitingRfq fails
             // with FailReply — would skew the measurement.

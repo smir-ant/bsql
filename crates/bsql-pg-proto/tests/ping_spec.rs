@@ -131,37 +131,33 @@ fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) 
 }
 
 /// Push a Ping command and assert the single expected emission —
-/// one `SendBytes` action carrying the const `SYNC_WIRE_BYTES`.
+/// `wb.as_bytes()` carries the literal `SYNC_WIRE_BYTES` payload.
 ///
-/// Using this helper instead of `let _ = proto.push_or_panic(..., &mut wb)`
+/// # DEF-212 (Alt Y', audit 2026-05-04)
+///
+/// Pre-(212) `push_or_panic` returned a 1-Action `OutActions` list
+/// containing `Action::SendBytes(SYNC_WIRE_BYTES)`. Post-(212) the
+/// helper returns `()`; the bytes live in `wb`. Ping is the simplest
+/// case — just the 5-byte Sync wire payload, no preceding frame, no
+/// trailing Sync (the Sync IS the Ping in PG §55.2.4).
+///
+/// Using this helper instead of `proto.push_or_panic(..., &mut wb)`
 /// verifies the setup is well-formed on every call site — any
-/// regression in the push path (wrong number of actions, wrong
-/// action kind, wrong bytes) is surfaced at the top of the test,
-/// not masked. Every test that uses `ping_setup` implicitly
-/// validates push-content for free, without duplicating the
-/// content assertion in each test's body.
+/// regression in the push path (wrong bytes, partial write) is
+/// surfaced at the top of the test, not masked. Every test that uses
+/// `ping_setup` implicitly validates push-content for free.
 #[track_caller]
 fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg_proto::WriteBuf) {
-    let out = proto.push_or_panic(PgCommand::Ping { reply }, wb);
-    assert_eq!(out.len(), 1, "Ping setup: push emits exactly 1 action");
-    match out.as_slice() {
-        [Action::SendBytes(send_buf)] => {
-            // F33: assert the LITERAL 5-byte Sync wire layout from
-            // PG §55.7 — tag 'S' + BE u32 length-field `4`. This is
-            // the load-bearing wire contract: stronger than comparing
-            // to the library's own internal `SYNC_WIRE_BYTES` const
-            // (which would be tautological — emission and expectation
-            // both sourced from the same symbol, any const-drift
-            // would be mirrored on both sides).
-            assert_eq!(
-                send_buf, &[b'S', 0, 0, 0, 4],
-                "Ping setup: SendBytes must carry PG Sync wire layout: tag 'S' + BE u32 length=4",
-            );
-        }
-        other => panic!(
-            "Ping setup: expected a single Action::SendBytes, got {other:?}",
-        ),
-    }
+    proto.push_or_panic(PgCommand::Ping { reply }, wb);
+    // F33: assert the LITERAL 5-byte Sync wire layout from PG §55.7 —
+    // tag 'S' + BE u32 length-field `4`. This is the load-bearing wire
+    // contract: stronger than comparing to the library's own internal
+    // `SYNC_WIRE_BYTES` const (which would be tautological).
+    assert_eq!(
+        wb.as_bytes(),
+        &[b'S', 0u8, 0u8, 0u8, 4u8],
+        "Ping setup: wb must carry the PG Sync wire layout (tag 'S' + BE u32 length=4)",
+    );
 }
 
 // ------------------------------------------------------------------
@@ -181,20 +177,16 @@ fn ping_from_idle_emits_sync_bytes() {
     assert!(matches!(proto.state(), ProtoState::Idle));
 
     let ping_raw = raw(1);
-    let out = proto.push_or_panic(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
+    proto.push_or_panic(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
 
-    assert_eq!(out.len(), 1, "Phase 1a budget: push_command emits exactly 1 action");
-    match out.as_slice() {
-        [Action::SendBytes(send_buf)] => {
-            // F33: assert literal PG Sync wire layout (tag 'S' + BE u32
-            // length=4). Avoids tautology with internal SYNC_WIRE_BYTES.
-            assert_eq!(
-                send_buf, &[b'S', 0, 0, 0, 4],
-                "must send PG Sync wire bytes: tag 'S' + BE u32 length=4",
-            );
-        }
-        _ => panic!("unexpected action shape: {out:?}"),
-    }
+    // DEF-212: bytes live in wb. F33 anti-tautology: assert literal PG
+    // Sync wire layout (tag 'S' + BE u32 length=4), not the internal
+    // SYNC_WIRE_BYTES const (which would mirror any drift).
+    assert_eq!(
+        wb.as_bytes(),
+        &[b'S', 0u8, 0u8, 0u8, 4u8],
+        "must send PG Sync wire bytes: tag 'S' + BE u32 length=4",
+    );
     expect_awaiting_ping_reply(proto.state(), ping_raw);
 
     // Tier-2 structural consume-discipline: drain the in-flight reply

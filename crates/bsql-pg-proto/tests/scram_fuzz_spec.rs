@@ -92,19 +92,19 @@ fn init_scram_protocol(seed: u64) -> Option<(PgProtocol, WriteBuf)> {
     let reply = bsql_pg_proto::reply_id::ReplyId::from_raw(
         NonZeroU64::new(seed.max(1)).unwrap_or(NonZeroU64::MIN),
     );
-    {
-        let out = proto.push_or_panic(
-            PgCommand::Startup {
-                user,
-                database: None,
-                app_name: None,
-                credentials: Credentials::ScramPassword(Sensitive::new(pw)),
-                reply,
-            },
-            &mut wb,
-        );
-        assert!(!out.as_slice().is_empty());
-    }
+    proto.push_or_panic(
+        PgCommand::Startup {
+            user,
+            database: None,
+            app_name: None,
+            credentials: Credentials::ScramPassword(Sensitive::new(pw)),
+            reply,
+        },
+        &mut wb,
+    );
+    // DEF-212: bytes live in wb (StartupMessage frame); non-empty
+    // confirms the push wrote.
+    assert!(!wb.as_bytes().is_empty(), "Startup push must emit StartupMessage frame");
     Some((proto, wb))
 }
 

@@ -249,7 +249,7 @@ pub mod write_buf;
 pub use action::{
     Action, CloseCompletePayload, DescribePortalCompletePayload,
     DescribeStatementCompletePayload, DescribedRows, OutActions, ParamOids,
-    ParseCompletePayload, PongPayload, QueryCompletePayload, Reply,
+    ParseCompletePayload, PongPayload, PushFailure, QueryCompletePayload, Reply,
     StartupCompletePayload, TxStatus,
 };
 pub use bounded::{BoundedLen, BoundedU8, BoundedU16};

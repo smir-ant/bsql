@@ -63,7 +63,7 @@ use bsql_pg_proto::{
 use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
+use common::{PushOrPanic, split_bind_execute_sync, split_frame_plus_sync};
 
 fn raw(v: u64) -> NonZeroU64 {
     // DEF-145: raw(0) is a test bug; assert fires loud.
@@ -154,8 +154,13 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
     frame(TAG_ERROR_RESPONSE.byte(), &body)
 }
 
-/// Push a statement describe + assert 2 SendBytes actions (D frame + Sync).
-/// Returns the D-frame bytes for wire-layout inspection.
+/// Push a statement describe + verify wire layout in `wb.as_bytes()`.
+/// Returns the D-frame bytes for further wire-layout inspection.
+///
+/// DEF-212 (Alt Y'): post-Phase-1a `push_command` returns
+/// `Result<(), PushFailure>`; bytes live in `wb`. This helper
+/// thin-wraps `common::split_frame_plus_sync` with the additional
+/// `'D'` tag check (PG §55.2.2 — Describe message).
 #[track_caller]
 fn describe_stmt_setup(
     proto: &mut PgProtocol,
@@ -163,29 +168,20 @@ fn describe_stmt_setup(
     reply: ReplyId<DescribeStatementKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
-    let out = proto.push_or_panic(
+    proto.push_or_panic(
         PgCommand::DescribeStatement { stmt_name, reply },
         wb,
     );
-    assert_eq!(out.len(), 2, "DescribeStatement emits 2 actions: D frame + Sync");
-    match out.as_slice() {
-        [Action::SendBytes(d_frame), Action::SendBytes(sync_frame)] => {
-            assert_eq!(
-                d_frame.first(),
-                Some(&TAG_DESCRIBE.byte()),
-                "first action must be 'D' frame",
-            );
-            assert_eq!(
-                *sync_frame, &[b'S', 0, 0, 0, 4],
-                "second action must be the PG Sync wire bytes",
-            );
-            d_frame.to_vec()
-        }
-        other => panic!("expected 2 SendBytes, got {other:?}"),
-    }
+    let (d_frame, _sync) = split_frame_plus_sync(wb.as_bytes());
+    assert_eq!(
+        d_frame.first(),
+        Some(&TAG_DESCRIBE.byte()),
+        "Describe-statement head must start with the 'D' tag",
+    );
+    d_frame.to_vec()
 }
 
-/// Push a portal describe + assert 2 SendBytes actions.
+/// Push a portal describe + verify wire layout.
 #[track_caller]
 fn describe_portal_setup(
     proto: &mut PgProtocol,
@@ -193,26 +189,17 @@ fn describe_portal_setup(
     reply: ReplyId<DescribePortalKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
-    let out = proto.push_or_panic(
+    proto.push_or_panic(
         PgCommand::DescribePortal { portal_name, reply },
         wb,
     );
-    assert_eq!(out.len(), 2, "DescribePortal emits 2 actions: D frame + Sync");
-    match out.as_slice() {
-        [Action::SendBytes(d_frame), Action::SendBytes(sync_frame)] => {
-            assert_eq!(
-                d_frame.first(),
-                Some(&TAG_DESCRIBE.byte()),
-                "first action must be 'D' frame",
-            );
-            assert_eq!(
-                *sync_frame, &[b'S', 0, 0, 0, 4],
-                "second action must be the PG Sync wire bytes",
-            );
-            d_frame.to_vec()
-        }
-        other => panic!("expected 2 SendBytes, got {other:?}"),
-    }
+    let (d_frame, _sync) = split_frame_plus_sync(wb.as_bytes());
+    assert_eq!(
+        d_frame.first(),
+        Some(&TAG_DESCRIBE.byte()),
+        "Describe-portal head must start with the 'D' tag",
+    );
+    d_frame.to_vec()
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -895,7 +882,7 @@ fn def198_describe_statement_while_bind_execute_in_flight_blocked() {
     // Start a BindExecute (DML path, row_desc=None).
     let be_raw = raw(800);
     use bsql_pg_proto::QueryKind as QK;
-    let be_out = proto.push_bind_execute_or_panic(
+    proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
@@ -904,7 +891,8 @@ fn def198_describe_statement_while_bind_execute_in_flight_blocked() {
         ReplyId::<QK>::from_raw(be_raw),
         &mut wb,
     );
-    assert_eq!(be_out.len(), 3, "Bind+Execute+Sync emits 3 SendBytes");
+    // DEF-212: verify wb contains B+E+Sync structurally.
+    let (_bind, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
 
     assert!(
         proto.as_ready().is_none(),
@@ -974,7 +962,7 @@ fn describe_after_completed_parse_starts_clean() {
     // Run a Parse to completion.
     use bsql_pg_proto::ParseKind;
     let parse_raw = raw(900);
-    let out = proto.push_or_panic(
+    proto.push_or_panic(
         PgCommand::Parse {
             stmt_name: stmt_unnamed(),
             sql: Sql::from_str_truncating("SELECT 1"),
@@ -982,7 +970,8 @@ fn describe_after_completed_parse_starts_clean() {
         },
         &mut wb,
     );
-    assert_eq!(out.len(), 2);
+    // DEF-212: verify Parse+Sync layout.
+    let (_p_frame, _sync) = split_frame_plus_sync(wb.as_bytes());
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&[TAG_PARSE_COMPLETE.byte(), 0, 0, 0, 4]);

@@ -67,7 +67,7 @@
 //! the guard exists. (Other secret-bearing variants — `Connecting*`,
 //! `PingAwaitingRfq`, etc. — never produce a guard.)
 
-use crate::action::OutActions;
+use crate::action::PushFailure;
 use crate::command::{FetchRows, PgCommand};
 use crate::decode::RowDesc;
 use crate::error::StateErrorKind;
@@ -286,23 +286,34 @@ impl<'a> ReadyGuard<'a> {
     ///
     /// Tier-1 elevation of the pre-DEF-198 `PgProtocol::push_command`
     /// public method: the guard's existence proves the precondition
-    /// (`state == Idle`), so the returned `OutActions` is guaranteed
-    /// to contain only `SendBytes`/`SendBytesStatic`/`SendBytesRange`
-    /// success-path actions (no `FailReply` from a state-mismatch
-    /// failure).
+    /// (`state == Idle`).
     ///
-    /// `OutActions` may still contain a single `FailReply` if the
-    /// command's *body construction* fails (e.g., SCRAM build error
-    /// for `Startup`); see `compute_push_startup` decision table.
-    /// That is a separate, tier-3 server-protocol-level error, not
-    /// a state-precondition violation.
-    #[must_use = "the returned actions carry side-effects that must be executed by the caller's I/O layer"]
+    /// # Returns
+    ///
+    /// - `Ok(())` — bytes (frame + optional trailing Sync) live in
+    ///   `write_buf`. Caller drains `write_buf.as_bytes()` to socket
+    ///   in a single write, then clears the buffer for reuse.
+    /// - `Err(PushFailure { id, cause })` — the command's body
+    ///   construction failed (e.g., SCRAM build error for `Startup`).
+    ///   State has transitioned to `Errored`; caller resolves user's
+    ///   oneshot via `id` + `cause` and closes the socket per the
+    ///   [`PushFailure`] `#[must_use]` contract. The state-precondition
+    ///   path (state ≠ Idle) is NOT reachable through this API —
+    ///   `ReadyGuard` proves Idle at construction.
+    ///
+    /// # DEF-212 (Alt Y', audit 2026-05-04)
+    ///
+    /// Pre-(212) returned `OutActions<'w, 'a>` (800 B per call); caller
+    /// iterated the action list. Post-(212) returns `Result<(), PushFailure>`
+    /// (~80 B); caller drains bytes from `write_buf` directly. -88%
+    /// per-call return frame; same tier-1 closure surface (state ==
+    /// Idle via guard, classified failure via `Result::Err`).
     #[inline]
-    pub fn push_command<'w>(
+    pub fn push_command(
         self,
         cmd: PgCommand,
-        write_buf: &'w mut WriteBuf,
-    ) -> OutActions<'w, 'a> {
+        write_buf: &mut WriteBuf,
+    ) -> Result<(), PushFailure> {
         // DEF-198 ext: synthesise the Idle-state witness here.
         // `IdleStateProof::new()` is reachable only inside `mod guard`,
         // and the guard's existence (acquired via `as_ready`) statically
@@ -313,14 +324,14 @@ impl<'a> ReadyGuard<'a> {
     /// Extended-Query Bind+Execute pipeline.
     ///
     /// Tier-1 elevation of the pre-DEF-198 `PgProtocol::push_bind_execute`
-    /// public method.
+    /// public method. See [`Self::push_command`] for the
+    /// `Result<(), PushFailure>` shape (DEF-212 Alt Y').
     #[expect(
         clippy::too_many_arguments,
         reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1; ReadyGuard wrapper preserves the same arg count by design"
     )]
-    #[must_use = "the returned actions carry side-effects that must be executed by the caller's I/O layer"]
     #[inline]
-    pub fn push_bind_execute<'w, P: ParamsWriter>(
+    pub fn push_bind_execute<P: ParamsWriter>(
         self,
         portal_name: &PortalName,
         stmt_name: &StmtName,
@@ -328,8 +339,8 @@ impl<'a> ReadyGuard<'a> {
         row_desc: Option<RowDesc>,
         fetch: FetchRows,
         reply: ReplyId<QueryKind>,
-        write_buf: &'w mut WriteBuf,
-    ) -> OutActions<'w, 'a> {
+        write_buf: &mut WriteBuf,
+    ) -> Result<(), PushFailure> {
         self.proto.push_bind_execute_internal(
             portal_name,
             stmt_name,

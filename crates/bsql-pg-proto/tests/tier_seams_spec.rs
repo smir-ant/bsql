@@ -221,9 +221,9 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let ping_raw = raw(7777);
-    // Push ping and feed a FrameTooLarge frame. Setup-action list
-    // discarded explicitly (`let _ = ...` is banned by user feedback).
-    _ = proto.push_or_panic(PgCommand::Ping {
+    // Push ping and feed a FrameTooLarge frame.
+    // DEF-212: push_or_panic returns (); bytes live in wb.
+    proto.push_or_panic(PgCommand::Ping {
         reply: id(ping_raw),
     }, &mut wb);
     // Declared length = 0xDEAD (way above MAX_FRAME_LEN_FIELD=4095).
@@ -305,7 +305,7 @@ fn scram_push_startup_carries_scram_session_inline() {
     let Ok(pw) = Password::try_from_bytes(b"pw") else {
         panic!("password construction must succeed");
     };
-    _ = proto.push_or_panic(
+    proto.push_or_panic(
         PgCommand::Startup {
             user,
             database: None,
@@ -338,7 +338,7 @@ fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
     // Drive into Errored(ServerError) via a server ErrorResponse
     // during a pending Ping (distinct kind from the Framing path
     // exercised in the sibling test).
-    _ = proto.push_or_panic(PgCommand::Ping { reply: id(raw(9001)) }, &mut wb);
+    proto.push_or_panic(PgCommand::Ping { reply: id(raw(9001)) }, &mut wb);
     // ErrorResponse frame: tag 'E' + length 5 (just the terminator
     // NUL) — empty body is legal per PG spec (all fields optional).
     let err_frame = [b'E', 0x00, 0x00, 0x00, 0x05, 0x00];
@@ -463,9 +463,9 @@ fn backend_key_data_wrong_payload_size_is_classified() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(9000);
-    // Setup: push Startup, feed AuthOk. Action lists are discarded
-    // explicitly via `drop(...)` — `let _ = ...` is banned.
-    _ = proto.push_or_panic(PgCommand::Startup {
+    // Setup: push Startup, feed AuthOk.
+    // DEF-212: push_or_panic returns (); bytes live in wb.
+    proto.push_or_panic(PgCommand::Startup {
         user: Ident::try_from_str("u").unwrap_or_else(|_| panic!("valid ident")),
         database: None,
         app_name: None,

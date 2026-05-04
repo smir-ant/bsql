@@ -100,7 +100,7 @@ fn def198_idle_after_drain_yields_ready_guard() {
     let mut wb = WriteBuf::new();
 
     // Push + drain Ping; final state should be Idle.
-    let _ = proto.push_or_panic(PgCommand::Ping { reply: ping_id(1) }, &mut wb);
+    proto.push_or_panic(PgCommand::Ping { reply: ping_id(1) }, &mut wb);
     let rfq = [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 5, b'I'];
     let _ = proto.feed_bytes(&rfq, &mut wb);
 
@@ -124,7 +124,7 @@ fn def198_ping_awaiting_classifies_busy() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let _ = proto.push_or_panic(PgCommand::Ping { reply: ping_id(1) }, &mut wb);
+    proto.push_or_panic(PgCommand::Ping { reply: ping_id(1) }, &mut wb);
 
     assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
     assert!(
@@ -151,7 +151,7 @@ fn def198_simple_query_awaiting_classifies_busy() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let _ = proto.push_or_panic(
+    proto.push_or_panic(
         PgCommand::SimpleQuery {
             sql: Sql::from_str_truncating("SELECT 1"),
             reply: query_id(1),
@@ -194,7 +194,7 @@ fn def198_connecting_startup_classifies_handshaking() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let _ = proto.push_or_panic(
+    proto.push_or_panic(
         PgCommand::Startup {
             user: ident("testuser"),
             database: None,
@@ -277,7 +277,20 @@ fn def198_ready_guard_consumes_on_push() {
 
     // Acquire guard, push (consumes), state transitions to non-Idle.
     if let Some(guard) = proto.as_ready() {
-        let _out = guard.push_command(PgCommand::Ping { reply: ping_id(1) }, &mut wb);
+        // DEF-212: explicit Ok arm — Ping push from Idle is
+        // architecturally infallible (Ping body = pure const SYNC, no
+        // builder Err path). The match preserves the
+        // `clippy::let_underscore_must_use` discipline (DEF-211 SAFE-05)
+        // by handling both arms; pre-(212) `let _out = ...` was a
+        // bind-to-named-underscore which avoided the lint but left
+        // failures silently unobserved at the test layer.
+        match guard.push_command(PgCommand::Ping { reply: ping_id(1) }, &mut wb) {
+            Ok(()) => {}
+            Err(failure) => panic!(
+                "Ping push from Idle must succeed (architecturally infallible); \
+                 got Err({failure:?})",
+            ),
+        }
         // Guard consumed; cannot be reused. The compile-fail test in
         // `tests/def198_compile_fail/` proves the type-level lock.
     } else {
