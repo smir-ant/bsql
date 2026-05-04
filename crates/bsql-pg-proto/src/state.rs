@@ -153,40 +153,48 @@ pub enum ProtoState {
         /// Box's Drop fires `ScramSession::Drop` (ZeroizeOnDrop) on
         /// every exit path. Cost in this variant: one heap alloc.
         ///
-        /// **Per-handshake total — DEF-210 SR-07 doc-drift fix
-        /// (audit 2026-04-28).** Pre-audit text claimed *"one heap
-        /// alloc per SCRAM connection"*, which described the
-        /// Phase-1 constellation accurately but missed the
-        /// Phase-2 reality: the next variant
-        /// [`Self::ConnectingScramAwaitingServerFirst`] adds two
-        /// further `Box<PodBytes<…>>` fields (`client_first_bare`,
-        /// `client_nonce_b64`), so the worst-case live-variant
-        /// footprint during a handshake is **three** heap allocs,
-        /// not one. Drop chain (Box → contents) still scrubs
-        /// every secret-bearing byte on transition; tier
-        /// classification unchanged. Consolidation into a single
-        /// `Box<ScramHandshakeState>` is tracked under DEF-210
-        /// REC-06 (alloc-count win + docstring becomes literally
-        /// accurate again).
+        /// **Per-handshake total — DEF-210 SR-07 + REC-06 (audit
+        /// 2026-04-28).** Pre-REC-06 text claimed *"one heap alloc
+        /// per SCRAM connection"*, which described the Phase-1
+        /// constellation accurately but missed the Phase-2 reality:
+        /// the next variant
+        /// [`Self::ConnectingScramAwaitingServerFirst`] used to add
+        /// two further `Box<PodBytes<…>>` fields (three live `Box`
+        /// allocs during ServerFirst-await). REC-06 consolidated
+        /// those into a single `Box<ScramHandshakeState>` carried by
+        /// the next variant, restoring the literal *"one heap alloc"*
+        /// invariant: at any moment in a SCRAM handshake's lifecycle
+        /// at most ONE `Box` is live (transition `StartupScram → ServerFirst`
+        /// performs `*scram` deref-move + new `Box::new` of the
+        /// consolidated struct; the old Box is freed and the new one
+        /// is allocated atomically per the move semantics).
         scram: alloc::boxed::Box<ScramSession>,
     },
 
     /// SCRAM step 1 complete (client-first sent); awaiting
     /// `AuthenticationSASLContinue` (server-first-message). DEF-002.
+    ///
+    /// # DEF-210 REC-06 (audit 2026-04-28): three Boxes → one
+    ///
+    /// Pre-REC-06 this variant carried three separate
+    /// `Box<...>` fields (`scram`, `client_first_bare`,
+    /// `client_nonce_b64`) — three heap allocations live during
+    /// the ServerFirst-await phase, three drops on transition.
+    /// Post-REC-06 they live inside one `Box<ScramHandshakeState>`
+    /// (see the struct definition below). Allocator ops per
+    /// SCRAM handshake: 6 → 4 (one alloc, one free saved at the
+    /// StartupScram → ServerFirst transition; two further frees
+    /// folded into one at the ServerFirst → ServerFinal transition).
+    /// Drop chain identical: `Box::drop` → `ScramHandshakeState::drop`
+    /// → field-by-field Drop including `ScramSession::drop`
+    /// (`ZeroizeOnDrop`).
     ConnectingScramAwaitingServerFirst {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
-        /// SCRAM session (heap-boxed, see [`Self::ConnectingStartupScram`]).
-        scram: alloc::boxed::Box<ScramSession>,
-        /// The `client-first-message-bare` (saved for AuthMessage).
-        /// Heap-boxed per DEF-187 to keep the variant compact —
-        /// boxed `PodBytes<128>` = 8 B in the variant vs 130 B inline.
-        client_first_bare:
-            alloc::boxed::Box<PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>>,
-        /// The client nonce (base64-encoded, for prefix validation).
-        /// Heap-boxed per DEF-187.
-        client_nonce_b64:
-            alloc::boxed::Box<PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>>,
+        /// Consolidated SCRAM handshake state — see
+        /// [`ScramHandshakeState`] for the three contained
+        /// fields and the rationale for boxing.
+        handshake: alloc::boxed::Box<ScramHandshakeState>,
     },
 
     /// SCRAM step 2 complete (client-final sent); awaiting
@@ -569,6 +577,45 @@ pub enum ProtoState {
     /// tier-1 compile — constructing `Errored(AlreadyClosed)` is a
     /// type error at the `StateErrorKind::try_from_kind` call site.
     Errored(StateErrorKind),
+}
+
+/// DEF-210 REC-06 (audit 2026-04-28): consolidates the three
+/// SCRAM-handshake heap-boxed fields previously inline in
+/// `ConnectingScramAwaitingServerFirst` (one each for `scram`,
+/// `client_first_bare`, `client_nonce_b64` — three live `Box`
+/// allocations) into a single `Box<ScramHandshakeState>` carried
+/// by the variant. Pre-REC-06 per-handshake allocator ops at
+/// the SASL-continue arm: 0 allocs + 3 Box-frees. Post-REC-06:
+/// 0 allocs + 1 Box-free + 1 stack ScramSession::drop with
+/// `ZeroizeOnDrop` scrub (cumulatively −2 allocator ops + same
+/// scrub coverage).
+///
+/// Drop chain unchanged: `Box::drop` → `ScramHandshakeState::drop`
+/// → field-by-field Drop including [`ScramSession::drop`]
+/// (`ZeroizeOnDrop` scrub of the password / digest / nonces).
+/// `PodBytes` carries `client-first-message-bare` (sent
+/// unencrypted on the wire — public-on-wire bytes per DEF-205
+/// step 4 / DEF-206 LOW-severity audit), so no scrub policy
+/// regression.
+///
+/// The struct is `pub` to match the visibility of its containing
+/// variant `ConnectingScramAwaitingServerFirst` and the sibling
+/// [`ScramSession`] (also `pub`). Like the surrounding [`ProtoState`]
+/// enum it is internal-by-convention — external users should never
+/// construct or pattern-match on it; the type only appears in the
+/// public surface because Rust requires `pub` enums to expose all
+/// reachable types in their variant fields.
+#[derive(Debug)]
+pub struct ScramHandshakeState {
+    /// SCRAM session state — passwords, digests, nonces; carries
+    /// the `ZeroizeOnDrop` chain for secret-bearing fields.
+    pub(crate) scram: ScramSession,
+    /// `client-first-message-bare` saved for SCRAM AuthMessage
+    /// composition at the ServerFirst → ServerFinal transition.
+    pub(crate) client_first_bare: PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
+    /// Client nonce (base64-encoded) saved for prefix validation
+    /// of the server-first-message's `r=` field.
+    pub(crate) client_nonce_b64: PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
 }
 
 impl ProtoState {
@@ -1063,13 +1110,15 @@ mod push_class_tests {
             );
         }
         if let Ok(pw) = Password::try_from_bytes(b"pw") {
-            let scram = alloc::boxed::Box::new(ScramSession::from_password(Sensitive::new(pw)));
+            let handshake = alloc::boxed::Box::new(ScramHandshakeState {
+                scram: ScramSession::from_password(Sensitive::new(pw)),
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
+            });
             pin(
                 ProtoState::ConnectingScramAwaitingServerFirst {
                     reply: ReplyId::from_raw(nz(2_003)),
-                    scram,
-                    client_first_bare: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
-                    client_nonce_b64: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
+                    handshake,
                 },
                 StatePushClass::Connecting,
             );

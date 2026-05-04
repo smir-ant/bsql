@@ -327,35 +327,41 @@ pub(crate) fn dispatch(
         // SCRAM: awaiting server-first-message
         // =============================================================
         (
-            ProtoState::ConnectingScramAwaitingServerFirst {
-                reply,
-                scram,
-                client_first_bare,
-                client_nonce_b64,
-            },
+            ProtoState::ConnectingScramAwaitingServerFirst { reply, handshake },
             TAG_AUTHENTICATION,
         ) => {
             // DEF-184 (A10/B22 revert 2026-04-24): heavy SCRAM fields
             // destructured inline from the variant — tier-1 invariant
             // (CREDO §1: variant-carries-field). No drift path.
             //
-            // DEF-187 (architect 2026-04-26): client_first_bare and
-            // client_nonce_b64 are Box<PodBytes<N>> in the variant for
-            // variant-size compaction; deref-move (`*box`) extracts
-            // the PodBytes by value for the dispatch helper which takes
-            // PodBytes by value (clippy::boxed_local would fire if we
-            // kept Box in the helper signature). `scram` stays Box since
-            // ScramSession is large enough that by-value would memcpy
-            // 520 B onto the helper's stack frame.
+            // DEF-210 REC-06 (audit 2026-04-28): the three SCRAM
+            // handshake fields previously each in their own Box are
+            // now consolidated inside `Box<ScramHandshakeState>` —
+            // one heap allocation instead of three. Deref-move
+            // (`*handshake`) extracts the inner struct by value for
+            // destructuring; the dispatch helper takes the three
+            // fields separately to preserve its existing signature
+            // (and to keep `ScramSession` Box-shaped since by-value
+            // would memcpy ~520 B onto the helper's stack frame).
+            let crate::state::ScramHandshakeState {
+                scram,
+                client_first_bare,
+                client_nonce_b64,
+            } = *handshake;
             dispatch_auth_sasl_continue(
                 state,
                 reply,
-                scram,
-                *client_first_bare,
-                *client_nonce_b64,
+                &scram,
+                client_first_bare,
+                client_nonce_b64,
                 payload,
                 reserved,
             )
+            // `scram` (ScramSession) drops here when this arm scope
+            // exits — `ZeroizeOnDrop` scrubs password / digest / nonce
+            // bytes. The `Box<ScramHandshakeState>` was already freed
+            // by the deref-move at `*handshake` above. Total drops on
+            // this arm: 1 Box-free + 1 ScramSession::drop with scrub.
         }
         (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
@@ -1253,14 +1259,25 @@ fn dispatch_auth_in_startup_scram(
             // boundary after the mutable write phase releases.
             match build_sasl_initial_response(&scram, reserved) {
                 Ok((range, client_first_bare, client_nonce_b64)) => {
-                    // DEF-184 (A10/B22 revert) + DEF-187 box transition:
-                    // tier-1 variant-carries-field; SCRAM bytes heap-
-                    // boxed for 24 B variant footprint vs 720 B inline.
+                    // DEF-184 (A10/B22 revert) + DEF-187 box transition
+                    // + DEF-210 REC-06 (audit 2026-04-28): tier-1
+                    // variant-carries-field; the three SCRAM handshake
+                    // fields are consolidated in a single
+                    // `Box<ScramHandshakeState>`. Move `scram` out of
+                    // its original `Box<ScramSession>` (deref-move
+                    // `*scram` frees the old Box and yields the inner
+                    // `ScramSession` by value) into the new
+                    // consolidated state, alongside `client_first_bare`
+                    // and `client_nonce_b64`. Net allocator delta: −1
+                    // alloc (was 2 separate PodBytes Boxes; now part
+                    // of one struct), −1 free at the next transition.
                     *state = ProtoState::ConnectingScramAwaitingServerFirst {
                         reply,
-                        scram,
-                        client_first_bare: alloc::boxed::Box::new(client_first_bare),
-                        client_nonce_b64: alloc::boxed::Box::new(client_nonce_b64),
+                        handshake: alloc::boxed::Box::new(crate::state::ScramHandshakeState {
+                            scram: *scram,
+                            client_first_bare,
+                            client_nonce_b64,
+                        }),
                     };
                     DispatchOutcome::AdvancedWithAction {
                         action: StagedAction::SendBytesRange(range),
@@ -1436,18 +1453,24 @@ fn build_sasl_initial_response(
 // clippy::too_many_arguments default threshold. No `#[expect]` needed.
 //
 // DEF-187 (architect 2026-04-26): SCRAM data is heap-boxed inside
-// the variant for variant-size compaction. The dispatch function takes
-// boxed values (scram still as Box because ScramSession is large
-// 520 B; passing by value would memcpy onto stack frame, same cost
-// either way but Box keeps the type explicit). client_first_bare /
-// client_nonce_b64 take PodBytes by value (caller derefs the Box at
-// the variant destructure). Clippy::boxed_local doesn't fire on the
-// owned-Box for ScramSession since the Box is consumed (passed into
-// password_bytes() ref methods).
+// the variant for variant-size compaction.
+//
+// DEF-210 REC-06 (audit 2026-04-28): the three SCRAM-handshake
+// fields previously each in their own Box are now consolidated
+// inside `Box<ScramHandshakeState>` carried by
+// `ConnectingScramAwaitingServerFirst`. The caller destructures
+// `*handshake` and passes `scram` BY REFERENCE (helper only reads
+// `scram.password_bytes()` once for HMAC composition; no need to
+// memcpy ~520 B onto this helper's stack frame, no need to re-Box).
+// `client_first_bare` and `client_nonce_b64` move by value into the
+// helper (caller drops them when the arm scope exits). Net per
+// SCRAM handshake: pre-REC-06 was 0 allocs + 3 Box-frees at this
+// arm; post-REC-06 is 0 allocs + 1 Box-free (the consolidated
+// `Box<ScramHandshakeState>`).
 fn dispatch_auth_sasl_continue(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
-    scram: alloc::boxed::Box<crate::scram::session::ScramSession>,
+    scram: &crate::scram::session::ScramSession,
     client_first_bare: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_FIRST_BARE_LEN }>,
     client_nonce_b64: crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
     payload: &[u8],

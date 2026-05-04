@@ -3579,16 +3579,16 @@ mod allows_unsolicited_param_status_tests {
         }
 
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
-            let scram = alloc::boxed::Box::new(
-                crate::scram::session::ScramSession::from_password(
+            let handshake = alloc::boxed::Box::new(crate::state::ScramHandshakeState {
+                scram: crate::scram::session::ScramSession::from_password(
                     crate::sensitive::Sensitive::new(pw),
                 ),
-            );
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
+            });
             let scram_first = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(nz(5)),
-                scram,
-                client_first_bare: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
-                client_nonce_b64: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
+                handshake,
             };
             assert!(!allows_unsolicited_param_status(&scram_first));
             consume_state(scram_first);
@@ -3641,6 +3641,212 @@ mod allows_unsolicited_param_status_tests {
         let q_drain = ProtoState::DrainRfqAfterError;
         assert!(allows_unsolicited_param_status(&q_drain));
         consume_state(q_drain);
+    }
+}
+
+#[cfg(test)]
+mod residue_policy_per_class_tests {
+    //! DEF-210 NB-04 (audit 2026-04-28): per-`StatePushClass` pinning
+    //! of `clear_session_residue_if_idle_or_errored` arm bodies.
+    //!
+    //! The production function uses a wildcard `_ => {}` for the
+    //! Connecting / PingAwaiting / BusyQuery preserve-residue arm
+    //! (the wildcard form compiles to a single discriminant compare
+    //! pair — explicit 25-variant or-pattern cost ~+2 ns, see
+    //! comment on `clear_session_residue_if_idle_or_errored`). The
+    //! wildcard is tier-2-by-discipline at the broad scope: a future
+    //! `ProtoState` variant inherits the wildcard "preserve" arm
+    //! silently, with no compile-time signal.
+    //!
+    //! These tests close the gap at the **`StatePushClass` granularity**
+    //! by pinning the per-class residue policy on observable state:
+    //! - **Idle** — `row_desc_slot` cleared; `session_params` preserved.
+    //! - **Errored(_)** — `row_desc_slot` cleared; `session_params`
+    //!   internally `clear()`-ed (verified via `is_pristine()`).
+    //! - **Connecting / PingAwaiting / BusyQuery** — every observable
+    //!   residue field preserved.
+    //!
+    //! An arm-body swap (e.g. `Idle => clear session_params` instead
+    //! of preserve) trips one of these tests immediately. Adding a
+    //! new `StatePushClass` variant requires a new test arm here too
+    //! (the test for the new class would be missing — caught by
+    //! contributor discipline + code review, not compile-fail; this
+    //! is the residual tier-3 surface that integration-via-public-
+    //! API would close, but the public-API path requires real
+    //! server-frame fixtures that are outside this test's scope).
+    use super::*;
+    use crate::decode::RowDesc;
+    use crate::error::{ErrorKind, StateErrorKind};
+    use crate::reply_id::ReplyId;
+    use crate::session_params::SessionParams;
+    use crate::state::ProtoState;
+    use core::num::NonZeroU64;
+
+    fn nz(n: u64) -> NonZeroU64 {
+        assert!(n > 0, "nz(0) is a test bug — must be ≥ 1");
+        NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
+    }
+
+    /// Construct a non-pristine `SessionParams` (one counter bumped
+    /// off-zero) to make the preserve-vs-clear distinction observable
+    /// via [`SessionParams::is_pristine`].
+    fn dirty_session_params() -> alloc::boxed::Box<SessionParams> {
+        let mut params = SessionParams::new();
+        params.n_unknown_dropped = 1;
+        alloc::boxed::Box::new(params)
+    }
+
+    /// Populate every observable residue field on `proto`:
+    /// `row_desc_slot = Some(EMPTY)`, `session_params` non-pristine,
+    /// `error_arena` allocated. After the test we observe how each
+    /// arm of `clear_session_residue_*` mutated them.
+    fn populate_residue(proto: &mut PgProtocol) {
+        proto.row_desc_slot = Some(RowDesc::EMPTY);
+        proto.session_params = Some(dirty_session_params());
+        proto.error_arena = Some(alloc::boxed::Box::new(
+            crate::error_arena::ErrorArena::new(),
+        ));
+    }
+
+    /// Replace `proto.state` with `Idle` so the destructor doesn't
+    /// trip the in-flight `ReplyId<_>` Drop-guard at scope end.
+    fn quench_inflight(proto: &mut PgProtocol) {
+        let prev = core::mem::replace(&mut proto.state, ProtoState::Idle);
+        match prev.take_inflight_reply_raw_id() {
+            Some(_) | None => {}
+        }
+    }
+
+    fn session_params_is_pristine(proto: &PgProtocol) -> bool {
+        match proto.session_params.as_deref() {
+            Some(p) => p.is_pristine(),
+            None => true,
+        }
+    }
+
+    #[test]
+    fn idle_clears_row_desc_preserves_session_params() {
+        let mut proto = PgProtocol::new();
+        // Default state is `Idle` post-`new()`.
+        populate_residue(&mut proto);
+        proto.clear_session_residue_if_idle_or_errored();
+
+        assert!(
+            proto.row_desc_slot.is_none(),
+            "Idle must clear row_desc_slot",
+        );
+        assert!(
+            proto.error_arena.is_some(),
+            "Idle preserves the error_arena Box (contents cleared internally)",
+        );
+        assert!(
+            proto.session_params.is_some(),
+            "Idle preserves session_params Box",
+        );
+        assert!(
+            !session_params_is_pristine(&proto),
+            "Idle MUST NOT clear session_params content (load-bearing during a healthy connection)",
+        );
+    }
+
+    #[test]
+    fn errored_clears_everything_including_session_params() {
+        let mut proto = PgProtocol::new();
+        proto.state = ProtoState::Errored(
+            StateErrorKind::from_kind_or_internal(ErrorKind::Framing),
+        );
+        populate_residue(&mut proto);
+        proto.clear_session_residue_if_idle_or_errored();
+
+        assert!(
+            proto.row_desc_slot.is_none(),
+            "Errored must clear row_desc_slot",
+        );
+        assert!(
+            proto.session_params.is_some(),
+            "Errored preserves session_params Box (only contents cleared)",
+        );
+        assert!(
+            session_params_is_pristine(&proto),
+            "Errored MUST clear session_params content (DEF-189 Q8-C3 forfeit on tear-down)",
+        );
+        // No state mutation back to Idle here — Errored is terminal.
+        // Drop-guard for `Errored(StateErrorKind)` is fine: the kind
+        // is `Copy`, no in-flight ReplyId to consume.
+    }
+
+    #[test]
+    fn connecting_preserves_all_residue() {
+        let mut proto = PgProtocol::new();
+        proto.state = ProtoState::ConnectingStartupTrust {
+            reply: ReplyId::from_raw(nz(11)),
+        };
+        populate_residue(&mut proto);
+        proto.clear_session_residue_if_idle_or_errored();
+
+        assert!(
+            proto.row_desc_slot.is_some(),
+            "Connecting (StatePushClass::Connecting) must preserve row_desc_slot",
+        );
+        assert!(
+            proto.session_params.is_some(),
+            "Connecting must preserve session_params Box",
+        );
+        assert!(
+            !session_params_is_pristine(&proto),
+            "Connecting must preserve session_params content",
+        );
+        assert!(
+            proto.error_arena.is_some(),
+            "Connecting must preserve error_arena",
+        );
+        quench_inflight(&mut proto);
+    }
+
+    #[test]
+    fn ping_awaiting_preserves_all_residue() {
+        let mut proto = PgProtocol::new();
+        proto.state = ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
+        populate_residue(&mut proto);
+        proto.clear_session_residue_if_idle_or_errored();
+
+        assert!(
+            proto.row_desc_slot.is_some(),
+            "PingAwaiting (StatePushClass::PingAwaiting) must preserve row_desc_slot",
+        );
+        assert!(
+            !session_params_is_pristine(&proto),
+            "PingAwaiting must preserve session_params content",
+        );
+        assert!(
+            proto.error_arena.is_some(),
+            "PingAwaiting must preserve error_arena",
+        );
+        quench_inflight(&mut proto);
+    }
+
+    #[test]
+    fn busy_query_preserves_all_residue() {
+        let mut proto = PgProtocol::new();
+        proto.state = ProtoState::SimpleQueryStreamingRows {
+            reply: ReplyId::from_raw(nz(13)),
+        };
+        populate_residue(&mut proto);
+        proto.clear_session_residue_if_idle_or_errored();
+
+        assert!(
+            proto.row_desc_slot.is_some(),
+            "BusyQuery (StatePushClass::BusyQuery) must preserve row_desc_slot",
+        );
+        assert!(
+            !session_params_is_pristine(&proto),
+            "BusyQuery must preserve session_params content",
+        );
+        assert!(
+            proto.error_arena.is_some(),
+            "BusyQuery must preserve error_arena",
+        );
+        quench_inflight(&mut proto);
     }
 }
 
@@ -3985,16 +4191,16 @@ mod compute_push_tests {
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
             let raw_prev = nz(203);
             let raw_new = nz(204);
-            let scram = alloc::boxed::Box::new(
-                crate::scram::session::ScramSession::from_password(
+            let handshake = alloc::boxed::Box::new(crate::state::ScramHandshakeState {
+                scram: crate::scram::session::ScramSession::from_password(
                     crate::sensitive::Sensitive::new(pw),
                 ),
-            );
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
+            });
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
-                scram,
-                client_first_bare: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
-                client_nonce_b64: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
+                handshake,
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);
@@ -4293,16 +4499,16 @@ mod compute_push_tests {
         {
             let raw_prev = nz(405);
             let raw_new = nz(406);
-            let scram = alloc::boxed::Box::new(
-                crate::scram::session::ScramSession::from_password(
+            let handshake = alloc::boxed::Box::new(crate::state::ScramHandshakeState {
+                scram: crate::scram::session::ScramSession::from_password(
                     crate::sensitive::Sensitive::new(pw),
                 ),
-            );
+                client_first_bare: crate::ident::PodBytes::new(),
+                client_nonce_b64: crate::ident::PodBytes::new(),
+            });
             let prev = ProtoState::ConnectingScramAwaitingServerFirst {
                 reply: ReplyId::from_raw(raw_prev),
-                scram,
-                client_first_bare: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
-                client_nonce_b64: alloc::boxed::Box::new(crate::ident::PodBytes::new()),
+                handshake,
             };
             let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
             assert_eq!(staged.len(), 1);
