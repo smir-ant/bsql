@@ -331,6 +331,13 @@ const _: fn() = || {
     // Send for any shorter lifetime by covariance. Sync would defeat
     // its exclusive-access purpose, so only Send is asserted.
     assert_send::<guard::ReadyGuard<'static>>();
+    // DEF-212: bytes-only push API (Phase 1) + per-event feed API (Phase 2).
+    // PushFailure is the typed Err arm of ReadyGuard::push_command;
+    // FeedEvent is the per-event return of advance_one_frame. Both
+    // cross task boundaries in the async wrapper (Phase 1e) — Send
+    // is load-bearing.
+    assert_send::<action::PushFailure>();
+    assert_send::<action::FeedEvent<'static, 'static>>();
 };
 
 // ---------------------------------------------------------------------
@@ -639,6 +646,72 @@ const _: () = assert!(
      Exact pin catches ANY layout drift. Change is decision-point \
      (not silent regression): audit Action size, OutActions cap, \
      ManuallyDrop shape.",
+);
+
+// ---------------------------------------------------------------------
+// DEF-212 Phase 3 (M4 — architect-vetted impl plan, audit 2026-05-04):
+// exact `==` size pins for the new bytes-only push API + per-event
+// secondary feed API. Pinned per CREDO §III no-permissive-ranges
+// policy: relative pins (e.g., `<= 96`) cushion silent drift; exact
+// pins make every byte change a contributor decision-point.
+// ---------------------------------------------------------------------
+
+// `PushFailure` exact size — 80 B post-Phase-1.
+//
+// Layout: NonZeroU64 (8 B, 8-aligned) + ProtocolError (72 B) = 80 B
+// total. Niche-packed: `Option<PushFailure>` is also 80 B (NonZeroU64
+// niche absorbs the discriminant).
+//
+// Drift surface: a future `ProtocolError` variant addition that
+// pushes the enum past 72 B would cascade here. The complementary
+// `ProtocolError == 72` pin (line 456+) catches drift at the source;
+// this pin catches the propagation.
+const _: () = assert!(
+    core::mem::size_of::<action::PushFailure>() == 80,
+    "PushFailure exact size — 80 B (NonZeroU64 8 B + ProtocolError 72 B). \
+     If this trips: (a) ProtocolError grew past 72 B (check sibling pin \
+     at action::PushFailure docstring + error.rs ProtocolError pin), \
+     or (b) NonZeroU64 alignment changed (architecturally impossible \
+     under stable Rust). Cascade impact: Result<(), PushFailure> return \
+     frame on push paths grows in lockstep — the DEF-212 Phase 1 -88% \
+     headline (800 B → 80 B) erodes proportionally.",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<action::PushFailure>>() == 80,
+    "Option<PushFailure> niche-pack — must stay 80 B via the NonZeroU64 \
+     niche on PushFailure.id. If this regresses to 88 B (or higher), \
+     the niche optimisation was lost — likely cause: a non-niche field \
+     added to PushFailure that consumed the discriminant slot.",
+);
+
+// `FeedEvent<'static, 'static>` exact size — 88 B post-Phase-2.
+//
+// Layout: max variant is `Deliver(NonZeroU64, Reply<'r>)` =
+// 8 + 80 = 88 B; discriminant niche-optimised via NonZeroU64
+// (zero bit-pattern reserved for variant tagging across the 7
+// variants). `Option<FeedEvent>` also niche-packs to 88 B.
+//
+// Drift surface: a future `Reply<'r>` widening past 80 B (Reply pin
+// is range [72, 96] currently — any growth toward 88+ regresses
+// FeedEvent). A new variant carrying a payload > 80 B would also
+// trip this.
+const _: () = assert!(
+    core::mem::size_of::<action::FeedEvent<'static, 'static>>() == 88,
+    "FeedEvent<'wb, 'r> exact size — 88 B (max variant = Deliver: \
+     NonZeroU64 8 B + Reply<'r> 80 B). Discriminant niche-optimised \
+     via NonZeroU64. If this trips: (a) Reply grew past 80 B (check \
+     sibling pin Reply<'r> in [72, 96] — tighten when Reply gets exact), \
+     (b) a new FeedEvent variant carries a payload > 80 B (rare — \
+     architectural change), or (c) niche optimisation lost. The DEF-212 \
+     Phase 2 design budget assumes ≤ 88 B per per-event return frame — \
+     larger means worse 1c-5 pipelining throughput per cycle.",
+);
+const _: () = assert!(
+    core::mem::size_of::<Option<action::FeedEvent<'static, 'static>>>() == 88,
+    "Option<FeedEvent> niche-pack — must stay 88 B via the NonZeroU64 \
+     niche on Deliver.id / Fail.id. If this regresses, the niche was \
+     lost — verify variant layout still routes the discriminant through \
+     a NonZero* slot.",
 );
 
 // ---------------------------------------------------------------------
