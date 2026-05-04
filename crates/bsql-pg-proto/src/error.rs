@@ -904,6 +904,18 @@ mod crate_bug_locus_display_tests {
 ///   exactly one `ErrorKind`": the `ProtocolError::kind` match is
 ///   exhaustive; adding a new `ProtocolError` variant without
 ///   classifying it is a build error.
+// DEF-211 SAFE-07 (audit 2026-05-04): `#[non_exhaustive]` pre-empts
+// the SemVer footgun — adding a new variant in a future release
+// would otherwise be a major-version break. With `non_exhaustive`,
+// downstream `match`es require a wildcard arm (or accept future
+// variants explicitly), so adding a variant is a minor-version
+// non-breaking change. Internal `match`es here remain exhaustive
+// because `#[non_exhaustive]` permits exhaustive matches WITHIN
+// the defining crate — only EXTERNAL crates are required to use
+// a wildcard. Tier-1 invariants on the internal exhaustive-match
+// shields (e.g., `ProtocolError::kind`, `StateErrorKind` mapping)
+// are preserved.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ErrorKind {

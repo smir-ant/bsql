@@ -44,24 +44,34 @@ use crate::scram::types::SecretDigest;
 /// internal dispatch is the load-bearing tier-1 invariant — a missed
 /// (state, tag) combination is a build failure.
 ///
-/// `Default` is `Idle`, which lets [`core::mem::take`] swap the state
-/// out for owned-pattern transitions without ceremony. `take` on an
-/// [`Errored`][ProtoState::Errored] state is a genuine hazard (it would
-/// lose the stored cause and replace it with `Idle`, re-opening the
-/// connection for commands); every caller that uses `mem::take` on the
-/// state must explicitly preserve the `Errored` case — see the
-/// `fail_inflight_and_close` and `handle_push_ping` bodies in
-/// `protocol.rs`.
+/// # DEF-211 FAKE-16 (audit 2026-05-04, 5th-pass architect-agent):
+/// `#[derive(Default)]` removed
+///
+/// Pre-FAKE-16 the enum derived `Default` (with `Idle` as the
+/// default arm), enabling `core::mem::take(&mut state)` to swap
+/// state out for an `Idle` placeholder. The convenience created a
+/// **latent hazard**: `mem::take` on an [`Errored`][ProtoState::Errored]
+/// variant would silently drop the stored [`StateErrorKind`] and
+/// replace it with `Idle`, re-opening the connection for commands
+/// (silent recovery from a terminal error). Every caller that
+/// used `mem::take` had to manually preserve the `Errored` case —
+/// a documented discipline, NOT a compile-time invariant.
+///
+/// Post-FAKE-16 the derive is removed. All callsites use
+/// `core::mem::replace(&mut state, ProtoState::Idle)` explicitly,
+/// making the placeholder choice load-bearing at the call site.
+/// Audit (2026-05-04) confirmed zero existing `mem::take(state)`
+/// callsites in the crate; the derive was unused. Tier-1
+/// future-proof: a future contributor cannot accidentally invoke
+/// `mem::take(state)` because the trait impl no longer exists.
 // Deliberately **not** `Copy`: moving out of `PingAwaitingRfq(id)`
 // must consume the [`crate::ReplyId`] inline — the state-as-data
 // invariant (reforge.md §7.2). `ProtoState` inherits non-Copy from
 // the non-Copy `ReplyId` field, so the `missing_copy_implementations`
 // lint does not fire here (there is no "could be Copy" suggestion to
 // suppress).
-#[derive(Default)]
 pub enum ProtoState {
     /// Connection established and idle. Accepts new commands.
-    #[default]
     Idle,
 
     /// A `Sync` was sent; awaiting the matching `ReadyForQuery` reply.

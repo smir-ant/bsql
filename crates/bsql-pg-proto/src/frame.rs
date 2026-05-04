@@ -66,24 +66,38 @@ pub const MAX_FRAME_LEN_FIELD: u32 = 4095;
 /// `tests/frame_parse.rs`.
 pub const HEADER_LEN: usize = 5;
 
-// Tier-1 drift guard: `MAX_FRAME_LEN_FIELD` (u32) must correspond to
-// `READ_BUF_CAP - 1` (usize). The two consts live in different
-// integer types — `usize` and `u32` — and stable Rust does not yet
-// expose `usize::try_from(u32)` in `const fn` context (RU-01,
-// pending-stabilisation in `crates/bsql-pg-proto/src/...`). The
-// `as` cast that would bridge them is forbidden by the workspace
-// clippy bundle (`cast_possible_truncation` etc.). So we PIN BOTH
-// VALUES exactly: a change to either without the matching change to
-// the other trips one of the two asserts. The arithmetic identity
-// `(MAX_FRAME_LEN_FIELD + 1) == READ_BUF_CAP` is preserved by the
-// pair-pin even though we cannot express it as a single equation
-// in stable const code. DEF-210 ML-03 audit (2026-04-28) confirmed
-// the prior third assert (`MAX_FRAME_LEN_FIELD.saturating_add(1)
-// == 4096`) was tautological — given asserts (1) and (2) plus the
-// math fact `4095 + 1 == 4096`, it carried no extra protection;
-// removed for signal-to-noise.
-const _: () = assert!(READ_BUF_CAP == 4096);
-const _: () = assert!(MAX_FRAME_LEN_FIELD == 4095);
+// Tier-1 drift guard: `MAX_FRAME_LEN_FIELD` (u32) must correspond
+// to `READ_BUF_CAP - 1` (usize). The two consts live in different
+// integer types; stable Rust does not yet expose `usize::try_from(u32)`
+// in `const fn` context (RU-01) and `as` casts are forbidden by
+// the workspace clippy bundle (`cast_possible_truncation` etc.).
+//
+// **DEF-211 FAKE-11 (audit 2026-05-04, 5th-pass architect-agent):**
+// the prior pair-pin form (separate `READ_BUF_CAP == 4096` +
+// `MAX_FRAME_LEN_FIELD == 4095` asserts) caught either-side drift
+// but left the **relationship** as documentation only — a
+// contributor could see one assert fail, update only that const,
+// and ship a binary with a different formula (e.g.
+// `MAX_FRAME_LEN_FIELD = 4096`, `READ_BUF_CAP = 4096`, off-by-one
+// frame-cap for the lifetime of the connection). Single-equation
+// form below makes the relationship load-bearing: the third
+// conjunct expresses the formula directly via `saturating_add` in
+// u32-space (the type both values fit in given the
+// `READ_BUF_CAP <= u16::MAX` const-assert below + `protocol.rs`
+// drift pin coupling `READ_BUF_CAP` to `frames_consumed: u16`).
+// Tier-1 by single assertion: failure message points to BOTH
+// consts AND the formula; no documentation-only relationship.
+const _: () = assert!(
+    READ_BUF_CAP == 4096
+        && MAX_FRAME_LEN_FIELD == 4095
+        && MAX_FRAME_LEN_FIELD.saturating_add(1) == 4096_u32,
+    "MAX_FRAME_LEN_FIELD + 1 == READ_BUF_CAP must hold (in u32 space); \
+     bumping either const requires updating BOTH literals here. \
+     The third conjunct is load-bearing — it pins the formula, NOT \
+     a tautology of the value pins (a paired bump like \
+     `READ_BUF_CAP=8192, MAX_FRAME_LEN_FIELD=8200` violates the \
+     formula even though both consts changed).",
+);
 const _: () = assert!(HEADER_LEN == 5, "wire header = 1 byte tag + 4 bytes BE length field");
 
 // READ_BUF_CAP must be large enough to hold the smallest legal complete

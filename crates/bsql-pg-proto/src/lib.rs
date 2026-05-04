@@ -79,8 +79,25 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
-    clippy::float_cmp
+    clippy::float_cmp,
+    // DEF-211 SAFE-05 (audit 2026-05-04, 5th-pass architect-agent):
+    // `clippy::let_underscore_must_use` catches `let _ = fn()` where
+    // the result carries a `#[must_use]` contract. The sibling
+    // `let_underscore_drop` was renamed/moved to a rustc lint —
+    // see the `#![deny(let_underscore_drop)]` line below. Tier-1
+    // closes the silent-discard class at build time; no production
+    // callsites trip these today (`cargo clippy` clean post-add).
+    clippy::let_underscore_must_use
 )]
+// DEF-211 SAFE-05 (continued): rustc-namespace `let_underscore_drop`
+// moved out of `clippy::*` after Rust 1.69. Catches the explicit
+// `let _ = drop_chain_value` form where the value's `Drop::drop`
+// still fires (so it is NOT a "leak" of secrets — `ZeroizeOnDrop`
+// chains still run) but the immediate discard is structurally
+// suspicious (a `let _binding = ...` or `drop(value)` makes the
+// intent explicit). Distinct from `unused_must_use` (which fires
+// on the call expression, not the let-pattern).
+#![deny(let_underscore_drop)]
 #![deny(
     unused_must_use,
     unused_lifetimes,
