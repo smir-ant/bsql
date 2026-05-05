@@ -233,6 +233,32 @@ proposals into factual data instead of speculation.
   without the gate. KEEP as-is; architect's "no benefit" concern
   falsified empirically.
 
+- **DEF-237 — `record_param_status` const-for-known-keys**
+  REJECTED 2026-05-05 pre-implementation. Original framing claimed
+  "removes runtime str-match on cold path" — but inspection of
+  `SessionParams::set(&mut self, key: &[u8], value: &[u8])` reveals
+  the existing implementation is **already compile-time byte-string
+  dispatch** via `match key { b"server_encoding" => ..., b"is_superuser"
+  => ..., ... }`. Rust/LLVM lowers this to length-first compare chain
+  (or jump table at sufficient density), not runtime hashing.
+  Possible real wins surveyed:
+  - Manual length-first branching: LLVM already does this on `match
+    &[u8]` (verified mental model; cargo asm spot-check optional).
+  - `phf` crate / hand-rolled perfect hash: adds dependency +
+    complexity for marginal gain on a 9-entry dispatch where the
+    match-jump-table is already O(1)-ish.
+  - First-byte dispatch: same — LLVM optimises transparently.
+  ParameterStatus is cold-path traffic (handshake-time only ~9
+  frames; mid-session SET-induced PS rare). No measurable user-
+  facing benefit available; the proposed refactor would add lines
+  without structural improvement.
+  **Premise**: original DEF-237 description was based on an
+  inaccurate model of the existing code. Match on byte-string
+  literals IS the compile-time dispatch DEF-237 was proposing.
+  Reopen requires NEW evidence — e.g., cargo asm output showing
+  current dispatch is suboptimal, or a workload where PS density
+  on hot path is measurable.
+
 - **DEF-211 SAFE-01 / SAFE-01' — `heapless::Vec` replacement**
   REJECTED 2026-05-04 pre-implementation. Architect-agent
   proposed replacing `heapless::Vec<T, N>` with a hand-rolled safe
