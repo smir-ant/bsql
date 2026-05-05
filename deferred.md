@@ -233,6 +233,32 @@ proposals into factual data instead of speculation.
   without the gate. KEEP as-is; architect's "no benefit" concern
   falsified empirically.
 
+- **DEF-239 — `FixedStr::default()` init cost optimisation**
+  REJECTED 2026-05-05 pre-implementation. Audit identified real
+  production callsites:
+  - `dispatch.rs:530`, `state.rs:1150/1178/1203`, `protocol.rs:4012`:
+    `command_tag: BoundedStr<32>::default()` on every CommandComplete
+    handling — ~32 B memset per query completion.
+  - `dispatch.rs:1767-1769`: 3× `SecretBoundedStr::default()` in
+    `parse_error_response` (cold path, `#[cold]` already applied).
+  Optimisation paths surveyed:
+  - **`MaybeUninit<[u8; N]>` skip-init**: would require crate-internal
+    `unsafe { assume_init }` — breaks `#![forbid(unsafe_code)]`. Same
+    SAFE-01 blocker. CREDO §1 absolute commit.
+  - **`const EMPTY: Self = Self::new()` rodata constant**: trades
+    deterministic memset (1-2 ns) for cache-miss potential (~5 ns).
+    Not Pareto-better.
+  - **Hand-rolled per-N const init**: same memset cost, no benefit
+    over Rust's `[0u8; N]` LLVM intrinsic lowering.
+  The current `Default::default()` is **near-optimal for safe Rust**:
+  `[0u8; N]` emits the fastest-possible memset on every supported
+  target. Real win requires `unsafe`, rejected per CREDO §1.
+  Reopen requires either a future stable Rust feature for safe
+  `MaybeUninit`-equivalent skip-init, or measurement evidence that
+  command_tag init cost is a measurable hot-path bottleneck (the
+  bench suite did not surface this on ping_round_trip / iter_rows
+  benches).
+
 - **DEF-237 — `record_param_status` const-for-known-keys**
   REJECTED 2026-05-05 pre-implementation. Original framing claimed
   "removes runtime str-match on cold path" — but inspection of
