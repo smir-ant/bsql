@@ -229,6 +229,28 @@ pub enum Credentials {
     /// The password is wrapped in [`Sensitive`] for zero-on-drop and
     /// debug redaction; same Drop chain as [`Self::ScramPassword`].
     CleartextPassword(Sensitive<Password>),
+    /// MD5 password authentication (PG `AuthenticationMD5Password`,
+    /// sub-code 5). DEF-216 (2026-05-05).
+    ///
+    /// Server sends a 4-byte salt; client responds with
+    /// `"md5" || md5_hex(md5_hex(password || username) || salt)` in
+    /// a `PasswordMessage`. Common in PG ≤ 13 enterprise on-prem
+    /// installs; PG 14 and newer default to SCRAM.
+    ///
+    /// **Security**: MD5 is cryptographically broken for collision-
+    /// resistant uses; PG's salt+rehash construction provides only
+    /// weak protection against passive observation, and offline
+    /// password cracking with modern GPUs is fast. Where the server
+    /// offers SCRAM as well, drivers SHOULD prefer SCRAM. Unlike
+    /// cleartext, MD5 does not require TLS to defeat passive
+    /// observation, but TLS is still strongly recommended (the
+    /// digest leaks enough information for offline cracking).
+    ///
+    /// The password is wrapped in [`Sensitive`] for zero-on-drop and
+    /// debug redaction. The MD5 computation is performed inside
+    /// [`crate::md5`] which uses `Zeroizing<>` for every password-
+    /// derived intermediate buffer.
+    Md5Password(Sensitive<Password>),
 }
 
 impl fmt::Debug for Credentials {
@@ -258,6 +280,7 @@ impl fmt::Debug for Credentials {
             Self::CleartextPassword(_) => {
                 f.write_str("Credentials::CleartextPassword(<REDACTED>)")
             }
+            Self::Md5Password(_) => f.write_str("Credentials::Md5Password(<REDACTED>)"),
         }
     }
 }

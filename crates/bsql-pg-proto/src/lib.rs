@@ -255,6 +255,7 @@ pub use error_arena::{ArenaError, DisplayError, ErrorPayload, ErrorRef};
 pub mod frame;
 pub mod guard;
 pub mod ident;
+pub(crate) mod md5;
 pub mod params;
 pub mod password;
 pub mod protocol;

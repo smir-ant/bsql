@@ -169,6 +169,57 @@ pub enum ProtoState {
     /// destructure completes).
     ConnectingCleartextAwaitingAuthOk(ReplyId<StartupKind>),
 
+    /// A `StartupMessage` was sent by an MD5-password connection;
+    /// awaiting `AuthenticationMD5Password` (sub-code 5) carrying
+    /// a 4-byte salt. DEF-216 (2026-05-05).
+    ///
+    /// # Why a single Box?
+    ///
+    /// MD5 password authentication needs BOTH the password AND the
+    /// username at digest-construction time (the inner hash is
+    /// `md5_hex(password || username)`). The username arrived in
+    /// the `StartupMessage` and is otherwise not retained by the
+    /// state machine; we keep it bundled with the password until
+    /// the handshake completes. Both live inside one
+    /// [`Md5HandshakeState`] struct, heap-boxed once, mirroring the
+    /// `SCRAM` PERF-02 single-Box pattern. Per-handshake total: 1
+    /// alloc (StartupMd5 construction) + 1 free (PasswordMessage
+    /// dispatch transition).
+    ///
+    /// # Tier-1 — variant carries its data
+    ///
+    /// `Box<Md5HandshakeState>` is non-`Option`; the variant cannot
+    /// exist without its handshake state. `ZeroizeOnDrop` fires on
+    /// every exit path through `Box::drop → Md5HandshakeState::drop`
+    /// → `Sensitive::drop` → `Password::drop`. The username field
+    /// is non-secret (it travelled cleartext in `StartupMessage`)
+    /// and does not need scrubbing.
+    ///
+    /// # Size pin
+    ///
+    /// Pre-Box: `Ident` (~64 B) + `Sensitive<Password>` (~514 B)
+    /// would balloon the variant past the 80 B `ProtoState` size
+    /// pin. Post-Box: 8 B (Box ptr) + 8 B (ReplyId) + 1 B (disc)
+    /// + align = ~24 B. Pin preserved.
+    ConnectingStartupMd5 {
+        /// Correlator for the Startup command.
+        reply: ReplyId<StartupKind>,
+        /// Bundled handshake state — username + password. See
+        /// [`Md5HandshakeState`] for fields. The Box is dropped on
+        /// every transition path, firing the ZeroizeOnDrop chain.
+        handshake: alloc::boxed::Box<crate::md5::Md5HandshakeState>,
+    },
+
+    /// `PasswordMessage` was sent (MD5 digest bytes); awaiting
+    /// `AuthenticationOk` (sub-code 0). DEF-216 (2026-05-05).
+    ///
+    /// Mirror of [`Self::ConnectingCleartextAwaitingAuthOk`]: only
+    /// `AuthOk` is legal here, anything else is `UnexpectedFrame`.
+    /// The handshake-state Box (containing password) was dropped at
+    /// the prior transition; this variant holds only the reply
+    /// correlator.
+    ConnectingMd5AwaitingAuthOk(ReplyId<StartupKind>),
+
     /// A `StartupMessage` was sent by a SCRAM-auth connection;
     /// awaiting `AuthenticationSASL` offering SCRAM-SHA-256.
     /// DEF-001 + DEF-097.
@@ -712,10 +763,12 @@ impl ProtoState {
             Self::ConnectingStartupTrust { reply }
             | Self::ConnectingStartupScram { reply, .. }
             | Self::ConnectingStartupCleartext { reply, .. }
+            | Self::ConnectingStartupMd5 { reply, .. }
             | Self::ConnectingScramAwaitingServerFirst { reply, .. }
             | Self::ConnectingScramAwaitingServerFinal { reply, .. }
             | Self::ConnectingScramAwaitingAuthOk(reply)
             | Self::ConnectingCleartextAwaitingAuthOk(reply)
+            | Self::ConnectingMd5AwaitingAuthOk(reply)
             | Self::ConnectingPostAuthAwaitingKey(reply)
             | Self::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
             Self::SimpleQueryAwaitingFirstResponse(id) => Some(id.consume()),
@@ -793,10 +846,12 @@ impl ProtoState {
             Self::ConnectingStartupTrust { .. }
             | Self::ConnectingStartupScram { .. }
             | Self::ConnectingStartupCleartext { .. }
+            | Self::ConnectingStartupMd5 { .. }
             | Self::ConnectingScramAwaitingServerFirst { .. }
             | Self::ConnectingScramAwaitingServerFinal { .. }
             | Self::ConnectingScramAwaitingAuthOk(_)
             | Self::ConnectingCleartextAwaitingAuthOk(_)
+            | Self::ConnectingMd5AwaitingAuthOk(_)
             | Self::ConnectingPostAuthAwaitingKey(_)
             | Self::ConnectingPostAuthHaveKey { .. } => StatePushClass::Connecting,
             Self::SimpleQueryAwaitingFirstResponse(_)
@@ -897,10 +952,12 @@ impl ProtoState {
             Self::ConnectingStartupTrust { .. }
             | Self::ConnectingStartupScram { .. }
             | Self::ConnectingStartupCleartext { .. }
+            | Self::ConnectingStartupMd5 { .. }
             | Self::ConnectingScramAwaitingServerFirst { .. }
             | Self::ConnectingScramAwaitingServerFinal { .. }
             | Self::ConnectingScramAwaitingAuthOk(_)
             | Self::ConnectingCleartextAwaitingAuthOk(_)
+            | Self::ConnectingMd5AwaitingAuthOk(_)
             | Self::Errored(_) => UnsolicitedAdmit {
                 allow_param_status: false,
                 allow_notice_response: false,
@@ -985,6 +1042,13 @@ impl core::fmt::Debug for ProtoState {
                 .finish_non_exhaustive(),
             Self::ConnectingCleartextAwaitingAuthOk(id) => {
                 write!(f, "ConnectingCleartextAwaitingAuthOk({id:?})")
+            }
+            Self::ConnectingStartupMd5 { reply, .. } => f
+                .debug_struct("ConnectingStartupMd5")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::ConnectingMd5AwaitingAuthOk(id) => {
+                write!(f, "ConnectingMd5AwaitingAuthOk({id:?})")
             }
             Self::ConnectingPostAuthAwaitingKey(id) => {
                 write!(f, "ConnectingPostAuthAwaitingKey({id:?})")

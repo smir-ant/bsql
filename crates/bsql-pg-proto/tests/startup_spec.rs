@@ -1625,3 +1625,286 @@ fn credentials_cleartext_debug_does_not_leak_password() {
         "Debug must NOT contain raw password text; got: {dbg}",
     );
 }
+
+// ------------------------------------------------------------------
+// (A) MD5-password auth handshake — DEF-216 (2026-05-05)
+// ------------------------------------------------------------------
+
+/// Build an `AuthenticationMD5Password` frame: tag 'R',
+/// length 12 (4 length + 4 sub-code + 4 salt), sub-code 5,
+/// 4-byte salt body.
+fn auth_md5_password_frame(salt: [u8; 4]) -> [u8; 13] {
+    [
+        b'R', 0, 0, 0, 12, // header: tag + length=12
+        0, 0, 0, 5,        // sub-code 5
+        salt[0], salt[1], salt[2], salt[3],
+    ]
+}
+
+/// Helper: push Startup with MD5 password credentials.
+fn startup_md5(
+    proto: &mut PgProtocol,
+    wb: &mut bsql_pg_proto::WriteBuf,
+    user: &str,
+    password: &str,
+    reply_raw: NonZeroU64,
+) {
+    let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
+    let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
+    proto.push_or_panic(
+        PgCommand::Startup {
+            user: user_ident,
+            database: None,
+            app_name: None,
+            credentials: Credentials::Md5Password(Sensitive::new(pw)),
+            reply: id(reply_raw),
+        },
+        wb,
+    );
+}
+
+/// Compute the expected MD5 password response body using the
+/// `md-5` library directly. The integration test asserts that the
+/// dispatcher's emitted bytes match this independent computation
+/// — a regression in input ordering, salt placement, or hex
+/// encoding produces a divergent response.
+fn expected_md5_response_body(password: &[u8], username: &[u8], salt: [u8; 4]) -> [u8; 35] {
+    use md5::{Digest, Md5};
+    let mut inner = Md5::new();
+    inner.update(password);
+    inner.update(username);
+    let inner_digest: [u8; 16] = inner.finalize().into();
+
+    let mut inner_hex = [0u8; 32];
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, byte) in inner_digest.iter().enumerate() {
+        let hi = usize::from(byte >> 4);
+        let lo = usize::from(byte & 0x0f);
+        if let (Some(h), Some(l)) = (HEX.get(hi).copied(), HEX.get(lo).copied()) {
+            if let Some(slot) = inner_hex.get_mut(i.saturating_mul(2)) {
+                *slot = h;
+            }
+            if let Some(slot) = inner_hex.get_mut(i.saturating_mul(2).saturating_add(1)) {
+                *slot = l;
+            }
+        }
+    }
+
+    let mut outer = Md5::new();
+    outer.update(inner_hex.as_slice());
+    outer.update(salt);
+    let outer_digest: [u8; 16] = outer.finalize().into();
+
+    let mut outer_hex = [0u8; 32];
+    for (i, byte) in outer_digest.iter().enumerate() {
+        let hi = usize::from(byte >> 4);
+        let lo = usize::from(byte & 0x0f);
+        if let (Some(h), Some(l)) = (HEX.get(hi).copied(), HEX.get(lo).copied()) {
+            if let Some(slot) = outer_hex.get_mut(i.saturating_mul(2)) {
+                *slot = h;
+            }
+            if let Some(slot) = outer_hex.get_mut(i.saturating_mul(2).saturating_add(1)) {
+                *slot = l;
+            }
+        }
+    }
+
+    let mut response = [0u8; 35];
+    if let Some(prefix) = response.get_mut(..3) {
+        prefix.copy_from_slice(b"md5");
+    }
+    if let Some(tail) = response.get_mut(3..) {
+        tail.copy_from_slice(&outer_hex);
+    }
+    response
+}
+
+/// Spec conformance: full MD5-password handshake. StartupMessage
+/// → AuthMD5Password (with 4-byte salt) → PasswordMessage with
+/// `"md5" + 32 hex chars + NUL` → AuthOk → BackendKeyData → RFQ
+/// → Idle + Reply::StartupComplete.
+#[test]
+fn md5_auth_handshake_end_to_end() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(600);
+    let password = "secret";
+    let user = "alice";
+    let salt: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+
+    startup_md5(&mut proto, &mut wb, user, password, startup_raw);
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingStartupMd5 { .. }
+    ));
+    wb.clear();
+
+    // Server replies with AuthMD5Password + 4-byte salt.
+    let out = proto.feed_bytes(&auth_md5_password_frame(salt), &mut wb);
+    assert_eq!(
+        out.len(),
+        1,
+        "AuthMD5Password must produce one SendBytes (PasswordMessage)",
+    );
+    let expected_body = expected_md5_response_body(password.as_bytes(), user.as_bytes(), salt);
+    match out.as_slice() {
+        [Action::SendBytes(bytes)] => {
+            // Frame: tag 'p' + BE u32 length + 35-byte body + NUL.
+            assert_eq!(bytes.len(), 1 + 4 + 35 + 1, "MD5 PasswordMessage frame size");
+            assert_eq!(
+                bytes.first().copied(),
+                Some(b'p'),
+                "MD5 PasswordMessage tag must be 'p'",
+            );
+            let len_bytes: [u8; 4] = bytes
+                .get(1..5)
+                .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                .unwrap_or_else(|| panic!("frame too short"));
+            let declared_len = u32::from_be_bytes(len_bytes);
+            let declared_len_usize = usize::try_from(declared_len)
+                .unwrap_or_else(|_| panic!("len overflow"));
+            assert_eq!(
+                declared_len_usize,
+                4 + 35 + 1,
+                "length-field includes itself + body + NUL",
+            );
+            // Body must equal the independently-computed expected
+            // response.
+            let body = bytes.get(5..40).unwrap_or_default();
+            assert_eq!(
+                body, &expected_body,
+                "MD5 response body byte-mismatch",
+            );
+            // Trailing NUL.
+            assert_eq!(
+                bytes.get(40).copied(),
+                Some(0u8),
+                "MD5 PasswordMessage body must be NUL-terminated",
+            );
+        }
+        other => panic!("expected single SendBytes, got {other:?}"),
+    }
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingMd5AwaitingAuthOk(_)
+    ));
+
+    // Server replies AuthOk; transition to PostAuthAwaitingKey.
+    wb.clear();
+    let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
+    assert_eq!(out.len(), 0, "AuthOk produces silent state transition");
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingPostAuthAwaitingKey(_)
+    ));
+
+    // BackendKeyData + RFQ complete the handshake.
+    let out = proto.feed_bytes(&backend_key_data_frame(11111, 22222), &mut wb);
+    assert_eq!(out.len(), 0);
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
+    assert_eq!(out.len(), 1);
+    match out.as_slice() {
+        [Action::DeliverReply { id: delivered_id, value }] => {
+            assert_eq!(delivered_id, &startup_raw);
+            match value {
+                Reply::StartupComplete(p) => {
+                    assert_eq!(p.pid, 11111);
+                    assert_eq!(p.secret_key, 22222);
+                }
+                other => panic!("expected StartupComplete, got {other:?}"),
+            }
+        }
+        other => panic!("expected DeliverReply, got {other:?}"),
+    }
+    assert!(matches!(proto.state(), ProtoState::Idle));
+}
+
+/// Wrong salt length (e.g. 3 bytes instead of 4) → tier-3
+/// `MalformedAuthentication` rejection. Server-side framing bug
+/// or active interference.
+#[test]
+fn md5_auth_rejects_wrong_salt_length() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(601);
+    startup_md5(&mut proto, &mut wb, "alice", "secret", startup_raw);
+    wb.clear();
+
+    // Build a malformed AuthMD5Password with only 3 salt bytes
+    // (length=11 instead of 12).
+    let frame: [u8; 12] = [
+        b'R', 0, 0, 0, 11, // length=11 (4 + 4 sub-code + 3 salt)
+        0, 0, 0, 5,        // sub-code 5
+        0xaa, 0xbb, 0xcc,  // 3-byte salt — protocol violation
+    ];
+    let out = proto.feed_bytes(&frame, &mut wb);
+    assert_eq!(
+        out.len(),
+        2,
+        "malformed MD5 salt → FailReply + CloseSocket",
+    );
+    match out.as_slice() {
+        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+            assert_eq!(failed_id, &startup_raw);
+            assert!(
+                matches!(cause, ProtocolError::MalformedAuthentication { .. }),
+                "expected MalformedAuthentication, got {cause:?}",
+            );
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+/// Server tries to coerce MD5 client into cleartext (downgrade) →
+/// rejected as `UnsupportedAuthMethod::KnownButWrong(CleartextPassword)`.
+/// Symmetric with cleartext + SCRAM downgrade-rejection pins.
+#[test]
+fn md5_startup_rejects_cleartext_offer() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(602);
+    startup_md5(&mut proto, &mut wb, "alice", "password", startup_raw);
+    wb.clear();
+
+    // AuthCleartextPassword frame: tag 'R', length 8, sub-code 3.
+    let cleartext_frame: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
+    let out = proto.feed_bytes(&cleartext_frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+            assert_eq!(failed_id, &startup_raw);
+            match cause {
+                ProtocolError::UnsupportedAuthMethod { sub_code } => {
+                    use bsql_pg_proto::error::AuthSubCodeClass;
+                    use bsql_pg_proto::wire::AuthSubCode;
+                    assert!(
+                        matches!(
+                            sub_code,
+                            AuthSubCodeClass::KnownButWrong(AuthSubCode::CleartextPassword),
+                        ),
+                        "expected KnownButWrong(CleartextPassword), got {sub_code:?}",
+                    );
+                }
+                other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
+            }
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+/// DEF-216 Debug-redaction pin: `Credentials::Md5Password` Debug
+/// must NOT print the password.
+#[test]
+fn credentials_md5_debug_does_not_leak_password() {
+    let pw = Password::try_from_str("super-secret-md5").unwrap_or_else(|e| panic!("{e}"));
+    let cred = bsql_pg_proto::Credentials::Md5Password(bsql_pg_proto::Sensitive::new(pw));
+    let dbg = format!("{cred:?}");
+    assert!(
+        dbg.contains("REDACTED"),
+        "Debug must contain REDACTED; got: {dbg}",
+    );
+    assert!(
+        !dbg.contains("super-secret-md5"),
+        "Debug must NOT contain raw password; got: {dbg}",
+    );
+}

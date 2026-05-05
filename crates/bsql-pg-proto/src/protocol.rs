@@ -2739,6 +2739,24 @@ fn compute_push_startup_idle_only(
             let password = alloc::boxed::Box::new(password);
             ProtoState::ConnectingStartupCleartext { reply, password }
         }
+        Credentials::Md5Password(password) => {
+            // DEF-216 (2026-05-05): MD5 needs BOTH password AND
+            // username at digest-construction time (server's
+            // 4-byte salt arrives later in
+            // AuthenticationMD5Password). Bundle them in a single
+            // Box<Md5HandshakeState> — same single-Box pattern as
+            // SCRAM PERF-02. Tier-1 variant-carries-field; the
+            // Box can never be None and ZeroizeOnDrop fires on
+            // every exit path through Box::drop →
+            // Md5HandshakeState::drop → Sensitive::drop →
+            // Password::drop. `user` is non-secret (cleartext on
+            // wire in StartupMessage above) and not zeroized.
+            let handshake = alloc::boxed::Box::new(crate::md5::Md5HandshakeState {
+                password,
+                user,
+            });
+            ProtoState::ConnectingStartupMd5 { reply, handshake }
+        }
     };
 }
 

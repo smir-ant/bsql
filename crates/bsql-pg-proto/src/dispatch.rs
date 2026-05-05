@@ -362,6 +362,43 @@ pub(crate) fn dispatch(
         (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
+        // ConnectingStartupMd5 — awaiting AuthenticationMD5Password
+        // (DEF-216, 2026-05-05). Mirror of cleartext + SCRAM startup
+        // arms. Only sub-code 5 (with a valid 4-byte salt) progresses;
+        // any other code is `UnsupportedAuthMethod` (downgrade
+        // rejection — security mirror of SCRAM dispatcher).
+        // =============================================================
+        (ProtoState::ConnectingStartupMd5 { reply, handshake }, TAG_AUTHENTICATION) => {
+            // Variant-carries-field: variant cannot exist without
+            // `Box<Md5HandshakeState>`. Move into per-variant
+            // dispatcher; the Box drops at function-return through
+            // the ZeroizeOnDrop chain (Box::drop → md5 state drop →
+            // Sensitive::drop → Password::drop).
+            dispatch_auth_in_startup_md5(state, reply, handshake, payload, reserved)
+        }
+        (ProtoState::ConnectingStartupMd5 { reply, .. }, TAG_ERROR_RESPONSE) => {
+            let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
+            install_errored(state, Some(reply.consume()), cause)
+        }
+        (ProtoState::ConnectingStartupMd5 { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
+            install_errored(state, Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
+        }
+        (ProtoState::ConnectingStartupMd5 { reply, .. }, other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+
+        // =============================================================
+        // ConnectingMd5AwaitingAuthOk — PasswordMessage sent;
+        // awaiting AuthenticationOk (DEF-216, 2026-05-05).
+        // =============================================================
+        (ProtoState::ConnectingMd5AwaitingAuthOk(reply), TAG_AUTHENTICATION) => {
+            dispatch_auth_ok_after_md5(state, reply, payload)
+        }
+        (ProtoState::ConnectingMd5AwaitingAuthOk(reply), TAG_ERROR_RESPONSE) => {
+            let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
+            install_errored(state, Some(reply.consume()), cause)
+        }
+        (ProtoState::ConnectingMd5AwaitingAuthOk(reply), other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+
+        // =============================================================
         // SCRAM: awaiting server-first-message
         // =============================================================
         (
@@ -1857,6 +1894,159 @@ fn build_password_message(
         w.push_bytes(password.get().as_bytes())?;
         // PG requires NUL-terminated password in the PasswordMessage
         // body. The length-prefix above includes the NUL byte.
+        w.push_u8(0)?;
+        Ok(())
+    })?;
+
+    crate::action::WriteRange::from_write_span(start, reserved)
+}
+
+// -----------------------------------------------------------------
+// MD5-password handshake — DEF-216 (2026-05-05)
+// -----------------------------------------------------------------
+
+/// Dispatch an Authentication message while in
+/// [`ProtoState::ConnectingStartupMd5`]. DEF-216.
+///
+/// Only `AUTH_MD5_PASSWORD` (sub-code 5) carrying a valid 4-byte
+/// salt is acceptable here. Any other code → `UnsupportedAuthMethod`.
+/// Wrong-length salt → `MalformedAuthentication`. Tier-1 exhaustive
+/// — adding a new `AuthSubCode` variant forces this dispatcher to
+/// classify it explicitly.
+///
+/// # Drop chain
+///
+/// `handshake: Box<Md5HandshakeState>` is moved in by value. The
+/// Box drops at function return on every path (success or error)
+/// through `Box::drop → Md5HandshakeState::drop → Sensitive::drop
+/// → Password::drop`, scrubbing the in-memory password copy via
+/// `ZeroizeOnDrop`. The MD5 digest computation in
+/// [`crate::md5::compute_response_body`] additionally wraps every
+/// password-derived intermediate buffer in `Zeroizing<>` so
+/// nothing leaks even transiently.
+fn dispatch_auth_in_startup_md5(
+    state: &mut ProtoState,
+    reply: ReplyId<crate::reply_id::StartupKind>,
+    handshake: alloc::boxed::Box<crate::md5::Md5HandshakeState>,
+    payload: &[u8],
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> DispatchOutcome {
+    let (code, rest) = match auth_sub_code(payload) {
+        Ok(pair) => pair,
+        Err(cause) => {
+            return install_errored(state, Some(reply.consume()), cause)
+        }
+    };
+
+    match code {
+        crate::wire::AuthSubCode::Md5Password => {
+            // Salt must be EXACTLY 4 bytes per PG §55.4. Anything
+            // else is a malformed Authentication frame — classify
+            // tier-3, transition to Errored. `payload_len` reports
+            // the FULL payload byte count (sub-code 4 B + salt
+            // bytes) for forensic visibility; a well-formed
+            // MD5 auth frame has payload_len == 8.
+            let salt: [u8; 4] = match <[u8; 4]>::try_from(rest) {
+                Ok(s) => s,
+                Err(_) => {
+                    return install_errored(
+                        state,
+                        Some(reply.consume()),
+                        ProtocolError::MalformedAuthentication {
+                            payload_len: payload.len(),
+                        },
+                    );
+                }
+            };
+
+            // Build the PasswordMessage frame inline against the
+            // branded write reservation. The handshake Box drops
+            // at function return (after this arm) — Drop chain
+            // scrubs password.
+            match build_md5_password_message(&handshake, salt, reserved) {
+                Ok(range) => {
+                    *state = ProtoState::ConnectingMd5AwaitingAuthOk(reply);
+                    DispatchOutcome::AdvancedWithAction {
+                        action: StagedAction::SendBytesRange(range),
+                    }
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
+        // Any other auth code in this state is an auth-method
+        // mismatch. Tier-1 exhaustive — symmetric with the
+        // cleartext + SCRAM dispatchers.
+        other @ (crate::wire::AuthSubCode::Ok
+            | crate::wire::AuthSubCode::CleartextPassword
+            | crate::wire::AuthSubCode::Sasl
+            | crate::wire::AuthSubCode::SaslContinue
+            | crate::wire::AuthSubCode::SaslFinal) => install_errored(state,
+            Some(reply.consume()),
+            ProtocolError::UnsupportedAuthMethod { sub_code: crate::error::AuthSubCodeClass::KnownButWrong(other) },
+        ),
+    }
+}
+
+/// Dispatch an Authentication message while in
+/// [`ProtoState::ConnectingMd5AwaitingAuthOk`]. DEF-216. Mirror of
+/// [`dispatch_auth_ok_after_cleartext`] / [`dispatch_auth_ok_after_scram`].
+fn dispatch_auth_ok_after_md5(
+    state: &mut ProtoState,
+    reply: ReplyId<crate::reply_id::StartupKind>,
+    payload: &[u8],
+) -> DispatchOutcome {
+    let code = match auth_sub_code(payload) {
+        Ok((code, _)) => code,
+        Err(cause) => {
+            return install_errored(state, Some(reply.consume()), cause)
+        }
+    };
+
+    if !matches!(code, crate::wire::AuthSubCode::Ok) {
+        return install_errored(
+            state,
+            Some(reply.consume()),
+            ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION },
+        );
+    }
+
+    *state = ProtoState::ConnectingPostAuthAwaitingKey(reply);
+    DispatchOutcome::AdvancedSilent
+}
+
+/// Build the `PasswordMessage` frame for MD5-password auth.
+/// DEF-216 (2026-05-05).
+///
+/// Wire shape: `'p' (TAG_SASL_RESPONSE)` + BE u32 length + 35-byte
+/// MD5 response body (`"md5" + 32 hex chars`) + NUL terminator.
+///
+/// The MD5 digest is computed by [`crate::md5::compute_response_body`]
+/// which wraps every password-derived intermediate in `Zeroizing<>`.
+fn build_md5_password_message(
+    handshake: &crate::md5::Md5HandshakeState,
+    salt: [u8; 4],
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> Result<crate::action::WriteRange, ProtocolError> {
+    // Compute the 35-byte response body into a Zeroizing buffer
+    // — although the body is what goes on the wire (not secret
+    // per se), it is password-derived; zeroizing the copy in our
+    // address space costs nothing and provides defence-in-depth.
+    let mut body: zeroize::Zeroizing<[u8; 35]> = zeroize::Zeroizing::new([0u8; 35]);
+    crate::md5::compute_response_body(
+        handshake.password.get(),
+        handshake.user.as_bytes(),
+        salt,
+        &mut body,
+    );
+
+    let start = reserved.len();
+    let buf = reserved.as_write_buf_mut();
+    buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte())?;
+    buf.with_length_prefix(|w| {
+        w.push_bytes(body.as_slice())?;
+        // PG's PasswordMessage body must be NUL-terminated (cleartext
+        // and MD5 share this contract — the body is treated as a
+        // cstring at the server).
         w.push_u8(0)?;
         Ok(())
     })?;
