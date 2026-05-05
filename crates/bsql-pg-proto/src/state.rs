@@ -115,6 +115,60 @@ pub enum ProtoState {
         reply: ReplyId<StartupKind>,
     },
 
+    /// A `StartupMessage` was sent by a cleartext-password connection;
+    /// awaiting `AuthenticationCleartextPassword` (sub-code 3).
+    /// DEF-215 (2026-05-05).
+    ///
+    /// # Tier-1 — variant carries its data
+    ///
+    /// `password` lives INSIDE this variant. The correlation
+    /// "cleartext-state has password material" is enforced
+    /// structurally — a future refactor cannot have
+    /// `ConnectingStartupCleartext` without a `Sensitive<Password>`.
+    /// `ZeroizeOnDrop` on `Password` (via `Sensitive`) fires
+    /// automatically on every exit path:
+    ///
+    /// - happy progression: arm body builds `PasswordMessage`,
+    ///   transitions to [`Self::ConnectingCleartextAwaitingAuthOk`];
+    ///   the `Box<Sensitive<Password>>` drops at the
+    ///   `mem::replace(state, ...)` call inside dispatch, scrubbing
+    ///   the password before the slot is reused.
+    /// - fatal teardown: `core::mem::replace(state, Errored(kind))`
+    ///   inside `fail_inflight_no_readbuf` drops the prev variant
+    ///   at function-return.
+    ///
+    /// # Heap-boxed (mirror of [`Self::ConnectingStartupScram`])
+    ///
+    /// `Sensitive<Password>` is ~514 B (512 B buf + len + align).
+    /// Inline storage would dominate `ProtoState` size pin
+    /// (currently 80 B exact). `Box` reduces variant footprint to
+    /// `8 B (ptr) + 8 B (ReplyId) + 1 B (disc) + align = ~24 B`.
+    /// Tier-1 preserved — `Box` cannot be `None`, its `Drop` fires
+    /// `Sensitive::Drop` → `Password::Drop` (`ZeroizeOnDrop`).
+    /// Cost in this variant: one heap alloc per cleartext handshake
+    /// (pre-StartupMessage construction; freed at PasswordMessage
+    /// dispatch time).
+    ConnectingStartupCleartext {
+        /// Correlator for the Startup command.
+        reply: ReplyId<StartupKind>,
+        /// Password material, heap-boxed for `ProtoState` size
+        /// containment. Drops with `ZeroizeOnDrop` on every exit
+        /// path. See variant docstring for size + Drop chain
+        /// rationale.
+        password: alloc::boxed::Box<crate::sensitive::Sensitive<crate::password::Password>>,
+    },
+
+    /// `PasswordMessage` was sent (cleartext bytes); awaiting
+    /// `AuthenticationOk` (sub-code 0). DEF-215 (2026-05-05).
+    ///
+    /// Only `AuthOk` is legal here — any other auth code or frame
+    /// is a protocol violation classified as `UnexpectedFrame`. The
+    /// password field has been scrubbed at the
+    /// `ConnectingStartupCleartext → ConnectingCleartextAwaitingAuthOk`
+    /// transition (variant-data Drop fires when the prior variant's
+    /// destructure completes).
+    ConnectingCleartextAwaitingAuthOk(ReplyId<StartupKind>),
+
     /// A `StartupMessage` was sent by a SCRAM-auth connection;
     /// awaiting `AuthenticationSASL` offering SCRAM-SHA-256.
     /// DEF-001 + DEF-097.
@@ -657,9 +711,11 @@ impl ProtoState {
             Self::PingAwaitingRfq(id) => Some(id.consume()),
             Self::ConnectingStartupTrust { reply }
             | Self::ConnectingStartupScram { reply, .. }
+            | Self::ConnectingStartupCleartext { reply, .. }
             | Self::ConnectingScramAwaitingServerFirst { reply, .. }
             | Self::ConnectingScramAwaitingServerFinal { reply, .. }
             | Self::ConnectingScramAwaitingAuthOk(reply)
+            | Self::ConnectingCleartextAwaitingAuthOk(reply)
             | Self::ConnectingPostAuthAwaitingKey(reply)
             | Self::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
             Self::SimpleQueryAwaitingFirstResponse(id) => Some(id.consume()),
@@ -736,9 +792,11 @@ impl ProtoState {
             Self::PingAwaitingRfq(_) => StatePushClass::PingAwaiting,
             Self::ConnectingStartupTrust { .. }
             | Self::ConnectingStartupScram { .. }
+            | Self::ConnectingStartupCleartext { .. }
             | Self::ConnectingScramAwaitingServerFirst { .. }
             | Self::ConnectingScramAwaitingServerFinal { .. }
             | Self::ConnectingScramAwaitingAuthOk(_)
+            | Self::ConnectingCleartextAwaitingAuthOk(_)
             | Self::ConnectingPostAuthAwaitingKey(_)
             | Self::ConnectingPostAuthHaveKey { .. } => StatePushClass::Connecting,
             Self::SimpleQueryAwaitingFirstResponse(_)
@@ -838,9 +896,11 @@ impl ProtoState {
             },
             Self::ConnectingStartupTrust { .. }
             | Self::ConnectingStartupScram { .. }
+            | Self::ConnectingStartupCleartext { .. }
             | Self::ConnectingScramAwaitingServerFirst { .. }
             | Self::ConnectingScramAwaitingServerFinal { .. }
             | Self::ConnectingScramAwaitingAuthOk(_)
+            | Self::ConnectingCleartextAwaitingAuthOk(_)
             | Self::Errored(_) => UnsolicitedAdmit {
                 allow_param_status: false,
                 allow_notice_response: false,
@@ -918,6 +978,13 @@ impl core::fmt::Debug for ProtoState {
                 .finish_non_exhaustive(),
             Self::ConnectingScramAwaitingAuthOk(id) => {
                 write!(f, "ConnectingScramAwaitingAuthOk({id:?})")
+            }
+            Self::ConnectingStartupCleartext { reply, .. } => f
+                .debug_struct("ConnectingStartupCleartext")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::ConnectingCleartextAwaitingAuthOk(id) => {
+                write!(f, "ConnectingCleartextAwaitingAuthOk({id:?})")
             }
             Self::ConnectingPostAuthAwaitingKey(id) => {
                 write!(f, "ConnectingPostAuthAwaitingKey({id:?})")

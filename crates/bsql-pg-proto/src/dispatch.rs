@@ -324,6 +324,44 @@ pub(crate) fn dispatch(
         (ProtoState::ConnectingStartupScram { reply, .. }, other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
+        // ConnectingStartupCleartext — awaiting AuthenticationCleartextPassword
+        // (DEF-215, 2026-05-05). Mirror of the Trust + SCRAM startup
+        // arms. A Cleartext connection only accepts AUTH_CLEARTEXT_PASSWORD
+        // (sub-code 3); AUTH_OK without challenge would be a server-side
+        // policy mismatch (server accepted nothing despite the user
+        // supplying a password — surfaced as `UnsupportedAuthMethod`).
+        // =============================================================
+        (ProtoState::ConnectingStartupCleartext { reply, password }, TAG_AUTHENTICATION) => {
+            // Variant-carries-field: the variant cannot exist without
+            // a `Box<Sensitive<Password>>`. Destructure here moves the
+            // Box into the per-variant dispatcher, which builds the
+            // `PasswordMessage` frame and drops the Box at scope end
+            // (Drop chain scrubs the password bytes).
+            dispatch_auth_in_startup_cleartext(state, reply, password, payload, reserved)
+        }
+        (ProtoState::ConnectingStartupCleartext { reply, .. }, TAG_ERROR_RESPONSE) => {
+            let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
+            install_errored(state, Some(reply.consume()), cause)
+        }
+        (ProtoState::ConnectingStartupCleartext { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
+            install_errored(state, Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
+        }
+        (ProtoState::ConnectingStartupCleartext { reply, .. }, other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+
+        // =============================================================
+        // ConnectingCleartextAwaitingAuthOk — PasswordMessage sent;
+        // awaiting AuthenticationOk (DEF-215, 2026-05-05).
+        // =============================================================
+        (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), TAG_AUTHENTICATION) => {
+            dispatch_auth_ok_after_cleartext(state, reply, payload)
+        }
+        (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), TAG_ERROR_RESPONSE) => {
+            let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
+            install_errored(state, Some(reply.consume()), cause)
+        }
+        (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+
+        // =============================================================
         // SCRAM: awaiting server-first-message
         // =============================================================
         (
@@ -1691,6 +1729,139 @@ fn dispatch_auth_ok_after_scram(
 
     *state = ProtoState::ConnectingPostAuthAwaitingKey(reply);
     DispatchOutcome::AdvancedSilent
+}
+
+// -----------------------------------------------------------------
+// Cleartext-password handshake — DEF-215 (2026-05-05)
+// -----------------------------------------------------------------
+
+/// Dispatch an Authentication message while in
+/// [`ProtoState::ConnectingStartupCleartext`]. DEF-215.
+///
+/// Only `AUTH_CLEARTEXT_PASSWORD` (sub-code 3) is acceptable here:
+/// any other code means the server expects an auth method this
+/// connection is not configured for. The match is tier-1 exhaustive
+/// — adding a new `AuthSubCode` variant forces this dispatcher to
+/// classify it explicitly.
+///
+/// # Drop chain
+///
+/// `password: Box<Sensitive<Password>>` is moved in by value. On the
+/// happy path the password bytes are written into the
+/// `PasswordMessage` frame (cleartext on the wire — TLS gate is the
+/// driver-wrapper's responsibility) and the Box drops at function
+/// return, scrubbing the in-memory copy via `ZeroizeOnDrop`. On any
+/// error path the Box drops at function return through the same
+/// chain.
+fn dispatch_auth_in_startup_cleartext(
+    state: &mut ProtoState,
+    reply: ReplyId<crate::reply_id::StartupKind>,
+    password: alloc::boxed::Box<crate::sensitive::Sensitive<crate::password::Password>>,
+    payload: &[u8],
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> DispatchOutcome {
+    let (code, _rest) = match auth_sub_code(payload) {
+        Ok(pair) => pair,
+        Err(cause) => {
+            return install_errored(state, Some(reply.consume()), cause)
+        }
+    };
+
+    match code {
+        crate::wire::AuthSubCode::CleartextPassword => {
+            // Build the PasswordMessage frame inline against the
+            // branded write reservation, then transition to the
+            // AuthOk-awaiting state. The Box drops at function
+            // return after this arm, scrubbing the password bytes.
+            match build_password_message(&password, reserved) {
+                Ok(range) => {
+                    *state = ProtoState::ConnectingCleartextAwaitingAuthOk(reply);
+                    DispatchOutcome::AdvancedWithAction {
+                        action: StagedAction::SendBytesRange(range),
+                    }
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
+        // Any other auth code in this state is an auth-method
+        // mismatch: the server expected something other than
+        // cleartext-password. Tier-1 exhaustive.
+        other @ (crate::wire::AuthSubCode::Ok
+            | crate::wire::AuthSubCode::Md5Password
+            | crate::wire::AuthSubCode::Sasl
+            | crate::wire::AuthSubCode::SaslContinue
+            | crate::wire::AuthSubCode::SaslFinal) => install_errored(state,
+            Some(reply.consume()),
+            ProtocolError::UnsupportedAuthMethod { sub_code: crate::error::AuthSubCodeClass::KnownButWrong(other) },
+        ),
+    }
+}
+
+/// Dispatch an Authentication message while in
+/// [`ProtoState::ConnectingCleartextAwaitingAuthOk`]. DEF-215.
+///
+/// Mirror of [`dispatch_auth_ok_after_scram`]: only `AUTH_OK` is
+/// acceptable; any other code or any other frame-tag is an
+/// `UnexpectedFrame` protocol error.
+fn dispatch_auth_ok_after_cleartext(
+    state: &mut ProtoState,
+    reply: ReplyId<crate::reply_id::StartupKind>,
+    payload: &[u8],
+) -> DispatchOutcome {
+    let code = match auth_sub_code(payload) {
+        Ok((code, _)) => code,
+        Err(cause) => {
+            return install_errored(state, Some(reply.consume()), cause)
+        }
+    };
+
+    if !matches!(code, crate::wire::AuthSubCode::Ok) {
+        return install_errored(
+            state,
+            Some(reply.consume()),
+            ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION },
+        );
+    }
+
+    *state = ProtoState::ConnectingPostAuthAwaitingKey(reply);
+    DispatchOutcome::AdvancedSilent
+}
+
+/// Build the `PasswordMessage` frame for cleartext-password auth.
+/// DEF-215 (2026-05-05).
+///
+/// PG protocol §55.7: the frame is `'p'` (`TAG_SASL_RESPONSE` —
+/// the byte is shared between SASL response and generic password
+/// messages, disambiguated by context) + BE u32 length-field
+/// (length includes itself + body) + password bytes + NUL
+/// terminator.
+///
+/// The length-prefix wrapper handles the BE u32 framing; we push
+/// password bytes followed by the trailing NUL inside the closure.
+fn build_password_message(
+    password: &crate::sensitive::Sensitive<crate::password::Password>,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> Result<crate::action::WriteRange, ProtocolError> {
+    let start = reserved.len();
+    let buf = reserved.as_write_buf_mut();
+    // `WriteBufFull` propagates through `?` via
+    // `From<WriteBufFull> for ProtocolError`
+    // (→ `InternalCrateBug { BuilderCapacityOverflow }`),
+    // matching the convention used by other branded builders
+    // (`build_query_message`, `build_parse_message`, etc.).
+    // Architecturally dead under `MAX_OWNED_SEND_LEN` budget per
+    // `write_buf.rs` const-asserts; routed through the error path
+    // for forensic visibility if a future drift slips through.
+    buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte())?;
+    buf.with_length_prefix(|w| {
+        w.push_bytes(password.get().as_bytes())?;
+        // PG requires NUL-terminated password in the PasswordMessage
+        // body. The length-prefix above includes the NUL byte.
+        w.push_u8(0)?;
+        Ok(())
+    })?;
+
+    crate::action::WriteRange::from_write_span(start, reserved)
 }
 
 // -----------------------------------------------------------------

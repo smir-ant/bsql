@@ -2728,6 +2728,17 @@ fn compute_push_startup_idle_only(
             );
             ProtoState::ConnectingStartupScram { reply, scram }
         }
+        Credentials::CleartextPassword(password) => {
+            // DEF-215 (2026-05-05): mirror of the SCRAM construction
+            // above. `Sensitive<Password>` is heap-boxed so the
+            // variant footprint stays within the `ProtoState == 80`
+            // size pin. Variant-carries-field invariant is
+            // compile-enforced — the variant cannot exist without a
+            // valid `Box<Sensitive<Password>>`. ZeroizeOnDrop fires
+            // on every exit path through the Box's Drop.
+            let password = alloc::boxed::Box::new(password);
+            ProtoState::ConnectingStartupCleartext { reply, password }
+        }
     };
 }
 

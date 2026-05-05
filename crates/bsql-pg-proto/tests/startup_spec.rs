@@ -1396,3 +1396,232 @@ fn param_status_missing_trailing_nul_classified_as_malformed() {
         proto.session_params().server_version,
     );
 }
+
+// ------------------------------------------------------------------
+// (A) Cleartext-password auth handshake — DEF-215 (2026-05-05)
+// ------------------------------------------------------------------
+
+/// Build an `AuthenticationCleartextPassword` frame: tag 'R',
+/// length 8, sub-code 3.
+fn auth_cleartext_password_frame() -> [u8; 9] {
+    [b'R', 0, 0, 0, 8, 0, 0, 0, 3]
+}
+
+/// Helper: push Startup with cleartext password credentials.
+fn startup_cleartext(
+    proto: &mut PgProtocol,
+    wb: &mut bsql_pg_proto::WriteBuf,
+    user: &str,
+    password: &str,
+    reply_raw: NonZeroU64,
+) {
+    let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
+    let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
+    proto.push_or_panic(
+        PgCommand::Startup {
+            user: user_ident,
+            database: None,
+            app_name: None,
+            credentials: Credentials::CleartextPassword(Sensitive::new(pw)),
+            reply: id(reply_raw),
+        },
+        wb,
+    );
+}
+
+/// Spec conformance: full cleartext-auth handshake. StartupMessage
+/// → AuthCleartextPassword → PasswordMessage emitted with the
+/// password bytes + NUL terminator → AuthOk → BackendKeyData → RFQ
+/// → Idle + Reply::StartupComplete.
+#[test]
+fn cleartext_auth_handshake_end_to_end() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(500);
+    let password = "secret123";
+
+    // Step 1: push StartupMessage with cleartext credentials.
+    startup_cleartext(&mut proto, &mut wb, "alice", password, startup_raw);
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingStartupCleartext { .. }
+    ));
+
+    // Drain the StartupMessage bytes from wb (don't need them
+    // for this test) before next-write.
+    wb.clear();
+
+    // Step 2: server replies with AuthenticationCleartextPassword.
+    // Client must respond with PasswordMessage.
+    let out = proto.feed_bytes(&auth_cleartext_password_frame(), &mut wb);
+    assert_eq!(
+        out.len(),
+        1,
+        "AuthCleartextPassword must produce exactly one SendBytes \
+         action (the PasswordMessage frame)",
+    );
+    match out.as_slice() {
+        [Action::SendBytes(bytes)] => {
+            // Frame shape: tag 'p' + BE u32 length + password + NUL.
+            let expected_body_len = password.len().saturating_add(1); // password + NUL
+            let expected_total = 5usize.saturating_add(expected_body_len);
+            assert_eq!(
+                bytes.len(),
+                expected_total,
+                "PasswordMessage frame size: tag(1) + length(4) + body({expected_body_len})",
+            );
+            assert_eq!(
+                bytes.first().copied(),
+                Some(b'p'),
+                "PasswordMessage tag must be 'p'",
+            );
+            // Length field is BE u32 of the 4-byte length itself + body.
+            let len_bytes: [u8; 4] = bytes
+                .get(1..5)
+                .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                .unwrap_or_else(|| panic!("frame too short for length field"));
+            let declared_len = u32::from_be_bytes(len_bytes);
+            let declared_len_usize = usize::try_from(declared_len)
+                .unwrap_or_else(|_| panic!("declared_len overflows usize"));
+            assert_eq!(
+                declared_len_usize,
+                4usize.saturating_add(expected_body_len),
+                "length-field includes itself + body",
+            );
+            // Body: password bytes + NUL.
+            let body = bytes.get(5..).unwrap_or_default();
+            let pw_slice = body.get(..password.len()).unwrap_or_default();
+            assert_eq!(
+                pw_slice,
+                password.as_bytes(),
+                "password bytes copied verbatim",
+            );
+            assert_eq!(
+                body.get(password.len()).copied(),
+                Some(0u8),
+                "PasswordMessage body must be NUL-terminated",
+            );
+        }
+        other => panic!("expected single SendBytes, got {other:?}"),
+    }
+    assert!(
+        matches!(proto.state(), ProtoState::ConnectingCleartextAwaitingAuthOk(_)),
+        "after PasswordMessage emission, state must transition to AwaitingAuthOk",
+    );
+
+    // Step 3: server replies with AuthenticationOk.
+    wb.clear();
+    let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
+    assert_eq!(out.len(), 0, "AuthOk produces silent state transition");
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingPostAuthAwaitingKey(_)
+    ));
+
+    // Step 4: BackendKeyData.
+    let out = proto.feed_bytes(&backend_key_data_frame(54321, 98765), &mut wb);
+    assert_eq!(out.len(), 0);
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingPostAuthHaveKey { .. }
+    ));
+
+    // Step 5: ReadyForQuery — completes the handshake.
+    let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
+    assert_eq!(out.len(), 1, "RFQ completes handshake with DeliverReply");
+    match out.as_slice() {
+        [Action::DeliverReply { id: delivered_id, value }] => {
+            assert_eq!(delivered_id, &startup_raw);
+            match value {
+                Reply::StartupComplete(p) => {
+                    assert_eq!(p.pid, 54321);
+                    assert_eq!(p.secret_key, 98765);
+                }
+                other => panic!("expected StartupComplete, got {other:?}"),
+            }
+        }
+        other => panic!("expected DeliverReply, got {other:?}"),
+    }
+    assert!(matches!(proto.state(), ProtoState::Idle));
+}
+
+/// Spec conformance: ErrorResponse mid-cleartext-handshake → tier-3
+/// classification, FailReply + CloseSocket, terminal Errored state.
+#[test]
+fn error_response_during_cleartext_startup() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(501);
+    startup_cleartext(&mut proto, &mut wb, "baduser", "wrong", startup_raw);
+    wb.clear();
+
+    let err_frame = error_response_frame("FATAL", "28P01", "password authentication failed");
+    let out = proto.feed_bytes(&err_frame, &mut wb);
+
+    assert_eq!(out.len(), 2, "ErrorResponse → FailReply + CloseSocket");
+    match out.as_slice() {
+        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+            assert_eq!(failed_id, &startup_raw);
+            assert!(
+                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+                "expected ServerErrorResponse, got {cause:?}",
+            );
+        }
+        other => panic!("unexpected action sequence: {other:?}"),
+    }
+}
+
+/// Spec conformance: server sends wrong auth code (e.g. SASL) while
+/// client is in cleartext-startup state → classified
+/// `UnsupportedAuthMethod` (tier-1: cleartext client refuses to
+/// engage with SASL even if it has credentials — security: prevent
+/// downgrade-by-server attacks).
+#[test]
+fn cleartext_startup_rejects_sasl_offer() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(502);
+    startup_cleartext(&mut proto, &mut wb, "alice", "password", startup_raw);
+    wb.clear();
+
+    let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
+    assert_eq!(out.len(), 2, "wrong auth code → FailReply + CloseSocket");
+    match out.as_slice() {
+        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+            assert_eq!(failed_id, &startup_raw);
+            match cause {
+                ProtocolError::UnsupportedAuthMethod { sub_code } => {
+                    use bsql_pg_proto::error::AuthSubCodeClass;
+                    use bsql_pg_proto::wire::AuthSubCode;
+                    assert!(
+                        matches!(
+                            sub_code,
+                            AuthSubCodeClass::KnownButWrong(AuthSubCode::Sasl),
+                        ),
+                        "expected KnownButWrong(Sasl), got {sub_code:?}",
+                    );
+                }
+                other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
+            }
+        }
+        other => panic!("unexpected action sequence: {other:?}"),
+    }
+}
+
+/// DEF-215 Debug-redaction pin (DEF-048-style): a `Credentials::
+/// CleartextPassword` instance must NOT print the password text
+/// in its Debug output.
+#[test]
+fn credentials_cleartext_debug_does_not_leak_password() {
+    let pw = Password::try_from_str("super-secret-cleartext").unwrap_or_else(|e| panic!("{e}"));
+    let cred = bsql_pg_proto::Credentials::CleartextPassword(bsql_pg_proto::Sensitive::new(pw));
+    let dbg = format!("{cred:?}");
+    assert!(
+        dbg.contains("REDACTED"),
+        "Debug must contain REDACTED marker; got: {dbg}",
+    );
+    assert!(
+        !dbg.contains("super-secret-cleartext"),
+        "Debug must NOT contain raw password text; got: {dbg}",
+    );
+}

@@ -182,19 +182,25 @@ impl fmt::Debug for Password {
 /// `Trust` means no password is sent — the server is configured to
 /// accept the connection based on pg_hba.conf rules alone.
 /// `ScramPassword` carries a password for SCRAM-SHA-256 authentication.
-// DEF-154 (O): `#[expect(clippy::large_enum_variant)]` retained.
-// Post-(O) shrink (1024→512 password), `ScramPassword` variant is
-// ~514 B vs `Trust`'s 0 B — clippy still flags the size diff.
-// Box the variant is forbidden by no_alloc; splitting the enum
-// would lose the single-return-type dispatch ergonomics. The
-// suppression is structural — user directive "no costyl" is
-// respected because the suppression has a LOAD-BEARING reason
-// (no_alloc), not a pragmatic "fix later".
-#[expect(
+// DEF-154 (O): originally `#[expect(clippy::large_enum_variant)]`.
+// DEF-215 (2026-05-05): downgraded to `#[allow]` after adding
+// `Credentials::CleartextPassword(Sensitive<Password>)` — clippy
+// no longer fires `large_enum_variant` once two distinct large
+// variants exist (the lint warns on dominant single-variant
+// imbalance, not symmetric large variants). The reason for
+// suppression remains load-bearing: `Credentials` is constructed
+// once per connection (cold path), the password lives on the
+// caller's stack by design, and boxing inside the enum would
+// require allocation that the no_alloc crate forbids at the
+// `Credentials` construction site.
+#[allow(
     clippy::large_enum_variant,
-    reason = "no_alloc crate: Box unavailable; Password lives on stack by design. \
-              Credentials is constructed once per connection, not per query. \
-              Pre-DEF-154 (O) the variant was 1026 B; (O) halved it to 514 B."
+    reason = "Credentials: cold-path enum constructed once per connection. \
+              Password is 512 B by design (MAX_PASSWORD_LEN); both \
+              ScramPassword and CleartextPassword carry one. Boxing at \
+              this layer would require allocation in the user's hand at \
+              the construction site, breaking the no_alloc-from-the- \
+              outside contract for the cold-path Credentials API."
 )]
 #[non_exhaustive]
 pub enum Credentials {
@@ -205,6 +211,24 @@ pub enum Credentials {
     /// The password is wrapped in [`Sensitive`] for zero-on-drop and
     /// debug redaction.
     ScramPassword(Sensitive<Password>),
+    /// Cleartext password authentication (PG `AuthenticationCleartextPassword`,
+    /// sub-code 3). DEF-215 (2026-05-05).
+    ///
+    /// The server requests the password as a NUL-terminated cleartext
+    /// string in a `PasswordMessage`. Common in legacy on-prem PG
+    /// configurations (PG ≤ 13 era).
+    ///
+    /// **Security**: cleartext password is sent as-is over the wire.
+    /// The connection MUST be TLS-protected (DEF-214) before the
+    /// startup phase begins, otherwise the password leaks.
+    /// `bsql-pg-proto` itself does not enforce the TLS gate; the
+    /// driver wrapper (`bsql-driver-postgres`, Phase 1e) is
+    /// responsible for refusing cleartext-credential constructs on
+    /// non-TLS connections.
+    ///
+    /// The password is wrapped in [`Sensitive`] for zero-on-drop and
+    /// debug redaction; same Drop chain as [`Self::ScramPassword`].
+    CleartextPassword(Sensitive<Password>),
 }
 
 impl fmt::Debug for Credentials {
@@ -231,6 +255,9 @@ impl fmt::Debug for Credentials {
         match self {
             Self::Trust => f.write_str("Credentials::Trust"),
             Self::ScramPassword(_) => f.write_str("Credentials::ScramPassword(<REDACTED>)"),
+            Self::CleartextPassword(_) => {
+                f.write_str("Credentials::CleartextPassword(<REDACTED>)")
+            }
         }
     }
 }
