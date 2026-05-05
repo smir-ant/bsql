@@ -233,6 +233,19 @@ proposals into factual data instead of speculation.
   without the gate. KEEP as-is; architect's "no benefit" concern
   falsified empirically.
 
+- **DEF-234 — SessionParams bool-pack audit**
+  REJECTED 2026-05-05 pre-implementation. Original framing assumed
+  `Option<bool>` fields take ~2 B each (Option discriminant + bool
+  byte). Empirical verification (`rustc check_size.rs`):
+  `Option<bool> = 1 byte` — niche-packed (bool uses bit-patterns 0/1;
+  Rust uses 2 as the `None` discriminant value). Two `Option<bool>`
+  fields = 2 bytes total. Packing into single u8 saves 1 byte.
+  Trade-off: 0.2% reduction of SessionParams (440 B → 439 B);
+  cost: typed bit accessors, loss of direct field-access
+  ergonomics, new BoolFlags(u8) struct + 4 method impls. **Cost
+  side dominates** for trivial space win on a cold-path
+  per-connection field. Not Pareto-better.
+
 - **DEF-239 — `FixedStr::default()` init cost optimisation**
   REJECTED 2026-05-05 pre-implementation. Audit identified real
   production callsites:
