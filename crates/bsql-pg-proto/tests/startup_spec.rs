@@ -1908,3 +1908,545 @@ fn credentials_md5_debug_does_not_leak_password() {
         "Debug must NOT contain raw password; got: {dbg}",
     );
 }
+
+// ==================================================================
+// (B) Negative-path & symmetric coverage — DEF-215 + DEF-216
+// (audit 2026-05-05): comprehensive dispatcher and downgrade-
+// rejection test suite. Crypto + auth cannot be "good enough"
+// covered; every transition × every input combination is exercised
+// to pin tier-1 invariants against future drift.
+// ==================================================================
+
+/// Build an Authentication frame whose body is exactly the 4-byte
+/// sub-code (no trailing data): tag 'R', length 8, sub-code as BE u32.
+/// Suitable for sub-codes that carry no body (Ok=0, Cleartext=3,
+/// arbitrary Unknown).
+fn auth_subcode_only_frame(subcode: u32) -> [u8; 9] {
+    let bytes = subcode.to_be_bytes();
+    [b'R', 0, 0, 0, 8, bytes[0], bytes[1], bytes[2], bytes[3]]
+}
+
+/// Helper: assert the FailReply path with `UnsupportedAuthMethod
+/// { sub_code: KnownButWrong(expected) }`.
+fn assert_known_but_wrong<const N: usize>(
+    proto: &mut PgProtocol,
+    wb: &mut bsql_pg_proto::WriteBuf,
+    frame: [u8; N],
+    expected_reply_raw: NonZeroU64,
+    expected_subcode: bsql_pg_proto::wire::AuthSubCode,
+) {
+    let out = proto.feed_bytes(&frame, wb);
+    assert_eq!(out.len(), 2, "wrong sub-code → FailReply + CloseSocket");
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &expected_reply_raw);
+            match cause {
+                ProtocolError::UnsupportedAuthMethod { sub_code } => {
+                    use bsql_pg_proto::error::AuthSubCodeClass;
+                    assert!(
+                        matches!(sub_code, AuthSubCodeClass::KnownButWrong(c) if *c == expected_subcode),
+                        "expected KnownButWrong({expected_subcode:?}), got {sub_code:?}",
+                    );
+                }
+                other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
+            }
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+/// Helper: assert UnexpectedFrame classification with the given
+/// frame tag.
+fn assert_unexpected_frame<const N: usize>(
+    proto: &mut PgProtocol,
+    wb: &mut bsql_pg_proto::WriteBuf,
+    frame: [u8; N],
+    expected_reply_raw: NonZeroU64,
+    expected_tag_byte: u8,
+) {
+    let out = proto.feed_bytes(&frame, wb);
+    assert_eq!(out.len(), 2, "unexpected frame → FailReply + CloseSocket");
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &expected_reply_raw);
+            match cause {
+                ProtocolError::UnexpectedFrame { tag } => {
+                    assert_eq!(tag.byte(), expected_tag_byte, "tag byte mismatch");
+                }
+                other => panic!("expected UnexpectedFrame, got {other:?}"),
+            }
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+// ----- MD5 startup state — negative AuthSubCode paths -----
+
+#[test]
+fn md5_startup_rejects_auth_ok_subcode() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(700);
+    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    assert_known_but_wrong(&mut proto, &mut wb, auth_subcode_only_frame(0), raw_id, AuthSubCode::Ok);
+}
+
+#[test]
+fn md5_startup_rejects_auth_sasl_continue_subcode() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(701);
+    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    assert_known_but_wrong(&mut proto, &mut wb, auth_subcode_only_frame(11), raw_id, AuthSubCode::SaslContinue);
+}
+
+#[test]
+fn md5_startup_rejects_auth_sasl_final_subcode() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(702);
+    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    assert_known_but_wrong(&mut proto, &mut wb, auth_subcode_only_frame(12), raw_id, AuthSubCode::SaslFinal);
+}
+
+#[test]
+fn md5_startup_rejects_unknown_subcode() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(703);
+    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+
+    let frame = auth_subcode_only_frame(99);
+    let out = proto.feed_bytes(&frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &raw_id);
+            match cause {
+                ProtocolError::UnsupportedAuthMethod { sub_code } => {
+                    use bsql_pg_proto::error::AuthSubCodeClass;
+                    let expected = match core::num::NonZeroU32::new(99) {
+                        Some(n) => n,
+                        None => panic!("99 is non-zero"),
+                    };
+                    assert!(
+                        matches!(sub_code, AuthSubCodeClass::Unknown(n) if *n == expected),
+                        "expected Unknown(99), got {sub_code:?}",
+                    );
+                }
+                other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
+            }
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+// ----- MD5AwaitingAuthOk — comprehensive negative paths -----
+
+/// Helper: drive proto to MD5AwaitingAuthOk state with valid
+/// MD5 challenge + response.
+fn drive_to_md5_awaiting_authok(
+    proto: &mut PgProtocol,
+    wb: &mut bsql_pg_proto::WriteBuf,
+    raw_id: NonZeroU64,
+) {
+    startup_md5(proto, wb, "user", "password", raw_id);
+    wb.clear();
+    let _ = proto.feed_bytes(&auth_md5_password_frame([1, 2, 3, 4]), wb);
+    assert!(
+        matches!(proto.state(), ProtoState::ConnectingMd5AwaitingAuthOk(_)),
+        "test setup invariant",
+    );
+    wb.clear();
+}
+
+#[test]
+fn md5_awaiting_authok_accepts_auth_ok() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(710);
+    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+
+    let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
+    assert_eq!(out.len(), 0, "AuthOk → silent state transition");
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingPostAuthAwaitingKey(_),
+    ));
+}
+
+#[test]
+fn md5_awaiting_authok_rejects_cleartext_subcode() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(711);
+    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    // After password sent, server replying with another auth
+    // request (cleartext sub-code) is a protocol violation.
+    assert_unexpected_frame(&mut proto, &mut wb, auth_subcode_only_frame(3), raw_id, b'R');
+}
+
+#[test]
+fn md5_awaiting_authok_rejects_md5_subcode() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(712);
+    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    assert_unexpected_frame(&mut proto, &mut wb, auth_md5_password_frame([0; 4]), raw_id, b'R');
+}
+
+#[test]
+fn md5_awaiting_authok_rejects_sasl_subcode() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(713);
+    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let frame = auth_sasl_frame();
+    let out = proto.feed_bytes(&frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &raw_id);
+            assert!(
+                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'R'),
+                "expected UnexpectedFrame{{R}}, got {cause:?}",
+            );
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+#[test]
+fn md5_awaiting_authok_handles_error_response() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(714);
+    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+
+    let err_frame = error_response_frame("FATAL", "28P01", "auth failed");
+    let out = proto.feed_bytes(&err_frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &raw_id);
+            assert!(
+                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+                "expected ServerErrorResponse, got {cause:?}",
+            );
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+#[test]
+fn md5_awaiting_authok_rejects_random_tag() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(715);
+    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    // 'Z' is the ReadyForQuery tag; arriving here pre-auth is
+    // out of order. Build a synthetic 6-byte RFQ frame.
+    let frame = [b'Z', 0, 0, 0, 5, b'I'];
+    let out = proto.feed_bytes(&frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &raw_id);
+            assert!(
+                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'Z'),
+                "expected UnexpectedFrame{{Z}}, got {cause:?}",
+            );
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+// ----- Cleartext startup — extended negative paths -----
+
+#[test]
+fn cleartext_startup_rejects_auth_ok_subcode() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(720);
+    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    assert_known_but_wrong(&mut proto, &mut wb, auth_subcode_only_frame(0), raw_id, AuthSubCode::Ok);
+}
+
+#[test]
+fn cleartext_startup_rejects_md5_password_offer() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(721);
+    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    assert_known_but_wrong(
+        &mut proto,
+        &mut wb,
+        auth_md5_password_frame([0xaa, 0xbb, 0xcc, 0xdd]),
+        raw_id,
+        AuthSubCode::Md5Password,
+    );
+}
+
+#[test]
+fn cleartext_startup_rejects_unknown_subcode() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(722);
+    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    let out = proto.feed_bytes(&auth_subcode_only_frame(77), &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
+            assert!(
+                matches!(cause, ProtocolError::UnsupportedAuthMethod { .. }),
+                "expected UnsupportedAuthMethod for unknown sub-code; got {cause:?}",
+            );
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+// ----- CleartextAwaitingAuthOk — negative paths -----
+
+fn drive_to_cleartext_awaiting_authok(
+    proto: &mut PgProtocol,
+    wb: &mut bsql_pg_proto::WriteBuf,
+    raw_id: NonZeroU64,
+) {
+    startup_cleartext(proto, wb, "user", "password", raw_id);
+    wb.clear();
+    let _ = proto.feed_bytes(&auth_subcode_only_frame(3), wb);
+    assert!(
+        matches!(proto.state(), ProtoState::ConnectingCleartextAwaitingAuthOk(_)),
+        "test setup invariant",
+    );
+    wb.clear();
+}
+
+#[test]
+fn cleartext_awaiting_authok_rejects_md5_subcode() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(730);
+    drive_to_cleartext_awaiting_authok(&mut proto, &mut wb, raw_id);
+    assert_unexpected_frame(
+        &mut proto,
+        &mut wb,
+        auth_md5_password_frame([0; 4]),
+        raw_id,
+        b'R',
+    );
+}
+
+#[test]
+fn cleartext_awaiting_authok_handles_error_response() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(731);
+    drive_to_cleartext_awaiting_authok(&mut proto, &mut wb, raw_id);
+
+    let err_frame = error_response_frame("FATAL", "28P01", "auth failed");
+    let out = proto.feed_bytes(&err_frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &raw_id);
+            assert!(
+                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+                "expected ServerErrorResponse, got {cause:?}",
+            );
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+// ----- Trust + SCRAM — symmetric downgrade rejection of new codes -----
+
+#[test]
+fn trust_startup_rejects_cleartext_password_offer() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(740);
+    startup_trust(&mut proto, &mut wb, "u", None, raw_id);
+    wb.clear();
+    assert_known_but_wrong(
+        &mut proto,
+        &mut wb,
+        auth_subcode_only_frame(3),
+        raw_id,
+        AuthSubCode::CleartextPassword,
+    );
+}
+
+#[test]
+fn trust_startup_rejects_md5_password_offer() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(741);
+    startup_trust(&mut proto, &mut wb, "u", None, raw_id);
+    wb.clear();
+    assert_known_but_wrong(
+        &mut proto,
+        &mut wb,
+        auth_md5_password_frame([0; 4]),
+        raw_id,
+        AuthSubCode::Md5Password,
+    );
+}
+
+#[test]
+fn scram_startup_rejects_cleartext_password_offer() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(742);
+    startup_scram(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    assert_known_but_wrong(
+        &mut proto,
+        &mut wb,
+        auth_subcode_only_frame(3),
+        raw_id,
+        AuthSubCode::CleartextPassword,
+    );
+}
+
+#[test]
+fn scram_startup_rejects_md5_password_offer() {
+    use bsql_pg_proto::wire::AuthSubCode;
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(743);
+    startup_scram(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    assert_known_but_wrong(
+        &mut proto,
+        &mut wb,
+        auth_md5_password_frame([0; 4]),
+        raw_id,
+        AuthSubCode::Md5Password,
+    );
+}
+
+// ----- ErrorResponse path coverage -----
+
+#[test]
+fn md5_startup_handles_error_response() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(750);
+    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+
+    let frame = error_response_frame("FATAL", "28000", "no pg_hba.conf entry");
+    let out = proto.feed_bytes(&frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &raw_id);
+            assert!(matches!(cause, ProtocolError::ServerErrorResponse { .. }));
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+#[test]
+fn md5_startup_handles_negotiate_protocol_version() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(751);
+    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    let frame = negotiate_proto_version_frame();
+    let out = proto.feed_bytes(&frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &raw_id);
+            assert!(matches!(cause, ProtocolError::UnsupportedProtocolOption));
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+#[test]
+fn cleartext_startup_handles_negotiate_protocol_version() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(752);
+    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    wb.clear();
+    let frame = negotiate_proto_version_frame();
+    let out = proto.feed_bytes(&frame, &mut wb);
+    assert_eq!(out.len(), 2);
+    match out.as_slice() {
+        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+            assert_eq!(id, &raw_id);
+            assert!(matches!(cause, ProtocolError::UnsupportedProtocolOption));
+        }
+        other => panic!("unexpected sequence: {other:?}"),
+    }
+}
+
+// ----- State preservation under password handling -----
+
+/// After a successful MD5 password emission, the password should
+/// no longer be reachable through the state. We can verify
+/// indirectly: the variant changes from
+/// `ConnectingStartupMd5 { handshake: Box<...> }` (carries pw) to
+/// `ConnectingMd5AwaitingAuthOk(reply)` (no pw field). Failing this
+/// transition would mean the password lingers in the state-machine
+/// envelope past the point it's needed.
+#[test]
+fn md5_state_post_dispatch_no_longer_carries_handshake() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(760);
+    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    // Pre-dispatch: state must be ConnectingStartupMd5.
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingStartupMd5 { .. },
+    ));
+    wb.clear();
+
+    let _ = proto.feed_bytes(&auth_md5_password_frame([0; 4]), &mut wb);
+    // Post-dispatch: state is the password-less variant.
+    assert!(
+        matches!(proto.state(), ProtoState::ConnectingMd5AwaitingAuthOk(_)),
+        "post-PasswordMessage state must be password-less variant",
+    );
+}
+
+#[test]
+fn cleartext_state_post_dispatch_no_longer_carries_password() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let raw_id = raw(761);
+    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    assert!(matches!(
+        proto.state(),
+        ProtoState::ConnectingStartupCleartext { .. },
+    ));
+    wb.clear();
+
+    let _ = proto.feed_bytes(&auth_subcode_only_frame(3), &mut wb);
+    assert!(
+        matches!(proto.state(), ProtoState::ConnectingCleartextAwaitingAuthOk(_)),
+        "post-PasswordMessage state must be password-less variant",
+    );
+}

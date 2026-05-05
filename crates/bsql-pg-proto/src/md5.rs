@@ -331,4 +331,216 @@ mod tests {
             assert_eq!(&out, expected, "hex encoding mismatch");
         }
     }
+
+    /// Exhaustive byte→hex coverage: every possible input byte
+    /// (0x00..=0xFF) at each of 16 positions produces the canonical
+    /// 2-char lowercase hex pair. A regression in the nibble lookup
+    /// table or in saturating-arithmetic offsets would surface here.
+    #[test]
+    fn hex_encoding_every_byte_value_at_every_position() {
+        for pos in 0..16usize {
+            for byte in 0..=255u8 {
+                let mut input = [0u8; 16];
+                if let Some(slot) = input.get_mut(pos) {
+                    *slot = byte;
+                }
+                let mut out = [0u8; 32];
+                write_hex_lowercase(&input, &mut out);
+
+                let hi = byte >> 4;
+                let lo = byte & 0x0f;
+                let expected_hi = if hi < 10 {
+                    b'0'.saturating_add(hi)
+                } else {
+                    b'a'.saturating_add(hi.saturating_sub(10))
+                };
+                let expected_lo = if lo < 10 {
+                    b'0'.saturating_add(lo)
+                } else {
+                    b'a'.saturating_add(lo.saturating_sub(10))
+                };
+                let i_hi = pos.saturating_mul(2);
+                let i_lo = i_hi.saturating_add(1);
+                assert_eq!(
+                    out.get(i_hi).copied(),
+                    Some(expected_hi),
+                    "hi nibble mismatch for byte {byte:#x} at pos {pos}",
+                );
+                assert_eq!(
+                    out.get(i_lo).copied(),
+                    Some(expected_lo),
+                    "lo nibble mismatch for byte {byte:#x} at pos {pos}",
+                );
+            }
+        }
+    }
+
+    /// Different salts on the same (password, username) pair must
+    /// produce different responses. If they didn't, the salt is
+    /// not load-bearing — a major protocol violation that would
+    /// allow replay attacks across reconnects with the same
+    /// credentials.
+    #[test]
+    fn different_salts_produce_different_responses() -> Result<(), &'static str> {
+        let pw = Password::try_from_str("hunter2").map_err(|_| "pw parse")?;
+        let user = b"user";
+
+        let mut out_a = [0u8; 35];
+        compute_response_body(&pw, user, [0x00, 0x00, 0x00, 0x00], &mut out_a);
+
+        let mut out_b = [0u8; 35];
+        compute_response_body(&pw, user, [0x00, 0x00, 0x00, 0x01], &mut out_b);
+
+        let mut out_c = [0u8; 35];
+        compute_response_body(&pw, user, [0xff, 0xff, 0xff, 0xff], &mut out_c);
+
+        assert_ne!(out_a, out_b, "1-bit salt change must alter response");
+        assert_ne!(out_a, out_c, "all-zero vs all-ones salt must differ");
+        assert_ne!(out_b, out_c, "different salts must produce different responses");
+        // All three start with "md5" — that prefix is constant.
+        assert_eq!(out_a.get(..3), Some(b"md5".as_slice()));
+        assert_eq!(out_b.get(..3), Some(b"md5".as_slice()));
+        assert_eq!(out_c.get(..3), Some(b"md5".as_slice()));
+        Ok(())
+    }
+
+    /// Different passwords on the same (username, salt) pair must
+    /// produce different responses. Sanity that password is
+    /// load-bearing in the digest computation.
+    #[test]
+    fn different_passwords_produce_different_responses() -> Result<(), &'static str> {
+        let pw1 = Password::try_from_str("password1").map_err(|_| "pw1 parse")?;
+        let pw2 = Password::try_from_str("password2").map_err(|_| "pw2 parse")?;
+        let user = b"alice";
+        let salt = [0xde, 0xad, 0xbe, 0xef];
+
+        let mut out1 = [0u8; 35];
+        compute_response_body(&pw1, user, salt, &mut out1);
+        let mut out2 = [0u8; 35];
+        compute_response_body(&pw2, user, salt, &mut out2);
+
+        assert_ne!(out1, out2, "different passwords must differ");
+        Ok(())
+    }
+
+    /// Different usernames on the same (password, salt) pair must
+    /// produce different responses. Sanity that username is
+    /// load-bearing — a regression that fed a wrong username (or
+    /// no username at all) would silently pass this test if the
+    /// distinction were absent. Per PG §55.4 username is part of
+    /// the inner hash.
+    #[test]
+    fn different_usernames_produce_different_responses() -> Result<(), &'static str> {
+        let pw = Password::try_from_str("samepw").map_err(|_| "pw parse")?;
+        let salt = [0x12, 0x34, 0x56, 0x78];
+
+        let mut out_alice = [0u8; 35];
+        compute_response_body(&pw, b"alice", salt, &mut out_alice);
+        let mut out_bob = [0u8; 35];
+        compute_response_body(&pw, b"bob", salt, &mut out_bob);
+
+        assert_ne!(out_alice, out_bob, "username must affect digest");
+        Ok(())
+    }
+
+    /// Empty username edge case. PG accepts empty username at the
+    /// SASL layer (the StartupMessage's user= field is the
+    /// authoritative source); the MD5 inner hash incorporates
+    /// whatever username we hash, even if empty. Verify the
+    /// algorithm doesn't panic or short-circuit on empty input.
+    #[test]
+    fn empty_username_does_not_panic() -> Result<(), &'static str> {
+        let pw = Password::try_from_str("x").map_err(|_| "pw parse")?;
+        let mut out = [0u8; 35];
+        compute_response_body(&pw, b"", [0; 4], &mut out);
+        assert_eq!(out.get(..3), Some(b"md5".as_slice()));
+        Ok(())
+    }
+
+    /// Idempotency: same inputs must produce same output across
+    /// multiple invocations. Catches regressions where someone
+    /// might accidentally introduce a stateful (e.g. nonce-mixing)
+    /// transformation.
+    #[test]
+    fn computation_is_deterministic() -> Result<(), &'static str> {
+        let pw = Password::try_from_str("test").map_err(|_| "pw parse")?;
+        let user = b"deterministic";
+        let salt = [0x42; 4];
+
+        let mut out_first = [0u8; 35];
+        compute_response_body(&pw, user, salt, &mut out_first);
+        for run in 0..10 {
+            let mut out_n = [0u8; 35];
+            compute_response_body(&pw, user, salt, &mut out_n);
+            assert_eq!(
+                out_n, out_first,
+                "run {run}: deterministic computation drifted",
+            );
+        }
+        Ok(())
+    }
+
+    /// Maximum-length password (the cap defined by `MAX_PASSWORD_LEN`).
+    /// MD5 is block-based and operates on arbitrary-length input; a
+    /// long password should hash without panic and produce a valid
+    /// 35-byte response.
+    #[test]
+    fn maximum_length_password_works() -> Result<(), &'static str> {
+        // MAX_PASSWORD_LEN = 512. Build a 512-byte string of 'x'.
+        let pw_str: alloc::string::String = "x".repeat(512);
+        let pw = Password::try_from_str(&pw_str).map_err(|_| "pw parse")?;
+        let mut out = [0u8; 35];
+        compute_response_body(&pw, b"u", [0; 4], &mut out);
+        assert_eq!(out.get(..3), Some(b"md5".as_slice()));
+        // Trailing 32 chars must be lowercase hex.
+        let tail = out.get(3..).ok_or("tail get")?;
+        for &b in tail {
+            assert!(
+                b.is_ascii_hexdigit() && !b.is_ascii_uppercase(),
+                "non-lowercase-hex byte {b:#x} in 512-byte-password response",
+            );
+        }
+        Ok(())
+    }
+
+    /// Salt pattern coverage — common byte patterns that historically
+    /// surface bugs (sign-extension, signed-vs-unsigned, all-zeros
+    /// short-circuit, off-by-one in array indexing).
+    #[test]
+    fn salt_pattern_coverage() -> Result<(), &'static str> {
+        let pw = Password::try_from_str("p").map_err(|_| "pw parse")?;
+        let user = b"u";
+
+        // Each salt pattern must produce a response distinct from
+        // all others (collision via salt would be catastrophic).
+        let salts: [[u8; 4]; 8] = [
+            [0x00, 0x00, 0x00, 0x00], // all zeros
+            [0xff, 0xff, 0xff, 0xff], // all ones
+            [0x55, 0xaa, 0x55, 0xaa], // alternating bits
+            [0xaa, 0x55, 0xaa, 0x55], // alternating bits, inverse
+            [0x80, 0x00, 0x00, 0x00], // high bit only (sign-extension trap)
+            [0x00, 0x00, 0x00, 0x80], // high bit only at end
+            [0x01, 0x02, 0x03, 0x04], // sequential
+            [0xfc, 0xfd, 0xfe, 0xff], // boundary
+        ];
+
+        let mut outputs: alloc::vec::Vec<[u8; 35]> = alloc::vec::Vec::with_capacity(salts.len());
+        for salt in salts {
+            let mut out = [0u8; 35];
+            compute_response_body(&pw, user, salt, &mut out);
+            outputs.push(out);
+        }
+        // Pairwise distinctness.
+        for i in 0..outputs.len() {
+            for j in i.saturating_add(1)..outputs.len() {
+                let oi = outputs.get(i).ok_or("idx i")?;
+                let oj = outputs.get(j).ok_or("idx j")?;
+                assert_ne!(
+                    oi, oj,
+                    "salt pattern {i} vs {j} produced colliding response",
+                );
+            }
+        }
+        Ok(())
+    }
 }
