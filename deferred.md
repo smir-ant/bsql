@@ -35,6 +35,8 @@ to git history. Keep this file a live work queue, NOT a diary.
 | DEF-160 | `PgCommand::Parse` carries `&'a str` SQL | Phase 1c-3a+ lifetime API |
 | DEF-161 | Error-body arena (closed — see DEF-184 A1+A13 shipped) | — |
 | DEF-162 | cargo-mutants kill-rate target | Phase 1d |
+| DEF-242 | **`ActiveGuard<'a>` typestate for feed-side** — symmetric to DEF-198 ReadyGuard. `proto.as_active() -> Option<ActiveGuard>` returns `None` when state==Errored; `ActiveGuard::feed_bytes` / `advance_one_frame` only callable from the guard. Lifts `IngressClassification::AlreadyErrored` arm from tier-3 runtime classification to **tier-1 compile-rejected** on the public API surface. Tier delta same shape as DEF-198. ~150 LoC, breaking API change. Identified by DEF-238 post-impl audit (2026-05-05) — only structural path to tier-1 closure of the AlreadyErrored arm. | Phase 1c-5 (state-machine guards bundle alongside DEF-005..009 pipelining) |
+| DEF-243 | **Eager `read_buf.clear()` at install_errored transition** — currently the transition-to-Errored path leaves read_buf un-scrubbed until next feed_bytes call (`AlreadyErrored` arm) or Drop-on-discard. Window ~one feed_bytes call interval; Drop catches the eager-discard pattern (DEF-185 P0-C zeroize-on-Drop). Tighter security: thread `read_buf` through `install_errored` / `fail_inflight_no_readbuf` signatures, scrub at the transition site itself. Mid-size refactor (signature plumbing through dispatch.rs + protocol.rs); non-critical (Drop path already scrubs eager-discard). Identified by DEF-238 post-impl audit (2026-05-05). | Phase 1d hygiene-tightening (bundle with other zeroize-timing audits) |
 
 ### Wire protocol coverage gaps (gap analysis 2026-05-04)
 
