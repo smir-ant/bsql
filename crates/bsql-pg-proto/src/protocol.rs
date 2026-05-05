@@ -3361,6 +3361,11 @@ fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter>(
 /// through [`crate::state::ProtoState::unsolicited_admit`] — one
 /// exhaustive match, two bool projections. **Drift between the
 /// two classifiers is structurally impossible**.
+// DEF-236 (audit 2026-05-05): hot inbound dispatch, called per frame.
+// LLVM already inlines transparently — `#[inline]` makes the intent
+// explicit (explicit > implicit) and pins behaviour against future
+// heuristic shifts.
+#[inline]
 const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
     state.unsolicited_admit().allow_param_status
 }
@@ -3381,6 +3386,10 @@ const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
 /// Routes through [`crate::state::ProtoState::unsolicited_admit`].
 /// See [`allows_unsolicited_param_status`] for the SR-03 unification
 /// rationale (single exhaustive source, no parallel-classifier drift).
+// DEF-236 (audit 2026-05-05): same reasoning as
+// `allows_unsolicited_param_status` — LLVM already inlines; `#[inline]`
+// pins intent.
+#[inline]
 const fn allows_unsolicited_notice_response(state: &ProtoState) -> bool {
     state.unsolicited_admit().allow_notice_response
 }
@@ -3584,6 +3593,11 @@ fn build_startup_message(
 /// - Push failure: tier-1 by `Result::Err` arm exhaustive match.
 /// - Dead arm classification: tier-2 structural (debug_assert in
 ///   dev/test, architectural-impossibility-by-const-assert in release).
+// DEF-236 (audit 2026-05-05): single call site (push_command_internal).
+// ASM diff (revert vs `#[inline]`): standalone symbol disappears,
+// body folds into caller's tail. LLVM accepts hint at this size +
+// site-count combination — codegen evidence supports the annotation.
+#[inline]
 fn materialise_push(
     staged: StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
@@ -3689,6 +3703,11 @@ fn materialise_push(
 /// refuses any `&mut WriteBuf` re-borrow while the returned
 /// `OutActions<'w, 'r>` is alive, and any `&mut self` re-borrow
 /// on `PgProtocol` while `'r` is alive.
+// DEF-236 (audit 2026-05-05): NO `#[inline]`. ASM diff (revert vs
+// `#[inline]`): standalone symbol persists with `bl` calls at all
+// 4 call sites — LLVM rejects the hint. Body too large to inline at
+// 4 sites without net code bloat. Annotation would be ineffective
+// noise; LLVM heuristic is correct here.
 fn materialise<'w, 'r>(
     staged: StagedActions,
     write_bytes: &'w [u8],

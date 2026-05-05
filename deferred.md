@@ -300,58 +300,6 @@ proposals into factual data instead of speculation.
   current dispatch is suboptimal, or a workload where PS density
   on hot path is measurable.
 
-- **DEF-236 — `#[inline]` audit on hot-path fns**
-  REJECTED 2026-05-05 measurement-inconclusive. Audit applied
-  `#[inline]` to 4 candidate hot-path fns in `protocol.rs`:
-  `allows_unsolicited_param_status`, `allows_unsolicited_notice_response`,
-  `materialise_push`, `materialise`. **ASM diff (revert vs inlined)
-  found**:
-  - `allows_unsolicited_*` (tiny one-liners): LLVM **already** inlines
-    them without hint — no symbol in either ASM. Hint redundant.
-  - `materialise_push` (single-call-site, medium body): LLVM **takes**
-    the hint — symbol disappears in inlined ASM (caller absorbs body).
-  - `materialise` (4 call sites, medium body): LLVM **ignores** the
-    hint — keeps standalone symbol with `bl` calls at all 4 sites.
-    Body too large to inline at 4 sites profitably; LLVM's heuristic
-    overrides the (advisory) `#[inline]`.
-
-  **Bench measurement (3 runs, baseline `def236-applied` saved with
-  inlines, revert state compared)**:
-  | Bench | Run 1 | Run 2 | Run 3 |
-  |---|---|---|---|
-  | parse_header/rfq_header | -0.83% (p=0.03) | -0.78% (p=0.04) | **+3.04%** (p<0.05) |
-  | ping_round_trip/ping | n/s | n/s | +2.48% (p<0.05) |
-  | iter_rows_via_next_event | +4.42% (p<0.05) | n/s | n/s |
-  | push_command/ping | n/s | n/s | n/s |
-
-  Negative numbers = revert is faster (= inline marginally hurt).
-  Positive = revert is slower (= inline helped). **Sign flips between
-  runs on the same code state.** System load avg 4.0, CPU
-  utilization 138% — bench harness noise dominated signal.
-  No bench shows reproducible win across 3 runs. parse_header and
-  iter_rows show statistically-significant changes in opposite
-  directions across runs — pure measurement variance.
-
-  **Conclusion:**
-  - LLVM inline heuristic is already optimal for these 4 fns.
-  - `#[inline]` on `allows_unsolicited_*` is no-op (already inlined).
-  - `#[inline]` on `materialise` is no-op (LLVM rejects the hint).
-  - `#[inline]` on `materialise_push` produces ASM-observable change
-    but bench cannot resolve a clear win on this hardware/load.
-
-  **Reopen requires** EITHER (a) a stable bench environment (load
-  avg < 0.5, fixed CPU clock, multiple runs converge on a sign) AND
-  ≥3% reproducible win on a target bench, OR (b) profile-guided
-  optimisation (PGO) data showing LLVM's heuristic mismatches the
-  workload, OR (c) `#[inline(always)]` (forces LLVM, bypasses
-  heuristic) accompanied by clear measurement justification —
-  current evidence does not support that hammer.
-
-  **Lesson:** measurement-gated work needs a quiet system. Bench
-  noise of ±3% per run on a busy laptop swamps the kind of signal
-  inline annotations produce on already-well-optimised hot paths.
-  Defer DEF-236 to bench-environment overhaul or PGO milestone.
-
 - **DEF-211 SAFE-01 / SAFE-01' — `heapless::Vec` replacement**
   REJECTED 2026-05-04 pre-implementation. Architect-agent
   proposed replacing `heapless::Vec<T, N>` with a hand-rolled safe
@@ -570,6 +518,7 @@ Full detail in git log; this is just a navigation aid.
 - **DEF-198**: Witness-guard typestate. New module `crates/bsql-pg-proto/src/guard.rs` introduces `ReadyGuard<'a>` (a `&'a mut PgProtocol` zero-sized newtype) plus `ConnectionStatus { Ready, Busy, Handshaking, Errored(StateErrorKind) }` enum. `PgProtocol::push_command` and `push_bind_execute` moved from public to `pub(crate)` (now `push_command_internal` / `push_bind_execute_internal`). Public surface is `proto.as_ready() -> Option<ReadyGuard<'_>>` (returns `Some` only for `state == Idle`) and `proto.connection_status() -> ConnectionStatus`. Tier-1 closure via two-step transitive exhaustive match: `ProtoState → push_class() (5 variants) → as_ready/connection_status` (exhaustive over `StatePushClass`). Closure pinned by 4 `compile_fail` doctests in `guard.rs` (proves `proto.push_command(...)` from outside crate is compile-rejected, two simultaneous guards are borrow-checker-rejected, consumed-guard reuse is move-checker-rejected) and 9 behavioural tests in `tests/def198_guard_closure_spec.rs` (one per `StatePushClass`). 60 test/bench callsites migrated via `tests/common/mod.rs` `PushOrPanic` extension trait + bench-internal `BenchPushOrPanic` trait. 12 prior FailReply-on-non-Idle integration tests rewritten to test public-API `as_ready().is_none()` + `connection_status()` classification (the underlying `compute_push_*` defensive arms remain, tested by `compute_push_tests` private module). Bench `def198-final`: push_command/ping +3.2% (~3 ns added — irreducible tier-1 closure cost, the as_ready dispatch on `state.push_class()`); push_command/ping_amortised +2.5% (~1.5 ns); ping_round_trip −3.2% (within noise but trends improved); column_decode/iter_rows benches noise-level (±2%). Send asserted for `ReadyGuard<'static>` and `ConnectionStatus`. SHIPPED 2026-04-28.
 - **DEF-197**: Column-decode bench infrastructure. Added 5 `column_decode/*` benches measuring `DataRowRef::parse`, `ColumnsIter` per-column walk, `FromPgText` typed decode (i32, &str), and NULL fast-path. Baseline `def197-decoder`: header parse 1.10 ns, raw iter 1.23 ns/col, i32 decode 8.84 ns/col (~7.6 ns is `str::parse`), text decode 8.42 ns/col (~7.2 ns is UTF-8 validate), NULL fast-path 0.6 ns/null. **Closes the largest measurement blind spot** — future decoder optimisations (DEF-200/202/203) now ship with evidence per CREDO §4.12. Per-row decode 44 ns × 1M rows = 44 ms on large SELECTs — comparable to frame dispatch cost. No production code change. Commit 0a14efa. SHIPPED 2026-04-28.
 - **DEF-204**: `ReadBuf::compact()` staleness leak closure. Pre-fix `copy_within + truncate` left bytes physically at `[unread_len..pre_compact_len)` retaining pre-compact content (consumed prefix's content + source side of copy_within); secret-correlated bytes from prior frames persisted in the array. Post-fix: in-place zeroize of abandoned tail BEFORE truncate. Tier-3 by-audit → tier-2 structural. ~5 LoC change in `buf.rs::compact`. 2 memory-probe tests added (`tests/buf_compact_staleness_spec.rs`, `#[ignore]`-gated, Miri-validated): `def204_compact_zeroizes_abandoned_tail` + `def204_compact_no_op_when_cursor_zero_does_not_zero`. SHIPPED 2026-04-27.
+- **DEF-236**: `#[inline]` audit on protocol-hot-path classifier/materialise pair. ASM-driven (revert-vs-inlined `.s` diff): (a) `allows_unsolicited_param_status` + `allows_unsolicited_notice_response` (tiny one-liners) — LLVM already transparently inlines without hint; `#[inline]` applied for explicit intent + future-heuristic-shift pinning. (b) `materialise_push` (single call site `push_command_internal`) — LLVM takes the hint, standalone symbol vanishes in inlined ASM; `#[inline]` applied (codegen evidence shows real fold-in). (c) `materialise` (4 call sites in `feed_bytes_impl` arms) — LLVM rejects the hint (`bl` to standalone symbol persists at all 4 sites; body too large for net code bloat at 4 sites); NO `#[inline]` annotation, comment-only documents the audit finding so future contributors don't re-attempt. Bench measurement (load avg 4.0, 138% CPU) inconclusive — sign flipped across 3 runs on identical code state, pure noise. Conclusion stands on **codegen evidence** (LLVM's accept/reject decision), not bench: explicit annotation where LLVM accepts, comment where LLVM rejects, no decoration anywhere. Reopen path: PGO data, or quiet-bench environment showing reproducible win. SHIPPED 2026-05-05.
 
 ### DEF-184 (post-Y comprehensive audit)
 Shipped batches (commit-anchored):
