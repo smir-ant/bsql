@@ -300,6 +300,58 @@ proposals into factual data instead of speculation.
   current dispatch is suboptimal, or a workload where PS density
   on hot path is measurable.
 
+- **DEF-236 — `#[inline]` audit on hot-path fns**
+  REJECTED 2026-05-05 measurement-inconclusive. Audit applied
+  `#[inline]` to 4 candidate hot-path fns in `protocol.rs`:
+  `allows_unsolicited_param_status`, `allows_unsolicited_notice_response`,
+  `materialise_push`, `materialise`. **ASM diff (revert vs inlined)
+  found**:
+  - `allows_unsolicited_*` (tiny one-liners): LLVM **already** inlines
+    them without hint — no symbol in either ASM. Hint redundant.
+  - `materialise_push` (single-call-site, medium body): LLVM **takes**
+    the hint — symbol disappears in inlined ASM (caller absorbs body).
+  - `materialise` (4 call sites, medium body): LLVM **ignores** the
+    hint — keeps standalone symbol with `bl` calls at all 4 sites.
+    Body too large to inline at 4 sites profitably; LLVM's heuristic
+    overrides the (advisory) `#[inline]`.
+
+  **Bench measurement (3 runs, baseline `def236-applied` saved with
+  inlines, revert state compared)**:
+  | Bench | Run 1 | Run 2 | Run 3 |
+  |---|---|---|---|
+  | parse_header/rfq_header | -0.83% (p=0.03) | -0.78% (p=0.04) | **+3.04%** (p<0.05) |
+  | ping_round_trip/ping | n/s | n/s | +2.48% (p<0.05) |
+  | iter_rows_via_next_event | +4.42% (p<0.05) | n/s | n/s |
+  | push_command/ping | n/s | n/s | n/s |
+
+  Negative numbers = revert is faster (= inline marginally hurt).
+  Positive = revert is slower (= inline helped). **Sign flips between
+  runs on the same code state.** System load avg 4.0, CPU
+  utilization 138% — bench harness noise dominated signal.
+  No bench shows reproducible win across 3 runs. parse_header and
+  iter_rows show statistically-significant changes in opposite
+  directions across runs — pure measurement variance.
+
+  **Conclusion:**
+  - LLVM inline heuristic is already optimal for these 4 fns.
+  - `#[inline]` on `allows_unsolicited_*` is no-op (already inlined).
+  - `#[inline]` on `materialise` is no-op (LLVM rejects the hint).
+  - `#[inline]` on `materialise_push` produces ASM-observable change
+    but bench cannot resolve a clear win on this hardware/load.
+
+  **Reopen requires** EITHER (a) a stable bench environment (load
+  avg < 0.5, fixed CPU clock, multiple runs converge on a sign) AND
+  ≥3% reproducible win on a target bench, OR (b) profile-guided
+  optimisation (PGO) data showing LLVM's heuristic mismatches the
+  workload, OR (c) `#[inline(always)]` (forces LLVM, bypasses
+  heuristic) accompanied by clear measurement justification —
+  current evidence does not support that hammer.
+
+  **Lesson:** measurement-gated work needs a quiet system. Bench
+  noise of ±3% per run on a busy laptop swamps the kind of signal
+  inline annotations produce on already-well-optimised hot paths.
+  Defer DEF-236 to bench-environment overhaul or PGO milestone.
+
 - **DEF-211 SAFE-01 / SAFE-01' — `heapless::Vec` replacement**
   REJECTED 2026-05-04 pre-implementation. Architect-agent
   proposed replacing `heapless::Vec<T, N>` with a hand-rolled safe
