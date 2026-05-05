@@ -421,6 +421,35 @@ pub const TERMINATE_WIRE_BYTES: [u8; 5] = [TAG_TERMINATE.byte(), 0, 0, 0, 4];
 /// `AuthenticationOk` — sub-code 0.
 pub const AUTH_OK: u32 = 0;
 
+/// `AuthenticationCleartextPassword` — sub-code 3. DEF-215 (2026-05-05).
+///
+/// Server requests the user's password as a NUL-terminated
+/// cleartext string in a `PasswordMessage` ('p') frame. Most
+/// legacy on-prem PG configurations still default to this auth
+/// method; SCRAM (sub-code 10) became the default only in PG 14.
+///
+/// Wire-protocol-only constant in this commit — actual flow
+/// (`Credentials::CleartextPassword` variant + state-machine
+/// integration) lands in DEF-215 follow-up. Exhaustive matches on
+/// `AuthSubCode` will fail to build until handlers explicitly
+/// classify this code (currently rejected as `KnownButWrong`).
+pub const AUTH_CLEARTEXT_PASSWORD: u32 = 3;
+
+/// `AuthenticationMD5Password` — sub-code 5. DEF-216 (2026-05-05).
+///
+/// Server requests the password salted and hashed via the legacy
+/// MD5-based scheme. Client digest is `md5_hex(md5_hex(password
+/// concat username) concat salt)`, prefixed with the literal
+/// `"md5"`, sent in a `PasswordMessage`. Salt is 4 bytes from the
+/// auth payload. Common in PG up to and including version 13 on
+/// enterprise on-prem installs; PG 14 and newer default to SCRAM.
+///
+/// Wire-protocol-only constant in this commit — actual flow
+/// (`Credentials::Md5Password` variant + `md5` RustCrypto
+/// dependency + state-machine integration) lands in DEF-216
+/// follow-up.
+pub const AUTH_MD5_PASSWORD: u32 = 5;
+
 /// `AuthenticationSASL` — sub-code 10. Mechanism list follows.
 pub const AUTH_SASL: u32 = 10;
 
@@ -433,8 +462,9 @@ pub const AUTH_SASL_FINAL: u32 = 12;
 /// Typed classification of PG `AuthenticationXxx` sub-codes.
 ///
 /// PG's `AuthenticationXxx` frame carries a 4-byte BE `u32` code as
-/// its first payload word. PG spec defines four values in our current
-/// scope: `Ok` (0), `SASL` (10), `SASLContinue` (11), `SASLFinal` (12).
+/// its first payload word. PG spec defines six values in our current
+/// scope: `Ok` (0), `CleartextPassword` (3), `Md5Password` (5),
+/// `SASL` (10), `SASLContinue` (11), `SASLFinal` (12).
 ///
 /// # Tier-1 compile benefits
 ///
@@ -468,7 +498,7 @@ pub const AUTH_SASL_FINAL: u32 = 12;
 /// # Unknown codes
 ///
 /// The server may send any `u32`. [`AuthSubCode::try_from_u32`]
-/// returns `None` for codes outside the 4 known values — callers
+/// returns `None` for codes outside the 6 known values — callers
 /// classify as `ProtocolError::UnsupportedAuthMethod` carrying the
 /// raw u32.
 ///
@@ -481,6 +511,14 @@ pub const AUTH_SASL_FINAL: u32 = 12;
 pub enum AuthSubCode {
     /// `AuthenticationOk` (0). Server accepted authentication.
     Ok = 0,
+    /// `AuthenticationCleartextPassword` (3). DEF-215 (2026-05-05).
+    /// Server requests cleartext password in a `PasswordMessage`.
+    /// Most legacy on-prem PG configs still default to this.
+    CleartextPassword = 3,
+    /// `AuthenticationMD5Password` (5). DEF-216 (2026-05-05).
+    /// Server requests salted MD5 password digest in a
+    /// `PasswordMessage`. Common in PG ≤ 13 enterprise installs.
+    Md5Password = 5,
     /// `AuthenticationSASL` (10). Server offers SASL mechanisms.
     Sasl = 10,
     /// `AuthenticationSASLContinue` (11). Server-first-message follows.
@@ -503,6 +541,8 @@ impl AuthSubCode {
     pub const fn try_from_u32(code: u32) -> Result<Self, u32> {
         match code {
             AUTH_OK => Ok(Self::Ok),
+            AUTH_CLEARTEXT_PASSWORD => Ok(Self::CleartextPassword),
+            AUTH_MD5_PASSWORD => Ok(Self::Md5Password),
             AUTH_SASL => Ok(Self::Sasl),
             AUTH_SASL_CONTINUE => Ok(Self::SaslContinue),
             AUTH_SASL_FINAL => Ok(Self::SaslFinal),
@@ -518,6 +558,8 @@ impl AuthSubCode {
     pub const fn raw(self) -> u32 {
         match self {
             Self::Ok => AUTH_OK,
+            Self::CleartextPassword => AUTH_CLEARTEXT_PASSWORD,
+            Self::Md5Password => AUTH_MD5_PASSWORD,
             Self::Sasl => AUTH_SASL,
             Self::SaslContinue => AUTH_SASL_CONTINUE,
             Self::SaslFinal => AUTH_SASL_FINAL,
@@ -530,6 +572,20 @@ const _: () = {
     assert!(
         matches!(AuthSubCode::try_from_u32(AuthSubCode::Ok.raw()), Ok(AuthSubCode::Ok)),
         "AuthSubCode round-trip broken: Ok",
+    );
+    assert!(
+        matches!(
+            AuthSubCode::try_from_u32(AuthSubCode::CleartextPassword.raw()),
+            Ok(AuthSubCode::CleartextPassword),
+        ),
+        "AuthSubCode round-trip broken: CleartextPassword",
+    );
+    assert!(
+        matches!(
+            AuthSubCode::try_from_u32(AuthSubCode::Md5Password.raw()),
+            Ok(AuthSubCode::Md5Password),
+        ),
+        "AuthSubCode round-trip broken: Md5Password",
     );
     assert!(
         matches!(AuthSubCode::try_from_u32(AuthSubCode::Sasl.raw()), Ok(AuthSubCode::Sasl)),
@@ -717,6 +773,8 @@ assert_all_distinct!(
 assert_all_distinct_raw!(
     "SCRAM auth sub-code",
     AUTH_OK,
+    AUTH_CLEARTEXT_PASSWORD,
+    AUTH_MD5_PASSWORD,
     AUTH_SASL,
     AUTH_SASL_CONTINUE,
     AUTH_SASL_FINAL,
@@ -767,6 +825,8 @@ const _: () = {
 
     // Auth sub-codes (raw u32, no newtype).
     assert!(AUTH_OK == 0, "AUTH_OK drift");
+    assert!(AUTH_CLEARTEXT_PASSWORD == 3, "AUTH_CLEARTEXT_PASSWORD drift");
+    assert!(AUTH_MD5_PASSWORD == 5, "AUTH_MD5_PASSWORD drift");
     assert!(AUTH_SASL == 10, "AUTH_SASL drift");
     assert!(AUTH_SASL_CONTINUE == 11, "AUTH_SASL_CONTINUE drift");
     assert!(AUTH_SASL_FINAL == 12, "AUTH_SASL_FINAL drift");

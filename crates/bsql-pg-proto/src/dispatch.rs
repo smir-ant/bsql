@@ -1202,12 +1202,17 @@ fn dispatch_auth_in_startup_trust(
             *state = ProtoState::ConnectingPostAuthAwaitingKey(reply);
             DispatchOutcome::AdvancedSilent
         }
-        // `Sasl` / `SaslContinue` / `SaslFinal`: a Trust connection
-        // never requested SCRAM, so any SASL message means the server
-        // expects an auth method we are not configured for.
+        // Any non-Ok auth code means the server expects an auth
+        // method this Trust connection is not configured for:
+        // `CleartextPassword` / `Md5Password` (DEF-215 / DEF-216
+        // foundation) — Trust client carries no password.
+        // `Sasl` / `SaslContinue` / `SaslFinal` — Trust client
+        // never requested SCRAM.
         // Tier-1 exhaustive — a future new `AuthSubCode` variant
         // forces this match to be updated.
-        other @ (crate::wire::AuthSubCode::Sasl
+        other @ (crate::wire::AuthSubCode::CleartextPassword
+            | crate::wire::AuthSubCode::Md5Password
+            | crate::wire::AuthSubCode::Sasl
             | crate::wire::AuthSubCode::SaslContinue
             | crate::wire::AuthSubCode::SaslFinal) => install_errored(state,
             Some(reply.consume()),
@@ -1272,7 +1277,20 @@ fn dispatch_auth_in_startup_scram(
                 Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
+        // Any non-`Sasl` auth code in this state is an auth-method
+        // mismatch: the SCRAM client expected the server to offer
+        // SASL mechanisms but got a different code instead.
+        // `CleartextPassword` / `Md5Password` (DEF-215 / DEF-216
+        // foundation): a SCRAM client refuses to downgrade to a
+        // weaker password-auth method even if it carries credentials
+        // (security: prevents server-side downgrade attacks).
+        // `Ok` here means the server accepted nothing without
+        // asking — also a mismatch from the client's POV.
+        // Tier-1 exhaustive — a future new `AuthSubCode` variant
+        // forces this match to be updated.
         other @ (crate::wire::AuthSubCode::Ok
+            | crate::wire::AuthSubCode::CleartextPassword
+            | crate::wire::AuthSubCode::Md5Password
             | crate::wire::AuthSubCode::SaslContinue
             | crate::wire::AuthSubCode::SaslFinal) => install_errored(state,
             Some(reply.consume()),
