@@ -369,6 +369,51 @@ pub const TAG_CLOSE: OutboundTag = OutboundTag::from_byte(b'C');
 /// not.)
 pub const TAG_FLUSH: OutboundTag = OutboundTag::from_byte(b'H');
 
+/// Frontend `Terminate` message tag (`'X'`) — DEF-223. Frontend
+/// graceful-close primitive (PG §55.7 "Message Formats").
+///
+/// Sent immediately before TCP close. The server completes any
+/// in-flight query (best effort), releases locks, and closes the
+/// connection cleanly. Without `Terminate`, a TCP RST or FIN-only
+/// teardown leaves the server in a transient confused state that
+/// surfaces as connection-loss warnings in the server log and
+/// momentarily-held locks.
+///
+/// `Terminate` carries no body — the entire wire form is the
+/// 5-byte literal [`TERMINATE_WIRE_BYTES`] below. Same shape as
+/// [`SYNC_WIRE_BYTES`] — tag + length-field of 4 (length includes
+/// itself, no payload).
+pub const TAG_TERMINATE: OutboundTag = OutboundTag::from_byte(b'X');
+
+/// The complete `Terminate` frame on the wire — DEF-223.
+///
+/// Static byte literal. Mirrors [`SYNC_WIRE_BYTES`]: 5-byte body =
+/// tag (`'X'`) + 4-byte length-field (BE u32 = 4, length includes
+/// itself but excludes tag).
+///
+/// # Visibility
+///
+/// `pub` — part of the user-facing API. Phase 1e wrapper drivers
+/// (`bsql-driver-postgres`, async wrappers) write these bytes to
+/// the socket immediately before TCP close to signal graceful
+/// shutdown. Direct byte exposure rather than a routed
+/// `Action::SendBytes` because Terminate happens OUTSIDE the
+/// state-machine envelope — it's the last frame, sent
+/// unconditionally regardless of `ProtoState`. The state-machine
+/// integration (an explicit `ProtoState::Closed` variant tracked
+/// by [`crate::ConnectionStatus`]) lands as DEF-009 in Phase 1e.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Driver pseudocode:
+/// async fn close(self) {
+///     self.socket.write_all(&bsql_pg_proto::TERMINATE_WIRE_BYTES).await?;
+///     self.socket.shutdown().await?;
+/// }
+/// ```
+pub const TERMINATE_WIRE_BYTES: [u8; 5] = [TAG_TERMINATE.byte(), 0, 0, 0, 4];
+
 // ---------------------------------------------------------------
 // Authentication sub-codes (first 4 bytes of 'R' payload)
 // ---------------------------------------------------------------
@@ -520,6 +565,21 @@ const _: () = assert!(
     "Sync length-field must be 4 (length includes itself, no payload)",
 );
 
+// DEF-223 (2026-05-05): drift-pin for `TERMINATE_WIRE_BYTES`. Same
+// shape as the `SYNC_WIRE_BYTES` block above. If a future edit
+// changes either the tag literal or the length field, these
+// asserts fail at build time. Tier-1 against typo-induced wire
+// breaks.
+const _: () = assert!(TERMINATE_WIRE_BYTES.len() == 5);
+const _: () = assert!(TERMINATE_WIRE_BYTES[0] == b'X');
+const _: () = assert!(
+    TERMINATE_WIRE_BYTES[1] == 0
+        && TERMINATE_WIRE_BYTES[2] == 0
+        && TERMINATE_WIRE_BYTES[3] == 0
+        && TERMINATE_WIRE_BYTES[4] == 4,
+    "Terminate length-field must be 4 (length includes itself, no payload)",
+);
+
 // ---------------------------------------------------------------
 // Tag collision defenses (§10 of DEF-094 audit round 2, 2026-04-20)
 //
@@ -646,6 +706,8 @@ assert_all_distinct!(
     TAG_EXECUTE,
     TAG_CLOSE,
     TAG_FLUSH,
+    // Phase 1e additions:
+    TAG_TERMINATE,
 );
 
 // **Authentication sub-codes** distinctness. The sub-code is
@@ -701,6 +763,7 @@ const _: () = {
     assert!(TAG_EXECUTE.byte() == b'E', "TAG_EXECUTE drift");
     assert!(TAG_CLOSE.byte() == b'C', "TAG_CLOSE drift");
     assert!(TAG_FLUSH.byte() == b'H', "TAG_FLUSH drift");
+    assert!(TAG_TERMINATE.byte() == b'X', "TAG_TERMINATE drift");
 
     // Auth sub-codes (raw u32, no newtype).
     assert!(AUTH_OK == 0, "AUTH_OK drift");

@@ -319,6 +319,14 @@ pub use session_params::{Encoding, OtherEncoding, SessionParams};
 pub use bsql_pg_proto_derive::Pristine;
 pub use pristine::Pristine;
 pub use state::ProtoState;
+// DEF-223 (2026-05-05): top-level re-export of the user-facing
+// `Terminate` wire literal. Drivers (`bsql-driver-postgres`,
+// async wrappers) write these bytes immediately before TCP
+// close to signal graceful shutdown. Convention matches
+// other top-level re-exports — wire-internal consts (e.g.
+// `SYNC_WIRE_BYTES`) stay `pub(crate)`; user-facing wire
+// primitives are re-exported here.
+pub use wire::TERMINATE_WIRE_BYTES;
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------
