@@ -1451,6 +1451,11 @@ impl PgProtocol {
         // variant fails the build here until handler exists.
         match classification {
             IngressClassification::AlreadyErrored => {
+                // DEF-238 (audit 2026-05-05): cold-path hint. Reaching
+                // here means caller fed bytes after a fatal teardown
+                // — adversarial / mis-driven state. Push the empty-
+                // OutActions emit out of the hot I-cache footprint.
+                core::hint::cold_path();
                 read_buf.clear();
                 // DEF-188: materialise needs an immutable view of
                 // terminal_row_desc. NLL collapses the prior `&mut`
@@ -1464,6 +1469,12 @@ impl PgProtocol {
                 });
             }
             IngressClassification::AppendFailed { attempted, available } => {
+                // DEF-238 (audit 2026-05-05): cold-path hint. ReadBuf
+                // overflow = fatal connection teardown (FailReply +
+                // CloseSocket) on a path the production hot loop never
+                // hits — keep this body out of the inlined ingress
+                // arm.
+                core::hint::cold_path();
                 // DEF-186 P1-4 ordering invariant (audit 2026-04-24):
                 // `read_buf.clear()` MUST precede `fail_inflight_no_readbuf`
                 // here. The clear() zero-on-clear path (P0-C) scrubs any
@@ -1764,6 +1775,13 @@ impl PgProtocol {
                 && frames_consumed > 0
                 && read_buf.advance(usize::from(frames_consumed)).is_err()
             {
+                // DEF-238 (audit 2026-05-05): cold-path hint on the
+                // dead-arm body. Reaching here implies a regression in
+                // cursor math (parse_header validates total_len <=
+                // populated.len() before each advance contribution).
+                // Marked cold so LLVM keeps fail_inflight_no_readbuf
+                // out of the hot post-loop epilogue.
+                core::hint::cold_path();
                 // Classified dead-arm — a regression in cursor math
                 // would land here. Transition to Errored and emit
                 // FailReply via fail_inflight.
@@ -3581,6 +3599,11 @@ fn materialise_push(
                         // OK; bytes are in wb at the verified range.
                     }
                     None => {
+                        // DEF-238 (audit 2026-05-05): cold hint on the
+                        // architecturally-dead arm. The brand-discipline
+                        // construction guarantees this branch is
+                        // unreachable under intact forbid_unsafe.
+                        core::hint::cold_path();
                         debug_assert!(
                             false,
                             "DEF-212 M5: SendBytesRange.apply == None — \
@@ -3603,6 +3626,10 @@ fn materialise_push(
                 match reserved.push_bytes(s) {
                     Ok(()) => {}
                     Err(_) => {
+                        // DEF-238 (audit 2026-05-05): cold hint —
+                        // architecturally-dead per the const-assert chain
+                        // in write_buf.rs (max_*_message_size sums).
+                        core::hint::cold_path();
                         debug_assert!(
                             false,
                             "DEF-212 M5: SendBytesStatic append overflowed wb — \
@@ -3616,6 +3643,10 @@ fn materialise_push(
                 }
             }
             StagedAction::DeliverReply(_) => {
+                // DEF-238 (audit 2026-05-05): cold hint. Push paths
+                // never emit DeliverReply (replies come from server
+                // via feed_bytes, not push). Architecturally dead.
+                core::hint::cold_path();
                 debug_assert!(
                     false,
                     "DEF-212 M5: push paths must NEVER emit DeliverReply — \
@@ -3625,6 +3656,11 @@ fn materialise_push(
                 );
             }
             StagedAction::FailReply { id, cause } => {
+                // DEF-238 (audit 2026-05-05): cold hint. Builder
+                // failures (EmptyWriteRange / BuilderCapacityOverflow /
+                // ParamsWriterOverflow) are rare classified-Err paths;
+                // happy path (no FailReply staged) dominates production.
+                core::hint::cold_path();
                 // Capture for Err arm. Architecturally exactly one FailReply
                 // per push cycle (single builder error per command).
                 if failure.is_none() {
