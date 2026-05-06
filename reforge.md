@@ -3319,6 +3319,7 @@ Rust `Result<T, E>` size = `max(size_of::<T>(), size_of::<E>()) + discriminant`.
 | cargo-deny (§95) | Supply-chain (CVE, license, duplicates) | Every PR |
 | cargo-vet (§95) | Human-reviewed dep trust | Every PR (incremental) |
 | Differential (§96) | Spec-conformance vs reference impl | Nightly |
+| ASM-diff + bench-stable (§96a) | Codegen drift + perf regression | **Mandatory on perf-relevant change** |
 | Reproducible builds (§97) | Supply-chain substitution | Release builds |
 
 ## §91. proptest
@@ -3393,6 +3394,81 @@ async fn select_one_row_equivalent(pool: bsql::Pool) {
 ```
 
 Macro `#[bsql::diff_test]` spawn'ит both bsql pool AND tokio-postgres client, compares results. Catches subtle spec-misunderstanding bugs.
+
+## §96a. Performance & codegen measurement methodology (mandatory)
+
+Established 2026-05-07 after DEF-236 demonstrated that default
+`cargo bench` runs under typical developer-machine load produce
+sign-flipping noise that swamps tier-elevation signal. Full
+playbook in [`BENCHMARKING.md`](./BENCHMARKING.md); summary here.
+
+**Mandatory contract.** Any change presented as performance-
+relevant — including but not limited to: hot-path refactors,
+inline annotations, allocation changes, type-system tier
+elevations that touch generated code, layout/repr changes —
+MUST be verified through BOTH layers in order:
+
+1. **`scripts/asm-diff.sh <symbol-pattern> [git-ref]`** —
+   deterministic codegen comparison. Same compiler + flags +
+   source = same `.s` bytes. If the diff is empty, the change is
+   codegen-neutral and no perf claim is warranted (or required).
+2. **`scripts/bench-stable.sh save|compare <baseline-name>`** —
+   statistical runtime measurement under stability-improving
+   conditions (`taskpolicy -c utility` / `nice -n 19`,
+   `--measurement-time 30 --warm-up-time 10`,
+   `--noise-threshold 0.05`). Baseline persists across commits.
+   Exit 1 on any regression beyond noise.
+
+**Rationale.** ASM-diff catches drift (deterministic, fast,
+zero noise). Bench-stable catches runtime regressions
+(statistical, slow, ±5% noise floor on quiet machine). Together
+they're the complete pair — neither alone is sufficient.
+ASM-only misses cache effects; bench-only is hostage to system
+noise (DEF-236 lesson).
+
+**When the rule binds.** ANY change that:
+- Touches hot-path code (decode, dispatch, parse_header, etc.)
+- Adds/removes inline annotations
+- Refactors a type carried in a hot variant
+- Changes allocation patterns in a per-call-frequent path
+- Bumps any size/layout const
+
+**When the rule does NOT bind.** Pure docs, test-only
+(`#[cfg(test)]`), or strictly-additive API surface that no
+existing path uses.
+
+**Example commit decision tree:**
+
+```
+                   change touches code?
+                          │
+                ┌─────────┴─────────┐
+                │                   │
+              docs/               yes
+              test-only             │
+                │            asm-diff <fn> <ref>
+              SHIP             /          \
+                          empty diff    diff present
+                              │              │
+                            SHIP    bench-stable compare BASE
+                                          /          \
+                                       PASS         FAIL
+                                        │            │
+                                       SHIP        revert/justify
+```
+
+**Limitations.** ASM-diff's hash-normalisation may collapse
+different LLVM-emitted instructions if they share the same
+mangled-name root (rare; pattern lists matched symbols so user
+can spot). bench-stable's noise floor is hardware-dependent —
+on a busy laptop, 5% may not be reliable; ship-gate decisions
+near that threshold need a quiet machine or a self-hosted CI
+runner (§98 future extension).
+
+**Bench environment expectations.** Run on a power-connected
+machine, foreground apps closed, no other heavy CPU load.
+First run after long idle can be slower (cache cold); criterion's
+warm-up phase mitigates but doesn't eliminate.
 
 ## §97. Reproducible builds
 
