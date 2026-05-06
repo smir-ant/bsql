@@ -109,7 +109,24 @@ use crate::ident::SecretBoundedStr;
 ///
 /// Users access via [`crate::PgProtocol::get_server_error`] →
 /// `Result<&ErrorPayload, ArenaError>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Tier-1 ZeroizeOnDrop enforcement
+///
+/// DEF-205 audit (2026-05-07): the struct derives
+/// [`zeroize::ZeroizeOnDrop`] explicitly. Every field MUST
+/// implement [`zeroize::Zeroize`] or carry `#[zeroize(skip)]` —
+/// adding a new non-zeroize-aware field is a build error. Pre-
+/// elevation, the three `SecretBoundedStr<N>` fields each had
+/// individual `Drop` impls (so the auto-derived struct Drop
+/// chained through them correctly), but a future contributor
+/// adding e.g. `pub server_session_id: BoundedStr<32>` (without
+/// the `Secret` prefix) would silently bypass scrubbing — server
+/// error context can carry SQL fragments and other forensic
+/// material that operators do NOT want lingering in freed memory
+/// after error-arena reuse. Post-elevation, the contributor must
+/// explicitly choose: zeroize-aware type or `#[zeroize(skip)]`
+/// annotation with rationale.
+#[derive(Debug, Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
 pub struct ErrorPayload {
     /// Server-provided human-readable error message (M field per
     /// PG §55.7 ErrorResponse). Truncated at 128 bytes with `"…"`

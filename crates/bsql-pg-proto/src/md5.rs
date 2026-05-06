@@ -77,13 +77,31 @@ use zeroize::Zeroizing;
 /// path resolves through a `pub(crate) mod md5;` barrier. Mirror
 /// of the SCRAM pattern (`pub struct ScramSession` inside
 /// `pub mod scram` with internal fields `pub(crate)`).
-#[derive(Debug)]
+///
+/// # Tier-1 ZeroizeOnDrop enforcement
+///
+/// DEF-216 audit (2026-05-07): the struct derives
+/// [`zeroize::ZeroizeOnDrop`] explicitly. Every field MUST either
+/// implement [`zeroize::Zeroize`] OR carry the `#[zeroize(skip)]`
+/// annotation — adding a new field without one of these is a
+/// build error. Pre-elevation, drop semantics relied on auto-
+/// generated field-by-field drop (which DOES fire ZeroizeOnDrop
+/// on the password field today), but a future contributor adding
+/// e.g. a `[u8; 64]` derivation buffer for SCRAM-SHA-512 would
+/// silently bypass scrubbing. Post-elevation, that contributor
+/// is forced to make an explicit decision: zeroize-aware type or
+/// explicit skip annotation.
+#[derive(Debug, zeroize::ZeroizeOnDrop)]
 pub struct Md5HandshakeState {
     /// Password sensitive bytes. ZeroizeOnDrop chain via
     /// `Sensitive::drop` → `Password::drop`.
     pub(crate) password: Sensitive<Password>,
     /// Username from the `StartupMessage`. Non-secret (cleartext on
-    /// wire); not zeroized.
+    /// wire); explicitly skip-zeroized — the value is forensic
+    /// metadata, not a secret. `#[zeroize(skip)]` forces a future
+    /// contributor renaming this field to a secret type to
+    /// re-evaluate the annotation.
+    #[zeroize(skip)]
     pub(crate) user: crate::ident::Ident,
 }
 
