@@ -87,86 +87,137 @@ pub struct Md5HandshakeState {
     pub(crate) user: crate::ident::Ident,
 }
 
-/// Compute the MD5 password digest per PG §55.4 and write the
-/// 35-byte response body (`"md5" + 32 hex chars`) into `out`.
+/// MD5 password-message body length: 3-byte literal `"md5"`
+/// prefix + 32-byte lowercase-hex outer digest = 35 bytes total.
+/// DEF-216 audit (2026-05-07): tier-1 layout pin to prevent drift
+/// in the response shape.
+pub(crate) const MD5_RESPONSE_BODY_LEN: usize = 35;
+
+/// MD5 prefix length — literal ASCII `"md5"`. PG §55.4 mandates
+/// this exact 3-byte prefix.
+pub(crate) const MD5_RESPONSE_PREFIX_LEN: usize = 3;
+
+/// MD5 hex-digest length — 16-byte raw digest expressed as 32
+/// lowercase hex characters. Tier-1 by formula (2 hex chars per
+/// byte, 16 bytes per MD5 output).
+pub(crate) const MD5_RESPONSE_HEX_LEN: usize = 32;
+
+// Layout drift-pin — PG §55.4: `"md5" + 32 hex chars` = 35 bytes
+// total. A regression that drops a byte or shifts the prefix
+// length fails the build here.
+const _: () = assert!(
+    MD5_RESPONSE_BODY_LEN
+        == MD5_RESPONSE_PREFIX_LEN.saturating_add(MD5_RESPONSE_HEX_LEN),
+    "MD5 response layout drift — PG §55.4: 'md5' (3) + hex (32) = 35",
+);
+const _: () = assert!(
+    MD5_RESPONSE_PREFIX_LEN == 3,
+    "MD5 prefix must be the 3-byte literal \"md5\"",
+);
+const _: () = assert!(
+    MD5_RESPONSE_HEX_LEN == 32,
+    "MD5 hex output: 16 raw digest bytes × 2 hex chars per byte",
+);
+
+/// Compute the MD5 password digest per PG §55.4 and return the
+/// 35-byte response body (`"md5" + 32 hex chars`).
 ///
 /// # Inputs
 ///
 /// - `password`: the user's password bytes.
-/// - `username`: the username (UTF-8 bytes from `Ident`).
+/// - `username`: the username (UTF-8 bytes from `Ident::as_bytes`,
+///   which returns ONLY the populated prefix — no padding).
 /// - `salt`: the 4-byte salt extracted from
 ///   `AuthenticationMD5Password`.
 ///
 /// # Output
 ///
-/// `out: &mut [u8; 35]` is filled with the bytes the wire frame's
-/// length-prefixed body should carry (excluding the trailing NUL,
-/// which the caller appends).
+/// `Zeroizing<[u8; 35]>` — owned, scrubs on drop. The caller
+/// (typically [`crate::dispatch`] PasswordMessage builder)
+/// appends the trailing NUL to form the wire body.
+///
+/// Returning an owned array (vs writing through `&mut [u8; 35]`)
+/// is a tier-1 elevation: the caller cannot pass a wrong-size
+/// buffer, partially-initialised buffer, or buffer that fails to
+/// receive all 35 bytes. The output is fully populated by
+/// construction.
 ///
 /// # Memory hygiene
 ///
-/// Three `Zeroizing` buffers hold password-derived intermediates:
-/// the `password || username` concatenation, the inner hex string,
-/// and the `inner_hex || salt` concatenation. All scrub on Drop at
-/// function return.
+/// Every password-derived intermediate is wrapped in `Zeroizing`:
+/// `inner_digest` (16 B), `inner_hex` (32 B), `outer_digest`
+/// (16 B), and the returned `response` itself (35 B). Each scrubs
+/// on Drop at scope exit. The `md-5` library does not retain
+/// input after `finalize` (RustCrypto's `Digest` trait drops the
+/// internal state).
 pub(crate) fn compute_response_body(
     password: &Password,
     username: &[u8],
     salt: [u8; 4],
-    out: &mut [u8; 35],
-) {
+) -> Zeroizing<[u8; MD5_RESPONSE_BODY_LEN]> {
     // Step 1: inner_digest = MD5(password || username).
     //
-    // Build the concatenation in a heap-allocated `Zeroizing<Vec<u8>>`
-    // so it scrubs on drop. Stack would also work but `Vec` is the
-    // simplest path that handles arbitrary password length up to
-    // MAX_PASSWORD_LEN (512 B) + max ident length without a static
-    // array sized for the worst case.
-    //
-    // No-alloc note: this is the cold auth path (handshake-time
-    // only, ~once per connection). Allocation is acceptable per
-    // the same audit-trust position as SCRAM's heapless::Vec
-    // intermediates in `scram::wire`.
+    // No concatenation buffer needed — `Md5::update` accepts
+    // chained calls, processing the input as a streaming
+    // sequence. Avoids allocating a `password || username`
+    // intermediate that would need its own Zeroizing wrapper.
     let mut hasher = Md5::new();
     hasher.update(password.as_bytes());
     hasher.update(username);
-    // `Output<Md5>` is a `GenericArray<u8, U16>`. Wrap in Zeroizing
+    // `Output<Md5>` is a `GenericArray<u8, U16>` which converts
+    // infallibly to `[u8; 16]` via `.into()`. Wrap in Zeroizing
     // so the 16-byte digest scrubs on drop.
     let inner_digest: Zeroizing<[u8; 16]> = Zeroizing::new(hasher.finalize().into());
 
     // Step 2: inner_hex = lowercase_hex(inner_digest) — 32 ASCII chars.
-    let mut inner_hex: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-    write_hex_lowercase(&inner_digest, &mut inner_hex);
+    let inner_hex: Zeroizing<[u8; MD5_RESPONSE_HEX_LEN]> =
+        Zeroizing::new(hex_lowercase(&inner_digest));
 
     // Step 3: outer_digest = MD5(inner_hex || salt).
     let mut outer_hasher = Md5::new();
     outer_hasher.update(inner_hex.as_slice());
     outer_hasher.update(salt);
-    // The outer digest is NOT secret in the same way: it goes on
-    // the wire as the response. But it's password-derived and
-    // wrapping in Zeroizing for the brief window before it's
-    // copied to `out` is cheap defence-in-depth.
     let outer_digest: Zeroizing<[u8; 16]> = Zeroizing::new(outer_hasher.finalize().into());
 
-    // Step 4: build "md5" || lowercase_hex(outer_digest) into `out`.
-    // The first 3 bytes are the literal "md5".
-    let prefix = b"md5";
-    if let Some(slot) = out.get_mut(..3) {
-        slot.copy_from_slice(prefix);
+    // Step 4: build "md5" || lowercase_hex(outer_digest) into a
+    // fresh owned array. Use `split_first_chunk_mut::<3>()` for
+    // tier-1 type-level array sub-references — assignments below
+    // are typed `*[u8; N] = [u8; N]`, no slice-length runtime
+    // checks, no defensive `if let Some` for impossible failures.
+    let outer_hex: [u8; MD5_RESPONSE_HEX_LEN] = hex_lowercase(&outer_digest);
+    let mut response: Zeroizing<[u8; MD5_RESPONSE_BODY_LEN]> =
+        Zeroizing::new([0u8; MD5_RESPONSE_BODY_LEN]);
+
+    // `split_first_chunk_mut::<3>()` returns
+    // `Option<(&mut [u8; 3], &mut [u8])>`. For a 35-byte slice
+    // this is structurally always Some, but the Option is part
+    // of the API contract; the architecturally-impossible None
+    // arm is silent (would leave response zeroed → server-side
+    // auth-fail, loud). The layout-pin asserts above + the
+    // exhaustive integration tests close the surface.
+    if let Some((prefix_slot, rest)) = response.split_first_chunk_mut::<MD5_RESPONSE_PREFIX_LEN>() {
+        // Type-level assignment: `*&mut [u8; 3] = [u8; 3]`. No
+        // length check, no panic, no defensive arm.
+        *prefix_slot = *b"md5";
+        // `first_chunk_mut::<32>()` on the 32-byte tail returns
+        // `Some(&mut [u8; 32])` by construction.
+        if let Some(hex_slot) = rest.first_chunk_mut::<MD5_RESPONSE_HEX_LEN>() {
+            *hex_slot = outer_hex;
+        }
     }
-    // The remaining 32 bytes hold the hex-encoded outer digest.
-    // Use a `Zeroizing<[u8; 32]>` intermediate so that — even
-    // though `outer_hex` content is what we send on the wire and
-    // is therefore not "more secret" than the response itself —
-    // the local stack copy scrubs on drop. Defence in depth: a
-    // future caller that retains `out` longer than the dispatch
-    // path expects will still see no lingering hex bytes in this
-    // function's stack frame after return.
-    let mut outer_hex: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-    write_hex_lowercase(&outer_digest, &mut outer_hex);
-    if let Some(hex_slot) = out.get_mut(3..35) {
-        hex_slot.copy_from_slice(outer_hex.as_slice());
-    }
+
+    response
+}
+
+/// Compute lowercase hex of a 16-byte input as a fresh `[u8; 32]`
+/// owned array. DEF-216 audit (2026-05-07): tier-1 type-level
+/// signature — caller cannot mistake the output size.
+///
+/// Branchless per-nibble lookup via a 16-element ASCII table.
+fn hex_lowercase(input: &[u8; 16]) -> [u8; MD5_RESPONSE_HEX_LEN] {
+    let mut out = [0u8; MD5_RESPONSE_HEX_LEN];
+    write_hex_lowercase(input, &mut out);
+    out
 }
 
 /// Write 16 input bytes as 32 lowercase ASCII hex characters into
@@ -247,18 +298,20 @@ mod tests {
         let user = b"alice";
         let salt: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
 
-        let mut out = [0u8; 35];
-        compute_response_body(&pw, user, salt, &mut out);
+        let out = compute_response_body(&pw, user, salt);
 
-        // Length / prefix sanity.
-        assert_eq!(out.len(), 35);
-        let prefix = out.get(..3).ok_or("out too short for prefix")?;
+        // Length / prefix sanity. `out` is owned `Zeroizing<[u8; 35]>`;
+        // deref via `.as_slice()` for slice-level inspection.
+        assert_eq!(out.as_slice().len(), MD5_RESPONSE_BODY_LEN);
+        let prefix = out.as_slice().get(..MD5_RESPONSE_PREFIX_LEN)
+            .ok_or("out too short for prefix")?;
         assert_eq!(prefix, b"md5", "response must start with literal 'md5'");
 
         // The remaining 32 bytes must be lowercase hex (digits +
         // a..f). `is_ascii_hexdigit` matches uppercase too, so
         // additionally assert no uppercase appears.
-        let hex_part = out.get(3..).ok_or("out too short for hex tail")?;
+        let hex_part = out.as_slice().get(MD5_RESPONSE_PREFIX_LEN..)
+            .ok_or("out too short for hex tail")?;
         for &b in hex_part {
             assert!(
                 b.is_ascii_hexdigit() && !b.is_ascii_uppercase(),
@@ -278,8 +331,7 @@ mod tests {
         let user = b"user";
         let salt: [u8; 4] = [0; 4];
 
-        let mut out_canonical = [0u8; 35];
-        compute_response_body(&pw, user, salt, &mut out_canonical);
+        let out_canonical = compute_response_body(&pw, user, salt);
 
         // Reference computation matching the canonical algorithm
         // (inline mirror — if production code drifts, this test
@@ -288,25 +340,26 @@ mod tests {
         hasher_inner.update(pw.as_bytes());
         hasher_inner.update(user);
         let inner: [u8; 16] = hasher_inner.finalize().into();
-        let mut inner_hex = [0u8; 32];
+        let mut inner_hex = [0u8; MD5_RESPONSE_HEX_LEN];
         write_hex_lowercase(&inner, &mut inner_hex);
         let mut hasher_outer = Md5::new();
         hasher_outer.update(inner_hex.as_slice());
         hasher_outer.update(salt);
         let outer: [u8; 16] = hasher_outer.finalize().into();
-        let mut outer_hex = [0u8; 32];
+        let mut outer_hex = [0u8; MD5_RESPONSE_HEX_LEN];
         write_hex_lowercase(&outer, &mut outer_hex);
 
-        let mut expected = [0u8; 35];
-        if let Some(prefix) = expected.get_mut(..3) {
+        let mut expected = [0u8; MD5_RESPONSE_BODY_LEN];
+        if let Some(prefix) = expected.get_mut(..MD5_RESPONSE_PREFIX_LEN) {
             prefix.copy_from_slice(b"md5");
         }
-        if let Some(tail) = expected.get_mut(3..) {
+        if let Some(tail) = expected.get_mut(MD5_RESPONSE_PREFIX_LEN..) {
             tail.copy_from_slice(&outer_hex);
         }
 
         assert_eq!(
-            out_canonical, expected,
+            *out_canonical.as_ref(),
+            expected,
             "compute_response_body must produce md5(md5(pw||user)||salt) format",
         );
         Ok(())
@@ -385,22 +438,17 @@ mod tests {
         let pw = Password::try_from_str("hunter2").map_err(|_| "pw parse")?;
         let user = b"user";
 
-        let mut out_a = [0u8; 35];
-        compute_response_body(&pw, user, [0x00, 0x00, 0x00, 0x00], &mut out_a);
+        let out_a = compute_response_body(&pw, user, [0x00, 0x00, 0x00, 0x00]);
+        let out_b = compute_response_body(&pw, user, [0x00, 0x00, 0x00, 0x01]);
+        let out_c = compute_response_body(&pw, user, [0xff, 0xff, 0xff, 0xff]);
 
-        let mut out_b = [0u8; 35];
-        compute_response_body(&pw, user, [0x00, 0x00, 0x00, 0x01], &mut out_b);
-
-        let mut out_c = [0u8; 35];
-        compute_response_body(&pw, user, [0xff, 0xff, 0xff, 0xff], &mut out_c);
-
-        assert_ne!(out_a, out_b, "1-bit salt change must alter response");
-        assert_ne!(out_a, out_c, "all-zero vs all-ones salt must differ");
-        assert_ne!(out_b, out_c, "different salts must produce different responses");
+        assert_ne!(*out_a.as_ref(), *out_b.as_ref(), "1-bit salt change must alter response");
+        assert_ne!(*out_a.as_ref(), *out_c.as_ref(), "all-zero vs all-ones salt must differ");
+        assert_ne!(*out_b.as_ref(), *out_c.as_ref(), "different salts must produce different responses");
         // All three start with "md5" — that prefix is constant.
-        assert_eq!(out_a.get(..3), Some(b"md5".as_slice()));
-        assert_eq!(out_b.get(..3), Some(b"md5".as_slice()));
-        assert_eq!(out_c.get(..3), Some(b"md5".as_slice()));
+        assert_eq!(out_a.as_slice().get(..3), Some(b"md5".as_slice()));
+        assert_eq!(out_b.as_slice().get(..3), Some(b"md5".as_slice()));
+        assert_eq!(out_c.as_slice().get(..3), Some(b"md5".as_slice()));
         Ok(())
     }
 
@@ -414,12 +462,10 @@ mod tests {
         let user = b"alice";
         let salt = [0xde, 0xad, 0xbe, 0xef];
 
-        let mut out1 = [0u8; 35];
-        compute_response_body(&pw1, user, salt, &mut out1);
-        let mut out2 = [0u8; 35];
-        compute_response_body(&pw2, user, salt, &mut out2);
+        let out1 = compute_response_body(&pw1, user, salt);
+        let out2 = compute_response_body(&pw2, user, salt);
 
-        assert_ne!(out1, out2, "different passwords must differ");
+        assert_ne!(*out1.as_ref(), *out2.as_ref(), "different passwords must differ");
         Ok(())
     }
 
@@ -434,12 +480,10 @@ mod tests {
         let pw = Password::try_from_str("samepw").map_err(|_| "pw parse")?;
         let salt = [0x12, 0x34, 0x56, 0x78];
 
-        let mut out_alice = [0u8; 35];
-        compute_response_body(&pw, b"alice", salt, &mut out_alice);
-        let mut out_bob = [0u8; 35];
-        compute_response_body(&pw, b"bob", salt, &mut out_bob);
+        let out_alice = compute_response_body(&pw, b"alice", salt);
+        let out_bob = compute_response_body(&pw, b"bob", salt);
 
-        assert_ne!(out_alice, out_bob, "username must affect digest");
+        assert_ne!(*out_alice.as_ref(), *out_bob.as_ref(), "username must affect digest");
         Ok(())
     }
 
@@ -451,9 +495,8 @@ mod tests {
     #[test]
     fn empty_username_does_not_panic() -> Result<(), &'static str> {
         let pw = Password::try_from_str("x").map_err(|_| "pw parse")?;
-        let mut out = [0u8; 35];
-        compute_response_body(&pw, b"", [0; 4], &mut out);
-        assert_eq!(out.get(..3), Some(b"md5".as_slice()));
+        let out = compute_response_body(&pw, b"", [0; 4]);
+        assert_eq!(out.as_slice().get(..3), Some(b"md5".as_slice()));
         Ok(())
     }
 
@@ -467,13 +510,11 @@ mod tests {
         let user = b"deterministic";
         let salt = [0x42; 4];
 
-        let mut out_first = [0u8; 35];
-        compute_response_body(&pw, user, salt, &mut out_first);
+        let out_first = compute_response_body(&pw, user, salt);
         for run in 0..10 {
-            let mut out_n = [0u8; 35];
-            compute_response_body(&pw, user, salt, &mut out_n);
+            let out_n = compute_response_body(&pw, user, salt);
             assert_eq!(
-                out_n, out_first,
+                *out_n.as_ref(), *out_first.as_ref(),
                 "run {run}: deterministic computation drifted",
             );
         }
@@ -489,11 +530,10 @@ mod tests {
         // MAX_PASSWORD_LEN = 512. Build a 512-byte string of 'x'.
         let pw_str: alloc::string::String = "x".repeat(512);
         let pw = Password::try_from_str(&pw_str).map_err(|_| "pw parse")?;
-        let mut out = [0u8; 35];
-        compute_response_body(&pw, b"u", [0; 4], &mut out);
-        assert_eq!(out.get(..3), Some(b"md5".as_slice()));
+        let out = compute_response_body(&pw, b"u", [0; 4]);
+        assert_eq!(out.as_slice().get(..3), Some(b"md5".as_slice()));
         // Trailing 32 chars must be lowercase hex.
-        let tail = out.get(3..).ok_or("tail get")?;
+        let tail = out.as_slice().get(3..).ok_or("tail get")?;
         for &b in tail {
             assert!(
                 b.is_ascii_hexdigit() && !b.is_ascii_uppercase(),
@@ -524,11 +564,11 @@ mod tests {
             [0xfc, 0xfd, 0xfe, 0xff], // boundary
         ];
 
-        let mut outputs: alloc::vec::Vec<[u8; 35]> = alloc::vec::Vec::with_capacity(salts.len());
+        let mut outputs: alloc::vec::Vec<[u8; MD5_RESPONSE_BODY_LEN]>
+            = alloc::vec::Vec::with_capacity(salts.len());
         for salt in salts {
-            let mut out = [0u8; 35];
-            compute_response_body(&pw, user, salt, &mut out);
-            outputs.push(out);
+            let out = compute_response_body(&pw, user, salt);
+            outputs.push(*out);
         }
         // Pairwise distinctness.
         for i in 0..outputs.len() {

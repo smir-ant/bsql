@@ -1719,6 +1719,96 @@ fn expected_md5_response_body(password: &[u8], username: &[u8], salt: [u8; 4]) -
     response
 }
 
+/// **Known Answer Test** (audit 2026-05-07): hardcoded expected
+/// digest computed externally via Python `hashlib.md5`. Catches
+/// drift between our `compute_response_body` implementation and
+/// the canonical PG/RFC 1321 algorithm. Crucially, this test
+/// would FAIL if `Ident::as_bytes()` returned padded bytes
+/// instead of the populated prefix — the digest would diverge
+/// from the externally-computed value. The earlier
+/// `algorithm_shape_pw_then_user_not_user_then_pw` test uses an
+/// inline mirror with the SAME `md-5` library and SAME `as_bytes`
+/// call, so it's self-referential and would NOT catch padding
+/// bugs. This file's KAT closes that gap.
+///
+/// Reference computation (Python):
+/// ```python
+/// import hashlib
+/// inner = hashlib.md5(b'secretalice').hexdigest()
+/// # = '4a0a68b43b6cd5cf266fa02f196e2371'
+/// outer = hashlib.md5(inner.encode() + bytes([0xde,0xad,0xbe,0xef])).hexdigest()
+/// # = '3e1d73ba00a55e8805aa0277d29996c5'
+/// response = 'md5' + outer
+/// # = 'md53e1d73ba00a55e8805aa0277d29996c5'
+/// ```
+#[test]
+fn md5_auth_kat_secret_alice_deadbeef() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(800);
+    startup_md5(&mut proto, &mut wb, "alice", "secret", startup_raw);
+    wb.clear();
+
+    let salt: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
+    let out = proto.feed_bytes(&auth_md5_password_frame(salt), &mut wb);
+    let expected_response: &[u8] = b"md53e1d73ba00a55e8805aa0277d29996c5";
+    match out.as_slice() {
+        [Action::SendBytes(bytes)] => {
+            // Wire frame: 'p' + len(4) + body(35) + NUL.
+            let body = bytes.get(5..40).unwrap_or_default();
+            assert_eq!(
+                body, expected_response,
+                "MD5 response body must match externally-computed reference; \
+                 a divergence here indicates either a library drift, an \
+                 algorithm-shape regression, or a username/password padding \
+                 bug (Ident::as_bytes returning padded bytes)",
+            );
+        }
+        other => panic!("expected single SendBytes, got {other:?}"),
+    }
+}
+
+/// KAT for empty username — PG accepts empty SASL user (the
+/// real username travels in StartupMessage's `user=` field). The
+/// MD5 inner hash incorporates whatever username we pass, even
+/// if empty. Reference: `md5(md5("p" || "") || 0x00000000) = ...`.
+///
+/// Note: we cannot construct an `Ident` with empty content via
+/// `try_from_str("")` (Ident requires non-empty). This KAT is
+/// covered at the `compute_response_body` level (lib unit
+/// `empty_username_does_not_panic`); here we pin the FULL
+/// startup-flow path with the smallest legal Ident: a single
+/// non-empty character.
+///
+/// Reference computation (Python):
+/// ```python
+/// inner = hashlib.md5(b'mypasswordalice').hexdigest()
+/// outer = hashlib.md5(inner.encode() + bytes([0x12,0x34,0x56,0x78])).hexdigest()
+/// # = '6570e2ae51c521b1f1ef46c78c104163'
+/// ```
+#[test]
+fn md5_auth_kat_mypassword_alice_seq_salt() {
+    let mut proto = PgProtocol::new();
+    let mut wb = bsql_pg_proto::WriteBuf::new();
+    let startup_raw = raw(801);
+    startup_md5(&mut proto, &mut wb, "alice", "mypassword", startup_raw);
+    wb.clear();
+
+    let salt: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
+    let out = proto.feed_bytes(&auth_md5_password_frame(salt), &mut wb);
+    let expected_response: &[u8] = b"md56570e2ae51c521b1f1ef46c78c104163";
+    match out.as_slice() {
+        [Action::SendBytes(bytes)] => {
+            let body = bytes.get(5..40).unwrap_or_default();
+            assert_eq!(
+                body, expected_response,
+                "MD5 response must match externally-computed Python reference",
+            );
+        }
+        other => panic!("expected single SendBytes, got {other:?}"),
+    }
+}
+
 /// Spec conformance: full MD5-password handshake. StartupMessage
 /// → AuthMD5Password (with 4-byte salt) → PasswordMessage with
 /// `"md5" + 32 hex chars + NUL` → AuthOk → BackendKeyData → RFQ

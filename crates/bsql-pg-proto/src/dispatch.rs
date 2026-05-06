@@ -2043,16 +2043,16 @@ fn build_md5_password_message(
     salt: [u8; 4],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<crate::action::WriteRange, ProtocolError> {
-    // Compute the 35-byte response body into a Zeroizing buffer
-    // — although the body is what goes on the wire (not secret
-    // per se), it is password-derived; zeroizing the copy in our
-    // address space costs nothing and provides defence-in-depth.
-    let mut body: zeroize::Zeroizing<[u8; 35]> = zeroize::Zeroizing::new([0u8; 35]);
-    crate::md5::compute_response_body(
+    // Compute the 35-byte response body. `compute_response_body`
+    // returns an owned `Zeroizing<[u8; 35]>` (DEF-216 Phase 2
+    // audit 2026-05-07: tier-1 type-level array signature — the
+    // caller cannot accidentally pass a wrong-size buffer or a
+    // buffer that wouldn't be fully overwritten). The returned
+    // array scrubs on drop at fn return.
+    let body = crate::md5::compute_response_body(
         handshake.password.get(),
         handshake.user.as_bytes(),
         salt,
-        &mut body,
     );
 
     let start = reserved.len();
