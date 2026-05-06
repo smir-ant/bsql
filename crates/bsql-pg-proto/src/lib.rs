@@ -334,6 +334,13 @@ pub use wire::TERMINATE_WIRE_BYTES;
 // the 1-byte server response is OOB (driver handles it
 // outside the frame parser).
 pub use wire::SSL_REQUEST_WIRE_BYTES;
+// DEF-214 Phase 2 (2026-05-05): typed classification of the
+// 1-byte SSL response. Pairs with SSL_REQUEST_WIRE_BYTES — driver
+// reads 1 byte and calls `classify_ssl_response_byte` to obtain
+// a `SslNegotiationOutcome` instead of ad-hoc `match byte` logic.
+// Tier-1 enforcement of all 4 currently-defined outcomes with
+// `#[non_exhaustive]` for SemVer-safe future extension.
+pub use wire::{SslNegotiationOutcome, classify_ssl_response_byte};
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------

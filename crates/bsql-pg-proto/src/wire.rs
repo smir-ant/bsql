@@ -695,6 +695,134 @@ pub const PROTOCOL_VERSION_3_0: u32 = 196608;
 /// shape (CancelRequest uses 1234 << 16 | 5678 = 80877102, etc.).
 pub const SSL_REQUEST_VERSION: u32 = 80877103;
 
+/// Typed classification of the single byte the server sends in
+/// response to an `SSLRequest` packet (PG §55.10). DEF-214
+/// (2026-05-05) Phase 2.
+///
+/// The SSL response byte is **out-of-band**: it has no length
+/// prefix and no tagged-frame envelope, so it cannot flow through
+/// the normal `feed_bytes` path. Drivers read the single byte
+/// directly from their socket and call
+/// [`classify_ssl_response_byte`] to obtain a typed outcome
+/// instead of carrying ad-hoc `match byte { b'S' => ... }` logic
+/// at every dispatch site.
+///
+/// # Tier-1 closure
+///
+/// `#[non_exhaustive]` — future PG versions could add a 4th
+/// response byte (e.g. for a new TLS extension); downstream
+/// consumers MUST use a catch-all when matching, but inside this
+/// crate the [`classify_ssl_response_byte`] match is exhaustive
+/// over the four currently-defined outcomes. Adding a new variant
+/// is a build error in the classifier until the new wire byte
+/// is mapped explicitly.
+///
+/// Drivers exhaustively-match (modulo the catch-all required by
+/// `#[non_exhaustive]`) to encode their `sslmode` policy:
+///
+/// ```ignore
+/// match bsql_pg_proto::wire::classify_ssl_response_byte(byte) {
+///     SslNegotiationOutcome::Accepted        => /* TLS handshake */,
+///     SslNegotiationOutcome::Refused         => /* sslmode policy: fallback or fail */,
+///     SslNegotiationOutcome::ErrorIncoming   => /* read ErrorResponse frame */,
+///     SslNegotiationOutcome::InvalidByte(b)  => /* protocol violation, fatal */,
+///     // catch-all required by #[non_exhaustive]
+///     _                                      => /* future extension; treat as fatal until handled */,
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SslNegotiationOutcome {
+    /// Server byte `'S'` (0x53) — server accepts SSL. The driver
+    /// MUST immediately initiate the TLS handshake on the same
+    /// socket; all subsequent protocol traffic flows through TLS.
+    Accepted,
+    /// Server byte `'N'` (0x4e) — server does NOT support SSL. The
+    /// driver decides per its `sslmode` policy:
+    /// - `disable`/`allow`/`prefer`: proceed with plaintext
+    ///   `StartupMessage`.
+    /// - `require`/`verify-ca`/`verify-full`: refuse the connection.
+    ///
+    /// `bsql-pg-proto` itself does NOT enforce policy — that is a
+    /// driver-level concern (the protocol crate has no I/O knowledge
+    /// of which mode the user requested).
+    Refused,
+    /// Server byte `'E'` (0x45) — an `ErrorResponse` frame follows.
+    /// The byte itself is the `TAG_ERROR_RESPONSE` tag of the
+    /// real frame; the remaining 4 bytes (length field) plus body
+    /// follow on the wire. The driver should buffer the consumed
+    /// `'E'` byte plus the rest, then route through the normal
+    /// frame parser ([`crate::parse_header`] +
+    /// [`crate::PgProtocol::feed_bytes`]) to surface the typed
+    /// error.
+    ///
+    /// Pre-TLS errors are typically auth-config issues (the server
+    /// was unable to honour the request before establishing TLS,
+    /// e.g. SSL globally disabled in `pg_hba.conf`).
+    ErrorIncoming,
+    /// Server sent a byte that is none of the three defined
+    /// responses. **Protocol violation** — the driver MUST treat
+    /// this as a fatal connection error (do not attempt recovery,
+    /// do not retry; the server's wire-state is unknowable).
+    /// Carries the offending byte for forensic logging.
+    InvalidByte(u8),
+}
+
+/// Classify the single byte a PG server sends in response to an
+/// `SSLRequest` packet. DEF-214 (2026-05-05) Phase 2.
+///
+/// Pure mapping — no allocation, no panic, `const fn`. See
+/// [`SslNegotiationOutcome`] for the response-byte semantics.
+///
+/// # Tier impact
+///
+/// Pre-DEF-214 Phase 2, drivers wrote ad-hoc
+/// `match byte { b'S' => ..., b'N' => ..., b'E' => ..., _ => ... }`
+/// at every call site — tier-3 by-discipline (forgetting a branch
+/// silently mishandles the connection). Post-Phase 2, the
+/// match scrutinee is the typed [`SslNegotiationOutcome`] with
+/// `#[non_exhaustive]`, lifting the dispatch to tier-1 for the
+/// known-byte arms (compiler enforces handling) and tier-3 for
+/// the future-extension arm (catch-all required by
+/// `#[non_exhaustive]`).
+#[inline]
+#[must_use]
+pub const fn classify_ssl_response_byte(byte: u8) -> SslNegotiationOutcome {
+    match byte {
+        b'S' => SslNegotiationOutcome::Accepted,
+        b'N' => SslNegotiationOutcome::Refused,
+        b'E' => SslNegotiationOutcome::ErrorIncoming,
+        other => SslNegotiationOutcome::InvalidByte(other),
+    }
+}
+
+// DEF-214 Phase 2 (2026-05-05): tier-1 round-trip pin for
+// `classify_ssl_response_byte`. If the classifier's mapping
+// drifts (e.g. someone swaps the 'S' and 'N' arm bodies), these
+// asserts fire at build time.
+const _: () = {
+    assert!(matches!(
+        classify_ssl_response_byte(b'S'),
+        SslNegotiationOutcome::Accepted,
+    ));
+    assert!(matches!(
+        classify_ssl_response_byte(b'N'),
+        SslNegotiationOutcome::Refused,
+    ));
+    assert!(matches!(
+        classify_ssl_response_byte(b'E'),
+        SslNegotiationOutcome::ErrorIncoming,
+    ));
+    assert!(matches!(
+        classify_ssl_response_byte(0x00),
+        SslNegotiationOutcome::InvalidByte(0x00),
+    ));
+    assert!(matches!(
+        classify_ssl_response_byte(0xff),
+        SslNegotiationOutcome::InvalidByte(0xff),
+    ));
+};
+
 /// Compile-time check: `Sync` body length matches the spec.
 ///
 /// Tier-1 against typo-induced wire breaks. If this assert fires, the

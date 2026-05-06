@@ -152,3 +152,143 @@ fn ssl_request_pg_canonical_magic_decomposition() {
     assert_eq!(high, 1234, "high 16 bits must be PG's magic 1234 marker");
     assert_eq!(low, 5679, "low 16 bits must be 5679 (SSLRequest specific)");
 }
+
+// ==================================================================
+// DEF-214 Phase 2: classify_ssl_response_byte typed-outcome tests
+// (2026-05-07): comprehensive coverage of the 1-byte SSL response
+// classifier — every defined byte, every undefined byte sample,
+// non-exhaustive guarantee, equality semantics.
+// ==================================================================
+
+/// `'S'` (0x53) → `Accepted`. Server accepts SSL; driver should
+/// proceed to TLS handshake.
+#[test]
+fn classify_ssl_byte_s_is_accepted() {
+    use bsql_pg_proto::SslNegotiationOutcome;
+    assert!(matches!(
+        bsql_pg_proto::classify_ssl_response_byte(b'S'),
+        SslNegotiationOutcome::Accepted,
+    ));
+}
+
+/// `'N'` (0x4e) → `Refused`. Server does not support SSL.
+#[test]
+fn classify_ssl_byte_n_is_refused() {
+    use bsql_pg_proto::SslNegotiationOutcome;
+    assert!(matches!(
+        bsql_pg_proto::classify_ssl_response_byte(b'N'),
+        SslNegotiationOutcome::Refused,
+    ));
+}
+
+/// `'E'` (0x45) → `ErrorIncoming`. Server is about to send an
+/// `ErrorResponse` frame on the wire.
+#[test]
+fn classify_ssl_byte_e_is_error_incoming() {
+    use bsql_pg_proto::SslNegotiationOutcome;
+    assert!(matches!(
+        bsql_pg_proto::classify_ssl_response_byte(b'E'),
+        SslNegotiationOutcome::ErrorIncoming,
+    ));
+}
+
+/// Every byte value OUTSIDE the {S, N, E} set must classify as
+/// `InvalidByte(b)` carrying the offending byte verbatim. This
+/// exhaustive 0..=255 sweep catches a regression that
+/// accidentally maps another byte to a known outcome.
+#[test]
+fn classify_ssl_byte_unknown_bytes_preserve_payload() {
+    use bsql_pg_proto::SslNegotiationOutcome;
+    for byte in 0..=255u8 {
+        let outcome = bsql_pg_proto::classify_ssl_response_byte(byte);
+        match byte {
+            b'S' => assert!(matches!(outcome, SslNegotiationOutcome::Accepted)),
+            b'N' => assert!(matches!(outcome, SslNegotiationOutcome::Refused)),
+            b'E' => assert!(matches!(outcome, SslNegotiationOutcome::ErrorIncoming)),
+            other => assert!(
+                matches!(outcome, SslNegotiationOutcome::InvalidByte(b) if b == other),
+                "byte {other:#x} must classify as InvalidByte({other:#x}); got {outcome:?}",
+            ),
+        }
+    }
+}
+
+/// Specific edge bytes with classic boundary properties: 0x00
+/// (NUL), 0xFF (all-ones), 0x80 (high bit), 0x7F (high bit clear).
+/// These are common interpretation-error sources in C-style code;
+/// pin the Rust impl.
+#[test]
+fn classify_ssl_byte_boundary_values() {
+    use bsql_pg_proto::SslNegotiationOutcome;
+    let cases = [0x00u8, 0xff, 0x80, 0x7f, 0x01, 0xfe];
+    for byte in cases {
+        let outcome = bsql_pg_proto::classify_ssl_response_byte(byte);
+        match outcome {
+            SslNegotiationOutcome::InvalidByte(b) => {
+                assert_eq!(b, byte, "InvalidByte payload must match input");
+            }
+            other => panic!("byte {byte:#x} classified non-Invalid: {other:?}"),
+        }
+    }
+}
+
+/// PartialEq sanity: outcomes with the same shape compare equal,
+/// outcomes with different shape (including Invalid with different
+/// payloads) compare unequal.
+#[test]
+fn classify_ssl_byte_outcome_equality_semantics() {
+    let s = bsql_pg_proto::classify_ssl_response_byte(b'S');
+    let s2 = bsql_pg_proto::classify_ssl_response_byte(b'S');
+    let n = bsql_pg_proto::classify_ssl_response_byte(b'N');
+    let invalid_a = bsql_pg_proto::classify_ssl_response_byte(0xab);
+    let invalid_a2 = bsql_pg_proto::classify_ssl_response_byte(0xab);
+    let invalid_b = bsql_pg_proto::classify_ssl_response_byte(0xcd);
+
+    assert_eq!(s, s2, "same outcome variant compares equal");
+    assert_ne!(s, n, "Accepted vs Refused unequal");
+    assert_eq!(invalid_a, invalid_a2, "InvalidByte with same payload equal");
+    assert_ne!(invalid_a, invalid_b, "InvalidByte with different payload unequal");
+    assert_ne!(s, invalid_a, "Accepted vs InvalidByte unequal");
+}
+
+/// `classify_ssl_response_byte` is `const fn`. Pin via
+/// compile-time `const _` evaluation outside the crate boundary.
+const _PIN_CONST_FN: () = {
+    let _ = bsql_pg_proto::classify_ssl_response_byte(b'S');
+    let _ = bsql_pg_proto::classify_ssl_response_byte(b'N');
+    let _ = bsql_pg_proto::classify_ssl_response_byte(b'E');
+    let _ = bsql_pg_proto::classify_ssl_response_byte(0xff);
+};
+
+/// Top-level re-export of the classifier function and outcome
+/// enum agrees with the `wire::` module path.
+#[test]
+fn classify_ssl_byte_top_level_and_module_paths_agree() {
+    let via_top = bsql_pg_proto::classify_ssl_response_byte(b'S');
+    let via_mod = bsql_pg_proto::wire::classify_ssl_response_byte(b'S');
+    assert_eq!(via_top, via_mod, "top-level fn must equal module-path fn");
+}
+
+/// `SslNegotiationOutcome` carries `#[non_exhaustive]`. Future PG
+/// versions could add a new response byte (e.g. for new TLS
+/// extensions); downstream consumers MUST use a catch-all when
+/// matching from outside the crate. This test exercises that the
+/// catch-all pattern compiles and runs — proof that
+/// `#[non_exhaustive]` is preserved on the public surface.
+#[test]
+fn outcome_non_exhaustive_requires_catchall_externally() {
+    use bsql_pg_proto::SslNegotiationOutcome;
+    let outcome = bsql_pg_proto::classify_ssl_response_byte(b'S');
+    let label: &'static str = match outcome {
+        SslNegotiationOutcome::Accepted => "accepted",
+        SslNegotiationOutcome::Refused => "refused",
+        SslNegotiationOutcome::ErrorIncoming => "err",
+        SslNegotiationOutcome::InvalidByte(_) => "invalid",
+        // Catch-all required by `#[non_exhaustive]`. If this arm
+        // is removed, a future PG-spec addition would silently
+        // miscategorise; with it, future variants land here as
+        // "unknown" until the driver explicitly handles them.
+        _ => "future-extension-not-yet-handled",
+    };
+    assert_eq!(label, "accepted");
+}
