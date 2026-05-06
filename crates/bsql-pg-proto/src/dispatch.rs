@@ -1875,20 +1875,28 @@ fn dispatch_auth_ok_after_cleartext(
 ///
 /// The length-prefix wrapper handles the BE u32 framing; we push
 /// password bytes followed by the trailing NUL inside the closure.
+///
+/// # Tier-1 architectural-impossibility of `WriteBufFull`
+///
+/// DEF-215 + DEF-216 audit (2026-05-07): the `Err(WriteBufFull)`
+/// arm propagated through `?` is **architecturally unreachable**
+/// per the const-assert
+/// `MAX_OWNED_SEND_LEN >= max_password_message_size()` in
+/// `write_buf.rs`. The error path is preserved as defence in
+/// depth (and to keep the function signature uniform with sibling
+/// builders that DO have legitimate runtime overflow paths), but
+/// any actual `Err` here would indicate a const-assert drift —
+/// itself a build error. Routed through
+/// `InternalCrateBug { BuilderCapacityOverflow }` via the existing
+/// `From<WriteBufFull> for ProtocolError` impl on the unlikely
+/// path; that classification gives forensic visibility if a
+/// future contributor disables the const-assert.
 fn build_password_message(
     password: &crate::sensitive::Sensitive<crate::password::Password>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<crate::action::WriteRange, ProtocolError> {
     let start = reserved.len();
     let buf = reserved.as_write_buf_mut();
-    // `WriteBufFull` propagates through `?` via
-    // `From<WriteBufFull> for ProtocolError`
-    // (→ `InternalCrateBug { BuilderCapacityOverflow }`),
-    // matching the convention used by other branded builders
-    // (`build_query_message`, `build_parse_message`, etc.).
-    // Architecturally dead under `MAX_OWNED_SEND_LEN` budget per
-    // `write_buf.rs` const-asserts; routed through the error path
-    // for forensic visibility if a future drift slips through.
     buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte())?;
     buf.with_length_prefix(|w| {
         w.push_bytes(password.get().as_bytes())?;
@@ -2022,6 +2030,14 @@ fn dispatch_auth_ok_after_md5(
 ///
 /// The MD5 digest is computed by [`crate::md5::compute_response_body`]
 /// which wraps every password-derived intermediate in `Zeroizing<>`.
+///
+/// # Tier-1 architectural-impossibility of `WriteBufFull`
+///
+/// Same as [`build_password_message`]: the const-assert
+/// `MAX_OWNED_SEND_LEN >= max_password_message_size()` in
+/// `write_buf.rs` makes the error path architecturally
+/// unreachable. The MD5 frame is fixed-size at 41 bytes total —
+/// trivially under the 2176 B `MAX_OWNED_SEND_LEN` budget.
 fn build_md5_password_message(
     handshake: &crate::md5::Md5HandshakeState,
     salt: [u8; 4],

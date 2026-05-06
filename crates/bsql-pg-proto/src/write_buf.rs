@@ -285,6 +285,99 @@ const _: () = assert!(
      'D' (1) + len (4) + target (1) + name (N) + NUL (1) = 7 + N",
 );
 
+/// Worst-case byte size of a PostgreSQL `PasswordMessage` (`'p'`)
+/// frame for **cleartext** auth (DEF-215, 2026-05-05). PG §55.7
+/// "PasswordMessage" — the body is the password bytes followed
+/// by a single NUL terminator.
+///
+/// Wire layout:
+///
+/// ```text
+/// 'p' (1) + len_i32 (4) + password (≤ MAX_PASSWORD_LEN) + NUL (1)
+/// ```
+///
+/// # Drift guard
+///
+/// Bumping [`crate::password::MAX_PASSWORD_LEN`] without growing
+/// [`MAX_OWNED_SEND_LEN`] fails the const-assert below — the
+/// overflow cannot silently sneak in.
+pub const fn max_password_message_size_cleartext() -> usize {
+    1usize // tag 'p'
+        .saturating_add(4) // length prefix (includes itself)
+        .saturating_add(crate::password::MAX_PASSWORD_LEN)
+        .saturating_add(1) // NUL terminator
+}
+
+/// Worst-case byte size of a PostgreSQL `PasswordMessage` (`'p'`)
+/// frame for **MD5** auth (DEF-216, 2026-05-05). The body is a
+/// fixed 35-byte digest response (`"md5"` + 32 lowercase hex
+/// chars) plus NUL terminator. Always smaller than the cleartext
+/// case; the [`max_password_message_size`] umbrella const takes
+/// the max of both for the global drift-pin.
+///
+/// Wire layout:
+///
+/// ```text
+/// 'p' (1) + len_i32 (4) + "md5" + 32 hex chars (35 total) + NUL (1)
+/// ```
+pub const fn max_password_message_size_md5() -> usize {
+    1usize // tag 'p'
+        .saturating_add(4) // length prefix (includes itself)
+        .saturating_add(35) // "md5" (3) + 32 hex chars
+        .saturating_add(1) // NUL terminator
+}
+
+/// Maximum across the two `PasswordMessage` shapes (cleartext +
+/// MD5). The cleartext form dominates because passwords can be up
+/// to [`crate::password::MAX_PASSWORD_LEN`] bytes; MD5 is fixed at
+/// 35-byte body. Used by the global [`MAX_OWNED_SEND_LEN`]
+/// drift-pin to make the `WriteBufFull` arm in
+/// [`crate::dispatch::build_password_message`] +
+/// [`crate::dispatch::build_md5_password_message`]
+/// **architecturally impossible** rather than tier-3 by-classification.
+pub const fn max_password_message_size() -> usize {
+    let cleartext = max_password_message_size_cleartext();
+    let md5 = max_password_message_size_md5();
+    if cleartext > md5 { cleartext } else { md5 }
+}
+
+// DEF-215 + DEF-216 drift-pin (audit 2026-05-07): the cleartext +
+// MD5 PasswordMessage builders' `Err(WriteBufFull)` arms are
+// **architecturally unreachable** if and only if
+// `MAX_OWNED_SEND_LEN >= max_password_message_size()`. Pre-pin the
+// builders propagated `WriteBufFull` via `?` to
+// `InternalCrateBug { BuilderCapacityOverflow }` (tier-3 by
+// classification — defence in depth, but not formally pinned to
+// be impossible). Post-pin: bumping `MAX_PASSWORD_LEN` without
+// growing `MAX_OWNED_SEND_LEN` is a build error. Tier-1
+// architectural-impossibility for the cleartext + MD5 outbound
+// frame paths.
+const _: () = assert!(
+    MAX_OWNED_SEND_LEN >= max_password_message_size(),
+    "MAX_OWNED_SEND_LEN below worst-case PasswordMessage frame size — \
+     full-size cleartext password (MAX_PASSWORD_LEN bytes) plus tag + \
+     length-prefix + NUL would overflow the caller's WriteBuf. Grow \
+     MAX_OWNED_SEND_LEN or shrink MAX_PASSWORD_LEN in lockstep.",
+);
+
+// DEF-215 + DEF-216 layout-decomposition drift-pin: pin the
+// cleartext + MD5 size formulas to their literal documented
+// summations. A refactor that dropped the NUL, the length-prefix,
+// or the tag byte from the formula would silently produce a wrong
+// total without this pin. Ties the computed totals to the
+// architectural shapes per PG §55.7.
+const _: () = assert!(
+    max_password_message_size_cleartext()
+        == 6usize.saturating_add(crate::password::MAX_PASSWORD_LEN),
+    "Cleartext PasswordMessage layout drift — PG §55.7: \
+     'p' (1) + len (4) + password (N) + NUL (1) = 6 + N",
+);
+const _: () = assert!(
+    max_password_message_size_md5() == 41,
+    "MD5 PasswordMessage layout drift — PG §55.7: \
+     'p' (1) + len (4) + 'md5' (3) + 32 hex chars (32) + NUL (1) = 41",
+);
+
 /// Bounded outbound frame buffer with PG wire builders.
 ///
 /// See [module-level docs](self) for sizing rationale.
