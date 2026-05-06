@@ -328,6 +328,12 @@ pub use state::ProtoState;
 // `SYNC_WIRE_BYTES`) stay `pub(crate)`; user-facing wire
 // primitives are re-exported here.
 pub use wire::TERMINATE_WIRE_BYTES;
+// DEF-214 (2026-05-05): top-level re-export of the user-facing
+// `SSLRequest` wire literal. Phase 1e wrapper drivers write
+// these bytes BEFORE `PgProtocol::new()` to negotiate TLS;
+// the 1-byte server response is OOB (driver handles it
+// outside the frame parser).
+pub use wire::SSL_REQUEST_WIRE_BYTES;
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------

@@ -414,6 +414,79 @@ pub const TAG_TERMINATE: OutboundTag = OutboundTag::from_byte(b'X');
 /// ```
 pub const TERMINATE_WIRE_BYTES: [u8; 5] = [TAG_TERMINATE.byte(), 0, 0, 0, 4];
 
+/// The complete `SSLRequest` packet on the wire — DEF-214
+/// (2026-05-05).
+///
+/// 8-byte StartupMessage-shaped probe sent BEFORE the real
+/// StartupMessage on connections that want TLS. PG §55.10:
+///
+/// ```text
+/// [length (BE u32 = 8)] [SSL_REQUEST_VERSION (BE u32 = 80877103)]
+///   = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f]
+/// ```
+///
+/// # Server response (out-of-band, NOT a tagged frame)
+///
+/// The server replies with a SINGLE byte (no length prefix, no
+/// frame tag — it's a special pre-frame negotiation byte):
+///
+/// - `'S'` (0x53) — server accepts SSL; the driver immediately
+///   performs the TLS handshake on the same socket, then sends
+///   the real `StartupMessage` THROUGH TLS. All subsequent
+///   protocol traffic is encrypted.
+/// - `'N'` (0x4e) — server does NOT support SSL; the driver
+///   decides per its `sslmode` policy whether to fall back to
+///   plaintext (sending `StartupMessage` directly) or fail.
+/// - Any other byte beginning an `ErrorResponse` ('E' = 0x45)
+///   indicates a server-side error before SSL negotiation
+///   completed; the driver reads the rest of the ErrorResponse
+///   frame normally and surfaces it.
+///
+/// # Visibility
+///
+/// `pub` — the user-facing wire primitive. Phase 1e wrapper drivers
+/// (`bsql-driver-postgres`) write these bytes BEFORE constructing
+/// the `PgProtocol` state machine; the byte handling for the
+/// 1-byte response is the driver's concern (it lives outside this
+/// crate's frame parser, which expects tagged + length-prefixed
+/// frames). Once TLS is established, the driver constructs
+/// `PgProtocol::new()` and pushes a normal `PgCommand::Startup`.
+///
+/// # State-machine integration (Phase 1e)
+///
+/// State-machine integration — explicit `ProtoState::ConnectingPreSsl
+/// AwaitingResponse` variant, response-byte feeder, transition
+/// logic — is deferred to Phase 1e alongside the driver wrapper.
+/// Today this primitive is wire-bytes-only, paralleling
+/// [`TERMINATE_WIRE_BYTES`].
+///
+/// # Usage
+///
+/// ```ignore
+/// // Driver pseudocode:
+/// async fn connect_tls(socket: &mut Socket) -> Result<TlsStream, Err> {
+///     socket.write_all(&bsql_pg_proto::SSL_REQUEST_WIRE_BYTES).await?;
+///     let mut response = [0u8; 1];
+///     socket.read_exact(&mut response).await?;
+///     match response[0] {
+///         b'S' => perform_tls_handshake(socket).await,
+///         b'N' => /* fallback per sslmode policy */,
+///         b'E' => /* read ErrorResponse via frame parser */,
+///         _    => /* protocol violation */,
+///     }
+/// }
+/// ```
+pub const SSL_REQUEST_WIRE_BYTES: [u8; 8] = [
+    // Length: BE u32 = 8 (length includes itself; no separate body
+    // beyond the 4-byte version code).
+    0, 0, 0, 8,
+    // SSL_REQUEST_VERSION = 80877103 in big-endian byte order.
+    // Spelled as literal bytes here (not derived from the const)
+    // to keep the array a pure byte literal — verification asserts
+    // below pin it against `SSL_REQUEST_VERSION`'s `to_be_bytes`.
+    0x04, 0xd2, 0x16, 0x2f,
+];
+
 // ---------------------------------------------------------------
 // Authentication sub-codes (first 4 bytes of 'R' payload)
 // ---------------------------------------------------------------
@@ -607,6 +680,21 @@ pub const SCRAM_SHA_256_MECHANISM: &[u8] = b"SCRAM-SHA-256";
 /// PG protocol version 3.0 = 196608 (0x00030000).
 pub const PROTOCOL_VERSION_3_0: u32 = 196608;
 
+/// PG `SSLRequest` magic version code = 80877103 (0x04d2162f).
+/// DEF-214 (2026-05-05).
+///
+/// This is NOT a real protocol version — it's a sentinel value in
+/// the `version` field of the StartupMessage-shaped 8-byte
+/// SSLRequest packet that tells PG "I want to negotiate SSL/TLS
+/// before sending the actual StartupMessage". PG §55.10
+/// "SSL Session Encryption". The companion code
+/// [`GSSENC_REQUEST_VERSION`] (80877104) is the GSS encryption
+/// counterpart, deferred to post-v1.0 (see DEF-230).
+///
+/// Composed of (1234 << 16) | 5679 — PG's standard "magic-version"
+/// shape (CancelRequest uses 1234 << 16 | 5678 = 80877102, etc.).
+pub const SSL_REQUEST_VERSION: u32 = 80877103;
+
 /// Compile-time check: `Sync` body length matches the spec.
 ///
 /// Tier-1 against typo-induced wire breaks. If this assert fires, the
@@ -635,6 +723,39 @@ const _: () = assert!(
         && TERMINATE_WIRE_BYTES[4] == 4,
     "Terminate length-field must be 4 (length includes itself, no payload)",
 );
+
+// DEF-214 (2026-05-05): drift-pin for `SSL_REQUEST_WIRE_BYTES` and
+// the underlying `SSL_REQUEST_VERSION` const. Sentinel value
+// 80877103 = 0x04d2162f per PG §55.10. The byte literal in the
+// array MUST match `SSL_REQUEST_VERSION.to_be_bytes()`; the
+// length field MUST be exactly 8 (length includes itself, version
+// is the only payload). A bump of either operand without
+// matching the other breaks the build here. Tier-1 against
+// typo-induced wire breaks.
+const _: () = assert!(SSL_REQUEST_WIRE_BYTES.len() == 8);
+const _: () = assert!(SSL_REQUEST_VERSION == 80_877_103);
+const _: () = assert!(
+    SSL_REQUEST_WIRE_BYTES[0] == 0
+        && SSL_REQUEST_WIRE_BYTES[1] == 0
+        && SSL_REQUEST_WIRE_BYTES[2] == 0
+        && SSL_REQUEST_WIRE_BYTES[3] == 8,
+    "SSLRequest length-field must be exactly 8 (length includes itself + 4-byte version)",
+);
+// Pin the version bytes by comparing against
+// `SSL_REQUEST_VERSION.to_be_bytes()`. If anyone bumps either
+// the const or the literal without updating the other, the
+// formula breaks here.
+const _: () = {
+    let v = SSL_REQUEST_VERSION.to_be_bytes();
+    assert!(
+        SSL_REQUEST_WIRE_BYTES[4] == v[0]
+            && SSL_REQUEST_WIRE_BYTES[5] == v[1]
+            && SSL_REQUEST_WIRE_BYTES[6] == v[2]
+            && SSL_REQUEST_WIRE_BYTES[7] == v[3],
+        "SSLRequest version bytes must equal SSL_REQUEST_VERSION.to_be_bytes() — \
+         bump both the const and the literal in lockstep, or the formula drifts",
+    );
+};
 
 // ---------------------------------------------------------------
 // Tag collision defenses (§10 of DEF-094 audit round 2, 2026-04-20)
