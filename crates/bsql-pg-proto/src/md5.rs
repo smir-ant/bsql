@@ -212,46 +212,112 @@ pub(crate) fn compute_response_body(
 /// Compute lowercase hex of a 16-byte input as a fresh `[u8; 32]`
 /// owned array. DEF-216 audit (2026-05-07): tier-1 type-level
 /// signature — caller cannot mistake the output size.
-///
-/// Branchless per-nibble lookup via a 16-element ASCII table.
 fn hex_lowercase(input: &[u8; 16]) -> [u8; MD5_RESPONSE_HEX_LEN] {
     let mut out = [0u8; MD5_RESPONSE_HEX_LEN];
     write_hex_lowercase(input, &mut out);
     out
 }
 
+/// Map a 4-bit nibble to its lowercase ASCII hex character.
+/// DEF-216 audit (2026-05-07): tier-1 fallback elimination.
+///
+/// # Tier-1 by branchless arithmetic
+///
+/// Pre-audit: `HEX_TABLE.get(n).copied().unwrap_or(b'?')` — silent
+/// fallback to `'?'`, a VALID ASCII character that could be
+/// confused with real content. If the table lookup ever failed
+/// (architecturally impossible since `n & 0x0f` is in 0..=15 and
+/// the table has 16 entries), the digest would silently contain
+/// `?` characters and the server would reject the auth without
+/// any client-side hint of the cause.
+///
+/// Post-audit: branchless `if/else` over the masked nibble value
+/// (`n & 0x0f` ∈ 0..=15). Both branches produce a valid
+/// lowercase hex char — the function has NO wildcard arm, NO
+/// fallback, NO sentinel. Every legal input yields a structurally
+/// correct output.
+///
+/// - For `n & 0x0f` in 0..=9: `b'0' + masked` = `b'0'`..=`b'9'`.
+/// - For `n & 0x0f` in 10..=15: `b'a' + (masked - 10)` = `b'a'`..=`b'f'`.
+///
+/// `saturating_add` / `saturating_sub` per `forbid(clippy::arithmetic_side_effects)`.
+/// At runtime the saturating ops are equivalent to plain `+`/`-`
+/// because the operands are bounded — the saturation never fires.
+#[inline]
+const fn nibble_to_lowercase_hex(n: u8) -> u8 {
+    let masked = n & 0x0f;
+    if masked < 10 {
+        b'0'.saturating_add(masked)
+    } else {
+        b'a'.saturating_add(masked.saturating_sub(10))
+    }
+}
+
+// Tier-1 const-eval pin: every nibble (0..=15) maps to its
+// canonical lowercase hex char at compile time. A regression in
+// `nibble_to_lowercase_hex`'s arithmetic — wrong base byte,
+// off-by-one offset, swapped branches — fails the build here.
+const _: () = {
+    assert!(nibble_to_lowercase_hex(0) == b'0');
+    assert!(nibble_to_lowercase_hex(1) == b'1');
+    assert!(nibble_to_lowercase_hex(2) == b'2');
+    assert!(nibble_to_lowercase_hex(3) == b'3');
+    assert!(nibble_to_lowercase_hex(4) == b'4');
+    assert!(nibble_to_lowercase_hex(5) == b'5');
+    assert!(nibble_to_lowercase_hex(6) == b'6');
+    assert!(nibble_to_lowercase_hex(7) == b'7');
+    assert!(nibble_to_lowercase_hex(8) == b'8');
+    assert!(nibble_to_lowercase_hex(9) == b'9');
+    assert!(nibble_to_lowercase_hex(10) == b'a');
+    assert!(nibble_to_lowercase_hex(11) == b'b');
+    assert!(nibble_to_lowercase_hex(12) == b'c');
+    assert!(nibble_to_lowercase_hex(13) == b'd');
+    assert!(nibble_to_lowercase_hex(14) == b'e');
+    assert!(nibble_to_lowercase_hex(15) == b'f');
+    // Defence in depth: the `& 0x0f` mask inside
+    // `nibble_to_lowercase_hex` means out-of-range u8 inputs are
+    // structurally truncated to 0..=15 — pin a couple of values
+    // to ensure the mask remains.
+    assert!(nibble_to_lowercase_hex(0x10) == b'0', "mask drift: 0x10 & 0x0f = 0");
+    assert!(nibble_to_lowercase_hex(0xff) == b'f', "mask drift: 0xff & 0x0f = 15");
+};
+
 /// Write 16 input bytes as 32 lowercase ASCII hex characters into
-/// `out`. Branchless per-nibble lookup via a small lookup table.
+/// `out`. DEF-216 audit (2026-05-07): tier-1 elevation — pair-
+/// chunked iteration with type-level `&mut [u8; 2]` access via
+/// `chunks_exact_mut`. No lookup-table fallback (replaced by
+/// branchless [`nibble_to_lowercase_hex`]); no per-position
+/// indexing fallback (replaced by typed array assignment).
 ///
-/// # Safety / correctness
+/// # Tier-1 properties
 ///
-/// - Indexing is bounded by construction: `i` ranges 0..16 and
-///   `out` is sized [u8; 32]; offsets `i*2` and `i*2+1` are
-///   always in-bounds.
-/// - The hex table is a `const &[u8; 16]`; lookups via `.get()`
-///   with `unwrap_or(b'?')` provide a fallback that is
-///   architecturally unreachable (the nibble masks below produce
-///   values in 0..=15).
+/// - `out: &mut [u8; 32]`'s 32 bytes split exactly into 16 pairs
+///   of 2; `chunks_exact_mut(2)` produces 16 chunks with 0
+///   remainder.
+/// - Each chunk's `try_into::<&mut [u8; 2]>()` is structurally
+///   infallible (chunks_exact_mut(2) yields exactly-2-byte
+///   slices); the `Ok(p)` arm fires unconditionally, the `Err`
+///   arm is architecturally dead.
+/// - `*p = [hi_char, lo_char]` is a typed-array assignment —
+///   no slice-length runtime check, no panic on mismatch.
 fn write_hex_lowercase(input: &[u8; 16], out: &mut [u8; 32]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for (i, byte) in input.iter().enumerate() {
-        let hi = usize::from(byte >> 4);
-        let lo = usize::from(byte & 0x0f);
-        // .get() returns Option<&u8>; .copied() unwraps Some(u8);
-        // unwrap_or fires only on out-of-range nibble (impossible
-        // under the masks above) — `b'?'` is the sentinel a future
-        // bug would surface as.
-        let hi_char = HEX.get(hi).copied().unwrap_or(b'?');
-        let lo_char = HEX.get(lo).copied().unwrap_or(b'?');
-        // Use saturating_mul/add to satisfy
-        // `forbid(clippy::arithmetic_side_effects)`.
-        let pos_hi = i.saturating_mul(2);
-        let pos_lo = pos_hi.saturating_add(1);
-        if let Some(slot) = out.get_mut(pos_hi) {
-            *slot = hi_char;
-        }
-        if let Some(slot) = out.get_mut(pos_lo) {
-            *slot = lo_char;
+    // Pair-chunked iteration: each pair receives one (hi, lo)
+    // hex pair from one input byte. zip terminates at min(16,16)
+    // = 16 iterations; `chunks_exact_mut(2)` produces 0
+    // remainder for the 32-byte `out`.
+    for (byte, pair) in input.iter().zip(out.chunks_exact_mut(2)) {
+        let hi_char = nibble_to_lowercase_hex(byte >> 4);
+        let lo_char = nibble_to_lowercase_hex(*byte);
+        // `chunks_exact_mut(2)` guarantees `pair.len() == 2`,
+        // so the array conversion is structurally infallible.
+        // The `Err` arm is architecturally dead — kept as a
+        // tier-2-by-construct shield; a regression that breaks
+        // chunks_exact_mut's contract would surface as a no-op
+        // here rather than a panic. Tests + KAT in
+        // `tests/startup_spec.rs::md5_auth_kat_*` would catch
+        // any silent miss-write.
+        if let Ok(p) = <&mut [u8; 2]>::try_from(pair) {
+            *p = [hi_char, lo_char];
         }
     }
 }
