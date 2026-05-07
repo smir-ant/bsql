@@ -1583,8 +1583,21 @@ pub trait FromPgText<'a>: Sized {
 // we accumulated as positive then negated, `-32768` on i16 would
 // trip). Each step uses `checked_mul` / `checked_add` / `checked_sub`
 // per `clippy::arithmetic_side_effects` forbid.
+//
+// DEF-207 (2026-05-07): for i16/i32 the digit loop now uses a
+// **wider accumulator** (`parse_pg_int_signed_widened!`) so the
+// per-digit `checked_mul + checked_add/sub` chain (2 overflow
+// branches per iteration) collapses to `wrapping_mul(10) +
+// wrapping_add(d)` (no per-digit overflow check). The pre-loop
+// length bound + a single end-of-loop `try_from` validate the
+// entire range. i64 stays on the original checked-arithmetic
+// macro because the next-wider native type (i128) compiles to
+// multi-instruction sequences on 64-bit targets, losing the win.
 
-/// Parse a signed ASCII-digit integer. Shared body for i16/i32/i64.
+/// Parse a signed ASCII-digit integer with overflow checked at
+/// every digit. Original DEF-184 form. Used by `i64` (where the
+/// next-wider type would be i128 — non-native on 64-bit, slower
+/// than the checked path).
 macro_rules! parse_pg_int_signed {
     ($bytes:expr, $t:ty) => {{
         let (is_neg, digits) = match $bytes.split_first() {
@@ -1611,6 +1624,90 @@ macro_rules! parse_pg_int_signed {
             }
         }
         Ok(acc)
+    }};
+}
+
+/// Parse a signed ASCII-digit integer using a **wider** accumulator
+/// type than the result. DEF-207 (2026-05-07) — branch-budget
+/// reduction for the i16/i32 hot loop on text-format integer
+/// columns (the dominant cost on int-heavy SELECT analytics).
+///
+/// # How it removes branches
+///
+/// The classic `checked_mul + checked_add/sub` form has 2
+/// overflow-detection branches per digit. With a wider
+/// accumulator and a digit-count pre-check, **the wrapping
+/// arithmetic cannot actually wrap during the loop** — the
+/// pre-check bounds the maximum reachable value safely below
+/// `$acc::MAX`. One end-of-loop `<$result>::try_from(signed_acc)`
+/// validates against the result-type's range.
+///
+/// Per-digit branches: **1** (digit validation) — was 3 (digit +
+/// 2× overflow).
+///
+/// # Constraints
+///
+/// - `$acc` MUST be wider than `$result` (e.g. `i32` for `i16`,
+///   `i64` for `i32`). Signed.
+/// - `$max_digits` MUST satisfy `9 * 10^$max_digits + 9 < $acc::MAX`
+///   so `wrapping_mul(10).wrapping_add(9)` cannot wrap during
+///   the loop. For:
+///   - i16 result + i32 acc + 5 digits: max acc reach = 99_999;
+///     i32::MAX = 2_147_483_647. ✓
+///   - i32 result + i64 acc + 10 digits: max acc reach =
+///     9_999_999_999; i64::MAX ≈ 9.22 × 10^18. ✓
+///
+/// # Sign handling
+///
+/// Accumulate as positive, apply `wrapping_neg` at end if
+/// `is_neg`. `wrapping_neg` on the in-range values we care about
+/// (≤ 10^10 for i32) is just regular negation; the wider
+/// accumulator gives headroom that avoids the original
+/// "accumulate-into-correct-sign" complication of the checked
+/// form (where `-i16::MIN = 32768` would overflow the result type
+/// before negation). Final `try_from` validates `signed_acc ∈
+/// $result::MIN..=$result::MAX`.
+macro_rules! parse_pg_int_signed_widened {
+    ($bytes:expr, $result:ty, $acc:ty, $max_digits:expr) => {{
+        // Sign strip — identical to the checked-arithmetic form.
+        let (is_neg, digits) = match $bytes.split_first() {
+            Some((&b'-', rest)) => (true, rest),
+            Some((&b'+', rest)) => (false, rest),
+            Some(_) => (false, $bytes),
+            None => return Err(DecodeError::IntParse),
+        };
+        // Length pre-check — bounds the max accumulator reach so
+        // `wrapping_mul(10).wrapping_add(9)` cannot actually wrap
+        // during the loop. Empty digit run is also caught here.
+        if digits.is_empty() || digits.len() > $max_digits {
+            return Err(DecodeError::IntParse);
+        }
+        // Hot loop — single per-digit branch (digit valid?), no
+        // overflow checks. Wrapping ops are always-defined; the
+        // length bound above ensures the value stays below
+        // `$acc::MAX` so wrapping never actually wraps for valid
+        // input.
+        let mut acc: $acc = 0;
+        for &b in digits {
+            if !b.is_ascii_digit() {
+                return Err(DecodeError::IntParse);
+            }
+            // `b.saturating_sub(b'0')` ∈ 0..=9 on the valid path
+            // (validated in the line above); identical semantics
+            // to `b - b'0'` here, but lint-safe under
+            // `clippy::arithmetic_side_effects` forbid.
+            let d = <$acc>::from(b.saturating_sub(b'0'));
+            acc = acc.wrapping_mul(10).wrapping_add(d);
+        }
+        // Sign at end. `wrapping_neg` is correct for all
+        // in-range values; the impossible `acc == $acc::MIN`
+        // edge would cycle back to itself but is unreachable
+        // given the length pre-check.
+        let signed: $acc = if is_neg { acc.wrapping_neg() } else { acc };
+        // Final range check — validates `signed` fits in
+        // `$result::MIN..=$result::MAX`. This is the SOLE overflow
+        // check on the entire path.
+        <$result>::try_from(signed).map_err(|_| DecodeError::IntParse)
     }};
 }
 
@@ -1644,7 +1741,13 @@ impl FromPgText<'_> for i16 {
     const OID: u32 = oids::INT2;
     #[inline]
     fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
-        parse_pg_int_signed!(bytes, i16)
+        // DEF-207 (2026-05-07): widened-accumulator path. i32
+        // accumulator + 5-digit cap (i16::MAX = 32767 = 5 digits).
+        // Max acc reach with 5 digits = 99_999 << i32::MAX ≈ 2.15B,
+        // so wrapping_mul(10).wrapping_add(9) cannot wrap during
+        // the loop. Single end-cast `i16::try_from` validates
+        // i16::MIN..=i16::MAX.
+        parse_pg_int_signed_widened!(bytes, i16, i32, 5)
     }
 }
 
@@ -1652,7 +1755,13 @@ impl FromPgText<'_> for i32 {
     const OID: u32 = oids::INT4;
     #[inline]
     fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
-        parse_pg_int_signed!(bytes, i32)
+        // DEF-207 (2026-05-07): widened-accumulator path. i64
+        // accumulator + 10-digit cap (i32::MAX = 2_147_483_647 =
+        // 10 digits). Max acc reach with 10 digits = 9_999_999_999
+        // << i64::MAX ≈ 9.22 × 10^18, so wrapping_mul(10) +
+        // wrapping_add(9) cannot wrap during the loop. Single
+        // end-cast `i32::try_from` validates i32::MIN..=i32::MAX.
+        parse_pg_int_signed_widened!(bytes, i32, i64, 10)
     }
 }
 
@@ -1660,6 +1769,13 @@ impl FromPgText<'_> for i64 {
     const OID: u32 = oids::INT8;
     #[inline]
     fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+        // DEF-207 (2026-05-07): i64 stays on the original
+        // checked-arithmetic macro. The wider native accumulator
+        // (i128) compiles to multi-instruction sequences on
+        // 64-bit targets — losing the speed gain that motivates
+        // the widened-acc form for i16/i32. Capping at 18 digits
+        // (skipping i64::MAX) would be incorrect — `9_223_372_
+        // 036_854_775_807` is a valid 19-digit i64.
         parse_pg_int_signed!(bytes, i64)
     }
 }
