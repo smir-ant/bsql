@@ -123,9 +123,15 @@ warn_if_dirty_for_save() {
     local head_short
     head_short="$(git -C "$WORKSPACE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
+    # `git status --porcelain` returns one line per file that
+    # differs from HEAD: modified-tracked, staged, AND untracked.
+    # We include untracked because an untracked .rs file in src/
+    # is picked up by cargo bench's compile (verified empirically
+    # 2026-05-07). `git diff --quiet` alone misses that case.
     local dirty=0
-    if ! git -C "$WORKSPACE" diff --quiet 2>/dev/null \
-        || ! git -C "$WORKSPACE" diff --cached --quiet 2>/dev/null; then
+    local porcelain
+    porcelain="$(git -C "$WORKSPACE" status --porcelain 2>/dev/null || echo "")"
+    if [[ -n "$porcelain" ]]; then
         dirty=1
     fi
 
