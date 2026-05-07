@@ -141,7 +141,7 @@ per CREDO §4.12. NONE deferred without structural reason.**
 |-----|------|-----------|--------------|--------|
 | DEF-195 | `BoundedU8<MAX>` newtype + apply to `RowDesc::n_columns` (u16 → BoundedU8<32>). NonZeroU8-backed offset-by-one encoding gives stable-Rust niche on `Option<BoundedU8<MAX>>` (1 B). New module `crates/bsql-pg-proto/src/bounded.rs` (~180 LoC + tests). Tier-1 size pins on `BoundedU8<32>`, `Option<BoundedU8<32>>`, `Option<RowDesc>`. | Tier-2 (rejected at construct via `try_new`) → tier-1 niche `Option<BoundedU8<MAX>>` (NonZeroU8 niche absorbs Option discriminant). | `Option<RowDesc>` 140 → 136 B (4 B saved per Option). `PgProtocol` 4352 B unchanged (alignment of other fields absorbs the field-level saving — niche-saving captured at Option<RowDesc> level where it counts). Bench: no regression (numbers within noise vs def202-simdutf8). | SHIPPED 2026-04-28 |
 | DEF-198 | Witness-guard typestate (DEF-119 round-4): `proto.as_ready()` → `Option<ReadyGuard<'_>>`; `push_command` / `push_bind_execute` are methods of guard. `connection_status() -> ConnectionStatus { Ready, Busy, Handshaking, Errored(StateErrorKind) }` for caller-side recovery decisions when guard returns None. | Tier-1 (compile-rejected on public API surface) | Foundation for pipelining | SHIPPED 2026-04-28 |
-| DEF-200 | Per-state-bucket dispatch LUTs — A7 adjacent shape (split global tag dispatch into `[fn; 14]` per bucket) | Same tier | Branch-predictor learns smaller patterns | PROPOSED, measurement-gated |
+| DEF-200 | ~~Per-state-bucket dispatch LUTs — A7 adjacent shape (split global tag dispatch into `[fn; 14]` per bucket)~~ **REJECTED 2026-05-07 pre-implementation — see §B for full analysis.** Same FAMILY as A7 (already MEASURED REGRESSION); indirect-call overhead vs current 2D-match jump-table likely produces neutral-to-regression on Apple M1+ class hardware where BTB capacity isn't the bottleneck. `#[cold]` already applied to error-path helpers, so structural extraction can't extract further hot/cold separation. | (REJECTED) | (no code shipped) | (CLOSED — see §B) |
 | DEF-201 | `PgCommand` per-kind monomorphisation: `trait PgCommandT { const TAG; type Payload }` + generic `push_command<C: PgCommandT>` | Tier-1 (typed dispatch) | Caller pays only HIS command size; current 2176 B per-command → real size | PROPOSED, **design discussion required** before impl |
 | DEF-202 | `simdutf8` for `<&str as FromPgText>::from_pg_text`. Routes UTF-8 validation through `simdutf8::basic::from_utf8` (lane-wise NEON shuffles + masks on aarch64; scalar fast-path elsewhere). Behaviour byte-identical to `core::str::from_utf8`. Hybrid length-threshold dispatch was tested and rejected (branch overhead ~1.5 ns/col exceeded short-ASCII savings). Workspace dep `simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon"] }`. Bench `def202-simdutf8` vs `pre-simdutf8` baselines on aarch64-apple-darwin: short ASCII (17 B × 5) +9.9% (43.6 vs 40.3 ns — acceptable cost on the cheapest path), **long ASCII (~200 B × 5) −49.9% (~2× faster: 26.6 vs 53.0 ns)**, **multi-byte UTF-8 (~78 B Cyrillic × 5) −74.0% (~3.9× faster: 78.5 vs 309.4 ns)**. | Same tier (runtime UTF-8 classification → tier-3 by `DecodeError::NonUtf8`; behaviour parity with `core::str::from_utf8` documented + property-tested upstream). | 2-4× speedup on the dominant decoder bottleneck for analytics / internationalised workloads. Binary-format codec sub-item (`i32::from_be_bytes` for binary wire) deferred to a follow-up DEF — requires server-side per-column binary opt-in via `format_codes` in Bind. | SHIPPED 2026-04-28 |
 | DEF-203 | Niche audit sweep — apply [`BoundedU8`]/[`BoundedU16`] to `len`-style fields uniformly. **FULLY SHIPPED 2026-04-28** (split commits, see §D Phase 1c entries `DEF-203 (API + 2 sites)` and `DEF-203 ext (FixedStr migration)`). Unified `bounded.rs` with `BoundedU8<const MAX: usize>` (MAX ≤ 254), `BoundedU16<const MAX: usize>` (MAX ≤ 65_534), sealed [`BoundedLen<N>`] trait. **Sites migrated**: `RowDesc::n_columns` (BoundedU8<32>), `OtherEncoding::len` (BoundedU8<32>), `FixedStr<N, Tag, LenT>` (default `BoundedU16<N>`; Ident/DatabaseName/StmtName/PortalName pick `BoundedU8<63>` for the niche win), `PodBytes<N, LenT>` (same pattern). **`const fn` cascade closed via Path C**: per-concrete-LenT inherent impls (`impl FixedStr<N, Tag, BoundedU8<N>>` + `impl FixedStr<N, Tag, BoundedU16<N>>` carry duplicated const fn methods); generic `Self::default()` is non-const but `static EMPTY` consumers don't transitively call it. Cumulative: ~50-60 B saved per `PgProtocol` across migrated sites + tighter `Option<T>` niches on Ident family. RU-01 (const-traits stabilisation) would let us collapse the duplicated inherent impls into a single generic `const fn` — keyword-flip migration when stable; tracked in §C. | (CLOSED) |
@@ -155,7 +155,7 @@ per CREDO §4.12. NONE deferred without structural reason.**
 
 **Priority order (§1) — REVISED 2026-04-28 after DEF-202 ship + Ext A/C register:**
 1. **Decoder perf wins (bench-gated by DEF-197):**
-   - **DEF-200** — per-state dispatch LUT (A7 adjacent shape). Branch-predictor-friendly bucket split. Measurement-gated.
+   - ~~**DEF-200**~~ REJECTED 2026-05-07 pre-implementation. Same family as §B A7 (MEASURED REGRESSION). Indirect-call overhead would likely overwhelm any branch-prediction win on Apple M1+ class hardware. See §B for the full analytical + empirical-precedent case.
    - ~~**DEF-207**~~ SHIPPED 2026-05-07 — wider-acc + length-bound + single-end-cast macro (`parse_pg_int_signed_widened!`). Real win: −35.5% on column_decode/iter_5cols_decode_i32 (CI [−42.4%, −30.6%], p=0.00), throughput +55% (102 → 152 Melem/s). See §D Phase 1c entry.
 2. **Architectural pre-discussion:** DEF-201 before any code (massive refactor; ≥3 alternatives per architect.txt process).
 3. **Zero-cost micro-wins:** ~~DEF-195~~ SHIPPED. ~~DEF-203 (full sweep)~~ SHIPPED — RowDesc/OtherEncoding/FixedStr/PodBytes all migrated 2026-04-28; remaining const-fn collapse waits for RU-01 const-traits stabilisation (Path C inherent-impl duplication shipped as workaround).
@@ -373,6 +373,82 @@ proposals into factual data instead of speculation.
   heapless) introduces a tax of its own (two patterns, two
   audit budgets). Net call: keep heapless uniformly until / unless
   a clear path to whole-crate replacement emerges.
+
+- **DEF-200 — Per-state-bucket dispatch LUTs**
+  REJECTED 2026-05-07 pre-implementation. Original framing
+  proposed splitting the global `match (state, tag)` dispatch
+  into `[fn; 14]`-per-state-class function tables, hypothesising
+  that branch-predictor learns smaller patterns per state.
+
+  **Analytical case against:**
+  1. **Indirect-call overhead.** Per-state fn-table dispatch
+     introduces an indirect call (load fn-ptr + branch-and-link)
+     where the current 2D match emits direct jump-table jumps.
+     On Apple M1+ each indirect call is ~2-3 cycles even when
+     the BTB is warm; modern LLVM compiles a 2D `match (state,
+     tag)` as a discriminant-folded jump table that costs ~1-2
+     cycles. Net: indirect-call overhead can **eliminate** the
+     hypothesised branch-prediction win.
+  2. **BTB capacity is not the bottleneck.** Apple M1+ BTB has
+     4096+ entries; current dispatch has 83 reachable arms.
+     "Branch predictor can't handle 83 targets" is empirically
+     false on this class of hardware.
+  3. **`#[cold]` already applied.** `install_errored` (line 152)
+     and `parse_error_response` (line 2139) carry `#[cold]
+     #[inline]`; LLVM already pushes error-path arms out of the
+     hot icache region. The remaining dispatch path is fully
+     hot-arm-only; per-state splitting can't extract additional
+     cold-vs-hot separation.
+  4. **`PROTOCOL_VERSION_3_0` and other dispatch-class
+     intermediate steps already optimised** — current arm bodies
+     do classification and transition in a single pass; per-state
+     fn dispatch would re-do classification implicit in the
+     fn-pointer-table index.
+
+  **Empirical case against (PRE-EXISTING evidence in this same
+  §B):**
+  - **A7 (Tag byte LUT, commit `1a762ca`, 2026-04-24)** is the
+    same FAMILY of optimization applied at the tag-classification
+    stage: `InboundTagClass` enum + `classify` fn instead of
+    sparse byte switch. **Measured regression** on all 4 bench
+    groups (+2.6% to +8.2%, p<0.05). The §B postmortem reads:
+    "LLVM's sparse-byte switch beats dense-enum form; classify
+    step adds indirection not foldable. Hypothesis 'dense
+    discriminant jump table wins' falsified on modern LLVM."
+    **DEF-200 is the same hypothesis** applied at the
+    state-dispatch stage instead of the tag-classification stage.
+  - **A4/B16 (cache-line layout reorder via `#[repr(C)]`,
+    2026-04-24)** — manual hint to LLVM about layout: regressed
+    parse_header +6.3%, push_command +3.8%, iter_rows +1.6%.
+    Same lesson: modern LLVM + Rust default beats manual layout
+    hints.
+  - **W3 (parse_header range-pattern match, 2026-04-24)** —
+    range pattern instead of sequential if-guards: +70% on
+    parse_header. Same lesson: structural rewrites of well-tuned
+    dispatch code regress.
+
+  Three independent measurements in the same dispatch-perf
+  domain produced regressions. DEF-200 is in the same family;
+  expected outcome: regression.
+
+  **What WOULD be required to reopen:**
+  - A new measurement framework that isolates dispatch cost
+    (not bundled into ping_round_trip / iter_rows). The current
+    bench harness measures end-to-end, so a 3% dispatch
+    improvement is below detection floor when wrapped in a
+    150-ns full cycle.
+  - Hardware where BTB capacity IS the bottleneck (embedded
+    targets with 16-32 entry BTBs). Out of v1.0 target hardware.
+  - PGO data showing branch-misprediction rates on the current
+    dispatch — feature not in our build infrastructure.
+  - A structural variant that AVOIDS the indirect-call cost
+    entirely (e.g., LLVM-friendly `match` rotation by tag-first
+    instead of state-first — Variant B from session analysis,
+    a design discussion before code).
+
+  No code shipped; no measurement run beyond the analytical
+  case. The §A row was downgraded to "REJECTED — see §B" and
+  the priority-order section updated.
 
 | DEF / Audit ID | Item | Disposition | Commit |
 |----------------|------|-------------|--------|
