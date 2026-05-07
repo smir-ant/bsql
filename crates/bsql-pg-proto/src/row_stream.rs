@@ -96,7 +96,30 @@ use crate::write_buf::WriteBuf;
 // DEF-184 (A1+A13): StreamItem shrunk 320 → ~80 B post-ErrorArena
 // externalisation. Reply<'a> dominates now (~72 B); no longer
 // large_enum_variant worthy.
+//
+// DEF-256 (audit 2026-05-08): `#[non_exhaustive]` so future variants
+// (e.g., partial-row signals, pipelining-multi-stream events) can
+// land without breaking downstream exhaustive matches at the
+// `cargo build` boundary. Internal `match StreamItem::*` inside the
+// crate stays exhaustive (the marker only constrains downstream
+// crates per Rust semantics).
+//
+// # Variant ordering — DEF-254 (audit 2026-05-08)
+//
+// Variants are in **production-frequency order** for the SELECT hot
+// loop:
+//
+// - `Row` — emitted N times per SELECT result (N can be 1000s) →
+//   **dominant** by orders of magnitude.
+// - `Complete` — once per query terminal.
+// - `SendBytes` — only mid-handshake (rare in steady state).
+// - `FailReply` — once per error.
+// - `CloseSocket` — once per fatal.
+// - `NeedMore` — when buffer drains mid-stream; caller signal.
+//
+// Order verified optimal at this audit; no reorder needed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StreamItem<'a> {
     /// One `DataRow` frame arrived — fast-path emission.
     /// `row_bytes` is the raw body (post column-count header, per

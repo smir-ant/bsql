@@ -328,6 +328,12 @@ pub use state::ProtoState;
 // `SYNC_WIRE_BYTES`) stay `pub(crate)`; user-facing wire
 // primitives are re-exported here.
 pub use wire::TERMINATE_WIRE_BYTES;
+// DEF-252 (audit 2026-05-08): top-level re-export of the
+// user-facing `Flush` wire literal. Phase 1c-5 pipelining drivers
+// write these bytes mid-batch to extract intermediate responses
+// without committing the implicit transaction (which would be
+// `Sync`'s job). Same convention as `TERMINATE_WIRE_BYTES`.
+pub use wire::FLUSH_WIRE_BYTES;
 // DEF-214 (2026-05-05): top-level re-export of the user-facing
 // `SSLRequest` wire literal. Phase 1e wrapper drivers write
 // these bytes BEFORE `PgProtocol::new()` to negotiate TLS;

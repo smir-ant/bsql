@@ -290,6 +290,13 @@ pub const TAG_DESCRIBE: OutboundTag = OutboundTag::from_byte(b'D');
 ///
 /// Const-asserts below pin the wire bytes to PG spec; an arm-body
 /// edit swapping the two values would fail the build.
+///
+/// # NOT `#[non_exhaustive]` — DEF-256 audit (2026-05-08)
+///
+/// PG §55.2.2 defines exactly two Describe targets (`'S'` statement,
+/// `'P'` portal). Adding a third would be a major-protocol bump,
+/// not a SemVer-compatible change. Closed-by-spec → exhaustive
+/// `match` is the load-bearing tier-1 invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DescribeTargetByte {
@@ -368,6 +375,43 @@ pub const TAG_CLOSE: OutboundTag = OutboundTag::from_byte(b'C');
 /// implicit transaction and emits `ReadyForQuery`; `Flush` does
 /// not.)
 pub const TAG_FLUSH: OutboundTag = OutboundTag::from_byte(b'H');
+
+/// The complete `Flush` frame on the wire — DEF-252 (audit 2026-05-08).
+///
+/// PG `Flush` has a 5-byte body: tag (`'H'`) + 4-byte length-field
+/// (BE u32 = 4, length includes itself but excludes the tag).
+///
+/// Static byte literal. Same shape as the (`pub(crate)`)
+/// `SYNC_WIRE_BYTES` and the public [`TERMINATE_WIRE_BYTES`] —
+/// parameter-free, exclusive of any payload.
+///
+/// # Visibility
+///
+/// `pub` — part of the user-facing API (parallels [`TERMINATE_WIRE_BYTES`]).
+/// Phase 1c-5 pipelining drivers will write `Flush` mid-batch to
+/// extract intermediate responses without committing the implicit
+/// transaction (that's `Sync`'s job).
+///
+/// # Why a const, not a routed `Action::SendBytes`
+///
+/// `Flush` carries no parameters and no state-machine residue —
+/// the entire wire form is these 5 bytes regardless of context.
+/// Direct byte exposure lets driver code emit it without staging
+/// through the protocol's WriteBuf (matches `TERMINATE_WIRE_BYTES`
+/// convention). State-machine integration (a `PgCommand::Flush`
+/// variant) lands when the dispatch path is wired in 1c-5.
+///
+/// # Usage (Phase 1c-5+ pipelining drivers)
+///
+/// ```ignore
+/// // Driver pseudocode — pipeline Bind+Execute then read partial
+/// // results before committing.
+/// proto.push_command(PgCommand::Bind { ... }, &mut wb)?;
+/// proto.push_command(PgCommand::Execute { ... }, &mut wb)?;
+/// socket.write_all(&bsql_pg_proto::FLUSH_WIRE_BYTES).await?;
+/// // ... read intermediate frames ...
+/// ```
+pub const FLUSH_WIRE_BYTES: [u8; 5] = [TAG_FLUSH.byte(), 0, 0, 0, 4];
 
 /// Frontend `Terminate` message tag (`'X'`) — DEF-223. Frontend
 /// graceful-close primitive (PG §55.7 "Message Formats").
@@ -890,6 +934,33 @@ const _: () = assert!(
         && TERMINATE_WIRE_BYTES[3] == 0
         && TERMINATE_WIRE_BYTES[4] == 4,
     "Terminate length-field must be 4 (length includes itself, no payload)",
+);
+
+// DEF-252 (audit 2026-05-08): drift-pin for `FLUSH_WIRE_BYTES`. Same
+// shape as the `SYNC_WIRE_BYTES` / `TERMINATE_WIRE_BYTES` blocks
+// above. If a future edit changes either the tag literal or the
+// length field, these asserts fail at build time. Tier-1 against
+// typo-induced wire breaks.
+const _: () = assert!(FLUSH_WIRE_BYTES.len() == 5);
+const _: () = assert!(FLUSH_WIRE_BYTES[0] == b'H');
+const _: () = assert!(
+    FLUSH_WIRE_BYTES[1] == 0
+        && FLUSH_WIRE_BYTES[2] == 0
+        && FLUSH_WIRE_BYTES[3] == 0
+        && FLUSH_WIRE_BYTES[4] == 4,
+    "Flush length-field must be 4 (length includes itself, no payload)",
+);
+// Family-disjointness — Flush, Sync, Terminate must not share bytes.
+// All three are 5-byte parameterless frames with a 4-byte length-field
+// — the ONLY distinguishing byte is the tag. A copy-paste error that
+// duplicated a tag literal would otherwise pass the per-frame asserts
+// above silently.
+const _: () = assert!(
+    FLUSH_WIRE_BYTES[0] != SYNC_WIRE_BYTES[0]
+        && FLUSH_WIRE_BYTES[0] != TERMINATE_WIRE_BYTES[0]
+        && SYNC_WIRE_BYTES[0] != TERMINATE_WIRE_BYTES[0],
+    "Flush/Sync/Terminate tag bytes must be pairwise distinct \
+     ('H' / 'S' / 'X' per PG §55.7) — copy-paste safety net",
 );
 
 // DEF-214 (2026-05-05): drift-pin for `SSL_REQUEST_WIRE_BYTES` and

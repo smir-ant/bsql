@@ -86,7 +86,17 @@ pub struct Password {
 }
 
 /// Errors from [`Password`] construction.
+///
+/// # `#[non_exhaustive]` (DEF-256, audit 2026-05-08)
+///
+/// New rejection classes may land as future password validation
+/// rules tighten (e.g. NUL-byte rejection mirroring [`Ident`],
+/// UTF-8-only requirements for SCRAM normalisation). Sealing via
+/// `non_exhaustive` forces downstream `match` callers to retain
+/// a catch-all arm so a new variant cannot silently fall through
+/// a downstream exhaustive match and lose its diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PasswordError {
     /// The password was empty. DEF-051: empty passwords are rejected
     /// at construction as a tier-1 visible choice (via `Result`).

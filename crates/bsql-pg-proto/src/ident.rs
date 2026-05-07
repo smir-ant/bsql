@@ -967,7 +967,18 @@ impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> PartialEq for PodBytes
 impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> Eq for PodBytes<N, LenT> {}
 
 /// Errors from validated-tag [`FixedStr`] construction.
+///
+/// # `#[non_exhaustive]` (DEF-256, audit 2026-05-08)
+///
+/// New rejection classes may land as additional [`FixedStr`] tags
+/// introduce new validation rules (e.g. UTF-8 normalisation
+/// requirements, Unicode scalar restrictions). Sealing via
+/// `non_exhaustive` forces downstream `match` callers to retain
+/// a catch-all arm — closes the silent-misclassification audit
+/// seam where a new variant could otherwise fall through a
+/// downstream exhaustive match and lose its diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IdentError {
     /// The input was empty and the tag requires non-empty input.
     Empty,

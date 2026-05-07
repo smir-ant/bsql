@@ -55,6 +55,16 @@ use core::num::{NonZeroU16, NonZeroU64};
 /// the pre-uplift `tx_status: u8` form where a byte-match had no
 /// compiler help and forgetting the `'E'` arm was a tier-3 audit
 /// seam.
+///
+/// # NOT `#[non_exhaustive]` — DEF-256 audit (2026-05-08)
+///
+/// PG §55.7 defines `{'I', 'T', 'E'}` and this set is closed by
+/// the wire protocol — a fourth status would require a major
+/// protocol revision. Sealing via `non_exhaustive` would force
+/// downstream catch-all arms for a case that **cannot exist on a
+/// well-formed wire**; the dispatcher rejects non-{I,T,E} bytes
+/// at framing-time as `MalformedReadyForQuery`. Closed-by-spec →
+/// exhaustive `match` is the load-bearing tier-1 invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum TxStatus {
@@ -768,6 +778,19 @@ pub(crate) type StagedActions = heapless::Vec<StagedAction, { crate::protocol::M
 /// not static). Two distinct lifetimes prove zero-copy on both
 /// paths; unification would force either staging copies or an
 /// API split.
+///
+/// # Variant ordering — DEF-254 (audit 2026-05-08)
+///
+/// Variants are in **production-frequency order**:
+///
+/// - `SendBytes` — emitted on every push, every Sync residue,
+///   every mid-handshake response → **dominant** across every
+///   workload.
+/// - `DeliverReply` — emitted once per successful command cycle.
+/// - `FailReply` — emitted once per error.
+/// - `CloseSocket` — emitted once per fatal teardown.
+///
+/// Order verified optimal at this audit; no reorder needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
@@ -900,6 +923,18 @@ pub enum Action<'w, 'r> {
 /// `clippy::let_underscore_must_use` lint (DEF-211 SAFE-05, in the
 /// forbid bundle) makes ignoring without explicit `match`/`?` a
 /// build failure.
+///
+/// # Variant ordering — DEF-254 (audit 2026-05-08)
+///
+/// Current declared order optimises for the polling pattern of an
+/// async driver loop: `Idle` (caller polls when idle), then
+/// `NeedMoreBytes` (caller awaits more network bytes), then
+/// progressively-more-eventful variants. `advance_one_frame` is
+/// forward-compat only (Phase 1c-5 pipelining) — no production hot
+/// path exists today, so reordering would be speculative without
+/// bench evidence. When pipelining benches arrive in 1c-5, revisit:
+/// if `Deliver` (terminal reply per response cycle) dominates,
+/// promote it to first.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 #[must_use = "FeedEvent variants carry side-effect contracts: \
@@ -1473,22 +1508,37 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// inline RowDesc + ParamOids).
 /// Post-DEF-119/DEF-188: `Reply<'r>` ~96 B (DescribeStatementComplete
 /// holds `&RowDesc` ref + ParamOids 68 + TxStatus = ~80 B).
+///
+/// # Variant ordering — DEF-254 (audit 2026-05-08)
+///
+/// Variants are declared in **production-frequency order**. LLVM
+/// lowers an exhaustive `match` on the discriminant to a cascade
+/// (`cmp eax, 0; je ...; cmp eax, 1; je ...; ...`) at low variant
+/// counts; the first-declared variant gets the cheapest predicted
+/// path. Real-workload frequency analysis:
+///
+/// - `QueryComplete` — every successful SELECT / INSERT /
+///   UPDATE / DELETE → **dominant** in OLTP and analytics.
+/// - `ParseComplete` — once per prepared statement (Extended Query).
+/// - `CloseComplete` — once per Close (Extended Query teardown).
+/// - `Describe*Complete` — pre-Bind schema introspection.
+/// - `Pong` — keep-alive Ping; rare in tight loops.
+/// - `StartupComplete` — exactly once per connection.
+///
+/// Pre-DEF-254 ordering (Pong, StartupComplete, QueryComplete, …)
+/// was Phase-1a historical (Ping was the only variant). Post-DEF-254
+/// the dominant operational case wins the cheapest dispatch slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reply<'r> {
-    /// The server is alive and responsive. See [`PongPayload`].
-    Pong(PongPayload),
-
-    /// The startup handshake completed successfully. The connection
-    /// is now in [`crate::ProtoState::Idle`] and ready for queries.
-    /// See [`StartupCompletePayload`].
-    StartupComplete(StartupCompletePayload),
-
     /// A Query / BindExecute command completed. Delivered on the
     /// terminal `CommandComplete + ReadyForQuery` pair at the end
     /// of the result stream. Rows (if any) were emitted individually
     /// via `Action::StreamRow` (sub-phase 1c-1). See
     /// [`QueryCompletePayload`].
+    ///
+    /// **DEF-254**: ordered first — dominant variant in real
+    /// workloads.
     QueryComplete(QueryCompletePayload<'r>),
 
     /// A `Parse` command succeeded (server accepted the prepared
@@ -1506,6 +1556,14 @@ pub enum Reply<'r> {
     /// A portal-level `Describe` (`'D' 'P' name`) completed. See
     /// [`DescribePortalCompletePayload`]. 1c-3c.
     DescribePortalComplete(DescribePortalCompletePayload<'r>),
+
+    /// The server is alive and responsive. See [`PongPayload`].
+    Pong(PongPayload),
+
+    /// The startup handshake completed successfully. The connection
+    /// is now in [`crate::ProtoState::Idle`] and ready for queries.
+    /// See [`StartupCompletePayload`].
+    StartupComplete(StartupCompletePayload),
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -1703,6 +1761,18 @@ impl<'r> From<CloseCompletePayload> for Reply<'r> {
 /// Size: ~8 B (ref + discriminant) vs ~264 B pre-arena. The
 /// `large_enum_variant` expect can be dropped alongside this
 /// refactor.
+///
+/// # NOT `#[non_exhaustive]` — DEF-256 audit (2026-05-08)
+///
+/// PG §55.7 defines exactly two outcomes for the post-Describe
+/// schema-presence reply: `RowDescription` (`'T'`) → result
+/// columns, `NoData` (`'n'`) → no columns. The wire vocabulary
+/// is closed by spec — a third outcome would be a major-protocol
+/// revision. Sealing via `non_exhaustive` would force downstream
+/// catch-all arms for a case that **cannot exist on a well-formed
+/// wire**; the dispatcher already classifies the byte BEFORE
+/// constructing this enum. Closed-by-spec → exhaustive `match`
+/// is the load-bearing tier-1 invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescribedRows<'r> {
     /// Server sent a `RowDescription` (`'T'`) — the statement/portal

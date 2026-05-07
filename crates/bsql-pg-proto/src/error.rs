@@ -229,7 +229,18 @@ pub use crate::ident::BoundedStr;
 /// — the latter preserves the typed [`crate::wire::AuthSubCode`]
 /// enum so diagnostics can say *which* known method the server
 /// requested.
+///
+/// # `#[non_exhaustive]` (DEF-256, audit 2026-05-08)
+///
+/// New variants may land if PG introduces additional sub-code
+/// classification dimensions (e.g., a separate "deprecated but
+/// recognised" tier) or if internal classification grows new
+/// boundaries. Sealed via `non_exhaustive` so any future variant
+/// addition forces external matches to add a catch-all arm —
+/// closes the silent-pass-through audit seam where new variants
+/// would otherwise land in a hidden default branch downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum AuthSubCodeClass {
     /// A sub-code outside the 4 PG-defined values (0/10/11/12).
     /// Carries the raw u32 for forensic logging.
@@ -673,8 +684,19 @@ pub enum ProtocolError {
 /// 1-byte. `Option<CrateBugLocus>` niche-packs in the same byte —
 /// const-asserted below to catch drift if a future variant with
 /// payload lands.
+///
+/// # `#[non_exhaustive]` (DEF-256, audit 2026-05-08)
+///
+/// This enum is the public catalogue of internal-bug classifications.
+/// New loci land as new architectural dead-arms get classified — every
+/// sub-phase potentially adds entries. Sealing via `non_exhaustive`
+/// forces downstream consumers (drivers logging crate-bug payloads,
+/// observability harnesses) to keep a catch-all arm, so a future
+/// variant addition cannot silently fall through a downstream
+/// exhaustive `match` and lose its diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum CrateBugLocus {
     /// [`crate::buf::ReadBuf::advance`] returned Err after
     /// `parse_header` successfully validated

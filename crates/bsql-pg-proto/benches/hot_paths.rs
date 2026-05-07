@@ -781,6 +781,29 @@ fn data_row_body_int4(n_cols: u16, value: i32) -> alloc::vec::Vec<u8> {
     body
 }
 
+/// DEF-251 (audit 2026-05-08): build a DataRow body with one column
+/// per supplied i32 value (text-format ASCII digits, no NUL).
+///
+/// Used by the `iter_5cols_decode_i32_common_values` bench to feed
+/// the common-literal fast-paths (`0`, `1`, `-1`) deliberately.
+/// Per-column len varies with the digit count of each value (`-1`
+/// is 2 bytes, `0` / `1` are 1 byte each); the column-count header
+/// plus length-prefix layout matches `data_row_body_int4`'s shape
+/// so the per-row parse cost is comparable.
+fn data_row_body_int4_mixed(values: &[i32]) -> alloc::vec::Vec<u8> {
+    let n_cols: u16 = u16::try_from(values.len()).unwrap_or(0);
+    let mut body = alloc::vec::Vec::with_capacity(2 + values.len() * 8);
+    body.extend_from_slice(&n_cols.to_be_bytes());
+    for v in values {
+        let s = alloc::format!("{v}");
+        let bytes = s.as_bytes();
+        let col_len: i32 = i32::try_from(bytes.len()).unwrap_or(0);
+        body.extend_from_slice(&col_len.to_be_bytes());
+        body.extend_from_slice(bytes);
+    }
+    body
+}
+
 /// Build a synthetic DataRow body with `n_cols` columns of fixed-len text.
 fn data_row_body_text(n_cols: u16, text: &str) -> alloc::vec::Vec<u8> {
     let bytes = text.as_bytes();
@@ -900,6 +923,34 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
     group.bench_function("iter_5cols_decode_i32", |b| {
         b.iter(|| {
             let row = match DataRowRef::parse(black_box(&body)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut sum: i64 = 0;
+            for col in row.columns() {
+                if let Ok(Some(bytes)) = col
+                    && let Ok(v) = i32::from_pg_text(bytes)
+                {
+                    sum = sum.saturating_add(i64::from(v));
+                }
+            }
+            black_box(sum);
+        });
+    });
+
+    // DEF-251 (audit 2026-05-08): common-value cache hit measurement.
+    // The 5 columns are populated with {0, 1, -1, 0, 1} — the three
+    // literals the fast-path branches exist for. On hit, the digit
+    // loop is bypassed entirely; the bench measures the byte-equality
+    // match cost in isolation.
+    //
+    // Compare with `iter_5cols_decode_i32` (above, 8-digit literal
+    // 42_000_000) for the cache-miss baseline. Hit-vs-miss delta
+    // should be 1-2 ns/col post-DEF-251.
+    let body_common = data_row_body_int4_mixed(&[0, 1, -1, 0, 1]);
+    group.bench_function("iter_5cols_decode_i32_common_values", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body_common)) {
                 Ok(r) => r,
                 Err(_) => return,
             };

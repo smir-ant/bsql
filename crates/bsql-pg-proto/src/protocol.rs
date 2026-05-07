@@ -2073,6 +2073,14 @@ impl PgProtocol {
     }
 
     /// DEF-154 (X): shared view of the populated read_buf region.
+    ///
+    /// DEF-249 audit (2026-05-08): per-row hot path — called twice per
+    /// row from `RowStream::next_row_bytes` (header peek + row carve).
+    /// `#[inline]` already present (was added pre-DEF-249); audit
+    /// confirms the call chain `next_row_bytes → read_buf_populated →
+    /// ReadBufN::populated` is fully inlined under workspace
+    /// `lto = "fat"` + `codegen-units = 1`. Future heuristic shifts
+    /// in LLVM are pinned by the explicit hint here.
     #[inline]
     #[must_use]
     pub(crate) fn read_buf_populated(&self) -> &[u8] {
@@ -2080,6 +2088,11 @@ impl PgProtocol {
     }
 
     /// DEF-154 (X): current read cursor (u16 storage).
+    ///
+    /// DEF-249 audit (2026-05-08): per-row hot path — called once per
+    /// row from `RowStream::next_row_bytes` (cursor capture for row
+    /// carve coordinates). `#[inline]` already present; audit
+    /// confirms the call chain is fully inlined under workspace LTO.
     #[inline]
     #[must_use]
     pub(crate) fn read_buf_cursor_u16(&self) -> u16 {
@@ -2145,6 +2158,12 @@ impl PgProtocol {
     /// branch-predicted state) — the compiler did not reliably fuse
     /// the two separate match calls because they were separated by
     /// header-parse logic.
+    ///
+    /// DEF-249 audit (2026-05-08): per-stream hot path — called once
+    /// per `next_event` / `next_row_bytes` invocation (cached in
+    /// `RowStream::cached_reply_id` after first call). Amortised
+    /// cost is sub-1 ns. `#[inline]` already present; audit confirms
+    /// the call chain is fully inlined under workspace LTO.
     #[inline]
     #[must_use]
     pub(crate) fn classify_for_iter_rows(&self) -> IterRowsClass {
