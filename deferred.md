@@ -931,6 +931,148 @@ ranges forbidden (drift surface > variance cushion).
 
 ---
 
+## §G. Linux-Transition Blockers
+
+Items deferred because they require Linux as the development /
+benchmarking host. Principal is migrating to Linux as primary OS
+in the near term (registered 2026-05-07); this section is the
+single grep-point for **"при переходе на Linux надо будет сделать X
+и не забыть проверить Y"**. Mirror of §C (Rust-Unstable Blockers)
+in spirit — deferred until external condition (OS migration)
+clears the blocker.
+
+**Discipline (when adding entries):** every row must specify
+(a) what's blocked on Linux, (b) why macOS can't deliver it
+today, (c) the action on transition (precise enough that a future
+session can execute without re-deriving the rationale).
+
+### LIN-01 — `iai-callgrind` instruction-level deterministic bench
+
+- **Tracking:** github.com/iai-callgrind/iai-callgrind (active,
+  primary maintenance on Linux).
+- **What's blocked:** sub-1% precision performance regression
+  detection. `criterion` (used today via
+  `scripts/bench-stable.sh`) has a ±5% statistical noise floor on
+  consumer hardware; `iai-callgrind` delivers **deterministic
+  instruction counts** via Valgrind's Cachegrind tool — same
+  binary, same input → exact same instruction count. Sub-1%
+  precision becomes meaningful (1 instruction is 1 instruction).
+- **Why macOS can't deliver:** Valgrind upstream (and Cachegrind
+  by extension) does not run reliably on macOS post-Catalina —
+  Apple's tightened sandboxing + the macOS dynamic loader changes
+  break Valgrind's process-injection model. `iai-callgrind` only
+  ships supported binaries for Linux. Apple Silicon's userspace
+  cycle counter (`pmccntr_el0`) is privileged-only; even if
+  Valgrind ran, the instruction-count alternative is the right
+  primitive on Linux.
+- **Action on transition:**
+  1. Add `iai-callgrind = "0.x"` to `[dev-dependencies]` of
+     `bsql-pg-proto` (workspace-relocatable).
+  2. Create `crates/bsql-pg-proto/benches/instruction_counts.rs`
+     with iai-callgrind harness mirroring the criterion bench
+     groups (parse_header / push_command / feed_bytes /
+     iter_rows).
+  3. Extend `scripts/bench-stable.sh` (or add sibling
+     `scripts/bench-icount.sh`) to run iai-callgrind alongside
+     criterion — orthogonal layers (instructions = deterministic;
+     ns/op = scheduler-affected statistical).
+  4. Update `BENCHMARKING.md` Tool 3 section + `reforge.md §96a`
+     verification stack to include the icount layer.
+- **Verification on transition:** before any perf claim, run BOTH
+  criterion (statistical) AND iai-callgrind (deterministic) — the
+  pair tightens the existing rule from "ASM-diff + bench-stable"
+  to "ASM-diff + icount + bench-stable" (3 layers, each with
+  different precision/scope tradeoff).
+
+### LIN-02 — `heaptrack` allocation traffic profiler
+
+- **Tracking:** github.com/KDE/heaptrack
+- **What's blocked:** allocation-traffic visibility on hot paths.
+  The proposed cross-platform allocation-counter (B path,
+  scheduled for ship pre-Linux migration) reports counts via
+  `GlobalAlloc` wrapper — sufficient for "this hot path allocs N
+  times" claims. `heaptrack` adds: per-callsite allocation
+  histogram, peak-RSS tracking with backtrace, leak detection at
+  process exit, flamegraph-style allocation profile.
+- **Why macOS can't deliver:** `heaptrack` uses `LD_PRELOAD` +
+  Linux-specific `/proc/self/maps` parsing for the allocation
+  interceptor and backtrace symbolisation. macOS uses
+  `DYLD_INSERT_LIBRARIES` (similar but not API-compatible) and
+  has no `/proc`-style introspection — port would require a full
+  rewrite of the interception layer. `Instruments.app
+  Allocations` template covers some of this on macOS but doesn't
+  produce machine-readable output for CI gating.
+- **Action on transition:**
+  1. Verify `heaptrack` package available in the chosen distro
+     (Ubuntu/Fedora/Arch all ship it).
+  2. Add `scripts/bench-heaptrack.sh` wrapping
+     `heaptrack cargo bench -p bsql-pg-proto -- --bench BENCH`
+     with output parsing → "allocs per bench iteration"
+     comparison vs saved baseline (mirror of bench-stable
+     save/compare pattern).
+  3. Document the layer in `BENCHMARKING.md` as an opt-in audit
+     tool (not part of the mandatory pre-ship verification —
+     reserved for "is this allocation pattern actually
+     improving?" investigations).
+
+### LIN-03 — `perf stat` cycle / cache / branch counters
+
+- **Tracking:** Linux kernel `perf_event_open(2)` syscall + the
+  `perf` userspace tool.
+- **What's blocked:** real CPU-cycle counts (not nanoseconds),
+  L1/L2/L3 cache miss rates, branch misprediction rates,
+  hardware prefetch counts. Apple Silicon exposes none of these
+  to userspace without entitled developer keys (Apple's
+  `pmccntr_el0` is EL0-readable-disabled by default;
+  `cntvct_el0` virtual counter is 24 MHz coarse — useless for
+  cycle-level perf). On Linux, `perf stat` reads the same
+  hardware PMU registers via the kernel and serves them in a
+  single CLI call.
+- **Why macOS can't deliver:** Apple ships
+  `xcrun xctrace record --template 'CPU Counters'` via the
+  Instruments family — closed-source, no machine-readable export
+  for CI, requires GUI-driven session config. Some events
+  available via DTrace if the System Integrity Protection is
+  partially disabled (impractical for daily dev). On Apple
+  Silicon, a subset of PMC events is accessible only through
+  signed-with-entitlement processes; rejecting that path keeps
+  the build reproducible without provisioning profiles.
+- **Action on transition:**
+  1. Confirm hardware-PMU access on the new Linux host
+     (`perf stat true` returns counters without `<not counted>`
+     for cycles/instructions/cache-misses/branch-misses).
+  2. Add `scripts/bench-perfstat.sh` wrapping
+     `perf stat -e cycles,instructions,cache-misses,branch-misses
+     cargo bench -p bsql-pg-proto -- --bench BENCH` with stable
+     parsing of the textual `perf stat` output (the JSON output
+     mode is `--json` since perf 5.18+).
+  3. The CPU-time-vs-wall-clock metric (C path, scheduled for
+     ship pre-Linux migration via `getrusage`) gives a coarse
+     read of "scheduler-fairness signal". `perf stat` is the
+     fine-grained version — pair the two for the full picture.
+- **Verification on transition:** confirm cycle counts match
+  expected scale (e.g., parse_header bench at ~2.5 ns at 3.5 GHz
+  = ~9 cycles per iteration; if `perf stat` reports 1000+ cycles
+  the harness is broken).
+
+### LIN-99 — Generic Linux-transition checklist (extend as needed)
+
+Reserved for items discovered during transition that don't fit
+LIN-01..LIN-98. Add a new LIN-NN row above this one when you
+spot something. Example placeholder shape:
+
+- **What:** `<thing that needs doing or verifying on Linux>`
+- **Why deferred:** `<reason it can't be done on macOS today>`
+- **Action on transition:** `<concrete steps>`
+- **Don't forget to verify:** `<post-action sanity check>`
+
+This bullet list is intentionally meta — `LIN-99` exists so a
+future "при переходе на Linux надо будет сделать X" item never
+gets dropped in chat between sessions. Capture immediately, fill
+out the four lines above, register a stable LIN-NN ID, ship later.
+
+---
+
 ## How to add / close entries
 
 **Add an OPEN item:**

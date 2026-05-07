@@ -12,11 +12,13 @@ tier-elevation work generates.
 | Question | Tool | Determinism |
 |---|---|---|
 | Did the codegen change? | `scripts/asm-diff.sh` | 100% — same compiler+flags+source = same ASM |
+| Did alloc traffic change? | `scripts/bench-allocs.sh` | 100% — `#[global_allocator]` counter wrapper |
 | By how many ns? | `scripts/bench-stable.sh` | Statistical, ±5% noise floor on quiet machine |
+| Was the bench machine quiet? | `scripts/bench-cpu-time.sh` | POSIX `getrusage` ratio — not noise-affected |
 
 **Mandatory rule** (also pinned in `reforge.md` measurement section):
 any change presented as performance-relevant MUST be verified
-through BOTH layers in order:
+through the FIRST TWO layers minimum, in order:
 
 1. **`asm-diff` first** — if codegen is unchanged, no perf claim
    needed. If codegen IS different, proceed to step 2.
@@ -24,8 +26,22 @@ through BOTH layers in order:
    any change that regresses an existing bench beyond the 5% noise
    threshold without explicit justification.
 
-ASM-diff alone catches drift; bench-stable alone catches
-runtime regressions; together they're the complete pair.
+ASM-diff catches codegen drift; bench-stable catches runtime
+regressions; together they're the minimum viable pair.
+
+**Recommended for substantive perf work** (not always required —
+use when noise / scheduler / alloc-traffic concerns warrant):
+
+3. **`bench-allocs`** — if the change is supposed to remove or add
+   an allocation, verify with deterministic counts (no statistical
+   noise — every alloc is counted exactly).
+4. **`bench-cpu-time`** — if `bench-stable` results look noisier
+   than usual, wrap the bench command and check the `cpu/wall`
+   ratio. Ratio < 0.8 means the OS was preempting; bench numbers
+   are unreliable until the machine quiets.
+
+Layer 1+2 is the daily workflow; 3-4 are situational reinforcements
+for when "is this a real signal?" matters more than ship velocity.
 
 ## Tool 1: `scripts/asm-diff.sh`
 
@@ -207,9 +223,159 @@ parse_header/rfq_header time:   [2.52 ns 2.53 ns 2.54 ns]
   both regimes. Use a power-connected machine, avoid running on
   battery.
 
+## Tool 3: `scripts/bench-allocs.sh`
+
+Deterministic allocation-traffic measurement via a custom
+`#[global_allocator]` wrapper. Reports alloc count, dealloc
+count, and bytes-allocated per scenario — same numbers, every
+run, every machine.
+
+### Usage
+
+```bash
+# Save a baseline before changes.
+scripts/bench-allocs.sh save <baseline-name>
+
+# Compare current state against saved baseline.
+scripts/bench-allocs.sh compare <baseline-name>
+
+# List saved baselines.
+scripts/bench-allocs.sh list
+```
+
+### Mechanism
+
+`crates/bsql-pg-proto/benches/alloc_counts.rs` is a small
+non-criterion bench (`harness = false`). It installs a custom
+`CountingAllocator` that wraps `System` and atomically counts
+every `alloc` / `dealloc` / `alloc_zeroed` / `realloc` call.
+Each scenario runs **exactly once** (not millions of times like
+criterion) — the integer count is the answer.
+
+Output format (one line per scenario, machine-parseable):
+
+```
+ALLOC_BENCH name=parse_header allocs=0 deallocs=0 bytes=0
+ALLOC_BENCH name=push_command_ping allocs=0 deallocs=0 bytes=0
+ALLOC_BENCH name=ping_round_trip allocs=0 deallocs=0 bytes=0
+ALLOC_BENCH name=advance_one_frame allocs=0 deallocs=0 bytes=0
+ALLOC_BENCH name=iter_rows_100 allocs=0 deallocs=0 bytes=0
+```
+
+`bsql-pg-proto` is `no_std` + `no_alloc` on the steady-state
+hot path — the expected outcome is **all zeros**. Any non-zero
+on a hot-path scenario is a regression: either the crate started
+allocating somewhere new, or the fixture leaked an allocation
+into the snapshot window.
+
+### What it catches that bench-stable misses
+
+A refactor that adds 1-2 small heap allocations per call is
+typically below the 5% noise floor of `bench-stable.sh` on
+modern allocators (jemalloc / mimalloc / system). It's still a
+real cost (cache pressure, fragmentation, future scaling
+penalty under contention) — but `bench-stable` won't see it.
+`bench-allocs` does, because the count goes from 0 to N
+deterministically.
+
+### Reading the output
+
+```
+============================================================
+Alloc-bench comparison vs baseline 'before-md5'
+============================================================
+  unchanged:    5
+  regressions:  0
+  improvements: 0
+  appeared:     0
+  disappeared:  0
+
+[bench-allocs] PASS: alloc traffic identical to baseline
+```
+
+- **unchanged** — every scenario allocates the same way as the
+  baseline. Exit 0.
+- **regressions** — at least one scenario allocates MORE than
+  baseline. Exit 1; investigate before merge.
+- **improvements** — scenario allocates LESS than baseline. Also
+  exit 1 (re-baseline if intentional) — surfaces a meaningful
+  change that should be acknowledged.
+- **appeared / disappeared** — scenario added or removed since
+  baseline. Exit 1; re-baseline after sanity-checking.
+
+### When it lies (limitations)
+
+- **Counts only `GlobalAlloc` calls** — stack frames, static
+  data, and `MaybeUninit`-without-init are invisible. The crate
+  forbids `unsafe`, so `MaybeUninit` is N/A; stack-frame growth
+  is caught by `asm-diff` if it materially changes.
+- **Allocator-internal bookkeeping is not separated** — if
+  `System` itself allocates a metadata block on first use, that
+  shows up. We always run from a clean process so this is
+  consistent across runs.
+
+## Tool 4: `scripts/bench-cpu-time.sh`
+
+Wall-clock-vs-CPU-time confidence indicator via POSIX
+`getrusage(2)` (exposed by `/usr/bin/time -p`). Doesn't replace
+`bench-stable.sh` — it answers a different question: "**was
+the bench machine quiet enough for bench-stable's numbers to be
+reliable?**".
+
+### Usage
+
+```bash
+# Wrap any command (including cargo bench).
+scripts/bench-cpu-time.sh -- cargo bench -p bsql-pg-proto --bench hot_paths
+
+# Wrap bench-stable.sh save in one call.
+scripts/bench-cpu-time.sh stable-wrap before-md5
+
+# Sanity check the wrapper.
+scripts/bench-cpu-time.sh check
+```
+
+### The signal
+
+```
+============================================================
+CPU-time stats for wrapped command
+============================================================
+  real (wall-clock):   2.81 s
+  user (on-CPU):       2.78 s
+  sys  (on-CPU kern):  0.01 s
+  ratio (cpu / wall):  0.993
+  verdict:             OK (machine quiet, bench numbers reliable)
+```
+
+Verdict tiers (single-threaded bench expectations):
+
+| ratio        | verdict | meaning                                                  |
+|--------------|---------|----------------------------------------------------------|
+| ≥ 0.95       | OK      | Machine quiet; bench-stable numbers reliable.            |
+| 0.80 – 0.95  | WARN    | Minor preemption; numbers usable with elevated noise.    |
+| < 0.80       | FAIL    | Heavy interference; rerun on quieter machine.            |
+
+If ratio < 0.95 *during* a save, you've discovered that the
+machine state was contaminating measurements. The
+`bench-stable.sh` numbers are still recorded, but you now know
+the noise floor was higher than nominal — a 5% delta in the
+numbers might be 10% in actual signal, or 0%.
+
+### When it lies (limitations)
+
+- **Multi-threaded benches** can exceed ratio 1.0 (sum across
+  cores) — verdict tiers are calibrated for single-threaded.
+  All current `bsql-pg-proto` benches are single-threaded.
+- **Background-flush amortisation** — a build that triggers
+  filesystem flushes near end can spike `sys` time after the
+  bench window closed. We measure the whole `cargo bench`
+  invocation including build + report generation; the bench
+  body's actual ratio may be tighter.
+
 ## Combined workflow
 
-A typical perf-relevant audit follows this template:
+### Daily flow (Tool 1 + Tool 2 — minimum viable)
 
 ```bash
 # Step 1: snapshot perf BEFORE your changes (commit, then save).
@@ -232,10 +398,57 @@ scripts/bench-stable.sh compare before-X
 # until next `cargo clean --release` or manual rm -rf.
 ```
 
+### Substantive perf work (full stack)
+
+When the change is load-bearing — the headline claim of a
+session, a tier-elevation bundle, or anything where "did this
+actually win?" is the user-facing question — add the
+situational layers:
+
+```bash
+# Step 1: snapshot baselines BEFORE changes.
+git commit -am "WIP: about to refactor"
+scripts/bench-allocs.sh save before-X
+scripts/bench-stable.sh save before-X
+
+# Step 2: apply changes.
+# ... edit ...
+
+# Step 3: codegen check.
+scripts/asm-diff.sh <relevant-fn>
+
+# Step 4: alloc-traffic check.
+scripts/bench-allocs.sh compare before-X
+# → exit 0 = unchanged, exit 1 = re-baseline if intentional
+
+# Step 5: ns/op check, optionally CPU-time-wrapped.
+scripts/bench-cpu-time.sh -- scripts/bench-stable.sh compare before-X
+# → ratio ≥ 0.95 means bench numbers reliable; exit 1 on regression
+```
+
+The substantive flow produces three orthogonal guarantees:
+
+1. **Codegen drift detected** (asm-diff exit code).
+2. **Alloc traffic identical** (alloc-bench exit code).
+3. **No regression beyond noise** (bench-stable exit code) on a
+   verified-quiet machine (cpu-time ratio).
+
+### Picking the right subset
+
+| Situation                                         | Run                                             |
+|---------------------------------------------------|--------------------------------------------------|
+| Routine inline-annotation change                  | asm-diff (alone if empty diff)                   |
+| Type tier elevation (compile-time only)           | asm-diff (alone if empty diff)                   |
+| Non-trivial refactor on existing hot path         | asm-diff + bench-stable                          |
+| Refactor claiming an alloc removal                | asm-diff + bench-allocs + bench-stable           |
+| Headline perf claim (e.g., "−15% on push")        | full stack (1+2+3+4)                             |
+| Suspect bench numbers are noisy                   | bench-cpu-time wrap                              |
+
 ## When to skip these tools
 
-These tools are **mandatory** for changes that claim a perf
-impact (positive or negative). They are **not required** for:
+Tools 1+2 (asm-diff + bench-stable) are **mandatory** for
+changes that claim a perf impact (positive or negative). They
+are **not required** for:
 
 - **Pure docs** changes (no source-code edit).
 - **Test-only** changes (`#[cfg(test)]` blocks; tests don't
@@ -247,6 +460,11 @@ impact (positive or negative). They are **not required** for:
 If unsure, run `asm-diff` — it's deterministic and fast (~5s
 build + parse). If the diff is empty, the change is
 codegen-neutral and you're done.
+
+Tools 3-4 (allocs / cpu-time) are **optional** and situational —
+the daily workflow doesn't need them. Reach for them when the
+perf claim is load-bearing or when bench-stable results look
+noisier than the noise floor would predict.
 
 ## Failure-recovery contract
 

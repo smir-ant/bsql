@@ -3320,6 +3320,7 @@ Rust `Result<T, E>` size = `max(size_of::<T>(), size_of::<E>()) + discriminant`.
 | cargo-vet (§95) | Human-reviewed dep trust | Every PR (incremental) |
 | Differential (§96) | Spec-conformance vs reference impl | Nightly |
 | ASM-diff + bench-stable (§96a) | Codegen drift + perf regression | **Mandatory on perf-relevant change** |
+| bench-allocs + bench-cpu-time (§96a optional) | Alloc-traffic determinism / scheduler interference | Recommended on load-bearing perf claims |
 | Reproducible builds (§97) | Supply-chain substitution | Release builds |
 
 ## §91. proptest
@@ -3419,12 +3420,36 @@ MUST be verified through BOTH layers in order:
    `--noise-threshold 0.05`). Baseline persists across commits.
    Exit 1 on any regression beyond noise.
 
+**Recommended layers (situational, not always required).** The
+following tools strengthen the verification stack when the
+change is load-bearing or `bench-stable` results look noisier
+than nominal:
+
+3. **`scripts/bench-allocs.sh save|compare <baseline-name>`** —
+   deterministic allocation-traffic measurement via
+   `#[global_allocator]` counter wrapper. Reports alloc /
+   dealloc / bytes per scenario. Exact integer counts (no
+   noise). Use when the change is supposed to remove or add an
+   allocation — the count delta is the answer.
+4. **`scripts/bench-cpu-time.sh -- <cmd>`** — wraps any command
+   with `/usr/bin/time -p` and reports `user+sys / real` ratio.
+   Confidence indicator: ratio < 0.95 means the OS was
+   preempting the bench, so `bench-stable` numbers are less
+   reliable than they look. Use when bench-stable results don't
+   match expectations.
+
 **Rationale.** ASM-diff catches drift (deterministic, fast,
 zero noise). Bench-stable catches runtime regressions
 (statistical, slow, ±5% noise floor on quiet machine). Together
-they're the complete pair — neither alone is sufficient.
+they're the minimum viable pair — neither alone is sufficient.
 ASM-only misses cache effects; bench-only is hostage to system
 noise (DEF-236 lesson).
+
+The optional layers (3-4) address noise sources that
+bench-stable cannot: alloc-bench eliminates bench-stable's
+sub-5% blind spot for sub-allocation-cost regressions;
+cpu-time exposes scheduler interference that turns reported
+noise floor into a lie.
 
 **When the rule binds.** ANY change that:
 - Touches hot-path code (decode, dispatch, parse_header, etc.)

@@ -97,3 +97,14 @@ criterion = { workspace = true }
 [[bench]]
 name = "hot_paths"
 harness = false
+
+# Allocation-traffic measurement bench (B-layer of `BENCHMARKING.md`
+# stack). Companion to `hot_paths.rs` criterion ns/op timings —
+# `alloc_counts.rs` reports deterministic alloc / dealloc / bytes
+# per scenario via a `#[global_allocator]` wrapper around `System`.
+# `harness = false` because we provide our own `fn main()`; criterion
+# is not used (each scenario runs exactly once for an integer answer
+# instead of statistically-sampled millions of iterations).
+[[bench]]
+name = "alloc_counts"
+harness = false
