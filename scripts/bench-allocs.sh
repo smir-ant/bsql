@@ -52,6 +52,45 @@ cd "$WORKSPACE"
 # (mirrors bench-stable.sh's --save-baseline behaviour).
 BASELINE_DIR="target/alloc_baselines"
 
+# Warn loudly if working tree is dirty when SAVING a baseline.
+# Mirrors `bench-stable.sh::warn_if_dirty_for_save` — the same
+# race (parallel save + edit picks up edits in cargo bench's
+# rebuild) applies here too.
+warn_if_dirty_for_save() {
+    local mode="$1"
+    [[ "$mode" != "save" ]] && return 0
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 0
+    fi
+    local head_short
+    head_short="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    local dirty=0
+    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+        dirty=1
+    fi
+    if [[ "$dirty" -eq 1 ]]; then
+        echo "" >&2
+        echo "============================================================" >&2
+        echo "[bench-allocs] ⚠  WARNING: dirty working tree on save" >&2
+        echo "============================================================" >&2
+        echo "  HEAD:   $head_short" >&2
+        echo "  STATE:  working tree differs from HEAD" >&2
+        echo "" >&2
+        echo "  Baseline will reflect your CURRENT working tree, NOT HEAD." >&2
+        echo "  cargo bench rebuilds before run; parallel edits leak in." >&2
+        echo "" >&2
+        echo "  Recommended if you want HEAD baseline:" >&2
+        echo "    Ctrl+C now → git stash → re-run → git stash pop" >&2
+        echo "" >&2
+        echo "  Continuing in 5 seconds (Ctrl+C to abort)..." >&2
+        echo "============================================================" >&2
+        sleep 5
+    else
+        echo "[bench-allocs] working tree CLEAN at $head_short — \
+baseline will reflect HEAD" >&2
+    fi
+}
+
 usage() {
     cat >&2 <<'EOF'
 Usage:
@@ -102,6 +141,7 @@ case "$CMD" in
             echo "[bench-allocs] save: <baseline-name> required" >&2
             usage
         fi
+        warn_if_dirty_for_save save
         ensure_baseline_dir
         BPATH="$(baseline_path "$NAME")"
         echo "[bench-allocs] running cargo bench --bench alloc_counts" >&2

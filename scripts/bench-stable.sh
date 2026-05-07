@@ -96,6 +96,70 @@ STABILITY_FLAGS=(
 # Where criterion stores baselines.
 BASELINE_DIR="target/criterion"
 
+# Warn loudly if the working tree differs from HEAD when SAVING a
+# baseline. The race we're protecting against:
+#
+#   user: save baseline (cargo bench takes ~3 min)
+#   user: edits code in parallel
+#   cargo bench: rebuilds — picks up the in-progress edits
+#   result: "baseline" reflects edited code, not HEAD
+#
+# This bit users (the principal architect, 2026-05-07 DEF-207
+# session) and the recovery requires manual `git stash` + delete
+# polluted baseline + re-save + `git stash pop`.
+#
+# Best defence is loud warning + clear statement of WHAT was
+# saved, so user sees the problem immediately rather than hours
+# later when comparing.
+warn_if_dirty_for_save() {
+    # Only warn for save mode — compare mode legitimately wants
+    # to measure working-tree changes against a saved reference.
+    local mode="$1"
+    [[ "$mode" != "save" ]] && return 0
+
+    if ! git -C "$WORKSPACE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 0  # not a git repo — skip check
+    fi
+    local head_short
+    head_short="$(git -C "$WORKSPACE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+    local dirty=0
+    if ! git -C "$WORKSPACE" diff --quiet 2>/dev/null \
+        || ! git -C "$WORKSPACE" diff --cached --quiet 2>/dev/null; then
+        dirty=1
+    fi
+
+    if [[ "$dirty" -eq 1 ]]; then
+        echo "" >&2
+        echo "============================================================" >&2
+        echo "[bench-stable] ⚠  WARNING: dirty working tree on save" >&2
+        echo "============================================================" >&2
+        echo "  HEAD:   $head_short" >&2
+        echo "  STATE:  working tree differs from HEAD" >&2
+        echo "" >&2
+        echo "  The baseline being saved will reflect your CURRENT" >&2
+        echo "  working tree (HEAD + uncommitted changes), NOT HEAD." >&2
+        echo "  cargo bench rebuilds the crate before each run; if you" >&2
+        echo "  edit code while this script is running, the rebuild" >&2
+        echo "  picks up the in-progress edits and the baseline becomes" >&2
+        echo "  invalid for measuring those edits." >&2
+        echo "" >&2
+        echo "  RECOMMENDED if you want a HEAD baseline:" >&2
+        echo "    Ctrl+C now → git stash → re-run → git stash pop" >&2
+        echo "" >&2
+        echo "  Or: proceed if you intentionally want a working-tree" >&2
+        echo "  baseline (e.g., snapshot post-change state for future" >&2
+        echo "  comparisons against further edits)." >&2
+        echo "" >&2
+        echo "  Continuing in 5 seconds (Ctrl+C to abort)..." >&2
+        echo "============================================================" >&2
+        sleep 5
+    else
+        echo "[bench-stable] working tree CLEAN at $head_short — \
+baseline will reflect HEAD" >&2
+    fi
+}
+
 run_bench() {
     local mode="$1"   # "save" or "baseline"
     local name="$2"
@@ -143,6 +207,7 @@ case "$CMD" in
             echo "[bench-stable] save: <baseline-name> required" >&2
             usage
         fi
+        warn_if_dirty_for_save save
         run_bench save "$NAME" "$FILTER"
         echo "" >&2
         echo "[bench-stable] baseline saved as '$NAME'" >&2

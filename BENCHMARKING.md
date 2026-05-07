@@ -481,3 +481,50 @@ git stash pop                  # restore working-tree changes
 The script's normal trap-handler does this automatically on
 any internal failure — manual recovery is only needed if the
 script process itself was killed externally.
+
+## Dirty-tree-on-save warning (bench-stable / bench-allocs)
+
+Both `bench-stable.sh save` and `bench-allocs.sh save` print a
+loud warning + 5-second pre-bench delay if the working tree
+differs from HEAD when invoked. The race they protect against:
+
+```
+user:   bench-stable.sh save baseline-X    # cargo bench takes ~3 min
+user:   edits source code in parallel
+cargo bench:  rebuilds — picks up the in-progress edits
+result: "baseline" reflects edited code, not HEAD
+```
+
+This happened in the DEF-207 (2026-05-07) session — I started a
+background `save` and edited the macro in parallel; the saved
+"before" baseline was actually a "with-changes" snapshot. Manual
+recovery via `git stash` + delete polluted baseline + re-save +
+`git stash pop`.
+
+The warning lets the user catch the mismatch immediately:
+
+```
+[bench-stable] ⚠  WARNING: dirty working tree on save
+  HEAD:   8493113
+  STATE:  working tree differs from HEAD
+  ...
+  RECOMMENDED if you want a HEAD baseline:
+    Ctrl+C now → git stash → re-run → git stash pop
+  Continuing in 5 seconds (Ctrl+C to abort)...
+```
+
+Press Ctrl+C in the 5-second window if the working tree state
+isn't what you wanted to save. If you intentionally want a
+working-tree baseline (e.g., snapshot post-change state for
+future comparisons against further edits), let it proceed — the
+warning is informational, not blocking.
+
+When the working tree IS clean, both scripts print one
+confirming line:
+
+```
+[bench-stable] working tree CLEAN at 8493113 — baseline will reflect HEAD
+```
+
+so the expected state is positively confirmed rather than
+silently assumed.
