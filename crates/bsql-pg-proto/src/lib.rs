@@ -341,6 +341,19 @@ pub use wire::SSL_REQUEST_WIRE_BYTES;
 // Tier-1 enforcement of all 4 currently-defined outcomes with
 // `#[non_exhaustive]` for SemVer-safe future extension.
 pub use wire::{SslNegotiationOutcome, classify_ssl_response_byte};
+// DEF-221 (2026-05-07): top-level re-export of the user-facing
+// `CancelRequest` builder. Drivers (`bsql-driver-postgres`) call
+// `cancel_request_bytes(pid, secret_key)` to materialise the
+// 16-byte cancel packet, open a parallel TCP connection, write
+// the bytes, and close. PG processes the cancel asynchronously;
+// no reply on the cancel socket. Pid + secret_key come from the
+// BackendKeyData ('K') frame on the original connection.
+//
+// `MAGIC_VERSION_HIGH_HALF` + `CANCEL_REQUEST_VERSION` are
+// re-exported via the `wire` module path only — they're internal
+// composition primitives, not user-facing wire literals (the
+// builder fn is the user surface).
+pub use wire::cancel_request_bytes;
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------

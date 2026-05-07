@@ -695,6 +695,46 @@ pub const PROTOCOL_VERSION_3_0: u32 = 196608;
 /// shape (CancelRequest uses 1234 << 16 | 5678 = 80877102, etc.).
 pub const SSL_REQUEST_VERSION: u32 = 80877103;
 
+/// PG `CancelRequest` magic version code = 80877102 (0x04d2162e).
+/// DEF-221 (2026-05-07).
+///
+/// Sentinel value sent in the version field of the StartupMessage-
+/// shaped 16-byte CancelRequest packet on a SEPARATE TCP connection
+/// to cancel an in-flight query on the original connection. PG §55.4
+/// "Canceling Requests in Progress".
+///
+/// Composed of (1234 << 16) | 5678 — same magic-version family as
+/// [`SSL_REQUEST_VERSION`] (5679). The shared 1234 high half is the
+/// family marker; the low half discriminates message type. See
+/// [`MAGIC_VERSION_HIGH_HALF`] for the family-pin formula.
+pub const CANCEL_REQUEST_VERSION: u32 = 80877102;
+
+/// Shared high half (1234 = 0x04d2) of every PG magic-version
+/// sentinel. DEF-221 (2026-05-07).
+///
+/// PG's StartupMessage-shaped magic packets all encode their
+/// "version" field as `(MAGIC_VERSION_HIGH_HALF << 16) | low`
+/// where `low` discriminates the variant:
+///
+/// | low  | message        | const                                |
+/// |------|----------------|--------------------------------------|
+/// | 5678 | CancelRequest  | [`CANCEL_REQUEST_VERSION`]           |
+/// | 5679 | SSLRequest     | [`SSL_REQUEST_VERSION`]              |
+/// | 5680 | GSSENCRequest  | post-v1.0 (DEF-230); not yet a const |
+///
+/// Real protocol version codes (e.g. [`PROTOCOL_VERSION_3_0`] =
+/// `3 << 16 | 0`) use a different shape — the magic 1234 marker
+/// is a deliberately-distinct sentinel band so a server can tell
+/// "this is a magic packet, not a real StartupMessage" by
+/// inspecting the high 16 bits alone.
+///
+/// Pinning the formula (not just the values) means: when DEF-230
+/// ships GSSENCRequest, the new const must satisfy
+/// `(MAGIC_VERSION_HIGH_HALF << 16) | 5680`; if a contributor
+/// types `1235 << 16` by mistake, the const-assert below fails at
+/// build time.
+pub const MAGIC_VERSION_HIGH_HALF: u32 = 1234;
+
 /// Typed classification of the single byte the server sends in
 /// response to an `SSLRequest` packet (PG §55.10). DEF-214
 /// (2026-05-05) Phase 2.
@@ -882,6 +922,197 @@ const _: () = {
             && SSL_REQUEST_WIRE_BYTES[7] == v[3],
         "SSLRequest version bytes must equal SSL_REQUEST_VERSION.to_be_bytes() — \
          bump both the const and the literal in lockstep, or the formula drifts",
+    );
+};
+
+// DEF-221 (2026-05-07): magic-version family pin.
+//
+// Every magic-version sentinel in the PG protocol shares the
+// shape `(MAGIC_VERSION_HIGH_HALF << 16) | low_half`. Pinning
+// the FORMULA (not just the value) means: when DEF-230 ships
+// GSSENCRequest, the new const must satisfy this same formula
+// (with `low_half = 5680`); if a contributor types `1235 << 16`
+// by mistake, the assert below fires at build time.
+//
+// We also pin the disjointness vs real protocol version codes
+// — `PROTOCOL_VERSION_3_0 = 3 << 16 | 0` uses high half 3, NOT
+// 1234 — so a copy-paste typo bumping the protocol version into
+// the magic band is caught.
+const _: () = assert!(MAGIC_VERSION_HIGH_HALF == 1234);
+const _: () = assert!(
+    SSL_REQUEST_VERSION == (MAGIC_VERSION_HIGH_HALF << 16) | 5679,
+    "SSL_REQUEST_VERSION must equal (1234 << 16) | 5679 = 80877103 \
+     per PG §55.10 magic-version family",
+);
+const _: () = assert!(
+    CANCEL_REQUEST_VERSION == (MAGIC_VERSION_HIGH_HALF << 16) | 5678,
+    "CANCEL_REQUEST_VERSION must equal (1234 << 16) | 5678 = 80877102 \
+     per PG §55.4 magic-version family",
+);
+// Family-disjointness from real protocol versions: the high half
+// of `PROTOCOL_VERSION_3_0` (= 3) MUST NOT collide with the magic
+// 1234 marker. If a future bump makes major = 1234 (extremely
+// unlikely; PG would never go past version 99-ish), the magic
+// family loses its discriminator role.
+const _: () = assert!(
+    (PROTOCOL_VERSION_3_0 >> 16) != MAGIC_VERSION_HIGH_HALF,
+    "PROTOCOL_VERSION_3_0 (3.0 = major.minor encoding) high half \
+     must NOT collide with magic-version family marker (1234)",
+);
+// Cross-pin: SSL and CancelRequest version codes MUST be distinct
+// (they live in the same family but discriminate via low half).
+// A copy-paste of one into the other would silently break dispatch.
+const _: () = assert!(
+    SSL_REQUEST_VERSION != CANCEL_REQUEST_VERSION,
+    "SSL and CancelRequest magic versions must be distinct",
+);
+
+/// Build a `CancelRequest` packet on the wire — DEF-221
+/// (2026-05-07).
+///
+/// 16-byte StartupMessage-shaped packet sent on a SEPARATE TCP
+/// connection to cancel an in-flight query on the ORIGINAL
+/// connection. PG §55.4 "Canceling Requests in Progress":
+///
+/// ```text
+/// [length (BE u32 = 16)] [CANCEL_REQUEST_VERSION (BE u32 = 80877102)]
+/// [process_id (BE i32)]  [secret_key (BE i32)]
+///   = [0x00, 0x00, 0x00, 0x10,
+///      0x04, 0xd2, 0x16, 0x2e,
+///      <pid 4B BE>,
+///      <secret_key 4B BE>]
+/// ```
+///
+/// `pid` and `secret_key` come from the `BackendKeyData` ('K')
+/// frame the server emits during startup (currently captured in
+/// the [`crate::ProtoState::ConnectingPostAuthHaveKey`] variant;
+/// Phase 1e will surface them on the `Connection` typestate).
+///
+/// # Driver protocol (Phase 1e wrapper concern)
+///
+/// 1. Open a NEW TCP socket to the same PG server (the cancel
+///    cannot piggy-back on the connection running the query —
+///    that connection is busy on the server side).
+/// 2. Write these 16 bytes.
+/// 3. Close the socket. PG processes the cancel asynchronously;
+///    no reply comes back on this socket.
+///
+/// The original connection's behaviour after a successful cancel
+/// is server-driven: depending on the operation, the server may
+/// emit `ErrorResponse` with code `57014` (query_canceled) +
+/// `ReadyForQuery`, or simply complete normally if the cancel
+/// arrived too late. That handling lives in the regular
+/// [`crate::PgProtocol::feed_bytes`] dispatch path on the
+/// original connection.
+///
+/// # Tier impact
+///
+/// Pure function returning `[u8; 16]`. No allocation, no panic,
+/// no `unsafe`, no I/O — `const fn`. Caller cannot misshape the
+/// buffer (return size compile-fixed) and cannot misorder fields
+/// (positional encoding hidden inside the function body); the
+/// dynamic payload (`pid` + `secret_key`) is BE-encoded
+/// internally. Tier-1 by-construction at the API surface.
+///
+/// # Why a function, not a static const
+///
+/// Unlike [`SSL_REQUEST_WIRE_BYTES`] / [`TERMINATE_WIRE_BYTES`] /
+/// [`SYNC_WIRE_BYTES`] (parameterless and thus encodable as
+/// `pub const` arrays), CancelRequest carries dynamic per-
+/// connection payload. A const can't capture the runtime values;
+/// the `const fn` form materialises the bytes at every call site,
+/// with the layout drift-pinned by the const-asserts immediately
+/// below this definition.
+///
+/// # Usage
+///
+/// ```ignore
+/// // Driver pseudocode (Phase 1e):
+/// async fn cancel_inflight(server_addr: SocketAddr, pid: i32, secret: i32) -> io::Result<()> {
+///     let mut socket = TcpStream::connect(server_addr).await?;
+///     socket.write_all(&bsql_pg_proto::cancel_request_bytes(pid, secret)).await?;
+///     socket.shutdown().await
+/// }
+/// ```
+#[inline]
+#[must_use]
+pub const fn cancel_request_bytes(pid: i32, secret_key: i32) -> [u8; 16] {
+    let len = 16u32.to_be_bytes();
+    let ver = CANCEL_REQUEST_VERSION.to_be_bytes();
+    let p = pid.to_be_bytes();
+    let s = secret_key.to_be_bytes();
+    [
+        len[0], len[1], len[2], len[3],
+        ver[0], ver[1], ver[2], ver[3],
+        p[0], p[1], p[2], p[3],
+        s[0], s[1], s[2], s[3],
+    ]
+}
+
+// DEF-221 (2026-05-07): tier-1 round-trip pins for
+// `cancel_request_bytes` layout. Same shape as the SSLRequest
+// drift-pins above. If a future edit reorders the fields, swaps
+// length/version positions, or breaks BE encoding, these
+// assertions fail at build time.
+const _: () = {
+    // Spec-canonical zero pid + zero secret_key — pins length
+    // field + version field exactly; the dynamic-payload bytes
+    // are zero by construction.
+    let bytes = cancel_request_bytes(0, 0);
+    // Length field = 16 BE u32 at bytes[0..4].
+    assert!(bytes[0] == 0 && bytes[1] == 0);
+    assert!(bytes[2] == 0 && bytes[3] == 16);
+    // Version field = 80877102 BE u32 at bytes[4..8] = 04 d2 16 2e.
+    assert!(bytes[4] == 0x04 && bytes[5] == 0xd2);
+    assert!(bytes[6] == 0x16 && bytes[7] == 0x2e);
+    // pid (zero) at bytes[8..12].
+    assert!(bytes[8] == 0 && bytes[9] == 0);
+    assert!(bytes[10] == 0 && bytes[11] == 0);
+    // secret_key (zero) at bytes[12..16].
+    assert!(bytes[12] == 0 && bytes[13] == 0);
+    assert!(bytes[14] == 0 && bytes[15] == 0);
+};
+const _: () = {
+    // Non-zero payload — pins dynamic positions. pid =
+    // 0x12345678 = 305419896, secret_key = 0x09abcdef =
+    // 162254319 (positive i32 to keep sign clean for the pin).
+    let pid: i32 = 0x1234_5678;
+    let key: i32 = 0x09ab_cdef;
+    let bytes = cancel_request_bytes(pid, key);
+    // Length + version unchanged from spec.
+    assert!(bytes[0] == 0 && bytes[1] == 0);
+    assert!(bytes[2] == 0 && bytes[3] == 16);
+    assert!(bytes[4] == 0x04 && bytes[5] == 0xd2);
+    assert!(bytes[6] == 0x16 && bytes[7] == 0x2e);
+    // pid (BE i32) at bytes[8..12].
+    assert!(bytes[8] == 0x12 && bytes[9] == 0x34);
+    assert!(bytes[10] == 0x56 && bytes[11] == 0x78);
+    // secret_key (BE i32) at bytes[12..16].
+    assert!(bytes[12] == 0x09 && bytes[13] == 0xab);
+    assert!(bytes[14] == 0xcd && bytes[15] == 0xef);
+};
+const _: () = {
+    // Negative i32 pid — sign-extended in BE encoding via two's
+    // complement. pid = -1 → 0xFFFFFFFF; secret_key = i32::MIN
+    // → 0x80000000. Pins the BE-encoding-of-signed-int contract.
+    let bytes = cancel_request_bytes(-1, i32::MIN);
+    assert!(bytes[8] == 0xff && bytes[9] == 0xff);
+    assert!(bytes[10] == 0xff && bytes[11] == 0xff);
+    assert!(bytes[12] == 0x80 && bytes[13] == 0x00);
+    assert!(bytes[14] == 0x00 && bytes[15] == 0x00);
+};
+// Total length sanity — the public API guarantees a 16-byte
+// return; this also pins it from another angle.
+const _: () = assert!(cancel_request_bytes(0, 0).len() == 16);
+const _: () = {
+    // Length field's declared value must equal the array's
+    // physical length (PG protocol convention: length includes
+    // self).
+    let bytes = cancel_request_bytes(0, 0);
+    let declared = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    assert!(
+        declared == 16,
+        "CancelRequest length field must equal physical packet size (16)"
     );
 };
 
