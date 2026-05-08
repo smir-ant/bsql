@@ -29,7 +29,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, PgCommand, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply,
+    Action, ConnectionStatus, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply,
     ReplyId, Sql, WriteBuf,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
@@ -166,7 +166,7 @@ fn simple_query_setup(
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
     proto.push_or_panic(
-        PgCommand::SimpleQuery {
+        bsql_pg_proto::push_command::SimpleQuery {
             sql: sql("SELECT 1"),
             reply,
         },
@@ -511,7 +511,7 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
 /// Invariant (1c-2a): a DML query following a SELECT must receive
 /// `Reply::QueryComplete { row_desc: None }` — NOT the prior
 /// SELECT's schema. This pins the `push_command` clear at line
-/// `self.row_desc = None` (in `PgCommand::SimpleQuery` branch).
+/// `self.row_desc = None` (in `bsql_pg_proto::push_command::SimpleQuery` branch).
 ///
 /// Without the clear, `feed_bytes` on the DML path would `copy` the
 /// stale row_desc from `PgProtocol.row_desc` into the Reply, leaking

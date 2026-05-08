@@ -34,7 +34,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    FeedEvent, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply, Sql, WriteBuf,
+    FeedEvent, PgProtocol, ProtoState, ProtocolError, Reply, Sql, WriteBuf,
     reply_id::{PingKind, QueryKind, ReplyId},
     wire::{TAG_DATA_ROW, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION},
 };
@@ -100,7 +100,7 @@ fn ping_then_rfq_yields_deliver_pong() {
     let ping_raw = raw(1);
 
     // Push Ping (state → PingAwaitingRfq).
-    proto.push_or_panic(PgCommand::Ping { reply: ping_id(1) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(1) }, &mut wb);
     assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
 
     // Feed inbound RFQ via the per-event API.
@@ -130,7 +130,7 @@ fn ping_then_rfq_yields_deliver_pong() {
 fn post_deliver_advance_returns_idle() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    proto.push_or_panic(PgCommand::Ping { reply: ping_id(2) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(2) }, &mut wb);
     let feed_result = proto.feed_inbound(&rfq_idle());
     assert!(feed_result.is_ok());
     let _first = proto.advance_one_frame(&mut wb); // consumes the Deliver
@@ -152,7 +152,7 @@ fn post_deliver_advance_returns_idle() {
 fn partial_header_yields_need_more_bytes() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    proto.push_or_panic(PgCommand::Ping { reply: ping_id(3) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(3) }, &mut wb);
 
     // Feed only 1 byte — header parser sees Incomplete.
     let partial = [b'Z'];
@@ -194,7 +194,7 @@ fn unexpected_frame_mid_ping_yields_fail_with_id() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let ping_raw = raw(4);
-    proto.push_or_panic(PgCommand::Ping { reply: ping_id(4) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(4) }, &mut wb);
 
     // Feed an unexpected DataRow ('D') frame while awaiting RFQ.
     let bad = frame(TAG_DATA_ROW.byte(), &[0, 0]);
@@ -241,7 +241,7 @@ fn row_description_transitions_to_streaming_rows_event() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     proto.push_or_panic(
-        PgCommand::SimpleQuery {
+        bsql_pg_proto::push_command::SimpleQuery {
             sql: Sql::from_str_truncating("SELECT 1"),
             reply: query_id(5),
         },
@@ -289,7 +289,7 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
     // (a) feed_bytes path.
     let mut proto_a = PgProtocol::new();
     let mut wb_a = WriteBuf::new();
-    proto_a.push_or_panic(PgCommand::Ping { reply: ping_id(101) }, &mut wb_a);
+    proto_a.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(101) }, &mut wb_a);
     let actions = proto_a.feed_bytes(&rfq_idle(), &mut wb_a);
     assert_eq!(actions.len(), 1, "feed_bytes: 1 DeliverReply on Ping/RFQ");
     // OutActions is ManuallyDrop<Vec<Action,9>>+len — not actually
@@ -300,7 +300,7 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
     // (b) advance_one_frame path.
     let mut proto_b = PgProtocol::new();
     let mut wb_b = WriteBuf::new();
-    proto_b.push_or_panic(PgCommand::Ping { reply: ping_id(101) }, &mut wb_b);
+    proto_b.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(101) }, &mut wb_b);
     assert!(proto_b.feed_inbound(&rfq_idle()).is_ok());
 
     let event = proto_b.advance_one_frame(&mut wb_b);

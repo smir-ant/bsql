@@ -33,10 +33,15 @@ use crate::reply_id::{
 /// cloneable id, which would break the tier-1 "no silent reply loss"
 /// invariant. If a caller needs multiple commands they mint multiple
 /// ids from the wrapper's monotonic counter and build multiple commands.
+/// DEF-269 v2 (T): demoted to `pub(crate)` — external callers construct
+/// per-command structs (`crate::push_command::{Ping, Startup, ...}`).
+/// The enum is retained for the lib-internal `compute_push_tests` mod
+/// and the legacy `impl PushCommand for PgCommand` blanket impl.
 #[derive(Debug)]
 #[non_exhaustive]
 #[must_use = "a PgCommand has no effect until pushed via PgProtocol::push_command"]
-pub enum PgCommand {
+#[allow(dead_code, reason = "DEF-269 v2: variants only constructed by lib-internal compute_push_tests mod + the blanket `impl PushCommand for PgCommand` (legacy slow-path)")]
+pub(crate) enum PgCommand {
     /// Cheap server liveness probe.
     ///
     /// Translated by the protocol to a `Sync` frame (5 wire bytes); the

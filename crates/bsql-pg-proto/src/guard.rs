@@ -68,7 +68,7 @@
 //! `PingAwaitingRfq`, etc. — never produce a guard.)
 
 use crate::action::PushFailure;
-use crate::command::{FetchRows, PgCommand};
+use crate::command::FetchRows;
 use crate::decode::RowDesc;
 use crate::error::StateErrorKind;
 use crate::ident::{PortalName, StmtName};
@@ -222,8 +222,16 @@ impl IdleStateProof {
     ///
     /// Crate-internal callers that need the proof MUST go through
     /// `ReadyGuard`; there is no other path.
+    ///
+    /// DEF-269 v2: visibility relaxed from module-private to
+    /// `pub(crate)` so `protocol::push_command_internal` can synthesise
+    /// the witness when re-entering through the generic `C: PushCommand`
+    /// dispatch. The witness's tier-1 closure (only constructible
+    /// inside the crate) is preserved — `_IdleProofMarker` stays
+    /// module-private to `mod guard`, so external callers cannot
+    /// fabricate the proof.
     #[inline]
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self(_IdleProofMarker)
     }
 }
@@ -308,10 +316,14 @@ impl<'a> ReadyGuard<'a> {
     /// (~80 B); caller drains bytes from `write_buf` directly. -88%
     /// per-call return frame; same tier-1 closure surface (state ==
     /// Idle via guard, classified failure via `Result::Err`).
+    /// DEF-269 v2 (T): generic over `C: PushCommand`. Caller passes a
+    /// per-command struct (e.g. [`crate::push_command::Ping`]) instead
+    /// of a `PgCommand` enum value. Each `C` is monomorphised — the
+    /// 2176-B-by-value PgCommand argument move is gone.
     #[inline]
-    pub fn push_command(
+    pub fn push_command<C: crate::push_command::PushCommand>(
         self,
-        cmd: PgCommand,
+        cmd: C,
         write_buf: &mut WriteBuf,
     ) -> Result<(), PushFailure> {
         // DEF-198 ext: synthesise the Idle-state witness here.
@@ -321,14 +333,14 @@ impl<'a> ReadyGuard<'a> {
         self.proto.push_command_internal(cmd, write_buf, IdleStateProof::new())
     }
 
-    /// Extended-Query Bind+Execute pipeline.
-    ///
-    /// Tier-1 elevation of the pre-DEF-198 `PgProtocol::push_bind_execute`
-    /// public method. See [`Self::push_command`] for the
-    /// `Result<(), PushFailure>` shape (DEF-212 Alt Y').
+    /// DEF-269 v2 (T): Extended-Query Bind+Execute is now a regular
+    /// `PushCommand` impl ([`crate::push_command::BindExecute`]).
+    /// Convenience wrapper preserved for callers that prefer the
+    /// argument-list shape; new callers should construct a
+    /// `BindExecute { ... }` and call `push_command` directly.
     #[expect(
         clippy::too_many_arguments,
-        reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1; ReadyGuard wrapper preserves the same arg count by design"
+        reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1; the wrapper preserves the same arg count by design"
     )]
     #[inline]
     pub fn push_bind_execute<P: ParamsWriter>(
@@ -341,15 +353,16 @@ impl<'a> ReadyGuard<'a> {
         reply: ReplyId<QueryKind>,
         write_buf: &mut WriteBuf,
     ) -> Result<(), PushFailure> {
-        self.proto.push_bind_execute_internal(
-            portal_name,
-            stmt_name,
-            params,
-            row_desc,
-            fetch,
-            reply,
+        self.push_command(
+            crate::push_command::BindExecute {
+                portal_name,
+                stmt_name,
+                params,
+                row_desc,
+                fetch,
+                reply,
+            },
             write_buf,
-            IdleStateProof::new(),
         )
     }
 }

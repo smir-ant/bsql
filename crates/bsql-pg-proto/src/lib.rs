@@ -259,6 +259,7 @@ pub(crate) mod md5;
 pub mod params;
 pub mod password;
 pub mod protocol;
+pub mod push_command;
 pub mod row_stream;
 pub mod reply_id;
 pub mod scram;
@@ -300,7 +301,14 @@ pub use action::{
 };
 pub use bounded::{BoundedLen, BoundedU8, BoundedU16};
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull, ReadBufN};
-pub use command::{FetchRows, PgCommand};
+// DEF-269 v2 (T): `PgCommand` enum no longer publicly re-exported.
+// External callers construct per-command structs directly:
+// `bsql_pg_proto::push_command::{Ping, Flush, Startup, ..., BindExecute}`.
+// The enum still exists internally (`crate::command::PgCommand`) and
+// is used by the `compute_push_tests` lib-internal test module +
+// the legacy `impl PushCommand for PgCommand` blanket impl which
+// preserves backwards-compat for the `compute_push` test dispatcher.
+pub use command::FetchRows;
 pub use decode::{
     ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, FormatCodeSet, FromPgText,
     MAX_ROW_COLUMNS, OutOfRange, RowDesc, RowDescBorrow, RowDescColumnsIter, oids,

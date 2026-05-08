@@ -41,7 +41,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ColumnDesc, DataRowRef, FormatCode, FromPgText, PgCommand, PgProtocol, ProtoState,
+    Action, ColumnDesc, DataRowRef, FormatCode, FromPgText, PgProtocol, ProtoState,
     ProtocolError, QueryKind, Reply, ReplyId, Sql, StreamItem, WriteBuf, oids,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_ERROR_RESPONSE, TAG_QUERY, TAG_READY_FOR_QUERY,
@@ -138,7 +138,7 @@ fn sql(s: &str) -> Sql {
 #[track_caller]
 fn push_simple_query(proto: &mut PgProtocol, reply: ReplyId<QueryKind>, wb: &mut WriteBuf) {
     proto.push_or_panic(
-        PgCommand::SimpleQuery {
+        bsql_pg_proto::push_command::SimpleQuery {
             sql: sql("SELECT 1"),
             reply,
         },

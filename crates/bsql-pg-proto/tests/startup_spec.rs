@@ -23,7 +23,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, Credentials, Ident, PgCommand, PgProtocol, Password, ProtoState,
+    Action, ConnectionStatus, Credentials, Ident, PgProtocol, Password, ProtoState,
     ProtocolError, Reply, ReplyId, ReplyKind, Sensitive,
 };
 use core::num::NonZeroU64;
@@ -38,8 +38,8 @@ fn raw(value: u64) -> NonZeroU64 {
 }
 
 /// Generic over `K: ReplyKind` — call-site infers the kind from the
-/// command being constructed (e.g. `PgCommand::Startup { reply:
-/// id(...) }` selects `StartupKind`; `PgCommand::Ping { reply:
+/// command being constructed (e.g. `bsql_pg_proto::push_command::Startup { reply:
+/// id(...) }` selects `StartupKind`; `bsql_pg_proto::push_command::Ping { reply:
 /// id(...) }` selects `PingKind`).
 fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
     ReplyId::from_raw(value)
@@ -177,7 +177,7 @@ fn startup_trust(
     });
     // DEF-212 (Alt Y'): push_or_panic returns (); bytes live in wb.
     // Caller drains via `wb.as_bytes()` for wire-layout assertions.
-    proto.push_or_panic(PgCommand::Startup {
+    proto.push_or_panic(bsql_pg_proto::push_command::Startup {
         user: user_ident,
         database,
         app_name: None,
@@ -643,7 +643,7 @@ fn startup_scram(
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
     // DEF-212 (Alt Y'): push_or_panic returns (); bytes live in wb.
-    proto.push_or_panic(PgCommand::Startup {
+    proto.push_or_panic(bsql_pg_proto::push_command::Startup {
         user: user_ident,
         database: None,
         app_name: None,
@@ -1195,8 +1195,6 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
 /// in flight.
 #[test]
 fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
-    use bsql_pg_proto::PgCommand;
-
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let startup_raw = raw(200);
@@ -1216,7 +1214,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     // wb until the next push wipes it. The helper test below
     // verifies the post-Ping wb contents are exactly Sync.
     let ping_raw = raw(201);
-    proto.push_or_panic(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: id(ping_raw) }, &mut wb);
     {
         // F33: literal PG Sync wire layout — avoids tautology with
         // internal SYNC_WIRE_BYTES const (both sourced from same symbol
@@ -1418,7 +1416,7 @@ fn startup_cleartext(
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
     proto.push_or_panic(
-        PgCommand::Startup {
+        bsql_pg_proto::push_command::Startup {
             user: user_ident,
             database: None,
             app_name: None,
@@ -1652,7 +1650,7 @@ fn startup_md5(
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
     proto.push_or_panic(
-        PgCommand::Startup {
+        bsql_pg_proto::push_command::Startup {
             user: user_ident,
             database: None,
             app_name: None,

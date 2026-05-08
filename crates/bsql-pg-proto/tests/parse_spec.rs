@@ -20,7 +20,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, ParseKind, PgCommand, PgProtocol, ProtoState, ProtocolError, Reply,
+    Action, ConnectionStatus, ParseKind, PgProtocol, ProtoState, ProtocolError, Reply,
     ReplyId, Sql, StmtName, WriteBuf,
     wire::{TAG_ERROR_RESPONSE, TAG_PARSE, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY},
 };
@@ -105,7 +105,7 @@ fn parse_setup(
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
     proto.push_or_panic(
-        PgCommand::Parse {
+        bsql_pg_proto::push_command::Parse {
             stmt_name,
             sql: sql(sql_text),
             reply,

@@ -43,7 +43,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, Credentials, Ident, PgCommand, PgProtocol, PingKind, ProtoState,
+    Action, ConnectionStatus, Credentials, Ident, PgProtocol, PingKind, ProtoState,
     QueryKind, ReplyId, Sql, WriteBuf,
     wire::TAG_READY_FOR_QUERY,
 };
@@ -100,7 +100,7 @@ fn def198_idle_after_drain_yields_ready_guard() {
     let mut wb = WriteBuf::new();
 
     // Push + drain Ping; final state should be Idle.
-    proto.push_or_panic(PgCommand::Ping { reply: ping_id(1) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(1) }, &mut wb);
     let rfq = [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 5, b'I'];
     let _ = proto.feed_bytes(&rfq, &mut wb);
 
@@ -124,7 +124,7 @@ fn def198_ping_awaiting_classifies_busy() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    proto.push_or_panic(PgCommand::Ping { reply: ping_id(1) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(1) }, &mut wb);
 
     assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
     assert!(
@@ -152,7 +152,7 @@ fn def198_simple_query_awaiting_classifies_busy() {
     let mut wb = WriteBuf::new();
 
     proto.push_or_panic(
-        PgCommand::SimpleQuery {
+        bsql_pg_proto::push_command::SimpleQuery {
             sql: Sql::from_str_truncating("SELECT 1"),
             reply: query_id(1),
         },
@@ -195,7 +195,7 @@ fn def198_connecting_startup_classifies_handshaking() {
     let mut wb = WriteBuf::new();
 
     proto.push_or_panic(
-        PgCommand::Startup {
+        bsql_pg_proto::push_command::Startup {
             user: ident("testuser"),
             database: None,
             app_name: None,
@@ -284,7 +284,7 @@ fn def198_ready_guard_consumes_on_push() {
         // by handling both arms; pre-(212) `let _out = ...` was a
         // bind-to-named-underscore which avoided the lint but left
         // failures silently unobserved at the test layer.
-        match guard.push_command(PgCommand::Ping { reply: ping_id(1) }, &mut wb) {
+        match guard.push_command(bsql_pg_proto::push_command::Ping { reply: ping_id(1) }, &mut wb) {
             Ok(()) => {}
             Err(failure) => panic!(
                 "Ping push from Idle must succeed (architecturally infallible); \

@@ -38,8 +38,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ApplicationName, ConnectionStatus, Credentials, DatabaseName, Ident, IdentError,
-    PgCommand, PgProtocol, ProtoState, ProtocolError, ReplyId, ReplyKind, SessionParams,
+    Action, ApplicationName, ConnectionStatus, Credentials, DatabaseName, Ident, IdentError, PgProtocol, ProtoState, ProtocolError, ReplyId, ReplyKind, SessionParams,
 };
 use core::num::NonZeroU64;
 
@@ -54,7 +53,7 @@ fn raw(value: u64) -> NonZeroU64 {
 
 /// Generic over `K: ReplyKind` so tests can mint either
 /// `ReplyId<PingKind>` or `ReplyId<StartupKind>` with the same
-/// helper. Call site infers K from usage context (e.g. `PgCommand::Ping
+/// helper. Call site infers K from usage context (e.g. `bsql_pg_proto::push_command::Ping
 /// { reply: id(raw(1)) }` picks `PingKind`).
 fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
     ReplyId::from_raw(value)
@@ -223,7 +222,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     let ping_raw = raw(7777);
     // Push ping and feed a FrameTooLarge frame.
     // DEF-212: push_or_panic returns (); bytes live in wb.
-    proto.push_or_panic(PgCommand::Ping {
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping {
         reply: id(ping_raw),
     }, &mut wb);
     // Declared length = 0xDEAD (way above MAX_FRAME_LEN_FIELD=4095).
@@ -293,7 +292,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
 /// build at the variant-construction site. No classifier needed.
 #[test]
 fn scram_push_startup_carries_scram_session_inline() {
-    use bsql_pg_proto::{PgCommand, PgProtocol, WriteBuf};
+    use bsql_pg_proto::{PgProtocol, WriteBuf};
     use bsql_pg_proto::ident::Ident;
     use bsql_pg_proto::password::{Credentials, Password};
     use bsql_pg_proto::sensitive::Sensitive;
@@ -306,7 +305,7 @@ fn scram_push_startup_carries_scram_session_inline() {
         panic!("password construction must succeed");
     };
     proto.push_or_panic(
-        PgCommand::Startup {
+        bsql_pg_proto::push_command::Startup {
             user,
             database: None,
             app_name: None,
@@ -338,7 +337,7 @@ fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
     // Drive into Errored(ServerError) via a server ErrorResponse
     // during a pending Ping (distinct kind from the Framing path
     // exercised in the sibling test).
-    proto.push_or_panic(PgCommand::Ping { reply: id(raw(9001)) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: id(raw(9001)) }, &mut wb);
     // ErrorResponse frame: tag 'E' + length 5 (just the terminator
     // NUL) — empty body is legal per PG spec (all fields optional).
     let err_frame = [b'E', 0x00, 0x00, 0x00, 0x05, 0x00];
@@ -465,7 +464,7 @@ fn backend_key_data_wrong_payload_size_is_classified() {
     let startup_raw = raw(9000);
     // Setup: push Startup, feed AuthOk.
     // DEF-212: push_or_panic returns (); bytes live in wb.
-    proto.push_or_panic(PgCommand::Startup {
+    proto.push_or_panic(bsql_pg_proto::push_command::Startup {
         user: Ident::try_from_str("u").unwrap_or_else(|_| panic!("valid ident")),
         database: None,
         app_name: None,

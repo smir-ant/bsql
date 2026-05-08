@@ -43,7 +43,6 @@
 //! ship — this file covers the robustness class.
 
 use bsql_pg_proto::{
-    command::PgCommand,
     frame::{parse_header, HeaderParse, READ_BUF_CAP},
     reply_id::{PingKind, ReplyId},
     PgProtocol, ProtoState, WriteBuf,
@@ -287,7 +286,7 @@ fn push_ping_then_feed_random_bytes_terminates() {
         // Push Ping first — state transitions to PingAwaitingRfq.
         // DEF-212: bytes live in wb; helper returns ().
         proto.push_or_panic(
-            PgCommand::Ping {
+            bsql_pg_proto::push_command::Ping {
                 reply: ping_id(u64::try_from(i.saturating_add(1)).unwrap_or(1)),
             },
             &mut wb,

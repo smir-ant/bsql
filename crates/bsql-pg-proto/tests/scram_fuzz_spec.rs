@@ -25,7 +25,7 @@
 //!   classification miss).
 
 use bsql_pg_proto::{
-    Action, PgCommand, PgProtocol, ProtoState, WriteBuf,
+    Action, PgProtocol, ProtoState, WriteBuf,
     error::ProtocolError,
     ident::Ident,
     password::{Credentials, Password},
@@ -93,7 +93,7 @@ fn init_scram_protocol(seed: u64) -> Option<(PgProtocol, WriteBuf)> {
         NonZeroU64::new(seed.max(1)).unwrap_or(NonZeroU64::MIN),
     );
     proto.push_or_panic(
-        PgCommand::Startup {
+        bsql_pg_proto::push_command::Startup {
             user,
             database: None,
             app_name: None,

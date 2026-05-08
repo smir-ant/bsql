@@ -38,7 +38,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, PgCommand, PgProtocol, PingKind, ProtoState, ProtocolError, Reply,
+    Action, ConnectionStatus, PgProtocol, PingKind, ProtoState, ProtocolError, Reply,
     ReplyId, ReplyKind,
     wire::{TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
 };
@@ -148,7 +148,7 @@ fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) 
 /// `ping_setup` implicitly validates push-content for free.
 #[track_caller]
 fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg_proto::WriteBuf) {
-    proto.push_or_panic(PgCommand::Ping { reply }, wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, wb);
     // F33: assert the LITERAL 5-byte Sync wire layout from PG §55.7 —
     // tag 'S' + BE u32 length-field `4`. This is the load-bearing wire
     // contract: stronger than comparing to the library's own internal
@@ -177,7 +177,7 @@ fn ping_from_idle_emits_sync_bytes() {
     assert!(matches!(proto.state(), ProtoState::Idle));
 
     let ping_raw = raw(1);
-    proto.push_or_panic(PgCommand::Ping { reply: id(ping_raw) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: id(ping_raw) }, &mut wb);
 
     // DEF-212: bytes live in wb. F33 anti-tautology: assert literal PG
     // Sync wire layout (tag 'S' + BE u32 length=4), not the internal

@@ -5,7 +5,7 @@
 //! pins a finding that the pre-audit suite did not cover.
 
 use bsql_pg_proto::{
-    Action, PgCommand, PgProtocol, ProtoState, WriteBuf, error::ProtocolError,
+    Action, PgProtocol, ProtoState, WriteBuf, error::ProtocolError,
 };
 use core::num::NonZeroU64;
 
@@ -34,7 +34,7 @@ fn startup_id(raw: NonZeroU64) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto
 }
 
 fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf, raw_id: NonZeroU64) {
-    proto.push_or_panic(PgCommand::Ping { reply: ping_id(raw_id) }, wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(raw_id) }, wb);
     // DEF-212 (Alt Y'): bytes live in wb (Sync = 5 B for Ping). The
     // helper's tier-1 invariant is "push succeeded" (Idle precondition
     // already proved by `as_ready` inside push_or_panic); the
@@ -60,7 +60,7 @@ fn empty_query_response_with_non_zero_body_classifies() {
     // feed_bytes call re-borrows it.
     let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
     proto.push_or_panic(
-        PgCommand::SimpleQuery { sql, reply: query_id(raw(9901)) },
+        bsql_pg_proto::push_command::SimpleQuery { sql, reply: query_id(raw(9901)) },
         &mut wb,
     );
     // DEF-212: SimpleQuery emits a 'Q' frame; non-empty wb verifies
@@ -101,7 +101,7 @@ fn parse_complete_with_non_zero_body_classifies() {
     };
     let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
     proto.push_or_panic(
-        PgCommand::Parse { stmt_name: stmt, sql, reply: parse_id(raw(9902)) },
+        bsql_pg_proto::push_command::Parse { stmt_name: stmt, sql, reply: parse_id(raw(9902)) },
         &mut wb,
     );
     // DEF-212: Parse emits 'P' frame + 5 B Sync; non-empty wb confirms.
@@ -214,7 +214,7 @@ fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
         Err(_) => return,
     };
     proto.push_or_panic(
-        PgCommand::Startup {
+        bsql_pg_proto::push_command::Startup {
             user,
             database: None,
             app_name: None,

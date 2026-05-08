@@ -51,8 +51,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows,
-    PgCommand, PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, Sql, StmtName,
+    Action, ConnectionStatus, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows, PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, Sql, StmtName,
     TxStatus, WriteBuf,
     wire::{
         DescribeTargetByte, TAG_BIND_COMPLETE, TAG_DATA_ROW, TAG_DESCRIBE, TAG_ERROR_RESPONSE,
@@ -169,7 +168,7 @@ fn describe_stmt_setup(
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
     proto.push_or_panic(
-        PgCommand::DescribeStatement { stmt_name, reply },
+        bsql_pg_proto::push_command::DescribeStatement { stmt_name, reply },
         wb,
     );
     let (d_frame, _sync) = split_frame_plus_sync(wb.as_bytes());
@@ -190,7 +189,7 @@ fn describe_portal_setup(
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
     proto.push_or_panic(
-        PgCommand::DescribePortal { portal_name, reply },
+        bsql_pg_proto::push_command::DescribePortal { portal_name, reply },
         wb,
     );
     let (d_frame, _sync) = split_frame_plus_sync(wb.as_bytes());
@@ -963,7 +962,7 @@ fn describe_after_completed_parse_starts_clean() {
     use bsql_pg_proto::ParseKind;
     let parse_raw = raw(900);
     proto.push_or_panic(
-        PgCommand::Parse {
+        bsql_pg_proto::push_command::Parse {
             stmt_name: stmt_unnamed(),
             sql: Sql::from_str_truncating("SELECT 1"),
             reply: ReplyId::<ParseKind>::from_raw(parse_raw),

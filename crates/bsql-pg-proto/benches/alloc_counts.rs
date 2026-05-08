@@ -55,7 +55,6 @@
 extern crate alloc;
 
 use bsql_pg_proto::{
-    command::PgCommand,
     ident::Sql,
     reply_id::{PingKind, QueryKind, ReplyId},
     PgProtocol, PushFailure, WriteBuf,
@@ -240,9 +239,9 @@ fn reply_id_ping(raw: u64) -> ReplyId<PingKind> {
     ReplyId::from_raw(NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN))
 }
 
-fn bench_push_or_panic(
+fn bench_push_or_panic<C: bsql_pg_proto::push_command::PushCommand>(
     proto: &mut PgProtocol,
-    cmd: PgCommand,
+    cmd: C,
     wb: &mut WriteBuf,
 ) -> Result<(), PushFailure> {
     let status = proto.connection_status();
@@ -290,7 +289,7 @@ fn scenario_ping_round_trip() {
     measure("ping_round_trip", || {
         let push_out = bench_push_or_panic(
             &mut proto,
-            PgCommand::Ping {
+            bsql_pg_proto::push_command::Ping {
                 reply: reply_id_ping(1),
             },
             &mut wb,
@@ -307,7 +306,7 @@ fn scenario_push_command_only() {
     measure("push_command_ping", || {
         let push_out = bench_push_or_panic(
             &mut proto,
-            PgCommand::Ping {
+            bsql_pg_proto::push_command::Ping {
                 reply: reply_id_ping(1),
             },
             &mut wb,
@@ -328,7 +327,7 @@ fn scenario_iter_rows_100() {
     let mut wb = WriteBuf::new();
     let push_out = bench_push_or_panic(
         &mut proto,
-        PgCommand::SimpleQuery {
+        bsql_pg_proto::push_command::SimpleQuery {
             sql: Sql::from_str_truncating("SELECT x"),
             reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
         },
@@ -372,7 +371,7 @@ fn scenario_advance_one_frame() {
     let mut wb = WriteBuf::new();
     let push_out = bench_push_or_panic(
         &mut proto,
-        PgCommand::Ping {
+        bsql_pg_proto::push_command::Ping {
             reply: reply_id_ping(1),
         },
         &mut wb,

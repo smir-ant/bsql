@@ -21,11 +21,15 @@
 #![allow(dead_code, reason = "shared helper module — not every test uses every helper")]
 
 use bsql_pg_proto::{
-    FetchRows, HeaderParse, PgCommand, PgProtocol, PortalName, PushFailure, QueryKind, ReplyId,
+    FetchRows, HeaderParse, PgProtocol, PortalName, PushFailure, QueryKind, ReplyId,
     RowDesc, StmtName, WriteBuf, params::ParamsWriter, parse_header,
+    push_command::{BindExecute, PushCommand},
 };
 
 /// Extension trait: pre-DEF-198 ergonomics for happy-path tests.
+///
+/// DEF-269 v2: generic over `C: PushCommand` — tests pass per-command
+/// structs (e.g. `Ping { reply }`) directly, no `PgCommand` enum.
 ///
 /// `proto.push_or_panic(cmd, wb)` panics on:
 /// - Non-Idle state (caller's test fixture is malformed; the helper
@@ -36,7 +40,7 @@ use bsql_pg_proto::{
 ///
 /// On success, returns `()`. The caller verifies via `wb.as_bytes()`.
 pub trait PushOrPanic {
-    fn push_or_panic(&mut self, cmd: PgCommand, wb: &mut WriteBuf);
+    fn push_or_panic<C: PushCommand>(&mut self, cmd: C, wb: &mut WriteBuf);
 
     #[expect(
         clippy::too_many_arguments,
@@ -57,15 +61,15 @@ pub trait PushOrPanic {
     /// EXPECT a `PushFailure` (e.g., builder-overflow classification
     /// tests). Panics on non-Idle (same fixture-malformed semantics
     /// as `push_or_panic`).
-    fn push_expect_failure(
+    fn push_expect_failure<C: PushCommand>(
         &mut self,
-        cmd: PgCommand,
+        cmd: C,
         wb: &mut WriteBuf,
     ) -> PushFailure;
 }
 
 impl PushOrPanic for PgProtocol {
-    fn push_or_panic(&mut self, cmd: PgCommand, wb: &mut WriteBuf) {
+    fn push_or_panic<C: PushCommand>(&mut self, cmd: C, wb: &mut WriteBuf) {
         let status = self.connection_status();
         let Some(g) = self.as_ready() else {
             panic!(
@@ -96,8 +100,16 @@ impl PushOrPanic for PgProtocol {
                 "test fixture: proto must be Idle for push_bind_execute (status = {status:?})",
             );
         };
-        match g.push_bind_execute(
-            portal_name, stmt_name, params, row_desc, fetch, reply, wb,
+        match g.push_command(
+            BindExecute {
+                portal_name,
+                stmt_name,
+                params,
+                row_desc,
+                fetch,
+                reply,
+            },
+            wb,
         ) {
             Ok(()) => {}
             Err(f) => panic!(
@@ -106,9 +118,9 @@ impl PushOrPanic for PgProtocol {
         }
     }
 
-    fn push_expect_failure(
+    fn push_expect_failure<C: PushCommand>(
         &mut self,
-        cmd: PgCommand,
+        cmd: C,
         wb: &mut WriteBuf,
     ) -> PushFailure {
         let status = self.connection_status();
