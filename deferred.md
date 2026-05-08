@@ -57,7 +57,7 @@ the right window for breaking churn.
 
 | Pos | DEF | Item | Expected | API impact |
 |-----|-----|------|----------|-----------|
-| 1 | DEF-265 | **α footprint reduction (PgProtocol shrink) — SHIPPED 2026-05-08 via Idea-38.** Three iterations: Attempt 1 (Box<ReadBuf>) → +54%; Attempt 2 (Idea-31 `&'buf mut ReadBuf`) → +18%; **Attempt 3 (Idea-38 two-tier inline + lazy heap escape) → ALL benches improved or neutral.** Final design: `pub struct ReadBuf { inline: heapless::Vec<u8, 256>, heap: Option<Box<heapless::Vec<u8, 4096>>>, cursor: u16 }`. Frames ≤ 256 B stay in stack-inline storage with full cache locality (state + small_buf adjacent in same struct); frames > 256 B trigger a one-time lazy escape (Box::new + memcpy of inline contents to heap). Once escaped, stays heap-resident for the buffer's lifetime. **Bench results vs `phase-c-clean-pre-heap-box`:** ping_round_trip/push_then_feed **−36.17%** (119→76 ns; smaller PgProtocol stack frame + cache locality preserved); iter_rows_via_next_event −10.54%, iter_rows_via_next_row_bytes −6.17%, iter_rows_via_consume_batch −5.28%, parse_header −3.35%, iter_rows_via_next_row −2.37%. Zero alloc-traffic regressions (5/5 scenarios identical to `initial-clean` baseline). PgProtocol size 4352 B → **520 B exact (-88% inline)**. Tests 447/0/17, clippy clean, DEF-259 manifest extended with `ReadBuf`. Why this beats earlier attempts: (a) inline-mode preserves cache locality (state + 256 B inline buf single struct); (b) zero heap alloc on common path (RFQ, small frames); (c) smaller stack frame reduces stack-probe cost on per-iter construction; (d) heap escape only on actual overflow — analytics workloads pay one-time alloc + memcpy, not per-cycle. **Generalisable insight:** for trade-offs of "footprint vs perf", explore the LAZY ESCAPE pattern — keep small inline (cache-friendly), upgrade to heap only on overflow (footprint-friendly). Same pattern applies to other bounded buffers (e.g., `WriteBuf` could potentially benefit from same two-tier design — register as exploratory follow-up). | -88% PgProtocol inline footprint + −36% ping_round_trip + zero alloc regression | None public; ReadBuf internals changed |
+| 1 | DEF-265 | **α footprint reduction (PgProtocol shrink) — SHIPPED 2026-05-08 via Idea-38.** Three iterations: Attempt 1 (Box<ReadBuf>) → +54%; Attempt 2 (Idea-31 `&'buf mut ReadBuf`) → +18%; **Attempt 3 (Idea-38 two-tier inline + lazy heap escape) → ALL benches improved or neutral.** Final design: `pub struct ReadBuf { inline: heapless::Vec<u8, 256>, heap: Option<Box<heapless::Vec<u8, 4096>>>, cursor: u16 }`. Frames ≤ 256 B stay in stack-inline storage with full cache locality (state + small_buf adjacent in same struct); frames > 256 B trigger a one-time lazy escape (Box::new + memcpy of inline contents to heap). Once escaped, stays heap-resident for the buffer's lifetime. **Bench results vs `phase-c-clean-pre-heap-box`:** ping_round_trip/push_then_feed **−36.17%** (119→76 ns; smaller PgProtocol stack frame + cache locality preserved); iter_rows_via_next_event −10.54%, iter_rows_via_next_row_bytes −6.17%, iter_rows_via_consume_batch −5.28%, parse_header −3.35%, iter_rows_via_next_row −2.37%. Zero alloc-traffic regressions (5/5 scenarios identical to `initial-clean` baseline). PgProtocol size 4352 B → **520 B exact (-88% inline)**. Tests 447/0/17, clippy clean, DEF-259 manifest extended with `ReadBuf`. Why this beats earlier attempts: (a) inline-mode preserves cache locality (state + 256 B inline buf single struct); (b) zero heap alloc on common path (RFQ, small frames); (c) smaller stack frame reduces stack-probe cost on per-iter construction; (d) heap escape only on actual overflow — analytics workloads pay one-time alloc + memcpy, not per-cycle. **Generalisable insight:** for trade-offs of "footprint vs perf", explore the LAZY ESCAPE pattern — keep small inline (cache-friendly), upgrade to heap only on overflow (footprint-friendly). Same pattern applied to `WriteBuf` (DEF-268, 2026-05-08) **MEASURED-REJECTED**: different physics (frequent reset, small frames, fresh-WriteBuf-per-iter benches) breaks the trade-off — see §B for full post-mortem. The pattern is NOT universal; pick by access pattern (ReadBuf is long-lived/append-many; WriteBuf is reset-heavy). | -88% PgProtocol inline footprint + −36% ping_round_trip + zero alloc regression | None public; ReadBuf internals changed |
 | 2 | DEF-266 | **β SWAR extension** — extends DEF-250 Phase B opt-in pattern. Three new opt-in helpers: (a) `parse_long_uint_swar` for 5-19 digit ASCII-decimal (i64 range); (b) `validate_utf8_swar` Lemire-style branch-free 4-byte chunks (for cases where `simdutf8` overhead dominates short ASCII); (c) `parse_pg_bool_swar` for `b"t"/b"f"/b"true"/b"false"` cache-hit fast-path. All caller-routed; falls back to generic on miss. | 1.5-3× per subset; cumulatively 2-5× on broad column-shape coverage | None; additive opt-in helpers, same pattern as Phase B |
 | 3 | DEF-267 | **γ const-frame templates everywhere** — extends DEF-252 from parameterless commands to **all** push surface. Pre-built `[u8; N]` templates for Parse/Bind/Execute frames with fixed-offset substitution: portal-name, statement-name, parameter-format codes, parameter values. `compute_push_*` becomes memcpy + small overwrite, not branch-y construction. | -10-20 ns per push (push_command/ping ~55 → ~35 ns) | None public; internal templates |
 | 4 | DEF-258 | **Compile-time FormatCode×OID matrix** — type-level encoding of which (FormatCode, OID) pairs are valid. `impl DecodeFormat<TextFmt> for i32`, etc. Runtime `DecodeError::FormatOidMismatch` → compile-time impossibility. | Tier-3 → tier-1 by-construction on decode dispatch | Decode trait API additive (new trait alongside `FromPgText`) |
@@ -374,6 +374,93 @@ proposals into factual data instead of speculation.
   Reopen requires NEW evidence — e.g., cargo asm output showing
   current dispatch is suboptimal, or a workload where PS density
   on hot path is measurable.
+
+- **DEF-268 — `WriteBuf` two-tier lazy-escape (DEF-265 Idea-38 pattern transposed)**
+  REJECTED 2026-05-08 post-implementation. Pattern from DEF-265 (Idea-38
+  ReadBuf two-tier) attempted on `WriteBuf`: split single
+  `heapless::Vec<u8, 2176>` into `inline: heapless::Vec<u8, 256>` +
+  `heap: Option<Box<heapless::Vec<u8, 2176>>>` with lazy escape on
+  inline overflow.
+
+  **Implementation reached working state**: 429/0/17 tests green, all
+  call sites (`with_length_prefix`, `BrandedWriteRange::apply`,
+  push_*  methods, fuzz_stress_spec) preserved offset semantics across
+  inline→heap escape; specialised `push_u8` fast path bypasses
+  `try_extend(&[byte])` and goes directly to `heapless::Vec::push`
+  for both inline and heap modes (1-byte memcpy avoidance).
+
+  **Bench-stable vs `phase-d-pre-writebuf-twotier` (single-tier baseline,
+  ReadBuf two-tier already shipped):**
+  - `push_command/ping`: **+147%** (33.32 ns vs 13.49 ns)
+  - `ping_round_trip/push_then_feed`: **+28.5%** (98.61 ns vs 76.75 ns)
+  - `iter_rows_via_for_each`: +6.3%
+  - `iter_rows_via_next_row`: +4.5%
+  - column_decode benches: +0% to +4% (mostly noise band)
+  - `iter_rows_via_consume_batch`: -5.9% (improvement from smaller WriteBuf footprint)
+
+  **Two regressions exceed the noise threshold + Pareto-better gate.**
+
+  **Mechanism (post-mortem):**
+  1. **Bench-artifact amplification.** `push_command/ping` and
+     `ping_round_trip/push_then_feed` create fresh `WriteBuf::new()`
+     PER iteration. The two-tier struct's `Option<Box<...>>` Drop has
+     side effects (conditional zeroize) that LLVM cannot elide,
+     whereas the original single-tier `heapless::Vec`'s Drop on an
+     empty buffer (zeroize 0 bytes) was elidable. Per-iter init/Drop
+     overhead grows ~20 ns.
+  2. **`WriteBuf::clear()` cost grows.** Single-tier was
+     `inner.as_mut_slice().zeroize() + inner.clear()` — empty buffer
+     = no-op. Two-tier adds `if let Some(heap) ... zeroize()` (cold)
+     + `heap = None` (always written). Cumulative ~2-3 cycles per
+     `push_command` entry.
+  3. **`push_u8` specialisation recovered ~25 ns of the ~45 ns gap**
+     (60% recovery), confirming the per-byte memcpy overhead in
+     `try_extend(&[byte])` was real, but the residual ~20 ns floor
+     comes from the elision loss above — micro-optimisation cannot
+     close it without removing the two-tier structure.
+
+  **Different physics from ReadBuf** (why the same pattern wins on
+  ReadBuf but loses on WriteBuf):
+  - **ReadBuf**: long-lived (one per connection), accumulates inbound
+    bytes across many feed cycles, single reset per session boundary.
+    Stack-frame footprint reduction (4096→256 B inline) directly
+    improves cache locality; the per-cycle inline-vs-heap branch is
+    amortised across many byte appends.
+  - **WriteBuf**: short-lived in benches (reset per `push_command`
+    via `wb.clear()`), many small frames (5-byte Sync, 6-byte
+    Describe), fresh-WriteBuf-per-iter pattern in synthetic benches
+    amplifies init/Drop overhead. The lazy-escape branch overhead
+    on every `push_*` call is NOT amortised — it pays per-push.
+
+  **Production reality vs synthetic bench:** in production, a
+  long-lived `WriteBuf` reused across many `push_command` calls
+  would see ONLY the per-clear/per-push branch overhead (small,
+  amortised), NOT the per-iter init/Drop cost. The
+  `iter_rows_via_consume_batch` bench (long-lived buffer, large
+  body) showed -5.9% — a real improvement. But the bench-stable
+  Pareto-better gate is strict: synthetic benches that regress
+  exceed +5% noise threshold count as failures.
+
+  **Reverted clean** (single file, `crates/bsql-pg-proto/src/write_buf.rs`).
+  `phase-d-pre-writebuf-twotier` baseline restored as the live shape.
+
+  **Future re-opening requires:**
+  - (a) bench evidence that long-lived WriteBuf scenarios dominate
+    over fresh-per-iter scenarios in real driver workloads
+    (i.e., production-like benches showing net win), AND
+  - (b) measurement of per-connection memory savings under realistic
+    pool sizes (N=100/1000/10000 connections) showing the 1.9 KB
+    per-WriteBuf saving outweighs the synthetic-bench cost, AND
+  - (c) a way to recover the ~20 ns elision floor (perhaps via
+    `#[inline(always)]` on the entire push chain — but this risks
+    other regressions per DEF-263 stack-carve-out exploratory).
+
+  **Generalisable lesson:** the lazy-escape pattern (DEF-265 Idea-38)
+  is **NOT universal**. Apply selectively by access pattern:
+  - **Long-lived + amortised reset**: pattern wins (ReadBuf).
+  - **Short-lived OR reset-heavy**: pattern loses (WriteBuf).
+  Don't transpose patterns across structurally different buffers
+  without measuring.
 
 - **DEF-211 SAFE-01 / SAFE-01' — `heapless::Vec` replacement**
   REJECTED 2026-05-04 pre-implementation. Architect-agent
