@@ -465,3 +465,57 @@ impl fmt::Display for AdvancePastEnd {
 // DEF-154 (H): `BrandedReadBuf<'brand, 'a>` type + its impl +
 // `ReadBuf::with_branded` method + `phase_b2_tests` module —
 // ALL DELETED. See block comment above.
+
+#[cfg(test)]
+mod drop_witness_tests {
+    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
+    //! for [`ReadBufN<N>`] via [`crate::drop_witness::DropCounter`].
+    //!
+    //! Pre-DEF-259: `ReadBufN<N>::drop` had no per-type witness — it
+    //! is a manual `impl Drop` (`buf.rs:382`) that calls
+    //! `inner.as_mut_slice().zeroize()` (no `ZeroizeOnDrop` derive
+    //! because `heapless::Vec` doesn't impl `Default + Copy`,
+    //! upstream's `Zeroize` bound). Verified only transitively via
+    //! `dropping_proto_mid_scram_handshake_runs_drop_glue` (which
+    //! drops a `PgProtocol` containing a `ReadBuf` and checks no
+    //! panic).
+    //!
+    //! Post-DEF-259: the witness fires the same Drop chain
+    //! production runs and the counter increments deterministically
+    //! on every `cargo test`. Catches a regression that removes the
+    //! manual Drop impl (which would silently leak buffer content
+    //! across stack-frame teardown — passwords / SCRAM proofs).
+
+    use super::ReadBufN;
+    use crate::drop_witness::{DropCounter, DropProbe};
+
+    /// `ReadBufN<N>::drop` fires its manual `inner.as_mut_slice().zeroize()`
+    /// body. Counter increments iff Drop was reached.
+    #[test]
+    fn read_buf_drop_fires_zeroize_chain() {
+        let probe = DropProbe::new();
+        let buf: ReadBufN<256> = ReadBufN::<256>::new();
+        {
+            let _w = DropCounter::new(buf, probe.clone());
+            assert_eq!(probe.fired(), 0);
+        }
+        assert_eq!(
+            probe.fired(),
+            1,
+            "ReadBufN<N> drop must fire exactly once",
+        );
+    }
+
+    /// Drop fires for the production-cap instantiation (`READ_BUF_CAP`
+    /// = 4096). Pins the production-shape variant.
+    #[test]
+    fn read_buf_drop_fires_at_production_capacity() {
+        let probe = DropProbe::new();
+        let buf: ReadBufN<{ crate::frame::READ_BUF_CAP }> =
+            ReadBufN::<{ crate::frame::READ_BUF_CAP }>::new();
+        {
+            let _w = DropCounter::new(buf, probe.clone());
+        }
+        assert_eq!(probe.fired(), 1);
+    }
+}

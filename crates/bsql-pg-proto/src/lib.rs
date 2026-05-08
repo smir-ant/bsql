@@ -271,6 +271,17 @@ pub mod scram;
 // `panic = "abort"` zeroize gap. See module docstring for the
 // full treatment.
 pub(crate) mod secret_zeroize;
+// DEF-259 (2026-05-08): test-only `DropCounter` machinery + sealed
+// `CrateZeroizeSecret` manifest. Tier-2 by-discipline (manual probes
+// per secret type, easy to forget) → tier-1 by-construction
+// (exhaustiveness gate fails build-time if manifest drifts from src;
+// per-type DropCounter witnesses run on every `cargo test`).
+//
+// Module is `#[cfg(test)]`-only — production builds compile without
+// it, zero downstream API surface impact. See module docstring for
+// the full design rationale.
+#[cfg(test)]
+pub(crate) mod drop_witness;
 pub mod sensitive;
 pub mod session_params;
 // DEF-211 INNO-01 / DEF-233: Pristine trait paired with

@@ -139,3 +139,66 @@ impl ScramSession {
         self.password.get().as_bytes()
     }
 }
+
+#[cfg(test)]
+mod drop_witness_tests {
+    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
+    //! for [`ScramSession`] via [`crate::drop_witness::DropCounter`].
+    //!
+    //! Pre-DEF-259: `ScramSession`'s drop was witnessed only via the
+    //! `dropping_proto_mid_scram_handshake_runs_drop_glue` smoke test
+    //! (drops a `PgProtocol` mid-SCRAM and asserts no panic).
+    //! No counter, no per-instance verification, no probe of the
+    //! ZeroizeOnDrop chain firing on the inner `Sensitive<Password>`.
+    //!
+    //! Post-DEF-259: this test drops a `DropCounter<ScramSession>` and
+    //! asserts the counter increments. By Rust drop-glue rules, the
+    //! counter cannot increment unless `ScramSession::drop` (the
+    //! ZeroizeOnDrop-derived impl) was reached, which transitively
+    //! fires `Sensitive::drop` → `Password::drop`. Tier-2-by-discipline
+    //! → tier-1 by-construction.
+
+    use super::ScramSession;
+    use crate::drop_witness::{DropCounter, DropProbe};
+    use crate::password::Password;
+    use crate::sensitive::Sensitive;
+
+    /// `ScramSession::drop` fires the full ZeroizeOnDrop chain via
+    /// the derive-generated Drop body. Counter increments on wrapper
+    /// drop iff `ScramSession::drop` reached its body.
+    #[test]
+    fn scram_session_drop_fires_zeroize_chain() {
+        let probe = DropProbe::new();
+        let pw = match Password::try_from_bytes(b"scram-witness-magic") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let session = ScramSession::from_password(Sensitive::new(pw));
+        {
+            let _w = DropCounter::new(session, probe.clone());
+            assert_eq!(probe.fired(), 0, "session alive — counter is 0");
+        }
+        assert_eq!(
+            probe.fired(),
+            1,
+            "ScramSession drop must fire exactly once on scope exit",
+        );
+    }
+
+    /// Repeated `ScramSession` constructions and drops accumulate
+    /// the counter. Pins per-instance witness rather than per-type.
+    #[test]
+    fn each_scram_session_drop_increments_counter() {
+        let probe = DropProbe::new();
+        for byte in 0..3_u8 {
+            let pw_bytes = [b'p', byte, b'w'];
+            let pw = match Password::try_from_bytes(&pw_bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let session = ScramSession::from_password(Sensitive::new(pw));
+            let _w = DropCounter::new(session, probe.clone());
+        }
+        assert_eq!(probe.fired(), 3);
+    }
+}

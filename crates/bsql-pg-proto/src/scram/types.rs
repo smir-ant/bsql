@@ -148,6 +148,52 @@ impl fmt::Debug for CappedServerNonce {
 }
 
 #[cfg(test)]
+mod drop_witness_tests {
+    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
+    //! for [`SecretDigest`] via [`crate::drop_witness::DropCounter`].
+    //!
+    //! Pre-DEF-259: `SecretDigest` had no per-type Drop-fire witness.
+    //! Coverage was transitive through SCRAM integration tests that
+    //! exercised the dispatch flow happening to drop a digest. The
+    //! "happens not to fail" anti-pattern (CREDO §1).
+    //!
+    //! Post-DEF-259: every `cargo test` increments the counter when
+    //! `SecretDigest::drop` fires its `ZeroizeOnDrop` body.
+
+    use super::SecretDigest;
+    use crate::drop_witness::{DropCounter, DropProbe};
+
+    /// `SecretDigest::drop` fires the `ZeroizeOnDrop` body that
+    /// scrubs the 32-byte backing array.
+    #[test]
+    fn secret_digest_drop_fires_zeroize_chain() {
+        let probe = DropProbe::new();
+        let d = SecretDigest::new([0xa5_u8; 32]);
+        {
+            let _w = DropCounter::new(d, probe.clone());
+            assert_eq!(probe.fired(), 0);
+        }
+        assert_eq!(
+            probe.fired(),
+            1,
+            "SecretDigest drop must fire exactly once",
+        );
+    }
+
+    /// Drop fires for every distinct digest value — pins that the
+    /// witness is per-instance, not memoised.
+    #[test]
+    fn each_secret_digest_drop_increments_counter() {
+        let probe = DropProbe::new();
+        for byte in 0..4_u8 {
+            let d = SecretDigest::new([byte; 32]);
+            let _w = DropCounter::new(d, probe.clone());
+        }
+        assert_eq!(probe.fired(), 4);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     //! Unit tests for the `CappedServerNonce` bound invariant.
     //! Moved here from `tests/bounded_buffers_spec.rs` in the

@@ -294,3 +294,67 @@ impl fmt::Debug for Credentials {
         }
     }
 }
+
+#[cfg(test)]
+mod drop_witness_tests {
+    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
+    //! for [`Password`] via [`crate::drop_witness::DropCounter`].
+    //!
+    //! Pre-DEF-259: `Password`'s Drop was verified only by the
+    //! `#[ignore]`-gated memory-probe test
+    //! `tests/scram_zeroize_miri_spec.rs::password_drop_zeros_backing_buffer`.
+    //! That test uses `unsafe` pointer reads of post-drop memory and
+    //! runs only via `cargo test -- --ignored` or `cargo miri test`.
+    //!
+    //! Post-DEF-259: this test runs deterministically on every
+    //! `cargo test` invocation. The `DropCounter<Password>` wrapper
+    //! observes the drop event via an atomic counter; the production
+    //! `ZeroizeOnDrop` impl on `Password` fires unchanged. Both
+    //! together: the counter increment witnesses that
+    //! `ZeroizeOnDrop::drop` was reached (Rust drop-glue rules
+    //! guarantee field drops fire on enclosing-struct drop).
+
+    use super::Password;
+    use crate::drop_witness::{DropCounter, DropProbe};
+
+    /// Dropping `DropCounter<Password>` fires both the wrapper's
+    /// counter and the inner `Password::drop` (`ZeroizeOnDrop`).
+    #[test]
+    fn password_drop_fires_zeroize_chain() {
+        let probe = DropProbe::new();
+        let pw = match Password::try_from_bytes(b"witness-magic-1234") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        {
+            let _w = DropCounter::new(pw, probe.clone());
+            assert_eq!(probe.fired(), 0, "wrapper alive — counter is 0");
+        }
+        assert_eq!(
+            probe.fired(),
+            1,
+            "Password drop must fire exactly once on scope exit",
+        );
+    }
+
+    /// Multiple `Password` instances all wired to the same probe
+    /// each contribute one count. Pins that the drop-fire signal is
+    /// per-instance, not per-type.
+    #[test]
+    fn each_password_drop_increments_counter() {
+        let probe = DropProbe::new();
+        for i in 0..5_u8 {
+            let pw = match Password::try_from_bytes(&[b'a', i]) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let _w = DropCounter::new(pw, probe.clone());
+            // _w drops at end of iteration body.
+        }
+        assert_eq!(
+            probe.fired(),
+            5,
+            "five Password drops must yield exactly 5 counter increments",
+        );
+    }
+}

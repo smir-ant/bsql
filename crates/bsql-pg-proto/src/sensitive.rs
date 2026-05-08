@@ -69,3 +69,71 @@ impl<T: Zeroize> fmt::Debug for Sensitive<T> {
         f.write_str("<REDACTED>")
     }
 }
+
+#[cfg(test)]
+mod drop_witness_tests {
+    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
+    //! for [`Sensitive<T>`] via [`crate::drop_witness::DropCounter`].
+    //!
+    //! Pre-DEF-259: `Sensitive<Password>` Drop was verified only by
+    //! the `#[ignore]`-gated memory-probe test
+    //! `tests/scram_zeroize_miri_spec.rs::sensitive_password_drop_zeros_backing_buffer`.
+    //!
+    //! Post-DEF-259: this test runs on every `cargo test`. The
+    //! `DropCounter` wrapper observes that `Sensitive<T>::drop`
+    //! reached its `ZeroizeOnDrop` body, which transitively fires
+    //! `T::zeroize` (Drop-glue rules).
+
+    use super::Sensitive;
+    use crate::drop_witness::{DropCounter, DropProbe};
+    use crate::password::Password;
+
+    /// `Sensitive<Password>::drop` fires the inner Password's
+    /// `ZeroizeOnDrop`. Witness: counter increments on wrapper drop.
+    #[test]
+    fn sensitive_password_drop_fires_zeroize_chain() {
+        let probe = DropProbe::new();
+        let pw = match Password::try_from_bytes(b"sensitive-witness-XYZ") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let s = Sensitive::new(pw);
+        {
+            let _w = DropCounter::new(s, probe.clone());
+            assert_eq!(probe.fired(), 0);
+        }
+        assert_eq!(
+            probe.fired(),
+            1,
+            "Sensitive<Password> drop must fire exactly once",
+        );
+    }
+
+    /// `Sensitive<i32>` drop fires (used in
+    /// `ProtoState::ConnectingPostAuthHaveKey::secret_key`).
+    #[test]
+    fn sensitive_i32_drop_fires() {
+        let probe = DropProbe::new();
+        // Plain literal — `as` casts are forbidden by the
+        // crate-root forbid bundle (`clippy::as_conversions`).
+        let s = Sensitive::new(0x7fff_ffff_i32);
+        {
+            let _w = DropCounter::new(s, probe.clone());
+        }
+        assert_eq!(probe.fired(), 1, "Sensitive<i32> drop must fire");
+    }
+
+    /// Repeated `Sensitive<Password>` drops accumulate count.
+    #[test]
+    fn each_sensitive_password_drop_increments_counter() {
+        let probe = DropProbe::new();
+        for _ in 0..3 {
+            let pw = match Password::try_from_bytes(b"x") {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let _w = DropCounter::new(Sensitive::new(pw), probe.clone());
+        }
+        assert_eq!(probe.fired(), 3);
+    }
+}

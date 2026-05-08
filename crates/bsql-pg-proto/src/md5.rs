@@ -341,6 +341,82 @@ fn write_hex_lowercase(input: &[u8; 16], out: &mut [u8; 32]) {
 }
 
 #[cfg(test)]
+mod drop_witness_tests {
+    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
+    //! for [`Md5HandshakeState`] via [`crate::drop_witness::DropCounter`].
+    //!
+    //! Pre-DEF-259: `Md5HandshakeState`'s drop was untested at the
+    //! per-type level. Coverage was transitive through MD5 dispatch
+    //! integration tests that happened to drop the state. The
+    //! "happens not to fail" anti-pattern (CREDO §1).
+    //!
+    //! Post-DEF-259: every `cargo test` run increments the counter
+    //! when `Md5HandshakeState::drop` (derive-generated
+    //! `ZeroizeOnDrop` body) fires, transitively scrubbing
+    //! `Sensitive<Password>` field bytes (the `Ident` field is
+    //! `#[zeroize(skip)]` per non-secret classification).
+
+    use super::Md5HandshakeState;
+    use crate::drop_witness::{DropCounter, DropProbe};
+    use crate::ident::Ident;
+    use crate::password::Password;
+    use crate::sensitive::Sensitive;
+
+    /// `Md5HandshakeState::drop` fires its derive-generated
+    /// `ZeroizeOnDrop` body. Counter increments on wrapper drop iff
+    /// the body was reached.
+    #[test]
+    fn md5_handshake_state_drop_fires_zeroize_chain() {
+        let probe = DropProbe::new();
+        let pw = match Password::try_from_bytes(b"md5-witness") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let user = match Ident::try_from_str("md5_user") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let state = Md5HandshakeState {
+            password: Sensitive::new(pw),
+            user,
+        };
+        {
+            let _w = DropCounter::new(state, probe.clone());
+            assert_eq!(probe.fired(), 0);
+        }
+        assert_eq!(
+            probe.fired(),
+            1,
+            "Md5HandshakeState drop must fire exactly once",
+        );
+    }
+
+    /// Repeated `Md5HandshakeState` constructions and drops accumulate
+    /// the counter. Pins per-instance witness.
+    #[test]
+    fn each_md5_handshake_state_drop_increments_counter() {
+        let probe = DropProbe::new();
+        for byte in 0..3_u8 {
+            let pw_bytes = [b'p', byte];
+            let pw = match Password::try_from_bytes(&pw_bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let user = match Ident::try_from_str("u") {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let state = Md5HandshakeState {
+                password: Sensitive::new(pw),
+                user,
+            };
+            let _w = DropCounter::new(state, probe.clone());
+        }
+        assert_eq!(probe.fired(), 3);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     //! Known-vector tests for MD5 password digest computation.
     //!

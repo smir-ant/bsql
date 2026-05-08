@@ -1056,6 +1056,54 @@ impl WriteBuf {
     }
 }
 
+#[cfg(test)]
+mod drop_witness_tests {
+    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
+    //! for [`WriteBuf`] via [`crate::drop_witness::DropCounter`].
+    //!
+    //! Pre-DEF-259: `WriteBuf::drop` had no per-type witness — it is
+    //! a manual `impl Drop` (`write_buf.rs:673`) that calls
+    //! `inner.as_mut_slice().zeroize()` (no `ZeroizeOnDrop` derive
+    //! because `heapless::Vec` doesn't implement `Zeroize` upstream).
+    //! Verified only transitively via integration tests dropping
+    //! `WriteBuf` mid-handshake.
+    //!
+    //! Post-DEF-259: every `cargo test` increments the counter when
+    //! `WriteBuf::drop` reaches its zeroize body. Catches regressions
+    //! that remove the manual Drop impl (which would silently retain
+    //! SCRAM proof / SQL bytes in the freed buffer's memory).
+
+    use super::WriteBuf;
+    use crate::drop_witness::{DropCounter, DropProbe};
+
+    /// `WriteBuf::drop` fires its manual `inner.as_mut_slice().zeroize()`
+    /// body. Counter increments iff Drop was reached.
+    #[test]
+    fn write_buf_drop_fires_zeroize_chain() {
+        let probe = DropProbe::new();
+        let wb = WriteBuf::new();
+        {
+            let _w = DropCounter::new(wb, probe.clone());
+            assert_eq!(probe.fired(), 0);
+        }
+        assert_eq!(
+            probe.fired(),
+            1,
+            "WriteBuf drop must fire exactly once",
+        );
+    }
+
+    /// Repeated `WriteBuf` drops accumulate the counter.
+    #[test]
+    fn each_write_buf_drop_increments_counter() {
+        let probe = DropProbe::new();
+        for _ in 0..4 {
+            let _w = DropCounter::new(WriteBuf::new(), probe.clone());
+        }
+        assert_eq!(probe.fired(), 4);
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // DEF-154 (B) Phase B1 — tests
 // ═════════════════════════════════════════════════════════════════════

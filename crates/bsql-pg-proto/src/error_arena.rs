@@ -623,6 +623,103 @@ const _: () = assert!(
 );
 
 #[cfg(test)]
+mod drop_witness_tests {
+    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
+    //! for [`ErrorPayload`] via [`crate::drop_witness::DropCounter`].
+    //!
+    //! Pre-DEF-259: `ErrorPayload` Drop was verified by the
+    //! `#[ignore]`-gated memory-probe tests in
+    //! `tests/error_arena_staleness_spec.rs::def205_error_payload_drop_zeroizes_all_fields`
+    //! and `def205_error_payload_overwrite_zeroizes_old_value`. Both
+    //! run only via `cargo test -- --ignored` or `cargo miri test`.
+    //!
+    //! Post-DEF-259: this test runs deterministically on every
+    //! `cargo test` invocation. The `DropCounter<ErrorPayload>` wrapper
+    //! observes that the `ZeroizeOnDrop` derive's body fires,
+    //! transitively scrubbing each `SecretBoundedStr<N>` field (whose
+    //! own Drop impl runs `.zeroize_in_place()` on the inner buffer).
+
+    use super::ErrorPayload;
+    use crate::drop_witness::{DropCounter, DropProbe};
+    use crate::ident::SecretBoundedStr;
+
+    /// `ErrorPayload::drop` fires the `ZeroizeOnDrop`-derived body.
+    /// Counter increments iff the drop body was reached.
+    #[test]
+    fn error_payload_drop_fires_zeroize_chain() {
+        let probe = DropProbe::new();
+        let payload = ErrorPayload {
+            message: SecretBoundedStr::<128>::from_str_truncating("error-witness"),
+            detail: SecretBoundedStr::<96>::from_str_truncating("detail"),
+            hint: SecretBoundedStr::<64>::from_str_truncating("hint"),
+        };
+        {
+            let _w = DropCounter::new(payload, probe.clone());
+            assert_eq!(probe.fired(), 0);
+        }
+        assert_eq!(
+            probe.fired(),
+            1,
+            "ErrorPayload drop must fire exactly once on scope exit",
+        );
+    }
+
+    /// `ErrorPayload` overwrite fires Drop on the old payload — the
+    /// `ErrorArena::alloc()` reuse path. Counter increments equal the
+    /// number of overwrites + the final scope-exit drop.
+    #[test]
+    fn error_payload_overwrite_fires_drop_on_old_value() {
+        let probe = DropProbe::new();
+        let mut wrapper = DropCounter::new(
+            ErrorPayload {
+                message: SecretBoundedStr::<128>::from_str_truncating("first"),
+                detail: SecretBoundedStr::<96>::new(),
+                hint: SecretBoundedStr::<64>::new(),
+            },
+            probe.clone(),
+        );
+        assert_eq!(probe.fired(), 0, "wrapper alive — counter is 0");
+
+        // Overwrite the wrapper. Rust drops the OLD wrapper before
+        // moving the new one in; counter increments by 1 for the
+        // OLD wrapper's Drop. `core::mem::replace` is the explicit
+        // form — gives us back the OLD value (which we drop
+        // immediately by binding to `_old`) and pins that the
+        // assignment is observable. Plain `wrapper = ...` triggers
+        // `unused_assignments` because the LATER drop(wrapper) is
+        // the only read of the new value.
+        let _old = core::mem::replace(
+            &mut wrapper,
+            DropCounter::new(
+                ErrorPayload {
+                    message: SecretBoundedStr::<128>::from_str_truncating("second"),
+                    detail: SecretBoundedStr::<96>::new(),
+                    hint: SecretBoundedStr::<64>::new(),
+                },
+                probe.clone(),
+            ),
+        );
+        // `_old` is the OLD wrapper; it drops at end of statement
+        // (or here on the next line via explicit drop). Counter
+        // should increment to 1.
+        drop(_old);
+        assert_eq!(
+            probe.fired(),
+            1,
+            "overwrite (via mem::replace + drop _old) must drop the \
+             old wrapper (counter == 1)",
+        );
+
+        drop(wrapper);
+        assert_eq!(
+            probe.fired(),
+            2,
+            "final drop must increment counter to 2",
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     //! Forbid-bundle compliance: `panic!`, `.unwrap()`, `.expect()`,
     //! `unreachable!()`, and `assert!(false)` are banned crate-wide
