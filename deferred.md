@@ -108,7 +108,7 @@ reports results back; principal reviews before commit.
 
 | DEF | Item | Expected | Status |
 |-----|------|----------|--------|
-| DEF-256 | **`#[non_exhaustive]` + sealed-trait sweep** — extension of SAFE-07. Full sweep of every pub enum and every pub trait. Pre-empts SemVer footgun on any future extension. Mechanical change. | Tier-3 → tier-1 by-construction (compiler requires catch-all on consumer side) | OPEN — Phase 1 parallel |
+| DEF-256 | **`#[non_exhaustive]` + sealed-trait sweep** — extension of SAFE-07. Full sweep of every pub enum and every pub trait. Pre-empts SemVer footgun on any future extension. Mechanical change. | Tier-3 → tier-1 by-construction (compiler requires catch-all on consumer side) | CLOSED — shipped in Phase 1 cluster `2f63897` |
 | DEF-257 | **Branded `ReadBuf` (mirror DEF-154 on read side)** — same brand-token discipline as write_buf. Compile-time tracking of "this slice came from THIS read buffer scope." Eliminates a bug class. | Tier safety | OPEN — Phase 2 parallel |
 | DEF-258 | **Compile-time FormatCode×OID combinations** — type-level encoding of which (FormatCode, OID) pairs are valid. `impl DecodeFormat<TextFmt> for i32` etc. Runtime DecodeError → compile-time impossibility. | Tier-1 decode-side, runtime errors → compile errors | OPEN — Phase 3 parallel |
 | DEF-259 | **Per-secret zeroize verification automated via test-only `DropCounter`** — currently manual memory-probe tests verify ZeroizeOnDrop fires on each transition. `cfg(test)` newtype tracks Drop count automatically across all secret-bearing types. | Tier-2 by-discipline → tier-1 by-construction (compile-time-verified test) | OPEN — Phase 1 parallel |
