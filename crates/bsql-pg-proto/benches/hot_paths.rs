@@ -969,6 +969,72 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
     group.finish();
 }
 
+/// DEF-250 Phase B (2026-05-08): caller-routed SWAR fast-path
+/// for short unsigned integers (ASCII-decimal, 0..=9999).
+///
+/// `parse_short_uint_swar` is exposed as an opt-in helper at the
+/// `decode` module surface, NOT integrated into
+/// `<i32 as FromPgText>::from_pg_text`. Two prior attempts to
+/// embed the SWAR inside `from_pg_text` regressed adjacent benches
+/// (Attempt 1: text +4-7%, 8-digit +5.2% from icache pressure;
+/// Attempt 2: `iter_5cols_decode_i32_common_values` +31% from
+/// `SimplifyCFG` merging dispatch with the DEF-251 common-value
+/// match — forensics at `/tmp/asm-attempt{1,2}-i32.s`).
+///
+/// This bench measures the realistic call shape: the caller knows
+/// (via SQL type info) the column is a short unsigned integer
+/// and tries the fast-path first, falling back to the generic
+/// `from_pg_text` on miss. The 4-digit body shape (`1234` ×5
+/// columns) exercises the SWAR path. Hit-case target: ~17-20 ns
+/// per row vs ~30+ ns for the generic 4-digit decode.
+///
+/// Compare with `iter_5cols_decode_i32` (8-digit literal
+/// `42_000_000`, generic decode) and `iter_5cols_decode_i32_common_values`
+/// (DEF-251 fast-path on `0`/`1`/`-1`). The SWAR helper is
+/// orthogonal to both — caller-routed dispatch decoupled from the
+/// `from_pg_text` body.
+fn bench_iter_columns_5x_int4_swar_short(c: &mut Criterion) {
+    use bsql_pg_proto::decode::{DataRowRef, FromPgText, parse_short_uint_swar};
+
+    let mut group = c.benchmark_group("column_decode");
+    const N_COLS: u16 = 5;
+    group.throughput(Throughput::Elements(u64::from(N_COLS)));
+
+    // 4-digit values exercise the SWAR helper at its full-cap
+    // shape (the slowest valid input for the helper). Real-world
+    // analogues: HTTP status codes, port numbers, small counts
+    // with leading-digit variance.
+    let body = data_row_body_int4(N_COLS, 1234);
+
+    group.bench_function("iter_5cols_decode_i32_short_4digit_via_swar", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut sum: i64 = 0;
+            for col in row.columns() {
+                if let Ok(Some(bytes)) = col {
+                    // Caller-routed fast-path: try SWAR first, fall
+                    // back to generic decode on miss. This is the
+                    // realistic call shape — caller has type info,
+                    // SWAR covers the unsigned 0..=9999 subset, the
+                    // generic path covers everything else.
+                    let v = parse_short_uint_swar(bytes)
+                        .and_then(|u| i32::try_from(u).ok())
+                        .or_else(|| i32::from_pg_text(bytes).ok());
+                    if let Some(v) = v {
+                        sum = sum.saturating_add(i64::from(v));
+                    }
+                }
+            }
+            black_box(sum);
+        });
+    });
+
+    group.finish();
+}
+
 /// Bench: per-column decode for 5 text columns of varying shapes.
 ///
 /// Three shapes cover the realistic Postgres text-column distribution:
@@ -1119,6 +1185,9 @@ criterion_group!(
     bench_data_row_parse,
     bench_iter_columns_raw,
     bench_iter_columns_5x_int4_decode,
+    // DEF-250 Phase B: caller-routed SWAR fast-path for 4-digit
+    // unsigned integers; opt-in helper, decoupled from `from_pg_text`.
+    bench_iter_columns_5x_int4_swar_short,
     bench_iter_columns_5x_text_decode,
     bench_iter_columns_with_nulls,
 );

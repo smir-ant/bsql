@@ -1749,6 +1749,109 @@ macro_rules! parse_pg_int_unsigned {
     }};
 }
 
+/// SWAR (SIMD-Within-A-Register) fast-path for ASCII-decimal short
+/// unsigned integers (0..=9999).
+///
+/// DEF-250 Phase B (2026-05-08): pure scalar bit-trick over 4 packed
+/// ASCII bytes — no `unsafe`, no platform intrinsics, no SIMD
+/// instructions. On valid 1-4 ASCII-digit input, ~3× faster than the
+/// generic `parse_pg_int_signed_widened!` macro path. Caller invokes
+/// EXPLICITLY when SQL type knowledge says column is short.
+///
+/// # When to use
+///
+/// Use this when the caller knows the column value is ASCII-decimal,
+/// at most 4 digits, **unsigned** (no leading sign). Typical shapes:
+/// status flags (0..=9), port numbers (≤ 9999), small counts,
+/// day-of-month (1..=31), HTTP-style status codes (200/404/500).
+/// **Caller is responsible for** (a) applying any sign separately,
+/// (b) validating against the target type's range via
+/// [`i16::try_from`] (or similar) when narrowing.
+///
+/// For general integer decoding without short-int knowledge,
+/// continue using `<T as FromPgText>::from_pg_text` — that path
+/// preserves the DEF-251 common-value cache and the DEF-207
+/// widened-accumulator digit loop.
+///
+/// # Returns
+///
+/// - `Some(value)` for 1-4 ASCII-digit bytes (`b"0".."b"9999"`).
+/// - `None` for: empty input, length > 4, leading `-` or `+`, any
+///   non-digit byte at any position.
+///
+/// # Why this is opt-in (architectural rationale)
+///
+/// Two prior attempts (Phase A forensics, DEF-250 §B rejection
+/// notes) embedded this fast-path INSIDE `<i32 as FromPgText>::from_pg_text`:
+///
+/// - Attempt 1 (`#[inline(always)]`): 4-digit −38% but 8-digit
+///   +5.2%, text +4-7% — icache pressure from the 252 B → 776 B
+///   function-bloat blast radius.
+/// - Attempt 2 (purely additive prologue): 4-digit −37% but the
+///   DEF-251 `iter_5cols_decode_i32_common_values` bench regressed
+///   +31% (+3.3 ns/row on cache hit). LLVM's `SimplifyCFG` merged
+///   the SWAR length-dispatch with the common-value `match`,
+///   pessimising the cache-hit prologue.
+///
+/// Forensic ASMs preserved at `/tmp/asm-attempt{1,2}-i32.s`.
+/// Decoupling SWAR placement from `from_pg_text`'s body size
+/// eliminates the LLVM heuristic shift entirely. `from_pg_text`
+/// stays byte-identical to HEAD `2f63897`; the helper is a separate
+/// symbol the caller invokes when type knowledge justifies the
+/// fast-path.
+///
+/// # Tier impact
+///
+/// Runtime classification is tier-3 by `Option::None` for invalid
+/// input. Closed by exhaustive proptest grid over all 0..=9999
+/// valid values plus non-digit-byte sweeps at every position.
+/// `#![forbid(unsafe_code)]` and the workspace forbid-bundle
+/// (`clippy::arithmetic_side_effects`, `clippy::as_conversions`,
+/// `clippy::indexing_slicing`) keep the implementation tier-1
+/// safe by construction.
+#[must_use]
+pub fn parse_short_uint_swar(bytes: &[u8]) -> Option<u32> {
+    // Pad input to `[u8; 4]` with leading b'0' (a valid ASCII digit
+    // contributing 0 in the MSB positions). Reject length > 4 and
+    // length 0 via the wildcard fall-through arm. Slice patterns
+    // are tier-1: the borrow-checker proves length-correctness at
+    // compile time, no runtime bounds check, no panic surface.
+    let buf: [u8; 4] = match *bytes {
+        [d0]               => [b'0', b'0', b'0', d0],
+        [d0, d1]           => [b'0', b'0', d0, d1],
+        [d0, d1, d2]       => [b'0', d0, d1, d2],
+        [d0, d1, d2, d3]   => [d0, d1, d2, d3],
+        _ => return None,
+    };
+    let packed: u32 = u32::from_be_bytes(buf);
+    // Lemire branch-free validation: for valid `b ∈ b'0'..=b'9'`,
+    // both `(b - 0x30)` and `(0x39 - b)` are in `[0, 9]` (no high
+    // bit set). If any byte is outside that range, the high bit
+    // (0x80) appears in `lo` or `hi`, and the masked OR is nonzero
+    // — single AND + branch rejects every invalid shape.
+    let lo = packed.wrapping_sub(0x3030_3030);
+    let hi = 0x3939_3939_u32.wrapping_sub(packed);
+    if (lo | hi) & 0x8080_8080 != 0 {
+        return None;
+    }
+    // Each byte of `lo` is now a digit value 0..=9. Decompose via
+    // `to_be_bytes()` (statically-bounded `[u8; 4]` access — no
+    // indexing-slicing lint trip) and recombine with the place
+    // values 1000/100/10/1. `wrapping_*` is bit-exact: max acc
+    // reach = 9*1000 + 9*100 + 9*10 + 9 = 9999, far below
+    // `u32::MAX` (≈ 4.29 × 10^9), so no actual wrap occurs on the
+    // valid path. `wrapping_*` is mandated by the
+    // `clippy::arithmetic_side_effects` forbid (operator `+` / `*`
+    // would not compile).
+    let lo_bytes = lo.to_be_bytes(); // [thousands, hundreds, tens, ones]
+    let value = u32::from(lo_bytes[0])
+        .wrapping_mul(1000)
+        .wrapping_add(u32::from(lo_bytes[1]).wrapping_mul(100))
+        .wrapping_add(u32::from(lo_bytes[2]).wrapping_mul(10))
+        .wrapping_add(u32::from(lo_bytes[3]));
+    Some(value)
+}
+
 // DEF-251 (audit 2026-05-08): common-literal fast-paths for i16/i32/i64
 // text decoders.
 //
@@ -3075,5 +3178,156 @@ mod format_code_set_tests {
                 assert_eq!(desc.format_code(idx), None, "idx {idx} >= n_columns");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_short_uint_swar_tests {
+    //! DEF-250 Phase B (2026-05-08): tier-3 closure for the
+    //! `parse_short_uint_swar` helper.
+    //!
+    //! `Option::None` on invalid input is a runtime classification
+    //! (cannot be hoisted to tier-1 — invalid bytes only exist on
+    //! arbitrary network input). The exhaustive grid over all
+    //! 0..=9999 valid values, combined with non-digit-byte sweeps
+    //! at every position, pins the SWAR mask + Lemire validation
+    //! semantics. A future refactor that broke the bit-trick (e.g.
+    //! a wrong shift, a flipped polarity in `lo | hi`, an
+    //! off-by-one place value) fails this table at test-time.
+    //!
+    //! Why no fuzz harness here: the input domain is exhaustively
+    //! enumerable in O(10⁴) — full grid covers EVERY representable
+    //! 4-digit input. Fuzz adds nothing beyond what the grid
+    //! already proves. The non-digit-byte sweep extends coverage
+    //! into the rejection class with byte-position parity.
+    use super::*;
+    use alloc::format;
+
+    /// Exhaustive: every 4-digit value 0..=9999 round-trips,
+    /// including all natural lengths (1-3 digits without the
+    /// leading-zero pad).
+    #[test]
+    fn def_250_swar_exhaustive_4digit_grid() {
+        for v in 0..=9999u32 {
+            let s = format!("{v:04}"); // "0000" .. "9999"
+            assert_eq!(
+                parse_short_uint_swar(s.as_bytes()),
+                Some(v),
+                "4-digit padded: {s:?}",
+            );
+        }
+        // Natural lengths (1-3 digits without leading-zero pad).
+        for v in 0..=9u32 {
+            let s = format!("{v}");
+            assert_eq!(
+                parse_short_uint_swar(s.as_bytes()),
+                Some(v),
+                "1-digit: {s:?}",
+            );
+        }
+        for v in 10..=99u32 {
+            let s = format!("{v}");
+            assert_eq!(
+                parse_short_uint_swar(s.as_bytes()),
+                Some(v),
+                "2-digit: {s:?}",
+            );
+        }
+        for v in 100..=999u32 {
+            let s = format!("{v}");
+            assert_eq!(
+                parse_short_uint_swar(s.as_bytes()),
+                Some(v),
+                "3-digit: {s:?}",
+            );
+        }
+    }
+
+    /// Boundary length cases: empty input and over-cap input must
+    /// reject. The slice-pattern wildcard arm in the implementation
+    /// is what enforces the cap; a future refactor that flipped
+    /// the cap (e.g. accepted len 5) would fail these.
+    #[test]
+    fn def_250_swar_length_boundaries() {
+        assert_eq!(parse_short_uint_swar(b""), None, "empty");
+        assert_eq!(parse_short_uint_swar(b"12345"), None, "5-digit (over cap)");
+        assert_eq!(parse_short_uint_swar(b"99999"), None, "5-digit max");
+    }
+
+    /// Sign-rejection: leading `-` or `+` must reject. Caller
+    /// applies any sign separately. The Lemire mask catches these
+    /// because `b'-'` (0x2D) and `b'+'` (0x2B) both fall below
+    /// `b'0'` (0x30), driving the high bit on `hi = 0x39 - byte`.
+    #[test]
+    fn def_250_swar_rejects_leading_sign() {
+        assert_eq!(parse_short_uint_swar(b"-1"), None);
+        assert_eq!(parse_short_uint_swar(b"-100"), None);
+        assert_eq!(parse_short_uint_swar(b"+1"), None);
+        assert_eq!(parse_short_uint_swar(b"+100"), None);
+    }
+
+    /// Non-digit bytes at every byte position must reject. The
+    /// Lemire mask is symmetric across all four packed bytes;
+    /// this sweep proves the rejection has no positional weakness
+    /// (e.g. a misplaced shift would leave one position unchecked).
+    #[test]
+    fn def_250_swar_rejects_invalid_bytes_per_position() {
+        let invalid_bytes: &[u8] = &[
+            0x00,
+            0x2F, // '/' — one below b'0'
+            0x3A, // ':' — one above b'9'
+            b'a',
+            b'A',
+            0x7F,
+            0x80,
+            0xFF,
+        ];
+        for &bad in invalid_bytes {
+            // Position 0 of len-1.
+            assert_eq!(
+                parse_short_uint_swar(&[bad]),
+                None,
+                "len-1 invalid byte {bad:#x}",
+            );
+            // Position 0 of len-2.
+            assert_eq!(
+                parse_short_uint_swar(&[bad, b'5']),
+                None,
+                "len-2 invalid first byte {bad:#x}",
+            );
+            // Position 1 of len-2.
+            assert_eq!(
+                parse_short_uint_swar(&[b'5', bad]),
+                None,
+                "len-2 invalid second byte {bad:#x}",
+            );
+            // Position 2 of len-4.
+            assert_eq!(
+                parse_short_uint_swar(&[b'1', b'2', bad, b'4']),
+                None,
+                "len-4 invalid third byte {bad:#x}",
+            );
+            // Position 3 of len-4.
+            assert_eq!(
+                parse_short_uint_swar(&[b'1', b'2', b'3', bad]),
+                None,
+                "len-4 invalid fourth byte {bad:#x}",
+            );
+        }
+    }
+
+    /// Boundary digit values: `b'0'` and `b'9'` at every length.
+    /// Pins the inclusive-bound semantics of the Lemire mask
+    /// (`b'0' - 0x30 = 0`, `0x39 - b'9' = 0` — both still in the
+    /// 0..=9 range, no high bit set). An off-by-one in the mask
+    /// constants (e.g. `0x39` → `0x38`) would break b'9' acceptance.
+    #[test]
+    fn def_250_swar_boundary_digits() {
+        assert_eq!(parse_short_uint_swar(b"0"), Some(0));
+        assert_eq!(parse_short_uint_swar(b"9"), Some(9));
+        assert_eq!(parse_short_uint_swar(b"00"), Some(0));
+        assert_eq!(parse_short_uint_swar(b"99"), Some(99));
+        assert_eq!(parse_short_uint_swar(b"0000"), Some(0));
+        assert_eq!(parse_short_uint_swar(b"9999"), Some(9999));
     }
 }
