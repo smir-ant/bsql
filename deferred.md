@@ -20,126 +20,78 @@ to git history. Keep this file a live work queue, NOT a diary.
 
 ## §A. Active OPEN — live work queue
 
-### v1.0 architectural & perf roadmap (TOP PRIORITY — registered 2026-05-08)
+### v1.0 architectural & perf roadmap (cleaned 2026-05-08)
 
-Eight execution phases delivering aggressive perf + safety-tier
-elevations, generated from full architectural brainstorm session
-on 2026-05-08 (principal directive: "максимум отовсюду, без unsafe,
-кроссплатформ, ABSOLUTE SAFETY"). Bench baseline anchor:
-`survey-2026-05-08` (HEAD `456e22b`).
+**SHIPPED so far (all closed entries removed from this section; one-line history in §D):**
+- Phase 1 cluster (DEF-249/251/252/254/256) — `2f63897` — 5-15% across hot path
+- Phase 2 SWAR opt-in helper (DEF-250) — `e098dca` — 2.09× on 4-digit shape, zero regressions
+- Phase 3 cache reorder (DEF-253) — `523b017` — AUDIT-CLOSED no-op (premise falsified)
+- DEF-259 DropCounter zeroize verification — `d7d8532` — tier-2 by-discipline → tier-1 by-construction
 
-**Constraints (non-negotiable across all 21 items):**
-- Stable Rust 1.95+ (no nightly features)
+**Generalisable pattern unlocked by Phase 2 (Phase B precedent):**
+> caller-known optimizations выносим как opt-in helpers, не вшиваем в shared dispatch
+
+Embedded versions cascade through LLVM inline budget and regress
+adjacent benches; opt-in helpers decouple the hot path from the
+specialisation. This pattern shapes the next sequential phases.
+
+**Constraints (non-negotiable):**
+- Stable Rust 1.95+ (no nightly)
 - `#![forbid(unsafe_code)]` preserved everywhere
 - Cross-platform (no Linux-only, no Apple-Silicon-only, no system-deps)
 - ABSOLUTE SAFETY (CREDO §1) — every change tier-stable or tier-elevating
-- Per CREDO §96a: ASM-diff + bench-stable evidence on every perf-relevant change
+- Per CREDO §96a: ASM-diff + bench-stable evidence on every perf change
 
-**Execution model:** each phase implemented via **architect-agent
-delegation cycle** (per principal directive 2026-05-08) — agent
-implements scope, runs tests + clippy + bench-stable measurements,
-reports results back; principal reviews before commit.
+**Execution model — sequential architect-cycle per phase** (refined
+2026-05-08 by principal: "несколько изменений тяжело будет понять
+выигрышь от каждого. тогда давай последовательно"). Each phase:
+implement → test+clippy → bench-stable measure-vs-prior-baseline →
+report → principal review → commit. **NO parallel architect dispatching**
+(prevents perf-attribution mixing).
 
-**Phase ordering rationale:**
-- Phases 1-3: incremental, no API breakage, integratable into current pipeline.
-- Phases 4-8: substantial breaking change; logically land atomically as
-  a `v1.0-arch` cycle that ships together (avoids partial-API churn).
-- Safety-tier elevations (S-series) run in parallel with Phases 1-3 (no conflict).
+**Breaking API acceptable** if "архитектурно лучше, красивее, главное
+стабильнее и эффективнее" (principal directive 2026-05-08). v1.0 is
+the right window for breaking churn.
 
-#### Phase 1 — Hot-path cluster (cheap wins, no API breakage)
+#### Sequential phase queue (ordered by impact-per-cost, lowest cost first)
 
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-249 | **`#[inline]` audit hot-path accessors** — extension of DEF-236. Found candidates pre-survey: `read_buf_populated`, `read_buf_cursor_u16` (called per-row in `next_row_bytes:576,579,609`), `classify_for_iter_rows` (cached, amortized). DEF-236 methodology: ASM-diff verifies LLVM accepted the hint vs auto-inlined under LTO=fat. | 0-3 ns/row | OPEN — Phase 1 |
-| DEF-251 | **Common-value cache for `FromPgText`** — `0`/`1`/`-1`/`t`/`f`/`\N` appear in tens of % of columns (status flags, bool, NULL). Cached `Option<(&[u8], decoded_value)>` for last-parsed slice → memcmp short-circuit on repeat. Branch-predictor-friendly. | 1-2 ns on cache-hit, ~0 on miss | OPEN — Phase 1 |
-| DEF-252 | **Pre-built const message templates** for ALL parameterless commands. Extends DEF-231 Flush + adds: default `Describe<Statement, "">`, default `Describe<Portal, "">`, etc. Each = `static const [u8; N]` with portal/stmt name fill at fixed offsets. | 5-10 ns per push on covered commands | OPEN — Phase 1 |
-| DEF-254 | **Enum variant ordering for branch prediction** — reorder `Action`/`StreamItem`/`FeedEvent` variants so most-frequent variant is FIRST in declaration. LLVM tests in declaration order. Mechanical change, ASM-diff verifies. | 1-2 ns per dispatch | OPEN — Phase 1 |
+| Pos | DEF | Item | Expected | API impact |
+|-----|-----|------|----------|-----------|
+| 1 | DEF-265 | **α heap-box ReadBuf** — wrap `ReadBuf` in `Box<ReadBufN<N>>` inside `PgProtocol`. Currently `PgProtocol = 4352 B` (4096 B inline ReadBuf + 256 B everything else); after = ~256 B. Fewer cache lines per `&PgProtocol` access in connection-pool hot loops. | -14× cache footprint per connection; per-conn `PgProtocol` fits in L1 with everything else around | None public; one Box, internal field type change |
+| 2 | DEF-266 | **β SWAR extension** — extends DEF-250 Phase B opt-in pattern. Three new opt-in helpers: (a) `parse_long_uint_swar` for 5-19 digit ASCII-decimal (i64 range); (b) `validate_utf8_swar` Lemire-style branch-free 4-byte chunks (for cases where `simdutf8` overhead dominates short ASCII); (c) `parse_pg_bool_swar` for `b"t"/b"f"/b"true"/b"false"` cache-hit fast-path. All caller-routed; falls back to generic on miss. | 1.5-3× per subset; cumulatively 2-5× on broad column-shape coverage | None; additive opt-in helpers, same pattern as Phase B |
+| 3 | DEF-267 | **γ const-frame templates everywhere** — extends DEF-252 from parameterless commands to **all** push surface. Pre-built `[u8; N]` templates for Parse/Bind/Execute frames with fixed-offset substitution: portal-name, statement-name, parameter-format codes, parameter values. `compute_push_*` becomes memcpy + small overwrite, not branch-y construction. | -10-20 ns per push (push_command/ping ~55 → ~35 ns) | None public; internal templates |
+| 4 | DEF-258 | **Compile-time FormatCode×OID matrix** — type-level encoding of which (FormatCode, OID) pairs are valid. `impl DecodeFormat<TextFmt> for i32`, etc. Runtime `DecodeError::FormatOidMismatch` → compile-time impossibility. | Tier-3 → tier-1 by-construction on decode dispatch | Decode trait API additive (new trait alongside `FromPgText`) |
+| 5 | DEF-247 | **Generic `RowStream<P: RowProjection>`** — replaces 5 pull APIs (`next_event`, `next_row`, `next_row_bytes`, `consume_batch`, `for_each`) with one canonical generic surface + projection types (`AsBytes`, `AsTuple<T>`, `AsCallback<F>`). Monomorphisation specialises inner loop per projection. | 5-10% on canonical iter + removes 4/5 dup APIs | BREAKING canonical pull API |
+| 6 | DEF-058 | **Ring-buffer ReadBuf rewrite** — eliminates `compact()` memmove on continuous streaming. Wraparound cursor + write_pos modulo N. `unread()` returns `(&[u8], &[u8])` for wrap-spanning frames. | 3-10× on continuous network streaming workloads (NOT visible on current criterion benches — pre-fill model; new streaming bench needed to measure) | BREAKING internal slice API; every consumer of `populated()`/`unread()` learns split-case |
+| 7 | DEF-257 | **Branded `ReadBuf`** — mirrors DEF-154 brand-token discipline on read side. Compile-time tracking of "this slice came from THIS read buffer scope." Eliminates a bug class structurally. | Tier safety only, no perf | Additive (lifetime-only) |
+| 8 | DEF-244 | **`prepared!` proc-macro** — `const Q: PreparedQuery<(i32,), (i32, &str)> = prepared!("SELECT id, name FROM users WHERE id = $1")`. Compile-time SQL parse + pre-built Parse/Bind/Execute byte templates with fixed-offset placeholders. Type-level binding of args to parameters, RowShape to response. | -25 ns per push on prepared queries + **closes SQL-injection class by-construction** | NEW FEATURE; macro engineering ~2-3 weeks |
+| 9 | DEF-248 | **Pull-based per-column decode** — `stream.col_next() -> ColEvent::Got(bytes) / NeedBytes / EndRow / EndQuery`. Eliminates whole-frame buffering. Frames > `READ_BUF_CAP` no longer require bumping caps (solves DEF-218 large rows structurally). | Architectural — memory becomes O(largest_value) not O(largest_row) | BREAKING canonical iterator API |
+| 10 | DEF-246 | **Const-generic typestate `ProtoPipeline`** — runtime `ProtoState` (80 B enum) replaced by type-state chain: `PgProtocol<Closed>` → `<ConnectingStartup>` → `<Idle>` → `<QueryAwaitingRfq>` etc. State transitions are `move` (zero-cost). Server-driven dispatch (Auth subcode, ErrorResponse mid-handshake) via enum-of-typestate-variants on return path (50-70% type-statifiable, rest stays runtime). | 80 B `ProtoState` eliminated in Idle case + tier-1 transitions | BREAKING (most ambitious refactor) |
+| 11 | DEF-245 | **`bsql-pg-wire` + `bsql-pg-state` crate split** — separate frame I/O (~1.5K LoC) from state machine (~3.5K LoC). Composable; proxy/relay scenarios get frame-level access without state-machine baggage. | Architectural cleanup, modularity, no perf change directly | BREAKING crate split |
 
-#### Phase 2 — SWAR short-int parse
+#### Deferred (per principal directive 2026-05-08)
 
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-250 | **SWAR short-int parse (extends DEF-207)** — 1-4 digit unsigned ASCII-decimal path. Pack 4 bytes into u32, Lemire branch-free `(lo \| hi) & 0x80808080` validation, wide-multiply accumulate. Pure scalar wrapping arithmetic — NO `unsafe`, NO SIMD intrinsics. **Phase A forensics (2026-05-08, ASM-diff):** two prior in-body attempts (`#[inline(always)]` and purely-additive prologue) both regressed adjacent benches via LLVM heuristic shifts (Attempt 1: 8-digit +5.2%, text +4-7% icache pressure; Attempt 2: DEF-251 common-values +31% from `SimplifyCFG` merging dispatch with the cache-hit `match`). Forensics preserved at `/tmp/asm-attempt{1,2}-i32.s`. **Phase B SHIPPED 2026-05-08:** structural rethink — SWAR placed as opt-in `pub fn parse_short_uint_swar` helper, NOT inside `<i32 as FromPgText>::from_pg_text`. Caller invokes when SQL type info justifies it. Decoupling from `from_pg_text` body size eliminates LLVM heuristic shift entirely; lib `.s` MD5 byte-identical to HEAD `2f63897`. **Result:** 14.94 ns 4-digit SWAR vs 31.24 ns generic 8-digit = 2.09× speedup on the SWAR-applicable subset; zero regressions on existing benches (16/17 within noise; the 17th was thermal artifact, A/A re-run +2.81% within threshold); 5 new tests passing including ~11k exhaustive 4-digit grid. Pareto-better gate cleared. **Generalizable pattern unlocked:** "caller-known optimizations выносим как opt-in helpers, не вшиваем в shared dispatch" — applicable to DEF-258 FormatCode×OID specialization, lazy column decode, DEF-244 `prepared!` macro. | 5-10× on 1-4 digit input WITHOUT regression — ACHIEVED 2.09× on 4-digit shape, zero regressions | CLOSED — Phase 2 (Phase B shipped) |
+| DEF | Item | Reason for deferral |
+|-----|------|---------------------|
+| DEF-255 | **PGO build infrastructure** — `cargo-pgo` setup + training workload definition. Cross-platform LLVM-native. | Library crate PGO needs representative training-binary; criterion benches are micro and may not reflect production patterns. Revisit when end-to-end driver workload exists (`bsql-driver-postgres` matures). |
 
-#### Phase 3 — Cache layout + PGO infra
-
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-253 | **Cache-line-friendly hot-field reorder via newtype** — **AUDIT-CLOSED 2026-05-08 (no-op).** Per-row hot path analysis (`next_row_bytes` after first-row classification cache via `cached_reply_id`) touches only `read_buf.cursor` (u16, R+W) and `read_buf.inner` data bytes (sequential scan, hardware-prefetched). `state` and `row_desc_slot` are NOT touched per row in the dominant hot path. Three field-reorder approaches all rejected: **(A) `#[repr(C)]` on PgProtocol** — repeats failed A4/B16 experiment from §B (regressed parse_header +6.3% via inline-budget cascade); **(B) duplicate hot-field newtype with `#[repr(transparent)]` + align(64)** — manufactures tier-4 silent-divergence between duplicate cursor and source-of-truth `read_buf.cursor`, CREDO §1 violation, also `#[repr(transparent)]` only wraps single fields not blocks; **(E) split cursor out of ReadBuf onto PgProtocol** — breaks the `cursor <= inner.len()` tier-2 structural invariant for zero measured win, plus all `ReadBuf` methods ripple. The current `repr(Rust)` layout is structurally optimal for the documented hot path; the assumed 2-5% gain doesn't survive per-row access pattern analysis (cursor is its own hot u16 fitting on a single line, buffer data is sequentially-scanned with hardware prefetch — neither cache-improvable by reorder). Architect note: PGO (DEF-255) addresses the LLVM heuristic concerns directly via measured frequency data — that IS the structural fix for the cache-locality class. | 2-5% on hot-loop benches — REJECTED by audit (premise falsified by per-row access pattern) | CLOSED — no-op (Phase 3, audit-driven) |
-| DEF-255 | **PGO build infrastructure** — `cargo-pgo` setup + training workload definition. `-Cprofile-generate` → run training → `-Cprofile-use`. Cross-platform LLVM-native (NOT Linux-only). Long-term investment in build complexity. | 10-20% across-the-board | OPEN — Phase 3 |
-
-#### Phase 4 — Generic `RowStream<P: RowProjection>` (BREAKING API)
-
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-247 | **Generic RowStream<P: RowProjection>** — replaces 5 current pull APIs (`next_event`, `next_row`, `next_row_bytes`, `consume_batch`, `for_each`) with one canonical generic surface + projection types (`AsBytes`, `AsTuple<T>`, `AsCallback<F>`). Monomorphization specializes inner loop per projection. | 5-10% on canonical iter, removes 4/5 API duplicates | OPEN — Phase 4 (BREAKING) |
-
-#### Phase 5 — Ring-buffer `ReadBuf` (BREAKING API)
-
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-058 | **Ring-buffer ReadBuf rewrite** — was previously in §A "crazy ideas pool"; now formal Phase 5 of v1.0-arch roadmap. Lazy-compaction `advance()` becomes wraparound. `&[u8]` API → `(&[u8], &[u8])` for wraparound case. Stable 1.95 `[T]::as_chunks` helps. | 3-10× on large frames | OPEN — Phase 5 (BREAKING) |
-
-#### Phase 6 — Compile-time `prepared!` macro (NEW FEATURE + BREAKING)
-
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-244 | **Compile-time-validated query templates via proc-macro `prepared!`** — `const Q: PreparedQuery<(i32,), (i32, &str)> = prepared!("SELECT id, name FROM users WHERE id = $1")`. Compile-time SQL parse: column-count, parameter-count, basic shape. Pre-built byte-template Parse+Bind+Execute wire frames with fixed-offset placeholders for parameters. Type-level binding of `(args)` to parameters and `RowShape` to response. **Tier**: push-side for repeated query — tier-3 runtime build → tier-1 by-construction. SQL-injection class closed by parameter-only binding (compiler enforces). | push 55 ns → ~25-30 ns on prepared queries; closes SQL-injection-by-construction | OPEN — Phase 6 (NEW FEATURE) |
-
-#### Phase 7 — Two-crate split (BREAKING API)
-
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-245 | **bsql-pg-wire + bsql-pg-state split** — separate frame I/O (~1.5K LoC) from state machine (~3.5K LoC). Composable; proxy/relay scenarios get frame-level access without state machine baggage. | Architectural cleanup, modularity, no perf change directly | OPEN — Phase 7 (BREAKING) |
-
-#### Phase 8 — Typestate ProtoPipeline (BREAKING — most ambitious)
-
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-246 | **Const-generic typestate ProtoPipeline** — replaces runtime ProtoState (80 B enum) with type-state chain: `PgProtocol<Closed>` → `<ConnectingStartup>` → `<Idle>` → `<QueryAwaitingRfq>` etc. State-transitions are `move` (zero-cost). Server-driven dispatch (Auth subcode, ErrorResponse mid-handshake) handled via enum-of-typestate-variants on return path (50-70% type-statifiable, rest stays runtime). | 80 B ProtoState eliminated in Idle case + tier-1 transitions | OPEN — Phase 8 (BREAKING — most aggressive) |
-
-#### Phase 9 — Streaming column decode (BREAKING — alternative path)
-
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-248 | **Pull-based per-column decode** — eliminates whole-frame buffering before iteration. `stream.col_next()? -> ColEvent::Got(bytes)` / `NeedBytes` / `EndRow` / `EndQuery`. Allows frames > READ_BUF_CAP without buffer expansion (solves DEF-218 large rows without bumping caps). | Architectural — solves DEF-218 by structural design | OPEN — Phase 9 (BREAKING) |
-
-#### Concurrent — Safety tier elevations (parallel with Phases 1-3)
-
-| DEF | Item | Expected | Status |
-|-----|------|----------|--------|
-| DEF-256 | **`#[non_exhaustive]` + sealed-trait sweep** — extension of SAFE-07. Full sweep of every pub enum and every pub trait. Pre-empts SemVer footgun on any future extension. Mechanical change. | Tier-3 → tier-1 by-construction (compiler requires catch-all on consumer side) | CLOSED — shipped in Phase 1 cluster `2f63897` |
-| DEF-257 | **Branded `ReadBuf` (mirror DEF-154 on read side)** — same brand-token discipline as write_buf. Compile-time tracking of "this slice came from THIS read buffer scope." Eliminates a bug class. | Tier safety | OPEN — Phase 2 parallel |
-| DEF-258 | **Compile-time FormatCode×OID combinations** — type-level encoding of which (FormatCode, OID) pairs are valid. `impl DecodeFormat<TextFmt> for i32` etc. Runtime DecodeError → compile-time impossibility. | Tier-1 decode-side, runtime errors → compile errors | OPEN — Phase 3 parallel |
-| DEF-259 | **Per-secret zeroize verification automated via test-only `DropCounter`** — currently manual memory-probe tests verify ZeroizeOnDrop fires on each transition. `cfg(test)` newtype tracks Drop count automatically across all secret-bearing types. | Tier-2 by-discipline → tier-1 by-construction (compile-time-verified test) | OPEN — Phase 1 parallel |
-
-#### Exploratory pool (measurement-gated, may fail)
-
-These are explored after Phases 1-2 land; each runs measure-first
-discipline; commitment gated on bench evidence per CREDO §96a.
+#### Exploratory pool (measure-first; commitment gated on evidence per CREDO §96a)
 
 | DEF | Item | Status |
 |-----|------|--------|
-| DEF-260 | Custom Action enum layout (`#[repr(u8, C)]` hand-tagged union; current Rust default may already be optimal — measure-first) | EXPLORATORY |
+| DEF-260 | Custom `Action` enum layout (`#[repr(u8, C)]` hand-tagged union; current Rust default may already be optimal) | EXPLORATORY |
 | DEF-261 | Branchless DataRow column-length-prefix decode (skip per-col-len validity check if invariants held) | EXPLORATORY |
-| DEF-262 | `core::hint::black_box` as code-motion barrier in production hot paths (risk: may pessimize; very careful measure) | EXPLORATORY |
-| DEF-263 | `#[inline(never)]` stack carve-out for hot fns with large stack frames (separates stack-cold from stack-hot path) | EXPLORATORY |
-| DEF-264 | GAT-driven `FromRow` projector chain (stable Rust 1.65+ GATs; unlock per-column zero-copy projections) | EXPLORATORY |
+| DEF-262 | `core::hint::black_box` as code-motion barrier in production hot paths (risk: may pessimise; careful measure) | EXPLORATORY |
+| DEF-263 | `#[inline(never)]` stack carve-out for hot fns with large stack frames (separates stack-cold from stack-hot) | EXPLORATORY |
+| DEF-264 | GAT-driven `FromRow` projector chain (stable Rust 1.65+ GATs; per-column zero-copy projections) | EXPLORATORY |
 
-#### Roadmap-level cross-cutting principles
+#### Roadmap operating principles
 
-1. **Each phase delivered by architect-agent cycle**: agent implements,
-   runs tests + clippy + bench-stable save+compare, reports numbers
-   back. Principal reviews before commit.
-2. **No partial Phase ships**: a Phase enters a single atomic commit
-   (or sequential commits within one architect-cycle).
-3. **Phase 1-3 shippable independently**: no API breakage, can land
-   alongside other Phase-1c-5/1d/1e work.
-4. **Phases 4-8 land atomically** as `v1.0-arch` super-cycle; partial
-   API-breaking ships create churn for downstream consumers.
-5. **Bench-evidence gate**: every Phase's commit message includes
-   `bench-stable compare survey-2026-05-08` results table for the
-   relevant subset of bench groups.
+1. **Sequential architect-cycle per phase** (refined 2026-05-08): one DEF item at a time, bench-stable baseline → change → bench-stable compare → review → commit. Per-change perf attribution is unambiguous.
+2. **Bench-evidence gate**: every commit message includes a `bench-stable compare` table vs the baseline saved BEFORE the change.
+3. **Pareto-better gate**: any phase that regresses an existing bench beyond noise (5%) is rejected unless ASM-diff forensics + structural rationale justify the trade. Phase 2 SWAR Attempts 1-2 → forensics → Attempt 3 (opt-in helper) is the canonical example.
+4. **Breaking-API atomic landings**: when a BREAKING phase ships, it gets one commit; downstream churn happens once.
+5. **No measurement guesses**: ASM-diff + bench-stable are the methodology of record (CREDO §96a, DEF-236 lesson).
 
 ---
 
@@ -687,6 +639,12 @@ Full detail in git log; this is just a navigation aid.
 - DEF-134: fuzz/stress harness — SHIPPED `1fde5d1` (property tests, stable Rust instead of cargo-fuzz)
 - DEF-138..DEF-142: pass-#8 audit cleanups + DEF-142 StateErrorKind newtype
 - DEF-143: criterion bench harness (PARTIAL — see §A)
+
+### v1.0-arch roadmap (2026-05-08 cycle)
+- **Phase 1 cluster (DEF-249/251/252/254/256)** — `2f63897` 2026-05-08: 5-15% across hot path. Bench evidence in commit message: parse_header −8.80%, ping_round_trip −6.03%, iter_rows_via_next_event −5.97%, iter_rows_via_next_row −14.53%. CPU-time ratio 0.992. Zero regressions vs `survey-2026-05-08`. DEF-256 sealed-trait + `#[non_exhaustive]` sweep bundled.
+- **Phase 2 — DEF-250 SWAR opt-in helper** — `e098dca` 2026-05-08: `pub fn parse_short_uint_swar(&[u8]) -> Option<u32>` for 1-4 ASCII digits unsigned. 14.94 ns vs 31.24 ns generic = **2.09× on 4-digit shape**. Two prior in-body attempts (`#[inline(always)]` and additive prologue) regressed adjacent benches via LLVM heuristic shifts (forensics at `/tmp/asm-attempt{1,2}-i32.s`); structural rethink moved SWAR out of `from_pg_text` body — lib `.s` MD5 byte-identical to HEAD `2f63897`. Pareto-better gate cleared. **Generalisable pattern unlocked**: caller-known optimisations as opt-in helpers, never embedded in shared dispatch.
+- **Phase 3 — DEF-253 cache-friendly hot-field reorder** — `523b017` 2026-05-08: AUDIT-CLOSED no-op. Per-row hot path (after `cached_reply_id` first-row classification) touches only `read_buf.cursor` (u16) and sequentially-scanned `read_buf.inner` bytes — neither improvable by struct reorder. Three alternatives all rejected: `#[repr(C)]` repeats failed A4/B16, duplicate-newtype manufactures tier-4 silent-divergence (CREDO §1), split-cursor breaks tier-2 invariant. Architect note: PGO is the structural fix for "manual layout vs LLVM defaults" failure class.
+- **DEF-259 — DropCounter zeroize verification** — `d7d8532` 2026-05-08: Tier-2 by-discipline → tier-1 by-construction. 9 secret-bearing types covered (Password, Sensitive<T>, ScramSession, SecretDigest, Md5HandshakeState, ErrorPayload, SecretBoundedStr<N>, ReadBufN<N>, WriteBuf). Mechanism: `cfg(test)` `DropCounter<T>` newtype + sealed `CrateZeroizeSecret` manifest + source-grep exhaustiveness gate at `tests/zeroize_coverage_spec.rs`. Adding a new secret type without manifest entry fails `cargo test` deterministically. Negative-tested by transient `FakeUnmanifestedSecret` injection + revert. Tests 420 → 447 (+27, ignored unchanged at 17). Production paths byte-identical (release build pre/post identical).
 
 ### Phase 1c
 - DEF-144..DEF-154: Phase α/β audit batch (parse_header, StatePushClass, FrameCoords narrow, SchemaRef shape, transition_to_errored, InternalCrateBug locus, size pins, SessionParams counter)
