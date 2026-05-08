@@ -690,7 +690,7 @@ const _: () = assert!(
 //   - Startup auth + errors:         2 allocs (~732 B total).
 //   - Malformed frame teardown:      0 allocations (counter inline).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 4352,
+    core::mem::size_of::<protocol::PgProtocol>() == 520,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf 4096 + state ~64 + row_desc_slot 140 + \

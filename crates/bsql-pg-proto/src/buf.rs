@@ -56,10 +56,32 @@ pub struct ReadBufN<const N: usize> {
     cursor: u16,
 }
 
-/// Default-cap [`ReadBufN`] — backward-compat alias picking
-/// `N = READ_BUF_CAP` (4096). Existing callers `ReadBuf::new()` resolve
-/// to this concrete type without changes.
-pub type ReadBuf = ReadBufN<READ_BUF_CAP>;
+/// Inline-mode capacity for the two-tier [`ReadBuf`] introduced by
+/// DEF-265 Idea-38 (2026-05-08). Frames ≤ 256 B stay in stack-inline
+/// storage with full cache-locality (state + small_buf adjacent).
+/// Frames > 256 B trigger a one-time lazy escape: the inline contents
+/// copy into a heap-allocated 4096-byte storage, and subsequent
+/// operations work against the heap. Once escaped, the buffer stays
+/// in heap mode for the connection's lifetime (downgrading would
+/// require copying back, no perf benefit).
+///
+/// **Why 256 B**: Postgres protocol frames break down by typical size:
+/// - `Sync` (5 B), `Flush` (5 B), `Terminate` (5 B): always inline ✓
+/// - `ReadyForQuery` (6 B), `ParseComplete` (5 B), `BindComplete` (5 B): ✓
+/// - `RowDescription` (~14-200 B for typical column lists): usually ✓
+/// - small `DataRow` (≤ 5 i32 columns ≈ 30-67 B): ✓
+/// - `CommandComplete` ('SELECT N\0' tags): ✓
+///
+/// Workloads where inline-mode-stays-resident:
+/// - PING / RFQ round-trip benches (`ping_round_trip`)
+/// - small OLTP queries with single-row or small-row results
+/// - SCRAM handshake frames (~500 B nonce — may escape on first frame)
+///
+/// Workloads that escape:
+/// - analytics queries with multi-KB JSON / TEXT cells
+/// - `iter_rows` benches feeding 100×row batch (~6700 B total)
+/// - large `RowDescription` (wide tables)
+const INLINE_BUF_CAP: usize = 256;
 
 impl<const N: usize> Default for ReadBufN<N> {
     fn default() -> Self {
@@ -178,8 +200,18 @@ impl<const N: usize> ReadBufN<N> {
     /// external caller reading `populated()` gets access to bytes
     /// already consumed past the cursor with no user benefit. Surface
     /// shrink closes a latent access hole.
+    ///
+    /// DEF-265 Idea-38 (2026-05-08): retained for completeness on the
+    /// `ReadBufN<N>` primitive type even though no production
+    /// callsite uses it (the wrapping `ReadBuf` two-tier struct is
+    /// the production read buffer). Marked `#[allow(dead_code)]`
+    /// rather than removed — `ReadBufN<N>` is a stable primitive
+    /// that may serve future wire-buffer types.
     #[inline]
     #[must_use]
+    #[allow(dead_code, reason = "DEF-265 Idea-38: ReadBufN<N> is a stable \
+        primitive retained for future wire-buffer designs; production read \
+        buffer is the wrapping ReadBuf struct")]
     pub(crate) fn populated(&self) -> &[u8] {
         self.inner.as_slice()
     }
@@ -196,8 +228,13 @@ impl<const N: usize> ReadBufN<N> {
     /// because the only production callsite
     /// (`BrandedReadBuf::cursor_position_scope_local`) now returns
     /// u16, and no other callers remain.
+    ///
+    /// DEF-265 Idea-38 (2026-05-08): same dead-code allowance as
+    /// `populated()` above.
     #[inline]
     #[must_use]
+    #[allow(dead_code, reason = "DEF-265 Idea-38: ReadBufN<N> is a stable \
+        primitive retained for future wire-buffer designs")]
     pub(crate) const fn cursor_position_u16(&self) -> u16 {
         self.cursor
     }
@@ -388,9 +425,357 @@ impl<const N: usize> Drop for ReadBufN<N> {
 
 impl<const N: usize> fmt::Debug for ReadBufN<N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReadBuf")
+        f.debug_struct("ReadBufN")
             .field("unread_len", &self.unread_len())
             .field("cap", &N)
+            .finish()
+    }
+}
+
+/// Two-tier inbound read buffer with stack-inline fast path and
+/// lazy heap escape (DEF-265 Idea-38, 2026-05-08).
+///
+/// # Design rationale
+///
+/// `PgProtocol` previously embedded a 4096-byte inline buffer
+/// (`ReadBufN<4096>`), making `PgProtocol` 4352 B inline. This was
+/// cache-locality-friendly (state + buffer co-located on the same
+/// struct) but cost 4352 B per connection in pool scenarios.
+///
+/// Two prior DEF-265 attempts (commits-then-revert, see
+/// `deferred.md` DEF-265 entry) tried `Box<ReadBuf>` and
+/// `&'buf mut ReadBuf` with lifetime parameter. Both regressed
+/// `ping_round_trip` (+54.65% and +18.01%) — the former from
+/// heap-alloc cost on every fresh `PgProtocol::new()`, the latter
+/// from cache-locality split + pointer-chase cost.
+///
+/// **Idea-38 design**: keep buffer storage *inline* for tiny frames
+/// (≤ 256 B), lazy-escape to heap only when inline overflows.
+///
+/// - Frames that fit in 256 B: zero alloc, full cache locality
+///   (inline storage adjacent to PgProtocol's other fields).
+/// - Frames > 256 B: one-time escape (Box::new + memcpy of inline
+///   contents to heap), subsequent operations work against heap.
+///
+/// PgProtocol with this two-tier ReadBuf shrinks from 4352 B inline
+/// to ~528 B inline (88% reduction) — without paying alloc cost on
+/// the common path.
+///
+/// # Tier-1 invariant
+///
+/// At any moment, **exactly one** of `inline` / `heap` holds the
+/// populated bytes:
+/// - Pre-escape: `heap == None`, `inline.len()` = populated_len.
+/// - Post-escape: `heap == Some`, `inline.len() == 0`, `heap.len()` =
+///   populated_len.
+///
+/// `cursor` is the read position into the active storage. Invariant:
+/// `cursor <= populated_len <= active_capacity <= 65_535`.
+///
+/// # `#[forbid(unsafe_code)]` preserved
+///
+/// All operations use `heapless::Vec`'s safe API. No `MaybeUninit`,
+/// no raw pointers, no transmute.
+///
+/// # Drop semantics (DEF-185 P0-C, DEF-204, DEF-259)
+///
+/// On Drop, both `inline` and `heap` (if Some) are zeroized. The
+/// `Box<heapless::Vec<…>>` heap allocation is then released by Box's
+/// own Drop. DEF-259 manifest registers `ReadBuf` as a
+/// secret-bearing type; DropCounter test verifies Drop fires on every
+/// teardown path.
+pub struct ReadBuf {
+    /// Inline storage for tiny frames. Always present in the
+    /// PgProtocol struct's stack/heap allocation; no extra alloc
+    /// cost vs current single-field inline.
+    inline: Vec<u8, INLINE_BUF_CAP>,
+    /// Lazily-allocated heap storage for frames > `INLINE_BUF_CAP`.
+    /// `None` until first append that exceeds inline capacity;
+    /// `Some` thereafter for the buffer's lifetime.
+    heap: Option<alloc::boxed::Box<Vec<u8, READ_BUF_CAP>>>,
+    /// Read cursor into the active storage. Tier-1 invariant:
+    /// `cursor <= active_storage.len() <= cap <= 65_535`.
+    cursor: u16,
+}
+
+impl Default for ReadBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReadBuf {
+    /// Construct an empty buffer in inline mode.
+    ///
+    /// `const fn` — caller-side stack allocation is zero-cost
+    /// (heapless::Vec::new is const, no memset).
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            inline: Vec::new(),
+            heap: None,
+            cursor: 0,
+        }
+    }
+
+    /// Append `bytes` to the unread region.
+    ///
+    /// Inline-mode fast path: try inline `extend_from_slice`. If the
+    /// inline storage is exhausted, escape to heap (one-time alloc +
+    /// memcpy of inline contents) and retry.
+    #[inline]
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
+        // Heap-mode: append to heap with compact-on-overflow (mirrors
+        // the pre-DEF-265 single-mode compact behaviour).
+        if self.heap.is_some() {
+            return self.append_heap(bytes);
+        }
+        // Inline-mode fast path: try inline append.
+        if self.inline.extend_from_slice(bytes).is_ok() {
+            return Ok(());
+        }
+        // Inline-mode SLOW PATH: inline overflow. Compact inline
+        // first (might fit after reclaiming consumed prefix); if
+        // still doesn't fit, escape to heap.
+        self.compact_inline();
+        if self.inline.extend_from_slice(bytes).is_ok() {
+            return Ok(());
+        }
+        // Escape: copy inline contents to a fresh heap-allocated
+        // 4096-byte buffer, then append the new bytes.
+        let mut heap_box: alloc::boxed::Box<Vec<u8, READ_BUF_CAP>> =
+            alloc::boxed::Box::new(Vec::new());
+        heap_box
+            .extend_from_slice(self.inline.as_slice())
+            .map_err(|CapacityError { .. }| ReadBufFull {
+                attempted: bytes.len(),
+                available: 0,
+                cap: READ_BUF_CAP,
+            })?;
+        heap_box
+            .extend_from_slice(bytes)
+            .map_err(|CapacityError { .. }| {
+                let len = heap_box.len();
+                ReadBufFull {
+                    attempted: bytes.len(),
+                    available: READ_BUF_CAP.saturating_sub(len),
+                    cap: READ_BUF_CAP,
+                }
+            })?;
+        // Zeroize inline before clearing — the bytes were copied to
+        // heap; the inline storage now holds stale duplicates that
+        // should not persist (CREDO §11 zeroize-on-clear discipline).
+        {
+            use zeroize::Zeroize;
+            self.inline.as_mut_slice().zeroize();
+        }
+        self.inline.clear();
+        self.heap = Some(heap_box);
+        Ok(())
+    }
+
+    /// Borrow the unread region.
+    ///
+    /// The returned slice is valid until the next `&mut self` method
+    /// call on this buffer.
+    #[inline]
+    #[must_use]
+    pub fn unread(&self) -> &[u8] {
+        let pop = self.populated();
+        debug_assert!(
+            usize::from(self.cursor) <= pop.len(),
+            "ReadBuf invariant: cursor ({}) must not exceed populated len ({})",
+            self.cursor,
+            pop.len(),
+        );
+        pop.get(usize::from(self.cursor)..).unwrap_or(&[])
+    }
+
+    /// Borrow the full populated region (used by 1c-1b
+    /// `StreamRow` materialiser for absolute-position slices).
+    #[inline]
+    #[must_use]
+    pub(crate) fn populated(&self) -> &[u8] {
+        match &self.heap {
+            None => self.inline.as_slice(),
+            Some(heap) => heap.as_slice(),
+        }
+    }
+
+    /// Absolute cursor position in u16 (DEF-154 G).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn cursor_position_u16(&self) -> u16 {
+        self.cursor
+    }
+
+    /// Advance the read cursor by `n` bytes.
+    #[inline]
+    pub fn advance(&mut self, n: usize) -> Result<(), AdvancePastEnd> {
+        let available = self.unread_len();
+        if n > available {
+            return Err(AdvancePastEnd {
+                requested: n,
+                available,
+            });
+        }
+        let new_cursor_usize =
+            usize::from(self.cursor)
+                .checked_add(n)
+                .ok_or(AdvancePastEnd {
+                    requested: n,
+                    available,
+                })?;
+        let new_cursor = u16::try_from(new_cursor_usize).map_err(|_| AdvancePastEnd {
+            requested: n,
+            available,
+        })?;
+        self.cursor = new_cursor;
+        Ok(())
+    }
+
+    /// Reset the buffer to empty. Zeroizes active storage; releases
+    /// heap allocation if escaped.
+    #[inline]
+    pub fn clear(&mut self) {
+        use zeroize::Zeroize;
+        self.inline.as_mut_slice().zeroize();
+        self.inline.clear();
+        if let Some(heap) = &mut self.heap {
+            heap.as_mut_slice().zeroize();
+        }
+        // Drop the heap allocation entirely — return to inline mode.
+        // Subsequent appends will reuse inline; if they overflow again,
+        // a new heap will be allocated. Per-connection-lifetime this is
+        // not a concern (clear runs at most a few times per conn).
+        self.heap = None;
+        self.cursor = 0;
+    }
+
+    /// Number of bytes currently unread.
+    #[inline]
+    #[must_use]
+    pub fn unread_len(&self) -> usize {
+        self.populated()
+            .len()
+            .saturating_sub(usize::from(self.cursor))
+    }
+
+    /// Heap-mode append helper: try direct extend; on capacity
+    /// failure, compact heap and retry (mirrors pre-DEF-265
+    /// `ReadBufN<N>::append` lazy-compact discipline).
+    #[inline]
+    fn append_heap(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
+        let Some(heap) = self.heap.as_mut() else {
+            // Caller bug — branch unreachable per `append` precondition.
+            return Err(ReadBufFull {
+                attempted: bytes.len(),
+                available: READ_BUF_CAP,
+                cap: READ_BUF_CAP,
+            });
+        };
+        if heap.extend_from_slice(bytes).is_ok() {
+            return Ok(());
+        }
+        // Slow path: heap full. Compact (reclaim consumed prefix) and
+        // retry. The cursor advances during dispatch — the heap may
+        // be physically full while the unread region is small.
+        self.compact_heap();
+        let Some(heap) = self.heap.as_mut() else {
+            return Err(ReadBufFull {
+                attempted: bytes.len(),
+                available: READ_BUF_CAP,
+                cap: READ_BUF_CAP,
+            });
+        };
+        heap.extend_from_slice(bytes)
+            .map_err(|CapacityError { .. }| {
+                let len = heap.len();
+                ReadBufFull {
+                    attempted: bytes.len(),
+                    available: READ_BUF_CAP.saturating_sub(len),
+                    cap: READ_BUF_CAP,
+                }
+            })
+    }
+
+    /// Reclaim the consumed prefix of inline storage.
+    ///
+    /// Internal helper called from [`append`] when the inline tail
+    /// runs out of room. Cheap when `cursor == 0` (no-op).
+    fn compact_inline(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        debug_assert!(
+            self.heap.is_none(),
+            "compact_inline called in heap mode — caller bug",
+        );
+        let cursor = usize::from(self.cursor);
+        let len = self.inline.len();
+        let unread_len = len.saturating_sub(cursor);
+        self.inline.copy_within(cursor..len, 0);
+        // Zeroize abandoned tail (DEF-204 staleness leak closure).
+        {
+            use zeroize::Zeroize;
+            if let Some(stale_tail) = self.inline.as_mut_slice().get_mut(unread_len..) {
+                stale_tail.zeroize();
+            }
+        }
+        self.inline.truncate(unread_len);
+        self.cursor = 0;
+    }
+
+    /// Reclaim the consumed prefix of heap storage. Mirrors
+    /// `compact_inline` but operates on the heap-mode buffer.
+    fn compact_heap(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let Some(heap) = self.heap.as_mut() else {
+            return; // caller bug; defensive no-op
+        };
+        let cursor = usize::from(self.cursor);
+        let len = heap.len();
+        let unread_len = len.saturating_sub(cursor);
+        heap.copy_within(cursor..len, 0);
+        // Zeroize abandoned tail (DEF-204 staleness leak closure).
+        {
+            use zeroize::Zeroize;
+            if let Some(stale_tail) = heap.as_mut_slice().get_mut(unread_len..) {
+                stale_tail.zeroize();
+            }
+        }
+        heap.truncate(unread_len);
+        self.cursor = 0;
+    }
+}
+
+/// DEF-185 P0-C + DEF-265 Idea-38: zeroize both inline and heap
+/// storage on Drop. `heapless::Vec` doesn't implement Zeroize
+/// natively (upstream bound requires `Default + Copy`); manual
+/// scrub via slice's `Zeroize` impl. The Box's own Drop releases
+/// the heap allocation after our zeroize completes.
+impl Drop for ReadBuf {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.inline.as_mut_slice().zeroize();
+        if let Some(heap) = &mut self.heap {
+            heap.as_mut_slice().zeroize();
+        }
+        // Box::drop runs next, releasing the heap allocation.
+    }
+}
+
+impl fmt::Debug for ReadBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mode = if self.heap.is_some() { "heap" } else { "inline" };
+        f.debug_struct("ReadBuf")
+            .field("mode", &mode)
+            .field("unread_len", &self.unread_len())
+            .field("inline_cap", &INLINE_BUF_CAP)
+            .field("heap_cap", &READ_BUF_CAP)
             .finish()
     }
 }

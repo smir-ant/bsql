@@ -265,6 +265,14 @@ pub(crate) trait CrateZeroizeSecret: sealed::Sealed {}
 impl<const N: usize> sealed::Sealed for crate::buf::ReadBufN<N> {}
 impl<const N: usize> CrateZeroizeSecret for crate::buf::ReadBufN<N> {}
 
+// `bsql-pg-proto::buf::ReadBuf` (DEF-265 Idea-38) — two-tier inline+heap
+// buffer. Manual Drop impl zeroizes BOTH inline storage and heap-Box
+// contents (if escaped). Production use replaces the previous inline
+// `ReadBufN<4096>`-as-`ReadBuf` alias. Inline path is the common case
+// (frames ≤ 256 B); heap escape on first overflow.
+impl sealed::Sealed for crate::buf::ReadBuf {}
+impl CrateZeroizeSecret for crate::buf::ReadBuf {}
+
 // `bsql-pg-proto::error_arena::ErrorPayload` — `derive(ZeroizeOnDrop)`
 // at `error_arena.rs:129`. Carries 3× `SecretBoundedStr<N>` fields.
 impl sealed::Sealed for crate::error_arena::ErrorPayload {}
