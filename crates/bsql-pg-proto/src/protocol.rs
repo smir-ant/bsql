@@ -50,6 +50,13 @@
 
 use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
+// `PgCommand` enum is referenced only by the test-only 5-arm
+// `compute_push_*` dispatchers (the `compute_push_idle_only` slow-path
+// dispatcher + `impl PushCommand for PgCommand` blanket impl were
+// deleted at DEF-270 Phase 2 ship — real call sites were zero). The
+// `use` is `#[cfg(test)]`-gated to avoid an unused-import warning in
+// release builds.
+#[cfg(test)]
 use crate::command::PgCommand;
 use crate::dispatch::{DispatchOutcome, dispatch};
 use crate::error::{ProtocolError, StateErrorKind};
@@ -153,18 +160,45 @@ macro_rules! emit_actions {
 /// but classified — `compute_push_*` handles it via `FailReply +
 /// CloseSocket + Errored` state transition.
 ///
-/// This macro centralises that handling. Each `compute_push_*`
-/// Idle arm uses `let range = try_builder!(build_X(...), reply,
-/// staged);`. On `Err(cause)`: derive `StateErrorKind` via
-/// `cause.state_kind()` (DEF-175/176 pattern), emit the FailReply
-/// and CloseSocket into `staged`, and early-return
-/// `ProtoState::Errored(state_kind)` from the enclosing
-/// `compute_push_*` function.
+/// This macro centralises that handling. Each `compute_push_*_idle_only`
+/// uses `let range = try_builder!(build_X(...), setter, reply, staged);`.
+/// On `Err(cause)`: derive `StateErrorKind` via `cause.state_kind()`
+/// (DEF-175/176 pattern), emit FailReply + CloseSocket into `staged`,
+/// consume `setter` via `install_errored(state_kind)`, and
+/// early-return from the enclosing `compute_push_*` function.
 ///
 /// The macro early-returns, so it must be used in a position
-/// where `return ProtoState::Errored(...)` is legal.
+/// where `return` is legal.
+///
+/// # DEF-270 N-D (Phase 2, 2026-05-10): setter consumption
+///
+/// Pre-DEF-270-N-D the macro took `$state: &mut ProtoState` and
+/// wrote `*$state = ProtoState::Errored(state_kind)` directly. With
+/// raw `&mut ProtoState` no longer reachable from `execute()` (only
+/// via [`crate::state_setter::StateSetter`]), the macro now takes
+/// `$setter: StateSetter<'_, _>` and consumes it via
+/// [`StateSetter::install_errored`] on the Err path. The setter's
+/// `must_use` lint surfaces a missed install at the call site;
+/// previously the responsibility lived in a docstring discipline
+/// note.
+///
+/// **NLL conditional-move:** on the Ok arm `$setter` is not
+/// touched, so the caller retains it for the happy-path
+/// `setter.install_post_state(witness)` at the tail of the helper.
+/// Rust's NLL borrow checker treats the Err arm's setter consumption
+/// as conditional (gated on the early-return), preserving setter
+/// ownership on the Ok path. Compile-tested across all 6 helpers
+/// using `try_builder!` (Ping skips since Sync is static-bytes
+/// infallible).
+///
+/// **Idle-only contract** is now enforced by setter privacy:
+/// `StateSetter::new` is `pub(crate)`, callable only from
+/// `PgProtocol::push_command_internal` which asserts
+/// `matches!(state, Idle)` at entry. The pre-DEF-270-N-D macro
+/// debug_assert (defense-in-depth on the same invariant) is
+/// dropped — same invariant, single load-bearing assertion site.
 macro_rules! try_builder {
-    ($result:expr, $state:expr, $reply:expr, $staged:expr) => {
+    ($result:expr, $setter:expr, $reply:expr, $staged:expr) => {
         match $result {
             Ok(r) => r,
             Err(cause) => {
@@ -172,34 +206,12 @@ macro_rules! try_builder {
                 // + debug_assert dance. Builders never return
                 // AlreadyClosed; the total projection fills any
                 // hypothetical AlreadyClosed with Internal honestly.
-                //
-                // DEF-186 perf-recovery 2026-04-24: macro now writes
-                // *$state = Errored(...) instead of returning the
-                // state by value (compute_push_* signatures changed
-                // to &mut state with `()` return).
-                //
-                // DEF-186 P1-3 (audit 2026-04-24): pin Idle-only
-                // contract. The macro overwrites $state with
-                // Errored(...) without consulting any embedded
-                // inflight ReplyId — safe ONLY when caller's prev
-                // state is Idle (no embedded inflight reply to leak).
-                // All current call sites are inside `Idle` arms of
-                // compute_push_*; debug_assert catches any future
-                // misplacement that would silently leak an embedded
-                // ReplyId<_>'s correlator (zombie-class regression
-                // mirroring P0-E).
-                debug_assert!(
-                    matches!(*$state, ProtoState::Idle),
-                    "try_builder! invoked outside Idle arm — would leak embedded \
-                     inflight ReplyId by overwriting state. Caller must call \
-                     fail_inflight_no_readbuf or take_inflight_reply_raw_id first.",
-                );
                 let state_kind = cause.state_kind();
                 emit_actions!($staged, budget: 2, [
                     StagedAction::FailReply { id: $reply.consume(), cause },
                     StagedAction::CloseSocket,
                 ]);
-                *$state = ProtoState::Errored(state_kind);
+                $setter.install_errored(state_kind);
                 return;
             }
         }
@@ -1154,11 +1166,19 @@ impl PgProtocol {
         let row_desc_slot = &mut self.row_desc_slot;
         // DEF-212: reserved kept alive across PushCommand::execute and
         // materialise_push (the latter appends static SYNC bytes).
+        // DEF-270 N-D (Phase 2, 2026-05-10): construct typed
+        // `StateSetter<'_, C::PostState>` here — this is the only
+        // call site in the crate that mints a setter via
+        // `pub(crate) StateSetter::new`. The raw `&mut ProtoState`
+        // never escapes this function. `execute()` consumes the
+        // setter via `install_post_state` (happy path) or
+        // `install_errored` (try_builder! Err path).
         write_buf.with_branded(|mut wb| -> Result<(), crate::action::PushFailure> {
             let mut reserved = wb.reserve();
             let mut staged = StagedActions::new();
+            let setter = crate::state_setter::StateSetter::<C::PostState>::new(state);
             cmd.execute(
-                state,
+                setter,
                 row_desc_slot,
                 &mut staged,
                 &mut reserved,
@@ -2541,62 +2561,12 @@ fn compute_push(
     staged
 }
 
-/// DEF-269 v2 (T) backwards-compat: `compute_push_idle_only` dispatches
-/// `PgCommand` via the runtime match for the `impl PushCommand for
-/// PgCommand` blanket impl. Pre-T callers (still passing
-/// `PgCommand::Ping { reply }`) route through this; new callers using
-/// per-command structs (`Ping { reply }`) bypass entirely via direct
-/// monomorphic dispatch in `push_command_inner`. The 2176-B
-/// argument cost only applies to the slow path.
-#[inline]
-pub(crate) fn compute_push_idle_only(
-    cmd: PgCommand,
-    state: &mut ProtoState,
-    staged: &mut StagedActions,
-    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) {
-    debug_assert!(
-        matches!(state, ProtoState::Idle),
-        "compute_push_idle_only: caller (ReadyGuard) must guarantee Idle state",
-    );
-    match cmd {
-        PgCommand::Ping { reply } => compute_push_ping_idle_only(state, reply, staged),
-        PgCommand::Startup {
-            user,
-            database,
-            app_name,
-            credentials,
-            reply,
-        } => compute_push_startup_idle_only(
-            state,
-            user,
-            database,
-            app_name,
-            credentials,
-            reply,
-            staged,
-            reserved,
-        ),
-        PgCommand::SimpleQuery { sql, reply } => {
-            compute_push_simple_query_idle_only(state, &sql, reply, staged, reserved)
-        }
-        PgCommand::Parse {
-            stmt_name,
-            sql,
-            reply,
-        } => compute_push_parse_idle_only(state, &stmt_name, &sql, reply, staged, reserved),
-        PgCommand::DescribeStatement { stmt_name, reply } => {
-            compute_push_describe_statement_idle_only(
-                state, &stmt_name, reply, staged, reserved,
-            )
-        }
-        PgCommand::DescribePortal { portal_name, reply } => {
-            compute_push_describe_portal_idle_only(
-                state, &portal_name, reply, staged, reserved,
-            )
-        }
-    }
-}
+// DEF-269 v2 (T) backwards-compat slow-path `compute_push_idle_only`
+// DELETED at DEF-270 Phase 2 (2026-05-10). Real call sites were zero
+// (audit grep `push_command(PgCommand::...)` returned only doc-comment
+// references); the legacy `impl PushCommand for PgCommand` blanket
+// impl was removed in the same commit. `PgCommand` enum survives for
+// the test-only `compute_push_tests` 5-arm dispatchers.
 
 /// Compute the transition for [`PgCommand::Ping`] against the current
 /// [`ProtoState`]. Pure; see [`compute_push`] for framing.
@@ -2635,7 +2605,10 @@ fn compute_push_ping(
     // preserved.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            compute_push_ping_idle_only(state, reply, staged);
+            let setter = crate::state_setter::StateSetter::<
+                crate::push_command::PingAwaitingRfqInstall,
+            >::new(state);
+            compute_push_ping_idle_only(setter, reply, staged);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             // Preserve the stored cause; emit ConnectionAlreadyClosed
@@ -2687,14 +2660,10 @@ fn compute_push_ping(
 /// ReadyGuard).
 #[inline]
 pub(crate) fn compute_push_ping_idle_only(
-    state: &mut ProtoState,
+    setter: crate::state_setter::StateSetter<'_, crate::push_command::PingAwaitingRfqInstall>,
     reply: ReplyId<crate::reply_id::PingKind>,
     staged: &mut StagedActions,
 ) {
-    debug_assert!(
-        matches!(state, ProtoState::Idle),
-        "compute_push_ping_idle_only: state must be Idle (caller's invariant)",
-    );
     // DEF-094: Sync is a compile-time const (5 bytes). Emit
     // `StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES)` so the
     // materialiser passes the static reference through directly —
@@ -2702,7 +2671,8 @@ pub(crate) fn compute_push_ping_idle_only(
     emit_actions!(staged, budget: 1, [
         StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES),
     ]);
-    *state = ProtoState::PingAwaitingRfq(reply);
+    // DEF-270 N-D: typed witness pairs Ping → PingAwaitingRfq.
+    setter.install_post_state(crate::push_command::PingAwaitingRfqInstall { reply });
 }
 
 /// Compute the transition for [`PgCommand::Startup`] against the current
@@ -2740,8 +2710,11 @@ fn compute_push_startup(
     // PingAwaiting / BusyQuery) leave state untouched.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
+            let setter = crate::state_setter::StateSetter::<
+                crate::push_command::StartupPostInstall,
+            >::new(state);
             compute_push_startup_idle_only(
-                state, user, database, app_name, credentials, reply, staged, reserved,
+                setter, user, database, app_name, credentials, reply, staged, reserved,
             );
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -2781,7 +2754,7 @@ fn compute_push_startup(
 #[expect(clippy::too_many_arguments, reason = "mirrors compute_push_startup signature 1:1; struct-arg refactor would obscure the pure-compute framing")]
 #[inline]
 pub(crate) fn compute_push_startup_idle_only(
-    state: &mut ProtoState,
+    setter: crate::state_setter::StateSetter<'_, crate::push_command::StartupPostInstall>,
     user: Ident,
     database: Option<DatabaseName>,
     app_name: Option<ApplicationName>,
@@ -2790,10 +2763,6 @@ pub(crate) fn compute_push_startup_idle_only(
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    debug_assert!(
-        matches!(state, ProtoState::Idle),
-        "compute_push_startup_idle_only: state must be Idle (caller's invariant)",
-    );
     // DEF-154 (B) P0-2: builder returns Result; Err →
     // FailReply + CloseSocket + Errored via `try_builder!`.
     let range = try_builder!(
@@ -2803,7 +2772,7 @@ pub(crate) fn compute_push_startup_idle_only(
             app_name.as_ref(),
             reserved,
         ),
-        state,
+        setter,
         reply,
         staged
     );
@@ -2814,8 +2783,9 @@ pub(crate) fn compute_push_startup_idle_only(
     // post-push state carries only what its auth method
     // needs. Trust: 24 bytes. Scram: 24 + ScramSession
     // (~1040).
-    *state = match credentials {
-        Credentials::Trust => ProtoState::ConnectingStartupTrust { reply },
+    // DEF-270 N-D: typed witness pairs Startup → ConnectingStartup{Trust|Scram|Cleartext|Md5}.
+    let post_install = match credentials {
+        Credentials::Trust => crate::push_command::StartupPostInstall::Trust { reply },
         Credentials::ScramPassword(password) => {
             // DEF-184 (A10/B22 revert 2026-04-24): tier-1
             // restored — ScramSession lives INSIDE the
@@ -2824,7 +2794,7 @@ pub(crate) fn compute_push_startup_idle_only(
             let scram = alloc::boxed::Box::new(
                 crate::scram::session::ScramSession::from_password(password),
             );
-            ProtoState::ConnectingStartupScram { reply, scram }
+            crate::push_command::StartupPostInstall::Scram { reply, scram }
         }
         Credentials::CleartextPassword(password) => {
             // DEF-215 (2026-05-05): mirror of the SCRAM construction
@@ -2835,7 +2805,7 @@ pub(crate) fn compute_push_startup_idle_only(
             // valid `Box<Sensitive<Password>>`. ZeroizeOnDrop fires
             // on every exit path through the Box's Drop.
             let password = alloc::boxed::Box::new(password);
-            ProtoState::ConnectingStartupCleartext { reply, password }
+            crate::push_command::StartupPostInstall::Cleartext { reply, password }
         }
         Credentials::Md5Password(password) => {
             // DEF-216 (2026-05-05): MD5 needs BOTH password AND
@@ -2853,9 +2823,10 @@ pub(crate) fn compute_push_startup_idle_only(
                 password,
                 user,
             });
-            ProtoState::ConnectingStartupMd5 { reply, handshake }
+            crate::push_command::StartupPostInstall::Md5 { reply, handshake }
         }
     };
+    setter.install_post_state(post_install);
 }
 
 /// Compute the transition for [`PgCommand::SimpleQuery`] against the
@@ -2882,7 +2853,10 @@ fn compute_push_simple_query(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            compute_push_simple_query_idle_only(state, sql, reply, staged, reserved);
+            let setter = crate::state_setter::StateSetter::<
+                crate::push_command::SimpleQueryAwaitingFirstResponseInstall,
+            >::new(state);
+            compute_push_simple_query_idle_only(setter, sql, reply, staged, reserved);
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -2915,18 +2889,23 @@ fn compute_push_simple_query(
 /// DEF-208 — Idle-only path for [`PgCommand::SimpleQuery`].
 #[inline]
 pub(crate) fn compute_push_simple_query_idle_only(
-    state: &mut ProtoState,
+    setter: crate::state_setter::StateSetter<
+        '_,
+        crate::push_command::SimpleQueryAwaitingFirstResponseInstall,
+    >,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::QueryKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    debug_assert!(matches!(state, ProtoState::Idle));
-    let range = try_builder!(build_query_message(sql, reserved), state, reply, staged);
+    let range = try_builder!(build_query_message(sql, reserved), setter, reply, staged);
     emit_actions!(staged, budget: 1, [
         StagedAction::SendBytesRange(range),
     ]);
-    *state = ProtoState::SimpleQueryAwaitingFirstResponse(reply);
+    // DEF-270 N-D: typed witness pairs SimpleQuery → SimpleQueryAwaitingFirstResponse.
+    setter.install_post_state(
+        crate::push_command::SimpleQueryAwaitingFirstResponseInstall { reply },
+    );
 }
 
 // DEF-154 (B) Phase B4: `from_write_span_infallible` deleted.
@@ -3013,7 +2992,10 @@ fn compute_push_parse(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            compute_push_parse_idle_only(state, stmt_name, sql, reply, staged, reserved);
+            let setter = crate::state_setter::StateSetter::<
+                crate::push_command::ParseAwaitingParseCompleteInstall,
+            >::new(state);
+            compute_push_parse_idle_only(setter, stmt_name, sql, reply, staged, reserved);
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -3046,20 +3028,28 @@ fn compute_push_parse(
 /// DEF-208 — Idle-only path for [`PgCommand::Parse`].
 #[inline]
 pub(crate) fn compute_push_parse_idle_only(
-    state: &mut ProtoState,
+    setter: crate::state_setter::StateSetter<
+        '_,
+        crate::push_command::ParseAwaitingParseCompleteInstall,
+    >,
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::ParseKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    debug_assert!(matches!(state, ProtoState::Idle));
-    let range = try_builder!(build_parse_message(stmt_name, sql, reserved), state, reply, staged);
+    let range = try_builder!(
+        build_parse_message(stmt_name, sql, reserved),
+        setter,
+        reply,
+        staged
+    );
     emit_actions!(staged, budget: 2, [
         StagedAction::SendBytesRange(range),
         StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
     ]);
-    *state = ProtoState::ParseAwaitingParseComplete(reply);
+    // DEF-270 N-D: typed witness pairs Parse → ParseAwaitingParseComplete.
+    setter.install_post_state(crate::push_command::ParseAwaitingParseCompleteInstall { reply });
 }
 
 // DEF-154 (A) closed pass-#7 F16: `frame_build_unreachable` helper
@@ -3135,7 +3125,10 @@ fn compute_push_describe_statement(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            compute_push_describe_statement_idle_only(state, stmt_name, reply, staged, reserved);
+            let setter = crate::state_setter::StateSetter::<
+                crate::push_command::DescribeStatementAwaitingParamDescInstall,
+            >::new(state);
+            compute_push_describe_statement_idle_only(setter, stmt_name, reply, staged, reserved);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -3168,20 +3161,22 @@ fn compute_push_describe_statement(
 /// DEF-208 — Idle-only path for [`PgCommand::DescribeStatement`].
 #[inline]
 pub(crate) fn compute_push_describe_statement_idle_only(
-    state: &mut ProtoState,
+    setter: crate::state_setter::StateSetter<
+        '_,
+        crate::push_command::DescribeStatementAwaitingParamDescInstall,
+    >,
     stmt_name: &crate::ident::StmtName,
     reply: ReplyId<crate::reply_id::DescribeStatementKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    debug_assert!(matches!(state, ProtoState::Idle));
     let range = try_builder!(
         build_describe_message(
             crate::wire::DescribeTargetByte::Statement,
             stmt_name,
             reserved,
         ),
-        state,
+        setter,
         reply,
         staged
     );
@@ -3189,7 +3184,10 @@ pub(crate) fn compute_push_describe_statement_idle_only(
         StagedAction::SendBytesRange(range),
         StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
     ]);
-    *state = ProtoState::DescribeStatementAwaitingParamDesc(reply);
+    // DEF-270 N-D: typed witness pairs DescribeStatement → DescribeStatementAwaitingParamDesc.
+    setter.install_post_state(
+        crate::push_command::DescribeStatementAwaitingParamDescInstall { reply },
+    );
 }
 
 /// Compute the transition for [`PgCommand::DescribePortal`] against
@@ -3214,7 +3212,10 @@ fn compute_push_describe_portal(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            compute_push_describe_portal_idle_only(state, portal_name, reply, staged, reserved);
+            let setter = crate::state_setter::StateSetter::<
+                crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall,
+            >::new(state);
+            compute_push_describe_portal_idle_only(setter, portal_name, reply, staged, reserved);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -3247,20 +3248,22 @@ fn compute_push_describe_portal(
 /// DEF-208 — Idle-only path for [`PgCommand::DescribePortal`].
 #[inline]
 pub(crate) fn compute_push_describe_portal_idle_only(
-    state: &mut ProtoState,
+    setter: crate::state_setter::StateSetter<
+        '_,
+        crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall,
+    >,
     portal_name: &crate::ident::PortalName,
     reply: ReplyId<crate::reply_id::DescribePortalKind>,
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    debug_assert!(matches!(state, ProtoState::Idle));
     let range = try_builder!(
         build_describe_message(
             crate::wire::DescribeTargetByte::Portal,
             portal_name,
             reserved,
         ),
-        state,
+        setter,
         reply,
         staged
     );
@@ -3268,7 +3271,55 @@ pub(crate) fn compute_push_describe_portal_idle_only(
         StagedAction::SendBytesRange(range),
         StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
     ]);
-    *state = ProtoState::DescribePortalAwaitingRowDescOrNoData(reply);
+    // DEF-270 N-D: typed witness pairs DescribePortal → DescribePortalAwaitingRowDescOrNoData.
+    setter.install_post_state(
+        crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall { reply },
+    );
+}
+
+/// DEF-270 P-ordering (Phase 2, 2026-05-10) — typed
+/// [`crate::action::WriteRange`] newtype identifying a `Bind` frame
+/// body. Constructed by [`build_bind_message`]; consumed by
+/// [`stage_bind_execute_sync`] (the only caller). Swapping with
+/// [`ExecuteRange`] at the consumer is a type error.
+///
+/// Tuple-struct field is module-private: only `mod protocol` can
+/// project to the inner `WriteRange`. Tier-1 by-construction:
+/// type-distinct from `ExecuteRange`, no path to silent reorder.
+struct BindRange(crate::action::WriteRange);
+
+/// DEF-270 P-ordering (Phase 2, 2026-05-10) — typed
+/// [`crate::action::WriteRange`] newtype identifying an `Execute`
+/// frame body. Sibling of [`BindRange`].
+struct ExecuteRange(crate::action::WriteRange);
+
+/// DEF-270 P-ordering (Phase 2, 2026-05-10) — single-purpose
+/// stager for the `Bind`+`Execute`+`Sync` frame triple. Argument
+/// order pins frame order; the const-asserted `budget: 3` matches
+/// the three actions emitted; `Sync` is the static
+/// [`crate::wire::SYNC_WIRE_BYTES`] reference (zero-copy).
+///
+/// **Tier-1 closures:**
+/// - argument-order swap (`(execute, bind)`) → type error.
+/// - missing `Sync` → impossible (function emits all three or none).
+/// - missing `Bind` or `Execute` → impossible (function takes both
+///   by value, function must be called to stage anything).
+///
+/// Pre-DEF-270-P-ordering the same wire-frame triple was open-coded
+/// inside `compute_push_bind_execute_idle_only` as three
+/// `emit_actions!` arms. Tier-3 by-discipline: a refactor that
+/// reordered them or dropped Sync would compile.
+#[inline]
+fn stage_bind_execute_sync(
+    staged: &mut StagedActions,
+    bind: BindRange,
+    execute: ExecuteRange,
+) {
+    emit_actions!(staged, budget: 3, [
+        StagedAction::SendBytesRange(bind.0),
+        StagedAction::SendBytesRange(execute.0),
+        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+    ]);
 }
 
 /// Build a PostgreSQL `Bind` (`'B'`) frame into `write_buf`.
@@ -3292,6 +3343,12 @@ pub(crate) fn compute_push_describe_portal_idle_only(
 /// Zero-alloc: params are streamed directly from the tuple into
 /// `write_buf` via [`crate::params::ParamsWriter::write_params`];
 /// no intermediate buffer.
+///
+/// # DEF-270 P-ordering (Phase 2): typed return
+///
+/// Returns [`BindRange`], not raw [`crate::action::WriteRange`]. The
+/// typed newtype binds at the boundary so [`stage_bind_execute_sync`]
+/// statically rejects an `ExecuteRange` in the bind slot.
 // DEF-184 (A1+A13): ProtocolError shrunk 312 → ~72 B post-
 // ErrorArena externalisation; Err path below 128 B
 // result_large_err threshold.
@@ -3300,7 +3357,7 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
     stmt_name: &crate::ident::StmtName,
     params: &P,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> Result<crate::action::WriteRange, ProtocolError> {
+) -> Result<BindRange, ProtocolError> {
     // Builder fns all return Result post-B4-W P0-2+P0-3 fix.
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_BIND.byte())?;
@@ -3365,7 +3422,8 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
     if let Some(err) = params_err {
         return Err(err);
     }
-    crate::action::WriteRange::from_write_span(start, reserved)
+    let raw = crate::action::WriteRange::from_write_span(start, reserved)?;
+    Ok(BindRange(raw))
 }
 
 /// Build a PostgreSQL `Execute` (`'E'`) frame into `write_buf`.
@@ -3380,11 +3438,17 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
 /// 1c-3b scope produces `0` (fetch all). F83: the enum narrows the
 /// API to only variants the sub-phase supports, turning tier-3 docs
 /// into tier-1 compile.
+///
+/// # DEF-270 P-ordering (Phase 2): typed return
+///
+/// Returns [`ExecuteRange`], not raw [`crate::action::WriteRange`].
+/// See [`build_bind_message`] / [`stage_bind_execute_sync`] for the
+/// typed-frame closure rationale.
 fn build_execute_message(
     portal_name: &crate::ident::PortalName,
     fetch: crate::command::FetchRows,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> Result<crate::action::WriteRange, ProtocolError> {
+) -> Result<ExecuteRange, ProtocolError> {
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_EXECUTE.byte())?;
     reserved.with_length_prefix(|w| {
@@ -3392,14 +3456,15 @@ fn build_execute_message(
         w.push_i32_be(fetch.as_wire_i32())?;
         Ok(())
     })?;
-    crate::action::WriteRange::from_write_span(start, reserved)
+    let raw = crate::action::WriteRange::from_write_span(start, reserved)?;
+    Ok(ExecuteRange(raw))
 }
 
 /// Idle-only push path for [`PgProtocol::push_bind_execute`].
 #[expect(clippy::too_many_arguments, reason = "mirrors compute_push_bind_execute signature 1:1")]
 #[inline]
 pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter>(
-    state: &mut ProtoState,
+    setter: crate::state_setter::StateSetter<'_, crate::push_command::BindExecutePostInstall>,
     row_desc_slot: &mut Option<crate::decode::RowDesc>,
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
@@ -3410,40 +3475,39 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    debug_assert!(matches!(state, ProtoState::Idle));
     let bind_range = try_builder!(
         build_bind_message(portal_name, stmt_name, params, reserved),
-        state,
+        setter,
         reply,
         staged
     );
     let execute_range = try_builder!(
         build_execute_message(portal_name, fetch, reserved),
-        state,
+        setter,
         reply,
         staged
     );
-    emit_actions!(staged, budget: 3, [
-        StagedAction::SendBytesRange(bind_range),
-        StagedAction::SendBytesRange(execute_range),
-        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
-    ]);
+    // DEF-270 P-ordering (Phase 2): typed builder fn pins frame order
+    // (Bind → Execute → Sync). Argument-order swap → type error.
+    stage_bind_execute_sync(staged, bind_range, execute_range);
     // DEF-189: caller-supplied RowDesc lands in the protocol's
     // single slot BEFORE the state transition. The variant
     // shape (Select vs Dml) is the tier-1 signal that the
     // slot is populated.
-    // DEF-270 R-rephrased: park via SchemaParkedSlot witness — auth
+    // DEF-270 R-rephrased (Phase 1): park via SchemaParkedSlot witness — auth
     // tag is `pub(in crate::protocol)` so only this module can mint.
-    *state = match row_desc {
+    // DEF-270 N-D (Phase 2): typed witness pairs BindExecute → BindExecuteAwaitingBindComplete{Dml,Select}.
+    let post_install = match row_desc {
         Some(desc) => {
             crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
                 row_desc_slot,
                 AtBindExecuteSelectTransition::new(),
             ).park(desc);
-            ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }
+            crate::push_command::BindExecutePostInstall::Select { reply }
         }
-        None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
+        None => crate::push_command::BindExecutePostInstall::Dml { reply },
     };
+    setter.install_post_state(post_install);
 }
 
 // Pass-#7 F6 / DEF-146 closure (2026-04-22):

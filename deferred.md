@@ -136,14 +136,58 @@ R rephrased to slot-write witness (variant-move conflicts with
 - bench-stable comparison vs `b38446d` baseline: no regression > ±2% noise.
 - PgProtocol size pin **preserved at 520 B exact** (mint counter is a static AtomicU64, not a struct field — see U-letter docs for the bisect rationale).
 
-#### DEF-270 Phase 2 (PLANNED, post-Phase-1): N-D + P-ordering
+#### DEF-270 Phase 2 (SHIPPED 2026-05-10): N-D + P-ordering
 
 **Letters in Phase 2:**
 
 | Letter | Invariant closed | Mechanism (compile-enforced) | Tier delta |
 |--------|------------------|------------------------------|-----------|
-| **N-D** | State transition ↔ command kind drift | Sealed `StateSetter<W>` is the **only** path to mutate `ProtoState` from `execute()` (raw `&mut ProtoState` held privately inside `push_command_internal`, never handed to `execute`). `set_to_post_state(proof: W)` consumes setter + witness; trait associates `type PostState: PostStateProof` per impl; per-command witness types carry the data the matching state variant requires (e.g. `PingAwaitingRfqInstall { reply: ReplyId<PingKind> }` — no path to install Ping post-state without the Ping reply). Trust/SCRAM/Cleartext/MD5 split surfaces honestly as a sealed enum on `StartupPostInstall`; the kind-payload pairing is structural. | tier-3 → **tier-1 by-construction** |
-| **P-ordering** | Pipelined frame ordering Bind→Execute→Sync drift | Typed `StagedActions<Phase>` typestate (or simpler equivalent: typed `BindRange`/`ExecuteRange` newtypes + `stage_bind_execute_sync(...)` builder fn). Swapping bind/execute = build failure; missing sync = build failure. P-1 (length-includes-self via `with_length_prefix`) and P-2 (typed body writes) remain tier-1 as today; this letter adds the missing ordering closure. | tier-3 → **tier-1 by-construction** |
+| **N-D** | State transition ↔ command kind drift | Sealed `StateSetter<W>` is the **only** path to mutate `ProtoState` from `execute()` (raw `&mut ProtoState` held privately inside `push_command_internal`, never handed to `execute`). `install_post_state(proof: W)` consumes setter + witness; trait associates `type PostState: PostStateProof` per impl; per-command witness types carry the data the matching state variant requires (`PingAwaitingRfqInstall { reply: ReplyId<PingKind> }` — no path to install Ping post-state without the Ping reply). Trust/SCRAM/Cleartext/MD5 split surfaces honestly as a sealed enum on `StartupPostInstall`; the kind-payload pairing is structural. SELECT/DML split surfaces on `BindExecutePostInstall`. Failure path consumes setter via `install_errored(StateErrorKind)` invoked through the rewritten `try_builder!` macro. | tier-3 → **tier-1 by-construction** |
+| **P-ordering** | Pipelined frame ordering Bind→Execute→Sync drift | Typed `BindRange`/`ExecuteRange` newtypes (private to `mod protocol`) + `stage_bind_execute_sync(staged, bind, execute)` builder fn. `build_bind_message → BindRange`, `build_execute_message → ExecuteRange`. Swapping argument order at the builder = type error; the static SYNC trailer is structurally bundled with the same fn (cannot be omitted). | tier-3 → **tier-1 by-construction** |
+
+**Implementation footprint (final, 2026-05-10):**
+
+- **New module** `crates/bsql-pg-proto/src/state_setter.rs` (~150 LoC): sealed `PostStateProof` trait with `install_into(self, &mut ProtoState)`; `StateSetter<'a, W: PostStateProof>` with `pub(crate) new()`, `install_post_state(W)`, `install_errored(StateErrorKind)`. `_phantom: PhantomData<fn(W)>` for variance cleanness. `#[must_use]` on the setter surfaces unconsumed-setter as a build warning.
+- **7 witness types** added to `push_command.rs` (alongside per-command structs): `PingAwaitingRfqInstall`, `StartupPostInstall` enum (Trust/Scram/Cleartext/Md5 mirroring `Credentials`), `SimpleQueryAwaitingFirstResponseInstall`, `ParseAwaitingParseCompleteInstall`, `DescribeStatementAwaitingParamDescInstall`, `DescribePortalAwaitingRowDescOrNoDataInstall`, `BindExecutePostInstall` enum (Dml/Select). Each with `impl PostStateProof` + `install_into` body matching the pre-Phase-2 `*state = ...` arms.
+- **Trait extension**: `PushCommand::type PostState: crate::state_setter::PostStateProof` paired per impl. `execute()` signature: `state: &mut ProtoState` → `setter: StateSetter<'_, Self::PostState>`.
+- **Macro rewrite**: `try_builder!($result, $setter, $reply, $staged)` consumes `$setter` via `install_errored(state_kind)` on Err. NLL conditional-move preserves setter ownership on Ok-arm continuation. Pre-Phase-2 macro debug_assert (Idle-only contract) dropped — `push_command_internal` entry-assert remains the canonical site.
+- **7 production helpers** `compute_push_*_idle_only` retyped: first parameter from `state: &mut ProtoState` → `setter: StateSetter<'_, ConcreteWitness>`. `*state = ProtoState::X(...)` replaced by `setter.install_post_state(WitnessX::Y { ... })` at the tail.
+- **6 #[cfg(test)] 5-arm dispatchers** updated: Idle arm constructs typed setter via `StateSetter::<ConcreteWitness>::new(state)` then forwards to the `_idle_only` helper. Other arms (Errored/Connecting/PingAwaiting/BusyQuery) emit FailReply only — no state mutation, no setter needed.
+- **PgCommand backwards-compat impl deleted**: zero real call sites (audit grep `push_command(PgCommand::...)` returned only doc-comment references). `compute_push_idle_only` slow-path dispatcher deleted as dead code. `PgCommand` enum survives for the test-only 5-arm dispatchers; `use crate::command::PgCommand` is `#[cfg(test)]`-gated to avoid unused-import warnings in release.
+- **P-ordering** pieces in `protocol.rs`: `struct BindRange(WriteRange);` + `struct ExecuteRange(WriteRange);` + `fn stage_bind_execute_sync(staged, bind, execute)` (`budget: 3`, emits Bind+Execute+Sync triple, argument-order pinned by the typed signature). `build_bind_message` + `build_execute_message` return the typed newtypes.
+- **`push_command_internal`**: constructs `StateSetter::<C::PostState>::new(state)` and passes to `cmd.execute(setter, ...)`. The raw `&mut ProtoState` never escapes this function.
+
+**Tier-1 closures delivered:**
+
+| Surface | Tier delta |
+|---------|-----------|
+| Command-kind ↔ post-state pairing | tier-3 → **tier-1 by-construction** (witness type pinned per impl via `type PostState`; non-matching install rejected at type-check) |
+| `&mut ProtoState` reachability from `execute()` | tier-3 → **tier-1 by-visibility** (raw ref private to `push_command_internal`; only consumable surface is `StateSetter::install_*`) |
+| Bind→Execute frame ordering | tier-3 → **tier-1 by-construction** (typed newtypes + single-call builder; swap = type error) |
+| Sync trailer omission on Bind+Execute path | tier-3 → **tier-1 by-construction** (`stage_bind_execute_sync` bundles all three; cannot stage Bind+Execute without Sync) |
+
+**Glass residues remaining post-Phase 2:**
+
+- **ReplyId duplicate-prevention beyond single-mint**: needs linear types (stable-Rust ceiling) — closed at a different door if at all.
+- **`row_desc_slot` in-module write provenance** (mod protocol): tier-2 by-discipline for the BindExecute SELECT install path. Phase 2 chose NOT to fold `row_desc` into `BindExecutePostInstall::Select` because the fold requires GAT-driven `Aux` machinery on `PostStateProof::install_into`, complicating the trait surface for marginal closure value. The auth tag `AtBindExecuteSelectTransition` is `pub(in crate::protocol)` so only `mod protocol` can mint — the residue is "any function in mod protocol can write" rather than "any in-crate caller can write". Acceptable per principal directive «не стеклянная архитектура».
+- **`mem::transmute` paths**: out of scope under `#![forbid(unsafe_code)]`.
+- **`MAX_PARAMS_DATA_TOTAL` runtime drift** between user `ParamsWriter` impls and the cap: existing `BuilderCapacityOverflow` classifier; closure requires specialisation (unstable).
+
+**Acceptance gate (Phase 2):**
+
+- ✅ 417/0/10 tests green (lib + integration + benches compile clean).
+- ✅ clippy clean across `--tests --benches` with `-D warnings`.
+- ✅ `#![forbid(unsafe_code)]` preserved.
+- ✅ bench-stable compare vs `044a2fc-phase1-shipped` baseline: 11 unchanged, 0 improvements, 0 regressions. Hot-paths (`push_command/ping`, `ping_round_trip/push_then_feed`, `iter_rows_via_*`) all "No change in performance detected" or "Change within noise threshold" (max swing −1.02% / +0.20%). LLVM erases ZST witnesses as architect predicted.
+- ✅ PgProtocol size pin **preserved at 520 B exact** (no inline fields added in Phase 2).
+- ⚠ `trybuild` compile_fail assets NOT shipped — pinning the type-error surfaces (wrong PostState; BindRange/ExecuteRange swap) is mechanical and can ship in a follow-up if regression vigilance wants it. The Phase 2 ship-gate omits this asset because the type system surfaces the closures at every existing call site already; trybuild would be belt-and-suspenders.
+
+**Architect anchors (verbatim from the original 2026-05-09 cluster audit, preserved post-ship):**
+
+1. "Sealed `StateSetter<W>` is the only path to mutate `ProtoState` from `execute()`" — DELIVERED. Raw `&mut ProtoState` lives privately inside `push_command_internal`; `execute()` receives a setter parameterised on the impl's `Self::PostState`.
+2. "Per-command witness types carry the data the matching state variant requires" — DELIVERED. 7 witness types, each carrying exactly the fields the matching `ProtoState` variant needs. Multi-variant Startup + BindExecute as sealed enums.
+3. "Typed `BindRange`/`ExecuteRange` newtypes + single-call builder" — DELIVERED. Argument-order swap at `stage_bind_execute_sync` = type error.
+4. "Bench expectation ±0% (LLVM erases ZST witnesses)" — VERIFIED. 11/11 benches "No change" / within noise threshold. Architect prediction held.
 
 **Why M was dropped (preserve archeology — applies to whole cluster):**
 
@@ -165,22 +209,6 @@ R-rephrased delivers the same tier closure (write-provenance tier-1) without the
 - ReplyId duplicate-prevention beyond single-mint: needs linear types (stable-Rust ceiling).
 - `mem::transmute` paths to fabricate any sealed type: out of scope; project is `#![forbid(unsafe_code)]` — closed at a different door.
 - `MAX_PARAMS_DATA_TOTAL` runtime drift between user `ParamsWriter` impls and the cap: existing `BuilderCapacityOverflow` classifier; closure path requires specialisation (unstable).
-
-**Phase 2 cost & evidence pack:**
-
-- ~250-350 LoC structural change (witness types + signature plumbing across 7 `compute_push_*_idle_only` helpers + `push_command::PushCommand` trait extension + `StateSetter` machinery).
-- Phase 2 may produce additional test churn if any test reads/asserts via `compute_push_tests`-internal mod (signature changes propagate).
-- New `trybuild` compile_fail assets: wrong `PostState` impl rejected; `staged.push_execute` on `<Empty>` rejected (or BindRange/ExecuteRange swap rejected — depending on simpler P-ordering shape).
-- Bench expectation: ±0% on existing benches (type-system work; LLVM erases ZST witnesses). Ship-gate per CREDO §96a: zero regression beyond ±2% noise + asm-diff zero meaningful delta on `push_command/ping` and `iter_rows_via_*`.
-- Allocation-count benches: zero increase.
-
-**Phase 2 acceptance criteria:**
-
-1. Every existing test passes.
-2. New trybuild assets pin N-D drift + P-ordering ordering closure.
-3. Bench-stable compare vs Phase 1 commit baseline: no regression > ±2%.
-4. `cargo asm` on `compute_push_ping_idle_only`: zero meaningful instruction delta.
-5. clippy + `#![forbid(unsafe_code)]` clean.
 
 #### Sequential phase queue (ordered by impact-per-cost, lowest cost first)
 

@@ -266,6 +266,12 @@ pub mod reply_id;
 // DEF-270 R-rephrased — tier-1 row_desc_slot write provenance.
 // Crate-internal module; no public re-exports.
 pub(crate) mod schema_slot;
+// DEF-270 N-D (Phase 2) — tier-1 state-transition ↔ command-kind
+// pairing. Crate-internal module; no public re-exports. Per-command
+// witness types live in `push_command` alongside the impls; this
+// module owns the `StateSetter<'_, W>` machinery + sealed
+// `PostStateProof` trait.
+pub(crate) mod state_setter;
 pub mod scram;
 // DEF-188: schema_arena module DELETED — RowDesc lives inline in
 // state variants; terminal-reply schema parks into
