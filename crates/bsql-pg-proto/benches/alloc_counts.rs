@@ -56,10 +56,9 @@ extern crate alloc;
 
 use bsql_pg_proto::{
     ident::Sql,
-    reply_id::{PingKind, QueryKind, ReplyId},
+    reply_id::{PingKind, QueryKind},
     PgProtocol, PushFailure, WriteBuf,
 };
-use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -235,9 +234,8 @@ fn build_rowdesc() -> alloc::vec::Vec<u8> {
     out
 }
 
-fn reply_id_ping(raw: u64) -> ReplyId<PingKind> {
-    ReplyId::from_raw(NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN))
-}
+// DEF-270: ReplyId::from_raw is now pub(crate). Benches mint via
+// `proto.next_reply_id::<K>()` directly inside each scenario.
 
 fn bench_push_or_panic<C: bsql_pg_proto::push_command::PushCommand>(
     proto: &mut PgProtocol,
@@ -286,12 +284,14 @@ fn scenario_ping_round_trip() {
     let rfq = rfq_frame();
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
+    // DEF-270: mint reply via the public counter API. Same cost as
+    // the prior `reply_id_ping(1)` helper (single integer counter
+    // bump, no allocation).
+    let reply = proto.next_reply_id::<PingKind>();
     measure("ping_round_trip", || {
         let push_out = bench_push_or_panic(
             &mut proto,
-            bsql_pg_proto::push_command::Ping {
-                reply: reply_id_ping(1),
-            },
+            bsql_pg_proto::push_command::Ping { reply },
             &mut wb,
         );
         let _ = black_box(push_out);
@@ -303,12 +303,11 @@ fn scenario_ping_round_trip() {
 fn scenario_push_command_only() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
+    let reply = proto.next_reply_id::<PingKind>();
     measure("push_command_ping", || {
         let push_out = bench_push_or_panic(
             &mut proto,
-            bsql_pg_proto::push_command::Ping {
-                reply: reply_id_ping(1),
-            },
+            bsql_pg_proto::push_command::Ping { reply },
             &mut wb,
         );
         let _ = black_box(push_out);
@@ -325,11 +324,13 @@ fn scenario_iter_rows_100() {
     let single_row = data_row_frame(16);
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
+    // DEF-270: mint via the public counter API.
+    let reply = proto.next_reply_id::<QueryKind>();
     let push_out = bench_push_or_panic(
         &mut proto,
         bsql_pg_proto::push_command::SimpleQuery {
             sql: Sql::from_str_truncating("SELECT x"),
-            reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+            reply,
         },
         &mut wb,
     );
@@ -369,11 +370,11 @@ fn scenario_advance_one_frame() {
     let rfq = rfq_frame();
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
+    // DEF-270: mint via the public counter API.
+    let reply = proto.next_reply_id::<PingKind>();
     let push_out = bench_push_or_panic(
         &mut proto,
-        bsql_pg_proto::push_command::Ping {
-            reply: reply_id_ping(1),
-        },
+        bsql_pg_proto::push_command::Ping { reply },
         &mut wb,
     );
     let _ = black_box(push_out);

@@ -54,6 +54,134 @@ report → principal review → commit. **NO parallel architect dispatching**
 стабильнее и эффективнее" (principal directive 2026-05-08). v1.0 is
 the right window for breaking churn.
 
+#### DEF-270 — Level D tier-1 hardening cluster (split: Phase 1 ship-ready, Phase 2 follows)
+
+**Principal directive 2026-05-09 (verbatim):** «никогда не допускай того,
+что если там перепутать или забыть что-то, то это риск для памяти,
+утечек, поломок, сбоев и паник — это значит не tier-1, это самое худшее,
+когда "задокументированно, чтобы не забыть" или около того — человеческий
+фактор случится рано или поздно со временем и ростом сложности проекта,
+поэтому надо автономность и устойчивость обеспечить!». Original ambition:
+all five letters one-commit. **Refined plan 2026-05-09 (mid-implementation
+principal call):** split into two atomic commits — **Phase 1 (U +
+R-rephrased) ships now**, **Phase 2 (N-D + P-ordering) follows
+separately**. Rationale: Phase 1 closes 2 high-value glass surfaces
+already; Phase 2's larger structural surgery (signature changes across
+7 `compute_push_*_idle_only` helpers + per-command witness types +
+`StagedActions<Phase>` typestate) gets its own design-validated
+commit. Each phase is atomic; cluster ships in two clean reviewable
+commits rather than one unreviewable one.
+
+**Architect adversarial audit 2026-05-09** (post-DEF-269 v2 ship)
+reshaped principal's original M+P+N+R+U into a tighter glass-free
+cluster: **N-D + P-ordering + U + R-rephrased**. M dropped (perf
+premise dead post-T; per-cmd `const CAP` structurally inexpressible
+for `BindExecute<P>`); P narrowed to frame-ordering only (P-1 + P-2
+already tier-1 via existing `BrandedWriteReserved` + typed builders);
+R rephrased to slot-write witness (variant-move conflicts with
+`ProtoState == 80 B` size pin and DEF-189 per-row-hot-path).
+
+#### DEF-270 Phase 1 (SHIP-READY, 2026-05-09): U + R-rephrased
+
+**Letters in Phase 1:**
+- **U-external** + **U-internal**: `ReplyId::from_raw` demoted to
+  `pub(crate)`; new public mint API
+  `PgProtocol::next_reply_id<K: ReplyKind>(&mut self) -> ReplyId<K>`
+  (static `AtomicU64` saturating-fetch_add — globally unique IDs
+  across all `PgProtocol` instances).
+- **R-rephrased**: `crate::schema_slot` module with `SchemaParkedSlot<'a>`
+  ZST witness + `SchemaWriteAuth` sealed trait + per-host-module auth
+  tags (`AtBindExecuteSelectTransition` / `AtClearSessionResidue` in
+  `mod protocol`; `AtRowDescriptionDispatch` in `mod dispatch`). Each
+  tag's `new()` is `pub(in <host_module>)` — cross-module callers
+  cannot mint another module's tag.
+
+**Implementation footprint:**
+- New module `crates/bsql-pg-proto/src/schema_slot.rs` (~150 LoC).
+- New `pub fn PgProtocol::next_reply_id<K>` + new field
+  static `AtomicU64` mint counter (mod-private inside `next_reply_id`);
+  PgProtocol size pin **preserved at 520 B** — bisect 2026-05-09 proved
+  that an inline `u64` field would grow the struct 520 → 528 B and
+  shift LLVM whole-crate codegen heuristic +6% on the synthetic
+  `column_decode/iter_10cols` decode bench. Static-atomic avoids
+  the size-shift AND strengthens the invariant (globally unique vs
+  per-instance).
+- New auth tags hosted in `mod protocol` (2 tags) + `mod dispatch`
+  (1 tag).
+- `ReplyId::from_raw` visibility demoted; doc updated.
+- 5 internal lib write sites for `row_desc_slot` migrated to
+  witness pattern (3 in dispatch, 2 in protocol).
+- 109 `from_raw` call sites flipped: 79 lib-internal stay on
+  `pub(crate) from_raw` (no test churn); 30 external test/bench
+  sites flipped to `proto.next_reply_id` via `mint_reply` helper
+  in `tests/common/mod.rs`.
+
+**Tier-1 closures delivered:**
+| Surface | Tier delta |
+|---------|-----------|
+| ReplyId external fabrication | tier-3 → **tier-1 by-visibility** (`from_raw` `pub(crate)`; `mem::transmute` blocked by `#![forbid(unsafe_code)]`) |
+| ReplyId cross-instance monotonicity | tier-3 → **tier-2 by atomic-fetch_add** (globally unique across all `PgProtocol` instances + threads; linear-types ceiling for tier-1) |
+| `row_desc_slot` cross-module write provenance | tier-3 → **tier-1 by-construction** (per-module `pub(in ...)` seal on auth tags) |
+| `row_desc_slot` external write | tier-3 → **tier-1 by-visibility** (field private to `mod protocol`) |
+
+**Glass residues remaining post-Phase 1 (closed by Phase 2 or stable-Rust irreducible):**
+- ReplyId duplicate-prevention beyond single-mint: needs linear types (stable-Rust ceiling).
+- `row_desc_slot` in-module write provenance (mod dispatch / mod protocol): tier-2 by-discipline (any function in the host module could mint the tag and write). Phase 2 N-D folds the BindExecute SELECT install into `BindExecutePostInstall` witness — closes that mod-protocol residue. Phase 2 dispatch tightening could narrow the dispatch tag to a sub-module if needed.
+- State-transition ↔ command-kind drift, frame-ordering Bind→Execute→Sync drift: closed in Phase 2 (N-D + P-ordering).
+
+**Acceptance gate (Phase 1):**
+- 417/0/10 tests green (lib + integration + benches compile clean).
+- clippy clean across `--tests --benches`.
+- `#![forbid(unsafe_code)]` preserved.
+- bench-stable comparison vs `b38446d` baseline: no regression > ±2% noise.
+- PgProtocol size pin **preserved at 520 B exact** (mint counter is a static AtomicU64, not a struct field — see U-letter docs for the bisect rationale).
+
+#### DEF-270 Phase 2 (PLANNED, post-Phase-1): N-D + P-ordering
+
+**Letters in Phase 2:**
+
+| Letter | Invariant closed | Mechanism (compile-enforced) | Tier delta |
+|--------|------------------|------------------------------|-----------|
+| **N-D** | State transition ↔ command kind drift | Sealed `StateSetter<W>` is the **only** path to mutate `ProtoState` from `execute()` (raw `&mut ProtoState` held privately inside `push_command_internal`, never handed to `execute`). `set_to_post_state(proof: W)` consumes setter + witness; trait associates `type PostState: PostStateProof` per impl; per-command witness types carry the data the matching state variant requires (e.g. `PingAwaitingRfqInstall { reply: ReplyId<PingKind> }` — no path to install Ping post-state without the Ping reply). Trust/SCRAM/Cleartext/MD5 split surfaces honestly as a sealed enum on `StartupPostInstall`; the kind-payload pairing is structural. | tier-3 → **tier-1 by-construction** |
+| **P-ordering** | Pipelined frame ordering Bind→Execute→Sync drift | Typed `StagedActions<Phase>` typestate (or simpler equivalent: typed `BindRange`/`ExecuteRange` newtypes + `stage_bind_execute_sync(...)` builder fn). Swapping bind/execute = build failure; missing sync = build failure. P-1 (length-includes-self via `with_length_prefix`) and P-2 (typed body writes) remain tier-1 as today; this letter adds the missing ordering closure. | tier-3 → **tier-1 by-construction** |
+
+**Why M was dropped (preserve archeology — applies to whole cluster):**
+
+1. **Perf premise evaporated.** T (DEF-269 v2) already delivered `push_command/ping` **−83.4%** (≈55 ns → 9.08 ns) — 4× better than architect predicted. The 2176-B argument-move cost M was attacking is gone.
+2. **Per-command `const CAP` structurally inexpressible** for `BindExecute<P: ParamsWriter>`. `P` is a runtime-trait generic; `MAX_PARAMS_DATA_TOTAL` is `pub const` but `P` itself does not expose a const upper bound at the trait level. Per-instantiation CAP requires specialisation (unstable).
+3. **Glass risk introduced.** A future contributor adding a new command picks `CAP: 5` (Ping precedent) for a frame that grows to 64 B → runtime stack-overflow / runtime-`SendListFull`. **Tier-4 wrapped in compile syntax** — exactly the "documented to remember" failure mode the principal directive bans.
+4. The `MAX_OWNED_SEND_LEN = 2176` global cap already serves the worst-case bound for all push paths; SendList<global-cap> equals current WriteBuf (no win).
+
+**Why R-as-framed (variant-move) was rejected (R-rephrased shipped in Phase 1):**
+
+1. **`ProtoState == 80 B` size pin breaks.** Currently dominant variant `DescribeStatementAwaitingRfq` = `ReplyId(8) + ParamOids(68) + disc(1) + pad(3) = 80`. Adding 140 B `RowDesc` to 7 schema-bearing variants pushes ProtoState dominant to ≈210-215 B — **2.6× growth** on a hot-path object inlined in `PgProtocol`.
+2. **DEF-189 per-row hot-path regression.** `current_row_desc()` is a single `Option` projection today (~1 ns). Field-in-variant requires a state pattern-match per row (~3-5 ns) — adversely material on 100-row SELECTs (×100 multiplier = 200-400 ns/query).
+3. **Conflicts with N-D StateSetter shape.** Each schema-bearing variant would need a different `PostStateProof::install` signature; the setter type would have to be enum-keyed by "schema-bearing?", inflating the seal.
+
+R-rephrased delivers the same tier closure (write-provenance tier-1) without the size/perf/setter conflicts. SHIPPED in Phase 1.
+
+**Glass residues remaining post-cluster (irreducible in stable safe Rust):**
+
+- ReplyId duplicate-prevention beyond single-mint: needs linear types (stable-Rust ceiling).
+- `mem::transmute` paths to fabricate any sealed type: out of scope; project is `#![forbid(unsafe_code)]` — closed at a different door.
+- `MAX_PARAMS_DATA_TOTAL` runtime drift between user `ParamsWriter` impls and the cap: existing `BuilderCapacityOverflow` classifier; closure path requires specialisation (unstable).
+
+**Phase 2 cost & evidence pack:**
+
+- ~250-350 LoC structural change (witness types + signature plumbing across 7 `compute_push_*_idle_only` helpers + `push_command::PushCommand` trait extension + `StateSetter` machinery).
+- Phase 2 may produce additional test churn if any test reads/asserts via `compute_push_tests`-internal mod (signature changes propagate).
+- New `trybuild` compile_fail assets: wrong `PostState` impl rejected; `staged.push_execute` on `<Empty>` rejected (or BindRange/ExecuteRange swap rejected — depending on simpler P-ordering shape).
+- Bench expectation: ±0% on existing benches (type-system work; LLVM erases ZST witnesses). Ship-gate per CREDO §96a: zero regression beyond ±2% noise + asm-diff zero meaningful delta on `push_command/ping` and `iter_rows_via_*`.
+- Allocation-count benches: zero increase.
+
+**Phase 2 acceptance criteria:**
+
+1. Every existing test passes.
+2. New trybuild assets pin N-D drift + P-ordering ordering closure.
+3. Bench-stable compare vs Phase 1 commit baseline: no regression > ±2%.
+4. `cargo asm` on `compute_push_ping_idle_only`: zero meaningful instruction delta.
+5. clippy + `#![forbid(unsafe_code)]` clean.
+
 #### Sequential phase queue (ordered by impact-per-cost, lowest cost first)
 
 | Pos | DEF | Item | Expected | API impact |

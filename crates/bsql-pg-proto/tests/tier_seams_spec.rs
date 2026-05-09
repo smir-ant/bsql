@@ -38,26 +38,12 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ApplicationName, ConnectionStatus, Credentials, DatabaseName, Ident, IdentError, PgProtocol, ProtoState, ProtocolError, ReplyId, ReplyKind, SessionParams,
+    Action, ApplicationName, ConnectionStatus, Credentials, DatabaseName, Ident, IdentError,
+    PgProtocol, PingKind, ProtoState, ProtocolError, SessionParams, StartupKind,
 };
-use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
-
-fn raw(value: u64) -> NonZeroU64 {
-    // DEF-145: raw(0) is a test bug; assert fires loud.
-    assert!(value > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
-    NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
-}
-
-/// Generic over `K: ReplyKind` so tests can mint either
-/// `ReplyId<PingKind>` or `ReplyId<StartupKind>` with the same
-/// helper. Call site infers K from usage context (e.g. `bsql_pg_proto::push_command::Ping
-/// { reply: id(raw(1)) }` picks `PingKind`).
-fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
-    ReplyId::from_raw(value)
-}
+use common::{PushOrPanic, mint_reply};
 
 // =================================================================
 // S2 — DELETED (DEF-089). The seam no longer exists: `SendBuf` is a
@@ -219,12 +205,10 @@ fn session_params_set_second_value_overwrites() {
 fn errored_cause_is_preserved_in_state_and_reply() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let ping_raw = raw(7777);
+    let (reply, _ping_raw) = mint_reply::<PingKind>(&mut proto);
     // Push ping and feed a FrameTooLarge frame.
     // DEF-212: push_or_panic returns (); bytes live in wb.
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping {
-        reply: id(ping_raw),
-    }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
     // Declared length = 0xDEAD (way above MAX_FRAME_LEN_FIELD=4095).
     let frame = [b'Z', 0x00, 0x00, 0xDE, 0xAD];
     let out = proto.feed_bytes(&frame, &mut wb);
@@ -304,13 +288,14 @@ fn scram_push_startup_carries_scram_session_inline() {
     let Ok(pw) = Password::try_from_bytes(b"pw") else {
         panic!("password construction must succeed");
     };
+    let (reply, _raw) = mint_reply::<StartupKind>(&mut proto);
     proto.push_or_panic(
         bsql_pg_proto::push_command::Startup {
             user,
             database: None,
             app_name: None,
             credentials: Credentials::ScramPassword(Sensitive::new(pw)),
-            reply: id(raw(42)),
+            reply,
         },
         &mut wb,
     );
@@ -337,7 +322,8 @@ fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
     // Drive into Errored(ServerError) via a server ErrorResponse
     // during a pending Ping (distinct kind from the Framing path
     // exercised in the sibling test).
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: id(raw(9001)) }, &mut wb);
+    let (reply, _raw) = mint_reply::<PingKind>(&mut proto);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
     // ErrorResponse frame: tag 'E' + length 5 (just the terminator
     // NUL) — empty body is legal per PG spec (all fields optional).
     let err_frame = [b'E', 0x00, 0x00, 0x00, 0x05, 0x00];
@@ -461,7 +447,7 @@ fn backend_key_data_wrong_payload_size_is_classified() {
     // Set up: drive to ConnectingPostAuthAwaitingKey.
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(9000);
+    let (reply, _startup_raw) = mint_reply::<StartupKind>(&mut proto);
     // Setup: push Startup, feed AuthOk.
     // DEF-212: push_or_panic returns (); bytes live in wb.
     proto.push_or_panic(bsql_pg_proto::push_command::Startup {
@@ -469,7 +455,7 @@ fn backend_key_data_wrong_payload_size_is_classified() {
         database: None,
         app_name: None,
         credentials: Credentials::Trust,
-        reply: id(startup_raw),
+        reply,
     }, &mut wb);
     // Feed AuthOk — now ConnectingPostAuthAwaitingKey.
     let auth_ok_frame: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];

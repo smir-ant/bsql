@@ -44,10 +44,9 @@
 
 use bsql_pg_proto::{
     frame::{parse_header, HeaderParse, READ_BUF_CAP},
-    reply_id::{PingKind, ReplyId},
+    reply_id::PingKind,
     PgProtocol, ProtoState, WriteBuf,
 };
-use core::num::NonZeroU64;
 
 mod common;
 use common::PushOrPanic;
@@ -113,12 +112,8 @@ impl XorShift64 {
 }
 
 // ---------------------------------------------------------------
-// Helpers — reply-id construction + invariant checks.
+// Helpers — invariant checks.
 // ---------------------------------------------------------------
-
-fn ping_id(raw: u64) -> ReplyId<PingKind> {
-    ReplyId::from_raw(NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN))
-}
 
 /// Returns true if `state` is a recognised `ProtoState` variant
 /// in a valid shape. Used to verify no torn/invalid state after
@@ -285,10 +280,11 @@ fn push_ping_then_feed_random_bytes_terminates() {
         let mut wb = WriteBuf::new();
         // Push Ping first — state transitions to PingAwaitingRfq.
         // DEF-212: bytes live in wb; helper returns ().
+        // DEF-270: mint via proto.next_reply_id (fuzz aspect is the
+        // input bytes, not the reply IDs).
+        let reply = proto.next_reply_id::<PingKind>();
         proto.push_or_panic(
-            bsql_pg_proto::push_command::Ping {
-                reply: ping_id(u64::try_from(i.saturating_add(1)).unwrap_or(1)),
-            },
+            bsql_pg_proto::push_command::Ping { reply },
             &mut wb,
         );
         assert!(

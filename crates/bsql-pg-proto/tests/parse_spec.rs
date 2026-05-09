@@ -24,20 +24,9 @@ use bsql_pg_proto::{
     ReplyId, Sql, StmtName, WriteBuf,
     wire::{TAG_ERROR_RESPONSE, TAG_PARSE, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY},
 };
-use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
-
-fn raw(v: u64) -> NonZeroU64 {
-    // DEF-145: raw(0) is a test bug; assert fires loud.
-    assert!(v > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
-    NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
-}
-
-fn id(v: NonZeroU64) -> ReplyId<ParseKind> {
-    ReplyId::from_raw(v)
-}
+use common::{PushOrPanic, mint_reply};
 
 fn sql(s: &str) -> Sql {
     Sql::from_str_truncating(s)
@@ -144,8 +133,8 @@ fn parse_setup(
 fn parse_success_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(100);
-    parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", id(reply_raw), &mut wb);
+    let (reply, reply_raw) = mint_reply::<ParseKind>(&mut proto);
+    parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", reply, &mut wb);
 
     assert!(matches!(
         proto.state(),
@@ -179,8 +168,8 @@ fn parse_success_end_to_end() {
 fn parse_error_is_recoverable() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(200);
-    parse_setup(&mut proto, stmt_unnamed(), "SELECT 1/0", id(reply_raw), &mut wb);
+    let (reply, reply_raw) = mint_reply::<ParseKind>(&mut proto);
+    parse_setup(&mut proto, stmt_unnamed(), "SELECT 1/0", reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&error_response_frame(b"division by zero"));
@@ -219,11 +208,11 @@ fn parse_error_is_recoverable() {
 fn parse_frame_wire_format_with_named_statement() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(300);
+    let (reply, _reply_raw) = mint_reply::<ParseKind>(&mut proto);
     let Ok(name) = StmtName::try_from_str("my_stmt") else {
         panic!("fixture: valid stmt name");
     };
-    let p_bytes = parse_setup(&mut proto, name, "SELECT 1", id(reply_raw), &mut wb);
+    let p_bytes = parse_setup(&mut proto, name, "SELECT 1", reply, &mut wb);
 
     // Layout check:
     //   byte 0: 'P'
@@ -274,8 +263,8 @@ fn parse_frame_wire_format_with_named_statement() {
 fn def198_parse_while_parse_in_flight_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let first_raw = raw(400);
-    parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", id(first_raw), &mut wb);
+    let (first_reply, _first_raw) = mint_reply::<ParseKind>(&mut proto);
+    parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", first_reply, &mut wb);
 
     // DEF-198: state is `ParseAwaitingParseComplete`. The public API
     // (`as_ready`) returns `None` — caller cannot acquire a guard,
@@ -354,8 +343,8 @@ fn def198_parse_on_errored_blocked_at_compile_time() {
 fn parse_unexpected_frame_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(600);
-    parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<ParseKind>(&mut proto);
+    parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", reply, &mut wb);
 
     // DataRow ('D') in ParseAwaitingParseComplete is out-of-spec.
     let bad = frame(b'D', &[0, 0]);

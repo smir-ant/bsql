@@ -44,26 +44,12 @@
 
 use bsql_pg_proto::{
     Action, ConnectionStatus, Credentials, Ident, PgProtocol, PingKind, ProtoState,
-    QueryKind, ReplyId, Sql, WriteBuf,
+    QueryKind, Sql, StartupKind, WriteBuf,
     wire::TAG_READY_FOR_QUERY,
 };
-use core::num::NonZeroU64;
 
 mod common;
 use common::PushOrPanic;
-
-fn nz(v: u64) -> NonZeroU64 {
-    assert!(v > 0, "nz(0) is a test bug");
-    NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
-}
-
-fn ping_id(v: u64) -> ReplyId<PingKind> {
-    ReplyId::from_raw(nz(v))
-}
-
-fn query_id(v: u64) -> ReplyId<QueryKind> {
-    ReplyId::from_raw(nz(v))
-}
 
 fn ident(s: &str) -> Ident {
     match Ident::try_from_str(s) {
@@ -100,7 +86,8 @@ fn def198_idle_after_drain_yields_ready_guard() {
     let mut wb = WriteBuf::new();
 
     // Push + drain Ping; final state should be Idle.
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(1) }, &mut wb);
+    let reply = proto.next_reply_id::<PingKind>();
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
     let rfq = [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 5, b'I'];
     let _ = proto.feed_bytes(&rfq, &mut wb);
 
@@ -124,7 +111,8 @@ fn def198_ping_awaiting_classifies_busy() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(1) }, &mut wb);
+    let reply = proto.next_reply_id::<PingKind>();
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
 
     assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
     assert!(
@@ -151,10 +139,11 @@ fn def198_simple_query_awaiting_classifies_busy() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
+    let reply = proto.next_reply_id::<QueryKind>();
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery {
             sql: Sql::from_str_truncating("SELECT 1"),
-            reply: query_id(1),
+            reply,
         },
         &mut wb,
     );
@@ -194,13 +183,14 @@ fn def198_connecting_startup_classifies_handshaking() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
+    let reply = proto.next_reply_id::<StartupKind>();
     proto.push_or_panic(
         bsql_pg_proto::push_command::Startup {
             user: ident("testuser"),
             database: None,
             app_name: None,
             credentials: Credentials::Trust,
-            reply: ReplyId::from_raw(nz(1)),
+            reply,
         },
         &mut wb,
     );
@@ -275,6 +265,10 @@ fn def198_ready_guard_consumes_on_push() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
+    // Mint reply BEFORE acquiring the guard. The guard borrows proto
+    // mutably, so we cannot call proto.next_reply_id() while holding
+    // the guard — extract first.
+    let reply = proto.next_reply_id::<PingKind>();
     // Acquire guard, push (consumes), state transitions to non-Idle.
     if let Some(guard) = proto.as_ready() {
         // DEF-212: explicit Ok arm — Ping push from Idle is
@@ -284,7 +278,7 @@ fn def198_ready_guard_consumes_on_push() {
         // by handling both arms; pre-(212) `let _out = ...` was a
         // bind-to-named-underscore which avoided the lint but left
         // failures silently unobserved at the test layer.
-        match guard.push_command(bsql_pg_proto::push_command::Ping { reply: ping_id(1) }, &mut wb) {
+        match guard.push_command(bsql_pg_proto::push_command::Ping { reply }, &mut wb) {
             Ok(()) => {}
             Err(failure) => panic!(
                 "Ping push from Idle must succeed (architecturally infallible); \

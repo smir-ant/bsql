@@ -39,13 +39,13 @@
 
 use bsql_pg_proto::{
     Action, ConnectionStatus, PgProtocol, PingKind, ProtoState, ProtocolError, Reply,
-    ReplyId, ReplyKind,
+    ReplyId,
     wire::{TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
 };
 use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
+use common::{PushOrPanic, mint_reply};
 
 /// Build a legal `ReadyForQuery` frame: tag `'Z'`, length 5 (self + 1
 /// payload byte), one byte of tx-status.
@@ -59,30 +59,6 @@ fn rfq_frame(tx_status: u8) -> [u8; 6] {
 /// terminator byte so the length is the minimum 5.
 fn error_frame() -> [u8; 6] {
     [TAG_ERROR_RESPONSE.byte(), 0, 0, 0, 5, b'\0']
-}
-
-/// Non-zero correlator value — the raw counter the wrapper would mint.
-///
-/// Tests keep the raw `NonZeroU64` on the side and compare against it
-/// via [`ReplyId::get`]; the `ReplyId` itself is move-only by design
-/// (non-`Copy`, non-`Clone` — see [`ReplyId`] docstring), so a test
-/// cannot hold a reference to it *and* pass it into a command at the
-/// same time.
-fn raw(value: u64) -> NonZeroU64 {
-    // DEF-145: raw(0) is a test bug — tests pass 1..= never 0.
-    // Assert fires loud; `unwrap_or(MIN)` keeps forbid-bundle happy
-    // on the assertion-proved dead branch.
-    assert!(value > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
-    NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
-}
-
-/// A distinguishable `ReplyId` for a single-command test, minted from a
-/// raw counter value. Consumes the raw so the caller also remembers the
-/// value on the side if they need to assert the round-trip.
-/// Generic over `K: ReplyKind` — call-site infers the kind from the
-/// command. Most ping_spec callers pass Ping commands, so K ≈ PingKind.
-fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
-    ReplyId::from_raw(value)
 }
 
 /// Assert the state is `PingAwaitingRfq` carrying the given raw value.
@@ -176,8 +152,8 @@ fn ping_from_idle_emits_sync_bytes() {
     let mut wb = bsql_pg_proto::WriteBuf::new();
     assert!(matches!(proto.state(), ProtoState::Idle));
 
-    let ping_raw = raw(1);
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: id(ping_raw) }, &mut wb);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
 
     // DEF-212: bytes live in wb. F33 anti-tautology: assert literal PG
     // Sync wire layout (tag 'S' + BE u32 length=4), not the internal
@@ -202,8 +178,8 @@ fn ping_from_idle_emits_sync_bytes() {
 fn rfq_delivers_pong_and_returns_to_idle() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let ping_raw = raw(42);
-    ping_setup(&mut proto, id(ping_raw), &mut wb);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
 
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
@@ -239,7 +215,8 @@ fn rfq_delivers_pong_and_returns_to_idle() {
 fn partial_rfq_feeds_are_buffered_until_complete() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    ping_setup(&mut proto, id(raw(7)), &mut wb);
+    let (reply, _raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
     let frame = rfq_frame(b'I');
 
     // Feed the header one byte at a time, then the payload.
@@ -295,8 +272,8 @@ fn rfq_in_idle_is_unexpected_frame() {
 fn error_response_fails_the_in_flight_ping() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let ping_raw = raw(5);
-    ping_setup(&mut proto, id(ping_raw), &mut wb);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
 
     let out = proto.feed_bytes(&error_frame(), &mut wb);
 
@@ -326,8 +303,8 @@ fn error_response_fails_the_in_flight_ping() {
 fn malformed_length_fails_and_closes() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let ping_raw = raw(9);
-    ping_setup(&mut proto, id(ping_raw), &mut wb);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
 
     // Tag 'Z', length field = 3 (illegal: min is 4).
     let frame = [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 3, b'I'];
@@ -375,8 +352,8 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
 
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let ping_raw = raw(333);
-    ping_setup(&mut proto, id(ping_raw), &mut wb);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
 
     // Feed a chunk one byte larger than READ_BUF_CAP. `append` rejects
     // with `ReadBufFull { attempted: CAP+1, available: CAP }`.
@@ -436,8 +413,8 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
 fn frame_too_large_is_rejected_pre_buffer() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let ping_raw = raw(11);
-    ping_setup(&mut proto, id(ping_raw), &mut wb);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
 
     // Tag 'Z', length field = u32::MAX (obviously > MAX_FRAME_LEN_FIELD).
     // Only the 5-byte header is fed; the body is never sent.
@@ -476,8 +453,8 @@ fn frame_too_large_is_rejected_pre_buffer() {
 fn def198_pipelined_ping_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let first_raw = raw(1);
-    ping_setup(&mut proto, id(first_raw), &mut wb);
+    let (first_reply, first_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, first_reply, &mut wb);
 
     // DEF-198: state is PingAwaitingRfq. Public API blocks second push.
     assert!(
@@ -532,8 +509,8 @@ fn rfq_with_non_single_byte_payload_is_rejected() {
     for payload_len in [0_usize, 2, 3, 10] {
         let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-        let ping_raw = raw(100);
-        ping_setup(&mut proto, id(ping_raw), &mut wb);
+        let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+        ping_setup(&mut proto, reply, &mut wb);
 
         let frame = build_rfq_frame_with_payload_len(payload_len);
         let out = proto.feed_bytes(&frame, &mut wb);
@@ -577,8 +554,8 @@ fn rfq_with_invalid_tx_status_byte_is_rejected() {
     for bad in [b'X', b'\0', b'i', b't', b'e', 0xFF] {
         let mut proto = PgProtocol::new();
         let mut wb = bsql_pg_proto::WriteBuf::new();
-        let ping_raw = raw(300);
-        ping_setup(&mut proto, id(ping_raw), &mut wb);
+        let (reply, _ping_raw) = mint_reply::<PingKind>(&mut proto);
+        ping_setup(&mut proto, reply, &mut wb);
 
         let out = proto.feed_bytes(&rfq_frame(bad), &mut wb);
         let actions = out.as_slice();
@@ -613,8 +590,8 @@ fn rfq_with_invalid_tx_status_byte_is_rejected() {
 fn errored_state_is_terminal_and_drops_subsequent_frames() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let ping_raw = raw(100);
-    ping_setup(&mut proto, id(ping_raw), &mut wb);
+    let (reply, _ping_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
 
     // Drive into Errored via an ErrorResponse — `ServerError` cause.
     let err_out = proto.feed_bytes(&error_frame(), &mut wb);
@@ -673,8 +650,8 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
 fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let first_raw = raw(50);
-    ping_setup(&mut proto, id(first_raw), &mut wb);
+    let (first_reply, _first_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, first_reply, &mut wb);
 
     // Drive into Errored via ErrorResponse.
     let err_out = proto.feed_bytes(&error_frame(), &mut wb);
@@ -726,8 +703,8 @@ fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
 fn notice_response_mid_flight_is_silently_consumed() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let ping_raw = raw(7001);
-    ping_setup(&mut proto, id(ping_raw), &mut wb);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
 
     // Build a NoticeResponse frame: tag 'N', minimal body with a
     // single field (`M` = message) then terminator. Body: 'M' +

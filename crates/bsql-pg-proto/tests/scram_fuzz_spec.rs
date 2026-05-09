@@ -31,7 +31,6 @@ use bsql_pg_proto::{
     password::{Credentials, Password},
     sensitive::Sensitive,
 };
-use core::num::NonZeroU64;
 
 mod common;
 use common::PushOrPanic;
@@ -84,14 +83,15 @@ impl XorShift64 {
 // Drive PgProtocol into ConnectingStartupScram via a canonical
 // push_startup call. Returns (proto, wb) ready to receive
 // AUTHENTICATION frames.
-fn init_scram_protocol(seed: u64) -> Option<(PgProtocol, WriteBuf)> {
+fn init_scram_protocol(_seed: u64) -> Option<(PgProtocol, WriteBuf)> {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let user = Ident::try_from_str("fuzz_user").ok()?;
     let pw = Password::try_from_bytes(b"fuzz_password").ok()?;
-    let reply = bsql_pg_proto::reply_id::ReplyId::from_raw(
-        NonZeroU64::new(seed.max(1)).unwrap_or(NonZeroU64::MIN),
-    );
+    // DEF-270 (U): protocol mints reply ids; seed parameter retained
+    // for call-shape compat but no longer used (counter starts fresh
+    // per `PgProtocol::new()`).
+    let reply = proto.next_reply_id::<bsql_pg_proto::reply_id::StartupKind>();
     proto.push_or_panic(
         bsql_pg_proto::push_command::Startup {
             user,

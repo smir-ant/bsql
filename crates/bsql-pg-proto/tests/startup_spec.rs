@@ -23,27 +23,13 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, Credentials, Ident, PgProtocol, Password, ProtoState,
-    ProtocolError, Reply, ReplyId, ReplyKind, Sensitive,
+    Action, ConnectionStatus, Credentials, Ident, PgProtocol, Password, PingKind, ProtoState,
+    ProtocolError, Reply, Sensitive, StartupKind,
 };
 use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
-
-fn raw(value: u64) -> NonZeroU64 {
-    // DEF-145: raw(0) is a test bug; assert fires loud.
-    assert!(value > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
-    NonZeroU64::new(value).unwrap_or(NonZeroU64::MIN)
-}
-
-/// Generic over `K: ReplyKind` — call-site infers the kind from the
-/// command being constructed (e.g. `bsql_pg_proto::push_command::Startup { reply:
-/// id(...) }` selects `StartupKind`; `bsql_pg_proto::push_command::Ping { reply:
-/// id(...) }` selects `PingKind`).
-fn id<K: ReplyKind>(value: NonZeroU64) -> ReplyId<K> {
-    ReplyId::from_raw(value)
-}
+use common::{PushOrPanic, mint_reply};
 
 /// Build an AuthenticationOk frame: tag 'R', length 8, sub-code 0.
 fn auth_ok_frame() -> [u8; 9] {
@@ -164,17 +150,18 @@ fn negotiate_proto_version_frame() -> Vec<u8> {
 }
 
 /// Push a Startup command (trust auth). DEF-212: bytes go to wb.
+/// DEF-270: returns the minted raw ID so callers can assert on round-trip.
 fn startup_trust(
     proto: &mut PgProtocol,
     wb: &mut bsql_pg_proto::WriteBuf,
     user: &str,
     db: Option<&str>,
-    reply_raw: NonZeroU64,
-) {
+) -> NonZeroU64 {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let database = db.map(|d| {
         bsql_pg_proto::DatabaseName::try_from_str(d).unwrap_or_else(|e| panic!("bad db: {e}"))
     });
+    let (reply, reply_raw) = mint_reply::<StartupKind>(proto);
     // DEF-212 (Alt Y'): push_or_panic returns (); bytes live in wb.
     // Caller drains via `wb.as_bytes()` for wire-layout assertions.
     proto.push_or_panic(bsql_pg_proto::push_command::Startup {
@@ -182,8 +169,9 @@ fn startup_trust(
         database,
         app_name: None,
         credentials: Credentials::Trust,
-        reply: id(reply_raw),
+        reply,
     }, wb);
+    reply_raw
 }
 
 // ------------------------------------------------------------------
@@ -197,10 +185,9 @@ fn startup_trust(
 fn trust_auth_handshake_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(1);
 
     // Push Startup (trust). DEF-212: bytes live in wb post-Ok.
-    startup_trust(&mut proto, &mut wb, "testuser", Some("testdb"), startup_raw);
+    let startup_raw = startup_trust(&mut proto, &mut wb, "testuser", Some("testdb"));
     {
         // Scope the `&wb` borrow so subsequent feed_bytes calls can
         // re-borrow `&mut wb` after the inspection.
@@ -285,8 +272,7 @@ fn trust_auth_handshake_end_to_end() {
 fn error_response_during_startup_is_classified() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(2);
-    startup_trust(&mut proto, &mut wb, "baduser", None, startup_raw);
+    let startup_raw = startup_trust(&mut proto, &mut wb, "baduser", None);
 
     let err_frame = error_response_frame("FATAL", "28P01", "password authentication failed");
     let out = proto.feed_bytes(&err_frame, &mut wb);
@@ -337,8 +323,7 @@ fn error_response_during_startup_is_classified() {
 fn negotiate_protocol_version_during_startup() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(3);
-    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
+    let startup_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
 
     let out = proto.feed_bytes(&negotiate_proto_version_frame(), &mut wb);
 
@@ -361,8 +346,7 @@ fn negotiate_protocol_version_during_startup() {
 fn unknown_auth_subcode_is_rejected() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(4);
-    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
+    let _startup_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
 
     // Build an Authentication frame with sub-code 99 (unknown).
     let frame = [b'R', 0, 0, 0, 8, 0, 0, 0, 99];
@@ -399,9 +383,8 @@ fn unknown_auth_subcode_is_rejected() {
 fn def198_pipelined_startup_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let first_raw = raw(10);
 
-    startup_trust(&mut proto, &mut wb, "testuser", None, first_raw);
+    let _first_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
 
     assert!(
         proto.as_ready().is_none(),
@@ -429,8 +412,7 @@ fn def198_pipelined_startup_blocked_at_compile_time() {
 fn def198_startup_on_errored_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let first_raw = raw(20);
-    startup_trust(&mut proto, &mut wb, "testuser", None, first_raw);
+    let _first_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
 
     // Drive into Errored via ErrorResponse.
     let err = error_response_frame("FATAL", "28000", "auth failed");
@@ -525,8 +507,7 @@ fn password_validation() {
 fn startup_message_wire_format() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(100);
-    startup_trust(&mut proto, &mut wb, "alice", Some("mydb"), startup_raw);
+    let _startup_raw = startup_trust(&mut proto, &mut wb, "alice", Some("mydb"));
 
     // DEF-212: bytes live in wb. Scope the borrow so subsequent
     // feed_bytes calls reacquire &mut wb cleanly.
@@ -604,8 +585,7 @@ fn contains_nul_terminated_pair(data: &[u8], key: &[u8], value: &[u8]) -> bool {
 fn connecting_states_become_errored_on_bad_frame() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(200);
-    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
+    let _startup_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
 
     // Feed a completely unexpected frame tag during ConnectingStartup.
     let garbage_frame = [b'X', 0, 0, 0, 4]; // tag X, minimal legal length
@@ -633,23 +613,25 @@ fn connecting_states_become_errored_on_bad_frame() {
 // ------------------------------------------------------------------
 
 /// Helper: push Startup with SCRAM password credentials. DEF-212: bytes go to wb.
+/// DEF-270: returns the minted raw ID so callers can assert on round-trip.
 fn startup_scram(
     proto: &mut PgProtocol,
     wb: &mut bsql_pg_proto::WriteBuf,
     user: &str,
     password: &str,
-    reply_raw: NonZeroU64,
-) {
+) -> NonZeroU64 {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
+    let (reply, reply_raw) = mint_reply::<StartupKind>(proto);
     // DEF-212 (Alt Y'): push_or_panic returns (); bytes live in wb.
     proto.push_or_panic(bsql_pg_proto::push_command::Startup {
         user: user_ident,
         database: None,
         app_name: None,
         credentials: Credentials::ScramPassword(Sensitive::new(pw)),
-        reply: id(reply_raw),
+        reply,
     }, wb);
+    reply_raw
 }
 
 /// Extract the client-first-message from a SASLInitialResponse frame.
@@ -702,11 +684,10 @@ fn scram_sha256_handshake_end_to_end() {
 
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(300);
-    let password = "pencil";
+        let password = "pencil";
 
     // Step 1: Push Startup with SCRAM password.
-    startup_scram(&mut proto, &mut wb, "user", password, startup_raw);
+    let startup_raw = startup_scram(&mut proto, &mut wb, "user", password);
     // DEF-212: bytes live in wb. StartupMessage has no tag byte;
     // protocol version 3.0 (196608 = 0x00030000) occupies bytes [4..8]
     // after the 4-byte length prefix.
@@ -849,10 +830,9 @@ fn scram_sha256_handshake_end_to_end() {
 fn scram_signature_mismatch_is_rejected() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(400);
-
+    
     // Start SCRAM handshake.
-    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let _startup_raw = startup_scram(&mut proto, &mut wb, "user", "pencil");
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
         [Action::SendBytes(send_buf)] => send_buf.to_vec(),
@@ -900,9 +880,8 @@ fn scram_signature_mismatch_is_rejected() {
 fn scram_iterations_too_low_is_rejected() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(500);
 
-    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let _startup_raw = startup_scram(&mut proto, &mut wb, "user", "pencil");
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
         [Action::SendBytes(send_buf)] => send_buf.to_vec(),
@@ -944,9 +923,8 @@ fn scram_iterations_above_cap_is_rejected() {
 
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(550);
-
-    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    
+    let _startup_raw = startup_scram(&mut proto, &mut wb, "user", "pencil");
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
         [Action::SendBytes(send_buf)] => send_buf.to_vec(),
@@ -989,9 +967,8 @@ fn scram_iterations_above_cap_is_rejected() {
 fn scram_server_error_preserves_diagnostic_message() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(700);
 
-    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let _startup_raw = startup_scram(&mut proto, &mut wb, "user", "pencil");
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     let sasl_initial_bytes: Vec<u8> = match out.as_slice() {
         [Action::SendBytes(send_buf)] => send_buf.to_vec(),
@@ -1042,9 +1019,8 @@ fn scram_server_error_preserves_diagnostic_message() {
 fn scram_nonce_prefix_mismatch_is_rejected() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(600);
 
-    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let _startup_raw = startup_scram(&mut proto, &mut wb, "user", "pencil");
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     assert_eq!(out.len(), 1);
 
@@ -1148,8 +1124,7 @@ fn credentials_debug_does_not_leak_password() {
 fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(100);
-    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
+    let _startup_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
 
     // Complete startup: AuthOk → BackendKeyData → RFQ → Idle.
     // Setup frames' actions are discarded explicitly (`drop`) rather
@@ -1197,8 +1172,7 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
 fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(200);
-    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
+    let _startup_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
     // Explicit `drop` (see preceding test for rationale).
     _ = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     _ = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
@@ -1213,8 +1187,8 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     // (which we do above), they see leftover handshake bytes in
     // wb until the next push wipes it. The helper test below
     // verifies the post-Ping wb contents are exactly Sync.
-    let ping_raw = raw(201);
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: id(ping_raw) }, &mut wb);
+    let (ping_reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_reply }, &mut wb);
     {
         // F33: literal PG Sync wire layout — avoids tautology with
         // internal SYNC_WIRE_BYTES const (both sourced from same symbol
@@ -1277,8 +1251,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
 fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(901);
-    startup_scram(&mut proto, &mut wb, "user", "pencil", startup_raw);
+    let startup_raw = startup_scram(&mut proto, &mut wb, "user", "pencil");
     // Server offers SASL → we emit SASLInitialResponse → state is now
     // ConnectingScramAwaitingServerFirst. Setup frame's actions discarded
     // explicitly — `let _ = ...` is banned.
@@ -1317,8 +1290,7 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
 fn param_status_during_pre_auth_is_unexpected() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(300);
-    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
+    let startup_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
     // State is now ConnectingStartup. Server should send
     // AuthenticationOk / SASL / ErrorResponse — not ParameterStatus.
     let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"), &mut wb);
@@ -1353,8 +1325,7 @@ fn param_status_during_pre_auth_is_unexpected() {
 fn param_status_missing_trailing_nul_classified_as_malformed() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(400);
-    startup_trust(&mut proto, &mut wb, "testuser", None, startup_raw);
+    let _startup_raw = startup_trust(&mut proto, &mut wb, "testuser", None);
 
     // Complete handshake: AuthOk → BackendKeyData → RFQ → Idle.
     let _ = proto.feed_bytes(&auth_ok_frame(), &mut wb);
@@ -1406,25 +1377,27 @@ fn auth_cleartext_password_frame() -> [u8; 9] {
 }
 
 /// Helper: push Startup with cleartext password credentials.
+/// DEF-270: returns the minted raw ID so callers can assert on round-trip.
 fn startup_cleartext(
     proto: &mut PgProtocol,
     wb: &mut bsql_pg_proto::WriteBuf,
     user: &str,
     password: &str,
-    reply_raw: NonZeroU64,
-) {
+) -> NonZeroU64 {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
+    let (reply, reply_raw) = mint_reply::<StartupKind>(proto);
     proto.push_or_panic(
         bsql_pg_proto::push_command::Startup {
             user: user_ident,
             database: None,
             app_name: None,
             credentials: Credentials::CleartextPassword(Sensitive::new(pw)),
-            reply: id(reply_raw),
+            reply,
         },
         wb,
     );
+    reply_raw
 }
 
 /// Spec conformance: full cleartext-auth handshake. StartupMessage
@@ -1435,11 +1408,10 @@ fn startup_cleartext(
 fn cleartext_auth_handshake_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(500);
-    let password = "secret123";
+        let password = "secret123";
 
     // Step 1: push StartupMessage with cleartext credentials.
-    startup_cleartext(&mut proto, &mut wb, "alice", password, startup_raw);
+    let startup_raw = startup_cleartext(&mut proto, &mut wb, "alice", password);
     assert!(matches!(
         proto.state(),
         ProtoState::ConnectingStartupCleartext { .. }
@@ -1549,8 +1521,7 @@ fn cleartext_auth_handshake_end_to_end() {
 fn error_response_during_cleartext_startup() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(501);
-    startup_cleartext(&mut proto, &mut wb, "baduser", "wrong", startup_raw);
+    let startup_raw = startup_cleartext(&mut proto, &mut wb, "baduser", "wrong");
     wb.clear();
 
     let err_frame = error_response_frame("FATAL", "28P01", "password authentication failed");
@@ -1578,8 +1549,7 @@ fn error_response_during_cleartext_startup() {
 fn cleartext_startup_rejects_sasl_offer() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(502);
-    startup_cleartext(&mut proto, &mut wb, "alice", "password", startup_raw);
+    let startup_raw = startup_cleartext(&mut proto, &mut wb, "alice", "password");
     wb.clear();
 
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
@@ -1640,25 +1610,27 @@ fn auth_md5_password_frame(salt: [u8; 4]) -> [u8; 13] {
 }
 
 /// Helper: push Startup with MD5 password credentials.
+/// DEF-270: returns the minted raw ID so callers can assert on round-trip.
 fn startup_md5(
     proto: &mut PgProtocol,
     wb: &mut bsql_pg_proto::WriteBuf,
     user: &str,
     password: &str,
-    reply_raw: NonZeroU64,
-) {
+) -> NonZeroU64 {
     let user_ident = Ident::try_from_str(user).unwrap_or_else(|e| panic!("bad user: {e}"));
     let pw = Password::try_from_str(password).unwrap_or_else(|e| panic!("bad pw: {e}"));
+    let (reply, reply_raw) = mint_reply::<StartupKind>(proto);
     proto.push_or_panic(
         bsql_pg_proto::push_command::Startup {
             user: user_ident,
             database: None,
             app_name: None,
             credentials: Credentials::Md5Password(Sensitive::new(pw)),
-            reply: id(reply_raw),
+            reply,
         },
         wb,
     );
+    reply_raw
 }
 
 /// Compute the expected MD5 password response body using the
@@ -1743,8 +1715,7 @@ fn expected_md5_response_body(password: &[u8], username: &[u8], salt: [u8; 4]) -
 fn md5_auth_kat_secret_alice_deadbeef() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(800);
-    startup_md5(&mut proto, &mut wb, "alice", "secret", startup_raw);
+    let _startup_raw = startup_md5(&mut proto, &mut wb, "alice", "secret");
     wb.clear();
 
     let salt: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
@@ -1788,8 +1759,7 @@ fn md5_auth_kat_secret_alice_deadbeef() {
 fn md5_auth_kat_mypassword_alice_seq_salt() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(801);
-    startup_md5(&mut proto, &mut wb, "alice", "mypassword", startup_raw);
+    let _startup_raw = startup_md5(&mut proto, &mut wb, "alice", "mypassword");
     wb.clear();
 
     let salt: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
@@ -1815,12 +1785,11 @@ fn md5_auth_kat_mypassword_alice_seq_salt() {
 fn md5_auth_handshake_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(600);
-    let password = "secret";
+        let password = "secret";
     let user = "alice";
     let salt: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];
 
-    startup_md5(&mut proto, &mut wb, user, password, startup_raw);
+    let startup_raw = startup_md5(&mut proto, &mut wb, user, password);
     assert!(matches!(
         proto.state(),
         ProtoState::ConnectingStartupMd5 { .. }
@@ -1914,8 +1883,7 @@ fn md5_auth_handshake_end_to_end() {
 fn md5_auth_rejects_wrong_salt_length() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(601);
-    startup_md5(&mut proto, &mut wb, "alice", "secret", startup_raw);
+    let startup_raw = startup_md5(&mut proto, &mut wb, "alice", "secret");
     wb.clear();
 
     // Build a malformed AuthMD5Password with only 3 salt bytes
@@ -1950,8 +1918,7 @@ fn md5_auth_rejects_wrong_salt_length() {
 fn md5_startup_rejects_cleartext_offer() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let startup_raw = raw(602);
-    startup_md5(&mut proto, &mut wb, "alice", "password", startup_raw);
+    let startup_raw = startup_md5(&mut proto, &mut wb, "alice", "password");
     wb.clear();
 
     // AuthCleartextPassword frame: tag 'R', length 8, sub-code 3.
@@ -2075,8 +2042,7 @@ fn md5_startup_rejects_auth_ok_subcode() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(700);
-    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_md5(&mut proto, &mut wb, "u", "p");
     wb.clear();
     assert_known_but_wrong(&mut proto, &mut wb, auth_subcode_only_frame(0), raw_id, AuthSubCode::Ok);
 }
@@ -2086,8 +2052,7 @@ fn md5_startup_rejects_auth_sasl_continue_subcode() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(701);
-    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_md5(&mut proto, &mut wb, "u", "p");
     wb.clear();
     assert_known_but_wrong(&mut proto, &mut wb, auth_subcode_only_frame(11), raw_id, AuthSubCode::SaslContinue);
 }
@@ -2097,8 +2062,7 @@ fn md5_startup_rejects_auth_sasl_final_subcode() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(702);
-    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_md5(&mut proto, &mut wb, "u", "p");
     wb.clear();
     assert_known_but_wrong(&mut proto, &mut wb, auth_subcode_only_frame(12), raw_id, AuthSubCode::SaslFinal);
 }
@@ -2107,8 +2071,7 @@ fn md5_startup_rejects_auth_sasl_final_subcode() {
 fn md5_startup_rejects_unknown_subcode() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(703);
-    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_md5(&mut proto, &mut wb, "u", "p");
     wb.clear();
 
     let frame = auth_subcode_only_frame(99);
@@ -2140,12 +2103,12 @@ fn md5_startup_rejects_unknown_subcode() {
 
 /// Helper: drive proto to MD5AwaitingAuthOk state with valid
 /// MD5 challenge + response.
+/// DEF-270: returns the minted raw ID so callers can assert on round-trip.
 fn drive_to_md5_awaiting_authok(
     proto: &mut PgProtocol,
     wb: &mut bsql_pg_proto::WriteBuf,
-    raw_id: NonZeroU64,
-) {
-    startup_md5(proto, wb, "user", "password", raw_id);
+) -> NonZeroU64 {
+    let raw_id = startup_md5(proto, wb, "user", "password");
     wb.clear();
     let _ = proto.feed_bytes(&auth_md5_password_frame([1, 2, 3, 4]), wb);
     assert!(
@@ -2153,14 +2116,14 @@ fn drive_to_md5_awaiting_authok(
         "test setup invariant",
     );
     wb.clear();
+    raw_id
 }
 
 #[test]
 fn md5_awaiting_authok_accepts_auth_ok() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(710);
-    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let _raw_id = drive_to_md5_awaiting_authok(&mut proto, &mut wb);
 
     let out = proto.feed_bytes(&auth_ok_frame(), &mut wb);
     assert_eq!(out.len(), 0, "AuthOk → silent state transition");
@@ -2174,8 +2137,7 @@ fn md5_awaiting_authok_accepts_auth_ok() {
 fn md5_awaiting_authok_rejects_cleartext_subcode() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(711);
-    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let raw_id = drive_to_md5_awaiting_authok(&mut proto, &mut wb);
     // After password sent, server replying with another auth
     // request (cleartext sub-code) is a protocol violation.
     assert_unexpected_frame(&mut proto, &mut wb, auth_subcode_only_frame(3), raw_id, b'R');
@@ -2185,8 +2147,7 @@ fn md5_awaiting_authok_rejects_cleartext_subcode() {
 fn md5_awaiting_authok_rejects_md5_subcode() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(712);
-    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let raw_id = drive_to_md5_awaiting_authok(&mut proto, &mut wb);
     assert_unexpected_frame(&mut proto, &mut wb, auth_md5_password_frame([0; 4]), raw_id, b'R');
 }
 
@@ -2194,8 +2155,7 @@ fn md5_awaiting_authok_rejects_md5_subcode() {
 fn md5_awaiting_authok_rejects_sasl_subcode() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(713);
-    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let raw_id = drive_to_md5_awaiting_authok(&mut proto, &mut wb);
     let frame = auth_sasl_frame();
     let out = proto.feed_bytes(&frame, &mut wb);
     assert_eq!(out.len(), 2);
@@ -2215,8 +2175,7 @@ fn md5_awaiting_authok_rejects_sasl_subcode() {
 fn md5_awaiting_authok_handles_error_response() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(714);
-    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let raw_id = drive_to_md5_awaiting_authok(&mut proto, &mut wb);
 
     let err_frame = error_response_frame("FATAL", "28P01", "auth failed");
     let out = proto.feed_bytes(&err_frame, &mut wb);
@@ -2237,8 +2196,7 @@ fn md5_awaiting_authok_handles_error_response() {
 fn md5_awaiting_authok_rejects_random_tag() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(715);
-    drive_to_md5_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let raw_id = drive_to_md5_awaiting_authok(&mut proto, &mut wb);
     // 'Z' is the ReadyForQuery tag; arriving here pre-auth is
     // out of order. Build a synthetic 6-byte RFQ frame.
     let frame = [b'Z', 0, 0, 0, 5, b'I'];
@@ -2263,8 +2221,7 @@ fn cleartext_startup_rejects_auth_ok_subcode() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(720);
-    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_cleartext(&mut proto, &mut wb, "u", "p");
     wb.clear();
     assert_known_but_wrong(&mut proto, &mut wb, auth_subcode_only_frame(0), raw_id, AuthSubCode::Ok);
 }
@@ -2274,8 +2231,7 @@ fn cleartext_startup_rejects_md5_password_offer() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(721);
-    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_cleartext(&mut proto, &mut wb, "u", "p");
     wb.clear();
     assert_known_but_wrong(
         &mut proto,
@@ -2290,8 +2246,7 @@ fn cleartext_startup_rejects_md5_password_offer() {
 fn cleartext_startup_rejects_unknown_subcode() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(722);
-    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    let _raw_id = startup_cleartext(&mut proto, &mut wb, "u", "p");
     wb.clear();
     let out = proto.feed_bytes(&auth_subcode_only_frame(77), &mut wb);
     assert_eq!(out.len(), 2);
@@ -2308,12 +2263,12 @@ fn cleartext_startup_rejects_unknown_subcode() {
 
 // ----- CleartextAwaitingAuthOk — negative paths -----
 
+/// DEF-270: returns the minted raw ID so callers can assert on round-trip.
 fn drive_to_cleartext_awaiting_authok(
     proto: &mut PgProtocol,
     wb: &mut bsql_pg_proto::WriteBuf,
-    raw_id: NonZeroU64,
-) {
-    startup_cleartext(proto, wb, "user", "password", raw_id);
+) -> NonZeroU64 {
+    let raw_id = startup_cleartext(proto, wb, "user", "password");
     wb.clear();
     let _ = proto.feed_bytes(&auth_subcode_only_frame(3), wb);
     assert!(
@@ -2321,14 +2276,14 @@ fn drive_to_cleartext_awaiting_authok(
         "test setup invariant",
     );
     wb.clear();
+    raw_id
 }
 
 #[test]
 fn cleartext_awaiting_authok_rejects_md5_subcode() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(730);
-    drive_to_cleartext_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let raw_id = drive_to_cleartext_awaiting_authok(&mut proto, &mut wb);
     assert_unexpected_frame(
         &mut proto,
         &mut wb,
@@ -2342,8 +2297,7 @@ fn cleartext_awaiting_authok_rejects_md5_subcode() {
 fn cleartext_awaiting_authok_handles_error_response() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(731);
-    drive_to_cleartext_awaiting_authok(&mut proto, &mut wb, raw_id);
+    let raw_id = drive_to_cleartext_awaiting_authok(&mut proto, &mut wb);
 
     let err_frame = error_response_frame("FATAL", "28P01", "auth failed");
     let out = proto.feed_bytes(&err_frame, &mut wb);
@@ -2367,8 +2321,7 @@ fn trust_startup_rejects_cleartext_password_offer() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(740);
-    startup_trust(&mut proto, &mut wb, "u", None, raw_id);
+    let raw_id = startup_trust(&mut proto, &mut wb, "u", None);
     wb.clear();
     assert_known_but_wrong(
         &mut proto,
@@ -2384,8 +2337,7 @@ fn trust_startup_rejects_md5_password_offer() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(741);
-    startup_trust(&mut proto, &mut wb, "u", None, raw_id);
+    let raw_id = startup_trust(&mut proto, &mut wb, "u", None);
     wb.clear();
     assert_known_but_wrong(
         &mut proto,
@@ -2401,8 +2353,7 @@ fn scram_startup_rejects_cleartext_password_offer() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(742);
-    startup_scram(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_scram(&mut proto, &mut wb, "u", "p");
     wb.clear();
     assert_known_but_wrong(
         &mut proto,
@@ -2418,8 +2369,7 @@ fn scram_startup_rejects_md5_password_offer() {
     use bsql_pg_proto::wire::AuthSubCode;
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(743);
-    startup_scram(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_scram(&mut proto, &mut wb, "u", "p");
     wb.clear();
     assert_known_but_wrong(
         &mut proto,
@@ -2436,8 +2386,7 @@ fn scram_startup_rejects_md5_password_offer() {
 fn md5_startup_handles_error_response() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(750);
-    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_md5(&mut proto, &mut wb, "u", "p");
     wb.clear();
 
     let frame = error_response_frame("FATAL", "28000", "no pg_hba.conf entry");
@@ -2456,8 +2405,7 @@ fn md5_startup_handles_error_response() {
 fn md5_startup_handles_negotiate_protocol_version() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(751);
-    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_md5(&mut proto, &mut wb, "u", "p");
     wb.clear();
     let frame = negotiate_proto_version_frame();
     let out = proto.feed_bytes(&frame, &mut wb);
@@ -2475,8 +2423,7 @@ fn md5_startup_handles_negotiate_protocol_version() {
 fn cleartext_startup_handles_negotiate_protocol_version() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(752);
-    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    let raw_id = startup_cleartext(&mut proto, &mut wb, "u", "p");
     wb.clear();
     let frame = negotiate_proto_version_frame();
     let out = proto.feed_bytes(&frame, &mut wb);
@@ -2503,8 +2450,7 @@ fn cleartext_startup_handles_negotiate_protocol_version() {
 fn md5_state_post_dispatch_no_longer_carries_handshake() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(760);
-    startup_md5(&mut proto, &mut wb, "u", "p", raw_id);
+    let _raw_id = startup_md5(&mut proto, &mut wb, "u", "p");
     // Pre-dispatch: state must be ConnectingStartupMd5.
     assert!(matches!(
         proto.state(),
@@ -2524,8 +2470,7 @@ fn md5_state_post_dispatch_no_longer_carries_handshake() {
 fn cleartext_state_post_dispatch_no_longer_carries_password() {
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let raw_id = raw(761);
-    startup_cleartext(&mut proto, &mut wb, "u", "p", raw_id);
+    let _raw_id = startup_cleartext(&mut proto, &mut wb, "u", "p");
     assert!(matches!(
         proto.state(),
         ProtoState::ConnectingStartupCleartext { .. },

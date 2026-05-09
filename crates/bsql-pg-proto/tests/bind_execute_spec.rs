@@ -26,29 +26,16 @@
 
 use bsql_pg_proto::{
     Action, ConnectionStatus, FetchRows, PgProtocol, PortalName, ProtoState, ProtocolError,
-    QueryKind, Reply, ReplyId, StmtName, WriteBuf,
+    QueryKind, Reply, StmtName, WriteBuf,
     decode::RowDesc,
     wire::{
         TAG_BIND, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_ERROR_RESPONSE,
         TAG_EXECUTE, TAG_READY_FOR_QUERY,
     },
 };
-use core::num::NonZeroU64;
 
 mod common;
-use common::{PushOrPanic, split_bind_execute_sync};
-
-fn raw(v: u64) -> NonZeroU64 {
-    // DEF-145: raw(0) is a test bug. Assert fires loud; the
-    // `unwrap_or(MIN)` keeps the forbid-bundle happy on the
-    // assertion-proved dead branch.
-    assert!(v > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
-    NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
-}
-
-fn id(v: NonZeroU64) -> ReplyId<QueryKind> {
-    ReplyId::from_raw(v)
-}
+use common::{PushOrPanic, mint_reply, split_bind_execute_sync};
 
 fn portal_unnamed() -> PortalName {
     PortalName::default()
@@ -128,7 +115,7 @@ fn error_response_frame(severity: &[u8], code: &[u8], message: &[u8]) -> std::ve
 fn bind_execute_emits_three_send_bytes_and_transitions() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(100);
+    let (reply, _reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
@@ -136,7 +123,7 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
         &(),
         None,
         FetchRows::All,
-        id(reply_raw),
+        reply,
         &mut wb,
     );
 
@@ -167,7 +154,7 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
 fn bind_execute_dml_full_round_trip() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(200);
+    let (reply, reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
@@ -175,7 +162,7 @@ fn bind_execute_dml_full_round_trip() {
         &(42i32,),
         None,
         FetchRows::All,
-        id(reply_raw),
+        reply,
         &mut wb,
     );
 
@@ -207,7 +194,7 @@ fn bind_execute_dml_full_round_trip() {
 fn bind_execute_select_with_schema_streams_rows() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(300);
+    let (reply, _reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
     // User-provided schema — 1 TEXT column. In real use, macro-
     // generated at compile time from Parse+Describe fingerprint.
@@ -219,7 +206,7 @@ fn bind_execute_select_with_schema_streams_rows() {
         &(),
         Some(schema),
         FetchRows::All,
-        id(reply_raw),
+        reply,
         &mut wb,
     );
 
@@ -252,7 +239,7 @@ fn bind_execute_select_with_schema_streams_rows() {
 fn bind_error_is_recoverable() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(400);
+    let (reply, reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
@@ -260,7 +247,7 @@ fn bind_error_is_recoverable() {
         &(),
         None,
         FetchRows::All,
-        id(reply_raw),
+        reply,
         &mut wb,
     );
 
@@ -300,7 +287,7 @@ fn bind_error_is_recoverable() {
 fn bind_execute_data_row_without_schema_is_unexpected_frame() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(500);
+    let (reply, _reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
@@ -308,7 +295,7 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
         &(),
         None, // DML path
         FetchRows::All,
-        id(reply_raw),
+        reply,
         &mut wb,
     );
 
@@ -340,7 +327,7 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
 fn portal_suspended_is_unexpected_frame_in_1c_3b() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(600);
+    let (reply, _reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
@@ -348,7 +335,7 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
         &(),
         None,
         FetchRows::All,
-        id(reply_raw),
+        reply,
         &mut wb,
     );
 
@@ -413,14 +400,14 @@ fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
-    let first = raw(801);
+    let (first_reply, _first_raw) = mint_reply::<QueryKind>(&mut proto);
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
         None,
         FetchRows::All,
-        id(first),
+        first_reply,
         &mut wb,
     );
     assert!(matches!(
@@ -466,13 +453,14 @@ fn bind_frame_wire_layout_empty_params() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
+    let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
         None,
         FetchRows::All,
-        id(raw(900)),
+        reply,
         &mut wb,
     );
     let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
@@ -507,13 +495,14 @@ fn execute_frame_wire_layout_unnamed_portal() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
+    let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
         None,
         FetchRows::All,
-        id(raw(901)),
+        reply,
         &mut wb,
     );
     let (_bind, execute_bytes, _sync) = split_bind_execute_sync(wb.as_bytes());
@@ -546,13 +535,14 @@ fn bind_frame_null_param_wire_layout() {
     let mut wb = WriteBuf::new();
 
     let none_i32: Option<i32> = None;
+    let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(none_i32,),
         None,
         FetchRows::All,
-        id(raw(903)),
+        reply,
         &mut wb,
     );
     let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
@@ -591,13 +581,14 @@ fn bind_frame_optional_mixed_with_some_and_none() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
+    let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(Some(42i32), None::<&str>),
         None,
         FetchRows::All,
-        id(raw(904)),
+        reply,
         &mut wb,
     );
     let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
@@ -646,13 +637,14 @@ fn bind_frame_wire_layout_one_i32_param() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
+    let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(42i32,),
         None,
         FetchRows::All,
-        id(raw(902)),
+        reply,
         &mut wb,
     );
     let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());

@@ -34,27 +34,13 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    FeedEvent, PgProtocol, ProtoState, ProtocolError, Reply, Sql, WriteBuf,
-    reply_id::{PingKind, QueryKind, ReplyId},
+    Action, FeedEvent, PgProtocol, ProtoState, ProtocolError, Reply, Sql, WriteBuf,
+    reply_id::{PingKind, QueryKind},
     wire::{TAG_DATA_ROW, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION},
 };
-use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
-
-fn raw(v: u64) -> NonZeroU64 {
-    assert!(v > 0, "raw(0) is a test bug — use raw(1..)");
-    NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
-}
-
-fn ping_id(v: u64) -> ReplyId<PingKind> {
-    ReplyId::from_raw(raw(v))
-}
-
-fn query_id(v: u64) -> ReplyId<QueryKind> {
-    ReplyId::from_raw(raw(v))
-}
+use common::{PushOrPanic, mint_reply};
 
 fn rfq_idle() -> [u8; 6] {
     [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 5, b'I']
@@ -97,10 +83,10 @@ fn fresh_idle_proto_yields_idle_event() {
 fn ping_then_rfq_yields_deliver_pong() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let ping_raw = raw(1);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
 
     // Push Ping (state → PingAwaitingRfq).
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(1) }, &mut wb);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
     assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
 
     // Feed inbound RFQ via the per-event API.
@@ -130,7 +116,8 @@ fn ping_then_rfq_yields_deliver_pong() {
 fn post_deliver_advance_returns_idle() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(2) }, &mut wb);
+    let reply = proto.next_reply_id::<PingKind>();
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
     let feed_result = proto.feed_inbound(&rfq_idle());
     assert!(feed_result.is_ok());
     let _first = proto.advance_one_frame(&mut wb); // consumes the Deliver
@@ -152,7 +139,8 @@ fn post_deliver_advance_returns_idle() {
 fn partial_header_yields_need_more_bytes() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(3) }, &mut wb);
+    let reply = proto.next_reply_id::<PingKind>();
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
 
     // Feed only 1 byte — header parser sees Incomplete.
     let partial = [b'Z'];
@@ -193,8 +181,8 @@ fn unsolicited_rfq_in_idle_yields_close_no_in_flight() {
 fn unexpected_frame_mid_ping_yields_fail_with_id() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let ping_raw = raw(4);
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(4) }, &mut wb);
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
 
     // Feed an unexpected DataRow ('D') frame while awaiting RFQ.
     let bad = frame(TAG_DATA_ROW.byte(), &[0, 0]);
@@ -240,10 +228,11 @@ fn errored_state_yields_close_on_advance() {
 fn row_description_transitions_to_streaming_rows_event() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
+    let reply = proto.next_reply_id::<QueryKind>();
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery {
             sql: Sql::from_str_truncating("SELECT 1"),
-            reply: query_id(5),
+            reply,
         },
         &mut wb,
     );
@@ -286,21 +275,36 @@ fn row_description_transitions_to_streaming_rows_event() {
 /// state and correlator delivery as `feed_bytes` in one call.
 #[test]
 fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
-    // (a) feed_bytes path.
+    // (a) feed_bytes path. DEF-270 (post-bisect 2026-05-09): mint
+    // counter is a static AtomicU64 (process-global), so each
+    // mint returns a different raw value; tests can no longer
+    // assume "fresh proto → raw=1". The equivalence between the
+    // two paths is observable on per-protocol routing — each
+    // path's minted id round-trips back through its own DeliverReply.
     let mut proto_a = PgProtocol::new();
     let mut wb_a = WriteBuf::new();
-    proto_a.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(101) }, &mut wb_a);
+    let (reply_a, raw_a) = mint_reply::<PingKind>(&mut proto_a);
+    proto_a.push_or_panic(bsql_pg_proto::push_command::Ping { reply: reply_a }, &mut wb_a);
     let actions = proto_a.feed_bytes(&rfq_idle(), &mut wb_a);
     assert_eq!(actions.len(), 1, "feed_bytes: 1 DeliverReply on Ping/RFQ");
+    // Confirm path A's DeliverReply carries A's minted raw id.
+    let path_a_id = match actions.as_slice() {
+        [Action::DeliverReply { id, .. }] => *id,
+        other => panic!("feed_bytes: expected single DeliverReply, got {other:?}"),
+    };
+    assert_eq!(path_a_id, raw_a, "feed_bytes: DeliverReply.id == minted raw");
     // OutActions is ManuallyDrop<Vec<Action,9>>+len — not actually
     // Drop. NLL ends its borrow at the last use (the assert above);
     // the next-line `proto_a.state()` is `&self`, no borrow conflict.
     assert!(matches!(proto_a.state(), ProtoState::Idle));
 
-    // (b) advance_one_frame path.
+    // (b) advance_one_frame path. Mint a fresh raw via a fresh
+    // proto; raw_b will be a different global counter value than
+    // raw_a (post-bisect static-atomic mint).
     let mut proto_b = PgProtocol::new();
     let mut wb_b = WriteBuf::new();
-    proto_b.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(101) }, &mut wb_b);
+    let (reply_b, raw_b) = mint_reply::<PingKind>(&mut proto_b);
+    proto_b.push_or_panic(bsql_pg_proto::push_command::Ping { reply: reply_b }, &mut wb_b);
     assert!(proto_b.feed_inbound(&rfq_idle()).is_ok());
 
     let event = proto_b.advance_one_frame(&mut wb_b);
@@ -308,12 +312,14 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
         FeedEvent::Deliver(id, value) => (id, value),
         other => panic!("path b: expected Deliver, got {other:?}"),
     };
-    assert_eq!(id_b, raw(101), "advance: same correlator");
+    assert_eq!(id_b, raw_b, "advance: DeliverReply.id == minted raw");
     assert!(matches!(proto_b.state(), ProtoState::Idle));
 
-    // Both paths reached Idle with same correlator routing — the per-
-    // event API is observationally equivalent on the canonical happy
-    // path.
+    // Both paths reached Idle, each delivering its own minted id —
+    // the per-event API is observationally equivalent on the canonical
+    // happy path. (Mint values differ across the two paths because
+    // the counter is process-global; equivalence is the routing
+    // shape, not the literal id values.)
 }
 
 // ═══════════════════════════════════════════════════════════════════

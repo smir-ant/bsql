@@ -48,18 +48,33 @@
 //! 2. **No sentinel collision.** Zero is reserved as "no ID"; the
 //!    constructor refuses it.
 //!
-//! `bsql-pg-proto` does **not** mint IDs. The wrapper crate runs a
-//! per-connection monotonic counter starting at 1; collision-freedom
-//! is the wrapper's responsibility. Per reforge.md §7.5, this is
-//! **tier-3 by audit**: the cross-crate seal is not expressible in
-//! stable Rust today. Mitigations:
+//! `bsql-pg-proto` mints IDs internally via [`crate::PgProtocol::next_reply_id`]
+//! (DEF-270 cluster, 2026-05-09 — supersedes reforge.md §7.5 wrapper-mint
+//! discipline). Pre-DEF-270 the wrapper crate ran a per-connection
+//! monotonic counter and collision-freedom was the wrapper's
+//! responsibility — **tier-3 by audit** (cross-crate seal not
+//! expressible in stable Rust). Post-DEF-270:
 //!
-//! - The constructor takes `NonZeroU64` (zero impossible at the type
-//!   level).
-//! - Production wrappers must use a single fetch-add counter per
-//!   connection. Reusing IDs across the same `PgProtocol` instance is
-//!   undefined at the spec level (the protocol can deliver to the
-//!   wrong sender), but cannot violate memory safety.
+//! - **External fabrication: tier-1 by-visibility.** [`ReplyId::from_raw`]
+//!   is `pub(crate)` — external crates cannot construct a `ReplyId<K>`.
+//!   The sole public mint is [`crate::PgProtocol::next_reply_id`]
+//!   `<K: ReplyKind>(&mut self) -> ReplyId<K>`.
+//! - **Cross-instance monotonicity: tier-2 by atomic-fetch_add.**
+//!   The mint counter is a `static AtomicU64` inside
+//!   `next_reply_id` (mod-private). `fetch_add(1, Relaxed)` gives
+//!   globally-unique IDs across all `PgProtocol` instances and
+//!   threads — stronger than per-instance uniqueness. Saturating
+//!   `u64` add — architecturally-distant ceiling (~10^19 mints
+//!   process-wide). The counter is NOT a `PgProtocol` field
+//!   (bisect 2026-05-09 proved an inline `u64` field would grow
+//!   the struct 520 → 528 B and shift LLVM whole-crate heuristic
+//!   +6% on `iter_10cols` decode bench). Linear types would lift
+//!   this to tier-1 ("counter has never returned this value");
+//!   not available pre-stable Rust.
+//! - **Niche optimization preserved.** `Option<ReplyId<K>>` stays the
+//!   same size as `ReplyId<K>` itself (the `NonZeroU64` niche).
+//! - **No sentinel collision.** Zero is reserved as "no ID"; the
+//!   constructor refuses it.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -279,21 +294,40 @@ impl<K: ReplyKind> ReplyId<K> {
     /// Construct a `ReplyId<K>` from a non-zero monotonic counter
     /// value.
     ///
-    /// **Caller contract** (tier-2, audit-enforced): `value` must
-    /// not have been used previously on the same `PgProtocol`
-    /// instance. Reuse causes the protocol to deliver future replies
-    /// to whichever sender is still registered under that ID — a
-    /// logic error, not a memory-safety issue.
+    /// # Visibility (DEF-270 cluster, 2026-05-09 — U letter)
     ///
-    /// The standard wrapper (`bsql-driver-postgres`) uses an
-    /// `AtomicU64` initialised to 1 with `fetch_add(1, Relaxed)`.
+    /// `pub(crate)` only. External crates cannot construct a
+    /// `ReplyId<K>`; the sole public mint is
+    /// [`crate::PgProtocol::next_reply_id`]. This closes the
+    /// "external fabrication" tier-3 seam: pre-DEF-270 the wrapper
+    /// crate (or any consumer) could mint duplicate IDs by accident,
+    /// causing the protocol to deliver replies to the wrong
+    /// correlator. Post-DEF-270, **fabrication is impossible from
+    /// outside this crate** — visibility tier-1.
+    ///
+    /// # Internal mint contract (tier-2 by-construction)
+    ///
+    /// Production callers (lib-internal) get the witness via
+    /// [`crate::PgProtocol::next_reply_id`], which uses a static
+    /// `AtomicU64` counter (mod-private) with `fetch_add(1, Relaxed)`
+    /// — globally unique across all `PgProtocol` instances and
+    /// threads. Cross-instance monotonicity is stronger than
+    /// per-protocol exclusivity. (Static-atomic chosen over inline
+    /// field after bisect proved an inline u64 caused +6% LLVM
+    /// codegen shift on synthetic decode benches.)
+    ///
+    /// Test callers inside this crate (state.rs / reply_id.rs unit
+    /// tests, compute_push_tests) construct fixtures directly via this
+    /// `pub(crate) from_raw` — collision-freedom in fixture context
+    /// is by-test-discipline (each test picks a distinct value range:
+    /// 1xxx for ping, 2xxx for startup, etc. — see `state::push_class_tests`).
     ///
     /// DEF-154 (K): construct a fresh `ReplyId`. Pre-(K) carried a
     /// `delivered: bool` field for Drop-time checking — now deleted
     /// since the Drop panic is gone (footgun under integration-test
     /// unwind; see Drop-impl deletion block above).
     #[inline]
-    pub const fn from_raw(value: NonZeroU64) -> Self {
+    pub(crate) const fn from_raw(value: NonZeroU64) -> Self {
         Self {
             value,
             _kind: PhantomData,

@@ -36,10 +36,9 @@ use bsql_pg_proto::{
         TAG_QUERY, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
     },
 };
-use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
+use common::{PushOrPanic, mint_reply};
 
 // ------------------------------------------------------------------
 // Frame builders — pure functions, no protocol state. Each builder
@@ -129,18 +128,8 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 }
 
 // ------------------------------------------------------------------
-// Correlator / ReplyId helpers.
+// Sql fixture helper.
 // ------------------------------------------------------------------
-
-fn raw(v: u64) -> NonZeroU64 {
-    // DEF-145: raw(0) is a test bug; assert fires loud.
-    assert!(v > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
-    NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
-}
-
-fn id(v: NonZeroU64) -> ReplyId<QueryKind> {
-    ReplyId::from_raw(v)
-}
 
 /// Construct a `Sql` value from a `&str` test fixture.
 ///
@@ -194,8 +183,8 @@ fn simple_query_setup(
 fn select_zero_rows_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(100);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+    let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, reply, &mut wb);
 
     // After push: state should be SimpleQueryAwaitingFirstResponse.
     assert!(matches!(
@@ -249,8 +238,8 @@ fn select_zero_rows_end_to_end() {
 fn dml_no_rows_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(102);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+    let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&command_complete_frame(b"INSERT 0 3"));
@@ -287,8 +276,8 @@ fn dml_no_rows_end_to_end() {
 fn empty_query_yields_empty_tag() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(103);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&empty_query_response_frame());
@@ -317,8 +306,8 @@ fn empty_query_yields_empty_tag() {
 fn query_error_emits_fail_reply_and_connection_survives() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(104);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+    let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&error_response_frame(b"syntax error at or near EOF"));
@@ -369,8 +358,8 @@ fn query_error_emits_fail_reply_and_connection_survives() {
 fn def198_simple_query_while_in_flight_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let first_raw = raw(110);
-    simple_query_setup(&mut proto, id(first_raw), &mut wb);
+    let (first_reply, _first_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, first_reply, &mut wb);
 
     assert!(
         proto.as_ready().is_none(),
@@ -444,8 +433,8 @@ fn def198_simple_query_on_errored_blocked_at_compile_time() {
 fn malformed_command_complete_no_nul_terminator_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(130);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, reply, &mut wb);
 
     // Body without NUL terminator.
     let bad = frame(TAG_COMMAND_COMPLETE.byte(), b"SELECT 1");
@@ -472,8 +461,8 @@ fn malformed_command_complete_no_nul_terminator_tears_down() {
 fn unexpected_rfq_during_await_first_response_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(140);
-    simple_query_setup(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, reply, &mut wb);
 
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     let actions = out.as_slice();
@@ -539,8 +528,8 @@ fn dml_after_select_clears_row_desc() {
     // (the sole row-streaming API post-(Y)). Drain the stream to
     // the terminal Complete event; the inner `flush_pending`
     // mechanism consumes the trailing Z so state returns to Idle.
-    let q1_raw = raw(300);
-    simple_query_setup(&mut proto, id(q1_raw), &mut wb);
+    let (q1_reply, _q1_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, q1_reply, &mut wb);
     let mut q1_bytes = std::vec::Vec::new();
     q1_bytes.extend_from_slice(&row_description_frame(1));
     q1_bytes.extend_from_slice(&data_row_frame(b"hello"));
@@ -573,8 +562,8 @@ fn dml_after_select_clears_row_desc() {
 
     // Query 2: DML path. No `T` frame → AwaitingRfq never gets a
     // schema in its row_desc field. QueryComplete carries None.
-    let q2_raw = raw(301);
-    simple_query_setup(&mut proto, id(q2_raw), &mut wb);
+    let (q2_reply, _q2_raw) = mint_reply::<QueryKind>(&mut proto);
+    simple_query_setup(&mut proto, q2_reply, &mut wb);
     let mut q2_bytes = std::vec::Vec::new();
     q2_bytes.extend_from_slice(&command_complete_frame(b"DELETE 3"));
     q2_bytes.extend_from_slice(&rfq_frame(b'I'));
@@ -604,8 +593,8 @@ fn dml_after_select_clears_row_desc() {
 fn query_frame_wire_format() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(160);
-    let sent = simple_query_setup(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    let sent = simple_query_setup(&mut proto, reply, &mut wb);
 
     // `simple_query_setup` uses `sql("SELECT 1")` — 8 bytes + NUL.
     let expected_sql = b"SELECT 1";

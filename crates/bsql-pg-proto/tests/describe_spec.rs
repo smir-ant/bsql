@@ -51,7 +51,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows, PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, Sql, StmtName,
+    Action, ConnectionStatus, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows,
+    PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, Sql, StmtName,
     TxStatus, WriteBuf,
     wire::{
         DescribeTargetByte, TAG_BIND_COMPLETE, TAG_DATA_ROW, TAG_DESCRIBE, TAG_ERROR_RESPONSE,
@@ -59,24 +60,9 @@ use bsql_pg_proto::{
         TAG_ROW_DESCRIPTION,
     },
 };
-use core::num::NonZeroU64;
 
 mod common;
-use common::{PushOrPanic, split_bind_execute_sync, split_frame_plus_sync};
-
-fn raw(v: u64) -> NonZeroU64 {
-    // DEF-145: raw(0) is a test bug; assert fires loud.
-    assert!(v > 0, "raw(0) is a test bug — use raw(1..) for non-zero test correlators");
-    NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
-}
-
-fn stmt_id(v: NonZeroU64) -> ReplyId<DescribeStatementKind> {
-    ReplyId::from_raw(v)
-}
-
-fn portal_id(v: NonZeroU64) -> ReplyId<DescribePortalKind> {
-    ReplyId::from_raw(v)
-}
+use common::{PushOrPanic, mint_reply, split_bind_execute_sync, split_frame_plus_sync};
 
 fn stmt_unnamed() -> StmtName {
     StmtName::default()
@@ -212,8 +198,8 @@ fn describe_portal_setup(
 fn describe_statement_with_rows_success_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(100);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     assert!(matches!(
         proto.state(),
@@ -257,8 +243,8 @@ fn describe_statement_with_rows_success_end_to_end() {
 fn describe_statement_no_data_success_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(101);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&parameter_description_frame(&[23])); // int4
@@ -287,8 +273,8 @@ fn describe_statement_no_data_success_end_to_end() {
 fn describe_statement_zero_params_ok() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(102);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&parameter_description_frame(&[]));
@@ -316,8 +302,8 @@ fn describe_statement_zero_params_ok() {
 fn describe_statement_max_params_ok() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(103);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     // 16 distinct OIDs — one per placeholder.
     let oids: std::vec::Vec<u32> = (1..=16u32).collect();
@@ -345,11 +331,11 @@ fn describe_statement_max_params_ok() {
 fn describe_statement_frame_wire_format_with_named_statement() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(104);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     let Ok(name) = StmtName::try_from_str("my_stmt") else {
         panic!("fixture: valid stmt name");
     };
-    let d_bytes = describe_stmt_setup(&mut proto, name, stmt_id(reply_raw), &mut wb);
+    let d_bytes = describe_stmt_setup(&mut proto, name, reply, &mut wb);
 
     // Layout:
     //   byte 0: 'D'
@@ -387,8 +373,8 @@ fn describe_statement_frame_wire_format_with_named_statement() {
 fn describe_portal_with_rows_success_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(200);
-    describe_portal_setup(&mut proto, portal_unnamed(), portal_id(reply_raw), &mut wb);
+    let (reply, reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
+    describe_portal_setup(&mut proto, portal_unnamed(), reply, &mut wb);
 
     assert!(matches!(
         proto.state(),
@@ -424,8 +410,8 @@ fn describe_portal_with_rows_success_end_to_end() {
 fn describe_portal_no_data_success_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(201);
-    describe_portal_setup(&mut proto, portal_unnamed(), portal_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
+    describe_portal_setup(&mut proto, portal_unnamed(), reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&no_data_frame());
@@ -449,11 +435,11 @@ fn describe_portal_no_data_success_end_to_end() {
 fn describe_portal_frame_wire_format_with_named_portal() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(202);
+    let (reply, _reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
     let Ok(name) = PortalName::try_from_str("my_portal") else {
         panic!("fixture: valid portal name");
     };
-    let d_bytes = describe_portal_setup(&mut proto, name, portal_id(reply_raw), &mut wb);
+    let d_bytes = describe_portal_setup(&mut proto, name, reply, &mut wb);
 
     let expected_len_field = 4u32 + 1 + 9 + 1;
     assert_eq!(d_bytes.first(), Some(&TAG_DESCRIBE.byte()));
@@ -483,8 +469,8 @@ fn describe_portal_frame_wire_format_with_named_portal() {
 fn describe_statement_error_at_param_desc_is_recoverable() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(300);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&error_response_frame(b"prepared statement \"foo\" does not exist"));
@@ -522,8 +508,8 @@ fn describe_statement_error_at_param_desc_is_recoverable() {
 fn describe_statement_error_at_row_desc_stage_is_recoverable() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(301);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&parameter_description_frame(&[23]));
@@ -545,8 +531,8 @@ fn describe_statement_error_at_row_desc_stage_is_recoverable() {
 fn describe_portal_error_response_is_recoverable() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(302);
-    describe_portal_setup(&mut proto, portal_unnamed(), portal_id(reply_raw), &mut wb);
+    let (reply, reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
+    describe_portal_setup(&mut proto, portal_unnamed(), reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&error_response_frame(b"portal \"bar\" does not exist"));
@@ -575,8 +561,8 @@ fn describe_portal_error_response_is_recoverable() {
 fn describe_statement_row_desc_before_param_desc_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(400);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     let out = proto.feed_bytes(&row_description_frame(1), &mut wb);
     let actions = out.as_slice();
@@ -601,8 +587,8 @@ fn describe_statement_row_desc_before_param_desc_tears_down() {
 fn describe_statement_no_data_before_param_desc_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(401);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     let out = proto.feed_bytes(&no_data_frame(), &mut wb);
     let actions = out.as_slice();
@@ -626,8 +612,8 @@ fn describe_statement_no_data_before_param_desc_tears_down() {
 fn describe_portal_param_desc_is_unexpected_and_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(402);
-    describe_portal_setup(&mut proto, portal_unnamed(), portal_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
+    describe_portal_setup(&mut proto, portal_unnamed(), reply, &mut wb);
 
     let out = proto.feed_bytes(&parameter_description_frame(&[23]), &mut wb);
     let actions = out.as_slice();
@@ -651,8 +637,8 @@ fn describe_portal_param_desc_is_unexpected_and_tears_down() {
 fn describe_statement_data_row_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(403);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     // A pretend DataRow frame — body has i16 column count + column data,
     // but the tag is what matters for the dispatcher.
@@ -679,8 +665,8 @@ fn describe_statement_data_row_tears_down() {
 fn describe_statement_malformed_param_desc_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(500);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     // Body: count=2 but only 4 bytes of OID data (one OID) — length
     // mismatch.
@@ -712,8 +698,8 @@ fn describe_statement_malformed_param_desc_tears_down() {
 fn describe_statement_too_many_params_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(501);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     // 17 OIDs — one over the cap.
     let oids: std::vec::Vec<u32> = (1..=17u32).collect();
@@ -740,8 +726,8 @@ fn describe_statement_too_many_params_tears_down() {
 fn describe_statement_malformed_rfq_tears_down() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let reply_raw = raw(502);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(reply_raw), &mut wb);
+    let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&parameter_description_frame(&[]));
@@ -817,8 +803,8 @@ fn def198_describe_portal_on_errored_blocked_at_compile_time() {
 fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let first_raw = raw(700);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(first_raw), &mut wb);
+    let (first_reply, _first_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), first_reply, &mut wb);
 
     assert!(
         proto.as_ready().is_none(),
@@ -850,8 +836,8 @@ fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
 fn def198_describe_statement_while_describe_portal_in_flight_blocked() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let first_raw = raw(702);
-    describe_portal_setup(&mut proto, portal_unnamed(), portal_id(first_raw), &mut wb);
+    let (first_reply, _first_raw) = mint_reply::<DescribePortalKind>(&mut proto);
+    describe_portal_setup(&mut proto, portal_unnamed(), first_reply, &mut wb);
 
     assert!(
         proto.as_ready().is_none(),
@@ -879,15 +865,15 @@ fn def198_describe_statement_while_bind_execute_in_flight_blocked() {
     let mut wb = WriteBuf::new();
 
     // Start a BindExecute (DML path, row_desc=None).
-    let be_raw = raw(800);
     use bsql_pg_proto::QueryKind as QK;
+    let (be_reply, be_raw) = mint_reply::<QK>(&mut proto);
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
         None,
         FetchRows::All,
-        ReplyId::<QK>::from_raw(be_raw),
+        be_reply,
         &mut wb,
     );
     // DEF-212: verify wb contains B+E+Sync structurally.
@@ -960,12 +946,12 @@ fn describe_after_completed_parse_starts_clean() {
 
     // Run a Parse to completion.
     use bsql_pg_proto::ParseKind;
-    let parse_raw = raw(900);
+    let parse_reply = proto.next_reply_id::<ParseKind>();
     proto.push_or_panic(
         bsql_pg_proto::push_command::Parse {
             stmt_name: stmt_unnamed(),
             sql: Sql::from_str_truncating("SELECT 1"),
-            reply: ReplyId::<ParseKind>::from_raw(parse_raw),
+            reply: parse_reply,
         },
         &mut wb,
     );
@@ -980,8 +966,8 @@ fn describe_after_completed_parse_starts_clean() {
     assert!(matches!(proto.state(), ProtoState::Idle));
 
     // Now describe — should proceed normally from Idle.
-    let describe_raw = raw(901);
-    describe_stmt_setup(&mut proto, stmt_unnamed(), stmt_id(describe_raw), &mut wb);
+    let (describe_reply, describe_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
+    describe_stmt_setup(&mut proto, stmt_unnamed(), describe_reply, &mut wb);
     let mut drain = std::vec::Vec::new();
     drain.extend_from_slice(&parameter_description_frame(&[]));
     drain.extend_from_slice(&no_data_frame());

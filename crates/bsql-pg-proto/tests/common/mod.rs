@@ -22,9 +22,31 @@
 
 use bsql_pg_proto::{
     FetchRows, HeaderParse, PgProtocol, PortalName, PushFailure, QueryKind, ReplyId,
-    RowDesc, StmtName, WriteBuf, params::ParamsWriter, parse_header,
+    ReplyKind, RowDesc, StmtName, WriteBuf, params::ParamsWriter, parse_header,
     push_command::{BindExecute, PushCommand},
 };
+use core::num::NonZeroU64;
+
+/// DEF-270 (U letter) — test-friendly mint of a fresh `ReplyId<K>` and
+/// its underlying raw `NonZeroU64`. Pre-DEF-270 tests minted via
+/// `ReplyId::from_raw(raw_value)`; that constructor is now `pub(crate)`
+/// (external fabrication closed at tier-1 by-visibility — see the U
+/// letter in deferred.md `DEF-270`).
+///
+/// Returns `(id, raw)` so the test can:
+/// - move `id` into a command's `reply` field, and
+/// - retain `raw` for later state-pattern assertions
+///   (e.g. `expect_awaiting_ping_reply(state, raw)`).
+///
+/// The minted value is the protocol's monotonic counter — first call
+/// returns 1, second 2, etc. Tests that want SPECIFIC raw values (e.g.
+/// for fixture-distinguishability across multiple commands in one
+/// scenario) can mint sequentially and capture the actual values.
+pub fn mint_reply<K: ReplyKind>(proto: &mut PgProtocol) -> (ReplyId<K>, NonZeroU64) {
+    let id = proto.next_reply_id::<K>();
+    let raw = id.get();
+    (id, raw)
+}
 
 /// Extension trait: pre-DEF-198 ergonomics for happy-path tests.
 ///

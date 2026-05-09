@@ -262,6 +262,10 @@ pub mod protocol;
 pub mod push_command;
 pub mod row_stream;
 pub mod reply_id;
+
+// DEF-270 R-rephrased — tier-1 row_desc_slot write provenance.
+// Crate-internal module; no public re-exports.
+pub(crate) mod schema_slot;
 pub mod scram;
 // DEF-188: schema_arena module DELETED — RowDesc lives inline in
 // state variants; terminal-reply schema parks into
@@ -677,38 +681,54 @@ const _: () = assert!(
 // surface beats variance cushion every time.
 // DEF-196 (2026-04-28): cold-path fields externalised into three
 // independent lazy slots — each cold field allocates its Box
-// independently only on first write. Hot `PgProtocol` shrinks
-// 5080 B → 4352 B (−728 B inline).
+// independently only on first write.
+// DEF-265 (2026-05-08): ReadBuf two-tier inline (256 B inline + lazy
+// heap escape Box).
+// DEF-270 cluster (2026-05-09 — U letter, post-bisect): mint counter
+// kept as a `static AtomicU64` in `next_reply_id`, NOT inline on
+// PgProtocol — adding an inline u64 field shifted LLVM whole-crate
+// codegen heuristic +6% on the synthetic `iter_10cols` decode bench
+// (bisect-confirmed). Static-atomic mint preserves the 520 B size
+// AND strengthens the invariant: globally-unique IDs across all
+// instances (per-protocol field would have given per-instance only).
 //
-// Layout breakdown:
-//   ReadBuf:                4096 B (4 KiB)
-//   state:                    64 B (post-DEF-189 strip)
-//   row_desc_slot:           140 B (Option<RowDesc>)
-//   session_params:            8 B (Option<Box<SessionParams>> niche)
-//   error_arena:               8 B (Option<Box<ErrorArena>> niche)
-//   malformed_frame_count:     4 B (inline u32 — too small to amortise
-//                                   pointer indirection)
-//   sync_marker:               0 B (PhantomData)
-//   alignment padding:        ~32 B (to align(8))
-//   total:                  4352 B
+// Layout breakdown (post-DEF-265):
+//   ReadBuf inline:          ~256 B (heapless::Vec<u8, 256> + cursor)
+//   ReadBuf heap slot:          8 B (Option<Box<...>> niche)
+//   state:                    ~80 B (DescribeStatementAwaitingRfq dominant)
+//   row_desc_slot:           ~140 B (Option<RowDesc>)
+//   session_params:             8 B (Option<Box<SessionParams>> niche)
+//   error_arena:                8 B (Option<Box<ErrorArena>> niche)
+//   malformed_frame_count:      4 B (inline u32)
+//   sync_marker:                0 B (PhantomData)
+//   alignment padding:        ~16 B (to align(8))
+//   total:                    520 B
 //
 // Heap economics per connection pattern:
 //   - Trust auth + no errors:        0 allocations.
 //   - Startup auth + no errors:      1 alloc (Box<SessionParams> 436 B).
 //   - Startup auth + errors:         2 allocs (~732 B total).
 //   - Malformed frame teardown:      0 allocations (counter inline).
+//   - First frame > 256 B:           1 alloc (Box<heapless::Vec<u8, 4096>>).
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() == 520,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
-     Budget: ReadBuf 4096 + state ~64 + row_desc_slot 140 + \
-     cold (Option<Box<ColdFields>>) 8 + alignment to align(8) = 4344 B. \
+     Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~80 + \
+     row_desc_slot ~140 + session_params 8 + error_arena 8 + \
+     malformed_frame_count 4 + alignment-pad to align(8) = 520 B. \
      \
      Pre-DEF-196 was 5080 B (cold fields inline). DEF-196 saves \
-     736 B per PgProtocol via heap-boxed cold storage. \
+     736 B via heap-boxed cold storage. DEF-265 (Idea-38) shrank \
+     ReadBuf 4096 → 256 inline + lazy heap escape (4352 → 520 B). \
+     DEF-270 U (2026-05-09): reply-id mint counter is a static \
+     AtomicU64 in `next_reply_id` (NOT a PgProtocol field) — bisect \
+     proved an inline u64 grew the struct 520 → 528 B and shifted \
+     LLVM heuristic +6% on iter_10cols. Static-atomic preserves \
+     520 B and gives globally-unique IDs (stronger than per-instance). \
      \
      Cross-platform: when CI matrix extends, either (a) every target \
-     lands at 4344 (most likely — alignment-stable types), or \
+     lands at 520 (most likely — alignment-stable types), or \
      (b) per-target cfg-gated pins land in the same commit. \
      Permissive ranges forbidden — drift surface > variance cushion \
      (CREDO §3 + §4.12).",

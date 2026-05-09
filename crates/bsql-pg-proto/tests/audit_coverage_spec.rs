@@ -7,34 +7,33 @@
 use bsql_pg_proto::{
     Action, PgProtocol, ProtoState, WriteBuf, error::ProtocolError,
 };
-use core::num::NonZeroU64;
 
 mod common;
 use common::PushOrPanic;
 
-fn raw(n: u64) -> NonZeroU64 {
-    assert!(n > 0, "raw(0) is a test bug — NonZeroU64 requires n > 0");
-    NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
+// DEF-270 (U letter): pre-DEF-270 these helpers wrapped
+// `ReplyId::from_raw(raw_value)`. Post-DEF-270 IDs are minted via
+// `proto.next_reply_id::<K>()`. Each helper now takes `&mut PgProtocol`
+// to mint via the production API.
+fn ping_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::PingKind> {
+    proto.next_reply_id()
 }
 
-fn ping_id(raw: NonZeroU64) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::PingKind> {
-    bsql_pg_proto::reply_id::ReplyId::from_raw(raw)
+fn query_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::QueryKind> {
+    proto.next_reply_id()
 }
 
-fn query_id(raw: NonZeroU64) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::QueryKind> {
-    bsql_pg_proto::reply_id::ReplyId::from_raw(raw)
+fn parse_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::ParseKind> {
+    proto.next_reply_id()
 }
 
-fn parse_id(raw: NonZeroU64) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::ParseKind> {
-    bsql_pg_proto::reply_id::ReplyId::from_raw(raw)
+fn startup_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::StartupKind> {
+    proto.next_reply_id()
 }
 
-fn startup_id(raw: NonZeroU64) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::StartupKind> {
-    bsql_pg_proto::reply_id::ReplyId::from_raw(raw)
-}
-
-fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf, raw_id: NonZeroU64) {
-    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply: ping_id(raw_id) }, wb);
+fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf) {
+    let reply = ping_id(proto);
+    proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, wb);
     // DEF-212 (Alt Y'): bytes live in wb (Sync = 5 B for Ping). The
     // helper's tier-1 invariant is "push succeeded" (Idle precondition
     // already proved by `as_ready` inside push_or_panic); the
@@ -59,8 +58,9 @@ fn empty_query_response_with_non_zero_body_classifies() {
     // Scope block ends the OutActions borrow of wb before the next
     // feed_bytes call re-borrows it.
     let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
+    let reply = query_id(&mut proto);
     proto.push_or_panic(
-        bsql_pg_proto::push_command::SimpleQuery { sql, reply: query_id(raw(9901)) },
+        bsql_pg_proto::push_command::SimpleQuery { sql, reply },
         &mut wb,
     );
     // DEF-212: SimpleQuery emits a 'Q' frame; non-empty wb verifies
@@ -100,8 +100,9 @@ fn parse_complete_with_non_zero_body_classifies() {
         Err(_) => return,
     };
     let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
+    let reply = parse_id(&mut proto);
     proto.push_or_panic(
-        bsql_pg_proto::push_command::Parse { stmt_name: stmt, sql, reply: parse_id(raw(9902)) },
+        bsql_pg_proto::push_command::Parse { stmt_name: stmt, sql, reply },
         &mut wb,
     );
     // DEF-212: Parse emits 'P' frame + 5 B Sync; non-empty wb confirms.
@@ -132,7 +133,7 @@ fn max_length_notice_frame_is_consumed_cleanly() {
     let mut wb = WriteBuf::new();
 
     // Ping to reach a state that accepts NoticeResponse.
-    push_ping(&mut proto, &mut wb, raw(8801));
+    push_ping(&mut proto, &mut wb);
 
     // Frame: tag 'N' + length=4095 + 4091 body bytes = 4096 total.
     // Fills the read buffer exactly — dispatch must consume without
@@ -165,7 +166,7 @@ fn max_length_notice_frame_is_consumed_cleanly() {
 fn pong_delivered_via_byte_at_a_time_fragmentation() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    push_ping(&mut proto, &mut wb, raw(9999));
+    push_ping(&mut proto, &mut wb);
 
     // RFQ frame: tag 'Z' + length 5 + tx_status 'I' (Idle) = 6 bytes total.
     let rfq_frame = [b'Z', 0x00, 0x00, 0x00, 0x05, b'I'];
@@ -213,13 +214,14 @@ fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
         Ok(p) => p,
         Err(_) => return,
     };
+    let reply = startup_id(&mut proto);
     proto.push_or_panic(
         bsql_pg_proto::push_command::Startup {
             user,
             database: None,
             app_name: None,
             credentials: Credentials::ScramPassword(Sensitive::new(pw)),
-            reply: startup_id(raw(42_000)),
+            reply,
         },
         &mut wb,
     );
@@ -303,7 +305,7 @@ fn scram_max_iterations_is_pinned_at_100k() {
 fn error_response_max_fields_boundary_is_bounded() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    push_ping(&mut proto, &mut wb, raw(7701));
+    push_ping(&mut proto, &mut wb);
 
     // Body: 32 `x=val\0` fields + trailing 0-byte terminator.
     // Each field: type-byte + payload + NUL = keep small to fit cap.

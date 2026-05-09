@@ -43,10 +43,9 @@
 use bsql_pg_proto::{
     frame::parse_header,
     ident::Sql,
-    reply_id::{PingKind, QueryKind, ReplyId},
+    reply_id::{PingKind, QueryKind},
     PgProtocol, PushFailure, WriteBuf,
 };
-use core::num::NonZeroU64;
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput,
 };
@@ -128,9 +127,8 @@ fn data_row_frame(len: u16) -> alloc::vec::Vec<u8> {
     out
 }
 
-fn reply_id_ping(raw: u64) -> ReplyId<PingKind> {
-    ReplyId::from_raw(NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN))
-}
+// DEF-270: ReplyId::from_raw is now pub(crate). Benches mint via
+// `proto.next_reply_id::<K>()` directly inside each iteration.
 
 // ---------------------------------------------------------------
 // Bench: parse_header single-frame.
@@ -177,10 +175,10 @@ fn bench_ping_round_trip(c: &mut Criterion) {
             let mut proto = PgProtocol::new();
             let mut wb = WriteBuf::new();
             // Push Ping — emits Sync frame bytes into write_buf.
+            // DEF-270: mint reply via the public counter API.
+            let reply = proto.next_reply_id::<PingKind>();
             let push_out = proto.bench_push_or_panic(
-                bsql_pg_proto::push_command::Ping {
-                    reply: reply_id_ping(1),
-                },
+                bsql_pg_proto::push_command::Ping { reply },
                 &mut wb,
             );
             let _ = black_box(push_out);
@@ -286,10 +284,11 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
+                let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
-                        reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+                        reply,
                     },
                     &mut wb,
                 );
@@ -377,10 +376,11 @@ fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
+                let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
-                        reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+                        reply,
                     },
                     &mut wb,
                 );
@@ -454,10 +454,11 @@ fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
+                let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
-                        reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+                        reply,
                     },
                     &mut wb,
                 );
@@ -532,10 +533,11 @@ fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
+                let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
-                        reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+                        reply,
                     },
                     &mut wb,
                 );
@@ -621,10 +623,11 @@ fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
             || {
                 let mut proto = PgProtocol::new();
                 let mut wb = WriteBuf::new();
+                let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
                         sql: Sql::from_str_truncating("SELECT x"),
-                        reply: ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
+                        reply,
                     },
                     &mut wb,
                 );
@@ -687,8 +690,10 @@ fn bench_push_ping(c: &mut Criterion) {
             // 16 B by-value vs 2176 B for the legacy `bsql_pg_proto::push_command::Ping`
             // (sized to Parse). This is the bench probe for T's claimed
             // -18..-22% gain.
+            // DEF-270: mint via the public counter API.
+            let reply = proto.next_reply_id::<PingKind>();
             let out = proto.bench_push_or_panic(
-                bsql_pg_proto::push_command::Ping::new(reply_id_ping(1)),
+                bsql_pg_proto::push_command::Ping::new(reply),
                 &mut wb,
             );
             let _ = black_box(out);

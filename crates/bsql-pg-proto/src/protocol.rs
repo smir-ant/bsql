@@ -552,6 +552,17 @@ pub struct PgProtocol {
     /// on every fail_inflight_no_readbuf invocation. DEF-185 P2-9 +
     /// DEF-186 P1-5 widened to u32 for adversarial-flood resilience.
     malformed_frame_count: u32,
+    // DEF-270 cluster (U letter, 2026-05-09 — fix-up after bisect):
+    // reply-id counter lives in a `static AtomicU64` (mod-private,
+    // see `next_reply_id` below) — NOT inline on PgProtocol.
+    //
+    // Why static instead of per-protocol field: bisect proved
+    // adding a `u64` field grew PgProtocol 520 → 528 B and shifted
+    // LLVM whole-crate codegen heuristic, regressing
+    // `column_decode/iter_10cols_alternating_null_i32` by +6%.
+    // Static-atomic mint preserves PgProtocol size at 520 B (no
+    // codegen shift) and STRENGTHENS the invariant: globally unique
+    // IDs across all `PgProtocol` instances (was per-protocol only).
     // DEF-189 row_desc_slot field is declared at the top of the
     // struct (above) for hot-path cache-line locality; full lifecycle
     // docstring follows.
@@ -745,6 +756,51 @@ pub struct PgProtocol {
 // timing is correct. Relative-to-baseline regression detection is
 // preserved.
 
+// ─────────────────────────────────────────────────────────────────
+// DEF-270 R-rephrased — schema-slot write auth tags hosted here.
+//
+// Per `mod schema_slot` docs: tag types must live in their host
+// modules so that `pub(in <host_module>) const fn new()` can name
+// the host module as a visibility ancestor. The tags below are
+// minted only at the matching transition sites inside `mod protocol`:
+// - `AtBindExecuteSelectTransition`: at `compute_push_bind_execute_idle_only`
+//   when the caller supplies `row_desc: Some(_)` (SELECT path).
+// - `AtClearSessionResidue`: at `clear_session_residue_for_class`
+//   when transitioning to Idle/Errored.
+//
+// Cross-module callers (e.g. `mod dispatch`) cannot mint these —
+// they have their own tag (`AtRowDescriptionDispatch`) hosted in
+// `mod dispatch`.
+// ─────────────────────────────────────────────────────────────────
+
+/// DEF-270 R-rephrased — tag for the BindExecute SELECT install
+/// transition. Minted inside `compute_push_bind_execute_idle_only`
+/// when a caller-supplied `row_desc` is parked into the slot.
+pub(crate) struct AtBindExecuteSelectTransition(());
+impl crate::schema_slot::sealed::Sealed for AtBindExecuteSelectTransition {}
+impl crate::schema_slot::SchemaWriteAuth for AtBindExecuteSelectTransition {}
+impl AtBindExecuteSelectTransition {
+    /// Construct the tag. Visibility limited to `mod crate::protocol`.
+    #[inline]
+    pub(in crate::protocol) const fn new() -> Self {
+        Self(())
+    }
+}
+
+/// DEF-270 R-rephrased — tag for the clear-session-residue transition.
+/// Minted inside `clear_session_residue_for_class` when the protocol
+/// scrubs the slot on Idle/Errored entry.
+pub(crate) struct AtClearSessionResidue(());
+impl crate::schema_slot::sealed::Sealed for AtClearSessionResidue {}
+impl crate::schema_slot::SchemaWriteAuth for AtClearSessionResidue {}
+impl AtClearSessionResidue {
+    /// Construct the tag. Visibility limited to `mod crate::protocol`.
+    #[inline]
+    pub(in crate::protocol) const fn new() -> Self {
+        Self(())
+    }
+}
+
 impl PgProtocol {
 
     /// Construct a new protocol in [`ProtoState::Idle`].
@@ -767,6 +823,89 @@ impl PgProtocol {
             malformed_frame_count: 0,
             sync_marker: PhantomData,
         }
+    }
+
+    /// Mint a fresh `ReplyId<K>` for an outbound command.
+    ///
+    /// **DEF-270 cluster (U letter, 2026-05-09):** this is the sole
+    /// public mint surface for [`crate::ReplyId<K>`]. Pre-DEF-270
+    /// `ReplyId::from_raw(...)` was `pub` and external crates minted
+    /// their own IDs (tier-3 by-discipline — duplicate-ID risk).
+    /// Post-DEF-270 `from_raw` is `pub(crate)` and the only path to a
+    /// `ReplyId<K>` from outside the crate is this method.
+    ///
+    /// # Why `&mut self` if mint is via static atomic
+    ///
+    /// The counter is a `static AtomicU64` (mod-private below) — NOT
+    /// a `PgProtocol` field. Bisect 2026-05-09 proved that adding an
+    /// inline `u64` field grew `PgProtocol` 520 → 528 B and shifted
+    /// LLVM whole-crate codegen heuristic, regressing the synthetic
+    /// `column_decode/iter_10cols` bench by +6%. Static-atomic mint
+    /// preserves PgProtocol size at 520 B (no codegen shift) AND
+    /// strengthens the invariant: globally-unique IDs across all
+    /// `PgProtocol` instances (per-protocol counter would only have
+    /// guaranteed per-instance uniqueness).
+    ///
+    /// `&mut self` is retained on the signature because: (a) it
+    /// keeps the API shape consistent with the prior per-protocol
+    /// design (forward-compat if we ever move back), and (b) the
+    /// borrow makes it obvious to callers that mint participates in
+    /// the protocol's mutation cycle (it is not a "look-only"
+    /// operation; the minted ID is correlator-bound to a future
+    /// push).
+    ///
+    /// # Tier-1 / tier-2 closure
+    ///
+    /// - **External fabrication: tier-1 by-visibility.** `ReplyId::from_raw`
+    ///   is `pub(crate)` — `mem::transmute` is the only escape, and the
+    ///   crate is `#![forbid(unsafe_code)]`.
+    /// - **Cross-instance monotonicity: tier-2 by atomic-fetch_add.**
+    ///   Globally unique across all `PgProtocol` instances and threads.
+    ///   `Ordering::Relaxed` is sufficient: monotonic visibility within
+    ///   one observer is not needed — the protocol's pending-replies
+    ///   table (in the wrapper) does the rendezvous; mint just needs
+    ///   to never return the same value twice. Linear types would
+    ///   lift this to tier-1 ("counter has never returned this
+    ///   value"); not available pre-stable Rust.
+    ///
+    /// # Type parameter
+    ///
+    /// `K: ReplyKind` — the typed reply-kind tag bound to the command
+    /// being pushed. Caller writes `proto.next_reply_id::<PingKind>()`
+    /// for a Ping reply, etc. The kind binds the payload type via
+    /// [`crate::ReplyKind::Payload`] (DEF-112) — passing the wrong
+    /// kind to a command's `reply` field is a type error.
+    ///
+    /// # Counter behaviour
+    ///
+    /// Saturating `u64` add. First call returns `NonZeroU64::new(1)`;
+    /// each subsequent call increments by 1. Saturation at `u64::MAX`
+    /// is architecturally distant (~10^19 commands process-wide).
+    /// On saturation the counter parks at `u64::MAX` — every
+    /// subsequent mint returns the same ID, surfacing as a
+    /// duplicate-correlator failure at the wrapper's pending-replies
+    /// table (post-Phase-1c-5).
+    #[inline]
+    pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
+        &mut self,
+    ) -> crate::reply_id::ReplyId<K> {
+        // DEF-270 U (post-bisect fix-up 2026-05-09): static atomic
+        // counter to keep PgProtocol size pin at 520 B. See method
+        // docstring for the bisect rationale.
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // saturating_add(1) prevents wrap to zero (NonZeroU64 niche
+        // violation) at the architecturally-distant u64::MAX
+        // saturation point.
+        let raw = COUNTER.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        // SAFETY contract: counter starts at 0, fetch_add returns
+        // pre-increment value, then we saturating_add(1). First call:
+        // pre=0, post=1. NonZeroU64::new(1) is Some; the unwrap_or
+        // fallback to MIN is dead but keeps `forbid(clippy::unwrap_used)`
+        // happy on the proven-dead branch.
+        let nz = core::num::NonZeroU64::new(raw)
+            .unwrap_or(core::num::NonZeroU64::MIN);
+        crate::reply_id::ReplyId::from_raw(nz)
     }
 
     // DEF-196 (2026-04-28): three-field split. Each cold slot
@@ -1808,14 +1947,19 @@ impl PgProtocol {
         //   over the full dispatch loop.
         match class {
             crate::state::StatePushClass::Idle => {
-                self.row_desc_slot = None;
+                // DEF-270 R-rephrased: clear via SchemaParkedSlot witness
+                // — auth tag mint is `pub(in crate::protocol)`.
+                self.schema_slot_for_write(AtClearSessionResidue::new())
+                    .clear();
                 // DEF-196: only clear arena if it was ever allocated.
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
             }
             crate::state::StatePushClass::Errored(_) => {
-                self.row_desc_slot = None;
+                // DEF-270 R-rephrased: same witness pattern as Idle arm.
+                self.schema_slot_for_write(AtClearSessionResidue::new())
+                    .clear();
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
@@ -2041,6 +2185,51 @@ impl PgProtocol {
         self.row_desc_slot
             .as_ref()
             .map(crate::decode::RowDescBorrow::from_ref)
+    }
+
+    /// DEF-270 cluster (R-rephrased letter, 2026-05-09) — sole
+    /// in-crate write surface for `row_desc_slot`.
+    ///
+    /// Returns a [`crate::schema_slot::SchemaParkedSlot`] witness
+    /// wrapping `&mut self.row_desc_slot`. The witness's `park` /
+    /// `clear` / `raw_mut` methods are the only paths to mutate the
+    /// slot; direct field assignment is impossible (field is private
+    /// to `mod protocol`).
+    ///
+    /// # Auth witness requirement
+    ///
+    /// `auth: A: SchemaWriteAuth` — caller must mint a typed auth
+    /// tag at the legitimate transition site. Each tag is hosted in
+    /// the module that performs the transition (so `pub(in <module>)`
+    /// visibility on `new()` can name the host module as ancestor):
+    /// - [`AtBindExecuteSelectTransition`]: hosted in `mod protocol`
+    ///   — for the BindExecute SELECT install path.
+    /// - [`crate::dispatch::AtRowDescriptionDispatch`]: hosted in
+    ///   `mod dispatch` — for inbound `'T'` (RowDescription) frame
+    ///   handling.
+    /// - [`AtClearSessionResidue`]: hosted in `mod protocol` — for
+    ///   the residue-scrub on Idle/Errored transitions.
+    ///
+    /// # Tier-1 closure
+    ///
+    /// External crates: cannot reach the slot at all (field private
+    /// to `mod protocol`; this method is `pub(crate)`).
+    ///
+    /// In-crate cross-module: cannot mint an auth tag for a transition
+    /// outside their module (visibility seal on the tag constructor).
+    /// Adding a new write transition requires (a) adding a new auth
+    /// tag with the appropriate `pub(in ...)` visibility in its host
+    /// module, AND (b) hooking the call. Both surface in the same
+    /// commit.
+    #[inline]
+    pub(crate) fn schema_slot_for_write<A: crate::schema_slot::SchemaWriteAuth>(
+        &mut self,
+        auth: A,
+    ) -> crate::schema_slot::SchemaParkedSlot<'_> {
+        crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+            &mut self.row_desc_slot,
+            auth,
+        )
     }
 
     /// DEF-189: fused state classification for the row-stream
@@ -3243,9 +3432,14 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
     // single slot BEFORE the state transition. The variant
     // shape (Select vs Dml) is the tier-1 signal that the
     // slot is populated.
+    // DEF-270 R-rephrased: park via SchemaParkedSlot witness — auth
+    // tag is `pub(in crate::protocol)` so only this module can mint.
     *state = match row_desc {
         Some(desc) => {
-            *row_desc_slot = Some(desc);
+            crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+                row_desc_slot,
+                AtBindExecuteSelectTransition::new(),
+            ).park(desc);
             ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }
         }
         None => ProtoState::BindExecuteAwaitingBindCompleteDml(reply),

@@ -48,10 +48,9 @@ use bsql_pg_proto::{
         TAG_ROW_DESCRIPTION,
     },
 };
-use core::num::NonZeroU64;
 
 mod common;
-use common::PushOrPanic;
+use common::{PushOrPanic, mint_reply};
 
 // ------------------------------------------------------------------
 // Frame builders — pure functions, mirror `simple_query_spec` shapes.
@@ -117,15 +116,6 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
     frame(TAG_ERROR_RESPONSE.byte(), &body)
 }
 
-fn raw(v: u64) -> NonZeroU64 {
-    assert!(v > 0, "raw(0) is a test bug");
-    NonZeroU64::new(v).unwrap_or(NonZeroU64::MIN)
-}
-
-fn id(v: NonZeroU64) -> ReplyId<QueryKind> {
-    ReplyId::from_raw(v)
-}
-
 fn sql(s: &str) -> Sql {
     Sql::from_str_truncating(s)
 }
@@ -170,8 +160,8 @@ fn push_simple_query(proto: &mut PgProtocol, reply: ReplyId<QueryKind>, wb: &mut
 fn multi_row_select_end_to_end() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(200);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     let row_values: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
     let mut bytes = std::vec::Vec::new();
@@ -231,8 +221,8 @@ fn multi_row_select_end_to_end() {
 fn drained_after_complete_emits_need_more() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(201);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&row_description_frame(1));
@@ -275,8 +265,8 @@ fn drained_after_complete_emits_need_more() {
 fn errored_state_emits_close_socket_once_then_need_more() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(202);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     // Tear down via a malformed frame: total_len < 4 is classified
     // as MalformedLength which routes through fail_inflight and
@@ -316,8 +306,8 @@ fn errored_state_emits_close_socket_once_then_need_more() {
 fn fast_path_empty_data_row_body_is_malformed() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(203);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     // Install RowDescription first so the fast-path (which looks
     // up `streaming_reply_id_and_schema`) engages on the next D
@@ -364,8 +354,8 @@ fn fast_path_empty_data_row_body_is_malformed() {
 fn feed_overflow_returns_tiny_read_buf_full_err() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(204);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     let mut stream = proto.iter_rows(&mut wb);
     // Feed a very large slice — read_buf capacity is bounded; this
@@ -400,8 +390,8 @@ fn feed_overflow_returns_tiny_read_buf_full_err() {
 fn server_error_response_surfaces_as_fail_reply() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(205);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&error_response_frame(b"syntax error at or near \"SELCT\""));
@@ -448,8 +438,8 @@ fn server_error_response_surfaces_as_fail_reply() {
 fn rows_before_mid_stream_error_are_preserved() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(206);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&row_description_frame(1));
@@ -506,8 +496,8 @@ fn rows_before_mid_stream_error_are_preserved() {
 fn rows_preserved_when_command_complete_malformed() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(207);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     let mut bytes = std::vec::Vec::new();
     bytes.extend_from_slice(&row_description_frame(1));
@@ -561,8 +551,8 @@ fn rows_preserved_when_command_complete_malformed() {
 fn rows_across_multiple_feed_calls() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(208);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     let mut batch1 = std::vec::Vec::new();
     batch1.extend_from_slice(&row_description_frame(1));
@@ -641,8 +631,8 @@ fn rows_across_multiple_feed_calls() {
 fn row_bytes_decode_via_data_row_ref() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(209);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     // Build DataRow with 2 columns: "answer" and NULL.
     let mut row_body = std::vec::Vec::new();
@@ -710,8 +700,8 @@ fn row_bytes_decode_via_data_row_ref() {
 fn end_to_end_decode_typed_row() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
-    let q_raw = raw(210);
-    push_simple_query(&mut proto, id(q_raw), &mut wb);
+    let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
+    push_simple_query(&mut proto, reply, &mut wb);
 
     // RowDescription: 2 cols — id INT4, name TEXT.
     let mut rd_body = std::vec::Vec::new();

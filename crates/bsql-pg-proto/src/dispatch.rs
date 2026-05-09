@@ -40,6 +40,31 @@ use crate::action::StagedAction;
 use crate::error::ProtocolError;
 use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
+
+// ─────────────────────────────────────────────────────────────────
+// DEF-270 R-rephrased — schema-slot write auth tag hosted here.
+//
+// Per `mod schema_slot` docs, tag types live in their host modules
+// to enable `pub(in <host_module>) const fn new()` visibility seal.
+// The 'T' (RowDescription) frame dispatch is the legitimate transition
+// point for parking schema into `PgProtocol::row_desc_slot`; this
+// tag is minted only there.
+// ─────────────────────────────────────────────────────────────────
+
+/// DEF-270 R-rephrased — tag for inbound `'T'` (RowDescription)
+/// frame dispatch. Minted at the dispatch handler 'T' arm transitions
+/// (simple-query, describe-statement, describe-portal paths).
+pub(crate) struct AtRowDescriptionDispatch(());
+impl crate::schema_slot::sealed::Sealed for AtRowDescriptionDispatch {}
+impl crate::schema_slot::SchemaWriteAuth for AtRowDescriptionDispatch {}
+impl AtRowDescriptionDispatch {
+    /// Construct the tag. Visibility limited to `mod crate::dispatch`
+    /// — only the dispatch handlers can mint this auth.
+    #[inline]
+    pub(in crate::dispatch) const fn new() -> Self {
+        Self(())
+    }
+}
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
     TAG_COMMAND_COMPLETE, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
@@ -580,7 +605,12 @@ pub(crate) fn dispatch(
             // The slot lives across the entire stream (DataRows + Z).
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    *row_desc_slot = Some(row_desc);
+                    // DEF-270 R-rephrased: park via SchemaParkedSlot
+                    // witness — auth tag mint is `pub(in crate::dispatch)`.
+                    crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+                        row_desc_slot,
+                        AtRowDescriptionDispatch::new(),
+                    ).park(row_desc);
                     *state = ProtoState::SimpleQueryStreamingRows { reply };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -1036,7 +1066,11 @@ pub(crate) fn dispatch(
                 // source of truth (no `rows: Rows` discriminator
                 // duplicate). Materialise reads the slot at the Z
                 // arm.
-                *row_desc_slot = Some(row_desc);
+                // DEF-270 R-rephrased: park via SchemaParkedSlot witness.
+                crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+                    row_desc_slot,
+                    AtRowDescriptionDispatch::new(),
+                ).park(row_desc);
                 *state = ProtoState::DescribeStatementAwaitingRfq {
                     reply,
                     param_oids,
@@ -1116,7 +1150,12 @@ pub(crate) fn dispatch(
             // in PgProtocol::row_desc_slot — single source of truth.
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    *row_desc_slot = Some(row_desc);
+                    // DEF-270 R-rephrased: park via SchemaParkedSlot
+                    // witness — auth tag mint is `pub(in crate::dispatch)`.
+                    crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+                        row_desc_slot,
+                        AtRowDescriptionDispatch::new(),
+                    ).park(row_desc);
                     *state = ProtoState::DescribePortalAwaitingRfq { reply };
                     DispatchOutcome::AdvancedSilent
                 }
