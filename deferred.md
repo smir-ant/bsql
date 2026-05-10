@@ -346,11 +346,115 @@ Architect's proposed `pub(in crate::protocol) const EMPTY` failed E0742 (visibil
 
 **Bench summary**: 17 benches, 4 "no change", 2 "improved" (+5-7% on row-stream pull paths), 11 "within noise threshold" (max +2.8% / -5.0%; criterion's noise floor is ±5% on consumer hardware). Architect prediction held: LLVM erases the cell newtypes (`#[repr(transparent)]`) and concrete-type tokens (ZST private fields). The 2 real improvements on row-stream paths likely stem from the cell newtype helping LLVM unify the read/write code paths through stricter borrow patterns — a perf side-effect of the closure tightening, not the goal.
 
+#### DEF-160 (SHIPPED 2026-05-11): zero-copy borrowed-SQL push API (Z2)
+
+DEF-218 colossal-data audit identified `MAX_SQL_LEN = 2048` as the highest-severity silent-corruption hazard in the crate: `Sql::from_str_truncating` accepted any `&str`, padded oversize input to a `…` marker, and the truncated query went on the wire as-is — server ran it, returned "results" for the wrong query, no error surfaced anywhere. Two architect cycles considered alternatives (cap-bump, const-generic) and rejected both as "fallback patterns that push the limit but do not eliminate it"; (Z2) eliminates the limit structurally.
+
+**Mechanism (Z2 — zero-copy SQL via scatter-gather chunks)**:
+
+1. **`StagedAction::SendBytesBorrowed(&'sql [u8])` variant** (commit 1, `ec6686b`) added alongside the existing range/static variants. The `'sql` lifetime is unified with `'w` (WriteBuf borrow) inside `materialise`'s signature — `&'sql [u8]` coerces to `Action::SendBytes(&'w [u8])` via `'sql: 'w` subtyping.
+2. **`Parse<'a> { sql: &'a str }` + `SimpleQuery<'a> { sql: &'a str }`** (commit 2) replace the owned `Sql` fields. `PushCommand::execute<'sql>(... where Self: 'sql)` threads the caller's lifetime through to the staged borrow. Per-command struct sizes drop from `MAX_SQL_LEN + header (≈2120 B)` to `≤128 B` (Parse) / `≤64 B` (SimpleQuery).
+3. **`compute_push_simple_query_idle_only` + `compute_push_parse_idle_only`** emit 3-4 staged actions: header range (in `wb`) + borrowed SQL (zero-copy) + trailer range (in `wb`) + Sync (`SendBytesStatic`, Parse only). Under `writev` / `IoSlice` these collapse to a single socket syscall.
+4. **`push_command_internal` + `ReadyGuard::push_command` return `Result<OutActions<'w, 'static>, PushFailure>`** (was `Result<(), PushFailure>` per DEF-212). Caller drains chunks via `for action in out_actions { ... }`. The pre-DEF-212 `OutActions` shape returns — same 800 B per-call return frame as pre-(212), but now load-bearing because SQL chunks span CALLER memory, not just `wb`.
+5. **`materialise_push` deleted**. Pre-Z2 it verified staged ranges against `wb` and appended `SendBytesStatic` (Sync) into `wb`. Post-Z2 push and feed paths unify through `materialise` (`terminal_row_desc: None` for push — push never emits `DeliverReply`). `BrandedWriteReserved::as_bytes` (orphan after `materialise_push` deletion) also deleted.
+
+**Tier impact**:
+
+| Surface | Pre-DEF-160 | Post-DEF-160 |
+|---------|-------------|--------------|
+| SQL > 2 KB on push (Parse / SimpleQuery) | **tier-4 silent semantic corruption** — server runs truncated query, returns wrong results, no error path | **tier-1 by-construction** — `&str` is unbounded, no cap, no truncation, no `…` marker; SQL length naturally limited only by `u32::MAX` PG-wire length field |
+| SQL → wb memcpy on every push | Always paid (MAX_SQL_LEN copy into WriteBuf) | Eliminated (`SendBytesBorrowed` references caller's `&'a str` directly) |
+| `Parse` / `SimpleQuery` struct sizes | ~2120 B / ~2054 B (inline `Sql` cap) | ≤128 B / ≤64 B (header pointers only) |
+| Caller-side socket I/O shape | Single `write` of `wb.as_bytes()` | `writev` / IoSlice over per-chunk `OutActions`; same syscall count under vectored I/O |
+
+**Tests**:
+
+`tests/common/mod.rs::actions_to_scratch` drains `OutActions` chunks into a heap scratch and rebuilds `wb` with the concatenated wire frame — preserving the pre-DEF-160 test invariant `wb.as_bytes() == on-wire frame` so existing fixture assertions (`split_frame_plus_sync`, `split_bind_execute_sync`, `parse_frame_wire_format_with_named_statement`) all pass unchanged. The rebuild costs one extra memcpy in tests only; production drives chunks directly to socket via `writev` / `IoSlice`.
+
+**Acceptance gate (DEF-160)**:
+
+- ✅ 157/0/10 tests green (lib unit + 10 doctest pin assertions). Lib went 158 → 157 only because `branded_reserve_as_bytes_len_mirrors_buf` was deleted alongside the orphan helper it pinned.
+- ✅ clippy clean across `--tests --benches` with `-D warnings` (incl. `expect_used` forbid in tests — fixture uses explicit `match + panic` instead of `.expect`).
+- ✅ `#![forbid(unsafe_code)]` preserved.
+- ✅ Architect-vetted (Z2 emerged from cycle 2 after cycle 1's (Y) proposal was found to carry 6 critical infections — WriteRange size-pin break, with_length_prefix back-patch break, DEF-185 P0-B zeroize gap, Option<SplicePoint> Drop physics replay, tier-3 reintroduction).
+- ✅ bench-stable compare vs `pre-def160` baseline: **0 regressions, 1 improvement, rest within noise** (17 benches). An intermediate naïve Z2 shape (two-pass: closure returns `StagedActions`, then push_command_internal scans for `FailReply`, then calls `materialise(staged, ...)`) regressed `push_command/ping` **+270%** + `ping_round_trip/push_then_feed` +46% during development. Principal-driven follow-up audit («если ... неожиданно сильно прибавили ... то это повод не откатываться ... а повод разобраться, глянуть asm») diagnosed root cause: redundant intermediate `StagedActions` closure-return (~2.8 KB stack frame) + duplicate iteration. Collapsing to **single-pass inside the `with_branded` closure** (open-coded materialise, FailReply classified inline) reversed the regression to **-7.97% vs pre-DEF-160** on `push_command/ping` and -3.18% (within noise) on `ping_round_trip/push_then_feed`. The shipped commit contains only the single-pass shape.
+
+**Bench-stable verification table** (final, 17 benches, full suite):
+
+`bench-stable compare pre-def160`: **0 regressions, 3 improvements, 14 within-noise**, exit code 0.
+
+| Bench | Shipped | Δ vs pre-DEF-160 | Classification |
+|-------|---------|-------------------|----------------|
+| `push_command/ping` | 11.42 ns | **-9.45%** ⚡ | improvement (was the +270% naïve-two-pass casualty; single-pass overrun the pre-DEF-160 baseline) |
+| `column_decode/iter_5cols_decode_i32` | 31.46 ns | **-14.93%** ⚡ | improvement (LLVM codegen rebalance from PushCommand lifetime threading + zero-copy API; not the design target, archeology only) |
+| `iter_rows_via_for_each/pull_100_rows_via_for_each` | 1356.52 ns | **-7.85%** ⚡ | improvement (paired with i32 decode improvement — same root cause) |
+| `column_decode/iter_5cols_raw_no_decode` | 6.06 ns | -4.26% | within noise |
+| `column_decode/iter_5cols_decode_text_cyrillic` | 77.69 ns | -3.73% | within noise |
+| `column_decode/iter_5cols_decode_text_short_ascii` | 43.35 ns | -3.58% | within noise |
+| `column_decode/iter_5cols_decode_i32_common_values` | 10.89 ns | -3.20% | within noise |
+| `ping_round_trip/push_then_feed` | 69.54 ns | -2.75% | within noise (was the +46% naïve-two-pass casualty; single-pass eliminated it) |
+| `column_decode/data_row_parse_5cols` | 1.05 ns | -2.45% | within noise |
+| `column_decode/iter_5cols_decode_i32_short_4digit_via_swar` | 14.24 ns | -2.20% | within noise |
+| `column_decode/iter_10cols_alternating_null_i32` | 34.90 ns | -2.01% | within noise |
+| `parse_header/rfq_header` | 2.50 ns | -0.65% | within noise |
+| `iter_rows_via_next_event/pull_100_rows` | 1642.31 ns | +1.56% | within noise |
+| `iter_rows_via_next_row_bytes/pull_100_rows_via_next_row_bytes` | 1440.43 ns | +0.44% | within noise |
+| `iter_rows_via_next_row/pull_100_rows_via_next_row` | 1421.42 ns | +0.30% | within noise |
+| `column_decode/iter_5cols_decode_text_long_ascii` | 24.62 ns | +0.18% | within noise |
+| `iter_rows_via_consume_batch/pull_100_rows_via_consume_batch_8` | 1472.47 ns | +0.10% | within noise |
+
+**Mitigation diagnostic (principal-driven, 2026-05-11)**:
+
+The naïve Z2 shape had `push_command_internal` doing:
+
+```text
+let staged = with_branded(|wb| {
+    let reserved = wb.reserve();
+    cmd.execute(...);          ← writes header/trailer into wb, stages 3-4 SendBytesRange/Borrowed/Static
+    staged                      ← returned from closure (~2.8 KB worst-case StagedActions stack frame)
+});
+for sa in staged.iter() { check FailReply }    ← iteration #1, by-ref
+Ok(materialise(staged, ...))                    ← iteration #2, consumes staged, builds OutActions (~2.8 KB stack frame)
+```
+
+Three large stack moves (closure→fn, materialise→fn, fn→caller) + two iterations = the +270% regression.
+
+The fix collapses everything into the closure:
+
+```text
+with_branded(|wb| -> Result<OutActions, PushFailure> {
+    let mut staged = ...;
+    cmd.execute(...);             ← stages
+    let bytes = wb.into_bytes();  ← &'w [u8], lifetime escapes closure
+    let mut out = OutActions::new();
+    let mut failure = None;
+    for sa in staged {             ← SINGLE iteration
+        match sa { ... FailReply → failure = Some(); SendBytesRange → out.push(slice); ... }
+    }
+    match failure { Some → Err, None → Ok(out) }
+})
+```
+
+LLVM coalesces the StagedActions stack slot with the OutActions slot (non-overlapping liveness inside the closure), so the closure's stack frame size = max(StagedActions, OutActions) ≈ 2.8 KB instead of staged + out ≈ 5.6 KB. The single iteration also eliminates one full enum-discriminant walk over 8 entries. The feed-side `materialise` keeps its broader contract (StagedAction::DeliverReply / FailReply → typed `Action` variants) for dispatcher use; push is open-coded inline.
+
+**Lesson archived** (principal directive verbatim 2026-05-11):
+
+> «если путь по safety хороший но мы неожиданно сильно прибавили в весе и footprint или в производительности и наносекундах, то это повод не откатываться и rollback делать, а повод разобраться, глянуть asm, измерения дополнительные может провести. и в ходе размышлений вероятно ты придешь или к прорывным практикам или к архитектуре какой-то модифицированной или вовсе альтернативный подход и путь ещё более чистый — главное результат»
+
+**Translation / generalisation**: a regression on a safety-improving change is a signal to investigate root cause, NOT to roll back. The DEF-160 +270% regression directly yielded the single-pass push-materialise pattern; applies to any future push-path that constructs an `OutActions` end-to-end.
+
+**Glass residues remaining post-DEF-160**:
+
+- **`MAX_OWNED_SEND_LEN` cap-shrink**: WriteBuf cap stays at 2176 B post-Z2; the dominant non-SQL contributor is SASLResponse (~389 B) so the cap could shrink ~4× to ~389-512 B. Drift-pin asserts (`max_simple_query_message_size`, `max_parse_message_size`) still hold (2176 ≥ 2054 / ≥ 2120) but are now semantically over-conservative — they bound the full wire frame, post-Z2 only the wb-residue (header + trailer) need fit. Cap-shrink + drift-pin re-semantics deferred to a follow-up commit so the change can be bench-stable-measured independently of the API change.
+- **`MAX_SQL_LEN` + `Sql` public-surface demotion**: post-Z2 external callers no longer construct `Sql` (push commands carry `&'a str`); `Sql` survives only as the cfg(test) legacy `PgCommand::SimpleQuery` enum field used by lib-internal `compute_push_tests`. Could be demoted from `pub` to `pub(crate)` in a follow-up; left untouched in this commit to keep the API change reviewable in isolation.
+- **`bsql-driver-postgres` does not yet exist** — the driver wrapper that will collapse the per-chunk `OutActions` into a single `writev` / `IoSlice` syscall is Phase 1e work. Today's bench fixtures simulate the production drain pattern by concatenating chunks into a heap scratch.
+
 #### Shipped from this queue (chronological)
 
 | Date | DEF | Result | Commit |
 |------|-----|--------|--------|
 | 2026-05-08 | DEF-265 | α footprint reduction via Idea-38 (two-tier inline + lazy heap escape). PgProtocol size 4352 B → **520 B exact (-88% inline)**. ping_round_trip/push_then_feed **-36.17%**; iter_rows_via_* family -2.4 to -10.5%. Zero alloc-traffic regressions. **Generalisable insight**: lazy-escape pattern works for long-lived/append-many access (ReadBuf); same pattern on reset-heavy access (WriteBuf, DEF-268) MEASURED-REJECTED. | `9ec3ca9` |
+| 2026-05-11 | DEF-160 | Zero-copy borrowed-SQL push API (Z2) + single-pass push-materialise. `Parse<'a>::sql` / `SimpleQuery<'a>::sql = &'a str`; `StagedAction::SendBytesBorrowed(&'sql [u8])` + `push_command -> Result<OutActions<'w, 'static>, PushFailure>`. **Closes DEF-218 silent-truncation hazard structurally** (was MAX_SQL_LEN=2048 cap → server ran wrong query, no error; now unbounded `&str`). Parse struct 2120 B → ≤128 B; SimpleQuery 2054 B → ≤64 B. SQL→wb memcpy eliminated. Initial commit shape regressed `push_command/ping` +270% (StagedActions return + duplicate iteration); principal-driven mitigation collapsed to single-pass inside `with_branded` closure → **-7.97% vs pre-DEF-160** (faster). Test fixtures `actions_to_scratch` rebuilds wb so pre-DEF-160 assertions still pass. | _(this commit)_ |
 
 #### Sequential phase queue (ordered by impact-per-cost, lowest cost first)
 
@@ -407,7 +511,7 @@ Architect's proposed `pub(in crate::protocol) const EMPTY` failed E0742 (visibil
 | DEF-156 | `materialise_push` vs `materialise_feed` type split | Phase 1c-5 pipelining |
 | DEF-157 | `ProtoState` sum-of-subsums restructure | Phase 1c research |
 | DEF-159 | SCRAM arena (D001) | A10 shipped but SCRAM arena scope is 1c-5+ |
-| DEF-160 | `PgCommand::Parse` carries `&'a str` SQL | Phase 1c-3a+ lifetime API |
+| DEF-160 | **SHIPPED 2026-05-11** — see §A header for the post-ship entry. Row kept as cross-reference. | — |
 | DEF-161 | Error-body arena (closed — see DEF-184 A1+A13 shipped) | — |
 | DEF-162 | cargo-mutants kill-rate target | Phase 1d |
 | DEF-242 | **`ActiveGuard<'a>` typestate for feed-side** — symmetric to DEF-198 ReadyGuard. `proto.as_active() -> Option<ActiveGuard>` returns `None` when state==Errored; `ActiveGuard::feed_bytes` / `advance_one_frame` only callable from the guard. Lifts `IngressClassification::AlreadyErrored` arm from tier-3 runtime classification to **tier-1 compile-rejected** on the public API surface. Tier delta same shape as DEF-198. ~150 LoC, breaking API change. Identified by DEF-238 post-impl audit (2026-05-05) — only structural path to tier-1 closure of the AlreadyErrored arm. | Phase 1c-5 (state-machine guards bundle alongside DEF-005..009 pipelining) |

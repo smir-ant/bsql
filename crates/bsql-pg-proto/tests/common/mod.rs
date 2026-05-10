@@ -7,11 +7,21 @@
 //!
 //! # DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04)
 //!
-//! Post-DEF-212 push paths return `Result<(), PushFailure>` (~80 B
+//! DEF-212 push paths returned `Result<(), PushFailure>` (~80 B
 //! return frame down from 800 B `OutActions`). On `Ok(())` bytes
-//! live in the caller's `WriteBuf`; tests verify via `wb.as_bytes()`.
-//! On `Err(PushFailure { id, cause })` state has transitioned to
-//! `Errored` and the test asserts on `id` + `cause`.
+//! lived in the caller's `WriteBuf`; tests verified via `wb.as_bytes()`.
+//!
+//! # DEF-160 Z2 (2026-05-11)
+//!
+//! Post-DEF-160 push paths return `Result<OutActions<'_, 'static>, PushFailure>`
+//! to surface the zero-copy SQL chunk (caller-owned `&str` borrowed
+//! via `SendBytesBorrowed`) alongside the header/trailer ranges in
+//! `WriteBuf`. Tests still want to assert on the FULL wire frame, so
+//! the helpers below drain `OutActions` into a local scratch buffer
+//! and rebuild `wb` with the concatenated bytes BEFORE returning —
+//! preserving the pre-DEF-160 test invariant `wb.as_bytes() == on-wire frame`.
+//! This costs one extra memcpy in tests only; production callers
+//! drain `OutActions` directly to socket via `writev` / `IoSlice`.
 //!
 //! Tests that intentionally test the non-Idle branch (e.g.,
 //! "pushing while busy returns FailReply") now test
@@ -21,8 +31,9 @@
 #![allow(dead_code, reason = "shared helper module — not every test uses every helper")]
 
 use bsql_pg_proto::{
-    FetchRows, HeaderParse, PgProtocol, PortalName, PushFailure, QueryKind, ReplyId,
-    ReplyKind, RowDesc, StmtName, WriteBuf, params::ParamsWriter, parse_header,
+    Action, FetchRows, HeaderParse, OutActions, PgProtocol, PortalName, PushFailure,
+    QueryKind, ReplyId, ReplyKind, RowDesc, StmtName, WriteBuf, params::ParamsWriter,
+    parse_header,
     push_command::{BindExecute, PushCommand},
 };
 use core::num::NonZeroU64;
@@ -90,6 +101,55 @@ pub trait PushOrPanic {
     ) -> PushFailure;
 }
 
+/// DEF-160 Z2 (2026-05-11): drain `OutActions` chunks into an owned
+/// scratch buffer.
+///
+/// Post-DEF-160 `OutActions` chunks span BOTH `wb` (header / trailer
+/// ranges via `SendBytesRange`) AND caller memory (SQL borrow via
+/// `SendBytesBorrowed`) AND static memory (Sync trailer via
+/// `SendBytesStatic`). Pre-DEF-160 tests checked `wb.as_bytes()` for
+/// the full frame; preserving that invariant in tests requires one
+/// extra memcpy here (production drains chunks directly via `writev`).
+///
+/// Consumes `actions` by value so the caller can re-mut-borrow `wb`
+/// after the call returns (the `'w` lifetime that flowed into
+/// `OutActions` is released on drop of the iterator).
+///
+/// Panics on unexpected action variants (push paths emit only
+/// `SendBytes` per the architecturally-pinned push contract).
+#[track_caller]
+fn actions_to_scratch(actions: OutActions<'_, '_>) -> std::vec::Vec<u8> {
+    let mut scratch: std::vec::Vec<u8> = std::vec::Vec::with_capacity(8192);
+    for action in actions {
+        match action {
+            Action::SendBytes(b) => scratch.extend_from_slice(b),
+            Action::DeliverReply { .. } => panic!(
+                "test fixture: push paths must NEVER emit DeliverReply",
+            ),
+            Action::FailReply { .. } => panic!(
+                "test fixture: FailReply short-circuits via Result::Err; \
+                 reaching the action list indicates a push_command_internal \
+                 contract regression",
+            ),
+            Action::CloseSocket => panic!(
+                "test fixture: push paths must NEVER emit CloseSocket on Ok",
+            ),
+            // `Action` is `#[non_exhaustive]`. A future variant addition
+            // (e.g., a new feed-side reply class) would fail the explicit
+            // arm coverage above, surfacing a test-fixture update need at
+            // compile time — but the non_exhaustive marker forces a
+            // wildcard arm to satisfy exhaustiveness. We classify the
+            // wildcard as a test-fixture drift signal rather than silently
+            // accepting unknown action bytes into the rebuilt frame.
+            _ => panic!(
+                "test fixture: unhandled Action variant — \
+                 update tests/common/mod.rs after adding a new Action arm",
+            ),
+        }
+    }
+    scratch
+}
+
 impl PushOrPanic for PgProtocol {
     fn push_or_panic<C: PushCommand>(&mut self, cmd: C, wb: &mut WriteBuf) {
         let status = self.connection_status();
@@ -99,7 +159,16 @@ impl PushOrPanic for PgProtocol {
             );
         };
         match g.push_command(cmd, wb) {
-            Ok(()) => {}
+            Ok(actions) => {
+                let scratch = actions_to_scratch(actions);
+                wb.clear();
+                if wb.push_bytes(&scratch).is_err() {
+                    panic!(
+                        "test fixture: rebuilt frame ({} B) must fit WriteBuf capacity",
+                        scratch.len(),
+                    );
+                }
+            }
             Err(f) => panic!(
                 "test fixture: push_or_panic expected Ok but got {f:?}"
             ),
@@ -133,7 +202,16 @@ impl PushOrPanic for PgProtocol {
             },
             wb,
         ) {
-            Ok(()) => {}
+            Ok(actions) => {
+                let scratch = actions_to_scratch(actions);
+                wb.clear();
+                if wb.push_bytes(&scratch).is_err() {
+                    panic!(
+                        "test fixture: rebuilt frame ({} B) must fit WriteBuf capacity",
+                        scratch.len(),
+                    );
+                }
+            }
             Err(f) => panic!(
                 "test fixture: push_bind_execute_or_panic expected Ok but got {f:?}"
             ),
@@ -152,7 +230,7 @@ impl PushOrPanic for PgProtocol {
             );
         };
         match g.push_command(cmd, wb) {
-            Ok(()) => panic!(
+            Ok(_actions) => panic!(
                 "test fixture: push_expect_failure expected Err but got Ok"
             ),
             Err(f) => f,

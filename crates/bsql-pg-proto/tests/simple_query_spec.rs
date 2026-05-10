@@ -30,7 +30,7 @@
 
 use bsql_pg_proto::{
     Action, ConnectionStatus, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply,
-    ReplyId, Sql, WriteBuf,
+    ReplyId, WriteBuf,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
         TAG_QUERY, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
@@ -128,18 +128,13 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 }
 
 // ------------------------------------------------------------------
-// Sql fixture helper.
+// DEF-160 Z2 (2026-05-11): `fn sql(s) -> Sql` helper retired —
+// `push_command::SimpleQuery.sql` is `&'a str`, fixtures pass &str
+// directly. The legacy `cfg(test)` `PgCommand::SimpleQuery` enum
+// (lib-internal tests only) still owns `Sql` and uses
+// `Sql::from_str_truncating` directly; integration tests like this
+// one operate on the typed surface and skip the truncation arena.
 // ------------------------------------------------------------------
-
-/// Construct a `Sql` value from a `&str` test fixture.
-///
-/// Uses the truncating constructor `FixedStr::from_str_truncating`
-/// (generic over `Truncating`-tagged types, of which `SqlTag` is
-/// one). Source ≤ `MAX_SQL_LEN` fits verbatim; overflow gets a
-/// trailing `"…"` — both paths are exact-byte round-trip.
-fn sql(s: &str) -> Sql {
-    Sql::from_str_truncating(s)
-}
 
 /// Push a SimpleQuery with the given SQL and correlator; assert the
 /// outbound bytes start with the `'Q'` tag and return them for
@@ -156,7 +151,7 @@ fn simple_query_setup(
 ) -> std::vec::Vec<u8> {
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery {
-            sql: sql("SELECT 1"),
+            sql: "SELECT 1",
             reply,
         },
         wb,

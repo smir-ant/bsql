@@ -34,7 +34,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, FeedEvent, PgProtocol, ProtoState, ProtocolError, Reply, Sql, WriteBuf,
+    Action, FeedEvent, PgProtocol, ProtoState, ProtocolError, Reply, WriteBuf,
     reply_id::{PingKind, QueryKind},
     wire::{TAG_DATA_ROW, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION},
 };
@@ -231,7 +231,7 @@ fn row_description_transitions_to_streaming_rows_event() {
     let reply = proto.next_reply_id::<QueryKind>();
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery {
-            sql: Sql::from_str_truncating("SELECT 1"),
+            sql: "SELECT 1",
             reply,
         },
         &mut wb,

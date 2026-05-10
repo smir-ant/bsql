@@ -45,7 +45,7 @@
 #![allow(private_interfaces, private_bounds)]
 
 use crate::command::FetchRows;
-use crate::ident::{ApplicationName, DatabaseName, Ident, PortalName, Sql, StmtName};
+use crate::ident::{ApplicationName, DatabaseName, Ident, PortalName, StmtName};
 use crate::password::Credentials;
 use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
@@ -140,13 +140,24 @@ pub trait PushCommand: sealed::PushCommandSealed {
     ///
     /// Failing to consume the setter triggers an unused-`#[must_use]`
     /// build warning at the impl site.
-    fn execute(
+    /// DEF-160 Z2 (2026-05-11): `'sql` is the lifetime carried by
+    /// `Self` for impls that borrow caller-owned bytes (currently
+    /// [`Parse<'a>`] / [`SimpleQuery<'a>`] for the SQL string). The
+    /// `where Self: 'sql` bound tells the borrow checker that `Self`
+    /// outlives `'sql`, so an impl with `Self = Parse<'a>` can stage
+    /// `&'a [u8]` into `StagedActions<'sql>` (covariance via the
+    /// `'a >= 'sql` subtyping induced by the bound). Impls with no
+    /// borrowed surface (e.g., [`Ping`]) ignore `'sql` — the bound
+    /// is trivially satisfied by `Self: 'static`.
+    fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
         row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions,
+        staged: &mut crate::action::StagedActions<'sql>,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    ) -> Self::Output;
+    ) -> Self::Output
+    where
+        Self: 'sql;
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -205,13 +216,16 @@ impl PushCommand for Ping {
     type PostState = PingAwaitingRfqInstall;
 
     #[inline]
-    fn execute(
+    fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
         _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions,
+        staged: &mut crate::action::StagedActions<'sql>,
         _reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    ) {
+    )
+    where
+        Self: 'sql,
+    {
         crate::protocol::compute_push_ping_idle_only(setter, self.reply, staged);
     }
 }
@@ -246,13 +260,16 @@ impl PushCommand for Startup {
     type PostState = StartupPostInstall;
 
     #[inline]
-    fn execute(
+    fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
         _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions,
+        staged: &mut crate::action::StagedActions<'sql>,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    ) {
+    )
+    where
+        Self: 'sql,
+    {
         crate::protocol::compute_push_startup_idle_only(
             setter,
             self.user,
@@ -268,67 +285,89 @@ impl PushCommand for Startup {
 
 /// Execute a single SQL statement via PG's Simple Query protocol
 /// (`Q`-frame).
+///
+/// DEF-160 Z2 (2026-05-11): `sql` is `&'a str` (was owned `Sql =
+/// FixedStr<MAX_SQL_LEN, _>`). The bytes are streamed zero-copy via
+/// [`StagedAction::SendBytesBorrowed`](crate::action::StagedAction)
+/// — no protocol cap on SQL size, no truncation arena. Caller owns
+/// the string allocation; for SQL containing secrets, hold it in
+/// `Zeroizing<String>` (zeroize-on-drop happens at the caller, not
+/// in our `WriteBuf::clear()`).
 #[derive(Debug)]
 #[must_use = "a SimpleQuery has no effect until passed to push_command"]
-pub struct SimpleQuery {
-    /// SQL text — bounded to [`crate::ident::MAX_SQL_LEN`] = 2048 bytes.
-    pub sql: Sql,
+pub struct SimpleQuery<'a> {
+    /// SQL text — borrowed; any length, zero-copy on the wire.
+    pub sql: &'a str,
     /// Correlator for the reply.
     pub reply: ReplyId<QueryKind>,
 }
 
-impl sealed::PushCommandSealed for SimpleQuery {}
+impl sealed::PushCommandSealed for SimpleQuery<'_> {}
 
-impl PushCommand for SimpleQuery {
+impl<'a> PushCommand for SimpleQuery<'a> {
     type Output = ();
     type PostState = SimpleQueryAwaitingFirstResponseInstall;
 
     #[inline]
-    fn execute(
+    fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
         _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions,
+        staged: &mut crate::action::StagedActions<'sql>,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    ) {
+    )
+    where
+        Self: 'sql,
+    {
+        // Self = SimpleQuery<'a>; Self: 'sql means 'a >= 'sql, so
+        // self.sql.as_bytes(): &'a [u8] coerces to &'sql [u8] safely.
         crate::protocol::compute_push_simple_query_idle_only(
-            setter, &self.sql, self.reply, staged, reserved,
+            setter, self.sql.as_bytes(), self.reply, staged, reserved,
         );
     }
 }
 
 /// Prepare a named SQL statement via PG's Extended Query protocol
 /// (`P`-frame + `S`-frame terminator).
+///
+/// DEF-160 Z2 (2026-05-11): `sql` is `&'a str` (was owned `Sql =
+/// FixedStr<MAX_SQL_LEN, _>`). See [`SimpleQuery`] for the rationale
+/// and zeroize-handoff contract.
 #[derive(Debug)]
 #[must_use = "a Parse has no effect until passed to push_command"]
-pub struct Parse {
+pub struct Parse<'a> {
     /// Prepared-statement name. Empty (the "unnamed statement"
     /// per PG convention) or a validated `StmtName`.
     pub stmt_name: StmtName,
-    /// SQL text — bounded to [`crate::ident::MAX_SQL_LEN`].
-    pub sql: Sql,
+    /// SQL text — borrowed; any length, zero-copy on the wire.
+    pub sql: &'a str,
     /// Correlator for the reply.
     pub reply: ReplyId<ParseKind>,
 }
 
-impl sealed::PushCommandSealed for Parse {}
+impl sealed::PushCommandSealed for Parse<'_> {}
 
-impl PushCommand for Parse {
+impl<'a> PushCommand for Parse<'a> {
     type Output = ();
     type PostState = ParseAwaitingParseCompleteInstall;
 
     #[inline]
-    fn execute(
+    fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
         _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions,
+        staged: &mut crate::action::StagedActions<'sql>,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    ) {
+    )
+    where
+        Self: 'sql,
+    {
+        // Self = Parse<'a>; Self: 'sql means 'a >= 'sql, so
+        // self.sql.as_bytes(): &'a [u8] coerces to &'sql [u8] safely.
         crate::protocol::compute_push_parse_idle_only(
             setter,
             &self.stmt_name,
-            &self.sql,
+            self.sql.as_bytes(),
             self.reply,
             staged,
             reserved,
@@ -354,13 +393,16 @@ impl PushCommand for DescribeStatement {
     type PostState = DescribeStatementAwaitingParamDescInstall;
 
     #[inline]
-    fn execute(
+    fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
         _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions,
+        staged: &mut crate::action::StagedActions<'sql>,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    ) {
+    )
+    where
+        Self: 'sql,
+    {
         crate::protocol::compute_push_describe_statement_idle_only(
             setter,
             &self.stmt_name,
@@ -389,13 +431,16 @@ impl PushCommand for DescribePortal {
     type PostState = DescribePortalAwaitingRowDescOrNoDataInstall;
 
     #[inline]
-    fn execute(
+    fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
         _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions,
+        staged: &mut crate::action::StagedActions<'sql>,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    ) {
+    )
+    where
+        Self: 'sql,
+    {
         crate::protocol::compute_push_describe_portal_idle_only(
             setter,
             &self.portal_name,
@@ -443,13 +488,16 @@ impl<P: crate::params::ParamsWriter> PushCommand for BindExecute<'_, P> {
     type PostState = BindExecutePostInstall;
 
     #[inline]
-    fn execute(
+    fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
         row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions,
+        staged: &mut crate::action::StagedActions<'sql>,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    ) {
+    )
+    where
+        Self: 'sql,
+    {
         crate::protocol::compute_push_bind_execute_idle_only(
             setter,
             row_desc_slot,
@@ -697,22 +745,32 @@ mod size_pins {
         );
     }
 
-    /// Tier-1 drift guard: per-command structs collectively replace
-    /// the former `PgCommand` enum. Pin that the **largest** non-
-    /// generic command (Parse) is comparable to the former enum's
-    /// dominant variant — but the others are dramatically smaller.
-    /// This is the structural witness that T's value proposition is
-    /// realised.
+    /// Tier-1 drift guard: post-DEF-160 (Z2) Parse is small —
+    /// `&'a str` SQL replaces the pre-Z2 owned `Sql = FixedStr<2048>`
+    /// inline. Pin Parse + SimpleQuery sizes at "small" (≤ 128 B)
+    /// — a regression that re-embeds owned SQL would surface here
+    /// dramatically (jump from ~96 B to ~2132 B).
+    ///
+    /// Pre-DEF-160 the test pinned `parse_size >= ping_size * 100`
+    /// (Parse 2132 ≥ Ping 8 × 100). Post-DEF-160 Parse is ~96 B and
+    /// the structural value proposition shifts: small per-command
+    /// structs **and** zero-copy SQL via `SendBytesBorrowed`. The
+    /// per-call size win that DEF-269 v2 (T) measured (push_command
+    /// /ping −83.4%) survives because PgCommand enum is gone — the
+    /// 2176 B move was the enum's by-value payload, not Parse-the-
+    /// struct's; T's win is preserved.
     #[test]
-    fn ping_dramatically_smaller_than_parse() {
-        let ping_size = core::mem::size_of::<Ping>();
-        let parse_size = core::mem::size_of::<Parse>();
-        // Parse is the dominant Pg-pushable command (~2132 B).
-        // Ping is 16 B. The ratio must be at least 100×.
+    fn parse_and_simple_query_carry_no_inline_sql() {
+        let parse_size = core::mem::size_of::<Parse<'static>>();
+        let simple_query_size = core::mem::size_of::<SimpleQuery<'static>>();
         assert!(
-            parse_size >= ping_size.saturating_mul(100),
-            "T's value proposition: Ping ({ping_size} B) << Parse ({parse_size} B). \
-             If this ratio shrinks, the synthetic-init bench gain disappears.",
+            parse_size <= 128,
+            "Parse must be ≤ 128 B post-DEF-160 (no inline SQL); got {parse_size} B. \
+             A regression to ~2132 B would mean the owned-Sql field came back.",
+        );
+        assert!(
+            simple_query_size <= 64,
+            "SimpleQuery must be ≤ 64 B post-DEF-160; got {simple_query_size} B.",
         );
     }
 }

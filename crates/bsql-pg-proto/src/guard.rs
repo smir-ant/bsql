@@ -67,7 +67,7 @@
 //! the guard exists. (Other secret-bearing variants — `Connecting*`,
 //! `PingAwaitingRfq`, etc. — never produce a guard.)
 
-use crate::action::PushFailure;
+use crate::action::{OutActions, PushFailure};
 use crate::command::FetchRows;
 use crate::decode::RowDesc;
 use crate::error::StateErrorKind;
@@ -194,9 +194,15 @@ impl<'a> ReadyGuard<'a> {
     ///
     /// # Returns
     ///
-    /// - `Ok(())` — bytes (frame + optional trailing Sync) live in
-    ///   `write_buf`. Caller drains `write_buf.as_bytes()` to socket
-    ///   in a single write, then clears the buffer for reuse.
+    /// - `Ok(OutActions)` — caller drains the per-chunk action list to
+    ///   the socket. The frame is the ordered concatenation of
+    ///   `SendBytes(&[u8])` chunks: (1) header range (in `write_buf`),
+    ///   (2) borrowed SQL (zero-copy from caller memory —
+    ///   `Parse<'a>::sql` / `SimpleQuery<'a>::sql`), (3) trailer range
+    ///   (in `write_buf`), (4) `&'static` Sync trailer if applicable.
+    ///   Under `writev` / `IoSlice` the chunks collapse to a single
+    ///   socket syscall. Commands with no caller-side payload (`Ping`,
+    ///   `BindExecute`, etc.) return a single-chunk `OutActions`.
     /// - `Err(PushFailure { id, cause })` — the command's body
     ///   construction failed (e.g., SCRAM build error for `Startup`).
     ///   State has transitioned to `Errored`; caller resolves user's
@@ -205,23 +211,27 @@ impl<'a> ReadyGuard<'a> {
     ///   path (state ≠ Idle) is NOT reachable through this API —
     ///   `ReadyGuard` proves Idle at construction.
     ///
-    /// # DEF-212 (Alt Y', audit 2026-05-04)
+    /// # DEF-160 Z2 (2026-05-11)
     ///
-    /// Pre-(212) returned `OutActions<'w, 'a>` (800 B per call); caller
-    /// iterated the action list. Post-(212) returns `Result<(), PushFailure>`
-    /// (~80 B); caller drains bytes from `write_buf` directly. -88%
-    /// per-call return frame; same tier-1 closure surface (state ==
-    /// Idle via guard, classified failure via `Result::Err`).
+    /// Pre-DEF-160 returned `Result<(), PushFailure>` (~80 B); caller
+    /// drained `write_buf.as_bytes()` after a successful push, with the
+    /// SQL copied into `write_buf` (cap-bounded by `MAX_SQL_LEN`). The
+    /// fixed cap silently truncated colossal queries — a tier-3 hazard
+    /// (DEF-218 colossal-data audit). Post-DEF-160 the SQL is borrowed
+    /// end-to-end via `SendBytesBorrowed` and surfaced as
+    /// `Action::SendBytes(&[u8])` chunks in `OutActions` — no cap, no
+    /// copy, no truncation. `OutActions` retains the pre-DEF-212 fail
+    /// classification (`FailReply` arm) via the `Result::Err` short-circuit.
     /// DEF-269 v2 (T): generic over `C: PushCommand`. Caller passes a
     /// per-command struct (e.g. [`crate::push_command::Ping`]) instead
     /// of a `PgCommand` enum value. Each `C` is monomorphised — the
     /// 2176-B-by-value PgCommand argument move is gone.
     #[inline]
-    pub fn push_command<C: crate::push_command::PushCommand>(
+    pub fn push_command<'w, C: crate::push_command::PushCommand + 'w>(
         self,
         cmd: C,
-        write_buf: &mut WriteBuf,
-    ) -> Result<(), PushFailure> {
+        write_buf: &'w mut WriteBuf,
+    ) -> Result<OutActions<'w, 'static>, PushFailure> {
         // DEF-272 cluster γ (2026-05-10): the Idle precondition is
         // re-checked inside `push_command_internal` via
         // `IdleState::try_from` (returns `Option<IdleState<'_>>`).
@@ -242,16 +252,16 @@ impl<'a> ReadyGuard<'a> {
         reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1; the wrapper preserves the same arg count by design"
     )]
     #[inline]
-    pub fn push_bind_execute<P: ParamsWriter>(
+    pub fn push_bind_execute<'w, P: ParamsWriter + 'w>(
         self,
-        portal_name: &PortalName,
-        stmt_name: &StmtName,
-        params: &P,
+        portal_name: &'w PortalName,
+        stmt_name: &'w StmtName,
+        params: &'w P,
         row_desc: Option<RowDesc>,
         fetch: FetchRows,
         reply: ReplyId<QueryKind>,
-        write_buf: &mut WriteBuf,
-    ) -> Result<(), PushFailure> {
+        write_buf: &'w mut WriteBuf,
+    ) -> Result<OutActions<'w, 'static>, PushFailure> {
         self.push_command(
             crate::push_command::BindExecute {
                 portal_name,

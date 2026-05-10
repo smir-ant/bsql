@@ -44,7 +44,7 @@
 
 use bsql_pg_proto::{
     Action, ConnectionStatus, Credentials, Ident, PgProtocol, PingKind, ProtoState,
-    QueryKind, Sql, StartupKind, WriteBuf,
+    QueryKind, StartupKind, WriteBuf,
     wire::TAG_READY_FOR_QUERY,
 };
 
@@ -142,7 +142,7 @@ fn def198_simple_query_awaiting_classifies_busy() {
     let reply = proto.next_reply_id::<QueryKind>();
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery {
-            sql: Sql::from_str_truncating("SELECT 1"),
+            sql: "SELECT 1",
             reply,
         },
         &mut wb,
@@ -279,7 +279,12 @@ fn def198_ready_guard_consumes_on_push() {
         // bind-to-named-underscore which avoided the lint but left
         // failures silently unobserved at the test layer.
         match guard.push_command(bsql_pg_proto::push_command::Ping { reply }, &mut wb) {
-            Ok(()) => {}
+            // DEF-160 Z2 (2026-05-11): push API returns `OutActions` so
+            // callers can zero-copy-stream borrowed SQL chunks. Ping has
+            // no SQL — `OutActions` carries only the static Sync chunk,
+            // which the test doesn't need to inspect (state-transition
+            // assertion below covers the wire side).
+            Ok(_actions) => {}
             Err(failure) => panic!(
                 "Ping push from Idle must succeed (architecturally infallible); \
                  got Err({failure:?})",

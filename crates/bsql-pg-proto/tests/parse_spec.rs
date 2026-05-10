@@ -21,16 +21,17 @@
 
 use bsql_pg_proto::{
     Action, ConnectionStatus, ParseKind, PgProtocol, ProtoState, ProtocolError, Reply,
-    ReplyId, Sql, StmtName, WriteBuf,
+    ReplyId, StmtName, WriteBuf,
     wire::{TAG_ERROR_RESPONSE, TAG_PARSE, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY},
 };
 
 mod common;
 use common::{PushOrPanic, mint_reply};
 
-fn sql(s: &str) -> Sql {
-    Sql::from_str_truncating(s)
-}
+// DEF-160 Z2 (2026-05-11): the `fn sql(s) -> Sql` helper is gone —
+// `push_command::Parse.sql` is `&'a str`, fixtures pass `&str` literals
+// directly. Legacy `cfg(test)` `PgCommand::Parse` enum still owns
+// `Sql` but lives only inside the lib's own unit tests.
 
 fn stmt_unnamed() -> StmtName {
     StmtName::default()
@@ -96,7 +97,7 @@ fn parse_setup(
     proto.push_or_panic(
         bsql_pg_proto::push_command::Parse {
             stmt_name,
-            sql: sql(sql_text),
+            sql: sql_text,
             reply,
         },
         wb,

@@ -1451,17 +1451,30 @@ impl PgProtocol {
     /// per-command struct (e.g. [`crate::push_command::Ping`]) instead
     /// of a `PgCommand` enum value. Each `C` is monomorphised — the
     /// 2176-B-by-value enum dispatch is gone.
-    #[must_use = "the returned Result carries the bytes-in-wb success signal \
-                  or the consumed-correlator + cause failure signal; both must \
-                  be observed by the caller's I/O layer"]
-    pub(crate) fn push_command_internal<C: crate::push_command::PushCommand>(
+    #[must_use = "the returned Result carries OutActions on success (caller drains \
+                  the multi-chunk frame: header range + borrowed SQL + trailer range \
+                  + Sync) or the consumed-correlator + cause failure signal — both \
+                  must be observed by the caller's I/O layer"]
+    pub(crate) fn push_command_internal<'w, C: crate::push_command::PushCommand + 'w>(
         &mut self,
         cmd: C,
-        write_buf: &mut WriteBuf,
-    ) -> Result<(), crate::action::PushFailure> {
-        // DEF-212: bytes-only push contract — bytes live in caller's wb
-        // post-Ok (drained via `wb.as_bytes()`); no per-call action
-        // allocation (~800 B → ~80 B return frame).
+        write_buf: &'w mut WriteBuf,
+    ) -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
+        // DEF-160 Z2 (2026-05-11): push API now returns OutActions.
+        // Pre-Z2 contract was "caller drains wb.as_bytes() post-Ok" —
+        // viable when push only stages SendBytesRange + SendBytesStatic
+        // (everything sits inside wb). DEF-160 introduces
+        // SendBytesBorrowed for zero-copy SQL — the SQL bytes live in
+        // CALLER memory (Parse<'a>::sql / SimpleQuery<'a>::sql), not in
+        // wb. The full outbound frame is the ordered concatenation of:
+        //   1. SendBytesRange (header bytes in wb)
+        //   2. SendBytesBorrowed (caller's SQL — zero-copy)
+        //   3. SendBytesRange (trailer bytes in wb)
+        //   4. SendBytesStatic (Sync trailer for Parse — `&'static`)
+        // OutActions surfaces these as `Action::SendBytes(&[u8])` per
+        // chunk (4 for Parse, 3 for SimpleQuery, 1 for Ping/Bind/etc).
+        // Under `writev` / IoSlice the caller collapses the chunks to
+        // a single socket syscall.
         write_buf.clear();
 
         // DEF-272 cluster γ (2026-05-10): the Idle precondition is
@@ -1506,20 +1519,116 @@ impl PgProtocol {
             }
         };
 
+        // DEF-160 Z2 (2026-05-11, post-bench-stable mitigation):
+        // single-pass materialise inside the branded closure. Earlier
+        // shape returned `StagedActions` from the closure (~700 B
+        // return frame), THEN scanned for `FailReply` in a `.iter()`
+        // pass, THEN passed `staged` by value to `materialise` for a
+        // second iteration producing `OutActions` (~800 B return).
+        // Three big stack moves + two iterations cost ≈+34 ns on
+        // `push_command/ping` per bench-stable vs `pre-def160`.
+        // Single-pass shape: stage, drain, classify-fail, emit
+        // `Action::SendBytes` chunks — all in one walk. Closure
+        // returns the final `Result<OutActions<'w, 'static>, _>`
+        // directly; no intermediate `StagedActions` escape. The
+        // feed-side `materialise` keeps its broader contract
+        // (DeliverReply/FailReply → typed `Action` variants) for
+        // dispatcher use; push is open-coded here for the perf-tier
+        // closure on the hot path.
+        //
         // DEF-154 (B+H): write-side keeps its brand (`'wb`) for
         // tier-1 `WriteRange::apply`; read side is unbranded.
         // DEF-269 v2: row_desc_slot threaded through for BindExecute
         // (other commands ignore it).
-        write_buf.with_branded(|mut wb| -> Result<(), crate::action::PushFailure> {
-            let mut reserved = wb.reserve();
-            let mut staged = StagedActions::new();
-            // DEF-272 cluster γ: setter is minted via the typestate
-            // (the only legitimate path — `StateSetter::new` is
-            // `pub(in crate::state_setter)`, callable only from
-            // [`IdleState::into_setter`]).
-            let setter = idle.into_setter::<C::PostState>();
-            cmd.execute(setter, row_desc_slot, &mut staged, &mut reserved);
-            materialise_push(staged, &mut reserved)
+        write_buf.with_branded(|mut wb| -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
+            let mut staged: StagedActions<'_> = StagedActions::new();
+            {
+                let mut reserved = wb.reserve();
+                // DEF-272 cluster γ: setter is minted via the typestate
+                // (the only legitimate path — `StateSetter::new` is
+                // `pub(in crate::state_setter)`, callable only from
+                // [`IdleState::into_setter`]).
+                let setter = idle.into_setter::<C::PostState>();
+                cmd.execute(setter, row_desc_slot, &mut staged, &mut reserved);
+            } // reserved dropped — wb is freely accessible for byte view
+
+            // `into_bytes` consumes `wb` and yields `&'w [u8]` (the outer
+            // WriteBuf borrow lifetime). The borrow flows into every
+            // `Action::SendBytes(&'w [u8])` chunk via `WriteRange::apply`.
+            let bytes: &'w [u8] = wb.into_bytes();
+
+            let mut failure: Option<crate::action::PushFailure> = None;
+            let mut out: crate::action::OutActions<'w, 'static> = crate::action::OutActions::new();
+            for sa in staged {
+                match sa {
+                    // Push-path failure surface: a `try_builder!`-emitted
+                    // FailReply (BuilderCapacityOverflow / EmptyWriteRange /
+                    // ParamsWriterOverflow / SqlFrameU32LengthOverflow).
+                    // Architecturally exactly one FailReply per push cycle;
+                    // capture the first and continue draining (consistent
+                    // with the pre-Z2 `materialise_push` shape that also
+                    // walked the full container — keeps the staged-action
+                    // accounting invariant intact for any future audit).
+                    StagedAction::FailReply { id, cause } => {
+                        if failure.is_none() {
+                            failure = Some(crate::action::PushFailure { id, cause });
+                        }
+                    }
+                    StagedAction::SendBytesRange(range) => {
+                        // DEF-154 (N) P0-4: `apply == None` is
+                        // architecturally unreachable under intact brand
+                        // discipline; classify `CloseSocket` rather than
+                        // the pre-(N) silent zero-byte SendBytes.
+                        let action = match range.apply(bytes) {
+                            Some(slice) => crate::action::Action::SendBytes(slice),
+                            None => {
+                                core::hint::cold_path();
+                                debug_assert!(
+                                    false,
+                                    "DEF-160 Z2: SendBytesRange.apply == None — \
+                                     architecturally impossible per intact brand \
+                                     discipline (DEF-154 N+W). Compiler bug or \
+                                     memory corruption.",
+                                );
+                                crate::action::Action::CloseSocket
+                            }
+                        };
+                        push_within_fanout_budget(&mut out, action);
+                    }
+                    StagedAction::SendBytesStatic(s) => {
+                        push_within_fanout_budget(&mut out, crate::action::Action::SendBytes(s));
+                    }
+                    // DEF-160 Z2: borrowed bytes (caller's SQL via Parse /
+                    // SimpleQuery push paths) flow through unchanged. The
+                    // `'sql >= 'w` subtyping induced by the `Self: 'sql`
+                    // bound on `PushCommand::execute` coerces `&'sql [u8]`
+                    // to `&'w [u8]` for the emitted `Action::SendBytes`.
+                    StagedAction::SendBytesBorrowed(b) => {
+                        push_within_fanout_budget(&mut out, crate::action::Action::SendBytes(b));
+                    }
+                    StagedAction::CloseSocket => {
+                        push_within_fanout_budget(&mut out, crate::action::Action::CloseSocket);
+                    }
+                    StagedAction::DeliverReply(_) => {
+                        // DEF-238 (audit 2026-05-05): cold hint. Push
+                        // paths never emit DeliverReply (replies come
+                        // from server via feed_bytes only). Architecturally
+                        // dead; classified loud in dev, silent in release.
+                        core::hint::cold_path();
+                        debug_assert!(
+                            false,
+                            "DEF-160 Z2: push paths must NEVER emit DeliverReply — \
+                             replies come from server via feed_bytes only. Reaching \
+                             this branch indicates a compute_push refactor regression \
+                             (or pipelining work without DEF-160 update).",
+                        );
+                    }
+                }
+            }
+            match failure {
+                Some(f) => Err(f),
+                None => Ok(out),
+            }
         })
     }
 
@@ -2873,10 +2982,19 @@ fn compute_push(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> StagedActions<'static> {
     // DEF-160 (Z2): the cfg(test) dispatcher operates on the legacy
-    // owned-`Sql` `PgCommand` enum (not the post-DEF-269-v2 typed
-    // surface) — no borrowed-SQL surface, so `StagedActions<'static>`
-    // is the natural choice.
-    let mut staged: StagedActions<'static> = StagedActions::new();
+    // owned-`Sql` `PgCommand` enum. Although the `PgCommand` variants
+    // own their `Sql`, the SimpleQuery / Parse arms route through
+    // `compute_push_simple_query` / `compute_push_parse` (cfg(test))
+    // which take `&'a Sql` and stage `&'a [u8]` via SendBytesBorrowed
+    // — so `staged` borrows from the locally-owned Sql for the
+    // duration of this function. Returning the staged container
+    // out of scope is safe because the inner StagedAction-lifetime
+    // tracks the caller's expectation; the local Sql lives for the
+    // 'static lifetime of `PgCommand` (variants are owned). Bind
+    // staged's 'sql to the function-local 'a to keep the borrow
+    // checker honest, then return as 'static (subtype) once we know
+    // no SendBytesBorrowed survives past the local scope.
+    let mut staged: StagedActions<'_> = StagedActions::new();
     match cmd {
         PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
         PgCommand::Startup {
@@ -3222,9 +3340,15 @@ fn compute_push_simple_query(
     state: &mut ProtoState,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::QueryKind>,
-    staged: &mut StagedActions,
+    staged: &mut StagedActions<'_>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
+    // DEF-160 Z2: `sql`'s lifetime is intentionally decoupled from
+    // `staged`'s `'sql` parameter. The cfg(test) legacy path copies
+    // SQL bytes into `reserved` (via build_query_message_cfgtest)
+    // and stages a single SendBytesRange — no borrow flows into
+    // staged, so staged's `'_` is independent and compute_push can
+    // return staged out of scope safely.
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
@@ -3241,7 +3365,24 @@ fn compute_push_simple_query(
                 }
             };
             let setter = idle.into_setter::<crate::push_command::SimpleQueryAwaitingFirstResponseInstall>();
-            compute_push_simple_query_idle_only(setter, sql, reply, staged, reserved);
+            // DEF-160 (Z2 cfg(test) legacy path): the typed-surface
+            // `SimpleQuery<'a>` uses `compute_push_simple_query_idle_only`
+            // with `SendBytesBorrowed` for zero-copy SQL. The cfg(test)
+            // dispatcher operates on the legacy `PgCommand::SimpleQuery`
+            // enum which owns `Sql` (FixedStr<2048>) and is consumed by
+            // value through `compute_push`. To keep the legacy path's
+            // staged-actions lifetime-portable (returnable from compute_push
+            // out of scope) we build the full single-frame here via the
+            // cfg(test)-only helper and emit one `SendBytesRange` —
+            // identical wire output, no SendBytesBorrowed surface.
+            let range_result = build_query_message_cfgtest(sql, reserved);
+            let range = try_builder!(range_result, setter, reply, staged);
+            emit_actions!(staged, budget: 1, [
+                StagedAction::SendBytesRange(range),
+            ]);
+            setter.install_post_state(
+                crate::push_command::SimpleQueryAwaitingFirstResponseInstall { reply },
+            );
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -3271,21 +3412,40 @@ fn compute_push_simple_query(
     }
 }
 
-/// DEF-208 — Idle-only path for [`PgCommand::SimpleQuery`].
+/// DEF-208 — Idle-only path for [`PgCommand::SimpleQuery`] (legacy
+/// cfg(test) enum) / [`crate::push_command::SimpleQuery<'a>`] (typed
+/// surface).
+///
+/// DEF-160 Z2 (2026-05-11): emits **3** staged actions (was 1 pre-Z2)
+/// — `SendBytesRange(header) + SendBytesBorrowed(sql) + SendBytesRange(trailer)`.
+/// SQL is borrowed end-to-end, never copied into `WriteBuf`.
 #[inline]
-pub(crate) fn compute_push_simple_query_idle_only(
+pub(crate) fn compute_push_simple_query_idle_only<'sql>(
     setter: crate::state_setter::StateSetter<
         '_,
         crate::push_command::SimpleQueryAwaitingFirstResponseInstall,
     >,
-    sql: &crate::ident::Sql,
+    sql_bytes: &'sql [u8],
     reply: ReplyId<crate::reply_id::QueryKind>,
-    staged: &mut StagedActions,
+    staged: &mut StagedActions<'sql>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    let range = try_builder!(build_query_message(sql, reserved), setter, reply, staged);
-    emit_actions!(staged, budget: 1, [
-        StagedAction::SendBytesRange(range),
+    let header_range = try_builder!(
+        build_query_header(sql_bytes.len(), reserved),
+        setter,
+        reply,
+        staged
+    );
+    let trailer_range = try_builder!(
+        build_query_trailer(reserved),
+        setter,
+        reply,
+        staged
+    );
+    emit_actions!(staged, budget: 3, [
+        StagedAction::SendBytesRange(header_range),
+        StagedAction::SendBytesBorrowed(sql_bytes),
+        StagedAction::SendBytesRange(trailer_range),
     ]);
     // DEF-270 N-D: typed witness pairs SimpleQuery → SimpleQueryAwaitingFirstResponse.
     setter.install_post_state(
@@ -3298,14 +3458,68 @@ pub(crate) fn compute_push_simple_query_idle_only(
 // [`crate::action::WriteRange::from_write_span`] directly —
 // identical shield logic, plus brand-identity binding.
 
-/// Build a PostgreSQL simple-query frame: `'Q'` + 4-byte length +
-/// NUL-terminated SQL.
+/// Build the PG simple-query (`'Q'`) frame **header** — tag plus the
+/// upfront-computed length prefix.
+///
+/// DEF-160 Z2 (2026-05-11): split from the pre-Z2 monolithic
+/// `build_query_message`. The PG length-prefix INCLUDES itself
+/// (PG §55.7 wire spec); for SimpleQuery the body is `sql + NUL`,
+/// so length = 4 (length self) + sql_len + 1 (NUL). Both inputs
+/// are known at the call site, so the length is computed upfront
+/// here — no `with_length_prefix` back-patch needed.
 ///
 /// PG frame body layout (§55.7 "Simple Query"):
-/// - Tag: `'Q'` (1 byte)
-/// - Length: u32 BE including itself
-/// - Query string: NUL-terminated
-fn build_query_message(
+/// - Tag: `'Q'` (1 byte) ← in this header
+/// - Length: u32 BE including itself ← in this header
+/// - Query string ← `SendBytesBorrowed` (NOT in WriteBuf)
+/// - NUL terminator (1 byte) ← in trailer
+///
+/// `BuilderCapacityOverflow` is classified Err iff the SQL is so
+/// large that `4 + sql_len + 1 > u32::MAX` — i.e., SQL > ~4 GB.
+/// This is a PG-protocol-level limit (the wire format's u32 length
+/// prefix), not a bsql-internal cap. Practically dead.
+fn build_query_header(
+    sql_len: usize,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> Result<crate::action::WriteRange, ProtocolError> {
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_QUERY.byte())?;
+    // length-prefix = 4 (self) + sql_len + 1 (NUL terminator).
+    // saturating_add stays within the forbid-bundle (no
+    // `arithmetic_side_effects`); u32::try_from gates the overflow
+    // case as `BuilderCapacityOverflow`.
+    let length_usize = 4_usize
+        .saturating_add(sql_len)
+        .saturating_add(1);
+    let length_u32 = u32::try_from(length_usize).map_err(|_| {
+        ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::BuilderCapacityOverflow,
+        }
+    })?;
+    reserved.push_u32_be(length_u32)?;
+    crate::action::WriteRange::from_write_span(start, reserved)
+}
+
+/// Build the PG simple-query (`'Q'`) frame **trailer** — the NUL
+/// terminator that follows the borrowed SQL bytes. DEF-160 Z2.
+fn build_query_trailer(
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> Result<crate::action::WriteRange, ProtocolError> {
+    let start = reserved.len();
+    reserved.push_u8(0)?; // NUL terminator for the SQL string
+    crate::action::WriteRange::from_write_span(start, reserved)
+}
+
+/// cfg(test)-only legacy single-frame builder: writes the full
+/// SimpleQuery (`'Q'`) frame including the SQL bytes into `reserved`
+/// and returns one [`crate::action::WriteRange`] covering the whole
+/// frame. Used by [`compute_push_simple_query`] which dispatches
+/// the legacy owned-`Sql` `PgCommand::SimpleQuery` variant; the
+/// production typed-surface path uses
+/// [`build_query_header`] / [`build_query_trailer`] +
+/// [`StagedAction::SendBytesBorrowed`] for zero-copy.
+#[cfg(test)]
+fn build_query_message_cfgtest(
     sql: &crate::ident::Sql,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<crate::action::WriteRange, ProtocolError> {
@@ -3315,21 +3529,60 @@ fn build_query_message(
         w.push_nul_terminated(sql.as_bytes())?;
         Ok(())
     })?;
-    // DEF-154 (B) Phase B4-W P0-2: `from_branded_write_span` returns
-    // `Result` post-audit. 'Q' frame is ≥ 6 bytes so Err is
-    // architecturally dead; classified upstream as
-    // `EmptyWriteRange` if ever triggered.
     crate::action::WriteRange::from_write_span(start, reserved)
 }
 
-/// Build a PostgreSQL Extended Query `Parse` frame (PG §55.7).
+/// Build the PG Extended Query `Parse` (`'P'`) frame **header** —
+/// tag, length prefix, NUL-terminated statement name. DEF-160 Z2.
 ///
-/// Wire layout: tag `'P'`, 4-byte BE length (self-inclusive),
-/// NUL-terminated statement name (empty = unnamed statement),
-/// NUL-terminated SQL text, then an `i16` BE parameter-type count
-/// (always zero in 1c-3a — no parameter-type hints; 1c-3b adds
-/// per-parameter OID hints and widens this field).
-fn build_parse_message(
+/// PG frame body layout (§55.7 "Parse"):
+/// - Tag: `'P'` (1 byte) ← in this header
+/// - Length: u32 BE including itself ← in this header
+/// - Statement name: NUL-terminated ← in this header
+/// - SQL text ← `SendBytesBorrowed` (NOT in WriteBuf)
+/// - NUL terminator (1 byte) ← in trailer
+/// - n_param_types: i16 BE (always 0 in Phase 1c-3a) ← in trailer
+fn build_parse_header(
+    stmt_name: &crate::ident::StmtName,
+    sql_len: usize,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> Result<crate::action::WriteRange, ProtocolError> {
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_PARSE.byte())?;
+    // length-prefix = 4 (self) + stmt_name + 1 (NUL) + sql_len + 1 (NUL) + 2 (i16)
+    let length_usize = 4_usize
+        .saturating_add(stmt_name.len())
+        .saturating_add(1)
+        .saturating_add(sql_len)
+        .saturating_add(1)
+        .saturating_add(2);
+    let length_u32 = u32::try_from(length_usize).map_err(|_| {
+        ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::BuilderCapacityOverflow,
+        }
+    })?;
+    reserved.push_u32_be(length_u32)?;
+    reserved.push_nul_terminated(stmt_name.as_bytes())?;
+    crate::action::WriteRange::from_write_span(start, reserved)
+}
+
+/// Build the PG Extended Query `Parse` (`'P'`) frame **trailer** —
+/// NUL terminator after the borrowed SQL bytes, plus the i16 BE
+/// parameter-type count (always 0 in Phase 1c-3a). DEF-160 Z2.
+fn build_parse_trailer(
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> Result<crate::action::WriteRange, ProtocolError> {
+    let start = reserved.len();
+    reserved.push_u8(0)?; // NUL terminator for the SQL string
+    // n_param_types = 0; Phase 1c-3b will widen to push actual OIDs here.
+    reserved.push_i16_be(0)?;
+    crate::action::WriteRange::from_write_span(start, reserved)
+}
+
+/// cfg(test)-only legacy single-frame builder for the Parse (`'P'`)
+/// frame. See [`build_query_message_cfgtest`] for the rationale.
+#[cfg(test)]
+fn build_parse_message_cfgtest(
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
@@ -3339,7 +3592,6 @@ fn build_parse_message(
     reserved.with_length_prefix(|w| {
         w.push_nul_terminated(stmt_name.as_bytes())?;
         w.push_nul_terminated(sql.as_bytes())?;
-        // n_param_types = 0; 1c-3b will widen to push actual OIDs here.
         w.push_i16_be(0)?;
         Ok(())
     })?;
@@ -3371,9 +3623,11 @@ fn compute_push_parse(
     stmt_name: &crate::ident::StmtName,
     sql: &crate::ident::Sql,
     reply: ReplyId<crate::reply_id::ParseKind>,
-    staged: &mut StagedActions,
+    staged: &mut StagedActions<'_>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
+    // DEF-160 Z2: see `compute_push_simple_query` — sql lifetime
+    // decoupled from staged's `'_`.
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
@@ -3390,7 +3644,16 @@ fn compute_push_parse(
                 }
             };
             let setter = idle.into_setter::<crate::push_command::ParseAwaitingParseCompleteInstall>();
-            compute_push_parse_idle_only(setter, stmt_name, sql, reply, staged, reserved);
+            // DEF-160 Z2 cfg(test) legacy path — see compute_push_simple_query above.
+            let range_result = build_parse_message_cfgtest(stmt_name, sql, reserved);
+            let range = try_builder!(range_result, setter, reply, staged);
+            emit_actions!(staged, budget: 2, [
+                StagedAction::SendBytesRange(range),
+                StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+            ]);
+            setter.install_post_state(
+                crate::push_command::ParseAwaitingParseCompleteInstall { reply },
+            );
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
             emit_actions!(staged, budget: 1, [
@@ -3420,27 +3683,41 @@ fn compute_push_parse(
     }
 }
 
-/// DEF-208 — Idle-only path for [`PgCommand::Parse`].
+/// DEF-208 — Idle-only path for [`PgCommand::Parse`] (legacy
+/// cfg(test) enum) / [`crate::push_command::Parse<'a>`] (typed
+/// surface).
+///
+/// DEF-160 Z2 (2026-05-11): emits **4** staged actions (was 2 pre-Z2)
+/// — `SendBytesRange(header) + SendBytesBorrowed(sql) + SendBytesRange(trailer) + SendBytesStatic(SYNC)`.
+/// SQL is borrowed end-to-end, never copied into `WriteBuf`.
 #[inline]
-pub(crate) fn compute_push_parse_idle_only(
+pub(crate) fn compute_push_parse_idle_only<'sql>(
     setter: crate::state_setter::StateSetter<
         '_,
         crate::push_command::ParseAwaitingParseCompleteInstall,
     >,
     stmt_name: &crate::ident::StmtName,
-    sql: &crate::ident::Sql,
+    sql_bytes: &'sql [u8],
     reply: ReplyId<crate::reply_id::ParseKind>,
-    staged: &mut StagedActions,
+    staged: &mut StagedActions<'sql>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    let range = try_builder!(
-        build_parse_message(stmt_name, sql, reserved),
+    let header_range = try_builder!(
+        build_parse_header(stmt_name, sql_bytes.len(), reserved),
         setter,
         reply,
         staged
     );
-    emit_actions!(staged, budget: 2, [
-        StagedAction::SendBytesRange(range),
+    let trailer_range = try_builder!(
+        build_parse_trailer(reserved),
+        setter,
+        reply,
+        staged
+    );
+    emit_actions!(staged, budget: 4, [
+        StagedAction::SendBytesRange(header_range),
+        StagedAction::SendBytesBorrowed(sql_bytes),
+        StagedAction::SendBytesRange(trailer_range),
         StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
     ]);
     // DEF-270 N-D: typed witness pairs Parse → ParseAwaitingParseComplete.
@@ -4074,199 +4351,16 @@ fn build_startup_message(
     crate::action::WriteRange::from_write_span(start, reserved)
 }
 
-/// DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04):
-/// push-path materialiser. Convert [`StagedActions`] into
-/// `Result<(), PushFailure>` while appending any [`StagedAction::SendBytesStatic`]
-/// bytes into the caller's `BrandedWriteReserved` (e.g., trailing
-/// `SYNC_WIRE_BYTES` post-Bind+Execute / post-Parse / post-Describe).
-///
-/// # Why a separate materialiser from [`materialise`]
-///
-/// [`materialise`] is FEED-side: it converts staged actions into
-/// `OutActions<'w, 'r>` which the caller iterates to drive I/O.
-/// [`materialise_push`] is PUSH-side: bytes already live in the
-/// caller's `WriteBuf` (compute_push_*_idle_only wrote them via the
-/// branded reserved); the caller drains `wb.as_bytes()` post-Ok to
-/// get the full outbound frame stream — the concatenation of all
-/// ranges with appended Sync. No `OutActions` allocation per push
-/// call — the per-call return frame shrinks 800 → ~80 B (DEF-212
-/// headline).
-///
-/// # Per-StagedAction semantics
-///
-/// - [`StagedAction::SendBytesRange`] — bytes already in
-///   `reserved.as_bytes()[range.start..range.start+range.len]` from
-///   the builder. M5 verification: `range.apply(reserved.as_bytes())`
-///   must resolve cleanly (`Some(_)`); the slice is unused (caller
-///   drains the entire `wb.as_bytes()` post-Ok), the call exists
-///   solely to detect brand/bounds invariant breaks. `apply == None`
-///   is architecturally unreachable per DEF-154 (N+W) brand
-///   discipline; classified `debug_assert!(false)` per architect M5.
-///
-/// - [`StagedAction::SendBytesStatic`] — append the static bytes
-///   (e.g., `SYNC_WIRE_BYTES` post-Bind+Execute) to `reserved` via
-///   `push_bytes`. Capacity is proven by const-asserts in
-///   `write_buf.rs`:
-///   - Bind+Execute+Sync (line 208-217 — pre-DEF-212)
-///   - Describe+Sync (line 247-251 — pre-DEF-212)
-///   - **Parse+Sync (DEF-212 M1, audit 2026-05-04)** — sibling pin,
-///     closes a pre-(212) tier-4 "happens to fit" gap to tier-1.
-///   - Ping=Sync alone (5 B trivially fits 2176 B empty wb).
-///
-///   `push_bytes` Err arm is architecturally-dead per the const-
-///   assert chain; classified `debug_assert!(false)` for dev-time
-///   loud signal, silent in release (the failure mode is "wire
-///   frame truncated → server detects malformed → server errors";
-///   not memory-unsafe).
-///
-/// - [`StagedAction::DeliverReply`] — UNREACHABLE on push paths.
-///   Push commands transition state to a "waiting for server reply"
-///   variant; the actual reply (`Pong`, `QueryComplete`, `ParseComplete`,
-///   `Describe*Complete`) is delivered later from a feed_bytes call
-///   processing the corresponding server frame. Any `DeliverReply`
-///   in push staged would indicate a compute_push refactor regression
-///   (or pipelining work without DEF-212 update). Classified
-///   `debug_assert!(false)` per architect M5.
-///
-/// - [`StagedAction::FailReply { id, cause }`] — the builder failed
-///   (`EmptyWriteRange`, `BuilderCapacityOverflow`,
-///   `ParamsWriterOverflow`) OR the public push API was reached
-///   without `state == Idle` (architecturally-dead via DEF-272 γ
-///   `IdleState::try_from` typestate at the `push_command_internal`
-///   entry; classified upstream by `compute_push` non-Idle arms).
-///   Captured for `Result::Err` arm.
-///   Architecturally exactly one `FailReply` per push cycle (single
-///   builder error per command); the `if failure.is_none()` guard is
-///   defensive against future pipelining refactors that batch pushes.
-///
-/// - [`StagedAction::CloseSocket`] — paired with `FailReply` on push
-///   paths (`install_errored` emits both atomically). State has
-///   ALREADY transitioned to `Errored` via `install_errored` from
-///   inside the compute_push body. Caller learns to close the
-///   socket via the [`crate::PushFailure`] `#[must_use]` contract;
-///   no explicit signal needed in `materialise_push`.
-///
-/// # `BrandedWriteReserved` lifetime
-///
-/// The reserved is borrowed mutably for the whole materialise call.
-/// The caller (`push_command_internal`) holds the reserved across
-/// `compute_push_idle_only` (which writes the main frame) AND
-/// `materialise_push` (which appends Sync). Sequential mutable
-/// borrows; brand stays sealed inside the parent `with_branded`
-/// closure.
-///
-/// # Tier classification
-///
-/// - Push success: tier-2 structural (bytes-in-wb contract).
-/// - Push failure: tier-1 by `Result::Err` arm exhaustive match.
-/// - Dead arm classification: tier-2 structural (debug_assert in
-///   dev/test, architectural-impossibility-by-const-assert in release).
-// DEF-236 (audit 2026-05-05): single call site (push_command_internal).
-// ASM diff (revert vs `#[inline]`): standalone symbol disappears,
-// body folds into caller's tail. LLVM accepts hint at this size +
-// site-count combination — codegen evidence supports the annotation.
-#[inline]
-fn materialise_push(
-    staged: StagedActions<'_>,
-    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> Result<(), crate::action::PushFailure> {
-    let mut failure: Option<crate::action::PushFailure> = None;
-    for sa in staged {
-        match sa {
-            StagedAction::SendBytesRange(range) => {
-                // M5 verification: apply must resolve cleanly. Slice unused
-                // (caller drains entire wb.as_bytes() post-Ok).
-                match range.apply(reserved.as_bytes()) {
-                    Some(_slice) => {
-                        // OK; bytes are in wb at the verified range.
-                    }
-                    None => {
-                        // DEF-238 (audit 2026-05-05): cold hint on the
-                        // architecturally-dead arm. The brand-discipline
-                        // construction guarantees this branch is
-                        // unreachable under intact forbid_unsafe.
-                        core::hint::cold_path();
-                        debug_assert!(
-                            false,
-                            "DEF-212 M5: SendBytesRange.apply == None — \
-                             architecturally impossible per intact brand \
-                             discipline (DEF-154 N+W). Compiler bug or \
-                             memory corruption.",
-                        );
-                        // Release: silent no-op. Reaching this branch under
-                        // intact forbid_unsafe + brand discipline implies
-                        // external memory corruption; the wire frame may be
-                        // partially truncated (server detects malformed,
-                        // errors out — not memory-unsafe at protocol layer).
-                    }
-                }
-            }
-            StagedAction::SendBytesStatic(s) => {
-                // Append to wb. Const-asserts in write_buf.rs prove capacity
-                // (Bind+Execute+Sync line 208; Describe+Sync line 247;
-                // Parse+Sync DEF-212 M1; Ping=Sync trivially).
-                match reserved.push_bytes(s) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        // DEF-238 (audit 2026-05-05): cold hint —
-                        // architecturally-dead per the const-assert chain
-                        // in write_buf.rs (max_*_message_size sums).
-                        core::hint::cold_path();
-                        debug_assert!(
-                            false,
-                            "DEF-212 M5: SendBytesStatic append overflowed wb — \
-                             const-assert chain in write_buf.rs violated. If a \
-                             new push command emits Sync, ship a sibling \
-                             const-assert in the same commit.",
-                        );
-                        // Release: silent. Architecturally-dead per the
-                        // const-assert chain.
-                    }
-                }
-            }
-            StagedAction::DeliverReply(_) => {
-                // DEF-238 (audit 2026-05-05): cold hint. Push paths
-                // never emit DeliverReply (replies come from server
-                // via feed_bytes, not push). Architecturally dead.
-                core::hint::cold_path();
-                debug_assert!(
-                    false,
-                    "DEF-212 M5: push paths must NEVER emit DeliverReply — \
-                     replies come from server via feed_bytes only. Reaching \
-                     this branch indicates a compute_push refactor regression \
-                     (or pipelining work without DEF-212 update).",
-                );
-            }
-            StagedAction::FailReply { id, cause } => {
-                // DEF-238 (audit 2026-05-05): cold hint. Builder
-                // failures (EmptyWriteRange / BuilderCapacityOverflow /
-                // ParamsWriterOverflow) are rare classified-Err paths;
-                // happy path (no FailReply staged) dominates production.
-                core::hint::cold_path();
-                // Capture for Err arm. Architecturally exactly one FailReply
-                // per push cycle (single builder error per command).
-                if failure.is_none() {
-                    failure = Some(crate::action::PushFailure { id, cause });
-                }
-            }
-            StagedAction::CloseSocket => {
-                // Paired with FailReply on push paths; state already Errored.
-                // Caller closes socket per PushFailure #[must_use] contract.
-            }
-            StagedAction::SendBytesBorrowed(_) => {
-                // DEF-160 (Z2): borrowed bytes (caller's SQL via Parse /
-                // SimpleQuery push paths) require no `apply` — they live
-                // in caller memory, not in `wb`. The `materialise`-stage
-                // counterpart converts the borrow to `Action::SendBytes`
-                // directly. Push-path verification is a no-op here.
-            }
-        }
-    }
-    match failure {
-        None => Ok(()),
-        Some(f) => Err(f),
-    }
-}
+// DEF-160 Z2 (2026-05-11): `materialise_push` removed. Pre-Z2 it was
+// the push-path counterpart to `materialise` — verifying staged ranges
+// resolve against `wb` and appending `SendBytesStatic` (Sync) bytes
+// INTO `wb`, returning `Result<(), PushFailure>`. Post-Z2 the push API
+// returns `OutActions` so callers can stream borrowed-SQL chunks via
+// `writev`; `push_command_internal` unifies push and feed materialisation
+// through the single `materialise` entry below (`terminal_row_desc:
+// None` for push — push never emits `DeliverReply`). The
+// `BrandedWriteReserved::as_bytes` helper that `materialise_push` used
+// for the M5 brand-roundtrip verification is also dead post-Z2.
 
 /// Phase-2 materialiser: convert the write-phase's
 /// [`StagedActions`] into [`OutActions<'w, 'r>`] with references
@@ -5673,9 +5767,17 @@ mod compute_push_tests {
         // dead `None` arm early-returns to satisfy the lib-level
         // `clippy::panic` forbid bundle.
         let Some(guard) = proto.as_ready() else { return };
+        // DEF-160 Z2 (2026-05-11): `push_bind_execute` borrows the
+        // identifier args for the `'w` lifetime that flows into the
+        // returned `OutActions`. Pre-Z2 the args were taken `&_` and
+        // didn't extend their lifetime past the call; post-Z2 named
+        // bindings are required to keep the borrows alive for the
+        // `Result::is_err` inspection below.
+        let portal = crate::ident::PortalName::default();
+        let stmt = crate::ident::StmtName::default();
         let result = guard.push_bind_execute(
-            &crate::ident::PortalName::default(),
-            &crate::ident::StmtName::default(),
+            &portal,
+            &stmt,
             &OverflowParams,
             None, // No row_desc; DML-style path
             crate::FetchRows::All,

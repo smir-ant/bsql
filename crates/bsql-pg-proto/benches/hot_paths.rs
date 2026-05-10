@@ -42,7 +42,6 @@
 
 use bsql_pg_proto::{
     frame::parse_header,
-    ident::Sql,
     reply_id::{PingKind, QueryKind},
     PgProtocol, PushFailure, WriteBuf,
 };
@@ -95,7 +94,12 @@ impl BenchPushOrPanic for PgProtocol {
         let Some(g) = self.as_ready() else {
             panic!("bench fixture: proto must be Idle for push (status = {status:?})");
         };
-        g.push_command(cmd, wb)
+        // DEF-160 Z2 (2026-05-11): `push_command` returns `OutActions` to
+        // surface borrowed-SQL chunks. The bench drops the iterator
+        // immediately — production drains it via `writev` to the socket,
+        // which the bench excludes (push path is the measurement target,
+        // not the kernel `writev` syscall). Drop is alloc-neutral.
+        g.push_command(cmd, wb).map(|_actions| ())
     }
 }
 
@@ -287,7 +291,7 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
-                        sql: Sql::from_str_truncating("SELECT x"),
+                        sql: "SELECT x",
                         reply,
                     },
                     &mut wb,
@@ -379,7 +383,7 @@ fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
-                        sql: Sql::from_str_truncating("SELECT x"),
+                        sql: "SELECT x",
                         reply,
                     },
                     &mut wb,
@@ -457,7 +461,7 @@ fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
-                        sql: Sql::from_str_truncating("SELECT x"),
+                        sql: "SELECT x",
                         reply,
                     },
                     &mut wb,
@@ -536,7 +540,7 @@ fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
-                        sql: Sql::from_str_truncating("SELECT x"),
+                        sql: "SELECT x",
                         reply,
                     },
                     &mut wb,
@@ -626,7 +630,7 @@ fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::SimpleQuery {
-                        sql: Sql::from_str_truncating("SELECT x"),
+                        sql: "SELECT x",
                         reply,
                     },
                     &mut wb,

@@ -55,7 +55,6 @@
 extern crate alloc;
 
 use bsql_pg_proto::{
-    ident::Sql,
     reply_id::{PingKind, QueryKind},
     PgProtocol, PushFailure, WriteBuf,
 };
@@ -246,7 +245,12 @@ fn bench_push_or_panic<C: bsql_pg_proto::push_command::PushCommand>(
     let Some(g) = proto.as_ready() else {
         panic!("alloc bench fixture: proto must be Idle for push (status = {status:?})");
     };
-    g.push_command(cmd, wb)
+    // DEF-160 Z2 (2026-05-11): `push_command` returns `OutActions` to
+    // surface borrowed-SQL chunks. The bench drops the iterator
+    // immediately — production drains it via `writev` to the socket,
+    // which the bench excludes (push path is the measurement target,
+    // not the kernel `writev` syscall). Drop is alloc-neutral.
+    g.push_command(cmd, wb).map(|_actions| ())
 }
 
 // ---------------------------------------------------------------
@@ -329,7 +333,7 @@ fn scenario_iter_rows_100() {
     let push_out = bench_push_or_panic(
         &mut proto,
         bsql_pg_proto::push_command::SimpleQuery {
-            sql: Sql::from_str_truncating("SELECT x"),
+            sql: "SELECT x",
             reply,
         },
         &mut wb,

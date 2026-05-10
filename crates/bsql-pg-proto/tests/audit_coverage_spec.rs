@@ -57,7 +57,7 @@ fn empty_query_response_with_non_zero_body_classifies() {
     // Push a simple-query to reach SimpleQueryAwaitingFirstResponse.
     // Scope block ends the OutActions borrow of wb before the next
     // feed_bytes call re-borrows it.
-    let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
+    let sql = "SELECT 1";
     let reply = query_id(&mut proto);
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery { sql, reply },
@@ -99,7 +99,7 @@ fn parse_complete_with_non_zero_body_classifies() {
         Ok(s) => s,
         Err(_) => return,
     };
-    let sql = bsql_pg_proto::ident::Sql::from_str_truncating("SELECT 1");
+    let sql = "SELECT 1";
     let reply = parse_id(&mut proto);
     proto.push_or_panic(
         bsql_pg_proto::push_command::Parse { stmt_name: stmt, sql, reply },

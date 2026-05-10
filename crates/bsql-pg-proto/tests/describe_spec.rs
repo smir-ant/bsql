@@ -52,7 +52,7 @@
 
 use bsql_pg_proto::{
     Action, ConnectionStatus, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows,
-    PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, Sql, StmtName,
+    PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, StmtName,
     TxStatus, WriteBuf,
     wire::{
         DescribeTargetByte, TAG_BIND_COMPLETE, TAG_DATA_ROW, TAG_DESCRIBE, TAG_ERROR_RESPONSE,
@@ -950,7 +950,7 @@ fn describe_after_completed_parse_starts_clean() {
     proto.push_or_panic(
         bsql_pg_proto::push_command::Parse {
             stmt_name: stmt_unnamed(),
-            sql: Sql::from_str_truncating("SELECT 1"),
+            sql: "SELECT 1",
             reply: parse_reply,
         },
         &mut wb,

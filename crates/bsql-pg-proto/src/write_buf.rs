@@ -982,21 +982,14 @@ impl BrandedWriteReserved<'_> {
         self.buf
     }
 
-    /// DEF-154 (W): view of buffer bytes. Pre-(W) returned
-    /// `BrandedBytes<'brand, '_>`; post-(W) plain `&[u8]`.
-    ///
-    /// DEF-212 (Alt Y', audit 2026-05-04): promoted from `#[cfg(test)]`
-    /// to non-test `pub(crate)` to support `materialise_push`'s M5
-    /// verification (`SendBytesRange::apply(reserved.as_bytes())` —
-    /// catches brand/bounds invariant breaks at the materialise
-    /// boundary). The exposure is read-only `&[u8]` of the
-    /// caller-owned WriteBuf — same data the caller already drains
-    /// post-Ok via `wb.as_bytes()`. No new escape surface.
-    #[inline]
-    #[must_use]
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        self.buf.as_bytes()
-    }
+    // DEF-160 Z2 (2026-05-11): `as_bytes(&self) -> &[u8]` removed.
+    // Pre-Z2 it surfaced the WriteBuf's bytes inside the branded scope
+    // for `materialise_push`'s M5 verification. Post-Z2 push paths emit
+    // the wire frame via `OutActions` chunks (one of which carries the
+    // header range — verified by `materialise` directly against the
+    // unbranded `wb.as_bytes()` slice), so the in-branded read view is
+    // no longer reachable from any call site. Re-adding it requires
+    // identifying a new caller and re-justifying the brand exposure.
 }
 
 impl fmt::Debug for BrandedWriteReserved<'_> {
@@ -1140,18 +1133,11 @@ mod phase_b1_tests {
         assert_eq!(reserved_len, 0);
     }
 
-    /// B1-2b (post W): builder-then-apply pattern uses
-    /// `reserved.as_bytes()` + reserved.len() in the same scope.
-    #[test]
-    fn branded_reserve_as_bytes_len_mirrors_buf() {
-        let mut buf = WriteBuf::new();
-        let (reserved_bytes_len, reserved_len) = buf.with_branded(|mut wb| {
-            let reserved = wb.reserve();
-            (reserved.as_bytes().len(), reserved.len())
-        });
-        assert_eq!(reserved_bytes_len, 0, "fresh reserved bytes view is empty");
-        assert_eq!(reserved_bytes_len, reserved_len, "as_bytes len must mirror reserved.len()");
-    }
+    // DEF-160 Z2 (2026-05-11): `branded_reserve_as_bytes_len_mirrors_buf`
+    // test DELETED. It pinned `BrandedWriteReserved::as_bytes` which has
+    // also been removed (orphan after `materialise_push` deletion — Z2
+    // unifies push / feed materialisation through the single feed-side
+    // `materialise` against the unbranded `wb.as_bytes()` slice).
 
     // DEF-154 (W): `branded_bytes_empty_is_empty` test DELETED —
     // it tested `BrandedBytes::empty()` factory which no longer

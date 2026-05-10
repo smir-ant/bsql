@@ -42,7 +42,7 @@
 
 use bsql_pg_proto::{
     Action, ColumnDesc, DataRowRef, FormatCode, FromPgText, PgProtocol, ProtoState,
-    ProtocolError, QueryKind, Reply, ReplyId, Sql, StreamItem, WriteBuf, oids,
+    ProtocolError, QueryKind, Reply, ReplyId, StreamItem, WriteBuf, oids,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_ERROR_RESPONSE, TAG_QUERY, TAG_READY_FOR_QUERY,
         TAG_ROW_DESCRIPTION,
@@ -116,9 +116,9 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
     frame(TAG_ERROR_RESPONSE.byte(), &body)
 }
 
-fn sql(s: &str) -> Sql {
-    Sql::from_str_truncating(s)
-}
+// DEF-160 Z2 (2026-05-11): `fn sql(s) -> Sql` helper retired —
+// `push_command::SimpleQuery.sql` is `&'a str`, fixtures pass &str
+// directly.
 
 /// Push a SimpleQuery and assert it produced an outbound `'Q'` frame.
 ///
@@ -129,7 +129,7 @@ fn sql(s: &str) -> Sql {
 fn push_simple_query(proto: &mut PgProtocol, reply: ReplyId<QueryKind>, wb: &mut WriteBuf) {
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery {
-            sql: sql("SELECT 1"),
+            sql: "SELECT 1",
             reply,
         },
         wb,
