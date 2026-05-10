@@ -50,6 +50,9 @@
 
 use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
+// DEF-271 cluster A (2026-05-10): install_errored_* return drained
+// Option<NonZeroU64>; FeedStateSetter::drain_and_install_errored API.
+use core::num::NonZeroU64;
 // `PgCommand` enum is referenced only by the test-only 5-arm
 // `compute_push_*` dispatchers (the `compute_push_idle_only` slow-path
 // dispatcher + `impl PushCommand for PgCommand` blanket impl were
@@ -1176,7 +1179,17 @@ impl PgProtocol {
         write_buf.with_branded(|mut wb| -> Result<(), crate::action::PushFailure> {
             let mut reserved = wb.reserve();
             let mut staged = StagedActions::new();
-            let setter = crate::state_setter::StateSetter::<C::PostState>::new(state);
+            // DEF-271 cluster A (2026-05-10): StateSetter::new now takes
+            // an IdleStateProof witness, structurally binding the
+            // `state == Idle` precondition at the mint site. The
+            // `debug_assert!(matches!(self.state, ProtoState::Idle))`
+            // above proves the precondition; we mint two proofs (one
+            // for the setter, one for execute()'s _proof param) — both
+            // land at the same load-bearing assertion.
+            let setter = crate::state_setter::StateSetter::<C::PostState>::new(
+                state,
+                crate::guard::IdleStateProof::new(),
+            );
             cmd.execute(
                 setter,
                 row_desc_slot,
@@ -2298,12 +2311,30 @@ impl PgProtocol {
     /// — architecturally impossible (total pre-validated) but
     /// tier-2 classification closes the drift surface at zero
     /// runtime cost (branch is cold-path unreachable in practice).
+    ///
+    /// # DEF-271 cluster A (2026-05-10): atomic drain via FeedStateSetter
+    ///
+    /// Pre-DEF-271 the helper wrote `*self.state = Errored(...)`
+    /// directly; the in-flight reply id was peeked separately at the
+    /// dispatch site (tier-3 dual-source-of-truth). Post-DEF-271 the
+    /// drain and install are one `mem::replace` via
+    /// [`crate::state_setter::FeedStateSetter::drain_and_install_errored`];
+    /// the returned `Option<NonZeroU64>` is `#[must_use]` and the
+    /// caller in `RowStream` uses it directly for
+    /// `StreamItem::FailReply { id, cause }`. The peek-then-write
+    /// dual-source-of-truth that previously existed at the
+    /// `classify_for_iter_rows` site collapses to a single source.
     #[inline]
-    pub(crate) fn install_errored_read_cursor_advance(&mut self) {
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically \
+                  drained by the Errored install. Caller MUST emit StreamItem::FailReply \
+                  or equivalent — dropping it leaks the user's oneshot-receiver \
+                  (zombie-reply class)."]
+    pub(crate) fn install_errored_read_cursor_advance(&mut self) -> Option<NonZeroU64> {
         let cause = ProtocolError::InternalCrateBug {
             locus: crate::error::CrateBugLocus::ReadCursorAdvance,
         };
-        self.state = ProtoState::Errored(cause.state_kind());
+        crate::state_setter::FeedStateSetter::new(&mut self.state)
+            .drain_and_install_errored(cause.state_kind())
     }
 
     /// DEF-154 (X): transition to `Errored(Framing)` for a
@@ -2320,11 +2351,23 @@ impl PgProtocol {
     /// on `total_len` (e.g. distinct kind for "0-byte body" vs other
     /// malformed lengths). Pass-through closes the "mismatched twin
     /// payloads" drift.
+    ///
+    /// # DEF-271 cluster A (2026-05-10): atomic drain via FeedStateSetter
+    ///
+    /// See [`Self::install_errored_read_cursor_advance`] for the
+    /// drain-and-install rationale. Same pattern.
     #[inline]
-    pub(crate) fn install_errored_malformed_data_row(&mut self, total_len: usize) {
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically \
+                  drained by the Errored install. Caller MUST emit StreamItem::FailReply \
+                  or equivalent — dropping it leaks the user's oneshot-receiver \
+                  (zombie-reply class)."]
+    pub(crate) fn install_errored_malformed_data_row(
+        &mut self,
+        total_len: usize,
+    ) -> Option<NonZeroU64> {
         let cause = ProtocolError::MalformedDataRow { total_len };
-        let state_kind = cause.state_kind();
-        self.state = ProtoState::Errored(state_kind);
+        crate::state_setter::FeedStateSetter::new(&mut self.state)
+            .drain_and_install_errored(cause.state_kind())
     }
 
     // DEF-188: install_errored_stale_schema_ref DELETED — there is
@@ -2460,8 +2503,14 @@ fn fail_inflight_no_readbuf(
     // `prev`. No explicit `scram_state = None` step needed post-revert
     // because there IS no separate scram_state field — SCRAM data
     // lives inline in the state variant and rides the drop glue.
-    let prev = core::mem::replace(state, ProtoState::Errored(state_kind));
-    let raw_id = prev.take_inflight_reply_raw_id();
+    //
+    // DEF-271 cluster A (2026-05-10): route through FeedStateSetter
+    // for tier-1 by-construction drain+install atomicity. Same
+    // mem::replace under the hood; the `#[must_use]` returned id is
+    // consumed in the FailReply emission below — explicit handling
+    // (no fallback, no leak).
+    let raw_id = crate::state_setter::FeedStateSetter::new(state)
+        .drain_and_install_errored(state_kind);
     match raw_id {
         Some(id) => {
             emit_actions!(staged, budget: 2, [
@@ -2605,9 +2654,11 @@ fn compute_push_ping(
     // preserved.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
+            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
+            // The Idle arm of push_class() is the precondition justification.
             let setter = crate::state_setter::StateSetter::<
                 crate::push_command::PingAwaitingRfqInstall,
-            >::new(state);
+            >::new(state, crate::guard::IdleStateProof::new());
             compute_push_ping_idle_only(setter, reply, staged);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -2710,9 +2761,10 @@ fn compute_push_startup(
     // PingAwaiting / BusyQuery) leave state untouched.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
+            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
             let setter = crate::state_setter::StateSetter::<
                 crate::push_command::StartupPostInstall,
-            >::new(state);
+            >::new(state, crate::guard::IdleStateProof::new());
             compute_push_startup_idle_only(
                 setter, user, database, app_name, credentials, reply, staged, reserved,
             );
@@ -2853,9 +2905,10 @@ fn compute_push_simple_query(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
+            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
             let setter = crate::state_setter::StateSetter::<
                 crate::push_command::SimpleQueryAwaitingFirstResponseInstall,
-            >::new(state);
+            >::new(state, crate::guard::IdleStateProof::new());
             compute_push_simple_query_idle_only(setter, sql, reply, staged, reserved);
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -2992,9 +3045,10 @@ fn compute_push_parse(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
+            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
             let setter = crate::state_setter::StateSetter::<
                 crate::push_command::ParseAwaitingParseCompleteInstall,
-            >::new(state);
+            >::new(state, crate::guard::IdleStateProof::new());
             compute_push_parse_idle_only(setter, stmt_name, sql, reply, staged, reserved);
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -3125,9 +3179,10 @@ fn compute_push_describe_statement(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
+            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
             let setter = crate::state_setter::StateSetter::<
                 crate::push_command::DescribeStatementAwaitingParamDescInstall,
-            >::new(state);
+            >::new(state, crate::guard::IdleStateProof::new());
             compute_push_describe_statement_idle_only(setter, stmt_name, reply, staged, reserved);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -3212,9 +3267,10 @@ fn compute_push_describe_portal(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
+            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
             let setter = crate::state_setter::StateSetter::<
                 crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall,
-            >::new(state);
+            >::new(state, crate::guard::IdleStateProof::new());
             compute_push_describe_portal_idle_only(setter, portal_name, reply, staged, reserved);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {

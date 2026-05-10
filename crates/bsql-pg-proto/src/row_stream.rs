@@ -847,13 +847,34 @@ impl<'p, 'w> RowStream<'p, 'w> {
         // body < 2 bytes cannot carry the column-count header.
         if row_body_len < 2 {
             self.drained = true;
-            self.proto.install_errored_malformed_data_row(total);
-            if self.proto.read_buf_advance(total).is_err() {
-                self.proto.install_errored_read_cursor_advance();
-            }
-            return StreamItem::FailReply {
-                id,
-                cause: ProtocolError::MalformedDataRow { total_len: total },
+            // DEF-271 cluster A (2026-05-10): install_errored_*
+            // returns the atomically-drained inflight reply id —
+            // tier-1 single-source-of-truth. The classify-time
+            // `id` parameter we received is the same value
+            // (single-field projection of the streaming variant's
+            // `reply: ReplyId<QueryKind>`); the match below uses
+            // the drained id when present and falls back to the
+            // classify-time `id` only on the architecturally-cold
+            // None branch.
+            //
+            // DEF-271 cluster A revision: drop the previous
+            // post-install secondary advance attempt. The advance
+            // would re-fail (read cursor unchanged), and a second
+            // install_errored_read_cursor_advance call would
+            // overwrite the better MalformedDataRow classifier
+            // with the worse ReadCursorAdvance classifier — the
+            // first cause IS the relevant diagnostic.
+            let drained = self.proto.install_errored_malformed_data_row(total);
+            let cause = ProtocolError::MalformedDataRow { total_len: total };
+            return match drained {
+                Some(drained_id) => StreamItem::FailReply { id: drained_id, cause },
+                // Architecturally cold: classify_for_iter_rows entered this fast-path
+                // only from streaming variants (which carry an inflight reply); the
+                // drain returns Some by construction. Fall through to the classify-
+                // time `id` parameter (same value by single-source projection — see
+                // pin above) in the unreachable branch to preserve the FailReply
+                // emission rather than collapse to CloseSocket-only.
+                None => StreamItem::FailReply { id, cause },
             };
         }
 
@@ -865,12 +886,15 @@ impl<'p, 'w> RowStream<'p, 'w> {
         // address-stable across the call.
         if self.proto.read_buf_advance(total).is_err() {
             self.drained = true;
-            self.proto.install_errored_read_cursor_advance();
-            return StreamItem::FailReply {
-                id,
-                cause: ProtocolError::InternalCrateBug {
-                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                },
+            // DEF-271 cluster A: atomic drain via FeedStateSetter.
+            let drained = self.proto.install_errored_read_cursor_advance();
+            let cause = ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+            };
+            return match drained {
+                Some(drained_id) => StreamItem::FailReply { id: drained_id, cause },
+                // Same architecturally-cold None branch as above.
+                None => StreamItem::FailReply { id, cause },
             };
         }
 

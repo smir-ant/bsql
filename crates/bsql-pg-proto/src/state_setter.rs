@@ -47,6 +47,7 @@
 use crate::error::StateErrorKind;
 use crate::state::ProtoState;
 use core::marker::PhantomData;
+use core::num::NonZeroU64;
 
 /// Sealed-supertrait module. `pub(crate)` so in-crate witness types
 /// can `impl Sealed for <their-witness>`. External crates cannot reach
@@ -106,13 +107,33 @@ pub(crate) struct StateSetter<'a, W: PostStateProof> {
 }
 
 impl<'a, W: PostStateProof> StateSetter<'a, W> {
-    /// Construct a new setter. `pub(crate)` — only crate-internal
-    /// callers (specifically [`crate::PgProtocol::push_command_internal`])
-    /// can mint a setter. External callers (and even other modules
-    /// outside the protocol body, save those that go through the
-    /// internal push path) have no path to construct one.
+    /// Construct a new setter. `pub(crate)` constructor with an
+    /// [`IdleStateProof`] witness parameter — the proof binds the
+    /// **`state == Idle` precondition** structurally at the mint site.
+    ///
+    /// # DEF-271 cluster A (2026-05-10): tier-1 by-construction Idle gate
+    ///
+    /// Pre-DEF-271 the constructor took only `&mut ProtoState`; the
+    /// `Idle`-only invariant was tier-2 by-discipline (lived as a
+    /// debug_assert inside `push_command_internal` + a non-load-bearing
+    /// audit comment in this module's docs). A future in-crate caller
+    /// minting `StateSetter::new(&mut some_non_idle_state)` would
+    /// compile, then `try_builder!`'s `install_errored` path would
+    /// transition from a non-Idle state to Errored — silently leaking
+    /// the prior variant's embedded `ReplyId<K>` (zombie-class
+    /// regression mirroring the pre-DEF-186 perf-recovery audit).
+    ///
+    /// Post-DEF-271 the [`IdleStateProof`] witness lives at the mint —
+    /// `IdleStateProof::new()` is `pub(crate)` (per DEF-269 v2), but
+    /// each call site that mints one must justify the precondition
+    /// (production: `push_command_internal` debug_asserts at entry;
+    /// `cfg(test)` 5-arm dispatchers: only the `Idle` arm of
+    /// `state.push_class()` mints the proof). Build-time enforcement.
     #[inline]
-    pub(crate) fn new(state: &'a mut ProtoState) -> Self {
+    pub(crate) fn new(
+        state: &'a mut ProtoState,
+        _proof: crate::guard::IdleStateProof,
+    ) -> Self {
         Self {
             state,
             _phantom: PhantomData,
@@ -157,6 +178,115 @@ impl<'a, W: PostStateProof> StateSetter<'a, W> {
     #[inline]
     pub(crate) fn install_errored(self, kind: StateErrorKind) {
         *self.state = ProtoState::Errored(kind);
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-271 cluster A (2026-05-10) — feed-side state setter
+//
+// Symmetric to push-side [`StateSetter<'_, W>`]. Mutates `ProtoState`
+// from feed-side dispatch / RowStream fast-paths via a single typed
+// surface that **atomically drains any in-flight reply id during the
+// transition to Errored**, returning it to the caller via a
+// `#[must_use]` Option. Pre-DEF-271 the feed-side `install_errored_*`
+// helpers wrote `*self.state = ProtoState::Errored(...)` directly and
+// the in-flight id was peeked separately at an earlier dispatch site —
+// a tier-3 dual-source-of-truth audit risk (peek-id vs would-be-drained-
+// id could diverge under refactor; the diverged path leaks the user's
+// oneshot-receiver as the **zombie-reply class**).
+// ═════════════════════════════════════════════════════════════════════
+
+/// Tier-1 witness binding a mutable borrow of [`ProtoState`] to a
+/// **feed-side** error transition. Mirror of [`StateSetter`] but for
+/// the inbound-frame dispatch and RowStream paths.
+///
+/// **Construction:** `pub(crate) fn new(&mut ProtoState)`. Production
+/// call sites (`PgProtocol::install_errored_*`,
+/// `fail_inflight_no_readbuf`) construct the setter, immediately
+/// consume it. The setter is `#[must_use]` — forgetting to consume is
+/// a build error under crate-wide `deny(unused_must_use)`.
+///
+/// **Consumption:** [`Self::drain_and_install_errored`] is the sole
+/// consumption path. Atomic: extracts the in-flight reply id from the
+/// prior state via [`ProtoState::take_inflight_reply_raw_id`] **and**
+/// installs `ProtoState::Errored(kind)` in one `mem::replace` —
+/// observer (the `!Sync` `PgProtocol`) cannot witness the partial
+/// triple. The returned `Option<NonZeroU64>` is `#[must_use]` —
+/// dropping it leaks the in-flight reply's correlator (zombie-reply
+/// class), and the crate's `deny(unused_must_use)` rejects the leak
+/// at build time. **Tier-1 by-construction**: there is no path to
+/// transition `ProtoState` to Errored from feed-side without surfacing
+/// the prior in-flight reply id to the caller.
+///
+/// **Idle-only contract intentionally NOT enforced**: feed-side
+/// transitions to Errored come from in-flight states (Streaming,
+/// AwaitingRfq, Connecting, etc.), the opposite of the push-side
+/// `StateSetter` Idle-only contract. The semantics differ; the witness
+/// names differ.
+#[must_use = "FeedStateSetter must be consumed via drain_and_install_errored — \
+              dropping the setter without consuming leaves ProtoState in its \
+              caller-provided value (likely an in-flight state) instead of the \
+              Errored-with-drained-reply transition the caller was supposed to \
+              perform"]
+pub(crate) struct FeedStateSetter<'a> {
+    state: &'a mut ProtoState,
+}
+
+impl<'a> FeedStateSetter<'a> {
+    /// Construct a new feed-side setter. `pub(crate)` — production
+    /// call sites are `PgProtocol::install_errored_*` and
+    /// `fail_inflight_no_readbuf`. No `IdleStateProof` parameter
+    /// (feed-side transitions are from in-flight states; an Idle
+    /// gate would invert the semantics).
+    #[inline]
+    pub(crate) fn new(state: &'a mut ProtoState) -> Self {
+        Self { state }
+    }
+
+    /// Atomic: drain any in-flight reply id from the prior state, then
+    /// install `ProtoState::Errored(kind)` via `mem::replace`. Returns
+    /// the drained id (Some if prior state carried an in-flight reply,
+    /// None for `Idle` / `DrainRfqAfterError` / `Errored`).
+    ///
+    /// # Tier-1 closure
+    ///
+    /// `mem::replace` is the single atomic step: there is no partial
+    /// state observable by an external borrower (`PgProtocol` is
+    /// `!Sync`; the `&mut self` borrow chain rules out concurrent
+    /// observers). Pre-DEF-271 the feed-side install_errored_* helpers
+    /// transitioned without draining — the caller used a separately-
+    /// peeked id at the dispatch site, a tier-3 dual-source-of-truth
+    /// risk. Post-DEF-271 the drain and install are the same step, the
+    /// returned id is the **only** id the caller can use, and the
+    /// `#[must_use]` lint rejects leaks at build time.
+    ///
+    /// # Caller contract
+    ///
+    /// The returned `Option<NonZeroU64>`:
+    /// - `Some(id)`: caller MUST emit `StagedAction::FailReply { id, cause }`
+    ///   (or `StreamItem::FailReply { id, cause }` from RowStream).
+    ///   Dropping the id leaves the user's oneshot-receiver hanging
+    ///   forever — the **zombie-reply class** that the typestate is
+    ///   here to prevent.
+    /// - `None`: prior state had no in-flight reply (architecturally
+    ///   unreachable from production feed-side call sites today, since
+    ///   the install_errored_* helpers fire from streaming variants
+    ///   that always carry a reply; classified rather than asserted to
+    ///   keep tier-1 from collapsing to tier-3 on a future refactor
+    ///   that allowed feed-side errors from a non-inflight variant).
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> contains the in-flight reply id (if any) \
+                  released by this transition. Caller MUST emit StagedAction::FailReply \
+                  { id, cause } or StreamItem::FailReply { id, cause } — dropping the id \
+                  leaves the user's oneshot-receiver hanging forever (zombie-reply class). \
+                  This `#[must_use]` + crate-wide `deny(unused_must_use)` rejects the leak \
+                  at build time."]
+    pub(crate) fn drain_and_install_errored(
+        self,
+        kind: StateErrorKind,
+    ) -> Option<NonZeroU64> {
+        let prev = core::mem::replace(self.state, ProtoState::Errored(kind));
+        prev.take_inflight_reply_raw_id()
     }
 }
 
