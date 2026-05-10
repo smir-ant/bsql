@@ -940,6 +940,115 @@ impl PgProtocol {
             sync_marker: PhantomData,
         }
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-272 cluster δ (2026-05-10) — feed-side error-transition leaves
+//
+// Per-call-site concrete-type tokens that gate
+// `crate::state_setter::drain_at_*` constructors. Each leaf submodule
+// hosts a token with PRIVATE field — the literal `Self(())` mint is
+// callable ONLY inside the submodule. The token is consumed by the
+// matching `drain_at_*` free fn in mod state_setter, which in turn
+// constructs `FeedStateSetter::new` (private to mod state_setter).
+// ═════════════════════════════════════════════════════════════════════
+
+/// DEF-272 cluster δ leaf submodule for the `install_errored_replyid_saturation`
+/// transition. The saturation classifier (cluster D) fires from any
+/// state, hence the `drain_at_replyid_saturation` returns
+/// `Option<NonZeroU64>` (None for `Idle` / `DrainRfqAfterError` /
+/// `Errored` prior states).
+#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+pub(crate) mod _replyid_saturation_drain_leaf {
+    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    pub(crate) struct ReplyIdSaturationToken(());
+
+    /// Mint a [`ReplyIdSaturationToken`] and route through
+    /// [`crate::state_setter::drain_at_replyid_saturation`]. Used by
+    /// [`crate::PgProtocol::install_errored_replyid_saturation`].
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id (if any). \
+                  Caller `install_errored_replyid_saturation` binds it to `_drained_id_at_saturation` \
+                  for documentation; saturation has no FailReply emission context."]
+    pub(in crate::protocol) fn drain(
+        state: &mut crate::state::ProtoState,
+        kind: crate::error::StateErrorKind,
+    ) -> Option<core::num::NonZeroU64> {
+        crate::state_setter::drain_at_replyid_saturation(state, ReplyIdSaturationToken(()), kind)
+    }
+}
+
+/// DEF-272 cluster δ leaf submodule for the
+/// `install_errored_read_cursor_advance` transition. Fires when the
+/// row-stream fast path detects a read-cursor advance failure
+/// (`CrateBugLocus::ReadCursorAdvance`).
+#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+pub(crate) mod _read_cursor_advance_drain_leaf {
+    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    pub(crate) struct ReadCursorAdvanceToken(());
+
+    /// Mint a [`ReadCursorAdvanceToken`] and route through
+    /// [`crate::state_setter::drain_at_read_cursor_advance`].
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+                  by the Errored install. Caller MUST emit StreamItem::FailReply or equivalent."]
+    pub(in crate::protocol) fn drain(
+        state: &mut crate::state::ProtoState,
+        kind: crate::error::StateErrorKind,
+    ) -> Option<core::num::NonZeroU64> {
+        crate::state_setter::drain_at_read_cursor_advance(state, ReadCursorAdvanceToken(()), kind)
+    }
+}
+
+/// DEF-272 cluster δ leaf submodule for the
+/// `install_errored_malformed_data_row` transition. Fires from
+/// streaming variants when a DataRow body is malformed (zero-length,
+/// etc.).
+#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+pub(crate) mod _malformed_data_row_drain_leaf {
+    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    pub(crate) struct MalformedDataRowToken(());
+
+    /// Mint a [`MalformedDataRowToken`] and route through
+    /// [`crate::state_setter::drain_at_malformed_data_row`].
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+                  by the Errored install. Caller MUST emit StreamItem::FailReply or equivalent."]
+    pub(in crate::protocol) fn drain(
+        state: &mut crate::state::ProtoState,
+        kind: crate::error::StateErrorKind,
+    ) -> Option<core::num::NonZeroU64> {
+        crate::state_setter::drain_at_malformed_data_row(state, MalformedDataRowToken(()), kind)
+    }
+}
+
+/// DEF-272 cluster δ leaf submodule for the
+/// `fail_inflight_no_readbuf` transition. Fires from dispatch when an
+/// in-flight error occurs and no read-buf state is available for
+/// payload preservation.
+#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+pub(crate) mod _fail_inflight_no_readbuf_drain_leaf {
+    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    pub(crate) struct FailInflightNoReadbufToken(());
+
+    /// Mint a [`FailInflightNoReadbufToken`] and route through
+    /// [`crate::state_setter::drain_at_fail_inflight_no_readbuf`].
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+                  by the Errored install. Caller emits FailReply with the cause."]
+    pub(in crate::protocol) fn drain(
+        state: &mut crate::state::ProtoState,
+        kind: crate::error::StateErrorKind,
+    ) -> Option<core::num::NonZeroU64> {
+        crate::state_setter::drain_at_fail_inflight_no_readbuf(
+            state,
+            FailInflightNoReadbufToken(()),
+            kind,
+        )
+    }
+}
+
+impl PgProtocol {
 
     /// Mint a fresh `ReplyId<K>` for an outbound command.
     ///
@@ -1080,8 +1189,7 @@ impl PgProtocol {
         // Operator-visible signal arrives on the next push as
         // ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }.
         let _drained_id_at_saturation =
-            crate::state_setter::FeedStateSetter::new(&mut self.state)
-                .drain_and_install_errored(cause.state_kind());
+            _replyid_saturation_drain_leaf::drain(&mut self.state, cause.state_kind());
     }
 
     // DEF-196 (2026-04-28): three-field split. Each cold slot
@@ -2488,8 +2596,7 @@ impl PgProtocol {
         let cause = ProtocolError::InternalCrateBug {
             locus: crate::error::CrateBugLocus::ReadCursorAdvance,
         };
-        crate::state_setter::FeedStateSetter::new(&mut self.state)
-            .drain_and_install_errored(cause.state_kind())
+        _read_cursor_advance_drain_leaf::drain(&mut self.state, cause.state_kind())
     }
 
     /// DEF-154 (X): transition to `Errored(Framing)` for a
@@ -2521,8 +2628,7 @@ impl PgProtocol {
         total_len: usize,
     ) -> Option<NonZeroU64> {
         let cause = ProtocolError::MalformedDataRow { total_len };
-        crate::state_setter::FeedStateSetter::new(&mut self.state)
-            .drain_and_install_errored(cause.state_kind())
+        _malformed_data_row_drain_leaf::drain(&mut self.state, cause.state_kind())
     }
 
     // DEF-188: install_errored_stale_schema_ref DELETED — there is
@@ -2664,8 +2770,7 @@ fn fail_inflight_no_readbuf(
     // mem::replace under the hood; the `#[must_use]` returned id is
     // consumed in the FailReply emission below — explicit handling
     // (no fallback, no leak).
-    let raw_id = crate::state_setter::FeedStateSetter::new(state)
-        .drain_and_install_errored(state_kind);
+    let raw_id = _fail_inflight_no_readbuf_drain_leaf::drain(state, state_kind);
     match raw_id {
         Some(id) => {
             emit_actions!(staged, budget: 2, [

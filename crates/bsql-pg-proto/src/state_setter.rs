@@ -235,13 +235,15 @@ pub(crate) struct FeedStateSetter<'a> {
 }
 
 impl<'a> FeedStateSetter<'a> {
-    /// Construct a new feed-side setter. `pub(crate)` — production
-    /// call sites are `PgProtocol::install_errored_*` and
-    /// `fail_inflight_no_readbuf`. No `IdleStateProof` parameter
-    /// (feed-side transitions are from in-flight states; an Idle
-    /// gate would invert the semantics).
+    /// Construct a new feed-side setter. **DEF-272 cluster δ (2026-05-10)**:
+    /// constructor is `pub(in crate::state_setter)` — only callable
+    /// from inside this module. Legitimate construction goes through
+    /// the per-call-site free fns below ([`drain_at_replyid_saturation`]
+    /// and friends), each of which requires a per-call-site concrete
+    /// token type whose mint is gated to a specific leaf submodule in
+    /// `mod protocol`.
     #[inline]
-    pub(crate) fn new(state: &'a mut ProtoState) -> Self {
+    pub(in crate::state_setter) fn new(state: &'a mut ProtoState) -> Self {
         Self { state }
     }
 
@@ -290,6 +292,90 @@ impl<'a> FeedStateSetter<'a> {
         let prev = core::mem::replace(self.state, ProtoState::Errored(kind));
         prev.take_inflight_reply_raw_id()
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-272 cluster δ (2026-05-10) — per-call-site token-gated FeedStateSetter constructors
+//
+// `FeedStateSetter::new` is `pub(in crate::state_setter)`; legitimate
+// construction goes through the 4 free fns below, each requiring a
+// distinct concrete-type token whose mint is gated to a specific leaf
+// submodule in `mod protocol`. Same closure pattern as cluster α/β:
+// the token's tuple-struct field is private to its leaf, so `Self(())`
+// mints are callable ONLY inside the leaf submodule. Hostile in-crate
+// (outside the leaf) attempting to call any `drain_at_*` fn cannot
+// supply the required token type — type system rejects.
+//
+// Pre-δ `FeedStateSetter::new` was `pub(crate)`; any in-crate caller
+// could mint a setter and trigger `drain_and_install_errored` to
+// transition any state to Errored. Tier-2 by-discipline within-crate.
+// Post-δ the call surface is exactly 4 named entry points, each
+// gated by its concrete-type token. Tier-1 within-crate.
+// ═════════════════════════════════════════════════════════════════════
+
+/// DEF-272 cluster δ leaf entry point: ReplyId saturation transition.
+/// Used by `PgProtocol::install_errored_replyid_saturation` (the
+/// only legitimate caller; saturation classifier per cluster D).
+/// Returns the drained in-flight reply id if any (None for `Idle` /
+/// `Errored` / `DrainRfqAfterError` prior states — saturation can
+/// fire from any state).
+#[inline]
+#[must_use = "the returned Option<NonZeroU64> is the in-flight reply id (if any) \
+              released by the saturation transition. Caller is `install_errored_replyid_saturation` \
+              which has no FailReply emission context (no &mut StagedActions); the value \
+              is bound to `_drained_id_at_saturation` for documentation + lint compliance."]
+pub(crate) fn drain_at_replyid_saturation(
+    state: &mut ProtoState,
+    _t: crate::protocol::_replyid_saturation_drain_leaf::ReplyIdSaturationToken,
+    kind: StateErrorKind,
+) -> Option<NonZeroU64> {
+    FeedStateSetter::new(state).drain_and_install_errored(kind)
+}
+
+/// DEF-272 cluster δ leaf entry point: read-cursor advance failure
+/// transition. Used by `PgProtocol::install_errored_read_cursor_advance`
+/// (the only legitimate caller; classified as
+/// `CrateBugLocus::ReadCursorAdvance`).
+#[inline]
+#[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+              by the Errored install. Caller MUST emit StreamItem::FailReply or equivalent — \
+              dropping it leaks the user's oneshot-receiver (zombie-reply class)."]
+pub(crate) fn drain_at_read_cursor_advance(
+    state: &mut ProtoState,
+    _t: crate::protocol::_read_cursor_advance_drain_leaf::ReadCursorAdvanceToken,
+    kind: StateErrorKind,
+) -> Option<NonZeroU64> {
+    FeedStateSetter::new(state).drain_and_install_errored(kind)
+}
+
+/// DEF-272 cluster δ leaf entry point: malformed-DataRow transition.
+/// Used by `PgProtocol::install_errored_malformed_data_row` (the only
+/// legitimate caller; classified as
+/// `ProtocolError::MalformedDataRow`).
+#[inline]
+#[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+              by the Errored install. Caller MUST emit StreamItem::FailReply or equivalent."]
+pub(crate) fn drain_at_malformed_data_row(
+    state: &mut ProtoState,
+    _t: crate::protocol::_malformed_data_row_drain_leaf::MalformedDataRowToken,
+    kind: StateErrorKind,
+) -> Option<NonZeroU64> {
+    FeedStateSetter::new(state).drain_and_install_errored(kind)
+}
+
+/// DEF-272 cluster δ leaf entry point: dispatch fail-inflight-no-readbuf
+/// transition. Used by `protocol::fail_inflight_no_readbuf` (the only
+/// legitimate caller; routes any `ProtocolError` cause that fires
+/// during dispatch when a read-buf state is unavailable).
+#[inline]
+#[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+              by the Errored install. Caller emits FailReply with the cause."]
+pub(crate) fn drain_at_fail_inflight_no_readbuf(
+    state: &mut ProtoState,
+    _t: crate::protocol::_fail_inflight_no_readbuf_drain_leaf::FailInflightNoReadbufToken,
+    kind: StateErrorKind,
+) -> Option<NonZeroU64> {
+    FeedStateSetter::new(state).drain_and_install_errored(kind)
 }
 
 // ═════════════════════════════════════════════════════════════════════
