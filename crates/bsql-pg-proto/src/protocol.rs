@@ -959,18 +959,78 @@ impl PgProtocol {
         // docstring for the bisect rationale.
         use core::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let raw_old = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // DEF-271 cluster D (2026-05-10): saturation classifier.
+        // Pre-DEF-271 `saturating_add(1)` capped at `u64::MAX` and
+        // returned the duplicate id silently; the atomic itself wraps
+        // to 0 by Rust spec, so subsequent mints cycle through
+        // previously-issued values — the wrapper's pending-replies
+        // table would mis-route server replies to the wrong correlator.
+        // Post-DEF-271 the cold branch detects the saturation point
+        // (`raw_old == u64::MAX`, the value at which the next mint
+        // wraps) and transitions THIS PgProtocol instance to
+        // `Errored(ReplyIdSaturation)`. The duplicate id IS still
+        // returned (caller gets a `ReplyId<K>` carrying `u64::MAX`
+        // wrapped to NonZeroU64::MIN via the saturating_add fallback),
+        // but the next push attempt sees Errored state and fails with
+        // `ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }`
+        // — the duplicate never reaches the server in a usable state.
+        //
+        // Cross-instance duplicate-ID risk after wrap remains tier-2
+        // (separate residue — architect's #1B brand-lifetime closure
+        // deferred to Phase 4+ pending invasive design review).
+        if raw_old == u64::MAX {
+            self.install_errored_replyid_saturation();
+        }
         // saturating_add(1) prevents wrap to zero (NonZeroU64 niche
-        // violation) at the architecturally-distant u64::MAX
-        // saturation point.
-        let raw = COUNTER.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        // SAFETY contract: counter starts at 0, fetch_add returns
-        // pre-increment value, then we saturating_add(1). First call:
-        // pre=0, post=1. NonZeroU64::new(1) is Some; the unwrap_or
-        // fallback to MIN is dead but keeps `forbid(clippy::unwrap_used)`
-        // happy on the proven-dead branch.
+        // violation) at u64::MAX. SAFETY contract: counter starts at
+        // 0, fetch_add returns pre-increment value, then we
+        // saturating_add(1). First call: pre=0, post=1.
+        // NonZeroU64::new(1) is Some; the unwrap_or fallback to MIN is
+        // dead in the non-saturated regime but keeps
+        // `forbid(clippy::unwrap_used)` happy on the proven-dead branch.
+        // In the saturated regime the fallback IS reached but the
+        // returned id is intentionally unusable (Errored state).
+        let raw = raw_old.saturating_add(1);
         let nz = core::num::NonZeroU64::new(raw)
             .unwrap_or(core::num::NonZeroU64::MIN);
         crate::reply_id::ReplyId::from_raw(nz)
+    }
+
+    /// DEF-271 cluster D (2026-05-10): cold-path classifier for the
+    /// `next_reply_id` saturation case. Marked `#[cold]` + `#[inline(never)]`
+    /// so LLVM keeps it off the hot mint path.
+    ///
+    /// The transition is `Idle → Errored(ReplyIdSaturation)` (or no-op
+    /// if state is already Errored — saturation classifier doesn't
+    /// override the original cause). The drained inflight reply id (if
+    /// any) is dropped silently — saturation has no FailReply emission
+    /// context (no `&mut StagedActions` accessible from `next_reply_id`).
+    /// The signal reaches the user via the next push attempt
+    /// classifying as `ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }`.
+    #[cold]
+    #[inline(never)]
+    fn install_errored_replyid_saturation(&mut self) {
+        if matches!(self.state, ProtoState::Errored(_)) {
+            return;
+        }
+        let cause = ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::ReplyIdSaturation,
+        };
+        // Route through cluster A's FeedStateSetter for tier-1
+        // single-mutation-surface. The drained id (if any inflight)
+        // is bound to an underscore-prefixed variable — saturation
+        // has no FailReply emission context (no &mut StagedActions
+        // accessible from next_reply_id). Option<NonZeroU64> is
+        // `Copy`, so the binding is a structural no-op; the
+        // `_drained_*` name documents the discard intent + dodges
+        // both `unused_variables` (underscore prefix) and
+        // `dropping_copy_types` (no `core::mem::drop` call).
+        // Operator-visible signal arrives on the next push as
+        // ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }.
+        let _drained_id_at_saturation =
+            crate::state_setter::FeedStateSetter::new(&mut self.state)
+                .drain_and_install_errored(cause.state_kind());
     }
 
     // DEF-196 (2026-04-28): three-field split. Each cold slot

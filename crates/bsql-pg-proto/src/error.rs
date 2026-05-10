@@ -779,6 +779,23 @@ pub enum CrateBugLocus {
     /// fallback (tier-4, CREDO §5) or new-variant-with-payload.
     AuthSubCodeZeroInErr,
 
+    /// DEF-271 cluster D (2026-05-10): the static `AtomicU64` counter
+    /// backing [`crate::PgProtocol::next_reply_id`] reached `u64::MAX`
+    /// and the next mint would produce a duplicate ID (atomics wrap
+    /// to 0 by spec; subsequent mints cycle through previously-issued
+    /// values). Architecturally distant (~10^19 mints process-wide)
+    /// but a real ceiling.
+    ///
+    /// Pre-DEF-271 the saturation point silently allowed the
+    /// duplicate-ID return; the wrapper's pending-replies table would
+    /// mis-route subsequent server replies to the wrong correlator.
+    /// Post-DEF-271 saturation detection transitions the affected
+    /// `PgProtocol` instance to `Errored(ReplyIdSaturation)`, so the
+    /// next push fails with `ConnectionAlreadyClosed`-classified the
+    /// duplicate never reaches the server in a usable state. Cross-
+    /// instance duplicate-ID risk remains tier-2 (separate residue —
+    /// architect's #1B brand-lifetime closure, deferred to Phase 4+).
+    ReplyIdSaturation,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -828,6 +845,7 @@ impl fmt::Display for CrateBugLocus {
             Self::EmptyWriteRange => f.write_str("empty-write-range"),
             Self::AuthSubCodeZeroInErr => f.write_str("auth-sub-code-zero-in-err"),
             Self::BuilderCapacityOverflow => f.write_str("builder-capacity-overflow"),
+            Self::ReplyIdSaturation => f.write_str("reply-id-saturation"),
         }
     }
 }
@@ -900,6 +918,21 @@ mod crate_bug_locus_display_tests {
     // infallible via the `WriteReserved` capacity witness, so the
     // locus variant + its stage-discriminator + the pin test all
     // became dead code. See `crate::protocol::build_*_message`.
+
+    /// DEF-271 cluster D (2026-05-10) pin: ReplyIdSaturation locus
+    /// renders to its canonical operator-facing string. Trips loudly
+    /// if a future rename or display-impl edit silently changes the
+    /// log output a wrapper-level monitor relies on.
+    #[test]
+    fn reply_id_saturation_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::ReplyIdSaturation,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus reply-id-saturation",
+        );
+    }
 }
 
 /// Compact 1-byte classification of a [`ProtocolError`], stored in
