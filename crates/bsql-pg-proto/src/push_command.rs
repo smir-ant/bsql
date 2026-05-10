@@ -133,7 +133,7 @@ pub trait PushCommand: sealed::PushCommandSealed {
     fn execute(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        row_desc_slot: &mut Option<crate::decode::RowDesc>,
+        row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         staged: &mut crate::action::StagedActions,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
         _proof: crate::guard::IdleStateProof,
@@ -199,7 +199,7 @@ impl PushCommand for Ping {
     fn execute(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        _row_desc_slot: &mut Option<crate::decode::RowDesc>,
+        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         staged: &mut crate::action::StagedActions,
         _reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
         _proof: crate::guard::IdleStateProof,
@@ -241,7 +241,7 @@ impl PushCommand for Startup {
     fn execute(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        _row_desc_slot: &mut Option<crate::decode::RowDesc>,
+        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         staged: &mut crate::action::StagedActions,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
         _proof: crate::guard::IdleStateProof,
@@ -280,7 +280,7 @@ impl PushCommand for SimpleQuery {
     fn execute(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        _row_desc_slot: &mut Option<crate::decode::RowDesc>,
+        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         staged: &mut crate::action::StagedActions,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
         _proof: crate::guard::IdleStateProof,
@@ -315,7 +315,7 @@ impl PushCommand for Parse {
     fn execute(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        _row_desc_slot: &mut Option<crate::decode::RowDesc>,
+        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         staged: &mut crate::action::StagedActions,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
         _proof: crate::guard::IdleStateProof,
@@ -352,7 +352,7 @@ impl PushCommand for DescribeStatement {
     fn execute(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        _row_desc_slot: &mut Option<crate::decode::RowDesc>,
+        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         staged: &mut crate::action::StagedActions,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
         _proof: crate::guard::IdleStateProof,
@@ -388,7 +388,7 @@ impl PushCommand for DescribePortal {
     fn execute(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        _row_desc_slot: &mut Option<crate::decode::RowDesc>,
+        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         staged: &mut crate::action::StagedActions,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
         _proof: crate::guard::IdleStateProof,
@@ -443,7 +443,7 @@ impl<P: crate::params::ParamsWriter> PushCommand for BindExecute<'_, P> {
     fn execute(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        row_desc_slot: &mut Option<crate::decode::RowDesc>,
+        row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         staged: &mut crate::action::StagedActions,
         reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
         _proof: crate::guard::IdleStateProof,

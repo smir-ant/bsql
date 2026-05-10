@@ -1,131 +1,204 @@
-//! DEF-270 cluster (R-rephrased letter, 2026-05-09) — tier-1
-//! `row_desc_slot` write provenance.
+//! DEF-272 cluster α (2026-05-10) — tier-1 within-crate
+//! `row_desc_slot` write provenance via concrete-token + Cell newtype.
 //!
-//! # Pre-DEF-270 R
+//! # Pre-DEF-272 α (post-DEF-270 R-rephrased + DEF-271 cluster B/C)
 //!
-//! `PgProtocol::row_desc_slot: Option<RowDesc>` was reachable through
-//! a `&mut Option<RowDesc>` raw mutable borrow that the protocol
-//! passed to dispatch handlers and `compute_push_*_idle_only` helpers.
-//! Any lib-internal site holding the borrow could write `*slot = ...`
-//! at any moment. **Tier-3 by-discipline**: the audit invariant
-//! "writes happen only at schema-bearing state transitions" was
-//! upheld by reviewer attention, not by the type system.
+//! - `row_desc_slot: Option<RowDesc>` was a raw field of `PgProtocol`,
+//!   with all of `mod protocol` (~5K LoC) holding direct mut access via
+//!   `pg.row_desc_slot = ...`.
+//! - The `SchemaParkedSlot<A: SchemaWriteAuth>` witness gated writes via
+//!   a sealed-trait auth tag, but the seal was `pub(crate)` — any
+//!   in-crate file could write `impl SchemaWriteAuth for HostileTag`
+//!   (the seal only closed the **external** API surface, not the
+//!   within-crate surface). Tier-1 EXTERNAL + tier-2 by-discipline
+//!   WITHIN-CRATE.
+//! - Architect audit (2026-05-10) verified empirically by appending a
+//!   hostile probe to `lib.rs`: `cargo check --tests` accepted hostile
+//!   `impl Sealed for H + impl SchemaWriteAuth for H + from_field_with_auth(slot, H).park(...)`
+//!   from a non-leaf in-crate location.
 //!
-//! # Post-DEF-270 R
+//! # Post-DEF-272 α
 //!
-//! - `PgProtocol::row_desc_slot` is private to `mod protocol`.
-//! - The sole write surface is [`SchemaParkedSlot`], a `must_use`
-//!   ZST-witness wrapping `&'a mut Option<RowDesc>`. Methods
-//!   [`SchemaParkedSlot::park`] / [`SchemaParkedSlot::clear`] /
-//!   [`SchemaParkedSlot::raw_mut`] consume self.
-//! - Construction is gated on a [`SchemaWriteAuth`] sealed-trait
-//!   witness. The tag types live in their **host modules**
-//!   (`mod protocol` for transitions inside the protocol body;
-//!   `mod dispatch` for inbound-frame transitions). Each tag's
-//!   `new()` constructor is `pub(in <host_module>)` — only the
-//!   host module can mint, achieving tier-1 cross-module closure
-//!   on write provenance.
+//! Two structural changes close the within-crate hole:
 //!
-//! # Why tags live in host modules (not here)
+//! 1. **`RowDescSlotCell` newtype** wraps the inner `Option<RowDesc>`
+//!    with a PRIVATE `inner` field (private to `mod schema_slot`). The
+//!    field is unreachable even from `mod protocol` — direct
+//!    `*self.row_desc_slot.inner = ...` does not compile. The only
+//!    paths to the inner value are read-only methods (`as_ref`,
+//!    `is_some`, `is_none`) and write-methods that require a
+//!    per-call-site **token** (private-field tuple struct).
 //!
-//! Rust's `pub(in <path>)` visibility requires `<path>` to be an
-//! **ancestor** of the item being annotated. A tag defined inside
-//! `mod schema_slot` cannot have its constructor restricted to
-//! `pub(in crate::dispatch)` (dispatch is a sibling, not an
-//! ancestor). To get tight per-call-site sealing, the tag must
-//! live where its constructor's visibility scope can name it as
-//! an ancestor — i.e., inside the host module.
+//! 2. **Per-leaf concrete-type tokens** replace the sealed-trait pattern.
+//!    Each leaf submodule defines its own token type (`pub(crate) struct
+//!    BeSelectToken(())` etc.) with a PRIVATE field. The token's
+//!    struct-literal mint `Self(())` is callable ONLY inside the
+//!    defining leaf submodule — the field's privacy is the seal, no
+//!    trait, no sealed-supertrait. Each `RowDescSlotCell` write method
+//!    takes a CONCRETE token type by value (consumed by the call):
+//!    `park_at_be_select(&mut self, desc, _t: BeSelectToken)`.
 //!
-//! `mod schema_slot` keeps the **shape** (trait, sealed marker,
-//! witness ZST). Host modules contribute their own tag types and
-//! impl the trait. The result: external crates cannot mint any
-//! tag (visibility seal); cross-module crate-internal callers
-//! cannot mint tags belonging to other modules.
+//! # Tier-1 closure (within-crate, by-construction)
+//!
+//! Hostile attempts (verified mentally, to be re-verified empirically
+//! by architect after this commit):
+//!
+//! - `slot.inner = ...` from anywhere outside `mod schema_slot`:
+//!   FAILS — `inner` is private to `mod schema_slot`.
+//! - `slot.park_at_be_select(desc, BeSelectToken(()))` from anywhere
+//!   outside `_bind_execute_select_install_leaf`: FAILS — token's `()`
+//!   field is private to the leaf submodule.
+//! - `impl HostileTrait for Whatever`: NO TRAIT EXISTS to bypass. The
+//!   sealed-trait + auth-tag pattern is gone; concrete-type tokens
+//!   replace it.
+//! - `slot.park_at_be_select(desc, X)` with `X != BeSelectToken`:
+//!   FAILS — Rust type system rejects parameter mismatch.
+//!
+//! The only paths to mutate the slot are:
+//! - `_bind_execute_select_install_leaf::install_select_transition` →
+//!   mints `BeSelectToken(())` inline → calls
+//!   `slot.park_at_be_select(desc, token)`.
+//! - `_row_description_dispatch_leaf::park_row_description_at_dispatch`
+//!   (in `mod dispatch`) → mints `TDispatchToken(())` → calls
+//!   `slot.park_at_t_dispatch(desc, token)`.
+//! - `_clear_residue_leaf::clear_schema_slot_residue` → mints
+//!   `ClearResidueSchemaToken(())` → calls
+//!   `slot.clear_at_residue(token)`.
+//!
+//! # Test-only setter
+//!
+//! [`RowDescSlotCell::_set_for_test`] is `#[cfg(test)]`-gated and lets
+//! mod protocol's residue-cleanup tests pre-populate the slot with a
+//! synthetic `RowDesc::EMPTY`. Production binaries do not see this
+//! method (the cfg gate strips it). External crates cannot reach it
+//! regardless (cell is `pub(crate)` only).
+//!
+//! # Bench cost
+//!
+//! The Cell is `#[repr(transparent)]` over `Option<RowDesc>`. Read
+//! methods (`as_ref`, `is_some`, etc.) compile to the same code as the
+//! direct `Option` accessors LLVM produced before. Write methods are
+//! a single field assignment plus a no-op token consume; LLVM erases
+//! the token (zero-sized type). 0 ns / 0 B perf delta vs. pre-DEF-272.
 
 use crate::decode::RowDesc;
 
-/// Sealed-supertrait module. `pub(crate)` so in-crate host modules
-/// can `impl Sealed for <their-tag>`. External crates cannot reach
-/// this module (no public re-export).
-pub(crate) mod sealed {
-    /// Sealed marker — implementors are crate-internal only by
-    /// virtue of `mod sealed`'s `pub(crate)` visibility (external
-    /// crates have no path to the trait).
-    pub trait Sealed {}
+/// Tier-1 within-crate write provenance for the protocol's parked
+/// `RowDescription`. Wraps `Option<RowDesc>` with a PRIVATE inner field;
+/// writes require per-leaf concrete-type tokens (see module-level docs).
+///
+/// `#[repr(transparent)]` so the layout is identical to the bare
+/// `Option<RowDesc>` — `mem::size_of::<RowDescSlotCell>() ==
+/// mem::size_of::<Option<RowDesc>>()`.
+#[repr(transparent)]
+pub(crate) struct RowDescSlotCell {
+    inner: Option<RowDesc>,
 }
 
-/// Sealed witness trait for a row-desc-slot write transition.
-/// Implementors are ZST tags emitted at specific transition sites
-/// (see [`mod self`] docs for the shape).
-pub(crate) trait SchemaWriteAuth: sealed::Sealed {}
+impl RowDescSlotCell {
+    /// The empty initial state. Used by `PgProtocol::new` at session
+    /// initialisation. Exposed as a `const` (not a `fn new()`) so that
+    /// any in-crate wholesale-replacement (`*cell = RowDescSlotCell::EMPTY`)
+    /// is **maximally grep-able** — the literal `EMPTY` is a single
+    /// audit-anchor across the crate, unlike the prior `::new()` which
+    /// reads as routine factory plumbing. Pre-DEF-272 the bare
+    /// `Option<RowDesc>` field had the same wholesale-replace shape
+    /// via `pg.row_desc_slot = None` — Rust's visibility cannot prevent
+    /// an owner of `&mut FieldType` from re-assigning the field, but
+    /// EMPTY at least surfaces the assignment site for review.
+    pub(crate) const EMPTY: Self = Self { inner: None };
 
-/// Tier-1 witness wrapping a mutable borrow of `PgProtocol::row_desc_slot`.
-///
-/// **Construction:** only via [`Self::from_field_with_auth`], which is
-/// gated on a [`SchemaWriteAuth`] tag. Tag minting lives in per-call-site
-/// leaf submodules in `mod protocol` and `mod dispatch` (DEF-271 cluster C);
-/// each tag has a private tuple-struct field, so `Self(())` is callable
-/// only inside the defining leaf submodule.
-///
-/// **Methods:** [`Self::park`] (set `Some(desc)`), [`Self::clear`]
-/// (set `None`), and [`Self::raw_mut`] (extract the raw `&mut Option<RowDesc>`
-/// borrow — used by `compute_push_bind_execute_idle_only`'s legacy
-/// signature, which receives the raw ref as a parameter today;
-/// post-N-D this surface will fold into the BindExecute install
-/// witness).
-///
-/// All methods consume `self` so a single witness performs exactly
-/// one write.
-#[must_use = "schema slot witness must be consumed via park / clear / raw_mut"]
-pub(crate) struct SchemaParkedSlot<'a> {
-    slot: &'a mut Option<RowDesc>,
-}
-
-impl<'a> SchemaParkedSlot<'a> {
-    /// Auth-typed constructor. Crate-internal modules can construct
-    /// a witness if and only if they hold a [`SchemaWriteAuth`] tag —
-    /// and tag construction is gated by the tag type's PRIVATE
-    /// tuple-struct field, mintable only inside the defining leaf
-    /// submodule (DEF-271 cluster C). The auth tag itself is the
-    /// proof that the caller is at a legitimate transition site.
-    ///
-    /// **Use case:** dispatch handlers receive `row_desc_slot:
-    /// &mut Option<RowDesc>` as a parameter (not `&mut PgProtocol`).
-    /// The leaf submodule that owns the transition mints its tag and
-    /// pairs it with the raw slot ref via this constructor; outside
-    /// the leaf, neither minting nor calling this fn for the tag is
-    /// possible.
+    /// Borrow the inner schema, if present. Read-only — no token needed.
+    /// Used by materialise (action.rs), row_stream projections, and
+    /// `compute_push_*` schema-presence checks.
     #[inline]
-    pub(crate) fn from_field_with_auth<A: SchemaWriteAuth>(
-        slot: &'a mut Option<RowDesc>,
-        _auth: A,
-    ) -> Self {
-        Self { slot }
+    #[must_use]
+    pub(crate) fn as_ref(&self) -> Option<&RowDesc> {
+        self.inner.as_ref()
     }
 
-    /// Set the slot to `Some(desc)`. Consumes self.
+    /// Returns `true` if the slot is populated. Read-only. Currently
+    /// only used by `cfg(test)` residue-cleanup fixtures; production
+    /// callers project `as_ref()` directly.
+    #[cfg(test)]
     #[inline]
-    pub(crate) fn park(self, desc: RowDesc) {
-        *self.slot = Some(desc);
+    #[must_use]
+    pub(crate) fn is_some(&self) -> bool {
+        self.inner.is_some()
     }
 
-    /// Set the slot to `None`. Consumes self.
+    /// Returns `true` if the slot is empty. Read-only. Currently
+    /// only used by `cfg(test)` residue-cleanup fixtures; production
+    /// callers project `as_ref()` directly.
+    #[cfg(test)]
     #[inline]
-    pub(crate) fn clear(self) {
-        *self.slot = None;
+    #[must_use]
+    pub(crate) fn is_none(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    /// Park `desc` from the BindExecute SELECT install transition. The
+    /// token's mint is gated to `_bind_execute_select_install_leaf`
+    /// (private tuple-struct field).
+    #[inline]
+    pub(crate) fn park_at_be_select(
+        &mut self,
+        desc: RowDesc,
+        _t: crate::protocol::_bind_execute_select_install_leaf::BeSelectToken,
+    ) {
+        self.inner = Some(desc);
+    }
+
+    /// Park `desc` from the inbound `'T'` (RowDescription) frame
+    /// dispatch. The token's mint is gated to
+    /// `_row_description_dispatch_leaf`.
+    #[inline]
+    pub(crate) fn park_at_t_dispatch(
+        &mut self,
+        desc: RowDesc,
+        _t: crate::dispatch::_row_description_dispatch_leaf::TDispatchToken,
+    ) {
+        self.inner = Some(desc);
+    }
+
+    /// Clear the slot at the residue-cleanup transition (Idle/Errored
+    /// entry). The token's mint is gated to `_clear_residue_leaf`.
+    #[inline]
+    pub(crate) fn clear_at_residue(
+        &mut self,
+        _t: crate::protocol::_clear_residue_leaf::ClearResidueSchemaToken,
+    ) {
+        self.inner = None;
+    }
+
+    /// Test-only setter. `#[cfg(test)]`-gated — production binaries
+    /// don't expose this. Used by `mod tests` in protocol.rs to
+    /// pre-populate the slot with synthetic `RowDesc::EMPTY` before
+    /// exercising residue-cleanup transitions.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn _set_for_test(&mut self, value: Option<RowDesc>) {
+        self.inner = value;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    /// Sealed-trait pin. The `mod sealed` module is `pub(crate)` and
-    /// `Sealed` itself is `pub` within it; external crates have no
-    /// path to either, so `impl SchemaWriteAuth for ExternalType`
-    /// cannot be written outside this crate. Within the crate,
-    /// each host module that defines a tag must `impl Sealed for
-    /// <tag>` — surfacing the cross-module impl, by-design.
+    /// Within-crate tier-1 closure pin. The `inner` field of
+    /// [`super::RowDescSlotCell`] is private to `mod schema_slot`; the
+    /// per-leaf tokens are `pub(crate)` types with PRIVATE tuple-struct
+    /// fields, mintable only inside their defining leaf submodule.
+    /// External crates: the cell + tokens are all `pub(crate)`-gated,
+    /// no public re-export. Within-crate hostile attempts to write the
+    /// slot bypass-style fail at compile time:
+    /// - `cell.inner = X` from outside `mod schema_slot` — `inner` private.
+    /// - `BeSelectToken(())` from outside the leaf — field private.
+    /// - `cell.park_at_be_select(desc, X)` with `X != BeSelectToken` —
+    ///   type mismatch.
+    /// - No trait to `impl` for HostileType — the sealed-trait pattern
+    ///   is deleted in this cluster; tokens are concrete types.
     #[test]
-    fn seal_pin_anchor() {
+    fn within_crate_seal_pin_anchor() {
         // Anchor for `git grep "schema_slot.*seal"` searches.
     }
 }

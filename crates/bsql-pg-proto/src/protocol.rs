@@ -551,9 +551,15 @@ pub struct PgProtocol {
     /// DEF-189 hot-slot — placed adjacent to `state` so the per-row
     /// fast-path's `match state` and `current_row_desc()` projection
     /// share a cache line on small `ProtoState` (~64 B).
+    ///
+    /// **DEF-272 cluster α (2026-05-10)**: wrapped in
+    /// [`crate::schema_slot::RowDescSlotCell`] (`#[repr(transparent)]`
+    /// over `Option<RowDesc>`); the inner `Option` is private to
+    /// `mod schema_slot`, write methods are gated on per-leaf concrete
+    /// tokens. Tier-1 within-crate write provenance.
     /// See full lifecycle docstring at the bottom of this struct's
     /// field block (kept short here for layout-readability).
-    row_desc_slot: Option<crate::decode::RowDesc>,
+    row_desc_slot: crate::schema_slot::RowDescSlotCell,
     read_buf: ReadBuf,
     /// DEF-196: session params from post-auth handshake. None
     /// until first ParameterStatus / NoticeResponse write.
@@ -772,98 +778,86 @@ pub struct PgProtocol {
 // preserved.
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-271 cluster C (2026-05-10) — auth-tag leaf-scope tightening
+// DEF-272 cluster α (2026-05-10) — schema-side concrete-token leaves
 //
-// Pre-DEF-271-C the schema_slot + session_params_slot auth tags were
-// `pub(crate) struct` with `pub(in crate::protocol) const fn new()`.
-// Visibility scope was the entire ~5K-LoC `mod protocol` — any in-mod
-// fn could grep+copy the inline mint pattern and write to either slot.
-// Tier-2 by-discipline; the audit invariant "writes happen only at the
-// sanctioned transition site" was upheld by reviewer attention.
+// Replaces the DEF-271 cluster C sealed-trait + auth-tag pattern with
+// per-leaf concrete-type tokens (private tuple-struct field). The
+// sealed-trait pattern was tier-1 EXTERNAL but tier-2 by-discipline
+// WITHIN-CRATE: any in-crate file could `impl Sealed for HostileTag` +
+// `impl SchemaWriteAuth for HostileTag` and bypass `from_field_with_auth`
+// via the hostile tag (architect's empirical hostile-probe verified).
 //
-// Post-DEF-271-C each tag lives inside a leaf submodule (~10-30 LoC)
-// with PRIVATE struct field — construction via the literal `Tag(())`
-// is callable ONLY from inside the submodule. The submodule contains
-// exactly the install/admit/clear helper fn(s) that mint+use the tag;
-// no other in-`mod protocol` code can construct the tag. **Tier-1
-// by-construction**: adding a sibling fn that mints requires editing
-// the leaf submodule itself (10-30 LoC scope), not anywhere else in
-// mod protocol.
+// Post-DEF-272-α each leaf has a CONCRETE token type (`pub(crate) struct
+// XToken(())`); the `()` field is private to the leaf submodule, so
+// `XToken(())` literal is mintable ONLY inside the leaf. The
+// `RowDescSlotCell::*_at_*` write methods take the concrete token type
+// by value. There is no trait to `impl` for hostile types; bypass
+// requires constructing a token (impossible outside the leaf) or a
+// type-mismatched parameter (rejected by Rust's type system).
 //
-// External callers invoke the leaf helper fn (`pub(in crate::protocol)`),
-// never the tag directly. The tag types are private to their leaf
-// submodule (bare `struct AtX(())` — no `pub` qualifier needed): the
-// trait bound `<A: SchemaWriteAuth>` on `from_field_with_auth` resolves
-// at the call site inside the leaf where the type is in scope, and the
-// `impl SchemaWriteAuth for AtX` is a local-type impl that compiles
-// regardless of `AtX` visibility. External crates cannot reach the type
-// nor construct it (`Self(())` literal is private to the submodule).
+// Cluster B-related leaves (`_parameter_status_admit_leaf`,
+// `_notice_response_admit_leaf`, the session_params side of
+// `_clear_residue_leaf`) still use the DEF-271 cluster B sealed-trait
+// pattern; cluster β (next subcluster) migrates them.
 //
-// Leaf-scope is the canonical Rust pattern for this class of tier-1
-// closure. Cost: visibility-only; LLVM erases everything; 0 ns / 0 B.
+// Cost: visibility-only; LLVM erases everything; 0 ns / 0 B.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-271 cluster C leaf submodule for the BindExecute SELECT
-/// install transition. Contains the auth tag + the single helper
-/// fn that mints + parks the schema. Mint scope = this submodule.
+/// DEF-272 cluster α leaf submodule for the BindExecute SELECT install
+/// transition. Hosts the [`BeSelectToken`] type and the single helper
+/// fn that mints+writes inline.
 #[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
-pub(in crate::protocol) mod _bind_execute_select_install_leaf {
-    /// DEF-271 cluster C leaf-scope tag. Both the tuple-struct field
-    /// AND the type itself are private — neither `Self(())` mints nor
-    /// the type-name are reachable outside this submodule.
-    struct AtBindExecuteSelectTransition(());
-    impl crate::schema_slot::sealed::Sealed for AtBindExecuteSelectTransition {}
-    impl crate::schema_slot::SchemaWriteAuth for AtBindExecuteSelectTransition {}
+pub(crate) mod _bind_execute_select_install_leaf {
+    /// DEF-272 cluster α leaf-scope token. The tuple-struct field is
+    /// PRIVATE to this submodule — `Self(())` mints are callable ONLY
+    /// here. The type itself is `pub(crate)` so
+    /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`] can
+    /// name it in its parameter signature; naming alone confers no
+    /// minting power.
+    pub(crate) struct BeSelectToken(());
 
-    /// Single mint + use site for [`AtBindExecuteSelectTransition`].
-    /// Park `desc` into `slot` via [`crate::schema_slot::SchemaParkedSlot`]
-    /// with the auth tag minted inline. External callers in mod
-    /// protocol invoke this helper instead of the inline mint+call;
-    /// the tag's struct literal `Self(())` is reachable only here.
+    /// Mint a [`BeSelectToken`] and write `desc` into `slot` via
+    /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`]. The
+    /// only legitimate path to populate the schema slot from the
+    /// BindExecute SELECT install code path.
     #[inline]
     pub(in crate::protocol) fn install_select_transition(
-        slot: &mut Option<crate::decode::RowDesc>,
+        slot: &mut crate::schema_slot::RowDescSlotCell,
         desc: crate::decode::RowDesc,
     ) {
-        crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
-            slot,
-            AtBindExecuteSelectTransition(()),
-        )
-        .park(desc);
+        slot.park_at_be_select(desc, BeSelectToken(()));
     }
 }
 
-/// DEF-271 cluster C leaf submodule for clear-session-residue
-/// transitions on Idle/Errored entry. Contains the auth tag (which
-/// implements BOTH `SchemaWriteAuth` AND `SessionParamsWriteAuth`
-/// per architect's #9 finding) + two helper fns (one per slot kind).
-/// Mint scope = this submodule.
+/// DEF-272 cluster α / DEF-271 cluster B leaf submodule for the
+/// clear-session-residue transitions on Idle/Errored entry. Holds the
+/// schema-side concrete token (cluster α) AND the legacy session-side
+/// auth tag (cluster B / β-pending). Two helper fns — one per slot
+/// kind. Cluster β will migrate the session-side to a concrete token.
 #[allow(missing_docs, reason = "submodule contains single-purpose leaf helpers; module-level docs above the submodule explain the design")]
-pub(in crate::protocol) mod _clear_residue_leaf {
-    /// DEF-271 cluster C leaf-scope tag. Implements BOTH
-    /// [`crate::schema_slot::SchemaWriteAuth`] AND
-    /// [`crate::session_params_slot::SessionParamsWriteAuth`] — the
-    /// same residue-cleanup site clears both slots; one ZST tag,
-    /// two sealed-trait impls. Both the tuple-struct field AND the
-    /// type itself are private to this submodule.
+pub(crate) mod _clear_residue_leaf {
+    /// DEF-272 cluster α leaf-scope token for the schema slot clear.
+    /// Field private to the leaf; type `pub(crate)` so the cell can
+    /// name it in its method signature.
+    pub(crate) struct ClearResidueSchemaToken(());
+
+    /// DEF-271 cluster B leaf-scope tag for the session_params clear.
+    /// Both the tuple-struct field AND the type itself are private to
+    /// this submodule. **Cluster β will migrate this to a concrete
+    /// token mirroring [`ClearResidueSchemaToken`].**
     struct AtClearSessionResidue(());
-    impl crate::schema_slot::sealed::Sealed for AtClearSessionResidue {}
-    impl crate::schema_slot::SchemaWriteAuth for AtClearSessionResidue {}
     impl crate::session_params_slot::sealed::Sealed for AtClearSessionResidue {}
     impl crate::session_params_slot::SessionParamsWriteAuth for AtClearSessionResidue {}
 
-    /// Clear the schema slot via [`crate::schema_slot::SchemaParkedSlot`]
-    /// with auth tag minted inline. Used by
+    /// Clear the schema slot via
+    /// [`crate::schema_slot::RowDescSlotCell::clear_at_residue`] with
+    /// the [`ClearResidueSchemaToken`] minted inline. Used by
     /// `clear_session_residue_for_class` Idle and Errored arms.
     #[inline]
     pub(in crate::protocol) fn clear_schema_slot_residue(
-        slot: &mut Option<crate::decode::RowDesc>,
+        slot: &mut crate::schema_slot::RowDescSlotCell,
     ) {
-        crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
-            slot,
-            AtClearSessionResidue(()),
-        )
-        .clear();
+        slot.clear_at_residue(ClearResidueSchemaToken(()));
     }
 
     /// Clear the session-params via
@@ -871,7 +865,8 @@ pub(in crate::protocol) mod _clear_residue_leaf {
     /// minted inline. Used by `clear_session_residue_for_class`
     /// Errored arm (per DEF-189 Q8-C3 + DEF-205 step 3 — session-state
     /// forfeit on tear-down; the params' Drop chain scrubs
-    /// `SecretBoundedStr` bytes).
+    /// `SecretBoundedStr` bytes). **Cluster β will migrate to a concrete
+    /// token + `SessionParamsCell::clear_at_residue`.**
     #[inline]
     pub(in crate::protocol) fn clear_session_params_residue(
         params: &mut crate::session_params::SessionParams,
@@ -959,7 +954,7 @@ impl PgProtocol {
         Self {
             state: ProtoState::Idle,
             read_buf: ReadBuf::new(),
-            row_desc_slot: None,
+            row_desc_slot: crate::schema_slot::RowDescSlotCell::EMPTY,
             // DEF-196: three independent cold slots — none allocated
             // at construction. Trust auth + no errors + no malformed
             // frames + no notice/param frames = lifetime-zero heap.
@@ -3707,7 +3702,7 @@ fn build_execute_message(
 #[inline]
 pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter>(
     setter: crate::state_setter::StateSetter<'_, crate::push_command::BindExecutePostInstall>,
-    row_desc_slot: &mut Option<crate::decode::RowDesc>,
+    row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
     params: &P,
@@ -4548,7 +4543,7 @@ mod residue_policy_per_class_tests {
     /// `error_arena` allocated. After the test we observe how each
     /// arm of `clear_session_residue_*` mutated them.
     fn populate_residue(proto: &mut PgProtocol) {
-        proto.row_desc_slot = Some(RowDesc::EMPTY);
+        proto.row_desc_slot._set_for_test(Some(RowDesc::EMPTY));
         proto.session_params = Some(dirty_session_params());
         proto.error_arena = Some(alloc::boxed::Box::new(
             crate::error_arena::ErrorArena::new(),

@@ -42,52 +42,47 @@ use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-271 cluster C (2026-05-10) — auth-tag leaf-scope tightening
+// DEF-272 cluster α (2026-05-10) — schema-side concrete-token leaf
 //
-// Pre-DEF-271-C `AtRowDescriptionDispatch` lived at module scope with
-// `pub(in crate::dispatch) const fn new()` — the entire ~2.8K-LoC
-// `mod dispatch` could mint and park. Tier-2 by-discipline.
+// Pre-DEF-272-α the `AtRowDescriptionDispatch` tag impl'd
+// `SchemaWriteAuth` (sealed-trait pattern). Tier-1 EXTERNAL but tier-2
+// by-discipline WITHIN-CRATE: any in-crate file could `impl Sealed +
+// SchemaWriteAuth for HostileTag` and bypass.
 //
-// Post-DEF-271-C the tag lives inside a leaf submodule with PRIVATE
-// struct field; the only public surface is `park_row_description(...)`
-// that does the mint+park inline. Three call sites (simple-query,
-// describe-statement, describe-portal 'T' arms) all invoke the same
-// leaf helper. **Tier-1 by-construction**: the auth tag's mint scope
-// is the leaf submodule (~10 LoC), not the entire dispatch module.
+// Post-DEF-272-α the leaf hosts a CONCRETE `TDispatchToken` type with a
+// private tuple-struct field; the literal `Self(())` mint is callable
+// ONLY inside this submodule. The cell's
+// `park_at_t_dispatch` method takes `TDispatchToken` by value — there
+// is no trait to `impl` for hostile types, no sealed-supertrait to
+// route around. Three call sites (simple-query, describe-statement,
+// describe-portal 'T' arms) all invoke the leaf helper.
 //
-// See `mod protocol` (DEF-271 cluster C block) for the parallel
-// schema_slot + session_params auth tags' leaf submodules.
+// See `mod protocol` (DEF-272 cluster α block) for the parallel
+// schema-slot leaves; cluster β migrates the session_params leaves.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-271 cluster C leaf submodule for the inbound `'T'` (RowDescription)
-/// frame dispatch. Contains the auth tag + the single park helper fn.
-/// Mint scope = this submodule.
+/// DEF-272 cluster α leaf submodule for the inbound `'T'`
+/// (RowDescription) frame dispatch. Hosts the [`TDispatchToken`] type
+/// and the single park helper fn.
 #[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
-pub(in crate::dispatch) mod _row_description_dispatch_leaf {
-    /// DEF-271 cluster C leaf-scope tag. Both the tuple-struct field
-    /// AND the type itself are private — neither `Self(())` mints nor
-    /// the type-name are reachable outside this submodule.
-    struct AtRowDescriptionDispatch(());
-    impl crate::schema_slot::sealed::Sealed for AtRowDescriptionDispatch {}
-    impl crate::schema_slot::SchemaWriteAuth for AtRowDescriptionDispatch {}
+pub(crate) mod _row_description_dispatch_leaf {
+    /// DEF-272 cluster α leaf-scope token. The tuple-struct field is
+    /// PRIVATE to this submodule — `Self(())` mints are callable ONLY
+    /// here. The type itself is `pub(crate)` so
+    /// [`crate::schema_slot::RowDescSlotCell::park_at_t_dispatch`] can
+    /// name it in its parameter signature.
+    pub(crate) struct TDispatchToken(());
 
-    /// Single mint + use site for [`AtRowDescriptionDispatch`].
-    /// Park `row_desc` into `slot` via [`crate::schema_slot::SchemaParkedSlot`]
-    /// with the auth tag minted inline. Used by all three 'T' arm
-    /// dispatch transitions (simple-query, describe-statement,
-    /// describe-portal). Adding a fourth call site means calling
-    /// this helper from the new arm — no new tag mint needed; mint
-    /// scope stays at this leaf.
+    /// Mint a [`TDispatchToken`] and write `row_desc` into `slot` via
+    /// [`crate::schema_slot::RowDescSlotCell::park_at_t_dispatch`].
+    /// Used by all three 'T' arm dispatch transitions (simple-query,
+    /// describe-statement, describe-portal).
     #[inline]
     pub(in crate::dispatch) fn park_row_description_at_dispatch(
-        slot: &mut Option<crate::decode::RowDesc>,
+        slot: &mut crate::schema_slot::RowDescSlotCell,
         row_desc: crate::decode::RowDesc,
     ) {
-        crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
-            slot,
-            AtRowDescriptionDispatch(()),
-        )
-        .park(row_desc);
+        slot.park_at_t_dispatch(row_desc, TDispatchToken(()));
     }
 }
 use crate::wire::{
@@ -275,7 +270,7 @@ pub(crate) fn dispatch(
     tag: crate::wire::InboundTag,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    row_desc_slot: &mut Option<crate::decode::RowDesc>,
+    row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
     // DEF-196 (2026-04-28): `&mut Option<Box<ErrorArena>>` slot for
     // the dispatch path's only cold-write target. Most dispatch arms
     // don't write error_arena; the few that do (ErrorResponse arms)
