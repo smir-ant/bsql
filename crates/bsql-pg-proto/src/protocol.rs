@@ -917,27 +917,80 @@ pub(crate) mod _notice_response_admit_leaf {
     }
 }
 
-impl PgProtocol {
+// ═════════════════════════════════════════════════════════════════════
+// DEF-272 P6 closure (2026-05-10) — `_proto_init_leaf` submodule
+//
+// Architect hostile-probe (2026-05-10) confirmed that pre-this-leaf
+// `*cell = RowDescSlotCell::EMPTY` / `SessionParamsCell::EMPTY` was
+// callable from any in-crate file via the `pub(crate) const EMPTY`. The
+// straightforward fix `pub(in crate::protocol) const EMPTY` is invalid
+// (E0742: visibility path must be ancestor; mod schema_slot / mod
+// session_params_slot are siblings of mod protocol, not children). The
+// proper closure is the leaf-token pattern (mirrors DEF-272 cluster δ):
+//
+//   - `_proto_init_leaf::ProtoInitToken` has a private tuple-struct
+//     field — `Self(())` mintable ONLY inside this submodule.
+//   - Cells expose `pub(crate) const fn empty(token: ProtoInitToken)`
+//     instead of `pub(crate) const EMPTY`. Fresh cell construction
+//     requires a token.
+//   - `PgProtocol::new` lives INSIDE `_proto_init_leaf` so it has
+//     access to `ProtoInitToken::mint()`. Code outside the leaf cannot
+//     mint tokens → cannot construct fresh cells → cannot wholesale-
+//     replace `*pg.row_desc_slot = …` (no fresh value to assign).
+//
+// Wholesale-replacement is gated to this submodule by construction.
+// Tier-1 within-crate. The leaf body is the entire init logic — small
+// enough to review as a unit.
+// ═════════════════════════════════════════════════════════════════════
 
-    /// Construct a new protocol in [`ProtoState::Idle`].
-    ///
-    /// **Note:** Phase 1a starts in `Idle` directly. The startup +
-    /// auth handshake that legitimately produces this state lives in
-    /// 1b/1e; until then the test harness pushes Ping commands without
-    /// having authenticated against a real PG server.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            state: ProtoState::Idle,
-            read_buf: ReadBuf::new(),
-            row_desc_slot: crate::schema_slot::RowDescSlotCell::EMPTY,
-            // DEF-196: three independent cold slots — none allocated
-            // at construction. Trust auth + no errors + no malformed
-            // frames + no notice/param frames = lifetime-zero heap.
-            session_params: crate::session_params_slot::SessionParamsCell::EMPTY,
-            error_arena: None,
-            malformed_frame_count: 0,
-            sync_marker: PhantomData,
+#[allow(missing_docs, reason = "submodule contains init-token + sole legitimate cell-construction site (DEF-272 P6 closure)")]
+pub(crate) mod _proto_init_leaf {
+    /// DEF-272 P6 closure token (2026-05-10). Field private to leaf —
+    /// `Self(())` mintable ONLY inside this submodule via
+    /// [`ProtoInitToken::mint`]. `pub(crate)` type signature so cell
+    /// modules can name the type in their `empty(token)` parameter,
+    /// but the private tuple-struct field gates construction.
+    #[derive(Clone, Copy)]
+    pub(crate) struct ProtoInitToken(());
+
+    impl ProtoInitToken {
+        /// Mint a token. Private (no `pub`) — only callable inside
+        /// `_proto_init_leaf` (which contains the sole legitimate
+        /// caller, [`super::PgProtocol::new`]).
+        const fn mint() -> Self {
+            Self(())
+        }
+    }
+
+    impl super::PgProtocol {
+        /// Construct a new protocol in [`crate::state::ProtoState::Idle`].
+        ///
+        /// **Note:** Phase 1a starts in `Idle` directly. The startup +
+        /// auth handshake that legitimately produces this state lives in
+        /// 1b/1e; until then the test harness pushes Ping commands without
+        /// having authenticated against a real PG server.
+        ///
+        /// Lives inside `_proto_init_leaf` (DEF-272 P6 closure 2026-05-10):
+        /// the token-gated [`crate::schema_slot::RowDescSlotCell::empty`]
+        /// and [`crate::session_params_slot::SessionParamsCell::empty`]
+        /// constructors require a [`ProtoInitToken`], which can only be
+        /// minted here. Wholesale-replacement of cell fields is therefore
+        /// narrowed to this submodule by construction.
+        #[must_use]
+        pub const fn new() -> Self {
+            let token = ProtoInitToken::mint();
+            Self {
+                state: super::ProtoState::Idle,
+                read_buf: super::ReadBuf::new(),
+                row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
+                // DEF-196: three independent cold slots — none allocated
+                // at construction. Trust auth + no errors + no malformed
+                // frames + no notice/param frames = lifetime-zero heap.
+                session_params: crate::session_params_slot::SessionParamsCell::empty(token),
+                error_arena: None,
+                malformed_frame_count: 0,
+                sync_marker: super::PhantomData,
+            }
         }
     }
 }

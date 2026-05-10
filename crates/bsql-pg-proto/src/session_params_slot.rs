@@ -90,12 +90,24 @@ pub(crate) struct SessionParamsCell {
 }
 
 impl SessionParamsCell {
-    /// The empty initial state. Used by `PgProtocol::new` at session
-    /// initialisation. Exposed as a `const` (not a `fn new()`) for
-    /// audit-readability of any future wholesale-replacement
-    /// (`*cell = SessionParamsCell::EMPTY`) — the literal `EMPTY` is
-    /// a single grep-anchor.
-    pub(crate) const EMPTY: Self = Self { inner: None };
+    /// Construct a fresh empty cell. Token-gated to
+    /// [`crate::protocol::_proto_init_leaf::ProtoInitToken`] — that's
+    /// the only mint site (private to that leaf submodule which also
+    /// hosts the sole legitimate caller, `PgProtocol::new`). Closes
+    /// wholesale-replacement (`*cell = SessionParamsCell::empty(...)`)
+    /// to the leaf by construction — DEF-272 P6 closure (2026-05-10),
+    /// architect hostile-probe-driven follow-up to DEF-272.
+    ///
+    /// The token is consumed (ZST, erased by LLVM); non-init code paths
+    /// must use the token-gated `admit_at_*` / `clear_at_*` methods which
+    /// mutate in-place without producing a fresh cell.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn empty(
+        _token: crate::protocol::_proto_init_leaf::ProtoInitToken,
+    ) -> Self {
+        Self { inner: None }
+    }
 
     /// Borrow the inner session params, if allocated. Read-only. Used
     /// by `PgProtocol::session_params` accessor and the residue-cleanup
