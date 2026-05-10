@@ -41,28 +41,53 @@ use crate::error::ProtocolError;
 use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
 
-// ─────────────────────────────────────────────────────────────────
-// DEF-270 R-rephrased — schema-slot write auth tag hosted here.
+// ═════════════════════════════════════════════════════════════════════
+// DEF-271 cluster C (2026-05-10) — auth-tag leaf-scope tightening
 //
-// Per `mod schema_slot` docs, tag types live in their host modules
-// to enable `pub(in <host_module>) const fn new()` visibility seal.
-// The 'T' (RowDescription) frame dispatch is the legitimate transition
-// point for parking schema into `PgProtocol::row_desc_slot`; this
-// tag is minted only there.
-// ─────────────────────────────────────────────────────────────────
+// Pre-DEF-271-C `AtRowDescriptionDispatch` lived at module scope with
+// `pub(in crate::dispatch) const fn new()` — the entire ~2.8K-LoC
+// `mod dispatch` could mint and park. Tier-2 by-discipline.
+//
+// Post-DEF-271-C the tag lives inside a leaf submodule with PRIVATE
+// struct field; the only public surface is `park_row_description(...)`
+// that does the mint+park inline. Three call sites (simple-query,
+// describe-statement, describe-portal 'T' arms) all invoke the same
+// leaf helper. **Tier-1 by-construction**: the auth tag's mint scope
+// is the leaf submodule (~10 LoC), not the entire dispatch module.
+//
+// See `mod protocol` (DEF-271 cluster C block) for the parallel
+// schema_slot + session_params auth tags' leaf submodules.
+// ═════════════════════════════════════════════════════════════════════
 
-/// DEF-270 R-rephrased — tag for inbound `'T'` (RowDescription)
-/// frame dispatch. Minted at the dispatch handler 'T' arm transitions
-/// (simple-query, describe-statement, describe-portal paths).
-pub(crate) struct AtRowDescriptionDispatch(());
-impl crate::schema_slot::sealed::Sealed for AtRowDescriptionDispatch {}
-impl crate::schema_slot::SchemaWriteAuth for AtRowDescriptionDispatch {}
-impl AtRowDescriptionDispatch {
-    /// Construct the tag. Visibility limited to `mod crate::dispatch`
-    /// — only the dispatch handlers can mint this auth.
+/// DEF-271 cluster C leaf submodule for the inbound `'T'` (RowDescription)
+/// frame dispatch. Contains the auth tag + the single park helper fn.
+/// Mint scope = this submodule.
+#[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
+pub(in crate::dispatch) mod _row_description_dispatch_leaf {
+    /// DEF-271 cluster C leaf-scope tag. Both the tuple-struct field
+    /// AND the type itself are private — neither `Self(())` mints nor
+    /// the type-name are reachable outside this submodule.
+    struct AtRowDescriptionDispatch(());
+    impl crate::schema_slot::sealed::Sealed for AtRowDescriptionDispatch {}
+    impl crate::schema_slot::SchemaWriteAuth for AtRowDescriptionDispatch {}
+
+    /// Single mint + use site for [`AtRowDescriptionDispatch`].
+    /// Park `row_desc` into `slot` via [`crate::schema_slot::SchemaParkedSlot`]
+    /// with the auth tag minted inline. Used by all three 'T' arm
+    /// dispatch transitions (simple-query, describe-statement,
+    /// describe-portal). Adding a fourth call site means calling
+    /// this helper from the new arm — no new tag mint needed; mint
+    /// scope stays at this leaf.
     #[inline]
-    pub(in crate::dispatch) const fn new() -> Self {
-        Self(())
+    pub(in crate::dispatch) fn park_row_description_at_dispatch(
+        slot: &mut Option<crate::decode::RowDesc>,
+        row_desc: crate::decode::RowDesc,
+    ) {
+        crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+            slot,
+            AtRowDescriptionDispatch(()),
+        )
+        .park(row_desc);
     }
 }
 use crate::wire::{
@@ -605,12 +630,12 @@ pub(crate) fn dispatch(
             // The slot lives across the entire stream (DataRows + Z).
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    // DEF-270 R-rephrased: park via SchemaParkedSlot
-                    // witness — auth tag mint is `pub(in crate::dispatch)`.
-                    crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+                    // DEF-271 cluster C: leaf helper performs the mint+park
+                    // with the auth tag's scope confined to its submodule.
+                    _row_description_dispatch_leaf::park_row_description_at_dispatch(
                         row_desc_slot,
-                        AtRowDescriptionDispatch::new(),
-                    ).park(row_desc);
+                        row_desc,
+                    );
                     *state = ProtoState::SimpleQueryStreamingRows { reply };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -1066,11 +1091,12 @@ pub(crate) fn dispatch(
                 // source of truth (no `rows: Rows` discriminator
                 // duplicate). Materialise reads the slot at the Z
                 // arm.
-                // DEF-270 R-rephrased: park via SchemaParkedSlot witness.
-                crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+                // DEF-271 cluster C: leaf helper performs the mint+park
+                // with the auth tag's scope confined to its submodule.
+                _row_description_dispatch_leaf::park_row_description_at_dispatch(
                     row_desc_slot,
-                    AtRowDescriptionDispatch::new(),
-                ).park(row_desc);
+                    row_desc,
+                );
                 *state = ProtoState::DescribeStatementAwaitingRfq {
                     reply,
                     param_oids,
@@ -1150,12 +1176,12 @@ pub(crate) fn dispatch(
             // in PgProtocol::row_desc_slot — single source of truth.
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    // DEF-270 R-rephrased: park via SchemaParkedSlot
-                    // witness — auth tag mint is `pub(in crate::dispatch)`.
-                    crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+                    // DEF-271 cluster C: leaf helper performs the mint+park
+                    // with the auth tag's scope confined to its submodule.
+                    _row_description_dispatch_leaf::park_row_description_at_dispatch(
                         row_desc_slot,
-                        AtRowDescriptionDispatch::new(),
-                    ).park(row_desc);
+                        row_desc,
+                    );
                     *state = ProtoState::DescribePortalAwaitingRfq { reply };
                     DispatchOutcome::AdvancedSilent
                 }

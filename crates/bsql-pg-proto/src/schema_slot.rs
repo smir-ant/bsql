@@ -61,10 +61,11 @@ pub(crate) trait SchemaWriteAuth: sealed::Sealed {}
 
 /// Tier-1 witness wrapping a mutable borrow of `PgProtocol::row_desc_slot`.
 ///
-/// **Construction:** only via [`crate::PgProtocol::schema_slot_for_write`]
-/// (which requires a [`SchemaWriteAuth`] proof at the call site) or
-/// the auth-typed [`Self::from_field_with_auth`] (also gated on a
-/// [`SchemaWriteAuth`] tag).
+/// **Construction:** only via [`Self::from_field_with_auth`], which is
+/// gated on a [`SchemaWriteAuth`] tag. Tag minting lives in per-call-site
+/// leaf submodules in `mod protocol` and `mod dispatch` (DEF-271 cluster C);
+/// each tag has a private tuple-struct field, so `Self(())` is callable
+/// only inside the defining leaf submodule.
 ///
 /// **Methods:** [`Self::park`] (set `Some(desc)`), [`Self::clear`]
 /// (set `None`), and [`Self::raw_mut`] (extract the raw `&mut Option<RowDesc>`
@@ -83,16 +84,17 @@ pub(crate) struct SchemaParkedSlot<'a> {
 impl<'a> SchemaParkedSlot<'a> {
     /// Auth-typed constructor. Crate-internal modules can construct
     /// a witness if and only if they hold a [`SchemaWriteAuth`] tag —
-    /// and tag construction is gated by per-module `pub(in ...)`
-    /// visibility on the tag type's `new()` (defined in the host
-    /// module). The auth tag itself is the proof that the caller is
-    /// at a legitimate transition site.
+    /// and tag construction is gated by the tag type's PRIVATE
+    /// tuple-struct field, mintable only inside the defining leaf
+    /// submodule (DEF-271 cluster C). The auth tag itself is the
+    /// proof that the caller is at a legitimate transition site.
     ///
     /// **Use case:** dispatch handlers receive `row_desc_slot:
-    /// &mut Option<RowDesc>` as a parameter (not `&mut PgProtocol`,
-    /// so they cannot call `schema_slot_for_write` directly). They
-    /// mint the auth tag at the 'T' arm transition and pair it with
-    /// the raw slot ref via this constructor.
+    /// &mut Option<RowDesc>` as a parameter (not `&mut PgProtocol`).
+    /// The leaf submodule that owns the transition mints its tag and
+    /// pairs it with the raw slot ref via this constructor; outside
+    /// the leaf, neither minting nor calling this fn for the tag is
+    /// possible.
     #[inline]
     pub(crate) fn from_field_with_auth<A: SchemaWriteAuth>(
         slot: &'a mut Option<RowDesc>,

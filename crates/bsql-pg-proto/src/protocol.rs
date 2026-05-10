@@ -771,98 +771,178 @@ pub struct PgProtocol {
 // timing is correct. Relative-to-baseline regression detection is
 // preserved.
 
-// ─────────────────────────────────────────────────────────────────
-// DEF-270 R-rephrased — schema-slot write auth tags hosted here.
+// ═════════════════════════════════════════════════════════════════════
+// DEF-271 cluster C (2026-05-10) — auth-tag leaf-scope tightening
 //
-// Per `mod schema_slot` docs: tag types must live in their host
-// modules so that `pub(in <host_module>) const fn new()` can name
-// the host module as a visibility ancestor. The tags below are
-// minted only at the matching transition sites inside `mod protocol`:
-// - `AtBindExecuteSelectTransition`: at `compute_push_bind_execute_idle_only`
-//   when the caller supplies `row_desc: Some(_)` (SELECT path).
-// - `AtClearSessionResidue`: at `clear_session_residue_for_class`
-//   when transitioning to Idle/Errored.
+// Pre-DEF-271-C the schema_slot + session_params_slot auth tags were
+// `pub(crate) struct` with `pub(in crate::protocol) const fn new()`.
+// Visibility scope was the entire ~5K-LoC `mod protocol` — any in-mod
+// fn could grep+copy the inline mint pattern and write to either slot.
+// Tier-2 by-discipline; the audit invariant "writes happen only at the
+// sanctioned transition site" was upheld by reviewer attention.
 //
-// Cross-module callers (e.g. `mod dispatch`) cannot mint these —
-// they have their own tag (`AtRowDescriptionDispatch`) hosted in
-// `mod dispatch`.
-// ─────────────────────────────────────────────────────────────────
+// Post-DEF-271-C each tag lives inside a leaf submodule (~10-30 LoC)
+// with PRIVATE struct field — construction via the literal `Tag(())`
+// is callable ONLY from inside the submodule. The submodule contains
+// exactly the install/admit/clear helper fn(s) that mint+use the tag;
+// no other in-`mod protocol` code can construct the tag. **Tier-1
+// by-construction**: adding a sibling fn that mints requires editing
+// the leaf submodule itself (10-30 LoC scope), not anywhere else in
+// mod protocol.
+//
+// External callers invoke the leaf helper fn (`pub(in crate::protocol)`),
+// never the tag directly. The tag types are private to their leaf
+// submodule (bare `struct AtX(())` — no `pub` qualifier needed): the
+// trait bound `<A: SchemaWriteAuth>` on `from_field_with_auth` resolves
+// at the call site inside the leaf where the type is in scope, and the
+// `impl SchemaWriteAuth for AtX` is a local-type impl that compiles
+// regardless of `AtX` visibility. External crates cannot reach the type
+// nor construct it (`Self(())` literal is private to the submodule).
+//
+// Leaf-scope is the canonical Rust pattern for this class of tier-1
+// closure. Cost: visibility-only; LLVM erases everything; 0 ns / 0 B.
+// ═════════════════════════════════════════════════════════════════════
 
-/// DEF-270 R-rephrased — tag for the BindExecute SELECT install
-/// transition. Minted inside `compute_push_bind_execute_idle_only`
-/// when a caller-supplied `row_desc` is parked into the slot.
-pub(crate) struct AtBindExecuteSelectTransition(());
-impl crate::schema_slot::sealed::Sealed for AtBindExecuteSelectTransition {}
-impl crate::schema_slot::SchemaWriteAuth for AtBindExecuteSelectTransition {}
-impl AtBindExecuteSelectTransition {
-    /// Construct the tag. Visibility limited to `mod crate::protocol`.
+/// DEF-271 cluster C leaf submodule for the BindExecute SELECT
+/// install transition. Contains the auth tag + the single helper
+/// fn that mints + parks the schema. Mint scope = this submodule.
+#[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
+pub(in crate::protocol) mod _bind_execute_select_install_leaf {
+    /// DEF-271 cluster C leaf-scope tag. Both the tuple-struct field
+    /// AND the type itself are private — neither `Self(())` mints nor
+    /// the type-name are reachable outside this submodule.
+    struct AtBindExecuteSelectTransition(());
+    impl crate::schema_slot::sealed::Sealed for AtBindExecuteSelectTransition {}
+    impl crate::schema_slot::SchemaWriteAuth for AtBindExecuteSelectTransition {}
+
+    /// Single mint + use site for [`AtBindExecuteSelectTransition`].
+    /// Park `desc` into `slot` via [`crate::schema_slot::SchemaParkedSlot`]
+    /// with the auth tag minted inline. External callers in mod
+    /// protocol invoke this helper instead of the inline mint+call;
+    /// the tag's struct literal `Self(())` is reachable only here.
     #[inline]
-    pub(in crate::protocol) const fn new() -> Self {
-        Self(())
+    pub(in crate::protocol) fn install_select_transition(
+        slot: &mut Option<crate::decode::RowDesc>,
+        desc: crate::decode::RowDesc,
+    ) {
+        crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+            slot,
+            AtBindExecuteSelectTransition(()),
+        )
+        .park(desc);
     }
 }
 
-/// DEF-270 R-rephrased — tag for the clear-session-residue transition.
-/// Minted inside `clear_session_residue_for_class` when the protocol
-/// scrubs the slot on Idle/Errored entry.
-///
-/// **DEF-271 cluster B (2026-05-10):** also implements
-/// [`crate::session_params_slot::SessionParamsWriteAuth`] — the same
-/// residue-cleanup site clears both the schema slot AND session params
-/// (architect's #9 finding: one ZST tag, two sealed-trait impls).
-pub(crate) struct AtClearSessionResidue(());
-impl crate::schema_slot::sealed::Sealed for AtClearSessionResidue {}
-impl crate::schema_slot::SchemaWriteAuth for AtClearSessionResidue {}
-impl crate::session_params_slot::sealed::Sealed for AtClearSessionResidue {}
-impl crate::session_params_slot::SessionParamsWriteAuth for AtClearSessionResidue {}
-impl AtClearSessionResidue {
-    /// Construct the tag. Visibility limited to `mod crate::protocol`.
+/// DEF-271 cluster C leaf submodule for clear-session-residue
+/// transitions on Idle/Errored entry. Contains the auth tag (which
+/// implements BOTH `SchemaWriteAuth` AND `SessionParamsWriteAuth`
+/// per architect's #9 finding) + two helper fns (one per slot kind).
+/// Mint scope = this submodule.
+#[allow(missing_docs, reason = "submodule contains single-purpose leaf helpers; module-level docs above the submodule explain the design")]
+pub(in crate::protocol) mod _clear_residue_leaf {
+    /// DEF-271 cluster C leaf-scope tag. Implements BOTH
+    /// [`crate::schema_slot::SchemaWriteAuth`] AND
+    /// [`crate::session_params_slot::SessionParamsWriteAuth`] — the
+    /// same residue-cleanup site clears both slots; one ZST tag,
+    /// two sealed-trait impls. Both the tuple-struct field AND the
+    /// type itself are private to this submodule.
+    struct AtClearSessionResidue(());
+    impl crate::schema_slot::sealed::Sealed for AtClearSessionResidue {}
+    impl crate::schema_slot::SchemaWriteAuth for AtClearSessionResidue {}
+    impl crate::session_params_slot::sealed::Sealed for AtClearSessionResidue {}
+    impl crate::session_params_slot::SessionParamsWriteAuth for AtClearSessionResidue {}
+
+    /// Clear the schema slot via [`crate::schema_slot::SchemaParkedSlot`]
+    /// with auth tag minted inline. Used by
+    /// `clear_session_residue_for_class` Idle and Errored arms.
     #[inline]
-    pub(in crate::protocol) const fn new() -> Self {
-        Self(())
+    pub(in crate::protocol) fn clear_schema_slot_residue(
+        slot: &mut Option<crate::decode::RowDesc>,
+    ) {
+        crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
+            slot,
+            AtClearSessionResidue(()),
+        )
+        .clear();
+    }
+
+    /// Clear the session-params via
+    /// [`crate::session_params_slot::SessionParamsSlot`] with auth tag
+    /// minted inline. Used by `clear_session_residue_for_class`
+    /// Errored arm (per DEF-189 Q8-C3 + DEF-205 step 3 — session-state
+    /// forfeit on tear-down; the params' Drop chain scrubs
+    /// `SecretBoundedStr` bytes).
+    #[inline]
+    pub(in crate::protocol) fn clear_session_params_residue(
+        params: &mut crate::session_params::SessionParams,
+    ) {
+        crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
+            params,
+            AtClearSessionResidue(()),
+        )
+        .clear();
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// DEF-271 cluster B (2026-05-10) — session-params write auth tags
-// hosted here.
-//
-// Per `mod session_params_slot` docs: tag types live in `mod protocol`
-// because that's where the mutation sites live (the inbound-frame
-// pre-dispatch filter for `ParameterStatus` / `NoticeResponse`).
-// Each tag's `new()` is `pub(in crate::protocol)` — no cross-module
-// caller (e.g. `mod dispatch`) can mint these; sites that need
-// session-params write authority for a different reason add their
-// own tag in their host module + impl the sealed trait.
-// ─────────────────────────────────────────────────────────────────
+/// DEF-271 cluster C leaf submodule for the inbound `ParameterStatus`
+/// pre-dispatch filter. Contains the auth tag + the single admit
+/// helper fn that does parse + record/bump.
+#[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
+pub(in crate::protocol) mod _parameter_status_admit_leaf {
+    /// DEF-271 cluster C leaf-scope tag. Both the tuple-struct field
+    /// AND the type itself are private to this submodule.
+    struct AtParameterStatusFrame(());
+    impl crate::session_params_slot::sealed::Sealed for AtParameterStatusFrame {}
+    impl crate::session_params_slot::SessionParamsWriteAuth for AtParameterStatusFrame {}
 
-/// DEF-271 cluster B — tag for the inbound `ParameterStatus`
-/// pre-dispatch filter. Minted inside `feed_bytes_bounded` at the
-/// PG `'S'` (ParameterStatus) admission site when
-/// [`allows_unsolicited_param_status`] returns true.
-pub(crate) struct AtParameterStatusFrame(());
-impl crate::session_params_slot::sealed::Sealed for AtParameterStatusFrame {}
-impl crate::session_params_slot::SessionParamsWriteAuth for AtParameterStatusFrame {}
-impl AtParameterStatusFrame {
-    /// Construct the tag. Visibility limited to `mod crate::protocol`.
+    /// Parse the `ParameterStatus` payload and record into
+    /// `session_params` via the typed slot witness. On
+    /// `MalformedPayload` the helper internally bumps the malformed
+    /// counter via the same witness (cluster B consolidation).
+    /// Returns the [`super::ParamStatusRecordOutcome`] for caller
+    /// observability (currently discarded; reserved for a
+    /// Phase-1d wrapper-advisory channel).
+    ///
+    /// Lazy-inits the `Box<SessionParams>` if not yet allocated
+    /// (DEF-196).
     #[inline]
-    pub(in crate::protocol) const fn new() -> Self {
-        Self(())
+    #[must_use]
+    pub(in crate::protocol) fn admit_parameter_status_frame(
+        session_params_slot: &mut Option<alloc::boxed::Box<crate::session_params::SessionParams>>,
+        payload: &[u8],
+    ) -> super::ParamStatusRecordOutcome {
+        let session_params = super::session_params_or_init(session_params_slot);
+        let slot = crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
+            session_params,
+            AtParameterStatusFrame(()),
+        );
+        super::record_param_status_with_slot(slot, payload)
     }
 }
 
-/// DEF-271 cluster B — tag for the inbound `NoticeResponse`
-/// pre-dispatch filter. Minted inside `feed_bytes_bounded` at the
-/// PG `'N'` (NoticeResponse) admission site when
-/// [`allows_unsolicited_notice_response`] returns true.
-pub(crate) struct AtNoticeResponseFrame(());
-impl crate::session_params_slot::sealed::Sealed for AtNoticeResponseFrame {}
-impl crate::session_params_slot::SessionParamsWriteAuth for AtNoticeResponseFrame {}
-impl AtNoticeResponseFrame {
-    /// Construct the tag. Visibility limited to `mod crate::protocol`.
+/// DEF-271 cluster C leaf submodule for the inbound `NoticeResponse`
+/// pre-dispatch filter. Contains the auth tag + the single admit
+/// helper fn that bumps the notice counter.
+#[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
+pub(in crate::protocol) mod _notice_response_admit_leaf {
+    /// DEF-271 cluster C leaf-scope tag. Both the tuple-struct field
+    /// AND the type itself are private to this submodule.
+    struct AtNoticeResponseFrame(());
+    impl crate::session_params_slot::sealed::Sealed for AtNoticeResponseFrame {}
+    impl crate::session_params_slot::SessionParamsWriteAuth for AtNoticeResponseFrame {}
+
+    /// Bump the unsolicited-NoticeResponse counter via the typed
+    /// slot witness. Lazy-inits the `Box<SessionParams>` if not yet
+    /// allocated (DEF-196).
     #[inline]
-    pub(in crate::protocol) const fn new() -> Self {
-        Self(())
+    pub(in crate::protocol) fn admit_notice_response_frame(
+        session_params_slot: &mut Option<alloc::boxed::Box<crate::session_params::SessionParams>>,
+    ) {
+        crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
+            super::session_params_or_init(session_params_slot),
+            AtNoticeResponseFrame(()),
+        )
+        .bump_notice_response();
     }
 }
 
@@ -1820,16 +1900,22 @@ impl PgProtocol {
                             // parse outcome. Consolidates the two-step
                             // "parse → caller-bumps" into a single
                             // mutation site behind the witness.
-                            let session_params = session_params_or_init(session_params_slot);
-                            let slot = crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
-                                session_params,
-                                AtParameterStatusFrame::new(),
-                            );
+                            //
+                            // DEF-271 cluster C (2026-05-10): full mint+use
+                            // moved into the leaf submodule
+                            // `_parameter_status_admit_leaf::admit_parameter_status_frame`.
+                            // The auth tag's struct literal `AtParameterStatusFrame(())`
+                            // is constructible only inside that submodule
+                            // (private field). External call sites in mod
+                            // protocol invoke the leaf helper.
                             // Outcome is signalled to the caller for
                             // potential future logging/test observation;
                             // current consumers (this site) discard it.
                             let _outcome: ParamStatusRecordOutcome =
-                                record_param_status_with_slot(slot, payload);
+                                _parameter_status_admit_leaf::admit_parameter_status_frame(
+                                    session_params_slot,
+                                    payload,
+                                );
                             frames_consumed =
                                 frames_consumed.saturating_add(total_len);
                             continue;
@@ -1854,10 +1940,15 @@ impl PgProtocol {
                             //
                             // DEF-271 cluster B (2026-05-10): write
                             // gated through SessionParamsSlot witness.
-                            crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
-                                session_params_or_init(session_params_slot),
-                                AtNoticeResponseFrame::new(),
-                            ).bump_notice_response();
+                            //
+                            // DEF-271 cluster C (2026-05-10): full
+                            // mint+use moved into the leaf submodule
+                            // `_notice_response_admit_leaf::admit_notice_response_frame`.
+                            // The auth tag literal is private to that
+                            // submodule.
+                            _notice_response_admit_leaf::admit_notice_response_frame(
+                                session_params_slot,
+                            );
                             frames_consumed =
                                 frames_consumed.saturating_add(total_len);
                             continue;
@@ -2110,19 +2201,19 @@ impl PgProtocol {
         //   over the full dispatch loop.
         match class {
             crate::state::StatePushClass::Idle => {
-                // DEF-270 R-rephrased: clear via SchemaParkedSlot witness
-                // — auth tag mint is `pub(in crate::protocol)`.
-                self.schema_slot_for_write(AtClearSessionResidue::new())
-                    .clear();
+                // DEF-270 R-rephrased: clear via SchemaParkedSlot witness.
+                // DEF-271 cluster C (2026-05-10): mint+use moved into
+                // the leaf submodule `_clear_residue_leaf`.
+                _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
                 // DEF-196: only clear arena if it was ever allocated.
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
             }
             crate::state::StatePushClass::Errored(_) => {
-                // DEF-270 R-rephrased: same witness pattern as Idle arm.
-                self.schema_slot_for_write(AtClearSessionResidue::new())
-                    .clear();
+                // DEF-270 R-rephrased + DEF-271 cluster C: same leaf
+                // submodule helper as the Idle arm.
+                _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
@@ -2136,11 +2227,11 @@ impl PgProtocol {
                 // SessionParamsWriteAuth — the same residue-cleanup
                 // site clears both slots; one tag, two sealed-trait
                 // impls (architect's #9 finding).
+                //
+                // DEF-271 cluster C (2026-05-10): mint+use for the
+                // session-params clear moved into the leaf helper too.
                 if let Some(params) = self.session_params.as_deref_mut() {
-                    crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
-                        params,
-                        AtClearSessionResidue::new(),
-                    ).clear();
+                    _clear_residue_leaf::clear_session_params_residue(params);
                 }
             }
             // In-flight states — preserve residue. The exhaustive
@@ -2358,51 +2449,6 @@ impl PgProtocol {
         self.row_desc_slot
             .as_ref()
             .map(crate::decode::RowDescBorrow::from_ref)
-    }
-
-    /// DEF-270 cluster (R-rephrased letter, 2026-05-09) — sole
-    /// in-crate write surface for `row_desc_slot`.
-    ///
-    /// Returns a [`crate::schema_slot::SchemaParkedSlot`] witness
-    /// wrapping `&mut self.row_desc_slot`. The witness's `park` /
-    /// `clear` / `raw_mut` methods are the only paths to mutate the
-    /// slot; direct field assignment is impossible (field is private
-    /// to `mod protocol`).
-    ///
-    /// # Auth witness requirement
-    ///
-    /// `auth: A: SchemaWriteAuth` — caller must mint a typed auth
-    /// tag at the legitimate transition site. Each tag is hosted in
-    /// the module that performs the transition (so `pub(in <module>)`
-    /// visibility on `new()` can name the host module as ancestor):
-    /// - [`AtBindExecuteSelectTransition`]: hosted in `mod protocol`
-    ///   — for the BindExecute SELECT install path.
-    /// - [`crate::dispatch::AtRowDescriptionDispatch`]: hosted in
-    ///   `mod dispatch` — for inbound `'T'` (RowDescription) frame
-    ///   handling.
-    /// - [`AtClearSessionResidue`]: hosted in `mod protocol` — for
-    ///   the residue-scrub on Idle/Errored transitions.
-    ///
-    /// # Tier-1 closure
-    ///
-    /// External crates: cannot reach the slot at all (field private
-    /// to `mod protocol`; this method is `pub(crate)`).
-    ///
-    /// In-crate cross-module: cannot mint an auth tag for a transition
-    /// outside their module (visibility seal on the tag constructor).
-    /// Adding a new write transition requires (a) adding a new auth
-    /// tag with the appropriate `pub(in ...)` visibility in its host
-    /// module, AND (b) hooking the call. Both surface in the same
-    /// commit.
-    #[inline]
-    pub(crate) fn schema_slot_for_write<A: crate::schema_slot::SchemaWriteAuth>(
-        &mut self,
-        auth: A,
-    ) -> crate::schema_slot::SchemaParkedSlot<'_> {
-        crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
-            &mut self.row_desc_slot,
-            auth,
-        )
     }
 
     /// DEF-189: fused state classification for the row-stream
@@ -3690,15 +3736,14 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
     // single slot BEFORE the state transition. The variant
     // shape (Select vs Dml) is the tier-1 signal that the
     // slot is populated.
-    // DEF-270 R-rephrased (Phase 1): park via SchemaParkedSlot witness — auth
-    // tag is `pub(in crate::protocol)` so only this module can mint.
+    // DEF-270 R-rephrased (Phase 1): park via SchemaParkedSlot witness.
     // DEF-270 N-D (Phase 2): typed witness pairs BindExecute → BindExecuteAwaitingBindComplete{Dml,Select}.
+    // DEF-271 cluster C (Phase 3): mint+park moved into the leaf
+    // submodule `_bind_execute_select_install_leaf::install_select_transition`.
+    // The auth tag's struct literal is private to that submodule.
     let post_install = match row_desc {
         Some(desc) => {
-            crate::schema_slot::SchemaParkedSlot::from_field_with_auth(
-                row_desc_slot,
-                AtBindExecuteSelectTransition::new(),
-            ).park(desc);
+            _bind_execute_select_install_leaf::install_select_transition(row_desc_slot, desc);
             crate::push_command::BindExecutePostInstall::Select { reply }
         }
         None => crate::push_command::BindExecutePostInstall::Dml { reply },
@@ -3838,9 +3883,12 @@ pub(crate) enum ParamStatusRecordOutcome {
 // OR bump_malformed_param_status() on MalformedPayload — consolidates
 // the pre-DEF-271 two-step "parse → caller bumps" pattern into a
 // single mutation site behind the typed witness.
+// DEF-271 cluster C (2026-05-10): pub(in crate::protocol) so the
+// leaf submodule `_parameter_status_admit_leaf` can call this from
+// inside its `admit_parameter_status_frame` helper.
 #[inline(always)]
 #[must_use]
-fn record_param_status_with_slot(
+pub(in crate::protocol) fn record_param_status_with_slot(
     slot: crate::session_params_slot::SessionParamsSlot<'_>,
     payload: &[u8],
 ) -> ParamStatusRecordOutcome {

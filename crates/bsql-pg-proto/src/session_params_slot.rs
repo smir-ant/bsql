@@ -28,23 +28,24 @@
 //!   [`Self::record`] / [`Self::bump_malformed_param_status`] /
 //!   [`Self::bump_notice_response`] / [`Self::clear`] consume self.
 //! - Construction is gated on a [`SessionParamsWriteAuth`] sealed-trait
-//!   witness. Per-host-module auth tags
-//!   ([`crate::protocol::AtParameterStatusFrame`],
-//!   [`crate::protocol::AtNoticeResponseFrame`],
-//!   [`crate::protocol::AtClearSessionResidue`]) live in `mod protocol`
-//!   with `pub(in crate::protocol) const fn new()` — only that module
-//!   can mint a tag.
-//! - `AtClearSessionResidue` is shared with the existing
-//!   [`crate::schema_slot::SchemaWriteAuth`] tag (same residue-cleanup
-//!   site clears both the schema slot and session params); one ZST,
-//!   two sealed-trait impls.
+//!   witness. Auth tags live inside per-call-site leaf submodules
+//!   in `mod protocol` (`_parameter_status_admit_leaf`,
+//!   `_notice_response_admit_leaf`, `_clear_residue_leaf`) with
+//!   PRIVATE tuple-struct fields — only the leaf submodule can
+//!   write `Self(())` to mint the tag. The dual-purpose
+//!   `AtClearSessionResidue` tag implements both
+//!   [`SessionParamsWriteAuth`] and
+//!   [`crate::schema_slot::SchemaWriteAuth`] (same residue-cleanup
+//!   site clears both slots); one ZST, two sealed-trait impls.
 //!
-//! # Cluster C follow-up (deferred)
+//! # Post-DEF-271 C (cluster C, 2026-05-10)
 //!
-//! `pub(in crate::protocol)` spans the entire `~5 K LoC` module.
-//! Phase 3 cluster C narrows the scope to leaf submodules per
-//! call site (architect's #2 finding); applies uniformly to all
-//! schema_slot + session_params_slot tags.
+//! Cluster B introduced the witness; cluster C tightened auth-tag
+//! mint scope from `pub(in crate::protocol)` (the whole ~5 K-LoC
+//! module) down to per-leaf submodules (~10–30 LoC). Adding a new
+//! write transition now requires (a) a new leaf submodule, (b) a
+//! new auth tag with private field, AND (c) a helper fn — all
+//! surface in the same review hunk.
 
 use crate::session_params::SessionParams;
 
@@ -69,7 +70,9 @@ pub(crate) trait SessionParamsWriteAuth: sealed::Sealed {}
 ///
 /// **Construction:** auth-typed via [`Self::from_field_with_auth`]
 /// (gated on a [`SessionParamsWriteAuth`] tag). Tag minting lives
-/// in `mod protocol` with `pub(in crate::protocol) const fn new()`.
+/// in per-call-site leaf submodules in `mod protocol`
+/// (DEF-271 cluster C); each tag has a private tuple-struct field,
+/// so `Self(())` is callable only inside the defining leaf submodule.
 ///
 /// **Methods:** [`Self::record`] / [`Self::bump_malformed_param_status`] /
 /// [`Self::bump_notice_response`] / [`Self::clear`] — each consumes
@@ -82,8 +85,9 @@ pub(crate) struct SessionParamsSlot<'a> {
 impl<'a> SessionParamsSlot<'a> {
     /// Auth-typed constructor. Crate-internal modules can construct
     /// a witness if and only if they hold a [`SessionParamsWriteAuth`]
-    /// tag — and tag construction is gated by per-module
-    /// `pub(in crate::protocol)` visibility on the tag's `new()`.
+    /// tag — and tag construction is gated by the tag type's PRIVATE
+    /// tuple-struct field, mintable only inside the defining leaf
+    /// submodule (DEF-271 cluster C).
     #[inline]
     pub(crate) fn from_field_with_auth<A: SessionParamsWriteAuth>(
         slot: &'a mut SessionParams,
