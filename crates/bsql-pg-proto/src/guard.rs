@@ -163,118 +163,14 @@ pub struct ReadyGuard<'a> {
     proto: &'a mut PgProtocol,
 }
 
-/// Tier-1 compile-time witness that `state == ProtoState::Idle`.
-///
-/// **Sealed, ZST, private-field constructor.** Only this module can
-/// construct an `IdleStateProof` (via the unit struct's private `()`
-/// field). Crate-internal API endpoints that require the Idle
-/// precondition take this witness as a parameter — the type system
-/// then guarantees the caller went through [`ReadyGuard`] (which is
-/// the only legitimate construction path).
-///
-/// # Why a ZST witness rather than just `debug_assert!`?
-///
-/// Pre-DEF-198 ext, `PgProtocol::push_command_internal` had a
-/// `debug_assert!(matches!(state, ProtoState::Idle))` at function
-/// entry. Release builds skip the assertion; a future internal
-/// caller could silently bypass [`ReadyGuard`] and call
-/// `push_command_internal` from a non-Idle state, getting
-/// **undefined behaviour at the protocol layer** (state corruption,
-/// lost reply correlator, etc.) without any compile-time signal.
-///
-/// Post-DEF-198 ext, `push_command_internal`'s signature requires
-/// an `IdleStateProof` parameter. Constructing one is impossible
-/// outside this module (private field). The only legitimate path
-/// to a proof is via [`ReadyGuard::push_command`] / `push_bind_execute`,
-/// which acquire the guard through `PgProtocol::as_ready` (runtime
-/// `state == Idle` check). **Result: tier-1 closure on the
-/// "push from Idle only" invariant for the internal API surface.**
-///
-/// Zero size, zero runtime cost — pure type-system enforcement.
-///
-/// # DEF-211 FAKE-08 seal hardening (audit 2026-05-04)
-///
-/// Pre-FAKE-08 the inner field was `()` (the unit type). `()` impls
-/// `Default`, so a future `#[derive(Default)]` on `IdleStateProof`
-/// would silently synthesise an external (crate-internal but
-/// non-`mod guard`) construction path — undermining the "only
-/// `mod guard` constructs this" tier-1 invariant. Replacing the
-/// field type with the strictly-private [`_IdleProofMarker`] (which
-/// deliberately does NOT impl `Default`) closes the gap: any
-/// future `#[derive(Default)]` on `IdleStateProof` is a build
-/// failure. Same ZST shape (`_IdleProofMarker` is a unit struct),
-/// same zero runtime cost. Pinned via the
-/// `idle_state_proof_default_seal` test below.
-#[derive(Debug)]
-pub(crate) struct IdleStateProof(_IdleProofMarker);
-
-/// Strictly-private ZST marker that deliberately does NOT impl
-/// `Default`. Used as the inner field of [`IdleStateProof`] so a
-/// future `#[derive(Default)]` on the proof struct fails the build
-/// (per DEF-211 FAKE-08).
-#[derive(Debug)]
-struct _IdleProofMarker;
-
-impl IdleStateProof {
-    /// Sealed within `mod guard` — only `ReadyGuard::push_*` paths
-    /// reach this constructor (which itself is reachable only after
-    /// `PgProtocol::as_ready` verified the state is Idle).
-    ///
-    /// Crate-internal callers that need the proof MUST go through
-    /// `ReadyGuard`; there is no other path.
-    ///
-    /// DEF-269 v2: visibility relaxed from module-private to
-    /// `pub(crate)` so `protocol::push_command_internal` can synthesise
-    /// the witness when re-entering through the generic `C: PushCommand`
-    /// dispatch. The witness's tier-1 closure (only constructible
-    /// inside the crate) is preserved — `_IdleProofMarker` stays
-    /// module-private to `mod guard`, so external callers cannot
-    /// fabricate the proof.
-    #[inline]
-    pub(crate) const fn new() -> Self {
-        Self(_IdleProofMarker)
-    }
-}
-
-#[cfg(test)]
-mod idle_state_proof_seal_tests {
-    //! DEF-211 FAKE-08 (audit 2026-05-04): pin that
-    //! `IdleStateProof` does NOT impl `Default`. A future
-    //! `#[derive(Default)]` regression on either `IdleStateProof`
-    //! or `_IdleProofMarker` would synthesise a `Default` impl,
-    //! tripping this test. Tier-1 by-construction at the
-    //! `mod guard` boundary.
-
-    use super::IdleStateProof;
-
-    /// `'static` bound on the trait-object form is just for the
-    /// test fixture — the assertion is the negative bound.
-    trait _AssertNotDefault {
-        const NOT_DEFAULT: () = ();
-    }
-    impl<T> _AssertNotDefault for T {}
-
-    /// Compile-time check: if `IdleStateProof: Default`, this trait
-    /// resolution would prefer the more-specific blanket impl, but
-    /// since no concrete `Default` impl exists for `IdleStateProof`,
-    /// the assertion compiles cleanly. The runtime body is just a
-    /// no-op marker; the build itself proves the seal.
-    #[test]
-    fn idle_state_proof_does_not_impl_default() {
-        // Compile-time witness: this `()` ascription forces resolution
-        // of the `_AssertNotDefault::NOT_DEFAULT` constant. Adding
-        // `#[derive(Default)]` to IdleStateProof would not break THIS
-        // test directly (Default is permitted alongside the blanket
-        // _AssertNotDefault impl) — but the enclosing private-marker
-        // field type [`_IdleProofMarker`] does NOT derive Default,
-        // so `#[derive(Default)]` on `IdleStateProof` would fail to
-        // expand: tier-1 by build-failure on the derive macro itself.
-        //
-        // The test exists primarily as documentation + a stable
-        // anchor for `git grep` to find this seal pattern.
-        let () = <IdleStateProof as _AssertNotDefault>::NOT_DEFAULT;
-    }
-}
+// DEF-272 cluster γ (2026-05-10): `IdleStateProof` deleted; replaced
+// by [`crate::state_setter::IdleState<'a>`] lifetime-bound typestate.
+// The pre-γ proof was a ZST with `pub(crate) const fn new()` — anyone
+// in-crate could mint regardless of state, then pair with non-Idle
+// `&mut state` (zombie-reply class). Post-γ the typestate IS the
+// state borrow + the Idle proof, inseparable; pairing-with-different-
+// state is impossible by lifetime ownership. See `mod state_setter`
+// (cluster γ block) for the typestate.
 
 impl<'a> ReadyGuard<'a> {
     /// Construct internally — public callers acquire via
@@ -326,11 +222,14 @@ impl<'a> ReadyGuard<'a> {
         cmd: C,
         write_buf: &mut WriteBuf,
     ) -> Result<(), PushFailure> {
-        // DEF-198 ext: synthesise the Idle-state witness here.
-        // `IdleStateProof::new()` is reachable only inside `mod guard`,
-        // and the guard's existence (acquired via `as_ready`) statically
-        // proves the precondition.
-        self.proto.push_command_internal(cmd, write_buf, IdleStateProof::new())
+        // DEF-272 cluster γ (2026-05-10): the Idle precondition is
+        // re-checked inside `push_command_internal` via
+        // `IdleState::try_from` (returns `Option<IdleState<'_>>`).
+        // ReadyGuard's existence still proves Idle via `as_ready`'s
+        // upstream classification; the typestate's runtime check is
+        // belt-and-braces (build-time tier-1 closure across in-crate
+        // call sites).
+        self.proto.push_command_internal(cmd, write_buf)
     }
 
     /// DEF-269 v2 (T): Extended-Query Bind+Execute is now a regular

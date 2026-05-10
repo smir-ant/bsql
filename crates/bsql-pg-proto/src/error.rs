@@ -796,6 +796,18 @@ pub enum CrateBugLocus {
     /// instance duplicate-ID risk remains tier-2 (separate residue —
     /// architect's #1B brand-lifetime closure, deferred to Phase 4+).
     ReplyIdSaturation,
+
+    /// DEF-272 cluster γ (2026-05-10): `push_command_internal` was
+    /// invoked from a non-Idle state — a contract violation between
+    /// the only legitimate caller (`ReadyGuard::push_command`, which
+    /// classifies state as Idle via `as_ready` upstream) and
+    /// `push_command_internal`. Reaching this locus implies a
+    /// structural regression in the ReadyGuard → push_command_internal
+    /// pipeline; production-built binaries never reach it under the
+    /// existing call graph (state cannot transition between
+    /// `as_ready`'s check and `push_command_internal`'s entry — the
+    /// `&mut PgProtocol` borrow chain rules out interleaving).
+    PushCommandInternalNonIdle,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -846,6 +858,7 @@ impl fmt::Display for CrateBugLocus {
             Self::AuthSubCodeZeroInErr => f.write_str("auth-sub-code-zero-in-err"),
             Self::BuilderCapacityOverflow => f.write_str("builder-capacity-overflow"),
             Self::ReplyIdSaturation => f.write_str("reply-id-saturation"),
+            Self::PushCommandInternalNonIdle => f.write_str("push-command-internal-non-idle"),
         }
     }
 }

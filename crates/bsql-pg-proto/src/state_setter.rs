@@ -107,33 +107,35 @@ pub(crate) struct StateSetter<'a, W: PostStateProof> {
 }
 
 impl<'a, W: PostStateProof> StateSetter<'a, W> {
-    /// Construct a new setter. `pub(crate)` constructor with an
-    /// [`IdleStateProof`] witness parameter — the proof binds the
-    /// **`state == Idle` precondition** structurally at the mint site.
+    /// Construct a new setter. **DEF-272 cluster γ (2026-05-10)**:
+    /// constructor is `pub(in crate::state_setter)` — only callable
+    /// from inside this module. The legitimate path to mint a setter
+    /// is [`IdleState::into_setter`], which structurally binds the
+    /// `state == Idle` precondition via the typestate's `try_from`
+    /// runtime check.
     ///
-    /// # DEF-271 cluster A (2026-05-10): tier-1 by-construction Idle gate
+    /// # Pre-γ (DEF-271 cluster A)
     ///
-    /// Pre-DEF-271 the constructor took only `&mut ProtoState`; the
-    /// `Idle`-only invariant was tier-2 by-discipline (lived as a
-    /// debug_assert inside `push_command_internal` + a non-load-bearing
-    /// audit comment in this module's docs). A future in-crate caller
-    /// minting `StateSetter::new(&mut some_non_idle_state)` would
-    /// compile, then `try_builder!`'s `install_errored` path would
-    /// transition from a non-Idle state to Errored — silently leaking
-    /// the prior variant's embedded `ReplyId<K>` (zombie-class
-    /// regression mirroring the pre-DEF-186 perf-recovery audit).
+    /// Constructor was `pub(crate) fn new(state, _proof: IdleStateProof)`.
+    /// `IdleStateProof::new()` was itself `pub(crate)` — any in-crate
+    /// caller could mint a proof regardless of actual state, then pair
+    /// with a non-Idle `&mut state` and trigger the Errored transition
+    /// from a non-Idle state (zombie-reply class). Tier-2
+    /// by-discipline within-crate; the precondition was a `debug_assert!`
+    /// (skipped in release).
     ///
-    /// Post-DEF-271 the [`IdleStateProof`] witness lives at the mint —
-    /// `IdleStateProof::new()` is `pub(crate)` (per DEF-269 v2), but
-    /// each call site that mints one must justify the precondition
-    /// (production: `push_command_internal` debug_asserts at entry;
-    /// `cfg(test)` 5-arm dispatchers: only the `Idle` arm of
-    /// `state.push_class()` mints the proof). Build-time enforcement.
+    /// # Post-γ
+    ///
+    /// Constructor is private to `mod state_setter`. The only path to
+    /// a `StateSetter<'a, W>` value is [`IdleState::into_setter`]; the
+    /// only path to an [`IdleState<'a>`] is [`IdleState::try_from`],
+    /// which performs a runtime `matches!(state, ProtoState::Idle)`
+    /// check and returns `None` for non-Idle states. Tier-1
+    /// by-construction — pairing a proof with a non-Idle state is
+    /// impossible (the typestate IS the state borrow + the Idle proof,
+    /// inseparable).
     #[inline]
-    pub(crate) fn new(
-        state: &'a mut ProtoState,
-        _proof: crate::guard::IdleStateProof,
-    ) -> Self {
+    pub(in crate::state_setter) fn new(state: &'a mut ProtoState) -> Self {
         Self {
             state,
             _phantom: PhantomData,
@@ -287,6 +289,74 @@ impl<'a> FeedStateSetter<'a> {
     ) -> Option<NonZeroU64> {
         let prev = core::mem::replace(self.state, ProtoState::Errored(kind));
         prev.take_inflight_reply_raw_id()
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-272 cluster γ (2026-05-10) — IdleState lifetime-bound typestate
+//
+// Replaces the legacy [`crate::guard::IdleStateProof`] (DEF-198 ext +
+// DEF-271 cluster A). The pre-γ proof was a ZST with `pub(crate) const
+// fn new()` — anyone in-crate could mint a proof regardless of actual
+// state, then pair it with a `&mut ProtoState` for a different state.
+// Tier-2 by-discipline within-crate.
+//
+// Post-γ the typestate IS the state borrow + the Idle proof,
+// inseparable. Construction via [`IdleState::try_from`] performs a
+// runtime `matches!(state, ProtoState::Idle)` check. The returned
+// `Option<Self>` is `None` for non-Idle states. The mut borrow
+// captured by [`IdleState`] cannot be paired with a different state
+// (lifetime ownership). [`IdleState::into_setter`] is the single
+// legitimate path from the typestate to a [`StateSetter`]; the
+// setter's `new()` constructor is `pub(in crate::state_setter)`
+// (private), so no in-crate code outside this module can mint a
+// setter without first proving Idle via the typestate.
+//
+// Tier-1 within-crate by-construction.
+// ═════════════════════════════════════════════════════════════════════
+
+/// Tier-1 within-crate typestate proving `state == ProtoState::Idle`
+/// + carrying the matching `&'a mut ProtoState` borrow.
+///
+/// **Construction:** [`Self::try_from`] performs the runtime Idle
+/// check. Returns `None` for non-Idle states. The mut borrow is
+/// captured by the typestate; pairing the proof with a different
+/// state is impossible by lifetime ownership.
+///
+/// **Consumption:** [`Self::into_setter`] consumes the typestate and
+/// produces a [`StateSetter<'a, W>`]. The W type parameter is supplied
+/// by the caller's match-on-command-kind dispatch (e.g.,
+/// `idle.into_setter::<PingAwaitingRfqInstall>()` for a Ping).
+#[must_use = "IdleState carries the &mut state borrow; dropping it leaves the state unchanged. \
+              Consume via into_setter to perform a state-modifying transition."]
+pub(crate) struct IdleState<'a> {
+    state: &'a mut ProtoState,
+}
+
+impl<'a> IdleState<'a> {
+    /// Construct an [`IdleState`] from a `&'a mut ProtoState`,
+    /// returning `Some(_)` if the state is currently
+    /// `ProtoState::Idle` and `None` otherwise. Production callers go
+    /// through [`crate::PgProtocol::push_command`] which performs an
+    /// upstream `as_ready()` runtime check; this `try_from` re-checks
+    /// at the typestate boundary, providing build-time tier-1
+    /// enforcement against any in-crate caller pairing a proof with a
+    /// non-Idle state.
+    #[inline]
+    #[must_use]
+    pub(crate) fn try_from(state: &'a mut ProtoState) -> Option<Self> {
+        matches!(state, ProtoState::Idle).then(|| Self { state })
+    }
+
+    /// Consume the typestate and produce a [`StateSetter<'a, W>`].
+    /// The setter inherits the mut borrow (the lifetime `'a` is
+    /// preserved). This is the SOLE legitimate path to a [`StateSetter`]
+    /// — the setter's constructor is `pub(in crate::state_setter)`
+    /// (private), so no caller outside this module can construct a
+    /// setter without first acquiring an [`IdleState`].
+    #[inline]
+    pub(crate) fn into_setter<W: PostStateProof>(self) -> StateSetter<'a, W> {
+        StateSetter::new(self.state)
     }
 }
 

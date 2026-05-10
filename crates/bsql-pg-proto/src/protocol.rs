@@ -1297,67 +1297,67 @@ impl PgProtocol {
         &mut self,
         cmd: C,
         write_buf: &mut WriteBuf,
-        // DEF-198 ext: tier-1 compile-time witness that state is Idle.
-        // Constructible only inside `mod guard`; reachable only via
-        // `ReadyGuard::push_command` which acquired the guard through
-        // `PgProtocol::as_ready`'s runtime classification.
-        _proof: crate::guard::IdleStateProof,
     ) -> Result<(), crate::action::PushFailure> {
         // DEF-212: bytes-only push contract — bytes live in caller's wb
         // post-Ok (drained via `wb.as_bytes()`); no per-call action
         // allocation (~800 B → ~80 B return frame).
         write_buf.clear();
 
-        // DEF-188: centralised entry-point terminal-row-desc reclamation.
-        // DEF-211 FAKE-01: the `IdleStateProof` witness above guarantees
-        // `state == Idle`, so pass `StatePushClass::Idle` as a STATIC
+        // DEF-272 cluster γ (2026-05-10): the Idle precondition is
+        // enforced by [`crate::state_setter::IdleState::try_from`]
+        // below — the `Option<IdleState<'_>>` typestate IS the proof
+        // (replaces the pre-γ `IdleStateProof` witness param). The
+        // legitimate caller is `ReadyGuard::push_command` (which
+        // performs `as_ready` Idle classification upstream); this
+        // re-check is the single load-bearing guard, eliminating the
+        // pre-γ "caller must promise + we debug_assert" surface.
+        // DEF-211 FAKE-01: pass `StatePushClass::Idle` as a STATIC
         // const argument — LLVM specialises the inlined
         // `clear_session_residue_for_class` body to the Idle arm only,
         // eliding the 5-arm dispatch entirely.
         self.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
 
-        // DEF-154 (B+H): write-side keeps its brand (`'wb`) for
-        // tier-1 `WriteRange::apply`; read side is unbranded.
-        // DEF-208: caller is `ReadyGuard::push_command`, which proves
-        // `state == Idle` via the witness-guard typestate (DEF-198).
-        // DEF-269 v2: row_desc_slot threaded through for BindExecute
-        // (other commands ignore it).
-        debug_assert!(
-            matches!(self.state, ProtoState::Idle),
-            "push_command_internal: caller (ReadyGuard) must guarantee Idle state",
-        );
         let state = &mut self.state;
         let row_desc_slot = &mut self.row_desc_slot;
-        // DEF-212: reserved kept alive across PushCommand::execute and
-        // materialise_push (the latter appends static SYNC bytes).
-        // DEF-270 N-D (Phase 2, 2026-05-10): construct typed
-        // `StateSetter<'_, C::PostState>` here — this is the only
-        // call site in the crate that mints a setter via
-        // `pub(crate) StateSetter::new`. The raw `&mut ProtoState`
-        // never escapes this function. `execute()` consumes the
-        // setter via `install_post_state` (happy path) or
-        // `install_errored` (try_builder! Err path).
+        let idle = match crate::state_setter::IdleState::try_from(state) {
+            Some(idle) => idle,
+            None => {
+                // Architecturally unreachable on production callers
+                // (ReadyGuard::push_command upstream classifies via
+                // `as_ready`'s runtime Idle check; the `&mut PgProtocol`
+                // borrow chain rules out interleaving between as_ready
+                // and push_command_internal entry). Classify rather
+                // than panic — `clippy::panic` + `clippy::expect_used`
+                // are forbid'd crate-wide. The sentinel reply-id is the
+                // same MIN-fallback shape used in `next_reply_id` post-
+                // saturation classification (cluster D).
+                debug_assert!(
+                    false,
+                    "push_command_internal: state must be Idle (ReadyGuard \
+                     contract violation — see CrateBugLocus::PushCommandInternalNonIdle)",
+                );
+                return Err(crate::action::PushFailure {
+                    id: core::num::NonZeroU64::MIN,
+                    cause: crate::error::ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::PushCommandInternalNonIdle,
+                    },
+                });
+            }
+        };
+
+        // DEF-154 (B+H): write-side keeps its brand (`'wb`) for
+        // tier-1 `WriteRange::apply`; read side is unbranded.
+        // DEF-269 v2: row_desc_slot threaded through for BindExecute
+        // (other commands ignore it).
         write_buf.with_branded(|mut wb| -> Result<(), crate::action::PushFailure> {
             let mut reserved = wb.reserve();
             let mut staged = StagedActions::new();
-            // DEF-271 cluster A (2026-05-10): StateSetter::new now takes
-            // an IdleStateProof witness, structurally binding the
-            // `state == Idle` precondition at the mint site. The
-            // `debug_assert!(matches!(self.state, ProtoState::Idle))`
-            // above proves the precondition; we mint two proofs (one
-            // for the setter, one for execute()'s _proof param) — both
-            // land at the same load-bearing assertion.
-            let setter = crate::state_setter::StateSetter::<C::PostState>::new(
-                state,
-                crate::guard::IdleStateProof::new(),
-            );
-            cmd.execute(
-                setter,
-                row_desc_slot,
-                &mut staged,
-                &mut reserved,
-                crate::guard::IdleStateProof::new(),
-            );
+            // DEF-272 cluster γ: setter is minted via the typestate
+            // (the only legitimate path — `StateSetter::new` is
+            // `pub(in crate::state_setter)`, callable only from
+            // [`IdleState::into_setter`]).
+            let setter = idle.into_setter::<C::PostState>();
+            cmd.execute(setter, row_desc_slot, &mut staged, &mut reserved);
             materialise_push(staged, &mut reserved)
         })
     }
@@ -2809,11 +2809,21 @@ fn compute_push_ping(
     // preserved.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
-            // The Idle arm of push_class() is the precondition justification.
-            let setter = crate::state_setter::StateSetter::<
-                crate::push_command::PingAwaitingRfqInstall,
-            >::new(state, crate::guard::IdleStateProof::new());
+            // DEF-272 cluster γ (2026-05-10): IdleState typestate
+            // replaces (state, IdleStateProof). Idle arm of
+            // push_class() classification is the precondition; the
+            // typestate's try_from re-checks at the boundary.
+            let idle = match crate::state_setter::IdleState::try_from(state) {
+                Some(idle) => idle,
+                None => {
+                    debug_assert!(
+                        false,
+                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    );
+                    return;
+                }
+            };
+            let setter = idle.into_setter::<crate::push_command::PingAwaitingRfqInstall>();
             compute_push_ping_idle_only(setter, reply, staged);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -2916,10 +2926,20 @@ fn compute_push_startup(
     // PingAwaiting / BusyQuery) leave state untouched.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
-            let setter = crate::state_setter::StateSetter::<
-                crate::push_command::StartupPostInstall,
-            >::new(state, crate::guard::IdleStateProof::new());
+            // DEF-272 cluster γ (2026-05-10): IdleState typestate
+            // replaces (state, IdleStateProof). Idle arm of
+            // push_class() classification is the precondition.
+            let idle = match crate::state_setter::IdleState::try_from(state) {
+                Some(idle) => idle,
+                None => {
+                    debug_assert!(
+                        false,
+                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    );
+                    return;
+                }
+            };
+            let setter = idle.into_setter::<crate::push_command::StartupPostInstall>();
             compute_push_startup_idle_only(
                 setter, user, database, app_name, credentials, reply, staged, reserved,
             );
@@ -3060,10 +3080,19 @@ fn compute_push_simple_query(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
-            let setter = crate::state_setter::StateSetter::<
-                crate::push_command::SimpleQueryAwaitingFirstResponseInstall,
-            >::new(state, crate::guard::IdleStateProof::new());
+            // DEF-272 cluster γ (2026-05-10): IdleState typestate
+            // replaces (state, IdleStateProof).
+            let idle = match crate::state_setter::IdleState::try_from(state) {
+                Some(idle) => idle,
+                None => {
+                    debug_assert!(
+                        false,
+                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    );
+                    return;
+                }
+            };
+            let setter = idle.into_setter::<crate::push_command::SimpleQueryAwaitingFirstResponseInstall>();
             compute_push_simple_query_idle_only(setter, sql, reply, staged, reserved);
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -3200,10 +3229,19 @@ fn compute_push_parse(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
-            let setter = crate::state_setter::StateSetter::<
-                crate::push_command::ParseAwaitingParseCompleteInstall,
-            >::new(state, crate::guard::IdleStateProof::new());
+            // DEF-272 cluster γ (2026-05-10): IdleState typestate
+            // replaces (state, IdleStateProof).
+            let idle = match crate::state_setter::IdleState::try_from(state) {
+                Some(idle) => idle,
+                None => {
+                    debug_assert!(
+                        false,
+                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    );
+                    return;
+                }
+            };
+            let setter = idle.into_setter::<crate::push_command::ParseAwaitingParseCompleteInstall>();
             compute_push_parse_idle_only(setter, stmt_name, sql, reply, staged, reserved);
         },
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -3334,10 +3372,19 @@ fn compute_push_describe_statement(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
-            let setter = crate::state_setter::StateSetter::<
-                crate::push_command::DescribeStatementAwaitingParamDescInstall,
-            >::new(state, crate::guard::IdleStateProof::new());
+            // DEF-272 cluster γ (2026-05-10): IdleState typestate
+            // replaces (state, IdleStateProof).
+            let idle = match crate::state_setter::IdleState::try_from(state) {
+                Some(idle) => idle,
+                None => {
+                    debug_assert!(
+                        false,
+                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    );
+                    return;
+                }
+            };
+            let setter = idle.into_setter::<crate::push_command::DescribeStatementAwaitingParamDescInstall>();
             compute_push_describe_statement_idle_only(setter, stmt_name, reply, staged, reserved);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
@@ -3422,10 +3469,19 @@ fn compute_push_describe_portal(
     // DEF-186 perf-recovery 2026-04-24: &mut state signature.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-271 cluster A: StateSetter::new requires IdleStateProof.
-            let setter = crate::state_setter::StateSetter::<
-                crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall,
-            >::new(state, crate::guard::IdleStateProof::new());
+            // DEF-272 cluster γ (2026-05-10): IdleState typestate
+            // replaces (state, IdleStateProof).
+            let idle = match crate::state_setter::IdleState::try_from(state) {
+                Some(idle) => idle,
+                None => {
+                    debug_assert!(
+                        false,
+                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    );
+                    return;
+                }
+            };
+            let setter = idle.into_setter::<crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall>();
             compute_push_describe_portal_idle_only(setter, portal_name, reply, staged, reserved);
         }
         crate::state::StatePushClass::Errored(prior_kind) => {
