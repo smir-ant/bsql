@@ -500,16 +500,6 @@ const _: () = assert!(
 /// Any field addition or size growth must update the pin in
 /// `lib.rs` alongside the code change. See DEF-163 G012 for
 /// this cross-reference discipline.
-/// DEF-196: lazy-init helper for `Option<Box<SessionParams>>`.
-/// Called at the two pre-dispatch filter sites that write
-/// session_params (ParameterStatus + NoticeResponse).
-#[inline]
-pub(crate) fn session_params_or_init(
-    slot: &mut Option<alloc::boxed::Box<SessionParams>>,
-) -> &mut SessionParams {
-    slot.get_or_insert_with(|| alloc::boxed::Box::new(SessionParams::new()))
-}
-
 /// DEF-196: lazy-init helper for `Option<Box<ErrorArena>>`.
 /// Called by `dispatch.rs` ErrorResponse arms when a server error
 /// payload needs to be parsed and stored.
@@ -561,10 +551,16 @@ pub struct PgProtocol {
     /// field block (kept short here for layout-readability).
     row_desc_slot: crate::schema_slot::RowDescSlotCell,
     read_buf: ReadBuf,
-    /// DEF-196: session params from post-auth handshake. None
+    /// DEF-196: session params from post-auth handshake. Empty
     /// until first ParameterStatus / NoticeResponse write.
-    /// `Option<Box<_>>` niches to 8 B inline.
-    session_params: Option<alloc::boxed::Box<SessionParams>>,
+    /// **DEF-272 cluster β (2026-05-10)**: wrapped in
+    /// [`crate::session_params_slot::SessionParamsCell`]
+    /// (`#[repr(transparent)]` over `Option<Box<SessionParams>>`); the
+    /// inner Option is private to `mod session_params_slot`, write
+    /// methods are gated on per-leaf concrete tokens. Tier-1
+    /// within-crate write provenance. Layout: 8 B niche-packed
+    /// (preserved from pre-β).
+    session_params: crate::session_params_slot::SessionParamsCell,
     /// DEF-196: server-error payload arena. None until first
     /// ErrorResponse frame allocates an `ErrorPayload`. Niche-packed.
     error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
@@ -829,11 +825,10 @@ pub(crate) mod _bind_execute_select_install_leaf {
     }
 }
 
-/// DEF-272 cluster α / DEF-271 cluster B leaf submodule for the
-/// clear-session-residue transitions on Idle/Errored entry. Holds the
-/// schema-side concrete token (cluster α) AND the legacy session-side
-/// auth tag (cluster B / β-pending). Two helper fns — one per slot
-/// kind. Cluster β will migrate the session-side to a concrete token.
+/// DEF-272 cluster α + β leaf submodule for the clear-session-residue
+/// transitions on Idle/Errored entry. Hosts two concrete-type tokens
+/// (one per slot kind) and two helper fns — schema-side (cluster α)
+/// and session_params-side (cluster β).
 #[allow(missing_docs, reason = "submodule contains single-purpose leaf helpers; module-level docs above the submodule explain the design")]
 pub(crate) mod _clear_residue_leaf {
     /// DEF-272 cluster α leaf-scope token for the schema slot clear.
@@ -841,13 +836,10 @@ pub(crate) mod _clear_residue_leaf {
     /// name it in its method signature.
     pub(crate) struct ClearResidueSchemaToken(());
 
-    /// DEF-271 cluster B leaf-scope tag for the session_params clear.
-    /// Both the tuple-struct field AND the type itself are private to
-    /// this submodule. **Cluster β will migrate this to a concrete
-    /// token mirroring [`ClearResidueSchemaToken`].**
-    struct AtClearSessionResidue(());
-    impl crate::session_params_slot::sealed::Sealed for AtClearSessionResidue {}
-    impl crate::session_params_slot::SessionParamsWriteAuth for AtClearSessionResidue {}
+    /// DEF-272 cluster β leaf-scope token for the session_params slot
+    /// clear. Field private to the leaf; type `pub(crate)` so the cell
+    /// can name it.
+    pub(crate) struct ClearResidueSessionToken(());
 
     /// Clear the schema slot via
     /// [`crate::schema_slot::RowDescSlotCell::clear_at_residue`] with
@@ -861,83 +853,67 @@ pub(crate) mod _clear_residue_leaf {
     }
 
     /// Clear the session-params via
-    /// [`crate::session_params_slot::SessionParamsSlot`] with auth tag
-    /// minted inline. Used by `clear_session_residue_for_class`
-    /// Errored arm (per DEF-189 Q8-C3 + DEF-205 step 3 — session-state
-    /// forfeit on tear-down; the params' Drop chain scrubs
-    /// `SecretBoundedStr` bytes). **Cluster β will migrate to a concrete
-    /// token + `SessionParamsCell::clear_at_residue`.**
+    /// [`crate::session_params_slot::SessionParamsCell::clear_at_residue`]
+    /// with the [`ClearResidueSessionToken`] minted inline. Used by
+    /// `clear_session_residue_for_class` Errored arm (per DEF-189
+    /// Q8-C3 + DEF-205 step 3 — session-state forfeit on tear-down;
+    /// the params' Drop chain scrubs `SecretBoundedStr` bytes).
     #[inline]
     pub(in crate::protocol) fn clear_session_params_residue(
-        params: &mut crate::session_params::SessionParams,
+        cell: &mut crate::session_params_slot::SessionParamsCell,
     ) {
-        crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
-            params,
-            AtClearSessionResidue(()),
-        )
-        .clear();
+        cell.clear_at_residue(ClearResidueSessionToken(()));
     }
 }
 
-/// DEF-271 cluster C leaf submodule for the inbound `ParameterStatus`
-/// pre-dispatch filter. Contains the auth tag + the single admit
-/// helper fn that does parse + record/bump.
+/// DEF-272 cluster β leaf submodule for the inbound `ParameterStatus`
+/// pre-dispatch filter. Hosts the [`ParamStatusToken`] type and the
+/// single admit helper fn that delegates to the cell's parse+record
+/// method.
 #[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
-pub(in crate::protocol) mod _parameter_status_admit_leaf {
-    /// DEF-271 cluster C leaf-scope tag. Both the tuple-struct field
-    /// AND the type itself are private to this submodule.
-    struct AtParameterStatusFrame(());
-    impl crate::session_params_slot::sealed::Sealed for AtParameterStatusFrame {}
-    impl crate::session_params_slot::SessionParamsWriteAuth for AtParameterStatusFrame {}
+pub(crate) mod _parameter_status_admit_leaf {
+    /// DEF-272 cluster β leaf-scope token. Field private to the leaf;
+    /// type `pub(crate)` so
+    /// [`crate::session_params_slot::SessionParamsCell::admit_at_param_status`]
+    /// can name it.
+    pub(crate) struct ParamStatusToken(());
 
-    /// Parse the `ParameterStatus` payload and record into
-    /// `session_params` via the typed slot witness. On
-    /// `MalformedPayload` the helper internally bumps the malformed
-    /// counter via the same witness (cluster B consolidation).
-    /// Returns the [`super::ParamStatusRecordOutcome`] for caller
-    /// observability (currently discarded; reserved for a
-    /// Phase-1d wrapper-advisory channel).
-    ///
-    /// Lazy-inits the `Box<SessionParams>` if not yet allocated
-    /// (DEF-196).
+    /// Mint a [`ParamStatusToken`] and admit the `ParameterStatus`
+    /// frame via [`crate::session_params_slot::SessionParamsCell::admit_at_param_status`].
+    /// The cell handles parse + record (success) / bump-malformed
+    /// (parse failure) internally; lazy-inits the inner box on first
+    /// call.
     #[inline]
     #[must_use]
     pub(in crate::protocol) fn admit_parameter_status_frame(
-        session_params_slot: &mut Option<alloc::boxed::Box<crate::session_params::SessionParams>>,
+        cell: &mut crate::session_params_slot::SessionParamsCell,
         payload: &[u8],
     ) -> super::ParamStatusRecordOutcome {
-        let session_params = super::session_params_or_init(session_params_slot);
-        let slot = crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
-            session_params,
-            AtParameterStatusFrame(()),
-        );
-        super::record_param_status_with_slot(slot, payload)
+        cell.admit_at_param_status(payload, ParamStatusToken(()))
     }
 }
 
-/// DEF-271 cluster C leaf submodule for the inbound `NoticeResponse`
-/// pre-dispatch filter. Contains the auth tag + the single admit
-/// helper fn that bumps the notice counter.
+/// DEF-272 cluster β leaf submodule for the inbound `NoticeResponse`
+/// pre-dispatch filter. Hosts the [`NoticeResponseToken`] type and
+/// the single admit helper fn.
 #[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
-pub(in crate::protocol) mod _notice_response_admit_leaf {
-    /// DEF-271 cluster C leaf-scope tag. Both the tuple-struct field
-    /// AND the type itself are private to this submodule.
-    struct AtNoticeResponseFrame(());
-    impl crate::session_params_slot::sealed::Sealed for AtNoticeResponseFrame {}
-    impl crate::session_params_slot::SessionParamsWriteAuth for AtNoticeResponseFrame {}
+pub(crate) mod _notice_response_admit_leaf {
+    /// DEF-272 cluster β leaf-scope token. Field private to the leaf;
+    /// type `pub(crate)` so
+    /// [`crate::session_params_slot::SessionParamsCell::admit_at_notice_response`]
+    /// can name it.
+    pub(crate) struct NoticeResponseToken(());
 
-    /// Bump the unsolicited-NoticeResponse counter via the typed
-    /// slot witness. Lazy-inits the `Box<SessionParams>` if not yet
-    /// allocated (DEF-196).
+    /// Mint a [`NoticeResponseToken`] and admit the `NoticeResponse`
+    /// frame via
+    /// [`crate::session_params_slot::SessionParamsCell::admit_at_notice_response`].
+    /// The cell bumps the notice counter and lazy-inits the inner box
+    /// on first call.
     #[inline]
     pub(in crate::protocol) fn admit_notice_response_frame(
-        session_params_slot: &mut Option<alloc::boxed::Box<crate::session_params::SessionParams>>,
+        cell: &mut crate::session_params_slot::SessionParamsCell,
     ) {
-        crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
-            super::session_params_or_init(session_params_slot),
-            AtNoticeResponseFrame(()),
-        )
-        .bump_notice_response();
+        cell.admit_at_notice_response(NoticeResponseToken(()));
     }
 }
 
@@ -958,7 +934,7 @@ impl PgProtocol {
             // DEF-196: three independent cold slots — none allocated
             // at construction. Trust auth + no errors + no malformed
             // frames + no notice/param frames = lifetime-zero heap.
-            session_params: None,
+            session_params: crate::session_params_slot::SessionParamsCell::EMPTY,
             error_arena: None,
             malformed_frame_count: 0,
             sync_marker: PhantomData,
@@ -2225,9 +2201,7 @@ impl PgProtocol {
                 //
                 // DEF-271 cluster C (2026-05-10): mint+use for the
                 // session-params clear moved into the leaf helper too.
-                if let Some(params) = self.session_params.as_deref_mut() {
-                    _clear_residue_leaf::clear_session_params_residue(params);
-                }
+                _clear_residue_leaf::clear_session_params_residue(&mut self.session_params);
             }
             // In-flight states — preserve residue. The exhaustive
             // match here is the load-bearing tier-1 closure: adding
@@ -3852,65 +3826,6 @@ pub(crate) enum ParamStatusRecordOutcome {
     MalformedPayload,
 }
 
-/// Parse a ParameterStatus payload and record it in session_params.
-///
-/// Payload format per PG §55.7: `key\0value\0` — two NUL-terminated
-/// C-strings. `[T]::split_once` with a predicate is still unstable
-/// (#112811); the `iter().position` idiom is the stable-library
-/// equivalent.
-///
-/// DEF-184 (B17): `#[inline(always)]` — called in the pre-dispatch
-/// filter of the main dispatch loop on every ParameterStatus frame;
-/// inlining saves a call frame per frame.
-///
-/// DEF-184 fallback-hygiene catch: pre-(184) the `value_region
-/// .strip_suffix(b"\0").unwrap_or(value_region)` silently accepted
-/// payload missing the trailing NUL (wire-spec violation per
-/// §55.7). CREDO §7 ось 12 — fallback как костыль: silently
-/// tolerated malformed input, ParameterStatus with missing
-/// trailing NUL recorded the value with potential trailing garbage.
-/// Post-(184): explicit `strip_suffix` Result — missing NUL =
-/// MalformedPayload, classified not silently absorbed.
-// DEF-271 cluster B (2026-05-10): record_param_status renamed to
-// record_param_status_with_slot, signature changed from
-// `(&mut SessionParams, &[u8])` to `(SessionParamsSlot<'_>, &[u8])`.
-// The helper now consumes the slot witness via record() on Processed
-// OR bump_malformed_param_status() on MalformedPayload — consolidates
-// the pre-DEF-271 two-step "parse → caller bumps" pattern into a
-// single mutation site behind the typed witness.
-// DEF-271 cluster C (2026-05-10): pub(in crate::protocol) so the
-// leaf submodule `_parameter_status_admit_leaf` can call this from
-// inside its `admit_parameter_status_frame` helper.
-#[inline(always)]
-#[must_use]
-pub(in crate::protocol) fn record_param_status_with_slot(
-    slot: crate::session_params_slot::SessionParamsSlot<'_>,
-    payload: &[u8],
-) -> ParamStatusRecordOutcome {
-    let Some(nul_pos) = payload.iter().position(|b| *b == 0) else {
-        slot.bump_malformed_param_status();
-        return ParamStatusRecordOutcome::MalformedPayload;
-    };
-    let Some(key) = payload.get(..nul_pos) else {
-        slot.bump_malformed_param_status();
-        return ParamStatusRecordOutcome::MalformedPayload;
-    };
-    let Some(value_start) = nul_pos.checked_add(1) else {
-        slot.bump_malformed_param_status();
-        return ParamStatusRecordOutcome::MalformedPayload;
-    };
-    let Some(value_region) = payload.get(value_start..) else {
-        slot.bump_malformed_param_status();
-        return ParamStatusRecordOutcome::MalformedPayload;
-    };
-    let Some(value) = value_region.strip_suffix(b"\0") else {
-        slot.bump_malformed_param_status();
-        return ParamStatusRecordOutcome::MalformedPayload;
-    };
-    slot.record(key, value);
-    ParamStatusRecordOutcome::Processed
-}
-
 /// Build a PostgreSQL StartupMessage frame.
 ///
 /// StartupMessage format (no tag byte):
@@ -4544,7 +4459,7 @@ mod residue_policy_per_class_tests {
     /// arm of `clear_session_residue_*` mutated them.
     fn populate_residue(proto: &mut PgProtocol) {
         proto.row_desc_slot._set_for_test(Some(RowDesc::EMPTY));
-        proto.session_params = Some(dirty_session_params());
+        proto.session_params._set_for_test(Some(dirty_session_params()));
         proto.error_arena = Some(alloc::boxed::Box::new(
             crate::error_arena::ErrorArena::new(),
         ));

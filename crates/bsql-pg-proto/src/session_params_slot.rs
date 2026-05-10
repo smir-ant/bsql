@@ -1,139 +1,226 @@
-//! DEF-271 cluster B (2026-05-10) — tier-1 `SessionParams` write
-//! provenance.
+//! DEF-272 cluster β (2026-05-10) — tier-1 within-crate
+//! `session_params` write provenance via concrete-token + Cell newtype.
 //!
-//! Direct mirror of [`crate::schema_slot`] (DEF-270 R-rephrased) for
-//! the `SessionParams` mutation surface.
+//! Direct mirror of [`crate::schema_slot`] cluster α; the same
+//! architectural reasoning applies to this slot's mutation surface.
 //!
-//! # Pre-DEF-271 B
+//! # Pre-DEF-272 β
 //!
-//! `PgProtocol::session_params: Option<Box<SessionParams>>` was
-//! mutable through any `&mut SessionParams` borrow that crate-internal
-//! callers extracted. Three mutation sites in `mod protocol`:
-//! - the `ParameterStatus` pre-dispatch filter calling `record_param_status`
-//!   (which internally calls `set` plus, on `MalformedPayload`, the
-//!   caller separately bumps the malformed counter);
-//! - the `NoticeResponse` pre-dispatch filter calling
-//!   `bump_notice_response`;
-//! - the residue-cleanup path inside `clear_session_residue_for_class`
-//!   calling `params.clear()`.
+//! - `PgProtocol::session_params: Option<Box<SessionParams>>` was
+//!   reachable via `&mut SessionParams` borrow that crate-internal
+//!   callers extracted (via `session_params_or_init` lazy-init).
+//! - `SessionParamsSlot<A: SessionParamsWriteAuth>` witness gated
+//!   writes via a sealed-trait auth tag; the `pub(crate) mod sealed`
+//!   surface allowed any in-crate file to write
+//!   `impl Sealed for HostileTag + impl SessionParamsWriteAuth for HostileTag`
+//!   and bypass `from_field_with_auth`. **Tier-1 EXTERNAL + tier-2
+//!   by-discipline WITHIN-CRATE** — verified empirically by the
+//!   architect's hostile probe (2026-05-10).
 //!
-//! Each was a raw `&mut SessionParams` write — the audit invariant
-//! "writes happen only at these three sites" was upheld by reviewer
-//! attention plus naming. **Tier-2 by-discipline.**
+//! # Post-DEF-272 β
 //!
-//! # Post-DEF-271 B
+//! Same two structural changes as schema_slot α:
 //!
-//! - The sole write surface is [`SessionParamsSlot`], a `must_use`
-//!   ZST-witness wrapping `&'a mut SessionParams`. Methods
-//!   [`Self::record`] / [`Self::bump_malformed_param_status`] /
-//!   [`Self::bump_notice_response`] / [`Self::clear`] consume self.
-//! - Construction is gated on a [`SessionParamsWriteAuth`] sealed-trait
-//!   witness. Auth tags live inside per-call-site leaf submodules
-//!   in `mod protocol` (`_parameter_status_admit_leaf`,
-//!   `_notice_response_admit_leaf`, `_clear_residue_leaf`) with
-//!   PRIVATE tuple-struct fields — only the leaf submodule can
-//!   write `Self(())` to mint the tag. The dual-purpose
-//!   `AtClearSessionResidue` tag implements both
-//!   [`SessionParamsWriteAuth`] and
-//!   [`crate::schema_slot::SchemaWriteAuth`] (same residue-cleanup
-//!   site clears both slots); one ZST, two sealed-trait impls.
+//! 1. **`SessionParamsCell` newtype** wraps `Option<Box<SessionParams>>`
+//!    with a PRIVATE `inner` field (private to `mod session_params_slot`).
+//!    Direct `*self.session_params.inner = ...` does not compile from
+//!    `mod protocol` or anywhere else. Read accessor (`as_deref`) and
+//!    token-gated write methods are the only paths.
 //!
-//! # Post-DEF-271 C (cluster C, 2026-05-10)
+//! 2. **Per-leaf concrete-type tokens** replace the sealed-trait
+//!    pattern. Each leaf hosts a `pub(crate) struct XToken(())` type
+//!    with a PRIVATE tuple-struct field (mintable only inside the
+//!    defining leaf). Cell methods take the concrete token type by
+//!    value:
+//!    - [`crate::protocol::_parameter_status_admit_leaf::ParamStatusToken`]
+//!      → [`SessionParamsCell::admit_at_param_status`]
+//!    - [`crate::protocol::_notice_response_admit_leaf::NoticeResponseToken`]
+//!      → [`SessionParamsCell::admit_at_notice_response`]
+//!    - [`crate::protocol::_clear_residue_leaf::ClearResidueSessionToken`]
+//!      → [`SessionParamsCell::clear_at_residue`]
 //!
-//! Cluster B introduced the witness; cluster C tightened auth-tag
-//! mint scope from `pub(in crate::protocol)` (the whole ~5 K-LoC
-//! module) down to per-leaf submodules (~10–30 LoC). Adding a new
-//! write transition now requires (a) a new leaf submodule, (b) a
-//! new auth tag with private field, AND (c) a helper fn — all
-//! surface in the same review hunk.
+//! # Lazy-init absorbed into Cell methods
+//!
+//! Pre-β the `session_params_or_init` helper extracted `&mut SessionParams`
+//! by lazy-init-ing the inner `Box`. Post-β each `admit_*` Cell method
+//! lazy-inits internally on first call — the `&mut SessionParams`
+//! never escapes the cell. This eliminates the
+//! `pub(crate) fn session_params_or_init(slot: &mut Option<Box<SessionParams>>) -> &mut SessionParams`
+//! escape-hatch entirely (deleted in this commit).
+//!
+//! # Tier-1 closure (within-crate, by-construction)
+//!
+//! Hostile attempts:
+//!
+//! - `cell.inner = ...` from outside `mod session_params_slot`: FAILS —
+//!   `inner` is private to `mod session_params_slot`.
+//! - `ParamStatusToken(())` from outside the leaf: FAILS — token's
+//!   `()` field is private to the leaf submodule.
+//! - `cell.admit_at_param_status(payload, X)` with `X` not the
+//!   matching token type: FAILS — type mismatch.
+//! - `impl HostileTrait for Whatever`: NO TRAIT EXISTS — the
+//!   sealed-trait pattern is deleted in this cluster.
+//! - `&mut SessionParams` extraction from outside `mod session_params_slot`:
+//!   FAILS — Cell never exposes `&mut SessionParams`; only
+//!   `&SessionParams` via `as_deref` (read-only) and internally-managed
+//!   mutation through token-gated methods.
+//!
+//! # Bench cost
+//!
+//! Cell is `#[repr(transparent)]` over `Option<Box<SessionParams>>`.
+//! `as_deref` compiles identically. `admit_*` methods do the same
+//! `get_or_insert_with` pattern that `session_params_or_init` did,
+//! plus a no-op token consume; LLVM erases the token. 0 ns / 0 B perf
+//! delta vs. pre-β.
 
 use crate::session_params::SessionParams;
 
-/// Sealed-supertrait module. `pub(crate)` so in-crate host modules
-/// can `impl Sealed for <their-tag>`. External crates cannot reach
-/// this module (no public re-export).
-pub(crate) mod sealed {
-    /// Sealed marker — implementors are crate-internal only by
-    /// virtue of `mod sealed`'s `pub(crate)` visibility.
-    pub trait Sealed {}
+/// Tier-1 within-crate write provenance for the protocol's session
+/// params (key/value pairs from `ParameterStatus`, `NoticeResponse`
+/// counter, malformed-payload counter). Wraps `Option<Box<SessionParams>>`
+/// with a PRIVATE inner field; writes require per-leaf concrete-type
+/// tokens (see module-level docs).
+///
+/// `#[repr(transparent)]` so the layout is identical to the bare
+/// `Option<Box<SessionParams>>` — the niche-packed 8 B footprint pre-β
+/// is preserved.
+#[repr(transparent)]
+pub(crate) struct SessionParamsCell {
+    inner: Option<alloc::boxed::Box<SessionParams>>,
 }
 
-/// Sealed witness trait for a `SessionParams` mutation site.
-/// Implementors are ZST tags emitted at specific transition sites
-/// (see module-level docs). Mirror of
-/// [`crate::schema_slot::SchemaWriteAuth`].
-pub(crate) trait SessionParamsWriteAuth: sealed::Sealed {}
+impl SessionParamsCell {
+    /// The empty initial state. Used by `PgProtocol::new` at session
+    /// initialisation. Exposed as a `const` (not a `fn new()`) for
+    /// audit-readability of any future wholesale-replacement
+    /// (`*cell = SessionParamsCell::EMPTY`) — the literal `EMPTY` is
+    /// a single grep-anchor.
+    pub(crate) const EMPTY: Self = Self { inner: None };
 
-/// Tier-1 witness wrapping a mutable borrow of
-/// `PgProtocol::session_params` (post-`session_params_or_init`
-/// initialisation).
-///
-/// **Construction:** auth-typed via [`Self::from_field_with_auth`]
-/// (gated on a [`SessionParamsWriteAuth`] tag). Tag minting lives
-/// in per-call-site leaf submodules in `mod protocol`
-/// (DEF-271 cluster C); each tag has a private tuple-struct field,
-/// so `Self(())` is callable only inside the defining leaf submodule.
-///
-/// **Methods:** [`Self::record`] / [`Self::bump_malformed_param_status`] /
-/// [`Self::bump_notice_response`] / [`Self::clear`] — each consumes
-/// `self` so a single witness performs exactly one write.
-#[must_use = "session params slot witness must be consumed via record / bump_* / clear"]
-pub(crate) struct SessionParamsSlot<'a> {
-    slot: &'a mut SessionParams,
-}
-
-impl<'a> SessionParamsSlot<'a> {
-    /// Auth-typed constructor. Crate-internal modules can construct
-    /// a witness if and only if they hold a [`SessionParamsWriteAuth`]
-    /// tag — and tag construction is gated by the tag type's PRIVATE
-    /// tuple-struct field, mintable only inside the defining leaf
-    /// submodule (DEF-271 cluster C).
+    /// Borrow the inner session params, if allocated. Read-only. Used
+    /// by `PgProtocol::session_params` accessor and the residue-cleanup
+    /// match arms.
     #[inline]
-    pub(crate) fn from_field_with_auth<A: SessionParamsWriteAuth>(
-        slot: &'a mut SessionParams,
-        _auth: A,
-    ) -> Self {
-        Self { slot }
+    #[must_use]
+    pub(crate) fn as_deref(&self) -> Option<&SessionParams> {
+        self.inner.as_deref()
     }
 
-    /// Record a parsed `(key, value)` pair from a `ParameterStatus`
-    /// payload. Consumes self.
+    /// Returns `true` if the inner box is allocated. Read-only. Used
+    /// only by `cfg(test)` residue-cleanup fixtures.
+    #[cfg(test)]
     #[inline]
-    pub(crate) fn record(self, key: &[u8], value: &[u8]) {
-        self.slot.set(key, value);
+    #[must_use]
+    pub(crate) fn is_some(&self) -> bool {
+        self.inner.is_some()
     }
 
-    /// Bump the malformed-`ParameterStatus`-payload counter
-    /// (DEF-185 P2-B operator-canary). Consumes self.
+    /// Admit a `ParameterStatus` frame: parse the payload, on success
+    /// record the (key, value) pair into the lazy-allocated
+    /// [`SessionParams`]; on parse failure bump the malformed-payload
+    /// counter (DEF-185 P2-B operator-canary). Returns the
+    /// [`crate::protocol::ParamStatusRecordOutcome`] for caller
+    /// observability.
+    ///
+    /// Lazy-allocates the `Box<SessionParams>` on first call. The
+    /// token's mint is gated to `_parameter_status_admit_leaf`.
+    ///
+    /// Payload format per PG §55.7: `key\0value\0` (two NUL-terminated
+    /// C-strings). Pre-β this logic lived in
+    /// `record_param_status_with_slot`; post-β it's a method on the
+    /// Cell so the `&mut SessionParams` borrow never escapes.
     #[inline]
-    pub(crate) fn bump_malformed_param_status(self) {
-        self.slot.bump_malformed_param_status();
+    #[must_use]
+    pub(crate) fn admit_at_param_status(
+        &mut self,
+        payload: &[u8],
+        _t: crate::protocol::_parameter_status_admit_leaf::ParamStatusToken,
+    ) -> crate::protocol::ParamStatusRecordOutcome {
+        let params = self
+            .inner
+            .get_or_insert_with(|| alloc::boxed::Box::new(SessionParams::new()));
+        let Some(nul_pos) = payload.iter().position(|b| *b == 0) else {
+            params.bump_malformed_param_status();
+            return crate::protocol::ParamStatusRecordOutcome::MalformedPayload;
+        };
+        let Some(key) = payload.get(..nul_pos) else {
+            params.bump_malformed_param_status();
+            return crate::protocol::ParamStatusRecordOutcome::MalformedPayload;
+        };
+        let Some(value_start) = nul_pos.checked_add(1) else {
+            params.bump_malformed_param_status();
+            return crate::protocol::ParamStatusRecordOutcome::MalformedPayload;
+        };
+        let Some(value_region) = payload.get(value_start..) else {
+            params.bump_malformed_param_status();
+            return crate::protocol::ParamStatusRecordOutcome::MalformedPayload;
+        };
+        let Some(value) = value_region.strip_suffix(b"\0") else {
+            params.bump_malformed_param_status();
+            return crate::protocol::ParamStatusRecordOutcome::MalformedPayload;
+        };
+        params.set(key, value);
+        crate::protocol::ParamStatusRecordOutcome::Processed
     }
 
-    /// Bump the unsolicited-`NoticeResponse` counter
-    /// (DEF-185 P2-3 operator-canary). Consumes self.
+    /// Admit a `NoticeResponse` frame: bump the unsolicited-notice
+    /// counter (DEF-185 P2-3 operator-canary). Lazy-allocates the
+    /// `Box<SessionParams>` on first call. The token's mint is gated
+    /// to `_notice_response_admit_leaf`.
     #[inline]
-    pub(crate) fn bump_notice_response(self) {
-        self.slot.bump_notice_response();
+    pub(crate) fn admit_at_notice_response(
+        &mut self,
+        _t: crate::protocol::_notice_response_admit_leaf::NoticeResponseToken,
+    ) {
+        let params = self
+            .inner
+            .get_or_insert_with(|| alloc::boxed::Box::new(SessionParams::new()));
+        params.bump_notice_response();
     }
 
-    /// Clear all session params (residue cleanup on Idle/Errored
-    /// entry). Consumes self. Drop chain scrubs `SecretBoundedStr`
-    /// bytes (DEF-189 Q8-C3 + DEF-205 step 3).
+    /// Clear the session params CONTENTS at the residue-cleanup
+    /// transition (Errored entry per DEF-189 Q8-C3 + DEF-205 step 3 —
+    /// session-state forfeit on tear-down). Calls `params.clear()` on
+    /// the inner box (which scrubs `SecretBoundedStr` bytes via its
+    /// own Drop chain on each replaced field) but PRESERVES the
+    /// `Box<SessionParams>` allocation itself — the test fixture
+    /// `errored_clears_everything_including_session_params` pins this
+    /// invariant: post-Errored, the box stays allocated, the contents
+    /// are pristine. Pre-β `params.clear()` was the operation; this
+    /// preserves the same semantics behind the cell. The token's mint
+    /// is gated to `_clear_residue_leaf`.
     #[inline]
-    pub(crate) fn clear(self) {
-        self.slot.clear();
+    pub(crate) fn clear_at_residue(
+        &mut self,
+        _t: crate::protocol::_clear_residue_leaf::ClearResidueSessionToken,
+    ) {
+        if let Some(params) = self.inner.as_deref_mut() {
+            params.clear();
+        }
+    }
+
+    /// Test-only setter. `#[cfg(test)]`-gated — production binaries
+    /// don't expose this. Used by `mod tests` in protocol.rs to
+    /// pre-populate the slot with a synthetic dirty `SessionParams`
+    /// before exercising residue-cleanup transitions.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn _set_for_test(&mut self, value: Option<alloc::boxed::Box<SessionParams>>) {
+        self.inner = value;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    /// Sealed-trait pin. The `mod sealed` module is `pub(crate)` and
-    /// `Sealed` itself is `pub` within it; external crates have no
-    /// path to either, so `impl SessionParamsWriteAuth for ExternalType`
-    /// cannot be written outside this crate.
+    /// Within-crate tier-1 closure pin. The `inner` field of
+    /// [`super::SessionParamsCell`] is private to `mod session_params_slot`;
+    /// per-leaf tokens have PRIVATE tuple-struct fields, mintable only
+    /// inside their defining leaf submodule. No trait surface remains
+    /// for hostile impls (sealed-trait pattern deleted in cluster β).
+    /// External crates: cell + tokens are all `pub(crate)`-gated, no
+    /// public re-export.
     #[test]
-    fn seal_pin_anchor() {
+    fn within_crate_seal_pin_anchor() {
         // Anchor for `git grep "session_params_slot.*seal"` searches.
     }
 }
