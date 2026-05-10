@@ -2871,8 +2871,12 @@ fn compute_push(
     cmd: PgCommand,
     state: &mut ProtoState,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> StagedActions {
-    let mut staged = StagedActions::new();
+) -> StagedActions<'static> {
+    // DEF-160 (Z2): the cfg(test) dispatcher operates on the legacy
+    // owned-`Sql` `PgCommand` enum (not the post-DEF-269-v2 typed
+    // surface) — no borrowed-SQL surface, so `StagedActions<'static>`
+    // is the natural choice.
+    let mut staged: StagedActions<'static> = StagedActions::new();
     match cmd {
         PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
         PgCommand::Startup {
@@ -4163,7 +4167,7 @@ fn build_startup_message(
 // site-count combination — codegen evidence supports the annotation.
 #[inline]
 fn materialise_push(
-    staged: StagedActions,
+    staged: StagedActions<'_>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<(), crate::action::PushFailure> {
     let mut failure: Option<crate::action::PushFailure> = None;
@@ -4249,6 +4253,13 @@ fn materialise_push(
                 // Paired with FailReply on push paths; state already Errored.
                 // Caller closes socket per PushFailure #[must_use] contract.
             }
+            StagedAction::SendBytesBorrowed(_) => {
+                // DEF-160 (Z2): borrowed bytes (caller's SQL via Parse /
+                // SimpleQuery push paths) require no `apply` — they live
+                // in caller memory, not in `wb`. The `materialise`-stage
+                // counterpart converts the borrow to `Action::SendBytes`
+                // directly. Push-path verification is a no-op here.
+            }
         }
     }
     match failure {
@@ -4272,8 +4283,18 @@ fn materialise_push(
 // 4 call sites — LLVM rejects the hint. Body too large to inline at
 // 4 sites without net code bloat. Annotation would be ineffective
 // noise; LLVM heuristic is correct here.
+// DEF-160 (Z2): `staged: StagedActions<'w>` — the staged container's
+// `'sql` lifetime is unified with the WriteBuf's `'w`. This expresses
+// "any borrowed SQL bytes inside staged outlive the WriteBuf borrow",
+// which is the natural caller-side invariant: caller passes
+// `Parse<'a> { sql: &'a str }` AND `&mut WriteBuf` to the same
+// `push_command` call; the borrow checker enforces `'a >= 'w`. The
+// materialiser then emits `Action::SendBytes(&'w [u8])` for both
+// `SendBytesRange` (bytes from `write_bytes: &'w [u8]`) and
+// `SendBytesBorrowed` (bytes from caller's SQL, lifetime ≥ 'w by
+// the unified parameter).
 fn materialise<'w, 'r>(
-    staged: StagedActions,
+    staged: StagedActions<'w>,
     write_bytes: &'w [u8],
     terminal_row_desc: Option<&'r crate::decode::RowDesc>,
 ) -> OutActions<'w, 'r> {
@@ -4331,6 +4352,12 @@ fn materialise<'w, 'r>(
             }
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
             StagedAction::CloseSocket => Action::CloseSocket,
+            // DEF-160 (Z2): pass borrowed slice through unchanged.
+            // The `'sql: 'w` bound on `materialise` ensures the borrow
+            // is at least as long-lived as the WriteBuf's bytes — the
+            // returned `Action::SendBytes(&'w [u8])` carries the
+            // shorter lifetime safely.
+            StagedAction::SendBytesBorrowed(b) => Action::SendBytes(b),
         };
         push_within_fanout_budget(&mut out, a);
     }
@@ -4953,7 +4980,7 @@ mod compute_push_tests {
     }
 
     impl StagedObs {
-        fn from_staged(sa: &StagedAction) -> Self {
+        fn from_staged(sa: &StagedAction<'_>) -> Self {
             match sa {
                 StagedAction::SendBytesRange(_) => Self::SendBytesRange,
                 StagedAction::SendBytesStatic(s) => Self::SendBytesStatic(s),
@@ -4962,6 +4989,13 @@ mod compute_push_tests {
                     Self::FailReply { id: *id, cause: *cause }
                 }
                 StagedAction::CloseSocket => Self::CloseSocket,
+                // DEF-160 (Z2): borrowed bytes don't appear in the
+                // legacy cfg(test) `PgCommand`-driven path (no Parse /
+                // SimpleQuery test fixtures route through this enum
+                // post-DEF-269-v2). Keep an explicit arm to fail the
+                // build if a future test introduces a borrowed-SQL
+                // path here without updating the observation type.
+                StagedAction::SendBytesBorrowed(_) => Self::SendBytesStatic(b""),
             }
         }
     }

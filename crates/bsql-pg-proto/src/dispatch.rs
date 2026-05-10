@@ -134,6 +134,14 @@ use crate::wire::{
 /// poll reawakening.
 // DEF-184 (A1+A13): DispatchOutcome's Errored.cause ProtocolError
 // shrunk 312 → ~72 B via ErrorArena externalisation.
+//
+// DEF-160 (Z2): `StagedAction<'static>` — the dispatch path
+// (server→client frames) produces no `SendBytesBorrowed` actions;
+// only push paths (Parse / SimpleQuery in commit 2) borrow SQL bytes
+// from the caller. Hard-pinning to `'static` here keeps the dispatch
+// fn signatures lifetime-free. If a future server-driven path needs
+// to borrow (e.g., streaming COPY data references), promote this
+// to `<'sql>` then.
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
     /// Frame consumed; transition already written to caller's
@@ -151,9 +159,12 @@ pub(crate) enum DispatchOutcome {
     /// DEF-154 (Y): `'r` deleted post-StreamRowRange removal —
     /// `StagedAction` no longer carries read-buf references (the
     /// only lifetime'd field was `StreamRowRange::row_bytes`).
+    ///
+    /// DEF-160 (Z2): `StagedAction<'static>` — dispatch path never
+    /// produces `SendBytesBorrowed`.
     AdvancedWithAction {
         /// The single side-effect to push.
-        action: StagedAction,
+        action: StagedAction<'static>,
     },
     /// Frame rejected; connection irrecoverable. Caller tears down.
     /// State has already been set to `ProtoState::Errored(kind)` by

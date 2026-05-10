@@ -719,7 +719,15 @@ impl<'a, 'w, 'r> IntoIterator for &'a OutActions<'w, 'r> {
 /// evidence per the deferred.md §B reopen contract.
 // DEF-154 (L): staged container uses `MAX_STAGED_PER_CALL`
 // (dispatch-side cap); output uses `MAX_ACTIONS_PER_CALL` (fan-out).
-pub(crate) type StagedActions = heapless::Vec<StagedAction, { crate::protocol::MAX_STAGED_PER_CALL }>;
+//
+// DEF-160 (Z2): `'sql` lifetime parameter carries the borrow of any
+// `StagedAction::SendBytesBorrowed(&'sql [u8])` variant — caller's
+// SQL bytes referenced zero-copy via Parse / SimpleQuery push paths.
+// Elision rules let most consumers write `&mut StagedActions<'_>`;
+// only PushCommand impls that stage borrowed bytes (Parse, SimpleQuery)
+// need to propagate the lifetime explicitly to ensure the borrow
+// outlives the materialisation step.
+pub(crate) type StagedActions<'sql> = heapless::Vec<StagedAction<'sql>, { crate::protocol::MAX_STAGED_PER_CALL }>;
 
 /// A directive from the protocol to its host.
 ///
@@ -1083,8 +1091,15 @@ pub struct PushFailure {
 // DEF-184 (A1+A13): StagedAction no longer triggers
 // `large_enum_variant` post-ErrorArena cascade (FailReply.cause
 // ProtocolError shrunk from 312 B to ~72 B).
+//
+// DEF-160 (Z2): `'sql` lifetime parameter introduced for the new
+// [`StagedAction::SendBytesBorrowed`] variant. Other variants do not
+// reference `'sql` directly; the parameter is "phantom" for them and
+// erased at monomorphisation. Lifetime is named `'sql` (not the
+// generic `'a`) to make the borrow's origin explicit — caller's SQL
+// from Parse / SimpleQuery push paths.
 #[derive(Debug)]
-pub(crate) enum StagedAction {
+pub(crate) enum StagedAction<'sql> {
     /// Bytes live at the range `[start..start+len]` in the
     /// caller's `write_buf`. Non-zero length (DEF-100).
     ///
@@ -1098,6 +1113,27 @@ pub(crate) enum StagedAction {
     /// Bytes are a static compile-time constant. Materialiser passes
     /// through directly — no write, no copy.
     SendBytesStatic(&'static [u8]),
+    /// Bytes are borrowed from a caller-owned source — currently the
+    /// SQL string of [`crate::push_command::Parse`] /
+    /// [`crate::push_command::SimpleQuery`]. The materialiser passes
+    /// the slice through unchanged (zero-copy, zero-stage).
+    ///
+    /// DEF-160 (Z2): introduced to take the SQL out of `WriteBuf`
+    /// staging. Pre-DEF-160 the SQL was copied into a fixed-size
+    /// `Sql = FixedStr<MAX_SQL_LEN, _>` (truncating at 2048 B with
+    /// "…" marker — silent semantic corruption on > 2048-byte
+    /// queries). Post-DEF-160 the SQL is borrowed end-to-end and
+    /// surfaces as this variant; no protocol cap on SQL size, no
+    /// truncation, tier-1 by-construction at the protocol layer.
+    /// Caller responsibility: SQL must outlive the materialised
+    /// `Action<'w, 'r>` (lifetime checked by the unified `'w` in
+    /// `materialise` / `materialise_push`). For SQL containing
+    /// secrets (e.g. passwords in `UPDATE` clauses), caller holds
+    /// the SQL in `Zeroizing<String>` — zeroize-on-drop happens at
+    /// the caller, not in our `WriteBuf::clear()` (which only
+    /// scrubs inline bytes).
+    #[allow(dead_code, reason = "DEF-160 commit 1 plumbing — first construction site lands in commit 2 Parse/SimpleQuery flip")]
+    SendBytesBorrowed(&'sql [u8]),
     /// Map to [`Action::DeliverReply`]. Opaque [`DeliverReplyEntry`]
     /// — the only construction path is [`deliver`] (below), which
     /// enforces kind-payload pairing at compile time via
@@ -1464,7 +1500,12 @@ pub(crate) use deliver_entry_priv::DeliverReplyEntry;
 pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
     id: crate::reply_id::ReplyId<K>,
     payload: K::StagedPayload,
-) -> StagedAction {
+) -> StagedAction<'static> {
+    // DEF-160 (Z2): `'static` because `DeliverReply` does not borrow
+    // any `'sql` data. `StagedAction<'static>` is a subtype of
+    // `StagedAction<'sql>` for any `'sql` (covariance via the
+    // `&'sql [u8]` reference in `SendBytesBorrowed`), so callers in
+    // any-`'sql` contexts can use this freely.
     StagedAction::DeliverReply(DeliverReplyEntry::new(id.consume(), payload.into()))
 }
 
