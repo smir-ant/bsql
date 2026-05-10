@@ -271,7 +271,16 @@ pub(crate) mod schema_slot;
 // witness types live in `push_command` alongside the impls; this
 // module owns the `StateSetter<'_, W>` machinery + sealed
 // `PostStateProof` trait.
+//
+// DEF-271 cluster A (Phase 3) — also hosts `FeedStateSetter<'_>` for
+// feed-side `Errored` transitions, atomically draining the in-flight
+// reply id from the prior state during `mem::replace`.
 pub(crate) mod state_setter;
+
+// DEF-271 cluster B (Phase 3) — tier-1 SessionParams write provenance.
+// Crate-internal module; no public re-exports. Mirror of `schema_slot`
+// for the `PgProtocol::session_params` field.
+pub(crate) mod session_params_slot;
 pub mod scram;
 // DEF-188: schema_arena module DELETED — RowDesc lives inline in
 // state variants; terminal-reply schema parks into

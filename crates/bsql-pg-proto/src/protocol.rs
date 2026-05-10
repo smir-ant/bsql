@@ -805,10 +805,60 @@ impl AtBindExecuteSelectTransition {
 /// DEF-270 R-rephrased — tag for the clear-session-residue transition.
 /// Minted inside `clear_session_residue_for_class` when the protocol
 /// scrubs the slot on Idle/Errored entry.
+///
+/// **DEF-271 cluster B (2026-05-10):** also implements
+/// [`crate::session_params_slot::SessionParamsWriteAuth`] — the same
+/// residue-cleanup site clears both the schema slot AND session params
+/// (architect's #9 finding: one ZST tag, two sealed-trait impls).
 pub(crate) struct AtClearSessionResidue(());
 impl crate::schema_slot::sealed::Sealed for AtClearSessionResidue {}
 impl crate::schema_slot::SchemaWriteAuth for AtClearSessionResidue {}
+impl crate::session_params_slot::sealed::Sealed for AtClearSessionResidue {}
+impl crate::session_params_slot::SessionParamsWriteAuth for AtClearSessionResidue {}
 impl AtClearSessionResidue {
+    /// Construct the tag. Visibility limited to `mod crate::protocol`.
+    #[inline]
+    pub(in crate::protocol) const fn new() -> Self {
+        Self(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DEF-271 cluster B (2026-05-10) — session-params write auth tags
+// hosted here.
+//
+// Per `mod session_params_slot` docs: tag types live in `mod protocol`
+// because that's where the mutation sites live (the inbound-frame
+// pre-dispatch filter for `ParameterStatus` / `NoticeResponse`).
+// Each tag's `new()` is `pub(in crate::protocol)` — no cross-module
+// caller (e.g. `mod dispatch`) can mint these; sites that need
+// session-params write authority for a different reason add their
+// own tag in their host module + impl the sealed trait.
+// ─────────────────────────────────────────────────────────────────
+
+/// DEF-271 cluster B — tag for the inbound `ParameterStatus`
+/// pre-dispatch filter. Minted inside `feed_bytes_bounded` at the
+/// PG `'S'` (ParameterStatus) admission site when
+/// [`allows_unsolicited_param_status`] returns true.
+pub(crate) struct AtParameterStatusFrame(());
+impl crate::session_params_slot::sealed::Sealed for AtParameterStatusFrame {}
+impl crate::session_params_slot::SessionParamsWriteAuth for AtParameterStatusFrame {}
+impl AtParameterStatusFrame {
+    /// Construct the tag. Visibility limited to `mod crate::protocol`.
+    #[inline]
+    pub(in crate::protocol) const fn new() -> Self {
+        Self(())
+    }
+}
+
+/// DEF-271 cluster B — tag for the inbound `NoticeResponse`
+/// pre-dispatch filter. Minted inside `feed_bytes_bounded` at the
+/// PG `'N'` (NoticeResponse) admission site when
+/// [`allows_unsolicited_notice_response`] returns true.
+pub(crate) struct AtNoticeResponseFrame(());
+impl crate::session_params_slot::sealed::Sealed for AtNoticeResponseFrame {}
+impl crate::session_params_slot::SessionParamsWriteAuth for AtNoticeResponseFrame {}
+impl AtNoticeResponseFrame {
     /// Construct the tag. Visibility limited to `mod crate::protocol`.
     #[inline]
     pub(in crate::protocol) const fn new() -> Self {
@@ -1699,13 +1749,27 @@ impl PgProtocol {
                             //
                             // DEF-196: lazy-init session_params Box only
                             // when actually writing (here).
+                            //
+                            // DEF-271 cluster B (2026-05-10): the
+                            // post-record MalformedPayload bump now lives
+                            // INSIDE record_param_status_with_slot — the
+                            // helper takes a SessionParamsSlot witness
+                            // (gated on AtParameterStatusFrame auth tag)
+                            // and consumes it via record() OR
+                            // bump_malformed_param_status() depending on
+                            // parse outcome. Consolidates the two-step
+                            // "parse → caller-bumps" into a single
+                            // mutation site behind the witness.
                             let session_params = session_params_or_init(session_params_slot);
-                            match record_param_status(session_params, payload) {
-                                ParamStatusRecordOutcome::Processed => {}
-                                ParamStatusRecordOutcome::MalformedPayload => {
-                                    session_params.bump_malformed_param_status();
-                                }
-                            }
+                            let slot = crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
+                                session_params,
+                                AtParameterStatusFrame::new(),
+                            );
+                            // Outcome is signalled to the caller for
+                            // potential future logging/test observation;
+                            // current consumers (this site) discard it.
+                            let _outcome: ParamStatusRecordOutcome =
+                                record_param_status_with_slot(slot, payload);
                             frames_consumed =
                                 frames_consumed.saturating_add(total_len);
                             continue;
@@ -1727,7 +1791,13 @@ impl PgProtocol {
                             // DEF-196: lazy-init session_params Box only
                             // when actually writing (here, bumping the
                             // notice counter).
-                            session_params_or_init(session_params_slot).bump_notice_response();
+                            //
+                            // DEF-271 cluster B (2026-05-10): write
+                            // gated through SessionParamsSlot witness.
+                            crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
+                                session_params_or_init(session_params_slot),
+                                AtNoticeResponseFrame::new(),
+                            ).bump_notice_response();
                             frames_consumed =
                                 frames_consumed.saturating_add(total_len);
                             continue;
@@ -1999,8 +2069,18 @@ impl PgProtocol {
                 // DEF-189 Q8-C3 + DEF-205 step 3: session-state
                 // forfeit on tear-down; `SessionParams::clear`'s Drop
                 // chain scrubs `SecretBoundedStr` bytes.
+                //
+                // DEF-271 cluster B (2026-05-10): write gated through
+                // SessionParamsSlot witness. AtClearSessionResidue
+                // implements both SchemaWriteAuth and
+                // SessionParamsWriteAuth — the same residue-cleanup
+                // site clears both slots; one tag, two sealed-trait
+                // impls (architect's #9 finding).
                 if let Some(params) = self.session_params.as_deref_mut() {
-                    params.clear();
+                    crate::session_params_slot::SessionParamsSlot::from_field_with_auth(
+                        params,
+                        AtClearSessionResidue::new(),
+                    ).clear();
                 }
             }
             // In-flight states — preserve residue. The exhaustive
@@ -3691,28 +3771,40 @@ pub(crate) enum ParamStatusRecordOutcome {
 /// trailing NUL recorded the value with potential trailing garbage.
 /// Post-(184): explicit `strip_suffix` Result — missing NUL =
 /// MalformedPayload, classified not silently absorbed.
+// DEF-271 cluster B (2026-05-10): record_param_status renamed to
+// record_param_status_with_slot, signature changed from
+// `(&mut SessionParams, &[u8])` to `(SessionParamsSlot<'_>, &[u8])`.
+// The helper now consumes the slot witness via record() on Processed
+// OR bump_malformed_param_status() on MalformedPayload — consolidates
+// the pre-DEF-271 two-step "parse → caller bumps" pattern into a
+// single mutation site behind the typed witness.
 #[inline(always)]
 #[must_use]
-fn record_param_status(
-    params: &mut SessionParams,
+fn record_param_status_with_slot(
+    slot: crate::session_params_slot::SessionParamsSlot<'_>,
     payload: &[u8],
 ) -> ParamStatusRecordOutcome {
     let Some(nul_pos) = payload.iter().position(|b| *b == 0) else {
+        slot.bump_malformed_param_status();
         return ParamStatusRecordOutcome::MalformedPayload;
     };
     let Some(key) = payload.get(..nul_pos) else {
+        slot.bump_malformed_param_status();
         return ParamStatusRecordOutcome::MalformedPayload;
     };
     let Some(value_start) = nul_pos.checked_add(1) else {
+        slot.bump_malformed_param_status();
         return ParamStatusRecordOutcome::MalformedPayload;
     };
     let Some(value_region) = payload.get(value_start..) else {
+        slot.bump_malformed_param_status();
         return ParamStatusRecordOutcome::MalformedPayload;
     };
     let Some(value) = value_region.strip_suffix(b"\0") else {
+        slot.bump_malformed_param_status();
         return ParamStatusRecordOutcome::MalformedPayload;
     };
-    params.set(key, value);
+    slot.record(key, value);
     ParamStatusRecordOutcome::Processed
 }
 
