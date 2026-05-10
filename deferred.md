@@ -210,6 +210,109 @@ R-rephrased delivers the same tier closure (write-provenance tier-1) without the
 - `mem::transmute` paths to fabricate any sealed type: out of scope; project is `#![forbid(unsafe_code)]` — closed at a different door.
 - `MAX_PARAMS_DATA_TOTAL` runtime drift between user `ParamsWriter` impls and the cap: existing `BuilderCapacityOverflow` classifier; closure path requires specialisation (unstable).
 
+#### DEF-271 (SHIPPED 2026-05-10): Phase 3 audit-residue closure (clusters A/B/C/D)
+
+Architect deep-audit (2026-05-09 cycle, post-DEF-270 Phase 2 ship) identified 4 residue surfaces beyond the U/R-rephrased/N-D/P-ordering letters. Each shipped as its own commit + audit anchor.
+
+| Cluster | Commit | Closure | Mechanism (compile-enforced) |
+|---------|--------|---------|------------------------------|
+| **A** feed-side parity | `6cdc0ea` | feed-side state-mutation drift | `FeedStateSetter<'a>` mirror of push-side `StateSetter`; `drain_and_install_errored` is atomic `mem::replace` returning `#[must_use] Option<NonZeroU64>` (drain + install in one step; previously two separate observation points). `StateSetter::new` gained an `IdleStateProof` parameter so the Idle precondition rides the type at the mint site (was a `debug_assert!` only). |
+| **B** session_params write provenance | `c34e52f` | `SessionParams` cross-module mutation drift | Sealed `SessionParamsWriteAuth` trait (mirror of `SchemaWriteAuth`) + `SessionParamsSlot<'a>` `must_use` ZST witness wrapping `&'a mut SessionParams`. 3 mutation sites (`ParameterStatus` admit, `NoticeResponse` admit, residue clear) consolidated behind the witness; each leaf-private auth tag (`AtParameterStatusFrame`, `AtNoticeResponseFrame`, `AtClearSessionResidue` dual-impl with `SchemaWriteAuth`). |
+| **C** auth-tag leaf-scope tightening | `78c077d` | tag mint scope `pub(in mod)` (~5K-LoC) → leaf-submodule (~10-30 LoC) | All schema_slot + session_params auth tags moved into per-call-site leaf submodules (`_bind_execute_select_install_leaf`, `_clear_residue_leaf`, `_parameter_status_admit_leaf`, `_notice_response_admit_leaf`, `_row_description_dispatch_leaf`). Each tag has a private tuple-struct field; `Self(())` mints are callable ONLY inside the defining leaf. The shared `SchemaParkedSlot::from_field_with_auth` + `SessionParamsSlot::from_field_with_auth` constructors stay `pub(crate)`; the closure boundary is the tag-mint surface. |
+| **D** ReplyId saturation classifier | `4f01136` | `next_reply_id` post-saturation cycle | `next_reply_id` detects `raw_old == u64::MAX` and routes through a new `#[cold] #[inline(never)]` `install_errored_replyid_saturation` helper that transitions the affected `PgProtocol` to `Errored(ReplyIdSaturation)` via `FeedStateSetter::drain_and_install_errored`. New `CrateBugLocus::ReplyIdSaturation` variant with kebab-case Display "reply-id-saturation". Pre-DEF-271 the saturation point silently returned the duplicate ID; post-DEF-271 the next push fails as `ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }` so the duplicate never reaches the server in a usable state. |
+
+**Acceptance gate (DEF-271):**
+
+- ✅ 159/0/10 tests green (lib unit + 10 doctest pin assertions).
+- ✅ clippy clean across `--tests --benches` with `-D warnings`.
+- ✅ `#![forbid(unsafe_code)]` preserved.
+- ✅ Architect audit verified each cluster individually (cluster C audit caught 3 stale doc references + nit on tag visibility tightening — all addressed in cluster C commit).
+
+**Glass residues identified by DEF-271 audit (closed by DEF-272):**
+
+The DEF-271 closures landed correctly but exposed a structural ceiling: the sealed-trait pattern (`SchemaWriteAuth`, `SessionParamsWriteAuth`, `PostStateProof`) closes the EXTERNAL crate boundary perfectly but is **tier-2 by-discipline within-crate** — any in-crate file can write `impl Sealed for HostileTag + impl <TraitName> for HostileTag` and bypass `from_field_with_auth`. Architect verified empirically (2026-05-10) by appending a hostile probe to `lib.rs` — `cargo check --tests` accepted the bypass. `IdleStateProof::new()` had the same shape (any in-crate caller could mint a proof regardless of state, then pair with non-Idle `&mut state`). `FeedStateSetter::new` similarly ungated. DEF-272 closes these.
+
+#### DEF-272 (SHIPPED 2026-05-10): within-crate tier-1 closure via concrete-tokens + Cell newtypes + lifetime-typestate
+
+Architect-driven follow-up to DEF-271. Replaces the sealed-trait + auth-tag pattern with three orthogonal mechanisms, each tier-1 within-crate by-construction:
+
+1. **Concrete-type per-leaf tokens** replace sealed-trait impls. Each leaf submodule hosts a `pub(crate) struct XToken(())` with a PRIVATE tuple-struct field — `Self(())` mints are callable ONLY inside the defining leaf. Witness methods take the concrete token type by value; there is no trait surface to `impl HostileTrait for HostileType` and bypass.
+2. **Cell newtypes** wrap the slot fields (`Option<RowDesc>`, `Option<Box<SessionParams>>`) with PRIVATE inner field. Direct `*self.row_desc_slot.inner = X` from outside `mod schema_slot` does not compile; the only paths to mutate are token-gated methods on the cell.
+3. **Lifetime-bound typestates** replace ZST proofs (`IdleStateProof`). `IdleState<'a>(&'a mut ProtoState)` IS the state borrow + the Idle proof, inseparable; `try_from(&mut state) -> Option<Self>` performs the runtime Idle classification, returning `None` for non-Idle states. Pairing the proof with a different state is impossible by lifetime ownership.
+
+| Subcluster | Commit | Closure |
+|------------|--------|---------|
+| **α** schema_slot | `e723f63` | `RowDescSlotCell` newtype (private inner) + 3 per-leaf concrete tokens (`BeSelectToken`, `TDispatchToken`, `ClearResidueSchemaToken`) + token-gated `park_at_*` / `clear_at_*` methods. Deletes `SchemaWriteAuth` trait + `mod sealed` + `SchemaParkedSlot` witness. |
+| **β** session_params_slot | `8d19558` | `SessionParamsCell` newtype (private inner) + 3 per-leaf concrete tokens (`ParamStatusToken`, `NoticeResponseToken`, `ClearResidueSessionToken`) + `admit_at_param_status` / `admit_at_notice_response` / `clear_at_residue`. `record_param_status_with_slot` + `session_params_or_init` deleted (logic absorbed into Cell methods; lazy-init via `get_or_insert_with` private to the cell). |
+| **γ** IdleState typestate | `29e1e70` | `IdleState<'a>` lifetime-bound typestate replaces `IdleStateProof`. `StateSetter::new` now `pub(in crate::state_setter)`; `IdleState::into_setter()` is the SOLE legitimate path to a setter. `push_command_internal` minds `IdleState::try_from(&mut self.state)` internally; the `None` arm classifies via new `CrateBugLocus::PushCommandInternalNonIdle` (architecturally unreachable on production callers — `ReadyGuard::push_command` upstream classifies). `IdleStateProof` + `_IdleProofMarker` + `idle_state_proof_seal_tests` deleted from `mod guard`. |
+| **δ** FeedStateSetter mint scope | `678801c` | `FeedStateSetter::new` becomes `pub(in crate::state_setter)`. 4 per-call-site free fns in `mod state_setter` (`drain_at_replyid_saturation`, `drain_at_read_cursor_advance`, `drain_at_malformed_data_row`, `drain_at_fail_inflight_no_readbuf`) take a concrete-type token from the matching leaf submodule in `mod protocol`. 4 leaf submodules host their tokens (`ReplyIdSaturationToken`, `ReadCursorAdvanceToken`, `MalformedDataRowToken`, `FailInflightNoReadbufToken`) with private fields. Adding a 5th call site requires (a) new leaf, (b) new token type, (c) new `drain_at_*` free fn — all surface in the same review hunk. |
+| **ε** doc-honesty pass | `fea5811` | Stale references to deleted/renamed types (`SchemaParkedSlot`, `SessionParamsSlot`, `IdleStateProof`, `record_param_status_with_slot`, `FeedStateSetter::new` ungated) updated in current-code comments + module docs to reflect post-DEF-272 architecture. Pre-α/β/γ/δ historical context (e.g., "Pre-α the seal was tier-2 by-discipline...") preserved as migration documentation. |
+
+**Architect empirical hostile-probe verification (2026-05-10, cluster α):**
+
+Architect appended `mod hostile_bypass_smoke { ... }` to `lib.rs`, ran `cargo check --tests`, removed the probe (working tree clean). Six hostile shapes tested:
+
+| Probe | Outcome | Reason |
+|-------|---------|--------|
+| **P1** `cell.inner = Some(...)` from outside `mod schema_slot` | **FAIL** ✓ | E0616: field private |
+| **P2** `BeSelectToken(())` mint from outside leaf | **FAIL** ✓ | E0603: tuple-struct constructor private |
+| **P3** `park_at_be_select(desc, X)` with `X != BeSelectToken` | **FAIL** ✓ | E0308: type mismatch |
+| **P4** `impl SchemaWriteAuth for H {}` | **FAIL** ✓ | E0405: trait deleted in α |
+| **P5** `SchemaParkedSlot::from_field_with_auth(...)` | **FAIL** ✓ | E0433: type deleted in α |
+| **P6** `*cell = RowDescSlotCell::EMPTY` (wholesale replacement) | **COMPILE** | Rust-fundamental: any owner of `&mut FieldType` can re-assign. Mitigated by `EMPTY` const (single grep-anchor for audit) instead of `fn new()`. |
+
+5 of 6 hostile shapes are now compile-errors-by-construction. P6 is a Rust-fundamental constraint (no language feature prevents `*field = same_type_value`); the `EMPTY` const surfaces such replacements for review (pre-α the equivalent was `pg.row_desc_slot = None` which read as routine plumbing — same shape, less obvious). β/γ/δ inherit α's pattern; equivalent probe outcomes by structural mirror.
+
+**Tier-1 closures delivered (DEF-271 + DEF-272 combined):**
+
+| Surface | Tier delta |
+|---------|-----------|
+| `row_desc_slot` external write | tier-3 → **tier-1 by-visibility** (cell `pub(crate)`, field private) |
+| `row_desc_slot` cross-module write provenance | tier-3 → **tier-1 by-construction** (per-leaf concrete tokens; field private to `mod schema_slot`) |
+| `row_desc_slot` within-`mod protocol` write provenance | tier-2 → **tier-1 by-construction** (cell methods only; no `*self.row_desc_slot.inner = X` path) |
+| `session_params` external write | tier-3 → **tier-1 by-visibility** |
+| `session_params` cross-module / within-crate write provenance | tier-3 → **tier-1 by-construction** (per-leaf concrete tokens; lazy-init private to cell methods) |
+| `StateSetter::new` mint scope | tier-2 → **tier-1 by-construction** (`pub(in crate::state_setter)`; sole path is `IdleState::into_setter`) |
+| `ProtoState == Idle` precondition at push entry | tier-2 (debug_assert) → **tier-1 by-construction** (lifetime-bound typestate; `try_from` runtime classification) |
+| `FeedStateSetter::new` mint scope | tier-2 → **tier-1 by-construction** (`pub(in crate::state_setter)`; 4 named entry points each gated by per-leaf concrete token) |
+| Sealed-trait hostile in-crate impl bypass | OPEN (architect-empirically verified) → **CLOSED** (no trait surface remains; concrete-type tokens are sealed by Rust's nominal type system + private-field mints) |
+
+**Glass residues remaining post-DEF-272 (Rust-fundamental or out-of-scope):**
+
+- **P6 wholesale Cell replacement** (`*cell = RowDescSlotCell::EMPTY`): Rust does not provide a way to make a struct field "append-only" / "no wholesale replacement". Mitigation: `EMPTY` const naming surfaces such replacements for grep-audit; pre-DEF-272 the equivalent shape was `pg.row_desc_slot = None` (same semantics, less obvious). Closing requires architectural moves outside the cluster scope (e.g., moving the slot into a sub-module with no `&mut field` exposure).
+- **Reviewer-attention path for `mod schema_slot` / `mod state_setter` internal edits**: a contributor editing those modules directly can write hostile patterns that bypass the closure (since the modules own the structures). Acceptable per «не стеклянная архитектура» — these modules are small (<200 LoC) and the visibility math has shrunk the within-crate audit surface from "all of `bsql-pg-proto`" (~10K LoC) to specific files.
+- **`mem::transmute` paths**: out of scope under `#![forbid(unsafe_code)]`.
+
+**Acceptance gate (DEF-271 + DEF-272):**
+
+- ✅ 159/0/10 tests green (lib unit + 10 doctest pin assertions; same counts as pre-DEF-271).
+- ✅ clippy clean across `--tests --benches` with `-D warnings` (lib forbids `expect_used`, `unwrap_used`, `panic`, `unreachable` — DEF-272 cluster γ's None-arm handling uses `match` + `debug_assert!(false)` + classified return per the forbid bundle).
+- ✅ `#![forbid(unsafe_code)]` preserved.
+- ✅ PgProtocol size pin **preserved at 520 B exact** (cells are `#[repr(transparent)]`; layout unchanged).
+- ✅ bench-stable compare vs `643d729-def270-shipped` baseline: **0 regressions, 2 real improvements, rest within noise**. Full table:
+
+| Bench | Time | Change | Classification |
+|-------|------|--------|---------------|
+| `parse_header/rfq_header` | 2.51 ns | -3.9% to -5.0% | within noise |
+| `ping_round_trip/push_then_feed` | 72 ns | -3.7% to -4.7% | within noise |
+| `iter_rows_via_next_event/pull_100_rows` | 1.60 µs | **-5.5% to -7.1%** | **PERFORMANCE IMPROVED** |
+| `iter_rows_via_next_row/pull_100_rows` | 1.43 µs | **-5.5% to -7.1%** | **PERFORMANCE IMPROVED** |
+| `iter_rows_via_next_row_bytes/pull_100_rows` | 1.43 µs | -2.8% to +0.16% | no change detected |
+| `iter_rows_via_consume_batch/pull_100_rows_8` | 1.46 µs | -1.5% to +0.07% | no change detected |
+| `iter_rows_via_for_each/pull_100_rows` | 1.44 µs | -3.5% to -1.7% | within noise |
+| `push_command/ping` | 12.8 ns | +0.27% to +1.0% | within noise |
+| `column_decode/data_row_parse_5cols` | 1.10 ns | +2.2% to +2.8% | within noise |
+| `column_decode/iter_5cols_raw_no_decode` | 6.19 ns | -0.17% to +0.67% | no change detected |
+| `column_decode/iter_5cols_decode_i32` | 32.1 ns | +0.16% to +0.94% | within noise |
+| `column_decode/iter_5cols_decode_i32_common_values` | 11.09 ns | +1.24% to +1.75% | within noise |
+| `column_decode/iter_5cols_decode_i32_short_4digit_via_swar` | 14.5 ns | +0.35% to +1.32% | within noise |
+| `column_decode/iter_5cols_decode_text_short_ascii` | 43.9 ns | +1.07% to +2.30% | within noise |
+| `column_decode/iter_5cols_decode_text_long_ascii` | 24.5 ns | +0.46% to +0.91% | within noise |
+| `column_decode/iter_5cols_decode_text_cyrillic` | 79.2 ns | -0.27% to +0.52% | no change detected |
+| `column_decode/iter_10cols_alternating_null_i32` | 35.6 ns | +0.32% to +1.02% | within noise |
+
+**Bench summary**: 17 benches, 4 "no change", 2 "improved" (+5-7% on row-stream pull paths), 11 "within noise threshold" (max +2.8% / -5.0%; criterion's noise floor is ±5% on consumer hardware). Architect prediction held: LLVM erases the cell newtypes (`#[repr(transparent)]`) and concrete-type tokens (ZST private fields). The 2 real improvements on row-stream paths likely stem from the cell newtype helping LLVM unify the read/write code paths through stricter borrow patterns — a perf side-effect of the closure tightening, not the goal.
+
 #### Sequential phase queue (ordered by impact-per-cost, lowest cost first)
 
 | Pos | DEF | Item | Expected | API impact |
