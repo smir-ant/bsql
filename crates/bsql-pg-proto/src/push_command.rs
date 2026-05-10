@@ -20,9 +20,15 @@
 //!
 //! # Tier-1 invariants
 //!
-//! - **Push from Idle**: `IdleStateProof` witness from `mod guard`,
-//!   reachable only through [`crate::guard::ReadyGuard::push_command`].
-//!   Same DEF-198 closure preserved.
+//! - **Push from Idle**: enforced at the
+//!   [`crate::PgProtocol::push_command_internal`] entry via the
+//!   [`crate::state_setter::IdleState::try_from`] lifetime-bound
+//!   typestate (DEF-272 cluster γ; supersedes the pre-γ `IdleStateProof`
+//!   ZST witness). The typestate IS the `&mut state` borrow + the Idle
+//!   proof, inseparable; pairing-with-different-state is impossible by
+//!   lifetime ownership. ReadyGuard's `as_ready` runtime check is the
+//!   upstream classifier; the typestate's `try_from` is belt-and-braces
+//!   tier-1 enforcement.
 //! - **Reply correlator typed**: Each impl statically knows its
 //!   `ReplyId<K>` parameter type — DEF-112 kind-parameterisation
 //!   surfaces at the impl boundary, no runtime command-kind tagging.
@@ -31,10 +37,11 @@
 //!   probe).
 
 // Sealed-trait pattern: `PushCommand::execute` references `pub(crate)`
-// types (`StagedAction`, `BrandedWriteReserved`, `IdleStateProof`).
-// External crates cannot construct any of these or implement the trait,
-// so the visibility "leakage" is purely cosmetic. Suppressed at module
-// scope so every per-command impl inherits the allow.
+// types (`StagedAction`, `BrandedWriteReserved`, `StateSetter<'_, W>`,
+// `RowDescSlotCell`). External crates cannot construct any of these
+// or implement the trait, so the visibility "leakage" is purely
+// cosmetic. Suppressed at module scope so every per-command impl
+// inherits the allow.
 #![allow(private_interfaces, private_bounds)]
 
 use crate::command::FetchRows;
@@ -69,10 +76,10 @@ mod sealed {
 /// # Sealed-trait visibility
 ///
 /// `execute` references `pub(crate)` types (`StagedAction`,
-/// `BrandedWriteReserved`, `IdleStateProof`). Per the sealed-trait
-/// pattern, external crates cannot construct these types or implement
-/// the trait — visibility leakage is purely cosmetic. Suppressed
-/// crate-locally.
+/// `BrandedWriteReserved`, `StateSetter<'_, W>`, `RowDescSlotCell`).
+/// Per the sealed-trait pattern, external crates cannot construct
+/// these types or implement the trait — visibility leakage is purely
+/// cosmetic. Suppressed crate-locally.
 #[allow(private_interfaces, private_bounds, reason = "sealed-trait pattern: trait method takes pub(crate) types — external crates cannot construct them or implement the trait, so the leakage is cosmetic only")]
 pub trait PushCommand: sealed::PushCommandSealed {
     /// Per-command output type. `()` for fire-and-forget commands;
@@ -109,11 +116,14 @@ pub trait PushCommand: sealed::PushCommandSealed {
     ///
     /// # Tier-1 witness — Idle state
     ///
-    /// `_proof: IdleStateProof` is constructible only inside
-    /// `mod guard` (DEF-198). The trait method requires it, so every
-    /// `execute` call must come through `ReadyGuard::push_command` —
-    /// which only constructs the witness after `as_ready()` confirmed
-    /// `state == Idle`.
+    /// The `setter: StateSetter<'_, Self::PostState>` parameter
+    /// inherits its `&mut state` borrow from the
+    /// [`crate::state_setter::IdleState::try_from`] typestate
+    /// constructed inside `push_command_internal` (DEF-272 cluster γ).
+    /// The typestate IS the proof + the borrow; reaching `execute()`
+    /// implies the runtime Idle classification succeeded. ReadyGuard's
+    /// `as_ready` is the upstream classifier; the typestate is
+    /// belt-and-braces enforcement at the boundary.
     ///
     /// # Tier-1 witness — post-state install
     ///
@@ -623,20 +633,20 @@ impl PostStateProof for DescribePortalAwaitingRowDescOrNoDataInstall {
 /// Witness pairing [`BindExecute<P>`] to one of two post-bind+execute
 /// variants (DML / SELECT). The split surfaces the schema-bearing
 /// vs schema-less path structurally — schema parking via
-/// [`crate::schema_slot::SchemaParkedSlot`] happens BEFORE the install,
-/// inside `compute_push_bind_execute_idle_only`; this witness only
-/// captures the variant choice + reply correlator.
+/// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`] happens
+/// BEFORE the install, inside `compute_push_bind_execute_idle_only`
+/// (gated by the leaf-private `BeSelectToken` per DEF-272 cluster α);
+/// this witness only captures the variant choice + reply correlator.
 ///
 /// **Note (Phase 2 scope):** the witness does NOT carry the
 /// `RowDesc` payload itself. The Phase 2 plan (`deferred.md` DEF-270)
 /// noted folding row_desc into the SELECT variant as one closure
 /// path; the chosen design keeps row_desc parking in
-/// `SchemaParkedSlot` (already tier-1 by-construction post-Phase 1)
-/// and only narrows the state-install pairing here. Rationale:
-/// avoiding GAT-driven `Aux` machinery on the trait keeps the
-/// surface clean; the residual mod-protocol `pub(in crate::protocol)`
-/// auth-tag scope from Phase 1 is acceptable tier-2 by-discipline.
-/// "Не стеклянная архитектура."
+/// `RowDescSlotCell` (tier-1 within-crate by-construction post-DEF-272
+/// cluster α) and only narrows the state-install pairing here.
+/// Rationale: avoiding GAT-driven `Aux` machinery on the trait keeps
+/// the surface clean; per-leaf concrete-token mints close the
+/// pre-DEF-272 sealed-trait bypass surface.
 #[must_use = "a BindExecutePostInstall has no effect until passed to StateSetter::install_post_state"]
 #[allow(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait")]
 pub enum BindExecutePostInstall {
@@ -647,7 +657,8 @@ pub enum BindExecutePostInstall {
     },
     /// Schema-bearing path → [`crate::state::ProtoState::BindExecuteAwaitingBindCompleteSelect`].
     /// `RowDesc` already parked in `PgProtocol::row_desc_slot` via
-    /// [`crate::schema_slot::SchemaParkedSlot`] before install.
+    /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`]
+    /// (gated by the `BeSelectToken` leaf-private mint) before install.
     Select {
         /// Correlator for the in-flight command.
         reply: ReplyId<QueryKind>,

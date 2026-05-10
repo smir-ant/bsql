@@ -1969,24 +1969,16 @@ impl PgProtocol {
                             // DEF-196: lazy-init session_params Box only
                             // when actually writing (here).
                             //
-                            // DEF-271 cluster B (2026-05-10): the
-                            // post-record MalformedPayload bump now lives
-                            // INSIDE record_param_status_with_slot — the
-                            // helper takes a SessionParamsSlot witness
-                            // (gated on AtParameterStatusFrame auth tag)
-                            // and consumes it via record() OR
-                            // bump_malformed_param_status() depending on
-                            // parse outcome. Consolidates the two-step
-                            // "parse → caller-bumps" into a single
-                            // mutation site behind the witness.
-                            //
-                            // DEF-271 cluster C (2026-05-10): full mint+use
-                            // moved into the leaf submodule
-                            // `_parameter_status_admit_leaf::admit_parameter_status_frame`.
-                            // The auth tag's struct literal `AtParameterStatusFrame(())`
-                            // is constructible only inside that submodule
-                            // (private field). External call sites in mod
-                            // protocol invoke the leaf helper.
+                            // DEF-272 cluster β (2026-05-10): admit goes
+                            // through `_parameter_status_admit_leaf::
+                            // admit_parameter_status_frame` which mints a
+                            // `ParamStatusToken` (private-field, leaf-
+                            // gated mint) and routes to
+                            // `SessionParamsCell::admit_at_param_status`.
+                            // The cell internally parses + records on
+                            // success / bumps malformed counter on parse
+                            // failure — single mutation site behind the
+                            // token-gated cell method.
                             // Outcome is signalled to the caller for
                             // potential future logging/test observation;
                             // current consumers (this site) discard it.
@@ -2017,14 +2009,11 @@ impl PgProtocol {
                             // when actually writing (here, bumping the
                             // notice counter).
                             //
-                            // DEF-271 cluster B (2026-05-10): write
-                            // gated through SessionParamsSlot witness.
-                            //
-                            // DEF-271 cluster C (2026-05-10): full
-                            // mint+use moved into the leaf submodule
-                            // `_notice_response_admit_leaf::admit_notice_response_frame`.
-                            // The auth tag literal is private to that
-                            // submodule.
+                            // DEF-272 cluster β (2026-05-10): admit goes
+                            // through `_notice_response_admit_leaf::
+                            // admit_notice_response_frame` which mints a
+                            // `NoticeResponseToken` (leaf-gated mint) and
+                            // routes to `SessionParamsCell::admit_at_notice_response`.
                             _notice_response_admit_leaf::admit_notice_response_frame(
                                 session_params_slot,
                             );
@@ -2280,9 +2269,10 @@ impl PgProtocol {
         //   over the full dispatch loop.
         match class {
             crate::state::StatePushClass::Idle => {
-                // DEF-270 R-rephrased: clear via SchemaParkedSlot witness.
-                // DEF-271 cluster C (2026-05-10): mint+use moved into
-                // the leaf submodule `_clear_residue_leaf`.
+                // DEF-272 cluster α: clear via leaf submodule
+                // `_clear_residue_leaf` which mints a
+                // `ClearResidueSchemaToken` (leaf-gated) and routes to
+                // `RowDescSlotCell::clear_at_residue`.
                 _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
                 // DEF-196: only clear arena if it was ever allocated.
                 if let Some(arena) = self.error_arena.as_deref_mut() {
@@ -2290,8 +2280,8 @@ impl PgProtocol {
                 }
             }
             crate::state::StatePushClass::Errored(_) => {
-                // DEF-270 R-rephrased + DEF-271 cluster C: same leaf
-                // submodule helper as the Idle arm.
+                // DEF-272 cluster α: same leaf-submodule helper as the
+                // Idle arm above.
                 _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
@@ -2300,15 +2290,11 @@ impl PgProtocol {
                 // forfeit on tear-down; `SessionParams::clear`'s Drop
                 // chain scrubs `SecretBoundedStr` bytes.
                 //
-                // DEF-271 cluster B (2026-05-10): write gated through
-                // SessionParamsSlot witness. AtClearSessionResidue
-                // implements both SchemaWriteAuth and
-                // SessionParamsWriteAuth — the same residue-cleanup
-                // site clears both slots; one tag, two sealed-trait
-                // impls (architect's #9 finding).
-                //
-                // DEF-271 cluster C (2026-05-10): mint+use for the
-                // session-params clear moved into the leaf helper too.
+                // DEF-272 cluster β: clear via the same leaf submodule
+                // `_clear_residue_leaf` which hosts both schema and
+                // session-side concrete tokens (`ClearResidueSchemaToken`
+                // and `ClearResidueSessionToken`). Each clear method on
+                // its respective Cell takes the matching token by value.
                 _clear_residue_leaf::clear_session_params_residue(&mut self.session_params);
             }
             // In-flight states — preserve residue. The exhaustive
@@ -3866,11 +3852,12 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
     // single slot BEFORE the state transition. The variant
     // shape (Select vs Dml) is the tier-1 signal that the
     // slot is populated.
-    // DEF-270 R-rephrased (Phase 1): park via SchemaParkedSlot witness.
-    // DEF-270 N-D (Phase 2): typed witness pairs BindExecute → BindExecuteAwaitingBindComplete{Dml,Select}.
-    // DEF-271 cluster C (Phase 3): mint+park moved into the leaf
-    // submodule `_bind_execute_select_install_leaf::install_select_transition`.
-    // The auth tag's struct literal is private to that submodule.
+    // DEF-270 N-D (Phase 2): typed witness pairs BindExecute →
+    // BindExecuteAwaitingBindComplete{Dml,Select}.
+    // DEF-272 cluster α: park via leaf submodule
+    // `_bind_execute_select_install_leaf::install_select_transition`
+    // which mints a `BeSelectToken` (private-field, leaf-gated mint)
+    // and routes to `RowDescSlotCell::park_at_be_select`.
     let post_install = match row_desc {
         Some(desc) => {
             _bind_execute_select_install_leaf::install_select_transition(row_desc_slot, desc);
@@ -4087,9 +4074,10 @@ fn build_startup_message(
 /// - [`StagedAction::FailReply { id, cause }`] — the builder failed
 ///   (`EmptyWriteRange`, `BuilderCapacityOverflow`,
 ///   `ParamsWriterOverflow`) OR the public push API was reached
-///   without `state == Idle` (architecturally-dead via DEF-198
-///   ReadyGuard + IdleStateProof witness; classified upstream by
-///   `compute_push` non-Idle arms). Captured for `Result::Err` arm.
+///   without `state == Idle` (architecturally-dead via DEF-272 γ
+///   `IdleState::try_from` typestate at the `push_command_internal`
+///   entry; classified upstream by `compute_push` non-Idle arms).
+///   Captured for `Result::Err` arm.
 ///   Architecturally exactly one `FailReply` per push cycle (single
 ///   builder error per command); the `if failure.is_none()` guard is
 ///   defensive against future pipelining refactors that batch pushes.
@@ -5589,13 +5577,14 @@ mod compute_push_tests {
         // PgProtocol::new() and hits the Idle arm). No handshake
         // drive needed.
         let reply_raw = nz(999);
-        // DEF-198 ext: internal test now goes through `ReadyGuard`
-        // since `push_bind_execute_internal`'s signature requires the
-        // sealed `IdleStateProof` witness (constructible only inside
-        // `mod guard`). Production-equivalent path; fresh proto is
-        // in `Idle` state so `as_ready()` returns `Some`. The
-        // architecturally-dead `None` arm early-returns to satisfy
-        // the lib-level `clippy::panic` forbid bundle.
+        // DEF-272 cluster γ: internal test goes through `ReadyGuard`
+        // (the only legitimate path that runtime-classifies state as
+        // Idle via `as_ready`). `push_command_internal` re-checks via
+        // `IdleState::try_from` typestate at entry; production
+        // callers always satisfy the check. Fresh proto is in `Idle`
+        // state so `as_ready()` returns `Some`. The architecturally-
+        // dead `None` arm early-returns to satisfy the lib-level
+        // `clippy::panic` forbid bundle.
         let Some(guard) = proto.as_ready() else { return };
         let result = guard.push_bind_execute(
             &crate::ident::PortalName::default(),
