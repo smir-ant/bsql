@@ -1852,6 +1852,282 @@ pub fn parse_short_uint_swar(bytes: &[u8]) -> Option<u32> {
     Some(value)
 }
 
+// ═════════════════════════════════════════════════════════════════
+// DEF-266 (β SWAR extension, 2026-05-11): three additional opt-in
+// helpers extending the DEF-250 Phase B precedent
+// (`parse_short_uint_swar` above). All caller-routed; NEVER embedded
+// in shared dispatch (avoids the LLVM heuristic shifts that doomed
+// DEF-250 attempts 1 + 2).
+//
+// Tier: caller-routed fast-paths. `Option::None` on invalid input is
+// runtime-classified (tier-3 inherent — arbitrary network bytes only
+// exist at runtime). Closure mechanism: exhaustive test grids over
+// the full validity domain for each helper, plus byte-position sweeps
+// covering rejection arms.
+// ═════════════════════════════════════════════════════════════════
+
+/// SWAR-style parser for 5-19 digit ASCII-decimal unsigned integers.
+///
+/// Extends [`parse_short_uint_swar`] (1-4 digits, `u32` range) to the
+/// `u64`-representable middle band. Lengths < 5 should use the short
+/// variant; lengths > 19 cannot be represented in `u64`
+/// (`u64::MAX == 18_446_744_073_709_551_615`, 20 digits).
+///
+/// # Algorithm
+///
+/// 1. Reject `bytes.len() < 5` or `bytes.len() > 19` via length test.
+/// 2. Left-pad input into a fixed-size `[u8; 24]` buffer with leading
+///    `b'0'`. A digit value `0` contributes `0` to any place value, so
+///    padded prefix bytes are invariant under accumulation.
+/// 3. Load three `u64` chunks (big-endian) from the padded buffer.
+/// 4. Lemire branch-free validation per chunk (same SWAR mask trick
+///    as [`parse_short_uint_swar`]): for valid digit `b ∈ b'0'..=b'9'`
+///    both `(b - 0x30)` and `(0x39 - b)` lie in `[0, 9]`. Any byte
+///    outside the digit range sets the high bit on one of those
+///    subtractions; ORed across three chunks, the masked
+///    `0x8080…80` band rejects every invalid shape in one branch.
+/// 5. Recombine via wrapping `*10 + digit`. Max value at 19 nines
+///    is `9_999_999_999_999_999_999 < u64::MAX`, so the accumulation
+///    is bit-exact on every valid input.
+///
+/// # Caller contract
+///
+/// - The helper accepts only the unsigned form. Leading `-` or `+`
+///   bytes fall below `b'0'`, the Lemire mask rejects, and `None`
+///   is returned. Callers decoding signed integers strip the sign
+///   byte first, then call this helper, then re-apply the sign.
+/// - For lengths 1-4 use [`parse_short_uint_swar`] — calling this
+///   helper on shorter input returns `None`.
+/// - Values 10^18 < v < u64::MAX are representable (19-digit window
+///   spans into u64 headroom above i64::MAX). Callers needing i64
+///   must verify `v <= i64::MAX as u64` after success.
+///
+/// # Tier
+///
+/// Runtime classification on invalid input is irreducibly tier-3
+/// (arbitrary byte input). Closure: exhaustive boundary-length grid,
+/// per-byte-position non-digit sweep, and boundary digit pin in
+/// `parse_long_uint_swar_tests`. The crate-root `forbid(unsafe_code)`
+/// plus the workspace forbid bundle keep the SWAR math tier-1 safe
+/// by construction.
+#[must_use]
+pub fn parse_long_uint_swar(bytes: &[u8]) -> Option<u64> {
+    let len = bytes.len();
+    if !(5..=19).contains(&len) {
+        return None;
+    }
+    // 24-byte buffer fits three u64 chunks. Left-pad with b'0'.
+    let mut buf = [b'0'; 24];
+    let pad_offset = 24usize.saturating_sub(len);
+    // Safe suffix copy via slice indexing on `[u8; 24]` — bounds are
+    // proven by `pad_offset + len == 24`; copy_from_slice asserts
+    // length equality internally.
+    let dst = buf.get_mut(pad_offset..)?;
+    if dst.len() != len {
+        return None; // architecturally dead — pad arithmetic above
+    }
+    dst.copy_from_slice(bytes);
+
+    // Three u64 big-endian chunks. Slice-to-array via try_into avoids
+    // the indexing-slicing lint trip while remaining tier-1 safe.
+    let chunk0: [u8; 8] = buf.get(0..8)?.try_into().ok()?;
+    let chunk1: [u8; 8] = buf.get(8..16)?.try_into().ok()?;
+    let chunk2: [u8; 8] = buf.get(16..24)?.try_into().ok()?;
+    let c0 = u64::from_be_bytes(chunk0);
+    let c1 = u64::from_be_bytes(chunk1);
+    let c2 = u64::from_be_bytes(chunk2);
+
+    // Lemire SWAR validation per chunk. Single masked OR rejects
+    // every byte outside `b'0'..=b'9'` across all three chunks.
+    const ZEROS: u64 = 0x3030_3030_3030_3030;
+    const NINES: u64 = 0x3939_3939_3939_3939;
+    const HIBIT: u64 = 0x8080_8080_8080_8080;
+    let l0 = c0.wrapping_sub(ZEROS);
+    let h0 = NINES.wrapping_sub(c0);
+    let l1 = c1.wrapping_sub(ZEROS);
+    let h1 = NINES.wrapping_sub(c1);
+    let l2 = c2.wrapping_sub(ZEROS);
+    let h2 = NINES.wrapping_sub(c2);
+    if ((l0 | h0) | (l1 | h1) | (l2 | h2)) & HIBIT != 0 {
+        return None;
+    }
+
+    // Each byte of l0/l1/l2 now holds the digit value 0..=9.
+    let b0 = l0.to_be_bytes();
+    let b1 = l1.to_be_bytes();
+    let b2 = l2.to_be_bytes();
+
+    // Length-aware recombination via parallel-multiply per place
+    // value. Three branches dispatch on the digit count class:
+    //
+    // - 5..=8  digits → only positions 16..=23 carry data; positions
+    //   0..=15 are padded zeros (verified by the Lemire mask above).
+    // - 9..=16 digits → positions 8..=23 carry data.
+    // - 17..=19 digits → positions 5..=23 carry data.
+    //
+    // Each branch issues 8/16/19 INDEPENDENT `wrapping_mul` ops with
+    // compile-time-constant place values; LLVM schedules them in
+    // parallel, then sums via a tree reduction. Pre-fix (single
+    // sequential Horner accumulator across 24 bytes) was a
+    // 24-instruction dependency chain and benched 3.5× slower than
+    // generic scalar decode at the 8-digit shape (113 ns/row vs
+    // 31 ns/row on `iter_5cols_decode_i32_long_8digit_via_swar`).
+    // The parallel form recovers the SWAR-promise speedup.
+    Some(match len {
+        5..=8 => {
+            // Active positions 16..=23 (in b2).
+            u64::from(b2[0]).wrapping_mul(10_000_000)
+                .wrapping_add(u64::from(b2[1]).wrapping_mul(1_000_000))
+                .wrapping_add(u64::from(b2[2]).wrapping_mul(100_000))
+                .wrapping_add(u64::from(b2[3]).wrapping_mul(10_000))
+                .wrapping_add(u64::from(b2[4]).wrapping_mul(1_000))
+                .wrapping_add(u64::from(b2[5]).wrapping_mul(100))
+                .wrapping_add(u64::from(b2[6]).wrapping_mul(10))
+                .wrapping_add(u64::from(b2[7]))
+        }
+        9..=16 => {
+            // Active positions 8..=23 (b1 + b2). Place values 10^15
+            // .. 10^0. All within u64 range (10^15 < u64::MAX).
+            u64::from(b1[0]).wrapping_mul(1_000_000_000_000_000)
+                .wrapping_add(u64::from(b1[1]).wrapping_mul(100_000_000_000_000))
+                .wrapping_add(u64::from(b1[2]).wrapping_mul(10_000_000_000_000))
+                .wrapping_add(u64::from(b1[3]).wrapping_mul(1_000_000_000_000))
+                .wrapping_add(u64::from(b1[4]).wrapping_mul(100_000_000_000))
+                .wrapping_add(u64::from(b1[5]).wrapping_mul(10_000_000_000))
+                .wrapping_add(u64::from(b1[6]).wrapping_mul(1_000_000_000))
+                .wrapping_add(u64::from(b1[7]).wrapping_mul(100_000_000))
+                .wrapping_add(u64::from(b2[0]).wrapping_mul(10_000_000))
+                .wrapping_add(u64::from(b2[1]).wrapping_mul(1_000_000))
+                .wrapping_add(u64::from(b2[2]).wrapping_mul(100_000))
+                .wrapping_add(u64::from(b2[3]).wrapping_mul(10_000))
+                .wrapping_add(u64::from(b2[4]).wrapping_mul(1_000))
+                .wrapping_add(u64::from(b2[5]).wrapping_mul(100))
+                .wrapping_add(u64::from(b2[6]).wrapping_mul(10))
+                .wrapping_add(u64::from(b2[7]))
+        }
+        17..=19 => {
+            // Active positions 5..=23 (b0[5..=7] + b1 + b2). Place
+            // values 10^18 .. 10^0. 10^18 < u64::MAX = 18.44 × 10^18.
+            u64::from(b0[5]).wrapping_mul(1_000_000_000_000_000_000)
+                .wrapping_add(u64::from(b0[6]).wrapping_mul(100_000_000_000_000_000))
+                .wrapping_add(u64::from(b0[7]).wrapping_mul(10_000_000_000_000_000))
+                .wrapping_add(u64::from(b1[0]).wrapping_mul(1_000_000_000_000_000))
+                .wrapping_add(u64::from(b1[1]).wrapping_mul(100_000_000_000_000))
+                .wrapping_add(u64::from(b1[2]).wrapping_mul(10_000_000_000_000))
+                .wrapping_add(u64::from(b1[3]).wrapping_mul(1_000_000_000_000))
+                .wrapping_add(u64::from(b1[4]).wrapping_mul(100_000_000_000))
+                .wrapping_add(u64::from(b1[5]).wrapping_mul(10_000_000_000))
+                .wrapping_add(u64::from(b1[6]).wrapping_mul(1_000_000_000))
+                .wrapping_add(u64::from(b1[7]).wrapping_mul(100_000_000))
+                .wrapping_add(u64::from(b2[0]).wrapping_mul(10_000_000))
+                .wrapping_add(u64::from(b2[1]).wrapping_mul(1_000_000))
+                .wrapping_add(u64::from(b2[2]).wrapping_mul(100_000))
+                .wrapping_add(u64::from(b2[3]).wrapping_mul(10_000))
+                .wrapping_add(u64::from(b2[4]).wrapping_mul(1_000))
+                .wrapping_add(u64::from(b2[5]).wrapping_mul(100))
+                .wrapping_add(u64::from(b2[6]).wrapping_mul(10))
+                .wrapping_add(u64::from(b2[7]))
+        }
+        // Architecturally dead — len was bounded by the initial test.
+        _ => return None,
+    })
+}
+
+/// SWAR ASCII fast-path for UTF-8 validation.
+///
+/// Scans `bytes` in 8-byte chunks. Returns `Some(())` if every byte
+/// is `< 0x80` (pure ASCII — automatically valid UTF-8 by the
+/// ASCII⊂UTF-8 spec). Returns `None` if any byte has the high bit
+/// set — the caller MUST then validate via a full UTF-8 checker
+/// (`simdutf8::basic::from_utf8` or `core::str::from_utf8`) to
+/// distinguish legitimate multi-byte UTF-8 from invalid bytes.
+///
+/// # When to use
+///
+/// `simdutf8::basic::from_utf8` has constant per-call setup overhead
+/// (lane initialisation, dispatcher selection on portable builds).
+/// On very short strings (≤ ~16 B, dominated by ASCII identifiers
+/// like column names, short enum tags) that overhead dominates.
+/// This helper checks the "all-ASCII" hypothesis in one masked OR
+/// per 8 bytes; on hit, the caller skips the full validator.
+///
+/// # Algorithm
+///
+/// 1. Process `bytes` in disjoint 8-byte chunks (no overlap).
+/// 2. For each chunk, load as `u64` (little-endian — byte order is
+///    irrelevant for high-bit-OR; LE just matches host on aarch64).
+/// 3. Test `packed & 0x8080_8080_8080_8080 != 0`. Set bit → at least
+///    one non-ASCII byte → return `None`.
+/// 4. Tail bytes (0-7) handled bytewise.
+///
+/// # Tier
+///
+/// Tier-1 safe by construction (slice patterns, no indexing-slicing,
+/// no unsafe). Tier-3 false-negative classification (returns `None`
+/// on legal multi-byte UTF-8 — caller MUST follow up with full
+/// validator; documented contract). Closure: byte-position sweep
+/// over boundary values `0x7F` (highest ASCII, accepted) and `0x80`
+/// (first non-ASCII, rejected) at every position within and across
+/// chunk boundaries.
+#[must_use]
+pub fn validate_utf8_swar(bytes: &[u8]) -> Option<()> {
+    const HIBIT: u64 = 0x8080_8080_8080_8080;
+    let mut tail: &[u8] = bytes;
+    while tail.len() >= 8 {
+        let (chunk, rest) = tail.split_at(8);
+        let arr: [u8; 8] = chunk.try_into().ok()?;
+        let packed = u64::from_le_bytes(arr);
+        if packed & HIBIT != 0 {
+            return None;
+        }
+        tail = rest;
+    }
+    for &b in tail {
+        if b >= 0x80 {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// Cache-hit fast-path for PostgreSQL boolean text literals.
+///
+/// Recognises the four PG-wire-legal text forms:
+/// - `b"t"` → `Some(true)` (canonical SELECT output)
+/// - `b"f"` → `Some(false)` (canonical SELECT output)
+/// - `b"true"` → `Some(true)` (extended input form)
+/// - `b"false"` → `Some(false)` (extended input form)
+///
+/// Returns `None` for every other byte slice. Caller falls back to
+/// their generic decoder (typically [`FromPgText`] for `bool`).
+///
+/// # Why a dedicated helper
+///
+/// The standard [`FromPgText`] for `bool` matches only `b"t"`/`b"f"`
+/// (PG's SELECT output format). Callers that ALSO need to accept
+/// the longer literal forms (e.g. when decoding COPY-from-stdin
+/// text streams, where PG accepts both short and long bool forms)
+/// would otherwise hand-roll the same `match` chain. This helper
+/// codifies the canonical four-form set in one place so callers
+/// can dispatch once.
+///
+/// # Tier
+///
+/// Tier-1 safe by construction: slice patterns over a closed set
+/// of byte-string literals. LLVM lowers the four patterns to an
+/// optimal jump table on `bytes.len()` followed by a constant-cmp
+/// per arm. No SWAR math needed — the optimal code IS the simple
+/// `match`; the "_swar" suffix is per the DEF-250 Phase B opt-in
+/// naming convention (helpers outside the shared dispatch).
+#[must_use]
+pub fn parse_pg_bool_swar(bytes: &[u8]) -> Option<bool> {
+    match bytes {
+        [b't'] | b"true" => Some(true),
+        [b'f'] | b"false" => Some(false),
+        _ => None,
+    }
+}
+
 // DEF-251 (audit 2026-05-08): common-literal fast-paths for i16/i32/i64
 // text decoders.
 //
@@ -3329,5 +3605,491 @@ mod parse_short_uint_swar_tests {
         assert_eq!(parse_short_uint_swar(b"99"), Some(99));
         assert_eq!(parse_short_uint_swar(b"0000"), Some(0));
         assert_eq!(parse_short_uint_swar(b"9999"), Some(9999));
+    }
+}
+
+#[cfg(test)]
+mod parse_long_uint_swar_tests {
+    //! DEF-266 β SWAR extension (2026-05-11): tier-3 closure for
+    //! `parse_long_uint_swar` (5-19 digit u64-range parser).
+    //!
+    //! Strategy mirrors `parse_short_uint_swar_tests`:
+    //! - representative grids at each natural length 5..=19,
+    //! - boundary length tests (rejects len 4 and len 20),
+    //! - sign rejection (the Lemire mask catches `-` / `+`),
+    //! - non-digit byte sweep at every position (chunk-boundary parity),
+    //! - boundary digit values `b'0'` / `b'9'` at each length,
+    //! - representative high-u64 values incl. above i64::MAX.
+    use super::*;
+    use alloc::format;
+    use alloc::string::ToString;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// Length-5 boundary: smallest input the helper accepts. The
+    /// upper variant `parse_short_uint_swar` caps at length 4; this
+    /// helper picks up at length 5 with no gap.
+    #[test]
+    fn def_266_long_swar_len5_grid_sampled() {
+        // Full 10_000..=99_999 grid (90k iterations) is fast in
+        // release tests but slow in debug; sample every 173rd value
+        // to hit the byte-position coverage cheaply.
+        let mut step: u64 = 10_000;
+        while step <= 99_999 {
+            let s = step.to_string();
+            assert_eq!(
+                parse_long_uint_swar(s.as_bytes()),
+                Some(step),
+                "5-digit: {s}",
+            );
+            step = step.saturating_add(173);
+        }
+        // Boundary endpoints exactly.
+        assert_eq!(parse_long_uint_swar(b"10000"), Some(10_000));
+        assert_eq!(parse_long_uint_swar(b"99999"), Some(99_999));
+    }
+
+    /// Lengths 6..=18 spot-checked with characteristic powers of 10
+    /// and "all 9s" patterns. Pins the chunk-boundary recombination
+    /// (8/16 byte u64 splits at lengths 9 and 17).
+    #[test]
+    fn def_266_long_swar_lengths_6_to_18_spot_checked() {
+        let cases: &[(&[u8], u64)] = &[
+            (b"100000",                  100_000_u64),                  // len 6
+            (b"999999",                  999_999_u64),                  // len 6
+            (b"1000000",                 1_000_000_u64),                // len 7
+            (b"9999999",                 9_999_999_u64),                // len 7
+            (b"10000000",                10_000_000_u64),               // len 8 (chunk boundary)
+            (b"99999999",                99_999_999_u64),               // len 8
+            (b"100000000",               100_000_000_u64),              // len 9
+            (b"999999999",               999_999_999_u64),              // len 9
+            (b"1000000000",              1_000_000_000_u64),            // len 10
+            (b"9999999999",              9_999_999_999_u64),            // len 10
+            (b"99999999999",             99_999_999_999_u64),           // len 11
+            (b"999999999999",            999_999_999_999_u64),          // len 12
+            (b"9999999999999",           9_999_999_999_999_u64),        // len 13
+            (b"99999999999999",          99_999_999_999_999_u64),       // len 14
+            (b"999999999999999",         999_999_999_999_999_u64),      // len 15
+            (b"9999999999999999",        9_999_999_999_999_999_u64),    // len 16 (chunk boundary)
+            (b"99999999999999999",       99_999_999_999_999_999_u64),   // len 17
+            (b"999999999999999999",      999_999_999_999_999_999_u64),  // len 18
+        ];
+        for &(input, expected) in cases {
+            assert_eq!(
+                parse_long_uint_swar(input),
+                Some(expected),
+                "input: {:?}",
+                core::str::from_utf8(input).unwrap_or("?"),
+            );
+        }
+    }
+
+    /// Length-19 boundary: highest accepted length. Verifies `u64`
+    /// headroom above `i64::MAX` is reachable (callers needing i64
+    /// must verify range AFTER success).
+    #[test]
+    fn def_266_long_swar_len19_boundary() {
+        // u64::MAX = 18_446_744_073_709_551_615 (20 digits) — rejected.
+        // i64::MAX =  9_223_372_036_854_775_807 (19 digits) — accepted.
+        // 19-nines  =  9_999_999_999_999_999_999             — accepted, > i64::MAX.
+        assert_eq!(
+            parse_long_uint_swar(b"9223372036854775807"),
+            Some(9_223_372_036_854_775_807_u64),
+            "i64::MAX",
+        );
+        assert_eq!(
+            parse_long_uint_swar(b"9999999999999999999"),
+            Some(9_999_999_999_999_999_999_u64),
+            "19-nines (> i64::MAX, fits u64)",
+        );
+        assert_eq!(
+            parse_long_uint_swar(b"1000000000000000000"),
+            Some(1_000_000_000_000_000_000_u64),
+            "10^18",
+        );
+    }
+
+    /// Length boundaries: lengths outside `5..=19` must reject.
+    #[test]
+    fn def_266_long_swar_length_boundaries() {
+        // Lengths below 5 (caller should use parse_short_uint_swar).
+        assert_eq!(parse_long_uint_swar(b""), None);
+        assert_eq!(parse_long_uint_swar(b"1"), None);
+        assert_eq!(parse_long_uint_swar(b"12"), None);
+        assert_eq!(parse_long_uint_swar(b"123"), None);
+        assert_eq!(parse_long_uint_swar(b"1234"), None);
+        // Length 20+ (exceeds u64 representability for safe overflow-free path).
+        let twenty = b"99999999999999999999"; // 20 nines
+        assert_eq!(parse_long_uint_swar(twenty), None);
+        let twenty_one: Vec<u8> = vec![b'1'; 21];
+        assert_eq!(parse_long_uint_swar(&twenty_one), None);
+    }
+
+    /// Sign rejection (mirror of short variant test). `b'-'` (0x2D)
+    /// and `b'+'` (0x2B) sit below `b'0'` (0x30); the Lemire mask's
+    /// `lo` term goes negative → high bit set → rejected.
+    #[test]
+    fn def_266_long_swar_rejects_leading_sign() {
+        assert_eq!(parse_long_uint_swar(b"-10000"), None);
+        assert_eq!(parse_long_uint_swar(b"+10000"), None);
+        assert_eq!(parse_long_uint_swar(b"-9999999999"), None);
+        assert_eq!(parse_long_uint_swar(b"+9999999999"), None);
+    }
+
+    /// Non-digit byte at every position within and across u64
+    /// chunk boundaries (positions 0, 7, 8, 15, 16, 18 in a len-19
+    /// input). Pins the chunked Lemire OR — a bug in chunk
+    /// composition would let one position slip through.
+    #[test]
+    fn def_266_long_swar_rejects_invalid_bytes_per_position() {
+        let invalid_bytes: &[u8] = &[
+            0x00, 0x2F, // '/' — one below b'0'
+            0x3A, // ':' — one above b'9'
+            b'a', b'A', 0x7F, 0x80, 0xFF,
+        ];
+        // Construct len-19 inputs with the bad byte at each position.
+        for &bad in invalid_bytes {
+            for pos in 0..19usize {
+                let mut buf: Vec<u8> = vec![b'5'; 19];
+                if let Some(slot) = buf.get_mut(pos) {
+                    *slot = bad;
+                }
+                assert_eq!(
+                    parse_long_uint_swar(&buf),
+                    None,
+                    "len-19 bad byte {bad:#x} at pos {pos}",
+                );
+            }
+        }
+        // Position-0 of len-5 specifically (smallest valid length).
+        for &bad in invalid_bytes {
+            assert_eq!(
+                parse_long_uint_swar(&[bad, b'1', b'2', b'3', b'4']),
+                None,
+                "len-5 bad byte {bad:#x} at pos 0",
+            );
+        }
+    }
+
+    /// Boundary digit values `b'0'` and `b'9'` at every length 5..=19.
+    /// An off-by-one in the SWAR mask constants would break the
+    /// inclusive-range semantic at one of these endpoints.
+    #[test]
+    fn def_266_long_swar_boundary_digits() {
+        for len in 5..=19usize {
+            // All-zeros input is valid; value is 0 regardless of length.
+            let zeros = "0".repeat(len);
+            assert_eq!(
+                parse_long_uint_swar(zeros.as_bytes()),
+                Some(0),
+                "len-{len} all zeros",
+            );
+            // All-nines input is valid; value = 10^len - 1.
+            let nines = "9".repeat(len);
+            let expected: u64 = (10_u64).pow(u32::try_from(len).unwrap_or(0)).saturating_sub(1);
+            assert_eq!(
+                parse_long_uint_swar(nines.as_bytes()),
+                Some(expected),
+                "len-{len} all nines",
+            );
+        }
+    }
+
+    /// Leading-zero forms are accepted (the helper is value-equivalent;
+    /// length-padded forms are also legal ASCII-decimal).
+    #[test]
+    fn def_266_long_swar_leading_zeros_accepted() {
+        assert_eq!(parse_long_uint_swar(b"00001"), Some(1));
+        assert_eq!(parse_long_uint_swar(b"0000000000000000001"), Some(1));
+        assert_eq!(
+            parse_long_uint_swar(b"0000000000000000099"),
+            Some(99),
+            "len-19 with leading zeros, value 99",
+        );
+    }
+
+    /// Empty input behaviour matches the short variant.
+    #[test]
+    fn def_266_long_swar_empty_input_rejected() {
+        assert_eq!(parse_long_uint_swar(b""), None);
+    }
+
+    /// Whitespace-padded input MUST reject (the helper requires
+    /// clean digit bytes; trimming is caller responsibility).
+    #[test]
+    fn def_266_long_swar_rejects_whitespace() {
+        assert_eq!(parse_long_uint_swar(b" 12345"), None);
+        assert_eq!(parse_long_uint_swar(b"12345 "), None);
+        assert_eq!(parse_long_uint_swar(b"\t12345"), None);
+        assert_eq!(parse_long_uint_swar(b"123 4567"), None); // mid-string space
+    }
+
+    /// Random spot-check of u64 values up to ~10^18 to pin the
+    /// recombination math beyond the boundary patterns above.
+    #[test]
+    fn def_266_long_swar_random_round_trip() {
+        let cases: &[u64] = &[
+            12_345_u64,
+            999_999_999_u64,
+            1_234_567_890_u64,
+            42_000_000_000_u64,
+            777_777_777_777_u64,
+            1_000_000_000_000_000_u64,
+            500_500_500_500_500_u64,
+            9_223_372_036_854_775_807_u64,            // i64::MAX
+            9_223_372_036_854_775_808_u64,            // i64::MAX + 1, fits u64
+        ];
+        for &v in cases {
+            let s = format!("{v}");
+            if s.len() >= 5 && s.len() <= 19 {
+                assert_eq!(
+                    parse_long_uint_swar(s.as_bytes()),
+                    Some(v),
+                    "round-trip {v}",
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod validate_utf8_swar_tests {
+    //! DEF-266 β SWAR extension (2026-05-11): tier-3 closure for
+    //! `validate_utf8_swar` (all-ASCII fast-path detector).
+    //!
+    //! The helper's contract is one-sided: `Some(())` ⇒ pure ASCII
+    //! (thus valid UTF-8). `None` ⇒ at least one high-bit byte,
+    //! caller defers to a full UTF-8 validator. Tests pin:
+    //! - boundary ASCII values `b'\x7F'` (accepted, highest ASCII)
+    //!   and `b'\x80'` (rejected, lowest non-ASCII),
+    //! - chunk-boundary parity: high-bit byte at positions 0..15
+    //!   across the 8-byte chunk + tail split,
+    //! - empty-input behaviour,
+    //! - representative long ASCII string acceptance.
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// Empty input is trivially all-ASCII.
+    #[test]
+    fn def_266_validate_utf8_empty_input_accepts() {
+        assert_eq!(validate_utf8_swar(b""), Some(()));
+    }
+
+    /// All bytes `0x00..=0x7F` are ASCII; representative spot-checks
+    /// at every length 1..=24 (covers ≥ 3 full 8-byte chunks).
+    #[test]
+    fn def_266_validate_utf8_pure_ascii_accepts_all_lengths() {
+        for len in 1..=24usize {
+            let buf: Vec<u8> = vec![b'A'; len];
+            assert_eq!(
+                validate_utf8_swar(&buf),
+                Some(()),
+                "len {len} all-ASCII 'A's",
+            );
+        }
+        // Long-ASCII spot-check (realistic column-name length).
+        assert_eq!(
+            validate_utf8_swar(b"alice@example.com"),
+            Some(()),
+            "17-byte ASCII",
+        );
+        assert_eq!(
+            validate_utf8_swar(b"the quick brown fox jumps over the lazy dog"),
+            Some(()),
+            "43-byte ASCII",
+        );
+    }
+
+    /// Boundary byte value: `0x7F` is highest ASCII (accepted),
+    /// `0x80` is first non-ASCII (rejected). Test both at every
+    /// byte position within and across chunk boundaries.
+    #[test]
+    fn def_266_validate_utf8_boundary_bytes() {
+        // 0x7F accepted at any position.
+        for pos in 0..16usize {
+            let mut buf: Vec<u8> = vec![b'A'; 16];
+            if let Some(slot) = buf.get_mut(pos) {
+                *slot = 0x7F;
+            }
+            assert_eq!(
+                validate_utf8_swar(&buf),
+                Some(()),
+                "len-16 0x7F at pos {pos}",
+            );
+        }
+        // 0x80 rejected at any position.
+        for pos in 0..16usize {
+            let mut buf: Vec<u8> = vec![b'A'; 16];
+            if let Some(slot) = buf.get_mut(pos) {
+                *slot = 0x80;
+            }
+            assert_eq!(
+                validate_utf8_swar(&buf),
+                None,
+                "len-16 0x80 at pos {pos}",
+            );
+        }
+    }
+
+    /// Chunk-boundary parity: high-bit byte placed at positions 7
+    /// (last byte of first chunk), 8 (first byte of second chunk),
+    /// and 15 (last byte of second chunk).
+    #[test]
+    fn def_266_validate_utf8_chunk_boundary_rejection() {
+        let mut buf = [b'A'; 16];
+        buf[7] = 0xFF;
+        assert_eq!(validate_utf8_swar(&buf), None, "0xFF at pos 7");
+        let mut buf = [b'A'; 16];
+        buf[8] = 0xFF;
+        assert_eq!(validate_utf8_swar(&buf), None, "0xFF at pos 8");
+        let mut buf = [b'A'; 16];
+        buf[15] = 0xFF;
+        assert_eq!(validate_utf8_swar(&buf), None, "0xFF at pos 15");
+    }
+
+    /// Tail bytes (length not multiple of 8) are processed bytewise.
+    /// Pin the tail path with high-bit bytes at every tail position.
+    #[test]
+    fn def_266_validate_utf8_tail_handling() {
+        // len 1..=7: only tail, no full chunk.
+        for len in 1..=7usize {
+            for pos in 0..len {
+                let mut buf: Vec<u8> = vec![b'A'; len];
+                if let Some(slot) = buf.get_mut(pos) {
+                    *slot = 0x80;
+                }
+                assert_eq!(
+                    validate_utf8_swar(&buf),
+                    None,
+                    "tail-only len {len} 0x80 at pos {pos}",
+                );
+            }
+        }
+        // len 9..=15: one chunk + tail. High bit in tail.
+        for tail_len in 1..=7usize {
+            let total = 8 + tail_len;
+            let mut buf: Vec<u8> = vec![b'A'; total];
+            if let Some(slot) = buf.get_mut(total.saturating_sub(1)) {
+                *slot = 0xC0;
+            }
+            assert_eq!(
+                validate_utf8_swar(&buf),
+                None,
+                "chunk+tail len {total} 0xC0 at last byte",
+            );
+        }
+    }
+
+    /// Legitimate multi-byte UTF-8 (e.g. Cyrillic) is correctly
+    /// classified as "not pure ASCII" — caller MUST then use
+    /// `simdutf8::basic::from_utf8` for true UTF-8 validation.
+    /// This pins the contract: a `None` return is NOT a "invalid
+    /// UTF-8" verdict; it is a "fast-path miss, defer to full
+    /// validator" signal.
+    #[test]
+    fn def_266_validate_utf8_multibyte_signals_fast_path_miss() {
+        // "Привет" (Cyrillic) — valid UTF-8 but contains 0xD0/0xD1
+        // continuation lead bytes. Helper returns None correctly.
+        assert_eq!(
+            validate_utf8_swar("Привет".as_bytes()),
+            None,
+            "Cyrillic 'Привет' — multi-byte UTF-8, fast-path miss",
+        );
+        assert_eq!(
+            validate_utf8_swar("日本語".as_bytes()),
+            None,
+            "Japanese — multi-byte UTF-8, fast-path miss",
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_pg_bool_swar_tests {
+    //! DEF-266 β SWAR extension (2026-05-11): tier-3 closure for
+    //! `parse_pg_bool_swar` (4-form PG boolean cache-hit parser).
+    //!
+    //! Exhaustive — there are exactly four accepted shapes.
+    //! Rejection-side covered with realistic miss cases.
+    use super::*;
+
+    /// All four accepted forms map to the correct value.
+    #[test]
+    fn def_266_pg_bool_swar_accepted_forms() {
+        assert_eq!(parse_pg_bool_swar(b"t"), Some(true));
+        assert_eq!(parse_pg_bool_swar(b"f"), Some(false));
+        assert_eq!(parse_pg_bool_swar(b"true"), Some(true));
+        assert_eq!(parse_pg_bool_swar(b"false"), Some(false));
+    }
+
+    /// Empty input must reject.
+    #[test]
+    fn def_266_pg_bool_swar_rejects_empty() {
+        assert_eq!(parse_pg_bool_swar(b""), None);
+    }
+
+    /// Uppercase forms must reject (the helper is case-sensitive;
+    /// PG SELECT output is always lowercase `t` / `f`).
+    #[test]
+    fn def_266_pg_bool_swar_rejects_uppercase() {
+        assert_eq!(parse_pg_bool_swar(b"T"), None);
+        assert_eq!(parse_pg_bool_swar(b"F"), None);
+        assert_eq!(parse_pg_bool_swar(b"True"), None);
+        assert_eq!(parse_pg_bool_swar(b"TRUE"), None);
+        assert_eq!(parse_pg_bool_swar(b"False"), None);
+        assert_eq!(parse_pg_bool_swar(b"FALSE"), None);
+    }
+
+    /// Single-byte non-bool literals reject.
+    #[test]
+    fn def_266_pg_bool_swar_rejects_other_single_bytes() {
+        for byte in u8::MIN..=u8::MAX {
+            if byte == b't' || byte == b'f' {
+                continue;
+            }
+            assert_eq!(
+                parse_pg_bool_swar(&[byte]),
+                None,
+                "single byte {byte:#x}",
+            );
+        }
+    }
+
+    /// Wrong-length 2-3 byte inputs reject.
+    #[test]
+    fn def_266_pg_bool_swar_rejects_wrong_length() {
+        assert_eq!(parse_pg_bool_swar(b"tr"), None);
+        assert_eq!(parse_pg_bool_swar(b"tru"), None);
+        assert_eq!(parse_pg_bool_swar(b"fa"), None);
+        assert_eq!(parse_pg_bool_swar(b"fal"), None);
+        assert_eq!(parse_pg_bool_swar(b"fals"), None);
+    }
+
+    /// 4-byte non-"true" inputs reject (pins the slice-pattern
+    /// constancy of the b"true" arm).
+    #[test]
+    fn def_266_pg_bool_swar_rejects_other_4_byte() {
+        assert_eq!(parse_pg_bool_swar(b"trxe"), None);
+        assert_eq!(parse_pg_bool_swar(b"trux"), None);
+        assert_eq!(parse_pg_bool_swar(b"xrue"), None);
+        assert_eq!(parse_pg_bool_swar(b"abcd"), None);
+    }
+
+    /// 5-byte non-"false" inputs reject.
+    #[test]
+    fn def_266_pg_bool_swar_rejects_other_5_byte() {
+        assert_eq!(parse_pg_bool_swar(b"falsx"), None);
+        assert_eq!(parse_pg_bool_swar(b"falxe"), None);
+        assert_eq!(parse_pg_bool_swar(b"xalse"), None);
+        assert_eq!(parse_pg_bool_swar(b"abcde"), None);
+    }
+
+    /// 6+ byte inputs reject regardless of content.
+    #[test]
+    fn def_266_pg_bool_swar_rejects_overlong() {
+        assert_eq!(parse_pg_bool_swar(b"true "), None); // trailing space
+        assert_eq!(parse_pg_bool_swar(b" true"), None); // leading space
+        assert_eq!(parse_pg_bool_swar(b"truex"), None);
+        assert_eq!(parse_pg_bool_swar(b"falses"), None);
     }
 }

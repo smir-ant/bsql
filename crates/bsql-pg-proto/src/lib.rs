@@ -331,7 +331,7 @@ pub use command::FetchRows;
 pub use decode::{
     ColumnDesc, ColumnsIter, DataRowRef, DecodeError, FormatCode, FormatCodeSet, FromPgText,
     MAX_ROW_COLUMNS, OutOfRange, RowDesc, RowDescBorrow, RowDescColumnsIter, oids,
-    parse_short_uint_swar,
+    parse_long_uint_swar, parse_pg_bool_swar, parse_short_uint_swar, validate_utf8_swar,
 };
 pub use error::{CrateBugLocus, ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};

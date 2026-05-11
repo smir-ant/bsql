@@ -1045,6 +1045,160 @@ fn bench_iter_columns_5x_int4_swar_short(c: &mut Criterion) {
     group.finish();
 }
 
+/// DEF-266 (β SWAR extension, 2026-05-11): caller-routed fast-path
+/// for unsigned i64 text decoding on 5-19 digit values.
+///
+/// `parse_long_uint_swar` extends the DEF-250 Phase B precedent to
+/// the i64-representable range. Bench shape: 5 columns of an 8-digit
+/// literal (`42_000_000`) — the same body as
+/// `iter_5cols_decode_i32` for direct comparison. The 8-digit shape
+/// puts the helper in the mid-band (between len-5 minimum and
+/// len-19 maximum). Realistic analogues: unix timestamps, customer
+/// IDs, transaction IDs.
+fn bench_iter_columns_5x_int4_swar_long(c: &mut Criterion) {
+    use bsql_pg_proto::decode::{DataRowRef, FromPgText, parse_long_uint_swar};
+
+    let mut group = c.benchmark_group("column_decode");
+    const N_COLS: u16 = 5;
+    group.throughput(Throughput::Elements(u64::from(N_COLS)));
+
+    // 8-digit value — middle of the helper's 5-19 acceptance window.
+    // Same body shape as `iter_5cols_decode_i32` for compare.
+    let body = data_row_body_int4(N_COLS, 42_000_000);
+
+    group.bench_function("iter_5cols_decode_i32_long_8digit_via_swar", |b| {
+        b.iter(|| {
+            let row = match DataRowRef::parse(black_box(&body)) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut sum: i64 = 0;
+            for col in row.columns() {
+                if let Ok(Some(bytes)) = col {
+                    // Caller knows the column is unsigned-ish i32;
+                    // SWAR long-uint covers the 5-19 digit unsigned
+                    // mid-band. Sign handling falls back to generic.
+                    let v = parse_long_uint_swar(bytes)
+                        .and_then(|u| i32::try_from(u).ok())
+                        .or_else(|| i32::from_pg_text(bytes).ok());
+                    if let Some(v) = v {
+                        sum = sum.saturating_add(i64::from(v));
+                    }
+                }
+            }
+            black_box(sum);
+        });
+    });
+
+    group.finish();
+}
+
+/// DEF-266 (β SWAR extension, 2026-05-11): micro-bench for the
+/// all-ASCII fast-path UTF-8 validator.
+///
+/// `validate_utf8_swar` returns `Some(())` on pure ASCII input
+/// (skipping the full `simdutf8` validator's setup overhead).
+/// Three shapes pin the per-length cost curve:
+///
+/// 1. **Short ASCII** (17 B `alice@example.com`) — typical column
+///    name / short identifier. The helper's win is largest here
+///    because `simdutf8` setup cost dominates short inputs.
+/// 2. **Long ASCII** (200 B descriptive text) — log lines, free
+///    text. Helper still wins (scanning is one masked-OR per 8 B)
+///    but `simdutf8` amortises better.
+/// 3. **Multi-byte UTF-8** (Cyrillic ~80 B) — helper returns `None`
+///    (fast-path miss); pin the miss-arm cost as ≤ helper-hit cost
+///    minus the SIMD setup cost.
+fn bench_validate_utf8_swar(c: &mut Criterion) {
+    use bsql_pg_proto::decode::validate_utf8_swar;
+
+    let mut group = c.benchmark_group("column_decode");
+    group.throughput(Throughput::Elements(1));
+
+    let short_ascii: &[u8] = b"alice@example.com"; // 17 B
+    let long_ascii: alloc::vec::Vec<u8> = b"The quick brown fox jumps over the lazy dog. \
+        Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
+        Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. \
+        Ut enim ad minim veniam, quis nostrud exercitation."
+        .to_vec();
+    let cyrillic: alloc::vec::Vec<u8> = "Привет, мир! Это многобайтный UTF-8 текст для проверки.".as_bytes().to_vec();
+
+    group.bench_function("validate_utf8_swar_short_ascii_17b", |b| {
+        b.iter(|| {
+            let r = validate_utf8_swar(black_box(short_ascii));
+            black_box(r);
+        });
+    });
+
+    group.bench_function("validate_utf8_swar_long_ascii_200b", |b| {
+        b.iter(|| {
+            let r = validate_utf8_swar(black_box(&long_ascii));
+            black_box(r);
+        });
+    });
+
+    group.bench_function("validate_utf8_swar_multibyte_miss", |b| {
+        b.iter(|| {
+            let r = validate_utf8_swar(black_box(&cyrillic));
+            black_box(r);
+        });
+    });
+
+    group.finish();
+}
+
+/// DEF-266 (β SWAR extension, 2026-05-11): micro-bench for the
+/// PG boolean text-literal cache-hit parser.
+///
+/// `parse_pg_bool_swar` recognises the four PG-wire-legal forms
+/// (`b"t"` / `b"f"` / `b"true"` / `b"false"`) and returns `None`
+/// on every other byte slice. Measures each accepted shape so
+/// LLVM jump-table layout is visible; a miss-case measures the
+/// fall-through cost.
+fn bench_parse_pg_bool_swar(c: &mut Criterion) {
+    use bsql_pg_proto::decode::parse_pg_bool_swar;
+
+    let mut group = c.benchmark_group("column_decode");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("parse_pg_bool_swar_t", |b| {
+        b.iter(|| {
+            let r = parse_pg_bool_swar(black_box(b"t"));
+            black_box(r);
+        });
+    });
+
+    group.bench_function("parse_pg_bool_swar_f", |b| {
+        b.iter(|| {
+            let r = parse_pg_bool_swar(black_box(b"f"));
+            black_box(r);
+        });
+    });
+
+    group.bench_function("parse_pg_bool_swar_true", |b| {
+        b.iter(|| {
+            let r = parse_pg_bool_swar(black_box(b"true"));
+            black_box(r);
+        });
+    });
+
+    group.bench_function("parse_pg_bool_swar_false", |b| {
+        b.iter(|| {
+            let r = parse_pg_bool_swar(black_box(b"false"));
+            black_box(r);
+        });
+    });
+
+    group.bench_function("parse_pg_bool_swar_miss", |b| {
+        b.iter(|| {
+            let r = parse_pg_bool_swar(black_box(b"yes"));
+            black_box(r);
+        });
+    });
+
+    group.finish();
+}
+
 /// Bench: per-column decode for 5 text columns of varying shapes.
 ///
 /// Three shapes cover the realistic Postgres text-column distribution:
@@ -1200,6 +1354,10 @@ criterion_group!(
     bench_iter_columns_5x_int4_swar_short,
     bench_iter_columns_5x_text_decode,
     bench_iter_columns_with_nulls,
+    // DEF-266 β SWAR extension: three additional opt-in helpers.
+    bench_iter_columns_5x_int4_swar_long,
+    bench_validate_utf8_swar,
+    bench_parse_pg_bool_swar,
 );
 criterion_main!(benches);
 
