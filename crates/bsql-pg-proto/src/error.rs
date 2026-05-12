@@ -808,6 +808,29 @@ pub enum CrateBugLocus {
     /// `as_ready`'s check and `push_command_internal`'s entry — the
     /// `&mut PgProtocol` borrow chain rules out interleaving).
     PushCommandInternalNonIdle,
+
+    /// DEF-248 Sub-A (2026-05-12): the closure passed to
+    /// [`crate::PgProtocol::iter_rows`] returned (normal exit, early
+    /// return, or panic unwind) while a `RowStream` was mid-frame —
+    /// either inside a row body (column events still pending) or in
+    /// partial-frame mode (frame body bytes still in flight on the
+    /// wire). The wire is in an ambiguous state: the read cursor may
+    /// sit mid-frame and any subsequent feed_bytes call on the same
+    /// connection would mis-classify the inbound bytes as a fresh
+    /// frame header.
+    ///
+    /// The [`crate::row_stream::RowStream`] `Drop` impl installs
+    /// `Errored(InternalCrateBug { locus: StreamDroppedMidStream })`
+    /// when the stream's `drained` flag is `false` at drop time. The
+    /// in-flight reply id (if any — streaming variants always carry
+    /// one) is atomically drained via the FeedStateSetter route;
+    /// because Drop has no caller context to which to deliver a
+    /// FailReply, the drained id is currently absorbed (architectural
+    /// boundary — see method doc on
+    /// `PgProtocol::install_errored_stream_dropped_mid_stream`). The
+    /// next operation on the connection observes the Errored state and
+    /// surfaces `ConnectionAlreadyClosed { prior_kind: ClientOrdering }`.
+    StreamDroppedMidStream,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -859,6 +882,7 @@ impl fmt::Display for CrateBugLocus {
             Self::BuilderCapacityOverflow => f.write_str("builder-capacity-overflow"),
             Self::ReplyIdSaturation => f.write_str("reply-id-saturation"),
             Self::PushCommandInternalNonIdle => f.write_str("push-command-internal-non-idle"),
+            Self::StreamDroppedMidStream => f.write_str("stream-dropped-mid-stream"),
         }
     }
 }
@@ -944,6 +968,21 @@ mod crate_bug_locus_display_tests {
         assert_eq!(
             format!("{e}"),
             "internal bsql-pg-proto bug at locus reply-id-saturation",
+        );
+    }
+
+    /// DEF-248 Sub-A (2026-05-12) pin: StreamDroppedMidStream locus
+    /// renders to its canonical operator-facing string. Watches for
+    /// drift on the closure-scoped iter_rows Drop-install path's
+    /// operator-facing log signal.
+    #[test]
+    fn stream_dropped_mid_stream_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::StreamDroppedMidStream,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus stream-dropped-mid-stream",
         );
     }
 }

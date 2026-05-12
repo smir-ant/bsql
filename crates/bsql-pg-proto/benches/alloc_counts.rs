@@ -319,7 +319,7 @@ fn scenario_push_command_only() {
 }
 
 fn scenario_iter_rows_100() {
-    use bsql_pg_proto::row_stream::StreamItem;
+    use bsql_pg_proto::ColEvent;
     const N_ROWS: u32 = 100;
 
     // Setup OUTSIDE the snapshot — we want to measure per-row
@@ -350,17 +350,19 @@ fn scenario_iter_rows_100() {
     }
 
     measure("iter_rows_100", || {
-        let mut stream = proto.iter_rows(&mut wb);
-        let mut rows_seen: u32 = 0;
-        loop {
-            match stream.next_event() {
-                StreamItem::Row { .. } => rows_seen = rows_seen.saturating_add(1),
-                StreamItem::NeedMore | StreamItem::CloseSocket | StreamItem::Complete { .. } => {
-                    break
+        let rows_seen = proto.iter_rows(&mut wb, |stream| {
+            let mut rows: u32 = 0;
+            loop {
+                match stream.col_next() {
+                    ColEvent::Got { .. } | ColEvent::Null { .. } => {}
+                    ColEvent::EndRow => rows = rows.saturating_add(1),
+                    ColEvent::Chunk { .. } | ColEvent::ChunkEnd { .. } => {}
+                    ColEvent::NeedMore | ColEvent::EndQuery { .. } => break,
+                    _ => break,
                 }
-                _ => break,
             }
-        }
+            rows
+        });
         assert!(
             rows_seen >= N_ROWS,
             "alloc bench: expected {N_ROWS} rows, pulled {rows_seen}",

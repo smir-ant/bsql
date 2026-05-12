@@ -268,7 +268,7 @@ impl<'a> FeedStateSetter<'a> {
     ///
     /// The returned `Option<NonZeroU64>`:
     /// - `Some(id)`: caller MUST emit `StagedAction::FailReply { id, cause }`
-    ///   (or `StreamItem::FailReply { id, cause }` from RowStream).
+    ///   (or `ColEvent::EndQuery::Err { id, cause }` from RowStream).
     ///   Dropping the id leaves the user's oneshot-receiver hanging
     ///   forever — the **zombie-reply class** that the typestate is
     ///   here to prevent.
@@ -281,7 +281,7 @@ impl<'a> FeedStateSetter<'a> {
     #[inline]
     #[must_use = "the returned Option<NonZeroU64> contains the in-flight reply id (if any) \
                   released by this transition. Caller MUST emit StagedAction::FailReply \
-                  { id, cause } or StreamItem::FailReply { id, cause } — dropping the id \
+                  { id, cause } or ColEvent::EndQuery::Err { id, cause } — dropping the id \
                   leaves the user's oneshot-receiver hanging forever (zombie-reply class). \
                   This `#[must_use]` + crate-wide `deny(unused_must_use)` rejects the leak \
                   at build time."]
@@ -338,7 +338,7 @@ pub(crate) fn drain_at_replyid_saturation(
 /// `CrateBugLocus::ReadCursorAdvance`).
 #[inline]
 #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
-              by the Errored install. Caller MUST emit StreamItem::FailReply or equivalent — \
+              by the Errored install. Caller MUST emit ColEvent::EndQuery::Err or equivalent — \
               dropping it leaks the user's oneshot-receiver (zombie-reply class)."]
 pub(crate) fn drain_at_read_cursor_advance(
     state: &mut ProtoState,
@@ -354,7 +354,7 @@ pub(crate) fn drain_at_read_cursor_advance(
 /// `ProtocolError::MalformedDataRow`).
 #[inline]
 #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
-              by the Errored install. Caller MUST emit StreamItem::FailReply or equivalent."]
+              by the Errored install. Caller MUST emit ColEvent::EndQuery::Err or equivalent."]
 pub(crate) fn drain_at_malformed_data_row(
     state: &mut ProtoState,
     _t: crate::protocol::_malformed_data_row_drain_leaf::MalformedDataRowToken,
@@ -373,6 +373,37 @@ pub(crate) fn drain_at_malformed_data_row(
 pub(crate) fn drain_at_fail_inflight_no_readbuf(
     state: &mut ProtoState,
     _t: crate::protocol::_fail_inflight_no_readbuf_drain_leaf::FailInflightNoReadbufToken,
+    kind: StateErrorKind,
+) -> Option<NonZeroU64> {
+    FeedStateSetter::new(state).drain_and_install_errored(kind)
+}
+
+/// DEF-248 Sub-A (2026-05-12) leaf entry point: RowStream Drop fired
+/// while the stream was mid-frame (column events still pending or
+/// partial-frame mode active). Used by
+/// [`crate::PgProtocol::install_errored_stream_dropped_mid_stream`]
+/// from inside [`crate::row_stream::RowStream::drop`]; classified as
+/// [`crate::error::CrateBugLocus::StreamDroppedMidStream`].
+///
+/// **Caller drop context**: Drop has no `&mut StagedActions` /
+/// downstream callbacks, so the drained in-flight reply id is absorbed
+/// at the call site (the receiver this id correlates to no longer has
+/// a path to be resolved via this RowStream invocation; the next
+/// `feed_bytes` / `push_command` will surface
+/// `ConnectionAlreadyClosed { prior_kind }` to indicate connection
+/// teardown). The `#[must_use]` lint still fires inside the call site
+/// for code-review discoverability (a future refactor that gains a
+/// FailReply path here should consume the id).
+#[inline]
+#[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+              by the Errored install. Drop-site caller binds it to `_drained_at_drop` \
+              for documentation — drop has no FailReply emission context, but the next \
+              operation on the connection surfaces ConnectionAlreadyClosed { prior_kind: \
+              ClientOrdering } so the user's oneshot is not silently leaked at the \
+              wrapper layer."]
+pub(crate) fn drain_at_stream_dropped_mid_stream(
+    state: &mut ProtoState,
+    _t: crate::protocol::_stream_dropped_mid_stream_drain_leaf::StreamDroppedMidStreamToken,
     kind: StateErrorKind,
 ) -> Option<NonZeroU64> {
     FeedStateSetter::new(state).drain_and_install_errored(kind)

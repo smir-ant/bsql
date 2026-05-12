@@ -346,7 +346,7 @@ pub use reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,
     ReplyId, ReplyKind, StartupKind,
 };
-pub use row_stream::{RowStream, StreamItem};
+pub use row_stream::{ColEvent, RowStream};
 pub use sensitive::Sensitive;
 pub use session_params::{Encoding, OtherEncoding, SessionParams};
 // DEF-211 INNO-01: re-export the `Pristine` trait + matching derive

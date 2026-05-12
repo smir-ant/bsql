@@ -496,6 +496,32 @@ pub struct ReadBuf {
     /// Read cursor into the active storage. Tier-1 invariant:
     /// `cursor <= active_storage.len() <= cap <= 65_535`.
     cursor: u16,
+    /// **DEF-248 Sub-A (2026-05-12)** — partial-frame mode tracker.
+    ///
+    /// `0` outside partial-frame mode (the common case: every frame
+    /// either fits whole in the active storage, or the dispatcher
+    /// classifies it as `FrameTooLarge` and tears down).
+    ///
+    /// Non-zero inside partial-frame mode: the count of body bytes
+    /// the wire still owes us before the in-flight frame body is
+    /// complete. Decremented as bytes are consumed (drained via
+    /// `subtract_partial_remaining`) by the streaming consumer
+    /// ([`crate::row_stream::RowStream::col_next`] in Sub-A scope).
+    ///
+    /// Tier-1 by-construction: the field is `pub(crate)`-visible
+    /// only via the `partial_*` accessors below, and the mutators
+    /// require a [`_row_stream_partial_leaf::PartialFrameToken`]
+    /// whose tuple-struct field is private to the leaf submodule.
+    /// External callers cannot toggle partial mode; the
+    /// leaf-submodule is the single proximate mint site.
+    ///
+    /// Sub-A scope: partial mode is entered ONLY for D-tag
+    /// (`DataRow`) frames in row-streaming protocol state. Non-D
+    /// tags > `READ_BUF_CAP` continue to tear down with
+    /// `HeaderParse::FrameTooLarge` (memo §1 third bullet — Sub-B's
+    /// concern). The partial-mode counter itself is frame-agnostic;
+    /// only the policy that gates entry is tag-restricted.
+    partial_remaining: u32,
 }
 
 impl Default for ReadBuf {
@@ -516,6 +542,10 @@ impl ReadBuf {
             inline: Vec::new(),
             heap: None,
             cursor: 0,
+            // DEF-248 Sub-A: `0` is the canonical "not in partial
+            // mode" sentinel. Entered only via the leaf-gated
+            // `enter_partial_mode` below.
+            partial_remaining: 0,
         }
     }
 
@@ -651,6 +681,13 @@ impl ReadBuf {
         // not a concern (clear runs at most a few times per conn).
         self.heap = None;
         self.cursor = 0;
+        // DEF-248 Sub-A: `clear` is the canonical "reset to fresh"
+        // operation (called on connection teardown, errored-state
+        // entry, post-fatal cleanup). Resetting partial_remaining
+        // here keeps the post-clear invariant tight: any subsequent
+        // header parse starts in non-partial mode regardless of
+        // whether the cleared state had been mid-frame.
+        self.partial_remaining = 0;
     }
 
     /// Number of bytes currently unread.
@@ -750,7 +787,142 @@ impl ReadBuf {
         heap.truncate(unread_len);
         self.cursor = 0;
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // DEF-248 Sub-A (2026-05-12) — partial-frame mode substrate.
+    //
+    // The counter `partial_remaining: u32` tracks bytes the wire still
+    // owes for the in-flight frame body. Entered via
+    // `enter_partial_mode`, exited via `exit_partial_mode`, queried via
+    // `is_in_partial_mode` / `partial_remaining`. Bytes drain via
+    // `subtract_partial_remaining`.
+    //
+    // All mutators require a [`_row_stream_partial_leaf::PartialFrameToken`]
+    // whose tuple-struct field is private to the leaf submodule. Tier-1
+    // within-crate by-construction: hostile in-crate callers cannot
+    // mint the token outside the leaf.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Whether the buffer is currently in partial-frame mode.
+    ///
+    /// `false` outside partial mode (the common case); `true` while a
+    /// frame body is being streamed in chunks larger than the
+    /// active-tier headroom.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_in_partial_mode(&self) -> bool {
+        self.partial_remaining > 0
+    }
+
+    /// Bytes the wire still owes for the in-flight frame body.
+    ///
+    /// `0` outside partial mode. Inside partial mode, this is the
+    /// count returned by `enter_partial_mode(declared_len)` minus the
+    /// sum of all `subtract_partial_remaining` since entry.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn partial_remaining(&self) -> u32 {
+        self.partial_remaining
+    }
+
+    /// Enter partial-frame mode. The leaf-minted token gates this
+    /// transition.
+    ///
+    /// # Caller contract
+    ///
+    /// - `declared_len` is the frame's wire-declared body length
+    ///   **including** the 4 length-field self-bytes (i.e., the raw
+    ///   `i32` value from the header). The streaming consumer
+    ///   subtracts these accounted-for bytes as it advances.
+    /// - The caller has already observed the 5-byte frame header
+    ///   (tag + length) and is responsible for advancing the read
+    ///   cursor past the header before chunked-body consumption
+    ///   begins. The counter tracks body bytes, not header bytes.
+    /// - It is a tier-2 caller bug to re-enter partial mode while
+    ///   already in it; debug-asserted, release-classified as a
+    ///   no-op overwrite.
+    #[inline]
+    pub(crate) fn enter_partial_mode(
+        &mut self,
+        _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
+        declared_len: u32,
+    ) {
+        debug_assert!(
+            self.partial_remaining == 0,
+            "ReadBuf: enter_partial_mode while already in partial mode \
+             (prev remaining: {}; new declared_len: {})",
+            self.partial_remaining,
+            declared_len,
+        );
+        self.partial_remaining = declared_len;
+    }
+
+    /// Exit partial-frame mode. The leaf-minted token gates this
+    /// transition.
+    ///
+    /// # Caller contract
+    ///
+    /// Exit is only legal once the body has been fully drained
+    /// (`partial_remaining == 0`). Debug-asserted; release path
+    /// classifies a non-zero exit as a no-op reset (preserves
+    /// tier-1 by-construction: the counter is always non-negative
+    /// regardless of caller drift).
+    #[inline]
+    pub(crate) fn exit_partial_mode(
+        &mut self,
+        _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
+    ) {
+        debug_assert!(
+            self.partial_remaining == 0,
+            "ReadBuf: exit_partial_mode with non-zero remaining ({} bytes still owed)",
+            self.partial_remaining,
+        );
+        self.partial_remaining = 0;
+    }
+
+    /// Subtract `n` bytes from the partial-mode counter. Caller drains
+    /// these bytes from the buffer's unread region (typically via
+    /// [`Self::advance`]) before or after this call.
+    ///
+    /// Returns `Err(AdvancePastEnd)` if `n` exceeds the current
+    /// remaining; the counter is left unchanged on Err. Architecturally
+    /// dead under intact callers (the streaming consumer subtracts only
+    /// what it actually consumed from the unread region), but the
+    /// signature forces every future caller to handle it. Tier-1
+    /// belt-and-braces vs silent decrement past zero.
+    #[inline]
+    pub(crate) fn subtract_partial_remaining(
+        &mut self,
+        _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
+        n: u32,
+    ) -> Result<(), AdvancePastEnd> {
+        if n > self.partial_remaining {
+            return Err(AdvancePastEnd {
+                requested: usize::try_from(n).unwrap_or(usize::MAX),
+                available: usize::try_from(self.partial_remaining).unwrap_or(usize::MAX),
+            });
+        }
+        self.partial_remaining = self.partial_remaining.saturating_sub(n);
+        Ok(())
+    }
 }
+
+// DEF-248 Sub-A (2026-05-12) — the partial-frame token TYPE lives in
+// `mod crate::row_stream::_row_stream_partial_leaf` so the mint is
+// `pub(in crate::row_stream)` (call surface restricted to row_stream).
+// `ReadBuf` imports the type and gates the partial_* methods above on
+// `&PartialFrameToken`. Tuple-struct field private to its leaf — no
+// in-crate caller outside the leaf can mint the token.
+//
+// Mirror of DEF-272 cluster δ pattern but inverted: the token type is
+// declared in the *caller* module (row_stream), not the *callee*
+// (buf), because we needed to restrict the call surface to a single
+// caller module that lives *outside* `mod buf`. The cluster δ pattern
+// declares tokens inside `mod protocol` for the same reason — same
+// shape, different module placement.
+//
+// See [`crate::row_stream::_row_stream_partial_leaf`] for the type
+// + mint function.
 
 /// DEF-185 P0-C + DEF-265 Idea-38: zeroize both inline and heap
 /// storage on Drop. `heapless::Vec` doesn't implement Zeroize

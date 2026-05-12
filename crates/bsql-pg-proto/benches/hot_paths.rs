@@ -251,9 +251,9 @@ fn bench_ping_round_trip(c: &mut Criterion) {
 // ~3900 B for rows / 27 = ~145 rows max. N_ROWS = 100 fits.
 
 fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
-    use bsql_pg_proto::row_stream::StreamItem;
+    use bsql_pg_proto::ColEvent;
 
-    let mut group = c.benchmark_group("iter_rows_via_next_event");
+    let mut group = c.benchmark_group("iter_rows_via_col_next");
 
     const N_ROWS: u32 = 100;
     group.throughput(Throughput::Elements(u64::from(N_ROWS)));
@@ -313,26 +313,26 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
                 }
                 (proto, wb)
             },
-            // Timed: pull rows via iter_rows fast-path until
-            // all 100 consumed or stream drains.
+            // Timed: pull rows via iter_rows closure-scoped API
+            // until all 100 consumed or stream drains. Each row
+            // emits Got × col_count + EndRow events.
             |(mut proto, mut wb)| {
-                let mut stream = proto.iter_rows(&mut wb);
-                let mut rows_seen: u32 = 0;
-                loop {
-                    match stream.next_event() {
-                        StreamItem::Row { .. } => {
-                            rows_seen = rows_seen.saturating_add(1);
+                let rows_seen = proto.iter_rows(&mut wb, |stream| {
+                    let mut rows: u32 = 0;
+                    loop {
+                        match stream.col_next() {
+                            ColEvent::Got { .. } | ColEvent::Null { .. } => {}
+                            ColEvent::EndRow => {
+                                rows = rows.saturating_add(1);
+                            }
+                            ColEvent::Chunk { .. } | ColEvent::ChunkEnd { .. } => {}
+                            ColEvent::NeedMore
+                            | ColEvent::EndQuery { .. } => break,
+                            _ => break,
                         }
-                        StreamItem::NeedMore
-                        | StreamItem::CloseSocket
-                        | StreamItem::Complete { .. } => break,
-                        _other => break,
                     }
-                }
-                // Sanity: ensure the bench actually pulled N_ROWS,
-                // not 0 (which would indicate setup failure).
-                // assert! is permitted in bench harness (separate
-                // crate target; forbid-bundle doesn't apply).
+                    rows
+                });
                 assert!(
                     rows_seen >= N_ROWS,
                     "per-row bench broken: expected {N_ROWS} rows, pulled {rows_seen}",
@@ -347,35 +347,84 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
-// DEF-190: per-row throughput via `next_row` API (compact Row
-// struct, no StreamItem enum allocation per row).
+// DEF-248 Sub-A (2026-05-12): the 4 pre-Sub-A per-row bench
+// variants (next_row / next_row_bytes / consume_batch / for_each_row)
+// are DELETED — they exercised API that no longer exists.
+//
+// Replacement: three additional benches pin Sub-A's new scenarios.
+// The `iter_rows_via_col_next` group above is the canonical
+// per-row throughput probe; the three below target
+//   - multi-column large-row throughput (`iter_10cols_large_5kb_row`),
+//   - partial-frame chunked-body streaming (`iter_jsonb_1mb_streaming`),
+//   - per-event dispatch overhead (`col_next_per_event_cost`).
 // ---------------------------------------------------------------
 
-fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
-    let mut group = c.benchmark_group("iter_rows_via_next_row");
-    const N_ROWS: u32 = 100;
-    group.throughput(Throughput::Elements(u64::from(N_ROWS)));
+/// **DEF-248 Sub-A** — 10-column row totalling ~5 KB. Exercises:
+/// - many Got events per row (col_count = 10);
+/// - row body 1 + length-field 4 + col_count 2 + 10 × (4 + 500) =
+///   5047 B > READ_BUF_CAP, so partial-frame mode activates and
+///   chunked-column events fire.
+fn bench_iter_10cols_large_5kb_row(c: &mut Criterion) {
+    use bsql_pg_proto::ColEvent;
+    let mut group = c.benchmark_group("iter_10cols_large_5kb_row");
+    group.throughput(Throughput::Elements(1));
 
-    let rowdesc = {
+    // Build a 10-column RowDescription.
+    let rowdesc: alloc::vec::Vec<u8> = {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&10u16.to_be_bytes());
+        for i in 0..10u16 {
+            body.extend_from_slice(b"c");
+            body.push(0);
+            body.extend_from_slice(&0u32.to_be_bytes());
+            body.extend_from_slice(&i.to_be_bytes());
+            body.extend_from_slice(&25u32.to_be_bytes());
+            body.extend_from_slice(&(-1_i16).to_be_bytes());
+            body.extend_from_slice(&(-1_i32).to_be_bytes());
+            body.extend_from_slice(&0u16.to_be_bytes());
+        }
         let mut out = alloc::vec::Vec::new();
         out.push(b'T');
-        let name = b"col\0";
-        let body_len = 2 + name.len() + 18;
-        let total = 4 + body_len;
-        out.extend_from_slice(&(u32::try_from(total).unwrap_or(0)).to_be_bytes());
-        out.extend_from_slice(&1u16.to_be_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(&25u32.to_be_bytes());
-        out.extend_from_slice(&(-1_i16).to_be_bytes());
-        out.extend_from_slice(&(-1_i32).to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
+        let Ok(total) = u32::try_from(body.len().saturating_add(4)) else {
+            unreachable!()
+        };
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend(body);
         out
     };
-    let single_row = data_row_frame(16);
 
-    group.bench_function("pull_100_rows_via_next_row", |b| {
+    // Build the large DataRow frame: 10 columns × 500 B each.
+    let big_row: alloc::vec::Vec<u8> = {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&10i16.to_be_bytes());
+        for _ in 0..10 {
+            body.extend_from_slice(&500i32.to_be_bytes());
+            body.extend(core::iter::repeat_n(b'x', 500));
+        }
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'D');
+        let Ok(total) = u32::try_from(body.len().saturating_add(4)) else {
+            unreachable!()
+        };
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend(body);
+        out
+    };
+    let cc_frame: alloc::vec::Vec<u8> = {
+        let mut body = alloc::vec::Vec::from(b"SELECT 1".as_slice());
+        body.push(0);
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'C');
+        let Ok(total) = u32::try_from(body.len().saturating_add(4)) else {
+            unreachable!()
+        };
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend(body);
+        out
+    };
+    let rfq = rfq_frame();
+
+    group.bench_function("pull_one_big_row", |b| {
         b.iter_batched(
             || {
                 let mut proto = PgProtocol::new();
@@ -391,199 +440,50 @@ fn bench_iter_rows_per_row_via_next_row(c: &mut Criterion) {
                 let _ = black_box(push_out);
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
-                for _ in 0..N_ROWS {
-                    // feed_inbound returns Result<(), ReadBufFull>.
-                    // Silent discard would mask setup misconfiguration
-                    // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
-                    // — assert success so bench breakage is loud, not
-                    // silent garbage numbers. Setup path is not timed.
-                    let append_res = proto.feed_inbound(&single_row);
-                    assert!(
-                        append_res.is_ok(),
-                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
-                    );
-                }
                 (proto, wb)
             },
             |(mut proto, mut wb)| {
-                let mut stream = proto.iter_rows(&mut wb);
-                let mut rows_seen: u32 = 0;
-                while let Some(_row) = stream.next_row() {
-                    rows_seen = rows_seen.saturating_add(1);
-                }
-                assert!(
-                    rows_seen >= N_ROWS,
-                    "next_row bench: expected {N_ROWS}, pulled {rows_seen}",
-                );
-                black_box(rows_seen);
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------
-// DEF-190: per-row throughput via `next_row_bytes` ULTRA-hot API.
-// 24 B return (id, &[u8]); desc projected once before loop.
-// ---------------------------------------------------------------
-
-fn bench_iter_rows_per_row_via_next_row_bytes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("iter_rows_via_next_row_bytes");
-    const N_ROWS: u32 = 100;
-    group.throughput(Throughput::Elements(u64::from(N_ROWS)));
-
-    let rowdesc = {
-        let mut out = alloc::vec::Vec::new();
-        out.push(b'T');
-        let name = b"col\0";
-        let body_len = 2 + name.len() + 18;
-        let total = 4 + body_len;
-        out.extend_from_slice(&(u32::try_from(total).unwrap_or(0)).to_be_bytes());
-        out.extend_from_slice(&1u16.to_be_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(&25u32.to_be_bytes());
-        out.extend_from_slice(&(-1_i16).to_be_bytes());
-        out.extend_from_slice(&(-1_i32).to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out
-    };
-    let single_row = data_row_frame(16);
-
-    group.bench_function("pull_100_rows_via_next_row_bytes", |b| {
-        b.iter_batched(
-            || {
-                let mut proto = PgProtocol::new();
-                let mut wb = WriteBuf::new();
-                let reply = proto.next_reply_id::<QueryKind>();
-                let push_out = proto.bench_push_or_panic(
-                    bsql_pg_proto::push_command::SimpleQuery {
-                        sql: "SELECT x",
-                        reply,
-                    },
-                    &mut wb,
-                );
-                let _ = black_box(push_out);
-                let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
-                black_box(feed_out);
-                for _ in 0..N_ROWS {
-                    // feed_inbound returns Result<(), ReadBufFull>.
-                    // Silent discard would mask setup misconfiguration
-                    // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
-                    // — assert success so bench breakage is loud, not
-                    // silent garbage numbers. Setup path is not timed.
-                    let append_res = proto.feed_inbound(&single_row);
-                    assert!(
-                        append_res.is_ok(),
-                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
-                    );
-                }
-                (proto, wb)
-            },
-            |(mut proto, mut wb)| {
-                let mut stream = proto.iter_rows(&mut wb);
-                let mut rows_seen: u32 = 0;
-                while let Some((_id, _bytes)) = stream.next_row_bytes() {
-                    rows_seen = rows_seen.saturating_add(1);
-                }
-                assert!(
-                    rows_seen >= N_ROWS,
-                    "next_row_bytes bench: expected {N_ROWS}, pulled {rows_seen}",
-                );
-                black_box(rows_seen);
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------
-// DEF-191: per-row throughput via `consume_rows::<8>` batch API.
-// Single cursor advance amortized across 8 rows; LLVM unrolls the
-// validation loop. Stack array, zero alloc, zero copy.
-// ---------------------------------------------------------------
-
-fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
-    let mut group = c.benchmark_group("iter_rows_via_consume_batch");
-    const N_ROWS: u32 = 100;
-    group.throughput(Throughput::Elements(u64::from(N_ROWS)));
-
-    let rowdesc = {
-        let mut out = alloc::vec::Vec::new();
-        out.push(b'T');
-        let name = b"col\0";
-        let body_len = 2 + name.len() + 18;
-        let total = 4 + body_len;
-        out.extend_from_slice(&(u32::try_from(total).unwrap_or(0)).to_be_bytes());
-        out.extend_from_slice(&1u16.to_be_bytes());
-        out.extend_from_slice(name);
-        out.extend_from_slice(&0u32.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out.extend_from_slice(&25u32.to_be_bytes());
-        out.extend_from_slice(&(-1_i16).to_be_bytes());
-        out.extend_from_slice(&(-1_i32).to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-        out
-    };
-    let single_row = data_row_frame(16);
-
-    group.bench_function("pull_100_rows_via_consume_batch_8", |b| {
-        b.iter_batched(
-            || {
-                let mut proto = PgProtocol::new();
-                let mut wb = WriteBuf::new();
-                let reply = proto.next_reply_id::<QueryKind>();
-                let push_out = proto.bench_push_or_panic(
-                    bsql_pg_proto::push_command::SimpleQuery {
-                        sql: "SELECT x",
-                        reply,
-                    },
-                    &mut wb,
-                );
-                let _ = black_box(push_out);
-                let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
-                black_box(feed_out);
-                for _ in 0..N_ROWS {
-                    // feed_inbound returns Result<(), ReadBufFull>.
-                    // Silent discard would mask setup misconfiguration
-                    // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
-                    // — assert success so bench breakage is loud, not
-                    // silent garbage numbers. Setup path is not timed.
-                    let append_res = proto.feed_inbound(&single_row);
-                    assert!(
-                        append_res.is_ok(),
-                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
-                    );
-                }
-                (proto, wb)
-            },
-            |(mut proto, mut wb)| {
-                let mut stream = proto.iter_rows(&mut wb);
-                let mut rows_seen: u32 = 0;
-                loop {
-                    let batch: [Option<bsql_pg_proto::row_stream::Row<'_>>; 8] =
-                        stream.consume_rows::<8>();
-                    let mut yielded = 0u32;
-                    for row in batch.iter() {
-                        if row.is_some() {
-                            yielded = yielded.saturating_add(1);
+                let total_chunks = proto.iter_rows(&mut wb, |stream| {
+                    // Feed the big-row body in slices ≤ READ_BUF_CAP
+                    // so partial-frame mode activates.
+                    let mut fed = 0usize;
+                    let bytes = &big_row;
+                    let chunk_size = 2048usize;
+                    let mut chunk_count = 0u32;
+                    while fed < bytes.len() {
+                        let end = core::cmp::min(fed.saturating_add(chunk_size), bytes.len());
+                        let Some(s) = bytes.get(fed..end) else { break };
+                        let _ = stream.feed(s);
+                        fed = end;
+                        // Drain events for this feed slice.
+                        loop {
+                            match stream.col_next() {
+                                ColEvent::Got { .. }
+                                | ColEvent::Null { .. }
+                                | ColEvent::Chunk { .. }
+                                | ColEvent::ChunkEnd { .. } => {
+                                    chunk_count = chunk_count.saturating_add(1);
+                                }
+                                ColEvent::EndRow => {}
+                                ColEvent::EndQuery { .. } => return chunk_count,
+                                ColEvent::NeedMore => break,
+                                _ => break,
+                            }
                         }
                     }
-                    if yielded == 0 {
-                        break;
+                    // Drain trailing CC + RFQ.
+                    let _ = stream.feed(&cc_frame);
+                    let _ = stream.feed(&rfq);
+                    loop {
+                        match stream.col_next() {
+                            ColEvent::EndQuery { .. } => break,
+                            ColEvent::NeedMore => break,
+                            _ => {}
+                        }
                     }
-                    rows_seen = rows_seen.saturating_add(yielded);
-                }
-                assert!(
-                    rows_seen >= N_ROWS,
-                    "consume_batch bench: expected {N_ROWS}, pulled {rows_seen}",
-                );
-                black_box(rows_seen);
+                    chunk_count
+                });
+                black_box(total_chunks);
             },
             BatchSize::SmallInput,
         );
@@ -592,16 +492,15 @@ fn bench_iter_rows_via_consume_batch(c: &mut Criterion) {
     group.finish();
 }
 
-// ---------------------------------------------------------------
-// DEF-190: per-row throughput via `for_each_row` closure API.
-// LLVM inlines the closure into the internal pull loop —
-// eliminates per-row function-call boundary.
-// ---------------------------------------------------------------
-
-fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
-    let mut group = c.benchmark_group("iter_rows_via_for_each");
-    const N_ROWS: u32 = 100;
-    group.throughput(Throughput::Elements(u64::from(N_ROWS)));
+/// **DEF-248 Sub-A** — 1 MB BYTEA / JSONB-style single-column streaming.
+/// The headline scenario for partial-frame mode: a single column body
+/// of 1 MiB is streamed as a sequence of `Chunk` events bounded by
+/// READ_BUF_CAP. Pre-Sub-A this tore down the connection with
+/// `FrameTooLarge`; Sub-A streams it as `Chunk × N → ChunkEnd`.
+fn bench_iter_jsonb_1mb_streaming(c: &mut Criterion) {
+    use bsql_pg_proto::ColEvent;
+    let mut group = c.benchmark_group("iter_jsonb_1mb_streaming");
+    group.throughput(Throughput::Bytes(1 << 20));
 
     let rowdesc = {
         let mut out = alloc::vec::Vec::new();
@@ -620,9 +519,140 @@ fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
         out.extend_from_slice(&0u16.to_be_bytes());
         out
     };
-    let single_row = data_row_frame(16);
 
-    group.bench_function("pull_100_rows_via_for_each", |b| {
+    // 1 MiB single-column DataRow frame.
+    let huge_row: alloc::vec::Vec<u8> = {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&1i16.to_be_bytes());
+        let payload_len: i32 = 1 << 20;
+        body.extend_from_slice(&payload_len.to_be_bytes());
+        let Ok(payload_len_usize) = usize::try_from(payload_len) else {
+            unreachable!()
+        };
+        body.extend(core::iter::repeat_n(b'x', payload_len_usize));
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'D');
+        let Ok(total) = u32::try_from(body.len().saturating_add(4)) else {
+            unreachable!()
+        };
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend(body);
+        out
+    };
+    let cc_frame: alloc::vec::Vec<u8> = {
+        let mut body = alloc::vec::Vec::from(b"SELECT 1".as_slice());
+        body.push(0);
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'C');
+        let Ok(total) = u32::try_from(body.len().saturating_add(4)) else {
+            unreachable!()
+        };
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend(body);
+        out
+    };
+    let rfq = rfq_frame();
+
+    group.bench_function("stream_1mb_chunked", |b| {
+        b.iter_batched(
+            || {
+                let mut proto = PgProtocol::new();
+                let mut wb = WriteBuf::new();
+                let reply = proto.next_reply_id::<QueryKind>();
+                let push_out = proto.bench_push_or_panic(
+                    bsql_pg_proto::push_command::SimpleQuery {
+                        sql: "SELECT x",
+                        reply,
+                    },
+                    &mut wb,
+                );
+                let _ = black_box(push_out);
+                let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
+                black_box(feed_out);
+                (proto, wb)
+            },
+            |(mut proto, mut wb)| {
+                let total_bytes = proto.iter_rows(&mut wb, |stream| {
+                    let chunk_feed_size = 3500usize; // < READ_BUF_CAP
+                    let mut fed = 0usize;
+                    let mut bytes_collected: u64 = 0;
+                    while fed < huge_row.len() {
+                        let end = core::cmp::min(
+                            fed.saturating_add(chunk_feed_size),
+                            huge_row.len(),
+                        );
+                        let Some(s) = huge_row.get(fed..end) else { break };
+                        let _ = stream.feed(s);
+                        fed = end;
+                        loop {
+                            match stream.col_next() {
+                                ColEvent::Got { bytes, .. }
+                                | ColEvent::Chunk { bytes, .. }
+                                | ColEvent::ChunkEnd { bytes, .. } => {
+                                    let Ok(n) = u64::try_from(bytes.len()) else {
+                                        break;
+                                    };
+                                    bytes_collected =
+                                        bytes_collected.saturating_add(n);
+                                }
+                                ColEvent::EndRow => {}
+                                ColEvent::EndQuery { .. } => return bytes_collected,
+                                ColEvent::NeedMore => break,
+                                _ => break,
+                            }
+                        }
+                    }
+                    let _ = stream.feed(&cc_frame);
+                    let _ = stream.feed(&rfq);
+                    loop {
+                        match stream.col_next() {
+                            ColEvent::EndQuery { .. } => break,
+                            ColEvent::NeedMore => break,
+                            _ => {}
+                        }
+                    }
+                    bytes_collected
+                });
+                black_box(total_bytes);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+/// **DEF-248 Sub-A** — per-event overhead measurement. 100 small
+/// rows (single 4-B column each) pre-loaded; each col_next yields
+/// one Got + one EndRow (200 events). Isolates the dispatch-loop
+/// cost from wire setup.
+fn bench_col_next_per_event_cost(c: &mut Criterion) {
+    use bsql_pg_proto::ColEvent;
+    let mut group = c.benchmark_group("col_next_per_event_cost");
+    const N_ROWS: u32 = 100;
+    // Each row emits 2 events (Got + EndRow).
+    group.throughput(Throughput::Elements(u64::from(N_ROWS).saturating_mul(2)));
+
+    let rowdesc = {
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'T');
+        let name = b"col\0";
+        let body_len = 2 + name.len() + 18;
+        let total = 4 + body_len;
+        out.extend_from_slice(&(u32::try_from(total).unwrap_or(0)).to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&25u32.to_be_bytes());
+        out.extend_from_slice(&(-1_i16).to_be_bytes());
+        out.extend_from_slice(&(-1_i32).to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out
+    };
+    let single_row = data_row_frame(4);
+
+    group.bench_function("200_events_tight_loop", |b| {
         b.iter_batched(
             || {
                 let mut proto = PgProtocol::new();
@@ -639,30 +669,33 @@ fn bench_iter_rows_per_row_via_for_each(c: &mut Criterion) {
                 let feed_out = proto.feed_bytes(&rowdesc, &mut wb);
                 black_box(feed_out);
                 for _ in 0..N_ROWS {
-                    // feed_inbound returns Result<(), ReadBufFull>.
-                    // Silent discard would mask setup misconfiguration
-                    // (e.g., READ_BUF_CAP shrunk below N_ROWS × row_size)
-                    // — assert success so bench breakage is loud, not
-                    // silent garbage numbers. Setup path is not timed.
                     let append_res = proto.feed_inbound(&single_row);
-                    assert!(
-                        append_res.is_ok(),
-                        "bench setup: feed_inbound must succeed for N_ROWS={N_ROWS}",
-                    );
+                    assert!(append_res.is_ok());
                 }
                 (proto, wb)
             },
             |(mut proto, mut wb)| {
-                let mut stream = proto.iter_rows(&mut wb);
-                let mut rows_seen: u32 = 0;
-                stream.for_each_row(|_row| {
-                    rows_seen = rows_seen.saturating_add(1);
+                let events_seen = proto.iter_rows(&mut wb, |stream| {
+                    let mut events: u32 = 0;
+                    loop {
+                        match stream.col_next() {
+                            ColEvent::Got { .. } | ColEvent::Null { .. } => {
+                                events = events.saturating_add(1);
+                            }
+                            ColEvent::EndRow => {
+                                events = events.saturating_add(1);
+                            }
+                            ColEvent::Chunk { .. } | ColEvent::ChunkEnd { .. } => {
+                                events = events.saturating_add(1);
+                            }
+                            ColEvent::NeedMore | ColEvent::EndQuery { .. } => break,
+                            _ => break,
+                        }
+                    }
+                    events
                 });
-                assert!(
-                    rows_seen >= N_ROWS,
-                    "for_each_row bench: expected {N_ROWS}, pulled {rows_seen}",
-                );
-                black_box(rows_seen);
+                assert!(events_seen >= N_ROWS.saturating_mul(2));
+                black_box(events_seen);
             },
             BatchSize::SmallInput,
         );
@@ -1340,10 +1373,10 @@ criterion_group!(
     bench_parse_header,
     bench_ping_round_trip,
     bench_iter_rows_per_row_throughput,
-    bench_iter_rows_per_row_via_next_row,
-    bench_iter_rows_per_row_via_next_row_bytes,
-    bench_iter_rows_via_consume_batch,
-    bench_iter_rows_per_row_via_for_each,
+    // DEF-248 Sub-A (2026-05-12): new bench surface.
+    bench_iter_10cols_large_5kb_row,
+    bench_iter_jsonb_1mb_streaming,
+    bench_col_next_per_event_cost,
     bench_push_ping,
     // DEF-197: column decode measurement infra.
     bench_data_row_parse,

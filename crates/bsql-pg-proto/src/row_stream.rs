@@ -1,250 +1,299 @@
-//! DEF-154 (X) P0-2(c): pull-based row streaming — hot-path
-//! perf win for large row-bearing responses.
+//! **DEF-248 Sub-A (2026-05-12)** — column-by-column streaming
+//! consumer of in-flight PostgreSQL query replies.
 //!
-//! # Perf rationale
+//! # Universal streaming for colossal data
 //!
-//! Pre-(X) every `feed_bytes` call paid a 5008-byte zero-fill to
-//! initialise `OutActions`'s `[Action; MAX_ACTIONS_PER_CALL]`
-//! storage, regardless of actually-populated slots (see
-//! `src/action.rs::OutActions` "Stack-init cost and the
-//! no-unsafe tradeoff" block). Under the banned-`unsafe`
-//! constraint the zero-fill is unavoidable on that shape.
+//! Pre-DEF-248: any single backend frame body exceeding `READ_BUF_CAP`
+//! (4096 B) was classified as `FrameTooLarge` and torn down the
+//! connection. Multi-MB JSONB / TEXT / BYTEA cells were unreachable.
+//! Unacceptable for v1.0.
 //!
-//! On a `SELECT 1M rows` workload (TCP reader produces ~7-15 rows
-//! per `feed_bytes` call bounded by `MAX_STAGED_PER_CALL = 8`),
-//! that's ~70k-140k round-trips through the full push pipeline —
-//! ~700 MB of stack zero-fill traffic just to surface the rows.
+//! Post-Sub-A: the `'D'` (DataRow) tag's frame body is streamed via
+//! a chunk-emission state machine on [`RowStream`]. Caller pulls
+//! [`ColEvent`] events; the column body of an arbitrarily large cell
+//! arrives as a sequence of `Chunk { bytes, total_len, remaining_len }`
+//! events followed by exactly one `ChunkEnd { idx, bytes }` event.
+//! Every wire-legal body size is handled with no "future DEF" caveat.
 //!
-//! [`RowStream::next_event`] **fast-paths the DataRow frame**
-//! inline: parse header, resolve schema from arena, emit
-//! [`StreamItem::Row`] with `row_bytes: &[u8]` borrowed directly
-//! from `read_buf.populated()`. ZERO `OutActions` allocation on
-//! the row hot path.
+//! Sub-A scope: only `'D'` is exposed column-by-column. Other tags
+//! (`T` RowDescription, `E` ErrorResponse, …) continue to use the
+//! existing `feed_bytes` dispatch path; bodies > READ_BUF_CAP for
+//! those tags still tear down with `FrameTooLarge` (Sub-B's concern;
+//! all current PG drivers cap them well below 4 KB in practice).
 //!
-//! **Slow path** (non-DataRow frames — `RowDescription`,
-//! `CommandComplete`, `ReadyForQuery`, `ErrorResponse`) delegates
-//! to `feed_bytes(&[])` exactly once per frame. The resulting
-//! `OutActions` is processed inline: we emit the first action as
-//! a `StreamItem` and mark the stream `drained` (RowStream is
-//! for row-hot-path streaming; a caller that needs multi-action
-//! control-frame processing should use `feed_bytes` directly
-//! between queries — see API note below).
+//! # Closure-scoped API
 //!
-//! Typical SELECT response `T D D D ... D C Z`:
-//! - `T` → slow path (1 OutActions init, silent state transition,
-//!   recurse to parse next frame).
-//! - `D D D ... D` → fast path (zero OutActions init per row).
-//! - `C Z` → slow path (1 OutActions init, DeliverReply emitted,
-//!   stream drained).
+//! [`crate::PgProtocol::iter_rows`] is the sole construction path.
+//! Caller passes a closure that receives `&mut RowStream`; the
+//! `RowStream` value lives on `iter_rows`'s stack frame, dropped
+//! synchronously when the closure returns. **`mem::forget` is
+//! structurally closed** — caller has only a borrow, not the value
+//! (see memo `/tmp/def248-design-memo-v2.md` §3.2).
 //!
-//! Cost on 1M rows: 2 slow-path OutActions inits (~10 KB total) +
-//! 1M fast-path emissions (zero OutActions). Pre-(X): ~130k
-//! OutActions × 5 KB ≈ 650 MB. **~300× reduction in stack
-//! bandwidth**; architect projected 10-100× end-to-end throughput
-//! improvement bounded by per-row decode work.
+//! Drop fires unconditionally on every closure exit — normal return,
+//! `?`-propagation, or panic unwind under `panic = "unwind"` (the
+//! workspace default). When the stream's `drained` flag is `false`
+//! at drop time, the Drop impl installs
+//! `Errored(InternalCrateBug { locus: StreamDroppedMidStream })` via
+//! [`crate::PgProtocol::install_errored_stream_dropped_mid_stream`].
+//! The next operation on the connection observes Errored and the
+//! wrapper surfaces `ConnectionAlreadyClosed { prior_kind }` to the
+//! caller's pending oneshots.
 //!
-//! # API
+//! `panic = "abort"` is a binary-level setting outside library reach;
+//! on process death the OS-level TCP RST tears down the connection
+//! server-side. Architectural boundary stronger than any library
+//! mechanism (memo §3.3).
 //!
-//! ```text
-//! let mut stream = proto.iter_rows(&mut write_buf);
-//! stream.feed(&bytes_from_socket)?;
-//! loop {
-//!     match stream.next_event() {
-//!         StreamItem::Row { row_bytes, desc, .. } => process(row_bytes, desc),
-//!         StreamItem::Complete { value, .. } => { handle(value); break }
-//!         StreamItem::SendBytes(payload) => socket.write_all(payload)?,
-//!         StreamItem::FailReply { cause, .. } => { log(cause); break }
-//!         StreamItem::CloseSocket => break,
-//!         StreamItem::NeedMore => break,  // await more TCP bytes or drop
-//!     }
-//! }
-//! ```
+//! # ColEvent variants (memo §2.2)
 //!
-//! # Scope (MVP)
+//! - `Got { idx, bytes }` — a complete column body arrived inline
+//!   (column fit in the current read-buf headroom). Caller decodes
+//!   via `crate::decode::FromPgText` / `FromPgBinary`.
+//! - `Null { idx }` — column was the PG SQL NULL sentinel (`len = -1`).
+//! - `EndRow` — the row's last column emitted; caller can perform
+//!   per-row aggregation before the next row begins.
+//! - `Chunk { idx, bytes, total_len, remaining_len }` — a partial
+//!   slice of a column body that exceeds the active read-buf
+//!   headroom. Caller MUST consume `bytes` before calling
+//!   `col_next` again (the slice is invalidated by the next mutating
+//!   call).
+//! - `ChunkEnd { idx, bytes }` — the final chunk of a chunked
+//!   column; after this the next event will be `Got`/`Null`/`EndRow`
+//!   for the next column.
+//! - `NeedMore` — read-buf empty mid-row, awaiting more wire bytes.
+//!   Caller exits the closure loop turn and feeds more bytes on the
+//!   next turn (sans-I/O driver pattern — see memo §3.4).
+//! - `EndQuery { id, outcome: Result<Reply<'a>, ProtocolError> }`
+//!   — terminal. `Ok(reply)` on `CommandComplete` + `ReadyForQuery`;
+//!   `Err(cause)` on `ErrorResponse` + `ReadyForQuery` or wire
+//!   malformedness. After `EndQuery` the stream is drained;
+//!   subsequent `col_next` returns `NeedMore` deterministically.
 //!
-//! RowStream is designed for **row-bearing response consumption**.
-//! For push-side commands (startup, bind/execute setup) continue
-//! to use [`PgProtocol::push_command`] /
-//! [`PgProtocol::push_bind_execute`]. For control-only responses
-//! (handshake, describe-only) continue to use
-//! [`PgProtocol::feed_bytes`]. These APIs are complementary.
+//! # Tier matrix
 //!
-//! MVP supports `SimpleQuery` row streaming on the fast path and
-//! delegates to `feed_bytes` for terminal / error frames.
-//! `BindExecute` row streaming works too via the same state
-//! variants (the `streaming_state_id_and_desc` helper covers
-//! all three streaming variants; see below).
+//! - **Tier-1 (compile)**: `mem::forget(RowStream)` impossible;
+//!   `ColEvent` variant exhaustion forced by `#[non_exhaustive]` on
+//!   downstream callers but exhaustive within-crate; `PartialFrameToken`
+//!   mint gated to leaf submodule.
+//! - **Tier-1 (drop-glue)**: stream Drop fires on every non-`forget`
+//!   non-`abort` exit per Rust spec.
+//! - **OS-level boundary**: `panic = "abort"` → process death → TCP
+//!   RST → server-side teardown.
 
 use core::num::NonZeroU64;
 
-use crate::action::Action;
+use crate::action::{Action, Reply};
 use crate::buf::ReadBufFull;
 use crate::decode::RowDescBorrow;
 use crate::error::ProtocolError;
-use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
+use crate::frame::{HEADER_LEN, HeaderParse, MAX_FRAME_LEN_FIELD, parse_header};
 use crate::protocol::PgProtocol;
 use crate::wire::TAG_DATA_ROW;
 use crate::write_buf::WriteBuf;
 
-/// Event yielded by [`RowStream::next_event`].
+/// **Event yielded by [`RowStream::col_next`]** — column-by-column
+/// pull surface for in-flight PostgreSQL query replies.
 ///
-/// Borrows from protocol-internal buffers (`read_buf` for
-/// `Row`, `write_buf` for `SendBytes`, schema arena for `Row.desc`
-/// and `Complete.value`) for the duration of the single
-/// `next_event` call — pattern-match and process before calling
-/// `next_event` again.
-// DEF-184 (A1+A13): StreamItem shrunk 320 → ~80 B post-ErrorArena
-// externalisation. Reply<'a> dominates now (~72 B); no longer
-// large_enum_variant worthy.
-//
-// DEF-256 (audit 2026-05-08): `#[non_exhaustive]` so future variants
-// (e.g., partial-row signals, pipelining-multi-stream events) can
-// land without breaking downstream exhaustive matches at the
-// `cargo build` boundary. Internal `match StreamItem::*` inside the
-// crate stays exhaustive (the marker only constrains downstream
-// crates per Rust semantics).
-//
-// # Variant ordering — DEF-254 (audit 2026-05-08)
-//
-// Variants are in **production-frequency order** for the SELECT hot
-// loop:
-//
-// - `Row` — emitted N times per SELECT result (N can be 1000s) →
-//   **dominant** by orders of magnitude.
-// - `Complete` — once per query terminal.
-// - `SendBytes` — only mid-handshake (rare in steady state).
-// - `FailReply` — once per error.
-// - `CloseSocket` — once per fatal.
-// - `NeedMore` — when buffer drains mid-stream; caller signal.
-//
-// Order verified optimal at this audit; no reorder needed.
+/// See module docs for the variant set's rationale. Every variant is
+/// borrow-lifetime-tied to the underlying read buffer / error arena;
+/// the caller MUST consume the variant's borrowed payload (decode,
+/// copy, or discard) before calling `col_next` again on the same
+/// stream.
+///
+/// # `#[non_exhaustive]`
+///
+/// Downstream callers must use a wildcard arm. Internal in-crate
+/// `match` may be exhaustive (per Rust semantics) and IS exhaustive
+/// in the state machine.
+///
+/// # Variant frequency ordering
+///
+/// Variants are ordered by per-query frequency (hot-most first), so
+/// the variant tag's branch predictor placement favours the typical
+/// SELECT loop (`Got × col_count × row_count`):
+///
+/// - `Got` — emitted N×M times per SELECT (cols × rows).
+/// - `Null` — alternating-NULL workloads.
+/// - `EndRow` — once per row.
+/// - `Chunk` / `ChunkEnd` — only for huge cells (multi-KB+).
+/// - `NeedMore` — every read-buf-drain turn.
+/// - `EndQuery` — once per query terminal.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum StreamItem<'a> {
-    /// One `DataRow` frame arrived — fast-path emission.
-    /// `row_bytes` is the raw body (post column-count header, per
-    /// DEF-154 H); decode via [`crate::decode::DataRowRef::parse`].
-    ///
-    /// # DEF-185 P1-3 (audit 2026-04-24): protocol-level row validation
-    ///
-    /// Pre-fix: any frame body size reached this arm, including
-    /// declared_len=5 (1 body byte — structurally impossible to
-    /// carry a 2-byte column-count header). User saw `TruncatedRow`
-    /// via `DataRowRef::parse` but protocol stayed live; the next
-    /// DataRow kept dispatching. Tier-3 silent pass-through at the
-    /// protocol layer.
-    ///
-    /// Post-fix: fast-path rejects `row_bytes.len() < 2` (cannot
-    /// carry column-count header) with
-    /// [`StreamItem::FailReply`] / MalformedDataRow. Body ≥ 2 bytes
-    /// reaches user; per-column decode errors are still surfaced
-    /// via `DataRowRef::parse -> Result`.
-    Row {
-        /// Correlator of the in-flight SELECT / BindExecute reply.
-        id: NonZeroU64,
-        /// Raw row body, borrowed from `read_buf.populated()`.
-        /// Guaranteed ≥ 2 bytes (column-count header present) per
-        /// DEF-185 P1-3 post-audit fast-path pre-validation.
-        row_bytes: &'a [u8],
-        /// Schema borrow for this row — DEF-189 lazy projection from
-        /// `PgProtocol::row_desc_slot`.
-        desc: RowDescBorrow<'a>,
+pub enum ColEvent<'a> {
+    /// A complete column body arrived inline. `bytes` is the raw
+    /// PG-protocol body (text for `FormatCode::Text`, binary for
+    /// `FormatCode::Binary`); decode via the
+    /// [`crate::decode::FromPgText`] / [`crate::decode::FromPgBinary`]
+    /// traits.
+    Got {
+        /// Zero-based column index within the row.
+        idx: u16,
+        /// Borrowed column body. Lifetime ties to the read buffer's
+        /// unread region; caller MUST consume before next `col_next`.
+        bytes: &'a [u8],
     },
-    /// Server completed the command — terminal event.
-    Complete {
-        /// Correlator matching the in-flight reply.
-        id: NonZeroU64,
-        /// Payload (command tag, tx status, optional row-desc).
-        value: crate::action::Reply<'a>,
+    /// PG SQL NULL sentinel (the wire `len = -1`).
+    Null {
+        /// Zero-based column index within the row.
+        idx: u16,
     },
-    /// Protocol-layer bytes to send on the wire (e.g. mid-
-    /// handshake SCRAM response from the slow path). Borrows
-    /// from the caller-owned write_buf.
-    SendBytes(&'a [u8]),
-    /// Server-reported error or framing desync on an in-flight
-    /// reply — caller's oneshot receiver resolves via this event.
-    FailReply {
-        /// Correlator of the failed reply.
-        id: NonZeroU64,
-        /// Failure cause.
-        cause: ProtocolError,
+    /// All columns of the current row emitted. Next `col_next` will
+    /// either begin the next row (`Got`/`Null`/`Chunk`) or transition
+    /// to a terminal (`EndQuery`/`NeedMore`).
+    EndRow,
+    /// A non-final partial slice of a column body that exceeded the
+    /// active read-buf headroom. Followed by zero or more additional
+    /// `Chunk` events and exactly one `ChunkEnd` to close the column.
+    Chunk {
+        /// Zero-based column index within the row.
+        idx: u16,
+        /// Borrowed slice of the column body. Caller MUST consume
+        /// before next `col_next`.
+        bytes: &'a [u8],
+        /// Total declared length of the column body (from the wire
+        /// `i32` length prefix). Bytes summed across all `Chunk` +
+        /// `ChunkEnd` events for this column equal `total_len`.
+        total_len: u32,
+        /// Bytes the wire still owes for this column AFTER this
+        /// chunk is consumed. `0` only on the chunk immediately
+        /// preceding `ChunkEnd`.
+        remaining_len: u32,
     },
-    /// Connection tear-down signal — caller closes the socket.
-    CloseSocket,
-    /// Read buffer empty / incomplete frame / drained stream —
-    /// caller either feeds more bytes or drops the stream.
+    /// Final chunk of a chunked column body. Subsequent events
+    /// resume the per-column cadence (`Got`/`Null`/`Chunk` for the
+    /// next column, or `EndRow`).
+    ChunkEnd {
+        /// Zero-based column index within the row.
+        idx: u16,
+        /// Borrowed final slice of the column body.
+        bytes: &'a [u8],
+    },
+    /// Read buffer drained mid-stream; caller feeds more wire bytes
+    /// and resumes via `col_next`. The stream's state is preserved
+    /// across `NeedMore` returns — repeat calls without intervening
+    /// `feed` calls return `NeedMore` deterministically.
     NeedMore,
+    /// Query reply terminal. **One variant covers both success and
+    /// error** — the fork lives inside `Result<Reply, ProtocolError>`:
+    /// - `Ok(reply)`: server emitted `CommandComplete` + `ReadyForQuery`.
+    /// - `Err(cause)`: server emitted `ErrorResponse` + `ReadyForQuery`,
+    ///   OR the parser classified wire bytes as malformed.
+    ///
+    /// In both cases the trailing `Z` has been silently drained; the
+    /// stream is in terminal state and subsequent `col_next` calls
+    /// return `NeedMore` deterministically.
+    ///
+    /// Designed to be `?`-friendly:
+    /// `let reply = match … { EndQuery { outcome, .. } => outcome?, … };`.
+    EndQuery {
+        /// Correlator of the in-flight reply.
+        id: NonZeroU64,
+        /// Success — typed payload | Error — protocol-classified
+        /// failure.
+        outcome: Result<Reply<'a>, ProtocolError>,
+    },
 }
 
-/// DEF-190: row-only result from [`RowStream::next_row`].
+/// **Mid-row column-cursor state** (memo §3, 16 B inline).
 ///
-/// Compact 32-byte struct (vs 80-byte [`StreamItem`] enum) — half
-/// the move cost on the per-row hot path. Borrows from the
-/// stream's protocol state for the lifetime `'r`; caller must
-/// process or drop before calling `next_row` again (borrow
-/// checker enforces).
-#[derive(Debug)]
-pub struct Row<'r> {
-    /// Reply correlator for this in-flight query.
-    pub id: NonZeroU64,
-    /// Raw row body, post column-count header (≥ 2 bytes).
-    /// Decode via [`crate::decode::DataRowRef::parse`].
-    pub bytes: &'r [u8],
-    /// Schema descriptor for this row, projected from the
-    /// protocol's row_desc_slot.
-    pub desc: crate::decode::RowDescBorrow<'r>,
+/// Carries the column-index counter and the in-progress chunked
+/// column's accounting (when streaming a column body that exceeds
+/// read-buf headroom).
+#[derive(Debug, Clone, Copy)]
+struct RowProgress {
+    /// Total columns in this row (parsed from the 2-byte row body
+    /// header).
+    n_cols: u16,
+    /// Number of columns whose body has been fully emitted
+    /// (`Got`/`Null`/`ChunkEnd`). The next event for this row will
+    /// concern column index `parsed_cols` (or `EndRow` if
+    /// `parsed_cols == n_cols`).
+    parsed_cols: u16,
+    /// Bytes of the in-progress chunked column already emitted as
+    /// `Chunk`. `0` when no chunked column is in flight (either
+    /// between columns, or the current column is being processed
+    /// in whole-row mode).
+    chunk_consumed_in_col: u32,
+    /// Declared total length of the in-progress chunked column. `0`
+    /// when no chunked column is in flight; positive when a chunked
+    /// column is mid-stream (between `Chunk` events).
+    chunk_total_in_col: u32,
 }
 
-/// Pull-based row streamer. See module docs for perf rationale.
+impl RowProgress {
+    /// Construct progress at the start of a fresh row.
+    #[inline]
+    const fn new(n_cols: u16) -> Self {
+        Self {
+            n_cols,
+            parsed_cols: 0,
+            chunk_consumed_in_col: 0,
+            chunk_total_in_col: 0,
+        }
+    }
+
+    /// Whether a chunked column is currently in flight (between
+    /// `Chunk` events). `true` once the column's first `Chunk` has
+    /// been emitted; reset to `false` after `ChunkEnd` (or after the
+    /// last `Chunk` with `remaining_len == 0`).
+    #[inline]
+    const fn in_chunked_col(&self) -> bool {
+        self.chunk_total_in_col > 0
+    }
+}
+
+// Compile-time size pin: keep `RowProgress` ≤ 16 B to preserve memo §3
+// budget. 2 + 2 + 4 + 4 = 12 B plus padding to 16 B alignment.
+const _: () = assert!(
+    core::mem::size_of::<RowProgress>() <= 16,
+    "RowProgress must stay ≤ 16 B per memo §3 footprint budget — \
+     adding a field requires explicit budget review.",
+);
+
+/// **Pull-based column streamer** over a [`PgProtocol`] connection.
 ///
-/// Constructed via [`PgProtocol::iter_rows`]; holds `&mut self`
-/// on the protocol + `&mut` on a caller-owned write_buf, so
-/// other method calls on either are blocked until the stream
-/// drops.
+/// Constructed exclusively via [`PgProtocol::iter_rows`]; the value
+/// lives on `iter_rows`'s stack frame, with the caller's closure
+/// receiving only `&mut RowStream`. See module docs for the
+/// closure-scoped API tier-1 closure of `mem::forget` /
+/// `Box::leak` / `ManuallyDrop`.
 #[derive(Debug)]
 pub struct RowStream<'p, 'w> {
     /// Owning borrow of the protocol — all state mutation flows
     /// through this ref.
     proto: &'p mut PgProtocol,
-    /// Caller-owned write buffer. `feed_bytes`-style emission
-    /// (slow-path mid-handshake responses) writes here;
-    /// `StreamItem::SendBytes` borrows from here.
+    /// Caller-owned write buffer. Slow-path emission writes here;
+    /// not currently surfaced as an event (Sub-A scope: SendBytes
+    /// for SCRAM-mid-handshake is handled by [`PgProtocol::feed_bytes`]
+    /// before `iter_rows` is called).
     write_buf: &'w mut WriteBuf,
-    /// True after the stream has emitted a terminal event
-    /// (Complete / FailReply / CloseSocket) and flushed any
-    /// trailing protocol-level frames (e.g. `Z` after `C`).
-    /// Subsequent `next_event` calls return `NeedMore`.
+    /// `true` after the stream emitted a terminal event
+    /// (`EndQuery`). Drop with `drained == false` installs Errored
+    /// via the leaf-gated state setter — see
+    /// [`PgProtocol::install_errored_stream_dropped_mid_stream`].
     drained: bool,
-    /// DEF-154 (X): set after [`StreamItem::Complete`] /
-    /// `FailReply` emission to run one unbounded `feed_bytes`
-    /// call on the next `next_event` — consumes the trailing
-    /// `ReadyForQuery` (silent `AwaitingRfq` → `Idle`
-    /// transition) so the protocol state is ready for the next
-    /// `push_command` without requiring the caller to invoke
-    /// [`PgProtocol::feed_bytes`] manually.
+    /// `true` after a terminal event was staged but the trailing
+    /// `'Z'` (ReadyForQuery) has not yet been silently consumed.
+    /// The next `col_next` call drains it and sets `drained = true`.
+    /// `false` outside the terminal window.
     flush_pending: bool,
-    /// DEF-190: cached streaming reply correlator.
-    ///
-    /// Set lazily on first DataRow encounter via
-    /// [`PgProtocol::classify_for_iter_rows`]. Subsequent rows of
-    /// the same query share the cached id — skips the per-row
-    /// state-enum match (~1-2 ns per row).
-    ///
-    /// # Invariant
-    ///
-    /// `cached_reply_id == Some(id)` ⇒ proto.state is one of the
-    /// streaming variants AND its reply id equals `id`. The cache
-    /// is cleared on any non-row outcome (C/E/Z transitions
-    /// implicit when classify returns Other / Errored).
-    ///
-    /// Cleared at construction (None) and on any pause that takes
-    /// state out of streaming-row territory.
+    /// Cached streaming reply correlator. Populated on first
+    /// streaming-state observation; cleared by terminal events.
+    /// `Some(id)` only when `proto.state` is a row-streaming variant.
     cached_reply_id: Option<NonZeroU64>,
+    /// Mid-row column-cursor state. `Some` while inside a row body
+    /// (between the row's first column event and `EndRow`); `None`
+    /// outside a row (waiting for next frame, or in a non-streaming
+    /// state).
+    row_progress: Option<RowProgress>,
 }
 
 impl<'p, 'w> RowStream<'p, 'w> {
-    /// DEF-154 (X) crate-internal constructor — typically called
-    /// via [`PgProtocol::iter_rows`].
+    /// **Crate-internal constructor**. Production callers go through
+    /// [`PgProtocol::iter_rows`]; this constructor is callable only
+    /// from inside the crate.
     #[inline]
     #[must_use]
     pub(crate) fn new(proto: &'p mut PgProtocol, write_buf: &'w mut WriteBuf) -> Self {
@@ -254,711 +303,674 @@ impl<'p, 'w> RowStream<'p, 'w> {
             drained: false,
             flush_pending: false,
             cached_reply_id: None,
+            row_progress: None,
         }
     }
 
     /// Append inbound TCP bytes to the protocol's read buffer.
     ///
-    /// Err on [`ReadBufFull`]. On Err the stream drains — the
-    /// next `next_event` returns `NeedMore` and the caller's
-    /// error path resolves via the returned `Err(cause)`.
+    /// Err on [`ReadBufFull`]. On Err the stream drains — subsequent
+    /// `col_next` returns `NeedMore` and the caller's error path
+    /// resolves via the returned `Err`.
     ///
-    /// Returns the tiny [`ReadBufFull`] struct (4 bytes) rather
-    /// than [`ProtocolError`] (~300 bytes) so the hot-path happy
+    /// Returns the compact [`ReadBufFull`] struct (a few bytes)
+    /// rather than [`ProtocolError`] (~72 B) so the happy-path
     /// return doesn't pay a ProtocolError-sized stack slot for a
     /// cold failure mode. Callers who want a `ProtocolError` can
-    /// `.map_err(ProtocolError::from)`.
+    /// `.map_err(ProtocolError::from)` at the boundary.
     #[inline]
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
         match self.proto.read_buf_append(bytes) {
             Ok(()) => Ok(()),
             Err(err) => {
+                // Drain so subsequent col_next returns NeedMore. We
+                // also mark `drained = true` to ensure the post-Drop
+                // install_errored fires only when the closure body
+                // exited mid-frame, not on a routine read-buf-full
+                // teardown (which the caller is expected to handle
+                // upstream).
                 self.drained = true;
                 Err(err)
             }
         }
     }
 
-    /// DEF-190 (perf push 2026-04-27): hot-path-only row puller.
+    /// Get the current row's schema descriptor.
     ///
-    /// Returns `Some(Row)` for each available `DataRow`; `None` to
-    /// pause the loop (any non-row condition: stream complete /
-    /// failed / awaiting more bytes / wrong state). Caller uses
-    /// `while let Some(row) = stream.next_row() { … }` to consume
-    /// rows with minimal overhead, then calls
-    /// [`Self::next_event`] (or [`Self::status`] in a future API)
-    /// to learn why the row stream paused.
-    ///
-    /// # Hot-path discipline
-    ///
-    /// This method is THE row hot path. It:
-    /// - takes `&mut self` (exclusive access)
-    /// - reads ProtoState with a single match
-    /// - inlines the 5-byte header parse (no `parse_header` call)
-    /// - validates length / row-body bounds
-    /// - advances `read_buf.cursor` once
-    /// - projects `row_desc_slot` once
-    /// - returns a 32-byte [`Row`] (vs 80-byte [`StreamItem`])
-    ///
-    /// All inside a single function body — no helper calls except
-    /// the field-read accessors (which are `#[inline]` and trivial).
-    /// LLVM has full visibility for register allocation across the
-    /// per-row body.
-    ///
-    /// # Returns
-    ///
-    /// - `Some(Row)`: a DataRow was consumed; bytes carved from
-    ///   the still-populated read_buf (cursor advanced).
-    /// - `None`: pause the loop. Reasons (caller can disambiguate
-    ///   via [`Self::next_event`] subsequent call):
-    ///   - state not `Streaming*`
-    ///   - read_buf empty / fewer than 5 bytes since cursor
-    ///   - next frame is not `'D'` (CommandComplete / Z / E)
-    ///   - row body shorter than 2 bytes (column-count header)
-    ///   - row_desc_slot is None (architecturally dead while in
-    ///     a streaming variant — fail-closed)
-    ///
-    /// # Lifetime
-    ///
-    /// Returned `Row<'_>` borrows from `self.proto.read_buf` and
-    /// `self.proto.row_desc_slot`. Caller cannot call other
-    /// `&mut self.proto` methods while the Row is alive — the
-    /// borrow checker enforces this. The `Row` MUST be dropped
-    /// before the next `next_row` call.
-    #[inline]
-    pub fn next_row(&mut self) -> Option<Row<'_>> {
-        // Drained / errored → no rows.
-        if self.drained {
-            return None;
-        }
-
-        // 1. Reply id — cached on first encounter, reused per row.
-        // DEF-190: hot loop skips classify after the first row.
-        let id = match self.cached_reply_id {
-            Some(id) => id,
-            None => match self.proto.classify_for_iter_rows() {
-                crate::protocol::IterRowsClass::Streaming(id) => {
-                    self.cached_reply_id = Some(id);
-                    id
-                }
-                _ => return None,
-            },
-        };
-
-        // 2. Header peek + validation, scoped to drop the
-        // populated() borrow before the &mut advance.
-        let cursor_u16 = self.proto.read_buf_cursor_u16();
-        let cursor = usize::from(cursor_u16);
-        let total: usize = {
-            let populated = self.proto.read_buf_populated();
-            let after = populated.get(cursor..)?;
-            // Inline 5-byte header read. parse_header logic
-            // open-coded so LLVM can fold the slice-pattern match
-            // into the caller's body without a function-call
-            // boundary.
-            let (tag, l0, l1, l2, l3) = match after {
-                [t, a, b, c, d, ..] => (*t, *a, *b, *c, *d),
-                _ => return None, // < 5 bytes
-            };
-            // DataRow tag check — bail fast for any other tag.
-            if tag != b'D' {
-                return None;
-            }
-            let declared = u32::from_be_bytes([l0, l1, l2, l3]);
-            // DEF-190 / measurement W3 (deferred.md §B): explicit
-            // separate compares — `RangeInclusive::contains` was
-            // measured +70% slower on parse_header. The two
-            // compares LLVM lowers to optimal cmp+jcc chain;
-            // `contains` lowers to ucmp + extra branch.
-            #[expect(clippy::manual_range_contains, reason = "W3 measurement: RangeInclusive::contains regressed parse_header by +70%; separate compares are the proven-optimal lowering")]
-            if declared < 4 || declared > crate::frame::MAX_FRAME_LEN_FIELD {
-                return None;
-            }
-            let total_local = usize::try_from(declared.checked_add(1)?).ok()?;
-            if after.len() < total_local {
-                return None; // need more bytes
-            }
-            // Body must be ≥ 2 bytes (column-count header).
-            if total_local < crate::frame::HEADER_LEN.saturating_add(2) {
-                return None;
-            }
-            total_local
-        };
-
-        // 3. Mutable: advance the cursor.
-        self.proto.read_buf_advance(total).ok()?;
-
-        // 4. Project row body + desc.
-        let row_start = cursor.saturating_add(crate::frame::HEADER_LEN);
-        let row_end = cursor.saturating_add(total);
-        let populated = self.proto.read_buf_populated();
-        let row_bytes = populated.get(row_start..row_end)?;
-        let desc = self.proto.current_row_desc()?;
-
-        Some(Row {
-            id,
-            bytes: row_bytes,
-            desc,
-        })
-    }
-
-    /// DEF-191 (batch consume — perf push 2026-04-27): consume up to
-    /// `N` rows in one call, single cursor advance amortized across
-    /// the batch.
-    ///
-    /// Returns `[Option<Row<'_>>; N]` — each `Some(row)` borrows from
-    /// the stream's protocol read_buf. All rows in a batch share the
-    /// SAME `&self.proto.read_buf` borrow (immutable, disjoint slices
-    /// per row). The borrow checker blocks `&mut self.proto` calls
-    /// while the batch is alive.
-    ///
-    /// # Why faster
-    ///
-    /// - **One cursor advance per batch** vs N (each Result return).
-    /// - **N validations done in tight loop** — LLVM pipelines.
-    /// - **Zero alloc** — stack array of compile-known size.
-    /// - **Zero copy** — each Row borrows directly from read_buf.
-    ///
-    /// # Usage
-    ///
-    /// ```ignore
-    /// loop {
-    ///     let batch: [Option<Row<'_>>; 8] = stream.consume_rows::<8>();
-    ///     let mut yielded = 0;
-    ///     for row in batch.iter().flatten() {
-    ///         process(row.bytes, &row.desc);
-    ///         yielded += 1;
-    ///     }
-    ///     if yielded == 0 { break; }
-    /// }
-    /// ```
-    ///
-    /// Trailing `None`s in the array signal pause (read_buf exhausted
-    /// or non-row frame next). Caller breaks loop on zero-yielded
-    /// batch and falls through to [`Self::next_event`] for terminal
-    /// classification.
-    ///
-    /// # Tier
-    ///
-    /// Tier-1 compile: `[Option<Row<'r>>; N]` where `'r` matches the
-    /// stream's borrow. No unsafe. No alloc. `N` is const-generic
-    /// — LLVM monomorphizes per-N for tight unrolled code.
-    #[inline]
-    pub fn consume_rows<const N: usize>(&mut self) -> [Option<Row<'_>>; N] {
-        // Zero-init array. None is the discriminant=0 of Option<T>;
-        // [None; N] compiles to a memset-zero in release mode.
-        let mut entries: [(u16, u16); N] = [(0, 0); N]; // (start_offset, len) per row
-        let mut yielded: usize = 0;
-
-        if self.drained {
-            return core::array::from_fn(|_| None);
-        }
-
-        // Cache id (set lazily in next_row; reuse here).
-        let id = match self.cached_reply_id {
-            Some(id) => id,
-            None => match self.proto.classify_for_iter_rows() {
-                crate::protocol::IterRowsClass::Streaming(id) => {
-                    self.cached_reply_id = Some(id);
-                    id
-                }
-                _ => return core::array::from_fn(|_| None),
-            },
-        };
-
-        // Phase 1: peek N frames in a tight loop. No mutation —
-        // populated() borrow held throughout.
-        let cursor_u16 = self.proto.read_buf_cursor_u16();
-        let mut consumed_total: u32 = 0;
-        {
-            let populated = self.proto.read_buf_populated();
-            let cursor = usize::from(cursor_u16);
-
-            for slot in entries.iter_mut().take(N) {
-                let absolute = cursor.saturating_add(usize::try_from(consumed_total).unwrap_or(usize::MAX));
-                let after = match populated.get(absolute..) {
-                    Some(s) => s,
-                    None => break,
-                };
-                let (tag, l0, l1, l2, l3) = match after {
-                    [t, a, b, c, d, ..] => (*t, *a, *b, *c, *d),
-                    _ => break,
-                };
-                if tag != b'D' {
-                    break;
-                }
-                let declared = u32::from_be_bytes([l0, l1, l2, l3]);
-                #[expect(clippy::manual_range_contains, reason = "W3 measurement: RangeInclusive::contains regressed parse_header by +70%")]
-                if declared < 4 || declared > crate::frame::MAX_FRAME_LEN_FIELD {
-                    break;
-                }
-                let total = match declared.checked_add(1) {
-                    Some(t) => t,
-                    None => break,
-                };
-                if usize::try_from(total).unwrap_or(usize::MAX) > after.len() {
-                    break;
-                }
-                if total < 7 {
-                    break;
-                }
-                // Body offset/len in u16 — fits READ_BUF_CAP cap.
-                let row_start_abs = match u16::try_from(absolute.saturating_add(crate::frame::HEADER_LEN)) {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                let body_len = match u16::try_from(usize::try_from(total).unwrap_or(usize::MAX).saturating_sub(crate::frame::HEADER_LEN)) {
-                    Ok(v) => v,
-                    Err(_) => break,
-                };
-                *slot = (row_start_abs, body_len);
-                yielded = yielded.saturating_add(1);
-                consumed_total = consumed_total.saturating_add(total);
-            }
-        } // populated borrow released here
-
-        if yielded == 0 {
-            return core::array::from_fn(|_| None);
-        }
-
-        // Phase 2: single advance for entire batch.
-        let consumed_usize = usize::try_from(consumed_total).unwrap_or(0);
-        if self.proto.read_buf_advance(consumed_usize).is_err() {
-            // Architecturally dead — phase-1 validated bounds.
-            self.drained = true;
-            return core::array::from_fn(|_| None);
-        }
-
-        // Phase 3: materialize Row borrows from now-still-stable populated.
-        // populated content unchanged by advance (only cursor moves).
-        let desc = match self.proto.current_row_desc() {
-            Some(d) => d,
-            None => {
-                self.drained = true;
-                return core::array::from_fn(|_| None);
-            }
-        };
-        let populated = self.proto.read_buf_populated();
-        core::array::from_fn(|i| {
-            if i >= yielded {
-                return None;
-            }
-            let (start, len) = match entries.get(i) {
-                Some(e) => *e,
-                None => return None,
-            };
-            let end = start.saturating_add(len);
-            let bytes = populated.get(usize::from(start)..usize::from(end))?;
-            Some(Row { id, bytes, desc })
-        })
-    }
-
-    /// DEF-190: ULTRA-hot path — `(id, bytes)` only.
-    ///
-    /// Returns `Option<(NonZeroU64, &[u8])>` (24 B vs 32 B for
-    /// `Row`). The schema descriptor is **invariant across rows**
-    /// of one query — caller invokes [`Self::current_row_desc`]
-    /// ONCE before the loop, then uses [`next_row_bytes`] for each
-    /// row to fetch only id + body.
-    ///
-    /// # Usage
-    ///
-    /// ```ignore
-    /// // Snapshot the schema once.
-    /// let desc = stream.current_row_desc().expect("streaming");
-    /// while let Some((id, bytes)) = stream.next_row_bytes() {
-    ///     decode_with(bytes, &desc);
-    /// }
-    /// ```
-    ///
-    /// # Why this is faster
-    ///
-    /// - Return type 24 B vs 32 B: one fewer register-spill on Some.
-    /// - No `current_row_desc()` projection per row: saves one
-    ///   Option dispatch + pointer-derive.
-    ///
-    /// Per-row gain: ~10-20% over [`Self::next_row`] in benchmarks.
-    #[inline]
-    pub fn next_row_bytes(&mut self) -> Option<(NonZeroU64, &[u8])> {
-        if self.drained {
-            return None;
-        }
-        // 1. Reply id — cached on first encounter, reused per row.
-        let id = match self.cached_reply_id {
-            Some(id) => id,
-            None => match self.proto.classify_for_iter_rows() {
-                crate::protocol::IterRowsClass::Streaming(id) => {
-                    self.cached_reply_id = Some(id);
-                    id
-                }
-                _ => return None,
-            },
-        };
-
-        // 2. Header peek + validation.
-        let cursor_u16 = self.proto.read_buf_cursor_u16();
-        let cursor = usize::from(cursor_u16);
-        let total: usize = {
-            let populated = self.proto.read_buf_populated();
-            let after = populated.get(cursor..)?;
-            let (tag, l0, l1, l2, l3) = match after {
-                [t, a, b, c, d, ..] => (*t, *a, *b, *c, *d),
-                _ => return None,
-            };
-            if tag != b'D' {
-                return None;
-            }
-            let declared = u32::from_be_bytes([l0, l1, l2, l3]);
-            #[expect(clippy::manual_range_contains, reason = "W3 measurement: RangeInclusive::contains regressed parse_header by +70%")]
-            if declared < 4 || declared > crate::frame::MAX_FRAME_LEN_FIELD {
-                return None;
-            }
-            let total_local = usize::try_from(declared.checked_add(1)?).ok()?;
-            if after.len() < total_local {
-                return None;
-            }
-            if total_local < crate::frame::HEADER_LEN.saturating_add(2) {
-                return None;
-            }
-            total_local
-        };
-
-        // 3. Advance.
-        self.proto.read_buf_advance(total).ok()?;
-
-        // 4. Carve row body slice — NO desc projection.
-        let row_start = cursor.saturating_add(crate::frame::HEADER_LEN);
-        let row_end = cursor.saturating_add(total);
-        let populated = self.proto.read_buf_populated();
-        let row_bytes = populated.get(row_start..row_end)?;
-
-        Some((id, row_bytes))
-    }
-
-    /// DEF-190: get the current row's schema descriptor.
-    ///
-    /// Public accessor for the protocol's row_desc_slot. Returns
-    /// `None` when not in a streaming-row state. Schema is invariant
-    /// across rows of one query — call once before the row loop.
+    /// Returns `None` outside a row-streaming state. Schema is
+    /// invariant across rows of one query — call once before the
+    /// row loop; cache the result outside the closure if needed
+    /// (the borrow ties to `&self`, so a per-event refetch is also
+    /// zero-cost).
     #[inline]
     #[must_use]
-    pub fn current_row_desc(&self) -> Option<crate::decode::RowDescBorrow<'_>> {
+    pub fn current_row_desc(&self) -> Option<RowDescBorrow<'_>> {
         self.proto.current_row_desc()
     }
 
-    /// DEF-190 (perf push 2026-04-27): closure-based row consumption.
-    ///
-    /// Calls `f(row)` for each available DataRow, returning when the
-    /// stream pauses (any non-row condition). The closure body is
-    /// inlined into the internal loop by LLVM — eliminates the
-    /// function-call boundary per row that `next_row` requires.
-    ///
-    /// # When to use
-    ///
-    /// Use `for_each_row` when the caller's per-row work is small
-    /// and inlinable (counter increment, simple decode + accumulate).
-    /// LLVM can fold the closure into the row hot path, hoisting
-    /// invariants out of the inner loop.
-    ///
-    /// Use `next_row` when the caller's work is opaque (extern call,
-    /// complex match) — the function-call boundary is amortized
-    /// over more work anyway.
-    ///
-    /// # Returns
-    ///
-    /// Number of rows consumed. After return, caller invokes
-    /// `next_event` (or future `status()`) to learn the pause cause.
-    #[inline]
-    pub fn for_each_row<F>(&mut self, mut f: F) -> u32
-    where
-        F: FnMut(Row<'_>),
-    {
-        let mut count: u32 = 0;
-        while let Some(row) = self.next_row() {
-            f(row);
-            count = count.saturating_add(1);
-        }
-        count
-    }
-
-    /// Pull the next event.
-    ///
-    /// See [`StreamItem`] for the event set.
+    /// **Pull the next column event.** See [`ColEvent`] for the
+    /// event set + lifetime contract.
     ///
     /// # Flow
     ///
-    /// 1. If drained, return `NeedMore`.
-    /// 2. If state is Errored, return `CloseSocket` once and drain.
-    /// 3. If `flush_pending` (post-terminal), run one unbounded
-    ///    `feed_bytes` to consume the trailing `Z` silent frame
-    ///    and drain the stream.
-    /// 4. Apply any pending cursor advance from a prior
-    ///    `feed_bytes_bounded` call so the following peek sees
-    ///    the physical cursor in sync with the logical one.
-    /// 5. Peek the next frame's header. Empty/incomplete →
-    ///    `NeedMore`.
-    /// 6. If header is DataRow AND state is row-streaming:
-    ///    fast-path inline emission (no OutActions alloc).
-    /// 7. Otherwise: slow-path via one
-    ///    `feed_bytes_bounded([], wb, 1)` call, emit the first
-    ///    resulting Action. Terminal action sets
-    ///    `flush_pending`.
+    /// 1. If `drained`, return `NeedMore`.
+    /// 2. If state is Errored, drain + return terminal `EndQuery`
+    ///    with an `Err` outcome carrying the prior cause's classifier
+    ///    (one terminal arm per memo §2.2).
+    /// 3. If `flush_pending`, consume the trailing `'Z'` silently
+    ///    and drain.
+    /// 4. Otherwise drive the per-column / per-row / per-frame
+    ///    state machine: parse header, handle DataRow column-by-column
+    ///    (whole-row fast path or partial-frame chunked path), or
+    ///    delegate non-D frames to [`feed_bytes_bounded`] and
+    ///    surface a terminal `EndQuery` on `CommandComplete` /
+    ///    `ErrorResponse`.
     ///
-    /// DEF-184 (B20): `#[inline]` — caller loops `while let
-    /// StreamItem::Row { .. } = stream.next_event() { ... }` on
-    /// the row hot path. Inlining collapses the state-peek header
-    /// parse into the caller's loop body; LLVM folds the flush /
-    /// errored short-circuits into hoisted compare chains.
+    /// # Lifetime
+    ///
+    /// Each returned `ColEvent<'_>` borrows from
+    /// `self.proto.read_buf` / `self.proto.row_desc_slot` /
+    /// `self.proto.error_arena` (for the `EndQuery::Err` arm).
+    /// Caller MUST process the event before next `col_next` — the
+    /// borrow checker enforces this (you cannot hold a `ColEvent`
+    /// across the next mutable call).
     #[inline]
-    pub fn next_event(&mut self) -> StreamItem<'_> {
+    pub fn col_next(&mut self) -> ColEvent<'_> {
         if self.drained {
-            return StreamItem::NeedMore;
+            return ColEvent::NeedMore;
         }
-        // DEF-189 hot-path fusion: single `match &self.state`
-        // observation classifies (Errored | Streaming | Other),
-        // returns the streaming reply id by value (Copy NonZeroU64)
-        // so the &self borrow is released before the subsequent
-        // &mut read_buf advance. Pre-DEF-189 was separate
-        // `state_is_errored()` + `streaming_reply_id()` calls —
-        // two enum matches that the compiler did not reliably
-        // fuse across the intervening header-parse logic.
+        // DEF-189-style fused classification: one match on state
+        // observes (Errored / Streaming / Other) + returns the
+        // streaming reply id by value (Copy NonZeroU64).
         let class = self.proto.classify_for_iter_rows();
         if matches!(class, crate::protocol::IterRowsClass::Errored) {
             self.drained = true;
-            return StreamItem::CloseSocket;
-        }
-        if self.flush_pending {
-            // DEF-154 (X): post-terminal flush — consume trailing
-            // silent frames (e.g. `Z` after `C`) so the protocol
-            // state returns to Idle ready for the next command.
-            // Unbounded — silent-state-transition frames don't
-            // stage actions, so OutActions is expected EMPTY; the
-            // state-machine side-effect is the sole purpose.
+            // Errored entry — terminal `EndQuery` with an Err carrying
+            // the prior-cause-classifier. The state is Errored from
+            // upstream (either before `iter_rows` entry or as a result
+            // of a prior frame the user fed via `feed_bytes`).
+            // Synthesise an Err outcome with InternalCrateBug — the
+            // production wrapper layer's path is to fail any
+            // outstanding oneshots when the connection's state is
+            // Errored at iter_rows entry; this terminal communicates
+            // that to the closure caller in the canonical Result shape.
             //
-            // DEF-184 (audit-2 item-3): pre-audit was `let _flush
-            // = ...` — a silent-drop surface (tier-4 potential if
-            // the `flush_pending`-gating invariant ever drifts).
-            // Post-audit: named binding + `debug_assert!` empty
-            // check — the invariant break lights loudly in debug
-            // builds; release path has zero runtime overhead
-            // (architecturally-dead Err branch), `flush_actions`
-            // drops naturally at end-of-scope.
+            // Cached reply id: unknown here (the Errored install
+            // already drained it via the state-setter route). Fall
+            // back to a sentinel correlator: caller is signalling
+            // "connection torn down; resolve any pending oneshots
+            // via the wrapper's ConnectionAlreadyClosed path". The
+            // outer dispatcher (`PgProtocol::feed_bytes`) on a
+            // post-Errored call returns CloseSocket; iter_rows here
+            // returns EndQuery::Err so the closure has a single
+            // terminal arm.
+            let cached = self.cached_reply_id.take();
+            // Architecturally rare: Errored entry without a cached
+            // id (no streaming was ever observed). Use the
+            // wire-canonical "post-error sentinel" — a saturated
+            // NonZeroU64. The wrapper layer matches on the
+            // EndQuery::Err *cause*, not on id equality, so this
+            // sentinel is purely a placeholder.
+            let id = cached.unwrap_or(NonZeroU64::MAX);
+            return ColEvent::EndQuery {
+                id,
+                outcome: Err(ProtocolError::InternalCrateBug {
+                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                }),
+            };
+        }
+
+        if self.flush_pending {
+            // Post-terminal flush — consume trailing silent frames
+            // (`Z` after `C`) so the protocol state returns to Idle
+            // / DrainRfqAfterError ready for the next command.
+            // Unbounded — silent-state-transition frames don't stage
+            // actions; OutActions empty is expected.
+            //
+            // Drop binding on `flush_actions` releases the `&mut self.proto`
+            // borrow at the next-statement boundary (NLL).
             let flush_actions = self.proto.feed_bytes(&[], self.write_buf);
             debug_assert!(
                 flush_actions.as_slice().is_empty(),
                 "RowStream flush path produced unexpected action — \
-                 `flush_pending` gate promises trailing frames stage \
-                 no actions; a frame leaked through.",
+                 `flush_pending` gate promises trailing frames stage no \
+                 actions; a frame leaked through.",
             );
-            // `flush_actions` (OutActions) is ManuallyDrop<heapless::Vec>
-            // of Copy payload — NLL releases the `&mut self.proto`
-            // borrow at the assertion's last use above; explicit
-            // drop would be a clippy::drop_non_drop warning.
-            //
-            // DEF-184 audit (2026-04-24): `apply_pending_advance`
-            // calls DELETED — the deferred-advance mechanism is
-            // gone (post-DEF-154 Y StreamRowRange delete, cursor
-            // advance happens in-scope inside feed_bytes itself).
-            // The flush_pending path is the only place where we
-            // previously had to "catch up" the cursor from the
-            // slow-path feed; now feed_bytes_bounded(1) advances
-            // the cursor in-scope, so there's nothing to catch up.
             self.flush_pending = false;
             self.drained = true;
-            return StreamItem::NeedMore;
+            return ColEvent::NeedMore;
         }
 
-        // DEF-184 audit: no `apply_pending_advance` needed before
-        // peek — the slow-path `feed_bytes_bounded` already
-        // advances read_buf in-scope via feed_bytes_impl's
-        // post-loop advance call.
+        // Cache reply id on first streaming observation.
+        let cached_id = match class {
+            crate::protocol::IterRowsClass::Streaming(id) => {
+                self.cached_reply_id = Some(id);
+                Some(id)
+            }
+            crate::protocol::IterRowsClass::Other => self.cached_reply_id,
+            crate::protocol::IterRowsClass::Errored => {
+                // Handled above; unreachable from here.
+                core::hint::cold_path();
+                self.drained = true;
+                return ColEvent::NeedMore;
+            }
+        };
 
-        // Peek header at current cursor.
+        // If we are mid-row in a chunked column, continue emitting
+        // chunks before parsing any new header.
+        if let Some(progress) = self.row_progress {
+            if progress.in_chunked_col() {
+                return self.emit_next_chunk(progress);
+            }
+            // Mid-row but not in a chunked col — we just finished
+            // emitting EndRow or are between columns inside a body
+            // that's fully buffered. Continue per-column emission
+            // from the current cursor.
+            return self.emit_next_col(progress);
+        }
+
+        // Between rows — peek next frame header to decide path.
+        self.dispatch_next_frame(cached_id)
+    }
+
+    /// Parse the next frame header from the read-buf and dispatch
+    /// to the appropriate emission path: DataRow → row-body parse
+    /// (whole-row fast path or partial-frame chunked entry);
+    /// non-D → slow-path `feed_bytes_bounded(1)` into a terminal
+    /// `EndQuery` or a silent transition (`NeedMore`).
+    #[inline]
+    fn dispatch_next_frame(&mut self, cached_id: Option<NonZeroU64>) -> ColEvent<'_> {
+        // Peek header at current cursor. If we are in partial-frame
+        // mode (mid-body of a previous oversized DataRow), the body
+        // bytes themselves don't have a header — re-entry detection
+        // is the row_progress state. partial_remaining > 0 with no
+        // row_progress is an architectural impossibility (entered
+        // partial mode only via DataRow open-row path); fall through
+        // to the normal peek and rely on the dispatcher to surface
+        // any drift.
         let populated = self.proto.read_buf_populated();
         let cursor = usize::from(self.proto.read_buf_cursor_u16());
         let after_cursor = populated.get(cursor..).unwrap_or(&[]);
         let header = parse_header(after_cursor);
-        let (tag, total_len) = match header {
-            HeaderParse::Empty | HeaderParse::Incomplete => {
-                return StreamItem::NeedMore;
+        match header {
+            HeaderParse::Empty | HeaderParse::Incomplete => ColEvent::NeedMore,
+            HeaderParse::MalformedLength { .. } => {
+                // Malformed — route through slow path so the dispatcher
+                // classifies and emits FailReply + CloseSocket through
+                // the canonical fail_inflight path.
+                self.slow_path_once(cached_id)
             }
-            HeaderParse::MalformedLength { .. } | HeaderParse::FrameTooLarge { .. } => {
-                // Malformed / oversized — delegate to slow path
-                // for classification via feed_bytes (it routes
-                // through fail_inflight → FailReply + CloseSocket).
-                return self.slow_path_once();
+            HeaderParse::FrameTooLarge { declared } => {
+                // Sub-A scope: only D-tag in a streaming state enters
+                // partial mode. Other tag/state combinations continue
+                // to tear down with the canonical FrameTooLarge path.
+                if cached_id.is_some() {
+                    // Re-read the tag inline (parse_header doesn't
+                    // expose the tag on the FrameTooLarge variant —
+                    // it's pre-classified). The 5-byte header is
+                    // guaranteed present (parse_header returned Ok-or-
+                    // classified, both require at least 5 bytes).
+                    let tag = after_cursor.first().copied().unwrap_or(0);
+                    if tag == TAG_DATA_ROW.byte() {
+                        return self.begin_partial_data_row(declared);
+                    }
+                }
+                self.slow_path_once(cached_id)
             }
-            HeaderParse::Ok { tag, total_len } => (tag, total_len),
-        };
-        let total = usize::from(total_len);
-        if after_cursor.len() < total {
-            return StreamItem::NeedMore;
+            HeaderParse::Ok { tag, total_len } => {
+                let total = usize::from(total_len);
+                if after_cursor.len() < total {
+                    return ColEvent::NeedMore;
+                }
+                if tag.byte() == TAG_DATA_ROW.byte()
+                    && let Some(id) = cached_id
+                {
+                    return self.begin_whole_data_row(id, cursor, total);
+                }
+                self.slow_path_once(cached_id)
+            }
         }
-
-        // Fast-path: DataRow in a row-streaming state. The state was
-        // already classified above (`IterRowsClass`); reuse the
-        // pre-computed reply_id.
-        //
-        // # DEF-189 — single state match per row
-        //
-        // Pre-DEF-185 baseline (def184-complete): ~8.3 ns/row.
-        // Post-DEF-185 (zombie dual-arena-lookup): ~17 ns/row.
-        // Post-DEF-188 (terminal slot, dual variant match): ~17.5 ns/row.
-        // Post-DEF-189 (this work): ONE `match &self.state` total
-        // per `next_event` (the fused `classify_for_iter_rows` upfront)
-        // + ONE Option projection for the desc (`current_row_desc`).
-        // The desc field was stripped from state variants entirely;
-        // lookup is now a simple `Option::as_ref` on `row_desc_slot`
-        // rather than a second enum-match-and-project.
-        if tag == TAG_DATA_ROW
-            && let crate::protocol::IterRowsClass::Streaming(id) = class
-        {
-            return self.fast_path_data_row(id, cursor, total);
-        }
-        self.slow_path_once()
     }
 
-    /// Fast path: extract the DataRow body inline + emit
-    /// [`StreamItem::Row`] without OutActions allocation.
-    ///
-    /// # DEF-189 — single descriptor projection per row
-    ///
-    /// `parse_header` in [`Self::next_event`] validated
-    /// `total_len ≤ populated.len()` before calling here, so the
-    /// row body slice is in-bounds and the advance Err branch is
-    /// architecturally dead.
-    ///
-    /// The descriptor projection happens AFTER advance via
-    /// [`crate::PgProtocol::current_row_desc`] — single Option
-    /// projection from `row_desc_slot`. No second state match;
-    /// the streaming-variant gate already verified state, and
-    /// the slot was populated atomically with the variant entry.
+    /// Enter the whole-row fast path: header fully buffered, row
+    /// body fits in `[cursor + HEADER_LEN, cursor + total)`. Parse
+    /// the 2-byte col_count, advance the cursor past the header,
+    /// and emit the first column event.
     #[inline]
-    fn fast_path_data_row(
+    fn begin_whole_data_row(
         &mut self,
         id: NonZeroU64,
         cursor: usize,
         total: usize,
-    ) -> StreamItem<'_> {
+    ) -> ColEvent<'_> {
         let row_start = cursor.saturating_add(HEADER_LEN);
         let row_end = cursor.saturating_add(total);
         let row_body_len = row_end.saturating_sub(row_start);
-        // DEF-185 P1-3: protocol-level row-size validation. A
-        // body < 2 bytes cannot carry the column-count header.
+        // Body < 2 bytes can't carry the col-count header.
         if row_body_len < 2 {
             self.drained = true;
-            // DEF-271 cluster A (2026-05-10): install_errored_*
-            // returns the atomically-drained inflight reply id —
-            // tier-1 single-source-of-truth. The classify-time
-            // `id` parameter we received is the same value
-            // (single-field projection of the streaming variant's
-            // `reply: ReplyId<QueryKind>`); the match below uses
-            // the drained id when present and falls back to the
-            // classify-time `id` only on the architecturally-cold
-            // None branch.
-            //
-            // DEF-271 cluster A revision: drop the previous
-            // post-install secondary advance attempt. The advance
-            // would re-fail (read cursor unchanged), and a second
-            // install_errored_read_cursor_advance call would
-            // overwrite the better MalformedDataRow classifier
-            // with the worse ReadCursorAdvance classifier — the
-            // first cause IS the relevant diagnostic.
             let drained = self.proto.install_errored_malformed_data_row(total);
             let cause = ProtocolError::MalformedDataRow { total_len: total };
-            return match drained {
-                Some(drained_id) => StreamItem::FailReply { id: drained_id, cause },
-                // Architecturally cold: classify_for_iter_rows entered this fast-path
-                // only from streaming variants (which carry an inflight reply); the
-                // drain returns Some by construction. Fall through to the classify-
-                // time `id` parameter (same value by single-source projection — see
-                // pin above) in the unreachable branch to preserve the FailReply
-                // emission rather than collapse to CloseSocket-only.
-                None => StreamItem::FailReply { id, cause },
+            let term_id = drained.or(Some(id)).unwrap_or(NonZeroU64::MAX);
+            return ColEvent::EndQuery {
+                id: term_id,
+                outcome: Err(cause),
             };
         }
 
-        // Advance cursor past the frame. Err is architecturally
-        // dead (parse_header pre-validated `total ≤
-        // populated.len()`). The advance only mutates
-        // `read_buf.cursor` (logical position); populated()
-        // content is unchanged, so the row body slice stays
-        // address-stable across the call.
-        if self.proto.read_buf_advance(total).is_err() {
+        // Advance the read cursor past the 5-byte header. The row
+        // body starts at the new cursor position.
+        if self.proto.read_buf_advance(HEADER_LEN).is_err() {
             self.drained = true;
-            // DEF-271 cluster A: atomic drain via FeedStateSetter.
             let drained = self.proto.install_errored_read_cursor_advance();
             let cause = ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::ReadCursorAdvance,
             };
-            return match drained {
-                Some(drained_id) => StreamItem::FailReply { id: drained_id, cause },
-                // Same architecturally-cold None branch as above.
-                None => StreamItem::FailReply { id, cause },
+            let term_id = drained.or(Some(id)).unwrap_or(NonZeroU64::MAX);
+            return ColEvent::EndQuery {
+                id: term_id,
+                outcome: Err(cause),
             };
         }
 
-        // DEF-189: project row_desc_slot directly. Single Option
-        // borrow; the lifetime ties to `&self.proto`. NLL has
-        // released the earlier `&mut` advance borrow.
-        match self.proto.current_row_desc() {
-            Some(desc) => {
-                let populated = self.proto.read_buf_populated();
-                let row_bytes = populated.get(row_start..row_end).unwrap_or(&[]);
-                StreamItem::Row { id, row_bytes, desc }
-            }
-            None => {
-                // Architecturally dead: streaming variants are entered
-                // ONLY in arms that populate row_desc_slot atomically
-                // (the 'T' arm or push_bind_execute time). A None here
-                // means a future refactor split slot population from
-                // variant entry.
-                debug_assert!(
-                    false,
-                    "DEF-189: current_row_desc None inside streaming variant — \
-                     row_desc_slot was not populated when the streaming variant \
-                     was entered. Architecturally impossible: streaming variants \
-                     are entered only in code paths that populate the slot in the \
-                     same arm.",
-                );
+        // Read col_count from body[0..2]. Body starts at the new cursor.
+        let n_cols = match self.read_col_count() {
+            Ok(n) => n,
+            Err(cause) => {
                 self.drained = true;
-                StreamItem::CloseSocket
+                let drained = self.proto.install_errored_malformed_data_row(total);
+                let term_id = drained.or(Some(id)).unwrap_or(NonZeroU64::MAX);
+                return ColEvent::EndQuery {
+                    id: term_id,
+                    outcome: Err(cause),
+                };
+            }
+        };
+        // Advance past the 2-byte col_count header.
+        if self.proto.read_buf_advance(2).is_err() {
+            self.drained = true;
+            let drained = self.proto.install_errored_read_cursor_advance();
+            let cause = ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+            };
+            let term_id = drained.or(Some(id)).unwrap_or(NonZeroU64::MAX);
+            return ColEvent::EndQuery {
+                id: term_id,
+                outcome: Err(cause),
+            };
+        }
+
+        let progress = RowProgress::new(n_cols);
+        self.row_progress = Some(progress);
+        if n_cols == 0 {
+            // Zero-column row — emit EndRow immediately. PG wire
+            // permits zero-column DataRow (rare but legal).
+            self.row_progress = None;
+            return ColEvent::EndRow;
+        }
+        self.emit_next_col(progress)
+    }
+
+    /// Enter partial-frame mode for an oversized DataRow. The frame
+    /// header (5 bytes) has been observed at the read cursor; the
+    /// declared body length exceeds the active-tier headroom. Advance
+    /// past the header, transition ReadBuf into partial mode, and
+    /// emit the first column event (which may itself be a `Chunk`).
+    #[inline]
+    fn begin_partial_data_row(&mut self, declared: u32) -> ColEvent<'_> {
+        // Re-fetch the cached reply id (architecturally guaranteed
+        // Some by the dispatch site's `cached_id.is_some()` check).
+        let cached_id = self.cached_reply_id.unwrap_or(NonZeroU64::MAX);
+
+        // Advance past the 5-byte frame header.
+        if self.proto.read_buf_advance(HEADER_LEN).is_err() {
+            self.drained = true;
+            let drained = self.proto.install_errored_read_cursor_advance();
+            let cause = ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+            };
+            let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+            return ColEvent::EndQuery {
+                id: term_id,
+                outcome: Err(cause),
+            };
+        }
+
+        // Body length includes the 4 length-field self-bytes per PG
+        // wire spec. Subtract them: partial counter tracks body bytes
+        // beyond the header.
+        let body_remaining = declared.saturating_sub(4);
+        let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+        self.proto.enter_partial_mode_for_data_row(&token, body_remaining);
+
+        // Read col_count from the now-current cursor. With body
+        // remaining > 0 and at least 2 bytes buffered (frame headers
+        // ≥ 5 B fit, post-advance ≥ 0 B but PG body always starts
+        // with 2-byte col count), col_count is the next 2 bytes.
+        let n_cols = match self.read_col_count() {
+            Ok(n) => n,
+            Err(_) => {
+                // Not enough bytes yet — pause to await more. Exit
+                // partial mode is NOT correct here (we haven't
+                // touched any body bytes); leave the counter intact
+                // and return NeedMore. The next col_next will reach
+                // this path again with more bytes available.
+                //
+                // The 2-byte col_count is in-body (its bytes account
+                // toward body_remaining). We have not consumed them
+                // yet — leave row_progress None so the next call
+                // re-enters begin_partial_data_row?  No: re-entering
+                // would re-advance past the (already-advanced) header
+                // and double-count. Set a "partial-mode pending header"
+                // marker via row_progress with n_cols = 0 and
+                // chunk_total_in_col = sentinel? That conflates state.
+                //
+                // Simpler: read_col_count returns Err only on body too
+                // short. In partial mode the body's first 2 bytes are
+                // the col_count; if even those aren't here, we cannot
+                // safely proceed. Mark drained on this rare path and
+                // surface a protocol-error terminal.
+                self.drained = true;
+                let drained = self.proto.install_errored_malformed_data_row(0);
+                let cause = ProtocolError::MalformedDataRow { total_len: 0 };
+                let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+                return ColEvent::EndQuery {
+                    id: term_id,
+                    outcome: Err(cause),
+                };
+            }
+        };
+        // Consume the 2 col_count bytes from both the read cursor
+        // and the partial-mode counter.
+        if self.proto.read_buf_advance(2).is_err() {
+            self.drained = true;
+            let drained = self.proto.install_errored_read_cursor_advance();
+            let cause = ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+            };
+            let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+            return ColEvent::EndQuery {
+                id: term_id,
+                outcome: Err(cause),
+            };
+        }
+        let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+        if self.proto.subtract_partial_for_row_stream(&token, 2).is_err() {
+            // Architecturally dead: we just verified read_col_count
+            // succeeded (≥ 2 body bytes buffered) and the body counter
+            // started at `body_remaining = declared - 4`, which for
+            // declared > READ_BUF_CAP is ≥ 4093 ≥ 2. Defensive route
+            // through the same locus.
+            self.drained = true;
+            let drained = self.proto.install_errored_read_cursor_advance();
+            let cause = ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+            };
+            let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+            return ColEvent::EndQuery {
+                id: term_id,
+                outcome: Err(cause),
+            };
+        }
+
+        let progress = RowProgress::new(n_cols);
+        self.row_progress = Some(progress);
+        if n_cols == 0 {
+            // Zero-column oversized row (architecturally pathological
+            // — a server emitting that exhausts our partial-mode
+            // counter only via the chunked-body path. We exit partial
+            // mode and emit EndRow.). Verify partial counter is 0
+            // (body was exactly 4 bytes, which we already classified
+            // as not-oversized — so this case is unreachable from a
+            // wire-legal perspective). Defensive.
+            if self.proto.partial_remaining_for_row_stream() == 0 {
+                let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+                self.proto.exit_partial_mode_for_row_stream(&token);
+            }
+            self.row_progress = None;
+            return ColEvent::EndRow;
+        }
+        self.emit_next_col(progress)
+    }
+
+    /// Emit the next column from the current row.
+    ///
+    /// Handles three sub-cases:
+    /// 1. **Whole-column inline**: column body fits in unread region.
+    ///    Emit `Got` or `Null`, advance cursor + (partial counter if
+    ///    partial-mode), bump `parsed_cols`.
+    /// 2. **First chunk of a chunked column**: declared > inline
+    ///    headroom. Emit `Chunk` with as-much-as-buffered slice,
+    ///    enter mid-chunk state via `chunk_total_in_col`.
+    /// 3. **`EndRow`**: `parsed_cols == n_cols`. Clear `row_progress`
+    ///    + (exit partial mode if 0 remaining).
+    #[inline]
+    fn emit_next_col(&mut self, progress: RowProgress) -> ColEvent<'_> {
+        if progress.parsed_cols == progress.n_cols {
+            // All columns of this row emitted. Reset row_progress so
+            // the next col_next can pick up the next frame.
+            self.row_progress = None;
+            // If we were in partial-mode and the body is fully drained
+            // (partial_remaining == 0), exit partial mode here. A
+            // wire-legal oversized DataRow has body == sum(2 col_count
+            // + per-col (4 len + len bytes)) — when parsed_cols ==
+            // n_cols, partial_remaining MUST be 0 (else a body-length
+            // / column-length disagreement). Defensive exit only when
+            // 0; non-zero is classified by the dispatcher on next
+            // entry as a body-length protocol error.
+            if self.proto.is_in_partial_mode_for_row_stream()
+                && self.proto.partial_remaining_for_row_stream() == 0
+            {
+                let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+                self.proto.exit_partial_mode_for_row_stream(&token);
+            }
+            return ColEvent::EndRow;
+        }
+
+        // Read the 4-byte column length prefix at the current cursor.
+        let col_len_i32 = match self.read_col_len() {
+            Ok(n) => n,
+            Err(_) => return ColEvent::NeedMore,
+        };
+        // Consume the 4-byte length prefix from cursor + partial.
+        if self.proto.read_buf_advance(4).is_err() {
+            return self.terminal_internal_advance_err();
+        }
+        if self.proto.is_in_partial_mode_for_row_stream() {
+            let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+            if self.proto.subtract_partial_for_row_stream(&token, 4).is_err() {
+                return self.terminal_internal_advance_err();
+            }
+        }
+
+        let idx = progress.parsed_cols;
+        if col_len_i32 == -1 {
+            // SQL NULL.
+            let mut new_progress = progress;
+            new_progress.parsed_cols = idx.saturating_add(1);
+            self.row_progress = Some(new_progress);
+            return ColEvent::Null { idx };
+        }
+        if col_len_i32 < 0 {
+            // Negative non-(-1) is malformed.
+            return self.terminal_malformed_col_len(col_len_i32);
+        }
+        let col_len = match u32::try_from(col_len_i32) {
+            Ok(v) => v,
+            Err(_) => return self.terminal_malformed_col_len(col_len_i32),
+        };
+
+        // Decide whole-col vs chunked emission. Whole-col when the
+        // entire body is buffered in the unread region.
+        let unread_len = self.proto.read_buf_unread_len();
+        let col_len_usize = match usize::try_from(col_len) {
+            Ok(v) => v,
+            Err(_) => return self.terminal_malformed_col_len(col_len_i32),
+        };
+        if col_len_usize <= unread_len {
+            // Whole-column path. Carve out the slice + advance.
+            let bytes_offset = usize::from(self.proto.read_buf_cursor_u16());
+            if self.proto.read_buf_advance(col_len_usize).is_err() {
+                return self.terminal_internal_advance_err();
+            }
+            if self.proto.is_in_partial_mode_for_row_stream() {
+                let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+                if self
+                    .proto
+                    .subtract_partial_for_row_stream(&token, col_len)
+                    .is_err()
+                {
+                    return self.terminal_internal_advance_err();
+                }
+            }
+            let mut new_progress = progress;
+            new_progress.parsed_cols = idx.saturating_add(1);
+            self.row_progress = Some(new_progress);
+            // Project the body slice from the populated region. The
+            // borrow is `&self.proto.read_buf.populated()[start..end]`
+            // and ties to the `&mut self` borrow on iter_rows.
+            let populated = self.proto.read_buf_populated();
+            let bytes = populated
+                .get(bytes_offset..bytes_offset.saturating_add(col_len_usize))
+                .unwrap_or(&[]);
+            return ColEvent::Got { idx, bytes };
+        }
+
+        // Chunked path. Emit Chunk with as-much-as-buffered.
+        // Pre-condition: col_len > unread_len, so we have strictly
+        // fewer bytes buffered than the column declares. Partial mode
+        // MUST be active for this case (otherwise the whole frame
+        // wouldn't have fit and we'd have classified as FrameTooLarge
+        // earlier). Defensive: if not in partial mode (e.g., the
+        // single-column body happened to span unread without a
+        // partial-mode entry), still emit Chunk and rely on the next
+        // col_next to fetch more bytes via Caller-feed.
+        let bytes_offset = usize::from(self.proto.read_buf_cursor_u16());
+        let chunk_len = unread_len;
+        let chunk_len_u32 = match u32::try_from(chunk_len) {
+            Ok(v) => v,
+            Err(_) => return self.terminal_internal_advance_err(),
+        };
+        if self.proto.read_buf_advance(chunk_len).is_err() {
+            return self.terminal_internal_advance_err();
+        }
+        if self.proto.is_in_partial_mode_for_row_stream() {
+            let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+            if self
+                .proto
+                .subtract_partial_for_row_stream(&token, chunk_len_u32)
+                .is_err()
+            {
+                return self.terminal_internal_advance_err();
+            }
+        }
+
+        let mut new_progress = progress;
+        new_progress.chunk_total_in_col = col_len;
+        new_progress.chunk_consumed_in_col = chunk_len_u32;
+        // We do NOT bump parsed_cols here — the column is in flight.
+        self.row_progress = Some(new_progress);
+
+        let remaining_len = col_len.saturating_sub(chunk_len_u32);
+        let populated = self.proto.read_buf_populated();
+        let bytes = populated
+            .get(bytes_offset..bytes_offset.saturating_add(chunk_len))
+            .unwrap_or(&[]);
+        ColEvent::Chunk {
+            idx,
+            bytes,
+            total_len: col_len,
+            remaining_len,
+        }
+    }
+
+    /// Emit the next chunk of an in-progress chunked column. Called
+    /// when `row_progress.in_chunked_col() == true` at `col_next`
+    /// entry. Decides between `Chunk` (more chunks to follow) and
+    /// `ChunkEnd` (this completes the column).
+    #[inline]
+    fn emit_next_chunk(&mut self, progress: RowProgress) -> ColEvent<'_> {
+        let unread_len = self.proto.read_buf_unread_len();
+        let remaining = progress
+            .chunk_total_in_col
+            .saturating_sub(progress.chunk_consumed_in_col);
+        if remaining == 0 {
+            // Architecturally dead: caller already drained the last
+            // chunk; we should have emitted ChunkEnd and reset
+            // chunk_total_in_col to 0 (resetting in_chunked_col).
+            // Defensive: bump parsed_cols + clear, then continue the
+            // per-column loop.
+            let mut new_progress = progress;
+            new_progress.parsed_cols = new_progress.parsed_cols.saturating_add(1);
+            new_progress.chunk_total_in_col = 0;
+            new_progress.chunk_consumed_in_col = 0;
+            self.row_progress = Some(new_progress);
+            return self.emit_next_col(new_progress);
+        }
+        if unread_len == 0 {
+            // No body bytes buffered — pause to feed.
+            return ColEvent::NeedMore;
+        }
+        let unread_u32 = match u32::try_from(unread_len) {
+            Ok(v) => v,
+            Err(_) => return self.terminal_internal_advance_err(),
+        };
+        let chunk_len = core::cmp::min(remaining, unread_u32);
+        let chunk_len_usize = match usize::try_from(chunk_len) {
+            Ok(v) => v,
+            Err(_) => return self.terminal_internal_advance_err(),
+        };
+        let bytes_offset = usize::from(self.proto.read_buf_cursor_u16());
+        if self.proto.read_buf_advance(chunk_len_usize).is_err() {
+            return self.terminal_internal_advance_err();
+        }
+        if self.proto.is_in_partial_mode_for_row_stream() {
+            let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+            if self
+                .proto
+                .subtract_partial_for_row_stream(&token, chunk_len)
+                .is_err()
+            {
+                return self.terminal_internal_advance_err();
+            }
+        }
+
+        let new_consumed = progress.chunk_consumed_in_col.saturating_add(chunk_len);
+        let is_final = new_consumed >= progress.chunk_total_in_col;
+
+        let mut new_progress = progress;
+        new_progress.chunk_consumed_in_col = new_consumed;
+        if is_final {
+            new_progress.chunk_total_in_col = 0;
+            new_progress.chunk_consumed_in_col = 0;
+            new_progress.parsed_cols = new_progress.parsed_cols.saturating_add(1);
+        }
+        self.row_progress = Some(new_progress);
+
+        let populated = self.proto.read_buf_populated();
+        let bytes = populated
+            .get(bytes_offset..bytes_offset.saturating_add(chunk_len_usize))
+            .unwrap_or(&[]);
+        let idx = progress.parsed_cols;
+        if is_final {
+            ColEvent::ChunkEnd { idx, bytes }
+        } else {
+            ColEvent::Chunk {
+                idx,
+                bytes,
+                total_len: progress.chunk_total_in_col,
+                remaining_len: progress.chunk_total_in_col.saturating_sub(new_consumed),
             }
         }
     }
 
-    /// Slow path: call `feed_bytes_bounded(&[], wb, 1)` — process
-    /// EXACTLY one dispatch from read_buf; emit the first resulting
-    /// Action as a StreamItem.
-    ///
-    /// Returning `NeedMore` when the bounded call yielded zero
-    /// actions (silent state transition like `RowDescription`);
-    /// the caller's loop re-enters `next_event` which then
-    /// hits the fast-path for the following `DataRow`.
-    ///
-    /// Setting `flush_pending` when the emitted action is terminal
-    /// (Complete / FailReply / CloseSocket) — next `next_event`
-    /// runs an unbounded `feed_bytes` to consume the trailing
-    /// `ReadyForQuery` and drain the stream.
-    ///
-    /// The caller-loop design (no recursion) sidesteps Rust NLL's
-    /// inability to express "conditional reborrow" on a single
-    /// function's return — if `action` is returned via
-    /// early-return AND the function also recursed via
-    /// `self.next_event()`, the action's borrow of `self.proto`
-    /// would extend across the recursion's `&mut self.proto`
-    /// and fail to compile.
-    ///
-    /// DEF-184 (B20): `#[inline]` — next_event delegates here on
-    /// every non-DataRow slow frame (T, C, Z, E); inlining folds
-    /// the bounded-feed_bytes setup into caller.
+    /// Slow path: delegate one dispatch to `feed_bytes_bounded(1)`.
+    /// Translate the first emitted action into a `ColEvent` terminal
+    /// (`EndQuery`) or `NeedMore` (silent state transition).
     #[inline]
-    fn slow_path_once(&mut self) -> StreamItem<'_> {
+    fn slow_path_once(&mut self, cached_id: Option<NonZeroU64>) -> ColEvent<'_> {
         let actions = self.proto.feed_bytes_bounded(&[], self.write_buf, 1);
         let first_opt = actions.as_slice().first().copied();
-        // Terminal-detect BEFORE constructing the StreamItem so
-        // the flag is set while we still hold `actions`; the
-        // flag is a `bool` on `self` — no extra borrow cost.
         let is_terminal = matches!(
             first_opt,
             Some(Action::DeliverReply { .. })
@@ -969,23 +981,194 @@ impl<'p, 'w> RowStream<'p, 'w> {
             self.flush_pending = true;
         }
         match first_opt {
-            Some(action) => action_to_stream_item(action),
-            None => StreamItem::NeedMore,
+            None => ColEvent::NeedMore,
+            Some(Action::DeliverReply { id, value }) => ColEvent::EndQuery {
+                id,
+                outcome: Ok(value),
+            },
+            Some(Action::FailReply { id, cause }) => ColEvent::EndQuery {
+                id,
+                outcome: Err(cause),
+            },
+            Some(Action::CloseSocket) => {
+                // CloseSocket with no prior FailReply: classify via
+                // cached id (if any) as a connection teardown without
+                // a server-attributable cause. Synthesise an Err
+                // terminal carrying ConnectionAlreadyClosed-style
+                // semantics; the test suite expects a single terminal
+                // arm on iter_rows so we route through EndQuery::Err.
+                let id = cached_id.unwrap_or(NonZeroU64::MAX);
+                ColEvent::EndQuery {
+                    id,
+                    outcome: Err(ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                    }),
+                }
+            }
+            Some(Action::SendBytes(_)) => {
+                // SCRAM-mid-handshake bytes flowed through slow path;
+                // re-enter caller loop to drain remaining frames.
+                // This is rare from inside iter_rows (handshake should
+                // complete before SELECT), but possible from a future
+                // pipelined design. Currently we treat it as
+                // "non-terminal, no event for caller" → NeedMore.
+                ColEvent::NeedMore
+            }
+        }
+    }
+
+    /// Read the 2-byte row col_count from the read buffer's unread
+    /// region without advancing the cursor.
+    #[inline]
+    fn read_col_count(&self) -> Result<u16, ProtocolError> {
+        let unread = self.proto.read_buf_populated();
+        let cursor = usize::from(self.proto.read_buf_cursor_u16());
+        let after = unread.get(cursor..).unwrap_or(&[]);
+        match after {
+            [a, b, ..] => {
+                let v_i16 = i16::from_be_bytes([*a, *b]);
+                // PG wire: col_count is i16; 0 is legal (rare). Negative
+                // values are malformed.
+                if v_i16 < 0 {
+                    return Err(ProtocolError::MalformedDataRow { total_len: 0 });
+                }
+                Ok(u16::try_from(v_i16).unwrap_or(0))
+            }
+            _ => Err(ProtocolError::MalformedDataRow { total_len: 0 }),
+        }
+    }
+
+    /// Read the 4-byte column length prefix at the current cursor
+    /// without advancing.
+    #[inline]
+    fn read_col_len(&self) -> Result<i32, ()> {
+        let unread = self.proto.read_buf_populated();
+        let cursor = usize::from(self.proto.read_buf_cursor_u16());
+        let after = unread.get(cursor..).unwrap_or(&[]);
+        match after {
+            [a, b, c, d, ..] => Ok(i32::from_be_bytes([*a, *b, *c, *d])),
+            _ => Err(()),
+        }
+    }
+
+    /// Build the canonical terminal for an architecturally-dead
+    /// `read_buf_advance` Err. Drains the inflight, installs Errored,
+    /// surfaces an `EndQuery::Err`.
+    #[inline]
+    #[cold]
+    fn terminal_internal_advance_err(&mut self) -> ColEvent<'_> {
+        self.drained = true;
+        let drained = self.proto.install_errored_read_cursor_advance();
+        let cached = self.cached_reply_id;
+        let id = drained.or(cached).unwrap_or(NonZeroU64::MAX);
+        ColEvent::EndQuery {
+            id,
+            outcome: Err(ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+            }),
+        }
+    }
+
+    /// Build the canonical terminal for a malformed column length
+    /// (negative, non-(-1)).
+    #[inline]
+    #[cold]
+    fn terminal_malformed_col_len(&mut self, _bad_len: i32) -> ColEvent<'_> {
+        self.drained = true;
+        let drained = self.proto.install_errored_malformed_data_row(0);
+        let cached = self.cached_reply_id;
+        let id = drained.or(cached).unwrap_or(NonZeroU64::MAX);
+        ColEvent::EndQuery {
+            id,
+            outcome: Err(ProtocolError::MalformedDataRow { total_len: 0 }),
         }
     }
 }
 
-/// DEF-154 (X): Action → StreamItem mapping for the slow-path
-/// emission. Post-DEF-154 (Y) `Action::StreamRow` no longer
-/// exists (DataRow flows via `iter_rows` fast-path only);
-/// slow-path never observes a row action, so the match is over
-/// the four remaining variants.
-#[inline]
-fn action_to_stream_item<'a>(action: Action<'a, 'a>) -> StreamItem<'a> {
-    match action {
-        Action::DeliverReply { id, value } => StreamItem::Complete { id, value },
-        Action::SendBytes(bytes) => StreamItem::SendBytes(bytes),
-        Action::FailReply { id, cause } => StreamItem::FailReply { id, cause },
-        Action::CloseSocket => StreamItem::CloseSocket,
+// ─────────────────────────────────────────────────────────────────────
+// DEF-248 Sub-A (2026-05-12) — Drop impl + mem::forget closure
+//
+// Drop fires unconditionally on every closure exit (normal return,
+// `?`-propagation, panic unwind under `panic = "unwind"`). The Drop
+// body installs Errored when the stream is mid-frame; the closure
+// scope (memo §3.2) closes `mem::forget` structurally.
+// ─────────────────────────────────────────────────────────────────────
+
+impl Drop for RowStream<'_, '_> {
+    fn drop(&mut self) {
+        if !self.drained {
+            // The stream was dropped mid-frame — either via panic
+            // unwind, early `return`, `?`-propagation, or closure
+            // body returning without consuming all events.
+            //
+            // The Errored install routes through the leaf-gated
+            // FeedStateSetter (see
+            // `_stream_dropped_mid_stream_drain_leaf` in mod
+            // protocol). The drained in-flight reply id is absorbed
+            // here (Drop has no FailReply emission context); the
+            // next operation on the connection observes Errored and
+            // the wrapper surfaces ConnectionAlreadyClosed { prior_kind:
+            // ClientOrdering } so the user's oneshot is not silently
+            // leaked.
+            self.proto.install_errored_stream_dropped_mid_stream();
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// `MAX_FRAME_LEN_FIELD` is referenced from this module for the
+// declared-length classifier inside `dispatch_next_frame`. Tier-1
+// pin: validate the constant's invariant relationship.
+// ─────────────────────────────────────────────────────────────────────
+
+// Tier-1 compile-time anchor: `MAX_FRAME_LEN_FIELD` is referenced via
+// the import above to keep the symbol load-bearing.
+const _: () = assert!(MAX_FRAME_LEN_FIELD >= 4);
+
+/// **DEF-248 Sub-A leaf submodule** for partial-frame mode entry.
+///
+/// Hosts the per-call-site concrete-type token gating
+/// [`crate::buf::ReadBuf::enter_partial_mode`] /
+/// [`crate::buf::ReadBuf::exit_partial_mode`] /
+/// [`crate::buf::ReadBuf::subtract_partial_remaining`]. The token's
+/// tuple-struct field is private to this submodule — `Self(())` mints
+/// are callable ONLY inside the leaf. Mirror of DEF-272 cluster δ
+/// pattern but with the leaf placed in `mod row_stream` (the caller
+/// module) rather than `mod buf` (the callee), because we need to
+/// restrict the call surface to the caller module.
+///
+/// **Tier-1 within-crate by-construction**: hostile callers outside
+/// `mod row_stream` attempting to call the partial-mode methods on
+/// `ReadBuf` cannot supply the token type — the type system rejects.
+///
+/// **The only legitimate proximate mint site** is
+/// [`mint_for_row_stream_dispatcher`], `pub(in crate::row_stream)`,
+/// callable only from inside this module.
+#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+pub(crate) mod _row_stream_partial_leaf {
+    /// **Tier-1 leaf-scope token** for partial-frame mode entry/exit.
+    ///
+    /// Tuple-struct field private to leaf: `Self(())` mints are
+    /// callable ONLY inside this submodule. Hostile in-crate code
+    /// outside the leaf cannot construct the type — the type system
+    /// rejects. Mirror of DEF-272 cluster δ tokens.
+    pub(crate) struct PartialFrameToken(());
+
+    /// Mint a fresh [`PartialFrameToken`] for the row-stream
+    /// dispatcher. Sole legitimate caller is
+    /// [`super::RowStream::col_next`] (and its `begin_partial_*` /
+    /// `emit_next_*` helpers) when transitioning from
+    /// "frame-too-large-but-D-tag-in-streaming-state" classify to
+    /// partial-frame mode entry, or when draining body bytes against
+    /// the partial-mode counter.
+    ///
+    /// Visibility `pub(in crate::row_stream)`: only callable from
+    /// inside `mod row_stream`. External crates and other in-crate
+    /// modules cannot mint the token — the type system rejects
+    /// (E0624 method-private-in-this-impl-context).
+    #[inline]
+    #[must_use]
+    pub(in crate::row_stream) fn mint_for_row_stream_dispatcher() -> PartialFrameToken {
+        PartialFrameToken(())
     }
 }

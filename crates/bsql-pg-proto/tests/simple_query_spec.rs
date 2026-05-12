@@ -519,10 +519,11 @@ fn dml_after_select_clears_row_desc() {
     // on `C`; consumed on `Z` into DeliverReply(QueryComplete).
     // Post-Q1 state = Idle (no residual schema anywhere).
     //
-    // DEF-154 (Y): row-bearing Q1 drives through `iter_rows`
-    // (the sole row-streaming API post-(Y)). Drain the stream to
-    // the terminal Complete event; the inner `flush_pending`
-    // mechanism consumes the trailing Z so state returns to Idle.
+    // DEF-248 Sub-A (2026-05-12): row-bearing Q1 drives through
+    // closure-scoped `iter_rows` + `col_next` (the sole row-streaming
+    // API post-(Sub-A)). Drain the stream to the terminal EndQuery
+    // event; the inner `flush_pending` mechanism consumes the
+    // trailing Z so state returns to Idle.
     let (q1_reply, _q1_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, q1_reply, &mut wb);
     let mut q1_bytes = std::vec::Vec::new();
@@ -530,29 +531,35 @@ fn dml_after_select_clears_row_desc() {
     q1_bytes.extend_from_slice(&data_row_frame(b"hello"));
     q1_bytes.extend_from_slice(&command_complete_frame(b"SELECT 1"));
     q1_bytes.extend_from_slice(&rfq_frame(b'I'));
-    {
-        let mut stream = proto.iter_rows(&mut wb);
+    proto.iter_rows(&mut wb, |stream| {
         if let Err(err) = stream.feed(&q1_bytes) {
             panic!("feed Q1 fits: {err:?}");
         }
-        let mut saw_complete = false;
-        for _ in 0..16 {
-            match stream.next_event() {
-                bsql_pg_proto::StreamItem::Complete { .. } => {
-                    saw_complete = true;
+        let mut saw_end_query = false;
+        for _ in 0..32 {
+            match stream.col_next() {
+                bsql_pg_proto::ColEvent::EndQuery { outcome: Ok(_), .. } => {
+                    saw_end_query = true;
                     break;
                 }
-                bsql_pg_proto::StreamItem::Row { .. }
-                | bsql_pg_proto::StreamItem::NeedMore => continue,
-                other => panic!("unexpected event on Q1: {other:?}"),
+                bsql_pg_proto::ColEvent::EndQuery { outcome: Err(cause), .. } => {
+                    panic!("unexpected EndQuery::Err on Q1: {cause:?}");
+                }
+                bsql_pg_proto::ColEvent::Got { .. }
+                | bsql_pg_proto::ColEvent::Null { .. }
+                | bsql_pg_proto::ColEvent::EndRow
+                | bsql_pg_proto::ColEvent::Chunk { .. }
+                | bsql_pg_proto::ColEvent::ChunkEnd { .. }
+                | bsql_pg_proto::ColEvent::NeedMore => continue,
+                _ => panic!("unexpected event on Q1"),
             }
         }
-        assert!(saw_complete, "query 1 must deliver");
-        // Drain the trailing Z via one more next_event so the
+        assert!(saw_end_query, "query 1 must deliver");
+        // Drain the trailing Z via one more col_next so the
         // RowStream's flush_pending returns state to Idle before
         // drop.
-        let _ = stream.next_event();
-    }
+        let _ = stream.col_next();
+    });
     assert!(matches!(proto.state(), ProtoState::Idle), "Q1 post-drain state must be Idle, got {:?}", proto.state());
 
     // Query 2: DML path. No `T` frame → AwaitingRfq never gets a

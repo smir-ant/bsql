@@ -1044,7 +1044,7 @@ pub(crate) mod _read_cursor_advance_drain_leaf {
     /// [`crate::state_setter::drain_at_read_cursor_advance`].
     #[inline]
     #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
-                  by the Errored install. Caller MUST emit StreamItem::FailReply or equivalent."]
+                  by the Errored install. Caller MUST emit ColEvent::EndQuery { outcome: Err(_) } or equivalent."]
     pub(in crate::protocol) fn drain(
         state: &mut crate::state::ProtoState,
         kind: crate::error::StateErrorKind,
@@ -1066,7 +1066,7 @@ pub(crate) mod _malformed_data_row_drain_leaf {
     /// [`crate::state_setter::drain_at_malformed_data_row`].
     #[inline]
     #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
-                  by the Errored install. Caller MUST emit StreamItem::FailReply or equivalent."]
+                  by the Errored install. Caller MUST emit ColEvent::EndQuery { outcome: Err(_) } or equivalent."]
     pub(in crate::protocol) fn drain(
         state: &mut crate::state::ProtoState,
         kind: crate::error::StateErrorKind,
@@ -1096,6 +1096,49 @@ pub(crate) mod _fail_inflight_no_readbuf_drain_leaf {
         crate::state_setter::drain_at_fail_inflight_no_readbuf(
             state,
             FailInflightNoReadbufToken(()),
+            kind,
+        )
+    }
+}
+
+/// DEF-248 Sub-A (2026-05-12) leaf submodule for the
+/// `install_errored_stream_dropped_mid_stream` transition. Fires from
+/// [`crate::row_stream::RowStream::drop`] when the stream is dropped
+/// with `drained == false` (closure exited mid-frame: normal early
+/// return, `?` propagation, panic unwind).
+///
+/// Mirror of cluster δ leaves above (`_read_cursor_advance_drain_leaf`,
+/// `_malformed_data_row_drain_leaf`, …). The
+/// `StreamDroppedMidStreamToken` tuple-struct field is private to this
+/// submodule — `Self(())` mints are callable ONLY inside the leaf.
+/// Hostile in-crate attempts to call `drain_at_stream_dropped_mid_stream`
+/// from outside this leaf cannot construct the required token type;
+/// the type system rejects.
+#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
+    /// DEF-248 Sub-A leaf-scope token. Field private to leaf.
+    pub(crate) struct StreamDroppedMidStreamToken(());
+
+    /// Mint a [`StreamDroppedMidStreamToken`] and route through
+    /// [`crate::state_setter::drain_at_stream_dropped_mid_stream`].
+    /// Sole legitimate caller is
+    /// [`crate::PgProtocol::install_errored_stream_dropped_mid_stream`]
+    /// (the `install_errored_*` helper invoked from
+    /// `RowStream`'s Drop impl).
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+                  by the Errored install. Drop-site caller binds it to `_drained_at_drop` for \
+                  documentation; drop has no FailReply emission context, but the next \
+                  operation on the connection surfaces ConnectionAlreadyClosed { prior_kind: \
+                  ClientOrdering } so the user's oneshot is not silently leaked at the \
+                  wrapper layer."]
+    pub(in crate::protocol) fn drain(
+        state: &mut crate::state::ProtoState,
+        kind: crate::error::StateErrorKind,
+    ) -> Option<core::num::NonZeroU64> {
+        crate::state_setter::drain_at_stream_dropped_mid_stream(
+            state,
+            StreamDroppedMidStreamToken(()),
             kind,
         )
     }
@@ -2648,6 +2691,69 @@ impl PgProtocol {
         self.read_buf.advance(n)
     }
 
+    /// DEF-248 Sub-A (2026-05-12): unread-region length accessor for
+    /// the row-stream state machine's chunk-vs-whole-col decision.
+    /// Re-export of [`crate::buf::ReadBuf::unread_len`].
+    #[inline]
+    #[must_use]
+    pub(crate) fn read_buf_unread_len(&self) -> usize {
+        self.read_buf.unread_len()
+    }
+
+    /// DEF-248 Sub-A (2026-05-12): partial-mode entry point routed
+    /// through the leaf-gated [`crate::buf::ReadBuf::enter_partial_mode`]
+    /// accepting a `&PartialFrameToken`. The token mint is gated to
+    /// `crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher`,
+    /// itself `pub(in crate::row_stream)` — so this entry point is
+    /// only legitimately reachable from inside `mod row_stream`.
+    #[inline]
+    pub(crate) fn enter_partial_mode_for_data_row(
+        &mut self,
+        token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
+        declared_body_len: u32,
+    ) {
+        self.read_buf.enter_partial_mode(token, declared_body_len);
+    }
+
+    /// DEF-248 Sub-A (2026-05-12): partial-mode exit point. Mirror
+    /// of [`Self::enter_partial_mode_for_data_row`].
+    #[inline]
+    pub(crate) fn exit_partial_mode_for_row_stream(
+        &mut self,
+        token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
+    ) {
+        self.read_buf.exit_partial_mode(token);
+    }
+
+    /// DEF-248 Sub-A (2026-05-12): drain `n` bytes from the
+    /// partial-mode counter. Returns Err on attempted underflow.
+    #[inline]
+    pub(crate) fn subtract_partial_for_row_stream(
+        &mut self,
+        token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
+        n: u32,
+    ) -> Result<(), crate::buf::AdvancePastEnd> {
+        self.read_buf.subtract_partial_remaining(token, n)
+    }
+
+    /// DEF-248 Sub-A (2026-05-12): partial-mode predicate. Used by
+    /// the row-stream state machine to decide whether the
+    /// `subtract_partial_*` bookkeeping is needed.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_in_partial_mode_for_row_stream(&self) -> bool {
+        self.read_buf.is_in_partial_mode()
+    }
+
+    /// DEF-248 Sub-A (2026-05-12): partial-mode counter readout.
+    /// Used by the row-stream state machine to decide whether
+    /// exit-partial-mode is safe (counter == 0).
+    #[inline]
+    #[must_use]
+    pub(crate) fn partial_remaining_for_row_stream(&self) -> u32 {
+        self.read_buf.partial_remaining()
+    }
+
     /// DEF-189: project the current row_desc_slot as a
     /// [`crate::decode::RowDescBorrow`], or `None` if no schema is
     /// parked.
@@ -2737,9 +2843,9 @@ impl PgProtocol {
     /// `classify_for_iter_rows` site collapses to a single source.
     #[inline]
     #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically \
-                  drained by the Errored install. Caller MUST emit StreamItem::FailReply \
-                  or equivalent — dropping it leaks the user's oneshot-receiver \
-                  (zombie-reply class)."]
+                  drained by the Errored install. Caller MUST emit ColEvent::EndQuery \
+                  { outcome: Err(_) } or equivalent — dropping it leaks the user's \
+                  oneshot-receiver (zombie-reply class)."]
     pub(crate) fn install_errored_read_cursor_advance(&mut self) -> Option<NonZeroU64> {
         let cause = ProtocolError::InternalCrateBug {
             locus: crate::error::CrateBugLocus::ReadCursorAdvance,
@@ -2768,9 +2874,9 @@ impl PgProtocol {
     /// drain-and-install rationale. Same pattern.
     #[inline]
     #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically \
-                  drained by the Errored install. Caller MUST emit StreamItem::FailReply \
-                  or equivalent — dropping it leaks the user's oneshot-receiver \
-                  (zombie-reply class)."]
+                  drained by the Errored install. Caller MUST emit ColEvent::EndQuery \
+                  { outcome: Err(_) } or equivalent — dropping it leaks the user's \
+                  oneshot-receiver (zombie-reply class)."]
     pub(crate) fn install_errored_malformed_data_row(
         &mut self,
         total_len: usize,
@@ -2785,36 +2891,157 @@ impl PgProtocol {
     // `&self.state.row_desc` directly. The "stale ref" bug class is
     // architecturally impossible (no handle to be stale).
 
-    /// DEF-154 (X) P0-2(c): construct a pull-based row stream
-    /// over this protocol + a caller-owned write buffer.
+    /// DEF-248 Sub-A (2026-05-12): transition to `Errored(Internal)`
+    /// when a [`crate::row_stream::RowStream`] is dropped mid-frame
+    /// (closure exited via early return / `?` / panic-unwind without
+    /// reaching a terminal `ColEvent::EndQuery`).
     ///
-    /// Returns a [`crate::row_stream::RowStream`] that the caller
-    /// feeds inbound TCP bytes via `.feed()` and pulls events via
-    /// `.next_event()`. Fast-paths the DataRow frame (zero
-    /// `OutActions` allocation per row on the SELECT hot path);
-    /// slow-path (non-DataRow frames) delegates to `feed_bytes`.
+    /// # When this fires
     ///
-    /// See `row_stream` module docs for perf rationale + API.
+    /// `RowStream::Drop` checks `self.drained` at scope close. The
+    /// flag is set `true` only by the terminal-event paths inside
+    /// `col_next` (success terminal, fail terminal, or
+    /// already-Errored state classifier). Any non-terminal closure
+    /// exit (normal `return`, `?`-propagation, panic unwind) leaves
+    /// the flag `false`; Drop installs Errored via this helper.
     ///
-    /// The returned stream holds `&mut self` + `&mut write_buf`;
-    /// both refs are blocked from other uses until the stream
-    /// drops.
+    /// # Tier-1 closure on `mem::forget`
+    ///
+    /// `iter_rows` owns the stream value on its stack frame; the
+    /// caller's closure receives `&mut RowStream`. `mem::forget` on a
+    /// `&mut` does nothing to the underlying value — the stream
+    /// always drops at `iter_rows`'s return. Structural by Rust's
+    /// drop-glue contract (see memo `/tmp/def248-design-memo-v2.md`
+    /// §3.2).
+    ///
+    /// # Tier-1 closure on panic unwind
+    ///
+    /// Drop fires unconditionally on stack unwind by Rust spec. The
+    /// crate runs under `panic = "unwind"` (workspace default); a
+    /// downstream binary with `panic = "abort"` is an OS-level
+    /// boundary (process death → TCP RST → server-side teardown;
+    /// stronger than any library mechanism — see memo §3.3).
+    ///
+    /// # Why no FailReply emission here
+    ///
+    /// Drop has no access to a `StagedActions` / closure-return
+    /// channel. The in-flight reply id is atomically drained by the
+    /// state-setter route, but absorbed at the call site —
+    /// architectural boundary documented on
+    /// [`crate::state_setter::drain_at_stream_dropped_mid_stream`].
+    /// The next operation on the connection observes the Errored
+    /// state and the wrapper layer surfaces
+    /// `ConnectionAlreadyClosed { prior_kind: ClientOrdering }` via
+    /// the existing `as_ready` classifier — the user's oneshot is
+    /// not silently leaked.
     #[inline]
-    pub fn iter_rows<'p, 'w>(
-        &'p mut self,
-        write_buf: &'w mut WriteBuf,
-    ) -> crate::row_stream::RowStream<'p, 'w> {
+    pub(crate) fn install_errored_stream_dropped_mid_stream(&mut self) {
+        let cause = ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::StreamDroppedMidStream,
+        };
+        // The drained id has no caller context here (Drop). Bind to
+        // `_drained_at_drop` for the `#[must_use]` discoverability
+        // contract — see the leaf submodule docstring.
+        let _drained_at_drop: Option<NonZeroU64> =
+            _stream_dropped_mid_stream_drain_leaf::drain(&mut self.state, cause.state_kind());
+        // DEF-248 Sub-A: clear read_buf so a subsequent feed_bytes on
+        // the post-Errored connection does not classify mid-frame
+        // bytes as a fresh frame header. The state is already Errored
+        // — `feed_bytes_impl`'s `IngressClassification::AlreadyErrored`
+        // arm also calls `read_buf.clear()`, but doing it here keeps
+        // the post-Drop invariant tight without needing a follow-up
+        // feed_bytes to scrub.
+        self.read_buf.clear();
+    }
+
+    /// DEF-248 Sub-A (2026-05-12): closure-scoped row-stream API.
+    ///
+    /// Caller passes a closure that receives `&mut RowStream`. The
+    /// `RowStream` value lives on this function's stack frame and is
+    /// dropped synchronously before this function returns. Caller
+    /// never owns the value — `mem::forget` of the closure-borrowed
+    /// reference is a no-op against the underlying stream.
+    ///
+    /// # Tier-1 closure of cycle-1 hazards
+    ///
+    /// 1. **`mem::forget(RowStream)`** — structurally impossible: the
+    ///    closure has only `&mut RowStream`, not `RowStream` by
+    ///    value. Forgetting the reference forgets a reborrow, not the
+    ///    value.
+    /// 2. **Drop mid-stream** — Rust drop-glue runs unconditionally
+    ///    on every closure exit (normal return, `?` propagation,
+    ///    panic unwind under `panic = "unwind"`). The stream's
+    ///    `Drop` impl installs Errored when the closure exited
+    ///    without reaching `ColEvent::EndQuery`.
+    /// 3. **`Box::leak` / `ManuallyDrop` on the stream** — caller has
+    ///    no value to wrap.
+    ///
+    /// `panic = "abort"` is a binary-level setting outside the
+    /// library's reach; on process death, the OS closes the TCP
+    /// socket and the peer observes connection teardown — an
+    /// architectural boundary stronger than any library mechanism
+    /// (memo §3.3).
+    ///
+    /// # Hot-path cost
+    ///
+    /// `#[inline]` + closure monomorphisation produces machine code
+    /// identical to inlined cycle-1-style usage. The `&mut RowStream`
+    /// indirection is elided by LLVM's inliner. Drop call at scope
+    /// end is one `call` instruction — same as a caller-side `}`
+    /// scope close would have had on a by-value stream.
+    ///
+    /// # Caller pattern
+    ///
+    /// ```ignore
+    /// let outcome: Result<MyRow, MyError> = proto.iter_rows(&mut wb, |stream| {
+    ///     stream.feed(&inbound_bytes_from_socket)?;
+    ///     loop {
+    ///         match stream.col_next() {
+    ///             ColEvent::Got { idx, bytes } => { /* … */ }
+    ///             ColEvent::Null { idx } => { /* … */ }
+    ///             ColEvent::EndRow => { /* … */ }
+    ///             ColEvent::Chunk { idx, bytes, .. } => { /* … */ }
+    ///             ColEvent::ChunkEnd { idx, bytes } => { /* … */ }
+    ///             ColEvent::NeedMore => return Err(MyError::NotEnoughBytes),
+    ///             ColEvent::EndQuery { id, outcome } => {
+    ///                 return outcome.map(/* … */).map_err(/* … */);
+    ///             }
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// # Sub-A scope
+    ///
+    /// D-tag streaming-exposed only. Non-D frames > READ_BUF_CAP
+    /// continue to tear down with `FrameTooLarge` (Sub-B's concern).
+    /// Within-D, every wire-legal body size is handled via
+    /// partial-frame chunking — see [`crate::row_stream::ColEvent`].
+    #[inline]
+    pub fn iter_rows<R, F>(&mut self, write_buf: &mut WriteBuf, f: F) -> R
+    where
+        F: for<'p, 'w> FnOnce(&mut crate::row_stream::RowStream<'p, 'w>) -> R,
+    {
         // Entry-point housekeeping mirrors feed_bytes:
         write_buf.clear();
         // DEF-211 FAKE-01: cached classification (see feed_bytes for
         // rationale).
         let entry_class = self.state.push_class();
         self.clear_session_residue_for_class(entry_class);
-        // DEF-184 audit (2026-04-24): `apply_pending_advance`
-        // DELETED — the deferred mechanism is gone (post-DEF-154 Y
-        // StreamRowRange delete, cursor advance happens in-scope
-        // inside feed_bytes_impl). Nothing to catch up.
-        crate::row_stream::RowStream::new(self, write_buf)
+
+        // The stream value lives here on `iter_rows`'s stack frame.
+        // Caller's closure receives `&mut stream` — a borrow, not
+        // the value. Drop fires at end of this function body, even
+        // on panic unwind (Rust spec). DEF-248 Sub-A `mem::forget`
+        // closure: caller has no value, only a borrow.
+        //
+        // The HRTB `for<'p, 'w>` binds the closure to ANY lifetimes
+        // `RowStream<'p, 'w>` carries; the actual lifetimes here are
+        // tied to this stack frame, but the trait bound prevents the
+        // closure from naming them (and thus from smuggling the
+        // stream out via type-state shenanigans).
+        let mut stream = crate::row_stream::RowStream::new(self, write_buf);
+        f(&mut stream)
     }
 }
 
