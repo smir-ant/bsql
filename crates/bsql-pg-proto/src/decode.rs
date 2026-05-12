@@ -2460,6 +2460,246 @@ const _: () = {
 };
 
 // ═════════════════════════════════════════════════════════════════
+// DEF-258 (2026-05-12): compile-time FormatCode × Type matrix.
+//
+// Type-level encoding of which (FormatCode, Rust-type) pairs are
+// valid for column decoding. Currently every primitive type
+// (i16/i32/i64/u32/bool/&str) implements BOTH text and binary
+// decoders — DEF-258 closes the runtime "is this (T, F) pair
+// supported" classification at the type level so any future type
+// with text-only OR binary-only support automatically rejects the
+// missing-format dispatch at compile time.
+//
+// Tier impact: caller dispatch on (T, F) is **tier-1 by-construction**
+// — a static `DecodeFormat<F>` bound is the type-system check;
+// missing impl == compile error.
+//
+// Additive — does NOT replace [`FromPgText`] / [`FromPgBinary`].
+// Both legacy traits remain (caller can still invoke `T::from_pg_text`
+// or `T::from_pg_binary` directly). DecodeFormat is the new
+// generic-F-parameterised dispatch surface; impls forward to the
+// underlying legacy trait.
+// ═════════════════════════════════════════════════════════════════
+
+mod format_marker_sealed {
+    pub trait FormatCodeMarkerSealed {}
+    pub trait DecodeFormatSealed<F> {}
+}
+
+/// Type-level marker corresponding to a [`FormatCode`] wire variant.
+///
+/// Two implementors exist, sealed inside this crate: [`TextFmt`] and
+/// [`BinaryFmt`]. The corresponding runtime [`FormatCode`] value is
+/// available via the [`Self::WIRE`] constant — used by the runtime
+/// dispatcher [`decode_with_format`] to bridge the runtime
+/// `FormatCode` from `RowDescription` to the static format marker.
+///
+/// Downstream crates cannot implement this trait (sealed); the
+/// closed set matches the PG wire spec (§55.2.2) which permits
+/// only two format codes. A future PG major-version revision adding
+/// a third format code would be a breaking-change major version
+/// of this crate.
+pub trait FormatCodeMarker: format_marker_sealed::FormatCodeMarkerSealed {
+    /// Runtime [`FormatCode`] value this marker corresponds to.
+    const WIRE: FormatCode;
+}
+
+/// Type-level marker for [`FormatCode::Text`] (wire byte `0`).
+///
+/// Zero-sized; used as the format type parameter on
+/// [`DecodeFormat`]. See [`FormatCodeMarker`] for the closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextFmt;
+
+/// Type-level marker for [`FormatCode::Binary`] (wire byte `1`).
+///
+/// Zero-sized; used as the format type parameter on
+/// [`DecodeFormat`]. See [`FormatCodeMarker`] for the closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BinaryFmt;
+
+impl format_marker_sealed::FormatCodeMarkerSealed for TextFmt {}
+impl format_marker_sealed::FormatCodeMarkerSealed for BinaryFmt {}
+
+impl FormatCodeMarker for TextFmt {
+    const WIRE: FormatCode = FormatCode::Text;
+}
+impl FormatCodeMarker for BinaryFmt {
+    const WIRE: FormatCode = FormatCode::Binary;
+}
+
+/// Type-level format-parameterised decoder.
+///
+/// Generic over `F: FormatCodeMarker` — the static format marker.
+/// Implemented for each (Rust type, wire format) pair the crate
+/// supports. Sealed via [`format_marker_sealed::DecodeFormatSealed`];
+/// downstream crates cannot add impls for their own types in the
+/// 1c-3a/3b phase. Wider type coverage (date, time, uuid, decimal)
+/// lands with the corresponding sub-phases.
+///
+/// # Type-level pair check
+///
+/// Calling `<T as DecodeFormat<F>>::decode(bytes)` requires T to
+/// implement DecodeFormat<F>. A missing pair (e.g. a hypothetical
+/// type with only text support but caller tries
+/// `<T as DecodeFormat<BinaryFmt>>::decode`) is a compile error,
+/// NOT a runtime classification. This **closes** the runtime
+/// "format-OID mismatch" classification at the type level.
+///
+/// # OID symmetry
+///
+/// Each impl's `OID` matches the corresponding [`FromPgText::OID`]
+/// or [`FromPgBinary::OID`] for the same Rust type — pinned via
+/// const-asserts after every impl block below. A drift in OID
+/// between DecodeFormat and the legacy traits fails compilation.
+///
+/// # Forwarding
+///
+/// Each impl forwards to the matching legacy trait
+/// ([`FromPgText`] for `F = TextFmt`, [`FromPgBinary`] for
+/// `F = BinaryFmt`) — no behavior change, no new decode paths.
+/// DecodeFormat is purely a dispatch-surface refinement.
+pub trait DecodeFormat<'a, F: FormatCodeMarker>:
+    Sized + format_marker_sealed::DecodeFormatSealed<F>
+{
+    /// PG type OID this (type, format) pair targets.
+    ///
+    /// Pinned via const-assert to match the corresponding
+    /// [`FromPgText::OID`] / [`FromPgBinary::OID`].
+    const OID: u32;
+
+    /// Decode the column's bytes in the format specified by `F`.
+    ///
+    /// Forwards to [`FromPgText::from_pg_text`] (for `F = TextFmt`)
+    /// or [`FromPgBinary::from_pg_binary`] (for `F = BinaryFmt`).
+    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError>;
+}
+
+// DEF-258 impls — six primitive types × two format markers = 12 impls.
+// Macro avoids 12 copies of the same boilerplate.
+macro_rules! impl_decode_format_text {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl format_marker_sealed::DecodeFormatSealed<TextFmt> for $t {}
+            impl<'a> DecodeFormat<'a, TextFmt> for $t {
+                const OID: u32 = <$t as FromPgText<'a>>::OID;
+                #[inline]
+                fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+                    <$t as FromPgText<'a>>::from_pg_text(bytes)
+                }
+            }
+        )+
+    };
+}
+
+macro_rules! impl_decode_format_binary {
+    ($($t:ty),+ $(,)?) => {
+        $(
+            impl format_marker_sealed::DecodeFormatSealed<BinaryFmt> for $t {}
+            impl<'a> DecodeFormat<'a, BinaryFmt> for $t {
+                const OID: u32 = <$t as FromPgBinary<'a>>::OID;
+                #[inline]
+                fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+                    <$t as FromPgBinary<'a>>::from_pg_binary(bytes)
+                }
+            }
+        )+
+    };
+}
+
+impl_decode_format_text!(i16, i32, i64, u32, bool);
+impl_decode_format_binary!(i16, i32, i64, u32, bool);
+
+// `&str` has a non-trivial lifetime in both legacy traits; macro
+// substitution would tangle the `'a` bindings. Hand-rolled below.
+impl format_marker_sealed::DecodeFormatSealed<TextFmt> for &str {}
+impl<'a> DecodeFormat<'a, TextFmt> for &'a str {
+    const OID: u32 = <&'a str as FromPgText<'a>>::OID;
+    #[inline]
+    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+        <&'a str as FromPgText<'a>>::from_pg_text(bytes)
+    }
+}
+
+impl format_marker_sealed::DecodeFormatSealed<BinaryFmt> for &str {}
+impl<'a> DecodeFormat<'a, BinaryFmt> for &'a str {
+    const OID: u32 = <&'a str as FromPgBinary<'a>>::OID;
+    #[inline]
+    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+        <&'a str as FromPgBinary<'a>>::from_pg_binary(bytes)
+    }
+}
+
+// DEF-258: compile-time OID drift pin between DecodeFormat and the
+// legacy FromPgText/FromPgBinary traits. A future refactor that
+// touched one side without the other (or assigned a stale OID
+// constant to a new DecodeFormat impl) fails the build.
+const _: () = {
+    // Text-format OID pins.
+    assert!(<i16 as DecodeFormat<TextFmt>>::OID == <i16 as FromPgText>::OID);
+    assert!(<i32 as DecodeFormat<TextFmt>>::OID == <i32 as FromPgText>::OID);
+    assert!(<i64 as DecodeFormat<TextFmt>>::OID == <i64 as FromPgText>::OID);
+    assert!(<u32 as DecodeFormat<TextFmt>>::OID == <u32 as FromPgText>::OID);
+    assert!(<bool as DecodeFormat<TextFmt>>::OID == <bool as FromPgText>::OID);
+    assert!(<&str as DecodeFormat<TextFmt>>::OID == <&str as FromPgText>::OID);
+
+    // Binary-format OID pins.
+    assert!(<i16 as DecodeFormat<BinaryFmt>>::OID == <i16 as FromPgBinary>::OID);
+    assert!(<i32 as DecodeFormat<BinaryFmt>>::OID == <i32 as FromPgBinary>::OID);
+    assert!(<i64 as DecodeFormat<BinaryFmt>>::OID == <i64 as FromPgBinary>::OID);
+    assert!(<u32 as DecodeFormat<BinaryFmt>>::OID == <u32 as FromPgBinary>::OID);
+    assert!(<bool as DecodeFormat<BinaryFmt>>::OID == <bool as FromPgBinary>::OID);
+    assert!(<&str as DecodeFormat<BinaryFmt>>::OID == <&str as FromPgBinary>::OID);
+
+    // Marker WIRE constants match the FormatCode variant they encode.
+    assert!(matches!(<TextFmt as FormatCodeMarker>::WIRE, FormatCode::Text));
+    assert!(matches!(<BinaryFmt as FormatCodeMarker>::WIRE, FormatCode::Binary));
+};
+
+/// Runtime [`FormatCode`] → static dispatch helper.
+///
+/// Bridges the runtime `FormatCode` value carried in
+/// [`RowDescription`] / [`ColumnDesc::format_code`] to the
+/// compile-time [`DecodeFormat`] dispatch surface. Requires `T`
+/// to implement **both** [`DecodeFormat<TextFmt>`] **and**
+/// [`DecodeFormat<BinaryFmt>`] — the common case for every
+/// primitive type in 1c-3a/3b.
+///
+/// A future type with only one format impl cannot be dispatched
+/// via this function (compile error at the trait-bound check),
+/// closing the (T, F) pair-validity question at the type level:
+/// either both impls exist and runtime dispatch is sound, or one
+/// is missing and the call site fails to compile.
+///
+/// # Why not a `match` on `FormatCode`?
+///
+/// Caller could inline `match fmt { Text => T::decode::<TextFmt>(b),
+/// Binary => T::decode::<BinaryFmt>(b) }` — that's exactly what
+/// this helper centralises. The win is one canonical dispatch site
+/// (per-callsite ad-hoc matches would diverge over time; one
+/// helper stays drift-pinned).
+///
+/// # Exhaustive over [`FormatCode`]
+///
+/// [`FormatCode`] is closed-by-spec exhaustive (Text / Binary
+/// only); a new variant would require a major PG protocol bump.
+/// Adding a variant without updating this helper is a compile
+/// error (the inner `match` is exhaustive, not `_ => `).
+#[inline]
+pub fn decode_with_format<'a, T>(
+    bytes: &'a [u8],
+    fmt: FormatCode,
+) -> Result<T, DecodeError>
+where
+    T: DecodeFormat<'a, TextFmt> + DecodeFormat<'a, BinaryFmt>,
+{
+    match fmt {
+        FormatCode::Text => <T as DecodeFormat<'a, TextFmt>>::decode(bytes),
+        FormatCode::Binary => <T as DecodeFormat<'a, BinaryFmt>>::decode(bytes),
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
 // EncodeBinary — PG binary format write path (mirror of FromPgBinary).
 // Used by ParamsWriter (1c-3b) to serialise parameter values into
 // the Bind frame's per-param length+bytes layout.
@@ -4091,5 +4331,145 @@ mod parse_pg_bool_swar_tests {
         assert_eq!(parse_pg_bool_swar(b" true"), None); // leading space
         assert_eq!(parse_pg_bool_swar(b"truex"), None);
         assert_eq!(parse_pg_bool_swar(b"falses"), None);
+    }
+}
+
+#[cfg(test)]
+mod decode_format_tests {
+    //! DEF-258 (2026-05-12): type-level (T, F) pair dispatch via the
+    //! generic-F `DecodeFormat<F>` trait.
+    //!
+    //! Tests cover:
+    //! - each `(T, F)` pair round-trips correctly (12 cases:
+    //!   6 primitive types × 2 format markers),
+    //! - OID consistency between `DecodeFormat<F>::OID` and the
+    //!   corresponding `FromPgText::OID` / `FromPgBinary::OID`
+    //!   (additional to the compile-time const-asserts above; these
+    //!   runtime checks pin the assert blocks against accidental
+    //!   removal),
+    //! - `FormatCodeMarker::WIRE` produces correct `FormatCode`,
+    //! - `decode_with_format` dispatches the right impl on a
+    //!   runtime `FormatCode`.
+    use super::*;
+
+    #[test]
+    fn def_258_markers_wire_consts() {
+        assert_eq!(<TextFmt as FormatCodeMarker>::WIRE, FormatCode::Text);
+        assert_eq!(<BinaryFmt as FormatCodeMarker>::WIRE, FormatCode::Binary);
+    }
+
+    #[test]
+    fn def_258_text_round_trips() {
+        assert_eq!(<i16 as DecodeFormat<TextFmt>>::decode(b"42"), Ok(42_i16));
+        assert_eq!(<i32 as DecodeFormat<TextFmt>>::decode(b"-1234567"), Ok(-1_234_567_i32));
+        assert_eq!(<i64 as DecodeFormat<TextFmt>>::decode(b"9223372036854775807"), Ok(9_223_372_036_854_775_807_i64));
+        assert_eq!(<u32 as DecodeFormat<TextFmt>>::decode(b"4294967295"), Ok(u32::MAX));
+        assert_eq!(<bool as DecodeFormat<TextFmt>>::decode(b"t"), Ok(true));
+        assert_eq!(<bool as DecodeFormat<TextFmt>>::decode(b"f"), Ok(false));
+        assert_eq!(<&str as DecodeFormat<TextFmt>>::decode(b"hello"), Ok("hello"));
+    }
+
+    #[test]
+    fn def_258_binary_round_trips() {
+        assert_eq!(<i16 as DecodeFormat<BinaryFmt>>::decode(&42_i16.to_be_bytes()), Ok(42_i16));
+        assert_eq!(<i32 as DecodeFormat<BinaryFmt>>::decode(&(-1_234_567_i32).to_be_bytes()), Ok(-1_234_567_i32));
+        assert_eq!(<i64 as DecodeFormat<BinaryFmt>>::decode(&i64::MAX.to_be_bytes()), Ok(i64::MAX));
+        assert_eq!(<u32 as DecodeFormat<BinaryFmt>>::decode(&u32::MAX.to_be_bytes()), Ok(u32::MAX));
+        assert_eq!(<bool as DecodeFormat<BinaryFmt>>::decode(&[1]), Ok(true));
+        assert_eq!(<bool as DecodeFormat<BinaryFmt>>::decode(&[0]), Ok(false));
+        assert_eq!(<&str as DecodeFormat<BinaryFmt>>::decode(b"hello"), Ok("hello"));
+    }
+
+    #[test]
+    fn def_258_oid_consistency_text() {
+        // Runtime double-check of the compile-time const-asserts.
+        // Removing the assert block would not be caught by compile,
+        // but THIS test would still fail.
+        assert_eq!(<i16 as DecodeFormat<TextFmt>>::OID, <i16 as FromPgText>::OID);
+        assert_eq!(<i32 as DecodeFormat<TextFmt>>::OID, <i32 as FromPgText>::OID);
+        assert_eq!(<i64 as DecodeFormat<TextFmt>>::OID, <i64 as FromPgText>::OID);
+        assert_eq!(<u32 as DecodeFormat<TextFmt>>::OID, <u32 as FromPgText>::OID);
+        assert_eq!(<bool as DecodeFormat<TextFmt>>::OID, <bool as FromPgText>::OID);
+        assert_eq!(<&str as DecodeFormat<TextFmt>>::OID, <&str as FromPgText>::OID);
+    }
+
+    #[test]
+    fn def_258_oid_consistency_binary() {
+        assert_eq!(<i16 as DecodeFormat<BinaryFmt>>::OID, <i16 as FromPgBinary>::OID);
+        assert_eq!(<i32 as DecodeFormat<BinaryFmt>>::OID, <i32 as FromPgBinary>::OID);
+        assert_eq!(<i64 as DecodeFormat<BinaryFmt>>::OID, <i64 as FromPgBinary>::OID);
+        assert_eq!(<u32 as DecodeFormat<BinaryFmt>>::OID, <u32 as FromPgBinary>::OID);
+        assert_eq!(<bool as DecodeFormat<BinaryFmt>>::OID, <bool as FromPgBinary>::OID);
+        assert_eq!(<&str as DecodeFormat<BinaryFmt>>::OID, <&str as FromPgBinary>::OID);
+    }
+
+    #[test]
+    fn def_258_oid_text_binary_symmetry() {
+        // Same Rust type → same PG type OID across text/binary.
+        // (Already const-asserted on the legacy FromPgText/FromPgBinary
+        // pair; mirrored here on the new DecodeFormat surface for
+        // explicit runtime drift detection.)
+        assert_eq!(
+            <i16 as DecodeFormat<TextFmt>>::OID,
+            <i16 as DecodeFormat<BinaryFmt>>::OID,
+            "i16 OID skew between text and binary DecodeFormat impls",
+        );
+        assert_eq!(
+            <i32 as DecodeFormat<TextFmt>>::OID,
+            <i32 as DecodeFormat<BinaryFmt>>::OID,
+        );
+        assert_eq!(
+            <i64 as DecodeFormat<TextFmt>>::OID,
+            <i64 as DecodeFormat<BinaryFmt>>::OID,
+        );
+        assert_eq!(
+            <u32 as DecodeFormat<TextFmt>>::OID,
+            <u32 as DecodeFormat<BinaryFmt>>::OID,
+        );
+        assert_eq!(
+            <bool as DecodeFormat<TextFmt>>::OID,
+            <bool as DecodeFormat<BinaryFmt>>::OID,
+        );
+        assert_eq!(
+            <&str as DecodeFormat<TextFmt>>::OID,
+            <&str as DecodeFormat<BinaryFmt>>::OID,
+        );
+    }
+
+    #[test]
+    fn def_258_decode_with_format_dispatches_correctly() {
+        // Text-side dispatch.
+        let v: i32 = decode_with_format(b"42", FormatCode::Text).unwrap_or(0);
+        assert_eq!(v, 42);
+        // Binary-side dispatch.
+        let v: i32 = decode_with_format(&42_i32.to_be_bytes(), FormatCode::Binary).unwrap_or(0);
+        assert_eq!(v, 42);
+        // bool — both formats.
+        let v: bool = decode_with_format(b"t", FormatCode::Text).unwrap_or(false);
+        assert!(v);
+        let v: bool = decode_with_format(&[1], FormatCode::Binary).unwrap_or(false);
+        assert!(v);
+        // &str — both formats (text and binary are byte-equivalent for &str).
+        let v: &str = decode_with_format(b"hello", FormatCode::Text).unwrap_or("");
+        assert_eq!(v, "hello");
+        let v: &str = decode_with_format(b"hello", FormatCode::Binary).unwrap_or("");
+        assert_eq!(v, "hello");
+    }
+
+    #[test]
+    fn def_258_decode_with_format_propagates_errors() {
+        // Invalid text bool — `from_pg_text` returns `BoolParse`.
+        let r: Result<bool, _> = decode_with_format(b"yes", FormatCode::Text);
+        assert!(matches!(r, Err(DecodeError::BoolParse)));
+        // Invalid binary i32 (wrong length) — `BinaryLengthMismatch`.
+        let r: Result<i32, _> = decode_with_format(&[0, 1, 2], FormatCode::Binary);
+        assert!(matches!(r, Err(DecodeError::BinaryLengthMismatch { expected_len: 4, .. })));
+    }
+
+    #[test]
+    fn def_258_marker_zero_sized() {
+        // ZST property — markers carry zero runtime cost.
+        assert_eq!(core::mem::size_of::<TextFmt>(), 0);
+        assert_eq!(core::mem::size_of::<BinaryFmt>(), 0);
     }
 }
