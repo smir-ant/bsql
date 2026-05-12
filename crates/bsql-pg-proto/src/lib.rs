@@ -281,6 +281,12 @@ pub(crate) mod state_setter;
 // Crate-internal module; no public re-exports. Mirror of `schema_slot`
 // for the `PgProtocol::session_params` field.
 pub(crate) mod session_params_slot;
+// DEF-248 Sub-B (2026-05-12) — universal-coverage streaming sink for
+// non-`'D'` backend frames whose declared body exceeds READ_BUF_CAP.
+// Stream-and-truncate: bounded 8 KB prefix + counted-and-skipped
+// remainder; covers every wire-legal size from 0 to ~2 GiB in
+// constant memory. Crate-internal; no public re-exports.
+pub(crate) mod partial_assembly;
 pub mod scram;
 // DEF-188: schema_arena module DELETED — RowDesc lives inline in
 // state variants; terminal-reply schema parks into
@@ -727,12 +733,13 @@ const _: () = assert!(
 //   - Malformed frame teardown:      0 allocations (counter inline).
 //   - First frame > 256 B:           1 alloc (Box<heapless::Vec<u8, 4096>>).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 520,
+    core::mem::size_of::<protocol::PgProtocol>() == 528,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~80 + \
      row_desc_slot ~140 + session_params 8 + error_arena 8 + \
-     malformed_frame_count 4 + alignment-pad to align(8) = 520 B. \
+     partial_assembly 8 (DEF-248 Sub-B) + \
+     malformed_frame_count 4 + alignment-pad to align(8) = 528 B. \
      \
      Pre-DEF-196 was 5080 B (cold fields inline). DEF-196 saves \
      736 B via heap-boxed cold storage. DEF-265 (Idea-38) shrank \
@@ -740,11 +747,15 @@ const _: () = assert!(
      DEF-270 U (2026-05-09): reply-id mint counter is a static \
      AtomicU64 in `next_reply_id` (NOT a PgProtocol field) — bisect \
      proved an inline u64 grew the struct 520 → 528 B and shifted \
-     LLVM heuristic +6% on iter_10cols. Static-atomic preserves \
-     520 B and gives globally-unique IDs (stronger than per-instance). \
+     LLVM heuristic +6% on iter_10cols. \
+     DEF-248 Sub-B (2026-05-12): partial-assembly cell `Option<Box<\
+     PartialAssemblyInner>>` niche-packed 8 B added; PgProtocol \
+     520 → 528 B. Bench-stable compare vs post-def248-suba is the \
+     load-bearing gate for this growth (Tier-1 absolutism feedback: \
+     regression on safety change is a signal to dig, not roll back). \
      \
      Cross-platform: when CI matrix extends, either (a) every target \
-     lands at 520 (most likely — alignment-stable types), or \
+     lands at 528 (most likely — alignment-stable types), or \
      (b) per-target cfg-gated pins land in the same commit. \
      Permissive ranges forbidden — drift surface > variance cushion \
      (CREDO §3 + §4.12).",

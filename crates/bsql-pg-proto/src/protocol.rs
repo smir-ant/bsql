@@ -564,6 +564,38 @@ pub struct PgProtocol {
     /// DEF-196: server-error payload arena. None until first
     /// ErrorResponse frame allocates an `ErrorPayload`. Niche-packed.
     error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    /// **DEF-248 Sub-B (2026-05-12)** — universal-coverage streaming
+    /// sink for non-`'D'` backend frames whose declared body exceeds
+    /// [`crate::frame::READ_BUF_CAP`].
+    ///
+    /// `None` until first oversize non-`'D'` frame arrives; populated
+    /// with a heap-allocated
+    /// [`crate::partial_assembly::PartialAssemblyInner`] holding the
+    /// bounded 8 KB prefix accumulator + the wire's remaining-byte
+    /// counter. Cleared back to `None` when the body completes (sink
+    /// dispatches the prefix to the existing per-tag parser) OR on
+    /// Idle / Errored entry residue cleanup.
+    ///
+    /// **Stream-and-truncate**: bytes within the first
+    /// [`crate::partial_assembly::PREFIX_CAP`] = 8 KB land in the
+    /// prefix buffer (the bytes the inline-bounded parser will read);
+    /// bytes beyond are counted-and-skipped. Memory stays constant
+    /// 8 KB regardless of declared body length — every wire-legal
+    /// size from 0 to ~2 GiB is consumable.
+    ///
+    /// **Layout**: 8 B niche-packed (`Option<Box<_>>`). The cell
+    /// wrapper is `#[repr(transparent)]` over the raw Option — no
+    /// overhead.
+    ///
+    /// **Tier-1 within-crate write provenance** (mirror of DEF-272
+    /// cluster α/β): the field is private to `mod protocol`,
+    /// mutations route through token-gated methods on
+    /// [`crate::partial_assembly::PartialAssemblyCell`].
+    /// `feed_bytes_impl` mutates through
+    /// [`_partial_assembly_dispatch_leaf`] helpers; residue cleanup
+    /// goes through [`_clear_residue_leaf::clear_partial_assembly_residue`].
+    /// External callers cannot toggle partial-assembly mode.
+    partial_assembly: crate::partial_assembly::PartialAssemblyCell,
     /// DEF-196: malformed-frame counter — INLINE u32 (no Box —
     /// 4 B is too small to amortise pointer indirection). Bumped
     /// on every fail_inflight_no_readbuf invocation. DEF-185 P2-9 +
@@ -841,6 +873,12 @@ pub(crate) mod _clear_residue_leaf {
     /// can name it.
     pub(crate) struct ClearResidueSessionToken(());
 
+    /// DEF-248 Sub-B (2026-05-12) leaf-scope token for the
+    /// partial-assembly slot clear at residue transitions. Field
+    /// private to the leaf; type `pub(crate)` so
+    /// [`crate::partial_assembly::PartialAssemblyCell`] can name it.
+    pub(crate) struct ClearResiduePartialAssemblyToken(());
+
     /// Clear the schema slot via
     /// [`crate::schema_slot::RowDescSlotCell::clear_at_residue`] with
     /// the [`ClearResidueSchemaToken`] minted inline. Used by
@@ -863,6 +901,94 @@ pub(crate) mod _clear_residue_leaf {
         cell: &mut crate::session_params_slot::SessionParamsCell,
     ) {
         cell.clear_at_residue(ClearResidueSessionToken(()));
+    }
+
+    /// DEF-248 Sub-B (2026-05-12): clear the partial assembly cell via
+    /// [`crate::partial_assembly::PartialAssemblyCell::clear_at_residue`]
+    /// with the [`ClearResiduePartialAssemblyToken`] minted inline.
+    /// Used by `clear_session_residue_for_class` Idle and Errored arms
+    /// — drops any in-flight assembly's Box on residue cleanup,
+    /// releasing its `heapless::Vec` allocation.
+    ///
+    /// Tier-1 by construction: the only way to release a partial
+    /// assembly without going through this clear is via PgProtocol's
+    /// own Drop — both fire the Box's Drop chain.
+    #[inline]
+    pub(in crate::protocol) fn clear_partial_assembly_residue(
+        cell: &mut crate::partial_assembly::PartialAssemblyCell,
+    ) {
+        cell.clear_at_residue(ClearResiduePartialAssemblyToken(()));
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-248 Sub-B (2026-05-12) — partial-assembly dispatch leaf submodule
+//
+// Per-call-site concrete-type tokens that gate
+// [`crate::partial_assembly::PartialAssemblyCell`]'s `enter_at_dispatch`
+// / `absorb_at_dispatch` / `take_completed` mutating methods. Mirror of
+// DEF-272 cluster α/β/δ patterns: tuple-struct field is PRIVATE to the
+// leaf submodule, so the `Self(())` literal mint is callable ONLY here.
+//
+// Tier-1 within-crate by-construction. The leaf body is small enough to
+// review as a unit; see [`crate::partial_assembly`] for the cell + sink
+// design rationale.
+// ═════════════════════════════════════════════════════════════════════
+
+/// DEF-248 Sub-B leaf submodule for [`PgProtocol::feed_bytes_impl`]'s
+/// partial-assembly transitions. Hosts three concrete-type tokens and
+/// the matching helper fns.
+#[allow(missing_docs, reason = "submodule contains single-purpose tokens + leaf helpers; module-level docs above the submodule explain the design")]
+pub(crate) mod _partial_assembly_dispatch_leaf {
+    /// DEF-248 Sub-B leaf-scope token for **entering** partial-assembly
+    /// mode. Field private to the leaf; type `pub(crate)` so
+    /// [`crate::partial_assembly::PartialAssemblyCell::enter_at_dispatch`]
+    /// can name it in its parameter signature.
+    pub(crate) struct PartialAssemblyEnterToken(());
+
+    /// DEF-248 Sub-B leaf-scope token for **absorbing** body bytes into
+    /// an active partial-assembly. Field private to the leaf.
+    pub(crate) struct PartialAssemblyAbsorbToken(());
+
+    /// DEF-248 Sub-B leaf-scope token for **taking** a completed partial
+    /// assembly out of the cell for dispatch. Field private to the leaf.
+    pub(crate) struct PartialAssemblyTakeToken(());
+
+    /// Enter partial-assembly mode via
+    /// [`crate::partial_assembly::PartialAssemblyCell::enter_at_dispatch`].
+    /// Sole legitimate caller: `feed_bytes_impl`'s `FrameTooLarge` arm
+    /// for streaming-eligible tags.
+    #[inline]
+    pub(in crate::protocol) fn enter_partial_assembly_at_dispatch(
+        cell: &mut crate::partial_assembly::PartialAssemblyCell,
+        tag: u8,
+        declared_body_len: u32,
+    ) {
+        cell.enter_at_dispatch(PartialAssemblyEnterToken(()), tag, declared_body_len);
+    }
+
+    /// Absorb body bytes via
+    /// [`crate::partial_assembly::PartialAssemblyCell::absorb_at_dispatch`].
+    /// Returns the number of bytes consumed from `bytes`; caller
+    /// advances its input pointer accordingly.
+    #[inline]
+    pub(in crate::protocol) fn absorb_partial_assembly_at_dispatch(
+        cell: &mut crate::partial_assembly::PartialAssemblyCell,
+        bytes: &[u8],
+    ) -> usize {
+        cell.absorb_at_dispatch(PartialAssemblyAbsorbToken(()), bytes)
+    }
+
+    /// Take a completed assembly via
+    /// [`crate::partial_assembly::PartialAssemblyCell::take_completed`].
+    /// Returns `Some(Box)` only when the assembly is complete (caller
+    /// must first check `cell.as_inner()?.is_complete()`).
+    #[inline]
+    #[must_use]
+    pub(in crate::protocol) fn take_completed_partial_assembly_at_dispatch(
+        cell: &mut crate::partial_assembly::PartialAssemblyCell,
+    ) -> Option<alloc::boxed::Box<crate::partial_assembly::PartialAssemblyInner>> {
+        cell.take_completed(PartialAssemblyTakeToken(()))
     }
 }
 
@@ -988,6 +1114,13 @@ pub(crate) mod _proto_init_leaf {
                 // frames + no notice/param frames = lifetime-zero heap.
                 session_params: crate::session_params_slot::SessionParamsCell::empty(token),
                 error_arena: None,
+                // DEF-248 Sub-B (2026-05-12): partial-assembly cell —
+                // 8 B niche, `None` at construction. Heap-allocates a
+                // single Box<PartialAssemblyInner> (8 KB prefix + ~12 B
+                // meta) only on the first oversize non-`'D'` frame.
+                // Re-used across subsequent oversize frames on the
+                // same connection.
+                partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
                 malformed_frame_count: 0,
                 sync_marker: super::PhantomData,
             }
@@ -1361,6 +1494,25 @@ impl PgProtocol {
         &self.state
     }
 
+    /// **DEF-248 Sub-B (2026-05-12)** — diagnostic predicate for the
+    /// partial-assembly cell. Returns `true` iff an oversize non-`'D'`
+    /// frame is currently mid-flight (body bytes accumulating across
+    /// multiple `feed_bytes` calls).
+    ///
+    /// Read-only; no token needed. Used by Sub-B integration tests to
+    /// pin lifecycle invariants (no orphaned Box across dispatch
+    /// completion / Errored-entry residue cleanup).
+    ///
+    /// Production callers: this is operator-diagnostic / test surface
+    /// only. The partial-assembly machinery is internal — drivers
+    /// observe the equivalent state via `Action::*` events emitted on
+    /// frame completion, not via this predicate.
+    #[inline]
+    #[must_use]
+    pub fn has_active_partial_assembly(&self) -> bool {
+        self.partial_assembly.is_active()
+    }
+
     /// Borrow the accumulated session parameters.
     ///
     /// Populated during the startup handshake from `ParameterStatus`
@@ -1718,6 +1870,34 @@ impl PgProtocol {
             // `advance_one_frame()` returning `FeedEvent::Close`.
             return Ok(());
         }
+        // DEF-248 Sub-B (2026-05-12): partial-mode bytes routing —
+        // identical to the top-of-feed_bytes_impl logic. If an oversize
+        // non-`'D'` body is mid-flight, bytes route to the assembly
+        // accumulator first; leftover (next-frame) bytes flow to
+        // ReadBuf. Without this hook, a chunk completing a 5 KB body
+        // would fail `read_buf.append` with `ReadBufFull` (ReadBuf cap
+        // is 4096 B).
+        //
+        // **Hot-path cost**: the `is_active()` check is one byte-load
+        // on the niche-packed `Option<Box<_>>` discriminator. For
+        // workloads that never trigger partial mode (every
+        // small-frame query, every SCRAM handshake, every error
+        // ≤ 4 KB body), the branch predicts false and the partial-
+        // mode path stays out of I-cache. `cold_path()` hints LLVM
+        // to push the partial-mode body to the end of the function's
+        // generated machine code.
+        if self.partial_assembly.is_active() {
+            core::hint::cold_path();
+            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+                &mut self.partial_assembly,
+                bytes,
+            );
+            let leftover = bytes.get(absorbed..).unwrap_or(&[]);
+            if leftover.is_empty() {
+                return Ok(());
+            }
+            return self.read_buf.append(leftover);
+        }
         self.read_buf.append(bytes)
     }
 
@@ -1966,10 +2146,46 @@ impl PgProtocol {
             Ok,
         }
 
+        // DEF-248 Sub-B (2026-05-12) — partial-mode bytes routing.
+        //
+        // When the partial-assembly cell is active (an oversize non-`'D'`
+        // body is mid-flight), inbound bytes route to the assembly
+        // accumulator FIRST. Up to `body_remaining` bytes are consumed
+        // (copied to the bounded prefix or counted-and-skipped beyond
+        // the cap); only the leftover (bytes belonging to the NEXT
+        // frame) flows to ReadBuf.
+        //
+        // Routing is gated on `is_active() -> bool`, a single byte-load
+        // on the `Option<Box<_>>` niche discriminant. The inactive arm
+        // runs `read_buf.append(bytes)` byte-for-byte as before — no
+        // perf delta on the hot path.
+        //
+        // Tier-1 closure: ReadBuf cannot hold > 4 KB; routing through
+        // the assembly absorber for active partial mode is the ONLY
+        // path that handles bytes 5..= the body's last byte. Without
+        // this hook, a 5 KB body would fail `read_buf.append` with
+        // `ReadBufFull` on the chunk completing the body.
+        let bytes_for_readbuf: &[u8] = if !matches!(self.state, ProtoState::Errored(_))
+            && self.partial_assembly.is_active()
+        {
+            // DEF-248 Sub-B (2026-05-12): cold-path hint. Partial mode
+            // is rare (only oversize non-`'D'` bodies engage it); the
+            // inactive arm is the hot path. Keep the routing body out
+            // of the I-cache footprint of the standard ingress.
+            core::hint::cold_path();
+            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+                &mut self.partial_assembly,
+                bytes,
+            );
+            bytes.get(absorbed..).unwrap_or(&[])
+        } else {
+            bytes
+        };
+
         let classification = if matches!(self.state, ProtoState::Errored(_)) {
             IngressClassification::AlreadyErrored
         } else {
-            match self.read_buf.append(bytes) {
+            match self.read_buf.append(bytes_for_readbuf) {
                 Ok(()) => IngressClassification::Ok,
                 Err(ReadBufFull { attempted, available, .. }) => {
                     IngressClassification::AppendFailed { attempted, available }
@@ -1996,6 +2212,14 @@ impl PgProtocol {
         let session_params_slot = &mut self.session_params;
         let error_arena_slot = &mut self.error_arena;
         let malformed_counter = &mut self.malformed_frame_count;
+        // DEF-248 Sub-B (2026-05-12): partial-assembly cell mut borrow
+        // threaded through the dispatch loop. Used at:
+        // 1. `HeaderParse::FrameTooLarge` for streaming-eligible tags
+        //    — enter partial mode + absorb the already-buffered prefix.
+        // 2. Top of dispatch loop — if the assembly is complete, take
+        //    + dispatch the assembled prefix through the existing
+        //    per-tag dispatch arm.
+        let partial_assembly_slot = &mut self.partial_assembly;
 
         // DEF-185 P1-6: single classification-driven dispatch.
         // Exhaustive match on `IngressClassification` — adding a new
@@ -2087,11 +2311,122 @@ impl PgProtocol {
             // fast-path loop after exactly one frame.
             let mut dispatches_this_call: u16 = 0_u16;
 
+            // DEF-248 Sub-B (2026-05-12): post-loop staging for
+            // partial-assembly entry.
+            //
+            // The dispatch loop's `populated` shared borrow conflicts
+            // with `partial_assembly_slot` mut access inside the loop
+            // body. The `FrameTooLarge` arm stages the entry work
+            // here; the post-loop block applies the mutation after
+            // NLL closes `populated`'s borrow.
+            //
+            // Carries: (tag_byte, body_remaining_at_entry,
+            // body_prefix_already_buffered: &[u8]). The prefix slice
+            // is a sub-slice of `populated` — its lifetime ends at
+            // the loop's `}` brace (NLL); the apply site at line
+            // 2470+ runs BEFORE the closing brace's NLL hits.
+            let mut staged_partial_entry:
+                Option<(u8, u32, &[u8])> = None;
+
             // Dispatch loop block: `reserved` holds `&mut wb.buf`
             // which must release before `wb.into_bytes()`
             // post-loop. NLL ends `reserved`'s borrow at the `}`.
             {
             let mut reserved = wb.reserve();
+            // DEF-248 Sub-B (2026-05-12): assembly-completion dispatch
+            // fires BEFORE the parse-header loop. If the prior
+            // `feed_inbound` / `read_buf_append` / top-of-feed-bytes
+            // bytes-routing path completed the in-flight body
+            // (`body_remaining == 0`), take the assembly out, route
+            // its prefix through the existing per-tag `dispatch()`,
+            // and free the Box. The standard parse-header loop below
+            // then runs against ReadBuf's tail (containing any
+            // bytes that arrived alongside the completing chunk —
+            // typically a trailing `'Z'`).
+            //
+            // Identical-event-semantics contract: the dispatch arm
+            // sees the (truncated-to-PREFIX_CAP) prefix in the place
+            // it would have seen the inline payload. Every non-`'D'`
+            // parser is inline-bounded; observation matches the
+            // inline-arrival path byte-for-byte.
+            // Check completion + budget BEFORE taking the box. If the
+            // staged-actions slot is full, defer the dispatch to the
+            // next `feed_bytes` call — the assembly stays in the cell
+            // (calling code routes any additional inbound bytes
+            // through the absorber, which no-ops for complete bodies).
+            // Universal coverage preserved: every wire-legal frame
+            // eventually dispatches; the budget gate just rate-limits
+            // per-call.
+            //
+            // **Hot-path cost**: `partial_assembly_slot.as_inner()` is
+            // a single byte-load on the niche-packed `Option<Box<_>>`
+            // discriminator. Common case (no partial mode) is `None`
+            // — `matches!` returns false in one compare. `cold_path()`
+            // marks the taken-and-dispatch body as the rare branch so
+            // LLVM emits it after the parse-header loop in machine
+            // code, keeping the hot loop's I-cache footprint
+            // unaffected.
+            // Fast-path gate: `is_active()` is a single byte-load on
+            // the niche-packed Option<Box> discriminator. Returns false
+            // 99.99% of the time (no oversize body in flight). The
+            // remaining checks (`is_complete()` + budget) only run on
+            // the cold arm where partial mode is active.
+            if partial_assembly_slot.is_active()
+                && matches!(
+                    partial_assembly_slot.as_inner(),
+                    Some(inner) if inner.is_complete(),
+                )
+                && staged
+                    .len()
+                    .saturating_add(WORST_CASE_PER_DISPATCH)
+                    <= MAX_STAGED_PER_CALL
+                && let Some(assembly_box) =
+                    _partial_assembly_dispatch_leaf::take_completed_partial_assembly_at_dispatch(
+                        partial_assembly_slot,
+                    )
+            {
+                core::hint::cold_path();
+                let assembled_tag = assembly_box.typed_tag();
+                let outcome = dispatch(
+                    state,
+                    assembled_tag,
+                    assembly_box.prefix(),
+                    &mut reserved,
+                    terminal_row_desc,
+                    error_arena_slot,
+                );
+                match outcome {
+                    DispatchOutcome::AdvancedSilent => {
+                        dispatches_this_call =
+                            dispatches_this_call.saturating_add(1);
+                    }
+                    DispatchOutcome::AdvancedWithAction { action } => {
+                        dispatches_this_call =
+                            dispatches_this_call.saturating_add(1);
+                        emit_actions!(&mut staged, budget: 1, [
+                            action,
+                        ]);
+                    }
+                    DispatchOutcome::Errored { reply_id, cause } => {
+                        match reply_id {
+                            Some(id) => {
+                                emit_actions!(&mut staged, budget: 2, [
+                                    StagedAction::FailReply { id, cause },
+                                    StagedAction::CloseSocket,
+                                ]);
+                            }
+                            None => {
+                                emit_actions!(&mut staged, budget: 1, [
+                                    StagedAction::CloseSocket,
+                                ]);
+                            }
+                        }
+                    }
+                }
+                // assembly_box drops here — heapless::Vec releases its
+                // inline allocation; no leak across iterations.
+                drop(assembly_box);
+            }
             loop {
                 // DEF-154 (X): frame-budget gate. Transparent-skip
                 // frames (ParameterStatus / NoticeResponse) do NOT
@@ -2132,13 +2467,85 @@ impl PgProtocol {
                         break;
                     }
                     HeaderParse::FrameTooLarge { declared } => {
-                        fail_inflight_no_readbuf(
-                            state,
-                            ProtocolError::FrameTooLarge { declared },
-                            &mut staged,
-                            malformed_counter,
-                        );
-                        break;
+                        // DEF-248 Sub-B (2026-05-12): universal-coverage
+                        // entry to partial-assembly mode for non-`'D'`
+                        // streaming-eligible tags.
+                        //
+                        // Pre-Sub-B: every `FrameTooLarge` tore the
+                        // connection down. Sub-A delivered partial mode
+                        // for `'D'` only, routed through
+                        // `RowStream::dispatch_next_frame` (not here).
+                        // Sub-B delivers the residue: `{T, E, N, A, C,
+                        // S, R, v}` tags whose body > READ_BUF_CAP
+                        // route through this arm.
+                        //
+                        // Decision:
+                        // 1. Streaming-eligible? If not → existing
+                        //    teardown.
+                        // 2. Else: stage partial-mode entry. Snapshot
+                        //    the body bytes already buffered
+                        //    (`after_consumed[HEADER_LEN..]`); the rest
+                        //    of the body arrives via subsequent
+                        //    `feed_bytes` calls and routes through the
+                        //    top-of-feed-bytes absorb path. **No
+                        //    frequency-based cap** — bodies up to ~2 GiB
+                        //    pass through; bytes beyond the 8 KB
+                        //    prefix cap are counted-and-skipped by
+                        //    the assembly absorber.
+                        //
+                        // The actual mutation (enter + absorb +
+                        // advance) is deferred to post-loop because
+                        // the loop's `populated` shared borrow
+                        // conflicts with `partial_assembly_slot` /
+                        // `read_buf` mut access here.
+                        let tag_byte = after_consumed.first().copied().unwrap_or(0);
+                        let body_len_opt = declared.checked_sub(4);
+                        match body_len_opt {
+                            Some(body_len)
+                                if crate::partial_assembly::is_streaming_eligible_tag(
+                                    tag_byte,
+                                ) =>
+                            {
+                                // Body bytes already in ReadBuf
+                                // (portion buffered alongside header).
+                                let already_buffered_body = after_consumed
+                                    .get(HEADER_LEN..)
+                                    .unwrap_or(&[]);
+                                // The slice we snapshot is bounded by
+                                // ReadBuf's unread length — at most
+                                // READ_BUF_CAP - HEADER_LEN bytes.
+                                // u16 storage suffices for the cursor
+                                // arithmetic below.
+                                let header_plus_body = u16::try_from(
+                                    HEADER_LEN.saturating_add(already_buffered_body.len()),
+                                )
+                                .unwrap_or(u16::MAX);
+                                staged_partial_entry = Some((
+                                    tag_byte,
+                                    body_len,
+                                    already_buffered_body,
+                                ));
+                                frames_consumed = frames_consumed
+                                    .saturating_add(header_plus_body);
+                                // Break — no more frames after partial
+                                // entry; the rest of the body arrives
+                                // out-of-band via subsequent calls.
+                                break;
+                            }
+                            _ => {
+                                // Tag is NOT streaming-eligible (fixed-size
+                                // bodies — K/Z/I/1/2/3/n — or D-tag
+                                // which Sub-A handles via column
+                                // streaming). Existing teardown path.
+                                fail_inflight_no_readbuf(
+                                    state,
+                                    ProtocolError::FrameTooLarge { declared },
+                                    &mut staged,
+                                    malformed_counter,
+                                );
+                                break;
+                            }
+                        }
                     }
                     HeaderParse::Ok { tag, total_len } => {
                         // total_len: u16 (DEF-154 (G)), bounded
@@ -2325,6 +2732,46 @@ impl PgProtocol {
             }
             } // end of reserved scope
 
+            // DEF-248 Sub-B (2026-05-12): apply staged partial-mode
+            // entry, if any. The dispatch loop's FrameTooLarge arm
+            // (for streaming-eligible tags) deferred enter+absorb to
+            // this point because the loop's `populated` shared borrow
+            // conflicted with `partial_assembly_slot` mut access.
+            //
+            // Sequence:
+            // 1. Enter partial mode for (tag, body_remaining_at_entry).
+            //    This either reuses the existing Box (capacity-
+            //    preserving reset) or allocates a fresh
+            //    Box<PartialAssemblyInner>.
+            // 2. Absorb the already-buffered body prefix. The first
+            //    PREFIX_CAP bytes land in `prefix_buf`; bytes beyond
+            //    are counted-and-skipped (body_remaining decrements).
+            // 3. The cursor advance below moves past
+            //    `HEADER_LEN + body_bytes.len()` — the bytes we just
+            //    absorbed are gone from ReadBuf.
+            if let Some((tag, body_len, body_bytes)) = staged_partial_entry.take() {
+                _partial_assembly_dispatch_leaf::enter_partial_assembly_at_dispatch(
+                    partial_assembly_slot,
+                    tag,
+                    body_len,
+                );
+                if !body_bytes.is_empty() {
+                    let _absorbed_n =
+                        _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+                            partial_assembly_slot,
+                            body_bytes,
+                        );
+                    debug_assert_eq!(
+                        _absorbed_n,
+                        body_bytes.len(),
+                        "DEF-248 Sub-B: partial-mode entry absorbed all \
+                         body bytes (absorbed={}, body_bytes.len={})",
+                        _absorbed_n,
+                        body_bytes.len(),
+                    );
+                }
+            }
+
             // DEF-184 audit (2026-04-24) — advance IN-SCOPE.
             //
             // Pre: recorded `pending_advance` for next call's entry,
@@ -2483,6 +2930,14 @@ impl PgProtocol {
                 if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
+                // DEF-248 Sub-B (2026-05-12): clear any in-flight
+                // partial assembly. Architecturally rare on Idle entry
+                // (a completed partial frame transitions state away
+                // from Idle via dispatch's terminal arms), but
+                // classifies any leftover Box from a torn-down
+                // partial-mode sequence — Box drops, inner
+                // heapless::Vec releases its inline allocation.
+                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.partial_assembly);
             }
             crate::state::StatePushClass::Errored(_) => {
                 // DEF-272 cluster α: same leaf-submodule helper as the
@@ -2501,6 +2956,13 @@ impl PgProtocol {
                 // and `ClearResidueSessionToken`). Each clear method on
                 // its respective Cell takes the matching token by value.
                 _clear_residue_leaf::clear_session_params_residue(&mut self.session_params);
+                // DEF-248 Sub-B (2026-05-12): also clear partial
+                // assembly on Errored entry — any in-flight oversize
+                // body is forfeit alongside the connection's other
+                // session state. The Box drops; the Vec releases its
+                // inline allocation; no leak across the post-Errored
+                // window.
+                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.partial_assembly);
             }
             // In-flight states — preserve residue. The exhaustive
             // match here is the load-bearing tier-1 closure: adding
@@ -2648,8 +3110,38 @@ impl PgProtocol {
     // single-line delegate — no logic added.
 
     /// DEF-154 (X): append bytes to read_buf; Err on overflow.
+    ///
+    /// # DEF-248 Sub-B (2026-05-12) — partial-mode routing
+    ///
+    /// When the partial-assembly cell is active (an oversize non-`'D'`
+    /// body is mid-flight), incoming bytes route to the assembly
+    /// absorber FIRST. Up to `body_remaining` bytes are consumed
+    /// (copied to the bounded prefix or counted-and-skipped beyond
+    /// the cap); only the leftover (next-frame bytes) flows to ReadBuf.
+    ///
+    /// Without this hook, a chunk completing a body > READ_BUF_CAP
+    /// would fail with `ReadBufFull` since ReadBuf is capped at 4 KB
+    /// while bodies of any wire-legal size (up to ~2 GiB) must pass
+    /// through.
     #[inline]
     pub(crate) fn read_buf_append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
+        // DEF-248 Sub-B (2026-05-12): partial-mode routing —
+        // `cold_path()` keeps the partial-mode body out of the hot
+        // I-cache footprint. RowStream's per-row fast path calls this
+        // function via `feed_inbound`-equivalent; the inactive arm
+        // is the hot path 99.99% of the time (real PG payloads ≤ 4 KB).
+        if self.partial_assembly.is_active() {
+            core::hint::cold_path();
+            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+                &mut self.partial_assembly,
+                bytes,
+            );
+            let leftover = bytes.get(absorbed..).unwrap_or(&[]);
+            if leftover.is_empty() {
+                return Ok(());
+            }
+            return self.read_buf.append(leftover);
+        }
         self.read_buf.append(bytes)
     }
 
