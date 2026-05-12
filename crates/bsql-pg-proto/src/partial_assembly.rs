@@ -31,6 +31,29 @@
 //! single-const change re-tunes the budget without any logic touching
 //! the literal. Tier-1 by construction on the buffer ceiling.
 //!
+//! # Do not conflate "parser reads X" with "library buffers Y"
+//!
+//! Two distinct numbers live in this file; future readers and reviewers
+//! often confuse them. They are:
+//!
+//! 1. **Parser-actually-reads worst case** ≈ **4.2 KB** — analytical
+//!    upper bound on bytes any non-`'D'` parser meaningfully consumes
+//!    before its inline-bounded outputs saturate. Dominated by
+//!    `parse_error_response` (32 fields × ~130 B). Other parsers
+//!    consume significantly less (RowDescription ~2.6 KB, SCRAM
+//!    ~330 B, all others ≤ 256 B).
+//!
+//! 2. **Library-buffered capacity** [`PREFIX_CAP`] = **8 KB** — what
+//!    this module's `heapless::Vec<u8, PREFIX_CAP>` allocates. Bigger
+//!    than (1) on purpose: 5 KB safety floor (const-asserted at
+//!    [`PREFIX_CAP`]) + future-proof + power-of-2 alignment. See the
+//!    [`PREFIX_CAP`] docstring for the full rationale.
+//!
+//! Library buffers MORE than the parser reads. The extra ~3.8 KB is
+//! **safety headroom**, NOT parser-required. Future PRs proposing
+//! "drop `PREFIX_CAP` to 4 KB since parsers only read 4 KB anyway"
+//! must address the floor rationale before changing the const.
+//!
 //! # Algorithm (stream-and-truncate)
 //!
 //! 1. On `HeaderParse::FrameTooLarge { declared }` for a
@@ -114,8 +137,48 @@ use alloc::boxed::Box;
 
 /// **Bounded prefix capacity** for the streaming sink. 8192 B = 8 KB.
 ///
-/// Sized to cover the worst-case parser-actually-reads bound across
-/// every non-`'D'` PG backend frame parser in this crate. Derivation:
+/// # Two numbers, do not conflate them
+///
+/// 1. **What the parser actually reads** (the analytical worst case):
+///    ≈ **4.2 KB** for `parse_error_response` (the most-jealous parser
+///    among all non-`'D'` tags). Beyond ~4.2 KB the parser is in
+///    saturation — every inline-bounded output field
+///    (`SecretBoundedStr<128>` / `<96>` / `<64>` × 32-field cap) is
+///    already full; subsequent bytes are scanned for NUL terminators
+///    but never stored anywhere.
+///
+/// 2. **What this library buffers** (the `PREFIX_CAP` const): **8 KB**.
+///    This is what `heapless::Vec<u8, PREFIX_CAP>` allocates as a
+///    fixed-capacity, const-generic-sized buffer on the heap (inside
+///    `Box<PartialAssemblyInner>`).
+///
+/// The library buffers MORE than the parser needs. The extra ~3.8 KB
+/// (8 KB - 4.2 KB) is **safety headroom**, not parser-required.
+///
+/// # Why 8 KB and not exactly 4.2 KB
+///
+/// Three reasons compound:
+///
+/// 1. **The 4.2 KB number is an analytical estimate**, not exact. A
+///    legitimate PG server could pack fields slightly above the
+///    ~130 B/field assumption (alternate UTF-8 encoding paths, edge
+///    cases in the NUL-positioning math). The 5 KB const-assert floor
+///    (`PREFIX_CAP >= 5 * 1024`, see below) is the safety boundary
+///    for "no typed field gets accidentally truncated below its
+///    prefix-buffered byte range".
+///
+/// 2. **Future-proof**: if a contributor bumps `SecretBoundedStr<128>`
+///    → `<256>` (e.g., DEF-2XX widening message-field cap), the
+///    worst-case parser read grows to ≈ 8 KB. 8 KB `PREFIX_CAP`
+///    absorbs that growth without touching this const.
+///
+/// 3. **Power-of-2 alignment**: 8192 B fits cleanly into allocator
+///    bucket boundaries on macOS (16 KB pages → two 8 KB slots) and
+///    Linux (4 KB pages → exactly two pages). 5 KB would land in an
+///    awkward bucket and waste internal-fragmentation bytes for the
+///    same effective coverage.
+///
+/// # Derivation of the ~4.2 KB worst case
 ///
 /// - `parse_error_response` reads ≤ 32 fields ×
 ///   `max(SecretBoundedStr widths) + tag byte + NUL` ≈ 32 × 130 B
@@ -130,20 +193,38 @@ use alloc::boxed::Box;
 /// - `parse_command_tag`, `parse_parameter_status`, notice / notification
 ///   handlers: ≤ 256 B real-world bound by their bounded output types.
 ///
-/// 8 KB gives ≥ 1.9× headroom on the worst case (ErrorResponse). The
-/// cap is structurally enforced by the `heapless::Vec` const generic
-/// in [`PartialAssemblyInner::prefix_buf`].
+/// `parse_error_response` dominates — every other parser reads
+/// significantly less. 8 KB gives ≥ 1.9× headroom over the
+/// dominator, ≥ 3× headroom over the second-largest.
 ///
-/// **This is NOT a frequency-based exclusion**: a 2 GiB ErrorResponse
-/// frame absorbs the first 8 KB and counts-and-skips the remaining
-/// ~2,147,483,640 B. The parser sees 8 KB worth of payload (more than
-/// it can fit in its inline `SecretBoundedStr` fields anyway) and
-/// produces the same `ProtocolError::ServerErrorResponse` it would
-/// have produced for any wire-legal ErrorResponse size.
+/// # This is NOT a frequency-based exclusion
+///
+/// A 2 GiB ErrorResponse frame absorbs the first 8 KB into
+/// `prefix_buf`, counts-and-skips the remaining ~2,147,483,640 B
+/// without copying, then hands the prefix to
+/// `parse_error_response`. The parser saturates its inline-bounded
+/// outputs from the first ~4.2 KB and produces the same
+/// `ProtocolError::ServerErrorResponse` it would have produced for
+/// any wire-legal ErrorResponse size. **No frame size is rejected.**
+///
+/// The 8 KB cap bounds **library memory**, not **wire coverage**.
 pub(crate) const PREFIX_CAP: usize = 8192;
 
 // `PREFIX_CAP` must comfortably hold the worst-case `parse_error_response`
 // inline-output ceiling (≤ 5 KB derivation in the module doc).
+//
+// **What this floor means** (so a future reader is not confused): the
+// parser-actually-reads worst case is ≈ 4.2 KB analytically. The floor
+// is 5 KB rather than 4.2 KB to cover the analytical-vs-actual gap
+// (alternate UTF-8 encoding paths can push a few hundred bytes above
+// the 130-B/field assumption). Going below 5 KB risks accidentally
+// truncating a typed E-field below its prefix-buffered byte range,
+// which would be observationally distinguishable from inline arrival —
+// breaking the stream-and-truncate observational-equivalence contract.
+//
+// Going ABOVE 5 KB is always safe; the chosen value (8 KB) sits above
+// the floor for future-proof + power-of-2-alignment reasons (see the
+// `PREFIX_CAP` const docstring).
 const _: () = assert!(
     PREFIX_CAP >= 5 * 1024,
     "PREFIX_CAP must hold parse_error_response's 32-field × ~130 B \
