@@ -725,6 +725,65 @@ impl RowDesc {
             len: self.len(),
         }
     }
+
+    /// DEF-244 (2026-05-13): synthesise a `RowDesc` from a static
+    /// OID list with all-text format codes.
+    ///
+    /// Used by the `prepared!` macro's runtime path
+    /// ([`crate::protocol::compute_push_bind_prepared_idle_only`]):
+    /// the macro carries `row_oids: &'static [u32]`, but the server's
+    /// Parse+Bind+Execute pipeline does NOT emit a `RowDescription`
+    /// frame absent a prior `Describe`. The synthetic descriptor
+    /// satisfies the existing SELECT-path's `RowDescSlotCell::park_at_be_select`
+    /// contract without a server round-trip.
+    ///
+    /// Format codes default to [`FormatCode::Text`] per memo §5.4
+    /// (v1 text format; DEF-228 binary track will conditionally use
+    /// `Binary` once the matrix coverage expands).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ProtocolError::TooManyColumns`] when
+    /// `oids.len() > MAX_ROW_COLUMNS`. The macro's `RowDecode` trait
+    /// caps tuple arity at 16 < 32, so this is architecturally dead
+    /// at the typical call site — but the Result keeps the no-panic
+    /// discipline.
+    #[inline]
+    pub(crate) fn from_static_oids_text_format(
+        oids: &[u32],
+    ) -> Result<Self, crate::error::ProtocolError> {
+        if oids.len() > MAX_ROW_COLUMNS {
+            return Err(crate::error::ProtocolError::TooManyColumns {
+                count: oids.len(),
+                max: MAX_ROW_COLUMNS,
+            });
+        }
+        let n_u8 = u8::try_from(oids.len()).map_err(|_| {
+            crate::error::ProtocolError::TooManyColumns {
+                count: oids.len(),
+                max: MAX_ROW_COLUMNS,
+            }
+        })?;
+        let n_columns = crate::bounded::BoundedU8::<MAX_ROW_COLUMNS>::try_new(n_u8)
+            .ok_or(crate::error::ProtocolError::TooManyColumns {
+                count: oids.len(),
+                max: MAX_ROW_COLUMNS,
+            })?;
+        let mut type_oids: [u32; MAX_ROW_COLUMNS] = [0; MAX_ROW_COLUMNS];
+        // Copy in-place — no allocator, no Vec round-trip.
+        for (slot, src) in type_oids.iter_mut().zip(oids.iter()) {
+            *slot = *src;
+        }
+        // FormatCodeSet::empty() initialises every bit to 0 = Text,
+        // matching the macro's v1 all-text choice.
+        let format_codes = FormatCodeSet::empty();
+        Ok(Self {
+            n_columns,
+            _pad: [0; 3],
+            type_oids,
+            format_codes,
+        })
+    }
 }
 
 /// Iterator yielded by [`RowDesc::columns_iter`].
@@ -1235,6 +1294,13 @@ pub enum DecodeError {
         /// Bytes actually received.
         actual_len: u16,
     },
+    /// DEF-244: server emitted SQL NULL (len = -1) for a column the
+    /// `prepared!` row tuple typed as non-Option. The macro infers
+    /// non-NULL semantics from the Rust type (`i32` vs `Option<i32>`);
+    /// if the schema admits NULL, the user types `Option<T>` in the
+    /// row tuple. Wide-typed nullable support (`Option<T>` row impls)
+    /// tracks DEF-228.
+    NullInNonNullColumn,
 }
 
 impl fmt::Display for DecodeError {
@@ -1266,6 +1332,10 @@ impl fmt::Display for DecodeError {
             Self::BinaryLengthMismatch { expected_len, actual_len } => write!(
                 f,
                 "binary column byte length mismatch: expected {expected_len}, got {actual_len}",
+            ),
+            Self::NullInNonNullColumn => f.write_str(
+                "server emitted SQL NULL for a column the prepared! row tuple typed as non-Option \
+                 — use Option<T> in the row tuple if the schema admits NULL",
             ),
         }
     }

@@ -258,6 +258,11 @@ pub mod ident;
 pub(crate) mod md5;
 pub mod params;
 pub mod password;
+// DEF-244 (2026-05-13): runtime support for the `prepared!`
+// proc-macro. Hosts `PreparedQuery<P, R>`, `RowDecode` sealed
+// trait, and the `new_prepared_query` macro-plumbing constructor.
+// See `/tmp/def244-design-memo.md` for the full design.
+pub mod prepared;
 pub mod protocol;
 pub mod push_command;
 pub mod row_stream;
@@ -365,6 +370,15 @@ pub use session_params::{Encoding, OtherEncoding, SessionParams};
 // Deserialize}` + `pub trait Serialize { ... }` pattern.
 pub use bsql_pg_proto_derive::Pristine;
 pub use pristine::Pristine;
+// DEF-244 (2026-05-13): top-level re-export of `prepared!` +
+// `PreparedQuery` + `RowDecode`. The macro lives in
+// `bsql-pg-proto-derive` (proc-macros must live in a
+// `proc-macro = true` crate per Rust's language rule); the runtime
+// types live here. `use bsql_pg_proto::{prepared, PreparedQuery}`
+// brings both into scope — the trait + type live in the type
+// namespace, the macro in the macro namespace.
+pub use bsql_pg_proto_derive::prepared;
+pub use prepared::{PreparedQuery, RowDecode};
 pub use state::ProtoState;
 // DEF-223 (2026-05-05): top-level re-export of the user-facing
 // `Terminate` wire literal. Drivers (`bsql-driver-postgres`,
@@ -864,6 +878,30 @@ const _: () = assert!(
      niche on Deliver.id / Fail.id. If this regresses, the niche was \
      lost — verify variant layout still routes the discriminant through \
      a NonZero* slot.",
+);
+
+// DEF-244 (2026-05-13): PreparedQuery + BindPrepared size pins.
+//
+// `PreparedQuery<P, R>` is a struct of 6 × `&'static`-fat-pointers
+// + `PhantomData<fn(P) -> R>` = 6 × 16 B + 0 = 96 B. The pin's
+// upper bound is 128 B with cushion for alignment / future
+// niche-friendly field changes; tighter exact pin at 96 B would
+// be brittle to layout heuristics on different targets.
+//
+// Rationale for the cushion: cross-target portability — `&[u8]`
+// fat pointer is 16 B on every 64-bit target stable today, but a
+// future ABI might pack the length differently. The 128-B ceiling
+// preserves the "static, small, .rodata-friendly" promise without
+// forcing per-target pins for a struct that's not perf-critical
+// at the per-byte level.
+//
+// Memo §10.5 specifies the 128 B ceiling; DEF-270 U pattern.
+const _: () = assert!(
+    core::mem::size_of::<prepared::PreparedQuery<(i32,), (i32, &'static str)>>() <= 128,
+    "PreparedQuery<(i32,), (i32, &'static str)> must stay ≤ 128 B \
+     (6 × 16 B fat pointers + PhantomData = 96 B + padding cushion). \
+     Larger sizes regress consumer crate .rodata footprint and \
+     LLVM whole-crate codegen heuristics per DEF-270 U precedent.",
 );
 
 // ---------------------------------------------------------------------

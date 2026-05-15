@@ -644,6 +644,38 @@ pub enum ProtocolError {
         locus: CrateBugLocus,
     },
 
+    /// DEF-244 (2026-05-13): `RowStream::collect_tuple<R>` observed
+    /// a row with column count different from the prepared query's
+    /// `R::ARITY`. This is a server-side contract violation — the
+    /// macro emitted the row OID list at compile time; PG would
+    /// only ship rows with the matching arity for the same SQL.
+    /// Diagnostic carries the mismatch for ops debugging.
+    ColumnCountMismatch {
+        /// Arity the prepared query expected (`R::ARITY`).
+        expected: u16,
+        /// Arity the server actually delivered.
+        actual: u16,
+    },
+
+    /// DEF-244 (2026-05-13): a column body exceeded the active
+    /// read-buf headroom during a typed `collect_tuple` call. The
+    /// v1 typed-decode path requires contiguous column bytes;
+    /// chunked columns are not assembled into typed values (would
+    /// require either caller-owned scratch buffer or heap-allocated
+    /// per-cell vectors — both outside the no_alloc contract).
+    ///
+    /// Caller falls back to `col_next` for the row to consume the
+    /// chunked bytes. Wider coverage tracks DEF-244 follow-up.
+    ChunkedColumnInTypedRow,
+
+    /// DEF-244 (2026-05-13): a per-column `DecodeFormat::decode`
+    /// call returned an error during a typed `collect_tuple` row
+    /// assembly. The inner [`crate::decode::DecodeError`] is the
+    /// root cause (bad UTF-8, IntParse, NullInNonNullColumn, etc.).
+    /// The connection itself is healthy — the error is row-level,
+    /// not transport-level.
+    DecodeFailure(crate::decode::DecodeError),
+
     /// A user command arrived on a connection that had already been
     /// torn down by a prior fatal. The wrapper translates this into
     /// the public error "connection closed, see earlier error" with
@@ -1266,6 +1298,16 @@ impl ProtocolError {
             | Self::MalformedParameterDescription { .. }
             | Self::TooManyParameters { .. } => ErrorKind::Framing,
             Self::InternalCrateBug { .. } => ErrorKind::Internal,
+            // DEF-244: typed-row decoder errors. Column-count mismatch
+            // is a Framing-class issue (server vs prepared query
+            // disagreement on schema shape); ChunkedColumnInTypedRow
+            // is a Framing-class limitation (caller used typed decode
+            // on a multi-MB column that doesn't fit one buffer).
+            // DecodeFailure is row-level data parsing — Framing class
+            // because the underlying server bytes failed parsing.
+            Self::ColumnCountMismatch { .. }
+            | Self::ChunkedColumnInTypedRow
+            | Self::DecodeFailure(_) => ErrorKind::Framing,
             Self::ConnectionAlreadyClosed { .. } => ErrorKind::AlreadyClosed,
         }
     }
@@ -1453,6 +1495,20 @@ impl fmt::Display for ProtocolError {
             Self::InternalCrateBug { locus } => write!(
                 f,
                 "internal bsql-pg-proto bug at locus {locus}",
+            ),
+            Self::ColumnCountMismatch { expected, actual } => write!(
+                f,
+                "prepared query row arity mismatch: expected {expected} columns (R::ARITY), \
+                 server delivered {actual}",
+            ),
+            Self::ChunkedColumnInTypedRow => f.write_str(
+                "prepared query: column body exceeds read-buf headroom and would require chunked \
+                 assembly; v1 typed-decode requires contiguous columns. Use `col_next` directly \
+                 for multi-MB cells (DEF-244 follow-up will add chunk-aware typed decoders)",
+            ),
+            Self::DecodeFailure(err) => write!(
+                f,
+                "prepared query: per-column decode failed: {err}",
             ),
             Self::ConnectionAlreadyClosed { prior_kind } => {
                 write!(

@@ -348,6 +348,186 @@ impl<'p, 'w> RowStream<'p, 'w> {
         self.proto.current_row_desc()
     }
 
+    /// DEF-244 (2026-05-13): collect the next complete row into a
+    /// typed tuple via [`crate::prepared::RowDecode`].
+    ///
+    /// Drives [`Self::col_next`] internally, accumulating per-column
+    /// byte ranges (`(start_offset, len)` pairs into the protocol's
+    /// populated read buffer) until `EndRow` arrives. The row's
+    /// columns are then decoded via `<R as RowDecode>::decode` and
+    /// returned as `R::Row<'_>` (the GAT projection at the read-buf
+    /// lifetime).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(R::Row<'_>))` — a complete row was assembled and
+    ///   typed-decoded successfully.
+    /// - `Ok(None)` — more bytes needed (mirrors [`ColEvent::NeedMore`]
+    ///   on the underlying stream).
+    /// - `Err(ProtocolError)` — terminal error in the underlying
+    ///   stream, OR a per-column decode failure (`DecodeError` is
+    ///   mapped to `ProtocolError::DecodeFailure` for uniformity).
+    ///   The stream's terminal state is preserved; subsequent calls
+    ///   return `Ok(None)`.
+    ///
+    /// # v1 constraint — no chunked columns
+    ///
+    /// If any column body exceeds the active read-buf headroom
+    /// (`ColEvent::Chunk` would fire on the underlying stream),
+    /// `collect_tuple` returns
+    /// `Err(ProtocolError::ChunkedColumnInTypedRow)`. The typed
+    /// decode path requires the column body in one contiguous
+    /// slice; assembling chunks into a typed value requires either
+    /// (a) caller-owned scratch buffer (out of the no_alloc contract)
+    /// or (b) heap-allocated per-cell vectors (also out of contract).
+    ///
+    /// Wider coverage tracks DEF-244 follow-up: chunk-aware decoders
+    /// for `&[u8]` (bytea) and `&str` (long text) would synthesise
+    /// a borrowed-or-stitched view; out of v1 scope.
+    pub fn collect_tuple<R>(&mut self) -> Result<Option<R::Row<'_>>, ProtocolError>
+    where
+        R: crate::prepared::RowDecode,
+    {
+        let mut col_offsets: [Option<(usize, usize)>; crate::decode::MAX_ROW_COLUMNS] =
+            [None; crate::decode::MAX_ROW_COLUMNS];
+        let col_formats: [crate::decode::FormatCode; crate::decode::MAX_ROW_COLUMNS] =
+            [crate::decode::FormatCode::Text; crate::decode::MAX_ROW_COLUMNS];
+        let mut col_count: u16 = 0;
+        loop {
+            // Pull one event; if it's a chunked column or terminal,
+            // handle inline. Other events accumulate into the
+            // offsets array.
+            let event = self.col_next();
+            match event {
+                ColEvent::Got { idx, bytes } => {
+                    // Convert the borrow into a (start, len) pair via
+                    // address arithmetic. The event's `bytes` borrow
+                    // holds `&mut self.proto` for its scope; capturing
+                    // the slice's *address* (a usize) does NOT hold the
+                    // borrow further. We compute the offset against the
+                    // current populated() base, re-fetched after the
+                    // event borrow ends. To capture both the slice ptr
+                    // and base ptr atomically (avoiding compaction
+                    // between them — see below), capture the slice's
+                    // ptr+len here and the populated len, then in the
+                    // outer scope (after the arm) re-fetch populated
+                    // base and compute offset.
+                    let idx_usize = usize::from(idx);
+                    if idx_usize >= crate::decode::MAX_ROW_COLUMNS {
+                        return Err(ProtocolError::TooManyColumns {
+                            count: idx_usize.saturating_add(1),
+                            max: crate::decode::MAX_ROW_COLUMNS,
+                        });
+                    }
+                    let slice_addr = bytes.as_ptr().addr();
+                    let len = bytes.len();
+                    let populated_now = self.proto.read_buf_populated();
+                    let populated_base_addr = populated_now.as_ptr().addr();
+                    let populated_total_len = populated_now.len();
+                    let Some(offset) = slice_addr.checked_sub(populated_base_addr) else {
+                        return Err(ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::RowRangeConstruction,
+                        });
+                    };
+                    if offset.checked_add(len).map(|end| end > populated_total_len).unwrap_or(true) {
+                        return Err(ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::RowRangeConstruction,
+                        });
+                    }
+                    let Some(slot) = col_offsets.get_mut(idx_usize) else {
+                        return Err(ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                        });
+                    };
+                    *slot = Some((offset, len));
+                    if idx_usize >= usize::from(col_count) {
+                        col_count = idx.saturating_add(1);
+                    }
+                }
+                ColEvent::Null { idx } => {
+                    let idx_usize = usize::from(idx);
+                    if idx_usize < crate::decode::MAX_ROW_COLUMNS {
+                        // Slot already None.
+                        if idx_usize >= usize::from(col_count) {
+                            col_count = idx.saturating_add(1);
+                        }
+                    }
+                }
+                ColEvent::EndRow => {
+                    // Assemble the row from `col_offsets` and decode.
+                    if R::ARITY != col_count {
+                        return Err(ProtocolError::ColumnCountMismatch {
+                            expected: R::ARITY,
+                            actual: col_count,
+                        });
+                    }
+                    // Slice the protocol's populated region to re-borrow
+                    // each column body. The populated region is stable
+                    // across the row body (buffer compaction happens only
+                    // between frames).
+                    let populated = self.proto.read_buf_populated();
+                    // Build the per-column &[u8] slice array.
+                    let mut col_bytes: [Option<&[u8]>; crate::decode::MAX_ROW_COLUMNS] =
+                        [None; crate::decode::MAX_ROW_COLUMNS];
+                    let n_used = usize::from(col_count).min(crate::decode::MAX_ROW_COLUMNS);
+                    for i in 0..n_used {
+                        let entry = col_offsets.get(i).copied().flatten();
+                        if let Some((off, len)) = entry {
+                            let slice = populated.get(off..off.saturating_add(len));
+                            if let Some(s) = slice
+                                && let Some(slot) = col_bytes.get_mut(i)
+                            {
+                                *slot = Some(s);
+                            }
+                        }
+                    }
+                    let formats_slice = col_formats.get(..n_used).unwrap_or(&[]);
+                    let bytes_slice = col_bytes.get(..n_used).unwrap_or(&[]);
+                    let decoded = R::decode(bytes_slice, formats_slice)
+                        .map_err(ProtocolError::DecodeFailure)?;
+                    return Ok(Some(decoded));
+                }
+                ColEvent::Chunk { .. } | ColEvent::ChunkEnd { .. } => {
+                    // v1: typed decode requires contiguous columns.
+                    self.drained = true;
+                    return Err(ProtocolError::ChunkedColumnInTypedRow);
+                }
+                ColEvent::NeedMore => {
+                    // NeedMore can mean either: (a) the read buffer
+                    // is exhausted (caller must feed more bytes), or
+                    // (b) `slow_path_once` advanced the state machine
+                    // silently (e.g., ParseComplete in prepared!'s
+                    // bundle) and we should retry to consume the next
+                    // frame.
+                    //
+                    // Disambiguate by checking whether the read buffer
+                    // has more bytes after the cursor. If yes — silent
+                    // advance happened, loop back. If no — true
+                    // buffer-empty, return Ok(None).
+                    let cursor = usize::from(self.proto.read_buf_cursor_u16());
+                    let pop_len = self.proto.read_buf_populated().len();
+                    if cursor < pop_len {
+                        // More bytes to consume; loop back to col_next.
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                ColEvent::EndQuery { outcome, .. } => {
+                    match outcome {
+                        Ok(_reply) => {
+                            // No row was assembled — the query completed
+                            // without producing a row. Signal end-of-rows
+                            // via the same None contract as NeedMore;
+                            // the caller observes `drained` separately.
+                            return Ok(None);
+                        }
+                        Err(cause) => return Err(cause),
+                    }
+                }
+            }
+        }
+    }
+
     /// **Pull the next column event.** See [`ColEvent`] for the
     /// event set + lifetime contract.
     ///

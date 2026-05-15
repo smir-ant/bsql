@@ -119,6 +119,29 @@ simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neo
 # with criterion's semver.
 criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
 
+# `trybuild` — DEF-244 (2026-05-14): compile_fail golden harness for
+# the `prepared!` proc-macro's hostile-bypass probes (memo §7 P1-P12).
+# Pins the EXACT compiler diagnostic for each forbidden user pattern
+# (e.g., `error[E0451]: field 'sql' of struct 'PreparedQuery' is
+# private`). A future contributor whose change perturbs the
+# diagnostic gets a noisy `.stderr` mismatch — forces them to either
+# fix the regression OR explicitly update the golden, both forms of
+# audit trail.
+#
+# Without trybuild the closure claim "12 hostile probes compile-
+# rejected" has no automated drift detection: a contributor who
+# accidentally promotes `pub(crate) sql` to `pub sql` (or removes
+# a sealed super-trait) gets ZERO signal until a hostile user files
+# a CVE. That violates the tier-1-by-construction discipline because
+# the enforcement isn't tested.
+#
+# Audit-trust class: ecosystem standard for proc-macro testing
+# (160M+ downloads; used by serde / tokio / clap / anyhow). Dev-only
+# dependency — no runtime cost to library consumers. Default features
+# acceptable (the crate is simple; `default-features = false` doesn't
+# meaningfully shrink it for dev-deps).
+trybuild = { version = "1" }
+
 # DEF-233 (2026-05-04): proc-macro toolchain used ONLY by
 # `bsql-pg-proto-derive` (proc-macro pair-crate for `bsql-pg-proto`).
 # `bsql-pg-proto` itself never depends on these — they live entirely

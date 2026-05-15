@@ -1,0 +1,5 @@
+error[E0599]: no function or associated item named `new` found for struct `PreparedQuery<Params, Row>` in the current scope
+  --> tests/prepared_compile_fail/p2_no_public_new.rs:36:58
+   |
+36 |     let _hostile: PreparedQuery<(), ()> = PreparedQuery::new(
+   |                                                          ^^^ function or associated item not found in `PreparedQuery<_, _>`

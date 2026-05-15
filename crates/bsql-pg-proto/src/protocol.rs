@@ -3192,6 +3192,7 @@ impl PgProtocol {
         self.read_buf.unread_len()
     }
 
+
     /// DEF-248 Sub-A (2026-05-12): partial-mode entry point routed
     /// through the leaf-gated [`crate::buf::ReadBuf::enter_partial_mode`]
     /// accepting a `&PartialFrameToken`. The token mint is gated to
@@ -4919,6 +4920,177 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
         None => crate::push_command::BindExecutePostInstall::Dml { reply },
     };
     setter.install_post_state(post_install);
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-244 (2026-05-13) — Idle-only push path for the `prepared!`
+// macro's `BindPrepared<'q, P, R>` command. Sister to
+// `compute_push_bind_execute_idle_only` above but routed through
+// the macro's pre-baked Parse + Bind-prefix bytes.
+//
+// Wire frame sequence:
+//   1. Parse template (static, baked by macro) — Parse frame with
+//      stmt_name + sql + per-param OID list.
+//   2. Bind prefix (static, baked by macro) — 'B' tag + length
+//      placeholder + empty portal NUL + stmt_name NUL + compact
+//      format-code block + n_params header.
+//   3. Per-param values — `args.write_params(reserved.as_write_buf_mut())`.
+//      Length prefix patched via `WriteBuf::with_length_prefix`.
+//   4. n_result_formats trailer (static, 2 bytes = 0 = all-text).
+//   5. Execute frame (static, 10 bytes for empty portal + fetch-all).
+//   6. Sync trailer (static, 5 bytes).
+//
+// State install: BindExecutePostInstall::Dml if row_oids is empty,
+// else BindExecutePostInstall::Select with a synthetic RowDesc
+// parked into row_desc_slot built from `q.row_oids`.
+// ═════════════════════════════════════════════════════════════════════
+
+/// Idle-only push path for [`BindPrepared`](crate::push_command::BindPrepared).
+///
+/// Per the design memo §6.2 + §5.3: emits the pre-baked Parse and
+/// Bind-prefix bytes (the macro computed them at expansion time;
+/// caller pays zero CPU on the header construction), appends the
+/// per-param payload via the existing `ParamsWriter` path, and
+/// stages the static Execute + Sync frames at the end.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors compute_push_bind_execute_idle_only's argument-list shape (sister helper for the prepared! macro's push path); collapsing into a struct would obscure the wire-frame parameter order"
+)]
+#[inline]
+pub(crate) fn compute_push_bind_prepared_idle_only<'sql, P, R>(
+    setter: crate::state_setter::StateSetter<'_, crate::push_command::BindExecutePostInstall>,
+    row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+    q: &'sql crate::prepared::PreparedQuery<P, R>,
+    args: P,
+    _fetch: crate::command::FetchRows,
+    reply: ReplyId<crate::reply_id::QueryKind>,
+    staged: &mut StagedActions<'sql>,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) where
+    P: crate::params::ParamsWriter,
+    R: crate::prepared::RowDecode,
+{
+    // Step 1: stage the pre-baked Parse template.
+    let parse_template: &'sql [u8] = q.parse_template;
+    // Step 2: build the Bind frame in-place — copy the static prefix
+    // into `reserved`, append per-param values via ParamsWriter,
+    // append the static `n_result_formats = 0` trailer, and patch
+    // the length prefix.
+    let bind_range_result = build_bind_prepared_frame(reserved, q.bind_execute_prefix, &args);
+    let bind_range = try_builder!(bind_range_result, setter, reply, staged);
+
+    // Step 3: row-less vs row-bearing dispatch. Empty row_oids →
+    // DML; non-empty → Select with a synthetic RowDesc.
+    let post_install = if q.row_oids.is_empty() {
+        crate::push_command::BindExecutePostInstall::Dml { reply }
+    } else {
+        // Synthesise a RowDesc from `q.row_oids` (all-text format,
+        // memo §5.4). The macro's row_oids list is small (≤ 16) and
+        // bounded by MAX_ROW_COLUMNS = 32; the construction is
+        // infallible at runtime.
+        let row_desc = match build_synthetic_row_desc(q.row_oids) {
+            Ok(desc) => desc,
+            Err(cause) => {
+                // Architecturally rare: macro emits row_oids of
+                // arity > MAX_ROW_COLUMNS would have failed the
+                // RowDecode trait bound at compile time (RowDecode
+                // tuple impls cap at 16 < 32). Fall through with a
+                // classified error.
+                emit_actions!(staged, budget: 1, [
+                    StagedAction::FailReply {
+                        id: reply.consume(),
+                        cause,
+                    },
+                ]);
+                setter.install_errored(
+                    crate::error::StateErrorKind::from_kind_or_internal(
+                        crate::error::ErrorKind::Internal,
+                    ),
+                );
+                return;
+            }
+        };
+        // Park via the leaf-private token mint (DEF-272 cluster α).
+        _bind_execute_select_install_leaf::install_select_transition(row_desc_slot, row_desc);
+        crate::push_command::BindExecutePostInstall::Select { reply }
+    };
+
+    // Step 4: stage the four wire-frame actions:
+    //   - Parse template (borrowed from q's .rodata)
+    //   - Bind frame range (written into write_buf)
+    //   - Execute frame (static)
+    //   - Sync trailer (static)
+    //
+    // Budget: 4 staged actions. MAX_FANOUT_PER_STAGED + MAX_STAGED_PER_CALL
+    // const-asserts ensure this fits within MAX_ACTIONS_PER_CALL.
+    emit_actions!(staged, budget: 4, [
+        StagedAction::SendBytesBorrowed(parse_template),
+        StagedAction::SendBytesRange(bind_range),
+        StagedAction::SendBytesStatic(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT),
+        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+    ]);
+
+    setter.install_post_state(post_install);
+}
+
+/// Build the Bind frame for a prepared query.
+///
+/// Layout per PG §55.2.2:
+/// 1. `'B'` tag (1 byte).
+/// 2. Length prefix (4 bytes, BE, self-inclusive) — patched by
+///    `with_length_prefix`.
+/// 3. Macro-baked `prefix` bytes (portal NUL + stmt_name NUL +
+///    compact format-code block + n_params).
+/// 4. Per-param values from `args.write_params(...)`.
+/// 5. `n_result_formats = 0` trailer (2 bytes,
+///    [`crate::prepared::BIND_N_RESULT_FORMATS_ZERO`]).
+fn build_bind_prepared_frame<P>(
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+    prefix: &[u8],
+    args: &P,
+) -> Result<crate::action::WriteRange, ProtocolError>
+where
+    P: crate::params::ParamsWriter,
+{
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_BIND.byte())?;
+    // `with_length_prefix` reserves 4 bytes for the length, runs the
+    // body closure, and patches the length on close (mirror of
+    // `build_bind_message`'s pattern in compute_push_bind_execute).
+    let mut params_err: Option<ProtocolError> = None;
+    reserved.with_length_prefix(|w| {
+        w.push_bytes(prefix)?;
+        if args.write_params(w.as_write_buf_mut()).is_err() {
+            params_err = Some(ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ParamsWriterOverflow,
+            });
+        }
+        w.push_bytes(&crate::prepared::BIND_N_RESULT_FORMATS_ZERO)?;
+        Ok(())
+    })?;
+    if let Some(err) = params_err {
+        return Err(err);
+    }
+    crate::action::WriteRange::from_write_span(start, reserved)
+}
+
+/// Build a synthetic [`crate::decode::RowDesc`] from a static OID
+/// list for the `prepared!` macro's path. All columns use
+/// [`FormatCode::Text`] (memo §5.4 — text format in v1).
+///
+/// Bounded above by [`crate::decode::MAX_ROW_COLUMNS`] = 32. The
+/// macro's RowDecode trait impls cap arity at 16 < 32, so this
+/// is architecturally always-success; the Result keeps the no-panic
+/// discipline.
+fn build_synthetic_row_desc(
+    oids: &[u32],
+) -> Result<crate::decode::RowDesc, ProtocolError> {
+    // We need to construct a RowDesc; the existing constructors are
+    // `RowDesc::EMPTY` (0 cols) and the internal `parse_row_description`
+    // (parses wire bytes). For the macro path we synthesise directly
+    // via a helper on `RowDesc` itself — exposed `pub(crate)` for
+    // the prepared module to use.
+    crate::decode::RowDesc::from_static_oids_text_format(oids)
 }
 
 // Pass-#7 F6 / DEF-146 closure (2026-04-22):

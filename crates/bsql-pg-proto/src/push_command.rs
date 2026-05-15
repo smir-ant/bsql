@@ -726,6 +726,105 @@ impl PostStateProof for BindExecutePostInstall {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// DEF-244 (2026-05-13) — BindPrepared<'q, P, R> wraps a PreparedQuery
+// + its argument tuple into a PushCommand impl. Caller-facing entry
+// is `ReadyGuard::execute_prepared` (see `guard.rs`).
+// ═════════════════════════════════════════════════════════════════════
+
+/// Pair a [`crate::prepared::PreparedQuery`] with its argument tuple
+/// for a single client→server execute cycle.
+///
+/// Implements [`PushCommand`]; dispatched via the existing
+/// [`ReadyGuard::push_command`](crate::guard::ReadyGuard::push_command)
+/// path so the Idle precondition (DEF-198) + post-state typed
+/// witness (DEF-270 N-D) closures apply unchanged. The execute
+/// helper on `ReadyGuard` is the ergonomic surface; this struct is
+/// the underlying mechanism.
+///
+/// # Lifetimes
+///
+/// `'q` — the borrow of the `PreparedQuery`. In practice `'q ==
+/// 'static` because the macro emits a `const`, but the generic
+/// lifetime keeps the struct composable with future stmt-cache
+/// flows that hold the query non-static.
+///
+/// # Fields
+///
+/// - `q`: borrowed prepared query (the macro's `const` artefact).
+/// - `args`: tuple of parameter values, owned by value for the
+///   move into `write_params`.
+/// - `fetch`: row-count scope. v1 only supports `FetchRows::All`
+///   (memo §5.3 + the existing closed-set enum from
+///   `crate::command`).
+/// - `reply`: typed correlator the wrapper routes the matching
+///   reply through.
+///
+/// # Size pin (memo §10.5)
+///
+/// `size_of::<BindPrepared<'_, (i32,), (i32, &str)>>() <= 144`
+/// (reference 16 B + tuple 16 B + FetchRows ≤ 16 B + reply 16 B +
+/// padding). Pinned in `lib.rs`.
+#[derive(Debug)]
+#[must_use = "a BindPrepared has no effect until passed to push_command"]
+pub struct BindPrepared<'q, P, R>
+where
+    P: crate::params::ParamsWriter,
+    R: crate::prepared::RowDecode,
+{
+    /// Borrowed prepared query — typically `'q = 'static` since the
+    /// macro emits a `const`.
+    pub q: &'q crate::prepared::PreparedQuery<P, R>,
+    /// Tuple of parameter values.
+    pub args: P,
+    /// Row-fetch scope. v1: `FetchRows::All`.
+    pub fetch: crate::command::FetchRows,
+    /// Typed correlator the wrapper routes the matching reply through.
+    pub reply: ReplyId<QueryKind>,
+}
+
+impl<'q, P, R> sealed::PushCommandSealed for BindPrepared<'q, P, R>
+where
+    P: crate::params::ParamsWriter,
+    R: crate::prepared::RowDecode,
+{
+}
+
+impl<'q, P, R> PushCommand for BindPrepared<'q, P, R>
+where
+    P: crate::params::ParamsWriter,
+    R: crate::prepared::RowDecode,
+{
+    type Output = ();
+    /// Reuses `BindExecutePostInstall` (DEF-270 N-D). Prepared
+    /// queries with result rows (`row_oids.is_empty() == false`)
+    /// route through the SELECT branch with a synthetic RowDesc
+    /// parked at push time; row-less queries route through DML.
+    type PostState = BindExecutePostInstall;
+
+    #[inline]
+    fn execute<'sql>(
+        self,
+        setter: crate::state_setter::StateSetter<'_, Self::PostState>,
+        row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+        staged: &mut crate::action::StagedActions<'sql>,
+        reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+    ) where
+        Self: 'sql,
+    {
+        crate::protocol::compute_push_bind_prepared_idle_only(
+            setter,
+            row_desc_slot,
+            self.q,
+            self.args,
+            self.fetch,
+            self.reply,
+            staged,
+            reserved,
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // Size pins — DEF-269 v2 (T) drift guards
 // ═════════════════════════════════════════════════════════════════════
 

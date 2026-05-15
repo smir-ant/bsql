@@ -274,6 +274,57 @@ impl<'a> ReadyGuard<'a> {
             write_buf,
         )
     }
+
+    /// DEF-244 (2026-05-13): execute a [`crate::prepared::PreparedQuery`]
+    /// with typed arguments. The macro emits a `const` of
+    /// `PreparedQuery<P, R>`; this helper wraps the (q, args, fetch,
+    /// reply) tuple into a [`crate::push_command::BindPrepared`]
+    /// and routes through the existing
+    /// [`Self::push_command`] path so the DEF-198 Idle precondition
+    /// and DEF-270 N-D typed post-state-install closures apply
+    /// unchanged.
+    ///
+    /// Compared to [`Self::push_bind_execute`], the prepared path:
+    /// - pays zero CPU on Parse + Bind-prefix header construction
+    ///   (the macro baked the bytes at compile time → emitted as
+    ///   `SendBytesBorrowed` / `SendBytesStatic` chunks);
+    /// - skips the explicit `portal_name`/`stmt_name`/`row_desc`
+    ///   arguments — all three are encoded in the prepared query
+    ///   (`empty portal` + `q.stmt_name` + synthetic RowDesc built
+    ///   from `q.row_oids`);
+    /// - emits the static Execute frame (10 bytes,
+    ///   `EXECUTE_EMPTY_PORTAL_NO_LIMIT`) instead of computing one.
+    ///
+    /// # Type parameters
+    ///
+    /// - `P`: parameter tuple type, sealed via
+    ///   [`crate::params::ParamsWriter`].
+    /// - `R`: row tuple type, sealed via
+    ///   [`crate::prepared::RowDecode`].
+    ///
+    /// # Memo cross-reference
+    ///
+    /// Memo §6.2 D4-b + thin guard helper combination (caller-facing
+    /// surface is terse, mechanism reuses the sealed `PushCommand`
+    /// path). Tier-1 by-construction Idle precondition propagates.
+    #[inline]
+    pub fn execute_prepared<'w, P, R>(
+        self,
+        q: &'static crate::prepared::PreparedQuery<P, R>,
+        args: P,
+        fetch: FetchRows,
+        reply: ReplyId<QueryKind>,
+        write_buf: &'w mut WriteBuf,
+    ) -> Result<OutActions<'w, 'static>, PushFailure>
+    where
+        P: ParamsWriter + 'w,
+        R: crate::prepared::RowDecode + 'static,
+    {
+        self.push_command(
+            crate::push_command::BindPrepared { q, args, fetch, reply },
+            write_buf,
+        )
+    }
 }
 
 /// Caller-facing fine-grained connection state classification.

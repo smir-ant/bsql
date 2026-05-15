@@ -1,0 +1,26 @@
+error: usage of an `unsafe` block
+  --> tests/prepared_compile_fail/p12_mutate_wire_template.rs:50:5
+   |
+50 | /     unsafe {
+51 | |         let ptr = &Q.parse_template as *const &[u8] as *mut &[u8];
+52 | |         ptr.write(b"hostile bytes");
+53 | |     }
+   | |_____^
+   |
+note: the lint level is defined here
+  --> tests/prepared_compile_fail/p12_mutate_wire_template.rs:34:11
+   |
+34 | #![forbid(unsafe_code)]
+   |           ^^^^^^^^^^^
+
+error[E0616]: field `parse_template` of struct `PreparedQuery` is private
+  --> tests/prepared_compile_fail/p12_mutate_wire_template.rs:48:35
+   |
+48 |     let _hostile_bytes: &[u8] = Q.parse_template;
+   |                                   ^^^^^^^^^^^^^^ private field
+
+error[E0616]: field `parse_template` of struct `PreparedQuery` is private
+  --> tests/prepared_compile_fail/p12_mutate_wire_template.rs:51:22
+   |
+51 |         let ptr = &Q.parse_template as *const &[u8] as *mut &[u8];
+   |                      ^^^^^^^^^^^^^^ private field

@@ -890,6 +890,33 @@ pub(crate) fn dispatch(
                 ),
             }
         }
+        // DEF-244 (2026-05-13): the prepared! macro path bundles Parse
+        // + Bind + Execute + Sync; server replies with `1` (ParseComplete)
+        // before `2` (BindComplete). Accept `1` as a silent transition
+        // in this state (state stays the same; ParseComplete carries no
+        // payload data we'd track separately). The post-condition still
+        // requires `2` to advance.
+        //
+        // **State restore**: the dispatch entry `mem::replace`'d state with
+        // Idle; the AdvancedSilent path MUST write back the original
+        // variant or the protocol would silently transition to Idle
+        // (and the next BindComplete frame would be UnexpectedFrame).
+        (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_PARSE_COMPLETE) => {
+            if payload.is_empty() {
+                *state = ProtoState::BindExecuteAwaitingBindCompleteDml(reply);
+                DispatchOutcome::AdvancedSilent
+            } else {
+                let payload_len = payload.len();
+                install_errored(
+                    state,
+                    Some(reply.consume()),
+                    ProtocolError::UnexpectedFrameBody {
+                        tag: TAG_PARSE_COMPLETE,
+                        payload_len,
+                    },
+                )
+            }
+        }
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
@@ -966,6 +993,28 @@ pub(crate) fn dispatch(
                         payload_len: other.len(),
                     },
                 ),
+            }
+        }
+        // DEF-244 (2026-05-13): prepared! macro path — same silent
+        // ParseComplete transition as the DML arm above. State name
+        // stays; the state semantically represents "awaiting BindComplete
+        // for the in-flight Bind, optionally preceded by ParseComplete".
+        // Same state-restore discipline as the DML arm (mem::replace
+        // dance — see line ~893).
+        (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }, TAG_PARSE_COMPLETE) => {
+            if payload.is_empty() {
+                *state = ProtoState::BindExecuteAwaitingBindCompleteSelect { reply };
+                DispatchOutcome::AdvancedSilent
+            } else {
+                let payload_len = payload.len();
+                install_errored(
+                    state,
+                    Some(reply.consume()),
+                    ProtocolError::UnexpectedFrameBody {
+                        tag: TAG_PARSE_COMPLETE,
+                        payload_len,
+                    },
+                )
             }
         }
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {

@@ -1,0 +1,10 @@
+error[E0616]: field `stmt_name` of struct `PreparedQuery` is private
+  --> tests/prepared_compile_fail/p11_stmt_name_hash_collision.rs:57:28
+   |
+57 |     let _hostile: &str = Q.stmt_name;
+   |                            ^^^^^^^^^ private field
+   |
+help: a method `stmt_name` also exists, call it with parentheses
+   |
+57 |     let _hostile: &str = Q.stmt_name();
+   |                                     ++

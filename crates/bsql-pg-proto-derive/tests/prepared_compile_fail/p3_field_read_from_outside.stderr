@@ -1,0 +1,10 @@
+error[E0616]: field `sql` of struct `PreparedQuery` is private
+  --> tests/prepared_compile_fail/p3_field_read_from_outside.rs:39:28
+   |
+39 |     let _hostile: &str = Q.sql;
+   |                            ^^^ private field
+   |
+help: a method `sql` also exists, call it with parentheses
+   |
+39 |     let _hostile: &str = Q.sql();
+   |                               ++

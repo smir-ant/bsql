@@ -1368,6 +1368,296 @@ fn bench_iter_columns_with_nulls(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------
+// DEF-244 (2026-05-13) — `prepared!` macro path benches.
+// ---------------------------------------------------------------
+//
+// Comparison anchor: `push_command/ping` and the
+// `push_bind_execute_one_int_param` bench below —
+// both measure the same shape (push one command, get OutActions).
+// The deferred.md claim was "-25 ns per push" relative to a hand-
+// constructed Parse + BindExecute pipeline; the prepared path skips
+// per-call header construction by baking Parse + Bind-prefix at
+// compile time. The paired bench (`push_bind_execute_one_int_param`)
+// is the parity anchor for the DML-shape sister
+// (`BENCH_PREPARED_DML_Q`): one i32 param, no result rows (DML),
+// fetch-all, push-only fresh PgProtocol per iter. Routes through
+// the runtime `BindExecute` path that constructs the Bind frame
+// (portal NUL + stmt_name NUL + format codes + n_params header)
+// per call. Delta = prepared's per-push advantage.
+
+use bsql_pg_proto::{
+    prepared, push_command::BindExecute, FetchRows, PortalName, PreparedQuery, StmtName,
+};
+
+const BENCH_PREPARED_Q: PreparedQuery<(i32,), (i32, &'static str)> = prepared!(
+    "SELECT id::int4, name::text FROM users WHERE id = $1::int4"
+);
+
+/// DEF-244 (2026-05-14) Gap 2 — DML-shape sister to
+/// [`BENCH_PREPARED_Q`] for the paired bench. One i32 param, zero
+/// result rows (DELETE with WHERE), fetch-all (vacuous since the
+/// statement returns 0 rows). Same wire-frame shape as the paired
+/// [`bench_push_bind_execute_one_int_param`]'s `BindExecute` with
+/// `row_desc = None`.
+const BENCH_PREPARED_DML_Q: PreparedQuery<(i32,), ()> = prepared!(
+    "DELETE FROM users WHERE id = $1::int4"
+);
+
+fn bench_prepared_query_push(c: &mut Criterion) {
+    let mut group = c.benchmark_group("prepared_query_push");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("execute_prepared", |b| {
+        b.iter_batched_ref(
+            || (PgProtocol::new(), WriteBuf::new()),
+            |(proto, wb)| {
+                let reply = proto.next_reply_id::<QueryKind>();
+                let g = match proto.as_ready() {
+                    Some(g) => g,
+                    None => panic!("bench fixture: proto must be Idle"),
+                };
+                let out = g.execute_prepared(
+                    &BENCH_PREPARED_Q,
+                    (42_i32,),
+                    FetchRows::All,
+                    reply,
+                    wb,
+                );
+                let _ = black_box(out);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    // DEF-244 Gap 2 (2026-05-14): DML-shape variant — matches the
+    // paired `push_bind_execute_one_int_param/bind_execute` bench's
+    // shape exactly (1 i32 param, no result rows, no RowDesc parking).
+    // The delta between this sub-bench and the paired bench is the
+    // pure prepared-vs-non-prepared per-push cost, isolating the
+    // header-construction saving.
+    group.bench_function("execute_prepared_dml", |b| {
+        b.iter_batched_ref(
+            || (PgProtocol::new(), WriteBuf::new()),
+            |(proto, wb)| {
+                let reply = proto.next_reply_id::<QueryKind>();
+                let g = match proto.as_ready() {
+                    Some(g) => g,
+                    None => panic!("bench fixture: proto must be Idle"),
+                };
+                let out = g.execute_prepared(
+                    &BENCH_PREPARED_DML_Q,
+                    (42_i32,),
+                    FetchRows::All,
+                    reply,
+                    wb,
+                );
+                let _ = black_box(out);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+// ---------------------------------------------------------------
+// DEF-244 (2026-05-14) Gap 2 — paired bench for the «-25 ns»
+// verification claim.
+// ---------------------------------------------------------------
+//
+// **Parity anchor** for `prepared_query_push/execute_prepared`:
+// same input shape (one i32 param, 2-column schema, fetch-all,
+// push-only fresh PgProtocol per iter) but routes through the
+// runtime `BindExecute` path that constructs the Bind frame body
+// (portal NUL + stmt_name NUL + compact format-code block +
+// n_params header + per-param values) on every call. The prepared
+// path bakes that prefix at macro-expand time.
+//
+// Delta interpretation:
+//   prepared `execute_prepared` time − this bench's time
+//   = the saving per push. Reported as the verification of
+//     deferred.md DEF-244's `-25 ns` claim.
+//
+// Notes on parity precision:
+//   - Both benches push 1 i32 param. The PAIRED variant uses
+//     `BENCH_PREPARED_DML_Q` (no result rows; matches the
+//     `BindExecute { row_desc: None, ... }` shape exactly).
+//   - Prepared path stages 4 wire frames (Parse + Bind + Execute +
+//     Sync), paired path stages 3 (Bind + Execute + Sync; Parse is
+//     out of scope here — in production you Parse once and reuse
+//     the stmt_name many times, which is why the prepared path
+//     bakes the Parse template).
+//   - The comparison is fair: the prepared path does Parse-template
+//     ferry (one `SendBytesBorrowed` of static bytes — essentially
+//     free) plus pre-baked Bind prefix copy + per-param values +
+//     pre-baked Execute + pre-baked Sync. The paired path does
+//     Bind-build (runtime prefix construction in-place) +
+//     Execute-build (runtime per-call frame) + Sync.
+//   - The cost the paired path pays that the prepared path does
+//     NOT pay: the runtime Bind frame builder
+//     (`build_bind_message`) formats portal_name + stmt_name +
+//     format-code block + n_params bytes, AND `build_execute_message`
+//     formats the Execute frame's portal name + max_rows bytes.
+//     The prepared macro baked both into static bytes. THIS is the
+//     "-25 ns" headline.
+
+/// Stmt name allocator for the paired bench — content is irrelevant
+/// since push-only mode (no server reply); a single small static
+/// portal/stmt pair amortises across iterations. Build-time-fallible
+/// `try_from_str` is consumed inside the bench setup; failure aborts
+/// the benchmark fixture (acceptable: bench fixture bugs surface
+/// loud, not silently).
+#[inline]
+fn make_stmt_name() -> StmtName {
+    match StmtName::try_from_str("s") {
+        Ok(n) => n,
+        Err(_) => panic!("bench fixture: 's' must be a valid StmtName"),
+    }
+}
+
+#[inline]
+fn make_portal_name() -> PortalName {
+    match PortalName::try_from_str("p") {
+        Ok(n) => n,
+        Err(_) => panic!("bench fixture: 'p' must be a valid PortalName"),
+    }
+}
+
+fn bench_push_bind_execute_one_int_param(c: &mut Criterion) {
+    let mut group = c.benchmark_group("push_bind_execute_one_int_param");
+    group.throughput(Throughput::Elements(1));
+    // DEF-244 Gap 2 (2026-05-14): pair anchor for
+    // `prepared_query_push/execute_prepared_dml`. Same exact shape —
+    // 1 i32 param, no RowDesc (DML), fetch-all. The two benches form
+    // the verification couple for deferred.md DEF-244's "-25 ns per
+    // push" claim: prepared time minus this time = per-push saving.
+    group.bench_function("bind_execute", |b| {
+        // Build the names once; criterion's iter_batched_ref gives
+        // us fresh proto + wb per iter (same fixture shape as the
+        // prepared bench).
+        let stmt = make_stmt_name();
+        let portal = make_portal_name();
+        b.iter_batched_ref(
+            || (PgProtocol::new(), WriteBuf::new()),
+            |(proto, wb)| {
+                let reply = proto.next_reply_id::<QueryKind>();
+                let g = match proto.as_ready() {
+                    Some(g) => g,
+                    None => panic!("bench fixture: proto must be Idle"),
+                };
+                let out = g.push_command(
+                    BindExecute {
+                        portal_name: &portal,
+                        stmt_name: &stmt,
+                        params: &(42_i32,),
+                        row_desc: None, // DML — matches BENCH_PREPARED_DML_Q's `()` row tuple
+                        fetch: FetchRows::All,
+                        reply,
+                    },
+                    wb,
+                );
+                let _ = black_box(out);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+// `prepared_iter_rows_typed` — end-to-end push + feed-bytes for a
+// 10-row reply + `collect_tuple` per row. Mirrors
+// `bench_iter_rows_per_row_throughput`'s shape but for the prepared
+// macro path.
+fn bench_prepared_iter_rows_typed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("prepared_iter_rows_typed");
+    group.throughput(Throughput::Elements(10));
+
+    // Pre-build the server reply: ParseComplete + BindComplete +
+    // 10 × DataRow + CommandComplete + RFQ.
+    let mut server_bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    server_bytes.extend_from_slice(&[b'1', 0, 0, 0, 4]);
+    server_bytes.extend_from_slice(&[b'2', 0, 0, 0, 4]);
+    for i in 0..10_u32 {
+        let id_text = alloc::format!("{i}");
+        let name_text = alloc::format!("user_{i}");
+        let id_b = id_text.as_bytes();
+        let nm_b = name_text.as_bytes();
+        let body_len = 2_usize + 4 + id_b.len() + 4 + nm_b.len();
+        let total_len = 4 + body_len;
+        let mut frame = alloc::vec::Vec::new();
+        frame.push(b'D');
+        if let Ok(tl) = u32::try_from(total_len) {
+            frame.extend_from_slice(&tl.to_be_bytes());
+        }
+        frame.extend_from_slice(&2i16.to_be_bytes());
+        if let Ok(l) = i32::try_from(id_b.len()) {
+            frame.extend_from_slice(&l.to_be_bytes());
+        }
+        frame.extend_from_slice(id_b);
+        if let Ok(l) = i32::try_from(nm_b.len()) {
+            frame.extend_from_slice(&l.to_be_bytes());
+        }
+        frame.extend_from_slice(nm_b);
+        server_bytes.extend_from_slice(&frame);
+    }
+    // CommandComplete body: NUL-terminated ASCII "SELECT 10"
+    let cc_body = b"SELECT 10\0";
+    let cc_total = 4 + cc_body.len();
+    let mut cc = alloc::vec::Vec::new();
+    cc.push(b'C');
+    if let Ok(tl) = u32::try_from(cc_total) {
+        cc.extend_from_slice(&tl.to_be_bytes());
+    }
+    cc.extend_from_slice(cc_body);
+    server_bytes.extend_from_slice(&cc);
+    server_bytes.extend_from_slice(&rfq_frame());
+
+    group.bench_function("push_feed_collect_10rows", |b| {
+        b.iter_batched_ref(
+            || (PgProtocol::new(), WriteBuf::new()),
+            |(proto, wb)| {
+                let reply = proto.next_reply_id::<QueryKind>();
+                {
+                    let g = match proto.as_ready() {
+                        Some(g) => g,
+                        None => panic!("bench fixture: proto must be Idle"),
+                    };
+                    let actions_result = g.execute_prepared(
+                        &BENCH_PREPARED_Q,
+                        (42_i32,),
+                        FetchRows::All,
+                        reply,
+                        wb,
+                    );
+                    if actions_result.is_err() {
+                        panic!("bench fixture: execute_prepared errored");
+                    }
+                }
+                let mut rows_count: u32 = 0;
+                let _result: Result<(), bsql_pg_proto::ProtocolError> = proto.iter_rows(wb, |stream| {
+                    if stream.feed(&server_bytes).is_err() {
+                        return Err(bsql_pg_proto::ProtocolError::InternalCrateBug {
+                            locus: bsql_pg_proto::CrateBugLocus::ReadCursorAdvance,
+                        });
+                    }
+                    for _ in 0..32 {
+                        match stream.collect_tuple::<(i32, &'static str)>() {
+                            Ok(Some((id, name))) => {
+                                rows_count = rows_count.saturating_add(1);
+                                let _ = black_box((id, name));
+                            }
+                            Ok(None) => return Ok(()),
+                            Err(c) => return Err(c),
+                        }
+                    }
+                    Ok(())
+                });
+                let _ = black_box(rows_count);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse_header,
@@ -1391,6 +1681,13 @@ criterion_group!(
     bench_iter_columns_5x_int4_swar_long,
     bench_validate_utf8_swar,
     bench_parse_pg_bool_swar,
+    // DEF-244 (2026-05-13): prepared! macro path.
+    bench_prepared_query_push,
+    bench_prepared_iter_rows_typed,
+    // DEF-244 Gap 2 (2026-05-14): paired bench for «-25 ns» claim
+    // verification — runtime BindExecute path, same shape as the
+    // prepared DML variant.
+    bench_push_bind_execute_one_int_param,
 );
 criterion_main!(benches);
 
