@@ -123,7 +123,7 @@ fn t4_cast_form() {
 // T5 — max arity (16 params + 16 columns)
 // ═══════════════════════════════════════════════════════════════════
 
-#[allow(clippy::type_complexity, reason = "16-tuple is intentional — pins MAX_PARAMS_ARITY support")]
+#[expect(clippy::type_complexity, reason = "16-tuple is intentional — pins MAX_PARAMS_ARITY support. Migrated #[allow]→#[expect] (Rust 1.81): if the arity shrinks or the type simplifies, the lint stops firing, prompting attribute removal.")]
 const Q_MAX_ARITY: PreparedQuery<
     (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32),
     (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32),

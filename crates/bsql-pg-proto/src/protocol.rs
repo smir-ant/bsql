@@ -834,7 +834,11 @@ pub struct PgProtocol {
 /// DEF-272 cluster α leaf submodule for the BindExecute SELECT install
 /// transition. Hosts the [`BeSelectToken`] type and the single helper
 /// fn that mints+writes inline.
-#[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
+//
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// `#[allow(missing_docs, ...)]` here was DEAD — `missing_docs` only
+// fires on `pub` items; this submodule is `pub(crate)`-only, so the
+// lint doesn't trigger. Attribute deleted.
 pub(crate) mod _bind_execute_select_install_leaf {
     /// DEF-272 cluster α leaf-scope token. The tuple-struct field is
     /// PRIVATE to this submodule — `Self(())` mints are callable ONLY
@@ -861,7 +865,10 @@ pub(crate) mod _bind_execute_select_install_leaf {
 /// transitions on Idle/Errored entry. Hosts two concrete-type tokens
 /// (one per slot kind) and two helper fns — schema-side (cluster α)
 /// and session_params-side (cluster β).
-#[allow(missing_docs, reason = "submodule contains single-purpose leaf helpers; module-level docs above the submodule explain the design")]
+//
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _clear_residue_leaf {
     /// DEF-272 cluster α leaf-scope token for the schema slot clear.
     /// Field private to the leaf; type `pub(crate)` so the cell can
@@ -938,7 +945,10 @@ pub(crate) mod _clear_residue_leaf {
 /// DEF-248 Sub-B leaf submodule for [`PgProtocol::feed_bytes_impl`]'s
 /// partial-assembly transitions. Hosts three concrete-type tokens and
 /// the matching helper fns.
-#[allow(missing_docs, reason = "submodule contains single-purpose tokens + leaf helpers; module-level docs above the submodule explain the design")]
+//
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _partial_assembly_dispatch_leaf {
     /// DEF-248 Sub-B leaf-scope token for **entering** partial-assembly
     /// mode. Field private to the leaf; type `pub(crate)` so
@@ -996,7 +1006,9 @@ pub(crate) mod _partial_assembly_dispatch_leaf {
 /// pre-dispatch filter. Hosts the [`ParamStatusToken`] type and the
 /// single admit helper fn that delegates to the cell's parse+record
 /// method.
-#[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _parameter_status_admit_leaf {
     /// DEF-272 cluster β leaf-scope token. Field private to the leaf;
     /// type `pub(crate)` so
@@ -1022,7 +1034,9 @@ pub(crate) mod _parameter_status_admit_leaf {
 /// DEF-272 cluster β leaf submodule for the inbound `NoticeResponse`
 /// pre-dispatch filter. Hosts the [`NoticeResponseToken`] type and
 /// the single admit helper fn.
-#[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _notice_response_admit_leaf {
     /// DEF-272 cluster β leaf-scope token. Field private to the leaf;
     /// type `pub(crate)` so
@@ -1069,7 +1083,10 @@ pub(crate) mod _notice_response_admit_leaf {
 // enough to review as a unit.
 // ═════════════════════════════════════════════════════════════════════
 
-#[allow(missing_docs, reason = "submodule contains init-token + sole legitimate cell-construction site (DEF-272 P6 closure)")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items). Original reason: submodule contains init-token
+// + sole legitimate cell-construction site (DEF-272 P6 closure).
 pub(crate) mod _proto_init_leaf {
     /// DEF-272 P6 closure token (2026-05-10). Field private to leaf —
     /// `Self(())` mintable ONLY inside this submodule via
@@ -1144,7 +1161,9 @@ pub(crate) mod _proto_init_leaf {
 /// state, hence the `drain_at_replyid_saturation` returns
 /// `Option<NonZeroU64>` (None for `Idle` / `DrainRfqAfterError` /
 /// `Errored` prior states).
-#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _replyid_saturation_drain_leaf {
     /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
     pub(crate) struct ReplyIdSaturationToken(());
@@ -1168,7 +1187,9 @@ pub(crate) mod _replyid_saturation_drain_leaf {
 /// `install_errored_read_cursor_advance` transition. Fires when the
 /// row-stream fast path detects a read-cursor advance failure
 /// (`CrateBugLocus::ReadCursorAdvance`).
-#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _read_cursor_advance_drain_leaf {
     /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
     pub(crate) struct ReadCursorAdvanceToken(());
@@ -1190,7 +1211,9 @@ pub(crate) mod _read_cursor_advance_drain_leaf {
 /// `install_errored_malformed_data_row` transition. Fires from
 /// streaming variants when a DataRow body is malformed (zero-length,
 /// etc.).
-#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _malformed_data_row_drain_leaf {
     /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
     pub(crate) struct MalformedDataRowToken(());
@@ -1212,7 +1235,9 @@ pub(crate) mod _malformed_data_row_drain_leaf {
 /// `fail_inflight_no_readbuf` transition. Fires from dispatch when an
 /// in-flight error occurs and no read-buf state is available for
 /// payload preservation.
-#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _fail_inflight_no_readbuf_drain_leaf {
     /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
     pub(crate) struct FailInflightNoReadbufToken(());
@@ -1247,7 +1272,9 @@ pub(crate) mod _fail_inflight_no_readbuf_drain_leaf {
 /// Hostile in-crate attempts to call `drain_at_stream_dropped_mid_stream`
 /// from outside this leaf cannot construct the required token type;
 /// the type system rejects.
-#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
     /// DEF-248 Sub-A leaf-scope token. Field private to leaf.
     pub(crate) struct StreamDroppedMidStreamToken(());

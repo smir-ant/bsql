@@ -64,7 +64,12 @@ use crate::state::ProtoState;
 /// DEF-272 cluster α leaf submodule for the inbound `'T'`
 /// (RowDescription) frame dispatch. Hosts the [`TDispatchToken`] type
 /// and the single park helper fn.
-#[allow(missing_docs, reason = "submodule contains a single-purpose leaf helper; module-level docs above the submodule explain the design")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): the
+// historical `#[allow(missing_docs, reason = "leaf helper")]`
+// here was DEAD — `missing_docs` only fires on `pub` items in
+// `#![deny(missing_docs)]` crates; this submodule and its items
+// are `pub(crate)`-only, so the lint doesn't trigger. Attribute
+// deleted rather than migrated to `#[expect]`.
 pub(crate) mod _row_description_dispatch_leaf {
     /// DEF-272 cluster α leaf-scope token. The tuple-struct field is
     /// PRIVATE to this submodule — `Self(())` mints are callable ONLY

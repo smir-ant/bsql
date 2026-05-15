@@ -203,10 +203,11 @@ fn def205_error_payload_overwrite_zeroizes_old_value() {
     }
 }
 
-// Quench the unused-import warning when the memory-probe tests
-// are filtered out by default. `PgProtocol` is imported for future
-// integration extension; remove if scope shifts.
-#[allow(dead_code)]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// `#[allow(dead_code)]` here was DEAD — `_`-prefixed function names
+// historically suppress the `dead_code` lint by convention. Attribute
+// removed; the helper still binds `PgProtocol` so the import survives
+// dead-import checks for any future test-extension scope.
 fn _silence_unused_proto_import() -> Option<PgProtocol> {
     None
 }

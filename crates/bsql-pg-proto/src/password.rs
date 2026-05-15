@@ -108,6 +108,10 @@ pub enum PasswordError {
     },
 }
 
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the public password-validation error.
+impl core::error::Error for PasswordError {}
+
 impl fmt::Display for PasswordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -203,15 +207,17 @@ impl fmt::Debug for Password {
 // caller's stack by design, and boxing inside the enum would
 // require allocation that the no_alloc crate forbids at the
 // `Credentials` construction site.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "Credentials: cold-path enum constructed once per connection. \
-              Password is 512 B by design (MAX_PASSWORD_LEN); both \
-              ScramPassword and CleartextPassword carry one. Boxing at \
-              this layer would require allocation in the user's hand at \
-              the construction site, breaking the no_alloc-from-the- \
-              outside contract for the cold-path Credentials API."
-)]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): the
+// `clippy::large_enum_variant` lint does NOT currently fire on
+// `Credentials` (Password+Sensitive padding interactions with the
+// default 200 B threshold + `#[non_exhaustive]` semantics). The
+// historical `#[allow]` was dead; attribute removed entirely. If a
+// future clippy version reintroduces the warning, the design
+// rationale stays load-bearing: Credentials is a cold-path enum
+// constructed once per connection, Password is 512 B by design
+// (MAX_PASSWORD_LEN), and boxing at the variant layer would require
+// allocation in user code — breaking the no_alloc-from-outside
+// contract.
 #[non_exhaustive]
 pub enum Credentials {
     /// Trust authentication — no password required.

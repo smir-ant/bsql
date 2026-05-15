@@ -169,6 +169,15 @@ mod sealed {
 /// module-private, so no downstream impl compiles.
 ///
 /// `ALLOW_EMPTY` is consulted by validated-constructor impls.
+//
+// DEF-115 follow-up (rust-version 1.78 modernisation): structural
+// diagnostic. Sealed-bound failures need the candidate set in plain
+// text.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `FixedStrKind` tag",
+    label = "valid tags are the uninhabited enums `IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `BoundedStrTag`, `SqlTag`, `StmtNameTag`, `PortalNameTag`",
+    note = "`FixedStrKind` is sealed (DEF-115) — the tag set is fixed at the crate boundary; downstream `impl FixedStrKind for ...` is forbidden by construction"
+)]
 pub trait FixedStrKind: sealed::FixedStrKindSealed {
     /// Human-readable type name used by `Debug`.
     const DEBUG_NAME: &'static str;
@@ -188,6 +197,11 @@ pub trait FixedStrKind: sealed::FixedStrKindSealed {
 ///
 /// **Sealed** (DEF-115): only the crate's own tags can be
 /// `Validated`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not opt into the validated constructor path",
+    label = "tags that implement `Validated`: `IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `StmtNameTag`, `PortalNameTag`",
+    note = "`Validated` is sealed — `BoundedStrTag` and `SqlTag` deliberately do NOT implement it because their construction is truncating (silent truncation with `…` marker), not validating; choose the matching tag or use `from_str_truncating` for those"
+)]
 pub trait Validated: FixedStrKind + sealed::ValidatedSealed {}
 
 /// Marker trait opting a tag into the truncating
@@ -198,6 +212,11 @@ pub trait Validated: FixedStrKind + sealed::ValidatedSealed {}
 /// hostile.
 ///
 /// **Sealed** (DEF-115).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not opt into the truncating constructor path",
+    label = "tags that implement `Truncating`: `BoundedStrTag`, `SqlTag`",
+    note = "`Truncating` is sealed — the validated tags (`IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `StmtNameTag`, `PortalNameTag`) deliberately reject silent truncation; choose the matching tag or use `try_from_str` for those"
+)]
 pub trait Truncating: FixedStrKind + sealed::TruncatingSealed {}
 
 /// Marker trait asserting that a tag's constructors guarantee the
@@ -214,6 +233,11 @@ pub trait Truncating: FixedStrKind + sealed::TruncatingSealed {}
 ///
 /// **Sealed** (DEF-115): only the crate's own tags can be
 /// `ValidUtf8`. A downstream tag type cannot bypass the check.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not assert UTF-8-validity of its stored bytes",
+    label = "all current crate tags implement `ValidUtf8` (DEF-115); only `as_str()` requires this bound",
+    note = "`ValidUtf8` is sealed — a downstream tag type cannot bypass the UTF-8 check; if you reach this error you're likely working in test code with a non-crate tag, which the `FixedStr` machinery deliberately rejects"
+)]
 pub trait ValidUtf8: FixedStrKind + sealed::ValidUtf8Sealed {}
 
 /// Tag for [`Ident`] — non-empty, no NUL, max 63 bytes.
@@ -783,6 +807,11 @@ mod describe_name_sealed {
 /// builder's `name` parameter to this trait makes "caller passes
 /// the right name type" a tier-1 compile guarantee; a caller who
 /// passes raw `&[u8]` fails to type-check.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid target for the PG `Describe` frame",
+    label = "valid targets are `StmtName` (prepared statement) and `PortalName` (bound statement instance)",
+    note = "`DescribeName` is sealed — the PG wire `Describe` frame ('D') takes exactly one of `S` (statement) or `P` (portal); raw `&[u8]` is rejected at compile time because it cannot guarantee absence of embedded NUL"
+)]
 pub trait DescribeName: describe_name_sealed::Sealed {
     /// The raw NUL-free bytes to embed into the `'D'` frame body,
     /// followed by the NUL terminator the builder appends. Every
@@ -850,6 +879,10 @@ pub struct PodBytesOverflow {
     /// Maximum capacity `N`.
     pub max: usize,
 }
+
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the PodBytes overflow sentinel.
+impl core::error::Error for PodBytesOverflow {}
 
 impl fmt::Display for PodBytesOverflow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -993,6 +1026,10 @@ pub enum IdentError {
         max: usize,
     },
 }
+
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the public ident-validation error.
+impl core::error::Error for IdentError {}
 
 impl fmt::Display for IdentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

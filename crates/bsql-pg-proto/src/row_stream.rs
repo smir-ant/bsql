@@ -429,7 +429,14 @@ impl<'p, 'w> RowStream<'p, 'w> {
                             locus: crate::error::CrateBugLocus::RowRangeConstruction,
                         });
                     };
-                    if offset.checked_add(len).map(|end| end > populated_total_len).unwrap_or(true) {
+                    // DEF-244 modernisation audit (rust-version 1.82
+                    // is_none_or): `m.map(p).unwrap_or(true)` is the verbose
+                    // form of `m.is_none_or(p)`. Semantics: `None` ⇒ true
+                    // (no add — overflow path; reject as out-of-range);
+                    // `Some(end)` ⇒ `end > populated_total_len`. The
+                    // shorter form names the condition: «the end either
+                    // overflows OR exceeds the buffer».
+                    if offset.checked_add(len).is_none_or(|end| end > populated_total_len) {
                         return Err(ProtocolError::InternalCrateBug {
                             locus: crate::error::CrateBugLocus::RowRangeConstruction,
                         });
@@ -470,15 +477,23 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     let mut col_bytes: [Option<&[u8]>; crate::decode::MAX_ROW_COLUMNS] =
                         [None; crate::decode::MAX_ROW_COLUMNS];
                     let n_used = usize::from(col_count).min(crate::decode::MAX_ROW_COLUMNS);
+                    // DEF-244 modernisation audit (edition 2024, rust-version
+                    // 1.88 let-chains): pre-modernisation, the outer `if let
+                    // Some((off, len)) = entry` was distinct from the inner
+                    // `if let Some(s) = slice && let Some(slot) = ...` pair
+                    // via an intermediate `let slice = populated.get(...)`
+                    // binding. Flattened: the intermediate binding inlines
+                    // into the second clause of a single chain, eliminating
+                    // one indentation level + one `let`. Semantics bit-
+                    // identical (short-circuit evaluation; inner body runs
+                    // iff all three clauses bind).
                     for i in 0..n_used {
                         let entry = col_offsets.get(i).copied().flatten();
-                        if let Some((off, len)) = entry {
-                            let slice = populated.get(off..off.saturating_add(len));
-                            if let Some(s) = slice
-                                && let Some(slot) = col_bytes.get_mut(i)
-                            {
-                                *slot = Some(s);
-                            }
+                        if let Some((off, len)) = entry
+                            && let Some(s) = populated.get(off..off.saturating_add(len))
+                            && let Some(slot) = col_bytes.get_mut(i)
+                        {
+                            *slot = Some(s);
                         }
                     }
                     let formats_slice = col_formats.get(..n_used).unwrap_or(&[]);
@@ -1324,7 +1339,10 @@ const _: () = assert!(MAX_FRAME_LEN_FIELD >= 4);
 /// **The only legitimate proximate mint site** is
 /// [`mint_for_row_stream_dispatcher`], `pub(in crate::row_stream)`,
 /// callable only from inside this module.
-#[allow(missing_docs, reason = "submodule contains a single-purpose token + leaf helper")]
+//
+// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
+// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
+// `pub(crate)` items).
 pub(crate) mod _row_stream_partial_leaf {
     /// **Tier-1 leaf-scope token** for partial-frame mode entry/exit.
     ///

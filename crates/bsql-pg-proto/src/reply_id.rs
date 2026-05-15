@@ -98,6 +98,16 @@ mod sealed {
 /// site (see [`crate::action::deliver`]).
 ///
 /// [`Payload`]: ReplyKind::Payload
+//
+// DEF-112 follow-up (rust-version 1.78 modernisation): structural
+// diagnostic. The sealed supertrait error «`T: Sealed` is not
+// satisfied» is not actionable from outside the crate — listing the
+// permitted kind tags here resolves that.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid `ReplyKind` tag",
+    label = "valid tags are the uninhabited enums `PingKind`, `StartupKind`, `QueryKind`, `ParseKind`, `CloseKind`, `DescribeStatementKind`, `DescribePortalKind`",
+    note = "`ReplyKind` is sealed (DEF-112) — the kind tag set is fixed at the crate boundary; downstream `impl ReplyKind for ...` is forbidden by construction"
+)]
 pub trait ReplyKind: sealed::Sealed {
     /// The typed STAGED payload constructed at dispatch time. Must
     /// convert to the internal [`crate::action::StagedReply`] sum.

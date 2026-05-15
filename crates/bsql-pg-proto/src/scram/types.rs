@@ -106,6 +106,10 @@ impl fmt::Display for ServerNonceTooLong {
     }
 }
 
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the server-nonce-too-long sentinel.
+impl core::error::Error for ServerNonceTooLong {}
+
 impl CappedServerNonce {
     /// Construct from raw bytes.
     ///

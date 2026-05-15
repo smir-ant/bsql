@@ -16,12 +16,14 @@ error: prepared!: unsupported PG type `bytea`.
 14 |     "SELECT $1::bytea"
    |     ^^^^^^^^^^^^^^^^^^
 
-error[E0277]: the trait bound `&'static [u8]: EncodeBinary` is not satisfied
+error[E0277]: `&'static [u8]` does not implement `EncodeBinary` (cannot encode to PG binary format)
   --> tests/prepared_unsupported_types/bytea.rs:13:10
    |
 13 | const Q: PreparedQuery<(&'static [u8],), ()> = prepared!(
-   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `EncodeBinary` is not implemented for `&'static [u8]`
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ supported binary-encode types are `i16`, `i32`, `i64`, `bool`, `&str`
    |
+   = help: the trait `EncodeBinary` is not implemented for `&'static [u8]`
+   = note: `EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction
    = help: the following other types implement trait `EncodeBinary`:
              &str
              bool
@@ -40,12 +42,14 @@ note: required by a bound in `PreparedQuery`
    |     Params: ParamsWriter,
    |             ^^^^^^^^^^^^ required by this bound in `PreparedQuery`
 
-error[E0277]: the trait bound `&'static [u8]: EncodeBinary` is not satisfied
+error[E0277]: `&'static [u8]` does not implement `EncodeBinary` (cannot encode to PG binary format)
   --> tests/prepared_unsupported_types/bytea.rs:14:5
    |
 14 |     "SELECT $1::bytea"
-   |     ^^^^^^^^^^^^^^^^^^ the trait `EncodeBinary` is not implemented for `&'static [u8]`
+   |     ^^^^^^^^^^^^^^^^^^ supported binary-encode types are `i16`, `i32`, `i64`, `bool`, `&str`
    |
+   = help: the trait `EncodeBinary` is not implemented for `&'static [u8]`
+   = note: `EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction
    = help: the following other types implement trait `EncodeBinary`:
              &str
              bool

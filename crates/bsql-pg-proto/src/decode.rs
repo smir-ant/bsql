@@ -184,6 +184,12 @@ pub struct OutOfRange {
     pub max: usize,
 }
 
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl — `OutOfRange` is a small ZST-shape error
+// sentinel signalling format-code-index out of range, used by callers
+// to detect MAX_ROW_COLUMNS / per-column index overrun.
+impl core::error::Error for OutOfRange {}
+
 impl fmt::Display for OutOfRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -1303,6 +1309,13 @@ pub enum DecodeError {
     NullInNonNullColumn,
 }
 
+// DEF-244 modernisation audit (rust-version 1.81 — `core::error::Error`
+// stabilised). Additive impl; matches the project-wide policy of
+// implementing the canonical `core::error::Error` on every public
+// error type so downstream `bsql-driver-postgres` can `?`-propagate
+// through `Box<dyn Error>` boundaries.
+impl core::error::Error for DecodeError {}
+
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1632,6 +1645,18 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 /// Query, 1c-3), a parallel `FromPgBinary` trait lands alongside
 /// the binary codec. Text vs binary dispatch at the caller level
 /// via `ColumnDesc::format_code`.
+//
+// DEF-244 modernisation audit (rust-version 1.78 modernisation):
+// `FromPgText` is NOT sealed — downstream crates may implement it for
+// their own types (e.g. `chrono::DateTime`, `uuid::Uuid`). The
+// diagnostic still pays off: the bare bound failure routes a user
+// who tries `let row: (MyType,) = ...;` (where `MyType` lacks the
+// impl) to the standard extension contract.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be decoded from PG text-format bytes",
+    label = "missing `impl<'a> FromPgText<'a> for {Self}`",
+    note = "implement `FromPgText` for your type to use it as a decoded column value, or use one of the crate-provided primitive types (`i16`, `i32`, `i64`, `u32`, `bool`, `&'a str`) which already implement it"
+)]
 pub trait FromPgText<'a>: Sized {
     /// PG type OID this text decoder targets.
     ///
@@ -2396,6 +2421,11 @@ impl<'a> FromPgText<'a> for &'a str {
 /// for their own Rust types — the binary-codec surface is a fixed
 /// set of primitives in 1c-3b; wider types land with their
 /// dedicated sub-phases (arrays 1c-6, uuid / timestamp Phase 2+).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not implement `FromPgBinary` (cannot decode from PG binary format)",
+    label = "supported binary-decode types are `i16`, `i32`, `i64`, `bool`, `&str`",
+    note = "`FromPgBinary` is sealed — extend by adding a `from_pg_binary_int!` invocation in `decode.rs`; downstream `impl FromPgBinary for ...` is forbidden by construction (DEF-115-class seal)"
+)]
 pub trait FromPgBinary<'a>: Sized + sealed::FromPgBinarySealed {
     /// PG type OID this decoder handles. Drift-pinned against
     /// [`oids`] via const-assert.
@@ -2569,6 +2599,11 @@ mod format_marker_sealed {
 /// only two format codes. A future PG major-version revision adding
 /// a third format code would be a breaking-change major version
 /// of this crate.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `FormatCodeMarker`",
+    label = "valid markers are `TextFmt` (PG `FormatCode::Text`, wire byte 0) and `BinaryFmt` (PG `FormatCode::Binary`, wire byte 1)",
+    note = "`FormatCodeMarker` is sealed — the closed set matches PG protocol spec §55.2.2 which permits exactly these two format codes; a third would be a major-version breaking change"
+)]
 pub trait FormatCodeMarker: format_marker_sealed::FormatCodeMarkerSealed {
     /// Runtime [`FormatCode`] value this marker corresponds to.
     const WIRE: FormatCode;
@@ -2629,6 +2664,11 @@ impl FormatCodeMarker for BinaryFmt {
 /// ([`FromPgText`] for `F = TextFmt`, [`FromPgBinary`] for
 /// `F = BinaryFmt`) — no behavior change, no new decode paths.
 /// DecodeFormat is purely a dispatch-surface refinement.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not implement `DecodeFormat<'_, {F}>`",
+    label = "the (type, format) pair `({Self}, {F})` is not in the supported decode matrix",
+    note = "`DecodeFormat` is sealed — supported pairs are the cartesian product of `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}` (DEF-258 matrix). Extend by adding a `decode_format_impl!` invocation in `decode.rs`; downstream `impl DecodeFormat for ...` is forbidden by construction (DEF-115-class seal)"
+)]
 pub trait DecodeFormat<'a, F: FormatCodeMarker>:
     Sized + format_marker_sealed::DecodeFormatSealed<F>
 {
@@ -2791,6 +2831,11 @@ where
 ///
 /// Same seal discipline as [`FromPgBinary`] — downstream crates
 /// cannot add impls for their own types.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` does not implement `EncodeBinary` (cannot encode to PG binary format)",
+    label = "supported binary-encode types are `i16`, `i32`, `i64`, `bool`, `&str`",
+    note = "`EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction"
+)]
 pub trait EncodeBinary: sealed::EncodeBinarySealed {
     /// PG type OID this encoder produces. Drift-pinned against
     /// [`oids`] and cross-asserted against the matching

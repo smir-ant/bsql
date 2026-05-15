@@ -209,9 +209,12 @@ impl<const N: usize> ReadBufN<N> {
     /// that may serve future wire-buffer types.
     #[inline]
     #[must_use]
-    #[allow(dead_code, reason = "DEF-265 Idea-38: ReadBufN<N> is a stable \
+    #[expect(dead_code, reason = "DEF-265 Idea-38: ReadBufN<N> is a stable \
         primitive retained for future wire-buffer designs; production read \
-        buffer is the wrapping ReadBuf struct")]
+        buffer is the wrapping ReadBuf struct. Migrated #[allow]→#[expect] \
+        (Rust 1.81): if a future caller starts using this method, the \
+        attribute fires (the lint no longer triggers), forcing the contributor \
+        to remove the now-dead attribute — drift-detection.")]
     pub(crate) fn populated(&self) -> &[u8] {
         self.inner.as_slice()
     }
@@ -233,8 +236,10 @@ impl<const N: usize> ReadBufN<N> {
     /// `populated()` above.
     #[inline]
     #[must_use]
-    #[allow(dead_code, reason = "DEF-265 Idea-38: ReadBufN<N> is a stable \
-        primitive retained for future wire-buffer designs")]
+    #[expect(dead_code, reason = "DEF-265 Idea-38: ReadBufN<N> is a stable \
+        primitive retained for future wire-buffer designs. Migrated \
+        #[allow]→#[expect] (Rust 1.81) — fires when a caller is added, \
+        prompting attribute removal.")]
     pub(crate) const fn cursor_position_u16(&self) -> u16 {
         self.cursor
     }
@@ -971,6 +976,10 @@ pub struct ReadBufFull {
     pub cap: usize,
 }
 
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the read-buf-overflow sentinel.
+impl core::error::Error for ReadBufFull {}
+
 impl fmt::Display for ReadBufFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -994,6 +1003,10 @@ pub struct AdvancePastEnd {
     /// How much was actually unread.
     pub available: usize,
 }
+
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the advance-past-end sentinel.
+impl core::error::Error for AdvancePastEnd {}
 
 impl fmt::Display for AdvancePastEnd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

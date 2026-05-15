@@ -71,6 +71,18 @@ pub(crate) mod sealed {
 /// post-state to a command would surface as a type mismatch at the
 /// `type PostState` declaration in the [`crate::push_command::PushCommand`]
 /// impl.
+//
+// DEF-270 N-D follow-up (rust-version 1.78 modernisation):
+// structural diagnostic for crate-internal contributors. The
+// PostStateProof set is closed at the crate boundary; the
+// witness-pairing rule is in module docs but a bare bound failure
+// is unactionable. Routes contributors to the matching `*Install`
+// witness types in `push_command`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `PostStateProof` witness for a `PushCommand` post-state install",
+    label = "valid witnesses live next to their command in `push_command.rs` (e.g. `PingAwaitingRfqInstall` for `Ping`, `StartupAwaitingAuthRequestInstall` for `Startup`, etc.)",
+    note = "`PostStateProof` is sealed crate-internal — each witness corresponds 1:1 to a `ProtoState` variant. To add a new command, define its struct in `push_command.rs` and add the matching `*Install` witness type with `impl PostStateProof` next to it (DEF-270 N-D pattern)"
+)]
 pub(crate) trait PostStateProof: sealed::Sealed {
     /// Consume the witness and write the corresponding [`ProtoState`]
     /// variant via `*state = ...`. Implementors should be `#[inline]`

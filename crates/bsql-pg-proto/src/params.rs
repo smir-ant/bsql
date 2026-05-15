@@ -107,6 +107,20 @@ mod sealed {
 /// `Option<T>` doesn't impl [`EncodeBinary`] — the blanket doesn't
 /// apply to it, so the dedicated `Option` impl is the only
 /// candidate.
+//
+// DEF-244 follow-up (rust-version 1.78 modernisation): structural
+// diagnostic for sealed-trait E0277. A user writing
+// `prepared!("SELECT $1", (u64,))` (banned — see
+// `prepared_unsupported_types/numeric.rs`) hits a bound failure on
+// `u64: ParamEncoderSealed` — the sealed module is private, so the
+// contributor cannot enumerate candidates from the failed bound. The
+// attribute below routes them to the supported set + the `EncodeBinary`
+// extension path directly.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid prepared-query parameter type",
+    label = "valid parameter types are those that implement `EncodeBinary` (e.g. `i16`, `i32`, `i64`, `bool`, `&str`) or `Option<T>` over such a type",
+    note = "`ParamEncoder` is sealed — extend the supported set by adding `impl EncodeBinary for ...` in `decode.rs`; downstream `impl ParamEncoder for ...` is forbidden by construction (DEF-244 memo §7 P8 closure on the params side)"
+)]
 pub trait ParamEncoder: sealed::ParamEncoderSealed {
     /// PG type OID this encoder targets. For `T: EncodeBinary`
     /// this equals `T::OID`; for `Option<T>` it equals `T::OID`
@@ -170,6 +184,17 @@ pub const MAX_PARAMS_DATA_TOTAL: usize = 1024;
 /// See module-level docs for the full wire-format contract and tier
 /// analysis. `ParamsWriter` is sealed; the impls in this module
 /// cover tuple arity `0..=16`.
+//
+// DEF-244 follow-up (rust-version 1.78 modernisation): structural
+// diagnostic for sealed-trait E0277. A user passing a non-tuple
+// value (e.g. `prepared!("...", my_struct)`) or a tuple of arity > 16
+// hits `T: ParamsWriterSealed` failure with the bare bound message.
+// The attribute below routes them to the tuple-shape contract.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid parameter tuple for a prepared query",
+    label = "expected a tuple `()` through `(T1, T2, ..., T16)` where each Ti implements `ParamEncoder`",
+    note = "`ParamsWriter` is sealed — only the crate-internal tuple impls (arity 0..=16) qualify; downstream `impl ParamsWriter for ...` is forbidden by construction (DEF-244 memo §7 P8 closure)"
+)]
 pub trait ParamsWriter: sealed::ParamsWriterSealed {
     /// Number of parameters this tuple encodes. Compile-time
     /// drift-pinned against tuple arity via the generating macro.

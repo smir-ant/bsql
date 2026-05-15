@@ -80,7 +80,12 @@ mod sealed {
 /// Per the sealed-trait pattern, external crates cannot construct
 /// these types or implement the trait — visibility leakage is purely
 /// cosmetic. Suppressed crate-locally.
-#[allow(private_interfaces, private_bounds, reason = "sealed-trait pattern: trait method takes pub(crate) types — external crates cannot construct them or implement the trait, so the leakage is cosmetic only")]
+#[expect(private_interfaces, private_bounds, reason = "sealed-trait pattern: trait method takes pub(crate) types — external crates cannot construct them or implement the trait, so the leakage is cosmetic only. Migrated #[allow]→#[expect] (Rust 1.81): if the referenced types become `pub`, the lint no longer fires, prompting attribute removal.")]
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid client→server command",
+    label = "valid commands are the per-command structs in `push_command`: `Ping`, `Flush`, `Startup`, `Parse`, `Close`, `DescribeStatement`, `DescribePortal`, `SimpleQuery`, `BindExecute`, `BindPrepared<P, R>` (DEF-244)",
+    note = "`PushCommand` is sealed — external crates cannot add command variants; extend the closed set inside `bsql-pg-proto::push_command` paired with the matching dispatcher arm and state-machine transition"
+)]
 pub trait PushCommand: sealed::PushCommandSealed {
     /// Per-command output type. `()` for fire-and-forget commands;
     /// future handles for prepared-statement / chunked-fetch flows.
@@ -545,7 +550,7 @@ use crate::state_setter::sealed::Sealed as PostStateSealed;
 /// [`crate::state::ProtoState::PingAwaitingRfq`]. Carries exactly the
 /// `ReplyId<PingKind>` the variant requires.
 #[must_use = "a PingAwaitingRfqInstall has no effect until passed to StateSetter::install_post_state"]
-#[allow(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait")]
+#[expect(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait. Migrated #[allow]→#[expect] (Rust 1.81): if a Debug impl is later added, the lint no longer fires, prompting attribute removal.")]
 pub struct PingAwaitingRfqInstall {
     pub(crate) reply: ReplyId<PingKind>,
 }
@@ -566,7 +571,7 @@ impl PostStateProof for PingAwaitingRfqInstall {
 /// Variant ordering mirrors [`crate::password::Credentials`] for
 /// reviewability; the enum-tag is independent at the wire level.
 #[must_use = "a StartupPostInstall has no effect until passed to StateSetter::install_post_state"]
-#[allow(missing_debug_implementations, reason = "fields contain secret material (Box<ScramSession>, Box<Sensitive<Password>>, Box<Md5HandshakeState>); ZST witness flows by-value through one consumption path; Debug impl would require redacting the secrets — defer until a concrete diagnostic surface needs the trait")]
+#[expect(missing_debug_implementations, reason = "fields contain secret material (Box<ScramSession>, Box<Sensitive<Password>>, Box<Md5HandshakeState>); ZST witness flows by-value through one consumption path; Debug impl would require redacting the secrets — defer until a concrete diagnostic surface needs the trait. Migrated #[allow]→#[expect] (Rust 1.81): if a Debug impl is later added, the lint no longer fires, prompting attribute removal.")]
 pub enum StartupPostInstall {
     /// Trust (no auth) → [`crate::state::ProtoState::ConnectingStartupTrust`].
     Trust {
@@ -621,7 +626,7 @@ impl PostStateProof for StartupPostInstall {
 /// Witness pairing [`SimpleQuery`] to
 /// [`crate::state::ProtoState::SimpleQueryAwaitingFirstResponse`].
 #[must_use = "a SimpleQueryAwaitingFirstResponseInstall has no effect until passed to StateSetter::install_post_state"]
-#[allow(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait")]
+#[expect(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait. Migrated #[allow]→#[expect] (Rust 1.81): if a Debug impl is later added, the lint no longer fires, prompting attribute removal.")]
 pub struct SimpleQueryAwaitingFirstResponseInstall {
     pub(crate) reply: ReplyId<QueryKind>,
 }
@@ -636,7 +641,7 @@ impl PostStateProof for SimpleQueryAwaitingFirstResponseInstall {
 /// Witness pairing [`Parse`] to
 /// [`crate::state::ProtoState::ParseAwaitingParseComplete`].
 #[must_use = "a ParseAwaitingParseCompleteInstall has no effect until passed to StateSetter::install_post_state"]
-#[allow(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait")]
+#[expect(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait. Migrated #[allow]→#[expect] (Rust 1.81): if a Debug impl is later added, the lint no longer fires, prompting attribute removal.")]
 pub struct ParseAwaitingParseCompleteInstall {
     pub(crate) reply: ReplyId<ParseKind>,
 }
@@ -651,7 +656,7 @@ impl PostStateProof for ParseAwaitingParseCompleteInstall {
 /// Witness pairing [`DescribeStatement`] to
 /// [`crate::state::ProtoState::DescribeStatementAwaitingParamDesc`].
 #[must_use = "a DescribeStatementAwaitingParamDescInstall has no effect until passed to StateSetter::install_post_state"]
-#[allow(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait")]
+#[expect(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait. Migrated #[allow]→#[expect] (Rust 1.81): if a Debug impl is later added, the lint no longer fires, prompting attribute removal.")]
 pub struct DescribeStatementAwaitingParamDescInstall {
     pub(crate) reply: ReplyId<DescribeStatementKind>,
 }
@@ -666,7 +671,7 @@ impl PostStateProof for DescribeStatementAwaitingParamDescInstall {
 /// Witness pairing [`DescribePortal`] to
 /// [`crate::state::ProtoState::DescribePortalAwaitingRowDescOrNoData`].
 #[must_use = "a DescribePortalAwaitingRowDescOrNoDataInstall has no effect until passed to StateSetter::install_post_state"]
-#[allow(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait")]
+#[expect(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait. Migrated #[allow]→#[expect] (Rust 1.81): if a Debug impl is later added, the lint no longer fires, prompting attribute removal.")]
 pub struct DescribePortalAwaitingRowDescOrNoDataInstall {
     pub(crate) reply: ReplyId<DescribePortalKind>,
 }
@@ -696,7 +701,7 @@ impl PostStateProof for DescribePortalAwaitingRowDescOrNoDataInstall {
 /// the surface clean; per-leaf concrete-token mints close the
 /// pre-DEF-272 sealed-trait bypass surface.
 #[must_use = "a BindExecutePostInstall has no effect until passed to StateSetter::install_post_state"]
-#[allow(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait")]
+#[expect(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait. Migrated #[allow]→#[expect] (Rust 1.81): if a Debug impl is later added, the lint no longer fires, prompting attribute removal.")]
 pub enum BindExecutePostInstall {
     /// Schema-less path → [`crate::state::ProtoState::BindExecuteAwaitingBindCompleteDml`].
     Dml {

@@ -81,6 +81,15 @@ use core::num::{NonZeroU8, NonZeroU16};
 /// use bsql_pg_proto::bounded::{BoundedLen, BoundedU16};
 /// const _: usize = <BoundedU16<70_000> as BoundedLen<70_000>>::MAX;
 /// ```
+// DEF-244 follow-up (rust-version 1.78 modernisation): structural
+// diagnostic. The supertrait failure on the sealed `Sealed` bound is
+// not actionable from downstream; pointing at the two carrier types
+// is.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `BoundedLen<{N}>` carrier",
+    label = "valid carriers are `BoundedU8<{N}>` (when `{N} <= 254`) and `BoundedU16<{N}>` (when `{N} <= 65_534`)",
+    note = "`BoundedLen` is sealed — only the two crate-internal carriers qualify; downstream `impl BoundedLen for ...` is forbidden by construction"
+)]
 pub trait BoundedLen<const N: usize>:
     Sized + Copy + Default + PartialEq + Eq + core::fmt::Debug + sealed::Sealed
 {

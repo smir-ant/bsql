@@ -273,6 +273,10 @@ impl core::fmt::Display for ArenaError {
     }
 }
 
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the arena-lookup error sentinel.
+impl core::error::Error for ArenaError {}
+
 // Niche-pack pin: Option<ArenaError> stays 1 byte via the 254 unused
 // u8 discriminants (`#[repr(u8)]` with 2 C-like variants).
 const _: () = assert!(

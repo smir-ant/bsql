@@ -389,6 +389,10 @@ pub struct WriteBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteBufFull;
 
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the write-buf-overflow sentinel.
+impl core::error::Error for WriteBufFull {}
+
 impl fmt::Display for WriteBufFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("write buffer full")

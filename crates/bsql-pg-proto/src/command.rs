@@ -40,7 +40,15 @@ use crate::reply_id::{
 #[derive(Debug)]
 #[non_exhaustive]
 #[must_use = "a PgCommand has no effect until pushed via PgProtocol::push_command"]
-#[allow(dead_code, reason = "DEF-269 v2: variants only constructed by lib-internal compute_push_tests mod + the blanket `impl PushCommand for PgCommand` (legacy slow-path)")]
+// DEF-244 modernisation audit (rust-version 1.81 sweep): kept as
+// `#[allow]` rather than `#[expect]` — the underlying `dead_code`
+// lint fires ONLY in non-test builds. In `--cfg test` builds, the
+// `compute_push_tests` module + the blanket `impl PushCommand for
+// PgCommand` legacy slow-path consume every variant, so the lint
+// doesn't fire and `#[expect]` would itself emit
+// `unfulfilled_lint_expectations`. The cfg-conditional firing makes
+// `#[expect]` the wrong tool here (CREDO §B-classify Skip + comment).
+#[allow(dead_code, reason = "DEF-269 v2: variants only constructed by lib-internal compute_push_tests mod + the blanket `impl PushCommand for PgCommand` (legacy slow-path). Cfg-conditional dead-code — see comment above for the #[expect] avoidance rationale.")]
 pub(crate) enum PgCommand {
     /// Cheap server liveness probe.
     ///

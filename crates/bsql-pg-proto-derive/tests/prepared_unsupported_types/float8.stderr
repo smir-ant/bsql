@@ -16,12 +16,14 @@ error: prepared!: unsupported PG type `float8`.
 10 |     "SELECT $1::float8"
    |     ^^^^^^^^^^^^^^^^^^^
 
-error[E0277]: the trait bound `f64: EncodeBinary` is not satisfied
+error[E0277]: `f64` does not implement `EncodeBinary` (cannot encode to PG binary format)
  --> tests/prepared_unsupported_types/float8.rs:9:10
   |
 9 | const Q: PreparedQuery<(f64,), ()> = prepared!(
-  |          ^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `EncodeBinary` is not implemented for `f64`
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^^ supported binary-encode types are `i16`, `i32`, `i64`, `bool`, `&str`
   |
+  = help: the trait `EncodeBinary` is not implemented for `f64`
+  = note: `EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction
 help: the following other types implement trait `EncodeBinary`
  --> $WORKSPACE/crates/bsql-pg-proto/src/decode.rs
   |

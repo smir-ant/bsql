@@ -1237,6 +1237,10 @@ impl StateErrorKind {
     }
 }
 
+// DEF-244 modernisation audit (rust-version 1.81): see ProtocolError
+// `core::error::Error` impl below for the rationale.
+impl core::error::Error for StateErrorKind {}
+
 impl fmt::Display for StateErrorKind {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1358,6 +1362,23 @@ impl From<crate::write_buf::WriteBufFull> for ProtocolError {
         }
     }
 }
+
+// DEF-244 modernisation audit (rust-version 1.81 — `core::error::Error`
+// stabilised). Additive impl: `ProtocolError` now satisfies the
+// canonical error-trait contract from `core`. Downstream crates
+// (`bsql-driver-postgres`, async wrappers) can `?`-propagate
+// `ProtocolError` through `Box<dyn core::error::Error>` boundaries +
+// downstream `thiserror`-style enums without a manual `From`/Display
+// wrapping bridge. Empty body: the default `Error::source()` (returns
+// `None`) is correct — `ProtocolError` is a leaf error type (no inner
+// errors it wraps that satisfy `Error`); it has variants carrying typed
+// classifications (ScramError, DecodeError) but those are independent
+// errors, not chained sources.
+//
+// `no_std` note: `core::error::Error` is available in `no_std` since
+// Rust 1.81; we use the `core::` path (NOT `std::`) to keep the crate
+// `no_std`-clean.
+impl core::error::Error for ProtocolError {}
 
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -213,15 +213,23 @@ pub(crate) fn compute_response_body(
     // arm is silent (would leave response zeroed → server-side
     // auth-fail, loud). The layout-pin asserts above + the
     // exhaustive integration tests close the surface.
-    if let Some((prefix_slot, rest)) = response.split_first_chunk_mut::<MD5_RESPONSE_PREFIX_LEN>() {
-        // Type-level assignment: `*&mut [u8; 3] = [u8; 3]`. No
-        // length check, no panic, no defensive arm.
+    //
+    // DEF-244 modernisation audit (edition 2024, rust-version 1.88
+    // let-chains): the nested `if let Some(...)` pair becomes a
+    // single let-chain. Semantics are bit-identical (each clause
+    // short-circuits; the inner block runs iff both clauses bind),
+    // but the chain expresses «both must be Some» as a single
+    // conjunction rather than two nested guards. The
+    // architecturally-impossible None arms remain silent — the
+    // chain just rephrases the same condition more readably.
+    if let Some((prefix_slot, rest)) = response.split_first_chunk_mut::<MD5_RESPONSE_PREFIX_LEN>()
+        && let Some(hex_slot) = rest.first_chunk_mut::<MD5_RESPONSE_HEX_LEN>()
+    {
+        // Type-level assignments: `*&mut [u8; 3] = [u8; 3]` and
+        // `*&mut [u8; 32] = [u8; 32]`. No length checks, no panics,
+        // no defensive arms.
         *prefix_slot = *b"md5";
-        // `first_chunk_mut::<32>()` on the 32-byte tail returns
-        // `Some(&mut [u8; 32])` by construction.
-        if let Some(hex_slot) = rest.first_chunk_mut::<MD5_RESPONSE_HEX_LEN>() {
-            *hex_slot = outer_hex;
-        }
+        *hex_slot = outer_hex;
     }
 
     response

@@ -1071,6 +1071,33 @@ pub struct PushFailure {
     pub cause: ProtocolError,
 }
 
+// DEF-244 modernisation audit (rust-version 1.81): additive Display +
+// `core::error::Error` impls on `PushFailure`. Pre-modernisation
+// `PushFailure` was Debug-only — downstream `?`-propagation into
+// `Box<dyn Error>` required a manual `From<PushFailure>` bridge in
+// every consumer. The Display delegates to the underlying typed
+// classification + correlator id; the Error impl exposes `cause` via
+// `source()` so downstream chain-walking utilities (anyhow's `Display`
+// chain, `Error::sources()` iterator on 1.82+) reach the typed
+// ProtocolError.
+//
+// API-surface note: this is purely additive — code that previously
+// only used the `Debug` derive continues to work. The brief disallows
+// public-API breakage; adding inherent trait impls is not a break
+// (inherent trait impl + Display/Error has no name collision potential
+// because both traits' methods are well-known).
+impl core::fmt::Display for PushFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "push command (id {}) failed: {}", self.id, self.cause)
+    }
+}
+
+impl core::error::Error for PushFailure {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 /// Internal staging variant emitted by dispatchers during the
 /// write-phase loop.
 ///
@@ -1132,7 +1159,11 @@ pub(crate) enum StagedAction<'sql> {
     /// the SQL in `Zeroizing<String>` — zeroize-on-drop happens at
     /// the caller, not in our `WriteBuf::clear()` (which only
     /// scrubs inline bytes).
-    #[allow(dead_code, reason = "DEF-160 commit 1 plumbing — first construction site lands in commit 2 Parse/SimpleQuery flip")]
+    // DEF-244 modernisation audit (rust-version 1.81 sweep): the
+    // historical `#[allow(dead_code, ...)]` (DEF-160 commit-1 plumbing)
+    // is now dead — the variant has multiple construction sites
+    // (protocol.rs:4194/4466/5054). Lint no longer fires; attribute
+    // removed.
     SendBytesBorrowed(&'sql [u8]),
     /// Map to [`Action::DeliverReply`]. Opaque [`DeliverReplyEntry`]
     /// — the only construction path is [`deliver`] (below), which

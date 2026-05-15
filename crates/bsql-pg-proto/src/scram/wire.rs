@@ -287,6 +287,10 @@ pub enum ScramError {
     RandomnessUnavailable,
 }
 
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the SCRAM-handshake error.
+impl core::error::Error for ScramError {}
+
 impl fmt::Display for ScramError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

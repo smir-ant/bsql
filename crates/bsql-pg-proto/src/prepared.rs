@@ -83,6 +83,23 @@ mod sealed {
 /// `None` for SQL NULL. v1 requires every column non-NULL — NULL
 /// returns [`DecodeError::NullInNonNullColumn`]. Nullable columns
 /// (`Option<T>` elements) track DEF-228.
+//
+// DEF-244 follow-up (rust-version 1.78 modernisation): structural
+// diagnostic for sealed-trait E0277. Pre-attribute, a hostile user
+// trying `impl RowDecode for Foo {}` (memo §7 P8-equivalent) got the
+// raw «trait bound `Foo: RowDecodeSealed` is not satisfied» message
+// — the sealed supertrait is module-private, so they cannot fix it
+// from outside. Post-attribute, the same compile error carries the
+// instructive note explaining that only crate-internal tuple impls
+// (arity 0..=16) are valid, lifting the diagnostic-UX surface from
+// «contributor must remember to look up RowDecodeSealed» (tier-3
+// by-discipline) to «compiler itself instructs the user» (tier-1
+// at the diagnostic surface).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a valid prepared-query row type",
+    label = "valid row types are tuples `()` through `(T1, T2, ..., T16)` where each Ti implements `ColTextAt`",
+    note = "`RowDecode` is sealed — only the crate-internal tuple impls (arity 0..=16) over primitive cell types (`i16`, `i32`, `i64`, `u32`, `bool`, `&'static str`) can satisfy it; downstream `impl RowDecode for ...` is forbidden by construction (DEF-244 memo §7 P8 closure)"
+)]
 pub trait RowDecode: sealed::RowDecodeSealed + Sized {
     /// Number of columns this row carries.
     const ARITY: u16;
@@ -127,6 +144,21 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
 
 /// Crate-internal projection: marker type → at-`'a` decoded type.
 /// `i32 → i32` (no lifetime), `&'static str → &'a str`, etc.
+//
+// DEF-244 follow-up (rust-version 1.78 modernisation): structural
+// diagnostic for the cell-type rejection path. Pre-attribute, a
+// `prepared!("... ROW (i64, u64)")` or similar with `u64` (banned
+// — see `prepared_unsupported_types/numeric.rs` for the symmetric
+// rejection on the params side) emitted the bare «trait bound `u64:
+// col_text_at_sealed::Sealed` is not satisfied» message — the
+// sealed module is private, so the contributor cannot inspect the
+// candidates. The attribute below routes them to the supported
+// list directly.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a supported prepared-query row cell type",
+    label = "supported cell types are `i16`, `i32`, `i64`, `u32`, `bool`, and `&'static str` (rendered as `&'a str` at decode time)",
+    note = "`ColTextAt` is sealed — extend the supported set by adding a `col_text_at_primitive!` invocation in `prepared.rs`; downstream `impl ColTextAt for ...` is forbidden by construction (DEF-244 memo §7 P8 closure on the row-decoder side)"
+)]
 pub trait ColTextAt<'a>: col_text_at_sealed::Sealed {
     /// The type decoded from text-format bytes at lifetime `'a`.
     type At;
