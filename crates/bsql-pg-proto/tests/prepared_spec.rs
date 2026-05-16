@@ -27,7 +27,7 @@
 extern crate std;
 
 use bsql_pg_proto::{
-    prepared, FetchRows, PgProtocol, PreparedQuery, ProtocolError, QueryKind, RowDecode, WriteBuf,
+    prepared, FetchRows, PreparedQuery, ProtocolError, QueryKind, RowDecode, WriteBuf,
     wire::{
         TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_PARSE_COMPLETE,
         TAG_READY_FOR_QUERY,
@@ -35,7 +35,7 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::mint_reply;
+use common::{fresh_active_via_trust_handshake, mint_reply};
 
 // ───────────────────── wire-fixture helpers ─────────────────────
 
@@ -117,7 +117,7 @@ const Q_INSERT_RETURN: PreparedQuery<(&'static str,), (i32,)> = prepared!(
 
 #[test]
 fn e1_select_emits_parse_bind_execute_sync() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
 
@@ -206,7 +206,7 @@ fn e6_dml_returning_has_row_oids() {
 
 #[test]
 fn e7_collect_tuple_decodes_rows() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
     let ready = match proto.as_ready() {
@@ -270,7 +270,7 @@ fn e7_collect_tuple_decodes_rows() {
 
 #[test]
 fn e8_null_in_required_column_errors() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
     let ready = match proto.as_ready() {
@@ -322,7 +322,7 @@ fn e8_null_in_required_column_errors() {
 
 #[test]
 fn e9_execute_prepared_requires_idle() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     // Idle at construction → as_ready returns Some.
     assert!(proto.as_ready().is_some(), "fresh proto must be Idle");
 }

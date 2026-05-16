@@ -43,7 +43,7 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::{PushOrPanic, mint_reply};
+use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 // =================================================================
 // S2 — DELETED (DEF-089). The seam no longer exists: `SendBuf` is a
@@ -203,7 +203,7 @@ fn session_params_set_second_value_overwrites() {
 /// so reply and state must both carry the exact same value.
 #[test]
 fn errored_cause_is_preserved_in_state_and_reply() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, _ping_raw) = mint_reply::<PingKind>(&mut proto);
     // Push ping and feed a FrameTooLarge frame.
@@ -280,6 +280,7 @@ fn scram_push_startup_carries_scram_session_inline() {
     use bsql_pg_proto::ident::Ident;
     use bsql_pg_proto::password::{Credentials, Password};
     use bsql_pg_proto::sensitive::Sensitive;
+    // DEF-246 Phase 2 (2026-05-16): consume-self push_startup.
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let Ok(user) = Ident::try_from_str("u") else {
@@ -288,21 +289,22 @@ fn scram_push_startup_carries_scram_session_inline() {
     let Ok(pw) = Password::try_from_bytes(b"pw") else {
         panic!("password construction must succeed");
     };
-    let (reply, _raw) = mint_reply::<StartupKind>(&mut proto);
-    proto.push_or_panic(
-        bsql_pg_proto::push_command::Startup {
-            user,
-            database: None,
-            app_name: None,
-            credentials: Credentials::ScramPassword(Sensitive::new(pw)),
-            reply,
-        },
+    let reply = proto.next_reply_id::<StartupKind>();
+    let (_actions, proto_connecting) = match proto.push_startup(
+        user,
+        None,
+        None,
+        Credentials::ScramPassword(Sensitive::new(pw)),
+        reply,
         &mut wb,
-    );
+    ) {
+        Ok(p) => p,
+        Err(f) => panic!("push_startup must succeed for SCRAM, got {:?}", f.cause),
+    };
     assert!(
-        matches!(proto.state(), ProtoState::ConnectingStartupScram { .. }),
+        matches!(proto_connecting.state(), ProtoState::ConnectingStartupScram { .. }),
         "SCRAM push_startup must land in ConnectingStartupScram carrying inline scram, got {:?}",
-        proto.state(),
+        proto_connecting.state(),
     );
 }
 /// into an already-Errored state preserves the original error kind
@@ -316,7 +318,7 @@ fn scram_push_startup_carries_scram_session_inline() {
 #[test]
 fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
     use bsql_pg_proto::error::ErrorKind;
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
 
     // Drive into Errored(ServerError) via a server ErrorResponse
@@ -444,19 +446,22 @@ fn application_name_validation_allows_empty() {
 /// the fallback `other` arm in `parse_backend_key_data`.
 #[test]
 fn backend_key_data_wrong_payload_size_is_classified() {
-    // Set up: drive to ConnectingPostAuthAwaitingKey.
+    // DEF-246 Phase 2 (2026-05-16): consume-self push_startup to drive
+    // to ConnectingPostAuthAwaitingKey via the typed handshake.
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    let (reply, _startup_raw) = mint_reply::<StartupKind>(&mut proto);
-    // Setup: push Startup, feed AuthOk.
-    // DEF-212: push_or_panic returns (); bytes live in wb.
-    proto.push_or_panic(bsql_pg_proto::push_command::Startup {
-        user: Ident::try_from_str("u").unwrap_or_else(|_| panic!("valid ident")),
-        database: None,
-        app_name: None,
-        credentials: Credentials::Trust,
+    let reply = proto.next_reply_id::<StartupKind>();
+    let (_actions, mut proto) = match proto.push_startup(
+        Ident::try_from_str("u").unwrap_or_else(|_| panic!("valid ident")),
+        None,
+        None,
+        Credentials::Trust,
         reply,
-    }, &mut wb);
+        &mut wb,
+    ) {
+        Ok(p) => p,
+        Err(f) => panic!("push_startup must succeed, got {:?}", f.cause),
+    };
     // Feed AuthOk — now ConnectingPostAuthAwaitingKey.
     let auth_ok_frame: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
     _ = proto.feed_bytes(&auth_ok_frame, &mut wb);

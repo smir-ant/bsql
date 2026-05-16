@@ -9,12 +9,15 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::PushOrPanic;
+use common::{PushOrPanic, fresh_active_via_trust_handshake};
 
 // DEF-270 (U letter): pre-DEF-270 these helpers wrapped
 // `ReplyId::from_raw(raw_value)`. Post-DEF-270 IDs are minted via
 // `proto.next_reply_id::<K>()`. Each helper now takes `&mut PgProtocol`
 // to mint via the production API.
+//
+// DEF-246 Phase 2 (2026-05-16): helpers typed for `<ActivePhase>` —
+// the audit tests below all start with a real Trust handshake.
 fn ping_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::PingKind> {
     proto.next_reply_id()
 }
@@ -27,9 +30,8 @@ fn parse_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_
     proto.next_reply_id()
 }
 
-fn startup_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::StartupKind> {
-    proto.next_reply_id()
-}
+// DEF-246 Phase 2 (2026-05-16): `startup_id` retired — `<DisconnectedPhase>`
+// has its own `next_reply_id` and `push_startup` consumes the ID.
 
 fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf) {
     let reply = ping_id(proto);
@@ -51,7 +53,7 @@ fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf) {
 /// classified as `UnexpectedFrameBody` → FailReply + CloseSocket.
 #[test]
 fn empty_query_response_with_non_zero_body_classifies() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Push a simple-query to reach SimpleQueryAwaitingFirstResponse.
@@ -92,7 +94,7 @@ fn empty_query_response_with_non_zero_body_classifies() {
 /// Same invariant for `ParseComplete` ('1').
 #[test]
 fn parse_complete_with_non_zero_body_classifies() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let stmt = match bsql_pg_proto::ident::StmtName::try_from_str("s") {
@@ -129,7 +131,7 @@ fn parse_complete_with_non_zero_body_classifies() {
 /// regardless of body content, avoiding content-specific dispatch.
 #[test]
 fn max_length_notice_frame_is_consumed_cleanly() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Ping to reach a state that accepts NoticeResponse.
@@ -164,7 +166,7 @@ fn max_length_notice_frame_is_consumed_cleanly() {
 /// invariant.
 #[test]
 fn pong_delivered_via_byte_at_a_time_fragmentation() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     push_ping(&mut proto, &mut wb);
 
@@ -204,6 +206,10 @@ fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
     use bsql_pg_proto::password::{Credentials, Password};
     use bsql_pg_proto::sensitive::Sensitive;
 
+    // DEF-246 Phase 2 (2026-05-16): mid-handshake test — use a fresh
+    // `<DisconnectedPhase>` protocol and consume-self push_startup;
+    // the returned `<ConnectingPhase>` is dropped to exercise the
+    // SCRAM drop cascade.
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let user = match Ident::try_from_str("scram_user") {
@@ -214,24 +220,27 @@ fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
         Ok(p) => p,
         Err(_) => return,
     };
-    let reply = startup_id(&mut proto);
-    proto.push_or_panic(
-        bsql_pg_proto::push_command::Startup {
-            user,
-            database: None,
-            app_name: None,
-            credentials: Credentials::ScramPassword(Sensitive::new(pw)),
-            reply,
-        },
+    let reply = proto.next_reply_id::<bsql_pg_proto::reply_id::StartupKind>();
+    let (_actions, proto_connecting) = match proto.push_startup(
+        user,
+        None,
+        None,
+        Credentials::ScramPassword(Sensitive::new(pw)),
+        reply,
         &mut wb,
-    );
-    // DEF-212: Startup emits StartupMessage frame; non-empty wb confirms.
-    assert!(!wb.as_bytes().is_empty(), "Startup push must emit StartupMessage frame");
-    assert!(matches!(proto.state(), ProtoState::ConnectingStartupScram { .. }));
+    ) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    assert!(matches!(
+        proto_connecting.state(),
+        ProtoState::ConnectingStartupScram { .. }
+    ));
 
-    // Drop proto — triggers Drop cascade including ScramSession
-    // zeroize + WriteBuf/ReadBuf scrub + error_arena cleanup.
-    drop(proto);
+    // Drop proto_connecting — triggers Drop cascade including
+    // ScramSession zeroize + WriteBuf/ReadBuf scrub + error_arena
+    // cleanup.
+    drop(proto_connecting);
     drop(wb);
     // Reached here without panic.
 }
@@ -303,7 +312,7 @@ fn scram_max_iterations_is_pinned_at_100k() {
 /// BoundedStr capacity — must parse without classification failure.
 #[test]
 fn error_response_max_fields_boundary_is_bounded() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     push_ping(&mut proto, &mut wb);
 

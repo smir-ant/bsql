@@ -31,9 +31,9 @@
 #![allow(dead_code, reason = "shared helper module — not every test uses every helper")]
 
 use bsql_pg_proto::{
-    Action, FetchRows, HeaderParse, OutActions, PgProtocol, PortalName, PushFailure,
-    QueryKind, ReplyId, ReplyKind, RowDesc, StmtName, WriteBuf, params::ParamsWriter,
-    parse_header,
+    Action, ActivePhase, Credentials, DisconnectedPhase, FetchRows, HeaderParse, Ident,
+    IntoActiveError, OutActions, PgProtocol, PortalName, PushFailure, QueryKind, ReplyId,
+    ReplyKind, RowDesc, StartupKind, StmtName, WriteBuf, params::ParamsWriter, parse_header,
     push_command::{BindExecute, PushCommand},
 };
 use core::num::NonZeroU64;
@@ -53,10 +53,163 @@ use core::num::NonZeroU64;
 /// returns 1, second 2, etc. Tests that want SPECIFIC raw values (e.g.
 /// for fixture-distinguishability across multiple commands in one
 /// scenario) can mint sequentially and capture the actual values.
+///
+/// DEF-246 Phase 2 (2026-05-16): default-phase shape on `<ActivePhase>`.
+/// For `<DisconnectedPhase>` (pre-Startup mint) callers use
+/// [`mint_reply_disconnected`] (same body, different phase type).
 pub fn mint_reply<K: ReplyKind>(proto: &mut PgProtocol) -> (ReplyId<K>, NonZeroU64) {
     let id = proto.next_reply_id::<K>();
     let raw = id.get();
     (id, raw)
+}
+
+/// DEF-246 Phase 2 (2026-05-16): mint a fresh `ReplyId<K>` on a
+/// `<DisconnectedPhase>` protocol (pre-Startup). Mirror of
+/// [`mint_reply`] but typed for the disconnect-phase shape.
+pub fn mint_reply_disconnected<K: ReplyKind>(
+    proto: &mut PgProtocol<DisconnectedPhase>,
+) -> (ReplyId<K>, NonZeroU64) {
+    let id = proto.next_reply_id::<K>();
+    let raw = id.get();
+    (id, raw)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DEF-246 Phase 2/3 (2026-05-16) — handshake-driver helper
+// ═══════════════════════════════════════════════════════════════════
+//
+// `fresh_active_via_trust_handshake()` drives a fresh
+// `PgProtocol<DisconnectedPhase>` through a synthetic Trust-auth
+// handshake using ONLY the public API:
+//
+//   1. PgProtocol::new() → <DisconnectedPhase>
+//   2. push_startup(user="testuser", trust)
+//      → (OutActions, <ConnectingPhase>)
+//   3. feed_inbound + advance_one_frame loop over synthetic wire
+//      bytes (AuthOk, ParameterStatus×N, BackendKeyData, RFQ)
+//   4. into_active() → <ActivePhase>
+//
+// Tests that need an Active protocol immediately (most spec-conformance
+// tests) call this helper to keep their fixtures terse. Tests that
+// observe handshake progression directly drive the public API without
+// this helper.
+
+/// Build an AuthenticationOk frame: tag 'R', length 8, sub-code 0.
+fn auth_ok_frame() -> [u8; 9] {
+    [b'R', 0, 0, 0, 8, 0, 0, 0, 0]
+}
+
+/// Build a ParameterStatus frame: tag 'S', key\0value\0.
+fn param_status_frame(key: &str, value: &str) -> Vec<u8> {
+    let body_len = key.len().saturating_add(1).saturating_add(value.len()).saturating_add(1);
+    let declared = u32::try_from(body_len).unwrap_or(0).saturating_add(4);
+    let mut frame = Vec::new();
+    frame.push(b'S');
+    frame.extend_from_slice(&declared.to_be_bytes());
+    frame.extend_from_slice(key.as_bytes());
+    frame.push(0);
+    frame.extend_from_slice(value.as_bytes());
+    frame.push(0);
+    frame
+}
+
+/// Build a BackendKeyData frame: tag 'K', 8-byte payload (pid + secret_key).
+fn backend_key_data_frame(pid: i32, secret_key: i32) -> [u8; 13] {
+    let pid_bytes = pid.to_be_bytes();
+    let key_bytes = secret_key.to_be_bytes();
+    [
+        b'K', 0, 0, 0, 12,
+        pid_bytes[0], pid_bytes[1], pid_bytes[2], pid_bytes[3],
+        key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3],
+    ]
+}
+
+/// Build a ReadyForQuery frame.
+fn rfq_frame(tx_status: u8) -> [u8; 6] {
+    [b'Z', 0, 0, 0, 5, tx_status]
+}
+
+/// DEF-246 Phase 2/3 (2026-05-16) — drive a fresh `PgProtocol` through
+/// a synthetic Trust-auth handshake to `<ActivePhase>`. Uses ONLY the
+/// public API:
+///
+/// - `PgProtocol::new()` produces `<DisconnectedPhase>`.
+/// - `push_startup` consumes it → `<ConnectingPhase>`.
+/// - `feed_inbound` + `advance_one_frame` drive the synthetic
+///   AuthOk + 2× ParameterStatus + BackendKeyData + RFQ chain.
+/// - `into_active` consumes the `<ConnectingPhase>` → `<ActivePhase>`.
+///
+/// No `_for_test`, no `__test_bypass_*`, no `#[doc(hidden)]` —
+/// every step is a publicly-callable method.
+///
+/// **Panics** on any non-Idle terminal state — the caller is in a
+/// happy-path fixture context. Tests that observe failure paths
+/// drive the API directly.
+#[track_caller]
+pub fn fresh_active_via_trust_handshake() -> PgProtocol<ActivePhase> {
+    let mut proto = PgProtocol::<DisconnectedPhase>::new();
+    let mut wb = WriteBuf::new();
+    let user = match Ident::try_from_str("testuser") {
+        Ok(u) => u,
+        Err(e) => panic!("test fixture: 'testuser' is a valid Ident, got {e}"),
+    };
+    let (reply, _raw) = mint_reply_disconnected::<StartupKind>(&mut proto);
+    let mut proto_connecting = {
+        let (_actions, p) = match proto.push_startup(
+            user,
+            None,
+            None,
+            Credentials::Trust,
+            reply,
+            &mut wb,
+        ) {
+            Ok((a, p)) => (a, p),
+            Err(f) => panic!(
+                "test fixture: push_startup must succeed for Trust auth, got {:?}",
+                f.cause,
+            ),
+        };
+        // `_actions` borrows into `wb`; drop it (block scope) before
+        // re-using `wb` for the subsequent handshake-drive calls.
+        let _ = _actions;
+        p
+    };
+
+    // Drive AuthOk → ParameterStatus×N → BackendKeyData → RFQ.
+    if let Err(e) = proto_connecting.feed_inbound(&auth_ok_frame()) {
+        panic!("test fixture: feed_inbound(AuthOk) must succeed, got {e:?}");
+    }
+    let _evt = proto_connecting.advance_one_frame(&mut wb);
+
+    if let Err(e) = proto_connecting.feed_inbound(&param_status_frame("server_version", "17.2")) {
+        panic!("test fixture: feed_inbound(ParameterStatus server_version) must succeed, got {e:?}");
+    }
+    let _evt = proto_connecting.advance_one_frame(&mut wb);
+
+    if let Err(e) = proto_connecting.feed_inbound(&param_status_frame("client_encoding", "UTF8")) {
+        panic!("test fixture: feed_inbound(ParameterStatus client_encoding) must succeed, got {e:?}");
+    }
+    let _evt = proto_connecting.advance_one_frame(&mut wb);
+
+    if let Err(e) = proto_connecting.feed_inbound(&backend_key_data_frame(12345, 67890)) {
+        panic!("test fixture: feed_inbound(BackendKeyData) must succeed, got {e:?}");
+    }
+    let _evt = proto_connecting.advance_one_frame(&mut wb);
+
+    if let Err(e) = proto_connecting.feed_inbound(&rfq_frame(b'I')) {
+        panic!("test fixture: feed_inbound(RFQ) must succeed, got {e:?}");
+    }
+    let _evt = proto_connecting.advance_one_frame(&mut wb);
+
+    match proto_connecting.into_active() {
+        Ok(p) => p,
+        Err(IntoActiveError::Closed(_)) => panic!(
+            "test fixture: trust handshake landed in Closed unexpectedly",
+        ),
+        Err(IntoActiveError::StillConnecting(_)) => panic!(
+            "test fixture: trust handshake landed in StillConnecting unexpectedly",
+        ),
+    }
 }
 
 /// Extension trait: pre-DEF-198 ergonomics for happy-path tests.

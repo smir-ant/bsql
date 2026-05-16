@@ -1296,13 +1296,24 @@ pub(crate) mod _proto_init_leaf {
         }
     }
 
-    impl super::PgProtocol<super::ActivePhase> {
-        /// Construct a new protocol in [`crate::state::ProtoState::Idle`].
+    impl super::PgProtocol<super::DisconnectedPhase> {
+        /// Construct a new protocol in [`crate::state::ProtoState::Idle`],
+        /// typed `PgProtocol<DisconnectedPhase>` — the only legal next
+        /// step is [`Self::push_startup`].
         ///
-        /// **Note:** Phase 1a starts in `Idle` directly. The startup +
-        /// auth handshake that legitimately produces this state lives in
-        /// 1b/1e; until then the test harness pushes Ping commands without
-        /// having authenticated against a real PG server.
+        /// **DEF-246 Phase 2 (2026-05-16):** the constructor now
+        /// produces `<DisconnectedPhase>` (pre-DEF-246 Phase 2 produced
+        /// `<ActivePhase>`). Tier-1 elevation #1: the
+        /// `PgCommand::Startup` enum + `push_command::Startup` struct +
+        /// `impl PushCommand for Startup` are deleted; the only path
+        /// into a connecting protocol is
+        /// `<DisconnectedPhase>::push_startup(...) ->
+        /// PgProtocol<ConnectingPhase>` (consume-self transition).
+        /// Pushing any other command from `<DisconnectedPhase>` is a
+        /// method-absent E0599 — the per-command structs
+        /// (`Ping`, `SimpleQuery`, `Parse`, …) implement
+        /// [`crate::push_command::PushCommand`] which is reachable
+        /// only through `<ActivePhase>::push_command_internal`.
         ///
         /// Lives inside `_proto_init_leaf` (DEF-272 P6 closure 2026-05-10):
         /// the token-gated [`crate::schema_slot::RowDescSlotCell::empty`]
@@ -1310,12 +1321,6 @@ pub(crate) mod _proto_init_leaf {
         /// constructors require a [`ProtoInitToken`], which can only be
         /// minted here. Wholesale-replacement of cell fields is therefore
         /// narrowed to this submodule by construction.
-        ///
-        /// **DEF-246 Phase 1 (2026-05-16):** constructor produces
-        /// `PgProtocol<ActivePhase>` (the default phase). The
-        /// `_phantom: PhantomData<fn() -> ActivePhase>` is a ZST; the
-        /// inner `PgProtocolInner` carries all the actual state.
-        /// Token-gated cell construction remains within this leaf.
         #[must_use]
         pub const fn new() -> Self {
             let token = ProtoInitToken::mint();
@@ -1342,6 +1347,566 @@ pub(crate) mod _proto_init_leaf {
                 phase_marker: super::PhantomData,
             }
         }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-246 Phase 2/3/4 transition surfaces (2026-05-16)
+//
+// `<DisconnectedPhase>::push_startup`           consume-self → ConnectingPhase
+// `<ConnectingPhase>::feed_inbound`             1-line delegate to Inner
+// `<ConnectingPhase>::feed_bytes`               1-line delegate to Inner
+// `<ConnectingPhase>::advance_one_frame`        1-line delegate to Inner
+// `<ConnectingPhase>::into_active`              consume-self → ActivePhase | IntoActiveError
+// `<ClosedPhase>::cause`                        accessor — reconstructed ProtocolError
+// `<ActivePhase>::into_closed_if_errored`       consume-self → ClosedPhase | ActivePhase (declared above)
+//
+// Tier elevations (Phase 2+3+4):
+//   #1: push-before-Startup            → method-absent E0599 on <DisconnectedPhase>::push_*
+//   #2: push-during-Connecting         → method-absent E0599 on <ConnectingPhase>::push_*
+//   #3: Closed absorbs no input        → method-absent E0599 on <ClosedPhase>::feed_*/push_*
+//   #4: feed_inbound surfaces typed err → Result<(), ProtocolError> across all phases that have feed_inbound
+// ═════════════════════════════════════════════════════════════════════
+
+/// DEF-246 Phase 3 (2026-05-16) — error returned by
+/// [`PgProtocol::<ConnectingPhase>::into_active`].
+///
+/// The protocol is consumed by the transition; both arms carry the
+/// state needed for the caller to recover or terminate:
+///
+/// - `Closed(PgProtocol<ClosedPhase>)` — handshake observed an
+///   `Errored(_)` transition (auth failure, malformed server frame,
+///   etc.). Caller writes `proto.cause()` for the typed error.
+/// - `StillConnecting(PgProtocol<ConnectingPhase>)` — handshake has
+///   not yet completed (mid-auth, no `ReadyForQuery` yet). Caller
+///   continues to drive `feed_inbound` / `advance_one_frame` until
+///   either RFQ arrives or the connection terminates.
+///
+/// Tier-1 closure: the user CANNOT obtain a `PgProtocol<ActivePhase>`
+/// without driving the handshake to `state == Idle`. The constructor
+/// `PgProtocol::new()` produces `<DisconnectedPhase>`; the only path
+/// to `<ConnectingPhase>` is `push_startup`; the only path from
+/// `<ConnectingPhase>` to `<ActivePhase>` is `into_active` with this
+/// classifier returning the `Ok` arm.
+#[expect(
+    missing_debug_implementations,
+    reason = "DEF-246 Phase 3: both variants carry PgProtocol wrappers with phase-typed markers; \
+              Debug is implemented blanket-style on `PgProtocol<P>`, so emitting one for the \
+              enum would either redact (defeating purpose) or print the full inner state. \
+              Deferred until a concrete diagnostic surface needs the trait."
+)]
+#[must_use = "IntoActiveError consumes the protocol — the caller must observe the variant \
+              to recover the typed wrapper or terminate"]
+pub enum IntoActiveError {
+    /// Handshake terminated in `Errored(_)` — the `ClosedPhase`
+    /// wrapper exposes `cause()` for the typed error.
+    Closed(PgProtocol<ClosedPhase>),
+    /// Handshake has not completed (mid-auth, no RFQ yet). The
+    /// wrapper is still `<ConnectingPhase>` — caller drives
+    /// `feed_inbound` / `advance_one_frame` further.
+    StillConnecting(PgProtocol<ConnectingPhase>),
+}
+
+impl PgProtocol<DisconnectedPhase> {
+    /// DEF-246 Phase 2 (2026-05-16) — diagnostic accessor mirror of
+    /// `<ActivePhase>::error_arena_overwrite_count`. A fresh
+    /// disconnected protocol has no errors yet (counter = 0); the
+    /// accessor exposes the same field for diagnostic compatibility.
+    #[inline]
+    #[must_use]
+    pub fn error_arena_overwrite_count(&self) -> u16 {
+        match self.inner.error_arena.as_deref() {
+            Some(a) => a.overwrite_count(),
+            None => 0,
+        }
+    }
+
+    /// DEF-246 Phase 2 (2026-05-16) — `connection_status` accessor on
+    /// `<DisconnectedPhase>`. A fresh protocol reports `Ready` (the
+    /// Idle bucket) since `push_startup` is the legal next operation.
+    /// This mirrors the runtime state (`ProtoState::Idle`) classifier;
+    /// the phase marker is orthogonal to the runtime status.
+    #[inline]
+    #[must_use]
+    pub fn connection_status(&self) -> crate::guard::ConnectionStatus {
+        use crate::guard::ConnectionStatus;
+        use crate::state::StatePushClass;
+        match self.inner.state.push_class() {
+            StatePushClass::Idle => ConnectionStatus::Ready,
+            StatePushClass::Errored(kind) => ConnectionStatus::Errored(kind),
+            StatePushClass::PingAwaiting | StatePushClass::BusyQuery => ConnectionStatus::Busy,
+            StatePushClass::Connecting => ConnectionStatus::Handshaking,
+        }
+    }
+
+    /// DEF-246 Phase 2 (2026-05-16) — public state accessor on
+    /// `<DisconnectedPhase>`. Fresh protocols always report `Idle`;
+    /// callers comparing against `ProtoState::Idle` in tests or
+    /// diagnostics use this.
+    #[inline]
+    #[must_use]
+    pub fn state(&self) -> &ProtoState {
+        &self.inner.state
+    }
+
+    /// Mint a fresh `ReplyId<K>` for the impending Startup push.
+    ///
+    /// DEF-246 Phase 2 (2026-05-16): mirror of
+    /// `<ActivePhase>::next_reply_id` — the disconnect-state needs a
+    /// ReplyId before `push_startup` so the wrapper can route the
+    /// Reply::StartupComplete back to the caller's oneshot. Same
+    /// static-atomic counter as the other phases (process-global
+    /// uniqueness preserved).
+    #[inline]
+    pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
+        &mut self,
+    ) -> crate::reply_id::ReplyId<K> {
+        self.inner.next_reply_id::<K>()
+    }
+
+    /// DEF-246 Phase 2 elevation #1 (2026-05-16) — initiate the
+    /// PostgreSQL startup handshake.
+    ///
+    /// Consume-self transition: the typed `<DisconnectedPhase>` is
+    /// converted into `<ConnectingPhase>` on every success path
+    /// (including the structurally-distant `Idle build-failed` arm
+    /// which transitions to `Errored` — observed via subsequent
+    /// `advance_one_frame` → `FeedEvent::Close`, then
+    /// `<ConnectingPhase>::into_active` returns
+    /// `IntoActiveError::Closed`).
+    ///
+    /// # Pre-Phase-2 shape (deleted)
+    ///
+    /// Pre-DEF-246 Phase 2 the entry point was the
+    /// `push_command::Startup` per-command struct +
+    /// `impl PushCommand for Startup` on `<ActivePhase>` (via the
+    /// `ReadyGuard::push_command` typed dispatch). The struct + impl +
+    /// the legacy `PgCommand::Startup` enum variant are deleted in the
+    /// same commit; this method is the only path.
+    ///
+    /// # Tier-1 closure
+    ///
+    /// - Calling `push_command(Ping)` (or any other per-command
+    ///   struct) on `<DisconnectedPhase>` is method-absent E0599 —
+    ///   `<DisconnectedPhase>` does not implement / expose
+    ///   `push_command_internal`. The `_proto_init_leaf` ZST-marker
+    ///   protocol can only call `push_startup`.
+    /// - The consume-self signature physically prevents calling
+    ///   `push_startup` twice on the same wrapper. The first call
+    ///   moves `self` into the returned `<ConnectingPhase>` wrapper
+    ///   and the original variable is no longer accessible at the
+    ///   source level (Rust ownership).
+    ///
+    /// # Returned tuple
+    ///
+    /// On `Ok((actions, proto_connecting))`:
+    /// - `actions: OutActions<'w, 'static>` — the StartupMessage wire
+    ///   bytes (single `Action::SendBytes` chunk in `write_buf`).
+    /// - `proto_connecting: PgProtocol<ConnectingPhase>` — the typed
+    ///   wrapper for the handshake window.
+    ///
+    /// On `Err(PushFailure)` (extremely rare — startup fits 512 B cap
+    /// and the build pipeline is const-asserted against the wire
+    /// frame), the protocol is destroyed — `Err` carries no recovery
+    /// surface. Caller logs the failure and drops the connection.
+    // DEF-246 Phase 2: argument count mirrors compute_push_startup_idle_only's
+    // signature 1:1. Splitting into a struct-arg would obscure the
+    // consume-self framing and force an inline destructure at every
+    // callsite (which would defeat the migration ergonomics from the
+    // pre-DEF-246 `Startup { ... }` struct-literal shape). The
+    // returned `Result<_, PushFailure>` carries ~80 B in the Err arm
+    // (below the 128 B threshold); no `result_large_err` exception
+    // needed.
+    pub fn push_startup<'w>(
+        mut self,
+        user: crate::ident::Ident,
+        database: Option<crate::ident::DatabaseName>,
+        app_name: Option<crate::ident::ApplicationName>,
+        credentials: crate::password::Credentials,
+        reply: crate::reply_id::ReplyId<crate::reply_id::StartupKind>,
+        write_buf: &'w mut WriteBuf,
+    ) -> Result<
+        (
+            crate::action::OutActions<'w, 'static>,
+            PgProtocol<ConnectingPhase>,
+        ),
+        crate::action::PushFailure,
+    > {
+        // Mirror of push_command_internal: clear residue + branded
+        // scope + materialise. The Idle precondition is structurally
+        // guaranteed by the `<DisconnectedPhase>` marker (fresh
+        // protocols start at `state == Idle`; this method consumes
+        // self so a second call is type-impossible).
+        write_buf.clear();
+        self.inner
+            .clear_session_residue_for_class(crate::state::StatePushClass::Idle);
+
+        let state = &mut self.inner.state;
+        let row_desc_slot = &mut self.inner.row_desc_slot;
+        let idle = match crate::state_setter::IdleState::try_from(state) {
+            Some(idle) => idle,
+            None => {
+                // Architecturally unreachable: `<DisconnectedPhase>`
+                // is consumed by the constructor only path, which
+                // installs `state == Idle`. The only other transition
+                // path into `<DisconnectedPhase>` does not exist.
+                // Classify defensively per CREDO §V (debug_assert!(false)
+                // banned for impossible) — the `Errored` arm transitions
+                // via the `IntoActiveError::Closed` channel.
+                core::hint::cold_path();
+                return Err(crate::action::PushFailure {
+                    id: reply.consume(),
+                    cause: crate::error::ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::PushCommandInternalNonIdle,
+                    },
+                });
+            }
+        };
+
+        // DEF-160 Z2: single-pass materialise inside branded closure.
+        // The closure produces the final `Result<OutActions, PushFailure>`
+        // directly — no intermediate StagedActions escape.
+        let result: Result<
+            crate::action::OutActions<'w, 'static>,
+            crate::action::PushFailure,
+        > = write_buf
+            .with_branded(
+                |mut wb| -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
+                    let mut staged: StagedActions<'_> = StagedActions::new();
+                    {
+                        let mut reserved = wb.reserve();
+                        let setter = idle.into_setter::<crate::push_command::StartupPostInstall>();
+                        compute_push_startup_idle_only(
+                            setter,
+                            user,
+                            database,
+                            app_name,
+                            credentials,
+                            reply,
+                            &mut staged,
+                            &mut reserved,
+                        );
+                    }
+                    let bytes: &'w [u8] = wb.into_bytes();
+
+                    let mut failure: Option<crate::action::PushFailure> = None;
+                    let mut out: crate::action::OutActions<'w, 'static> =
+                        crate::action::OutActions::new();
+                    for sa in staged {
+                        match sa {
+                            StagedAction::FailReply { id, cause } => {
+                                if failure.is_none() {
+                                    failure = Some(crate::action::PushFailure { id, cause });
+                                }
+                            }
+                            StagedAction::SendBytesRange(range) => {
+                                if let Some(slice) = range.apply(bytes) {
+                                    push_within_fanout_budget(
+                                        &mut out,
+                                        crate::action::Action::SendBytes(slice),
+                                    );
+                                }
+                            }
+                            StagedAction::SendBytesStatic(slice) => {
+                                push_within_fanout_budget(
+                                    &mut out,
+                                    crate::action::Action::SendBytes(slice),
+                                );
+                            }
+                            StagedAction::SendBytesBorrowed(_)
+                            | StagedAction::CloseSocket
+                            | StagedAction::DeliverReply(_) => {
+                                // compute_push_startup_idle_only emits
+                                // only SendBytesRange (StartupMessage)
+                                // + post_install. Other variants are
+                                // architecturally unreachable from
+                                // this push path. Skip silently rather
+                                // than panic (CREDO §V); a future
+                                // refactor adding emits would surface
+                                // via test failure (no actions in out).
+                            }
+                        }
+                    }
+                    match failure {
+                        Some(f) => Err(f),
+                        None => Ok(out),
+                    }
+                },
+            );
+
+        let _: () = row_desc_slot.consume_unused_witness();
+        match result {
+            Ok(out) => {
+                // Move self.inner into the new <ConnectingPhase>
+                // wrapper. The inner state is now one of
+                // ConnectingStartup{Trust|Scram|Cleartext|Md5}.
+                Ok((
+                    out,
+                    PgProtocol {
+                        inner: self.inner,
+                        phase_marker: PhantomData,
+                    },
+                ))
+            }
+            Err(f) => Err(f),
+        }
+    }
+}
+
+// Phase 2 helper: keep `row_desc_slot: &mut RowDescSlotCell` named so
+// the borrow checker is satisfied; the cell is not used by
+// Startup push (only BindExecute parks a RowDesc) but the type-system
+// path forces a placeholder method.
+impl crate::schema_slot::RowDescSlotCell {
+    /// DEF-246 Phase 2 (2026-05-16): no-op marker consumed by
+    /// `<DisconnectedPhase>::push_startup` to discharge the
+    /// `&mut row_desc_slot` binding without an `_ = …` discard
+    /// (banned crate-wide). The cell is structurally untouched.
+    #[inline]
+    pub(crate) const fn consume_unused_witness(&self) {
+        // No-op: cell is untouched by Startup push.
+    }
+}
+
+impl PgProtocol<ConnectingPhase> {
+    /// Mint a fresh `ReplyId<K>` during the handshake window.
+    ///
+    /// DEF-246 Phase 3 (2026-05-16): mirror of
+    /// `<ActivePhase>::next_reply_id`. Useful for pipelined drivers
+    /// that pre-mint correlators before observing `into_active()`'s
+    /// classifier (typically not used during the standard handshake
+    /// but available for advanced pipelined flows).
+    #[inline]
+    pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
+        &mut self,
+    ) -> crate::reply_id::ReplyId<K> {
+        self.inner.next_reply_id::<K>()
+    }
+
+    /// DEF-246 Phase 3 elevation #2 (2026-05-16) — append inbound
+    /// auth-flow bytes during the startup handshake.
+    ///
+    /// 1-line delegate to [`PgProtocolInner::feed_inbound`]. The
+    /// `<ActivePhase>::feed_inbound` mirror exists on
+    /// [`PgProtocol<ActivePhase>`] for the post-handshake hot path.
+    /// Both phases route through the same byte path.
+    pub fn feed_inbound(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), crate::error::ProtocolError> {
+        self.inner.feed_inbound(bytes)
+    }
+
+    /// DEF-246 Phase 3 elevation #2 (2026-05-16) — per-event advance
+    /// during handshake.
+    ///
+    /// 1-line delegate to [`PgProtocolInner::advance_one_frame`]
+    /// (same body as `<ActivePhase>::advance_one_frame`). During
+    /// handshake the caller drives this until either
+    /// `FeedEvent::Deliver` (StartupComplete reply) arrives or
+    /// `FeedEvent::Close` (Errored) terminates the connection. The
+    /// public consume-self [`Self::into_active`] then classifies the
+    /// outcome.
+    #[must_use = "FeedEvent variants carry side-effect contracts: \
+                  SendBytes/Deliver MUST be processed; Fail/Close MUST \
+                  trigger socket teardown"]
+    pub fn advance_one_frame<'w, 'r>(
+        &'r mut self,
+        write_buf: &'w mut WriteBuf,
+    ) -> crate::action::FeedEvent<'w, 'r> {
+        self.inner.advance_one_frame(write_buf)
+    }
+
+    /// DEF-246 Phase 3 elevation #2 (2026-05-16) — batched
+    /// feed-and-dispatch during handshake.
+    ///
+    /// Mirror of `<ActivePhase>::feed_bytes` — useful for callers
+    /// that prefer the batched OutActions surface over the per-event
+    /// `advance_one_frame` loop. Same const-generic specialisation
+    /// (`BOUNDED = false`).
+    #[must_use = "the returned actions carry side-effects that must be executed"]
+    pub fn feed_bytes<'w, 'r>(
+        &'r mut self,
+        bytes: &[u8],
+        write_buf: &'w mut WriteBuf,
+    ) -> OutActions<'w, 'r> {
+        self.inner.feed_bytes_impl::<false>(bytes, write_buf, 0)
+    }
+
+    /// DEF-246 Phase 3 (2026-05-16) — consume-self transition from
+    /// `<ConnectingPhase>` to `<ActivePhase>`.
+    ///
+    /// Returns `Ok(PgProtocol<ActivePhase>)` only when the runtime
+    /// state is `ProtoState::Idle` (handshake completed via RFQ).
+    /// Pre-RFQ states return `Err(IntoActiveError::StillConnecting(self))`;
+    /// `Errored(_)` returns `Err(IntoActiveError::Closed(closed))`.
+    ///
+    /// # Tier-1 closure
+    ///
+    /// The user CANNOT obtain a `<ActivePhase>` without observing
+    /// either (a) RFQ + state==Idle (Ok arm), or (b) handshake error
+    /// (Closed arm). There is no «assume Active» bypass; the only
+    /// constructor is `PgProtocol::new() -> <DisconnectedPhase>` and
+    /// the only path through is `push_startup → ConnectingPhase →
+    /// into_active`.
+    #[expect(
+        clippy::result_large_err,
+        reason = "consume-self transition: BOTH variants carry phase-typed PgProtocol \
+                  wrappers (~520 B) by value so the caller can recover the next-phase \
+                  state without an alloc. Boxing would penalise every handshake path."
+    )]
+    pub fn into_active(self) -> Result<PgProtocol<ActivePhase>, IntoActiveError> {
+        if matches!(self.inner.state, ProtoState::Errored(_)) {
+            return Err(IntoActiveError::Closed(PgProtocol {
+                inner: self.inner,
+                phase_marker: PhantomData,
+            }));
+        }
+        if matches!(self.inner.state, ProtoState::Idle) {
+            return Ok(PgProtocol {
+                inner: self.inner,
+                phase_marker: PhantomData,
+            });
+        }
+        Err(IntoActiveError::StillConnecting(self))
+    }
+
+    /// DEF-246 Phase 3 (2026-05-16) — public read-only accessor for
+    /// the current state during handshake. Useful for diagnostic
+    /// logging without converting to `<ActivePhase>`.
+    #[inline]
+    #[must_use]
+    pub fn state(&self) -> &ProtoState {
+        &self.inner.state
+    }
+
+    /// DEF-246 Phase 3 (2026-05-16) — session_params accessor during
+    /// handshake (mirrors `<ActivePhase>::session_params`). The
+    /// server's `ParameterStatus` frames during the handshake populate
+    /// these; callers may inspect mid-handshake values for diagnostic
+    /// purposes.
+    #[inline]
+    #[must_use]
+    pub fn session_params(&self) -> &SessionParams {
+        // Mirror of `<ActivePhase>::cold_session_params`. The static
+        // empty fallback lives at the inner accessor (and matches
+        // `<ActivePhase>` byte-for-byte).
+        static EMPTY: SessionParams = SessionParams::new();
+        match self.inner.session_params.as_deref() {
+            Some(p) => p,
+            None => &EMPTY,
+        }
+    }
+
+    /// DEF-246 Phase 3 (2026-05-16) — server-error arena accessor
+    /// during handshake (mirrors `<ActivePhase>::get_server_error`).
+    /// Useful when handshake fails: `ErrorResponse` during startup
+    /// classifies as `ProtocolError::ServerErrorResponse
+    /// { details_ref, … }`; callers resolve via this method to
+    /// inspect the server's message before transitioning to
+    /// `<ClosedPhase>`.
+    #[inline]
+    pub fn get_server_error(
+        &self,
+        r: crate::error_arena::ErrorRef,
+    ) -> Result<&crate::error_arena::ErrorPayload, crate::error_arena::ArenaError> {
+        static EMPTY: crate::error_arena::ErrorArena =
+            crate::error_arena::ErrorArena::new();
+        let arena: &crate::error_arena::ErrorArena = match self.inner.error_arena.as_deref() {
+            Some(a) => a,
+            None => &EMPTY,
+        };
+        // Static-arena fallback never holds a real payload, but
+        // generation-mismatch resolves correctly via `get`'s
+        // Stale classification — identity result is what we want.
+        arena.get(r)
+    }
+
+    /// DEF-246 Phase 3 (2026-05-16) — `as_ready` accessor during
+    /// handshake. ALWAYS returns `None` while in `<ConnectingPhase>`
+    /// because the phase classifier maps every `Connecting*` variant
+    /// to `ConnectionStatus::Handshaking` (not `Ready`). Exposed for
+    /// test compatibility with the pre-DEF-246 callsites that did
+    /// `proto.as_ready().is_none()` checks during a handshake.
+    ///
+    /// **Type signature note:** returns `Option<()>` rather than
+    /// `Option<ReadyGuard>` — there is NO legitimate push path during
+    /// handshake (the only Connecting-state command would be
+    /// re-Startup, which is also banned by `<DisconnectedPhase>`
+    /// consume-self). The `()` return marks "handshaking, no push
+    /// guard available" without exposing the ActivePhase-bound
+    /// `ReadyGuard` type.
+    #[inline]
+    #[must_use]
+    pub fn as_ready(&mut self) -> Option<()> {
+        // `<ConnectingPhase>` always reports Handshaking; no Idle
+        // classification path exists during handshake (Idle here would
+        // imply RFQ-complete, at which point the caller must
+        // `into_active()` to access the push surface).
+        None
+    }
+
+    /// DEF-246 Phase 3 (2026-05-16) — `connection_status` accessor
+    /// during handshake — mirrors `<ActivePhase>::connection_status`.
+    #[inline]
+    #[must_use]
+    pub fn connection_status(&self) -> crate::guard::ConnectionStatus {
+        use crate::guard::ConnectionStatus;
+        use crate::state::StatePushClass;
+        match self.inner.state.push_class() {
+            StatePushClass::Idle => ConnectionStatus::Ready,
+            StatePushClass::Errored(kind) => ConnectionStatus::Errored(kind),
+            StatePushClass::PingAwaiting | StatePushClass::BusyQuery => ConnectionStatus::Busy,
+            StatePushClass::Connecting => ConnectionStatus::Handshaking,
+        }
+    }
+}
+
+impl PgProtocol<ClosedPhase> {
+    /// DEF-246 Phase 4 (2026-05-16) — typed error accessor for a
+    /// terminally-Errored protocol.
+    ///
+    /// Reconstructs a `ProtocolError::ConnectionAlreadyClosed
+    /// { prior_kind }` from the stored `StateErrorKind`. Full arena
+    /// lookup (server ErrorResponse details) is reachable separately
+    /// via the still-living `inner.error_arena` if the wrapper layer
+    /// stashed an `ErrorRef` before the consume-self transition; see
+    /// follow-up surfaces for the multi-phase arena handle plan.
+    ///
+    /// # Tier-1 closure
+    ///
+    /// `<ClosedPhase>` exposes ONLY `cause()`. No `push_command`, no
+    /// `feed_inbound`, no `feed_bytes`, no `advance_one_frame`,
+    /// no `into_active`. Calling any of those on a `<ClosedPhase>`
+    /// instance is method-absent E0599 (Phase 4 elevation #3 —
+    /// «Closed absorbs no input»). The protocol is terminal.
+    #[inline]
+    #[must_use = "the returned ProtocolError carries the terminal cause; observing it is the only \
+                  legitimate operation on a Closed protocol"]
+    pub fn cause(&self) -> crate::error::ProtocolError {
+        match &self.inner.state {
+            ProtoState::Errored(k) => {
+                crate::error::ProtocolError::ConnectionAlreadyClosed { prior_kind: *k }
+            }
+            // Architecturally unreachable: `<ClosedPhase>` is reached
+            // ONLY via `<ActivePhase>::into_closed_if_errored` (guard
+            // `matches!(state, Errored(_))`) or
+            // `<ConnectingPhase>::into_active` (Closed arm — same
+            // guard). The non-Errored arm is dead at the type level
+            // but the runtime field type does not know that.
+            // CREDO §V: classify defensively rather than debug_assert.
+            _ => crate::error::ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+            },
+        }
+    }
+
+    /// DEF-246 Phase 4 (2026-05-16) — public read-only state
+    /// accessor for the closed protocol (mirrors `<ActivePhase>::state`).
+    #[inline]
+    #[must_use]
+    pub fn state(&self) -> &ProtoState {
+        &self.inner.state
     }
 }
 
@@ -1617,35 +2182,14 @@ impl PgProtocol<ActivePhase> {
     /// `next_reply_id` saturation case. Marked `#[cold]` + `#[inline(never)]`
     /// so LLVM keeps it off the hot mint path.
     ///
-    /// The transition is `Idle → Errored(ReplyIdSaturation)` (or no-op
-    /// if state is already Errored — saturation classifier doesn't
-    /// override the original cause). The drained inflight reply id (if
-    /// any) is dropped silently — saturation has no FailReply emission
-    /// context (no `&mut StagedActions` accessible from `next_reply_id`).
-    /// The signal reaches the user via the next push attempt
-    /// classifying as `ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }`.
+    /// DEF-246 Phase 2 (2026-05-16): delegate to
+    /// `PgProtocolInner::install_errored_replyid_saturation` so the
+    /// blanket `impl<P: SealedPhase> PgProtocol<P>::next_reply_id`
+    /// can call the same machinery without an `<ActivePhase>` bound.
     #[cold]
     #[inline(never)]
     fn install_errored_replyid_saturation(&mut self) {
-        if matches!(self.inner.state, ProtoState::Errored(_)) {
-            return;
-        }
-        let cause = ProtocolError::InternalCrateBug {
-            locus: crate::error::CrateBugLocus::ReplyIdSaturation,
-        };
-        // Route through cluster A's FeedStateSetter for tier-1
-        // single-mutation-surface. The drained id (if any inflight)
-        // is bound to an underscore-prefixed variable — saturation
-        // has no FailReply emission context (no &mut StagedActions
-        // accessible from next_reply_id). Option<NonZeroU64> is
-        // `Copy`, so the binding is a structural no-op; the
-        // `_drained_*` name documents the discard intent + dodges
-        // both `unused_variables` (underscore prefix) and
-        // `dropping_copy_types` (no `core::mem::drop` call).
-        // Operator-visible signal arrives on the next push as
-        // ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }.
-        let _drained_id_at_saturation =
-            _replyid_saturation_drain_leaf::drain(&mut self.inner.state, cause.state_kind());
+        self.inner.install_errored_replyid_saturation();
     }
 
     // DEF-196 (2026-04-28): three-field split. Each cold slot
@@ -1911,7 +2455,11 @@ impl PgProtocol<ActivePhase> {
         // const argument — LLVM specialises the inlined
         // `clear_session_residue_for_class` body to the Idle arm only,
         // eliding the 5-arm dispatch entirely.
-        self.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
+        //
+        // DEF-246 Option α (2026-05-16):
+        // `clear_session_residue_for_class` lives on `PgProtocolInner`;
+        // route through `self.inner` directly.
+        self.inner.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
 
         let state = &mut self.inner.state;
         let row_desc_slot = &mut self.inner.row_desc_slot;
@@ -2090,42 +2638,21 @@ impl PgProtocol<ActivePhase> {
     /// inbound bytes are ignored. This matches the pre-(212)
     /// `feed_bytes` shape (which routes Errored to the
     /// `IngressClassification::AlreadyErrored` arm).
-    pub fn feed_inbound(&mut self, bytes: &[u8]) -> Result<(), crate::buf::ReadBufFull> {
-        if matches!(self.inner.state, ProtoState::Errored(_)) {
-            // Silent no-op — terminal state, further bytes irrelevant.
-            // Caller learns of Errored via `connection_status()` /
-            // `advance_one_frame()` returning `FeedEvent::Close`.
-            return Ok(());
-        }
-        // DEF-248 Sub-B (2026-05-12): partial-mode bytes routing —
-        // identical to the top-of-feed_bytes_impl logic. If an oversize
-        // non-`'D'` body is mid-flight, bytes route to the assembly
-        // accumulator first; leftover (next-frame) bytes flow to
-        // ReadBuf. Without this hook, a chunk completing a 5 KB body
-        // would fail `read_buf.append` with `ReadBufFull` (ReadBuf cap
-        // is 4096 B).
+    pub fn feed_inbound(&mut self, bytes: &[u8]) -> Result<(), crate::error::ProtocolError> {
+        // DEF-246 Phase 4 elevation #4: signature returns
+        // `Result<(), ProtocolError>` so Errored state surfaces to the
+        // caller as a typed error instead of silent no-op. The
+        // pre-existing `ReadBufFull` shape is lifted into
+        // `ProtocolError::ReadBufferFull { … }` (the same enum the
+        // dispatch path uses).
         //
-        // **Hot-path cost**: the `is_active()` check is one byte-load
-        // on the niche-packed `Option<Box<_>>` discriminator. For
-        // workloads that never trigger partial mode (every
-        // small-frame query, every SCRAM handshake, every error
-        // ≤ 4 KB body), the branch predicts false and the partial-
-        // mode path stays out of I-cache. `cold_path()` hints LLVM
-        // to push the partial-mode body to the end of the function's
-        // generated machine code.
-        if self.inner.partial_assembly.is_active() {
-            core::hint::cold_path();
-            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
-                &mut self.inner.partial_assembly,
-                bytes,
-            );
-            let leftover = bytes.get(absorbed..).unwrap_or(&[]);
-            if leftover.is_empty() {
-                return Ok(());
-            }
-            return self.inner.read_buf.append(leftover);
-        }
-        self.inner.read_buf.append(bytes)
+        // DEF-246 Option α: dispatch machinery lives on `PgProtocolInner`;
+        // this method is a 1-line delegate so the same body executes
+        // identically from `<ActivePhase>`, `<ConnectingPhase>` (Phase 3
+        // elevation #2 — server-driven auth bytes during handshake).
+        // `<ClosedPhase>` does NOT have feed_inbound (Phase 4 elevation
+        // #3 — Errored/Closed terminal absorbs no input).
+        self.inner.feed_inbound(bytes)
     }
 
     /// Process at most one user-observable event and return it.
@@ -2179,76 +2706,11 @@ impl PgProtocol<ActivePhase> {
         &'r mut self,
         write_buf: &'w mut WriteBuf,
     ) -> crate::action::FeedEvent<'w, 'r> {
-        use crate::action::{Action, FeedEvent};
-
-        // Fast-path classifications BEFORE reusing feed_bytes_bounded
-        // (which calls write_buf.clear() unconditionally — we want to
-        // avoid that on these "no work" paths to preserve any caller
-        // residue in wb across spurious advance calls).
-        //
-        // Streaming-rows transition signal: the caller should use
-        // `iter_rows()` for per-row decoding while in this state. We
-        // detect BEFORE feed_bytes_bounded would consume DataRows in
-        // its dispatch loop (which is the wrong shape for the per-
-        // event API).
-        if matches!(
-            self.inner.state,
-            ProtoState::SimpleQueryStreamingRows { .. }
-                | ProtoState::BindExecuteStreamingRows { .. }
-        ) {
-            return FeedEvent::StreamingRows;
-        }
-
-        // Errored terminal: the connection is dead. Caller closes.
-        if matches!(self.inner.state, ProtoState::Errored(_)) {
-            return FeedEvent::Close;
-        }
-
-        // Idle + empty read_buf: nothing to process — caller can push.
-        if matches!(self.inner.state, ProtoState::Idle) && self.inner.read_buf.unread().is_empty() {
-            return FeedEvent::Idle;
-        }
-
-        // Drive the bounded dispatch loop with empty bytes (no append)
-        // and max_dispatches=1 (one actionable frame). The result is
-        // an OutActions with 0..=2 actions corresponding to one frame
-        // event.
-        let actions = self.feed_bytes_bounded(b"", write_buf, 1);
-
-        // Map actions → FeedEvent. The exhaustive match below is the
-        // tier-1 contract: any future Action variant addition fails
-        // the build until classified here.
-        match actions.as_slice() {
-            // No actionable frame in this cycle. Caller needs more
-            // bytes from network (state was non-Idle non-Errored, so
-            // a partial frame is buffered or none at all).
-            [] => FeedEvent::NeedMoreBytes,
-            // Single SendBytes — outbound message (e.g., SCRAM
-            // client-final). The slice borrows into the caller's wb.
-            [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
-            // Single DeliverReply — terminal happy reply.
-            [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
-            // FailReply [+ CloseSocket]: per M2, Fail implies close.
-            // Caller learns "close required" from the Fail variant
-            // documentation; no separate CloseSocket event needed.
-            // Pre-(212) feed_bytes returned a 2-Action slice; post-Phase-2
-            // the FeedEvent::Fail collapses both into one.
-            [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
-            // CloseSocket alone (no in-flight reply): adversarial
-            // frame in Idle, post-handshake fatal. Caller closes.
-            [Action::CloseSocket] => FeedEvent::Close,
-            // Architecturally unreachable: feed_bytes_bounded with
-            // max_dispatches=1 emits AT MOST 2 actions per cycle
-            // (FailReply+CloseSocket pair from install_errored). Any
-            // other shape indicates a regression in dispatch's
-            // emit-budget invariants.
-            //
-            // CREDO §V banned `debug_assert!(false, ...)` defensive-
-            // for-impossible — instead, classify to the conservative
-            // `Close` (forces caller to discard connection, avoiding
-            // any silent-state-corruption window).
-            _ => FeedEvent::Close,
-        }
+        // DEF-246 Option α: dispatch machinery on `PgProtocolInner`;
+        // 1-line delegate so `<ConnectingPhase>` and `<ActivePhase>`
+        // share the same implementation (handshake-window callers also
+        // need per-event advance for server-driven auth chains).
+        self.inner.advance_one_frame(write_buf)
     }
 
     /// Feed inbound wire bytes.
@@ -2277,7 +2739,12 @@ impl PgProtocol<ActivePhase> {
         // frame (the pre-(184) shape supplied u16::MAX, which LLVM
         // sometimes optimised away but only via inlining — not
         // guaranteed on large functions).
-        self.feed_bytes_impl::<false>(bytes, write_buf, 0)
+        //
+        // DEF-246 Option α: dispatch machinery on `PgProtocolInner`;
+        // 1-line delegate. The `<ConnectingPhase>::feed_bytes` mirror
+        // (Phase 3) shares the identical inner-method dispatch — same
+        // const-generic specialisation, same hot-path codegen.
+        self.inner.feed_bytes_impl::<false>(bytes, write_buf, 0)
     }
 
     /// DEF-154 (X) P0-2(c): frame-bounded variant of [`feed_bytes`].
@@ -2302,7 +2769,69 @@ impl PgProtocol<ActivePhase> {
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
     ) -> OutActions<'w, 'r> {
-        self.feed_bytes_impl::<true>(bytes, write_buf, max_dispatches)
+        // DEF-246 Option α: 1-line delegate to `PgProtocolInner` mirror.
+        // `row_stream`'s slow-path call site (`self.proto.feed_bytes_bounded`)
+        // resolves through this delegate unchanged.
+        self.inner.feed_bytes_bounded(bytes, write_buf, max_dispatches)
+    }
+
+    // DEF-246 Option α (2026-05-16): dispatch machinery extracted to
+    // `impl PgProtocolInner` below. The next two large method bodies —
+    // `feed_bytes_impl<const BOUNDED>` and `clear_session_residue_for_class`
+    // — now live on `Inner` so `<ActivePhase>` (default phase) and
+    // `<ConnectingPhase>` (Phase 3 — server-driven auth bytes during
+    // handshake) reach the SAME implementation via 1-line delegates.
+    // The 4 surface-facing delegates above (`feed_inbound`,
+    // `advance_one_frame`, `feed_bytes`, `feed_bytes_bounded`,
+    // `clear_session_residue_for_class`) close the bridge.
+    //
+    // Re-opens `impl PgProtocol<ActivePhase>` BELOW the moved
+    // `feed_bytes_impl` so the remaining methods on `<ActivePhase>`
+    // (`get_server_error`, `read_buf_append`, `current_row_desc`,
+    // `iter_rows`, etc.) stay where they were before DEF-246. Caller
+    // surface unchanged.
+}
+
+impl PgProtocolInner {
+    /// DEF-246 Phase 2 (2026-05-16): saturation-classifier mutation
+    /// surface lives on `PgProtocolInner` so blanket
+    /// `impl<P: SealedPhase> PgProtocol<P>::next_reply_id` calls the
+    /// same machinery without an `<ActivePhase>` bound.
+    ///
+    /// Body unchanged from the pre-DEF-246 `<ActivePhase>` location:
+    /// fast-return on already-Errored, otherwise install
+    /// `Errored(ReplyIdSaturation)` via the leaf-token-gated drain.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn install_errored_replyid_saturation(&mut self) {
+        if matches!(self.state, ProtoState::Errored(_)) {
+            return;
+        }
+        let cause = crate::error::ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::ReplyIdSaturation,
+        };
+        let _drained_id_at_saturation =
+            _replyid_saturation_drain_leaf::drain(&mut self.state, cause.state_kind());
+    }
+
+    /// DEF-246 Phase 2 (2026-05-16): mint a fresh ReplyId for any
+    /// phase. Body identical to the pre-DEF-246
+    /// `<ActivePhase>::next_reply_id` (static atomic counter; cold
+    /// saturation classifier).
+    #[inline]
+    pub(crate) fn next_reply_id<K: crate::reply_id::ReplyKind>(
+        &mut self,
+    ) -> crate::reply_id::ReplyId<K> {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let raw_old = COUNTER.fetch_add(1, Ordering::Relaxed);
+        if raw_old == u64::MAX {
+            self.install_errored_replyid_saturation();
+        }
+        let raw = raw_old.saturating_add(1);
+        let nz = core::num::NonZeroU64::new(raw)
+            .unwrap_or(core::num::NonZeroU64::MIN);
+        crate::reply_id::ReplyId::from_raw(nz)
     }
 
     /// DEF-184 (B6): const-generic dispatch loop body.
@@ -2317,7 +2846,13 @@ impl PgProtocol<ActivePhase> {
     /// release profile has LTO fat + codegen-units=1 which
     /// further de-duplicates common sub-expressions, so actual
     /// text-segment growth is smaller).
-    fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
+    ///
+    /// DEF-246 Option α (2026-05-16): moved from
+    /// `impl PgProtocol<ActivePhase>` to `impl PgProtocolInner` so
+    /// the `<ConnectingPhase>::feed_bytes` mirror (Phase 3 elevation
+    /// #2) reaches the same code path via the same delegate shape.
+    /// `self.inner.X` references became `self.X` in the move.
+    pub(crate) fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
         &'r mut self,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
@@ -2330,7 +2865,7 @@ impl PgProtocol<ActivePhase> {
         // internally (~+10 ns per call). Caching at the entry point
         // amortises one classification across the full feed_bytes
         // dispatch loop.
-        let entry_class = self.inner.state.push_class();
+        let entry_class = self.state.push_class();
         self.clear_session_residue_for_class(entry_class);
 
         // DEF-154 (H+V) pending_advance DELETED 2026-04-24: the
@@ -2392,8 +2927,10 @@ impl PgProtocol<ActivePhase> {
         // path that handles bytes 5..= the body's last byte. Without
         // this hook, a 5 KB body would fail `read_buf.append` with
         // `ReadBufFull` on the chunk completing the body.
-        let bytes_for_readbuf: &[u8] = if !matches!(self.inner.state, ProtoState::Errored(_))
-            && self.inner.partial_assembly.is_active()
+        // DEF-246 Option α: `self.inner.X` references rewritten to
+        // `self.X` for the moved body (on `PgProtocolInner` directly).
+        let bytes_for_readbuf: &[u8] = if !matches!(self.state, ProtoState::Errored(_))
+            && self.partial_assembly.is_active()
         {
             // DEF-248 Sub-B (2026-05-12): cold-path hint. Partial mode
             // is rare (only oversize non-`'D'` bodies engage it); the
@@ -2401,7 +2938,7 @@ impl PgProtocol<ActivePhase> {
             // of the I-cache footprint of the standard ingress.
             core::hint::cold_path();
             let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
-                &mut self.inner.partial_assembly,
+                &mut self.partial_assembly,
                 bytes,
             );
             bytes.get(absorbed..).unwrap_or(&[])
@@ -2409,10 +2946,10 @@ impl PgProtocol<ActivePhase> {
             bytes
         };
 
-        let classification = if matches!(self.inner.state, ProtoState::Errored(_)) {
+        let classification = if matches!(self.state, ProtoState::Errored(_)) {
             IngressClassification::AlreadyErrored
         } else {
-            match self.inner.read_buf.append(bytes_for_readbuf) {
+            match self.read_buf.append(bytes_for_readbuf) {
                 Ok(()) => IngressClassification::Ok,
                 Err(ReadBufFull { attempted, available, .. }) => {
                     IngressClassification::AppendFailed { attempted, available }
@@ -2428,17 +2965,17 @@ impl PgProtocol<ActivePhase> {
         // `read_buf` while `state` is separately `&mut` for
         // transitions, AND advances `read_buf` cursor in-scope
         // after each frame is consumed.
-        let state = &mut self.inner.state;
-        let read_buf = &mut self.inner.read_buf;
-        let terminal_row_desc = &mut self.inner.row_desc_slot;
+        let state = &mut self.state;
+        let read_buf = &mut self.read_buf;
+        let terminal_row_desc = &mut self.row_desc_slot;
         // DEF-196 (2026-04-28): three independent cold slots, each
         // lazy-allocated only at its specific write site:
         //   - session_params slot: ParameterStatus + NoticeResponse filters.
         //   - error_arena slot:    ErrorResponse arms in dispatch.rs.
         //   - malformed_counter:   inline u32, direct write (no Box).
-        let session_params_slot = &mut self.inner.session_params;
-        let error_arena_slot = &mut self.inner.error_arena;
-        let malformed_counter = &mut self.inner.malformed_frame_count;
+        let session_params_slot = &mut self.session_params;
+        let error_arena_slot = &mut self.error_arena;
+        let malformed_counter = &mut self.malformed_frame_count;
         // DEF-248 Sub-B (2026-05-12): partial-assembly cell mut borrow
         // threaded through the dispatch loop. Used at:
         // 1. `HeaderParse::FrameTooLarge` for streaming-eligible tags
@@ -2446,7 +2983,7 @@ impl PgProtocol<ActivePhase> {
         // 2. Top of dispatch loop — if the assembly is complete, take
         //    + dispatch the assembled prefix through the existing
         //    per-tag dispatch arm.
-        let partial_assembly_slot = &mut self.inner.partial_assembly;
+        let partial_assembly_slot = &mut self.partial_assembly;
 
         // DEF-185 P1-6: single classification-driven dispatch.
         // Exhaustive match on `IngressClassification` — adding a new
@@ -3050,9 +3587,197 @@ impl PgProtocol<ActivePhase> {
             materialise(staged, wb.into_bytes(), terminal_ref)
         })
     }
+
+    /// DEF-184 (X) P0-2(c): frame-bounded variant of [`Self::feed_bytes_impl`]
+    /// — `Self::feed_bytes_impl::<true>` with caller-supplied
+    /// `max_dispatches`. Sole production caller is
+    /// [`crate::row_stream::RowStream`]'s slow path which needs single-frame
+    /// observability after a silent `RowDescription`.
+    ///
+    /// DEF-246 Option α (2026-05-16): moved from
+    /// `impl PgProtocol<ActivePhase>` to `impl PgProtocolInner`; the
+    /// `<ActivePhase>` delegate above forwards via
+    /// `self.inner.feed_bytes_bounded(...)`. `row_stream`'s call
+    /// (`self.proto.feed_bytes_bounded`) routes through the delegate.
+    #[inline]
+    pub(crate) fn feed_bytes_bounded<'w, 'r>(
+        &'r mut self,
+        bytes: &[u8],
+        write_buf: &'w mut WriteBuf,
+        max_dispatches: u16,
+    ) -> OutActions<'w, 'r> {
+        self.feed_bytes_impl::<true>(bytes, write_buf, max_dispatches)
+    }
+
+    /// Append inbound wire bytes into the read buffer **without
+    /// dispatching**.
+    ///
+    /// DEF-246 Phase 4 elevation #4 (2026-05-16): signature returns
+    /// `Result<(), ProtocolError>` so Errored state is a typed-error
+    /// signal at the caller (previously silent no-op). The previous
+    /// `ReadBufFull` map-from is preserved via
+    /// `ProtocolError::ReadBufferFull { … }`.
+    ///
+    /// DEF-246 Option α (2026-05-16): moved from
+    /// `impl PgProtocol<ActivePhase>` to `impl PgProtocolInner` so
+    /// `<ActivePhase>::feed_inbound` and `<ConnectingPhase>::feed_inbound`
+    /// (Phase 3 elevation #2) share the identical body via 1-line
+    /// delegate.
+    pub(crate) fn feed_inbound(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), crate::error::ProtocolError> {
+        if matches!(self.state, ProtoState::Errored(_)) {
+            // DEF-246 Phase 4 #4: typed `ConnectionAlreadyClosed`
+            // surfaces post-Errored fee attempts instead of silent
+            // no-op. `prior_kind` reconstructs from the stored
+            // `StateErrorKind` in the Errored variant.
+            core::hint::cold_path();
+            return Err(crate::error::ProtocolError::ConnectionAlreadyClosed {
+                prior_kind: match &self.state {
+                    ProtoState::Errored(k) => *k,
+                    // SAFETY (tier-1 by match-guard above): `matches!` above
+                    // already proved this arm dead. CREDO §V bans
+                    // `debug_assert!(false, …)`; classify defensively to
+                    // a Crate-bug locus instead.
+                    _ => crate::error::ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                    }.state_kind(),
+                },
+            });
+        }
+        // DEF-248 Sub-B (2026-05-12): partial-mode bytes routing —
+        // identical to the top-of-feed_bytes_impl logic. If an oversize
+        // non-`'D'` body is mid-flight, bytes route to the assembly
+        // accumulator first; leftover (next-frame) bytes flow to
+        // ReadBuf. Without this hook, a chunk completing a 5 KB body
+        // would fail `read_buf.append` with `ReadBufFull` (ReadBuf cap
+        // is 4096 B).
+        //
+        // **Hot-path cost**: the `is_active()` check is one byte-load
+        // on the niche-packed `Option<Box<_>>` discriminator. For
+        // workloads that never trigger partial mode (every
+        // small-frame query, every SCRAM handshake, every error
+        // ≤ 4 KB body), the branch predicts false and the partial-
+        // mode path stays out of I-cache. `cold_path()` hints LLVM
+        // to push the partial-mode body to the end of the function's
+        // generated machine code.
+        if self.partial_assembly.is_active() {
+            core::hint::cold_path();
+            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+                &mut self.partial_assembly,
+                bytes,
+            );
+            let leftover = bytes.get(absorbed..).unwrap_or(&[]);
+            if leftover.is_empty() {
+                return Ok(());
+            }
+            return self.read_buf.append(leftover).map_err(|e| {
+                let crate::buf::ReadBufFull { attempted, available, .. } = e;
+                crate::error::ProtocolError::ReadBufferFull { attempted, available }
+            });
+        }
+        self.read_buf.append(bytes).map_err(|e| {
+            let crate::buf::ReadBufFull { attempted, available, .. } = e;
+            crate::error::ProtocolError::ReadBufferFull { attempted, available }
+        })
+    }
+
+    /// Process at most one user-observable event and return it.
+    ///
+    /// DEF-246 Option α (2026-05-16): moved from
+    /// `impl PgProtocol<ActivePhase>` to `impl PgProtocolInner` —
+    /// shared by `<ActivePhase>` and `<ConnectingPhase>` (Phase 3
+    /// elevation #2). The body is unchanged otherwise; the original
+    /// `self.inner.X` references collapsed to `self.X`.
+    #[must_use = "FeedEvent variants carry side-effect contracts: \
+                  SendBytes/Deliver MUST be processed; Fail/Close MUST \
+                  trigger socket teardown"]
+    pub(crate) fn advance_one_frame<'w, 'r>(
+        &'r mut self,
+        write_buf: &'w mut WriteBuf,
+    ) -> crate::action::FeedEvent<'w, 'r> {
+        use crate::action::{Action, FeedEvent};
+
+        // Fast-path classifications BEFORE reusing feed_bytes_bounded
+        // (which calls write_buf.clear() unconditionally — we want to
+        // avoid that on these "no work" paths to preserve any caller
+        // residue in wb across spurious advance calls).
+        //
+        // Streaming-rows transition signal: the caller should use
+        // `iter_rows()` for per-row decoding while in this state. We
+        // detect BEFORE feed_bytes_bounded would consume DataRows in
+        // its dispatch loop (which is the wrong shape for the per-
+        // event API).
+        if matches!(
+            self.state,
+            ProtoState::SimpleQueryStreamingRows { .. }
+                | ProtoState::BindExecuteStreamingRows { .. }
+        ) {
+            return FeedEvent::StreamingRows;
+        }
+
+        // Errored terminal: the connection is dead. Caller closes.
+        if matches!(self.state, ProtoState::Errored(_)) {
+            return FeedEvent::Close;
+        }
+
+        // Idle + empty read_buf: nothing to process — caller can push.
+        if matches!(self.state, ProtoState::Idle) && self.read_buf.unread().is_empty() {
+            return FeedEvent::Idle;
+        }
+
+        // Drive the bounded dispatch loop with empty bytes (no append)
+        // and max_dispatches=1 (one actionable frame). The result is
+        // an OutActions with 0..=2 actions corresponding to one frame
+        // event.
+        let actions = self.feed_bytes_bounded(b"", write_buf, 1);
+
+        // Map actions → FeedEvent. The exhaustive match below is the
+        // tier-1 contract: any future Action variant addition fails
+        // the build until classified here.
+        match actions.as_slice() {
+            // No actionable frame in this cycle. Caller needs more
+            // bytes from network (state was non-Idle non-Errored, so
+            // a partial frame is buffered or none at all).
+            [] => FeedEvent::NeedMoreBytes,
+            // Single SendBytes — outbound message (e.g., SCRAM
+            // client-final). The slice borrows into the caller's wb.
+            [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
+            // Single DeliverReply — terminal happy reply.
+            [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
+            // FailReply [+ CloseSocket]: per M2, Fail implies close.
+            // Caller learns "close required" from the Fail variant
+            // documentation; no separate CloseSocket event needed.
+            // Pre-(212) feed_bytes returned a 2-Action slice; post-Phase-2
+            // the FeedEvent::Fail collapses both into one.
+            [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
+            // CloseSocket alone (no in-flight reply): adversarial
+            // frame in Idle, post-handshake fatal. Caller closes.
+            [Action::CloseSocket] => FeedEvent::Close,
+            // Architecturally unreachable: feed_bytes_bounded with
+            // max_dispatches=1 emits AT MOST 2 actions per cycle
+            // (FailReply+CloseSocket pair from install_errored). Any
+            // other shape indicates a regression in dispatch's
+            // emit-budget invariants.
+            //
+            // CREDO §V banned `debug_assert!(false, ...)` defensive-
+            // for-impossible — instead, classify to the conservative
+            // `Close` (forces caller to discard connection, avoiding
+            // any silent-state-corruption window).
+            _ => FeedEvent::Close,
+        }
+    }
+
     /// DEF-188 — entry-point terminal-row-desc reclamation.
     ///
     /// DEF-189 — entry-point session-residue reclamation.
+    ///
+    /// DEF-246 Option α (2026-05-16): moved from
+    /// `impl PgProtocol<ActivePhase>` to `impl PgProtocolInner` so
+    /// `<ActivePhase>` (default phase) and `<ConnectingPhase>` (Phase
+    /// 3) both reach the residue policy via the SAME implementation.
+    /// `self.inner.X` references became `self.X` in the move.
     ///
     /// If the connection state is `Idle`, clear the row_desc_slot and
     /// the error_arena. If state is `Errored`, additionally clear
@@ -3114,7 +3839,7 @@ impl PgProtocol<ActivePhase> {
     /// residue semantics for a new variant must extend `StatePushClass`
     /// — at which point the build fails here until they decide.
     #[inline]
-    fn clear_session_residue_for_class(
+    pub(crate) fn clear_session_residue_for_class(
         &mut self,
         class: crate::state::StatePushClass,
     ) {
@@ -3146,15 +3871,19 @@ impl PgProtocol<ActivePhase> {
         //   specialises to the Idle-only arm body. feed_bytes pays one
         //   `push_class()` call (28-arm match) per call — amortised
         //   over the full dispatch loop.
+        //
+        // DEF-246 Option α (2026-05-16): moved from
+        // `impl PgProtocol<ActivePhase>` to `impl PgProtocolInner`;
+        // `self.inner.X` references became `self.X` in the move.
         match class {
             crate::state::StatePushClass::Idle => {
                 // DEF-272 cluster α: clear via leaf submodule
                 // `_clear_residue_leaf` which mints a
                 // `ClearResidueSchemaToken` (leaf-gated) and routes to
                 // `RowDescSlotCell::clear_at_residue`.
-                _clear_residue_leaf::clear_schema_slot_residue(&mut self.inner.row_desc_slot);
+                _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
                 // DEF-196: only clear arena if it was ever allocated.
-                if let Some(arena) = self.inner.error_arena.as_deref_mut() {
+                if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
                 // DEF-248 Sub-B (2026-05-12): clear any in-flight
@@ -3164,13 +3893,13 @@ impl PgProtocol<ActivePhase> {
                 // classifies any leftover Box from a torn-down
                 // partial-mode sequence — Box drops, inner
                 // heapless::Vec releases its inline allocation.
-                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.inner.partial_assembly);
+                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.partial_assembly);
             }
             crate::state::StatePushClass::Errored(_) => {
                 // DEF-272 cluster α: same leaf-submodule helper as the
                 // Idle arm above.
-                _clear_residue_leaf::clear_schema_slot_residue(&mut self.inner.row_desc_slot);
-                if let Some(arena) = self.inner.error_arena.as_deref_mut() {
+                _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
+                if let Some(arena) = self.error_arena.as_deref_mut() {
                     arena.clear();
                 }
                 // DEF-189 Q8-C3 + DEF-205 step 3: session-state
@@ -3182,14 +3911,14 @@ impl PgProtocol<ActivePhase> {
                 // session-side concrete tokens (`ClearResidueSchemaToken`
                 // and `ClearResidueSessionToken`). Each clear method on
                 // its respective Cell takes the matching token by value.
-                _clear_residue_leaf::clear_session_params_residue(&mut self.inner.session_params);
+                _clear_residue_leaf::clear_session_params_residue(&mut self.session_params);
                 // DEF-248 Sub-B (2026-05-12): also clear partial
                 // assembly on Errored entry — any in-flight oversize
                 // body is forfeit alongside the connection's other
                 // session state. The Box drops; the Vec releases its
                 // inline allocation; no leak across the post-Errored
                 // window.
-                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.inner.partial_assembly);
+                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.partial_assembly);
             }
             // In-flight states — preserve residue. The exhaustive
             // match here is the load-bearing tier-1 closure: adding
@@ -3198,6 +3927,70 @@ impl PgProtocol<ActivePhase> {
             crate::state::StatePushClass::Connecting
             | crate::state::StatePushClass::PingAwaiting
             | crate::state::StatePushClass::BusyQuery => {}
+        }
+    }
+}
+
+// DEF-246 Option α (2026-05-16): re-open `impl PgProtocol<ActivePhase>`
+// for the remaining methods. The five methods moved to
+// `impl PgProtocolInner` above (feed_bytes_impl, feed_bytes_bounded,
+// feed_inbound, advance_one_frame, clear_session_residue_for_class)
+// are reached through delegates near the top of this impl + via
+// `self.inner.X` from in-crate sites (row_stream slow path,
+// cfg(test) integration tests, etc.).
+impl PgProtocol<ActivePhase> {
+
+    /// DEF-246 Phase 4 transition surface (2026-05-16). Drives the
+    /// terminally-Errored protocol into a typed `PgProtocol<ClosedPhase>`
+    /// wrapper. Returns `Err(self)` when the protocol is NOT yet
+    /// Errored — caller continues using the `<ActivePhase>` instance.
+    ///
+    /// # Tier-1 closure
+    ///
+    /// Pre-DEF-246 Phase 4: callers checked `connection_status()` and
+    /// kept driving an Errored `<ActivePhase>`; every `push_command`
+    /// classified through the existing `Errored` arm in
+    /// `compute_push_*`. Tier-3 by-discipline — a future refactor
+    /// could omit the Errored check.
+    ///
+    /// Post-Phase-4: the `<ClosedPhase>` ZST-marker physically lacks
+    /// `push_command`, `feed_bytes`, `feed_inbound`, `advance_one_frame`,
+    /// etc. (method-absent E0599 at compile time). The only operation
+    /// available on `<ClosedPhase>` is `cause()` accessor (Phase 4 #1).
+    ///
+    /// The transition is **consume-self** — moving the wrapper keeps
+    /// the byte layout identical (`#[repr(transparent)]`) and the
+    /// `PhantomData<fn() -> P>` marker swaps cheaply at zero cost.
+    ///
+    /// # Why both `Ok` and `Err` carry `PgProtocol`
+    ///
+    /// The signature uses `Result<PgProtocol<ClosedPhase>,
+    /// PgProtocol<ActivePhase>>` to return the wrapper by value in
+    /// both arms — caller writes
+    /// `let active = proto.into_closed_if_errored().map_err(|p| p)?;`
+    /// or matches and recovers. `Box<PgProtocol>` would penalise the
+    /// happy `Ok` path with an allocation that the wrapper layer does
+    /// not need. The clippy `result_large_err` lint
+    /// (520 B variant threshold) is acknowledged: the moving-by-value
+    /// return is a load-bearing API shape, not a perf footgun
+    /// (consume-self, called at most once per protocol lifecycle).
+    #[expect(
+        clippy::result_large_err,
+        reason = "consume-self transition: BOTH arms carry the protocol \
+                  wrapper by value so the caller recovers the typed phase \
+                  without a Box. Boxing would penalise the happy `Ok` path \
+                  with an alloc the wrapper does not need."
+    )]
+    pub fn into_closed_if_errored(
+        self,
+    ) -> Result<PgProtocol<ClosedPhase>, PgProtocol<ActivePhase>> {
+        if matches!(self.inner.state, ProtoState::Errored(_)) {
+            Ok(PgProtocol {
+                inner: self.inner,
+                phase_marker: PhantomData,
+            })
+        } else {
+            Err(self)
         }
     }
 
@@ -3746,8 +4539,12 @@ impl PgProtocol<ActivePhase> {
         write_buf.clear();
         // DEF-211 FAKE-01: cached classification (see feed_bytes for
         // rationale).
+        //
+        // DEF-246 Option α (2026-05-16):
+        // `clear_session_residue_for_class` lives on `PgProtocolInner`;
+        // route through `self.inner` directly.
         let entry_class = self.inner.state.push_class();
-        self.clear_session_residue_for_class(entry_class);
+        self.inner.clear_session_residue_for_class(entry_class);
 
         // The stream value lives here on `iter_rows`'s stack frame.
         // Caller's closure receives `&mut stream` — a borrow, not
@@ -3944,22 +4741,12 @@ fn compute_push(
     let mut staged: StagedActions<'_> = StagedActions::new();
     match cmd {
         PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
-        PgCommand::Startup {
-            user,
-            database,
-            app_name,
-            credentials,
-            reply,
-        } => compute_push_startup(
-            state,
-            user,
-            database,
-            app_name,
-            credentials,
-            reply,
-            &mut staged,
-            reserved,
-        ),
+        // DEF-246 Phase 2 (2026-05-16): `PgCommand::Startup` arm
+        // deleted alongside the variant itself. Startup is the only
+        // command with a phase-typed entry-point
+        // (`<DisconnectedPhase>::push_startup`); the test-only
+        // dispatcher no longer needs the arm because
+        // `compute_push_startup` (cfg(test)) is also deleted.
         PgCommand::SimpleQuery { sql, reply } => {
             compute_push_simple_query(state, &sql, reply, &mut staged, reserved)
         }
@@ -4104,90 +4891,16 @@ pub(crate) fn compute_push_ping_idle_only(
     setter.install_post_state(crate::push_command::PingAwaitingRfqInstall { reply });
 }
 
-/// Compute the transition for [`PgCommand::Startup`] against the current
-/// [`ProtoState`]. Pure; see [`compute_push`] for framing.
-///
-/// Exhaustive match over every `ProtoState` variant. Decision table:
-///
-/// | current state          | action                       | new state                   |
-/// |------------------------|------------------------------|-----------------------------|
-/// | `Idle` (build OK)      | `SendBytes(StartupMessage)`  | `ConnectingStartup { ... }` |
-/// | `Idle` (build Err)     | `FailReply(ScramError)`      | `Idle` (unchanged)          |
-/// | `Errored(cause)`       | `FailReply(cause)`           | `Errored(cause)` preserved  |
-/// | any non-`Idle` other   | `FailReply(InProgress)`      | same state preserved        |
-///
-/// The `Idle` build-failure arm is architecturally unreachable in
-/// normal operation (startup fits 512-byte cap) but surfaced honestly
-/// — a future refactor that breaks the const drift-guard on
-/// `MAX_OWNED_SEND_LEN` classifies as a typed reply failure instead of
-/// silent truncation.
-#[cfg(test)]
-#[expect(clippy::too_many_arguments, reason = "compute_push_startup is an internal helper for Pg startup-command dispatch; its arg count matches the `PgCommand::Startup` payload + write_buf + staged accumulator. Splitting into a struct-arg would obscure the pure-compute framing (DEF-059).")]
-fn compute_push_startup(
-    state: &mut ProtoState,
-    user: Ident,
-    database: Option<DatabaseName>,
-    app_name: Option<ApplicationName>,
-    credentials: Credentials,
-    reply: ReplyId<crate::reply_id::StartupKind>,
-    staged: &mut StagedActions,
-    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) {
-    // DEF-186 perf-recovery 2026-04-24: signature changed to
-    // `&mut ProtoState` with `()` return. Idle arm writes new state
-    // via `*state = ...`; preserve arms (Errored / Connecting /
-    // PingAwaiting / BusyQuery) leave state untouched.
-    match state.push_class() {
-        crate::state::StatePushClass::Idle => {
-            // DEF-272 cluster γ (2026-05-10): IdleState typestate
-            // replaces (state, IdleStateProof). Idle arm of
-            // push_class() classification is the precondition.
-            let idle = match crate::state_setter::IdleState::try_from(state) {
-                Some(idle) => idle,
-                None => {
-                    debug_assert!(
-                        false,
-                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
-                    );
-                    return;
-                }
-            };
-            let setter = idle.into_setter::<crate::push_command::StartupPostInstall>();
-            compute_push_startup_idle_only(
-                setter, user, database, app_name, credentials, reply, staged, reserved,
-            );
-        },
-        crate::state::StatePushClass::Errored(prior_kind) => {
-            emit_actions!(staged, budget: 1, [
-                StagedAction::FailReply {
-                    id: reply.consume(),
-                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind },
-                },
-            ]);
-        }
-        // Startup-specific: PingAwaiting groups with Connecting
-        // (both imply "startup sequence cannot be re-initiated").
-        crate::state::StatePushClass::PingAwaiting
-        | crate::state::StatePushClass::Connecting => {
-            emit_actions!(staged, budget: 1, [
-                StagedAction::FailReply {
-                    id: reply.consume(),
-                    cause: ProtocolError::StartupAlreadyInProgress,
-                },
-            ]);
-        }
-        crate::state::StatePushClass::BusyQuery => {
-            emit_actions!(staged, budget: 1, [
-                StagedAction::FailReply {
-                    id: reply.consume(),
-                    cause: ProtocolError::CommandInProgress,
-                },
-            ]);
-        }
-    }
-}
+// DEF-246 Phase 2 (2026-05-16): `compute_push_startup` cfg(test) +
+// `compute_push_tests::push_startup_*` retired tests deleted —
+// `<DisconnectedPhase>::push_startup`'s consume-self signature
+// physically forbids pushing Startup from non-Disconnected states,
+// so the per-state dispatcher (Idle / Errored / Connecting /
+// PingAwaiting / BusyQuery) is dead. The remaining `Idle` path
+// lives in `compute_push_startup_idle_only` below (still reached
+// from `<DisconnectedPhase>::push_startup`).
 
-/// DEF-208 — Idle-only path for [`PgCommand::Startup`] push.
+/// DEF-208 — Idle-only path for the Startup handshake push.
 ///
 /// Caller must guarantee `state == ProtoState::Idle`. See
 /// [`compute_push_ping_idle_only`] for closure rationale.
@@ -5646,18 +6359,35 @@ fn push_within_fanout_budget<'w, 'r>(
     }
 }
 
-impl Default for PgProtocol<ActivePhase> {
+// DEF-246 Phase 2 (2026-05-16): `Default` impl moved from
+// `<ActivePhase>` to `<DisconnectedPhase>` — `PgProtocol::default()`
+// produces a fresh disconnected protocol (matches `PgProtocol::new()`).
+impl Default for PgProtocol<DisconnectedPhase> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl core::fmt::Debug for PgProtocol<ActivePhase> {
+// DEF-246 Phase 1 + 2 (2026-05-16): blanket `Debug` for every phase.
+// Phase-specific marker is the `phase_marker: PhantomData<fn() -> P>`
+// ZST; the human-readable contents are inner fields that exist in
+// every phase (no phase-conditional Debug output). The previous
+// `<ActivePhase>`-only impl is upgraded to `<P: SealedPhase>` so
+// `eprintln!("{:?}", proto)` works in handshake / closed contexts too.
+impl<P: SealedPhase> core::fmt::Debug for PgProtocol<P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Inline routing mirrors `cold_session_params`: prefer the
+        // boxed contents if allocated, else fall back to a static
+        // empty `SessionParams::new()` (pristine, never dropped).
+        static EMPTY: SessionParams = SessionParams::new();
+        let session_params: &SessionParams = match self.inner.session_params.as_deref() {
+            Some(p) => p,
+            None => &EMPTY,
+        };
         f.debug_struct("PgProtocol")
             .field("state", &self.inner.state)
             .field("read_buf", &self.inner.read_buf)
-            .field("session_params", self.cold_session_params())
+            .field("session_params", session_params)
             .finish_non_exhaustive()
     }
 }
@@ -5898,7 +6628,12 @@ mod residue_policy_per_class_tests {
     /// `row_desc_slot = Some(EMPTY)`, `session_params` non-pristine,
     /// `error_arena` allocated. After the test we observe how each
     /// arm of `clear_session_residue_*` mutated them.
-    fn populate_residue(proto: &mut PgProtocol) {
+    ///
+    /// DEF-246 Phase 2 (2026-05-16): generic over `P: SealedPhase` so
+    /// the same helper drives both the new `<DisconnectedPhase>`
+    /// protocols (from `PgProtocol::new()`) and the legacy
+    /// `<ActivePhase>` set-up paths inside `mod compute_push_tests`.
+    fn populate_residue<P: SealedPhase>(proto: &mut PgProtocol<P>) {
         proto.inner.row_desc_slot._set_for_test(Some(RowDesc::EMPTY));
         proto.inner.session_params._set_for_test(Some(dirty_session_params()));
         proto.inner.error_arena = Some(alloc::boxed::Box::new(
@@ -5908,14 +6643,16 @@ mod residue_policy_per_class_tests {
 
     /// Replace `proto.inner.state` with `Idle` so the destructor doesn't
     /// trip the in-flight `ReplyId<_>` Drop-guard at scope end.
-    fn quench_inflight(proto: &mut PgProtocol) {
+    /// DEF-246 Phase 2 (2026-05-16): generic over `P: SealedPhase`.
+    fn quench_inflight<P: SealedPhase>(proto: &mut PgProtocol<P>) {
         let prev = core::mem::replace(&mut proto.inner.state, ProtoState::Idle);
         match prev.take_inflight_reply_raw_id() {
             Some(_) | None => {}
         }
     }
 
-    fn session_params_is_pristine(proto: &PgProtocol) -> bool {
+    /// DEF-246 Phase 2 (2026-05-16): generic over `P: SealedPhase`.
+    fn session_params_is_pristine<P: SealedPhase>(proto: &PgProtocol<P>) -> bool {
         // DEF-211 INNO-01 (2026-05-04): trait method via `Pristine` import.
         // Inherent `__pristine_const` would also work but trait dispatch
         // here matches polymorphic intent (test helper takes any
@@ -5932,7 +6669,8 @@ mod residue_policy_per_class_tests {
         let mut proto = PgProtocol::new();
         // Default state is `Idle` post-`new()`.
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.inner.state.push_class());
+        let class = proto.inner.state.push_class();
+        proto.inner.clear_session_residue_for_class(class);
 
         assert!(
             proto.inner.row_desc_slot.is_none(),
@@ -5959,7 +6697,8 @@ mod residue_policy_per_class_tests {
             StateErrorKind::from_kind_or_internal(ErrorKind::Framing),
         );
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.inner.state.push_class());
+        let class = proto.inner.state.push_class();
+        proto.inner.clear_session_residue_for_class(class);
 
         assert!(
             proto.inner.row_desc_slot.is_none(),
@@ -5985,7 +6724,8 @@ mod residue_policy_per_class_tests {
             reply: ReplyId::from_raw(nz(11)),
         };
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.inner.state.push_class());
+        let class = proto.inner.state.push_class();
+        proto.inner.clear_session_residue_for_class(class);
 
         assert!(
             proto.inner.row_desc_slot.is_some(),
@@ -6011,7 +6751,8 @@ mod residue_policy_per_class_tests {
         let mut proto = PgProtocol::new();
         proto.inner.state = ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.inner.state.push_class());
+        let class = proto.inner.state.push_class();
+        proto.inner.clear_session_residue_for_class(class);
 
         assert!(
             proto.inner.row_desc_slot.is_some(),
@@ -6035,7 +6776,8 @@ mod residue_policy_per_class_tests {
             reply: ReplyId::from_raw(nz(13)),
         };
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.inner.state.push_class());
+        let class = proto.inner.state.push_class();
+        proto.inner.clear_session_residue_for_class(class);
 
         assert!(
             proto.inner.row_desc_slot.is_some(),
@@ -6074,7 +6816,10 @@ mod compute_push_tests {
     //! test calls [`compute_push`] directly on a synthesised
     //! `(cmd, state)` pair.
     use super::*;
-    use crate::password::Credentials;
+    // DEF-246 Phase 2 (2026-05-16): `Credentials` import was used by
+    // the retired Startup cross-state tests; the new
+    // `<DisconnectedPhase>::push_startup` consumes Credentials via
+    // its own param, not via the cfg(test) dispatcher.
     use crate::reply_id::ReplyId;
     use core::num::NonZeroU64;
 
@@ -6146,12 +6891,11 @@ mod compute_push_tests {
         }
     }
 
-    /// Build a minimal valid `Ident` for tests. `"u"` is 1 byte, well
-    /// within MAX_IDENT_LEN; the Err branch is architecturally dead
-    /// but surfaced via `.ok()?` so the forbid-bundle is honoured.
-    fn mk_user() -> Option<Ident> {
-        Ident::try_from_str("u").ok()
-    }
+    // DEF-246 Phase 2 (2026-05-16): `mk_user` was used by the
+    // retired Startup cross-state tests. The new
+    // `<DisconnectedPhase>::push_startup` consume-self entry point
+    // makes those tests structurally impossible; the helper is
+    // removed alongside them.
 
     /// Test-only observation of a [`StagedAction`] — brand stripped,
     /// range carried as `NonEmptyRange`. Tests compare against this
@@ -6540,303 +7284,33 @@ mod compute_push_tests {
     }
 
     // -----------------------------------------------------------------
-    // Startup — per-variant policy table
+    // Startup — per-variant policy table  (DEF-246 Phase 2 RETIRED)
+    //
+    // The 3 tests previously here
+    // (`startup_from_idle_transitions_and_emits_startup_message`,
+    //  `startup_from_errored_preserves_kind_and_fails_with_connection_already_closed`,
+    //  `startup_from_non_idle_non_errored_fails_with_startup_in_progress`)
+    // defended the legacy `compute_push_startup` 5-arm dispatcher.
+    // Post-DEF-246 Phase 2 (2026-05-16) the Startup push lives on
+    // `<DisconnectedPhase>::push_startup` (consume-self) and the
+    // type system physically forbids pushing Startup from any other
+    // state — the 3 tests' invariants are STRUCTURALLY IMPOSSIBLE
+    // (`Closed`-state push is a method-absent E0599 compile error,
+    // not a FailReply runtime classification). Tests deleted.
+    //
+    // The Idle arm (which DID produce real wire-bytes) is preserved
+    // structurally: `<DisconnectedPhase>::push_startup` exercises the
+    // exact same `compute_push_startup_idle_only` body, so the wire
+    // shape is unchanged. Integration tests in
+    // `tests/startup_spec.rs` cover the wire-shape end-to-end.
     // -----------------------------------------------------------------
 
     #[test]
-    fn startup_from_idle_transitions_and_emits_startup_message() {
-        let Some(user) = mk_user() else { return };
-        let raw_id = nz(301);
-        let cmd = PgCommand::Startup {
-            user,
-            database: None,
-            app_name: None,
-            credentials: Credentials::Trust,
-            reply: ReplyId::from_raw(raw_id),
-        };
-        let (new_state, staged) = compute_staged(cmd, ProtoState::Idle);
-
-        // Action: SendBytes with non-empty payload (startup frame, no tag).
-        // DEF-094: Startup from Idle writes the message into `wb` via
-        // a StagedAction::SendBytesRange(NonEmptyRange). DEF-100:
-        // non-empty is a type invariant, so presence of the variant
-        // alone is sufficient — no explicit `end > start` check.
-        assert_eq!(staged.len(), 1);
-        assert!(
-            matches!(staged.first(), Some(StagedObs::SendBytesRange)),
-            "expected SendBytesRange into write_buf",
-        );
-
-        // State: ConnectingStartup with the pushed reply id.
-        assert_eq!(take_connecting_startup_raw(new_state), Some(raw_id));
-    }
-
-    #[test]
-    fn startup_from_errored_preserves_kind_and_fails_with_connection_already_closed() {
-        // DEF-061 + DEF-142 semantic — same shape as
-        // `ping_from_errored_preserves_kind_and_fails_with_connection_already_closed`.
-        use crate::error::ErrorKind;
-        let Some(user) = mk_user() else { return };
-        let raw_id = nz(302);
-        let prior_kind_raw = ErrorKind::Framing;
-        let prior_kind = crate::error::StateErrorKind::from_kind_or_internal(prior_kind_raw);
-        let cmd = PgCommand::Startup {
-            user,
-            database: None,
-            app_name: None,
-            credentials: Credentials::Trust,
-            reply: ReplyId::from_raw(raw_id),
-        };
-        let (new_state, staged) = compute_staged(cmd, ProtoState::Errored(prior_kind));
-
-        // Action: FailReply(ConnectionAlreadyClosed{prior_kind}).
-        assert_eq!(staged.len(), 1);
-        assert!(
-            matches!(
-                staged.first(),
-                Some(StagedObs::FailReply {
-                    id,
-                    cause: ProtocolError::ConnectionAlreadyClosed { prior_kind: pk },
-                }) if *id == raw_id && *pk == prior_kind
-            ),
-            "expected FailReply(ConnectionAlreadyClosed{{prior_kind={prior_kind_raw:?}}})",
-        );
-
-        // State: Errored(prior_kind) preserved.
-        assert!(
-            matches!(&new_state, ProtoState::Errored(k) if *k == prior_kind),
-            "expected Errored preserved",
-        );
-        consume_state(new_state);
-    }
-
-    /// Every non-`Idle`/non-`Errored` state rejects Startup with
-    /// `StartupAlreadyInProgress` and preserves its state. Closes the
-    /// same or-pattern seam as the ping counterpart.
-    #[test]
-    fn startup_from_non_idle_non_errored_fails_with_startup_in_progress() {
-        // Factory to build a Startup command consuming a fresh
-        // `user` per sub-case. Each Startup consumes its `user`, so
-        // we cannot share one across iterations.
-        let make_startup_cmd = |user: Ident, raw: NonZeroU64| PgCommand::Startup {
-            user,
-            database: None,
-            app_name: None,
-            credentials: Credentials::Trust,
-            reply: ReplyId::from_raw(raw),
-        };
-
-        // PingAwaitingRfq.
-        if let Some(user) = mk_user() {
-            let raw_prev = nz(401);
-            let raw_new = nz(402);
-            let prev = ProtoState::PingAwaitingRfq(ReplyId::from_raw(raw_prev));
-            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(staged.len(), 1);
-            assert!(
-                matches!(
-                    staged.first(),
-                    Some(StagedObs::FailReply {
-                        id,
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    }) if *id == raw_new
-                ),
-                "PingAwaitingRfq → expected StartupAlreadyInProgress",
-            );
-            assert_eq!(take_awaiting_ping_raw(new_state), Some(raw_prev));
-        }
-
-        // ConnectingStartupTrust (DEF-097 — the old
-        // `ConnectingStartup { credentials }` split).
-        if let Some(user) = mk_user() {
-            let raw_prev = nz(403);
-            let raw_new = nz(404);
-            let prev = ProtoState::ConnectingStartupTrust {
-                reply: ReplyId::from_raw(raw_prev),
-            };
-            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(staged.len(), 1);
-            assert!(
-                matches!(
-                    staged.first(),
-                    Some(StagedObs::FailReply {
-                        id,
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    }) if *id == raw_new
-                ),
-                "ConnectingStartupTrust → expected StartupAlreadyInProgress",
-            );
-            assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
-        }
-
-        // ConnectingStartupScram — DEF-184 A10/B22 revert 2026-04-24:
-        // variant carries `scram: ScramSession` inline per tier-1
-        // invariant. Construction requires SCRAM data.
-        if let Some(user) = mk_user()
-            && let Ok(pw) = crate::password::Password::try_from_bytes(b"pw")
-        {
-            let raw_prev = nz(405_100);
-            let raw_new = nz(405_101);
-            let scram = alloc::boxed::Box::new(
-                crate::scram::session::ScramSession::from_password(
-                    crate::sensitive::Sensitive::new(pw),
-                ),
-            );
-            let prev = ProtoState::ConnectingStartupScram {
-                reply: ReplyId::from_raw(raw_prev),
-                scram,
-            };
-            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(staged.len(), 1);
-            assert!(
-                matches!(
-                    staged.first(),
-                    Some(StagedObs::FailReply {
-                        id,
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    }) if *id == raw_new
-                ),
-                "ConnectingStartupScram → expected StartupAlreadyInProgress",
-            );
-            assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
-        }
-
-        // ConnectingScramAwaitingServerFirst — tier-1 variant-carries-field.
-        if let Some(user) = mk_user()
-            && let Ok(pw) = crate::password::Password::try_from_bytes(b"pw")
-        {
-            let raw_prev = nz(405);
-            let raw_new = nz(406);
-            let scram = alloc::boxed::Box::new(
-                crate::scram::session::ScramSession::from_password(
-                    crate::sensitive::Sensitive::new(pw),
-                ),
-            );
-            let prev = ProtoState::ConnectingScramAwaitingServerFirst {
-                reply: ReplyId::from_raw(raw_prev),
-                scram,
-            };
-            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(staged.len(), 1);
-            assert!(
-                matches!(
-                    staged.first(),
-                    Some(StagedObs::FailReply {
-                        id,
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    }) if *id == raw_new
-                ),
-                "ScramAwaitingServerFirst → expected StartupAlreadyInProgress",
-            );
-            assert!(matches!(
-                &new_state,
-                ProtoState::ConnectingScramAwaitingServerFirst { .. }
-            ));
-            consume_state(new_state);
-        }
-
-        // ConnectingScramAwaitingServerFinal — `expected_server_sig` inline.
-        if let Some(user) = mk_user() {
-            let raw_prev = nz(407);
-            let raw_new = nz(408);
-            let prev = ProtoState::ConnectingScramAwaitingServerFinal {
-                reply: ReplyId::from_raw(raw_prev),
-                expected_server_sig: crate::scram::types::SecretDigest::new([0_u8; 32]),
-            };
-            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(staged.len(), 1);
-            assert!(
-                matches!(
-                    staged.first(),
-                    Some(StagedObs::FailReply {
-                        id,
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    }) if *id == raw_new
-                ),
-                "ScramAwaitingServerFinal → expected StartupAlreadyInProgress",
-            );
-            assert!(matches!(
-                &new_state,
-                ProtoState::ConnectingScramAwaitingServerFinal { .. }
-            ));
-            consume_state(new_state);
-        }
-
-        // ConnectingScramAwaitingAuthOk.
-        if let Some(user) = mk_user() {
-            let raw_prev = nz(409);
-            let raw_new = nz(410);
-            let prev = ProtoState::ConnectingScramAwaitingAuthOk(ReplyId::from_raw(raw_prev));
-            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(staged.len(), 1);
-            assert!(
-                matches!(
-                    staged.first(),
-                    Some(StagedObs::FailReply {
-                        id,
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    }) if *id == raw_new
-                ),
-                "ScramAwaitingAuthOk → expected StartupAlreadyInProgress",
-            );
-            assert!(matches!(
-                &new_state,
-                ProtoState::ConnectingScramAwaitingAuthOk(_)
-            ));
-            consume_state(new_state);
-        }
-
-        // ConnectingPostAuthAwaitingKey.
-        if let Some(user) = mk_user() {
-            let raw_prev = nz(411);
-            let raw_new = nz(412);
-            let prev = ProtoState::ConnectingPostAuthAwaitingKey(ReplyId::from_raw(raw_prev));
-            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(staged.len(), 1);
-            assert!(
-                matches!(
-                    staged.first(),
-                    Some(StagedObs::FailReply {
-                        id,
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    }) if *id == raw_new
-                ),
-                "PostAuthAwaitingKey → expected StartupAlreadyInProgress",
-            );
-            assert!(matches!(
-                &new_state,
-                ProtoState::ConnectingPostAuthAwaitingKey(_)
-            ));
-            consume_state(new_state);
-        }
-
-        // ConnectingPostAuthHaveKey.
-        if let Some(user) = mk_user() {
-            let raw_prev = nz(413);
-            let raw_new = nz(414);
-            let prev = ProtoState::ConnectingPostAuthHaveKey {
-                reply: ReplyId::from_raw(raw_prev),
-                pid: 1,
-                secret_key: crate::sensitive::Sensitive::new(2_i32),
-            };
-            let (new_state, staged) = compute_staged(make_startup_cmd(user, raw_new), prev);
-            assert_eq!(staged.len(), 1);
-            assert!(
-                matches!(
-                    staged.first(),
-                    Some(StagedObs::FailReply {
-                        id,
-                        cause: ProtocolError::StartupAlreadyInProgress,
-                    }) if *id == raw_new
-                ),
-                "PostAuthHaveKey → expected StartupAlreadyInProgress",
-            );
-            assert!(matches!(
-                &new_state,
-                ProtoState::ConnectingPostAuthHaveKey { .. }
-            ));
-            consume_state(new_state);
-        }
+    #[allow(dead_code, reason = "DEF-246 Phase 2: 3 tests retired (see comment block above). The cfg(test) `compute_push_startup` helper that drove the Idle/Errored/Connecting/PingAwaiting/BusyQuery decision table is also retired — the new typed entry point `<DisconnectedPhase>::push_startup` is consume-self, so non-Idle dispatches are E0599 at compile time.")]
+    fn _def246_phase2_startup_dispatch_table_retired_compile_anchor() {
+        // Placeholder test: exists only so a grep for `fn startup_from_`
+        // in protocol.rs lands here with the retired-block comment
+        // above. No body — empty test passes trivially.
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -6863,18 +7337,21 @@ mod compute_push_tests {
         use crate::error::{CrateBugLocus, ProtocolError};
         use crate::params::OverflowParams;
 
-        let mut proto = PgProtocol::new();
+        // DEF-246 Phase 2 (2026-05-16): `PgProtocol::new()` produces
+        // `<DisconnectedPhase>` — for this test we want an
+        // `<ActivePhase>` so we can exercise `push_bind_execute`. The
+        // in-crate cfg(test) path constructs the Active wrapper
+        // directly from `<DisconnectedPhase>::new()` by re-tagging the
+        // phase marker. This is NOT a production bypass: external
+        // crates cannot reach the `inner` field (module-private to
+        // `mod protocol`) and the `phase_marker` is reachable only
+        // from sibling `cfg(test)` code (no `pub`).
+        let proto_disconnected = PgProtocol::<DisconnectedPhase>::new();
+        let mut proto: PgProtocol<ActivePhase> = PgProtocol {
+            inner: proto_disconnected.inner,
+            phase_marker: PhantomData,
+        };
         let mut wb = WriteBuf::new();
-        // Drive through a trivial startup so push_bind_execute
-        // routes through the Idle-state arm (without a startup the
-        // state is pre-handshake and Bind would fail-route as
-        // "StartupAlreadyInProgress" — the wrong code path).
-        //
-        // PgProtocol::new() starts in ProtoState::Idle per
-        // tests/bind_execute_spec.rs precedent (bind_execute_spec
-        // line 126 calls push_bind_execute immediately after
-        // PgProtocol::new() and hits the Idle arm). No handshake
-        // drive needed.
         let reply_raw = nz(999);
         // DEF-272 cluster γ: internal test goes through `ReadyGuard`
         // (the only legitimate path that runtime-classifies state as

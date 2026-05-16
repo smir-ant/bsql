@@ -9,11 +9,13 @@
 //! variants (`Query`, `Execute`, `Begin`, …) land with their drivers
 //! per reforge.md §3.5.
 
-use crate::ident::{ApplicationName, DatabaseName, Ident, PortalName, Sql, StmtName};
-use crate::password::Credentials;
+use crate::ident::{PortalName, Sql, StmtName};
+// DEF-246 Phase 2 (2026-05-16): `ApplicationName`, `DatabaseName`,
+// `Ident`, `Credentials`, `StartupKind` imports were used by the
+// deleted `Startup` variant + `compute_push_startup` cfg(test)
+// dispatcher. Pulled out alongside the variant.
 use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
-    StartupKind,
 };
 
 /// A command pushed by the wrapper into the protocol state machine.
@@ -71,28 +73,15 @@ pub(crate) enum PgCommand {
         reply: ReplyId<PingKind>,
     },
 
-    /// Initiate the PostgreSQL startup handshake.
-    ///
-    /// Builds and sends a `StartupMessage` frame. The protocol then
-    /// navigates the authentication exchange (trust or SCRAM-SHA-256)
-    /// followed by the post-auth chain (ParameterStatus, BackendKeyData,
-    /// ReadyForQuery) before transitioning to [`crate::ProtoState::Idle`]
-    /// and emitting [`crate::Reply::StartupComplete`].
-    Startup {
-        /// The PostgreSQL user to authenticate as.
-        user: Ident,
-        /// Optional database name (defaults to user name on the server).
-        database: Option<DatabaseName>,
-        /// Optional application name for `application_name` parameter.
-        app_name: Option<ApplicationName>,
-        /// Authentication credentials.
-        credentials: Credentials,
-        /// Correlator for the Startup command.
-        ///
-        /// DEF-112: typed `ReplyId<StartupKind>` binds the reply
-        /// payload to [`crate::action::StartupCompletePayload`].
-        reply: ReplyId<StartupKind>,
-    },
+    // DEF-246 Phase 2 (2026-05-16): `Startup` variant deleted.
+    // The startup handshake is now driven by
+    // `<DisconnectedPhase>::push_startup` (consume-self transition
+    // to `<ConnectingPhase>`). Tier-1 elevation #1: the only legal
+    // entry point is from `<DisconnectedPhase>`; constructing a
+    // `PgCommand::Startup { ... }` was never reachable via the
+    // public API post-DEF-198, but the variant survived for the
+    // `compute_push_tests` per-state dispatcher. That dispatcher is
+    // also deleted in this commit.
 
     /// Prepare a named SQL statement via PG's Extended Query protocol
     /// (`P`-frame + `S`-frame terminator). 1c-3a.

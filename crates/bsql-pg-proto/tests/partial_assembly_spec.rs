@@ -61,7 +61,7 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::{PushOrPanic, mint_reply};
+use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 // ------------------------------------------------------------------
 // Frame builders — pure helpers, mirror simple_query_spec /
@@ -213,7 +213,7 @@ fn push_simple_query(proto: &mut PgProtocol, reply: ReplyId<QueryKind>, wb: &mut
 /// `SimpleQueryStreamingRows`).
 #[test]
 fn streaming_t_row_description_oversized_dispatches_correctly() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -259,7 +259,7 @@ fn streaming_t_row_description_oversized_dispatches_correctly() {
 /// assert it produces a FailReply terminal.
 #[test]
 fn streaming_e_error_response_oversized_dispatches_to_fail_reply() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -296,7 +296,7 @@ fn streaming_e_error_response_oversized_dispatches_to_fail_reply() {
 /// The Sub-B-specific invariant is the frame REACHED dispatch.
 #[test]
 fn streaming_n_notice_response_oversized_reaches_dispatch() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -324,7 +324,7 @@ fn streaming_n_notice_response_oversized_reaches_dispatch() {
 /// dispatch (not torn down at parse-header time).
 #[test]
 fn streaming_a_notification_oversized_is_received() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let large_a = large_notification_frame(4500);
@@ -355,7 +355,7 @@ fn streaming_a_notification_oversized_is_received() {
 /// frame reaches dispatch (no FrameTooLarge teardown).
 #[test]
 fn streaming_c_command_complete_oversized_dispatches_correctly() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -384,7 +384,7 @@ fn streaming_c_command_complete_oversized_dispatches_correctly() {
 /// **`'S'` ParameterStatus** — feed a > 4 KB ParameterStatus frame.
 #[test]
 fn streaming_s_parameter_status_oversized_reaches_dispatch() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -410,7 +410,7 @@ fn streaming_s_parameter_status_oversized_reaches_dispatch() {
 /// frame.
 #[test]
 fn streaming_r_authentication_oversized_is_received() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let large_r = large_authentication_sasl_continue_frame(4500);
@@ -440,7 +440,7 @@ fn streaming_r_authentication_oversized_is_received() {
 /// dispatch (not torn down at parse-header).
 #[test]
 fn streaming_v_negotiate_oversized_is_received() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let large_v = large_negotiate_protocol_version_frame(4500);
@@ -478,7 +478,7 @@ fn streaming_v_negotiate_oversized_is_received() {
 /// the algorithmic property is the same.
 #[test]
 fn universal_coverage_100_kb_e_body_in_constant_memory() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -523,7 +523,7 @@ fn universal_coverage_100_kb_e_body_in_constant_memory() {
 /// partial-mode (would mask the violation).
 #[test]
 fn nonstreaming_k_backend_key_data_oversize_still_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let pre_count = proto.malformed_frame_count();
@@ -559,7 +559,7 @@ fn nonstreaming_k_backend_key_data_oversize_still_tears_down() {
 /// oversize 'D' tears down (existing behavior).
 #[test]
 fn nonstreaming_d_data_row_oversize_outside_iter_rows_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let body = std::vec![0u8; 4500];
@@ -588,7 +588,7 @@ fn nonstreaming_d_data_row_oversize_outside_iter_rows_tears_down() {
 /// completes, the partial_assembly cell is back to None.
 #[test]
 fn post_dispatch_partial_assembly_slot_is_none() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -613,7 +613,7 @@ fn post_dispatch_partial_assembly_slot_is_none() {
 /// cleanup, which clears any leftover partial-assembly state.
 #[test]
 fn errored_entry_clears_partial_assembly_residue() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -639,7 +639,7 @@ fn errored_entry_clears_partial_assembly_residue() {
 /// path even though it would have exceeded ReadBuf's 4 KB cap.
 #[test]
 fn single_chunk_oversize_e_frame_completes_correctly() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -679,7 +679,7 @@ fn single_chunk_oversize_e_frame_completes_correctly() {
 /// with byte-identical semantics.
 #[test]
 fn inline_path_unchanged_for_small_e_frame() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);

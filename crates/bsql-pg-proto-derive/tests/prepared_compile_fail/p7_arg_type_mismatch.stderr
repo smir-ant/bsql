@@ -1,5 +1,5 @@
 error[E0308]: mismatched types
-  --> tests/prepared_compile_fail/p7_arg_type_mismatch.rs:51:10
+  --> tests/prepared_compile_fail/p7_arg_type_mismatch.rs:99:10
    |
-51 |         ("hostile",),
+99 |         ("hostile",),
    |          ^^^^^^^^^ expected `i32`, found `&str`

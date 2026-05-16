@@ -1,0 +1,5 @@
+error[E0599]: no method named `push_command` found for struct `PgProtocol<P>` in the current scope
+  --> tests/def246_phase2-4_compile_fail/p_e_5_connecting_push_command_absent.rs:35:19
+   |
+35 |     let _ = proto.push_command(Ping { reply }, &mut wb);
+   |                   ^^^^^^^^^^^^ method not found in `PgProtocol<ConnectingPhase>`

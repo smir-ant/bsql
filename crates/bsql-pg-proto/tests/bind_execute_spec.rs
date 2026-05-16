@@ -25,7 +25,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, FetchRows, PgProtocol, PortalName, ProtoState, ProtocolError,
+    Action, ConnectionStatus, FetchRows, PortalName, ProtoState, ProtocolError,
     QueryKind, Reply, StmtName, WriteBuf,
     decode::RowDesc,
     wire::{
@@ -35,7 +35,7 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::{PushOrPanic, mint_reply, split_bind_execute_sync};
+use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply, split_bind_execute_sync};
 
 fn portal_unnamed() -> PortalName {
     PortalName::default()
@@ -113,7 +113,7 @@ fn error_response_frame(severity: &[u8], code: &[u8], message: &[u8]) -> std::ve
 /// `BindExecuteAwaitingBindComplete`.
 #[test]
 fn bind_execute_emits_three_send_bytes_and_transitions() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
@@ -152,7 +152,7 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
 /// Delivers `Reply::QueryComplete` with no schema.
 #[test]
 fn bind_execute_dml_full_round_trip() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
@@ -192,7 +192,7 @@ fn bind_execute_dml_full_round_trip() {
 /// emits `Action::StreamRow` with the schema by value.
 #[test]
 fn bind_execute_select_with_schema_streams_rows() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
@@ -237,7 +237,7 @@ fn bind_execute_select_with_schema_streams_rows() {
 /// BindComplete) → FailReply + drain-to-Idle. Connection survives.
 #[test]
 fn bind_error_is_recoverable() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
@@ -285,7 +285,7 @@ fn bind_error_is_recoverable() {
 /// by variant dispatch.
 #[test]
 fn bind_execute_data_row_without_schema_is_unexpected_frame() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
@@ -325,7 +325,7 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
 /// — the dispatcher classifies, doesn't accept silently.
 #[test]
 fn portal_suspended_is_unexpected_frame_in_1c_3b() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<QueryKind>(&mut proto);
 
@@ -370,7 +370,7 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
 /// exposes the underlying cause for caller recovery decisions.
 #[test]
 fn def198_bind_execute_from_errored_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Force Errored by feeding an unexpected frame at Idle.
@@ -397,7 +397,7 @@ fn def198_bind_execute_from_errored_blocked_at_compile_time() {
 /// state is preserved (caller must drive `feed_bytes` to drain).
 #[test]
 fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let (first_reply, _first_raw) = mint_reply::<QueryKind>(&mut proto);
@@ -450,7 +450,7 @@ fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
 /// ordering or size changes.
 #[test]
 fn bind_frame_wire_layout_empty_params() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
@@ -492,7 +492,7 @@ fn bind_frame_wire_layout_empty_params() {
 /// NUL, max_rows u32.
 #[test]
 fn execute_frame_wire_layout_unnamed_portal() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
@@ -531,7 +531,7 @@ fn execute_frame_wire_layout_unnamed_portal() {
 /// `ParamEncoder for Option<T>` impl.
 #[test]
 fn bind_frame_null_param_wire_layout() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let none_i32: Option<i32> = None;
@@ -578,7 +578,7 @@ fn bind_frame_null_param_wire_layout() {
 /// writes -1. Verifies the impl dispatches correctly per element.
 #[test]
 fn bind_frame_optional_mixed_with_some_and_none() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
@@ -634,7 +634,7 @@ fn bind_frame_optional_mixed_with_some_and_none() {
 /// format. Verifies per-param length-prefix + body layout.
 #[test]
 fn bind_frame_wire_layout_one_i32_param() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);

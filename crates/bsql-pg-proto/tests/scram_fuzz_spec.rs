@@ -33,7 +33,9 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::PushOrPanic;
+// DEF-246 Phase 2 (2026-05-16): `use common::PushOrPanic` deleted —
+// SCRAM-fuzz now drives push_startup directly (consume-self), the
+// PushOrPanic trait is no longer reached from this file.
 
 const SCRAM_FUZZ_ITERS: u32 = 5_000;
 
@@ -83,29 +85,43 @@ impl XorShift64 {
 // Drive PgProtocol into ConnectingStartupScram via a canonical
 // push_startup call. Returns (proto, wb) ready to receive
 // AUTHENTICATION frames.
-fn init_scram_protocol(_seed: u64) -> Option<(PgProtocol, WriteBuf)> {
-    let mut proto = PgProtocol::new();
+//
+// DEF-246 Phase 2/3 (2026-05-16): consume-self push_startup returns
+// `<ConnectingPhase>`; the protocol from a SCRAM init is mid-handshake
+// until the test drives the server-frame sequence.
+fn init_scram_protocol(
+    _seed: u64,
+) -> Option<(PgProtocol<bsql_pg_proto::ConnectingPhase>, WriteBuf)> {
+    let mut proto = PgProtocol::<bsql_pg_proto::DisconnectedPhase>::new();
     let mut wb = WriteBuf::new();
     let user = Ident::try_from_str("fuzz_user").ok()?;
     let pw = Password::try_from_bytes(b"fuzz_password").ok()?;
-    // DEF-270 (U): protocol mints reply ids; seed parameter retained
-    // for call-shape compat but no longer used (counter starts fresh
-    // per `PgProtocol::new()`).
     let reply = proto.next_reply_id::<bsql_pg_proto::reply_id::StartupKind>();
-    proto.push_or_panic(
-        bsql_pg_proto::push_command::Startup {
-            user,
-            database: None,
-            app_name: None,
-            credentials: Credentials::ScramPassword(Sensitive::new(pw)),
-            reply,
-        },
+    let (actions, proto_connecting) = match proto.push_startup(
+        user,
+        None,
+        None,
+        Credentials::ScramPassword(Sensitive::new(pw)),
+        reply,
         &mut wb,
-    );
-    // DEF-212: bytes live in wb (StartupMessage frame); non-empty
-    // confirms the push wrote.
+    ) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    // Drain the staged StartupMessage bytes back into `wb` so the
+    // legacy `wb.as_bytes()` non-empty invariant survives.
+    let mut scratch: std::vec::Vec<u8> = std::vec::Vec::with_capacity(512);
+    for action in actions {
+        if let bsql_pg_proto::Action::SendBytes(b) = action {
+            scratch.extend_from_slice(b);
+        }
+    }
+    wb.clear();
+    if wb.push_bytes(&scratch).is_err() {
+        return None;
+    }
     assert!(!wb.as_bytes().is_empty(), "Startup push must emit StartupMessage frame");
-    Some((proto, wb))
+    Some((proto_connecting, wb))
 }
 
 /// Build an AuthenticationSASL frame: tag 'R' + length + 4-byte

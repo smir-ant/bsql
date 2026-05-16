@@ -1,0 +1,25 @@
+warning: unreachable expression
+  --> tests/def246_phase2-4_compile_fail/p_e_8_struct_literal_field_private.rs:17:23
+   |
+16 |         inner: panic!("never reached — the literal is structurally rejected"),
+   |                -------------------------------------------------------------- any code following this expression is unreachable
+17 |         phase_marker: PhantomData,
+   |                       ^^^^^^^^^^^ unreachable expression
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `inner` and `phase_marker` of struct `PgProtocol` are private
+  --> tests/def246_phase2-4_compile_fail/p_e_8_struct_literal_field_private.rs:16:9
+   |
+15 |     let _: PgProtocol = PgProtocol {
+   |                         ---------- in this type
+16 |         inner: panic!("never reached — the literal is structurally rejected"),
+   |         ^^^^^ private field
+17 |         phase_marker: PhantomData,
+   |         ^^^^^^^^^^^^ private field
+
+error: type `protocol::PgProtocolInner` is private
+  --> tests/def246_phase2-4_compile_fail/p_e_8_struct_literal_field_private.rs:16:16
+   |
+16 |         inner: panic!("never reached — the literal is structurally rejected"),
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private type

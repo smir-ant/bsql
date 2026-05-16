@@ -62,6 +62,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 
+mod common;
+use common::fresh_active_via_trust_handshake;
+
 // ---------------------------------------------------------------
 // Counting allocator.
 // ---------------------------------------------------------------
@@ -286,7 +289,7 @@ fn scenario_parse_header() {
 
 fn scenario_ping_round_trip() {
     let rfq = rfq_frame();
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     // DEF-270: mint reply via the public counter API. Same cost as
     // the prior `reply_id_ping(1)` helper (single integer counter
@@ -305,7 +308,7 @@ fn scenario_ping_round_trip() {
 }
 
 fn scenario_push_command_only() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let reply = proto.next_reply_id::<PingKind>();
     measure("push_command_ping", || {
@@ -326,7 +329,7 @@ fn scenario_iter_rows_100() {
     // pull cost, not RowDesc / DataRow Vec construction.
     let rowdesc = build_rowdesc();
     let single_row = data_row_frame(16);
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     // DEF-270: mint via the public counter API.
     let reply = proto.next_reply_id::<QueryKind>();
@@ -374,7 +377,7 @@ fn scenario_iter_rows_100() {
 fn scenario_advance_one_frame() {
     use bsql_pg_proto::FeedEvent;
     let rfq = rfq_frame();
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     // DEF-270: mint via the public counter API.
     let reply = proto.next_reply_id::<PingKind>();

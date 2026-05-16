@@ -1,0 +1,5 @@
+error[E0599]: no method named `__test_bypass_into_active` found for struct `PgProtocol<P>` in the current scope
+  --> tests/def246_phase2-4_compile_fail/p_e_2_test_bypass_into_active_absent.rs:12:25
+   |
+12 |     let _active = proto.__test_bypass_into_active();
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `PgProtocol<DisconnectedPhase>`

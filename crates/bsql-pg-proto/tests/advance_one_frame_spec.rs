@@ -34,13 +34,13 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, FeedEvent, PgProtocol, ProtoState, ProtocolError, Reply, WriteBuf,
+    Action, FeedEvent, ProtoState, ProtocolError, Reply, WriteBuf,
     reply_id::{PingKind, QueryKind},
     wire::{TAG_DATA_ROW, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION},
 };
 
 mod common;
-use common::{PushOrPanic, mint_reply};
+use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 fn rfq_idle() -> [u8; 6] {
     [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 5, b'I']
@@ -65,7 +65,7 @@ fn frame(tag: u8, body: &[u8]) -> std::vec::Vec<u8> {
 /// Fresh proto, empty read_buf, state==Idle → FeedEvent::Idle.
 #[test]
 fn fresh_idle_proto_yields_idle_event() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let event = proto.advance_one_frame(&mut wb);
     assert!(
@@ -81,7 +81,7 @@ fn fresh_idle_proto_yields_idle_event() {
 /// Push Ping, feed RFQ via feed_inbound, advance → Deliver(Pong).
 #[test]
 fn ping_then_rfq_yields_deliver_pong() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
 
@@ -114,7 +114,7 @@ fn ping_then_rfq_yields_deliver_pong() {
 /// Drain after Deliver: subsequent advance returns Idle.
 #[test]
 fn post_deliver_advance_returns_idle() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let reply = proto.next_reply_id::<PingKind>();
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
@@ -137,7 +137,7 @@ fn post_deliver_advance_returns_idle() {
 /// Partial header (1 of 5 bytes) in non-Idle state → NeedMoreBytes.
 #[test]
 fn partial_header_yields_need_more_bytes() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let reply = proto.next_reply_id::<PingKind>();
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
@@ -165,7 +165,7 @@ fn partial_header_yields_need_more_bytes() {
 /// Adversarial RFQ in Idle (no in-flight reply) → Close.
 #[test]
 fn unsolicited_rfq_in_idle_yields_close_no_in_flight() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     assert!(proto.feed_inbound(&rfq_idle()).is_ok());
     let event = proto.advance_one_frame(&mut wb);
@@ -179,7 +179,7 @@ fn unsolicited_rfq_in_idle_yields_close_no_in_flight() {
 /// Adversarial wrong-tag frame mid-Ping → Fail (M2 implies close).
 #[test]
 fn unexpected_frame_mid_ping_yields_fail_with_id() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
@@ -204,7 +204,7 @@ fn unexpected_frame_mid_ping_yields_fail_with_id() {
 /// Errored state on subsequent advance → Close.
 #[test]
 fn errored_state_yields_close_on_advance() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     // Force Errored via unsolicited RFQ.
     assert!(proto.feed_inbound(&rfq_idle()).is_ok());
@@ -226,7 +226,7 @@ fn errored_state_yields_close_on_advance() {
 /// yields StreamingRows (signal to switch to iter_rows API).
 #[test]
 fn row_description_transitions_to_streaming_rows_event() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let reply = proto.next_reply_id::<QueryKind>();
     proto.push_or_panic(
@@ -281,7 +281,7 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
     // assume "fresh proto → raw=1". The equivalence between the
     // two paths is observable on per-protocol routing — each
     // path's minted id round-trips back through its own DeliverReply.
-    let mut proto_a = PgProtocol::new();
+    let mut proto_a = fresh_active_via_trust_handshake();
     let mut wb_a = WriteBuf::new();
     let (reply_a, raw_a) = mint_reply::<PingKind>(&mut proto_a);
     proto_a.push_or_panic(bsql_pg_proto::push_command::Ping { reply: reply_a }, &mut wb_a);
@@ -301,7 +301,7 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
     // (b) advance_one_frame path. Mint a fresh raw via a fresh
     // proto; raw_b will be a different global counter value than
     // raw_a (post-bisect static-atomic mint).
-    let mut proto_b = PgProtocol::new();
+    let mut proto_b = fresh_active_via_trust_handshake();
     let mut wb_b = WriteBuf::new();
     let (reply_b, raw_b) = mint_reply::<PingKind>(&mut proto_b);
     proto_b.push_or_panic(bsql_pg_proto::push_command::Ping { reply: reply_b }, &mut wb_b);
@@ -323,28 +323,35 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// (G) feed_inbound on Errored is silent no-op
+// (G) feed_inbound on Errored surfaces typed ConnectionAlreadyClosed
 // ═══════════════════════════════════════════════════════════════════
 
-/// `feed_inbound` returns Ok(()) without appending when state==Errored
-/// (terminal — caller learns via `connection_status` /
-/// `advance_one_frame → Close`).
+/// DEF-246 Phase 4 elevation #4 (2026-05-16). `feed_inbound` on
+/// Errored returns `Err(ProtocolError::ConnectionAlreadyClosed
+/// { prior_kind })` so the caller is notified rather than silently
+/// no-op'd. Pre-DEF-246 the return was `Ok(())` (silent no-op);
+/// the regression was tier-3 by-discipline (caller had to
+/// remember to `connection_status()` poll between feeds).
 #[test]
-fn feed_inbound_on_errored_is_silent_noop() {
-    let mut proto = PgProtocol::new();
+fn feed_inbound_on_errored_surfaces_connection_already_closed() {
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
-    // Force Errored.
+    // Force Errored via adversarial RFQ (Idle → unsolicited 'Z'
+    // classifies as UnexpectedFrame → Errored).
     assert!(proto.feed_inbound(&rfq_idle()).is_ok());
     let _close = proto.advance_one_frame(&mut wb);
     assert!(matches!(proto.state(), ProtoState::Errored(_)));
 
-    // Subsequent feed_inbound is silent — Ok despite being on Errored.
+    // Subsequent feed_inbound surfaces the typed error.
     let result = proto.feed_inbound(b"some bytes");
     assert!(
-        result.is_ok(),
-        "feed_inbound on Errored must silently no-op, got {result:?}",
+        matches!(
+            result,
+            Err(bsql_pg_proto::ProtocolError::ConnectionAlreadyClosed { .. }),
+        ),
+        "feed_inbound on Errored must surface ConnectionAlreadyClosed, got {result:?}",
     );
-    // Verify advance still returns Close (state unchanged).
+    // State unchanged, advance still returns Close.
     assert!(matches!(
         proto.advance_one_frame(&mut wb),
         FeedEvent::Close,

@@ -45,11 +45,11 @@
 use bsql_pg_proto::{
     frame::{parse_header, HeaderParse, READ_BUF_CAP},
     reply_id::PingKind,
-    PgProtocol, ProtoState, WriteBuf,
+    ProtoState, WriteBuf,
 };
 
 mod common;
-use common::PushOrPanic;
+use common::{PushOrPanic, fresh_active_via_trust_handshake};
 
 // ---------------------------------------------------------------
 // Deterministic xorshift RNG — reproducible random byte streams.
@@ -234,7 +234,7 @@ fn feed_bytes_from_idle_on_random_bytes_terminates() {
     const ITERATIONS: usize = 10_000;
 
     for i in 0..ITERATIONS {
-        let mut proto = PgProtocol::new();
+        let mut proto = fresh_active_via_trust_handshake();
         let mut wb = WriteBuf::new();
         // Random length [0, READ_BUF_CAP-1] — covers empty, tiny,
         // near-full chunks.
@@ -276,7 +276,7 @@ fn push_ping_then_feed_random_bytes_terminates() {
     const ITERATIONS: usize = 10_000;
 
     for i in 0..ITERATIONS {
-        let mut proto = PgProtocol::new();
+        let mut proto = fresh_active_via_trust_handshake();
         let mut wb = WriteBuf::new();
         // Push Ping first — state transitions to PingAwaitingRfq.
         // DEF-212: bytes live in wb; helper returns ().
@@ -322,7 +322,7 @@ fn push_ping_then_feed_random_bytes_terminates() {
 #[test]
 fn progressive_feed_preserves_state_validity() {
     let mut rng = XorShift64::new(0xFACE_B00C_5AFE_BABE);
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let mut chunk = [0u8; 128];
     const CHUNKS: usize = 1_000;

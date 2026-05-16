@@ -45,7 +45,7 @@ use bsql_pg_proto::{
 use core::num::NonZeroU64;
 
 mod common;
-use common::{PushOrPanic, mint_reply};
+use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 /// Build a legal `ReadyForQuery` frame: tag `'Z'`, length 5 (self + 1
 /// payload byte), one byte of tx-status.
@@ -148,7 +148,7 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg
 /// a Ping maps 1:1 to a `Sync` frame on the wire.
 #[test]
 fn ping_from_idle_emits_sync_bytes() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     assert!(matches!(proto.state(), ProtoState::Idle));
 
@@ -176,7 +176,7 @@ fn ping_from_idle_emits_sync_bytes() {
 /// no bytes in the read buffer.
 #[test]
 fn rfq_delivers_pong_and_returns_to_idle() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, reply, &mut wb);
@@ -213,7 +213,7 @@ fn rfq_delivers_pong_and_returns_to_idle() {
 /// — the parser must never act on a half-read frame.
 #[test]
 fn partial_rfq_feeds_are_buffered_until_complete() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, _raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, reply, &mut wb);
@@ -255,7 +255,7 @@ fn partial_rfq_feeds_are_buffered_until_complete() {
 /// `DeliverReply` — there is no in-flight ReplyId to deliver to.
 #[test]
 fn rfq_in_idle_is_unexpected_frame() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
@@ -270,7 +270,7 @@ fn rfq_in_idle_is_unexpected_frame() {
 /// caller) and CloseSocket (the connection is desynced) are emitted.
 #[test]
 fn error_response_fails_the_in_flight_ping() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, reply, &mut wb);
@@ -301,7 +301,7 @@ fn error_response_fails_the_in_flight_ping() {
 /// classified and tears the connection down.
 #[test]
 fn malformed_length_fails_and_closes() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, reply, &mut wb);
@@ -350,7 +350,7 @@ fn malformed_length_fails_and_closes() {
 fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
     use bsql_pg_proto::READ_BUF_CAP;
 
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, reply, &mut wb);
@@ -411,7 +411,7 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
 /// is made toward the body.
 #[test]
 fn frame_too_large_is_rejected_pre_buffer() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, reply, &mut wb);
@@ -451,7 +451,7 @@ fn frame_too_large_is_rejected_pre_buffer() {
 /// covered by `compute_push_tests` in protocol.rs.
 #[test]
 fn def198_pipelined_ping_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (first_reply, first_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, first_reply, &mut wb);
@@ -507,7 +507,7 @@ fn build_rfq_frame_with_payload_len(payload_len: usize) -> Vec<u8> {
 #[test]
 fn rfq_with_non_single_byte_payload_is_rejected() {
     for payload_len in [0_usize, 2, 3, 10] {
-        let mut proto = PgProtocol::new();
+        let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
         let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
         ping_setup(&mut proto, reply, &mut wb);
@@ -552,7 +552,7 @@ fn rfq_with_non_single_byte_payload_is_rejected() {
 #[test]
 fn rfq_with_invalid_tx_status_byte_is_rejected() {
     for bad in [b'X', b'\0', b'i', b't', b'e', 0xFF] {
-        let mut proto = PgProtocol::new();
+        let mut proto = fresh_active_via_trust_handshake();
         let mut wb = bsql_pg_proto::WriteBuf::new();
         let (reply, _ping_raw) = mint_reply::<PingKind>(&mut proto);
         ping_setup(&mut proto, reply, &mut wb);
@@ -588,7 +588,7 @@ fn rfq_with_invalid_tx_status_byte_is_rejected() {
 /// ordering / action-presence assumption).
 #[test]
 fn errored_state_is_terminal_and_drops_subsequent_frames() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, _ping_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, reply, &mut wb);
@@ -648,7 +648,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
 /// caller-side recovery without synthesising a fake reply id.
 #[test]
 fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, first_reply, &mut wb);
@@ -701,7 +701,7 @@ fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
 /// must complete the ping flow cleanly.
 #[test]
 fn notice_response_mid_flight_is_silently_consumed() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, reply, &mut wb);

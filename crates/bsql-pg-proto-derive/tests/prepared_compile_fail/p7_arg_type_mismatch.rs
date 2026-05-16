@@ -26,11 +26,23 @@
 //! # Memo cross-reference
 //!
 //! Memo §7 Probe P7.
+//!
+//! # DEF-246 Phase 2 migration (2026-05-16)
+//!
+//! Pre-DEF-246 the probe used `PgProtocol::new() -> <ActivePhase>` +
+//! `as_ready()` to obtain a `ReadyGuard`. Post-DEF-246 the
+//! constructor returns `<DisconnectedPhase>`; the handshake must
+//! complete (`push_startup → ConnectingPhase` + auth frames +
+//! `into_active`) to reach `<ActivePhase>`. The probe drives a
+//! synthetic Trust handshake inline so the type-mismatch check at
+//! `execute_prepared` is the FIRST compile-time failure.
 
 extern crate bsql_pg_proto;
 
-use bsql_pg_proto::{prepared, FetchRows, PgProtocol, PreparedQuery, WriteBuf};
-use bsql_pg_proto::reply_id::QueryKind;
+use bsql_pg_proto::{
+    prepared, Credentials, FetchRows, Ident, IntoActiveError, PgProtocol, PreparedQuery, WriteBuf,
+};
+use bsql_pg_proto::reply_id::{QueryKind, StartupKind};
 
 const Q_INT4: PreparedQuery<(i32,), ()> = prepared!(
     "DELETE FROM users WHERE id = $1::int4"
@@ -39,6 +51,42 @@ const Q_INT4: PreparedQuery<(i32,), ()> = prepared!(
 fn main() {
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
+    let startup_reply = proto.next_reply_id::<StartupKind>();
+    let user = match Ident::try_from_str("u") {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let mut proto = {
+        let (_, p) = match proto.push_startup(
+            user,
+            None,
+            None,
+            Credentials::Trust,
+            startup_reply,
+            &mut wb,
+        ) {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        p
+    };
+
+    // Drive AuthOk + RFQ.
+    if proto.feed_inbound(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).is_err() {
+        return;
+    }
+    let _ = proto.advance_one_frame(&mut wb);
+    if proto.feed_inbound(&[b'Z', 0, 0, 0, 5, b'I']).is_err() {
+        return;
+    }
+    let _ = proto.advance_one_frame(&mut wb);
+
+    let mut proto = match proto.into_active() {
+        Ok(p) => p,
+        Err(IntoActiveError::Closed(_)) => return,
+        Err(IntoActiveError::StillConnecting(_)) => return,
+    };
+
     let reply = proto.next_reply_id::<QueryKind>();
     let g = match proto.as_ready() {
         Some(g) => g,

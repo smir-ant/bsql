@@ -38,7 +38,7 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::{PushOrPanic, mint_reply};
+use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 // ------------------------------------------------------------------
 // Frame builders — pure functions, no protocol state. Each builder
@@ -176,7 +176,7 @@ fn simple_query_setup(
 /// the terminal Z.
 #[test]
 fn select_zero_rows_end_to_end() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, reply, &mut wb);
@@ -231,7 +231,7 @@ fn select_zero_rows_end_to_end() {
 /// tag (`"INSERT 0 3"`, `"UPDATE 7"`, …).
 #[test]
 fn dml_no_rows_end_to_end() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, reply, &mut wb);
@@ -269,7 +269,7 @@ fn dml_no_rows_end_to_end() {
 /// an empty `command_tag`.
 #[test]
 fn empty_query_yields_empty_tag() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, reply, &mut wb);
@@ -299,7 +299,7 @@ fn empty_query_yields_empty_tag() {
 /// query-level errors; the connection must survive.
 #[test]
 fn query_error_emits_fail_reply_and_connection_survives() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, reply, &mut wb);
@@ -351,7 +351,7 @@ fn query_error_emits_fail_reply_and_connection_survives() {
 /// state is preserved (caller must drive `feed_bytes` to drain).
 #[test]
 fn def198_simple_query_while_in_flight_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, first_reply, &mut wb);
@@ -390,7 +390,7 @@ fn def198_simple_query_while_in_flight_blocked_at_compile_time() {
 /// `ConnectionStatus::Errored(kind)` exposes the underlying cause.
 #[test]
 fn def198_simple_query_on_errored_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Force an Errored state: feed an unexpected frame from Idle.
@@ -426,7 +426,7 @@ fn def198_simple_query_on_errored_blocked_at_compile_time() {
 /// connection down — no silent recovery of a wire-framing desync.
 #[test]
 fn malformed_command_complete_no_nul_terminator_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, reply, &mut wb);
@@ -454,7 +454,7 @@ fn malformed_command_complete_no_nul_terminator_tears_down() {
 /// is classified as UnexpectedFrame — desync.
 #[test]
 fn unexpected_rfq_during_await_first_response_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, reply, &mut wb);
@@ -510,7 +510,7 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
 /// payload carries `row_desc: None` by construction, not by discipline.
 #[test]
 fn dml_after_select_clears_row_desc() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Query 1: SELECT with 1 TEXT column. Schema lives in the
@@ -593,7 +593,7 @@ fn dml_after_select_clears_row_desc() {
 /// - byte 5+len(sql): NUL terminator
 #[test]
 fn query_frame_wire_format() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     let sent = simple_query_setup(&mut proto, reply, &mut wb);

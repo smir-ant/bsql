@@ -49,7 +49,7 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::PushOrPanic;
+use common::{PushOrPanic, fresh_active_via_trust_handshake};
 
 fn ident(s: &str) -> Ident {
     match Ident::try_from_str(s) {
@@ -64,7 +64,7 @@ fn ident(s: &str) -> Ident {
 
 #[test]
 fn def198_idle_state_yields_ready_guard() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     assert!(
         proto.as_ready().is_some(),
         "fresh PgProtocol::new() must yield Some(ReadyGuard)",
@@ -82,7 +82,7 @@ fn def198_idle_state_yields_ready_guard() {
 
 #[test]
 fn def198_idle_after_drain_yields_ready_guard() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Push + drain Ping; final state should be Idle.
@@ -108,7 +108,7 @@ fn def198_idle_after_drain_yields_ready_guard() {
 
 #[test]
 fn def198_ping_awaiting_classifies_busy() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let reply = proto.next_reply_id::<PingKind>();
@@ -136,7 +136,7 @@ fn def198_ping_awaiting_classifies_busy() {
 
 #[test]
 fn def198_simple_query_awaiting_classifies_busy() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let reply = proto.next_reply_id::<QueryKind>();
@@ -180,20 +180,28 @@ fn def198_simple_query_awaiting_classifies_busy() {
 
 #[test]
 fn def198_connecting_startup_classifies_handshaking() {
+    // DEF-246 Phase 2/3 (2026-05-16): the only path to a Connecting
+    // protocol is `<DisconnectedPhase>::push_startup(...)` consume-
+    // self. Use a fresh `<DisconnectedPhase>` and drive it through
+    // push_startup to land in `<ConnectingPhase>`; the `<ConnectingPhase>`
+    // accessors mirror the `<ActivePhase>` shape (`connection_status`,
+    // `state`, `as_ready` — the last always returns None during
+    // handshake by construction).
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
     let reply = proto.next_reply_id::<StartupKind>();
-    proto.push_or_panic(
-        bsql_pg_proto::push_command::Startup {
-            user: ident("testuser"),
-            database: None,
-            app_name: None,
-            credentials: Credentials::Trust,
-            reply,
-        },
+    let (_actions, mut proto) = match proto.push_startup(
+        ident("testuser"),
+        None,
+        None,
+        Credentials::Trust,
+        reply,
         &mut wb,
-    );
+    ) {
+        Ok(p) => p,
+        Err(f) => panic!("push_startup must succeed for Trust, got {:?}", f.cause),
+    };
 
     assert!(matches!(
         proto.state(),
@@ -227,7 +235,7 @@ fn def198_connecting_startup_classifies_handshaking() {
 fn def198_errored_classifies_errored_with_kind() {
     use bsql_pg_proto::error::ErrorKind;
 
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Force Errored: unsolicited Z in Idle.
@@ -262,7 +270,7 @@ fn def198_errored_classifies_errored_with_kind() {
 
 #[test]
 fn def198_ready_guard_consumes_on_push() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Mint reply BEFORE acquiring the guard. The guard borrows proto
@@ -309,7 +317,7 @@ fn def198_ready_guard_consumes_on_push() {
 
 #[test]
 fn def198_ready_guard_drop_without_push_preserves_state() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
 
     // Acquire and drop without pushing.
     drop(proto.as_ready());

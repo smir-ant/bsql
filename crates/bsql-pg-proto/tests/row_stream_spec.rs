@@ -61,7 +61,7 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::{PushOrPanic, mint_reply};
+use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 // ------------------------------------------------------------------
 // Frame builders — pure functions, mirror `simple_query_spec` shapes.
@@ -158,7 +158,7 @@ fn push_simple_query(proto: &mut PgProtocol, reply: ReplyId<QueryKind>, wb: &mut
 /// `Got × N → EndRow × N → EndQuery(Ok(QueryComplete))`.
 #[test]
 fn multi_row_select_end_to_end() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -221,7 +221,7 @@ fn multi_row_select_end_to_end() {
 /// `NeedMore`, even if the read buffer still holds bytes.
 #[test]
 fn drained_after_end_query_emits_need_more() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -263,7 +263,7 @@ fn drained_after_end_query_emits_need_more() {
 /// exactly once, then the stream drains.
 #[test]
 fn errored_state_emits_end_query_err_once_then_need_more() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -305,7 +305,7 @@ fn errored_state_emits_end_query_err_once_then_need_more() {
 /// stream drain is deterministic.
 #[test]
 fn fast_path_empty_data_row_body_is_malformed() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -351,7 +351,7 @@ fn fast_path_empty_data_row_body_is_malformed() {
 /// `NeedMore`.
 #[test]
 fn feed_overflow_returns_tiny_read_buf_full_err() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -380,7 +380,7 @@ fn feed_overflow_returns_tiny_read_buf_full_err() {
 /// through the slow path to `EndQuery::Err(ServerErrorResponse)`.
 #[test]
 fn server_error_response_surfaces_as_end_query_err() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -421,7 +421,7 @@ fn server_error_response_surfaces_as_end_query_err() {
 /// `EndQuery::Err` replaces the would-be `EndQuery::Ok` terminal.
 #[test]
 fn rows_before_mid_stream_error_are_preserved() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -470,7 +470,7 @@ fn rows_before_mid_stream_error_are_preserved() {
 /// are preserved; the terminal is `EndQuery::Err(MalformedCommandComplete)`.
 #[test]
 fn rows_preserved_when_command_complete_malformed() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -518,7 +518,7 @@ fn rows_preserved_when_command_complete_malformed() {
 /// boundaries; rows split across feeds are emitted in order.
 #[test]
 fn rows_across_multiple_feed_calls() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -603,7 +603,7 @@ fn rows_across_multiple_feed_calls() {
 /// `FromPgBinary`.
 #[test]
 fn got_bytes_decode_per_column() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -676,7 +676,7 @@ fn got_bytes_decode_per_column() {
 /// reconstruct Rust values. User-level API that Phase 2 macros target.
 #[test]
 fn end_to_end_decode_typed_row() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -791,7 +791,7 @@ fn end_to_end_decode_typed_row() {
 /// the Errored state.
 #[test]
 fn drop_mid_stream_installs_errored() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -841,7 +841,7 @@ fn drop_mid_stream_installs_errored() {
 /// (workspace default). Use `catch_unwind` to assert the post-state.
 #[test]
 fn drop_on_closure_panic_installs_errored() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);
@@ -891,7 +891,7 @@ fn drop_on_closure_panic_installs_errored() {
 /// the entire body decodes correctly.
 #[test]
 fn partial_frame_mode_streams_huge_data_row() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _q_raw) = mint_reply::<QueryKind>(&mut proto);
     push_simple_query(&mut proto, reply, &mut wb);

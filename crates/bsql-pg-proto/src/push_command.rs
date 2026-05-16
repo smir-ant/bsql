@@ -45,8 +45,13 @@
 #![allow(private_interfaces, private_bounds)]
 
 use crate::command::FetchRows;
-use crate::ident::{ApplicationName, DatabaseName, Ident, PortalName, StmtName};
-use crate::password::Credentials;
+use crate::ident::{PortalName, StmtName};
+// DEF-246 Phase 2 (2026-05-16): `ApplicationName`, `DatabaseName`,
+// `Ident`, `Credentials` were used by the deleted
+// `pub struct Startup` + `impl PushCommand for Startup`. They live
+// on `<DisconnectedPhase>::push_startup`'s signature directly
+// (`use crate::ident::{ApplicationName, DatabaseName, Ident}` /
+// `use crate::password::Credentials` inside `mod protocol`).
 use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
     StartupKind,
@@ -83,7 +88,7 @@ mod sealed {
 #[expect(private_interfaces, private_bounds, reason = "sealed-trait pattern: trait method takes pub(crate) types — external crates cannot construct them or implement the trait, so the leakage is cosmetic only. Migrated #[allow]→#[expect] (Rust 1.81): if the referenced types become `pub`, the lint no longer fires, prompting attribute removal.")]
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid client→server command",
-    label = "valid commands are the per-command structs in `push_command`: `Ping`, `Flush`, `Startup`, `Parse`, `Close`, `DescribeStatement`, `DescribePortal`, `SimpleQuery`, `BindExecute`, `BindPrepared<P, R>` (DEF-244)",
+    label = "valid commands are the per-command structs in `push_command`: `Ping`, `Parse`, `DescribeStatement`, `DescribePortal`, `SimpleQuery`, `BindExecute`, `BindPrepared<P, R>` (DEF-244). For startup, see `PgProtocol::<DisconnectedPhase>::push_startup` (DEF-246 Phase 2).",
     note = "`PushCommand` is sealed — external crates cannot add command variants; extend the closed set inside `bsql-pg-proto::push_command` paired with the matching dispatcher arm and state-machine transition"
 )]
 pub trait PushCommand: sealed::PushCommandSealed {
@@ -235,58 +240,14 @@ impl PushCommand for Ping {
     }
 }
 
-/// Initiate the PostgreSQL startup handshake.
-///
-/// Builds and sends a `StartupMessage` frame. The protocol then
-/// navigates the authentication exchange (trust / SCRAM / Cleartext /
-/// MD5) followed by the post-auth chain (ParameterStatus,
-/// BackendKeyData, ReadyForQuery) before transitioning to
-/// [`crate::ProtoState::Idle`] and emitting
-/// [`crate::Reply::StartupComplete`].
-#[derive(Debug)]
-#[must_use = "a Startup has no effect until passed to push_command"]
-pub struct Startup {
-    /// The PostgreSQL user to authenticate as.
-    pub user: Ident,
-    /// Optional database name (defaults to user name on the server).
-    pub database: Option<DatabaseName>,
-    /// Optional application name for `application_name` parameter.
-    pub app_name: Option<ApplicationName>,
-    /// Authentication credentials.
-    pub credentials: Credentials,
-    /// Correlator for the Startup command.
-    pub reply: ReplyId<StartupKind>,
-}
-
-impl sealed::PushCommandSealed for Startup {}
-
-impl PushCommand for Startup {
-    type Output = ();
-    type PostState = StartupPostInstall;
-
-    #[inline]
-    fn execute<'sql>(
-        self,
-        setter: crate::state_setter::StateSetter<'_, Self::PostState>,
-        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-        staged: &mut crate::action::StagedActions<'sql>,
-        reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-    )
-    where
-        Self: 'sql,
-    {
-        crate::protocol::compute_push_startup_idle_only(
-            setter,
-            self.user,
-            self.database,
-            self.app_name,
-            self.credentials,
-            self.reply,
-            staged,
-            reserved,
-        );
-    }
-}
+// DEF-246 Phase 2 (2026-05-16): `pub struct Startup` +
+// `impl PushCommand for Startup` DELETED. The handshake entry-point
+// is now `PgProtocol<DisconnectedPhase>::push_startup(...)`
+// (consume-self → `<ConnectingPhase>`). Tier-1 elevation #1:
+// the only legal path into a Connecting state is from
+// `<DisconnectedPhase>`; pushing a Startup command from a Ready
+// `<ActivePhase>` is method-absent E0599 by construction (the struct
+// physically does not exist).
 
 /// Execute a single SQL statement via PG's Simple Query protocol
 /// (`Q`-frame).

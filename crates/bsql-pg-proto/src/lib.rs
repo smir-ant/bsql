@@ -353,8 +353,8 @@ pub use ident::{
 };
 pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{
-    ActivePhase, ClosedPhase, ConnectingPhase, DisconnectedPhase, MAX_ACTIONS_PER_CALL,
-    MAX_STAGED_PER_CALL, PgProtocol, SealedPhase,
+    ActivePhase, ClosedPhase, ConnectingPhase, DisconnectedPhase, IntoActiveError,
+    MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL, PgProtocol, SealedPhase,
 };
 pub use reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,

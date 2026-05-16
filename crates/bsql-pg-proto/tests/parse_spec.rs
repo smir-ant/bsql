@@ -26,7 +26,7 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::{PushOrPanic, mint_reply};
+use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 // DEF-160 Z2 (2026-05-11): the `fn sql(s) -> Sql` helper is gone —
 // `push_command::Parse.sql` is `&'a str`, fixtures pass `&str` literals
@@ -132,7 +132,7 @@ fn parse_setup(
 /// `Reply::ParseComplete` on the terminal RFQ.
 #[test]
 fn parse_success_end_to_end() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<ParseKind>(&mut proto);
     parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", reply, &mut wb);
@@ -167,7 +167,7 @@ fn parse_success_end_to_end() {
 /// `Z` after `E`).
 #[test]
 fn parse_error_is_recoverable() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<ParseKind>(&mut proto);
     parse_setup(&mut proto, stmt_unnamed(), "SELECT 1/0", reply, &mut wb);
@@ -207,7 +207,7 @@ fn parse_error_is_recoverable() {
 /// + NUL + SQL + NUL + i16(0).
 #[test]
 fn parse_frame_wire_format_with_named_statement() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<ParseKind>(&mut proto);
     let Ok(name) = StmtName::try_from_str("my_stmt") else {
@@ -262,7 +262,7 @@ fn parse_frame_wire_format_with_named_statement() {
 /// only the public API contract.
 #[test]
 fn def198_parse_while_parse_in_flight_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<ParseKind>(&mut proto);
     parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", first_reply, &mut wb);
@@ -305,7 +305,7 @@ fn def198_parse_while_parse_in_flight_blocked_at_compile_time() {
 /// (typically: discard the connection, return to pool with disposal).
 #[test]
 fn def198_parse_on_errored_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Force Errored via an unsolicited Z in Idle.
@@ -342,7 +342,7 @@ fn def198_parse_on_errored_blocked_at_compile_time() {
 /// desync.
 #[test]
 fn parse_unexpected_frame_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<ParseKind>(&mut proto);
     parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", reply, &mut wb);

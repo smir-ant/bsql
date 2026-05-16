@@ -62,7 +62,10 @@ use bsql_pg_proto::{
 };
 
 mod common;
-use common::{PushOrPanic, mint_reply, split_bind_execute_sync, split_frame_plus_sync};
+use common::{
+    PushOrPanic, fresh_active_via_trust_handshake, mint_reply, split_bind_execute_sync,
+    split_frame_plus_sync,
+};
 
 fn stmt_unnamed() -> StmtName {
     StmtName::default()
@@ -196,7 +199,7 @@ fn describe_portal_setup(
 /// `param_oids` and `rows: DescribedRows::Rows(..)` on the terminal RFQ.
 #[test]
 fn describe_statement_with_rows_success_end_to_end() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -241,7 +244,7 @@ fn describe_statement_with_rows_success_end_to_end() {
 /// payload carries `DescribedRows::NoData`.
 #[test]
 fn describe_statement_no_data_success_end_to_end() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -271,7 +274,7 @@ fn describe_statement_no_data_success_end_to_end() {
 /// `param_oids.is_empty() == true`.
 #[test]
 fn describe_statement_zero_params_ok() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -300,7 +303,7 @@ fn describe_statement_zero_params_ok() {
 /// accepted, not rejected as too-many.
 #[test]
 fn describe_statement_max_params_ok() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -329,7 +332,7 @@ fn describe_statement_max_params_ok() {
 /// `D | len | 'S' | name | NUL`.
 #[test]
 fn describe_statement_frame_wire_format_with_named_statement() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     let Ok(name) = StmtName::try_from_str("my_stmt") else {
@@ -371,7 +374,7 @@ fn describe_statement_frame_wire_format_with_named_statement() {
 /// no `param_oids` field (type-level — can't be asked).
 #[test]
 fn describe_portal_with_rows_success_end_to_end() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
     describe_portal_setup(&mut proto, portal_unnamed(), reply, &mut wb);
@@ -408,7 +411,7 @@ fn describe_portal_with_rows_success_end_to_end() {
 /// Invariant (spec): portal-describe NoData branch.
 #[test]
 fn describe_portal_no_data_success_end_to_end() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
     describe_portal_setup(&mut proto, portal_unnamed(), reply, &mut wb);
@@ -433,7 +436,7 @@ fn describe_portal_no_data_success_end_to_end() {
 /// `D | len | 'P' | name | NUL`.
 #[test]
 fn describe_portal_frame_wire_format_with_named_portal() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
     let Ok(name) = PortalName::try_from_str("my_portal") else {
@@ -467,7 +470,7 @@ fn describe_portal_frame_wire_format_with_named_portal() {
 /// unknown statement name) → FailReply + drain + Idle.
 #[test]
 fn describe_statement_error_at_param_desc_is_recoverable() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -506,7 +509,7 @@ fn describe_statement_error_at_param_desc_is_recoverable() {
 /// indistinguishable from early for recoverable-vs-fatal purposes.
 #[test]
 fn describe_statement_error_at_row_desc_stage_is_recoverable() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -529,7 +532,7 @@ fn describe_statement_error_at_row_desc_stage_is_recoverable() {
 /// Invariant (spec): portal-describe `'E'` → FailReply + drain + Idle.
 #[test]
 fn describe_portal_error_response_is_recoverable() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
     describe_portal_setup(&mut proto, portal_unnamed(), reply, &mut wb);
@@ -559,7 +562,7 @@ fn describe_portal_error_response_is_recoverable() {
 /// sequence.
 #[test]
 fn describe_statement_row_desc_before_param_desc_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -585,7 +588,7 @@ fn describe_statement_row_desc_before_param_desc_tears_down() {
 /// statement-describe MUST emit `'t'` first.
 #[test]
 fn describe_statement_no_data_before_param_desc_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -610,7 +613,7 @@ fn describe_statement_no_data_before_param_desc_tears_down() {
 /// §55.2.2). A `'t'` arrival is UnexpectedFrame → tear-down.
 #[test]
 fn describe_portal_param_desc_is_unexpected_and_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribePortalKind>(&mut proto);
     describe_portal_setup(&mut proto, portal_unnamed(), reply, &mut wb);
@@ -635,7 +638,7 @@ fn describe_portal_param_desc_is_unexpected_and_tears_down() {
 /// RowDescription which DECLARES columns, not actual rows).
 #[test]
 fn describe_statement_data_row_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -663,7 +666,7 @@ fn describe_statement_data_row_tears_down() {
 /// as `MalformedParameterDescription`, not as a silent parse.
 #[test]
 fn describe_statement_malformed_param_desc_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -696,7 +699,7 @@ fn describe_statement_malformed_param_desc_tears_down() {
 /// is a structural rejection.
 #[test]
 fn describe_statement_too_many_params_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -724,7 +727,7 @@ fn describe_statement_too_many_params_tears_down() {
 /// final describe-stage RFQ classifies as MalformedReadyForQuery.
 #[test]
 fn describe_statement_malformed_rfq_tears_down() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
@@ -756,7 +759,7 @@ fn describe_statement_malformed_rfq_tears_down() {
 /// surfaces the underlying cause for caller recovery.
 #[test]
 fn def198_describe_statement_on_errored_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Force Errored via an unsolicited Z in Idle.
@@ -779,7 +782,7 @@ fn def198_describe_statement_on_errored_blocked_at_compile_time() {
 /// blocked at the public API.
 #[test]
 fn def198_describe_portal_on_errored_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     let unsolicited = frame(TAG_READY_FOR_QUERY.byte(), b"I");
@@ -801,7 +804,7 @@ fn def198_describe_portal_on_errored_blocked_at_compile_time() {
 /// (caller must drive `feed_bytes` to drain).
 #[test]
 fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), first_reply, &mut wb);
@@ -834,7 +837,7 @@ fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
 /// exclusive single-command shapes; pipelining lands in 1c-5.
 #[test]
 fn def198_describe_statement_while_describe_portal_in_flight_blocked() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<DescribePortalKind>(&mut proto);
     describe_portal_setup(&mut proto, portal_unnamed(), first_reply, &mut wb);
@@ -861,7 +864,7 @@ fn def198_describe_statement_while_describe_portal_in_flight_blocked() {
 /// flight is structurally blocked.
 #[test]
 fn def198_describe_statement_while_bind_execute_in_flight_blocked() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Start a BindExecute (DML path, row_desc=None).
@@ -941,7 +944,7 @@ fn describe_target_byte_portal_pins_to_p() {
 /// `Idle` even after another command ended cleanly.
 #[test]
 fn describe_after_completed_parse_starts_clean() {
-    let mut proto = PgProtocol::new();
+    let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
     // Run a Parse to completion.

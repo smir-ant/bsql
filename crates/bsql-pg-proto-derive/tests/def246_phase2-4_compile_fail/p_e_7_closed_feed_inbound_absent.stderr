@@ -1,0 +1,9 @@
+error[E0599]: no method named `feed_inbound` found for struct `PgProtocol<ClosedPhase>` in the current scope
+  --> tests/def246_phase2-4_compile_fail/p_e_7_closed_feed_inbound_absent.rs:38:20
+   |
+38 |     let _ = closed.feed_inbound(&[]);
+   |                    ^^^^^^^^^^^^ method not found in `PgProtocol<ClosedPhase>`
+   |
+   = note: the method was found for
+           - `PgProtocol`
+           - `PgProtocol<ConnectingPhase>`
