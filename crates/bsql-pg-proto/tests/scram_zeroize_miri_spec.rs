@@ -4,9 +4,9 @@
 //! # Scope
 //!
 //! Verifies that dropping a `ScramSession` actually overwrites the
-//! password bytes in memory. Uses pointer-based probing — available
-//! only under Miri (which checks UB-free reads) or explicit opt-in
-//! via `RUST_TEST_NOCAPTURE=1 cargo test -- --ignored`.
+//! password bytes in memory. Uses pointer-based probing — runs in
+//! debug mode (default `cargo test`); Miri provides UB-free
+//! verification on top (`cargo +nightly miri test`).
 //!
 //! # Why unsafe here is acceptable
 //!
@@ -74,12 +74,7 @@ unsafe fn read_bytes_at(ptr: *const u8, len: usize) -> Vec<u8> {
 /// Under regular `cargo test`: runs and usually passes (release-
 /// profile compiler may have optimized the move differently — see
 /// module docs).
-///
-/// Marked `#[ignore]` for regular test runs to avoid flakiness on
-/// architectures/compilers that optimize away the stack frame; run
-/// explicitly via `cargo test -- --ignored` or under Miri.
 #[test]
-#[ignore = "memory-probe: run via cargo miri test or --ignored"]
 fn password_drop_zeros_backing_buffer() {
     // Magic password bytes so we can visually confirm they were present.
     const MAGIC: &[u8] = b"zeroize-probe-magic-XYZ";
@@ -113,8 +108,7 @@ fn password_drop_zeros_backing_buffer() {
     // scope ended), but the physical memory at `ptr` is still within
     // THIS function's stack frame. Miri permits this read under the
     // stacked-borrows model; regular cargo-test also permits but
-    // behavior is compiler-dependent. The test is `#[ignore]` by
-    // default for this reason.
+    // behavior is compiler-dependent.
     let post_drop = unsafe { read_bytes_at(ptr, len) };
     assert!(
         post_drop.iter().all(|&b| b == 0),
@@ -124,7 +118,6 @@ fn password_drop_zeros_backing_buffer() {
 
 /// DEF-185 P3-1: Same invariant for `Sensitive<Password>`.
 #[test]
-#[ignore = "memory-probe: run via cargo miri test or --ignored"]
 fn sensitive_password_drop_zeros_backing_buffer() {
     const MAGIC: &[u8] = b"sensitive-zeroize-probe";
 

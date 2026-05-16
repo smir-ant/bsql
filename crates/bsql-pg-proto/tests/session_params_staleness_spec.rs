@@ -80,7 +80,6 @@ fn def205_session_params_is_non_copy() {
 /// Verifies via raw-pointer probe that an `application_name`
 /// populated with magic bytes is zeroed after `clear()`.
 #[test]
-#[ignore = "memory-probe: run via `cargo test -- --ignored` or `cargo miri test`"]
 fn def205_clear_zeroizes_populated_fields() {
     const MAGIC_APP: &str = "DEPLOYMENT-MAGIC-APP-NAME-XYZ-1234567890";
     const MAGIC_VER: &str = "SERVER-VERSION-MAGIC";
@@ -170,7 +169,6 @@ fn def205_clear_zeroizes_populated_fields() {
 /// (server sends multiple `ParameterStatus` frames overwriting
 /// previously-cached values).
 #[test]
-#[ignore = "memory-probe: run via `cargo test -- --ignored` or `cargo miri test`"]
 fn def205_overwrite_zeroizes_old_value() {
     const FIRST: &str = "FIRST-APPLICATION-NAME-MAGIC-XYZ";
     const SECOND: &str = "second";

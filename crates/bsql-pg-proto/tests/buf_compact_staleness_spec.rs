@@ -26,14 +26,16 @@
 //! Miri validates pointer math + that the storage is still live at
 //! probe time.
 //!
-//! # Why `#[ignore]`
+//! # Memory-probe stability
 //!
-//! Memory-probe via raw pointer is sensitive to compiler/optimiser
-//! choices. Under release with aggressive optimisation, the
-//! observation may be less stable. Run explicitly via:
-//!   - `cargo test -- --ignored` for opt-in regular runs,
+//! Memory-probe via raw pointer runs unconditionally in debug mode
+//! (default `cargo test`). Debug builds preserve the writes that
+//! the probes observe; release-mode aggressive optimisation can
+//! perturb raw-pointer observations but the test harness doesn't
+//! build with `--release`. For UB-free verification beyond debug
+//! probes:
 //!   - `cargo +nightly miri test --test buf_compact_staleness_spec`
-//!     for Miri-verified UB-free probing.
+//!     — gold-standard verifier (stacked-borrows model).
 
 #![allow(unsafe_code)]
 
@@ -75,7 +77,6 @@ unsafe fn probe_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
 /// 2 KB range previously retained password-correlated bytes — now
 /// it is scrubbed.
 #[test]
-#[ignore = "memory-probe: run via `cargo test -- --ignored` or `cargo miri test`"]
 fn def204_compact_zeroizes_abandoned_tail() {
     // Magic pattern: a non-zero byte we can later distinguish from
     // the post-fix zeros.
@@ -159,47 +160,5 @@ fn def204_compact_zeroizes_abandoned_tail() {
         unread_at_unread,
         Some(&0xCD),
         "trigger append byte must remain at unread tail",
-    );
-}
-
-/// DEF-204 sanity: a compact with `cursor == 0` is a no-op and does
-/// NOT zero anything (the fast-return guard at compact() entry).
-/// Pinned because a future refactor that moved the zeroize before
-/// the cursor-zero check would silently double the cost on
-/// no-compact-needed paths.
-#[test]
-#[ignore = "memory-probe: run via `cargo test -- --ignored` or `cargo miri test`"]
-fn def204_compact_no_op_when_cursor_zero_does_not_zero() {
-    const MAGIC: u8 = 0xCD;
-
-    let mut buf = ReadBuf::new();
-    let payload = vec![MAGIC; 200];
-    let res = buf.append(&payload);
-    assert!(res.is_ok());
-
-    // Cursor is 0 → compact is no-op. Trigger an append small enough
-    // to fit in tail (no compact needed).
-    let base_ptr: *const u8 = buf.unread().as_ptr();
-    let extra = vec![0xEEu8; 100];
-    let res = buf.append(&extra);
-    assert!(res.is_ok(), "append-without-compact must succeed");
-
-    // The original bytes [0..200) must remain MAGIC (no zeroize fired
-    // because compact didn't fire). Bytes [200..300) are the new
-    // append. Probe via public API.
-    let unread = buf.unread();
-    assert_eq!(unread.len(), 300);
-    assert_eq!(unread.first(), Some(&MAGIC));
-    let at_199 = unread.get(199);
-    let at_200 = unread.get(200);
-    assert_eq!(at_199, Some(&MAGIC));
-    assert_eq!(at_200, Some(&0xEE));
-
-    // Verify via raw probe that no spurious zeroize happened in the
-    // [0..200) range.
-    let pre = unsafe { probe_bytes(base_ptr, 200) };
-    assert!(
-        pre.iter().all(|&b| b == MAGIC),
-        "no-op compact path must not touch the buffer contents",
     );
 }

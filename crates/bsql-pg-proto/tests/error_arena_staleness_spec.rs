@@ -98,7 +98,6 @@ fn def205_error_payload_is_non_copy() {
 /// Captures raw pointers to the message/detail/hint buffers,
 /// drops the payload, then probes memory. Post-Drop: all zeros.
 #[test]
-#[ignore = "memory-probe: run via `cargo test -- --ignored` or `cargo miri test`"]
 fn def205_error_payload_drop_zeroizes_all_fields() {
     const MAGIC_M: &str = "ERROR-MESSAGE-MAGIC-XYZ-1234";
     const MAGIC_D: &str = "DETAIL-MAGIC-ABCDEFGH";
@@ -157,7 +156,6 @@ fn def205_error_payload_drop_zeroizes_all_fields() {
 /// `ErrorArena::alloc()` path: allocating a new payload over an
 /// existing slot invokes `Some(old) → Drop`.
 #[test]
-#[ignore = "memory-probe: run via `cargo test -- --ignored` or `cargo miri test`"]
 fn def205_error_payload_overwrite_zeroizes_old_value() {
     const FIRST: &str = "FIRST-MAGIC-XYZ";
     const SECOND: &str = "second";

@@ -26,12 +26,12 @@
 //! same pattern as the existing memory-probe specs. Miri validates
 //! pointer math + that the storage is still live at probe time.
 //!
-//! # `#[ignore]` gating
+//! # Memory-probe stability
 //!
-//! Memory-probe via raw pointer is sensitive to compiler/optimiser
-//! choices. Run via `cargo test -- --ignored` or
-//! `cargo +nightly miri test --test secret_bounded_str_spec` for
-//! Miri-verified UB-free probing.
+//! Memory-probe via raw pointer runs unconditionally in debug mode
+//! (default `cargo test`). For UB-free verification under Miri's
+//! stacked-borrows model:
+//!   - `cargo +nightly miri test --test secret_bounded_str_spec`
 
 #![allow(unsafe_code)]
 
@@ -161,7 +161,6 @@ fn debug_redacts_content() {
 /// type were Copy or had no Drop, the buffer would retain its
 /// content past scope exit until the stack frame is reused.
 #[test]
-#[ignore = "memory-probe: run via `cargo test -- --ignored` or `cargo miri test`"]
 fn def205_drop_zeroizes_buffer() {
     const MAGIC: &str = "zeroize-probe-MAGIC-XYZ-1234567890";
 
@@ -197,7 +196,6 @@ fn def205_drop_zeroizes_buffer() {
 /// `Option<T> = None` and `*self = Self::new()` patterns: the
 /// language semantics guarantee Drop firing on overwrite.
 #[test]
-#[ignore = "memory-probe: run via `cargo test -- --ignored` or `cargo miri test`"]
 fn def205_overwrite_zeroizes_old_value() {
     const FIRST: &str = "first-secret-MAGIC";
     const SECOND: &str = "second";
