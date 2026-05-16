@@ -352,7 +352,10 @@ pub use ident::{
     ApplicationName, DatabaseName, Ident, IdentError, PortalName, SecretBoundedStr, Sql, StmtName,
 };
 pub use password::{Credentials, Password, PasswordError};
-pub use protocol::{MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL, PgProtocol};
+pub use protocol::{
+    ActivePhase, ClosedPhase, ConnectingPhase, DisconnectedPhase, MAX_ACTIONS_PER_CALL,
+    MAX_STAGED_PER_CALL, PgProtocol, SealedPhase,
+};
 pub use reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,
     ReplyId, ReplyKind, StartupKind,
@@ -774,6 +777,54 @@ const _: () = assert!(
      Permissive ranges forbidden — drift surface > variance cushion \
      (CREDO §3 + §4.12).",
 );
+
+// DEF-246 Phase 1 (2026-05-16): branch-collapse typestate layout pins.
+//
+// `PgProtocol<P: SealedPhase>` is `#[repr(transparent)]` over
+// `PgProtocolInner` + a ZST `PhantomData<fn() -> P>`. Layout MUST be
+// byte-identical for all 4 phases (ZST phantom propagates no bytes;
+// repr(transparent) propagates inner layout). If any of these trips,
+// either (a) PhantomData was rendered non-ZST under a future rustc
+// heuristic (CREDO §3 — file an issue, do NOT relax the pin),
+// (b) repr(transparent) was removed from PgProtocol<P> (review the
+// commit), or (c) a new non-ZST field was added to PgProtocol<P>
+// outside `inner` (architectural violation — Phase 1 forbids this).
+//
+// The `PgProtocolInner == 528` pin is the single source of truth;
+// all 4 phase pins reduce to it via repr(transparent) + ZST phantom.
+const _: () = assert!(
+    core::mem::size_of::<protocol::PgProtocolInner>() == 528,
+    "PgProtocolInner exact size — must match pre-DEF-246 PgProtocol \
+     size. If this trips, a field was added/removed/reshaped on the \
+     inner data struct; audit budget at the original 528 B pin above.",
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::PgProtocol<protocol::DisconnectedPhase>>() == 528,
+    "PgProtocol<DisconnectedPhase> layout drift — should be \
+     byte-identical to PgProtocolInner via repr(transparent) + ZST \
+     PhantomData<fn() -> DisconnectedPhase>.",
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 528,
+    "PgProtocol<ConnectingPhase> layout drift — should be \
+     byte-identical to PgProtocolInner.",
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 528,
+    "PgProtocol<ActivePhase> layout drift — should be byte-identical \
+     to PgProtocolInner. This is also the type that the bare \
+     `PgProtocol` pin above resolves to (via the default phase \
+     parameter), so both pins are over the same concrete type. \
+     Kept separate for documentation: the bare pin pre-dates DEF-246 \
+     (preserved for git-blame continuity), this one names the phase \
+     explicitly.",
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::PgProtocol<protocol::ClosedPhase>>() == 528,
+    "PgProtocol<ClosedPhase> layout drift — should be byte-identical \
+     to PgProtocolInner.",
+);
+
 // DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B
 // post-`new_state` extraction. Pre-(B21/C6) each Advanced variant
 // carried a `ProtoState` payload (712 B); the total enum was dominated

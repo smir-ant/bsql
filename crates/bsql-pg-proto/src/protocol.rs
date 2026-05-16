@@ -523,7 +523,30 @@ pub(crate) fn error_arena_or_init(
 /// `!Sync` by construction (the `sync_marker: PhantomData<Cell<()>>`
 /// field). One task / thread can hold an exclusive borrow at a time —
 /// concurrent `&mut PgProtocol` access is structurally impossible.
-pub struct PgProtocol {
+///
+/// # DEF-246 Phase 1 (2026-05-16)
+///
+/// This is the inner data struct. The public surface is the
+/// [`PgProtocol<P: SealedPhase>`] wrapper below, which is
+/// `#[repr(transparent)]` over `PgProtocolInner` + a ZST
+/// [`PhantomData<fn() -> P>`] phase marker. Layout is byte-identical
+/// to pre-DEF-246 `PgProtocol` — all const-asserts on size hold.
+///
+/// Phase 1 is scaffolding only: all existing methods route through
+/// `impl PgProtocol<ActivePhase>` via the default phase parameter; no
+/// existing caller code changes. Phase 2+ will introduce
+/// phase-conditional methods on `<DisconnectedPhase>`,
+/// `<ConnectingPhase>`, and `<ClosedPhase>` to elevate the
+/// state-transition invariants from §1 of the design memo
+/// (`/tmp/def246-design-memo.md`).
+///
+/// `pub(crate)` visibility keeps inner-field manipulation
+/// within-crate-only. Field-level visibility (no modifier = private to
+/// `mod protocol` plus submodules per Rust visibility rules)
+/// preserves the DEF-272 cluster's token-gated mutation surface
+/// (cells live in private fields; mutations route through token-gated
+/// methods).
+pub(crate) struct PgProtocolInner {
     // DEF-189 hot-path field ordering: per-row fast-path touches
     // `state` (discriminant + reply_id), `row_desc_slot` (Option
     // projection), and `read_buf` (cursor + populated() slice). All
@@ -646,9 +669,9 @@ pub struct PgProtocol {
     // Pre-DEF-189: state variants carried inline `RowDesc` (264 B
     // payload duplicated across BindExecuteSelect's 4 transitions +
     // SimpleQueryStreamingRows + AwaitingRfq). Per-row fast path did
-    // `match &self.state` twice (gate + project). Post-DEF-189:
+    // `match &self.inner.state` twice (gate + project). Post-DEF-189:
     // state strips the schema field entirely; the schema lives in
-    // this slot; fast path does `match &self.state` once + a single
+    // this slot; fast path does `match &self.inner.state` once + a single
     // Option projection.
     //
     // Cost: ~168 B on `PgProtocol` (164 B SoA RowDesc + 1 B
@@ -760,6 +783,174 @@ pub struct PgProtocol {
     /// `_not_sync` (leading-underscore convention for structurally-used
     /// fields is forbidden per user-feedback memory).
     sync_marker: PhantomData<Cell<()>>,
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-246 Phase 1 — Branch-collapse typestate scaffolding (2026-05-16)
+//
+// `PgProtocol<P: SealedPhase>` is a `#[repr(transparent)]` wrapper
+// over `PgProtocolInner` + a ZST `PhantomData<fn() -> P>` phase
+// marker. Layout is byte-identical to pre-DEF-246 `PgProtocol`.
+//
+// Phase 1 deliverables (memo §7.7):
+// - 4 ZST phase markers: DisconnectedPhase / ConnectingPhase /
+//   ActivePhase / ClosedPhase (memo §1 phase taxonomy)
+// - `SealedPhase` super-trait via `_sealed_phase::Sealed` (mirrors
+//   DEF-244 sealed-trait pattern + DEF-272 leaf-token pattern)
+// - `PgProtocol<P: SealedPhase = ActivePhase>` outer wrapper
+// - `Deref` / `DerefMut` from `PgProtocol<P>` to `PgProtocolInner`
+//   (canonical zero-cost-wrapper idiom — `repr(transparent)` + Deref
+//   is the idiomatic Rust pair). Field access via `self.<field>`
+//   continues to work in existing methods without 78 manual
+//   substitutions; the deref coercion is structurally zero-cost
+//   (asm-diff confirms bit-identical hot paths).
+// - Default phase `P = ActivePhase` keeps every existing caller
+//   (`PgProtocol::new()`, type-name `PgProtocol` in tests/benches,
+//   `impl X for PgProtocol`) compiling without changes
+//
+// Tier impact: 0 elevations (scaffolding only). Phase 2-4 land the
+// 3 tier-elevations (push-before-Startup, push-during-Connecting,
+// Errored absorbs input) on top of this scaffolding. Phase 6 removes
+// the default phase parameter for final API stabilisation.
+// ═════════════════════════════════════════════════════════════════════
+
+/// DEF-246 Phase 1 sealed-trait seal for [`SealedPhase`]. Field-private
+/// tuple-struct pattern (mirror of DEF-272 leaf tokens) ensures
+/// downstream code cannot extend the phase set via
+/// `impl SealedPhase for MyPhase`.
+pub(crate) mod _sealed_phase {
+    /// Super-trait seal. Field-less marker. Implemented only for the
+    /// 4 phase types defined in `mod protocol` below.
+    pub trait Sealed {}
+}
+
+/// DEF-246 Phase 1 sealed phase marker trait.
+///
+/// `P: SealedPhase` is the type-level proof that the runtime
+/// [`PgProtocol<P>`] is in phase `P`. The trait is sealed via
+/// [`_sealed_phase::Sealed`]; the 4 implementing types are
+/// [`DisconnectedPhase`], [`ConnectingPhase`], [`ActivePhase`],
+/// [`ClosedPhase`].
+///
+/// Adding a new phase requires an update inside `mod protocol`
+/// (sealed-supertrait pattern — downstream `impl SealedPhase for X`
+/// fails with E0277 on the sealed-supertrait bound).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a sealed phase of `PgProtocol`",
+    label = "phases are `DisconnectedPhase`, `ConnectingPhase`, `ActivePhase`, `ClosedPhase`",
+    note = "the phase set is sealed by `_sealed_phase::Sealed`; downstream cannot add phases. Extend by editing `mod protocol` in the bsql-pg-proto crate."
+)]
+pub trait SealedPhase: _sealed_phase::Sealed + 'static {}
+
+/// DEF-246 Phase 1 — Disconnected phase marker.
+///
+/// `PgProtocol<DisconnectedPhase>` represents a fresh protocol
+/// instance that has not yet sent the Startup message. The legal
+/// operation is `push_startup(...)` (Phase 2 will introduce this).
+/// Pushing a regular command from this phase will be a method-absent
+/// E0599 compile error.
+///
+/// Phase 1: marker only; no phase-conditional methods yet.
+#[derive(Debug, Clone, Copy)]
+pub struct DisconnectedPhase;
+
+/// DEF-246 Phase 1 — Connecting phase marker.
+///
+/// `PgProtocol<ConnectingPhase>` represents the Startup → AuthOk
+/// handshake window. The legal operations are `feed_inbound` /
+/// `advance_one_frame` to consume server-driven auth-flow frames.
+/// Pushing a regular command from this phase will be a method-absent
+/// E0599 compile error (Phase 3 elevation).
+///
+/// Phase 1: marker only.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectingPhase;
+
+/// DEF-246 Phase 1 — Active phase marker.
+///
+/// `PgProtocol<ActivePhase>` represents the post-handshake, ready
+/// state. This is the **default** phase parameter — every existing
+/// caller and impl block continues to compile unchanged because
+/// `PgProtocol` (no explicit phase) resolves to
+/// `PgProtocol<ActivePhase>`.
+///
+/// All existing methods (push, feed, materialise, etc.) live on
+/// `impl PgProtocol<ActivePhase>` in Phase 1.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivePhase;
+
+/// DEF-246 Phase 1 — Closed phase marker.
+///
+/// `PgProtocol<ClosedPhase>` represents a terminally-Errored protocol
+/// instance. The legal operation is `cause()` accessor (Phase 4 will
+/// introduce this). All push / feed paths are method-absent E0599
+/// compile errors (Phase 4 elevation — «Errored absorbs input»).
+///
+/// Phase 1: marker only.
+#[derive(Debug, Clone, Copy)]
+pub struct ClosedPhase;
+
+impl _sealed_phase::Sealed for DisconnectedPhase {}
+impl _sealed_phase::Sealed for ConnectingPhase {}
+impl _sealed_phase::Sealed for ActivePhase {}
+impl _sealed_phase::Sealed for ClosedPhase {}
+
+impl SealedPhase for DisconnectedPhase {}
+impl SealedPhase for ConnectingPhase {}
+impl SealedPhase for ActivePhase {}
+impl SealedPhase for ClosedPhase {}
+
+/// DEF-246 Phase 1 — Phase-typed wrapper over [`PgProtocolInner`].
+///
+/// `#[repr(transparent)]` over a single non-ZST field
+/// (`inner: PgProtocolInner`) and a ZST
+/// [`PhantomData<fn() -> P>`] — layout is byte-identical to
+/// `PgProtocolInner` (and to pre-DEF-246 `PgProtocol`). The
+/// `fn() -> P` phantom shape gives covariant `P` + unconditional
+/// `Send + Sync` of the phantom itself (the wrapper's `!Sync`
+/// inherits from `inner.sync_marker: PhantomData<Cell<()>>` via
+/// `repr(transparent)` auto-trait propagation).
+///
+/// **Default `P = ActivePhase`** — Phase 1 is purely additive: every
+/// existing `PgProtocol::new()`, `let proto: PgProtocol = ...`,
+/// `impl Trait for PgProtocol`, etc., resolves to
+/// `PgProtocol<ActivePhase>`. **No caller code changes in Phase 1.**
+///
+/// # Field-access discipline (foundation for Phase 2+)
+///
+/// Methods inside `impl PgProtocol<P>` access inner fields via
+/// **explicit `self.inner.<field>`** — there is no [`Deref`] /
+/// [`DerefMut`] impl. The explicit projection is load-bearing for
+/// the multi-phase foundation:
+///
+/// 1. **Phase transitions** (`fn into_connecting(self) -> PgProtocol<ConnectingPhase>`)
+///    move `self.inner` into the new wrapper — the boundary is
+///    visible at the call site, not hidden by deref coercion.
+/// 2. **Phase-conditional methods** (Phase 2+: `impl PgProtocol<DisconnectedPhase>`
+///    gets `push_startup`, `impl PgProtocol<ClosedPhase>` gets
+///    `cause()`-only surface) read `self.inner.<field>` — uniform
+///    access pattern across all phase impls regardless of which
+///    inner fields the phase touches.
+/// 3. **Future inner-state evolution** — if Phase 4 adds an
+///    error-tracking field on `PgProtocolInner`, the new field is
+///    accessible via the same `self.inner.<new_field>` pattern;
+///    deref-based access would need additional method shadowing
+///    discipline to handle phase-conditional inner fields.
+///
+/// The `inner` field is **module-private** (no visibility modifier),
+/// not `pub(crate)`. Sibling modules (`dispatch.rs`, `row_stream.rs`,
+/// etc.) access `PgProtocol<P>` exclusively via the public method
+/// surface — the inner-data shape stays an internal detail of
+/// `mod protocol` (and its leaf submodules per Rust submodule
+/// visibility rules).
+#[repr(transparent)]
+pub struct PgProtocol<P: SealedPhase = ActivePhase> {
+    inner: PgProtocolInner,
+    /// ZST phase marker. Load-bearing for the type-level phase
+    /// proof; named without leading-underscore per the user-feedback
+    /// convention that structurally-used fields must not be
+    /// `_`-prefixed (mirrors `sync_marker` renaming).
+    phase_marker: PhantomData<fn() -> P>,
 }
 
 // DEF-211 FAKE-19 (audit + ship 2026-05-04): bench-hooks feature
@@ -1105,7 +1296,7 @@ pub(crate) mod _proto_init_leaf {
         }
     }
 
-    impl super::PgProtocol {
+    impl super::PgProtocol<super::ActivePhase> {
         /// Construct a new protocol in [`crate::state::ProtoState::Idle`].
         ///
         /// **Note:** Phase 1a starts in `Idle` directly. The startup +
@@ -1119,27 +1310,36 @@ pub(crate) mod _proto_init_leaf {
         /// constructors require a [`ProtoInitToken`], which can only be
         /// minted here. Wholesale-replacement of cell fields is therefore
         /// narrowed to this submodule by construction.
+        ///
+        /// **DEF-246 Phase 1 (2026-05-16):** constructor produces
+        /// `PgProtocol<ActivePhase>` (the default phase). The
+        /// `_phantom: PhantomData<fn() -> ActivePhase>` is a ZST; the
+        /// inner `PgProtocolInner` carries all the actual state.
+        /// Token-gated cell construction remains within this leaf.
         #[must_use]
         pub const fn new() -> Self {
             let token = ProtoInitToken::mint();
             Self {
-                state: super::ProtoState::Idle,
-                read_buf: super::ReadBuf::new(),
-                row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
-                // DEF-196: three independent cold slots — none allocated
-                // at construction. Trust auth + no errors + no malformed
-                // frames + no notice/param frames = lifetime-zero heap.
-                session_params: crate::session_params_slot::SessionParamsCell::empty(token),
-                error_arena: None,
-                // DEF-248 Sub-B (2026-05-12): partial-assembly cell —
-                // 8 B niche, `None` at construction. Heap-allocates a
-                // single Box<PartialAssemblyInner> (8 KB prefix + ~12 B
-                // meta) only on the first oversize non-`'D'` frame.
-                // Re-used across subsequent oversize frames on the
-                // same connection.
-                partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
-                malformed_frame_count: 0,
-                sync_marker: super::PhantomData,
+                inner: super::PgProtocolInner {
+                    state: super::ProtoState::Idle,
+                    read_buf: super::ReadBuf::new(),
+                    row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
+                    // DEF-196: three independent cold slots — none allocated
+                    // at construction. Trust auth + no errors + no malformed
+                    // frames + no notice/param frames = lifetime-zero heap.
+                    session_params: crate::session_params_slot::SessionParamsCell::empty(token),
+                    error_arena: None,
+                    // DEF-248 Sub-B (2026-05-12): partial-assembly cell —
+                    // 8 B niche, `None` at construction. Heap-allocates a
+                    // single Box<PartialAssemblyInner> (8 KB prefix + ~12 B
+                    // meta) only on the first oversize non-`'D'` frame.
+                    // Re-used across subsequent oversize frames on the
+                    // same connection.
+                    partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
+                    malformed_frame_count: 0,
+                    sync_marker: super::PhantomData,
+                },
+                phase_marker: super::PhantomData,
             }
         }
     }
@@ -1304,7 +1504,7 @@ pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
     }
 }
 
-impl PgProtocol {
+impl PgProtocol<ActivePhase> {
 
     /// Mint a fresh `ReplyId<K>` for an outbound command.
     ///
@@ -1427,7 +1627,7 @@ impl PgProtocol {
     #[cold]
     #[inline(never)]
     fn install_errored_replyid_saturation(&mut self) {
-        if matches!(self.state, ProtoState::Errored(_)) {
+        if matches!(self.inner.state, ProtoState::Errored(_)) {
             return;
         }
         let cause = ProtocolError::InternalCrateBug {
@@ -1445,7 +1645,7 @@ impl PgProtocol {
         // Operator-visible signal arrives on the next push as
         // ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }.
         let _drained_id_at_saturation =
-            _replyid_saturation_drain_leaf::drain(&mut self.state, cause.state_kind());
+            _replyid_saturation_drain_leaf::drain(&mut self.inner.state, cause.state_kind());
     }
 
     // DEF-196 (2026-04-28): three-field split. Each cold slot
@@ -1464,7 +1664,7 @@ impl PgProtocol {
         // pinned at module scope by `_BS11_EMPTY_SESSION_PARAMS_IS_PRISTINE`
         // below.
         static EMPTY: SessionParams = SessionParams::new();
-        match self.session_params.as_deref() {
+        match self.inner.session_params.as_deref() {
             Some(p) => p,
             None => &EMPTY,
         }
@@ -1476,7 +1676,7 @@ impl PgProtocol {
     fn cold_error_arena(&self) -> &crate::error_arena::ErrorArena {
         static EMPTY: crate::error_arena::ErrorArena =
             crate::error_arena::ErrorArena::new();
-        match self.error_arena.as_deref() {
+        match self.inner.error_arena.as_deref() {
             Some(a) => a,
             None => &EMPTY,
         }
@@ -1486,7 +1686,7 @@ impl PgProtocol {
     /// read — no Box indirection (counter is inline since v2).
     #[inline]
     fn cold_malformed_frame_count(&self) -> u32 {
-        self.malformed_frame_count
+        self.inner.malformed_frame_count
     }
 
     /// DEF-185 P2-9 (audit 2026-04-24): count of malformed-frame
@@ -1518,7 +1718,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub const fn state(&self) -> &ProtoState {
-        &self.state
+        &self.inner.state
     }
 
     /// **DEF-248 Sub-B (2026-05-12)** — diagnostic predicate for the
@@ -1537,7 +1737,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub fn has_active_partial_assembly(&self) -> bool {
-        self.partial_assembly.is_active()
+        self.inner.partial_assembly.is_active()
     }
 
     /// Borrow the accumulated session parameters.
@@ -1569,7 +1769,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub fn unread(&self) -> &[u8] {
-        self.read_buf.unread()
+        self.inner.read_buf.unread()
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -1602,7 +1802,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub fn as_ready(&mut self) -> Option<crate::guard::ReadyGuard<'_>> {
-        match self.state.push_class() {
+        match self.inner.state.push_class() {
             crate::state::StatePushClass::Idle => {
                 Some(crate::guard::ReadyGuard::new(self))
             }
@@ -1630,7 +1830,7 @@ impl PgProtocol {
     pub fn connection_status(&self) -> crate::guard::ConnectionStatus {
         use crate::guard::ConnectionStatus;
         use crate::state::StatePushClass;
-        match self.state.push_class() {
+        match self.inner.state.push_class() {
             StatePushClass::Idle => ConnectionStatus::Ready,
             StatePushClass::Errored(kind) => ConnectionStatus::Errored(kind),
             StatePushClass::PingAwaiting | StatePushClass::BusyQuery => {
@@ -1654,7 +1854,7 @@ impl PgProtocol {
     /// `compute_push_<cmd>_idle_only` free functions (testable
     /// directly, no `PgProtocol` construction needed).
     ///
-    /// `debug_assert!(matches!(self.state, ProtoState::Idle))` pins
+    /// `debug_assert!(matches!(self.inner.state, ProtoState::Idle))` pins
     /// the caller's invariant in development builds; release builds
     /// skip the assertion for zero overhead.
     ///
@@ -1713,8 +1913,8 @@ impl PgProtocol {
         // eliding the 5-arm dispatch entirely.
         self.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
 
-        let state = &mut self.state;
-        let row_desc_slot = &mut self.row_desc_slot;
+        let state = &mut self.inner.state;
+        let row_desc_slot = &mut self.inner.row_desc_slot;
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
             None => {
@@ -1891,7 +2091,7 @@ impl PgProtocol {
     /// `feed_bytes` shape (which routes Errored to the
     /// `IngressClassification::AlreadyErrored` arm).
     pub fn feed_inbound(&mut self, bytes: &[u8]) -> Result<(), crate::buf::ReadBufFull> {
-        if matches!(self.state, ProtoState::Errored(_)) {
+        if matches!(self.inner.state, ProtoState::Errored(_)) {
             // Silent no-op — terminal state, further bytes irrelevant.
             // Caller learns of Errored via `connection_status()` /
             // `advance_one_frame()` returning `FeedEvent::Close`.
@@ -1913,19 +2113,19 @@ impl PgProtocol {
         // mode path stays out of I-cache. `cold_path()` hints LLVM
         // to push the partial-mode body to the end of the function's
         // generated machine code.
-        if self.partial_assembly.is_active() {
+        if self.inner.partial_assembly.is_active() {
             core::hint::cold_path();
             let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
-                &mut self.partial_assembly,
+                &mut self.inner.partial_assembly,
                 bytes,
             );
             let leftover = bytes.get(absorbed..).unwrap_or(&[]);
             if leftover.is_empty() {
                 return Ok(());
             }
-            return self.read_buf.append(leftover);
+            return self.inner.read_buf.append(leftover);
         }
-        self.read_buf.append(bytes)
+        self.inner.read_buf.append(bytes)
     }
 
     /// Process at most one user-observable event and return it.
@@ -1992,7 +2192,7 @@ impl PgProtocol {
         // its dispatch loop (which is the wrong shape for the per-
         // event API).
         if matches!(
-            self.state,
+            self.inner.state,
             ProtoState::SimpleQueryStreamingRows { .. }
                 | ProtoState::BindExecuteStreamingRows { .. }
         ) {
@@ -2000,12 +2200,12 @@ impl PgProtocol {
         }
 
         // Errored terminal: the connection is dead. Caller closes.
-        if matches!(self.state, ProtoState::Errored(_)) {
+        if matches!(self.inner.state, ProtoState::Errored(_)) {
             return FeedEvent::Close;
         }
 
         // Idle + empty read_buf: nothing to process — caller can push.
-        if matches!(self.state, ProtoState::Idle) && self.read_buf.unread().is_empty() {
+        if matches!(self.inner.state, ProtoState::Idle) && self.inner.read_buf.unread().is_empty() {
             return FeedEvent::Idle;
         }
 
@@ -2058,7 +2258,7 @@ impl PgProtocol {
     /// the staged-dispatch architecture.
     ///
     /// 1c-1a: `&'r mut self` — the row slices in `Action::StreamRow`
-    /// borrow from `self.read_buf`. The `'r` lifetime propagates
+    /// borrow from `self.inner.read_buf`. The `'r` lifetime propagates
     /// into `OutActions<'w, 'r>`; the borrow checker blocks
     /// subsequent `&mut self` calls (and thus the next `feed_bytes`)
     /// until `OutActions` drops.
@@ -2130,7 +2330,7 @@ impl PgProtocol {
         // internally (~+10 ns per call). Caching at the entry point
         // amortises one classification across the full feed_bytes
         // dispatch loop.
-        let entry_class = self.state.push_class();
+        let entry_class = self.inner.state.push_class();
         self.clear_session_residue_for_class(entry_class);
 
         // DEF-154 (H+V) pending_advance DELETED 2026-04-24: the
@@ -2192,8 +2392,8 @@ impl PgProtocol {
         // path that handles bytes 5..= the body's last byte. Without
         // this hook, a 5 KB body would fail `read_buf.append` with
         // `ReadBufFull` on the chunk completing the body.
-        let bytes_for_readbuf: &[u8] = if !matches!(self.state, ProtoState::Errored(_))
-            && self.partial_assembly.is_active()
+        let bytes_for_readbuf: &[u8] = if !matches!(self.inner.state, ProtoState::Errored(_))
+            && self.inner.partial_assembly.is_active()
         {
             // DEF-248 Sub-B (2026-05-12): cold-path hint. Partial mode
             // is rare (only oversize non-`'D'` bodies engage it); the
@@ -2201,7 +2401,7 @@ impl PgProtocol {
             // of the I-cache footprint of the standard ingress.
             core::hint::cold_path();
             let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
-                &mut self.partial_assembly,
+                &mut self.inner.partial_assembly,
                 bytes,
             );
             bytes.get(absorbed..).unwrap_or(&[])
@@ -2209,10 +2409,10 @@ impl PgProtocol {
             bytes
         };
 
-        let classification = if matches!(self.state, ProtoState::Errored(_)) {
+        let classification = if matches!(self.inner.state, ProtoState::Errored(_)) {
             IngressClassification::AlreadyErrored
         } else {
-            match self.read_buf.append(bytes_for_readbuf) {
+            match self.inner.read_buf.append(bytes_for_readbuf) {
                 Ok(()) => IngressClassification::Ok,
                 Err(ReadBufFull { attempted, available, .. }) => {
                     IngressClassification::AppendFailed { attempted, available }
@@ -2228,17 +2428,17 @@ impl PgProtocol {
         // `read_buf` while `state` is separately `&mut` for
         // transitions, AND advances `read_buf` cursor in-scope
         // after each frame is consumed.
-        let state = &mut self.state;
-        let read_buf = &mut self.read_buf;
-        let terminal_row_desc = &mut self.row_desc_slot;
+        let state = &mut self.inner.state;
+        let read_buf = &mut self.inner.read_buf;
+        let terminal_row_desc = &mut self.inner.row_desc_slot;
         // DEF-196 (2026-04-28): three independent cold slots, each
         // lazy-allocated only at its specific write site:
         //   - session_params slot: ParameterStatus + NoticeResponse filters.
         //   - error_arena slot:    ErrorResponse arms in dispatch.rs.
         //   - malformed_counter:   inline u32, direct write (no Box).
-        let session_params_slot = &mut self.session_params;
-        let error_arena_slot = &mut self.error_arena;
-        let malformed_counter = &mut self.malformed_frame_count;
+        let session_params_slot = &mut self.inner.session_params;
+        let error_arena_slot = &mut self.inner.error_arena;
+        let malformed_counter = &mut self.inner.malformed_frame_count;
         // DEF-248 Sub-B (2026-05-12): partial-assembly cell mut borrow
         // threaded through the dispatch loop. Used at:
         // 1. `HeaderParse::FrameTooLarge` for streaming-eligible tags
@@ -2246,7 +2446,7 @@ impl PgProtocol {
         // 2. Top of dispatch loop — if the assembly is complete, take
         //    + dispatch the assembled prefix through the existing
         //    per-tag dispatch arm.
-        let partial_assembly_slot = &mut self.partial_assembly;
+        let partial_assembly_slot = &mut self.inner.partial_assembly;
 
         // DEF-185 P1-6: single classification-driven dispatch.
         // Exhaustive match on `IngressClassification` — adding a new
@@ -2893,7 +3093,7 @@ impl PgProtocol {
     ///
     /// # DEF-210 SR-02 (audit 2026-04-28): exhaustive policy
     ///
-    /// Pre-Path-2 the `match self.state { Idle => …, Errored(_) => …,
+    /// Pre-Path-2 the `match self.inner.state { Idle => …, Errored(_) => …,
     /// _ => {} }` wildcard accepted any future `ProtoState` variant
     /// silently — the new variant would inherit the "do not clear"
     /// branch with no contributor decision recorded. Tier-2 surface.
@@ -2952,9 +3152,9 @@ impl PgProtocol {
                 // `_clear_residue_leaf` which mints a
                 // `ClearResidueSchemaToken` (leaf-gated) and routes to
                 // `RowDescSlotCell::clear_at_residue`.
-                _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
+                _clear_residue_leaf::clear_schema_slot_residue(&mut self.inner.row_desc_slot);
                 // DEF-196: only clear arena if it was ever allocated.
-                if let Some(arena) = self.error_arena.as_deref_mut() {
+                if let Some(arena) = self.inner.error_arena.as_deref_mut() {
                     arena.clear();
                 }
                 // DEF-248 Sub-B (2026-05-12): clear any in-flight
@@ -2964,13 +3164,13 @@ impl PgProtocol {
                 // classifies any leftover Box from a torn-down
                 // partial-mode sequence — Box drops, inner
                 // heapless::Vec releases its inline allocation.
-                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.partial_assembly);
+                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.inner.partial_assembly);
             }
             crate::state::StatePushClass::Errored(_) => {
                 // DEF-272 cluster α: same leaf-submodule helper as the
                 // Idle arm above.
-                _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
-                if let Some(arena) = self.error_arena.as_deref_mut() {
+                _clear_residue_leaf::clear_schema_slot_residue(&mut self.inner.row_desc_slot);
+                if let Some(arena) = self.inner.error_arena.as_deref_mut() {
                     arena.clear();
                 }
                 // DEF-189 Q8-C3 + DEF-205 step 3: session-state
@@ -2982,14 +3182,14 @@ impl PgProtocol {
                 // session-side concrete tokens (`ClearResidueSchemaToken`
                 // and `ClearResidueSessionToken`). Each clear method on
                 // its respective Cell takes the matching token by value.
-                _clear_residue_leaf::clear_session_params_residue(&mut self.session_params);
+                _clear_residue_leaf::clear_session_params_residue(&mut self.inner.session_params);
                 // DEF-248 Sub-B (2026-05-12): also clear partial
                 // assembly on Errored entry — any in-flight oversize
                 // body is forfeit alongside the connection's other
                 // session state. The Box drops; the Vec releases its
                 // inline allocation; no leak across the post-Errored
                 // window.
-                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.partial_assembly);
+                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.inner.partial_assembly);
             }
             // In-flight states — preserve residue. The exhaustive
             // match here is the load-bearing tier-1 closure: adding
@@ -3157,19 +3357,19 @@ impl PgProtocol {
         // I-cache footprint. RowStream's per-row fast path calls this
         // function via `feed_inbound`-equivalent; the inactive arm
         // is the hot path 99.99% of the time (real PG payloads ≤ 4 KB).
-        if self.partial_assembly.is_active() {
+        if self.inner.partial_assembly.is_active() {
             core::hint::cold_path();
             let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
-                &mut self.partial_assembly,
+                &mut self.inner.partial_assembly,
                 bytes,
             );
             let leftover = bytes.get(absorbed..).unwrap_or(&[]);
             if leftover.is_empty() {
                 return Ok(());
             }
-            return self.read_buf.append(leftover);
+            return self.inner.read_buf.append(leftover);
         }
-        self.read_buf.append(bytes)
+        self.inner.read_buf.append(bytes)
     }
 
     /// DEF-154 (X): shared view of the populated read_buf region.
@@ -3184,7 +3384,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub(crate) fn read_buf_populated(&self) -> &[u8] {
-        self.read_buf.populated()
+        self.inner.read_buf.populated()
     }
 
     /// DEF-154 (X): current read cursor (u16 storage).
@@ -3196,7 +3396,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub(crate) fn read_buf_cursor_u16(&self) -> u16 {
-        self.read_buf.cursor_position_u16()
+        self.inner.read_buf.cursor_position_u16()
     }
 
     /// DEF-154 (X): advance the read cursor. Err architecturally
@@ -3207,7 +3407,7 @@ impl PgProtocol {
         &mut self,
         n: usize,
     ) -> Result<(), crate::buf::AdvancePastEnd> {
-        self.read_buf.advance(n)
+        self.inner.read_buf.advance(n)
     }
 
     /// DEF-248 Sub-A (2026-05-12): unread-region length accessor for
@@ -3216,7 +3416,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub(crate) fn read_buf_unread_len(&self) -> usize {
-        self.read_buf.unread_len()
+        self.inner.read_buf.unread_len()
     }
 
 
@@ -3232,7 +3432,7 @@ impl PgProtocol {
         token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
         declared_body_len: u32,
     ) {
-        self.read_buf.enter_partial_mode(token, declared_body_len);
+        self.inner.read_buf.enter_partial_mode(token, declared_body_len);
     }
 
     /// DEF-248 Sub-A (2026-05-12): partial-mode exit point. Mirror
@@ -3242,7 +3442,7 @@ impl PgProtocol {
         &mut self,
         token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
     ) {
-        self.read_buf.exit_partial_mode(token);
+        self.inner.read_buf.exit_partial_mode(token);
     }
 
     /// DEF-248 Sub-A (2026-05-12): drain `n` bytes from the
@@ -3253,7 +3453,7 @@ impl PgProtocol {
         token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
         n: u32,
     ) -> Result<(), crate::buf::AdvancePastEnd> {
-        self.read_buf.subtract_partial_remaining(token, n)
+        self.inner.read_buf.subtract_partial_remaining(token, n)
     }
 
     /// DEF-248 Sub-A (2026-05-12): partial-mode predicate. Used by
@@ -3262,7 +3462,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub(crate) fn is_in_partial_mode_for_row_stream(&self) -> bool {
-        self.read_buf.is_in_partial_mode()
+        self.inner.read_buf.is_in_partial_mode()
     }
 
     /// DEF-248 Sub-A (2026-05-12): partial-mode counter readout.
@@ -3271,7 +3471,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub(crate) fn partial_remaining_for_row_stream(&self) -> u32 {
-        self.read_buf.partial_remaining()
+        self.inner.read_buf.partial_remaining()
     }
 
     /// DEF-189: project the current row_desc_slot as a
@@ -3284,12 +3484,12 @@ impl PgProtocol {
     ///
     /// # DEF-189 perf win
     ///
-    /// Pre-DEF-188/-189 the per-row hot path did `match &self.state`
+    /// Pre-DEF-188/-189 the per-row hot path did `match &self.inner.state`
     /// twice: once for the streaming-variant gate (returning the
     /// `reply_id`) and once after `read_buf_advance` to re-project
     /// the schema field on the variant. Two enum matches per row.
     ///
-    /// Post-DEF-189 the fast path is `match &self.state` ONCE for
+    /// Post-DEF-189 the fast path is `match &self.inner.state` ONCE for
     /// the gate (with the schema NOT in the variant) + a single
     /// `Option::as_ref` projection here. The Option projection is
     /// strictly cheaper than the enum match — one byte read for the
@@ -3297,13 +3497,13 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub fn current_row_desc(&self) -> Option<crate::decode::RowDescBorrow<'_>> {
-        self.row_desc_slot
+        self.inner.row_desc_slot
             .as_ref()
             .map(crate::decode::RowDescBorrow::from_ref)
     }
 
     /// DEF-189: fused state classification for the row-stream
-    /// fast-path entry. Single `match &self.state` returns the
+    /// fast-path entry. Single `match &self.inner.state` returns the
     /// classification needed by `RowStream::next_event`:
     ///
     /// - `Errored`: state is terminal — caller drains and emits
@@ -3331,7 +3531,7 @@ impl PgProtocol {
     #[inline]
     #[must_use]
     pub(crate) fn classify_for_iter_rows(&self) -> IterRowsClass {
-        match &self.state {
+        match &self.inner.state {
             ProtoState::Errored(_) => IterRowsClass::Errored,
             ProtoState::SimpleQueryStreamingRows { reply }
             | ProtoState::BindExecuteStreamingRows { reply }
@@ -3351,7 +3551,7 @@ impl PgProtocol {
     ///
     /// # DEF-271 cluster A (2026-05-10): atomic drain via FeedStateSetter
     ///
-    /// Pre-DEF-271 the helper wrote `*self.state = Errored(...)`
+    /// Pre-DEF-271 the helper wrote `*self.inner.state = Errored(...)`
     /// directly; the in-flight reply id was peeked separately at the
     /// dispatch site (tier-3 dual-source-of-truth). Post-DEF-271 the
     /// drain and install are one `mem::replace` via
@@ -3370,7 +3570,7 @@ impl PgProtocol {
         let cause = ProtocolError::InternalCrateBug {
             locus: crate::error::CrateBugLocus::ReadCursorAdvance,
         };
-        _read_cursor_advance_drain_leaf::drain(&mut self.state, cause.state_kind())
+        _read_cursor_advance_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
     }
 
     /// DEF-154 (X): transition to `Errored(Framing)` for a
@@ -3402,13 +3602,13 @@ impl PgProtocol {
         total_len: usize,
     ) -> Option<NonZeroU64> {
         let cause = ProtocolError::MalformedDataRow { total_len };
-        _malformed_data_row_drain_leaf::drain(&mut self.state, cause.state_kind())
+        _malformed_data_row_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
     }
 
     // DEF-188: install_errored_stale_schema_ref DELETED — there is
     // no longer a SchemaRef type or generation drift class. State
     // variants carry RowDesc inline; the fast-path reads
-    // `&self.state.row_desc` directly. The "stale ref" bug class is
+    // `&self.inner.state.row_desc` directly. The "stale ref" bug class is
     // architecturally impossible (no handle to be stale).
 
     /// DEF-248 Sub-A (2026-05-12): transition to `Errored(Internal)`
@@ -3463,7 +3663,7 @@ impl PgProtocol {
         // `_drained_at_drop` for the `#[must_use]` discoverability
         // contract — see the leaf submodule docstring.
         let _drained_at_drop: Option<NonZeroU64> =
-            _stream_dropped_mid_stream_drain_leaf::drain(&mut self.state, cause.state_kind());
+            _stream_dropped_mid_stream_drain_leaf::drain(&mut self.inner.state, cause.state_kind());
         // DEF-248 Sub-A: clear read_buf so a subsequent feed_bytes on
         // the post-Errored connection does not classify mid-frame
         // bytes as a fresh frame header. The state is already Errored
@@ -3471,7 +3671,7 @@ impl PgProtocol {
         // arm also calls `read_buf.clear()`, but doing it here keeps
         // the post-Drop invariant tight without needing a follow-up
         // feed_bytes to scrub.
-        self.read_buf.clear();
+        self.inner.read_buf.clear();
     }
 
     /// DEF-248 Sub-A (2026-05-12): closure-scoped row-stream API.
@@ -3546,7 +3746,7 @@ impl PgProtocol {
         write_buf.clear();
         // DEF-211 FAKE-01: cached classification (see feed_bytes for
         // rationale).
-        let entry_class = self.state.push_class();
+        let entry_class = self.inner.state.push_class();
         self.clear_session_residue_for_class(entry_class);
 
         // The stream value lives here on `iter_rows`'s stack frame.
@@ -3569,7 +3769,7 @@ impl PgProtocol {
 ///
 /// 3-variant enum (each ZST-discriminator except Streaming carrying
 /// `NonZeroU64`) selecting the row-stream fast-path entry behaviour.
-/// Returned by a single `match &self.state` in
+/// Returned by a single `match &self.inner.state` in
 /// `classify_for_iter_rows`, replacing the pre-DEF-189 separate
 /// `state_is_errored()` + `streaming_reply_id()` calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3593,7 +3793,7 @@ pub(crate) enum IterRowsClass {
 // `fail_inflight_and_close` + `replace_state_errored_and_drain` +
 // `fail_read_cursor_advance` historically took `&mut self` (full
 // PgProtocol). DEF-154 (E) wraps `feed_bytes`'s dispatch loop in a
-// `self.read_buf.with_branded(|mut rb| { ... })` branded scope —
+// `self.inner.read_buf.with_branded(|mut rb| { ... })` branded scope —
 // inside which `read_buf` is borrowed via `rb` (mut via
 // BrandedReadBuf::advance_scope_local / clear_scope_local; shared
 // otherwise). `&mut self` calls are incompatible with `rb`'s borrow.
@@ -3608,7 +3808,7 @@ pub(crate) enum IterRowsClass {
 /// read scope.
 ///
 /// Takes `&mut ProtoState` + `&mut StagedActions` only — DOES NOT
-/// take `&mut ReadBuf`, because inside `self.read_buf.with_branded`
+/// take `&mut ReadBuf`, because inside `self.inner.read_buf.with_branded`
 /// the read_buf is held by `rb` and cannot be separately
 /// reborrowed. Callers inside the branded scope clear read_buf via
 /// `rb.clear_scope_local()` at an appropriate post-mutation point.
@@ -3700,19 +3900,19 @@ const MALFORMED_STORM_THRESHOLD: u32 = 10_000;
 /// This free function owns the entire push-path decision: given the
 /// command and current [`ProtoState`] *by value*, it produces the new
 /// state and a bounded [`OutActions`] list. No `&mut PgProtocol` — the
-/// only mutation the caller needs is the single `self.state = new_state`
+/// only mutation the caller needs is the single `self.inner.state = new_state`
 /// assignment in [`PgProtocol::push_command`].
 ///
 /// Why pure:
 /// - **Testability.** Unit tests call `compute_push` directly with a
 ///   synthesised `(cmd, state)` pair and inspect the returned tuple.
 ///   No `PgProtocol` construction, no `&mut self` dance.
-/// - **Single locus of mutation.** All `self.state = ...` statements
+/// - **Single locus of mutation.** All `self.inner.state = ...` statements
 ///   in the crate are restricted to `push_command` and `feed_bytes`.
 ///   Adding a new command variant grows the match here, not the
 ///   mutable surface of `PgProtocol`.
 /// - **Errored pre-check dissolves.** The DEF-093 workaround (reading
-///   `&self.state` *before* `core::mem::take` to avoid a transient
+///   `&self.inner.state` *before* `core::mem::take` to avoid a transient
 ///   `Idle` window) is no longer needed. `ProtoState::Errored` is a
 ///   first-class arm: it preserves the cause (returns
 ///   `ProtoState::Errored(cause)` unchanged) and emits the
@@ -5446,17 +5646,17 @@ fn push_within_fanout_budget<'w, 'r>(
     }
 }
 
-impl Default for PgProtocol {
+impl Default for PgProtocol<ActivePhase> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl core::fmt::Debug for PgProtocol {
+impl core::fmt::Debug for PgProtocol<ActivePhase> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PgProtocol")
-            .field("state", &self.state)
-            .field("read_buf", &self.read_buf)
+            .field("state", &self.inner.state)
+            .field("read_buf", &self.inner.read_buf)
             .field("session_params", self.cold_session_params())
             .finish_non_exhaustive()
     }
@@ -5699,17 +5899,17 @@ mod residue_policy_per_class_tests {
     /// `error_arena` allocated. After the test we observe how each
     /// arm of `clear_session_residue_*` mutated them.
     fn populate_residue(proto: &mut PgProtocol) {
-        proto.row_desc_slot._set_for_test(Some(RowDesc::EMPTY));
-        proto.session_params._set_for_test(Some(dirty_session_params()));
-        proto.error_arena = Some(alloc::boxed::Box::new(
+        proto.inner.row_desc_slot._set_for_test(Some(RowDesc::EMPTY));
+        proto.inner.session_params._set_for_test(Some(dirty_session_params()));
+        proto.inner.error_arena = Some(alloc::boxed::Box::new(
             crate::error_arena::ErrorArena::new(),
         ));
     }
 
-    /// Replace `proto.state` with `Idle` so the destructor doesn't
+    /// Replace `proto.inner.state` with `Idle` so the destructor doesn't
     /// trip the in-flight `ReplyId<_>` Drop-guard at scope end.
     fn quench_inflight(proto: &mut PgProtocol) {
-        let prev = core::mem::replace(&mut proto.state, ProtoState::Idle);
+        let prev = core::mem::replace(&mut proto.inner.state, ProtoState::Idle);
         match prev.take_inflight_reply_raw_id() {
             Some(_) | None => {}
         }
@@ -5721,7 +5921,7 @@ mod residue_policy_per_class_tests {
         // here matches polymorphic intent (test helper takes any
         // `SessionParams`-like thing).
         use crate::pristine::Pristine as _;
-        match proto.session_params.as_deref() {
+        match proto.inner.session_params.as_deref() {
             Some(p) => p.is_pristine(),
             None => true,
         }
@@ -5732,18 +5932,18 @@ mod residue_policy_per_class_tests {
         let mut proto = PgProtocol::new();
         // Default state is `Idle` post-`new()`.
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.state.push_class());
+        proto.clear_session_residue_for_class(proto.inner.state.push_class());
 
         assert!(
-            proto.row_desc_slot.is_none(),
+            proto.inner.row_desc_slot.is_none(),
             "Idle must clear row_desc_slot",
         );
         assert!(
-            proto.error_arena.is_some(),
+            proto.inner.error_arena.is_some(),
             "Idle preserves the error_arena Box (contents cleared internally)",
         );
         assert!(
-            proto.session_params.is_some(),
+            proto.inner.session_params.is_some(),
             "Idle preserves session_params Box",
         );
         assert!(
@@ -5755,18 +5955,18 @@ mod residue_policy_per_class_tests {
     #[test]
     fn errored_clears_everything_including_session_params() {
         let mut proto = PgProtocol::new();
-        proto.state = ProtoState::Errored(
+        proto.inner.state = ProtoState::Errored(
             StateErrorKind::from_kind_or_internal(ErrorKind::Framing),
         );
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.state.push_class());
+        proto.clear_session_residue_for_class(proto.inner.state.push_class());
 
         assert!(
-            proto.row_desc_slot.is_none(),
+            proto.inner.row_desc_slot.is_none(),
             "Errored must clear row_desc_slot",
         );
         assert!(
-            proto.session_params.is_some(),
+            proto.inner.session_params.is_some(),
             "Errored preserves session_params Box (only contents cleared)",
         );
         assert!(
@@ -5781,18 +5981,18 @@ mod residue_policy_per_class_tests {
     #[test]
     fn connecting_preserves_all_residue() {
         let mut proto = PgProtocol::new();
-        proto.state = ProtoState::ConnectingStartupTrust {
+        proto.inner.state = ProtoState::ConnectingStartupTrust {
             reply: ReplyId::from_raw(nz(11)),
         };
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.state.push_class());
+        proto.clear_session_residue_for_class(proto.inner.state.push_class());
 
         assert!(
-            proto.row_desc_slot.is_some(),
+            proto.inner.row_desc_slot.is_some(),
             "Connecting (StatePushClass::Connecting) must preserve row_desc_slot",
         );
         assert!(
-            proto.session_params.is_some(),
+            proto.inner.session_params.is_some(),
             "Connecting must preserve session_params Box",
         );
         assert!(
@@ -5800,7 +6000,7 @@ mod residue_policy_per_class_tests {
             "Connecting must preserve session_params content",
         );
         assert!(
-            proto.error_arena.is_some(),
+            proto.inner.error_arena.is_some(),
             "Connecting must preserve error_arena",
         );
         quench_inflight(&mut proto);
@@ -5809,12 +6009,12 @@ mod residue_policy_per_class_tests {
     #[test]
     fn ping_awaiting_preserves_all_residue() {
         let mut proto = PgProtocol::new();
-        proto.state = ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
+        proto.inner.state = ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.state.push_class());
+        proto.clear_session_residue_for_class(proto.inner.state.push_class());
 
         assert!(
-            proto.row_desc_slot.is_some(),
+            proto.inner.row_desc_slot.is_some(),
             "PingAwaiting (StatePushClass::PingAwaiting) must preserve row_desc_slot",
         );
         assert!(
@@ -5822,7 +6022,7 @@ mod residue_policy_per_class_tests {
             "PingAwaiting must preserve session_params content",
         );
         assert!(
-            proto.error_arena.is_some(),
+            proto.inner.error_arena.is_some(),
             "PingAwaiting must preserve error_arena",
         );
         quench_inflight(&mut proto);
@@ -5831,14 +6031,14 @@ mod residue_policy_per_class_tests {
     #[test]
     fn busy_query_preserves_all_residue() {
         let mut proto = PgProtocol::new();
-        proto.state = ProtoState::SimpleQueryStreamingRows {
+        proto.inner.state = ProtoState::SimpleQueryStreamingRows {
             reply: ReplyId::from_raw(nz(13)),
         };
         populate_residue(&mut proto);
-        proto.clear_session_residue_for_class(proto.state.push_class());
+        proto.clear_session_residue_for_class(proto.inner.state.push_class());
 
         assert!(
-            proto.row_desc_slot.is_some(),
+            proto.inner.row_desc_slot.is_some(),
             "BusyQuery (StatePushClass::BusyQuery) must preserve row_desc_slot",
         );
         assert!(
@@ -5846,7 +6046,7 @@ mod residue_policy_per_class_tests {
             "BusyQuery must preserve session_params content",
         );
         assert!(
-            proto.error_arena.is_some(),
+            proto.inner.error_arena.is_some(),
             "BusyQuery must preserve error_arena",
         );
         quench_inflight(&mut proto);
