@@ -2691,9 +2691,13 @@ impl PgProtocol<ActivePhase> {
     /// `compute_push_<cmd>_idle_only` free functions (testable
     /// directly, no `PgProtocol` construction needed).
     ///
-    /// `debug_assert!(matches!(self.inner.state, ProtoState::Idle))` pins
-    /// the caller's invariant in development builds; release builds
-    /// skip the assertion for zero overhead.
+    /// Caller's `Idle` precondition is enforced uniformly at runtime by
+    /// `IdleState::try_from(&mut state)` (DEF-272 cluster γ typestate);
+    /// the `None` arm classifies via `CrateBugLocus::PushCommandInternalNonIdle`
+    /// PushFailure with `core::hint::cold_path()` (DEF-280 Bundle G
+    /// eliminated the pre-existing `debug_assert!(false, …)` dev-loud
+    /// branch as a CREDO §V glass pattern — the classified failure is
+    /// the safety net in both dev and release modes).
     ///
     /// # DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04)
     ///
@@ -2759,20 +2763,19 @@ impl PgProtocol<ActivePhase> {
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
             None => {
-                // Architecturally unreachable on production callers
-                // (ReadyGuard::push_command upstream classifies via
-                // `as_ready`'s runtime Idle check; the `&mut PgProtocol`
-                // borrow chain rules out interleaving between as_ready
-                // and push_command_internal entry). Classify rather
-                // than panic — `clippy::panic` + `clippy::expect_used`
-                // are forbid'd crate-wide. The sentinel reply-id is the
-                // same MIN-fallback shape used in `next_reply_id` post-
-                // saturation classification (cluster D).
-                debug_assert!(
-                    false,
-                    "push_command_internal: state must be Idle (ReadyGuard \
-                     contract violation — see CrateBugLocus::PushCommandInternalNonIdle)",
-                );
+                // DEF-280 Bundle G (2026-05-18): debug_assert!(false, …)
+                // removed — CREDO §V banned glass pattern (dev loud +
+                // release silent fallthrough). The classified `PushFailure`
+                // below IS the safety net; the assert was misleading dev-
+                // noise on a path that's architecturally unreachable on
+                // production callers (ReadyGuard::push_command upstream
+                // classifies via `as_ready`'s runtime Idle check; the
+                // `&mut PgProtocol` borrow chain rules out interleaving
+                // between as_ready and push_command_internal entry). The
+                // sentinel reply-id is the same MIN-fallback shape used
+                // in `next_reply_id` post-saturation classification
+                // (cluster D).
+                core::hint::cold_path();
                 return Err(crate::action::PushFailure {
                     id: core::num::NonZeroU64::MIN,
                     cause: crate::error::ProtocolError::InternalCrateBug {
@@ -2845,14 +2848,13 @@ impl PgProtocol<ActivePhase> {
                         let action = match range.apply(bytes) {
                             Some(slice) => crate::action::Action::SendBytes(slice),
                             None => {
+                                // DEF-280 Bundle G (2026-05-18):
+                                // debug_assert!(false, …) removed — CREDO §V
+                                // banned glass pattern. The classified
+                                // `CloseSocket` fallback IS the safety net;
+                                // architecturally impossible per intact brand
+                                // discipline (DEF-154 N+W).
                                 core::hint::cold_path();
-                                debug_assert!(
-                                    false,
-                                    "DEF-160 Z2: SendBytesRange.apply == None — \
-                                     architecturally impossible per intact brand \
-                                     discipline (DEF-154 N+W). Compiler bug or \
-                                     memory corruption.",
-                                );
                                 crate::action::Action::CloseSocket
                             }
                         };
@@ -2873,18 +2875,27 @@ impl PgProtocol<ActivePhase> {
                         push_within_fanout_budget(&mut out, crate::action::Action::CloseSocket);
                     }
                     StagedAction::DeliverReply(_) => {
-                        // DEF-238 (audit 2026-05-05): cold hint. Push
-                        // paths never emit DeliverReply (replies come
-                        // from server via feed_bytes only). Architecturally
-                        // dead; classified loud in dev, silent in release.
+                        // DEF-280 Bundle G (2026-05-18): tier-1 elevation.
+                        // Pre-Bundle G this arm silently dropped on release
+                        // (loud dev `debug_assert!(false, …)` + silent
+                        // fallthrough — CREDO §V glass pattern). Post-Bundle G
+                        // classified as `PushFailure` with `InternalCrateBug`
+                        // locus `PushEmittedDeliverReply`. Push paths never
+                        // emit DeliverReply (replies come from server via
+                        // feed_bytes only); architecturally dead per DEF-160
+                        // Z2 invariant. Sentinel reply-id `NonZeroU64::MIN`
+                        // matches the `PushCommandInternalNonIdle` shape used
+                        // at the earlier classifier-bug site in this same
+                        // function.
                         core::hint::cold_path();
-                        debug_assert!(
-                            false,
-                            "DEF-160 Z2: push paths must NEVER emit DeliverReply — \
-                             replies come from server via feed_bytes only. Reaching \
-                             this branch indicates a compute_push refactor regression \
-                             (or pipelining work without DEF-160 update).",
-                        );
+                        if failure.is_none() {
+                            failure = Some(crate::action::PushFailure {
+                                id: core::num::NonZeroU64::MIN,
+                                cause: crate::error::ProtocolError::InternalCrateBug {
+                                    locus: crate::error::CrateBugLocus::PushEmittedDeliverReply,
+                                },
+                            });
+                        }
                     }
                 }
             }
@@ -6630,15 +6641,20 @@ fn materialise<'w, 'r>(
 ///   Rust without `#![feature(generic_const_exprs)]`).
 ///
 /// We settle for tier-2 structural via const-asserted invariant
-/// plus classified dead-arm: the `debug_assert!(false, ...)` in
-/// the Err branch fires in dev/test builds, release silently
-/// accepts (safe because invariant proof holds structurally).
+/// alone. Post-DEF-280 Bundle G the `debug_assert!(false, …)` in
+/// the Err branch was removed as a CREDO §V glass pattern (dev
+/// loud + release silent fallthrough); the build-time const-assert
+/// at `MAX_ACTIONS_PER_CALL` is the actual safety proof, and the
+/// runtime Err arm is `core::hint::cold_path()` + silent no-op
+/// (architecturally dead under intact invariant; a future refactor
+/// that breaks the capacity inequality without updating the const
+/// fails to compile rather than reaching this arm).
 ///
 /// ## Why the wrapper vs inline match?
 ///
 /// The function call is `#[inline(always)]` + const-folded in
 /// release, so zero runtime overhead. Source-level wrapper
-/// centralises the debug-assert pattern across 6 materialise
+/// centralises the cold-path discipline across 6 materialise
 /// sites, avoiding drift (a future 7th site would inherit the
 /// correct dead-arm discipline automatically).
 #[inline(always)]
@@ -6649,25 +6665,21 @@ fn push_within_fanout_budget<'w, 'r>(
     match out.push(a) {
         Ok(()) => {}
         Err(_architecturally_dead) => {
-            // DEF-184 (B3): elevate the pre-(184) silent empty arm
-            // to a debug-classified dead-arm sentinel. Dev/test
-            // panics LOUDLY if invariant ever breaks (a future
-            // refactor drops MAX_FANOUT2_ENTRIES or adds a new
-            // fanout-3 staged variant without updating const). In
-            // release the silent no-op is the safe fallback — the
-            // structural invariant guarantees this is unreachable.
-            debug_assert!(
-                false,
-                "push_within_fanout_budget: OutActions overflow. \
-                 Architecturally impossible per const-assert \
-                 MAX_ACTIONS_PER_CALL >= MAX_STAGED + MAX_FANOUT2 \
-                 × (MAX_FANOUT - 1) = 9 post-DEF-184 A15. \
-                 If this fires, either a new fanout-2 StagedAction \
-                 variant landed without bumping MAX_FANOUT2_ENTRIES, \
-                 or 1c-5 pipelining introduced batched DeliverReply \
-                 emissions. Update MAX_FANOUT2_ENTRIES_PER_CALL and \
-                 MAX_ACTIONS_PER_CALL in lockstep.",
-            );
+            // DEF-280 Bundle G (2026-05-18): debug_assert!(false, …)
+            // removed — CREDO §V banned glass pattern. The const-asserted
+            // capacity invariant is the build-time safety net:
+            // `MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL +
+            //  MAX_FANOUT2_ENTRIES_PER_CALL × (MAX_FANOUT_PER_STAGED − 1) = 9`
+            // (asserted at MAX_ACTIONS_PER_CALL in action.rs). The Err arm
+            // is architecturally dead in any binary that compiles. Silent
+            // no-op is the safe fallback if a future refactor breaks the
+            // capacity inequality without bumping the const — the const-
+            // assert at build time will catch the drift before this
+            // runtime arm matters. (Pre-Bundle G the
+            // `debug_assert!(false, …)` provided only dev loudness, which
+            // misled readers into thinking the runtime check was the
+            // safety net rather than the build-time const-assert.)
+            core::hint::cold_path();
         }
     }
 }

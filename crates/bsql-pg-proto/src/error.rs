@@ -863,6 +863,22 @@ pub enum CrateBugLocus {
     /// next operation on the connection observes the Errored state and
     /// surfaces `ConnectionAlreadyClosed { prior_kind: ClientOrdering }`.
     StreamDroppedMidStream,
+
+    /// DEF-280 Bundle G (2026-05-18): a `compute_push_*` family function
+    /// staged a `StagedAction::DeliverReply` action — architecturally
+    /// dead because replies come from the server via `feed_bytes` only;
+    /// the push path never emits DeliverReply. Reaching this locus
+    /// indicates a `compute_push` refactor regression (or pipelining
+    /// work that didn't update DEF-160 Z2 invariant).
+    ///
+    /// Pre-Bundle G the dead arm in the materialise closure for the
+    /// push path used `debug_assert!(false, …)` plus a silent drop on
+    /// release — the CREDO §V glass pattern. Post-Bundle G the dead
+    /// arm classifies via `PushFailure { id: NonZeroU64::MIN, cause:
+    /// InternalCrateBug { locus: PushEmittedDeliverReply } }` (same
+    /// sentinel-id shape as `PushCommandInternalNonIdle`); both modes
+    /// return Err uniformly.
+    PushEmittedDeliverReply,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -915,6 +931,7 @@ impl fmt::Display for CrateBugLocus {
             Self::ReplyIdSaturation => f.write_str("reply-id-saturation"),
             Self::PushCommandInternalNonIdle => f.write_str("push-command-internal-non-idle"),
             Self::StreamDroppedMidStream => f.write_str("stream-dropped-mid-stream"),
+            Self::PushEmittedDeliverReply => f.write_str("push-emitted-deliver-reply"),
         }
     }
 }
@@ -1015,6 +1032,22 @@ mod crate_bug_locus_display_tests {
         assert_eq!(
             format!("{e}"),
             "internal bsql-pg-proto bug at locus stream-dropped-mid-stream",
+        );
+    }
+
+    /// DEF-280 Bundle G (2026-05-18) pin: PushEmittedDeliverReply locus
+    /// renders to its canonical operator-facing string. Watches for
+    /// drift on the compute_push pipeline classifier-bug signal —
+    /// replaces the pre-Bundle G `debug_assert!(false, …)` glass
+    /// pattern at protocol.rs:2881 with classified PushFailure.
+    #[test]
+    fn push_emitted_deliver_reply_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::PushEmittedDeliverReply,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus push-emitted-deliver-reply",
         );
     }
 }
