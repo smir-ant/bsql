@@ -954,13 +954,29 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // Zero-column oversized row (architecturally pathological
             // — a server emitting that exhausts our partial-mode
             // counter only via the chunked-body path. We exit partial
-            // mode and emit EndRow.). Verify partial counter is 0
-            // (body was exactly 4 bytes, which we already classified
-            // as not-oversized — so this case is unreachable from a
-            // wire-legal perspective). Defensive.
-            if self.proto.partial_remaining_for_row_stream() == 0 {
-                let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
-                self.proto.exit_partial_mode_for_row_stream(&token);
+            // mode and emit EndRow.). Verify partial counter is 0 via
+            // the function's typed-Err precondition (Bundle K-mirror)
+            // — pre-Bundle-K-mirror this site pre-checked
+            // `partial_remaining == 0` upstream (tier-2 by-discipline);
+            // post-Bundle-K-mirror the exit function itself enforces
+            // the precondition (Approach B, single source of truth)
+            // and returns Err if the wire still owed bytes (would
+            // indicate a body-length protocol error since this case
+            // is unreachable from wire-legal perspective with a
+            // non-zero counter — same elevation as Bundle K's
+            // enter-side classified-Err routing).
+            let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
+            if self.proto.exit_partial_mode_for_row_stream(&token).is_err() {
+                self.drained = true;
+                let drained = self.proto.install_errored_partial_mode_exit_undrained();
+                let cause = ProtocolError::InternalCrateBug {
+                    locus: crate::error::CrateBugLocus::PartialModeExitUndrained,
+                };
+                let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+                return ColEvent::EndQuery {
+                    id: term_id,
+                    outcome: Err(cause),
+                };
             }
             self.row_progress = None;
             return ColEvent::EndRow;
@@ -985,19 +1001,42 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // All columns of this row emitted. Reset row_progress so
             // the next col_next can pick up the next frame.
             self.row_progress = None;
-            // If we were in partial-mode and the body is fully drained
-            // (partial_remaining == 0), exit partial mode here. A
-            // wire-legal oversized DataRow has body == sum(2 col_count
-            // + per-col (4 len + len bytes)) — when parsed_cols ==
-            // n_cols, partial_remaining MUST be 0 (else a body-length
-            // / column-length disagreement). Defensive exit only when
-            // 0; non-zero is classified by the dispatcher on next
-            // entry as a body-length protocol error.
-            if self.proto.is_in_partial_mode_for_row_stream()
-                && self.proto.partial_remaining_for_row_stream() == 0
-            {
+            // If we were in partial-mode at end-of-row, exit partial
+            // mode here. A wire-legal oversized DataRow has body ==
+            // sum(2 col_count + per-col (4 len + len bytes)) — when
+            // parsed_cols == n_cols, partial_remaining MUST be 0
+            // (else a body-length / column-length disagreement).
+            //
+            // DEF-280 Bundle K-mirror (2026-05-18): the exit call
+            // returns `Result<(), PartialModeExitUndrained>` (Approach
+            // B — single source of truth: the function enforces the
+            // `partial_remaining == 0` precondition). Pre-Bundle-K-mirror
+            // this site pre-checked both `is_in_partial_mode` AND
+            // `partial_remaining == 0` upstream (tier-2 by-discipline)
+            // and silently skipped exit on non-zero remaining — the
+            // protocol-error classification was deferred to the
+            // dispatcher's next-frame entry (silent for the duration
+            // of this dispatch frame's body). Post-Bundle-K-mirror the
+            // classification happens IMMEDIATELY at end-of-row via the
+            // typed Err + install_errored_partial_mode_exit_undrained
+            // path. The `is_in_partial_mode` predicate-check is
+            // preserved as the fast-path gate (non-partial rows don't
+            // pay the exit-call cost).
+            if self.proto.is_in_partial_mode_for_row_stream() {
                 let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
-                self.proto.exit_partial_mode_for_row_stream(&token);
+                if self.proto.exit_partial_mode_for_row_stream(&token).is_err() {
+                    self.drained = true;
+                    let drained = self.proto.install_errored_partial_mode_exit_undrained();
+                    let cause = ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::PartialModeExitUndrained,
+                    };
+                    let cached_id = self.cached_reply_id.unwrap_or(NonZeroU64::MAX);
+                    let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+                    return ColEvent::EndQuery {
+                        id: term_id,
+                        outcome: Err(cause),
+                    };
+                }
             }
             return ColEvent::EndRow;
         }
@@ -1486,6 +1525,72 @@ mod bundle_k_spec_tests {
             std::format!("{e}"),
             "enter_partial_mode called while already in partial mode \
              (prev remaining: 100 bytes; rejected declared_len: 200)",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // DEF-280 Bundle K-mirror (2026-05-18) — exit_partial_mode spec
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Exit from `partial_remaining == 0` is the happy path — Ok and
+    /// counter remains 0.
+    #[test]
+    fn exit_partial_mode_on_drained_buffer_is_ok() {
+        use crate::buf::PartialModeExitUndrained;
+        let _ = core::marker::PhantomData::<PartialModeExitUndrained>;
+        let mut buf = ReadBuf::new();
+        let token = mint_for_row_stream_dispatcher();
+        // Buffer starts with partial_remaining == 0 (idle).
+        let result = buf.exit_partial_mode(&token);
+        assert!(result.is_ok(), "Bundle K-mirror: idle exit must succeed");
+        assert_eq!(buf.partial_remaining(), 0);
+    }
+
+    /// Exit while `partial_remaining > 0` returns Err and does NOT
+    /// reset the counter. Pre-Bundle-K-mirror this silently reset on
+    /// release builds — wire-desync class (body bytes still owed on
+    /// wire abandoned).
+    #[test]
+    fn exit_partial_mode_with_undrained_returns_err_and_preserves_counter() {
+        use crate::buf::PartialModeExitUndrained;
+        let mut buf = ReadBuf::new();
+        let token = mint_for_row_stream_dispatcher();
+        // Set up partial-mode with 512 bytes still owed.
+        assert!(
+            buf.enter_partial_mode(&token, 512).is_ok(),
+            "Bundle K-mirror fixture: enter must succeed from idle",
+        );
+        assert_eq!(buf.partial_remaining(), 512);
+
+        let token2 = mint_for_row_stream_dispatcher();
+        let result = buf.exit_partial_mode(&token2);
+        assert_eq!(
+            result,
+            Err(PartialModeExitUndrained { remaining: 512 }),
+            "Bundle K-mirror: undrained exit returns typed witness, \
+             not silent counter reset",
+        );
+        // Counter preserved at its prior value (NOT reset to 0).
+        assert_eq!(
+            buf.partial_remaining(),
+            512,
+            "Bundle K-mirror: Err arm leaves counter unchanged — \
+             pre-Bundle-K-mirror release builds silently reset 512 → 0, \
+             abandoning the 512 bytes still owed on the wire",
+        );
+    }
+
+    /// Display impl for PartialModeExitUndrained renders the
+    /// canonical diagnostic string (drift-detection pin).
+    #[test]
+    fn partial_mode_exit_undrained_display() {
+        extern crate std;
+        use crate::buf::PartialModeExitUndrained;
+        let e = PartialModeExitUndrained { remaining: 256 };
+        assert_eq!(
+            std::format!("{e}"),
+            "exit_partial_mode called with 256 bytes still owed on the wire \
+             (counter preserved; not silently reset)",
         );
     }
 }

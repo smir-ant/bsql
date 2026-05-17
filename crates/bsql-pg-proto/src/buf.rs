@@ -824,6 +824,24 @@ impl ReadBuf {
     /// `0` outside partial mode. Inside partial mode, this is the
     /// count returned by `enter_partial_mode(declared_len)` minus the
     /// sum of all `subtract_partial_remaining` since entry.
+    ///
+    /// # DEF-280 Bundle K-mirror (2026-05-18) — `#[cfg(test)]`-gated
+    ///
+    /// Pre-Bundle-K-mirror this accessor was a `pub(crate)` predicate
+    /// for upstream callers in `row_stream.rs` that pre-checked
+    /// `partial_remaining == 0` before calling `exit_partial_mode`
+    /// (tier-2 by-discipline). Bundle K-mirror moved that precondition
+    /// INTO `exit_partial_mode` itself (Approach B); the upstream
+    /// predicate became dead and the wrapper
+    /// `PgProtocol::partial_remaining_for_row_stream` was deleted.
+    ///
+    /// The accessor is retained as `#[cfg(test)]` because Bundle K's
+    /// spec tests (`row_stream::bundle_k_spec_tests`) assert the
+    /// counter value directly on a `ReadBuf` fixture — pinning the
+    /// no-overwrite-on-Err invariant. Production code uses only the
+    /// Result return shape; there is no legitimate production read
+    /// path on the counter field.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub(crate) const fn partial_remaining(&self) -> u32 {
@@ -879,24 +897,49 @@ impl ReadBuf {
     /// Exit partial-frame mode. The leaf-minted token gates this
     /// transition.
     ///
-    /// # Caller contract
+    /// # Caller contract — DEF-280 Bundle K-mirror (2026-05-18)
     ///
     /// Exit is only legal once the body has been fully drained
-    /// (`partial_remaining == 0`). Debug-asserted; release path
-    /// classifies a non-zero exit as a no-op reset (preserves
-    /// tier-1 by-construction: the counter is always non-negative
-    /// regardless of caller drift).
+    /// (`partial_remaining == 0`).
+    ///
+    /// Pre-Bundle-K-mirror: `debug_assert!(partial_remaining == 0)` +
+    /// silent reset of the counter to `0` on release builds. The
+    /// docstring claimed «tier-1 by-construction: counter is non-
+    /// negative regardless of caller drift» — but that argument only
+    /// covers counter-value correctness, NOT **wire-synchronisation
+    /// correctness**. A silent reset with `partial_remaining > 0`
+    /// means body bytes that the wire still owes are never drained;
+    /// the next inbound bytes get classified as a fresh frame header
+    /// instead of body continuation — wire-desync class (same hazard
+    /// class as Bundle K's enter-side silent overwrite, mirror
+    /// direction).
+    ///
+    /// Post-Bundle-K-mirror: returns `Result<(), PartialModeExitUndrained>`.
+    /// On Err the counter is **left unchanged** (preserves the
+    /// caller's view of body bytes still owed); the caller classifies
+    /// via `CrateBugLocus::PartialModeExitUndrained` and transitions
+    /// to Errored. Both dev and release route through the same path.
+    ///
+    /// The pre-Bundle-K-mirror upstream `if partial_remaining == 0`
+    /// caller-side checks (defense by-discipline) were removed when
+    /// migrating callers to the Err-propagation shape (Approach B —
+    /// single source of truth: the function itself enforces the
+    /// precondition, caller handles the typed Err).
     #[inline]
     pub(crate) fn exit_partial_mode(
         &mut self,
         _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
-    ) {
-        debug_assert!(
-            self.partial_remaining == 0,
-            "ReadBuf: exit_partial_mode with non-zero remaining ({} bytes still owed)",
-            self.partial_remaining,
-        );
+    ) -> Result<(), PartialModeExitUndrained> {
+        if self.partial_remaining != 0 {
+            return Err(PartialModeExitUndrained {
+                remaining: self.partial_remaining,
+            });
+        }
+        // Already 0; the explicit write makes the intent visible and
+        // mirrors the enter-side's `self.partial_remaining = declared_len`
+        // shape symmetry.
         self.partial_remaining = 0;
+        Ok(())
     }
 
     /// Subtract `n` bytes from the partial-mode counter. Caller drains
@@ -1070,6 +1113,53 @@ impl fmt::Display for AlreadyInPartialMode {
             "enter_partial_mode called while already in partial mode \
              (prev remaining: {} bytes; rejected declared_len: {})",
             self.prev_remaining, self.new_declared_len,
+        )
+    }
+}
+
+/// DEF-280 Bundle K-mirror (2026-05-18): returned by
+/// [`ReadBuf::exit_partial_mode`] when called while the buffer still
+/// owes wire body bytes (`partial_remaining > 0`).
+///
+/// Pre-Bundle-K-mirror the same condition was a `debug_assert!`
+/// (panic in dev) plus a silent counter reset to `0` in release —
+/// the CREDO §V glass pattern (loud dev + silent release). The
+/// release-mode reset's hazard: the previously-pending body bytes
+/// are never drained from the wire; the next inbound bytes get
+/// mis-classified as a fresh frame header. Wire-desync class —
+/// mirror of [`AlreadyInPartialMode`]'s entry-side hazard.
+///
+/// Post-Bundle-K-mirror the counter is **left unchanged** on
+/// detection and a typed witness is returned for caller
+/// classification via `CrateBugLocus::PartialModeExitUndrained`.
+/// Both dev and release route through the same path.
+///
+/// Architecturally dead under intact callers — pre-Bundle-K-mirror
+/// the two callers in `row_stream.rs` did `if partial_remaining == 0
+/// { exit_partial_mode(...) }` upstream-defense; Bundle K-mirror
+/// moved that check INTO the function (Approach B — single source
+/// of truth) and the caller now routes Err through Errored install
+/// + `ColEvent::EndQuery::Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialModeExitUndrained {
+    /// Body bytes still owed on the wire at the moment of the
+    /// rejected exit attempt (provided here for diagnostic logs;
+    /// the counter is NOT reset by Err).
+    pub remaining: u32,
+}
+
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the partial-mode exit-undrained
+// sentinel.
+impl core::error::Error for PartialModeExitUndrained {}
+
+impl fmt::Display for PartialModeExitUndrained {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "exit_partial_mode called with {} bytes still owed on the wire \
+             (counter preserved; not silently reset)",
+            self.remaining,
         )
     }
 }

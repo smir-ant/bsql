@@ -899,6 +899,27 @@ pub enum CrateBugLocus {
     /// continuation). Post-Bundle K both modes return typed `Err` and
     /// route through this locus + `Errored` state install.
     PartialModeReentry,
+
+    /// DEF-280 Bundle K-mirror (2026-05-18): [`crate::buf::ReadBuf::exit_partial_mode`]
+    /// was called while the buffer still owed wire body bytes
+    /// (`partial_remaining > 0`). The streaming dispatcher's
+    /// state machine guarantees the precondition (every wire-legal
+    /// streaming row drains its body before reaching the
+    /// end-of-row code path), so reaching this locus indicates
+    /// either an internal refactor regression in the dispatch loop
+    /// OR an adversarial server emitting a malformed DataRow whose
+    /// `col_count`/per-column length sum doesn't match the
+    /// frame-header body length.
+    ///
+    /// Pre-Bundle-K-mirror the same condition was a `debug_assert!`
+    /// plus silent reset of `partial_remaining` to `0` on release —
+    /// the CREDO §V glass pattern, mirror of [`Self::PartialModeReentry`]'s
+    /// entry-side hazard. Wire-desync consequence: previously-pending
+    /// body bytes never drained from the wire, next inbound bytes
+    /// mis-classified as a fresh frame header. Post-Bundle-K-mirror
+    /// both modes return typed `Err`, the counter is preserved, and
+    /// the caller routes through this locus and `Errored` state install.
+    PartialModeExitUndrained,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -953,6 +974,7 @@ impl fmt::Display for CrateBugLocus {
             Self::StreamDroppedMidStream => f.write_str("stream-dropped-mid-stream"),
             Self::PushEmittedDeliverReply => f.write_str("push-emitted-deliver-reply"),
             Self::PartialModeReentry => f.write_str("partial-mode-reentry"),
+            Self::PartialModeExitUndrained => f.write_str("partial-mode-exit-undrained"),
         }
     }
 }
@@ -1086,6 +1108,24 @@ mod crate_bug_locus_display_tests {
         assert_eq!(
             format!("{e}"),
             "internal bsql-pg-proto bug at locus partial-mode-reentry",
+        );
+    }
+
+    /// DEF-280 Bundle K-mirror (2026-05-18) pin: PartialModeExitUndrained
+    /// locus renders to its canonical operator-facing string. Watches
+    /// for drift on the row-stream partial-mode exit-with-bytes-owed
+    /// classifier-bug signal — replaces the pre-Bundle-K-mirror
+    /// `debug_assert!(partial_remaining == 0, …)` glass pattern at
+    /// buf.rs:894 with typed Err return + classified install_errored
+    /// routing.
+    #[test]
+    fn partial_mode_exit_undrained_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::PartialModeExitUndrained,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus partial-mode-exit-undrained",
         );
     }
 }

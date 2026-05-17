@@ -2028,6 +2028,30 @@ pub(crate) mod _partial_mode_reentry_drain_leaf {
     }
 }
 
+/// DEF-280 Bundle K-mirror (2026-05-18) leaf submodule for the
+/// `install_errored_partial_mode_exit_undrained` transition. Fires
+/// when [`crate::buf::ReadBuf::exit_partial_mode`] returns
+/// `Err(PartialModeExitUndrained)` — an internal classifier bug OR
+/// adversarial server emitting a body-length-vs-column-sum-mismatched
+/// DataRow; classified as
+/// [`crate::error::CrateBugLocus::PartialModeExitUndrained`].
+pub(crate) mod _partial_mode_exit_undrained_drain_leaf {
+    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    pub(crate) struct PartialModeExitUndrainedToken(());
+
+    /// Mint a [`PartialModeExitUndrainedToken`] and route through
+    /// [`crate::state_setter::drain_at_partial_mode_exit_undrained`].
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+                  by the Errored install. Caller MUST emit ColEvent::EndQuery { outcome: Err(_) } or equivalent."]
+    pub(in crate::protocol) fn drain(
+        state: &mut crate::state::ProtoState,
+        kind: crate::error::StateErrorKind,
+    ) -> Option<core::num::NonZeroU64> {
+        crate::state_setter::drain_at_partial_mode_exit_undrained(state, PartialModeExitUndrainedToken(()), kind)
+    }
+}
+
 /// DEF-272 cluster δ leaf submodule for the
 /// `install_errored_malformed_data_row` transition. Fires from
 /// streaming variants when a DataRow body is malformed (zero-length,
@@ -4604,12 +4628,25 @@ impl PgProtocol<ActivePhase> {
 
     /// DEF-248 Sub-A (2026-05-12): partial-mode exit point. Mirror
     /// of [`Self::enter_partial_mode_for_data_row`].
+    ///
+    /// # DEF-280 Bundle K-mirror (2026-05-18)
+    ///
+    /// Now propagates the `Err(PartialModeExitUndrained)` from
+    /// [`crate::buf::ReadBuf::exit_partial_mode`]. Pre-Bundle-K-mirror
+    /// callers received `()` and pre-checked `partial_remaining == 0`
+    /// upstream (tier-2 by-discipline); the silent-reset path in
+    /// release was wire-desync-class. Post-Bundle-K-mirror callers
+    /// receive `Result` and route Err through
+    /// [`Self::install_errored_partial_mode_exit_undrained`] +
+    /// `ColEvent::EndQuery::Err` (classifier-bug protocol).
+    /// Single source of truth: the function enforces the
+    /// `partial_remaining == 0` precondition.
     #[inline]
     pub(crate) fn exit_partial_mode_for_row_stream(
         &mut self,
         token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
-    ) {
-        self.inner.read_buf.exit_partial_mode(token);
+    ) -> Result<(), crate::buf::PartialModeExitUndrained> {
+        self.inner.read_buf.exit_partial_mode(token)
     }
 
     /// DEF-248 Sub-A (2026-05-12): drain `n` bytes from the
@@ -4632,14 +4669,20 @@ impl PgProtocol<ActivePhase> {
         self.inner.read_buf.is_in_partial_mode()
     }
 
-    /// DEF-248 Sub-A (2026-05-12): partial-mode counter readout.
-    /// Used by the row-stream state machine to decide whether
-    /// exit-partial-mode is safe (counter == 0).
-    #[inline]
-    #[must_use]
-    pub(crate) fn partial_remaining_for_row_stream(&self) -> u32 {
-        self.inner.read_buf.partial_remaining()
-    }
+    // DEF-280 Bundle K-mirror (2026-05-18): `partial_remaining_for_row_stream`
+    // DELETED. Pre-Bundle-K-mirror this was used by `row_stream.rs`'s
+    // two `if self.proto.partial_remaining_for_row_stream() == 0 { exit }`
+    // discipline-checks before calling exit. Bundle K-mirror moved the
+    // precondition INTO `exit_partial_mode_for_row_stream` itself
+    // (Approach B — single source of truth: the function enforces the
+    // invariant via typed Err return). The accessor became dead with
+    // the upstream-check removal.
+    //
+    // The underlying `ReadBuf::partial_remaining()` accessor is preserved
+    // because Bundle K's spec tests in `row_stream::bundle_k_spec_tests`
+    // assert the counter value directly on a `ReadBuf` fixture — that
+    // load-bearing use is via the field-accessor path, not the
+    // protocol-level wrapper this comment replaces.
 
     /// DEF-189: project the current row_desc_slot as a
     /// [`crate::decode::RowDescBorrow`], or `None` if no schema is
@@ -4762,6 +4805,32 @@ impl PgProtocol<ActivePhase> {
             locus: crate::error::CrateBugLocus::PartialModeReentry,
         };
         _partial_mode_reentry_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
+    }
+
+    /// DEF-280 Bundle K-mirror (2026-05-18): transition to
+    /// `Errored(InternalCrateBug { locus: PartialModeExitUndrained })`
+    /// when [`Self::exit_partial_mode_for_row_stream`] returns Err.
+    /// Routes the drain through the cluster δ leaf shape mirroring
+    /// [`Self::install_errored_partial_mode_reentry`]; same atomic
+    /// drain-and-install discipline (DEF-271 cluster A).
+    ///
+    /// Two paths reach this: (a) internal classifier bug in the
+    /// dispatch loop (architecturally dead under intact callers); (b)
+    /// adversarial server emitting a malformed DataRow whose
+    /// per-column-length sum disagrees with the frame-header body
+    /// length, leaving body bytes uncounted at end-of-row. Either
+    /// way, classification + Errored transition + reply-id drain
+    /// + ColEvent::EndQuery::Err.
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically \
+                  drained by the Errored install. Caller MUST emit ColEvent::EndQuery \
+                  { outcome: Err(_) } or equivalent — dropping it leaks the user's \
+                  oneshot-receiver (zombie-reply class)."]
+    pub(crate) fn install_errored_partial_mode_exit_undrained(&mut self) -> Option<NonZeroU64> {
+        let cause = ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::PartialModeExitUndrained,
+        };
+        _partial_mode_exit_undrained_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
     }
 
     /// DEF-154 (X): transition to `Errored(Framing)` for a

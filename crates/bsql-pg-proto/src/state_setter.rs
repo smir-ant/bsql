@@ -377,6 +377,23 @@ pub(crate) fn drain_at_partial_mode_reentry(
     FeedStateSetter::new(state).drain_and_install_errored(kind)
 }
 
+/// DEF-280 Bundle K-mirror (2026-05-18) leaf entry point:
+/// partial-mode exit-with-bytes-owed detection. Used by
+/// `PgProtocol::install_errored_partial_mode_exit_undrained` (the only
+/// legitimate caller; classified as
+/// `CrateBugLocus::PartialModeExitUndrained`).
+#[inline]
+#[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+              by the Errored install. Caller MUST emit ColEvent::EndQuery::Err or equivalent — \
+              dropping it leaks the user's oneshot-receiver (zombie-reply class)."]
+pub(crate) fn drain_at_partial_mode_exit_undrained(
+    state: &mut ProtoState,
+    _t: crate::protocol::_partial_mode_exit_undrained_drain_leaf::PartialModeExitUndrainedToken,
+    kind: StateErrorKind,
+) -> Option<NonZeroU64> {
+    FeedStateSetter::new(state).drain_and_install_errored(kind)
+}
+
 /// DEF-272 cluster δ leaf entry point: malformed-DataRow transition.
 /// Used by `PgProtocol::install_errored_malformed_data_row` (the only
 /// legitimate caller; classified as
