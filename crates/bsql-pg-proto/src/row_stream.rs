@@ -81,6 +81,7 @@
 //! - **OS-level boundary**: `panic = "abort"` → process death → TCP
 //!   RST → server-side teardown.
 
+use core::marker::PhantomData;
 use core::num::NonZeroU64;
 
 use crate::action::{Action, Reply};
@@ -288,6 +289,21 @@ pub struct RowStream<'p, 'w> {
     /// outside a row (waiting for next frame, or in a non-streaming
     /// state).
     row_progress: Option<RowProgress>,
+    /// DEF-280 Bundle H (2026-05-18): force `RowStream: !Send + !Sync`
+    /// via a ZST `PhantomData<*const ()>` (`*const ()` is the canonical
+    /// non-`Send` / non-`Sync` witness in core). The closure-scoped
+    /// API already pins lifetime via HRTB on `iter_rows`'s closure, but
+    /// nothing prevented a caller from capturing `&mut RowStream`
+    /// inside a `tokio::spawn(async move { ... })` (the spawned future
+    /// requires `Send` on its captures — with `!Send` RowStream the
+    /// spawn fails to compile rather than running Drop on a foreign
+    /// thread after `iter_rows`'s frame returns).
+    ///
+    /// ZST: no layout cost. `*const ()` carries no provenance — purely
+    /// a marker type. Cannot be constructed by anyone outside this
+    /// struct (the field is private + has no `pub` constructor surface;
+    /// callers go through `RowStream::new`).
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<'p, 'w> RowStream<'p, 'w> {
@@ -304,6 +320,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             flush_pending: false,
             cached_reply_id: None,
             row_progress: None,
+            _not_send: PhantomData,
         }
     }
 
