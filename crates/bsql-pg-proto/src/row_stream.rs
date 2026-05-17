@@ -1193,10 +1193,18 @@ impl<'p, 'w> RowStream<'p, 'w> {
         self.row_progress = Some(new_progress);
 
         let remaining_len = col_len.saturating_sub(chunk_len_u32);
+        // DEF-281 Site A-mirror (2026-05-18): two-phase defense.
+        // `read_buf_advance(chunk_len)` succeeded above ⇒
+        // `bytes_offset + chunk_len <= populated.len()`. Pre-check
+        // via len-copy + classified Err on the architecturally-dead
+        // bounds-violation arm before the populated re-borrow.
+        let populated_len = self.proto.read_buf_populated().len();
+        let slice_end = bytes_offset.saturating_add(chunk_len);
+        if slice_end > populated_len || slice_end < bytes_offset {
+            return self.terminal_internal_advance_err();
+        }
         let populated = self.proto.read_buf_populated();
-        let bytes = populated
-            .get(bytes_offset..bytes_offset.saturating_add(chunk_len))
-            .unwrap_or(&[]);
+        let bytes = populated.get(bytes_offset..slice_end).unwrap_or(&[]);
         ColEvent::Chunk {
             idx,
             bytes,
@@ -1268,10 +1276,17 @@ impl<'p, 'w> RowStream<'p, 'w> {
         }
         self.row_progress = Some(new_progress);
 
+        // DEF-281 Site A-mirror (chunk continuation, 2026-05-18):
+        // two-phase defense, same pattern as the first-chunk site.
+        // `read_buf_advance(chunk_len_usize)` succeeded above ⇒
+        // `bytes_offset + chunk_len_usize <= populated.len()`.
+        let populated_len = self.proto.read_buf_populated().len();
+        let slice_end = bytes_offset.saturating_add(chunk_len_usize);
+        if slice_end > populated_len || slice_end < bytes_offset {
+            return self.terminal_internal_advance_err();
+        }
         let populated = self.proto.read_buf_populated();
-        let bytes = populated
-            .get(bytes_offset..bytes_offset.saturating_add(chunk_len_usize))
-            .unwrap_or(&[]);
+        let bytes = populated.get(bytes_offset..slice_end).unwrap_or(&[]);
         let idx = progress.parsed_cols;
         if is_final {
             ColEvent::ChunkEnd { idx, bytes }
