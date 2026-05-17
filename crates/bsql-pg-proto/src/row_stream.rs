@@ -469,12 +469,28 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     }
                 }
                 ColEvent::Null { idx } => {
+                    // DEF-281 Site B (2026-05-18): pre-Bundle this arm
+                    // silently dropped Null events with `idx >= MAX_ROW_COLUMNS`
+                    // (the `if idx_usize < MAX_ROW_COLUMNS { … }` guard
+                    // simply skipped the col_count bump on overflow). A
+                    // server emitting a row with 33+ Null columns would
+                    // see `col_count` plateau at 32 + the R::ARITY check
+                    // pass false-positively if R::ARITY happened to equal
+                    // the truncated `col_count`. Silent data-corruption
+                    // class. Post-Bundle the Null path mirrors the Got
+                    // path immediately above (line ~433): classify oversize
+                    // index as `TooManyColumns` and surface a typed
+                    // ProtocolError.
                     let idx_usize = usize::from(idx);
-                    if idx_usize < crate::decode::MAX_ROW_COLUMNS {
-                        // Slot already None.
-                        if idx_usize >= usize::from(col_count) {
-                            col_count = idx.saturating_add(1);
-                        }
+                    if idx_usize >= crate::decode::MAX_ROW_COLUMNS {
+                        return Err(ProtocolError::TooManyColumns {
+                            count: idx_usize.saturating_add(1),
+                            max: crate::decode::MAX_ROW_COLUMNS,
+                        });
+                    }
+                    // Slot already None.
+                    if idx_usize >= usize::from(col_count) {
+                        col_count = idx.saturating_add(1);
                     }
                 }
                 ColEvent::EndRow => {
@@ -1100,13 +1116,44 @@ impl<'p, 'w> RowStream<'p, 'w> {
             let mut new_progress = progress;
             new_progress.parsed_cols = idx.saturating_add(1);
             self.row_progress = Some(new_progress);
-            // Project the body slice from the populated region. The
-            // borrow is `&self.proto.read_buf.populated()[start..end]`
-            // and ties to the `&mut self` borrow on iter_rows.
+
+            // DEF-281 Site A (2026-05-18): two-phase defense for the
+            // body-slice projection. Pre-Bundle this site silently
+            // delivered an empty slice on architecturally-dead None
+            // via `.unwrap_or(&[])` — the CREDO §V glass pattern,
+            // user-visible-data-corruption-class if `read_buf_advance`'s
+            // contract ever broke.
+            //
+            // Post-Bundle phase 1 (explicit pre-check, uses populated
+            // .len() as a copy so the borrow is fully released before
+            // any `&mut self` call): if the slice end exceeds the
+            // populated region OR bytes_offset arithmetic underflowed
+            // (saturating_add could produce a smaller-than-offset end
+            // only on usize wrap, architecturally impossible because
+            // col_len_usize fits in i32), classify via the canonical
+            // terminal helper — `CrateBugLocus::ReadCursorAdvance`
+            // (closest existing semantics: "cursor/populated invariant
+            // broke between `read_buf_advance` Ok and slice
+            // projection"). The borrow-checker constraint forces this
+            // pre-check to live BEFORE the `populated` re-borrow,
+            // because `terminal_internal_advance_err` takes `&mut self`
+            // and the slice's lifetime ties to the populated borrow.
+            //
+            // Post-Bundle phase 2: project the slice. The
+            // `.unwrap_or(&[])` fallback is preserved as the closing
+            // syntactic shape (no `clippy::indexing_slicing` use; no
+            // `unwrap()` / `expect()` panic class), but its None arm is
+            // now ARCHITECTURALLY UNREACHABLE per phase 1's pre-check.
+            // The pair is the tier-1 elevation: classified Err on the
+            // hazard path, syntactic-shape fallback on the proven-dead
+            // path.
+            let populated_len = self.proto.read_buf_populated().len();
+            let slice_end = bytes_offset.saturating_add(col_len_usize);
+            if slice_end > populated_len || slice_end < bytes_offset {
+                return self.terminal_internal_advance_err();
+            }
             let populated = self.proto.read_buf_populated();
-            let bytes = populated
-                .get(bytes_offset..bytes_offset.saturating_add(col_len_usize))
-                .unwrap_or(&[]);
+            let bytes = populated.get(bytes_offset..slice_end).unwrap_or(&[]);
             return ColEvent::Got { idx, bytes };
         }
 
