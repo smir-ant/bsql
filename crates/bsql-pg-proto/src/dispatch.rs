@@ -610,11 +610,34 @@ pub(crate) fn dispatch(
             // (tier-1 within-crate write provenance).
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
-                    let secret_key_inner: i32 = *secret_key.get();
+                    // DEF-280 Bundle I / Bundle D'' (2026-05-18):
+                    // Wrap the local `i32` extraction in `Zeroizing<i32>`
+                    // so the stack slot scrubs deterministically when
+                    // the arm scope ends. Pre-Bundle I the plain `i32`
+                    // local lived unscrubbed on the dispatch arm's
+                    // function frame; the source `Sensitive<i32>`
+                    // (variant payload) scrubbed at arm-scope exit and
+                    // the cell-installed `Sensitive<i32>` scrubbed at
+                    // connection teardown, but the **stack-resident
+                    // intermediate** between the two scrub points was
+                    // not covered. Under `panic = "unwind"` (cargo test)
+                    // Drop runs even on early-return; under
+                    // `panic = "abort"` (release; documented gap
+                    // Cargo.toml lines 97-151) the process exits before
+                    // the unscrubbed slot matters. Tier-1 within scope:
+                    // the secret can no longer leak via a future cold-
+                    // path borrow / leak / coredump-of-stack-frame.
+                    //
+                    // `Zeroizing<i32>` defers to `<i32 as Zeroize>` (
+                    // zeroize crate's blanket impl for primitive ints
+                    // writes `0`). `Deref` exposes the inner `i32` for
+                    // the two consumers below without cloning.
+                    let secret_key_inner: zeroize::Zeroizing<i32> =
+                        zeroize::Zeroizing::new(*secret_key.get());
                     crate::protocol::_backend_key_install_leaf::install_at_dispatch_arm(
                         backend_key_slot,
                         pid,
-                        crate::sensitive::Sensitive::new(secret_key_inner),
+                        crate::sensitive::Sensitive::new(*secret_key_inner),
                     );
                     *state = ProtoState::Idle;
                     DispatchOutcome::AdvancedWithAction {
@@ -622,7 +645,7 @@ pub(crate) fn dispatch(
                             reply,
                             crate::action::StartupCompletePayload {
                                 pid,
-                                secret_key: secret_key_inner,
+                                secret_key: *secret_key_inner,
                                 tx_status,
                             },
                         ),

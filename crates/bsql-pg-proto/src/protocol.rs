@@ -2346,29 +2346,32 @@ impl PgProtocol<ActivePhase> {
         // (CREDO §V).
         let key: &crate::cancel::BackendKey = self.inner.backend_key.as_inner()?;
         let pid: i32 = key.pid;
-        // Copy the i32 out of the cell's Sensitive<i32>. The plain
-        // i32 lives in this stack frame for the duration of the
-        // `cancel_request_bytes` build below; the Zeroizing guard
-        // scrubs the encoded array's 16 bytes (which includes a
-        // BE copy of this secret at bytes[12..16]) on closure
-        // return. The plain-i32 stack slot itself is overwritten by
-        // normal function-prologue/epilogue conventions on return —
-        // not scrubbed explicitly. For Bundle D'' (if ever needed),
-        // wrap `secret` in `Zeroizing` and pass by reference into
-        // an i32-aware `cancel_request_bytes_into` helper. Not
-        // required for D' tier elevation: the lifetime of the
-        // unscrubbed slot is bounded by this function's invocation
-        // and not addressable from outside.
-        let secret: i32 = *key.secret_key.get();
+        // DEF-280 Bundle I / Bundle D'' (2026-05-18): Copy the i32
+        // out of the cell's Sensitive<i32> into a `Zeroizing<i32>`
+        // guard so the stack slot scrubs deterministically when the
+        // function frame ends. Pre-Bundle I the plain `i32` local
+        // lived unscrubbed on the function frame for the duration of
+        // the `cancel_request_bytes` build below; the encoded
+        // `[u8; 16]` was already wrapped in `Zeroizing` (covering
+        // BE bytes[12..16]), but the plain-i32 intermediate was not.
+        // Under `panic = "unwind"` (cargo test) Drop fires; under
+        // `panic = "abort"` (release; documented gap) the process
+        // exits before the unscrubbed slot matters. Tier-1 within
+        // scope.
+        let secret_key_guard: zeroize::Zeroizing<i32> =
+            zeroize::Zeroizing::new(*key.secret_key.get());
         // Materialise the wire frame inside a Zeroizing guard. The
         // `cancel_request_bytes` const-fn returns `[u8; 16]` on the
         // stack; the move into `Zeroizing::new(...)` is NRVO-friendly
         // (LLVM writes directly into the guard's inline storage).
         // Single source of truth for the byte layout: the
         // `cancel_request_bytes` builder, which is itself
-        // const-pinned in `wire.rs`.
+        // const-pinned in `wire.rs`. The `*secret_key_guard` deref
+        // copies the i32 (Copy primitive) into the builder's
+        // parameter slot; LLVM is free to fold this into a direct
+        // load.
         let bytes_guard: zeroize::Zeroizing<[u8; 16]> = zeroize::Zeroizing::new(
-            crate::wire::cancel_request_bytes(pid, secret),
+            crate::wire::cancel_request_bytes(pid, *secret_key_guard),
         );
         // Lend the borrow into the closure. The closure's HRTB
         // `for<'a> FnOnce(&'a [u8; 16], i32) -> R` quantifies `'a`
