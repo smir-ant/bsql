@@ -843,23 +843,37 @@ impl ReadBuf {
     ///   (tag + length) and is responsible for advancing the read
     ///   cursor past the header before chunked-body consumption
     ///   begins. The counter tracks body bytes, not header bytes.
-    /// - It is a tier-2 caller bug to re-enter partial mode while
-    ///   already in it; debug-asserted, release-classified as a
-    ///   no-op overwrite.
+    ///
+    /// # Re-entry protection (DEF-280 Bundle K, 2026-05-18)
+    ///
+    /// Pre-Bundle K re-entry while already in partial mode was a
+    /// tier-2 caller-bug condition: `debug_assert!(partial_remaining
+    /// == 0, ...)` panicked loudly in dev builds, while release
+    /// builds silently overwrote `partial_remaining` and dropped the
+    /// previously-pending body-byte count — wire-level desync once
+    /// the next inbound bytes were classified as a fresh frame
+    /// header. The CREDO §V glass pattern (dev loud + release silent).
+    ///
+    /// Post-Bundle K `enter_partial_mode` returns
+    /// `Result<(), AlreadyInPartialMode>`. On Err the counter is
+    /// left unchanged (no overwrite); the caller is expected to
+    /// classify the bug via `CrateBugLocus::PartialModeReentry` and
+    /// transition the connection to Errored. Both dev and release
+    /// route through the same path.
     #[inline]
     pub(crate) fn enter_partial_mode(
         &mut self,
         _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
         declared_len: u32,
-    ) {
-        debug_assert!(
-            self.partial_remaining == 0,
-            "ReadBuf: enter_partial_mode while already in partial mode \
-             (prev remaining: {}; new declared_len: {})",
-            self.partial_remaining,
-            declared_len,
-        );
+    ) -> Result<(), AlreadyInPartialMode> {
+        if self.partial_remaining != 0 {
+            return Err(AlreadyInPartialMode {
+                prev_remaining: self.partial_remaining,
+                new_declared_len: declared_len,
+            });
+        }
         self.partial_remaining = declared_len;
+        Ok(())
     }
 
     /// Exit partial-frame mode. The leaf-minted token gates this
@@ -1014,6 +1028,48 @@ impl fmt::Display for AdvancePastEnd {
             f,
             "advance past end: requested {} bytes, only {} unread",
             self.requested, self.available,
+        )
+    }
+}
+
+/// DEF-280 Bundle K (2026-05-18): returned by
+/// [`ReadBuf::enter_partial_mode`] when called while the buffer is
+/// already in partial-frame mode (`partial_remaining > 0`).
+///
+/// Pre-Bundle K the same condition was a `debug_assert!` that
+/// panicked in dev builds and silently overwrote the prior
+/// `partial_remaining` value in release — the CREDO §V glass pattern
+/// (loud dev + silent release). Post-Bundle K the counter is left
+/// unchanged on detection and a typed witness is returned for caller
+/// classification via `CrateBugLocus::PartialModeReentry`. Both dev
+/// and release route through the same path.
+///
+/// Architecturally dead under intact callers — the streaming
+/// dispatcher in `row_stream.rs` guarantees `exit_partial_mode` runs
+/// before `enter_partial_mode` recurrence — but the typed return is
+/// the by-construction shield against future refactor drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlreadyInPartialMode {
+    /// Bytes still outstanding for the IN-FLIGHT partial frame at
+    /// the moment of the rejected re-entry attempt.
+    pub prev_remaining: u32,
+    /// `declared_len` that the re-entry attempt would have written
+    /// (provided here for diagnostic logs; the counter is NOT
+    /// overwritten by Err).
+    pub new_declared_len: u32,
+}
+
+// DEF-244 modernisation audit (rust-version 1.81): additive
+// `core::error::Error` impl on the partial-mode re-entry sentinel.
+impl core::error::Error for AlreadyInPartialMode {}
+
+impl fmt::Display for AlreadyInPartialMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "enter_partial_mode called while already in partial mode \
+             (prev remaining: {} bytes; rejected declared_len: {})",
+            self.prev_remaining, self.new_declared_len,
         )
     }
 }

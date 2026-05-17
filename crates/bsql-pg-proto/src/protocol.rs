@@ -2006,6 +2006,28 @@ pub(crate) mod _read_cursor_advance_drain_leaf {
     }
 }
 
+/// DEF-280 Bundle K (2026-05-18) leaf submodule for the
+/// `install_errored_partial_mode_reentry` transition. Fires when
+/// [`crate::buf::ReadBuf::enter_partial_mode`] returns
+/// `Err(AlreadyInPartialMode)` — an internal classifier bug
+/// classified as [`crate::error::CrateBugLocus::PartialModeReentry`].
+pub(crate) mod _partial_mode_reentry_drain_leaf {
+    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    pub(crate) struct PartialModeReentryToken(());
+
+    /// Mint a [`PartialModeReentryToken`] and route through
+    /// [`crate::state_setter::drain_at_partial_mode_reentry`].
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
+                  by the Errored install. Caller MUST emit ColEvent::EndQuery { outcome: Err(_) } or equivalent."]
+    pub(in crate::protocol) fn drain(
+        state: &mut crate::state::ProtoState,
+        kind: crate::error::StateErrorKind,
+    ) -> Option<core::num::NonZeroU64> {
+        crate::state_setter::drain_at_partial_mode_reentry(state, PartialModeReentryToken(()), kind)
+    }
+}
+
 /// DEF-272 cluster δ leaf submodule for the
 /// `install_errored_malformed_data_row` transition. Fires from
 /// streaming variants when a DataRow body is malformed (zero-length,
@@ -4558,13 +4580,23 @@ impl PgProtocol<ActivePhase> {
     /// `crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher`,
     /// itself `pub(in crate::row_stream)` — so this entry point is
     /// only legitimately reachable from inside `mod row_stream`.
+    ///
+    /// # DEF-280 Bundle K (2026-05-18)
+    ///
+    /// Now propagates the `Err(AlreadyInPartialMode)` from
+    /// [`crate::buf::ReadBuf::enter_partial_mode`]. Pre-Bundle K
+    /// callers received `()` and the re-entry condition was a silent
+    /// overwrite in release (debug-asserted in dev). Post-Bundle K
+    /// callers receive `Result` and route Err through
+    /// [`Self::install_errored_partial_mode_reentry`] +
+    /// `ColEvent::EndQuery::Err` (classifier-bug protocol).
     #[inline]
     pub(crate) fn enter_partial_mode_for_data_row(
         &mut self,
         token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
         declared_body_len: u32,
-    ) {
-        self.inner.read_buf.enter_partial_mode(token, declared_body_len);
+    ) -> Result<(), crate::buf::AlreadyInPartialMode> {
+        self.inner.read_buf.enter_partial_mode(token, declared_body_len)
     }
 
     /// DEF-248 Sub-A (2026-05-12): partial-mode exit point. Mirror
@@ -4703,6 +4735,30 @@ impl PgProtocol<ActivePhase> {
             locus: crate::error::CrateBugLocus::ReadCursorAdvance,
         };
         _read_cursor_advance_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
+    }
+
+    /// DEF-280 Bundle K (2026-05-18): transition to
+    /// `Errored(InternalCrateBug { locus: PartialModeReentry })` when
+    /// [`Self::enter_partial_mode_for_data_row`] returns Err. Routes
+    /// the drain through the cluster δ leaf shape mirroring
+    /// `install_errored_read_cursor_advance`; same atomic
+    /// drain-and-install discipline (DEF-271 cluster A).
+    ///
+    /// Architecturally dead under intact callers — the streaming
+    /// dispatcher in row_stream.rs's begin_partial_data_row
+    /// guarantees `exit_partial_mode` runs before any re-entry
+    /// attempt — but the typed-Err + classified install is the
+    /// by-construction shield against future dispatch-loop drift.
+    #[inline]
+    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically \
+                  drained by the Errored install. Caller MUST emit ColEvent::EndQuery \
+                  { outcome: Err(_) } or equivalent — dropping it leaks the user's \
+                  oneshot-receiver (zombie-reply class)."]
+    pub(crate) fn install_errored_partial_mode_reentry(&mut self) -> Option<NonZeroU64> {
+        let cause = ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::PartialModeReentry,
+        };
+        _partial_mode_reentry_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
     }
 
     /// DEF-154 (X): transition to `Errored(Framing)` for a

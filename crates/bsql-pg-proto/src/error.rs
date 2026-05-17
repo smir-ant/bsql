@@ -883,6 +883,22 @@ pub enum CrateBugLocus {
     /// first id minted by `next_reply_id` on every connection's first
     /// command. Closed by-construction by the distinct sentinel.
     PushEmittedDeliverReply,
+
+    /// DEF-280 Bundle K (2026-05-18): [`crate::buf::ReadBuf::enter_partial_mode`]
+    /// was called while the buffer was already in partial-frame mode
+    /// (`partial_remaining > 0`). The streaming dispatcher's state
+    /// machine guarantees the precondition (`exit_partial_mode` runs
+    /// before re-entry), so reaching this locus indicates an internal
+    /// refactor regression in the dispatch loop.
+    ///
+    /// Pre-Bundle K the same condition was a `debug_assert!` panic in
+    /// dev builds + silent overwrite of the prior `partial_remaining`
+    /// in release — the CREDO §V glass pattern, with wire-desync
+    /// consequence (forgotten body-byte count: the next inbound bytes
+    /// classified as a fresh frame header instead of body
+    /// continuation). Post-Bundle K both modes return typed `Err` and
+    /// route through this locus + `Errored` state install.
+    PartialModeReentry,
 }
 
 // DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
@@ -936,6 +952,7 @@ impl fmt::Display for CrateBugLocus {
             Self::PushCommandInternalNonIdle => f.write_str("push-command-internal-non-idle"),
             Self::StreamDroppedMidStream => f.write_str("stream-dropped-mid-stream"),
             Self::PushEmittedDeliverReply => f.write_str("push-emitted-deliver-reply"),
+            Self::PartialModeReentry => f.write_str("partial-mode-reentry"),
         }
     }
 }
@@ -1052,6 +1069,23 @@ mod crate_bug_locus_display_tests {
         assert_eq!(
             format!("{e}"),
             "internal bsql-pg-proto bug at locus push-emitted-deliver-reply",
+        );
+    }
+
+    /// DEF-280 Bundle K (2026-05-18) pin: PartialModeReentry locus
+    /// renders to its canonical operator-facing string. Watches for
+    /// drift on the row-stream partial-mode classifier-bug signal —
+    /// replaces the pre-Bundle K `debug_assert!(partial_remaining
+    /// == 0, …)` glass pattern at buf.rs:855 with typed Err return
+    /// + classified install_errored routing.
+    #[test]
+    fn partial_mode_reentry_display() {
+        let e = ProtocolError::InternalCrateBug {
+            locus: CrateBugLocus::PartialModeReentry,
+        };
+        assert_eq!(
+            format!("{e}"),
+            "internal bsql-pg-proto bug at locus partial-mode-reentry",
         );
     }
 }

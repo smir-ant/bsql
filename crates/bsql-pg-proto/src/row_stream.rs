@@ -853,7 +853,30 @@ impl<'p, 'w> RowStream<'p, 'w> {
         // beyond the header.
         let body_remaining = declared.saturating_sub(4);
         let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
-        self.proto.enter_partial_mode_for_data_row(&token, body_remaining);
+        // DEF-280 Bundle K (2026-05-18): typed-Err propagation from
+        // ReadBuf::enter_partial_mode. Pre-Bundle K this call
+        // returned `()` and the re-entry condition was a silent
+        // overwrite in release (debug-assert panic in dev) — the
+        // CREDO §V glass pattern with wire-desync consequence.
+        // Post-Bundle K the Err arm classifies the bug via
+        // `CrateBugLocus::PartialModeReentry`, installs Errored, and
+        // surfaces ColEvent::EndQuery::Err uniformly across both
+        // build modes. Architecturally dead under intact dispatcher
+        // (every begin_partial_data_row precedes a matching
+        // exit_partial_mode), but the typed return closes the
+        // by-construction shield.
+        if self.proto.enter_partial_mode_for_data_row(&token, body_remaining).is_err() {
+            self.drained = true;
+            let drained = self.proto.install_errored_partial_mode_reentry();
+            let cause = ProtocolError::InternalCrateBug {
+                locus: crate::error::CrateBugLocus::PartialModeReentry,
+            };
+            let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+            return ColEvent::EndQuery {
+                id: term_id,
+                outcome: Err(cause),
+            };
+        }
 
         // Read col_count from the now-current cursor. With body
         // remaining > 0 and at least 2 bytes buffered (frame headers
@@ -1385,5 +1408,84 @@ pub(crate) mod _row_stream_partial_leaf {
     #[must_use]
     pub(in crate::row_stream) fn mint_for_row_stream_dispatcher() -> PartialFrameToken {
         PartialFrameToken(())
+    }
+}
+
+/// DEF-280 Bundle K (2026-05-18) — spec tests for the partial-mode
+/// re-entry tier elevation. Pins:
+/// - `enter_partial_mode` returns `Ok(())` on a fresh buffer (counter
+///   was `0`).
+/// - `enter_partial_mode` returns `Err(AlreadyInPartialMode)` if called
+///   while the counter is already non-zero, AND **does not overwrite**
+///   the existing counter value (no silent state corruption).
+///
+/// Pre-Bundle K both paths were `()`-typed; the re-entry path
+/// debug-asserted in dev and silently overwrote in release. Post-Bundle
+/// K both paths return typed Result and the re-entry path preserves the
+/// existing counter, leaving the caller to classify the bug.
+#[cfg(test)]
+mod bundle_k_spec_tests {
+    use super::_row_stream_partial_leaf::mint_for_row_stream_dispatcher;
+    use crate::buf::{AlreadyInPartialMode, ReadBuf};
+
+    /// First entry into partial mode from `partial_remaining == 0` is
+    /// the happy path — Ok and counter updated to declared_len.
+    #[test]
+    fn enter_partial_mode_on_idle_buffer_is_ok() {
+        let mut buf = ReadBuf::new();
+        let token = mint_for_row_stream_dispatcher();
+        let result = buf.enter_partial_mode(&token, 1024);
+        assert!(result.is_ok());
+        assert_eq!(buf.partial_remaining(), 1024);
+    }
+
+    /// Re-entry while already in partial mode returns Err and does NOT
+    /// overwrite the existing counter. Pre-Bundle K this silently
+    /// overwrote on release builds — wire-desync class.
+    #[test]
+    fn enter_partial_mode_on_partial_buffer_returns_err_and_preserves_counter() {
+        let mut buf = ReadBuf::new();
+        let token1 = mint_for_row_stream_dispatcher();
+        // `clippy::expect_used` is forbid'd crate-wide; assert + tier-1
+        // unwrap_or shape for the precondition setup.
+        assert!(
+            buf.enter_partial_mode(&token1, 2048).is_ok(),
+            "Bundle K test fixture: first entry from idle must succeed",
+        );
+
+        let token2 = mint_for_row_stream_dispatcher();
+        let result = buf.enter_partial_mode(&token2, 4096);
+        assert_eq!(
+            result,
+            Err(AlreadyInPartialMode {
+                prev_remaining: 2048,
+                new_declared_len: 4096,
+            }),
+            "Bundle K: re-entry returns typed witness, not silent overwrite",
+        );
+        // Counter preserved at its prior value (NOT overwritten to 4096).
+        assert_eq!(
+            buf.partial_remaining(),
+            2048,
+            "Bundle K: Err arm leaves counter unchanged — pre-Bundle K \
+             release builds silently overwrote 2048 → 4096, dropping \
+             the 2048 bytes still owed on the wire",
+        );
+    }
+
+    /// Display impl for AlreadyInPartialMode renders the canonical
+    /// diagnostic string (drift-detection pin).
+    #[test]
+    fn already_in_partial_mode_display() {
+        extern crate std;
+        let e = AlreadyInPartialMode {
+            prev_remaining: 100,
+            new_declared_len: 200,
+        };
+        assert_eq!(
+            std::format!("{e}"),
+            "enter_partial_mode called while already in partial mode \
+             (prev remaining: 100 bytes; rejected declared_len: 200)",
+        );
     }
 }
