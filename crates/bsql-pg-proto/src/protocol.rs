@@ -628,7 +628,7 @@ pub(crate) struct PgProtocolInner {
     /// arm `(ConnectingPostAuthHaveKey, 'Z')` via the token-gated
     /// path through
     /// [`crate::protocol::_backend_key_install_leaf::install_at_dispatch_arm`].
-    /// **Read** by [`PgProtocol::<ActivePhase>::cancel_request_credentials`].
+    /// **Read** by [`PgProtocol::<ActivePhase>::with_cancel_request`].
     ///
     /// `secret_key` carried inline as [`crate::sensitive::Sensitive<i32>`]
     /// (`ZeroizeOnDrop`) — the cell's drop fires the inner Sensitive's
@@ -2190,49 +2190,98 @@ pub(crate) mod _backend_key_install_leaf {
 }
 
 impl PgProtocol<ActivePhase> {
-    /// DEF-278 Bundle D (2026-05-17) — credentials for the
-    /// PostgreSQL §55.2.7 CancelRequest side-channel mechanism.
+    /// DEF-278 Bundle D' (2026-05-18) — closure-scoped access to the
+    /// PostgreSQL §55.2.7 CancelRequest wire frame.
     ///
-    /// Returns `Some(creds)` once the connection completed handshake
-    /// (the standard PG path emits `BackendKeyData` followed by
-    /// `ReadyForQuery`; the dispatch arm at
-    /// `(ConnectingPostAuthHaveKey, 'Z')` installs the cell). On the
-    /// architecturally-distant path where a non-standard PG fork
-    /// skipped the `K` frame, returns `None`.
+    /// # Tier-1 against retention (Bundle D' elevation)
+    ///
+    /// The 16-byte wire frame is materialised on THIS function's
+    /// stack inside a [`zeroize::Zeroizing`]`<[u8; 16]>` guard. The
+    /// closure receives `&[u8; 16]` borrowed from that guard. On
+    /// closure return (`Ok` / early-`Err` / panic unwind under
+    /// `panic = "unwind"`) the guard's `Drop` fires `zeroize::Zeroize`
+    /// and scrubs the bytes.
+    ///
+    /// **Retention is structurally impossible:**
+    /// - `mem::forget(guard)` / `Box::leak(guard)` /
+    ///   `ManuallyDrop::new(guard)` cannot run because the guard is
+    ///   never in scope outside this function — neither the closure
+    ///   nor any caller can reach it.
+    /// - Retaining the `&[u8; 16]` past the closure is rejected at
+    ///   compile time: the HRTB on `FnOnce(&[u8; 16], i32) -> R`
+    ///   quantifies the borrow's lifetime over `'a` so the reference
+    ///   cannot escape the call. Pinned by trybuild probe
+    ///   `p_d278d_6` (`E0521` lifetime-may-not-live-long-enough).
+    ///
+    /// **What the caller CAN do — and the documented gap:** copying
+    /// the bytes' *contents* into caller memory (e.g. `bytes.to_vec()`
+    /// or `let mut buf = [0u8; 16]; buf.copy_from_slice(bytes);`) is
+    /// intentionally allowed — drivers need this for async writes
+    /// that outlive the synchronous closure. The copy then lives in
+    /// caller-controlled storage and is the caller's responsibility
+    /// to scrub. The original bytes (in the Zeroizing guard) are
+    /// unaffected and get scrubbed on closure return regardless.
+    ///
+    /// # Closure arguments
+    ///
+    /// - `bytes: &[u8; 16]` — the wire-encoded CancelRequest frame
+    ///   per PG §55.2.7, ready for `socket.write_all(bytes)`.
+    /// - `pid: i32` — the backend process id (wire-public, no
+    ///   redaction needed). Useful for diagnostic logging
+    ///   (`"cancelling pid {pid}"`).
+    ///
+    /// # Return semantics
+    ///
+    /// - `Some(R)` — handshake-complete: cell holds the installed
+    ///   `(pid, secret_key)`; closure invoked, its `R` returned.
+    /// - `None` — architecturally-distant: a non-standard PG fork
+    ///   that skipped the `K` frame would land in `Idle` without an
+    ///   install. The closure is **not** invoked.
     ///
     /// # Sans-I/O (CREDO §1)
     ///
     /// The protocol crate does **not** open the side TCP connection.
     /// The driver opens a SEPARATE TCP connection to the same
-    /// backend, writes the bytes from [`crate::CancelRequestCredentials::encode`],
-    /// and closes the socket. The server does not reply on this
-    /// socket.
+    /// backend, writes the bytes lent through the closure, and
+    /// closes the socket. The server does not reply on this socket.
     ///
     /// # Tier impact
     ///
-    /// - **`Some` arm**: pure read of the cell + one
-    ///   `Sensitive<i32>` re-wrap (alloc-free; both wrappers are
-    ///   `#[repr(transparent)]` over `i32`).
+    /// - **`Some` arm**: build the array via the const-fn
+    ///   `cancel_request_bytes` (zero alloc), move into Zeroizing
+    ///   guard, invoke closure. ≤ 8 ns per `benches/hot_paths.rs`
+    ///   floor.
     /// - **Method-absent on every other phase**: tier-1 by
     ///   visibility. `<DisconnectedPhase>` / `<ConnectingPhase>` /
-    ///   `<ClosedPhase>` have no `cancel_request_credentials` method
-    ///   — calling produces `E0599`. Pinned by trybuild probes
-    ///   `p_d278d_1` / `_2` / `_3` in
-    ///   `crates/bsql-pg-proto-derive/tests/def278d_compile_fail/`.
+    ///   `<ClosedPhase>` have no `with_cancel_request` method —
+    ///   calling produces `E0599`. Pinned by trybuild probes
+    ///   `p_d278d_1` / `_2` / `_3`.
+    /// - **Retention rejection**: tier-1 by HRTB lifetime quantification.
+    ///   Pinned by trybuild probe `p_d278d_6` (`E0521`).
     ///
     /// # Driver pattern
     ///
     /// ```ignore
-    /// let Some(creds) = active.cancel_request_credentials() else {
-    ///     // Architecturally-distant: non-standard PG without K frame.
-    ///     return Err(PoolError::NoBackendKey);
-    /// };
-    /// let mut side = TcpStream::connect(backend_addr).await?;
-    /// side.write_all(&creds.encode()).await?;
-    /// drop(side);  // No response expected.
-    /// // Server now cancels the in-flight query; the cancellation
-    /// // surfaces as ErrorResponse on the original connection,
-    /// // which `reset_to_idle` / normal feed drain naturally consumes.
+    /// // Synchronous side-channel write:
+    /// let wrote = active.with_cancel_request(|bytes, pid| {
+    ///     log::info!("cancelling pid {pid}");
+    ///     side_socket.write_all(bytes)
+    /// });
+    /// match wrote {
+    ///     Some(Ok(())) => {} // bytes scrubbed automatically.
+    ///     Some(Err(e)) => return Err(e.into()),
+    ///     None => return Err(PoolError::NoBackendKey),
+    /// }
+    /// drop(side_socket); // No response expected on cancel socket.
+    ///
+    /// // Async pattern (needs owned-copy across .await):
+    /// let owned: Option<[u8; 16]> = active.with_cancel_request(|bytes, _| *bytes);
+    /// if let Some(buf) = owned {
+    ///     side_socket.write_all(&buf).await?;
+    ///     // `buf` is caller-owned; explicit zeroize on drop
+    ///     // (e.g. wrap in `Zeroizing<[u8; 16]>` if scrubbing the
+    ///     // copy matters for the driver's threat model).
+    /// }
     /// ```
     ///
     /// # Wire correctness
@@ -2242,34 +2291,77 @@ impl PgProtocol<ActivePhase> {
     /// backend. A leaked `secret_key` enables impersonated
     /// cancellation of the target query (capability-token class —
     /// see [`crate::StartupCompletePayload`] docstring for the
-    /// analogous threat treatment). The
-    /// [`crate::CancelRequestCredentials`] return type carries
-    /// `Sensitive<i32>` for the secret so caller-side drop scrubs
-    /// the bytes regardless of caller discipline.
+    /// analogous threat treatment). The closure-scoped API ensures
+    /// the bytes themselves never escape; the secret_key bytes in
+    /// the Zeroizing guard are scrubbed on every return path
+    /// (`panic = "unwind"`; under `panic = "abort"` see the panic
+    /// semantics note in [`crate::cancel`]).
     ///
-    /// # Decision §8.3 / §8.4 (DEF-278 Bundle D principal sign-off)
+    /// # Decision §8.3 / §8.4 / §8.5 (DEF-278 Bundle D / D' sign-off)
     ///
-    /// - **§8.3 — `pid()` exposed**: pid is wire-public; matching
-    ///   the [`crate::StartupCompletePayload`] precedent. Diagnostic
-    ///   value for operators.
-    /// - **§8.4 — `Zeroize-on-drop`**: implemented via the
-    ///   `Sensitive<i32>` wrapper on the inner secret field.
-    ///   Tier-1 by-construction.
+    /// - **§8.3 — `pid` exposed inside closure**: pid is wire-public;
+    ///   matching the [`crate::StartupCompletePayload`] precedent.
+    ///   Diagnostic value for operators.
+    /// - **§8.4 — Zeroize-on-drop via stack guard**: Bundle D' lifts
+    ///   the secret-scrub mechanism from a Sensitive<i32> field
+    ///   (tier-1 by-Drop-fire, suppressible by mem::forget /
+    ///   Box::leak / ManuallyDrop) to a stack-local Zeroizing
+    ///   guard (tier-1 by-closure-scope, retention structurally
+    ///   impossible).
     /// - **§8.5 — method-absent on `<ConnectingPhase>`**: tier-1.
     ///   A driver wanting to cancel mid-handshake must drop the
     ///   connection; there is no production scenario where a pool
     ///   cancels a mid-handshake connection (cost of opening a new
     ///   connection < cost of debugging cancel semantics).
     #[inline]
-    #[must_use = "CancelRequestCredentials are returned by-value — the caller must call \
-                  `.encode()` to obtain the 16-byte wire frame, or `.pid()` for the \
-                  diagnostic accessor. Discarding the value drops the secret_key \
-                  (zeroize-on-drop fires)."]
-    pub fn cancel_request_credentials(&self) -> Option<crate::cancel::CancelRequestCredentials> {
-        self.inner
-            .backend_key
-            .as_inner()
-            .map(crate::cancel::CancelRequestCredentials::from_backend_key)
+    pub fn with_cancel_request<R>(
+        &self,
+        f: impl FnOnce(&[u8; 16], i32) -> R,
+    ) -> Option<R> {
+        // Architectural-distant `None` case: standard PG always emits
+        // `K` before `Z`, but a non-standard fork could land here in
+        // `Idle` without an install. Honest modelling > runtime panic
+        // (CREDO §V).
+        let key: &crate::cancel::BackendKey = self.inner.backend_key.as_inner()?;
+        let pid: i32 = key.pid;
+        // Copy the i32 out of the cell's Sensitive<i32>. The plain
+        // i32 lives in this stack frame for the duration of the
+        // `cancel_request_bytes` build below; the Zeroizing guard
+        // scrubs the encoded array's 16 bytes (which includes a
+        // BE copy of this secret at bytes[12..16]) on closure
+        // return. The plain-i32 stack slot itself is overwritten by
+        // normal function-prologue/epilogue conventions on return —
+        // not scrubbed explicitly. For Bundle D'' (if ever needed),
+        // wrap `secret` in `Zeroizing` and pass by reference into
+        // an i32-aware `cancel_request_bytes_into` helper. Not
+        // required for D' tier elevation: the lifetime of the
+        // unscrubbed slot is bounded by this function's invocation
+        // and not addressable from outside.
+        let secret: i32 = *key.secret_key.get();
+        // Materialise the wire frame inside a Zeroizing guard. The
+        // `cancel_request_bytes` const-fn returns `[u8; 16]` on the
+        // stack; the move into `Zeroizing::new(...)` is NRVO-friendly
+        // (LLVM writes directly into the guard's inline storage).
+        // Single source of truth for the byte layout: the
+        // `cancel_request_bytes` builder, which is itself
+        // const-pinned in `wire.rs`.
+        let bytes_guard: zeroize::Zeroizing<[u8; 16]> = zeroize::Zeroizing::new(
+            crate::wire::cancel_request_bytes(pid, secret),
+        );
+        // Lend the borrow into the closure. The closure's HRTB
+        // `for<'a> FnOnce(&'a [u8; 16], i32) -> R` quantifies `'a`
+        // so the borrow cannot escape this call. R is independent
+        // of `'a` — caller may return a Copy/owned value (e.g.
+        // `[u8; 16]` via `*bytes`) but not the reference itself.
+        let r = f(&bytes_guard, pid);
+        // `bytes_guard` drops here on the Ok return path; under
+        // `panic = "unwind"` it also drops if `f` panicked (stack
+        // unwind fires Drop). Either way `Zeroizing::Drop` runs
+        // `Zeroize::zeroize` on the [u8; 16]. Tier-1 by
+        // closure-scope: nothing inside or outside this function
+        // can prevent the guard's Drop short of `panic = "abort"`
+        // (documented gap aligned with DEF-185 P0-A).
+        Some(r)
     }
 
     /// Mint a fresh `ReplyId<K>` for an outbound command.

@@ -1,31 +1,37 @@
-//! DEF-278 Bundle D probe **P-D278D-5** — `CancelRequestCredentials`'s
-//! `secret_key` field is private to `mod cancel`. External code
-//! cannot read or write it directly (E0616).
+//! DEF-278 Bundle D' probe **P-D278D-5** — the
+//! `CancelRequestCredentials` type from Bundle D is no longer
+//! publicly exported. External code cannot import it (E0432
+//! unresolved import).
 //!
-//! Tier-1 by construction: the public surface for the credentials
-//! is `pid()`, `encode()`, `Debug` (which redacts the secret), and
-//! Drop (which zeroizes). Direct field access is rejected at compile
-//! time so a downstream contributor cannot accidentally bypass the
-//! `Sensitive<i32>` redaction by reading the raw `secret_key` bytes.
+//! Tier-1 by construction: Bundle D' eliminated the public struct
+//! entirely. The closure-scoped `with_cancel_request` lends a
+//! `&[u8; 16]` directly; there is no longer any externally-nameable
+//! type carrying the secret_key. Removing the type from the public
+//! surface forecloses an entire class of misuse (struct-literal
+//! construction via destructured fields, direct Debug, Clone via
+//! `derive`-after-the-fact, etc.).
 //!
-//! Mirror of the cell-payload privacy invariant (`BackendKeyCell.inner`
-//! / `BackendKey.secret_key` are also field-private to `mod cancel`,
-//! but those types themselves are `pub(crate)` and thus unreachable
-//! from an external crate). This probe targets the only externally-
-//! reachable type in the chain — `CancelRequestCredentials` — and
-//! ensures its `secret_key` field is private.
+//! The two cell-level types `BackendKey` and `BackendKeyCell` are
+//! `pub(crate)` — even before Bundle D' they were unreachable from
+//! external crates. This probe pins the Bundle-D' delta: the ONE
+//! type that WAS publicly exported is gone.
+//!
+//! Filename is preserved from the Bundle-D revision for git-blame
+//! continuity even though the probe target shifted from field
+//! privacy (E0616) to import resolution (E0432). Comments updated.
 
 extern crate bsql_pg_proto;
 
+// E0432 expected — `CancelRequestCredentials` is not in
+// `bsql_pg_proto`'s public surface post-Bundle-D'.
 use bsql_pg_proto::CancelRequestCredentials;
 
-fn _force_use(c: CancelRequestCredentials) {
-    // Direct field access — E0616 expected because secret_key is
-    // private to `mod cancel`. The field's type is
-    // `Sensitive<i32>` internally, but the privacy gate fires before
-    // any type-resolution issue — E0616 surfaces first.
-    let _stolen = c.secret_key;
-    let _ = _stolen;
+fn _force_use() {
+    // Force the import to actually be used so the compiler emits
+    // the E0432 diagnostic on `use` rather than a "unused import"
+    // warning that would not fail the build under the trybuild
+    // golden contract.
+    let _ = core::mem::size_of::<CancelRequestCredentials>();
 }
 
 fn main() {}

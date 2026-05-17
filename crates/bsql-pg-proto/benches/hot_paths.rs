@@ -1699,18 +1699,30 @@ fn bench_prepared_iter_rows_typed(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
-// DEF-278 Bundle D (2026-05-17) — cancel_request_credentials extract
+// DEF-278 Bundle D' (2026-05-18) — with_cancel_request closure extract
 //
-// Measures the cost of `<ActivePhase>::cancel_request_credentials()`
-// on a post-handshake protocol. The accessor path is:
+// Measures the cost of `<ActivePhase>::with_cancel_request(...)` on
+// a post-handshake protocol. The accessor path is:
 //   1. Project `&self.inner.backend_key` — 0 cycles (struct field).
 //   2. `as_inner() -> Option<&BackendKey>` — 1 branch on Option niche.
-//   3. Map Some arm: `CancelRequestCredentials::from_backend_key` —
-//      one i32 copy + one Sensitive<i32>::new (transparent wrap).
+//   3. Pull `pid: i32` + `secret: i32` from the cell (2 i32 reads).
+//   4. `cancel_request_bytes(pid, secret) -> [u8; 16]` — pure const
+//      fn; LLVM inlines + writes the 16-byte array on the stack.
+//   5. Move into `Zeroizing<[u8; 16]>` — NRVO writes directly into
+//      the guard's inline storage (no copy).
+//   6. Invoke closure with `&bytes`, return `Some(R)`.
+//   7. Guard's Drop fires on scope exit — `zeroize::Zeroize` writes
+//      16 zero bytes (cheap; cache-hot single store).
 //
-// Expected floor: ≤ 5 ns (per design memo §4.6 / §7.2). Setup
-// (fresh_active_via_trust_handshake) is NOT timed — `iter_batched_ref`
-// hoists it outside the measurement window.
+// Bundle-D' delta vs Bundle-D: the secret-scrub mechanism shifted
+// from `Sensitive<i32>::ZeroizeOnDrop` on the credentials struct's
+// 4-byte secret field to `Zeroizing<[u8; 16]>::ZeroizeOnDrop` on the
+// 16-byte wire-frame array. The 16-byte zeroize is ~4x the work of
+// a 4-byte zeroize but still <2 ns; the closure-scope tier
+// elevation closes a retention-bypass class. Expected floor: ≤ 8 ns
+// (per principal sign-off in spec). Setup
+// (fresh_active_via_trust_handshake) is NOT timed —
+// `iter_batched_ref` hoists it outside the measurement window.
 // ---------------------------------------------------------------
 
 fn bench_cancel_credentials_extract(c: &mut Criterion) {
@@ -1722,9 +1734,16 @@ fn bench_cancel_credentials_extract(c: &mut Criterion) {
             fresh_active_via_trust_handshake,
             |active| {
                 // The accessor takes &self — no consume. Each call
-                // surfaces a freshly-constructed CancelRequestCredentials.
-                let creds = active.cancel_request_credentials();
-                black_box(creds);
+                // builds the wire frame on the stack, lends `&bytes`
+                // + `pid` into the closure, scrubs on closure return.
+                let r = active.with_cancel_request(|bytes, pid| {
+                    // black_box both so LLVM cannot constant-fold
+                    // the closure body away. Returning a
+                    // `(*bytes, pid)` tuple measures the full lend +
+                    // memcpy-out path the driver pattern uses.
+                    black_box((*bytes, pid))
+                });
+                black_box(r);
             },
             BatchSize::SmallInput,
         );
@@ -1763,7 +1782,8 @@ criterion_group!(
     // verification — runtime BindExecute path, same shape as the
     // prepared DML variant.
     bench_push_bind_execute_one_int_param,
-    // DEF-278 Bundle D (2026-05-17): cancel_request_credentials path.
+    // DEF-278 Bundle D / D' (2026-05-17 / 2026-05-18):
+    // `with_cancel_request` closure-scoped path.
     bench_cancel_credentials_extract,
 );
 criterion_main!(benches);

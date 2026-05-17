@@ -247,12 +247,14 @@ pub mod action;
 pub mod bounded;
 pub mod buf;
 pub mod command;
-// DEF-278 Bundle D (2026-05-17) — PostgreSQL §55.2.7 CancelRequest
-// mechanism. Re-exports `CancelRequestCredentials` at the crate
-// root via the `pub use cancel::CancelRequestCredentials;` line
-// below. Internal types (`BackendKey`, `BackendKeyCell`) stay
-// `pub(crate)` — they are construction-only and the cell-level
-// shape is leaf-token-gated.
+// DEF-278 Bundle D / D' (2026-05-17 / 2026-05-18) — PostgreSQL
+// §55.2.7 CancelRequest mechanism. Bundle D shipped a public
+// `CancelRequestCredentials` struct + accessor; Bundle D' replaced
+// the entire public surface with the closure-scoped
+// `<ActivePhase>::with_cancel_request` accessor (see `protocol.rs`).
+// Internal types (`BackendKey`, `BackendKeyCell`) stay `pub(crate)`;
+// no public re-export from `mod cancel` post-Bundle-D' — the
+// closure-scoped lend handles materialisation inline.
 pub mod cancel;
 pub mod decode;
 mod dispatch;
@@ -430,12 +432,16 @@ pub use wire::{SslNegotiationOutcome, classify_ssl_response_byte};
 // composition primitives, not user-facing wire literals (the
 // builder fn is the user surface).
 pub use wire::cancel_request_bytes;
-// DEF-278 Bundle D (2026-05-17) — typed CancelRequest credentials
-// returned by `<ActivePhase>::cancel_request_credentials()`. The
-// internal `BackendKey` / `BackendKeyCell` stay `pub(crate)`; the
-// public surface is the credentials struct + its `encode()` /
-// `pid()` methods.
-pub use cancel::CancelRequestCredentials;
+// DEF-278 Bundle D' (2026-05-18) — closure-scoped API replaces the
+// Bundle-D public `CancelRequestCredentials` struct. The wire frame
+// is now lent through `<ActivePhase>::with_cancel_request(|bytes,
+// pid| ...)`, materialised on the function's stack inside a
+// `Zeroizing<[u8; 16]>` guard. The `BackendKey` / `BackendKeyCell`
+// cell-level types stay `pub(crate)`; there is no longer a public
+// re-export from `mod cancel`. Retention is structurally impossible
+// (HRTB bounded borrow + stack-local guard) — see
+// `with_cancel_request` doc and the `cancel.rs` module-level docs
+// for the tier elevation rationale.
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------
@@ -777,6 +783,17 @@ const _: () = assert!(
 // budget breakdown is preserved verbatim below the new total for
 // git-blame continuity; the +8 B Bundle-D delta is the only change.
 //
+// DEF-278 Bundle D' (2026-05-18): public API refactor from a
+// returned-by-value `CancelRequestCredentials` struct to a closure-
+// scoped `with_cancel_request<R>(&self, f) -> Option<R>` accessor.
+// The cell-level types (`BackendKey`, `BackendKeyCell`) are
+// UNCHANGED — `PgProtocolInner` field layout is byte-identical;
+// size pins remain at 536 B. The wire-frame Zeroizing guard lives
+// on the function's stack, not on `PgProtocolInner`. Tier elevation
+// of "secret bytes scrub on drop" from tier-1 by-Drop-fire
+// (suppressible by `mem::forget` / `Box::leak` / `ManuallyDrop`) to
+// tier-1 by-closure-scope (retention structurally impossible).
+//
 // Tier-1 absolutism feedback (memory `feedback_regression_on_safety_change`):
 // the +8 B growth must be gated by `bench-stable.sh` on a quiet
 // system (`load avg < 8`). On regression, investigate (asm-diff,
@@ -814,6 +831,12 @@ const _: () = assert!(
      at the dispatch arm `(ConnectingPostAuthHaveKey, 'Z')`; reads \
      are O(1) Option projection. Bench-stable gate vs post-DEF-272 \
      baseline on `feed_bytes/ping_amortised`. \
+     DEF-278 Bundle D' (2026-05-18): public API closure-scoped \
+     refactor (no `PgProtocolInner` layout change — same 536 B). \
+     Tier elevation of secret-scrub from by-Drop-fire to \
+     by-closure-scope; the wire frame's Zeroizing<[u8;16]> guard \
+     lives on the `with_cancel_request` stack frame, not on the \
+     struct. \
      \
      Cross-platform: when CI matrix extends, either (a) every target \
      lands at 536 (most likely — alignment-stable types), or \

@@ -1,5 +1,6 @@
-//! DEF-278 Bundle D (2026-05-17) — `trybuild` golden harness for the
-//! CancelRequest mechanism's tier-1 closure probes.
+//! DEF-278 Bundle D / D' (2026-05-17 / 2026-05-18) — `trybuild`
+//! golden harness for the CancelRequest mechanism's tier-1 closure
+//! probes.
 //!
 //! Each probe is a self-contained `.rs` file under
 //! `tests/def278d_compile_fail/`. Trybuild attempts to compile each
@@ -8,19 +9,26 @@
 //!
 //! # Probes
 //!
-//! - **P-D278D-1** `<DisconnectedPhase>::cancel_request_credentials()`
-//!   → E0599 (method-absent — phase has no `cancel_request_credentials`).
-//! - **P-D278D-2** `<ConnectingPhase>::cancel_request_credentials()`
+//! - **P-D278D-1** `<DisconnectedPhase>::with_cancel_request()`
+//!   → E0599 (method-absent — phase has no `with_cancel_request`).
+//! - **P-D278D-2** `<ConnectingPhase>::with_cancel_request()`
 //!   → E0599 (method-absent — per §8.5 decision, a driver must drive
 //!   handshake to completion or drop the connection).
-//! - **P-D278D-3** `<ClosedPhase>::cancel_request_credentials()` →
+//! - **P-D278D-3** `<ClosedPhase>::with_cancel_request()` →
 //!   E0599 (method-absent — terminal phase, no cancel surface).
 //! - **P-D278D-4** `BackendKeyInstallToken` field-private struct
-//!   literal → E0451 (the inner `()` tuple-struct field is private to
-//!   `_backend_key_install_leaf`, so external code cannot mint a token).
-//! - **P-D278D-5** `BackendKeyCell` field-private direct access →
-//!   E0616 (the inner `Option<BackendKey>` is private to `mod cancel`,
-//!   so external code cannot read/write the cell's payload directly).
+//!   literal → E0603 (the leaf submodule is `pub(crate)` so external
+//!   code cannot name it; behind that the tuple-struct field is also
+//!   private to the leaf).
+//! - **P-D278D-5** `CancelRequestCredentials` no longer publicly
+//!   exported post-Bundle-D' → E0432 (unresolved import). Bundle D'
+//!   eliminated the public struct entirely; the closure-scoped
+//!   `with_cancel_request` lends `&[u8; 16]` directly.
+//! - **P-D278D-6** `&[u8; 16]` lent into the closure cannot escape
+//!   past the call → `E0521` "borrowed data escapes outside of
+//!   closure" (HRTB-quantified lifetime). This is the **closure-
+//!   scope retention guarantee** — the tier elevation that
+//!   Bundle D' lands.
 //!
 //! # Regenerating goldens
 //!
@@ -35,7 +43,7 @@
 
 #![forbid(unsafe_code)]
 
-/// **P-D278D-1** — `<DisconnectedPhase>::cancel_request_credentials()`
+/// **P-D278D-1** — `<DisconnectedPhase>::with_cancel_request()`
 /// is method-absent. Expected: E0599.
 #[test]
 fn p_d278d_1_cancel_credentials_on_disconnected_absent() {
@@ -43,7 +51,7 @@ fn p_d278d_1_cancel_credentials_on_disconnected_absent() {
         .compile_fail("tests/def278d_compile_fail/p_d278d_1_cancel_credentials_on_disconnected_absent.rs");
 }
 
-/// **P-D278D-2** — `<ConnectingPhase>::cancel_request_credentials()`
+/// **P-D278D-2** — `<ConnectingPhase>::with_cancel_request()`
 /// is method-absent. Expected: E0599.
 #[test]
 fn p_d278d_2_cancel_credentials_on_connecting_absent() {
@@ -51,7 +59,7 @@ fn p_d278d_2_cancel_credentials_on_connecting_absent() {
         .compile_fail("tests/def278d_compile_fail/p_d278d_2_cancel_credentials_on_connecting_absent.rs");
 }
 
-/// **P-D278D-3** — `<ClosedPhase>::cancel_request_credentials()` is
+/// **P-D278D-3** — `<ClosedPhase>::with_cancel_request()` is
 /// method-absent. Expected: E0599.
 #[test]
 fn p_d278d_3_cancel_credentials_on_closed_absent() {
@@ -60,20 +68,29 @@ fn p_d278d_3_cancel_credentials_on_closed_absent() {
 }
 
 /// **P-D278D-4** — minting a `BackendKeyInstallToken` from outside
-/// the leaf submodule is rejected: the inner `()` tuple-struct field
-/// is private. Expected: E0451 / E0603 (field-private literal +
-/// possibly module-private type).
+/// the leaf submodule is rejected: the leaf is `pub(crate)`.
+/// Expected: E0603 (module-private path) + secondary diagnostic on
+/// the tuple-struct field privacy.
 #[test]
 fn p_d278d_4_backend_key_install_token_field_private() {
     trybuild::TestCases::new()
         .compile_fail("tests/def278d_compile_fail/p_d278d_4_backend_key_install_token_field_private.rs");
 }
 
-/// **P-D278D-5** — accessing `BackendKeyCell`'s inner field from
-/// outside `mod cancel` is rejected: the field is private.
-/// Expected: E0616 (or E0603 on the module itself if pub(crate)).
+/// **P-D278D-5** — `CancelRequestCredentials` is no longer publicly
+/// exported. Expected: E0432 (unresolved import).
 #[test]
 fn p_d278d_5_backend_key_cell_field_private() {
     trybuild::TestCases::new()
         .compile_fail("tests/def278d_compile_fail/p_d278d_5_backend_key_cell_field_private.rs");
+}
+
+/// **P-D278D-6** (Bundle D' new probe) — the `&[u8; 16]` lent into
+/// the `with_cancel_request` closure cannot escape past the call.
+/// Expected: `E0521`-class diagnostic ("borrowed data escapes
+/// outside of closure" / "lifetime may not live long enough").
+#[test]
+fn p_d278d_6_lifetime_escape_from_closure() {
+    trybuild::TestCases::new()
+        .compile_fail("tests/def278d_compile_fail/p_d278d_6_lifetime_escape_from_closure.rs");
 }

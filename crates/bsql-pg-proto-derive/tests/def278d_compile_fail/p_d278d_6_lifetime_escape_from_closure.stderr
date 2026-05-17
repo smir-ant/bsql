@@ -1,0 +1,9 @@
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/def278d_compile_fail/p_d278d_6_lifetime_escape_from_closure.rs:78:9
+   |
+76 |     let mut escape_slot: Option<&[u8; 16]> = None;
+   |         --------------- `escape_slot` declared here, outside of the closure body
+77 |     let _ = active.with_cancel_request(|bytes, _pid| {
+   |                                         ----- `bytes` is a reference that is only valid in the closure body
+78 |         escape_slot = Some(bytes);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^ `bytes` escapes the closure body here

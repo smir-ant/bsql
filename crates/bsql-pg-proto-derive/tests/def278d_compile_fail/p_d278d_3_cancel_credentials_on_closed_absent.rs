@@ -1,4 +1,4 @@
-//! DEF-278 Bundle D probe **P-D278D-3** — `cancel_request_credentials()`
+//! DEF-278 Bundle D / D' probe **P-D278D-3** — `with_cancel_request()`
 //! is method-absent on `<ClosedPhase>`.
 //!
 //! Tier-1 by construction: the method lives ONLY on
@@ -43,6 +43,6 @@ fn main() {
         Err(IntoActiveError::Closed(c)) => c,
         Err(_) => return,
     };
-    // closed is <ClosedPhase>; cancel_request_credentials does NOT exist.
-    let _ = closed.cancel_request_credentials();
+    // closed is <ClosedPhase>; with_cancel_request does NOT exist.
+    let _ = closed.with_cancel_request(|_bytes, _pid| ());
 }

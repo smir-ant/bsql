@@ -1,4 +1,4 @@
-//! DEF-278 Bundle D probe **P-D278D-2** — `cancel_request_credentials()`
+//! DEF-278 Bundle D / D' probe **P-D278D-2** — `with_cancel_request()`
 //! is method-absent on `<ConnectingPhase>`.
 //!
 //! Tier-1 by construction: the method lives ONLY on
@@ -37,6 +37,6 @@ fn main() {
         Ok(p) => p,
         Err(_) => return,
     };
-    // proto is now <ConnectingPhase>; cancel_request_credentials does NOT exist.
-    let _ = proto.cancel_request_credentials();
+    // proto is now <ConnectingPhase>; with_cancel_request does NOT exist.
+    let _ = proto.with_cancel_request(|_bytes, _pid| ());
 }

@@ -1,17 +1,50 @@
-//! DEF-278 Bundle D (2026-05-17) — PostgreSQL §55.2.7 CancelRequest
+//! DEF-278 Bundle D' (2026-05-18) — PostgreSQL §55.2.7 CancelRequest
 //! mechanism.
 //!
 //! Surfaces the `(pid, secret_key)` material captured at
-//! `BackendKeyData` ('K') receipt during the handshake, plus the
-//! 16-byte wire encoding required by the PG cancel side-channel.
+//! `BackendKeyData` ('K') receipt during the handshake. The public
+//! API is [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`],
+//! a closure-scoped accessor that materialises the 16-byte wire
+//! frame inside a [`zeroize::Zeroizing`] stack guard and lends a
+//! `&[u8; 16]` to the caller. On closure return (Ok / Err / unwind
+//! panic), the guard's `Drop` scrubs the bytes via `zeroize::Zeroize`.
+//!
+//! # Tier-1 by closure scope (Bundle D' elevation, 2026-05-18)
+//!
+//! Pre-D' (Bundle D, 2026-05-17): the public surface was a
+//! `pub struct CancelRequestCredentials { pid, secret_key:
+//! Sensitive<i32> }` returned by value. Drop fired
+//! `Sensitive<i32>::ZeroizeOnDrop` on the secret — tier-1 by-Drop,
+//! but retention was possible via `mem::forget`, `Box::leak`,
+//! `ManuallyDrop::new`, which all bypass `Drop`. Invariant lived on
+//! tier-1 by-Drop-fire (suppressible) — the principal classified this
+//! as residue.
+//!
+//! Post-D' (Bundle D', 2026-05-18): the closure-scoped API materialises
+//! the wire bytes on `with_cancel_request`'s STACK inside a
+//! `Zeroizing<[u8; 16]>` guard. The closure receives `&[u8; 16]`
+//! borrowed from that guard. The guard is OWNED by the function
+//! frame — neither the closure nor any outer scope can reach it.
+//! `mem::forget(guard)`, `Box::leak(guard)`, `ManuallyDrop::new(guard)`
+//! are all unreachable because the guard is not in scope where the
+//! caller writes code. Retention of the `&[u8; 16]` itself is
+//! rejected at compile time: the HRTB on `FnOnce(&[u8; 16], i32) -> R`
+//! quantifies over `'a`, so the borrow cannot escape the call.
+//!
+//! What the caller CAN do: copy bytes contents into their own memory
+//! (e.g. `bytes.to_vec()`). That copy lives in caller-controlled
+//! storage and is the caller's responsibility to scrub. The ORIGINAL
+//! bytes (in the Zeroizing guard) are unaffected by the caller's copy
+//! and get scrubbed on closure return regardless. Documented in
+//! [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`].
 //!
 //! # Sans-I/O contract
 //!
 //! This module **does not** open the side TCP connection. The driver
 //! (Phase 1e `bsql-driver-postgres`) is responsible for opening a
 //! SEPARATE TCP connection to the same backend, writing the 16-byte
-//! payload returned by [`CancelRequestCredentials::encode`], and
-//! closing the socket. The server does not respond on this socket.
+//! payload lent through the closure, and closing the socket. The
+//! server does not respond on this socket.
 //!
 //! # Lifecycle of the captured `(pid, secret_key)` pair
 //!
@@ -30,19 +63,15 @@
 //! [`crate::protocol::_backend_key_install_leaf::BackendKeyInstallToken`]
 //! (private tuple-struct field — mintable only inside the leaf).
 //!
-//! # `BackendKey` vs `CancelRequestCredentials`
+//! # `BackendKey` cell payload
 //!
-//! - [`BackendKey`] is the `pub(crate)` cell payload — the storage
-//!   shape that lives on `PgProtocolInner`. Carries `Sensitive<i32>`
-//!   for the secret_key so the cell's drop chain scrubs the secret
-//!   when the connection terminates.
-//! - [`CancelRequestCredentials`] is the **public** by-value shape
-//!   returned to driver code. Constructed on-demand by
-//!   [`crate::PgProtocol::<crate::ActivePhase>::cancel_request_credentials`].
-//!   Carries a plain `i32` secret_key wrapped in [`crate::Sensitive`]
-//!   so the public type's drop chain scrubs the secret too — the
-//!   driver's copy is short-lived (single-use up to `encode()`) and
-//!   gets zeroed on drop regardless of caller discipline.
+//! [`BackendKey`] is the `pub(crate)` cell payload — the storage
+//! shape that lives on `PgProtocolInner`. Carries `Sensitive<i32>`
+//! for the secret_key so the cell's drop chain scrubs the secret
+//! when the connection terminates. Bundle D' eliminated the public
+//! `CancelRequestCredentials` struct; the wire-frame materialisation
+//! happens inline inside `with_cancel_request` against a stack-local
+//! `Zeroizing<[u8; 16]>` guard.
 //!
 //! # Wire format (PG §55.2.7)
 //!
@@ -53,19 +82,33 @@
 //! The const [`CANCEL_REQUEST_LEN`] pins the length-field value;
 //! [`crate::wire::CANCEL_REQUEST_VERSION`] pins the magic. The
 //! existing crate-level [`crate::cancel_request_bytes`] free function
-//! is the construction primitive; [`CancelRequestCredentials::encode`]
-//! is a thin typed wrapper over it so the typed flow does not
-//! duplicate the byte layout.
+//! is the single source of truth for the byte composition;
+//! `with_cancel_request` calls it to build the array, then moves the
+//! result into the `Zeroizing` guard.
+//!
+//! # Panic semantics
+//!
+//! - Under `panic = "unwind"` (workspace default for `cargo test`):
+//!   closure panic propagates, `with_cancel_request`'s frame unwinds,
+//!   the `Zeroizing<[u8; 16]>` guard's `Drop` fires during unwind,
+//!   bytes are scrubbed.
+//! - Under `panic = "abort"` (workspace `release` profile): process
+//!   terminates without running `Drop` glue. The OS reclaims the
+//!   stack frame on exit; the bytes are not explicitly scrubbed.
+//!   Aligned with DEF-185 P0-A policy.
 
 use crate::sensitive::Sensitive;
 
-/// DEF-278 Bundle D — cell-level storage for the `(pid, secret_key)`
-/// pair captured at `BackendKeyData` receipt.
+/// DEF-278 Bundle D / D' — cell-level storage for the
+/// `(pid, secret_key)` pair captured at `BackendKeyData` receipt.
 ///
 /// Lives on [`crate::protocol::PgProtocolInner::backend_key`] wrapped
 /// in [`BackendKeyCell`]; installed exactly once per connection via
 /// the token-gated path inside the dispatch arm that processes
-/// `(ConnectingPostAuthHaveKey, 'Z')`.
+/// `(ConnectingPostAuthHaveKey, 'Z')`. Read on-demand by
+/// [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`]
+/// to build the 16-byte wire frame on the function's stack inside a
+/// `Zeroizing<[u8; 16]>` guard.
 ///
 /// `secret_key` wrapped in [`Sensitive<i32>`] — the cell's drop fires
 /// `ZeroizeOnDrop` on the inner `i32` when the connection terminates,
@@ -180,8 +223,9 @@ impl BackendKeyCell {
         self.inner = Some(key);
     }
 
-    /// DEF-278 Bundle D — read-only access to the inner payload for
-    /// public-API construction of [`CancelRequestCredentials`].
+    /// DEF-278 Bundle D / D' — read-only access to the inner payload
+    /// for the closure-scoped public API
+    /// [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`].
     ///
     /// Returns `None` before the handshake's `BackendKeyData`/`RFQ`
     /// pair is processed; `Some` once the dispatch arm installed the
@@ -194,9 +238,9 @@ impl BackendKeyCell {
     ///
     /// **`None` returns** on `<ActivePhase>` are architecturally
     /// distant: a non-standard PG fork that skipped the `K` frame
-    /// would land in `Idle` without an install. Public API surface
-    /// returns `Option<CancelRequestCredentials>` to model this
-    /// honestly.
+    /// would land in `Idle` without an install. The public API
+    /// surface returns `Option<R>` from `with_cancel_request` so the
+    /// caller models this honestly without a panic.
     #[inline]
     #[must_use]
     pub(crate) fn as_inner(&self) -> Option<&BackendKey> {
@@ -210,17 +254,18 @@ impl core::fmt::Debug for BackendKeyCell {
     }
 }
 
-/// DEF-278 Bundle D — re-export of the wire-length constant for
-/// the CancelRequest packet. The single source of truth lives in
-/// [`crate::wire::CANCEL_REQUEST_LEN`] (next to
+/// DEF-278 Bundle D' — `pub(crate)` re-export of the wire-length
+/// constant for the CancelRequest packet. The single source of truth
+/// lives in [`crate::wire::CANCEL_REQUEST_LEN`] (next to
 /// [`crate::wire::CANCEL_REQUEST_VERSION`] for proximity to the
-/// magic-version constant family). This module's const-pins below
-/// cross-check it against
-/// [`CancelRequestCredentials::encode`]'s return-type shape.
+/// magic-version constant family). The drift-pin block below
+/// cross-checks it against the
+/// [`crate::wire::cancel_request_bytes`] return shape.
 ///
 /// `pub(crate)` because the constant is an internal composition
-/// primitive — the user-facing surface is [`CancelRequestCredentials::encode`]
-/// (returns `[u8; 16]`, size implied by the return type).
+/// primitive — the user-facing surface is
+/// [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`]
+/// which lends `&[u8; 16]` directly (size implied by the borrow type).
 pub(crate) use crate::wire::CANCEL_REQUEST_LEN;
 
 const _CANCEL_LEN_CROSS_MODULE_PIN: () = {
@@ -230,15 +275,11 @@ const _CANCEL_LEN_CROSS_MODULE_PIN: () = {
          The single source of truth lives in `wire.rs`; this re-export \
          must agree.",
     );
-    // Cross-pin: `CancelRequestCredentials::encode` returns
-    // `[u8; 16]`. If the return-type ever drifts from the constant,
-    // either this pin fires or the function signature fails to type-
-    // check (the array literal in `cancel_request_bytes`'s return
-    // is structurally tied to the constant by way of the
-    // `crate::wire::CANCEL_REQUEST_LEN` import). Both are tier-1
-    // build-time guards.
-    // Use `CANCEL_REQUEST_LEN` value-equality at u32 then compare
-    // to the literal slice length (16). The crate forbids
+    // Cross-pin: `cancel_request_bytes` returns `[u8; 16]`. The
+    // closure-scoped `with_cancel_request` borrows from a
+    // `Zeroizing<[u8; 16]>` guard built from this function — if the
+    // return-type ever drifts from 16, the cross-module type-check
+    // catches it AND this pin fires. The crate forbids
     // `clippy::as_conversions`, so a direct `CANCEL_REQUEST_LEN as
     // usize` would not type-check; instead pin both sides against
     // the literal 16 and rely on the cross-pin in `wire.rs`
@@ -246,152 +287,18 @@ const _CANCEL_LEN_CROSS_MODULE_PIN: () = {
     assert!(
         crate::wire::cancel_request_bytes(0, 0).len() == 16,
         "cancel_request_bytes return slice length must equal \
-         CANCEL_REQUEST_LEN — drift here breaks the typed-encode \
-         return slot.",
+         CANCEL_REQUEST_LEN — drift here breaks the with_cancel_request \
+         lend slot.",
     );
 };
-
-/// DEF-278 Bundle D — credentials for the PostgreSQL §55.2.7
-/// CancelRequest side-channel mechanism.
-///
-/// Returned by-value from
-/// [`crate::PgProtocol::<crate::ActivePhase>::cancel_request_credentials`].
-/// Holds the backend pid (wire-public diagnostic field) and the
-/// secret_key (sensitive — wrapped in [`Sensitive<i32>`] so a
-/// caller's dropped credentials scrub the secret bytes).
-///
-/// # Why not `Copy` / `Clone`
-///
-/// `secret_key` is a capability-token-class secret. A leaked secret
-/// enables impersonated cancellation of the target query (same
-/// threat model as [`crate::StartupCompletePayload`]'s docstring).
-/// `Copy` / `Clone` would double the scrub surface for zero benefit;
-/// `Sensitive<T>` itself is `!Copy + !Clone` (see `sensitive.rs`).
-///
-/// # Drop scrubs the secret
-///
-/// `secret_key: Sensitive<i32>` implements
-/// [`zeroize::ZeroizeOnDrop`]; on drop the inner `i32` bytes are
-/// overwritten with zeros via the
-/// [`zeroize::Zeroize`] chain. Tier-1 by-construction: a future
-/// caller forgetting to `drop()` early still gets a scrubbed
-/// credential whenever the value goes out of scope.
-///
-/// # Debug redacts the secret
-///
-/// Manual [`Debug`] impl prints the pid plain and redacts
-/// `secret_key` as `<REDACTED>` — matches the
-/// [`crate::StartupCompletePayload`] precedent. Pinned by spec test
-/// `cancel_credentials_debug_redacts_secret_key`.
-///
-/// # Wire shape — handled by [`Self::encode`]
-///
-/// 16 bytes per PG §55.2.7. The encode method delegates to
-/// [`crate::cancel_request_bytes`] (the crate's pre-existing free
-/// function) so the typed flow does not duplicate the byte layout.
-/// See [`CANCEL_REQUEST_LEN`] for the length-field drift pin.
-///
-/// # Sans-I/O reminder
-///
-/// The protocol crate does not open the side socket. The driver
-/// (Phase 1e `bsql-driver-postgres`) calls [`Self::encode`], opens a
-/// SEPARATE TCP connection to the same backend, writes the bytes,
-/// closes the socket. No reply is expected. See module-level docs
-/// for the full driver pattern.
-pub struct CancelRequestCredentials {
-    pid: i32,
-    secret_key: Sensitive<i32>,
-}
-
-impl CancelRequestCredentials {
-    /// DEF-278 Bundle D — construct from the cell-level payload.
-    /// `pub(crate)` so the construction surface is confined to
-    /// [`crate::PgProtocol::<crate::ActivePhase>::cancel_request_credentials`].
-    ///
-    /// External callers cannot construct `CancelRequestCredentials`
-    /// directly — `pid` and `secret_key` fields are field-private to
-    /// `mod cancel`, blocking struct-literal construction outside.
-    #[inline]
-    #[must_use]
-    pub(crate) fn from_backend_key(key: &BackendKey) -> Self {
-        // Copy the i32 out of the cell's Sensitive and wrap in a
-        // fresh Sensitive for the credentials struct. Both wrappers
-        // implement ZeroizeOnDrop independently — the cell's wrapper
-        // scrubs the cell's slot on connection teardown; the
-        // credentials' wrapper scrubs the public struct's slot on
-        // user-side drop. Two drop sites, two zeroes — defense-in-depth.
-        let secret_inner: i32 = *key.secret_key.get();
-        Self {
-            pid: key.pid,
-            secret_key: Sensitive::new(secret_inner),
-        }
-    }
-
-    /// DEF-278 Bundle D — encode to the 16-byte CancelRequest wire
-    /// frame per PG §55.2.7.
-    ///
-    /// Layout (BE):
-    ///
-    /// ```text
-    /// [length=16] [magic=80877102] [pid] [secret_key]
-    /// ```
-    ///
-    /// Delegates to [`crate::cancel_request_bytes`] (the crate's
-    /// pre-existing const-fn wire builder) so the byte layout has
-    /// exactly one source of truth. The const-assert drift-pin in
-    /// [`crate::wire`] catches any future divergence at build time.
-    ///
-    /// # Tier impact
-    ///
-    /// Pure function returning `[u8; 16]`. No allocation, no panic,
-    /// no I/O. Tier-1 by-return-shape (the size is type-fixed) and
-    /// tier-1 by-const-pin (the byte layout is build-time verified).
-    #[inline]
-    #[must_use]
-    pub fn encode(&self) -> [u8; 16] {
-        crate::wire::cancel_request_bytes(self.pid, *self.secret_key.get())
-    }
-
-    /// DEF-278 Bundle D — pid accessor (non-sensitive, wire-public).
-    ///
-    /// The PG backend's process id is announced via the
-    /// `BackendKeyData` ('K') frame in plaintext alongside the
-    /// secret_key; the pid alone is not a capability and is safe to
-    /// log for operator diagnostics ("cancelling pid 12345 on
-    /// backend.internal:5432").
-    ///
-    /// # Option α §8.3 (DEF-278 Bundle D principal sign-off)
-    ///
-    /// Decision recorded: expose `pid()` for diagnostic value. Match
-    /// the existing precedent on [`crate::StartupCompletePayload`]
-    /// where `pid: i32` is a plain field (no Sensitive wrapper).
-    #[inline]
-    #[must_use]
-    pub fn pid(&self) -> i32 {
-        self.pid
-    }
-}
-
-impl core::fmt::Debug for CancelRequestCredentials {
-    /// DEF-278 Bundle D — prints pid plain (wire-public) and redacts
-    /// `secret_key` via [`Sensitive<i32>`]'s `<REDACTED>` Debug. Tier
-    /// impact: tier-1 by-impl (the entire impl is one
-    /// `debug_struct` call; no formatting branches that could leak).
-    /// Pinned by `tests/cancel_request_spec.rs::cancel_credentials_debug_redacts_secret_key`.
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CancelRequestCredentials")
-            .field("pid", &self.pid)
-            .field("secret_key", &self.secret_key)
-            .finish()
-    }
-}
 
 #[cfg(test)]
 mod cell_tests {
     //! Crate-internal smoke tests for [`BackendKey`]'s Debug
     //! redaction. Cell write/read provenance is exercised end-to-end
     //! via `tests/cancel_request_spec.rs` through the public
-    //! `cancel_request_credentials` accessor.
+    //! [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`]
+    //! closure-scoped accessor.
 
     use super::*;
     use crate::sensitive::Sensitive;
