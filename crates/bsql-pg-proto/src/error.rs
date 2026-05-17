@@ -874,10 +874,14 @@ pub enum CrateBugLocus {
     /// Pre-Bundle G the dead arm in the materialise closure for the
     /// push path used `debug_assert!(false, …)` plus a silent drop on
     /// release — the CREDO §V glass pattern. Post-Bundle G the dead
-    /// arm classifies via `PushFailure { id: NonZeroU64::MIN, cause:
-    /// InternalCrateBug { locus: PushEmittedDeliverReply } }` (same
-    /// sentinel-id shape as `PushCommandInternalNonIdle`); both modes
-    /// return Err uniformly.
+    /// arm classifies via `PushFailure { id: …, cause: InternalCrateBug
+    /// { locus: PushEmittedDeliverReply } }` (same sentinel-id shape
+    /// as `PushCommandInternalNonIdle`); both modes return Err
+    /// uniformly. Post-DEF-280 Bundle J the sentinel id is the distinct
+    /// [`crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL`] (= NonZeroU64::MAX),
+    /// not `NonZeroU64::MIN` — the latter collided with the legitimate
+    /// first id minted by `next_reply_id` on every connection's first
+    /// command. Closed by-construction by the distinct sentinel.
     PushEmittedDeliverReply,
 }
 

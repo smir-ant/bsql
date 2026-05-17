@@ -80,6 +80,44 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
 
+/// DEF-280 Bundle J (2026-05-18): canonical sentinel raw value for a
+/// [`crate::action::PushFailure::id`] field on a `PushFailure` whose
+/// `cause` is an [`crate::error::ProtocolError::InternalCrateBug`] and
+/// where no real in-flight `ReplyId` is associated.
+///
+/// # Why a distinct sentinel
+///
+/// Pre-Bundle J the two CrateBug PushFailure sites in `protocol.rs`
+/// (`push_command_internal` non-`Idle` precondition + Bundle G's
+/// `PushEmittedDeliverReply` arm) used `NonZeroU64::MIN` (= raw value
+/// `1`) as the sentinel. That value is **byte-identical** with the
+/// legitimate first `ReplyId` minted by
+/// [`crate::PgProtocol::next_reply_id`] (the static atomic counter
+/// returns `NonZeroU64::new(1)` on its first call). Monitoring code
+/// that distinguishes "CrateBug-classified failure" vs "first-command
+/// genuine failure" by inspecting the id alone false-positives every
+/// connection's first command.
+///
+/// Post-Bundle J both sites carry `CRATE_BUG_REPLY_ID_SENTINEL` which
+/// is set to [`NonZeroU64::MAX`] (raw value `u64::MAX`). Legitimate
+/// minting reaches `u64::MAX` only at the saturation edge of the
+/// global counter — architecturally distant (~10^19 mints
+/// process-wide) AND immediately followed by an Errored-state
+/// transition (`install_errored_replyid_saturation`) that drops the
+/// connection — so the sentinel can collide with a legitimate id only
+/// in a fully-quiescent test fixture that explicitly pre-loads the
+/// counter to `u64::MAX − 1`. Production wrappers never observe the
+/// collision.
+///
+/// # Monitoring contract
+///
+/// Wrappers SHOULD prefer matching on `push_failure.cause` (typed
+/// [`crate::error::ProtocolError`] variant) over inspecting
+/// `push_failure.id` for classifier disambiguation. This sentinel is
+/// the secondary signal, intended for log-line readability and for
+/// the very-rare wrapper that lacks a typed-cause inspection path.
+pub(crate) const CRATE_BUG_REPLY_ID_SENTINEL: NonZeroU64 = NonZeroU64::MAX;
+
 /// Seal for [`ReplyKind`] — external crates cannot introduce new
 /// kinds. Each supported PG command-kind is part of this module's
 /// private sealed set.
@@ -469,4 +507,50 @@ mod reply_id_semantics {
     // the Drop impl itself. Each kind is exercised through
     // dispatch flow tests in `tests/*.rs` which assert delivery by
     // matching on Action variants — the tier ABOVE Drop-guard.
+
+    /// DEF-280 Bundle J (2026-05-18) — category (2) tier-1
+    /// verification: the `CRATE_BUG_REPLY_ID_SENTINEL` is distinct
+    /// from the legitimate first id minted by `next_reply_id`.
+    ///
+    /// Pre-Bundle J the two CrateBug PushFailure sites in protocol.rs
+    /// (`PushCommandInternalNonIdle` + `PushEmittedDeliverReply`) used
+    /// `NonZeroU64::MIN` (= raw `1`) as the sentinel. That value was
+    /// byte-identical with the legitimate first id returned by
+    /// `next_reply_id` (the static atomic counter starts at 0 and the
+    /// first `fetch_add(1) + saturating_add(1)` produces 1) — a
+    /// monitoring system distinguishing CrateBug failures from
+    /// genuine first-command failures by inspecting `push_failure.id`
+    /// alone false-positived every connection's first command.
+    ///
+    /// Post-Bundle J the sentinel is `NonZeroU64::MAX`. The
+    /// legitimate first id is `NonZeroU64::new(1).unwrap()` = `MIN`;
+    /// the sentinel is `MAX` — provably distinct.
+    #[test]
+    fn crate_bug_sentinel_distinct_from_first_mint() {
+        // Legitimate first mint by `next_reply_id` cannot be
+        // observed directly here (`next_reply_id` is on PgProtocol,
+        // and the static counter is process-global), but the FIRST
+        // value emitted by an atomic counter starting at 0 with
+        // `fetch_add(1, Relaxed)` followed by `saturating_add(1)` is
+        // provably `1` = `NonZeroU64::MIN`. Pin the distinctness
+        // against that known value.
+        let first_mint_shape: NonZeroU64 = NonZeroU64::MIN;
+        assert_ne!(
+            CRATE_BUG_REPLY_ID_SENTINEL,
+            first_mint_shape,
+            "Bundle J invariant: CRATE_BUG_REPLY_ID_SENTINEL must be \
+             distinct from the legitimate first id (NonZeroU64::MIN) — \
+             pre-Bundle J they collided and monitoring systems false-\
+             positived every first-command genuine failure as CrateBug",
+        );
+        // Pin the exact value so a future edit that changes the
+        // sentinel surfaces here loudly (and motivates updating the
+        // monitoring contract docstring on the const).
+        assert_eq!(
+            CRATE_BUG_REPLY_ID_SENTINEL,
+            NonZeroU64::MAX,
+            "Bundle J: CRATE_BUG_REPLY_ID_SENTINEL is canonical at \
+             NonZeroU64::MAX — see reply_id.rs docstring",
+        );
+    }
 }

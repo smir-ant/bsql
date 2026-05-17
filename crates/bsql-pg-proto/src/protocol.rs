@@ -2444,11 +2444,16 @@ impl PgProtocol<ActivePhase> {
         // (`raw_old == u64::MAX`, the value at which the next mint
         // wraps) and transitions THIS PgProtocol instance to
         // `Errored(ReplyIdSaturation)`. The duplicate id IS still
-        // returned (caller gets a `ReplyId<K>` carrying `u64::MAX`
-        // wrapped to NonZeroU64::MIN via the saturating_add fallback),
-        // but the next push attempt sees Errored state and fails with
-        // `ConnectionAlreadyClosed { prior_kind: ReplyIdSaturation }`
-        // — the duplicate never reaches the server in a usable state.
+        // returned (caller gets a `ReplyId<K>` carrying `u64::MAX` —
+        // `saturating_add(1)` at `u64::MAX` saturates at `u64::MAX`,
+        // never wrapping to zero, so the `NonZeroU64::new(raw)` Some
+        // arm is taken and the `unwrap_or(MIN)` fallback is dead
+        // here; the docstring previously claimed the saturated value
+        // wrapped to MIN — DEF-280 Bundle J 2026-05-18 audit corrected
+        // that), but the next push attempt sees Errored state and
+        // fails with `ConnectionAlreadyClosed { prior_kind:
+        // ReplyIdSaturation }` — the duplicate never reaches the
+        // server in a usable state.
         //
         // Cross-instance duplicate-ID risk after wrap remains tier-2
         // (separate residue — architect's #1B brand-lifetime closure
@@ -2771,13 +2776,17 @@ impl PgProtocol<ActivePhase> {
                 // production callers (ReadyGuard::push_command upstream
                 // classifies via `as_ready`'s runtime Idle check; the
                 // `&mut PgProtocol` borrow chain rules out interleaving
-                // between as_ready and push_command_internal entry). The
-                // sentinel reply-id is the same MIN-fallback shape used
-                // in `next_reply_id` post-saturation classification
-                // (cluster D).
+                // between as_ready and push_command_internal entry).
+                //
+                // DEF-280 Bundle J (2026-05-18): sentinel id is now the
+                // distinct `CRATE_BUG_REPLY_ID_SENTINEL` (NonZeroU64::MAX,
+                // see `reply_id.rs` docstring). Pre-Bundle J this site
+                // used `NonZeroU64::MIN` which collided with the
+                // legitimate first id minted by `next_reply_id` — the
+                // collision is now closed by-construction.
                 core::hint::cold_path();
                 return Err(crate::action::PushFailure {
-                    id: core::num::NonZeroU64::MIN,
+                    id: crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL,
                     cause: crate::error::ProtocolError::InternalCrateBug {
                         locus: crate::error::CrateBugLocus::PushCommandInternalNonIdle,
                     },
@@ -2883,14 +2892,20 @@ impl PgProtocol<ActivePhase> {
                         // locus `PushEmittedDeliverReply`. Push paths never
                         // emit DeliverReply (replies come from server via
                         // feed_bytes only); architecturally dead per DEF-160
-                        // Z2 invariant. Sentinel reply-id `NonZeroU64::MIN`
-                        // matches the `PushCommandInternalNonIdle` shape used
-                        // at the earlier classifier-bug site in this same
-                        // function.
+                        // Z2 invariant.
+                        //
+                        // DEF-280 Bundle J (2026-05-18): sentinel id is now
+                        // the distinct `CRATE_BUG_REPLY_ID_SENTINEL`
+                        // (NonZeroU64::MAX, see `reply_id.rs` docstring).
+                        // Mirrors the `PushCommandInternalNonIdle` site at
+                        // the entry of this same function. Pre-Bundle J both
+                        // sites used `NonZeroU64::MIN` which collided with
+                        // the legitimate first id minted by `next_reply_id`;
+                        // closed by-construction by the distinct sentinel.
                         core::hint::cold_path();
                         if failure.is_none() {
                             failure = Some(crate::action::PushFailure {
-                                id: core::num::NonZeroU64::MIN,
+                                id: crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL,
                                 cause: crate::error::ProtocolError::InternalCrateBug {
                                     locus: crate::error::CrateBugLocus::PushEmittedDeliverReply,
                                 },
