@@ -753,6 +753,50 @@ pub const SSL_REQUEST_VERSION: u32 = 80877103;
 /// [`MAGIC_VERSION_HIGH_HALF`] for the family-pin formula.
 pub const CANCEL_REQUEST_VERSION: u32 = 80877102;
 
+/// DEF-278 Bundle D (2026-05-17) — wire-length constant for the
+/// CancelRequest packet per PG §55.2.7.
+///
+/// 16 bytes total: 4 B length-field + 4 B magic version + 4 B pid +
+/// 4 B secret_key. The drift-pin below cross-checks against
+/// [`cancel_request_bytes`]'s return-type `[u8; 16]` so a future
+/// edit reshaping the encoded packet fails at build time.
+///
+/// `pub(crate)` because the constant is an internal composition
+/// primitive used by [`crate::cancel`] for its own const-pins, plus
+/// referenced directly inside [`cancel_request_bytes`] as the
+/// length-field source-of-truth (single binding for all four
+/// length-related sites).
+pub(crate) const CANCEL_REQUEST_LEN: u32 = 16;
+
+const _CANCEL_REQUEST_LEN_DRIFT_PIN: () = {
+    assert!(
+        CANCEL_REQUEST_LEN == 16,
+        "CancelRequest length must be exactly 16 bytes per PG §55.2.7. \
+         If this constant ever drifts from 16, the packet body composition \
+         in `cancel_request_bytes` must update in lockstep.",
+    );
+    // Cross-pin against the wire-encoding function: the const and
+    // the byte builder agree on packet size.
+    assert!(
+        cancel_request_bytes(0, 0).len() == 16,
+        "cancel_request_bytes return-type slice length must equal \
+         CANCEL_REQUEST_LEN — drift here is a wire-spec break.",
+    );
+    // Cross-pin the length field encoded inside the packet matches
+    // the constant (the length field is itself the BE encoding of
+    // CANCEL_REQUEST_LEN). Catches a typo where the builder's
+    // hardcoded `16u32.to_be_bytes()` drifts from this constant.
+    let bytes = cancel_request_bytes(0, 0);
+    let len_be = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    let len_decoded = u32::from_be_bytes(len_be);
+    assert!(
+        len_decoded == CANCEL_REQUEST_LEN,
+        "CancelRequest length field encoded in bytes[0..4] must equal \
+         CANCEL_REQUEST_LEN constant — drift here breaks the wire \
+         length-field invariant (length includes self per PG protocol).",
+    );
+};
+
 /// Shared high half (1234 = 0x04d2) of every PG magic-version
 /// sentinel. DEF-221 (2026-05-07).
 ///
@@ -1108,7 +1152,14 @@ const _: () = assert!(
 #[inline]
 #[must_use]
 pub const fn cancel_request_bytes(pid: i32, secret_key: i32) -> [u8; 16] {
-    let len = 16u32.to_be_bytes();
+    // DEF-278 Bundle D (2026-05-17): reference CANCEL_REQUEST_LEN
+    // instead of the hardcoded 16u32 so the constant is the single
+    // source of truth for the length-field byte composition. The
+    // drift-pin above asserts `CANCEL_REQUEST_LEN == 16` and the
+    // post-builder assert block below cross-checks the encoded
+    // length-field bytes — three independent pins on the same
+    // invariant.
+    let len = CANCEL_REQUEST_LEN.to_be_bytes();
     let ver = CANCEL_REQUEST_VERSION.to_be_bytes();
     let p = pid.to_be_bytes();
     let s = secret_key.to_be_bytes();

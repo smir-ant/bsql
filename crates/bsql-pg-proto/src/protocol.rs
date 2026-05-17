@@ -619,6 +619,32 @@ pub(crate) struct PgProtocolInner {
     /// goes through [`_clear_residue_leaf::clear_partial_assembly_residue`].
     /// External callers cannot toggle partial-assembly mode.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
+    /// DEF-278 Bundle D (2026-05-17) — backend-key pair captured at
+    /// handshake-complete (the first RFQ frame after
+    /// `BackendKeyData`).
+    ///
+    /// **Empty** at construction (`<DisconnectedPhase>` /
+    /// `<ConnectingPhase>` pre-`K`). **Installed** by the dispatch
+    /// arm `(ConnectingPostAuthHaveKey, 'Z')` via the token-gated
+    /// path through
+    /// [`crate::protocol::_backend_key_install_leaf::install_at_dispatch_arm`].
+    /// **Read** by [`PgProtocol::<ActivePhase>::cancel_request_credentials`].
+    ///
+    /// `secret_key` carried inline as [`crate::sensitive::Sensitive<i32>`]
+    /// (`ZeroizeOnDrop`) — the cell's drop fires the inner Sensitive's
+    /// zero-scrub when the connection terminates. `pid` is plain `i32`
+    /// (wire-public, used for diagnostic logging).
+    ///
+    /// **Layout**: `Option<BackendKey>` = 1 B discriminant +
+    /// `{ pid: i32, secret_key: Sensitive<i32> }` (8 B) +
+    /// padding to align(4) = 12 B. The size pin in `lib.rs` reflects
+    /// the post-Bundle-D `PgProtocolInner` total.
+    ///
+    /// **Tier-1 within-crate write provenance**: the field is private
+    /// to `mod protocol`, mutations route through the leaf-token
+    /// helper above (`_backend_key_install_leaf`). No other call site
+    /// in the crate can install or clear the cell.
+    backend_key: crate::cancel::BackendKeyCell,
     /// DEF-196: malformed-frame counter — INLINE u32 (no Box —
     /// 4 B is too small to amortise pointer indirection). Bumped
     /// on every fail_inflight_no_readbuf invocation. DEF-185 P2-9 +
@@ -1341,6 +1367,14 @@ pub(crate) mod _proto_init_leaf {
                     // Re-used across subsequent oversize frames on the
                     // same connection.
                     partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
+                    // DEF-278 Bundle D (2026-05-17): backend-key cell —
+                    // None at construction; installed by the dispatch arm
+                    // at `(ConnectingPostAuthHaveKey, 'Z')` once the
+                    // handshake completes. The same `ProtoInitToken`
+                    // gates this empty constructor (mirror of the
+                    // schema_slot / session_params / partial_assembly
+                    // pattern).
+                    backend_key: crate::cancel::BackendKeyCell::empty(token),
                     malformed_frame_count: 0,
                     sync_marker: super::PhantomData,
                 },
@@ -2069,7 +2103,174 @@ pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// DEF-278 Bundle D (2026-05-17) — `_backend_key_install_leaf`
+//
+// Per-call-site concrete-type token gating the one-shot install of
+// `(pid, secret_key)` into [`crate::cancel::BackendKeyCell`] at the
+// dispatch arm that processes `(ConnectingPostAuthHaveKey, 'Z')`.
+//
+// Mirror of DEF-272 cluster α/β/Sub-B leaf-token pattern. The
+// tuple-struct field is PRIVATE to the leaf submodule (no
+// `pub(crate)` modifier on the inner `()`), so the `Self(())` literal
+// mint is callable ONLY inside this module. The `BackendKeyCell`
+// names the token type in its `install_via_token` parameter signature
+// but cannot mint a token of its own.
+//
+// Why a `&BackendKeyInstallToken` parameter (not a value): the token
+// is minted once per dispatch call (inside the leaf's
+// [`install_at_dispatch_arm`] helper) and the cell's
+// `install_via_token` borrows it for the duration of the write. The
+// shared-ref shape matches DEF-272 cluster α `ClearResidueSchemaToken`
+// which is also passed by-value-of-`()` — both cost zero bytes (ZST)
+// and zero cycles (no register pressure beyond the token's ABI
+// no-op).
+//
+// Tier-1 within-crate by-construction: the only legal install path
+// is via [`install_at_dispatch_arm`]; no other code site can mint a
+// token to call `BackendKeyCell::install_via_token` directly.
+// ═════════════════════════════════════════════════════════════════════
+
+/// DEF-278 Bundle D leaf submodule for the one-shot backend-key
+/// install at the dispatch arm `(ConnectingPostAuthHaveKey,
+/// TAG_READY_FOR_QUERY)`. Hosts the concrete-type token + the helper
+/// fn that performs the install.
+pub(crate) mod _backend_key_install_leaf {
+    /// DEF-278 Bundle D leaf-scope token. Field private to the leaf
+    /// (no `pub(crate)` modifier on the inner `()`) — the `Self(())`
+    /// literal mint is callable ONLY inside this module. The type
+    /// itself is `pub(crate)` so
+    /// [`crate::cancel::BackendKeyCell::install_via_token`] can name
+    /// it in its parameter signature.
+    ///
+    /// # Why a separate leaf for one install site
+    ///
+    /// The one-shot install lives at a single dispatch arm
+    /// (`dispatch.rs:587-604`), but a separate leaf gives:
+    /// - **Tier-1 within-crate by-construction**: any future code
+    ///   trying to install a second key would need to either (a)
+    ///   call the leaf helper (which is fine — it's the legitimate
+    ///   entry point) or (b) mint its own token, which is rejected
+    ///   by the field-private tuple-struct payload at compile time
+    ///   (`E0451`).
+    /// - **Future-extensibility surface**: if a hypothetical follow-up
+    ///   ever needs to clear/re-install the key (e.g.
+    ///   `<ErroredPhase>::into_disconnected_for_retry` from Bundle A
+    ///   in DEF-278 — out of scope for Bundle D), the leaf gains a
+    ///   second token + helper, keeping the surface tight.
+    pub(crate) struct BackendKeyInstallToken(());
+
+    /// DEF-278 Bundle D — install `(pid, secret_key)` into the cell
+    /// at the dispatch arm that processes the handshake-complete
+    /// `ReadyForQuery` frame.
+    ///
+    /// Sole legitimate caller is the dispatch arm at
+    /// `(ConnectingPostAuthHaveKey, TAG_READY_FOR_QUERY)` in
+    /// `dispatch.rs`. Token is minted inline and consumed by the
+    /// cell's `install_via_token` method.
+    ///
+    /// # Tier-1 within-crate closure
+    ///
+    /// The leaf submodule path is `pub(crate)` so the dispatch
+    /// module can call it; the token field is leaf-private so no
+    /// outside-the-leaf code can mint one. The only write provenance
+    /// for the cell traces back through this helper.
+    #[inline]
+    pub(in crate) fn install_at_dispatch_arm(
+        cell: &mut crate::cancel::BackendKeyCell,
+        pid: i32,
+        secret_key: crate::sensitive::Sensitive<i32>,
+    ) {
+        let token = BackendKeyInstallToken(());
+        cell.install_via_token(
+            &token,
+            crate::cancel::BackendKey { pid, secret_key },
+        );
+    }
+}
+
 impl PgProtocol<ActivePhase> {
+    /// DEF-278 Bundle D (2026-05-17) — credentials for the
+    /// PostgreSQL §55.2.7 CancelRequest side-channel mechanism.
+    ///
+    /// Returns `Some(creds)` once the connection completed handshake
+    /// (the standard PG path emits `BackendKeyData` followed by
+    /// `ReadyForQuery`; the dispatch arm at
+    /// `(ConnectingPostAuthHaveKey, 'Z')` installs the cell). On the
+    /// architecturally-distant path where a non-standard PG fork
+    /// skipped the `K` frame, returns `None`.
+    ///
+    /// # Sans-I/O (CREDO §1)
+    ///
+    /// The protocol crate does **not** open the side TCP connection.
+    /// The driver opens a SEPARATE TCP connection to the same
+    /// backend, writes the bytes from [`crate::CancelRequestCredentials::encode`],
+    /// and closes the socket. The server does not reply on this
+    /// socket.
+    ///
+    /// # Tier impact
+    ///
+    /// - **`Some` arm**: pure read of the cell + one
+    ///   `Sensitive<i32>` re-wrap (alloc-free; both wrappers are
+    ///   `#[repr(transparent)]` over `i32`).
+    /// - **Method-absent on every other phase**: tier-1 by
+    ///   visibility. `<DisconnectedPhase>` / `<ConnectingPhase>` /
+    ///   `<ClosedPhase>` have no `cancel_request_credentials` method
+    ///   — calling produces `E0599`. Pinned by trybuild probes
+    ///   `p_d278d_1` / `_2` / `_3` in
+    ///   `crates/bsql-pg-proto-derive/tests/def278d_compile_fail/`.
+    ///
+    /// # Driver pattern
+    ///
+    /// ```ignore
+    /// let Some(creds) = active.cancel_request_credentials() else {
+    ///     // Architecturally-distant: non-standard PG without K frame.
+    ///     return Err(PoolError::NoBackendKey);
+    /// };
+    /// let mut side = TcpStream::connect(backend_addr).await?;
+    /// side.write_all(&creds.encode()).await?;
+    /// drop(side);  // No response expected.
+    /// // Server now cancels the in-flight query; the cancellation
+    /// // surfaces as ErrorResponse on the original connection,
+    /// // which `reset_to_idle` / normal feed drain naturally consumes.
+    /// ```
+    ///
+    /// # Wire correctness
+    ///
+    /// `CancelRequest` is **unauthenticated** at the wire level —
+    /// the server validates `(pid, secret_key)` matches a live
+    /// backend. A leaked `secret_key` enables impersonated
+    /// cancellation of the target query (capability-token class —
+    /// see [`crate::StartupCompletePayload`] docstring for the
+    /// analogous threat treatment). The
+    /// [`crate::CancelRequestCredentials`] return type carries
+    /// `Sensitive<i32>` for the secret so caller-side drop scrubs
+    /// the bytes regardless of caller discipline.
+    ///
+    /// # Decision §8.3 / §8.4 (DEF-278 Bundle D principal sign-off)
+    ///
+    /// - **§8.3 — `pid()` exposed**: pid is wire-public; matching
+    ///   the [`crate::StartupCompletePayload`] precedent. Diagnostic
+    ///   value for operators.
+    /// - **§8.4 — `Zeroize-on-drop`**: implemented via the
+    ///   `Sensitive<i32>` wrapper on the inner secret field.
+    ///   Tier-1 by-construction.
+    /// - **§8.5 — method-absent on `<ConnectingPhase>`**: tier-1.
+    ///   A driver wanting to cancel mid-handshake must drop the
+    ///   connection; there is no production scenario where a pool
+    ///   cancels a mid-handshake connection (cost of opening a new
+    ///   connection < cost of debugging cancel semantics).
+    #[inline]
+    #[must_use = "CancelRequestCredentials are returned by-value — the caller must call \
+                  `.encode()` to obtain the 16-byte wire frame, or `.pid()` for the \
+                  diagnostic accessor. Discarding the value drops the secret_key \
+                  (zeroize-on-drop fires)."]
+    pub fn cancel_request_credentials(&self) -> Option<crate::cancel::CancelRequestCredentials> {
+        self.inner
+            .backend_key
+            .as_inner()
+            .map(crate::cancel::CancelRequestCredentials::from_backend_key)
+    }
 
     /// Mint a fresh `ReplyId<K>` for an outbound command.
     ///
@@ -2984,6 +3185,20 @@ impl PgProtocolInner {
         //    + dispatch the assembled prefix through the existing
         //    per-tag dispatch arm.
         let partial_assembly_slot = &mut self.partial_assembly;
+        // DEF-278 Bundle D (2026-05-17): backend-key cell mut borrow
+        // threaded through the dispatch loop. Written by exactly one
+        // arm in `dispatch()`:
+        // `(ConnectingPostAuthHaveKey, TAG_READY_FOR_QUERY)` —
+        // installs `(pid, secret_key)` at handshake-complete via the
+        // token-gated `_backend_key_install_leaf` helper.
+        //
+        // Hot-path cost: the parameter is a fat pointer (8 B on
+        // arm64). Passed by `&mut` to every dispatch call; the cell
+        // itself is touched only when the matching arm fires (one
+        // arm out of ~70). Pre-arm `mem::replace` is unaffected — no
+        // additional memcpy. Bench gate: `feed_bytes/ping_amortised`
+        // must stay within ±1% of baseline.
+        let backend_key_slot = &mut self.backend_key;
 
         // DEF-185 P1-6: single classification-driven dispatch.
         // Exhaustive match on `IngressClassification` — adding a new
@@ -3158,6 +3373,7 @@ impl PgProtocolInner {
                     &mut reserved,
                     terminal_row_desc,
                     error_arena_slot,
+                    backend_key_slot,
                 );
                 match outcome {
                     DispatchOutcome::AdvancedSilent => {
@@ -3422,6 +3638,10 @@ impl PgProtocolInner {
                         // DEF-196: pass error_arena_slot only.
                         // Dispatch arms (ErrorResponse) lazy-init the
                         // Box<ErrorArena> when actually writing.
+                        // DEF-278 Bundle D (2026-05-17): also pass
+                        // `backend_key_slot` so the
+                        // `(ConnectingPostAuthHaveKey, 'Z')` arm can
+                        // install at handshake-complete.
                         let outcome = dispatch(
                             state,
                             tag,
@@ -3429,6 +3649,7 @@ impl PgProtocolInner {
                             &mut reserved,
                             terminal_row_desc,
                             error_arena_slot,
+                            backend_key_slot,
                         );
                         match outcome {
                             DispatchOutcome::AdvancedSilent => {

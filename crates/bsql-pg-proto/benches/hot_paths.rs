@@ -1698,6 +1698,41 @@ fn bench_prepared_iter_rows_typed(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------
+// DEF-278 Bundle D (2026-05-17) — cancel_request_credentials extract
+//
+// Measures the cost of `<ActivePhase>::cancel_request_credentials()`
+// on a post-handshake protocol. The accessor path is:
+//   1. Project `&self.inner.backend_key` — 0 cycles (struct field).
+//   2. `as_inner() -> Option<&BackendKey>` — 1 branch on Option niche.
+//   3. Map Some arm: `CancelRequestCredentials::from_backend_key` —
+//      one i32 copy + one Sensitive<i32>::new (transparent wrap).
+//
+// Expected floor: ≤ 5 ns (per design memo §4.6 / §7.2). Setup
+// (fresh_active_via_trust_handshake) is NOT timed — `iter_batched_ref`
+// hoists it outside the measurement window.
+// ---------------------------------------------------------------
+
+fn bench_cancel_credentials_extract(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cancel_credentials_extract");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("active_some_arm", |b| {
+        b.iter_batched_ref(
+            fresh_active_via_trust_handshake,
+            |active| {
+                // The accessor takes &self — no consume. Each call
+                // surfaces a freshly-constructed CancelRequestCredentials.
+                let creds = active.cancel_request_credentials();
+                black_box(creds);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse_header,
@@ -1728,6 +1763,8 @@ criterion_group!(
     // verification — runtime BindExecute path, same shape as the
     // prepared DML variant.
     bench_push_bind_execute_one_int_param,
+    // DEF-278 Bundle D (2026-05-17): cancel_request_credentials path.
+    bench_cancel_credentials_extract,
 );
 criterion_main!(benches);
 

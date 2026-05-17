@@ -247,6 +247,13 @@ pub mod action;
 pub mod bounded;
 pub mod buf;
 pub mod command;
+// DEF-278 Bundle D (2026-05-17) — PostgreSQL §55.2.7 CancelRequest
+// mechanism. Re-exports `CancelRequestCredentials` at the crate
+// root via the `pub use cancel::CancelRequestCredentials;` line
+// below. Internal types (`BackendKey`, `BackendKeyCell`) stay
+// `pub(crate)` — they are construction-only and the cell-level
+// shape is leaf-token-gated.
+pub mod cancel;
 pub mod decode;
 mod dispatch;
 pub mod error;
@@ -423,6 +430,12 @@ pub use wire::{SslNegotiationOutcome, classify_ssl_response_byte};
 // composition primitives, not user-facing wire literals (the
 // builder fn is the user surface).
 pub use wire::cancel_request_bytes;
+// DEF-278 Bundle D (2026-05-17) — typed CancelRequest credentials
+// returned by `<ActivePhase>::cancel_request_credentials()`. The
+// internal `BackendKey` / `BackendKeyCell` stay `pub(crate)`; the
+// public surface is the credentials struct + its `encode()` /
+// `pid()` methods.
+pub use cancel::CancelRequestCredentials;
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------
@@ -731,32 +744,56 @@ const _: () = assert!(
 // AND strengthens the invariant: globally-unique IDs across all
 // instances (per-protocol field would have given per-instance only).
 //
-// Layout breakdown (post-DEF-265):
+// Layout breakdown (post-DEF-278 Bundle D):
 //   ReadBuf inline:          ~256 B (heapless::Vec<u8, 256> + cursor)
 //   ReadBuf heap slot:          8 B (Option<Box<...>> niche)
 //   state:                    ~80 B (DescribeStatementAwaitingRfq dominant)
 //   row_desc_slot:           ~140 B (Option<RowDesc>)
 //   session_params:             8 B (Option<Box<SessionParams>> niche)
 //   error_arena:                8 B (Option<Box<ErrorArena>> niche)
+//   partial_assembly:           8 B (Option<Box<...>> niche, DEF-248 Sub-B)
+//   backend_key:                8 B (BackendKeyCell over Option<{pid:i32, secret:Sensitive<i32>}>, DEF-278 Bundle D)
 //   malformed_frame_count:      4 B (inline u32)
 //   sync_marker:                0 B (PhantomData)
 //   alignment padding:        ~16 B (to align(8))
-//   total:                    520 B
+//   total:                    536 B
 //
-// Heap economics per connection pattern:
+// Heap economics per connection pattern (unchanged by Bundle D —
+// the cell is inline, no allocation):
 //   - Trust auth + no errors:        0 allocations.
 //   - Startup auth + no errors:      1 alloc (Box<SessionParams> 436 B).
 //   - Startup auth + errors:         2 allocs (~732 B total).
 //   - Malformed frame teardown:      0 allocations (counter inline).
 //   - First frame > 256 B:           1 alloc (Box<heapless::Vec<u8, 4096>>).
+// DEF-278 Bundle D (2026-05-17): PgProtocol grew by BackendKeyCell
+// payload. The cell wraps `Option<BackendKey>` where `BackendKey`
+// is `{ pid: i32, secret_key: Sensitive<i32> }` (8 B inline);
+// alignment + the inline-cell shape land at 8 B per the
+// `#[repr(transparent)]` chain (`BackendKeyCell` over `Option<...>`,
+// `Sensitive<i32>` over `i32`). The struct uses the niche-packing
+// rules to absorb the Option discriminant into existing padding.
+// Pre-Bundle-D was 528 B; post-Bundle-D measured 536 B (a +8 B
+// growth on the cell field). The pre-existing perf-justification
+// budget breakdown is preserved verbatim below the new total for
+// git-blame continuity; the +8 B Bundle-D delta is the only change.
+//
+// Tier-1 absolutism feedback (memory `feedback_regression_on_safety_change`):
+// the +8 B growth must be gated by `bench-stable.sh` on a quiet
+// system (`load avg < 8`). On regression, investigate (asm-diff,
+// alternative cell shapes), do NOT roll back the tier-elevation.
+// The cell shape itself is the minimum (8 B for two i32s); the
+// only knob is whether Bundle D belongs on `<ActivePhase>` at all
+// — and per the design memo §4 it does, so the +8 B is the
+// floor cost.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 528,
+    core::mem::size_of::<protocol::PgProtocol>() == 536,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~80 + \
      row_desc_slot ~140 + session_params 8 + error_arena 8 + \
      partial_assembly 8 (DEF-248 Sub-B) + \
-     malformed_frame_count 4 + alignment-pad to align(8) = 528 B. \
+     backend_key 8 (DEF-278 Bundle D) + \
+     malformed_frame_count 4 + alignment-pad to align(8) = 536 B. \
      \
      Pre-DEF-196 was 5080 B (cold fields inline). DEF-196 saves \
      736 B via heap-boxed cold storage. DEF-265 (Idea-38) shrank \
@@ -770,9 +807,16 @@ const _: () = assert!(
      520 → 528 B. Bench-stable compare vs post-def248-suba is the \
      load-bearing gate for this growth (Tier-1 absolutism feedback: \
      regression on safety change is a signal to dig, not roll back). \
+     DEF-278 Bundle D (2026-05-17): `BackendKeyCell` carrying \
+     `Option<{{ pid: i32, secret_key: Sensitive<i32> }}>` adds 8 B \
+     (niche-optimized — Option discriminant absorbed via padding). \
+     PgProtocol 528 → 536 B. The cell installs once per connection \
+     at the dispatch arm `(ConnectingPostAuthHaveKey, 'Z')`; reads \
+     are O(1) Option projection. Bench-stable gate vs post-DEF-272 \
+     baseline on `feed_bytes/ping_amortised`. \
      \
      Cross-platform: when CI matrix extends, either (a) every target \
-     lands at 528 (most likely — alignment-stable types), or \
+     lands at 536 (most likely — alignment-stable types), or \
      (b) per-target cfg-gated pins land in the same commit. \
      Permissive ranges forbidden — drift surface > variance cushion \
      (CREDO §3 + §4.12).",
@@ -793,24 +837,24 @@ const _: () = assert!(
 // The `PgProtocolInner == 528` pin is the single source of truth;
 // all 4 phase pins reduce to it via repr(transparent) + ZST phantom.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocolInner>() == 528,
+    core::mem::size_of::<protocol::PgProtocolInner>() == 536,
     "PgProtocolInner exact size — must match pre-DEF-246 PgProtocol \
      size. If this trips, a field was added/removed/reshaped on the \
      inner data struct; audit budget at the original 528 B pin above.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::DisconnectedPhase>>() == 528,
+    core::mem::size_of::<protocol::PgProtocol<protocol::DisconnectedPhase>>() == 536,
     "PgProtocol<DisconnectedPhase> layout drift — should be \
      byte-identical to PgProtocolInner via repr(transparent) + ZST \
      PhantomData<fn() -> DisconnectedPhase>.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 528,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 536,
     "PgProtocol<ConnectingPhase> layout drift — should be \
      byte-identical to PgProtocolInner.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 528,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 536,
     "PgProtocol<ActivePhase> layout drift — should be byte-identical \
      to PgProtocolInner. This is also the type that the bare \
      `PgProtocol` pin above resolves to (via the default phase \
@@ -820,7 +864,7 @@ const _: () = assert!(
      explicitly.",
 );
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ClosedPhase>>() == 528,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ClosedPhase>>() == 536,
     "PgProtocol<ClosedPhase> layout drift — should be byte-identical \
      to PgProtocolInner.",
 );

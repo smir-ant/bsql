@@ -1,0 +1,5 @@
+error[E0616]: field `secret_key` of struct `CancelRequestCredentials` is private
+  --> tests/def278d_compile_fail/p_d278d_5_backend_key_cell_field_private.rs:27:21
+   |
+27 |     let _stolen = c.secret_key;
+   |                     ^^^^^^^^^^ private field

@@ -295,6 +295,14 @@ pub(crate) fn dispatch(
     // connection. Frames that don't reach an ErrorResponse arm pay
     // zero allocation cost.
     error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    // DEF-278 Bundle D (2026-05-17): backend-key cell for the
+    // one-shot install at the handshake-complete arm
+    // `(ConnectingPostAuthHaveKey, 'Z')`. Every other dispatch arm
+    // ignores this parameter (the cell is read-only outside that one
+    // arm); the cold-path overhead is zero — the parameter is a fat
+    // pointer passed by `&mut`, no dereference happens unless the
+    // matching arm fires.
+    backend_key_slot: &mut crate::cancel::BackendKeyCell,
 ) -> DispatchOutcome {
     // DEF-184 (B21/C6): snap owned prev for pattern matching; state
     // slot holds the explicit `ProtoState::Idle` placeholder during
@@ -584,9 +592,30 @@ pub(crate) fn dispatch(
             // StartupCompletePayload then flows through the staged
             // pipeline; that payload's manual Debug impl already
             // redacts the field (P1-C).
+            //
+            // DEF-278 Bundle D (2026-05-17): persist `(pid,
+            // secret_key)` into the connection-scoped
+            // `backend_key_slot` BEFORE the variant's Sensitive
+            // drops. Re-wraps the secret in a fresh `Sensitive<i32>`
+            // (the variant's wrapper drops + scrubs at arm scope
+            // exit; the cell holds an independent
+            // `Sensitive<i32>` whose drop fires on connection
+            // teardown). Two scrub sites, two `ZeroizeOnDrop`
+            // chains — defense-in-depth.
+            //
+            // The install runs inside the success arm only — on
+            // parse-error the cell stays empty and the connection
+            // tears down via `install_errored`. The
+            // `BackendKeyInstallToken` is minted by the leaf helper
+            // (tier-1 within-crate write provenance).
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
                     let secret_key_inner: i32 = *secret_key.get();
+                    crate::protocol::_backend_key_install_leaf::install_at_dispatch_arm(
+                        backend_key_slot,
+                        pid,
+                        crate::sensitive::Sensitive::new(secret_key_inner),
+                    );
                     *state = ProtoState::Idle;
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::deliver(
