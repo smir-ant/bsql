@@ -30,3 +30,13 @@ fn p_d280e_1_sensitive_get_method_absent() {
     trybuild::TestCases::new()
         .compile_fail("tests/def280e_compile_fail/p_d280e_1_sensitive_get_method_absent.rs");
 }
+
+/// **P-D280E-2** — the HRTB-scoped `&T` borrow inside
+/// `with_inner`'s closure cannot escape via the closure return.
+/// Pins the retention-impossibility guarantee. Expected: E0495 /
+/// E0521 (lifetime-escape diagnostic class).
+#[test]
+fn p_d280e_2_sensitive_borrow_escape_rejected() {
+    trybuild::TestCases::new()
+        .compile_fail("tests/def280e_compile_fail/p_d280e_2_sensitive_borrow_escape_rejected.rs");
+}
