@@ -2436,7 +2436,13 @@ fn build_md5_password_message(
               PgProtocol::get_server_error before drop. Silent drop loses the \
               only handle to server message/detail/hint strings."]
 pub(crate) struct ParsedServerError {
-    pub(crate) severity: crate::error::Severity,
+    /// Severity classification.
+    ///
+    /// `None` indicates a non-conformant peer (missing S+V fields).
+    /// `Some(Severity::Unknown)` indicates an unrecognised severity
+    /// string. See [`ProtocolError::ServerErrorResponse::severity`]
+    /// for the full classification.
+    pub(crate) severity: Option<crate::error::Severity>,
     pub(crate) code: crate::error::SqlStateCode,
     pub(crate) details_ref: crate::error_arena::ErrorRef,
 }
@@ -2643,9 +2649,13 @@ fn parse_error_response(
         hint,
     });
     ParsedServerError {
-        // No S or V field in payload → `Severity::Unknown` fallback
-        // (public API preserves the pre-uplift shape).
-        severity: severity.unwrap_or(Severity::Unknown),
+        // Tier-3 #30 (2026-05-19) — preserve the absence as `None`
+        // instead of collapsing to `Some(Severity::Unknown)`. The
+        // public API consumer (via ProtocolError::ServerErrorResponse)
+        // can now distinguish "server didn't send S/V" (None) from
+        // "server sent an unrecognised severity string"
+        // (Some(Severity::Unknown)).
+        severity,
         code,
         details_ref,
     }
@@ -2911,10 +2921,13 @@ mod parse_error_response_tests {
     }
 
     /// DEF-184 (A1+A13): post-refactor test-fixture tuple —
-    /// (Severity, SqlStateCode, ErrorPayload). Tests build expected
-    /// tuples and compare against parsed actual via `parse_and_resolve`.
+    /// (Option<Severity>, SqlStateCode, ErrorPayload). Tests build
+    /// expected tuples and compare against parsed actual via
+    /// `parse_and_resolve`. Tier-3 #30 (2026-05-19): severity is
+    /// `Option<_>` to disambiguate "server didn't send" (None) from
+    /// "server sent unknown" (Some(Severity::Unknown)).
     type ExpectedErr = (
-        crate::error::Severity,
+        Option<crate::error::Severity>,
         crate::error::SqlStateCode,
         crate::error_arena::ErrorPayload,
     );
@@ -2928,8 +2941,18 @@ mod parse_error_response_tests {
     ) -> ExpectedErr {
         use crate::error::{Severity, SqlStateCode};
         use crate::ident::SecretBoundedStr;
+        // Tier-3 #30 convention: an empty severity string means "no
+        // S/V field in the wire payload" — maps to `None`. A non-empty
+        // string maps to `Some(Severity::from_bytes(...))` which
+        // classifies known severities and falls back to
+        // `Severity::Unknown` for unrecognised strings.
+        let parsed_severity = if severity.is_empty() {
+            None
+        } else {
+            Some(Severity::from_bytes(severity.as_bytes()))
+        };
         (
-            Severity::from_bytes(severity.as_bytes()),
+            parsed_severity,
             SqlStateCode::from_bytes(code.as_bytes()),
             crate::error_arena::ErrorPayload {
                 message: SecretBoundedStr::<128>::from_str_truncating(message),

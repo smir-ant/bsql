@@ -322,7 +322,19 @@ fn error_response_during_startup_is_classified() {
                     code,
                     details_ref,
                 } => {
-                    assert_eq!(severity.as_str(), "FATAL");
+                    // Tier-3 #30 (2026-05-19): severity is now
+                    // `Option<Severity>`. `Some(_)` is required here
+                    // (PG sent `SFATAL` field per fixture below);
+                    // `None` would indicate a non-conformant peer
+                    // (no S/V field at all).
+                    match severity {
+                        Some(s) => assert_eq!(s.as_str(), "FATAL"),
+                        None => panic!(
+                            "expected Some(Severity::Fatal), got None — \
+                             fixture sent SFATAL on the wire so the parser \
+                             should have captured it",
+                        ),
+                    }
                     assert_eq!(code.as_str(), "28P01");
                     *details_ref
                 }

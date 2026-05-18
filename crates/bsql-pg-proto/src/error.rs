@@ -431,10 +431,27 @@ pub enum ProtocolError {
     /// inline. That shrink cascades: `Action<'w,'r>` 312 → 88 B,
     /// `OutActions = [Action; 9]` 2808 → 800 B per feed_bytes call.
     ServerErrorResponse {
-        /// Severity classification (enum, 1 byte). Unknown server
-        /// severities map to [`Severity::Unknown`] rather than silently
-        /// dropping the field.
-        severity: Severity,
+        /// Severity classification.
+        ///
+        /// - `None` — the wire payload contained no `S` (localised) or
+        ///   `V` (non-localised) severity field. Servers in compliance
+        ///   with PostgreSQL §55.7 always send `S`; `None` indicates a
+        ///   non-conformant peer (proxy, debugging shim, or wire
+        ///   corruption).
+        /// - `Some(Severity::Unknown)` — the server sent a severity
+        ///   string but it didn't match any known variant. The raw
+        ///   bytes are preserved in the arena-resolved `ErrorPayload`.
+        /// - `Some(Severity::Error)` (or other known variant) — server
+        ///   sent a recognised severity string.
+        ///
+        /// Niche-packs into the 1-byte `Severity` discriminant via
+        /// `core::option::Option<Severity>` — total payload still 1 B
+        /// (Severity has unused discriminant range). Pre-Tier-3
+        /// uplift, the field was `Severity` directly and the
+        /// `unwrap_or(Severity::Unknown)` fallback at the parser
+        /// collapsed "absent" and "unknown" into the same observable;
+        /// the Option layer preserves the diagnostic distinction.
+        severity: Option<Severity>,
         /// SQLSTATE code — always exactly 5 ASCII chars, packed as
         /// a `[u8; 5]` newtype. Space-padded if shorter; never empty.
         code: SqlStateCode,
@@ -1567,11 +1584,26 @@ impl fmt::Display for ProtocolError {
                 // fabricated "details" content), (b) is grep-able in
                 // production logs, and (c) directs operators to the
                 // adapter API instead of silently hiding the regression.
-                write!(
-                    f,
-                    "server error: {severity} ({code}) \
-                     [use PgProtocol::display_error for message/detail/hint]",
-                )
+                //
+                // Tier-3 #30 (2026-05-19) — severity is now
+                // `Option<Severity>` to disambiguate "server didn't
+                // send the field" (`None`) from "server sent unknown
+                // string" (`Some(Severity::Unknown)`). Display renders
+                // `None` as the literal `[severity absent]` so log
+                // readers can distinguish without needing to consult
+                // the source structure.
+                match severity {
+                    Some(s) => write!(
+                        f,
+                        "server error: {s} ({code}) \
+                         [use PgProtocol::display_error for message/detail/hint]",
+                    ),
+                    None => write!(
+                        f,
+                        "server error: [severity absent] ({code}) \
+                         [use PgProtocol::display_error for message/detail/hint]",
+                    ),
+                }
             },
             // Typed Severity + SqlStateCode + BoundedStr all impl
             // Display — no extra plumbing needed.

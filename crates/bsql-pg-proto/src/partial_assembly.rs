@@ -507,8 +507,16 @@ impl PartialAssemblyInner {
         }
         // body_remaining always decrements by the full `take` — bytes
         // beyond prefix_headroom are counted-and-skipped, not copied.
-        // u32 sub via saturating_sub: `take <= owed_usize <= u32::MAX`
-        // by the upstream min(), so the saturation arm is dead.
+        // `take = min(bytes.len(), owed_usize)` and `owed_usize` was
+        // widened from a `u32` (body_remaining) above, so `take <=
+        // owed_usize <= u32::MAX`. `u32::try_from(take)` is therefore
+        // infallible; the `unwrap_or(u32::MAX)` saturation arm is
+        // architecturally dead. A structural lift to a branded narrowing
+        // helper (mirror of `_usize_widening::u32_to_usize` proposed at
+        // :472) would close this tier-1; deferred because `absorb`'s
+        // public signature returns `usize` (changing to `Result<usize,
+        // MalformedLengthCrateBug>` ripples through every caller in
+        // dispatch.rs — out of scope for Tier 3).
         let take_u32 = u32::try_from(take).unwrap_or(u32::MAX);
         self.body_remaining = self.body_remaining.saturating_sub(take_u32);
         take

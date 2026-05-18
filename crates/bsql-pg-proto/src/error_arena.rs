@@ -534,7 +534,13 @@ impl core::fmt::Display for DisplayError<'_> {
                 code,
                 details_ref,
             } => {
-                write!(f, "server error: {severity} ({code})")?;
+                // Tier-3 #30: `severity` is `Option<Severity>`. `None`
+                // = wire-payload had no S/V field (non-conformant
+                // peer); `Some(_)` renders normally.
+                match severity {
+                    Some(s) => write!(f, "server error: {s} ({code})")?,
+                    None => write!(f, "server error: [severity absent] ({code})")?,
+                }
                 match self.arena.get(*details_ref) {
                     Ok(payload) => {
                         let message = payload.message.as_str();
@@ -948,7 +954,7 @@ mod tests {
             hint: SecretBoundedStr::<64>::from_str_truncating("check pg_hba.conf"),
         });
         let err = ProtocolError::ServerErrorResponse {
-            severity: Severity::Fatal,
+            severity: Some(Severity::Fatal),
             code: SqlStateCode::from_bytes(b"28P01"),
             details_ref,
         };
@@ -971,7 +977,7 @@ mod tests {
             hint: SecretBoundedStr::<64>::new(),
         });
         let err = ProtocolError::ServerErrorResponse {
-            severity: Severity::Error,
+            severity: Some(Severity::Error),
             code: SqlStateCode::from_bytes(b"42000"),
             details_ref,
         };
@@ -993,7 +999,7 @@ mod tests {
         // deferred diagnostic log past an entry-point boundary.)
         arena.clear();
         let err = ProtocolError::ServerErrorResponse {
-            severity: Severity::Error,
+            severity: Some(Severity::Error),
             code: SqlStateCode::from_bytes(b"XX000"),
             details_ref,
         };
@@ -1029,7 +1035,7 @@ mod tests {
             hint: SecretBoundedStr::<64>::new(),
         });
         let err = ProtocolError::ServerErrorResponse {
-            severity: Severity::Fatal,
+            severity: Some(Severity::Fatal),
             code: SqlStateCode::from_bytes(b"28P01"),
             details_ref,
         };
