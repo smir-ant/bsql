@@ -106,7 +106,9 @@ use crate::write_buf::WriteBuf;
 /// let mut wb = WriteBuf::new();
 /// let reply = ReplyId::<PingKind>::from_raw(NonZeroU64::MIN);
 /// // ERROR: `push_command` is not public; only `ReadyGuard::push_command` is.
-/// let _ = proto.push_command(PgCommand::Ping { reply }, &mut wb);
+/// match proto.push_command(PgCommand::Ping { reply }, &mut wb) {
+///     Ok(_) | Err(_) => {}
+/// }
 /// ```
 ///
 /// **(2) Bypassing the guard — `push_bind_execute` is not public:**
@@ -119,7 +121,7 @@ use crate::write_buf::WriteBuf;
 /// let mut proto = PgProtocol::new();
 /// let mut wb = WriteBuf::new();
 /// // ERROR: `push_bind_execute` is not public; only `ReadyGuard::push_bind_execute` is.
-/// let _ = proto.push_bind_execute(
+/// match proto.push_bind_execute(
 ///     &PortalName::default(),
 ///     &StmtName::default(),
 ///     &(),
@@ -127,7 +129,9 @@ use crate::write_buf::WriteBuf;
 ///     FetchRows::All,
 ///     ReplyId::<QueryKind>::from_raw(NonZeroU64::MIN),
 ///     &mut wb,
-/// );
+/// ) {
+///     Ok(_) | Err(_) => {}
+/// }
 /// ```
 ///
 /// **(3) Two simultaneous guards — borrow checker rejects:**
@@ -153,9 +157,13 @@ use crate::write_buf::WriteBuf;
 /// let mut wb = WriteBuf::new();
 /// let reply = ReplyId::<PingKind>::from_raw(NonZeroU64::MIN);
 /// if let Some(guard) = proto.as_ready() {
-///     let _ = guard.push_command(PgCommand::Ping { reply }, &mut wb);
+///     match guard.push_command(PgCommand::Ping { reply }, &mut wb) {
+///         Ok(_) | Err(_) => {}
+///     }
 ///     // ERROR: `guard` was moved by the first push_command call
-///     let _ = guard.push_command(PgCommand::Ping { reply }, &mut wb);
+///     match guard.push_command(PgCommand::Ping { reply }, &mut wb) {
+///         Ok(_) | Err(_) => {}
+///     }
 /// }
 /// ```
 #[derive(Debug)]

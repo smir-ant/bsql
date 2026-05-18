@@ -322,6 +322,13 @@ pub(crate) mod secret_zeroize;
 // the full design rationale.
 #[cfg(test)]
 pub(crate) mod drop_witness;
+// Shared test-fixture narrowing helpers — loud-fail `usize → i16/i32`
+// conversion for hand-built wire-frame fixtures across the crate's
+// test modules. Replaces the silent `try_from(...).unwrap_or(0)`
+// fixture-corruption mode with `#[track_caller]` invariant pinning.
+// Test-only; zero production surface.
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 pub mod sensitive;
 pub mod session_params;
 // DEF-211 INNO-01 / DEF-233: Pristine trait paired with

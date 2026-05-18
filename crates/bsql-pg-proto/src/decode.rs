@@ -1597,20 +1597,19 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 /// code can adapt to its own error strategy (`?` into custom errors,
 /// slogged through a macro in Phase 2's `query!`, etc.).
 ///
-/// DEF-154 (R) P1-3: the doc-test below is now COMPILE-CHECKED
-/// (pre-(R) was `rust,ignore` — pure prose that rotted silently on
-/// any signature change). DEF-154 (Y): migrated from
-/// `Action::StreamRow` to `StreamItem::Row` (row-bearing path is
-/// now exclusively `iter_rows`). If a future refactor alters
-/// `DataRowRef::parse`, `RowColumns::next`, `StreamItem::Row`,
-/// `FromPgText` trait shape, or `DecodeError` variants, this example
-/// fails to compile in CI.
+/// The doc-test below is COMPILE-CHECKED — a future refactor that
+/// alters `DataRowRef::parse`, `ColumnsIter::next`, the `FromPgText`
+/// trait shape, or `DecodeError` variants fails the build in CI.
+/// The example operates directly on `row_bytes: &[u8]` — the raw
+/// PostgreSQL DataRow body the protocol surfaces via its row-streaming
+/// API (`RowStream::col_next`, etc.).
 ///
 /// ```rust
-/// use bsql_pg_proto::{DataRowRef, DecodeError, FromPgText, StreamItem};
+/// use bsql_pg_proto::{DataRowRef, DecodeError, FromPgText};
 ///
-/// fn example(item: StreamItem<'_>) -> Result<Option<(i32, String)>, DecodeError> {
-///     let StreamItem::Row { row_bytes, .. } = item else { return Ok(None) };
+/// fn decode_id_and_name<'a>(row_bytes: &'a [u8])
+///     -> Result<Option<(Option<i32>, Option<&'a str>)>, DecodeError>
+/// {
 ///     let row = DataRowRef::parse(row_bytes)?;
 ///     let mut cols = row.columns();
 ///
@@ -1621,14 +1620,12 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 ///     let id: Option<i32> = id_result?.map(i32::from_pg_text).transpose()?;
 ///
 ///     let Some(name_result) = cols.next() else { return Ok(None) };
-///     let name: Option<&str> = name_result?.map(<&str>::from_pg_text).transpose()?;
+///     let name: Option<&'a str> = name_result?.map(<&'a str>::from_pg_text).transpose()?;
 ///
-///     // Both columns NOT-NULL → return the decoded tuple; any NULL
-///     // surfaces as `Ok(None)` to the caller without silent defaults.
-///     match (id, name) {
-///         (Some(i), Some(n)) => Ok(Some((i, n.to_string()))),
-///         _ => Ok(None),
-///     }
+///     // Return the decoded pair (per-column NULL preserved via `Option`).
+///     // The example never silently defaults — every absence is explicit
+///     // in the return type.
+///     Ok(Some((id, name)))
 /// }
 /// ```
 ///
@@ -3048,12 +3045,13 @@ mod parse_tests {
     }
 
     /// Build a full RowDescription body. `columns.len() ≤ i16::MAX`
-    /// is guaranteed by `MAX_ROW_COLUMNS = 32 ≪ i16::MAX`; the
-    /// `unwrap_or(0)` branch below is architecturally dead but
-    /// honours the forbid-bundle ban on `unwrap()`.
+    /// is guaranteed by `MAX_ROW_COLUMNS = 32 ≪ i16::MAX`. The
+    /// `fixture_i16` helper asserts the bound and narrows;
+    /// invariant breach is `#[track_caller]`-attributed loud-fail,
+    /// not silent `unwrap_or(0)` fixture corruption.
     fn build(columns: &[(&[u8], u32, i16)]) -> alloc::vec::Vec<u8> {
         let mut out = alloc::vec::Vec::new();
-        let count = i16::try_from(columns.len()).unwrap_or(0);
+        let count = crate::test_fixtures::fixture_i16(columns.len());
         out.extend_from_slice(&count.to_be_bytes());
         for (name, oid, fc) in columns {
             out.extend_from_slice(&column_block(name, *oid, *fc));
@@ -3139,7 +3137,7 @@ mod parse_tests {
         // Declare count = MAX + 1 (still fits i16); parser rejects
         // before per-column parsing.
         let over = MAX_ROW_COLUMNS.saturating_add(1);
-        let count = i16::try_from(over).unwrap_or(0);
+        let count = crate::test_fixtures::fixture_i16(over);
         let mut body = alloc::vec::Vec::new();
         body.extend_from_slice(&count.to_be_bytes());
         let result = parse_row_description(&body);
@@ -3236,15 +3234,18 @@ mod data_row_tests {
     use super::*;
 
     /// Build a DataRow body: 2-byte count + per-column payloads.
-    /// `None` = NULL, `Some(bytes)` = data.
+    /// `None` = NULL, `Some(bytes)` = data. `fixture_i16` /
+    /// `fixture_i32` enforce the wire-width bounds with
+    /// `#[track_caller]` loud-fail; previous `unwrap_or(0)` silently
+    /// emitted zero counts/lengths on overflow, corrupting fixtures.
     fn build(columns: &[Option<&[u8]>]) -> alloc::vec::Vec<u8> {
         let mut out = alloc::vec::Vec::new();
-        let count = i16::try_from(columns.len()).unwrap_or(0);
+        let count = crate::test_fixtures::fixture_i16(columns.len());
         out.extend_from_slice(&count.to_be_bytes());
         for col in columns {
             match col {
                 Some(data) => {
-                    let len = i32::try_from(data.len()).unwrap_or(0);
+                    let len = crate::test_fixtures::fixture_i32(data.len());
                     out.extend_from_slice(&len.to_be_bytes());
                     out.extend_from_slice(data);
                 }
@@ -3734,12 +3735,11 @@ mod format_code_set_tests {
         use alloc::vec::Vec;
         let mut frame: Vec<u8> = Vec::new();
         // MAX_ROW_COLUMNS = 32 fits i16 trivially; const-asserts in
-        // this module pin the value. The Err arm is architecturally
-        // dead but explicit (forbid-bundle bans `.expect()`).
-        let n_cols: i16 = match i16::try_from(MAX_ROW_COLUMNS) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
+        // this module pin the value. `fixture_i16` loud-fails on
+        // overflow via `#[track_caller]` assert — replaces the prior
+        // silent `return` (which would have masked a future widening
+        // of MAX_ROW_COLUMNS past `i16::MAX`).
+        let n_cols: i16 = crate::test_fixtures::fixture_i16(MAX_ROW_COLUMNS);
         frame.extend_from_slice(&n_cols.to_be_bytes());
         for idx in 0..MAX_ROW_COLUMNS {
             let name = format!("c{idx}");

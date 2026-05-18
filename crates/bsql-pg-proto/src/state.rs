@@ -2030,9 +2030,12 @@ mod push_class_tests {
     //! # Forbid-bundle compliance
     //!
     //! `panic!`, `unwrap()`, `expect()`, `unreachable!()` all banned
-    //! crate-wide. Fixture construction uses the `assert!(is_some) +
-    //! unwrap_or(fallback)` idiom where needed; `nz()` asserts on
-    //! `0` before falling back to `MIN`. RowDesc fixtures use
+    //! crate-wide. Fixture construction routes through the shared
+    //! [`crate::test_fixtures`] module — `fixture_nz_u64` (aliased as
+    //! `nz` in this scope) asserts the input is non-zero with a
+    //! `#[track_caller]`-attributed message, then narrows via the
+    //! `NonZeroU64::new(...).unwrap_or(MIN)` form whose fall-through
+    //! arm is architecturally dead post-assert. RowDesc fixtures use
     //! `RowDesc::EMPTY` as the test-only zero-column sentinel.
     //!
     //! # Coverage
@@ -2050,13 +2053,7 @@ mod push_class_tests {
     use crate::scram::session::ScramSession;
     use crate::scram::types::SecretDigest;
     use crate::sensitive::Sensitive;
-    use core::num::NonZeroU64;
-
-    fn nz(n: u64) -> NonZeroU64 {
-        // DEF-145: assert on 0, forbid-bundle-safe fallback.
-        assert!(n > 0, "nz(0) is a test bug — use nz(1..) for non-zero test correlators");
-        NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
-    }
+    use crate::test_fixtures::fixture_nz_u64 as nz;
 
     /// Consume the ReplyId carried by a state so Drop-guard doesn't
     /// trip at scope end. Delegates to `take_inflight_reply_raw_id`.
@@ -2303,13 +2300,8 @@ mod per_phase_state_roundtrip_tests {
     use crate::scram::session::ScramSession;
     use crate::scram::types::SecretDigest;
     use crate::sensitive::Sensitive;
+    use crate::test_fixtures::fixture_nz_u64 as nz;
     use core::mem::discriminant;
-    use core::num::NonZeroU64;
-
-    fn nz(n: u64) -> NonZeroU64 {
-        assert!(n > 0, "nz(0) is a test bug");
-        NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
-    }
 
     /// Consume the ReplyId carried by a state so Drop-guard doesn't
     /// trip at scope end.

@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn inner_reset_preserves_inline_buffer() {
         let mut inner = PartialAssemblyInner::new(b'T', 256);
-        let _ = inner.absorb(b"hello");
+        assert_eq!(inner.absorb(b"hello"), 5);
         inner.reset(b'E', 512);
         assert_eq!(inner.prefix().len(), 0);
         assert_eq!(inner.tag, b'E');
@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn inner_absorb_on_complete_consumes_nothing() {
         let mut inner = PartialAssemblyInner::new(b'T', 4);
-        let _ = inner.absorb(&[0u8; 4]);
+        assert_eq!(inner.absorb(&[0u8; 4]), 4);
         assert!(inner.is_complete());
         let n = inner.absorb(b"more bytes");
         assert_eq!(n, 0);
