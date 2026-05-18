@@ -996,10 +996,14 @@ pub enum ErroredState {
 /// already names the mirrored [`ProtoState`] variant via intra-doc
 /// link.
 ///
-/// **`#[allow(missing_debug_implementations)]`**: same rationale as
-/// [`ErroredState`] — manual Debug (matching [`ProtoState`]'s
-/// Sensitive-redacting impl) lands in Commit 2.
-#[allow(missing_docs, missing_debug_implementations)]
+/// **Manual `Debug` impl** (DEF-279 Phase 1c Bundle Commit 7,
+/// 2026-05-18) — Sensitive-redaction parity with
+/// [`ProtoState`]'s manual Debug. Variants carrying SCRAM /
+/// MD5 / Cleartext password material or `Sensitive<i32>` secret keys
+/// use `finish_non_exhaustive()` to elide the secret fields from
+/// the formatted output; non-sensitive variants print all fields
+/// via `finish()` / `write!`.
+#[allow(missing_docs)]
 #[non_exhaustive]
 pub enum ConnectingState {
     /// Mirror of [`ProtoState::ConnectingStartupTrust`].
@@ -1081,6 +1085,65 @@ pub enum ConnectingState {
     /// `<ConnectingPhase>`. Lifted to `<ClosedPhase>` via
     /// `into_closed_if_errored`.
     Errored(StateErrorKind),
+}
+
+/// DEF-279 Phase 1c Bundle Commit 7 (2026-05-18) — manual `Debug`
+/// for [`ConnectingState`] with **Sensitive-redaction parity** with
+/// [`ProtoState`]'s manual Debug.
+///
+/// Variants carrying SCRAM `ScramSession` / `SecretDigest`, MD5
+/// `Md5HandshakeState`, cleartext `Sensitive<Password>`, or post-auth
+/// `Sensitive<i32>` secret keys use `finish_non_exhaustive()` to
+/// elide secret fields from the formatted output. Non-sensitive
+/// variants print all fields via `finish()` / `write!`.
+impl core::fmt::Debug for ConnectingState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::StartupTrust { reply } => f
+                .debug_struct("StartupTrust")
+                .field("reply", reply)
+                .finish(),
+            Self::StartupCleartext { reply, .. } => f
+                .debug_struct("StartupCleartext")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::CleartextAwaitingAuthOk(id) => {
+                write!(f, "CleartextAwaitingAuthOk({id:?})")
+            }
+            Self::StartupMd5 { reply, .. } => f
+                .debug_struct("StartupMd5")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::Md5AwaitingAuthOk(id) => {
+                write!(f, "Md5AwaitingAuthOk({id:?})")
+            }
+            Self::StartupScram { reply, .. } => f
+                .debug_struct("StartupScram")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::ScramAwaitingServerFirst { reply, .. } => f
+                .debug_struct("ScramAwaitingServerFirst")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::ScramAwaitingServerFinal { reply, .. } => f
+                .debug_struct("ScramAwaitingServerFinal")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::ScramAwaitingAuthOk(id) => {
+                write!(f, "ScramAwaitingAuthOk({id:?})")
+            }
+            Self::PostAuthAwaitingKey(id) => {
+                write!(f, "PostAuthAwaitingKey({id:?})")
+            }
+            Self::PostAuthHaveKey { reply, pid, .. } => f
+                .debug_struct("PostAuthHaveKey")
+                .field("reply", reply)
+                .field("pid", pid)
+                .finish_non_exhaustive(),
+            Self::HandshakeReady => f.write_str("HandshakeReady"),
+            Self::Errored(kind) => write!(f, "Errored({kind:?})"),
+        }
+    }
 }
 
 /// DEF-279 Phase 1c (Commit 1) — state space reachable from
