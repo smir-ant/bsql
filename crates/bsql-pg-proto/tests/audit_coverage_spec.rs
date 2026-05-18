@@ -5,7 +5,7 @@
 //! pins a finding that the pre-audit suite did not cover.
 
 use bsql_pg_proto::{
-    Action, ConnectingState, PgProtocol, ProtoState, WriteBuf, error::ProtocolError,
+    Action, ActiveState, ConnectingState, PgProtocol, WriteBuf, error::ProtocolError,
 };
 
 mod common;
@@ -88,7 +88,7 @@ fn empty_query_response_with_non_zero_body_classifies() {
     }
     assert!(saw_fail, "EmptyQueryResponse with body must classify UnexpectedFrameBody");
     assert!(saw_close, "classified violation must emit CloseSocket");
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
 /// Same invariant for `ParseComplete` ('1').
@@ -118,7 +118,7 @@ fn parse_complete_with_non_zero_body_classifies() {
             Action::FailReply { cause: ProtocolError::UnexpectedFrameBody { .. }, .. })),
         "ParseComplete with body must classify UnexpectedFrameBody",
     );
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -153,7 +153,7 @@ fn max_length_notice_frame_is_consumed_cleanly() {
     let errored = out.as_slice().iter().any(|a| matches!(a, Action::FailReply { .. }));
     assert!(!errored, "max-length notice must be consumed cleanly without classification");
     // State is unchanged (still PingAwaitingRfq).
-    assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
+    assert!(matches!(proto.state(), ActiveState::PingAwaitingRfq(_)));
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ fn pong_delivered_via_byte_at_a_time_fragmentation() {
         }
     }
     assert!(found_pong, "byte-at-a-time feed must eventually deliver Pong");
-    assert!(matches!(proto.state(), ProtoState::Idle), "post-Pong state must be Idle");
+    assert!(matches!(proto.state(), ActiveState::Idle), "post-Pong state must be Idle");
 }
 
 // ───────────────────────────────────────────────────────────────────

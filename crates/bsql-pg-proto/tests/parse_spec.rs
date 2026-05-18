@@ -20,7 +20,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, ParseKind, PgProtocol, ProtoState, ProtocolError, Reply,
+    Action, ActiveState, ConnectionStatus, ParseKind, PgProtocol, ProtocolError, Reply,
     ReplyId, StmtName, WriteBuf,
     wire::{TAG_ERROR_RESPONSE, TAG_PARSE, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY},
 };
@@ -139,7 +139,7 @@ fn parse_success_end_to_end() {
 
     assert!(matches!(
         proto.state(),
-        ProtoState::ParseAwaitingParseComplete(_),
+        ActiveState::ParseAwaitingParseComplete(_),
     ));
 
     let mut bytes = std::vec::Vec::new();
@@ -158,7 +158,7 @@ fn parse_success_end_to_end() {
         }
         other => panic!("expected DeliverReply(ParseComplete), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant (spec): Parse error path — server sends ErrorResponse
@@ -197,7 +197,7 @@ fn parse_error_is_recoverable() {
         );
     }
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
+        matches!(proto.state(), ActiveState::Idle),
         "state returns to Idle after drain; got {:?}", proto.state(),
     );
 }
@@ -283,7 +283,7 @@ fn def198_parse_while_parse_in_flight_blocked_at_compile_time() {
     // First Parse correlator still pending (state preserved).
     assert!(matches!(
         proto.state(),
-        ProtoState::ParseAwaitingParseComplete(_),
+        ActiveState::ParseAwaitingParseComplete(_),
     ));
 
     // Drain the first parse so its ReplyId is consumed before drop.
@@ -312,7 +312,7 @@ fn def198_parse_on_errored_blocked_at_compile_time() {
     let unsolicited = frame(TAG_READY_FOR_QUERY.byte(), b"I");
     let out = proto.feed_bytes(&unsolicited, &mut wb);
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 
     // DEF-198: as_ready returns None on Errored.
     assert!(
@@ -362,5 +362,5 @@ fn parse_unexpected_frame_tears_down() {
         "expected FailReply(UnexpectedFrame), got {actions:?}",
     );
     assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }

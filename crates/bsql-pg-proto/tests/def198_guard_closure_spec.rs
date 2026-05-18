@@ -17,11 +17,11 @@
 //!
 //! | StatePushClass  | Representative state                     | as_ready  | connection_status |
 //! |-----------------|------------------------------------------|-----------|-------------------|
-//! | Idle            | `ProtoState::Idle`                       | `Some(_)` | `Ready`           |
-//! | PingAwaiting    | `ProtoState::PingAwaitingRfq(_)`         | `None`    | `Busy`            |
+//! | Idle            | `ActiveState::Idle`                       | `Some(_)` | `Ready`           |
+//! | PingAwaiting    | `ActiveState::PingAwaitingRfq(_)`         | `None`    | `Busy`            |
 //! | BusyQuery       | `ProtoState::SimpleQueryAwaitingFirst..` | `None`    | `Busy`            |
 //! | Connecting      | `ConnectingState::StartupTrust { .. }` | `None`  | `Handshaking`     |
-//! | Errored         | `ProtoState::Errored(_)`                 | `None`    | `Errored(_)`      |
+//! | Errored         | `ActiveState::Errored(_)`                 | `None`    | `Errored(_)`      |
 //!
 //! The per-ProtoState-variant exhaustive grid lives in protocol.rs's
 //! `compute_push_tests` module (private state-field access). This file
@@ -43,8 +43,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectingState, ConnectionStatus, Credentials, Ident, PgProtocol, PingKind,
-    ProtoState, QueryKind, StartupKind, WriteBuf,
+    Action, ActiveState, ConnectingState, ConnectionStatus, Credentials, Ident, PgProtocol, PingKind,
+    QueryKind, StartupKind, WriteBuf,
     wire::TAG_READY_FOR_QUERY,
 };
 
@@ -70,7 +70,7 @@ fn def198_idle_state_yields_ready_guard() {
         "fresh PgProtocol::new() must yield Some(ReadyGuard)",
     );
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
+        matches!(proto.state(), ActiveState::Idle),
         "fresh proto must be in Idle state",
     );
     assert_eq!(
@@ -114,7 +114,7 @@ fn def198_ping_awaiting_classifies_busy() {
     let reply = proto.next_reply_id::<PingKind>();
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
 
-    assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
+    assert!(matches!(proto.state(), ActiveState::PingAwaitingRfq(_)));
     assert!(
         proto.as_ready().is_none(),
         "DEF-198: as_ready returns None during PingAwaitingRfq",
@@ -150,7 +150,7 @@ fn def198_simple_query_awaiting_classifies_busy() {
 
     assert!(matches!(
         proto.state(),
-        ProtoState::SimpleQueryAwaitingFirstResponse(_),
+        ActiveState::SimpleQueryAwaitingFirstResponse(_),
     ));
     assert!(
         proto.as_ready().is_none(),
@@ -243,7 +243,7 @@ fn def198_errored_classifies_errored_with_kind() {
     let out = proto.feed_bytes(&unsolicited, &mut wb);
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
 
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
     assert!(
         proto.as_ready().is_none(),
         "DEF-198: as_ready returns None on Errored",
@@ -324,7 +324,7 @@ fn def198_ready_guard_drop_without_push_preserves_state() {
 
     // State unchanged: still Idle, as_ready still returns Some.
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
+        matches!(proto.state(), ActiveState::Idle),
         "ReadyGuard drop without push preserves Idle state",
     );
     assert!(

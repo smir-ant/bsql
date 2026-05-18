@@ -38,7 +38,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, PgProtocol, PingKind, ProtoState, ProtocolError, Reply,
+    Action, ActiveState, ConnectionStatus, PgProtocol, PingKind, ProtocolError, Reply,
     ReplyId,
     wire::{TAG_ERROR_RESPONSE, TAG_READY_FOR_QUERY},
 };
@@ -68,9 +68,9 @@ fn error_frame() -> [u8; 6] {
 /// drop and trip the consume-discipline Drop-guard at end-of-expression.
 /// Instead we pattern-match and extract the inner `value` directly.
 #[track_caller]
-fn expect_awaiting_ping_reply(state: &ProtoState, expected: NonZeroU64) {
+fn expect_awaiting_ping_reply(state: &ActiveState, expected: NonZeroU64) {
     match state {
-        ProtoState::PingAwaitingRfq(id) => assert_eq!(
+        ActiveState::PingAwaitingRfq(id) => assert_eq!(
             id.get(),
             expected,
             "state is PingAwaitingRfq but carrier id does not match",
@@ -150,7 +150,7 @@ fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg
 fn ping_from_idle_emits_sync_bytes() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
@@ -201,7 +201,7 @@ fn rfq_delivers_pong_and_returns_to_idle() {
         }
         other => panic!("unexpected action shape: {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
     assert_eq!(proto.unread().len(), 0, "frame fully consumed");
 }
 
@@ -228,7 +228,7 @@ fn partial_rfq_feeds_are_buffered_until_complete() {
             "no actions until frame is complete (after feeding byte {i})",
         );
         assert!(
-            matches!(proto.state(), ProtoState::PingAwaitingRfq(_)),
+            matches!(proto.state(), ActiveState::PingAwaitingRfq(_)),
             "state stays in PingAwaitingRfq while buffering",
         );
     }
@@ -241,7 +241,7 @@ fn partial_rfq_feeds_are_buffered_until_complete() {
     let out = proto.feed_bytes(last_slice, &mut wb);
     assert_eq!(out.len(), 1);
     assert!(matches!(out.as_slice(), [Action::DeliverReply { .. }]));
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 // ------------------------------------------------------------------
@@ -394,7 +394,7 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
     // FailReply action above, which the test already pins.
     use bsql_pg_proto::error::ErrorKind;
     match proto.state() {
-        ProtoState::Errored(k) if k.as_kind() == ErrorKind::Transport => {}
+        ActiveState::Errored(k) if k.as_kind() == ErrorKind::Transport => {}
         other => panic!(
             "state must be Errored(Transport), got {other:?}",
         ),
@@ -601,7 +601,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     use bsql_pg_proto::error::ErrorKind;
     // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
     match proto.state() {
-        ProtoState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
+        ActiveState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
         other => panic!("expected Errored(ServerError), got {other:?}"),
     }
 
@@ -615,7 +615,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     );
     // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
     match proto.state() {
-        ProtoState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
+        ActiveState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
         other => panic!("expected Errored(ServerError), got {other:?}"),
     }
 
@@ -630,7 +630,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     );
     // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
     match proto.state() {
-        ProtoState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
+        ActiveState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
         other => panic!("expected Errored(ServerError), got {other:?}"),
     }
 }
@@ -683,7 +683,7 @@ fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
 
     // State unchanged — kind preserved internally.
     match proto.state() {
-        ProtoState::Errored(k) => {
+        ActiveState::Errored(k) => {
             assert_eq!(k.as_kind(), ErrorKind::ServerError);
         }
         other => panic!("expected Errored(ServerError), got {other:?}"),

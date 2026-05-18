@@ -34,7 +34,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, FeedEvent, ProtoState, ProtocolError, Reply, WriteBuf,
+    Action, ActiveState, FeedEvent, ProtocolError, Reply, WriteBuf,
     reply_id::{PingKind, QueryKind},
     wire::{TAG_DATA_ROW, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION},
 };
@@ -87,7 +87,7 @@ fn ping_then_rfq_yields_deliver_pong() {
 
     // Push Ping (state → PingAwaitingRfq).
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
-    assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
+    assert!(matches!(proto.state(), ActiveState::PingAwaitingRfq(_)));
 
     // Feed inbound RFQ via the per-event API.
     let rfq = rfq_idle();
@@ -108,7 +108,7 @@ fn ping_then_rfq_yields_deliver_pong() {
         matches!(value, Reply::Pong(_)),
         "Ping reply must be Pong variant, got {value:?}",
     );
-    assert!(matches!(proto.state(), ProtoState::Idle), "post-Pong state == Idle");
+    assert!(matches!(proto.state(), ActiveState::Idle), "post-Pong state == Idle");
 }
 
 /// Drain after Deliver: subsequent advance returns Idle.
@@ -173,7 +173,7 @@ fn unsolicited_rfq_in_idle_yields_close_no_in_flight() {
         matches!(event, FeedEvent::Close),
         "unsolicited RFQ in Idle must yield Close, got {event:?}",
     );
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
 /// Adversarial wrong-tag frame mid-Ping → Fail (M2 implies close).
@@ -198,7 +198,7 @@ fn unexpected_frame_mid_ping_yields_fail_with_id() {
         matches!(cause, ProtocolError::UnexpectedFrame { .. }),
         "wrong-tag must classify as UnexpectedFrame, got {cause:?}",
     );
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
 /// Errored state on subsequent advance → Close.
@@ -296,7 +296,7 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
     // OutActions is ManuallyDrop<Vec<Action,9>>+len — not actually
     // Drop. NLL ends its borrow at the last use (the assert above);
     // the next-line `proto_a.state()` is `&self`, no borrow conflict.
-    assert!(matches!(proto_a.state(), ProtoState::Idle));
+    assert!(matches!(proto_a.state(), ActiveState::Idle));
 
     // (b) advance_one_frame path. Mint a fresh raw via a fresh
     // proto; raw_b will be a different global counter value than
@@ -313,7 +313,7 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
         other => panic!("path b: expected Deliver, got {other:?}"),
     };
     assert_eq!(id_b, raw_b, "advance: DeliverReply.id == minted raw");
-    assert!(matches!(proto_b.state(), ProtoState::Idle));
+    assert!(matches!(proto_b.state(), ActiveState::Idle));
 
     // Both paths reached Idle, each delivering its own minted id —
     // the per-event API is observationally equivalent on the canonical
@@ -340,7 +340,7 @@ fn feed_inbound_on_errored_surfaces_connection_already_closed() {
     // classifies as UnexpectedFrame → Errored).
     assert!(proto.feed_inbound(&rfq_idle()).is_ok());
     let _close = proto.advance_one_frame(&mut wb);
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 
     // Subsequent feed_inbound surfaces the typed error.
     let result = proto.feed_inbound(b"some bytes");

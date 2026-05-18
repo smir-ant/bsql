@@ -29,7 +29,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, PgProtocol, ProtoState, ProtocolError, QueryKind, Reply,
+    Action, ActiveState, ConnectionStatus, PgProtocol, ProtocolError, QueryKind, Reply,
     ReplyId, WriteBuf,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
@@ -184,7 +184,7 @@ fn select_zero_rows_end_to_end() {
     // After push: state should be SimpleQueryAwaitingFirstResponse.
     assert!(matches!(
         proto.state(),
-        ProtoState::SimpleQueryAwaitingFirstResponse(_),
+        ActiveState::SimpleQueryAwaitingFirstResponse(_),
     ));
 
     // Feed: T (0 cols) + C ("SELECT 0\0") + Z('I').
@@ -214,7 +214,7 @@ fn select_zero_rows_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 // DEF-154 (Y): `select_multiple_rows_stream_then_deliver` DELETED —
@@ -261,7 +261,7 @@ fn dml_no_rows_end_to_end() {
         }
         other => panic!("expected DeliverReply(QueryComplete(INSERT 0 3)), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant (spec): submitting an empty / whitespace-only SQL
@@ -290,7 +290,7 @@ fn empty_query_yields_empty_tag() {
         }
         other => panic!("expected DeliverReply with empty command_tag, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant (spec): a query-level error (E → Z) emits FailReply
@@ -329,7 +329,7 @@ fn query_error_emits_fail_reply_and_connection_survives() {
         );
     }
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
+        matches!(proto.state(), ActiveState::Idle),
         "state returns to Idle after drain Z; got {:?}",
         proto.state(),
     );
@@ -368,7 +368,7 @@ fn def198_simple_query_while_in_flight_blocked_at_compile_time() {
     // Original state preserved.
     assert!(matches!(
         proto.state(),
-        ProtoState::SimpleQueryAwaitingFirstResponse(_),
+        ActiveState::SimpleQueryAwaitingFirstResponse(_),
     ));
 
     // Drain the first query so the protocol doesn't drop with an
@@ -400,7 +400,7 @@ fn def198_simple_query_on_errored_blocked_at_compile_time() {
         out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)),
         "Errored transition must emit CloseSocket",
     );
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 
     assert!(
         proto.as_ready().is_none(),
@@ -446,7 +446,7 @@ fn malformed_command_complete_no_nul_terminator_tears_down() {
         actions.iter().any(|a| matches!(a, Action::CloseSocket)),
         "malformed wire framing must close the socket: {actions:?}",
     );
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
 /// Invariant: a `ReadyForQuery` arriving BEFORE any C (i.e. in
@@ -472,7 +472,7 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
         "expected FailReply(UnexpectedFrame{{Z}}), got {actions:?}",
     );
     assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
 // DEF-154 (Y): `rows_across_multiple_feed_bytes_calls` DELETED —
@@ -560,7 +560,7 @@ fn dml_after_select_clears_row_desc() {
         // drop.
         let _ = stream.col_next();
     });
-    assert!(matches!(proto.state(), ProtoState::Idle), "Q1 post-drain state must be Idle, got {:?}", proto.state());
+    assert!(matches!(proto.state(), ActiveState::Idle), "Q1 post-drain state must be Idle, got {:?}", proto.state());
 
     // Query 2: DML path. No `T` frame → AwaitingRfq never gets a
     // schema in its row_desc field. QueryComplete carries None.

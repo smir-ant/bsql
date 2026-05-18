@@ -52,7 +52,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ColEvent, ColumnDesc, DataRowRef, FormatCode, FromPgText, PgProtocol, ProtoState,
+    Action, ActiveState, ColEvent, ColumnDesc, DataRowRef, FormatCode, FromPgText, PgProtocol,
     ProtocolError, QueryKind, Reply, ReplyId, WriteBuf, oids,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_ERROR_RESPONSE, TAG_QUERY, TAG_READY_FOR_QUERY,
@@ -277,7 +277,7 @@ fn errored_state_emits_end_query_err_once_then_need_more() {
         out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)),
         "malformed frame drives protocol to CloseSocket",
     );
-    assert!(matches!(proto.state(), ProtoState::Errored { .. }));
+    assert!(matches!(proto.state(), ActiveState::Errored { .. }));
 
     // Now open a stream on the errored protocol.
     proto.iter_rows(&mut wb, |stream| {
@@ -826,7 +826,7 @@ fn drop_mid_stream_installs_errored() {
 
     // Post-Drop: protocol is Errored.
     assert!(
-        matches!(proto.state(), ProtoState::Errored(_)),
+        matches!(proto.state(), ActiveState::Errored(_)),
         "Drop must install Errored, got state {:?}",
         proto.state(),
     );
@@ -867,7 +867,7 @@ fn drop_on_closure_panic_installs_errored() {
     assert!(result.is_err(), "closure panic must propagate");
     // Post-unwind: protocol is Errored.
     assert!(
-        matches!(proto.state(), ProtoState::Errored(_)),
+        matches!(proto.state(), ActiveState::Errored(_)),
         "Drop on panic unwind must install Errored, got state {:?}",
         proto.state(),
     );

@@ -45,7 +45,7 @@
 use bsql_pg_proto::{
     frame::{parse_header, HeaderParse, READ_BUF_CAP},
     reply_id::PingKind,
-    ProtoState, WriteBuf,
+    ActiveState, WriteBuf,
 };
 
 mod common;
@@ -115,10 +115,10 @@ impl XorShift64 {
 // Helpers — invariant checks.
 // ---------------------------------------------------------------
 
-/// Returns true if `state` is a recognised `ProtoState` variant
+/// Returns true if `state` is a recognised `ActiveState` variant
 /// in a valid shape. Used to verify no torn/invalid state after
 /// random input.
-fn state_is_valid(state: &ProtoState) -> bool {
+fn state_is_valid(state: &ActiveState) -> bool {
     // Any matched variant is valid by compile-time exhaustiveness.
     // The real test here is that `matches!` doesn't panic — if
     // state is somehow corrupted (unreachable outside `unsafe`),
@@ -127,34 +127,27 @@ fn state_is_valid(state: &ProtoState) -> bool {
     // check rather than a real failure mode.
     matches!(
         state,
-        ProtoState::Idle
-            | ProtoState::PingAwaitingRfq(_)
-            | ProtoState::ConnectingStartupTrust { .. }
-            | ProtoState::ConnectingStartupScram { .. }
-            | ProtoState::ConnectingScramAwaitingServerFirst { .. }
-            | ProtoState::ConnectingScramAwaitingServerFinal { .. }
-            | ProtoState::ConnectingScramAwaitingAuthOk(_)
-            | ProtoState::ConnectingPostAuthAwaitingKey(_)
-            | ProtoState::ConnectingPostAuthHaveKey { .. }
-            | ProtoState::SimpleQueryAwaitingFirstResponse(_)
-            | ProtoState::SimpleQueryStreamingRows { .. }
-            | ProtoState::SimpleQueryAwaitingRfq { .. }
-            | ProtoState::DrainRfqAfterError
-            | ProtoState::ParseAwaitingParseComplete(_)
-            | ProtoState::ParseAwaitingRfq(_)
-            | ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-            | ProtoState::BindExecuteAwaitingCommandCompleteDml(_)
-            | ProtoState::BindExecuteAwaitingRfqDml { .. }
-            | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
-            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
-            | ProtoState::BindExecuteStreamingRows { .. }
-            | ProtoState::BindExecuteAwaitingRfqSelect { .. }
-            | ProtoState::DescribeStatementAwaitingParamDesc(_)
-            | ProtoState::DescribeStatementAwaitingRowDescOrNoData { .. }
-            | ProtoState::DescribeStatementAwaitingRfq { .. }
-            | ProtoState::DescribePortalAwaitingRowDescOrNoData(_)
-            | ProtoState::DescribePortalAwaitingRfq { .. }
-            | ProtoState::Errored(_)
+        ActiveState::Idle
+            | ActiveState::PingAwaitingRfq(_)
+            | ActiveState::SimpleQueryAwaitingFirstResponse(_)
+            | ActiveState::SimpleQueryStreamingRows { .. }
+            | ActiveState::SimpleQueryAwaitingRfq { .. }
+            | ActiveState::DrainRfqAfterError
+            | ActiveState::ParseAwaitingParseComplete(_)
+            | ActiveState::ParseAwaitingRfq(_)
+            | ActiveState::BindExecuteAwaitingBindCompleteDml(_)
+            | ActiveState::BindExecuteAwaitingCommandCompleteDml(_)
+            | ActiveState::BindExecuteAwaitingRfqDml { .. }
+            | ActiveState::BindExecuteAwaitingBindCompleteSelect { .. }
+            | ActiveState::BindExecuteAwaitingDataOrCompleteSelect { .. }
+            | ActiveState::BindExecuteStreamingRows { .. }
+            | ActiveState::BindExecuteAwaitingRfqSelect { .. }
+            | ActiveState::DescribeStatementAwaitingParamDesc(_)
+            | ActiveState::DescribeStatementAwaitingRowDescOrNoData { .. }
+            | ActiveState::DescribeStatementAwaitingRfq { .. }
+            | ActiveState::DescribePortalAwaitingRowDescOrNoData(_)
+            | ActiveState::DescribePortalAwaitingRfq { .. }
+            | ActiveState::Errored(_)
     )
 }
 
@@ -288,7 +281,7 @@ fn push_ping_then_feed_random_bytes_terminates() {
             &mut wb,
         );
         assert!(
-            matches!(proto.state(), ProtoState::PingAwaitingRfq(_)),
+            matches!(proto.state(), ActiveState::PingAwaitingRfq(_)),
             "iter {i}: state after push_ping must be PingAwaitingRfq, got {:?}",
             proto.state(),
         );
@@ -343,7 +336,7 @@ fn progressive_feed_preserves_state_validity() {
         );
         // Once in Errored, subsequent feeds must STAY in Errored.
         // Tier-1 terminality: no recovery path from Errored.
-        if matches!(proto.state(), ProtoState::Errored(_)) {
+        if matches!(proto.state(), ActiveState::Errored(_)) {
             // Verify stickiness over the rest of the test.
             for j in (i + 1)..CHUNKS {
                 let n2 = rng.len_up_to(chunk.len());
@@ -355,7 +348,7 @@ fn progressive_feed_preserves_state_validity() {
                     let _acts = proto.feed_bytes(view2, &mut wb);
                 }
                 assert!(
-                    matches!(proto.state(), ProtoState::Errored(_)),
+                    matches!(proto.state(), ActiveState::Errored(_)),
                     "chunk {j} (post-error): state leaked out of Errored to {:?}",
                     proto.state(),
                 );

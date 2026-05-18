@@ -52,7 +52,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, PgProtocol, ProtoState, ProtocolError, QueryKind, ReplyId, WriteBuf,
+    Action, ActiveState, PgProtocol, ProtocolError, QueryKind, ReplyId, WriteBuf,
     wire::{
         TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_COMMAND_COMPLETE, TAG_DATA_ROW,
         TAG_ERROR_RESPONSE, TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NOTICE_RESPONSE, TAG_QUERY,
@@ -240,7 +240,7 @@ fn streaming_t_row_description_oversized_dispatches_correctly() {
     // or reports MalformedRowDescription on the truncated tail.
     // Sub-B-specific assertion: the frame REACHED dispatch — no
     // FrameTooLarge teardown.
-    if let ProtoState::Errored(kind) = proto.state() {
+    if let ActiveState::Errored(kind) = proto.state() {
         let kind_str = format!("{kind:?}");
         assert!(
             !kind_str.contains("FrameTooLarge"),
@@ -339,7 +339,7 @@ fn streaming_a_notification_oversized_is_received() {
     }
 
     // Sub-B invariant: NOT FrameTooLarge.
-    if let ProtoState::Errored(kind) = proto.state() {
+    if let ActiveState::Errored(kind) = proto.state() {
         let kind_str = format!("{kind:?}");
         assert!(
             !kind_str.contains("FrameTooLarge"),
@@ -371,7 +371,7 @@ fn streaming_c_command_complete_oversized_dispatches_correctly() {
         pos = end;
     }
 
-    if let ProtoState::Errored(kind) = proto.state() {
+    if let ActiveState::Errored(kind) = proto.state() {
         let kind_str = format!("{kind:?}");
         assert!(
             !kind_str.contains("FrameTooLarge"),
@@ -424,7 +424,7 @@ fn streaming_r_authentication_oversized_is_received() {
         pos = end;
     }
 
-    if let ProtoState::Errored(kind) = proto.state() {
+    if let ActiveState::Errored(kind) = proto.state() {
         let kind_str = format!("{kind:?}");
         assert!(
             !kind_str.contains("FrameTooLarge"),
@@ -454,7 +454,7 @@ fn streaming_v_negotiate_oversized_is_received() {
         pos = end;
     }
 
-    if let ProtoState::Errored(kind) = proto.state() {
+    if let ActiveState::Errored(kind) = proto.state() {
         let kind_str = format!("{kind:?}");
         assert!(
             !kind_str.contains("FrameTooLarge"),
@@ -540,7 +540,7 @@ fn nonstreaming_k_backend_key_data_oversize_still_tears_down() {
     }
 
     assert!(
-        matches!(proto.state(), ProtoState::Errored(_)),
+        matches!(proto.state(), ActiveState::Errored(_)),
         "'K' oversize must tear down; state: {:?}",
         proto.state(),
     );
@@ -574,7 +574,7 @@ fn nonstreaming_d_data_row_oversize_outside_iter_rows_tears_down() {
     }
 
     assert!(
-        matches!(proto.state(), ProtoState::Errored(_)),
+        matches!(proto.state(), ActiveState::Errored(_)),
         "'D' oversize outside streaming must tear down; state: {:?}",
         proto.state(),
     );
@@ -621,7 +621,7 @@ fn errored_entry_clears_partial_assembly_residue() {
     // Trigger Errored via malformed-length frame.
     let malformed: [u8; 5] = [TAG_DATA_ROW.byte(), 0, 0, 0, 3]; // declared < 4
     let _ = proto.feed_bytes(&malformed, &mut wb);
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 
     // Next entry-point call clears residue (including partial_assembly).
     let _ = proto.feed_bytes(&[], &mut wb);

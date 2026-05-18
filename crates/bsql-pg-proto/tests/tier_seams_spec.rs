@@ -38,8 +38,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ApplicationName, ConnectingState, ConnectionStatus, Credentials, DatabaseName,
-    Ident, IdentError, PgProtocol, PingKind, ProtoState, ProtocolError, SessionParams,
+    Action, ActiveState, ApplicationName, ConnectingState, ConnectionStatus, Credentials, DatabaseName,
+    Ident, IdentError, PgProtocol, PingKind, ProtocolError, SessionParams,
     StartupKind,
 };
 
@@ -233,7 +233,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
         other => panic!("expected [FailReply(FrameTooLarge 0xDEAD), CloseSocket], got {other:?}"),
     }
     assert!(
-        matches!(proto.state(), ProtoState::Errored(k) if k.as_kind() == ErrorKind::Framing),
+        matches!(proto.state(), ActiveState::Errored(k) if k.as_kind() == ErrorKind::Framing),
         "state after first fatal must be Errored(Framing), got {:?}",
         proto.state(),
     );
@@ -261,7 +261,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     }
     // State preservation: still Errored(Framing) after as_ready check.
     assert!(
-        matches!(proto.state(), ProtoState::Errored(k) if k.as_kind() == ErrorKind::Framing),
+        matches!(proto.state(), ActiveState::Errored(k) if k.as_kind() == ErrorKind::Framing),
         "state must stay Errored(Framing), got {:?}",
         proto.state(),
     );
@@ -334,7 +334,7 @@ fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
     // FailReply + state → Errored(ServerError).
     assert!(!out.as_slice().is_empty());
     let initial_kind = match proto.state() {
-        ProtoState::Errored(k) => k.as_kind(),
+        ActiveState::Errored(k) => k.as_kind(),
         other => panic!("expected Errored after E frame, got {other:?}"),
     };
     assert_eq!(
@@ -351,7 +351,7 @@ fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
     let arbitrary = [b'T', 0x00, 0x00, 0x00, 0x06, 0x00, 0x00];
     let _ = proto.feed_bytes(&arbitrary, &mut wb);
     let after_kind = match proto.state() {
-        ProtoState::Errored(k) => k.as_kind(),
+        ActiveState::Errored(k) => k.as_kind(),
         other => panic!("expected Errored to persist after re-feed, got {other:?}"),
     };
     assert_eq!(

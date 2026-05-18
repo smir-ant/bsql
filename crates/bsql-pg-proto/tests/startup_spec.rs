@@ -23,8 +23,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectingPhase, ConnectingState, ConnectionStatus, Credentials, DisconnectedPhase,
-    Ident, PgProtocol, Password, PingKind, ProtoState, ProtocolError, Reply, Sensitive,
+    Action, ActiveState, ConnectingPhase, ConnectingState, ConnectionStatus, Credentials, DisconnectedPhase,
+    Ident, PgProtocol, Password, PingKind, ProtocolError, Reply, Sensitive,
     StartupKind,
 };
 use core::num::NonZeroU64;
@@ -1243,14 +1243,14 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
             "Ping must emit PG Sync wire bytes: tag 'S' + BE u32 length=4",
         );
     }
-    assert!(matches!(proto.state(), ProtoState::PingAwaitingRfq(_)));
+    assert!(matches!(proto.state(), ActiveState::PingAwaitingRfq(_)));
 
     // Server emits ParameterStatus before RFQ (e.g. an ALTER SYSTEM
     // committed during our ping's round-trip).
     let out = proto.feed_bytes(&param_status_frame("client_encoding", "LATIN1"), &mut wb);
     assert_eq!(out.len(), 0, "PS during flight emits no actions");
     assert!(
-        matches!(proto.state(), ProtoState::PingAwaitingRfq(_)),
+        matches!(proto.state(), ActiveState::PingAwaitingRfq(_)),
         "PS must not disturb the PingAwaitingRfq state",
     );
     // DEF-114: typed Encoding.
@@ -1268,7 +1268,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant (spec): ParameterStatus arriving during the SCRAM

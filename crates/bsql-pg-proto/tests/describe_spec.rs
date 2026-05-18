@@ -51,8 +51,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows,
-    PgProtocol, PortalName, ProtoState, ProtocolError, Reply, ReplyId, StmtName,
+    Action, ActiveState, ConnectionStatus, DescribePortalKind, DescribeStatementKind, DescribedRows, FetchRows,
+    PgProtocol, PortalName, ProtocolError, Reply, ReplyId, StmtName,
     TxStatus, WriteBuf,
     wire::{
         DescribeTargetByte, TAG_BIND_COMPLETE, TAG_DATA_ROW, TAG_DESCRIBE, TAG_ERROR_RESPONSE,
@@ -206,7 +206,7 @@ fn describe_statement_with_rows_success_end_to_end() {
 
     assert!(matches!(
         proto.state(),
-        ProtoState::DescribeStatementAwaitingParamDesc(_),
+        ActiveState::DescribeStatementAwaitingParamDesc(_),
     ));
 
     let mut bytes = std::vec::Vec::new();
@@ -236,7 +236,7 @@ fn describe_statement_with_rows_success_end_to_end() {
         }
         other => panic!("expected DeliverReply(DescribeStatementComplete), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant (spec): statement-describe on a DML-without-RETURNING
@@ -266,7 +266,7 @@ fn describe_statement_no_data_success_end_to_end() {
         }
         other => panic!("expected DescribeStatementComplete (NoData), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant (spec): zero-parameter statement describes cleanly —
@@ -381,7 +381,7 @@ fn describe_portal_with_rows_success_end_to_end() {
 
     assert!(matches!(
         proto.state(),
-        ProtoState::DescribePortalAwaitingRowDescOrNoData(_),
+        ActiveState::DescribePortalAwaitingRowDescOrNoData(_),
     ));
 
     let mut bytes = std::vec::Vec::new();
@@ -405,7 +405,7 @@ fn describe_portal_with_rows_success_end_to_end() {
         }
         other => panic!("expected DescribePortalComplete, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant (spec): portal-describe NoData branch.
@@ -499,7 +499,7 @@ fn describe_statement_error_at_param_desc_is_recoverable() {
         );
     }
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
+        matches!(proto.state(), ActiveState::Idle),
         "state returns to Idle after drain; got {:?}", proto.state(),
     );
 }
@@ -526,7 +526,7 @@ fn describe_statement_error_at_row_desc_stage_is_recoverable() {
         }
         other => panic!("expected single FailReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant (spec): portal-describe `'E'` → FailReply + drain + Idle.
@@ -548,7 +548,7 @@ fn describe_portal_error_response_is_recoverable() {
         }
         other => panic!("expected FailReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -580,7 +580,7 @@ fn describe_statement_row_desc_before_param_desc_tears_down() {
         "expected FailReply(UnexpectedFrame), got {actions:?}",
     );
     assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
 /// Invariant (spec): `'n'` arriving in
@@ -766,7 +766,7 @@ fn def198_describe_statement_on_errored_blocked_at_compile_time() {
     let unsolicited = frame(TAG_READY_FOR_QUERY.byte(), b"I");
     let out = proto.feed_bytes(&unsolicited, &mut wb);
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 
     assert!(
         proto.as_ready().is_none(),
@@ -820,7 +820,7 @@ fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
     );
     assert!(matches!(
         proto.state(),
-        ProtoState::DescribeStatementAwaitingParamDesc(_),
+        ActiveState::DescribeStatementAwaitingParamDesc(_),
     ));
 
     // Drain describe so the Drop-guard is happy.
@@ -966,7 +966,7 @@ fn describe_after_completed_parse_starts_clean() {
     bytes.extend_from_slice(&rfq_frame(b'I'));
     let out = proto.feed_bytes(&bytes, &mut wb);
     assert!(matches!(out.as_slice(), [Action::DeliverReply { .. }]));
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 
     // Now describe — should proceed normally from Idle.
     let (describe_reply, describe_raw) = mint_reply::<DescribeStatementKind>(&mut proto);

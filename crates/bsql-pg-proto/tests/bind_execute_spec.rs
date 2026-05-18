@@ -25,7 +25,7 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, FetchRows, PortalName, ProtoState, ProtocolError,
+    Action, ActiveState, ConnectionStatus, FetchRows, PortalName, ProtocolError,
     QueryKind, Reply, StmtName, WriteBuf,
     decode::RowDesc,
     wire::{
@@ -136,8 +136,8 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
 
     assert!(matches!(
         proto.state(),
-        ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-            | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        ActiveState::BindExecuteAwaitingBindCompleteDml(_)
+            | ActiveState::BindExecuteAwaitingBindCompleteSelect { .. }
     ));
 
     // Drain to Idle so ReplyId's Drop-guard doesn't trip.
@@ -185,7 +185,7 @@ fn bind_execute_dml_full_round_trip() {
         }
         other => panic!("expected DeliverReply(QueryComplete), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 /// Invariant: SELECT path. User pre-provided row_desc → DataRow
@@ -271,7 +271,7 @@ fn bind_error_is_recoverable() {
         }
         other => panic!("expected single FailReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -377,7 +377,7 @@ fn def198_bind_execute_from_errored_blocked_at_compile_time() {
     let bogus = frame(b'Z', b"I");
     let out = proto.feed_bytes(&bogus, &mut wb);
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ActiveState::Errored(_)));
 
     // DEF-198: as_ready returns None on Errored.
     assert!(
@@ -412,8 +412,8 @@ fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
     );
     assert!(matches!(
         proto.state(),
-        ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-            | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        ActiveState::BindExecuteAwaitingBindCompleteDml(_)
+            | ActiveState::BindExecuteAwaitingBindCompleteSelect { .. }
     ));
 
     // DEF-198: as_ready returns None during in-flight Bind+Execute.
@@ -429,8 +429,8 @@ fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
     // First state preserved.
     assert!(matches!(
         proto.state(),
-        ProtoState::BindExecuteAwaitingBindCompleteDml(_)
-            | ProtoState::BindExecuteAwaitingBindCompleteSelect { .. }
+        ActiveState::BindExecuteAwaitingBindCompleteDml(_)
+            | ActiveState::BindExecuteAwaitingBindCompleteSelect { .. }
     ));
 
     // Drain the first reply so its ReplyId doesn't trip the Drop-guard.

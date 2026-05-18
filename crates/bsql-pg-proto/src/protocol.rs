@@ -556,6 +556,14 @@ pub(crate) fn error_arena_or_init(
 // to obtain a `PgProtocolInner` instance. The promoted name visibility
 // adds no new capability — external code can name `PgProtocolInner`
 // but cannot construct, mutate, or borrow one outside the crate.
+//
+// **DEF-279 Phase 2 Bundle Commit 12 (2026-05-18)**: `PgProtocolInner`
+// is no longer the `Inner` type for any phase — every phase now uses
+// a per-phase Inner (`DisconnectedInner` / `ConnectingInner` /
+// `ActiveInner` / `ClosedInner`). The struct + its impl block survive
+// transiently only because the size pin in `lib.rs` references the
+// type; full deletion lands in Commit 13.
+#[allow(dead_code)]
 pub struct PgProtocolInner {
     // DEF-189 hot-path field ordering: per-row fast-path touches
     // `state` (discriminant + reply_id), `row_desc_slot` (Option
@@ -1310,7 +1318,14 @@ impl SealedPhase for ConnectingPhase {
     type Inner = ConnectingInner;
 }
 impl SealedPhase for ActivePhase {
-    type Inner = PgProtocolInner;
+    // DEF-279 Phase 2 Bundle Commit 12 (2026-05-18): FLIPPED from
+    // `PgProtocolInner` to per-phase [`ActiveInner`]. Tier-1
+    // closure on state-variant-in-wrong-phase by storage absence
+    // (`ActiveInner.state: ActiveState` — no Connecting variants
+    // exist in the per-phase enum). Field set unchanged from
+    // PgProtocolInner (8 fields, same layout) since every cell is
+    // reachable from at least one Active variant.
+    type Inner = ActiveInner;
 }
 impl SealedPhase for ClosedPhase {
     // DEF-279 Phase 1b (2026-05-18): switched from `PgProtocolInner`
@@ -1798,6 +1813,7 @@ pub(crate) mod _proto_init_leaf {
     /// still cannot reach it.
     #[cfg(test)]
     #[must_use]
+    #[allow(dead_code)] // DEF-279 Phase 2 Bundle Commit 12: callers migrated to fresh_active_inner
     pub(in crate::protocol) const fn fresh_inner() -> super::PgProtocolInner {
         let token = ProtoInitToken::mint();
         super::PgProtocolInner {
@@ -1857,6 +1873,41 @@ pub(crate) mod _proto_init_leaf {
                     crate::error::ErrorKind::Framing,
                 ),
             ),
+            read_buf: super::ReadBuf::new(),
+            row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
+            session_params: crate::session_params_slot::SessionParamsCell::empty(token),
+            error_arena: None,
+            partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
+            backend_key: crate::cancel::BackendKeyCell::empty(token),
+            malformed_frame_count: 0,
+            sync_marker: super::PhantomData,
+        }
+    }
+
+    /// DEF-279 Phase 2 Bundle Commit 12 (2026-05-18) — materialise
+    /// a fresh [`super::ActiveInner`] for use by transitions into
+    /// `<ActivePhase>`.
+    ///
+    /// **Sole production caller**:
+    /// [`super::PgProtocol::<super::ConnectingPhase>::into_active`]
+    /// after observing `ConnectingState::HandshakeReady`. The
+    /// fields are populated by destructuring the consumed
+    /// `ConnectingInner` (field-by-field move) — see
+    /// `into_active`'s body. This constructor is used only when a
+    /// caller needs a from-scratch ActiveInner (e.g.
+    /// `#[cfg(test)] fresh_active_proto` for residue tests).
+    ///
+    /// **State sentinel**: `ActiveState::Idle` — the natural
+    /// post-handshake state. Caller may overwrite if needed.
+    ///
+    /// **`#[allow(dead_code)]`** until Commit 12 wires `into_active`
+    /// to produce ActiveInner.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(in crate::protocol) fn fresh_active_inner() -> super::ActiveInner {
+        let token = ProtoInitToken::mint();
+        super::ActiveInner {
+            state: crate::state::ActiveState::Idle,
             read_buf: super::ReadBuf::new(),
             row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
             session_params: crate::session_params_slot::SessionParamsCell::empty(token),
@@ -2394,9 +2445,14 @@ impl PgProtocol<ConnectingPhase> {
                 malformed_frame_count,
                 sync_marker: _,
             } = self.inner;
+            // DEF-279 Phase 2 Bundle Commit 12: per-phase ActiveInner
+            // (was PgProtocolInner pre-Commit-12). State opens at
+            // `ActiveState::Idle` — the natural post-handshake state
+            // that the Connecting wrapper's `HandshakeReady` signal
+            // represents. All other fields move byte-identically.
             return Ok(PgProtocol {
-                inner: PgProtocolInner {
-                    state: ProtoState::Idle,
+                inner: ActiveInner {
+                    state: crate::state::ActiveState::Idle,
                     read_buf,
                     row_desc_slot,
                     session_params,
@@ -3295,10 +3351,20 @@ impl PgProtocol<ActivePhase> {
         self.cold_malformed_frame_count()
     }
 
-    /// Borrow the current state. Read-only inspection.
+    /// DEF-279 Phase 2 Bundle Commit 12 (2026-05-18) — per-phase
+    /// state accessor for diagnostic logging.
+    ///
+    /// **Return type changed**: `&ProtoState` → `&ActiveState`. The
+    /// per-phase enum carries only post-handshake variants —
+    /// `ProtoState`'s Connecting* variants don't exist here.
+    /// Callers that pattern-matched against `ProtoState::SimpleQuery*`
+    /// etc. now match the same-meaning `ActiveState::SimpleQuery*`;
+    /// `ProtoState::Idle` / `ProtoState::PingAwaitingRfq` /
+    /// `ProtoState::Errored(_)` map 1:1 to the same-named
+    /// `ActiveState` variants.
     #[inline]
     #[must_use]
-    pub const fn state(&self) -> &ProtoState {
+    pub const fn state(&self) -> &crate::state::ActiveState {
         &self.inner.state
     }
 
@@ -3502,7 +3568,19 @@ impl PgProtocol<ActivePhase> {
         // route through `self.inner` directly.
         self.inner.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
 
-        let state = &mut self.inner.state;
+        // DEF-279 Phase 2 Bundle Commit 12 (2026-05-18): lift+lower
+        // for the IdleState setter machinery (which operates on
+        // `&mut ProtoState`). self.inner.state is now ActiveState;
+        // we mem::replace with the `Idle` sentinel (the natural
+        // value when ready), pass `&mut proto_state` to the setter,
+        // then lower the result back via `ActiveState::try_from`
+        // after the branded closure returns.
+        let mut proto_state: ProtoState = core::mem::replace(
+            &mut self.inner.state,
+            crate::state::ActiveState::Idle,
+        )
+        .into();
+        let state = &mut proto_state;
         let row_desc_slot = &mut self.inner.row_desc_slot;
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
@@ -3554,7 +3632,7 @@ impl PgProtocol<ActivePhase> {
         // tier-1 `WriteRange::apply`; read side is unbranded.
         // DEF-269 v2: row_desc_slot threaded through for BindExecute
         // (other commands ignore it).
-        write_buf.with_branded(|mut wb| -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
+        let result = write_buf.with_branded(|mut wb| -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
             let mut staged: StagedActions<'_> = StagedActions::new();
             {
                 let mut reserved = wb.reserve();
@@ -3657,7 +3735,34 @@ impl PgProtocol<ActivePhase> {
                 Some(f) => Err(f),
                 None => Ok(out),
             }
-        })
+        });
+
+        // DEF-279 Phase 2 Bundle Commit 12 lower: project the
+        // setter-mutated `proto_state` back to ActiveState and
+        // install on self.inner.state. The setter's terminal
+        // mutation set `proto_state` to one of the Active flow
+        // variants (SimpleQueryAwaitingFirstResponse,
+        // ParseAwaitingParseComplete, etc.) which all project
+        // cleanly to ActiveState. Connecting outcomes are
+        // architecturally impossible from an Idle setter (the
+        // setter's PostState bound restricts target variants);
+        // defensive Errored absorbs any.
+        use crate::state::{ActiveState, WrongPhase};
+        self.inner.state = match ActiveState::try_from(proto_state) {
+            Ok(active) => active,
+            Err(WrongPhase { recovered }) => {
+                core::hint::cold_path();
+                match recovered.take_inflight_reply_raw_id() {
+                    Some(_) | None => {}
+                }
+                ActiveState::Errored(
+                    crate::error::StateErrorKind::from_kind_or_internal(
+                        crate::error::ErrorKind::Internal,
+                    ),
+                )
+            }
+        };
+        result
     }
 
     // DEF-269 v2 (T): push_bind_execute_internal removed; callers now
@@ -4462,9 +4567,16 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bo
 /// fast-path checks read `*ctx.state` / `ctx.read_buf` immutably;
 /// NLL releases those borrows before `ctx` is moved into
 /// `feed_bytes_dispatch`.
+// **DEF-279 Phase 2 Bundle Commit 12 (2026-05-18)**: dead post-flip.
+// Both phases that drive advance_one_frame (`<ConnectingPhase>` /
+// `<ActivePhase>`) now use their per-phase variants
+// `advance_one_frame_dispatch_connecting` (Commit 6) /
+// `advance_one_frame_dispatch_active` (Commit 10). Full deletion in
+// Commit 13.
 #[must_use = "FeedEvent variants carry side-effect contracts: \
               SendBytes/Deliver MUST be processed; Fail/Close MUST \
               trigger socket teardown"]
+#[allow(dead_code)]
 pub(in crate::protocol) fn advance_one_frame_dispatch<'w, 'state, 'r>(
     ctx: DispatchContext<'state, 'r>,
     write_buf: &'w mut WriteBuf,
@@ -4911,6 +5023,15 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
     }
 }
 
+/// **DEF-279 Phase 2 Bundle Commit 12 (2026-05-18)**: this entire impl
+/// block is dead post-flip — `<ActivePhase>::Inner = ActiveInner`
+/// (Commit 12), `<ConnectingPhase>::Inner = ConnectingInner` (Phase 1c
+/// Commit 8b), `<DisconnectedPhase>::Inner = DisconnectedInner` (ZST),
+/// `<ClosedPhase>::Inner = ClosedInner` (DEF-279 Phase 1b). No live
+/// caller invokes any method here. Full deletion lands in Commit 13
+/// once the size pin in `lib.rs` is also retired (the pin's referenced
+/// type goes with the struct).
+#[allow(dead_code)]
 impl PgProtocolInner {
     /// DEF-246 Phase 2 (2026-05-16): saturation-classifier mutation
     /// surface lives on `PgProtocolInner` so blanket
@@ -5724,12 +5845,14 @@ impl PgProtocol<ActivePhase> {
     ) -> Result<PgProtocol<ClosedPhase>, PgProtocol<ActivePhase>> {
         // DEF-279 Phase 1b (2026-05-18): Ok arm materialises
         // `ClosedInner` (~16 B) instead of moving the full 536-B
-        // `PgProtocolInner`. Same extract-and-drop shape as
+        // `PgProtocolInner` (Phase 2 Bundle Commit 12: now
+        // `ActiveInner`, same field shape).
+        // Same extract-and-drop shape as
         // `<ConnectingPhase>::into_active`'s Closed arm: state_kind
         // is Copy from `&state`; error_arena is mem::take'd; the
-        // remaining PgProtocolInner Drops at scope end, releasing
+        // remaining ActiveInner Drops at scope end, releasing
         // ~520 B of stack + any heap behind the Box-niche cells.
-        if let ProtoState::Errored(state_kind) = &self.inner.state {
+        if let crate::state::ActiveState::Errored(state_kind) = &self.inner.state {
             let state_kind = *state_kind;
             let error_arena = core::mem::take(&mut self.inner.error_arena);
             Ok(PgProtocol {
@@ -6104,11 +6227,12 @@ impl PgProtocol<ActivePhase> {
     #[inline]
     #[must_use]
     pub(crate) fn classify_for_iter_rows(&self) -> IterRowsClass {
+        use crate::state::ActiveState;
         match &self.inner.state {
-            ProtoState::Errored(_) => IterRowsClass::Errored,
-            ProtoState::SimpleQueryStreamingRows { reply }
-            | ProtoState::BindExecuteStreamingRows { reply }
-            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply } => {
+            ActiveState::Errored(_) => IterRowsClass::Errored,
+            ActiveState::SimpleQueryStreamingRows { reply }
+            | ActiveState::BindExecuteStreamingRows { reply }
+            | ActiveState::BindExecuteAwaitingDataOrCompleteSelect { reply } => {
                 IterRowsClass::Streaming(reply.get())
             }
             _ => IterRowsClass::Other,
@@ -6143,7 +6267,53 @@ impl PgProtocol<ActivePhase> {
         let cause = ProtocolError::InternalCrateBug {
             locus: crate::error::CrateBugLocus::ReadCursorAdvance,
         };
-        _read_cursor_advance_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
+        self.drain_via_leaf(cause.state_kind(), _read_cursor_advance_drain_leaf::drain)
+    }
+
+    /// DEF-279 Phase 2 Bundle Commit 12 (2026-05-18) — per-phase
+    /// lift+lower wrapper for the cluster δ drain-and-install
+    /// pattern.
+    ///
+    /// Five `install_errored_*` sites (RowStream cold paths + Drop)
+    /// need to drain the in-flight reply id and atomically install
+    /// `Errored(kind)`. The cluster δ drain leaves expect
+    /// `&mut ProtoState`; this helper provides the per-phase
+    /// `ActiveState → ProtoState` lift, calls the supplied `drain_fn`
+    /// (which mints its own per-call-site token internally — tier-1
+    /// closure on `FeedStateSetter::new` preserved), then lowers the
+    /// result.
+    ///
+    /// All 5 drain leaves produce `ProtoState::Errored(kind)` on
+    /// success; the `ActiveState::try_from` lower-step projects this
+    /// cleanly to `ActiveState::Errored(kind)`. The `WrongPhase` arm
+    /// is architecturally impossible (drain always produces Errored)
+    /// and falls through to the sentinel `Errored(kind)` already
+    /// installed by the `mem::replace`.
+    #[inline]
+    fn drain_via_leaf<F>(
+        &mut self,
+        kind: crate::error::StateErrorKind,
+        drain_fn: F,
+    ) -> Option<NonZeroU64>
+    where
+        F: FnOnce(&mut ProtoState, crate::error::StateErrorKind) -> Option<NonZeroU64>,
+    {
+        use crate::state::{ActiveState, WrongPhase};
+        let sentinel = ActiveState::Errored(kind);
+        let lifted = core::mem::replace(&mut self.inner.state, sentinel);
+        let mut proto_state: ProtoState = lifted.into();
+        let drained = drain_fn(&mut proto_state, kind);
+        self.inner.state = match ActiveState::try_from(proto_state) {
+            Ok(s) => s,
+            Err(WrongPhase { recovered }) => {
+                core::hint::cold_path();
+                match recovered.take_inflight_reply_raw_id() {
+                    Some(_) | None => {}
+                }
+                ActiveState::Errored(kind)
+            }
+        };
+        drained
     }
 
     /// DEF-280 Bundle K (2026-05-18): transition to
@@ -6167,7 +6337,7 @@ impl PgProtocol<ActivePhase> {
         let cause = ProtocolError::InternalCrateBug {
             locus: crate::error::CrateBugLocus::PartialModeReentry,
         };
-        _partial_mode_reentry_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
+        self.drain_via_leaf(cause.state_kind(), _partial_mode_reentry_drain_leaf::drain)
     }
 
     /// DEF-280 Bundle K-mirror (2026-05-18): transition to
@@ -6193,7 +6363,10 @@ impl PgProtocol<ActivePhase> {
         let cause = ProtocolError::InternalCrateBug {
             locus: crate::error::CrateBugLocus::PartialModeExitUndrained,
         };
-        _partial_mode_exit_undrained_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
+        self.drain_via_leaf(
+            cause.state_kind(),
+            _partial_mode_exit_undrained_drain_leaf::drain,
+        )
     }
 
     /// DEF-154 (X): transition to `Errored(Framing)` for a
@@ -6225,7 +6398,7 @@ impl PgProtocol<ActivePhase> {
         total_len: usize,
     ) -> Option<NonZeroU64> {
         let cause = ProtocolError::MalformedDataRow { total_len };
-        _malformed_data_row_drain_leaf::drain(&mut self.inner.state, cause.state_kind())
+        self.drain_via_leaf(cause.state_kind(), _malformed_data_row_drain_leaf::drain)
     }
 
     // DEF-188: install_errored_stale_schema_ref DELETED — there is
@@ -6285,8 +6458,10 @@ impl PgProtocol<ActivePhase> {
         // The drained id has no caller context here (Drop). Bind to
         // `_drained_at_drop` for the `#[must_use]` discoverability
         // contract — see the leaf submodule docstring.
-        let _drained_at_drop: Option<NonZeroU64> =
-            _stream_dropped_mid_stream_drain_leaf::drain(&mut self.inner.state, cause.state_kind());
+        let _drained_at_drop: Option<NonZeroU64> = self.drain_via_leaf(
+            cause.state_kind(),
+            _stream_dropped_mid_stream_drain_leaf::drain,
+        );
         // DEF-248 Sub-A: clear read_buf so a subsequent feed_bytes on
         // the post-Errored connection does not classify mid-frame
         // bytes as a fresh frame header. The state is already Errored
@@ -8492,7 +8667,7 @@ mod residue_policy_per_class_tests {
     use crate::error::{ErrorKind, StateErrorKind};
     use crate::reply_id::ReplyId;
     use crate::session_params::SessionParams;
-    use crate::state::ProtoState;
+    use crate::state::ActiveState;
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
@@ -8524,7 +8699,7 @@ mod residue_policy_per_class_tests {
     /// test module.
     fn fresh_active_proto() -> PgProtocol<ActivePhase> {
         PgProtocol {
-            inner: _proto_init_leaf::fresh_inner(),
+            inner: _proto_init_leaf::fresh_active_inner(),
             phase_marker: PhantomData,
         }
     }
@@ -8535,7 +8710,7 @@ mod residue_policy_per_class_tests {
     /// arm of `clear_session_residue_*` mutated them.
     ///
     /// DEF-279 Phase 1a (2026-05-18): constraint tightened from
-    /// `<P: SealedPhase>` to `<P: SealedPhase<Inner = PgProtocolInner>>`
+    /// `<P: SealedPhase>` to `<P: SealedPhase<Inner = ActiveInner>>`
     /// — the helper accesses inner fields that exist only on the
     /// three non-Disconnected phases (Disconnected uses ZST
     /// DisconnectedInner post-Bundle). Callers using
@@ -8544,7 +8719,7 @@ mod residue_policy_per_class_tests {
     /// handshake path) OR use the
     /// `_proto_init_leaf::fresh_inner()` bypass for `<ActivePhase>`
     /// (test-only, pub(in crate::protocol)).
-    fn populate_residue<P: SealedPhase<Inner = PgProtocolInner>>(
+    fn populate_residue<P: SealedPhase<Inner = ActiveInner>>(
         proto: &mut PgProtocol<P>,
     ) {
         proto.inner.row_desc_slot._set_for_test(Some(RowDesc::EMPTY));
@@ -8556,18 +8731,18 @@ mod residue_policy_per_class_tests {
 
     /// Replace `proto.inner.state` with `Idle` so the destructor doesn't
     /// trip the in-flight `ReplyId<_>` Drop-guard at scope end.
-    /// DEF-279 Phase 1a (2026-05-18): constrained to `<P: SealedPhase<Inner = PgProtocolInner>>`.
-    fn quench_inflight<P: SealedPhase<Inner = PgProtocolInner>>(
+    /// DEF-279 Phase 1a (2026-05-18): constrained to `<P: SealedPhase<Inner = ActiveInner>>`.
+    fn quench_inflight<P: SealedPhase<Inner = ActiveInner>>(
         proto: &mut PgProtocol<P>,
     ) {
-        let prev = core::mem::replace(&mut proto.inner.state, ProtoState::Idle);
+        let prev = core::mem::replace(&mut proto.inner.state, ActiveState::Idle);
         match prev.take_inflight_reply_raw_id() {
             Some(_) | None => {}
         }
     }
 
-    /// DEF-279 Phase 1a (2026-05-18): constrained to `<P: SealedPhase<Inner = PgProtocolInner>>`.
-    fn session_params_is_pristine<P: SealedPhase<Inner = PgProtocolInner>>(
+    /// DEF-279 Phase 1a (2026-05-18): constrained to `<P: SealedPhase<Inner = ActiveInner>>`.
+    fn session_params_is_pristine<P: SealedPhase<Inner = ActiveInner>>(
         proto: &PgProtocol<P>,
     ) -> bool {
         // DEF-211 INNO-01 (2026-05-04): trait method via `Pristine` import.
@@ -8610,7 +8785,7 @@ mod residue_policy_per_class_tests {
     #[test]
     fn errored_clears_everything_including_session_params() {
         let mut proto = fresh_active_proto();
-        proto.inner.state = ProtoState::Errored(
+        proto.inner.state = ActiveState::Errored(
             StateErrorKind::from_kind_or_internal(ErrorKind::Framing),
         );
         populate_residue(&mut proto);
@@ -8636,13 +8811,17 @@ mod residue_policy_per_class_tests {
 
     #[test]
     fn connecting_preserves_all_residue() {
+        // DEF-279 Phase 2 Bundle Commit 12 (2026-05-18): post-flip
+        // an `<ActivePhase>` cannot hold a `ConnectingStartupTrust`
+        // state — variant doesn't exist in `ActiveState` (tier-1
+        // by storage absence). Test the class-arm directly via
+        // `StatePushClass::Connecting` constant, fed to
+        // `clear_session_residue_for_class`, with the state held
+        // at any legal ActiveState value (Idle here for shape).
         let mut proto = fresh_active_proto();
-        proto.inner.state = ProtoState::ConnectingStartupTrust {
-            reply: ReplyId::from_raw(nz(11)),
-        };
+        proto.inner.state = ActiveState::Idle;
         populate_residue(&mut proto);
-        let class = proto.inner.state.push_class();
-        proto.inner.clear_session_residue_for_class(class);
+        proto.inner.clear_session_residue_for_class(crate::state::StatePushClass::Connecting);
 
         assert!(
             proto.inner.row_desc_slot.is_some(),
@@ -8666,7 +8845,7 @@ mod residue_policy_per_class_tests {
     #[test]
     fn ping_awaiting_preserves_all_residue() {
         let mut proto = fresh_active_proto();
-        proto.inner.state = ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
+        proto.inner.state = ActiveState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
         populate_residue(&mut proto);
         let class = proto.inner.state.push_class();
         proto.inner.clear_session_residue_for_class(class);
@@ -8689,7 +8868,7 @@ mod residue_policy_per_class_tests {
     #[test]
     fn busy_query_preserves_all_residue() {
         let mut proto = fresh_active_proto();
-        proto.inner.state = ProtoState::SimpleQueryStreamingRows {
+        proto.inner.state = ActiveState::SimpleQueryStreamingRows {
             reply: ReplyId::from_raw(nz(13)),
         };
         populate_residue(&mut proto);
@@ -9269,15 +9448,14 @@ mod compute_push_tests {
         // 536-B PgProtocolInner that lived on the Disconnected proto).
         // Post-Bundle `<DisconnectedPhase>::Inner` is the ZST
         // `DisconnectedInner` — no PgProtocolInner to extract.
-        // `_proto_init_leaf::fresh_inner()` is the leaf-private
-        // (`pub(in crate::protocol)`) helper that materialises a fresh
-        // PgProtocolInner, callable from sibling tests inside mod
-        // protocol but unreachable from outside the crate. This is
-        // NOT a production bypass: external crates cannot reach
-        // `fresh_inner` (leaf visibility) and the `phase_marker` is
-        // ZST without external construction.
+        // Phase 1c Bundle Commit 8b (2026-05-18): `<ActivePhase>::Inner`
+        // flipped to `ActiveInner`, so the construction goes through
+        // `_proto_init_leaf::fresh_active_inner()` (leaf-private,
+        // `pub(in crate::protocol)`). NOT a production bypass: external
+        // crates cannot reach `fresh_active_inner` (leaf visibility) and
+        // the `phase_marker` is ZST without external construction.
         let mut proto: PgProtocol<ActivePhase> = PgProtocol {
-            inner: _proto_init_leaf::fresh_inner(),
+            inner: _proto_init_leaf::fresh_active_inner(),
             phase_marker: PhantomData,
         };
         let mut wb = WriteBuf::new();
@@ -9349,7 +9527,7 @@ mod compute_push_tests {
         // State must have transitioned to Errored — the connection
         // is terminal per the usual InternalCrateBug discipline.
         assert!(
-            matches!(proto.state(), ProtoState::Errored(_)),
+            matches!(proto.state(), crate::state::ActiveState::Errored(_)),
             "ParamsWriterOverflow triggers terminal Errored state, \
              not a recoverable preserved-state path. Got: {:?}",
             proto.state(),
