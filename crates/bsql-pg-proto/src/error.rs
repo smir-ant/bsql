@@ -793,9 +793,9 @@ pub enum CrateBugLocus {
     /// indicates a builder bug (missed push) or const-assert drift
     /// on `MAX_OWNED_SEND_LEN`.
     ///
-    /// Pre-P0-2 fix, the None case silently fell back to
-    /// `NonEmptyRange::DEAD_FALLBACK = (start=0, len=1)` — applied
-    /// against an empty buffer in materialise, produced a 0-byte
+    /// Pre-P0-2 fix, the None case silently fell back to a
+    /// unit-length `NonEmptyRange (start=0, len=1)` — applied against
+    /// an empty buffer in materialise, produced a 0-byte
     /// `Action::SendBytes`, handshake hangs at the wire (tier-4
     /// silent corruption). Tier-3 classified now: builders return
     /// `Result<WriteRange, ProtocolError>`; `compute_push_*`

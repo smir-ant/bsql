@@ -146,32 +146,13 @@ pub struct ErrorPayload {
 // `.copied().unwrap_or_default()` — the exact silent-fallback
 // pattern banned per CREDO §5 + user feedback_no_underscore_vars.md).
 //
-// A test-only named fallback `ErrorPayload::dead_for_test()` is
-// provided below — mirror of `SchemaRef::dead_for_test` in
-// schema_arena.rs. The name makes intent explicit: only exists to
-// satisfy the `assert!(is_ok) + unwrap_or(fallback)` idiom demanded
-// by the crate's `#[forbid(clippy::unwrap_used, clippy::panic)]`
-// bundle. Production code `match`es the Result exhaustively.
-
-#[cfg(test)]
-impl ErrorPayload {
-    /// Test-only dead-code fallback. Used exclusively inside
-    /// `assert!(r.is_ok(), ...) + r.unwrap_or(dead_for_test())`
-    /// — the assert fires loudly if the precondition breaks; the
-    /// fallback is defensive dead code keeping the helper compiling
-    /// under the crate-root `#[forbid(clippy::panic, ...)]` bundle.
-    ///
-    /// Mirrors `SchemaRef::dead_for_test` in schema_arena.rs.
-    /// NOT production code — explicitly-named, `#[cfg(test)]`-gated.
-    #[must_use]
-    pub(crate) fn dead_for_test() -> Self {
-        Self {
-            message: SecretBoundedStr::<128>::new(),
-            detail: SecretBoundedStr::<96>::new(),
-            hint: SecretBoundedStr::<64>::new(),
-        }
-    }
-}
+// Pre-Tier 3 cleanup, an `ErrorPayload::dead_for_test()` constructor
+// was provided as a test-only fallback for the `assert!(is_ok) +
+// unwrap_or(fallback)` idiom. That single call site (in
+// `dispatch.rs::parse_and_resolve`) now inlines the empty-field
+// fallback explicitly; the API surface is gone. Production code
+// `match`es the Result exhaustively — the test sites use the same
+// idiom locally where needed.
 
 /// Opaque handle into [`ErrorArena`]. 8 bytes (u8 slot-marker +
 /// u32 generation + padding), niche-packed for `Option<ErrorRef>`
@@ -724,12 +705,13 @@ mod tests {
     //! Forbid-bundle compliance: `panic!`, `.unwrap()`, `.expect()`,
     //! `unreachable!()`, and `assert!(false)` are banned crate-wide
     //! (including unit tests). Tests below use the
-    //! `assert!(is_ok/matches!, ...) + if-let-Ok` idiom or the
-    //! `.unwrap_or(ErrorPayload::dead_for_test())` fallback — the
+    //! `assert!(is_ok/matches!, ...) + if-let-Ok` idiom or an
+    //! explicit `match { Ok | Err(_) => fallback }` form — the
     //! `assert!` fires loudly if the precondition breaks; the
-    //! `if let` / `unwrap_or` landing pad is defensive dead code
-    //! keeping the test compiling. Same pattern as
-    //! `schema_arena::tests::must_alloc` + `decode::data_row_ref_tests`.
+    //! `if let` / `match` landing pad is defensive dead code
+    //! keeping the test compiling. The pre-Tier-3
+    //! `ErrorPayload::dead_for_test()` helper is gone; the single
+    //! call site inlines its empty-field fallback.
     use super::*;
 
     #[test]

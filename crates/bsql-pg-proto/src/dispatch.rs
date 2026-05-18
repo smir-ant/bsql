@@ -2557,28 +2557,35 @@ fn parse_error_response(
         // messages can be up to 128 bytes). ~3× on server-error
         // parsing hot path — fired on every ServerErrorResponse.
         let start = pos;
-        // DEF-280 sweep (2026-05-18): explicit bounds-check before the
-        // `.unwrap_or(&[])` syntactic fallback. `pos` is incremented
-        // via `checked_add(1)` in the surrounding loop which `break`s
-        // on overflow; so `start = pos <= payload.len()` is the loop
-        // invariant. None arm architecturally dead.
-        let tail: &[u8] = if start > payload.len() {
-            core::hint::cold_path();
-            &[]
-        } else {
-            payload.get(start..).unwrap_or(&[])
+        // Single match on the natural failure mode: `split_at_checked`
+        // returns None iff `start > payload.len()`. The surrounding
+        // loop maintains `pos <= payload.len()` via `checked_add(1)`
+        // + `break` on overflow; the None arm is architecturally dead
+        // but classified via `cold_path` for the future-drift safety
+        // net. Replaces the prior `if start > len { &[] } else
+        // { payload.get(start..).unwrap_or(&[]) }` form whose two
+        // dead-arm branches each carried a separate fallback.
+        let tail: &[u8] = match payload.split_at_checked(start) {
+            Some((_head, tail)) => tail,
+            None => {
+                core::hint::cold_path();
+                &[]
+            }
         };
         let value_bytes;
         match tail.iter().position(|&b| b == 0) {
             Some(n) => {
-                // DEF-280 sweep (2026-05-18): same explicit-check pattern.
-                // `n` is an index from `iter().position()`, so `n < tail
-                // .len()`; the None arm of `tail.get(..n)` is dead.
-                value_bytes = if n > tail.len() {
-                    core::hint::cold_path();
-                    &[]
-                } else {
-                    tail.get(..n).unwrap_or(&[])
+                // `n` is an index from `iter().position()`, so `n <=
+                // tail.len()`; `split_at_checked(n)` always succeeds
+                // unless `n > tail.len()` (architecturally impossible
+                // post-position). The None arm is cold-hinted dead
+                // code under the bundle's no-unwrap_or policy.
+                value_bytes = match tail.split_at_checked(n) {
+                    Some((head, _tail)) => head,
+                    None => {
+                        core::hint::cold_path();
+                        &[]
+                    }
                 };
                 // Advance past value + NUL. `start + n + 1 ≤
                 // payload.len()` by construction (n is an index
@@ -2954,25 +2961,29 @@ mod parse_error_response_tests {
         let mut arena = crate::error_arena::ErrorArena::new();
         let parsed = parse_error_response(body, &mut arena);
         let r = arena.get(parsed.details_ref);
-        // Forbid-bundle compliance (mirror of error_arena::tests::must_alloc):
-        // `assert!(is_ok) + .copied().unwrap_or(dead_for_test())` — assert
-        // fires loudly if the invariant (parse always populates arena) breaks;
-        // the dead_for_test fallback satisfies the no-panic bundle without
-        // the tier-4 silent `unwrap_or_default` pattern banned per CREDO §5.
+        // Forbid-bundle compliance: `assert!(is_ok, ...) + match { Ok |
+        // Err(_) => fallback }` — the assert fires loudly if the
+        // invariant (parse always populates the fresh arena, no
+        // intervening clear) breaks; the structural match consumes
+        // `r.cloned()` exhaustively so the architecturally-dead Err
+        // arm doesn't trip the bundle's `unwrap_used` ban. The Err
+        // arm's fallback is inlined explicitly (deliberately-empty
+        // SecretBoundedStr fields) — previously routed through
+        // `ErrorPayload::dead_for_test()`, but the single call site
+        // does not justify a separate public API.
         assert!(
             r.is_ok(),
             "parse_error_response + arena.get Err {r:?} — architecturally unreachable \
              (parse always allocates into the fresh arena, no intervening clear)",
         );
-        // DEF-205: ErrorPayload is no longer Copy (fields are
-        // SecretBoundedStr<N> which is non-Copy + ZeroizeOnDrop).
-        // `r.copied()` no longer compiles; `r.cloned()` requires
-        // Clone (still derived). Same defensive idiom — `assert!`
-        // fires loudly on the unexpected None path; `unwrap_or`
-        // keeps the test compiling under the crate's no-panic
-        // forbid bundle. Eager `dead_for_test()` evaluation is fine
-        // (test path, no perf concern).
-        let payload = r.cloned().unwrap_or(crate::error_arena::ErrorPayload::dead_for_test());
+        let payload = match r.cloned() {
+            Ok(p) => p,
+            Err(_) => crate::error_arena::ErrorPayload {
+                message: crate::ident::SecretBoundedStr::<128>::new(),
+                detail: crate::ident::SecretBoundedStr::<96>::new(),
+                hint: crate::ident::SecretBoundedStr::<64>::new(),
+            },
+        };
         (parsed.severity, parsed.code, payload)
     }
 

@@ -207,29 +207,24 @@ impl NonEmptyRange {
     // with buffer-identity proof); no remaining caller needed the
     // raw-buffer unbranded form.
 
-    /// DEF-154 (A) — test-only fallback (post-P0-2 gated).
+    /// Test-only constant constructor for a unit-length range
+    /// (`start=0`, `len=1`). Returns `Self` directly (not `Option<Self>`)
+    /// — the values are infallibly valid by construction, so the
+    /// `unwrap_or(_)` route that the prior `DEAD_FALLBACK` constant
+    /// induced is gone. Use for fixtures that need a concrete
+    /// `NonEmptyRange` without the Option-discrimination ceremony of
+    /// `new()`.
     ///
-    /// A valid minimum `NonEmptyRange (start=0, len=1)`. Originally
-    /// the `unwrap_or` fallback inside
-    /// `WriteRange::from_write_span`; deleted from
-    /// production by DEF-154 (B) Phase B4-W P0-2 fix (architect
-    /// audit) because it silently produced zero-length
-    /// `Action::SendBytes` frames in release on builder drift —
-    /// post-P0-2 the None branch classifies as
-    /// `CrateBugLocus::EmptyWriteRange` and routes through
-    /// `compute_push_*` → `FailReply + CloseSocket`.
-    ///
-    /// Retained under `#[cfg(test)]` for test fixtures that
-    /// construct concrete `NonEmptyRange` values without going
-    /// through `new`'s Option + explicit shield.
+    /// `NonZeroU16::MIN` is the canonical "value 1" anchor (no `as`
+    /// cast, no `unwrap()`, no panic-able construction).
     #[cfg(test)]
-    pub(crate) const DEAD_FALLBACK: Self = Self {
-        start: 0,
-        len: match NonZeroU16::new(1) {
-            Some(n) => n,
-            None => NonZeroU16::MIN,
-        },
-    };
+    #[must_use]
+    pub(crate) const fn test_unit() -> Self {
+        Self {
+            start: 0,
+            len: NonZeroU16::MIN,
+        }
+    }
 
     /// Resolve the range against a buffer, returning the slice or
     /// `None` on bounds mismatch.
@@ -461,7 +456,7 @@ mod phase_b3_tests {
         // DEF-154 (W): no more `with_branded` HRTB closure; direct
         // access to the unbranded buffer.
         let bytes = buf.as_bytes();
-        let raw = NonEmptyRange::new(0, 1, 1).unwrap_or(NonEmptyRange::DEAD_FALLBACK);
+        let raw = NonEmptyRange::test_unit();
         let range = WriteRange::from_raw(raw);
         let slice: &[u8] = range.apply(bytes).unwrap_or(&[]);
         let byte = slice.first().copied().unwrap_or(0);
@@ -483,7 +478,7 @@ mod phase_b3_tests {
     /// B3-3 + DEF-154 (W): `inner()` accessor round-trip.
     #[test]
     fn branded_range_inner_roundtrip() {
-        let raw = NonEmptyRange::DEAD_FALLBACK;
+        let raw = NonEmptyRange::test_unit();
         let w = WriteRange::from_raw(raw);
         assert_eq!(w.inner(), raw);
     }
@@ -502,7 +497,7 @@ mod phase_b3_tests {
     /// The test forces `start > reserved.len()` by calling
     /// `from_write_span(10, ...)` on a fresh (empty) reserved.
     /// Err path fires with `CrateBugLocus::EmptyWriteRange` —
-    /// pre-P0-2 this silently returned `WriteRange(DEAD_FALLBACK)`,
+    /// pre-P0-2 this silently returned a unit-length `WriteRange`,
     /// a tier-4 0-byte Action::SendBytes on apply.
     #[test]
     fn from_write_span_err_classified_as_empty_write_range() {
@@ -522,8 +517,8 @@ mod phase_b3_tests {
         assert!(
             is_empty_write_range,
             "from_branded_write_span must return Err(EmptyWriteRange) when \
-             start > reserved.len() — pre-P0-2 this silently fell back to \
-             DEAD_FALLBACK (tier-4 0-byte Action::SendBytes).",
+             start > reserved.len() — pre-P0-2 this silently fell back to a \
+             unit-length range (tier-4 0-byte Action::SendBytes).",
         );
     }
 }
