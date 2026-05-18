@@ -1754,6 +1754,50 @@ pub(crate) mod _proto_init_leaf {
             sync_marker: super::PhantomData,
         }
     }
+
+    /// DEF-279 Phase 1c Bundle Commit 8 (2026-05-18) — materialise a
+    /// fresh [`super::ConnectingInner`] for use by the
+    /// `<DisconnectedPhase>::push_startup` transition once Commit 8b
+    /// flips `<ConnectingPhase>::Inner = ConnectingInner`.
+    ///
+    /// **Per-phase parity with [`fresh_inner`]**: cells start empty
+    /// via the same [`ProtoInitToken`]-gated constructors;
+    /// `read_buf` starts empty; `malformed_frame_count` starts 0;
+    /// `sync_marker` is `PhantomData`.
+    ///
+    /// **State sentinel**: `ConnectingState::Errored(Framing)` — a
+    /// transient placeholder kind. The `push_startup` body
+    /// IMMEDIATELY overwrites this with the appropriate
+    /// `ConnectingState::Startup{Trust|Scram|Cleartext|Md5}` variant
+    /// via lift+lower through the setter machinery (which operates
+    /// on `&mut ProtoState`). The sentinel is unobservable: no
+    /// reader sees the state between this constructor and the
+    /// setter write. `Framing` kind is semantically meaningless
+    /// here — the slot is always overwritten.
+    ///
+    /// **`#[allow(dead_code)]`** until Commit 8b flips
+    /// `<ConnectingPhase>::Inner = ConnectingInner` and migrates
+    /// push_startup to call this.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(in crate::protocol) fn fresh_connecting_inner() -> super::ConnectingInner {
+        let token = ProtoInitToken::mint();
+        super::ConnectingInner {
+            state: crate::state::ConnectingState::Errored(
+                crate::error::StateErrorKind::from_kind_or_internal(
+                    crate::error::ErrorKind::Framing,
+                ),
+            ),
+            read_buf: super::ReadBuf::new(),
+            row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
+            session_params: crate::session_params_slot::SessionParamsCell::empty(token),
+            error_arena: None,
+            partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
+            backend_key: crate::cancel::BackendKeyCell::empty(token),
+            malformed_frame_count: 0,
+            sync_marker: super::PhantomData,
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════
