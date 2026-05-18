@@ -173,10 +173,9 @@ mod drop_witness_tests {
     fn secret_digest_drop_fires_zeroize_chain() {
         let probe = DropProbe::new();
         let d = SecretDigest::new([0xa5_u8; 32]);
-        {
-            let _w = DropCounter::new(d, probe.clone());
+        DropCounter::scoped(d, probe.clone(), || {
             assert_eq!(probe.fired(), 0);
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,
@@ -191,7 +190,7 @@ mod drop_witness_tests {
         let probe = DropProbe::new();
         for byte in 0..4_u8 {
             let d = SecretDigest::new([byte; 32]);
-            let _w = DropCounter::new(d, probe.clone());
+            DropCounter::scoped(d, probe.clone(), || {});
         }
         assert_eq!(probe.fired(), 4);
     }

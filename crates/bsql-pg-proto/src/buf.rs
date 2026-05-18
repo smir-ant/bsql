@@ -1211,10 +1211,9 @@ mod drop_witness_tests {
     fn read_buf_drop_fires_zeroize_chain() {
         let probe = DropProbe::new();
         let buf: ReadBufN<256> = ReadBufN::<256>::new();
-        {
-            let _w = DropCounter::new(buf, probe.clone());
+        DropCounter::scoped(buf, probe.clone(), || {
             assert_eq!(probe.fired(), 0);
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,
@@ -1229,9 +1228,7 @@ mod drop_witness_tests {
         let probe = DropProbe::new();
         let buf: ReadBufN<{ crate::frame::READ_BUF_CAP }> =
             ReadBufN::<{ crate::frame::READ_BUF_CAP }>::new();
-        {
-            let _w = DropCounter::new(buf, probe.clone());
-        }
+        DropCounter::scoped(buf, probe.clone(), || {});
         assert_eq!(probe.fired(), 1);
     }
 }

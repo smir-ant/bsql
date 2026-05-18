@@ -1079,10 +1079,9 @@ mod drop_witness_tests {
     fn write_buf_drop_fires_zeroize_chain() {
         let probe = DropProbe::new();
         let wb = WriteBuf::new();
-        {
-            let _w = DropCounter::new(wb, probe.clone());
+        DropCounter::scoped(wb, probe.clone(), || {
             assert_eq!(probe.fired(), 0);
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,
@@ -1095,7 +1094,7 @@ mod drop_witness_tests {
     fn each_write_buf_drop_increments_counter() {
         let probe = DropProbe::new();
         for _ in 0..4 {
-            let _w = DropCounter::new(WriteBuf::new(), probe.clone());
+            DropCounter::scoped(WriteBuf::new(), probe.clone(), || {});
         }
         assert_eq!(probe.fired(), 4);
     }

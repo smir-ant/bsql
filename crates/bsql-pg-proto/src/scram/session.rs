@@ -180,10 +180,9 @@ mod drop_witness_tests {
             Err(_) => return,
         };
         let session = ScramSession::from_password(Sensitive::new(pw));
-        {
-            let _w = DropCounter::new(session, probe.clone());
+        DropCounter::scoped(session, probe.clone(), || {
             assert_eq!(probe.fired(), 0, "session alive — counter is 0");
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,
@@ -203,7 +202,7 @@ mod drop_witness_tests {
                 Err(_) => continue,
             };
             let session = ScramSession::from_password(Sensitive::new(pw));
-            let _w = DropCounter::new(session, probe.clone());
+            DropCounter::scoped(session, probe.clone(), || {});
         }
         assert_eq!(probe.fired(), 3);
     }

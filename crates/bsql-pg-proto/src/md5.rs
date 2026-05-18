@@ -388,10 +388,9 @@ mod drop_witness_tests {
             password: Sensitive::new(pw),
             user,
         };
-        {
-            let _w = DropCounter::new(state, probe.clone());
+        DropCounter::scoped(state, probe.clone(), || {
             assert_eq!(probe.fired(), 0);
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,
@@ -418,7 +417,7 @@ mod drop_witness_tests {
                 password: Sensitive::new(pw),
                 user,
             };
-            let _w = DropCounter::new(state, probe.clone());
+            DropCounter::scoped(state, probe.clone(), || {});
         }
         assert_eq!(probe.fired(), 3);
     }

@@ -1542,10 +1542,9 @@ mod drop_witness_tests {
     fn secret_bounded_str_drop_fires_zeroize_chain() {
         let probe = DropProbe::new();
         let s = SecretBoundedStr::<32>::from_str_truncating("witness-XYZ");
-        {
-            let _w = DropCounter::new(s, probe.clone());
+        DropCounter::scoped(s, probe.clone(), || {
             assert_eq!(probe.fired(), 0);
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,
@@ -1558,31 +1557,26 @@ mod drop_witness_tests {
     #[test]
     fn secret_bounded_str_drop_fires_for_each_used_capacity() {
         let probe = DropProbe::new();
-
-        {
-            let _w = DropCounter::new(
-                SecretBoundedStr::<32>::from_str_truncating("a"),
-                probe.clone(),
-            );
-        }
-        {
-            let _w = DropCounter::new(
-                SecretBoundedStr::<64>::from_str_truncating("b"),
-                probe.clone(),
-            );
-        }
-        {
-            let _w = DropCounter::new(
-                SecretBoundedStr::<96>::from_str_truncating("c"),
-                probe.clone(),
-            );
-        }
-        {
-            let _w = DropCounter::new(
-                SecretBoundedStr::<128>::from_str_truncating("d"),
-                probe.clone(),
-            );
-        }
+        DropCounter::scoped(
+            SecretBoundedStr::<32>::from_str_truncating("a"),
+            probe.clone(),
+            || {},
+        );
+        DropCounter::scoped(
+            SecretBoundedStr::<64>::from_str_truncating("b"),
+            probe.clone(),
+            || {},
+        );
+        DropCounter::scoped(
+            SecretBoundedStr::<96>::from_str_truncating("c"),
+            probe.clone(),
+            || {},
+        );
+        DropCounter::scoped(
+            SecretBoundedStr::<128>::from_str_truncating("d"),
+            probe.clone(),
+            || {},
+        );
         assert_eq!(
             probe.fired(),
             4,
@@ -1595,9 +1589,7 @@ mod drop_witness_tests {
     #[test]
     fn empty_secret_bounded_str_drop_fires() {
         let probe = DropProbe::new();
-        {
-            let _w = DropCounter::new(SecretBoundedStr::<32>::new(), probe.clone());
-        }
+        DropCounter::scoped(SecretBoundedStr::<32>::new(), probe.clone(), || {});
         assert_eq!(
             probe.fired(),
             1,

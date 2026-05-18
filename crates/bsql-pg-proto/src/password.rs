@@ -332,10 +332,9 @@ mod drop_witness_tests {
             Ok(p) => p,
             Err(_) => return,
         };
-        {
-            let _w = DropCounter::new(pw, probe.clone());
+        DropCounter::scoped(pw, probe.clone(), || {
             assert_eq!(probe.fired(), 0, "wrapper alive — counter is 0");
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,
@@ -354,8 +353,8 @@ mod drop_witness_tests {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            let _w = DropCounter::new(pw, probe.clone());
-            // _w drops at end of iteration body.
+            DropCounter::scoped(pw, probe.clone(), || {});
+            // wrapper drops at closure exit, before next iteration.
         }
         assert_eq!(
             probe.fired(),

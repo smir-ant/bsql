@@ -657,10 +657,9 @@ mod drop_witness_tests {
             detail: SecretBoundedStr::<96>::from_str_truncating("detail"),
             hint: SecretBoundedStr::<64>::from_str_truncating("hint"),
         };
-        {
-            let _w = DropCounter::new(payload, probe.clone());
+        DropCounter::scoped(payload, probe.clone(), || {
             assert_eq!(probe.fired(), 0);
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,

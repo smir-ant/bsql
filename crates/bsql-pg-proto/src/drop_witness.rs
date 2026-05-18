@@ -25,11 +25,12 @@
 //!    `T` (firing `T`'s Drop chain — `ZeroizeOnDrop` for derive-types,
 //!    manual zeroize for `WriteBuf`/`ReadBuf`), and (b) increments an
 //!    atomic counter through a clone-able [`DropProbe`] handle. Tests
-//!    construct `DropCounter::new(t, probe.clone())`, drop it, and
-//!    assert `probe.fired() == 1`. Because the increment is written
-//!    inside `DropCounter::drop`, it CANNOT execute without `T`'s
-//!    Drop also running — Rust language semantics guarantee field
-//!    drops fire on enclosing-struct drop.
+//!    use [`DropCounter::scoped`] — a closure-form helper that
+//!    constructs the wrapper, runs the test body, drops the wrapper
+//!    at closure exit, then the caller asserts `probe.fired() == 1`.
+//!    Because the increment is written inside `DropCounter::drop`, it
+//!    CANNOT execute without `T`'s Drop also running — Rust language
+//!    semantics guarantee field drops fire on enclosing-struct drop.
 //!
 //! 2. **Sealed [`CrateZeroizeSecret`] trait + exhaustiveness gate**
 //!    (test `tests/zeroize_coverage_spec.rs`): every secret-bearing
@@ -105,9 +106,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// `DropProbe::clone()` returns another handle on the SAME counter,
 /// not a fresh counter. A test that creates a probe, clones it into
-/// a `DropCounter::new(...)`, then asserts on the original handle's
-/// `fired()` count is structurally guaranteed to observe the
-/// clone-wrapper's drop because both share the `Arc`'s atomic.
+/// a `DropCounter::scoped(value, probe.clone(), || { ... })` call,
+/// then asserts on the original handle's `fired()` count is
+/// structurally guaranteed to observe the clone-wrapper's drop
+/// because both share the `Arc`'s atomic.
 #[derive(Debug, Clone)]
 pub(crate) struct DropProbe {
     counter: Arc<AtomicUsize>,
@@ -195,6 +197,33 @@ impl<T> DropCounter<T> {
     #[must_use]
     pub(crate) fn inner(&self) -> &T {
         &self.inner
+    }
+
+    /// Closure-scoped variant. Constructs a [`DropCounter`] wrapping
+    /// `value`, runs `body` to perform the test assertions, then drops
+    /// the wrapper at closure-exit (recording the drop on `probe` and
+    /// firing `T`'s Drop chain in turn).
+    ///
+    /// Replaces the broader-crate convention `{ let _w =
+    /// DropCounter::new(value, probe.clone()); ...assertions... }` —
+    /// the closure form makes the wrapper's lifetime explicit and aligns
+    /// with the crate's other closure-scoped lend APIs
+    /// (`Sensitive::with_inner`, `with_cancel_request`,
+    /// `iter_rows::<F>`). Eliminates the underscore-named `_w` /
+    /// `_wrapper` discard binding at every test site.
+    ///
+    /// Note: the closure does NOT receive a borrow of `value` — for
+    /// pre-drop assertions on the wrapped value, fall back to the
+    /// explicit-bind form `let wrapper = DropCounter::new(...);
+    /// assert!(wrapper.inner().invariant()); drop(wrapper);` or layer
+    /// a closure-scope on a containing scope that owns the value
+    /// separately.
+    #[inline]
+    pub(crate) fn scoped<R>(value: T, probe: DropProbe, body: impl FnOnce() -> R) -> R {
+        let wrapper = Self::new(value, probe);
+        let result = body();
+        drop(wrapper);
+        result
     }
 }
 
@@ -340,17 +369,15 @@ mod self_tests {
         let probe = DropProbe::new();
         assert_eq!(probe.fired(), 0, "fresh probe must read zero");
 
-        // Build a wrapper, drop it, check the counter.
-        {
-            let _wrapper = DropCounter::new(42_i32, probe.clone());
-            // Wrapper alive — counter still 0.
+        DropCounter::scoped(42_i32, probe.clone(), || {
+            // Wrapper alive inside the closure — counter still 0.
             assert_eq!(probe.fired(), 0, "wrapper alive — counter must stay 0");
-        }
-        // Wrapper out of scope — counter == 1.
+        });
+        // Wrapper dropped at closure exit — counter == 1.
         assert_eq!(
             probe.fired(),
             1,
-            "DropCounter::drop must increment exactly once on scope exit",
+            "DropCounter::drop must increment exactly once on closure exit",
         );
     }
 
@@ -372,12 +399,10 @@ mod self_tests {
         let probe = DropProbe::new();
         let inner_counter = Arc::new(AtomicUsize::new(0));
 
-        {
-            let marker = DropMarker {
-                counter: inner_counter.clone(),
-            };
-            let _wrapper = DropCounter::new(marker, probe.clone());
-        }
+        let marker = DropMarker {
+            counter: inner_counter.clone(),
+        };
+        DropCounter::scoped(marker, probe.clone(), || {});
 
         assert_eq!(
             probe.fired(),

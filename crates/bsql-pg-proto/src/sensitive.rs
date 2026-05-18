@@ -132,10 +132,9 @@ mod drop_witness_tests {
             Err(_) => return,
         };
         let s = Sensitive::new(pw);
-        {
-            let _w = DropCounter::new(s, probe.clone());
+        DropCounter::scoped(s, probe.clone(), || {
             assert_eq!(probe.fired(), 0);
-        }
+        });
         assert_eq!(
             probe.fired(),
             1,
@@ -151,9 +150,7 @@ mod drop_witness_tests {
         // Plain literal — `as` casts are forbidden by the
         // crate-root forbid bundle (`clippy::as_conversions`).
         let s = Sensitive::new(0x7fff_ffff_i32);
-        {
-            let _w = DropCounter::new(s, probe.clone());
-        }
+        DropCounter::scoped(s, probe.clone(), || {});
         assert_eq!(probe.fired(), 1, "Sensitive<i32> drop must fire");
     }
 
@@ -166,7 +163,7 @@ mod drop_witness_tests {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            let _w = DropCounter::new(Sensitive::new(pw), probe.clone());
+            DropCounter::scoped(Sensitive::new(pw), probe.clone(), || {});
         }
         assert_eq!(probe.fired(), 3);
     }
