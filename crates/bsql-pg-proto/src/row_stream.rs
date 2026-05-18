@@ -734,7 +734,16 @@ impl<'p, 'w> RowStream<'p, 'w> {
         // any drift.
         let populated = self.proto.read_buf_populated();
         let cursor = usize::from(self.proto.read_buf_cursor_u16());
-        let after_cursor = populated.get(cursor..).unwrap_or(&[]);
+        // DEF-281 Site G (2026-05-18): explicit-match form. None arm
+        // is architecturally-dead (cursor ≤ populated.len() upheld by
+        // read_buf invariants); downstream `parse_header(&[])` returns
+        // HeaderParse::Empty which routes to ColEvent::NeedMore — but
+        // the call-site silent-fallback `.unwrap_or(&[])` itself is
+        // banned per CREDO §V regardless of downstream classification.
+        let after_cursor = match populated.get(cursor..) {
+            Some(s) => s,
+            None => &[],
+        };
         let header = parse_header(after_cursor);
         match header {
             HeaderParse::Empty | HeaderParse::Incomplete => ColEvent::NeedMore,
@@ -1375,7 +1384,15 @@ impl<'p, 'w> RowStream<'p, 'w> {
     fn read_col_count(&self) -> Result<u16, ProtocolError> {
         let unread = self.proto.read_buf_populated();
         let cursor = usize::from(self.proto.read_buf_cursor_u16());
-        let after = unread.get(cursor..).unwrap_or(&[]);
+        // DEF-281 Site H (2026-05-18): explicit-match. Architecturally-
+        // dead None arm (cursor ≤ unread.len() by ReadBuf invariant);
+        // the downstream `_ => Err(MalformedDataRow)` classifies the
+        // empty-slice case to a typed wire error, but the call-site
+        // silent `.unwrap_or(&[])` is banned per CREDO §V.
+        let after = match unread.get(cursor..) {
+            Some(s) => s,
+            None => &[],
+        };
         match after {
             [a, b, ..] => {
                 let v_i16 = i16::from_be_bytes([*a, *b]);
@@ -1396,7 +1413,15 @@ impl<'p, 'w> RowStream<'p, 'w> {
     fn read_col_len(&self) -> Result<i32, ()> {
         let unread = self.proto.read_buf_populated();
         let cursor = usize::from(self.proto.read_buf_cursor_u16());
-        let after = unread.get(cursor..).unwrap_or(&[]);
+        // DEF-281 Site I (2026-05-18): explicit-match. Architecturally-
+        // dead None arm (cursor ≤ unread.len() by ReadBuf invariant);
+        // downstream `_ => Err(())` classifies upstream into the
+        // caller's MalformedDataRow surface. Call-site silent
+        // `.unwrap_or(&[])` banned per CREDO §V.
+        let after = match unread.get(cursor..) {
+            Some(s) => s,
+            None => &[],
+        };
         match after {
             [a, b, c, d, ..] => Ok(i32::from_be_bytes([*a, *b, *c, *d])),
             _ => Err(()),
