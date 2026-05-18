@@ -307,7 +307,7 @@ impl ReplyKind for DescribePortalKind {
 ///   [`crate::action::deliver`]. DEF-112.
 /// - **Tier 2 structural** — cannot be silently ignored from a
 ///   pattern match. The crate-root `#[deny(unused_variables)]`
-///   combined with the architect.txt Part V bans on `let _ = expr;`
+///   combined with the crate-wide CREDO bans on `let _ = expr;`
 ///   and `_varname` suppression forces a match arm that binds
 ///   `id: ReplyId<K>` to refer to `id` in the arm body.
 /// - **Tier 2 runtime** — Drop-guard asserts delivered on drop

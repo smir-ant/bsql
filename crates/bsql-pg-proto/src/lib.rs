@@ -629,6 +629,17 @@ const _: fn() = || {
 //                            ZeroizeOnDrop fires on state transition
 //                            automatically via variant drop glue)
 // ---------------------------------------------------------------------
+// Target architecture support bound: the crate uses `u32` body counters
+// and assumes `usize::BITS >= 32` for infallible `u32 → usize` widening
+// (see `crate::partial_assembly::PartialAssemblyInner::absorb` and the
+// `_usize_widening` leaf helper). 16-bit targets are unsupported.
+const _: () = assert!(
+    usize::BITS >= 32,
+    "bsql-pg-proto requires a target with usize >= 32 bits. \
+     16-bit targets are unsupported; the wire-protocol body counters \
+     are u32 and several call sites infallibly widen u32 → usize.",
+);
+
 // DEF-151: tight-range size asserts. Bound BOTH directions to catch
 // field additions (upper) AND accidental field removals (lower). The
 // ±8 B slack tolerates cross-platform alignment differences; on

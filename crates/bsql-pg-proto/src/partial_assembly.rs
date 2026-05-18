@@ -461,6 +461,14 @@ impl PartialAssemblyInner {
     /// `copy_take` would fail-closed (no copy) rather than panic.
     #[inline]
     fn absorb(&mut self, bytes: &[u8]) -> usize {
+        // `usize::try_from(u32)` is infallible on every supported
+        // target (the `usize::BITS >= 32` const-assert at the crate
+        // root rejects 16-bit targets at build time). The `unwrap_or(0)`
+        // fallback is therefore architecturally dead — it survives
+        // syntactically because `expect`/`unreachable!`/`as` are all
+        // forbid-bundle-banned; the const-assert is the actual safety
+        // net. A future tier-1 lift would introduce a branded const
+        // widening that doesn't go through `Result`.
         let owed_usize = usize::try_from(self.body_remaining).unwrap_or(0);
         let take = core::cmp::min(bytes.len(), owed_usize);
         // The first `take` bytes are consumed from the wire stream;

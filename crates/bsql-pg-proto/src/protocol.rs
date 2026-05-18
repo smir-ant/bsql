@@ -1889,9 +1889,8 @@ impl PgProtocol<DisconnectedPhase> {
         // lower the result back to `ConnectingState` and assign it to
         // `new_inner.state` before completing the transition.
         //
-        // Drop `self` early — `DisconnectedInner` is ZST, drop is
-        // trivial; explicit `_ = self;` documents the consume.
-        let _ = self;
+        // `self` is consumed by-value per fn signature (ZST drop is trivial);
+        // structural ownership guarantee — no explicit discard needed.
         let mut new_inner = _proto_init_leaf::fresh_connecting_inner();
 
         write_buf.clear();
@@ -7770,21 +7769,17 @@ fn push_within_fanout_budget<'w, 'r>(
 ) {
     match out.push(a) {
         Ok(()) => {}
-        Err(_architecturally_dead) => {
-            // DEF-280 Bundle G (2026-05-18): debug_assert!(false, …)
-            // removed — CREDO §V banned glass pattern. The const-asserted
-            // capacity invariant is the build-time safety net:
-            // `MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL +
-            //  MAX_FANOUT2_ENTRIES_PER_CALL × (MAX_FANOUT_PER_STAGED − 1) = 9`
-            // (asserted at MAX_ACTIONS_PER_CALL in action.rs). The Err arm
-            // is architecturally dead in any binary that compiles. Silent
-            // no-op is the safe fallback if a future refactor breaks the
-            // capacity inequality without bumping the const — the const-
-            // assert at build time will catch the drift before this
-            // runtime arm matters. (Pre-Bundle G the
-            // `debug_assert!(false, …)` provided only dev loudness, which
-            // misled readers into thinking the runtime check was the
-            // safety net rather than the build-time const-assert.)
+        // Architecturally dead in any compiling binary — the const-asserted
+        // capacity invariant is the build-time safety net:
+        // `MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL +
+        //  MAX_FANOUT2_ENTRIES_PER_CALL × (MAX_FANOUT_PER_STAGED − 1) = 9`
+        // (asserted at MAX_ACTIONS_PER_CALL in action.rs). The Err
+        // payload carries the rejected `Action` (`heapless::Vec::push`
+        // returns `Err(value)`); silent drop is the safe fallback —
+        // a future refactor that breaks the capacity inequality
+        // without bumping the const fails to compile rather than
+        // reaching this arm.
+        Err(_) => {
             core::hint::cold_path();
         }
     }
@@ -8467,9 +8462,11 @@ mod compute_push_tests {
             let staged = compute_push(cmd, &mut state_var, &mut reserved);
             let mut obs: heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL> = heapless::Vec::new();
             for a in &staged {
-                obs.push(StagedObs::from_staged(a)).unwrap_or_else(|_| {
-                    debug_assert!(false, "MAX_ACTIONS_PER_CALL overflow in test");
-                });
+                let push_result = obs.push(StagedObs::from_staged(a));
+                assert!(
+                    push_result.is_ok(),
+                    "MAX_ACTIONS_PER_CALL overflow in test fixture",
+                );
             }
             obs
         });

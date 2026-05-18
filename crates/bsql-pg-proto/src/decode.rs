@@ -1609,21 +1609,26 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 /// ```rust
 /// use bsql_pg_proto::{DataRowRef, DecodeError, FromPgText, StreamItem};
 ///
-/// fn example(item: StreamItem<'_>) -> Result<(), DecodeError> {
-///     let StreamItem::Row { row_bytes, .. } = item else { return Ok(()) };
+/// fn example(item: StreamItem<'_>) -> Result<Option<(i32, String)>, DecodeError> {
+///     let StreamItem::Row { row_bytes, .. } = item else { return Ok(None) };
 ///     let row = DataRowRef::parse(row_bytes)?;
 ///     let mut cols = row.columns();
 ///
 ///     // `Option::None` from `next()` = fewer columns than expected.
 ///     // `Option::None` from the inner `Ok(None)` = SQL NULL.
-///     // Both surfaces via structural match, no `unwrap()`.
-///     let Some(id_result) = cols.next() else { return Ok(()) };
-///     let _id: Option<i32> = id_result?.map(i32::from_pg_text).transpose()?;
+///     // Both surface via structural match, no `unwrap()`.
+///     let Some(id_result) = cols.next() else { return Ok(None) };
+///     let id: Option<i32> = id_result?.map(i32::from_pg_text).transpose()?;
 ///
-///     let Some(name_result) = cols.next() else { return Ok(()) };
-///     let _name: Option<&str> = name_result?.map(<&str>::from_pg_text).transpose()?;
+///     let Some(name_result) = cols.next() else { return Ok(None) };
+///     let name: Option<&str> = name_result?.map(<&str>::from_pg_text).transpose()?;
 ///
-///     Ok(())
+///     // Both columns NOT-NULL → return the decoded tuple; any NULL
+///     // surfaces as `Ok(None)` to the caller without silent defaults.
+///     match (id, name) {
+///         (Some(i), Some(n)) => Ok(Some((i, n.to_string()))),
+///         _ => Ok(None),
+///     }
 /// }
 /// ```
 ///

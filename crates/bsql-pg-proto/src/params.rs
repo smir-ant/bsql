@@ -316,7 +316,7 @@ macro_rules! params_writer_impl {
 /// const-assert (which needs a concrete monomorphic type to
 /// reference `<Anchor as ParamsWriter>::COUNT`).
 macro_rules! repeat_as_i32 {
-    ($_t:ident) => { i32 };
+    ($tok:ident) => { i32 };
 }
 
 /// Token-munging helper — consume a `$t` ident and emit the literal
@@ -324,7 +324,7 @@ macro_rules! repeat_as_i32 {
 /// its `$t` repetition through FORMATS without resorting to
 /// `let _ = <$t>::OID;` (crate-banned).
 macro_rules! emit_binary_per_token {
-    ($_t:ident) => { FormatCode::Binary };
+    ($tok:ident) => { FormatCode::Binary };
 }
 
 // ───────────────── Arity 0..=16 impls ─────────────────
@@ -455,11 +455,26 @@ mod tests {
         );
     }
 
+    // Compile-time invariants on the arity-3 anchor — drift detection
+    // at build time rather than per-test runtime check.
+    const _: () = assert!(
+        <(i32, &str, bool) as ParamsWriter>::COUNT == 3,
+        "arity-3 anchor COUNT must equal 3",
+    );
+    const _: () = assert!(
+        <(i32, &str, bool) as ParamsWriter>::FORMATS.len() == 3,
+        "arity-3 anchor FORMATS slice must be length 3",
+    );
+    const _: () = assert!(
+        <(i32, &str, bool) as ParamsWriter>::OIDS.len() == 3,
+        "arity-3 anchor OIDS slice must be length 3",
+    );
+
     #[test]
     fn arity_three_oids_and_formats_coherent() {
-        assert_eq!(<(i32, &str, bool) as ParamsWriter>::COUNT, 3);
-        assert_eq!(<(i32, &str, bool) as ParamsWriter>::FORMATS.len(), 3);
-        assert_eq!(<(i32, &str, bool) as ParamsWriter>::OIDS.len(), 3);
+        // COUNT/FORMATS.len/OIDS.len pinned by const-asserts above;
+        // this test verifies the runtime invariants the consts can't
+        // express (all FORMATS == Binary).
         assert!(
             <(i32, &str, bool) as ParamsWriter>::FORMATS
                 .iter()

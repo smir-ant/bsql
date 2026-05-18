@@ -1640,7 +1640,10 @@ mod bundle_k_spec_tests {
     #[test]
     fn exit_partial_mode_on_drained_buffer_is_ok() {
         use crate::buf::PartialModeExitUndrained;
-        let _ = core::marker::PhantomData::<PartialModeExitUndrained>;
+        // Const-context witness: pins type-import for `git grep` without
+        // `let _ =` form.
+        const _: core::marker::PhantomData<PartialModeExitUndrained> =
+            core::marker::PhantomData;
         let mut buf = ReadBuf::new();
         let token = mint_for_row_stream_dispatcher();
         // Buffer starts with partial_remaining == 0 (idle).

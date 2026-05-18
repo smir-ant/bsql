@@ -352,12 +352,12 @@ fn synthesise_check(field: &Field) -> syn::Result<TokenStream2> {
     // PhantomData<T> is a ZST — no runtime data, always trivially
     // pristine. Future-proofs the derive for state-machine types
     // with phantom markers (e.g. `ReplyId<K>`'s
-    // `PhantomData<fn() -> K>` pattern). The `_field` binding
-    // suppresses unused-variable warnings on the generated body
-    // (the field still exists on `self`, but the check itself is
-    // a constant `true`).
+    // `PhantomData<fn() -> K>` pattern). PhantomData is exempt from
+    // `dead_code` lint regardless of access, so the check body is
+    // simply the constant `true` — no `let _ = &self.#name` placeholder
+    // needed (and the let-underscore form is banned crate-wide).
     if is_phantom_data(&field.ty) {
-        return Ok(quote! { { let _ = &self.#name; true } });
+        return Ok(quote! { true });
     }
 
     Err(syn::Error::new_spanned(

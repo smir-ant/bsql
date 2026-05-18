@@ -209,8 +209,8 @@ impl ErrorPayload {
 ///
 /// An `ErrorRef` obtained from a pattern destructure must either
 /// be resolved (via `PgProtocol::get_server_error`) or explicitly
-/// discarded with `let _ =`. Silent drop loses the only handle to
-/// server message/detail/hint.
+/// consumed via `match ref { _ => () }` / `core::mem::drop(ref)`.
+/// Silent drop loses the only handle to server message/detail/hint.
 // DEF-184 (audit #4 P2-11): `Hash` removed. Pre-(P2-11) it was
 // present via copy-paste from multi-slot SchemaRef where hashing
 // matters for dedup sets. ErrorRef is single-slot and never used as
@@ -218,8 +218,8 @@ impl ErrorPayload {
 // a concrete consumer landing in the same commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "ErrorRef is the sole handle to server error message/detail/hint; \
-              resolve via PgProtocol::get_server_error before drop, or discard \
-              explicitly with `let _ = ref;`"]
+              resolve via PgProtocol::get_server_error before drop, or consume \
+              explicitly via `match r { _ => () }` / `core::mem::drop(r)`"]
 pub struct ErrorRef {
     /// Fixed marker = 1 (single slot). `NonZeroU8` for niche.
     slot: core::num::NonZeroU8,
@@ -687,12 +687,11 @@ mod drop_witness_tests {
         // Overwrite the wrapper. Rust drops the OLD wrapper before
         // moving the new one in; counter increments by 1 for the
         // OLD wrapper's Drop. `core::mem::replace` is the explicit
-        // form — gives us back the OLD value (which we drop
-        // immediately by binding to `_old`) and pins that the
-        // assignment is observable. Plain `wrapper = ...` triggers
-        // `unused_assignments` because the LATER drop(wrapper) is
-        // the only read of the new value.
-        let _old = core::mem::replace(
+        // form — gives us back the OLD value, which is dropped
+        // immediately via `core::mem::drop`. Plain `wrapper = ...`
+        // triggers `unused_assignments` because the LATER drop(wrapper)
+        // is the only read of the new value.
+        core::mem::drop(core::mem::replace(
             &mut wrapper,
             DropCounter::new(
                 ErrorPayload {
@@ -702,11 +701,9 @@ mod drop_witness_tests {
                 },
                 probe.clone(),
             ),
-        );
-        // `_old` is the OLD wrapper; it drops at end of statement
-        // (or here on the next line via explicit drop). Counter
-        // should increment to 1.
-        drop(_old);
+        ));
+        // The replaced OLD wrapper dropped above (via mem::drop);
+        // counter should increment to 1.
         assert_eq!(
             probe.fired(),
             1,

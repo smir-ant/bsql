@@ -901,11 +901,14 @@ mod bundle_f_seal_probe {
         // Sanity: HostileWitness satisfies PostStateSealed + PostStateProof
         // (the two layers above InstallBody). Confirms the pin probes
         // the RIGHT layer (the install-body authority), not a layer
-        // already closed by `pub(crate)` sealing.
-        let _ = core::marker::PhantomData::<HostileWitness>;
+        // already closed by `pub(crate)` sealing. Const-context witness:
+        // type-equality is checked at compile-time without `let _ =` form.
+        const _: core::marker::PhantomData<HostileWitness> =
+            core::marker::PhantomData;
 
         // PushCommandSealed import for `git grep` discoverability:
-        // PushCommand's own seal is a separate concern (DEF-244 P1).
-        let _ = core::marker::PhantomData::<dyn PushCommandSealed>;
+        // PushCommand's own seal is a separate concern.
+        const _: core::marker::PhantomData<dyn PushCommandSealed> =
+            core::marker::PhantomData;
     }
 }
