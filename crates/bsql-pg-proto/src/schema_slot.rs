@@ -90,8 +90,23 @@ use crate::decode::RowDesc;
 /// `#[repr(transparent)]` so the layout is identical to the bare
 /// `Option<RowDesc>` — `mem::size_of::<RowDescSlotCell>() ==
 /// mem::size_of::<Option<RowDesc>>()`.
+///
+/// DEF-279 follow-up (2026-05-18): visibility raised to `pub` so the
+/// type can appear as the associated type
+/// `<protocol::ActivePhase as protocol::SealedPhase>::Extras`. The
+/// `inner` field stays private — external code cannot construct or
+/// observe the cell's contents except via the token-gated
+/// `pub(crate)` constructor + read-only `as_ref` projection.
+// DEF-279 follow-up (2026-05-18): `#[allow]` for missing_copy /
+// missing_debug post-`pub` raise. `Copy` is BANNED on the cell —
+// the field-write protocol (token-gated `park_at_*` / `clear_at_*`)
+// would be subvertable by mass-copying. Debug is suppressed because
+// RowDesc itself prints column metadata that callers may not want
+// exposed via {:?}; production code observes via `as_ref()` and
+// projects through `RowDescBorrow`.
+#[allow(missing_copy_implementations, missing_debug_implementations)]
 #[repr(transparent)]
-pub(crate) struct RowDescSlotCell {
+pub struct RowDescSlotCell {
     inner: Option<RowDesc>,
 }
 

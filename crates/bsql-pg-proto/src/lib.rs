@@ -814,7 +814,8 @@ const _: () = assert!(
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~80 + \
-     row_desc_slot ~140 + session_params 8 + error_arena 8 + \
+     row_desc_slot ~140 (outer Extras post-DEF-279 follow-up) + \
+     session_params 8 + error_arena 8 + \
      partial_assembly 8 (DEF-248 Sub-B) + \
      backend_key 8 (DEF-278 Bundle D) + \
      malformed_frame_count 4 + alignment-pad to align(8) = 536 B. \
@@ -900,25 +901,41 @@ const _: () = assert!(
 // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): switched from
 // PgProtocolInner (536 B; ProtoState 80 B) to ConnectingInner
 // (state: ConnectingState 48 B; saves 32 B on the state field
-// vs ProtoState 80 B). Other 7 fields are byte-identical to
-// PgProtocolInner. Field-narrow drops of row_desc_slot (140 B)
-// and backend_key (12 B) deferred to a follow-up commit
-// pending lift+lower wrapper's transient-slot redesign.
+// vs ProtoState 80 B).
+//
+// DEF-279 follow-up (2026-05-18, architect Interpretation B): row_desc_slot
+// HOISTED off `ConnectingInner` to outer `<ConnectingPhase>::Extras = ()`
+// (the slot doesn't exist on Connecting at all — no dispatch arm
+// reachable from a `ConnectingState` LHS writes it). ConnectingInner
+// shrinks by 144 B (RowDescSlotCell size) → ~360 B with alignment.
+// PgProtocol<ConnectingPhase> equals ConnectingInner + Extras=() (ZST)
+// + ZST phase_marker → same as ConnectingInner.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 504,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 368,
     "PgProtocol<ConnectingPhase> layout drift — must equal \
-     ConnectingInner (8 fields: state 48 B + read_buf 264 B + \
-     4 cells × 8 B + 1 u32 + alignment). If this trips, audit \
-     `mod protocol::ConnectingInner` for unexpected field changes.",
+     ConnectingInner (7 fields post-DEF-279-follow-up: state \
+     ConnectingState 48 B + read_buf 264 B + 3 cells × 8 B + \
+     1 u32 + alignment) PLUS Extras = () (ZST) PLUS ZST phase_marker. \
+     Pre-follow-up was 504 B; row_desc_slot HOISTED off Inner \
+     (saves 136 B by alignment-aware narrowing). If this trips, \
+     audit `mod protocol::ConnectingInner` and the SealedPhase \
+     Extras = () mapping for ConnectingPhase.",
 );
+// DEF-279 follow-up (2026-05-18): `<ActivePhase>::Extras = RowDescSlotCell`
+// (140 B; align 4). `ActiveInner` shrinks by the cell. PgProtocol<ActivePhase>
+// = ActiveInner + Extras + ZST phase_marker. Net byte-neutral vs
+// pre-follow-up (cell moved from Inner to outer Extras), measured at
+// 536 B on aarch64-apple-darwin.
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 536,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
-     (8 fields: state ActiveState 80 B + read_buf 264 B + 4 cells \
-     × 8 B + 1 u32 + alignment). If this trips, audit \
-     `mod protocol::ActiveInner` for unexpected field changes. \
-     DEF-279 Phase 2 Bundle Commit 13: PgProtocolInner DELETED — \
-     the size is now sourced from ActiveInner directly.",
+     (7 fields post-DEF-279-follow-up: state ActiveState 80 B + \
+     read_buf 264 B + 3 cells × 8 B + 1 u32 + alignment) PLUS \
+     Extras = RowDescSlotCell (140 B inline; align 4) PLUS ZST \
+     phase_marker. Pre-follow-up was 536 B (cell inside ActiveInner); \
+     net byte-neutral. If this trips, audit `mod protocol::ActiveInner` \
+     and the SealedPhase Extras = RowDescSlotCell mapping for \
+     ActivePhase.",
 );
 // DEF-279 Phase 1b (2026-05-18): <ClosedPhase>::Inner is now
 // `ClosedInner` (~16 B) — state_kind 1B + 7B pad + error_arena

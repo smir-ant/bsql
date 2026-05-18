@@ -589,15 +589,6 @@ pub struct ConnectingInner {
     /// state-variant-in-wrong-phase is impossible by type — Active
     /// variants don't exist in `ConnectingState`.
     state: crate::state::ConnectingState,
-    /// Mirror of [`PgProtocolInner::row_desc_slot`].
-    ///
-    /// **Phase 1c Commit 3 (deferred)**: this field will be dropped
-    /// — no `RowDescription` reachable from Connecting states.
-    /// Kept here in Commit 2 to enable reuse of the existing
-    /// `feed_bytes_dispatch` / `DispatchContext` body (8-field shape)
-    /// without forcing field-narrow + state-variant signal work
-    /// into the same commit.
-    row_desc_slot: crate::schema_slot::RowDescSlotCell,
     /// Mirror of [`PgProtocolInner::read_buf`].
     read_buf: ReadBuf,
     /// Mirror of [`PgProtocolInner::session_params`]. Populated by
@@ -667,10 +658,6 @@ pub struct ActiveInner {
     state: crate::state::ActiveState,
     /// Mirror of [`PgProtocolInner::read_buf`].
     read_buf: ReadBuf,
-    /// Mirror of [`PgProtocolInner::row_desc_slot`]. Reachable from
-    /// `DescribeStatement*`, `BindExecuteStreamingRows`, etc. —
-    /// CAN be written during Active.
-    row_desc_slot: crate::schema_slot::RowDescSlotCell,
     /// Mirror of [`PgProtocolInner::session_params`].
     session_params: crate::session_params_slot::SessionParamsCell,
     /// Mirror of [`PgProtocolInner::error_arena`].
@@ -843,6 +830,61 @@ pub trait SealedPhase: _sealed_phase::Sealed + 'static {
     /// - `size_of::<PgProtocol<{Connecting,Active,Closed}>>() == 536`
     ///   (unchanged through Phase 1a; will diverge per phase).
     type Inner;
+
+    /// DEF-279 follow-up (2026-05-18) — per-phase outer Extras storage.
+    ///
+    /// Holds cells whose write surface is reachable only from a SUBSET
+    /// of phases — keeping such cells out of the broader phases' Inner
+    /// achieves tier-1 closure on the dispatch-arm-can't-write side
+    /// (Interpretation B per architect verdict).
+    ///
+    /// # Mapping
+    ///
+    /// - [`DisconnectedPhase`]: `type Extras = ()` (ZST). No schema
+    ///   reachable pre-Startup.
+    /// - [`ConnectingPhase`]: `type Extras = ()` (ZST). No dispatch
+    ///   arm reachable from a `ConnectingState` LHS writes
+    ///   [`crate::schema_slot::RowDescSlotCell`] — the field
+    ///   physically does not exist on the outer for this phase.
+    /// - [`ActivePhase`]: `type Extras = `[`crate::schema_slot::RowDescSlotCell`].
+    ///   BindExecute SELECT install + Describe arms write the slot;
+    ///   storage lives on the outer (hoisted from `ActiveInner`).
+    /// - [`ClosedPhase`]: `type Extras = ()` (ZST). Closed absorbs no
+    ///   input; schema state cleared at the into_closed boundary.
+    ///
+    /// # Tier impact
+    ///
+    /// `<ConnectingPhase>::Extras = ()` is the tier-1 closure: any
+    /// future code that tries `&mut p.row_desc_slot` on a
+    /// `PgProtocol<ConnectingPhase>` fails with E0609 "no field named
+    /// `row_desc_slot`" because the field literally does not exist
+    /// on the outer monomorphisation. The doctest below pins this
+    /// type-level invariant.
+    ///
+    /// # Compile-fail probe (DEF-279 follow-up trybuild)
+    ///
+    /// **(i) `row_desc_slot` field does not exist on
+    /// `PgProtocol<ConnectingPhase>`:**
+    ///
+    /// ```compile_fail
+    /// use bsql_pg_proto::protocol::{PgProtocol, ConnectingPhase};
+    /// fn no_row_desc_slot_field(p: &mut PgProtocol<ConnectingPhase>) {
+    ///     // E0609: no field `row_desc_slot` on type
+    ///     // `&mut PgProtocol<ConnectingPhase>` — the slot was
+    ///     // HOISTED off the Inner AND `<ConnectingPhase>::Extras
+    ///     // = ()`, so no field by that name exists at any level.
+    ///     let _ = &mut p.row_desc_slot;
+    /// }
+    /// ```
+    ///
+    /// The dual side of the probe (verifying that
+    /// `<ConnectingPhase>::Extras = ()` and `<ActivePhase>::Extras =
+    /// RowDescSlotCell`) is enforced by the layout pins in `lib.rs`
+    /// (PgProtocol<ConnectingPhase> at 368 B, PgProtocol<ActivePhase>
+    /// at 536 B). A regression in either Extras mapping would shift
+    /// the layout and trip those `const _: () = assert!(…)` gates at
+    /// compile time.
+    type Extras;
 }
 
 /// DEF-246 Phase 1 — Disconnected phase marker.
@@ -1004,29 +1046,42 @@ pub struct ClosedInner {
 
 impl SealedPhase for DisconnectedPhase {
     type Inner = DisconnectedInner;
+    type Extras = ();
 }
 impl SealedPhase for ConnectingPhase {
     // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): FLIPPED from
     // `PgProtocolInner` to per-phase [`ConnectingInner`]. Tier-1
     // closure on state-variant-in-wrong-phase by storage absence
     // (`ConnectingInner.state: ConnectingState` — no Active variants
-    // exist in the per-phase enum). Field set unchanged from
-    // PgProtocolInner (8 fields); per-phase narrowing of row_desc_slot
-    // / backend_key deferred to a follow-up commit per the lift+lower
-    // wrapper's transient-DispatchContext requirement (slots must be
-    // borrowable during the shared dispatch's match-arm evaluation
-    // even though they're never written during handshake).
+    // exist in the per-phase enum).
+    //
+    // DEF-279 follow-up (2026-05-18, architect Interpretation B):
+    // `row_desc_slot` HOISTED off Inner — `<ConnectingPhase>::Extras
+    // = ()` (storage-absence at the outer). The `feed_bytes_dispatch_
+    // connecting` wrapper mints a stack-local transient
+    // RowDescSlotCell that the shared dispatch body can name; the
+    // transient is empty (Connecting LHS arms never write it), and
+    // drops with the wrapper's frame. Tier-1 closure on
+    // outer-level-can't-write-schema by storage absence.
     type Inner = ConnectingInner;
+    type Extras = ();
 }
 impl SealedPhase for ActivePhase {
     // DEF-279 Phase 2 Bundle Commit 12 (2026-05-18): FLIPPED from
     // `PgProtocolInner` to per-phase [`ActiveInner`]. Tier-1
     // closure on state-variant-in-wrong-phase by storage absence
     // (`ActiveInner.state: ActiveState` — no Connecting variants
-    // exist in the per-phase enum). Field set unchanged from
-    // PgProtocolInner (8 fields, same layout) since every cell is
-    // reachable from at least one Active variant.
+    // exist in the per-phase enum).
+    //
+    // DEF-279 follow-up (2026-05-18, architect Interpretation B):
+    // `row_desc_slot` HOISTED off Inner — `<ActivePhase>::Extras =
+    // RowDescSlotCell`. The cell lives on the outer for Active alone;
+    // the `feed_bytes_dispatch_active` wrapper borrows
+    // `&mut self.extras` and threads it into the shared dispatch
+    // body's `DispatchContext`. Net footprint preserved (slot moved
+    // from Inner → outer Extras for Active monomorphisation).
     type Inner = ActiveInner;
+    type Extras = crate::schema_slot::RowDescSlotCell;
 }
 impl SealedPhase for ClosedPhase {
     // DEF-279 Phase 1b (2026-05-18): switched from `PgProtocolInner`
@@ -1037,6 +1092,7 @@ impl SealedPhase for ClosedPhase {
     // the error_arena, letting the remaining PgProtocolInner fields
     // Drop at the boundary.
     type Inner = ClosedInner;
+    type Extras = ();
 }
 
 /// DEF-246 Phase 1 — Phase-typed wrapper over [`PgProtocolInner`].
@@ -1082,20 +1138,26 @@ impl SealedPhase for ClosedPhase {
 /// surface — the inner-data shape stays an internal detail of
 /// `mod protocol` (and its leaf submodules per Rust submodule
 /// visibility rules).
-#[repr(transparent)]
 pub struct PgProtocol<P: SealedPhase = ActivePhase> {
     // DEF-279 Phase 1a (2026-05-18): per-phase `Inner` storage via the
-    // associated type `<P as SealedPhase>::Inner`. The compiler normalises
-    // this through the impl blocks (`type Inner = …`) before the
-    // `#[repr(transparent)]` layout check fires, so each monomorphisation
+    // associated type `<P as SealedPhase>::Inner`. Each monomorphisation
     // has a concrete layout:
     //   PgProtocol<DisconnectedPhase> ≡ DisconnectedInner (ZST, 0 B)
-    //   PgProtocol<ConnectingPhase>   ≡ PgProtocolInner   (536 B)
-    //   PgProtocol<ActivePhase>       ≡ PgProtocolInner   (536 B)
-    //   PgProtocol<ClosedPhase>       ≡ PgProtocolInner   (536 B)
-    // Future phases (Phase 1b ClosedInner / 1c ConnectingInner) diverge
-    // independently.
+    //                                 + Extras = () (ZST) → 0 B
+    //   PgProtocol<ConnectingPhase>   ≡ ConnectingInner (narrowed, no slot)
+    //                                 + Extras = () (ZST)
+    //   PgProtocol<ActivePhase>       ≡ ActiveInner (narrowed, no slot)
+    //                                 + Extras = RowDescSlotCell (144 B)
+    //   PgProtocol<ClosedPhase>       ≡ ClosedInner (16 B)
+    //                                 + Extras = () (ZST) → 16 B
     inner: <P as SealedPhase>::Inner,
+    /// DEF-279 follow-up (2026-05-18, architect Interpretation B) —
+    /// per-phase outer Extras storage. Hoisted from `Inner` for cells
+    /// whose write surface is phase-restricted; allows tier-1 closure
+    /// on `<P>` monomorphisations that semantically reject the cell
+    /// (e.g. `<ConnectingPhase>::Extras = ()` → no `row_desc_slot`
+    /// reachable on the outer). See [`SealedPhase::Extras`].
+    extras: <P as SealedPhase>::Extras,
     /// ZST phase marker. Load-bearing for the type-level phase
     /// proof; named without leading-underscore per the user-feedback
     /// convention that structurally-used fields must not be
@@ -1487,6 +1549,7 @@ pub(crate) mod _proto_init_leaf {
                 inner: super::DisconnectedInner {
                     sync_marker: super::PhantomData,
                 },
+                extras: (),
                 phase_marker: super::PhantomData,
             }
         }
@@ -1526,7 +1589,6 @@ pub(crate) mod _proto_init_leaf {
                 ),
             ),
             read_buf: super::ReadBuf::new(),
-            row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
             session_params: crate::session_params_slot::SessionParamsCell::empty(token),
             error_arena: None,
             partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
@@ -1534,6 +1596,37 @@ pub(crate) mod _proto_init_leaf {
             malformed_frame_count: 0,
             sync_marker: super::PhantomData,
         }
+    }
+
+    /// DEF-279 follow-up (2026-05-18, architect Interpretation B) —
+    /// mint the outer `<ActivePhase>::Extras = RowDescSlotCell` at the
+    /// `<ConnectingPhase>::into_active` transition boundary. Mirror
+    /// of the per-cell `empty(token)` mint pattern used by
+    /// [`fresh_active_inner`]; lives inside `_proto_init_leaf` so the
+    /// [`ProtoInitToken`] stays leaf-private (DEF-272 P6 closure).
+    #[must_use]
+    pub(in crate::protocol) fn fresh_active_row_desc_slot()
+    -> crate::schema_slot::RowDescSlotCell {
+        let token = ProtoInitToken::mint();
+        crate::schema_slot::RowDescSlotCell::empty(token)
+    }
+
+    /// DEF-279 follow-up (2026-05-18, architect Z' verdict) — mint a
+    /// stack-local transient `RowDescSlotCell` for
+    /// [`super::feed_bytes_dispatch_connecting`]'s call into the
+    /// shared dispatch body. The slot is empty (no Connecting LHS
+    /// arm writes to it) and drops with the wrapper's frame.
+    ///
+    /// **Tier impact**: the `<ConnectingPhase>::Extras = ()` storage
+    /// absence is the load-bearing closure (no slot on the outer);
+    /// this transient is a per-call wrapper-internal placeholder
+    /// the shared dispatch body can name, never observable outside
+    /// the wrapper frame.
+    #[must_use]
+    pub(in crate::protocol) fn fresh_connecting_transient_row_desc_slot()
+    -> crate::schema_slot::RowDescSlotCell {
+        let token = ProtoInitToken::mint();
+        crate::schema_slot::RowDescSlotCell::empty(token)
     }
 
     /// DEF-279 Phase 2 Bundle Commit 12 (2026-05-18) — materialise
@@ -1561,7 +1654,6 @@ pub(crate) mod _proto_init_leaf {
         super::ActiveInner {
             state: crate::state::ActiveState::Idle,
             read_buf: super::ReadBuf::new(),
-            row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
             session_params: crate::session_params_slot::SessionParamsCell::empty(token),
             error_arena: None,
             partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
@@ -1818,7 +1910,6 @@ impl PgProtocol<DisconnectedPhase> {
         // and install on new_inner.
         let mut proto_state: ProtoState = ProtoState::Idle;
         let state = &mut proto_state;
-        let row_desc_slot = &mut new_inner.row_desc_slot;
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
             None => {
@@ -1908,7 +1999,10 @@ impl PgProtocol<DisconnectedPhase> {
                 },
             );
 
-        let _: () = row_desc_slot.consume_unused_witness();
+        // DEF-279 follow-up (2026-05-18): row_desc_slot no longer
+        // exists on ConnectingInner (hoisted off; Extras = () for
+        // ConnectingPhase). The previous `consume_unused_witness`
+        // placeholder is gone — no slot to discharge.
         match result {
             Ok(out) => {
                 // DEF-279 Phase 1c Bundle Commit 8b: lower the lifted
@@ -1938,27 +2032,13 @@ impl PgProtocol<DisconnectedPhase> {
                     out,
                     PgProtocol {
                         inner: new_inner,
+                        extras: (),
                         phase_marker: PhantomData,
                     },
                 ))
             }
             Err(f) => Err(f),
         }
-    }
-}
-
-// Phase 2 helper: keep `row_desc_slot: &mut RowDescSlotCell` named so
-// the borrow checker is satisfied; the cell is not used by
-// Startup push (only BindExecute parks a RowDesc) but the type-system
-// path forces a placeholder method.
-impl crate::schema_slot::RowDescSlotCell {
-    /// DEF-246 Phase 2 (2026-05-16): no-op marker consumed by
-    /// `<DisconnectedPhase>::push_startup` to discharge the
-    /// `&mut row_desc_slot` binding without an `_ = …` discard
-    /// (banned crate-wide). The cell is structurally untouched.
-    #[inline]
-    pub(crate) const fn consume_unused_witness(&self) {
-        // No-op: cell is untouched by Startup push.
     }
 }
 
@@ -2075,21 +2155,28 @@ impl PgProtocol<ConnectingPhase> {
                     state_kind,
                     error_arena,
                 },
+                extras: (),
                 phase_marker: PhantomData,
             }));
         }
         if matches!(self.inner.state, ConnectingState::HandshakeReady) {
-            // Destructure ConnectingInner and re-assemble PgProtocolInner
-            // for ActivePhase (which still uses PgProtocolInner as its
-            // Inner type per current SealedPhase). state lifts to
-            // ProtoState::Idle (HandshakeReady's lifted equivalent —
-            // the post-handshake state the dispatch saw before the
-            // wrapper translated it to HandshakeReady). All other
-            // fields move byte-identically.
+            // DEF-279 Phase 2 Bundle Commit 12: per-phase ActiveInner.
+            // State opens at `ActiveState::Idle` — the natural post-
+            // handshake state the Connecting wrapper's `HandshakeReady`
+            // signal represents. All other fields move byte-identically.
+            //
+            // DEF-279 follow-up (2026-05-18, architect Interpretation B):
+            // row_desc_slot HOISTED to outer `<ActivePhase>::Extras`;
+            // ConnectingInner no longer carries it. Mint a fresh cell
+            // via `_proto_init_leaf::fresh_active_row_desc_slot()` at
+            // this transition boundary — the cell-is-reset-on-transition
+            // invariant means a fresh empty mint is byte-identical to
+            // what a carry-forward-from-Connecting would have produced
+            // (Connecting LHS arms never write to row_desc_slot, so
+            // even a hypothetical carry-forward starts empty here).
             let ConnectingInner {
                 state: _,
                 read_buf,
-                row_desc_slot,
                 session_params,
                 error_arena,
                 partial_assembly,
@@ -2097,16 +2184,10 @@ impl PgProtocol<ConnectingPhase> {
                 malformed_frame_count,
                 sync_marker: _,
             } = self.inner;
-            // DEF-279 Phase 2 Bundle Commit 12: per-phase ActiveInner
-            // (was PgProtocolInner pre-Commit-12). State opens at
-            // `ActiveState::Idle` — the natural post-handshake state
-            // that the Connecting wrapper's `HandshakeReady` signal
-            // represents. All other fields move byte-identically.
             return Ok(PgProtocol {
                 inner: ActiveInner {
                     state: crate::state::ActiveState::Idle,
                     read_buf,
-                    row_desc_slot,
                     session_params,
                     error_arena,
                     partial_assembly,
@@ -2114,6 +2195,7 @@ impl PgProtocol<ConnectingPhase> {
                     malformed_frame_count,
                     sync_marker: PhantomData,
                 },
+                extras: _proto_init_leaf::fresh_active_row_desc_slot(),
                 phase_marker: PhantomData,
             });
         }
@@ -3218,7 +3300,14 @@ impl PgProtocol<ActivePhase> {
         // DEF-246 Option α (2026-05-16):
         // `clear_session_residue_for_class` lives on `PgProtocolInner`;
         // route through `self.inner` directly.
-        self.inner.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
+        //
+        // DEF-279 follow-up (2026-05-18): `row_desc_slot` HOISTED to
+        // outer `<ActivePhase>::Extras` — pass `&mut self.extras` to
+        // the per-Inner residue method.
+        self.inner.clear_session_residue_for_class(
+            &mut self.extras,
+            crate::state::StatePushClass::Idle,
+        );
 
         // DEF-279 Phase 2 Bundle Commit 12 (2026-05-18): lift+lower
         // for the IdleState setter machinery (which operates on
@@ -3233,7 +3322,7 @@ impl PgProtocol<ActivePhase> {
         )
         .into();
         let state = &mut proto_state;
-        let row_desc_slot = &mut self.inner.row_desc_slot;
+        let row_desc_slot = &mut self.extras;
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
             None => {
@@ -3525,7 +3614,10 @@ impl PgProtocol<ActivePhase> {
         // 1-line delegate so `<ConnectingPhase>` and `<ActivePhase>`
         // share the same implementation (handshake-window callers also
         // need per-event advance for server-driven auth chains).
-        self.inner.advance_one_frame(write_buf)
+        //
+        // DEF-279 follow-up (2026-05-18): row_desc_slot HOISTED to
+        // outer Extras — pass via disjoint-field borrow.
+        self.inner.advance_one_frame(&mut self.extras, write_buf)
     }
 
     /// Feed inbound wire bytes.
@@ -3559,7 +3651,10 @@ impl PgProtocol<ActivePhase> {
         // 1-line delegate. The `<ConnectingPhase>::feed_bytes` mirror
         // (Phase 3) shares the identical inner-method dispatch — same
         // const-generic specialisation, same hot-path codegen.
-        self.inner.feed_bytes_impl::<false>(bytes, write_buf, 0)
+        //
+        // DEF-279 follow-up (2026-05-18): row_desc_slot HOISTED to
+        // outer Extras — pass via disjoint-field borrow.
+        self.inner.feed_bytes_impl::<false>(&mut self.extras, bytes, write_buf, 0)
     }
 
     /// DEF-154 (X) P0-2(c): frame-bounded variant of [`feed_bytes`].
@@ -3587,7 +3682,10 @@ impl PgProtocol<ActivePhase> {
         // DEF-246 Option α: 1-line delegate to `PgProtocolInner` mirror.
         // `row_stream`'s slow-path call site (`self.proto.feed_bytes_bounded`)
         // resolves through this delegate unchanged.
-        self.inner.feed_bytes_bounded(bytes, write_buf, max_dispatches)
+        //
+        // DEF-279 follow-up (2026-05-18): row_desc_slot HOISTED to
+        // outer Extras — pass via disjoint-field borrow.
+        self.inner.feed_bytes_bounded(&mut self.extras, bytes, write_buf, max_dispatches)
     }
 
     // DEF-246 Option α (2026-05-16): dispatch machinery extracted to
@@ -3721,12 +3819,39 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
 /// slow path, `<ActivePhase>::feed_bytes`, `<ConnectingPhase>::feed_bytes`)
 /// is bit-equivalent to the pre-refactor code (asm-diff verified
 /// gate).
-pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bool>(
+// DEF-279 follow-up (2026-05-18, architect Option Y verdict):
+// feed_bytes_dispatch now takes a `materialise_fn` closure for the
+// three terminal materialise call sites. The closure decouples the
+// `OutActions<'w, ?>` return-lifetime from the slot's `'r`:
+//
+// - **With-schema (Active path)** — closure does
+//   `materialise(staged, bytes, terminal_ref)` where `terminal_ref`
+//   has the slot's `'r` lifetime → returns `OutActions<'w, 'r>`.
+//
+// - **No-schema (Connecting path)** — closure ignores `terminal_ref`
+//   and calls `materialise(staged, bytes, None::<&'static RowDesc>)`
+//   → returns `OutActions<'w, 'static>`. By covariance the caller
+//   observes this as `OutActions<'w, 'r_outer>` for any `'r_outer`.
+//
+// This pattern keeps the dispatch body unified (one source of truth,
+// asm-diff cleared once) while splitting the output type at the
+// closure seam — exactly where the lifetime invariant diverges.
+//
+// **Closure signature note**: `Fn(...) -> R` (not `FnOnce`) because
+// the body has THREE materialise sites (`AlreadyErrored` /
+// `AppendFailed` early-exit arms + main-loop end). All three call
+// the closure exactly once per invocation; `Fn` admits the multi-
+// call pattern with no capture-by-move restriction.
+pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, R, M, const BOUNDED: bool>(
     ctx: DispatchContext<'state, 'r>,
     bytes: &[u8],
     write_buf: &'w mut WriteBuf,
     max_dispatches: u16,
-) -> OutActions<'w, 'r> {
+    materialise_fn: M,
+) -> R
+where
+    M: Fn(StagedActions<'w>, &'w [u8], Option<&'r crate::decode::RowDesc>) -> R,
+{
     let DispatchContext {
         state,
         read_buf,
@@ -3843,9 +3968,9 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bo
             read_buf.clear();
             let terminal_ref: Option<&crate::decode::RowDesc> =
                 (*terminal_row_desc).as_ref();
-            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+            return write_buf.with_branded(|wb| -> R {
                 let staged: StagedActions = StagedActions::new();
-                materialise(staged, wb.into_bytes(), terminal_ref)
+                materialise_fn(staged, wb.into_bytes(), terminal_ref)
             });
         }
         IngressClassification::AppendFailed { attempted, available } => {
@@ -3865,7 +3990,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bo
             // into the post-Errored phase until the wrapper drops
             // the connection.
             read_buf.clear();
-            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+            return write_buf.with_branded(|wb| -> R {
                 let mut staged: StagedActions = StagedActions::new();
                 fail_inflight_no_readbuf(
                     state,
@@ -3875,7 +4000,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bo
                 );
                 let terminal_ref: Option<&crate::decode::RowDesc> =
                     (*terminal_row_desc).as_ref();
-                materialise(staged, wb.into_bytes(), terminal_ref)
+                materialise_fn(staged, wb.into_bytes(), terminal_ref)
             });
         }
         IngressClassification::Ok => {
@@ -3885,7 +4010,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bo
 
     // Main dispatch. Take shared borrow of populated + cursor
     // (both via immutable reborrow of read_buf's &mut).
-    write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
+    write_buf.with_branded(|mut wb| -> R {
         let mut staged: StagedActions = StagedActions::new();
         let populated: &[u8] = read_buf.populated();
         let cursor: u16 = read_buf.cursor_position_u16();
@@ -4205,7 +4330,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bo
         // above; reborrow as immutable here for materialise.
         let terminal_ref: Option<&crate::decode::RowDesc> =
             (*terminal_row_desc).as_ref();
-        materialise(staged, wb.into_bytes(), terminal_ref)
+        materialise_fn(staged, wb.into_bytes(), terminal_ref)
     })
 }
 
@@ -4234,11 +4359,19 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bo
 ///
 /// **`#[allow(dead_code)]`** until Commit 7+ wires
 /// `ConnectingInner.feed_bytes_impl` to assemble + pass this.
+// DEF-279 follow-up (2026-05-18, architect Interpretation B + Z'):
+// `row_desc_slot` FIELD DROPPED — the cell does not exist on the
+// outer for `<ConnectingPhase>` (Extras = ()). The
+// [`feed_bytes_dispatch_connecting`] wrapper mints a stack-local
+// transient via [`_proto_init_leaf::fresh_connecting_transient_row_desc_slot`]
+// and threads it into the shared dispatch body's `DispatchContext`.
+// The transient is empty (Connecting LHS arms never write it) and
+// drops with the wrapper's frame. Trybuild compile-fail probe pins
+// the field-absence at the outer (PgProtocol<ConnectingPhase>).
 #[allow(dead_code)]
 pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
     pub(in crate::protocol) state: &'state mut crate::state::ConnectingState,
     pub(in crate::protocol) read_buf: &'r mut ReadBuf,
-    pub(in crate::protocol) row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -4310,13 +4443,35 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     let ConnectingDispatchContext {
         state,
         read_buf,
-        row_desc_slot,
         session_params,
         error_arena,
         partial_assembly,
         backend_key,
         malformed_count,
     } = ctx;
+
+    // DEF-279 follow-up (2026-05-18, architect Z' verdict):
+    // `<ConnectingPhase>::Extras = ()` — no row_desc_slot on the
+    // outer. Mint a stack-local transient via the leaf-private
+    // constructor for the duration of the shared dispatch call.
+    // The transient is empty; no Connecting LHS arm writes to it;
+    // it drops with this frame. Tier-1 closure on the outer
+    // (PgProtocol<ConnectingPhase> has no row_desc_slot field);
+    // the transient is wrapper-internal scaffolding the shared
+    // dispatch body can name.
+    //
+    // **Lifetime safety**: the inner `DispatchContext.row_desc_slot`
+    // is `&'r mut RowDescSlotCell` — `'r` here is the wrapper's
+    // outer lifetime, BUT the borrow only flows out via
+    // `OutActions<'_, 'r>` if `terminal_ref: Option<&'r RowDesc>`
+    // is `Some`. The transient is always empty (Connecting LHS
+    // never writes), so `terminal_ref = None` for the whole call;
+    // no `'r` borrow escapes via the return value. The
+    // `&mut transient` reborrow needed by `feed_bytes_dispatch`
+    // is supplied by reborrowing the local — Rust's NLL closes
+    // the borrow at function return; the local drops cleanly.
+    let mut transient_row_desc =
+        _proto_init_leaf::fresh_connecting_transient_row_desc_slot();
 
     let sentinel = ConnectingState::Errored(
         crate::error::StateErrorKind::from_kind_or_internal(
@@ -4326,11 +4481,19 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     let lifted: ConnectingState = core::mem::replace(state, sentinel);
     let mut proto_state: ProtoState = lifted.into();
 
-    let actions = feed_bytes_dispatch::<BOUNDED>(
+    // DEF-279 follow-up (2026-05-18, architect Y verdict): no-schema
+    // closure. The closure ignores `terminal_ref` (architecturally
+    // `None` for Connecting LHS — no arm writes the slot) and calls
+    // `materialise` with `None::<&'static RowDesc>`. R is inferred
+    // as `OutActions<'w, 'static>`; covariance lets the wrapper's
+    // outer signature `OutActions<'w, 'r>` accept it (since
+    // `'static: 'r` for any `'r`). The transient slot's local
+    // lifetime never leaks into R.
+    let actions: OutActions<'w, 'static> = feed_bytes_dispatch::<_, _, BOUNDED>(
         DispatchContext {
             state: &mut proto_state,
             read_buf,
-            row_desc_slot,
+            row_desc_slot: &mut transient_row_desc,
             session_params,
             error_arena,
             partial_assembly,
@@ -4340,6 +4503,9 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         bytes,
         write_buf,
         max_dispatches,
+        |staged, write_bytes, _terminal_ref_unused: Option<&crate::decode::RowDesc>| -> OutActions<'w, 'static> {
+            materialise(staged, write_bytes, None::<&'static crate::decode::RowDesc>)
+        },
     );
 
     // Lower: project proto_state back to ConnectingState.
@@ -4451,7 +4617,10 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
     let lifted: ActiveState = core::mem::replace(state, sentinel);
     let mut proto_state: ProtoState = lifted.into();
 
-    let actions = feed_bytes_dispatch::<BOUNDED>(
+    // DEF-279 follow-up (2026-05-18, architect Y verdict): with-schema
+    // closure. Reads the slot's RowDesc as `Option<&'r RowDesc>` and
+    // forwards to `materialise`; R is inferred as `OutActions<'w, 'r>`.
+    let actions = feed_bytes_dispatch::<_, _, BOUNDED>(
         DispatchContext {
             state: &mut proto_state,
             read_buf,
@@ -4465,6 +4634,9 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         bytes,
         write_buf,
         max_dispatches,
+        |staged, write_bytes, terminal_ref: Option<&crate::decode::RowDesc>| -> OutActions<'w, 'r> {
+            materialise(staged, write_bytes, terminal_ref)
+        },
     );
 
     // Lower: project proto_state back to ActiveState. Any
@@ -4700,7 +4872,6 @@ impl ConnectingInner {
             ConnectingDispatchContext {
                 state: &mut self.state,
                 read_buf: &mut self.read_buf,
-                row_desc_slot: &mut self.row_desc_slot,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
@@ -4785,7 +4956,6 @@ impl ConnectingInner {
             ConnectingDispatchContext {
                 state: &mut self.state,
                 read_buf: &mut self.read_buf,
-                row_desc_slot: &mut self.row_desc_slot,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
@@ -4888,8 +5058,15 @@ impl ActiveInner {
     /// DEF-279 Phase 2 Bundle Commit 11 — feed_bytes dispatch loop
     /// for Active. Thin delegate to
     /// [`feed_bytes_dispatch_active::<BOUNDED>`].
+    ///
+    /// DEF-279 follow-up (2026-05-18, architect Interpretation B):
+    /// `row_desc_slot` HOISTED off `ActiveInner` to outer
+    /// `<ActivePhase>::Extras` — caller (PgProtocol<ActivePhase>
+    /// method) sources from `&mut self.extras` via disjoint-field
+    /// borrow and passes here.
     pub(crate) fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
         &'r mut self,
+        row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
@@ -4898,7 +5075,7 @@ impl ActiveInner {
             ActiveDispatchContext {
                 state: &mut self.state,
                 read_buf: &mut self.read_buf,
-                row_desc_slot: &mut self.row_desc_slot,
+                row_desc_slot,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
@@ -4915,11 +5092,12 @@ impl ActiveInner {
     #[inline]
     pub(crate) fn feed_bytes_bounded<'w, 'r>(
         &'r mut self,
+        row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
     ) -> OutActions<'w, 'r> {
-        self.feed_bytes_impl::<true>(bytes, write_buf, max_dispatches)
+        self.feed_bytes_impl::<true>(row_desc_slot, bytes, write_buf, max_dispatches)
     }
 
     /// DEF-279 Phase 2 Bundle Commit 11 — append inbound bytes
@@ -4970,13 +5148,14 @@ impl ActiveInner {
                   trigger socket teardown"]
     pub(crate) fn advance_one_frame<'w, 'r>(
         &'r mut self,
+        row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
         write_buf: &'w mut WriteBuf,
     ) -> crate::action::FeedEvent<'w, 'r> {
         advance_one_frame_dispatch_active(
             ActiveDispatchContext {
                 state: &mut self.state,
                 read_buf: &mut self.read_buf,
-                row_desc_slot: &mut self.row_desc_slot,
+                row_desc_slot,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
@@ -4993,13 +5172,19 @@ impl ActiveInner {
     /// — the helper is state-agnostic (operates only on the four
     /// cell &muts + class). Same `#[inline]` for DEF-211 FAKE-01
     /// const-class specialisation by the inliner.
+    ///
+    /// DEF-279 follow-up (2026-05-18, architect Interpretation B):
+    /// `row_desc_slot` HOISTED off `ActiveInner`; this method now
+    /// takes the cell as a `&mut` parameter sourced from the outer
+    /// [`PgProtocol::extras`] by the caller.
     #[inline]
     pub(crate) fn clear_session_residue_for_class(
         &mut self,
+        row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
         class: crate::state::StatePushClass,
     ) {
         clear_session_residue_for_class_dispatch(
-            &mut self.row_desc_slot,
+            row_desc_slot,
             &mut self.session_params,
             &mut self.error_arena,
             &mut self.partial_assembly,
@@ -5097,6 +5282,7 @@ impl PgProtocol<ActivePhase> {
                     state_kind,
                     error_arena,
                 },
+                extras: (),
                 phase_marker: PhantomData,
             })
         } else {
@@ -5429,7 +5615,7 @@ impl PgProtocol<ActivePhase> {
     #[inline]
     #[must_use]
     pub fn current_row_desc(&self) -> Option<crate::decode::RowDescBorrow<'_>> {
-        self.inner.row_desc_slot
+        self.extras
             .as_ref()
             .map(crate::decode::RowDescBorrow::from_ref)
     }
@@ -5784,8 +5970,11 @@ impl PgProtocol<ActivePhase> {
         // DEF-246 Option α (2026-05-16):
         // `clear_session_residue_for_class` lives on `PgProtocolInner`;
         // route through `self.inner` directly.
+        //
+        // DEF-279 follow-up (2026-05-18): `row_desc_slot` HOISTED to
+        // outer `<ActivePhase>::Extras`.
         let entry_class = self.inner.state.push_class();
-        self.inner.clear_session_residue_for_class(entry_class);
+        self.inner.clear_session_residue_for_class(&mut self.extras, entry_class);
 
         // The stream value lives here on `iter_rows`'s stack frame.
         // Caller's closure receives `&mut stream` — a borrow, not
@@ -7639,7 +7828,14 @@ impl core::fmt::Debug for PgProtocol<ConnectingPhase> {
 
 impl core::fmt::Debug for PgProtocol<ActivePhase> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.inner.fmt(f)
+        // DEF-279 follow-up (2026-05-18): `row_desc_slot` HOISTED to
+        // outer `extras`. Surface its populated/empty state alongside
+        // the inner's debug projection.
+        f.debug_struct("PgProtocol")
+            .field("phase", &"ActivePhase")
+            .field("row_desc_slot_present", &self.extras.as_ref().is_some())
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
     }
 }
 
@@ -7906,6 +8102,7 @@ mod residue_policy_per_class_tests {
     fn fresh_active_proto() -> PgProtocol<ActivePhase> {
         PgProtocol {
             inner: _proto_init_leaf::fresh_active_inner(),
+            extras: _proto_init_leaf::fresh_active_row_desc_slot(),
             phase_marker: PhantomData,
         }
     }
@@ -7915,20 +8112,14 @@ mod residue_policy_per_class_tests {
     /// `error_arena` allocated. After the test we observe how each
     /// arm of `clear_session_residue_*` mutated them.
     ///
-    /// DEF-279 Phase 1a (2026-05-18): constraint tightened from
-    /// `<P: SealedPhase>` to `<P: SealedPhase<Inner = ActiveInner>>`
-    /// — the helper accesses inner fields that exist only on the
-    /// three non-Disconnected phases (Disconnected uses ZST
-    /// DisconnectedInner post-Bundle). Callers using
-    /// `<DisconnectedPhase>` constructed from `PgProtocol::new()` must
-    /// now drive through `push_startup` then `into_active` (legitimate
-    /// handshake path) OR use the
-    /// `_proto_init_leaf::fresh_inner()` bypass for `<ActivePhase>`
-    /// (test-only, pub(in crate::protocol)).
-    fn populate_residue<P: SealedPhase<Inner = ActiveInner>>(
-        proto: &mut PgProtocol<P>,
-    ) {
-        proto.inner.row_desc_slot._set_for_test(Some(RowDesc::EMPTY));
+    /// DEF-279 follow-up (2026-05-18, architect Interpretation B):
+    /// `row_desc_slot` HOISTED to outer `<ActivePhase>::Extras`;
+    /// helpers tighten to `PgProtocol<ActivePhase>` (was generic
+    /// `<P: SealedPhase<Inner = ActiveInner>>`) — only `<ActivePhase>`
+    /// monomorphisation has both ActiveInner AND the
+    /// RowDescSlotCell extras.
+    fn populate_residue(proto: &mut PgProtocol<ActivePhase>) {
+        proto.extras._set_for_test(Some(RowDesc::EMPTY));
         proto.inner.session_params._set_for_test(Some(dirty_session_params()));
         proto.inner.error_arena = Some(alloc::boxed::Box::new(
             crate::error_arena::ErrorArena::new(),
@@ -7937,20 +8128,16 @@ mod residue_policy_per_class_tests {
 
     /// Replace `proto.inner.state` with `Idle` so the destructor doesn't
     /// trip the in-flight `ReplyId<_>` Drop-guard at scope end.
-    /// DEF-279 Phase 1a (2026-05-18): constrained to `<P: SealedPhase<Inner = ActiveInner>>`.
-    fn quench_inflight<P: SealedPhase<Inner = ActiveInner>>(
-        proto: &mut PgProtocol<P>,
-    ) {
+    /// DEF-279 follow-up (2026-05-18): tightened to `PgProtocol<ActivePhase>`.
+    fn quench_inflight(proto: &mut PgProtocol<ActivePhase>) {
         let prev = core::mem::replace(&mut proto.inner.state, ActiveState::Idle);
         match prev.take_inflight_reply_raw_id() {
             Some(_) | None => {}
         }
     }
 
-    /// DEF-279 Phase 1a (2026-05-18): constrained to `<P: SealedPhase<Inner = ActiveInner>>`.
-    fn session_params_is_pristine<P: SealedPhase<Inner = ActiveInner>>(
-        proto: &PgProtocol<P>,
-    ) -> bool {
+    /// DEF-279 follow-up (2026-05-18): tightened to `PgProtocol<ActivePhase>`.
+    fn session_params_is_pristine(proto: &PgProtocol<ActivePhase>) -> bool {
         // DEF-211 INNO-01 (2026-05-04): trait method via `Pristine` import.
         // Inherent `__pristine_const` would also work but trait dispatch
         // here matches polymorphic intent (test helper takes any
@@ -7968,10 +8155,10 @@ mod residue_policy_per_class_tests {
         // Default state is `Idle` post-`fresh_inner()`.
         populate_residue(&mut proto);
         let class = proto.inner.state.push_class();
-        proto.inner.clear_session_residue_for_class(class);
+        proto.inner.clear_session_residue_for_class(&mut proto.extras, class);
 
         assert!(
-            proto.inner.row_desc_slot.is_none(),
+            proto.extras.is_none(),
             "Idle must clear row_desc_slot",
         );
         assert!(
@@ -7996,10 +8183,10 @@ mod residue_policy_per_class_tests {
         );
         populate_residue(&mut proto);
         let class = proto.inner.state.push_class();
-        proto.inner.clear_session_residue_for_class(class);
+        proto.inner.clear_session_residue_for_class(&mut proto.extras, class);
 
         assert!(
-            proto.inner.row_desc_slot.is_none(),
+            proto.extras.is_none(),
             "Errored must clear row_desc_slot",
         );
         assert!(
@@ -8027,10 +8214,13 @@ mod residue_policy_per_class_tests {
         let mut proto = fresh_active_proto();
         proto.inner.state = ActiveState::Idle;
         populate_residue(&mut proto);
-        proto.inner.clear_session_residue_for_class(crate::state::StatePushClass::Connecting);
+        proto.inner.clear_session_residue_for_class(
+            &mut proto.extras,
+            crate::state::StatePushClass::Connecting,
+        );
 
         assert!(
-            proto.inner.row_desc_slot.is_some(),
+            proto.extras.is_some(),
             "Connecting (StatePushClass::Connecting) must preserve row_desc_slot",
         );
         assert!(
@@ -8054,10 +8244,10 @@ mod residue_policy_per_class_tests {
         proto.inner.state = ActiveState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
         populate_residue(&mut proto);
         let class = proto.inner.state.push_class();
-        proto.inner.clear_session_residue_for_class(class);
+        proto.inner.clear_session_residue_for_class(&mut proto.extras, class);
 
         assert!(
-            proto.inner.row_desc_slot.is_some(),
+            proto.extras.is_some(),
             "PingAwaiting (StatePushClass::PingAwaiting) must preserve row_desc_slot",
         );
         assert!(
@@ -8079,10 +8269,10 @@ mod residue_policy_per_class_tests {
         };
         populate_residue(&mut proto);
         let class = proto.inner.state.push_class();
-        proto.inner.clear_session_residue_for_class(class);
+        proto.inner.clear_session_residue_for_class(&mut proto.extras, class);
 
         assert!(
-            proto.inner.row_desc_slot.is_some(),
+            proto.extras.is_some(),
             "BusyQuery (StatePushClass::BusyQuery) must preserve row_desc_slot",
         );
         assert!(
@@ -8662,6 +8852,7 @@ mod compute_push_tests {
         // the `phase_marker` is ZST without external construction.
         let mut proto: PgProtocol<ActivePhase> = PgProtocol {
             inner: _proto_init_leaf::fresh_active_inner(),
+            extras: _proto_init_leaf::fresh_active_row_desc_slot(),
             phase_marker: PhantomData,
         };
         let mut wb = WriteBuf::new();
