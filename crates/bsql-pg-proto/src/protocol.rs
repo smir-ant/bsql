@@ -954,18 +954,33 @@ pub struct ConnectingInner {
 /// (e.g. `DisconnectedInner` has no `state`/`read_buf`) and
 /// physically cannot construct a `DispatchContext` — tier-1 closure
 /// at the type level.
-pub(in crate::protocol) struct DispatchContext<'a> {
-    pub(in crate::protocol) state: &'a mut ProtoState,
-    pub(in crate::protocol) read_buf: &'a mut ReadBuf,
-    pub(in crate::protocol) row_desc_slot: &'a mut crate::schema_slot::RowDescSlotCell,
+/// DEF-279 Phase 1c Bundle Commit 5.5 (2026-05-18) — lifetime split.
+///
+/// `'state` covers the state `&mut` (lifted local in per-phase lift+lower
+/// wrappers). `'r` covers all other `&mut` refs that flow into
+/// [`OutActions<'_, 'r>`] via `materialise`. Independent lifetimes
+/// enable per-phase wrappers (Commit 6+) to provide a short-lived
+/// lifted `&mut ProtoState` (local owned `proto_state`) alongside
+/// outer-lifetime borrows for the data fields. Returns
+/// `OutActions<'w, 'r>` constrained only by `'r`, so the wrapper's
+/// projection of state back to per-phase form after the call does
+/// not constrain the return-borrow lifetime.
+///
+/// **Existing single-lifetime call sites** (`<ActivePhase>::feed_bytes`,
+/// `<ConnectingPhase>::feed_bytes`, etc.) infer `'state = 'r` from
+/// `&mut self` and compile unchanged.
+pub(in crate::protocol) struct DispatchContext<'state, 'r> {
+    pub(in crate::protocol) state: &'state mut ProtoState,
+    pub(in crate::protocol) read_buf: &'r mut ReadBuf,
+    pub(in crate::protocol) row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
     pub(in crate::protocol) session_params:
-        &'a mut crate::session_params_slot::SessionParamsCell,
+        &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
-        &'a mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+        &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     pub(in crate::protocol) partial_assembly:
-        &'a mut crate::partial_assembly::PartialAssemblyCell,
-    pub(in crate::protocol) backend_key: &'a mut crate::cancel::BackendKeyCell,
-    pub(in crate::protocol) malformed_count: &'a mut u32,
+        &'r mut crate::partial_assembly::PartialAssemblyCell,
+    pub(in crate::protocol) backend_key: &'r mut crate::cancel::BackendKeyCell,
+    pub(in crate::protocol) malformed_count: &'r mut u32,
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -3722,8 +3737,8 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
 /// slow path, `<ActivePhase>::feed_bytes`, `<ConnectingPhase>::feed_bytes`)
 /// is bit-equivalent to the pre-refactor code (asm-diff verified
 /// gate).
-pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'r, const BOUNDED: bool>(
-    ctx: DispatchContext<'r>,
+pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, const BOUNDED: bool>(
+    ctx: DispatchContext<'state, 'r>,
     bytes: &[u8],
     write_buf: &'w mut WriteBuf,
     max_dispatches: u16,
@@ -4223,8 +4238,8 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'r, const BOUNDED: bool>(
 #[must_use = "FeedEvent variants carry side-effect contracts: \
               SendBytes/Deliver MUST be processed; Fail/Close MUST \
               trigger socket teardown"]
-pub(in crate::protocol) fn advance_one_frame_dispatch<'w, 'r>(
-    ctx: DispatchContext<'r>,
+pub(in crate::protocol) fn advance_one_frame_dispatch<'w, 'state, 'r>(
+    ctx: DispatchContext<'state, 'r>,
     write_buf: &'w mut WriteBuf,
 ) -> crate::action::FeedEvent<'w, 'r> {
     use crate::action::{Action, FeedEvent};
