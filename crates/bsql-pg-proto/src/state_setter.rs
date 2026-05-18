@@ -59,6 +59,45 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
+// DEF-280 Bundle F Phase 1 (2026-05-18) — within-crate hostile-witness closure
+//
+// The `mod install_body_seal` module below is PRIVATE to `mod state_setter`
+// (no visibility keyword → private to parent). Combined with `InstallBody`
+// having `install_body_seal::InstallBodySealed` as a supertrait, this seals
+// the install-body trait against IN-CRATE callers outside this module.
+//
+// Pre-Bundle-F shape: `PostStateProof: sealed::Sealed { fn install_into(self, &mut ProtoState); }`.
+// `sealed::Sealed` is `pub(crate)` (not module-private), so any in-crate module
+// could write `impl Sealed for HostileWitness {} impl PostStateProof for
+// HostileWitness { fn install_into(self, state) { *state = arbitrary_variant; } }`
+// then mint a `StateSetter<HostileWitness>` via the generic `IdleState::into_setter::<W>`
+// and call `setter.install_post_state(HostileWitness)`, dispatching to the
+// hostile body. Tier-2-by-discipline within-crate.
+//
+// Post-Bundle-F: install bodies live in `impl InstallBody for *` blocks here in
+// `mod state_setter`. `InstallBody` has private supertrait `InstallBodySealed`.
+// Any in-crate caller outside state_setter attempting `impl InstallBody for
+// HostileWitness` fails E0277 (HostileWitness: InstallBodySealed not satisfied),
+// because writing `impl InstallBodySealed for HostileWitness` fails E0603
+// (mod install_body_seal is private to state_setter). Tier-1-by-construction
+// within-crate.
+//
+// `PostStateProof` becomes a pure marker (no method). It survives only for the
+// `#[diagnostic::on_unimplemented]` UX message and as the publicly-named
+// trait that PushCommand impls can satisfy at declaration time. The actual
+// installation surface is `InstallBody`, with bound tightened on
+// `StateSetter::install_post_state`, `StateSetter::install_errored`,
+// `IdleState::into_setter`, and `PushCommand::PostState`.
+mod install_body_seal {
+    /// Tier-1 closure: this trait + the containing module are
+    /// PRIVATE to `mod state_setter`. No in-crate code outside
+    /// state_setter can reach the module (E0603 on the path), so
+    /// no `impl InstallBodySealed for X` can be written from a sibling
+    /// module. Combined with `InstallBody: ... + InstallBodySealed`,
+    /// this seals `InstallBody` impls to state_setter only.
+    pub trait InstallBodySealed {}
+}
+
 /// Sealed witness trait for a post-push state install. Implementors
 /// are per-command witness types defined in
 /// [`crate::push_command`] alongside their per-command struct.
@@ -81,14 +120,57 @@ pub(crate) mod sealed {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a `PostStateProof` witness for a `PushCommand` post-state install",
     label = "valid witnesses live next to their command in `push_command.rs` (e.g. `PingAwaitingRfqInstall` for `Ping`, `StartupAwaitingAuthRequestInstall` for `Startup`, etc.)",
-    note = "`PostStateProof` is sealed crate-internal — each witness corresponds 1:1 to a `ProtoState` variant. To add a new command, define its struct in `push_command.rs` and add the matching `*Install` witness type with `impl PostStateProof` next to it (DEF-270 N-D pattern)"
+    note = "`PostStateProof` is sealed crate-internal — each witness corresponds 1:1 to a `ProtoState` variant. To add a new command, define its struct in `push_command.rs` and add the matching `*Install` witness type with `impl PostStateProof` next to it (DEF-270 N-D pattern). The accompanying [`InstallBody`] impl must be added in `state_setter.rs` (DEF-280 Bundle F)."
 )]
 pub(crate) trait PostStateProof: sealed::Sealed {
+    // DEF-280 Bundle F Phase 1: `fn install_into(self, state: &mut ProtoState)`
+    // moved to private [`InstallBody`] trait below. `PostStateProof` is now
+    // a pure marker — preserved for the `#[diagnostic::on_unimplemented]`
+    // UX message and as the publicly-named trait satisfied by `*Install`
+    // witnesses in `push_command.rs`. The actual install surface
+    // (`fn install(self, &mut ProtoState)`) lives on `InstallBody`, whose
+    // private supertrait `install_body_seal::InstallBodySealed` confines
+    // impls to state_setter only (tier-1 within-crate by-construction).
+}
+
+/// Tier-1 within-crate install-body trait. **PRIVATE supertrait sealed:**
+/// `InstallBody: ... + install_body_seal::InstallBodySealed`, and
+/// `install_body_seal` is `mod install_body_seal` (no visibility keyword)
+/// — private to `mod state_setter`. Any in-crate caller outside
+/// state_setter attempting `impl InstallBody for X` fails E0277
+/// (`X: InstallBodySealed` not satisfied), because writing
+/// `impl InstallBodySealed for X` fails E0603 (mod install_body_seal
+/// unreachable from siblings).
+///
+/// `install` consumes the witness and writes the matching `ProtoState`
+/// variant via `*state = ...`. Implementors are `#[inline]` since each
+/// call site is monomorphic and the body is a single (match +) assignment.
+///
+/// ## Bound at consumer surfaces
+///
+/// Tightened from `PostStateProof` → `InstallBody` on:
+/// - [`StateSetter::install_post_state`] (was the attacker-controllable
+///   dispatch site pre-Bundle-F)
+/// - [`StateSetter::install_errored`] (mirror closure on the failure
+///   transition; pre-Bundle-F any in-crate `StateSetter<HostileWitness>`
+///   could flip state to `Errored(_)` — limited blast radius but the
+///   same zombie-class hazard the audit table at lines 199-211
+///   was built to close on the feed-side)
+/// - [`IdleState::into_setter`] (declaration boundary closure: minting
+///   a `StateSetter<HostileWitness>` itself is now E0277 unless
+///   `HostileWitness: InstallBody` — unreachable for any non-state_setter
+///   author)
+/// - [`crate::push_command::PushCommand::PostState`] associated type bound
+///   (full type-level pairing: a future `impl PushCommand for X` with
+///   `type PostState = HostileWitness` is rejected at the trait-impl
+///   declaration site, not just at the call site)
+pub(crate) trait InstallBody: PostStateProof + install_body_seal::InstallBodySealed {
     /// Consume the witness and write the corresponding [`ProtoState`]
-    /// variant via `*state = ...`. Implementors should be `#[inline]`
-    /// since each call site is monomorphic and the body is a single
-    /// match + assignment.
-    fn install_into(self, state: &mut ProtoState);
+    /// variant via `*state = ...`. The body lives in state_setter only —
+    /// every `impl InstallBody for *Install { fn install(...) {...} }`
+    /// block is in this file. Hostile witnesses cannot supply a body
+    /// (sealed supertrait blocks the impl declaration).
+    fn install(self, state: &mut ProtoState);
 }
 
 /// Tier-1 witness binding a mutable borrow of [`ProtoState`] to a
@@ -113,12 +195,12 @@ pub(crate) trait PostStateProof: sealed::Sealed {
               dropping the setter without consuming leaves ProtoState in its \
               caller-provided value (Idle for push paths) instead of the post-push \
               transition the impl was supposed to perform"]
-pub(crate) struct StateSetter<'a, W: PostStateProof> {
+pub(crate) struct StateSetter<'a, W: InstallBody> {
     state: &'a mut ProtoState,
     _phantom: PhantomData<fn(W)>,
 }
 
-impl<'a, W: PostStateProof> StateSetter<'a, W> {
+impl<'a, W: InstallBody> StateSetter<'a, W> {
     /// Construct a new setter. **DEF-272 cluster γ (2026-05-10)**:
     /// constructor is `pub(in crate::state_setter)` — only callable
     /// from inside this module. The legitimate path to mint a setter
@@ -172,7 +254,7 @@ impl<'a, W: PostStateProof> StateSetter<'a, W> {
     /// is `PingAwaitingRfqInstall`.
     #[inline]
     pub(crate) fn install_post_state(self, proof: W) {
-        proof.install_into(self.state);
+        proof.install(self.state);
     }
 
     /// Consume the setter and transition the state to
@@ -518,8 +600,106 @@ impl<'a> IdleState<'a> {
     /// (private), so no caller outside this module can construct a
     /// setter without first acquiring an [`IdleState`].
     #[inline]
-    pub(crate) fn into_setter<W: PostStateProof>(self) -> StateSetter<'a, W> {
+    pub(crate) fn into_setter<W: InstallBody>(self) -> StateSetter<'a, W> {
         StateSetter::new(self.state)
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-280 Bundle F Phase 1 (2026-05-18) — InstallBody impls
+//
+// All 7 install bodies live HERE (not in push_command.rs) because
+// `mod install_body_seal::InstallBodySealed` is private to state_setter.
+// Any in-crate caller outside this module attempting `impl InstallBody
+// for *Install` fails E0277 (witness: InstallBodySealed not satisfied),
+// because writing `impl InstallBodySealed for witness` fails E0603
+// (mod install_body_seal unreachable). Tier-1 within-crate by-construction.
+//
+// Pre-Bundle-F these bodies lived inside `impl PostStateProof for *Install`
+// blocks in push_command.rs, where any in-crate author could mint a
+// HostileWitness and supply an arbitrary `install_into` body. The trait
+// split moves the install-code authority to state_setter alone.
+//
+// Each witness type's fields are `pub(crate)`, so state_setter can read
+// them. The Cargo cross-module type reference (state_setter → push_command
+// for type names; push_command → state_setter for the InstallBody bound on
+// PushCommand::PostState) is non-cyclic at the type level (no recursive
+// trait bounds) and Rust resolves it normally.
+// ═════════════════════════════════════════════════════════════════════
+
+impl install_body_seal::InstallBodySealed for crate::push_command::PingAwaitingRfqInstall {}
+impl InstallBody for crate::push_command::PingAwaitingRfqInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        *state = ProtoState::PingAwaitingRfq(self.reply);
+    }
+}
+
+impl install_body_seal::InstallBodySealed for crate::push_command::StartupPostInstall {}
+impl InstallBody for crate::push_command::StartupPostInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        *state = match self {
+            crate::push_command::StartupPostInstall::Trust { reply } => {
+                ProtoState::ConnectingStartupTrust { reply }
+            }
+            crate::push_command::StartupPostInstall::Scram { reply, scram } => {
+                ProtoState::ConnectingStartupScram { reply, scram }
+            }
+            crate::push_command::StartupPostInstall::Cleartext { reply, password } => {
+                ProtoState::ConnectingStartupCleartext { reply, password }
+            }
+            crate::push_command::StartupPostInstall::Md5 { reply, handshake } => {
+                ProtoState::ConnectingStartupMd5 { reply, handshake }
+            }
+        };
+    }
+}
+
+impl install_body_seal::InstallBodySealed for crate::push_command::SimpleQueryAwaitingFirstResponseInstall {}
+impl InstallBody for crate::push_command::SimpleQueryAwaitingFirstResponseInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        *state = ProtoState::SimpleQueryAwaitingFirstResponse(self.reply);
+    }
+}
+
+impl install_body_seal::InstallBodySealed for crate::push_command::ParseAwaitingParseCompleteInstall {}
+impl InstallBody for crate::push_command::ParseAwaitingParseCompleteInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        *state = ProtoState::ParseAwaitingParseComplete(self.reply);
+    }
+}
+
+impl install_body_seal::InstallBodySealed for crate::push_command::DescribeStatementAwaitingParamDescInstall {}
+impl InstallBody for crate::push_command::DescribeStatementAwaitingParamDescInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        *state = ProtoState::DescribeStatementAwaitingParamDesc(self.reply);
+    }
+}
+
+impl install_body_seal::InstallBodySealed for crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall {}
+impl InstallBody for crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        *state = ProtoState::DescribePortalAwaitingRowDescOrNoData(self.reply);
+    }
+}
+
+impl install_body_seal::InstallBodySealed for crate::push_command::BindExecutePostInstall {}
+impl InstallBody for crate::push_command::BindExecutePostInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        *state = match self {
+            crate::push_command::BindExecutePostInstall::Dml { reply } => {
+                ProtoState::BindExecuteAwaitingBindCompleteDml(reply)
+            }
+            crate::push_command::BindExecutePostInstall::Select { reply } => {
+                ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }
+            }
+        };
     }
 }
 
@@ -535,5 +715,26 @@ mod tests {
     #[test]
     fn seal_pin_anchor() {
         // Anchor for `git grep "state_setter.*seal"` searches.
+    }
+
+    /// DEF-280 Bundle F Phase 1 (2026-05-18) — InstallBody seal pin
+    /// anchor. The `mod install_body_seal` module is PRIVATE to
+    /// `mod state_setter` (no visibility keyword). External crates AND
+    /// in-crate siblings cannot reach
+    /// `state_setter::install_body_seal::InstallBodySealed`, so
+    /// `impl InstallBody for HostileWitness` is structurally rejected
+    /// (E0277: HostileWitness: InstallBodySealed not satisfied; the
+    /// required `impl InstallBodySealed for HostileWitness` fails E0603
+    /// at the path). All 7 legitimate `impl InstallBody for *Install`
+    /// blocks live in this file (above the `tests` module).
+    ///
+    /// Negative-bound regression pin: see `push_command::tests::
+    /// bundle_f_hostile_witness_install_body_absent` — uses the no-dep
+    /// ambiguous-blanket-impl trick (mirror of `lib.rs:535`'s
+    /// `assert_not_sync`) to assert at compile time that a HostileWitness
+    /// constructed outside state_setter cannot satisfy InstallBody.
+    #[test]
+    fn install_body_seal_pin_anchor() {
+        // Anchor for `git grep "state_setter.*install_body_seal"` searches.
     }
 }

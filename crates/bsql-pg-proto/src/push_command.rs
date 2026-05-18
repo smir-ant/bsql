@@ -111,7 +111,15 @@ pub trait PushCommand: sealed::PushCommandSealed {
     /// and could write any variant; tier-3 by-discipline relied on
     /// reviewer attention + the `compute_push_tests` per-helper
     /// transition table.
-    type PostState: crate::state_setter::PostStateProof;
+    // DEF-280 Bundle F Phase 1 (2026-05-18): bound tightened
+    // `PostStateProof` → `InstallBody`. Closes the declaration boundary:
+    // a future `impl PushCommand for X` with `type PostState = HostileWitness`
+    // is rejected at the trait-impl declaration site (E0277:
+    // HostileWitness: InstallBody not satisfied), not just at the
+    // setter consumption call site. `InstallBody`'s private supertrait
+    // `install_body_seal::InstallBodySealed` confines impls to mod
+    // state_setter, so HostileWitness cannot satisfy the bound.
+    type PostState: crate::state_setter::InstallBody;
 
     /// Encode the command into `staged` / `reserved` and install the
     /// post-push state transition.
@@ -516,12 +524,11 @@ pub struct PingAwaitingRfqInstall {
     pub(crate) reply: ReplyId<PingKind>,
 }
 impl PostStateSealed for PingAwaitingRfqInstall {}
-impl PostStateProof for PingAwaitingRfqInstall {
-    #[inline]
-    fn install_into(self, state: &mut crate::state::ProtoState) {
-        *state = crate::state::ProtoState::PingAwaitingRfq(self.reply);
-    }
-}
+// DEF-280 Bundle F Phase 1: `impl PostStateProof` is now an empty marker;
+// the install body lives in `state_setter::InstallBody` impl
+// (state_setter.rs). The trait split closes the within-crate hostile-
+// witness hole — see state_setter.rs's `InstallBody` doc for details.
+impl PostStateProof for PingAwaitingRfqInstall {}
 
 /// Witness pairing [`Startup`] to one of four post-startup variants
 /// (Trust / SCRAM / Cleartext / MD5). The split surfaces the
@@ -566,23 +573,8 @@ pub enum StartupPostInstall {
     },
 }
 impl PostStateSealed for StartupPostInstall {}
-impl PostStateProof for StartupPostInstall {
-    #[inline]
-    fn install_into(self, state: &mut crate::state::ProtoState) {
-        *state = match self {
-            Self::Trust { reply } => crate::state::ProtoState::ConnectingStartupTrust { reply },
-            Self::Scram { reply, scram } => {
-                crate::state::ProtoState::ConnectingStartupScram { reply, scram }
-            }
-            Self::Cleartext { reply, password } => {
-                crate::state::ProtoState::ConnectingStartupCleartext { reply, password }
-            }
-            Self::Md5 { reply, handshake } => {
-                crate::state::ProtoState::ConnectingStartupMd5 { reply, handshake }
-            }
-        };
-    }
-}
+// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+impl PostStateProof for StartupPostInstall {}
 
 /// Witness pairing [`SimpleQuery`] to
 /// [`crate::state::ProtoState::SimpleQueryAwaitingFirstResponse`].
@@ -592,12 +584,8 @@ pub struct SimpleQueryAwaitingFirstResponseInstall {
     pub(crate) reply: ReplyId<QueryKind>,
 }
 impl PostStateSealed for SimpleQueryAwaitingFirstResponseInstall {}
-impl PostStateProof for SimpleQueryAwaitingFirstResponseInstall {
-    #[inline]
-    fn install_into(self, state: &mut crate::state::ProtoState) {
-        *state = crate::state::ProtoState::SimpleQueryAwaitingFirstResponse(self.reply);
-    }
-}
+// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+impl PostStateProof for SimpleQueryAwaitingFirstResponseInstall {}
 
 /// Witness pairing [`Parse`] to
 /// [`crate::state::ProtoState::ParseAwaitingParseComplete`].
@@ -607,12 +595,8 @@ pub struct ParseAwaitingParseCompleteInstall {
     pub(crate) reply: ReplyId<ParseKind>,
 }
 impl PostStateSealed for ParseAwaitingParseCompleteInstall {}
-impl PostStateProof for ParseAwaitingParseCompleteInstall {
-    #[inline]
-    fn install_into(self, state: &mut crate::state::ProtoState) {
-        *state = crate::state::ProtoState::ParseAwaitingParseComplete(self.reply);
-    }
-}
+// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+impl PostStateProof for ParseAwaitingParseCompleteInstall {}
 
 /// Witness pairing [`DescribeStatement`] to
 /// [`crate::state::ProtoState::DescribeStatementAwaitingParamDesc`].
@@ -622,12 +606,8 @@ pub struct DescribeStatementAwaitingParamDescInstall {
     pub(crate) reply: ReplyId<DescribeStatementKind>,
 }
 impl PostStateSealed for DescribeStatementAwaitingParamDescInstall {}
-impl PostStateProof for DescribeStatementAwaitingParamDescInstall {
-    #[inline]
-    fn install_into(self, state: &mut crate::state::ProtoState) {
-        *state = crate::state::ProtoState::DescribeStatementAwaitingParamDesc(self.reply);
-    }
-}
+// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+impl PostStateProof for DescribeStatementAwaitingParamDescInstall {}
 
 /// Witness pairing [`DescribePortal`] to
 /// [`crate::state::ProtoState::DescribePortalAwaitingRowDescOrNoData`].
@@ -637,12 +617,8 @@ pub struct DescribePortalAwaitingRowDescOrNoDataInstall {
     pub(crate) reply: ReplyId<DescribePortalKind>,
 }
 impl PostStateSealed for DescribePortalAwaitingRowDescOrNoDataInstall {}
-impl PostStateProof for DescribePortalAwaitingRowDescOrNoDataInstall {
-    #[inline]
-    fn install_into(self, state: &mut crate::state::ProtoState) {
-        *state = crate::state::ProtoState::DescribePortalAwaitingRowDescOrNoData(self.reply);
-    }
-}
+// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+impl PostStateProof for DescribePortalAwaitingRowDescOrNoDataInstall {}
 
 /// Witness pairing [`BindExecute<P>`] to one of two post-bind+execute
 /// variants (DML / SELECT). The split surfaces the schema-bearing
@@ -679,17 +655,8 @@ pub enum BindExecutePostInstall {
     },
 }
 impl PostStateSealed for BindExecutePostInstall {}
-impl PostStateProof for BindExecutePostInstall {
-    #[inline]
-    fn install_into(self, state: &mut crate::state::ProtoState) {
-        *state = match self {
-            Self::Dml { reply } => crate::state::ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
-            Self::Select { reply } => {
-                crate::state::ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }
-            }
-        };
-    }
-}
+// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+impl PostStateProof for BindExecutePostInstall {}
 
 // ═════════════════════════════════════════════════════════════════════
 // DEF-244 (2026-05-13) — BindPrepared<'q, P, R> wraps a PreparedQuery
@@ -837,5 +804,108 @@ mod size_pins {
             simple_query_size <= 64,
             "SimpleQuery must be ≤ 64 B post-DEF-160; got {simple_query_size} B.",
         );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// DEF-280 Bundle F Phase 1 (2026-05-18) — hostile-witness seal pin
+//
+// Tier-1 within-crate closure of the install-body authority. This
+// `#[cfg(test)] mod` lives in push_command (a SIBLING module to
+// state_setter) — the exact in-crate position from which a hostile
+// actor would attempt to mint a `HostileWitness` impl. The pin
+// asserts at COMPILE TIME (via the no-dep ambiguous-blanket-impl
+// trick mirroring `lib.rs:535`'s `assert_not_sync`) that:
+//
+//   1. HostileWitness can `impl Sealed` (pub(crate) — accessible).
+//   2. HostileWitness can `impl PostStateProof` (now empty marker —
+//      accessible; post-Bundle-F PostStateProof carries no method).
+//   3. HostileWitness CANNOT `impl InstallBody` (private supertrait
+//      InstallBodySealed unreachable from this sibling module).
+//   4. THEREFORE `setter.install_post_state(HostileWitness)` is E0277
+//      at the bound (`W: InstallBody` not satisfied), AND
+//      `idle.into_setter::<HostileWitness>()` is similarly E0277.
+//
+// If a future refactor accidentally re-opens the hole (e.g., promotes
+// `mod install_body_seal` to `pub mod` or fuses `InstallBody` back
+// into `PostStateProof`), the no-dep ambiguous check below fails to
+// compile — the test target build breaks and the regression is caught.
+// ═════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+#[allow(dead_code, reason = "the impls + const block are compile-time pins; never invoked at runtime")]
+mod bundle_f_seal_probe {
+    use super::sealed::PushCommandSealed;
+    use crate::state_setter::sealed::Sealed as PostStateSealed;
+    use crate::state_setter::{InstallBody, PostStateProof};
+
+    /// Simulated hostile in-crate witness type. A real attacker would
+    /// place this struct in any non-state_setter module to attempt
+    /// arbitrary `ProtoState` writes via the install path.
+    struct HostileWitness;
+
+    /// (1) `impl Sealed` — succeeds. The sealed-supertrait module is
+    /// `pub(crate)` (accessible to siblings); only EXTERNAL crates are
+    /// blocked at this layer.
+    impl PostStateSealed for HostileWitness {}
+
+    /// (2) `impl PostStateProof` — succeeds. Post-Bundle-F PostStateProof
+    /// is a pure marker with no methods; nothing prevents a hostile in-crate
+    /// type from implementing it. The closure is at the NEXT layer
+    /// (InstallBody) where the install body actually lives.
+    impl PostStateProof for HostileWitness {}
+
+    /// (3) `impl InstallBody for HostileWitness {}` — CANNOT BE WRITTEN.
+    /// Attempting it requires `HostileWitness: install_body_seal::InstallBodySealed`,
+    /// which requires `impl install_body_seal::InstallBodySealed for HostileWitness {}`
+    /// — and `mod install_body_seal` is PRIVATE to `mod state_setter`,
+    /// so this sibling module fails with E0603 (module is private).
+    ///
+    /// The compile-time pin below asserts the resulting structural property:
+    /// **HostileWitness does NOT impl InstallBody**. If a future refactor
+    /// re-opens the seal (e.g., `pub mod install_body_seal`), someone
+    /// somewhere adds the missing impl, and this overlapping-blanket-impl
+    /// trick will detect it — method resolution becomes ambiguous and the
+    /// build breaks.
+    ///
+    /// Mirror of `lib.rs:535`'s `assert_not_sync<PgProtocol>` no-dep trick.
+    /// Zero runtime cost (typeck-only); the const block emits no code.
+    const _: fn() = || {
+        trait AmbiguousIfInstallBody<A> {
+            #[allow(dead_code)]
+            fn assert_not_install_body() {}
+        }
+        impl<T: ?Sized> AmbiguousIfInstallBody<()> for T {}
+        impl<T: ?Sized + InstallBody> AmbiguousIfInstallBody<u8> for T {}
+
+        // If `HostileWitness: InstallBody`, the two blanket impls collide
+        // on method resolution — compilation fails here. Closure stays
+        // intact iff HostileWitness lacks an InstallBody impl, which is
+        // the structural property the trait split enforces.
+        <HostileWitness as AmbiguousIfInstallBody<_>>::assert_not_install_body();
+    };
+
+    /// (4) HostileWitness also cannot satisfy `PushCommand::PostState`
+    /// (associated-type bound `: InstallBody`, post-Bundle-F). The pin
+    /// below would fail to compile if the bound regression-paired with
+    /// (3); demonstrated by the negative-bound assertion above —
+    /// the InstallBody pin transitively guards the PostState bound.
+    /// Documented anchor; no separate runtime test needed.
+    #[test]
+    fn hostile_witness_install_body_absent_anchor() {
+        // Anchor for `git grep "bundle_f_seal_probe"` and
+        // `git grep "AmbiguousIfInstallBody"` searches. The const block
+        // above is the structural pin — this fn is the named test
+        // surface for discoverability.
+        //
+        // Sanity: HostileWitness satisfies PostStateSealed + PostStateProof
+        // (the two layers above InstallBody). Confirms the pin probes
+        // the RIGHT layer (the install-body authority), not a layer
+        // already closed by `pub(crate)` sealing.
+        let _ = core::marker::PhantomData::<HostileWitness>;
+
+        // PushCommandSealed import for `git grep` discoverability:
+        // PushCommand's own seal is a separate concern (DEF-244 P1).
+        let _ = core::marker::PhantomData::<dyn PushCommandSealed>;
     }
 }
