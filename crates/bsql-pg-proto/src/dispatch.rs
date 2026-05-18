@@ -221,6 +221,128 @@ fn install_errored(
     DispatchOutcome::Errored { reply_id, cause }
 }
 
+/// DEF-279 Phase 1c Bundle Commit 5 — per-phase mirror of
+/// [`install_errored`] for [`crate::state::ConnectingState`].
+///
+/// Used by [`connecting_dispatch`] (and future per-phase dispatch
+/// helpers) when a Connecting arm needs to mark the state Errored.
+/// Returns the same [`DispatchOutcome::Errored`] shape — the state-
+/// agnostic `reply_id` + `cause` carry to the caller.
+///
+/// **`#[allow(dead_code)]`** until Commit 6+ wires `connecting_dispatch`
+/// into the per-phase Inner method bodies.
+#[allow(dead_code)]
+fn install_errored_connecting(
+    state: &mut crate::state::ConnectingState,
+    reply_id: Option<core::num::NonZeroU64>,
+    cause: ProtocolError,
+) -> DispatchOutcome {
+    *state = crate::state::ConnectingState::Errored(cause.state_kind());
+    DispatchOutcome::Errored { reply_id, cause }
+}
+
+/// DEF-279 Phase 1c Bundle Commit 5 — per-phase dispatch entry for
+/// `<ConnectingPhase>`'s `ConnectingInner`.
+///
+/// **Lift+lower approach**: rather than duplicating ~310 LoC of
+/// Connecting dispatch arms, this thin wrapper lifts the per-phase
+/// `ConnectingState` to [`ProtoState`] for the shared
+/// [`dispatch`] body, then projects back. Runtime cost: one
+/// `mem::replace` + one `Into` + one `TryFrom` per frame — ~5-10 ns
+/// overhead amortised over the dispatch loop's per-frame ~50-100 ns
+/// cost.
+///
+/// **Tier-1 closure preserved at the per-phase wrapper boundary**:
+/// the caller (`ConnectingInner.feed_bytes_impl`) holds a
+/// `ConnectingState` typed reference — the type system prevents
+/// the caller from constructing a non-Connecting state. The
+/// lift converts to `ProtoState` only INSIDE this function (a
+/// transient widening for the shared dispatch's match arms);
+/// the lower projects back to `ConnectingState` before returning.
+/// The shared `dispatch` body's writes are constrained by the
+/// state-variant set it can construct (only the variants that
+/// were originally reachable from Connecting transitions).
+///
+/// **HandshakeReady transition signal**: the only legitimate non-
+/// Connecting state the shared dispatch can produce from a
+/// Connecting LHS is `ProtoState::Idle` (post-handshake, written
+/// by the `(PostAuthHaveKey, RFQ)` arm). The lower-step catches
+/// this and translates to [`crate::state::ConnectingState::HandshakeReady`]
+/// — the signal that `<ConnectingPhase>::into_active` observes.
+///
+/// **`#[allow(dead_code)]`** until Commit 6+ wires this into
+/// `ConnectingInner.feed_bytes_impl`.
+#[allow(dead_code)]
+pub(crate) fn connecting_dispatch(
+    state: &mut crate::state::ConnectingState,
+    tag: crate::wire::InboundTag,
+    payload: &[u8],
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+    row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+    error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    backend_key_slot: &mut crate::cancel::BackendKeyCell,
+) -> DispatchOutcome {
+    use crate::state::{ConnectingState, WrongPhase};
+
+    // Sentinel placeholder during the lift window. Using Framing as
+    // a sentinel kind is a transient placeholder — it gets overwritten
+    // by the lower step (either with the legitimate new state or with
+    // a real Errored kind from `install_errored`). Choice of kind
+    // doesn't matter semantically because the slot is always
+    // overwritten before any reader sees it.
+    let sentinel = ConnectingState::Errored(
+        crate::error::StateErrorKind::from_kind_or_internal(
+            crate::error::ErrorKind::Framing,
+        ),
+    );
+    let connecting_state = core::mem::replace(state, sentinel);
+    let mut proto_state: ProtoState = connecting_state.into();
+
+    let outcome = dispatch(
+        &mut proto_state,
+        tag,
+        payload,
+        reserved,
+        row_desc_slot,
+        error_arena_slot,
+        backend_key_slot,
+    );
+
+    // Project back. The shared `dispatch` from a Connecting LHS can
+    // produce: a Connecting* variant (handshake progression),
+    // ProtoState::Errored (failure → install_errored), or
+    // ProtoState::Idle (only from the (PostAuthHaveKey, RFQ) success
+    // arm — handshake complete).
+    match ConnectingState::try_from(proto_state) {
+        Ok(cs) => *state = cs,
+        Err(WrongPhase { recovered }) => {
+            // Only Idle is the legitimate non-Connecting outcome.
+            // Other non-Connecting variants would be a dispatch.rs
+            // bug — defensive Errored tears down the connection.
+            match recovered {
+                ProtoState::Idle => *state = ConnectingState::HandshakeReady,
+                other => {
+                    // Drain any ReplyId<K> from the recovered variant
+                    // to honour Drop-guard discipline before dropping.
+                    // Returns Copy `Option<NonZeroU64>` — `match`-discard
+                    // form per crate convention (forbid-bundle bans
+                    // `let _ = ...` for `#[must_use]` returns).
+                    match other.take_inflight_reply_raw_id() {
+                        Some(_) | None => {}
+                    }
+                    *state = ConnectingState::Errored(
+                        crate::error::StateErrorKind::from_kind_or_internal(
+                            crate::error::ErrorKind::Internal,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    outcome
+}
+
 // DEF-177 + DEF-184 (B21/C6) `install_internal_bug` DELETED 2026-04-25
 // (DEF-188 cascade): the helper's only callers were the three
 // `SchemaArenaAllocFull` arms in dispatch (one per RowDescription
