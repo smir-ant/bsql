@@ -110,3 +110,14 @@ fn p_e_9_feed_inbound_result_must_use() {
     trybuild::TestCases::new()
         .compile_fail("tests/def246_phase2-4_compile_fail/p_e_9_feed_inbound_result_must_use.rs");
 }
+
+/// **P-E-10** (Tier-3 audit #33) — `DispatchContext<'state, 'r>` is
+/// `pub(in crate::protocol)`; external `use` fails to resolve the
+/// type. Pins the within-crate tier-1 closure of dispatch-context
+/// construction — external crates cannot name the type, cannot
+/// import it, cannot construct it. Expected: E0603 / E0432.
+#[test]
+fn p_e_10_dispatch_context_private() {
+    trybuild::TestCases::new()
+        .compile_fail("tests/def246_phase2-4_compile_fail/p_e_10_dispatch_context_private.rs");
+}
