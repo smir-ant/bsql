@@ -38,8 +38,9 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ApplicationName, ConnectionStatus, Credentials, DatabaseName, Ident, IdentError,
-    PgProtocol, PingKind, ProtoState, ProtocolError, SessionParams, StartupKind,
+    Action, ApplicationName, ConnectingState, ConnectionStatus, Credentials, DatabaseName,
+    Ident, IdentError, PgProtocol, PingKind, ProtoState, ProtocolError, SessionParams,
+    StartupKind,
 };
 
 mod common;
@@ -267,7 +268,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
 }
 
 /// DEF-184 (A10/B22 revert 2026-04-24): pin that `push_startup` with
-/// SCRAM credentials lands in `ProtoState::ConnectingStartupScram`
+/// SCRAM credentials lands in `ConnectingState::StartupScram`
 /// with the `ScramSession` carried INLINE in the variant — tier-1
 /// variant-carries-field invariant (CREDO §1: safety > tier-1 > perf).
 ///
@@ -302,7 +303,7 @@ fn scram_push_startup_carries_scram_session_inline() {
         Err(f) => panic!("push_startup must succeed for SCRAM, got {:?}", f.cause),
     };
     assert!(
-        matches!(proto_connecting.state(), ProtoState::ConnectingStartupScram { .. }),
+        matches!(proto_connecting.state(), ConnectingState::StartupScram { .. }),
         "SCRAM push_startup must land in ConnectingStartupScram carrying inline scram, got {:?}",
         proto_connecting.state(),
     );
@@ -467,7 +468,7 @@ fn backend_key_data_wrong_payload_size_is_classified() {
     _ = proto.feed_bytes(&auth_ok_frame, &mut wb);
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthAwaitingKey(_),
+        ConnectingState::PostAuthAwaitingKey(_),
     ));
 
     // Feed a BackendKeyData frame with a 4-byte body (wrong — spec says 8).
@@ -487,5 +488,5 @@ fn backend_key_data_wrong_payload_size_is_classified() {
         },
         other => panic!("unexpected: {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 }

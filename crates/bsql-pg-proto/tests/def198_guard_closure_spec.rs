@@ -20,7 +20,7 @@
 //! | Idle            | `ProtoState::Idle`                       | `Some(_)` | `Ready`           |
 //! | PingAwaiting    | `ProtoState::PingAwaitingRfq(_)`         | `None`    | `Busy`            |
 //! | BusyQuery       | `ProtoState::SimpleQueryAwaitingFirst..` | `None`    | `Busy`            |
-//! | Connecting      | `ProtoState::ConnectingStartupTrust { .. }` | `None`  | `Handshaking`     |
+//! | Connecting      | `ConnectingState::StartupTrust { .. }` | `None`  | `Handshaking`     |
 //! | Errored         | `ProtoState::Errored(_)`                 | `None`    | `Errored(_)`      |
 //!
 //! The per-ProtoState-variant exhaustive grid lives in protocol.rs's
@@ -43,8 +43,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectionStatus, Credentials, Ident, PgProtocol, PingKind, ProtoState,
-    QueryKind, StartupKind, WriteBuf,
+    Action, ConnectingState, ConnectionStatus, Credentials, Ident, PgProtocol, PingKind,
+    ProtoState, QueryKind, StartupKind, WriteBuf,
     wire::TAG_READY_FOR_QUERY,
 };
 
@@ -205,7 +205,7 @@ fn def198_connecting_startup_classifies_handshaking() {
 
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingStartupTrust { .. },
+        ConnectingState::StartupTrust { .. },
     ));
     assert!(
         proto.as_ready().is_none(),

@@ -23,8 +23,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_pg_proto::{
-    Action, ConnectingPhase, ConnectionStatus, Credentials, DisconnectedPhase, Ident,
-    PgProtocol, Password, PingKind, ProtoState, ProtocolError, Reply, Sensitive,
+    Action, ConnectingPhase, ConnectingState, ConnectionStatus, Credentials, DisconnectedPhase,
+    Ident, PgProtocol, Password, PingKind, ProtoState, ProtocolError, Reply, Sensitive,
     StartupKind,
 };
 use core::num::NonZeroU64;
@@ -236,7 +236,7 @@ fn trust_auth_handshake_end_to_end() {
     }
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingStartupTrust { .. }
+        ConnectingState::StartupTrust { .. }
     ));
 
     // Feed AuthenticationOk.
@@ -244,7 +244,7 @@ fn trust_auth_handshake_end_to_end() {
     assert_eq!(out.len(), 0, "AuthOk produces no actions (state transition only)");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthAwaitingKey(_)
+        ConnectingState::PostAuthAwaitingKey(_)
     ));
 
     // Feed ParameterStatus messages.
@@ -258,7 +258,7 @@ fn trust_auth_handshake_end_to_end() {
     assert_eq!(out.len(), 0);
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthHaveKey { .. }
+        ConnectingState::PostAuthHaveKey { .. }
     ));
 
     // Feed more ParameterStatus after BackendKeyData (allowed).
@@ -282,7 +282,7 @@ fn trust_auth_handshake_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ConnectingState::HandshakeReady));
 
     // Verify session params were recorded.
     assert_eq!(
@@ -632,7 +632,7 @@ fn connecting_states_become_errored_on_bad_frame() {
         }
         other => panic!("unexpected: {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 
     // Post-terminal frames are dropped silently.
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
@@ -745,7 +745,7 @@ fn scram_sha256_handshake_end_to_end() {
             "StartupMessage protocol version must be 3.0 (196608)",
         );
     }
-    assert!(matches!(proto.state(), ProtoState::ConnectingStartupScram { .. }));
+    assert!(matches!(proto.state(), ConnectingState::StartupScram { .. }));
 
     // Step 2: Server sends AuthenticationSASL with SCRAM-SHA-256.
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
@@ -757,7 +757,7 @@ fn scram_sha256_handshake_end_to_end() {
     };
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingScramAwaitingServerFirst { .. }
+        ConnectingState::ScramAwaitingServerFirst { .. }
     ));
 
     // Step 3: Extract client nonce from SASLInitialResponse.
@@ -798,7 +798,7 @@ fn scram_sha256_handshake_end_to_end() {
     }
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingScramAwaitingServerFinal { .. }
+        ConnectingState::ScramAwaitingServerFinal { .. }
     ));
 
     // Step 6: Compute the expected server signature.
@@ -835,7 +835,7 @@ fn scram_sha256_handshake_end_to_end() {
     assert_eq!(out.len(), 0, "SASLFinal → state transition only (awaiting AuthOk)");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingScramAwaitingAuthOk(_)
+        ConnectingState::ScramAwaitingAuthOk(_)
     ));
 
     // Step 8: Feed AuthenticationOk.
@@ -843,7 +843,7 @@ fn scram_sha256_handshake_end_to_end() {
     assert_eq!(out.len(), 0, "AuthOk after SCRAM → post-auth chain");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthAwaitingKey(_)
+        ConnectingState::PostAuthAwaitingKey(_)
     ));
 
     // Step 9: Complete post-auth chain.
@@ -867,7 +867,7 @@ fn scram_sha256_handshake_end_to_end() {
         }
         other => panic!("expected DeliverReply(StartupComplete), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ConnectingState::HandshakeReady));
 }
 
 /// Invariant (spec): SCRAM server signature mismatch → classified error.
@@ -1181,8 +1181,8 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     _ = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
     _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
-        "handshake should land in Idle, got {:?}",
+        matches!(proto.state(), ConnectingState::HandshakeReady),
+        "handshake should land in HandshakeReady, got {:?}",
         proto.state(),
     );
 
@@ -1193,8 +1193,8 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     let out = proto.feed_bytes(&param_status_frame("TimeZone", "America/New_York"), &mut wb);
     assert_eq!(out.len(), 0, "unsolicited PS in Idle emits no actions");
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
-        "state must remain Idle after unsolicited PS, got {:?}",
+        matches!(proto.state(), ConnectingState::HandshakeReady),
+        "state must remain HandshakeReady after unsolicited PS, got {:?}",
         proto.state(),
     );
     assert_eq!(
@@ -1302,7 +1302,7 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
     _ = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingScramAwaitingServerFirst { .. },
+        ConnectingState::ScramAwaitingServerFirst { .. },
     ));
 
     // Unsolicited ParameterStatus during SCRAM — must be classified.
@@ -1318,7 +1318,7 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
         }
         other => panic!("unexpected action sequence: {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 }
 
 /// Invariant (spec): ParameterStatus arriving in a pre-auth state
@@ -1349,7 +1349,7 @@ fn param_status_during_pre_auth_is_unexpected() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Errored(_)));
+    assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 }
 
 /// DEF-184 (B17 fallback-hygiene catch): ParameterStatus with
@@ -1376,8 +1376,8 @@ fn param_status_missing_trailing_nul_classified_as_malformed() {
     let _ = proto.feed_bytes(&backend_key_data_frame(12345, 67890), &mut wb);
     let _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
-        "handshake must complete to Idle — got {:?}",
+        matches!(proto.state(), ConnectingState::HandshakeReady),
+        "handshake must complete to HandshakeReady — got {:?}",
         proto.state(),
     );
 
@@ -1397,7 +1397,7 @@ fn param_status_missing_trailing_nul_classified_as_malformed() {
     // Classified silent-skip — no action emitted, state unchanged.
     assert_eq!(out.len(), 0, "malformed PS is silently dropped, not an action");
     assert!(
-        matches!(proto.state(), ProtoState::Idle),
+        matches!(proto.state(), ConnectingState::HandshakeReady),
         "state preserved through malformed PS",
     );
     // Critical: server_version must remain None. Pre-(184) the
@@ -1470,7 +1470,7 @@ fn cleartext_auth_handshake_end_to_end() {
     let (startup_raw, mut proto) = startup_cleartext_consume(proto, &mut wb,"alice", password);
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingStartupCleartext { .. }
+        ConnectingState::StartupCleartext { .. }
     ));
 
     // Drain the StartupMessage bytes from wb (don't need them
@@ -1531,7 +1531,7 @@ fn cleartext_auth_handshake_end_to_end() {
         other => panic!("expected single SendBytes, got {other:?}"),
     }
     assert!(
-        matches!(proto.state(), ProtoState::ConnectingCleartextAwaitingAuthOk(_)),
+        matches!(proto.state(), ConnectingState::CleartextAwaitingAuthOk(_)),
         "after PasswordMessage emission, state must transition to AwaitingAuthOk",
     );
 
@@ -1541,7 +1541,7 @@ fn cleartext_auth_handshake_end_to_end() {
     assert_eq!(out.len(), 0, "AuthOk produces silent state transition");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthAwaitingKey(_)
+        ConnectingState::PostAuthAwaitingKey(_)
     ));
 
     // Step 4: BackendKeyData.
@@ -1549,7 +1549,7 @@ fn cleartext_auth_handshake_end_to_end() {
     assert_eq!(out.len(), 0);
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthHaveKey { .. }
+        ConnectingState::PostAuthHaveKey { .. }
     ));
 
     // Step 5: ReadyForQuery — completes the handshake.
@@ -1568,7 +1568,7 @@ fn cleartext_auth_handshake_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ConnectingState::HandshakeReady));
 }
 
 /// Spec conformance: ErrorResponse mid-cleartext-handshake → tier-3
@@ -1860,7 +1860,7 @@ fn md5_auth_handshake_end_to_end() {
     let (startup_raw, mut proto) = startup_md5_consume(proto, &mut wb,user, password);
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingStartupMd5 { .. }
+        ConnectingState::StartupMd5 { .. }
     ));
     wb.clear();
 
@@ -1911,7 +1911,7 @@ fn md5_auth_handshake_end_to_end() {
     }
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingMd5AwaitingAuthOk(_)
+        ConnectingState::Md5AwaitingAuthOk(_)
     ));
 
     // Server replies AuthOk; transition to PostAuthAwaitingKey.
@@ -1920,7 +1920,7 @@ fn md5_auth_handshake_end_to_end() {
     assert_eq!(out.len(), 0, "AuthOk produces silent state transition");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthAwaitingKey(_)
+        ConnectingState::PostAuthAwaitingKey(_)
     ));
 
     // BackendKeyData + RFQ complete the handshake.
@@ -1941,7 +1941,7 @@ fn md5_auth_handshake_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ProtoState::Idle));
+    assert!(matches!(proto.state(), ConnectingState::HandshakeReady));
 }
 
 /// Wrong salt length (e.g. 3 bytes instead of 4) → tier-3
@@ -2188,7 +2188,7 @@ fn drive_to_md5_awaiting_authok(
     wb.clear();
     let _ = proto.feed_bytes(&auth_md5_password_frame([1, 2, 3, 4]), wb);
     assert!(
-        matches!(proto.state(), ProtoState::ConnectingMd5AwaitingAuthOk(_)),
+        matches!(proto.state(), ConnectingState::Md5AwaitingAuthOk(_)),
         "test setup invariant",
     );
     wb.clear();
@@ -2205,7 +2205,7 @@ fn md5_awaiting_authok_accepts_auth_ok() {
     assert_eq!(out.len(), 0, "AuthOk → silent state transition");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingPostAuthAwaitingKey(_),
+        ConnectingState::PostAuthAwaitingKey(_),
     ));
 }
 
@@ -2349,7 +2349,7 @@ fn drive_to_cleartext_awaiting_authok(
     wb.clear();
     let _ = proto.feed_bytes(&auth_subcode_only_frame(3), wb);
     assert!(
-        matches!(proto.state(), ProtoState::ConnectingCleartextAwaitingAuthOk(_)),
+        matches!(proto.state(), ConnectingState::CleartextAwaitingAuthOk(_)),
         "test setup invariant",
     );
     wb.clear();
@@ -2531,14 +2531,14 @@ fn md5_state_post_dispatch_no_longer_carries_handshake() {
     // Pre-dispatch: state must be ConnectingStartupMd5.
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingStartupMd5 { .. },
+        ConnectingState::StartupMd5 { .. },
     ));
     wb.clear();
 
     let _ = proto.feed_bytes(&auth_md5_password_frame([0; 4]), &mut wb);
     // Post-dispatch: state is the password-less variant.
     assert!(
-        matches!(proto.state(), ProtoState::ConnectingMd5AwaitingAuthOk(_)),
+        matches!(proto.state(), ConnectingState::Md5AwaitingAuthOk(_)),
         "post-PasswordMessage state must be password-less variant",
     );
 }
@@ -2550,13 +2550,13 @@ fn cleartext_state_post_dispatch_no_longer_carries_password() {
     let (_raw_id, mut proto) = startup_cleartext_consume(proto, &mut wb,"u", "p");
     assert!(matches!(
         proto.state(),
-        ProtoState::ConnectingStartupCleartext { .. },
+        ConnectingState::StartupCleartext { .. },
     ));
     wb.clear();
 
     let _ = proto.feed_bytes(&auth_subcode_only_frame(3), &mut wb);
     assert!(
-        matches!(proto.state(), ProtoState::ConnectingCleartextAwaitingAuthOk(_)),
+        matches!(proto.state(), ConnectingState::CleartextAwaitingAuthOk(_)),
         "post-PasswordMessage state must be password-less variant",
     );
 }

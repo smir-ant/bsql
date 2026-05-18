@@ -1236,16 +1236,17 @@ impl SealedPhase for DisconnectedPhase {
     type Inner = DisconnectedInner;
 }
 impl SealedPhase for ConnectingPhase {
-    // DEF-279 Phase 1c Bundle Commit 3 target (next session): migrate
-    // from PgProtocolInner to per-phase ConnectingInner (the struct
-    // type defined above). Tier-1 closure on state-variant-in-wrong-
-    // phase + row_desc_slot/backend_key physically absent during
-    // handshake. Multi-hour migration: requires per-phase
-    // connecting_dispatch + feed_bytes_dispatch_connecting +
-    // ConnectingState::HandshakeReady transition signal + method
-    // body migration on all <ConnectingPhase>::* methods. Deferred
-    // from this commit to keep the scope manageable.
-    type Inner = PgProtocolInner;
+    // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): FLIPPED from
+    // `PgProtocolInner` to per-phase [`ConnectingInner`]. Tier-1
+    // closure on state-variant-in-wrong-phase by storage absence
+    // (`ConnectingInner.state: ConnectingState` — no Active variants
+    // exist in the per-phase enum). Field set unchanged from
+    // PgProtocolInner (8 fields); per-phase narrowing of row_desc_slot
+    // / backend_key deferred to a follow-up commit per the lift+lower
+    // wrapper's transient-DispatchContext requirement (slots must be
+    // borrowable during the shared dispatch's match-arm evaluation
+    // even though they're never written during handshake).
+    type Inner = ConnectingInner;
 }
 impl SealedPhase for ActivePhase {
     type Inner = PgProtocolInner;
@@ -1725,9 +1726,16 @@ pub(crate) mod _proto_init_leaf {
     /// [`ProtoInitToken`]-gated cell construction discipline (DEF-272 P6
     /// closure — only this submodule can mint the token).
     ///
-    /// `pub(in crate::protocol)` so push_startup (a sibling submodule
-    /// item within `mod protocol`) can call it. External crates and
-    /// sibling files outside `mod protocol` cannot reach it.
+    /// **DEF-279 Phase 1c Bundle Commit 8b (2026-05-18)** — gated to
+    /// `#[cfg(test)]`. Pre-flip, this was the sole constructor for
+    /// `<ConnectingPhase>::push_startup`'s new_inner. Post-flip,
+    /// push_startup uses [`fresh_connecting_inner`] (ConnectingInner);
+    /// only `#[cfg(test)]` helpers (`fresh_active_proto`,
+    /// `populate_residue`) need a fresh `PgProtocolInner` — and
+    /// they don't ship in production, hence the test-only gate.
+    /// External crates and sibling files outside `mod protocol`
+    /// still cannot reach it.
+    #[cfg(test)]
     #[must_use]
     pub(in crate::protocol) const fn fresh_inner() -> super::PgProtocolInner {
         let token = ProtoInitToken::mint();
@@ -2013,44 +2021,48 @@ impl PgProtocol<DisconnectedPhase> {
         ),
         crate::action::PushFailure,
     > {
-        // DEF-279 Phase 1a (2026-05-18): `self.inner` is the ZST
-        // `DisconnectedInner` — no protocol storage pre-Startup. We
-        // materialise a fresh `PgProtocolInner` here (the post-transition
-        // storage). Pre-Bundle the inner was already in `self.inner` (a
-        // 536-B `PgProtocolInner` that was tautologically Idle + empty);
-        // moving the construction here makes the storage allocation
-        // strictly post-Startup — the `<DisconnectedPhase>` constructor
-        // does zero work. `fresh_inner` is leaf-private inside
-        // `_proto_init_leaf` (DEF-272 P6) so the cell-construction
-        // tokens stay gated.
+        // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): `self.inner`
+        // is the ZST `DisconnectedInner` — no protocol storage pre-
+        // Startup. We materialise a fresh `ConnectingInner` here (the
+        // post-transition per-phase storage). The setter machinery
+        // (`IdleState::try_from` + `idle.into_setter::<StartupPostInstall>()`)
+        // operates on `&mut ProtoState`, so we lift+lower: a local
+        // `proto_state = ProtoState::Idle` provides the setter target;
+        // after the setter writes one of the
+        // `ConnectingStartup{Trust|Scram|Cleartext|Md5}` variants, we
+        // lower the result back to `ConnectingState` and assign it to
+        // `new_inner.state` before completing the transition.
         //
         // Drop `self` early — `DisconnectedInner` is ZST, drop is
         // trivial; explicit `_ = self;` documents the consume.
         let _ = self;
-        let mut new_inner = _proto_init_leaf::fresh_inner();
+        let mut new_inner = _proto_init_leaf::fresh_connecting_inner();
 
-        // Mirror of push_command_internal: clear residue + branded
-        // scope + materialise. The Idle precondition is structurally
-        // guaranteed: `fresh_inner` materialises `state: Idle` and
-        // no other code has access to mutate it before this point.
-        // `clear_session_residue_for_class` is a no-op on a fresh
-        // inner (all cells start empty) but kept for shape parity
-        // with the post-Bundle materialise path.
         write_buf.clear();
-        new_inner.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
+        // `clear_session_residue_for_class` is a no-op on a fresh
+        // ConnectingInner (all cells start empty). Skipped here for
+        // a fresh-inner — equivalent behaviour to the pre-flip
+        // PgProtocolInner version (which called the method as a no-op
+        // "for shape parity"). The method is not implemented on
+        // ConnectingInner because the only call site is push_startup
+        // which constructs from `fresh_connecting_inner` and never
+        // needs the residue clear.
 
-        let state = &mut new_inner.state;
+        // Lift: local `proto_state` is the setter machinery's target
+        // (it expects `&mut ProtoState`). After the setter writes one
+        // of the ConnectingStartup* variants, we lower to ConnectingState
+        // and install on new_inner.
+        let mut proto_state: ProtoState = ProtoState::Idle;
+        let state = &mut proto_state;
         let row_desc_slot = &mut new_inner.row_desc_slot;
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
             None => {
-                // Architecturally unreachable: `<DisconnectedPhase>`
-                // is consumed by the constructor only path, which
-                // installs `state == Idle`. The only other transition
-                // path into `<DisconnectedPhase>` does not exist.
-                // Classify defensively per CREDO §V (debug_assert!(false)
-                // banned for impossible) — the `Errored` arm transitions
-                // via the `IntoActiveError::Closed` channel.
+                // Architecturally unreachable: we just constructed
+                // `proto_state = ProtoState::Idle` locally. The only
+                // way IdleState::try_from(&Idle) returns None is a
+                // semantic break in the IdleState newtype guard.
+                // Classify defensively per CREDO §V.
                 core::hint::cold_path();
                 return Err(crate::action::PushFailure {
                     id: reply.consume(),
@@ -2135,15 +2147,29 @@ impl PgProtocol<DisconnectedPhase> {
         let _: () = row_desc_slot.consume_unused_witness();
         match result {
             Ok(out) => {
-                // DEF-279 Phase 1a: move the locally-materialised
-                // `new_inner` (whose state is now one of
-                // ConnectingStartup{Trust|Scram|Cleartext|Md5}, written
-                // by `compute_push_startup_idle_only`'s setter
-                // consumption) into the new `<ConnectingPhase>` wrapper.
-                // Pre-Bundle this was `self.inner` (the
-                // already-storage-allocated PgProtocolInner); post-Bundle
-                // `<DisconnectedPhase>::Inner` is ZST so the storage was
-                // newly minted here.
+                // DEF-279 Phase 1c Bundle Commit 8b: lower the lifted
+                // `proto_state` (now a ConnectingStartup{Trust|Scram|
+                // Cleartext|Md5} variant after the setter machinery
+                // wrote it) back to ConnectingState and install on
+                // new_inner. The `TryFrom` is total over the four
+                // ConnectingStartup* variants — they map 1:1 to
+                // ConnectingState::Startup{Trust|Scram|Cleartext|Md5}.
+                // Any other ProtoState here is a setter-machinery bug.
+                use crate::state::{ConnectingState, WrongPhase};
+                new_inner.state = match ConnectingState::try_from(proto_state) {
+                    Ok(cs) => cs,
+                    Err(WrongPhase { recovered }) => {
+                        core::hint::cold_path();
+                        match recovered.take_inflight_reply_raw_id() {
+                            Some(_) | None => {}
+                        }
+                        ConnectingState::Errored(
+                            crate::error::StateErrorKind::from_kind_or_internal(
+                                crate::error::ErrorKind::Internal,
+                            ),
+                        )
+                    }
+                };
                 Ok((
                     out,
                     PgProtocol {
@@ -2260,14 +2286,23 @@ impl PgProtocol<ConnectingPhase> {
                   state without an alloc. Boxing would penalise every handshake path."
     )]
     pub fn into_active(mut self) -> Result<PgProtocol<ActivePhase>, IntoActiveError> {
-        // DEF-279 Phase 1b (2026-05-18): Closed arm materialises
-        // `ClosedInner` (~16 B) instead of moving the full 536-B
-        // `PgProtocolInner`. Extract state_kind (Copy, from &state's
-        // Errored arm) + mem::take the error_arena Box; the remaining
-        // PgProtocolInner fields Drop at this scope's end, releasing
-        // ~520 B of stack + any heap behind the Box-niche cells
-        // (Box<ScramSession>, Box<Password>, etc.).
-        if let ProtoState::Errored(state_kind) = &self.inner.state {
+        use crate::state::ConnectingState;
+
+        // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): per-phase
+        // Inner means `self.inner: ConnectingInner` and
+        // `self.inner.state: ConnectingState`. The Errored arm
+        // matches `ConnectingState::Errored(k)` (not `ProtoState::Errored`);
+        // the success arm observes `ConnectingState::HandshakeReady`
+        // (the per-phase transition signal — `ProtoState::Idle`
+        // mapped to HandshakeReady by the dispatch wrapper's
+        // lower step when the `(PostAuthHaveKey, RFQ)` arm produced
+        // post-handshake Idle).
+        //
+        // Closed arm materialises `ClosedInner` (~16 B) instead of
+        // moving the full 504-B `ConnectingInner`. Extract state_kind
+        // (Copy) + mem::take the error_arena Box; the remaining
+        // ConnectingInner fields Drop at this scope's end.
+        if let ConnectingState::Errored(state_kind) = &self.inner.state {
             let state_kind = *state_kind;
             let error_arena = core::mem::take(&mut self.inner.error_arena);
             return Err(IntoActiveError::Closed(PgProtocol {
@@ -2279,22 +2314,109 @@ impl PgProtocol<ConnectingPhase> {
                 phase_marker: PhantomData,
             }));
         }
-        if matches!(self.inner.state, ProtoState::Idle) {
+        if matches!(self.inner.state, ConnectingState::HandshakeReady) {
+            // Destructure ConnectingInner and re-assemble PgProtocolInner
+            // for ActivePhase (which still uses PgProtocolInner as its
+            // Inner type per current SealedPhase). state lifts to
+            // ProtoState::Idle (HandshakeReady's lifted equivalent —
+            // the post-handshake state the dispatch saw before the
+            // wrapper translated it to HandshakeReady). All other
+            // fields move byte-identically.
+            let ConnectingInner {
+                state: _,
+                read_buf,
+                row_desc_slot,
+                session_params,
+                error_arena,
+                partial_assembly,
+                backend_key,
+                malformed_frame_count,
+                sync_marker: _,
+            } = self.inner;
             return Ok(PgProtocol {
-                inner: self.inner,
+                inner: PgProtocolInner {
+                    state: ProtoState::Idle,
+                    read_buf,
+                    row_desc_slot,
+                    session_params,
+                    error_arena,
+                    partial_assembly,
+                    backend_key,
+                    malformed_frame_count,
+                    sync_marker: PhantomData,
+                },
                 phase_marker: PhantomData,
             });
         }
         Err(IntoActiveError::StillConnecting(self))
     }
 
-    /// DEF-246 Phase 3 (2026-05-16) — public read-only accessor for
-    /// the current state during handshake. Useful for diagnostic
-    /// logging without converting to `<ActivePhase>`.
+    /// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18) — per-phase
+    /// state accessor for diagnostic logging.
+    ///
+    /// **Return type changed**: `&ProtoState` → `&ConnectingState`.
+    /// The per-phase enum carries only the handshake-reachable
+    /// variants — `ProtoState`'s post-handshake `Active*` variants
+    /// don't exist here. Callers that pattern-matched against
+    /// `ProtoState::Connecting{Startup,Scram,…}*` now match against
+    /// the same-meaning unprefixed `ConnectingState::{Startup,
+    /// Scram,…}*` variants; `ProtoState::Idle` on Connecting
+    /// becomes [`crate::state::ConnectingState::HandshakeReady`]
+    /// (the per-phase transition signal); `ProtoState::Errored(_)`
+    /// becomes `ConnectingState::Errored(_)`.
+    ///
+    /// **For typed predicates**: callers should prefer
+    /// [`Self::is_handshake_ready`] and [`Self::is_errored`] for the
+    /// transition-decision use cases — they're stronger invariants
+    /// than open pattern matching (future variant additions cannot
+    /// silently change what "ready" means).
     #[inline]
     #[must_use]
-    pub fn state(&self) -> &ProtoState {
+    pub fn state(&self) -> &crate::state::ConnectingState {
         &self.inner.state
+    }
+
+    /// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18) — typed
+    /// predicate: handshake successfully completed, ready for
+    /// [`Self::into_active`].
+    ///
+    /// Returns `true` iff `self.inner.state` is
+    /// [`crate::state::ConnectingState::HandshakeReady`] — the
+    /// transition signal written by the per-phase dispatch wrapper
+    /// when the shared dispatch's `(PostAuthHaveKey, RFQ)` arm
+    /// produced post-handshake `ProtoState::Idle`. The
+    /// `BackendKeyCell` install completed atomically with that
+    /// transition (Bundle D' tier preservation).
+    ///
+    /// **Mirrors the pre-Commit-8b pattern**
+    /// `matches!(proto.state(), ProtoState::Idle)`. Future-proof
+    /// against `ConnectingState` variant additions — adding a new
+    /// variant cannot change what "ready" means.
+    #[inline]
+    #[must_use]
+    pub fn is_handshake_ready(&self) -> bool {
+        matches!(
+            self.inner.state,
+            crate::state::ConnectingState::HandshakeReady,
+        )
+    }
+
+    /// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18) — typed
+    /// predicate: handshake failed, transition will route to
+    /// [`PgProtocol<ClosedPhase>`] via [`Self::into_active`].
+    ///
+    /// Returns `true` iff `self.inner.state` is
+    /// [`crate::state::ConnectingState::Errored`]. Useful for
+    /// caller-side classification before triggering
+    /// `into_active()` (which returns `IntoActiveError::Closed` in
+    /// this case).
+    #[inline]
+    #[must_use]
+    pub fn is_errored(&self) -> bool {
+        matches!(
+            self.inner.state,
+            crate::state::ConnectingState::Errored(_),
+        )
     }
 
     /// DEF-246 Phase 3 (2026-05-16) — session_params accessor during
@@ -4574,30 +4696,16 @@ impl PgProtocolInner {
             _replyid_saturation_drain_leaf::drain(&mut self.state, cause.state_kind());
     }
 
-    /// DEF-246 Phase 2 (2026-05-16): mint a fresh ReplyId for any
-    /// phase. Body identical to the pre-DEF-246
-    /// `<ActivePhase>::next_reply_id` (static atomic counter; cold
-    /// saturation classifier).
-    #[inline]
-    pub(crate) fn next_reply_id<K: crate::reply_id::ReplyKind>(
-        &mut self,
-    ) -> crate::reply_id::ReplyId<K> {
-        use core::sync::atomic::Ordering;
-        // DEF-279 Phase 1a (2026-05-18): counter promoted to module-
-        // level `super::PROCESS_REPLY_ID_COUNTER` for cross-phase
-        // sharing with `<DisconnectedPhase>::next_reply_id` (which
-        // has no `inner.next_reply_id` to delegate to post-Bundle —
-        // DisconnectedInner is ZST). Process-global uniqueness pinned
-        // by single static across all four phases' mint sites.
-        let raw_old = PROCESS_REPLY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-        if raw_old == u64::MAX {
-            self.install_errored_replyid_saturation();
-        }
-        let raw = raw_old.saturating_add(1);
-        let nz = core::num::NonZeroU64::new(raw)
-            .unwrap_or(core::num::NonZeroU64::MIN);
-        crate::reply_id::ReplyId::from_raw(nz)
-    }
+    // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): pre-flip
+    // `PgProtocolInner::next_reply_id` DELETED — its sole non-Active
+    // caller was `<ConnectingPhase>::next_reply_id` which now
+    // delegates to `ConnectingInner::next_reply_id` (Commit 7).
+    // `<ActivePhase>::next_reply_id` (line ~3093) has always had
+    // its own body that consumes `PROCESS_REPLY_ID_COUNTER`
+    // directly + calls the install_errored_replyid_saturation
+    // delegate on this impl. Removing the unused method shrinks the
+    // public-on-`pub(crate)` API surface and removes a duplicate
+    // mint path (CREDO §0 «one source of truth»).
 
     /// DEF-184 (B6): const-generic dispatch loop body.
     ///

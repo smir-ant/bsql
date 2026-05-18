@@ -25,7 +25,7 @@
 //!   classification miss).
 
 use bsql_pg_proto::{
-    Action, PgProtocol, ProtoState, WriteBuf,
+    Action, ConnectingState, PgProtocol, WriteBuf,
     error::ProtocolError,
     ident::Ident,
     password::{Credentials, Password},
@@ -191,8 +191,8 @@ fn scram_server_first_fuzz_never_panics_never_silent_pass() {
         // the feed_bytes() expression is used as a statement; its
         // return value drops at statement end.
         assert!(!proto.feed_bytes(&auth_frame, &mut wb).as_slice().is_empty()
-            || matches!(proto.state(), ProtoState::Errored(_)));
-        if !matches!(proto.state(), ProtoState::ConnectingScramAwaitingServerFirst { .. }) {
+            || matches!(proto.state(), ConnectingState::Errored(_)));
+        if !matches!(proto.state(), ConnectingState::ScramAwaitingServerFirst { .. }) {
             continue;
         }
 
@@ -217,14 +217,14 @@ fn scram_server_first_fuzz_never_panics_never_silent_pass() {
         // Errored or to ConnectingScramAwaitingServerFinal (legit
         // parse). Anything else = silent desync.
         match proto.state() {
-            ProtoState::Errored(_) => {
+            ConnectingState::Errored(_) => {
                 if has_classified {
                     classified = classified.saturating_add(1);
                 } else {
                     panics_implicit = panics_implicit.saturating_add(1);
                 }
             }
-            ProtoState::ConnectingScramAwaitingServerFinal { .. } => {
+            ConnectingState::ScramAwaitingServerFinal { .. } => {
                 // Legit advance — server-first parsed successfully.
                 classified = classified.saturating_add(1);
             }
@@ -279,9 +279,9 @@ fn scram_server_final_fuzz_never_panics() {
         rng.fill(&mut body);
         // Fire-and-discard per no-underscore-var policy.
         assert!(!proto.feed_bytes(&build_sasl_continue_frame(&body), &mut wb).as_slice().is_empty()
-            || matches!(proto.state(), ProtoState::ConnectingScramAwaitingServerFinal { .. }));
+            || matches!(proto.state(), ConnectingState::ScramAwaitingServerFinal { .. }));
 
-        if !matches!(proto.state(), ProtoState::ConnectingScramAwaitingServerFinal { .. }) {
+        if !matches!(proto.state(), ConnectingState::ScramAwaitingServerFinal { .. }) {
             continue;
         }
         iters_reached_final = iters_reached_final.saturating_add(1);
@@ -302,12 +302,12 @@ fn scram_server_final_fuzz_never_panics() {
         };
 
         match proto.state() {
-            ProtoState::Errored(_) => {
+            ConnectingState::Errored(_) => {
                 if has_classified {
                     classified = classified.saturating_add(1);
                 }
             }
-            ProtoState::ConnectingScramAwaitingAuthOk(_) => {
+            ConnectingState::ScramAwaitingAuthOk(_) => {
                 classified = classified.saturating_add(1);
             }
             _ => {
@@ -352,12 +352,12 @@ fn scram_arbitrary_bytes_never_panic() {
         assert!(proto.feed_bytes(&random, &mut wb).as_slice().len() <= 64);
 
         // State MUST be either still pre-auth (no valid frames
-        // parsed) or Errored. Never Idle / post-auth without going
-        // through a valid handshake.
+        // parsed) or Errored. Never HandshakeReady / post-auth
+        // without going through a valid handshake.
         match proto.state() {
-            ProtoState::Idle
-            | ProtoState::ConnectingPostAuthAwaitingKey(_)
-            | ProtoState::ConnectingPostAuthHaveKey { .. } => {
+            ConnectingState::HandshakeReady
+            | ConnectingState::PostAuthAwaitingKey(_)
+            | ConnectingState::PostAuthHaveKey { .. } => {
                 panic!(
                     "random bytes drove proto into post-auth state: {:?}",
                     proto.state(),

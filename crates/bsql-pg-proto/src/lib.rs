@@ -392,6 +392,13 @@ pub use pristine::Pristine;
 pub use bsql_pg_proto_derive::prepared;
 pub use prepared::{PreparedQuery, RowDecode};
 pub use state::ProtoState;
+// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): per-phase state
+// enums for the `<ConnectingPhase>` / `<ActivePhase>` / `<ClosedPhase>`
+// API. ConnectingState is the active surface (queried by
+// `<ConnectingPhase>::connecting_state()`); ActiveState +
+// ErroredState are dead but pre-exported for the eventual
+// per-phase ActivePhase / ClosedPhase migrations.
+pub use state::{ActiveState, ConnectingState, ErroredState};
 // DEF-223 (2026-05-05): top-level re-export of the user-facing
 // `Terminate` wire literal. Drivers (`bsql-driver-postgres`,
 // async wrappers) write these bytes immediately before TCP
@@ -892,10 +899,19 @@ const _: () = assert!(
      trips, a non-ZST field was added to DisconnectedInner — \
      architectural violation of Phase 1a tier-1-by-storage-absence.",
 );
+// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): switched from
+// PgProtocolInner (536 B; ProtoState 80 B) to ConnectingInner
+// (state: ConnectingState 48 B; saves 32 B on the state field
+// vs ProtoState 80 B). Other 7 fields are byte-identical to
+// PgProtocolInner. Field-narrow drops of row_desc_slot (140 B)
+// and backend_key (12 B) deferred to a follow-up commit
+// pending lift+lower wrapper's transient-slot redesign.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 536,
-    "PgProtocol<ConnectingPhase> layout drift — should be \
-     byte-identical to PgProtocolInner.",
+    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 504,
+    "PgProtocol<ConnectingPhase> layout drift — must equal \
+     ConnectingInner (8 fields: state 48 B + read_buf 264 B + \
+     4 cells × 8 B + 1 u32 + alignment). If this trips, audit \
+     `mod protocol::ConnectingInner` for unexpected field changes.",
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 536,

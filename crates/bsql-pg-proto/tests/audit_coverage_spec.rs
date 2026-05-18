@@ -5,7 +5,7 @@
 //! pins a finding that the pre-audit suite did not cover.
 
 use bsql_pg_proto::{
-    Action, PgProtocol, ProtoState, WriteBuf, error::ProtocolError,
+    Action, ConnectingState, PgProtocol, ProtoState, WriteBuf, error::ProtocolError,
 };
 
 mod common;
@@ -234,7 +234,7 @@ fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
     };
     assert!(matches!(
         proto_connecting.state(),
-        ProtoState::ConnectingStartupScram { .. }
+        ConnectingState::StartupScram { .. }
     ));
 
     // Drop proto_connecting — triggers Drop cascade including
