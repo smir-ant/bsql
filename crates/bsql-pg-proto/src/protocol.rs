@@ -918,6 +918,67 @@ pub struct ConnectingInner {
     sync_marker: PhantomData<Cell<()>>,
 }
 
+/// DEF-279 Phase 2 Bundle Commit 9 (2026-05-18) — per-phase Inner
+/// for `<ActivePhase>`.
+///
+/// **Narrowed vs [`PgProtocolInner`]**: state field type narrows to
+/// [`crate::state::ActiveState`] (~80 B, same as ProtoState). The
+/// other seven fields are byte-identical to PgProtocolInner — no
+/// post-handshake field can be physically dropped (every cell is
+/// reachable from at least one Active variant).
+///
+/// **Tier-1 closure by storage absence**:
+/// - `<ActivePhase>` CANNOT physically hold a Connecting state
+///   variant (e.g. `StartupScram`) because `ActiveState` doesn't
+///   have those variants.
+/// - State-variant-in-wrong-phase is impossible by-type.
+///
+/// **Layout**: ~536 B (state ActiveState 80 B + read_buf 264 B +
+/// 4 cells 8 B each + u32 + alignment). Byte-identical to today's
+/// PgProtocolInner — the per-phase split delivers tier-1 closure
+/// without a footprint regression.
+///
+/// **Construction**: only via [`_proto_init_leaf::fresh_active_inner`]
+/// (Commit 12) called from `<ConnectingPhase>::into_active`.
+///
+/// **Scaffolding stage** (Commit 9): this type is defined but not
+/// yet used as `<ActivePhase>::Inner` (still `PgProtocolInner` in
+/// this commit). Commit 12 lands the SealedPhase flip plus the
+/// `<ConnectingPhase>::into_active` rebuild that produces an
+/// ActiveInner instead of PgProtocolInner.
+///
+/// **`#[allow(dead_code)]`** justified by the explicit Commit-12
+/// target purpose documented above + deferred.md queue entry.
+#[allow(dead_code, missing_debug_implementations)]
+pub struct ActiveInner {
+    /// State narrowed to [`crate::state::ActiveState`] variants
+    /// (Idle + PingAwaitingRfq + all SimpleQuery/Parse/BindExecute/
+    /// Describe flow variants + DrainRfqAfterError + transient
+    /// Errored).
+    state: crate::state::ActiveState,
+    /// Mirror of [`PgProtocolInner::read_buf`].
+    read_buf: ReadBuf,
+    /// Mirror of [`PgProtocolInner::row_desc_slot`]. Reachable from
+    /// `DescribeStatement*`, `BindExecuteStreamingRows`, etc. —
+    /// CAN be written during Active.
+    row_desc_slot: crate::schema_slot::RowDescSlotCell,
+    /// Mirror of [`PgProtocolInner::session_params`].
+    session_params: crate::session_params_slot::SessionParamsCell,
+    /// Mirror of [`PgProtocolInner::error_arena`].
+    error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    /// Mirror of [`PgProtocolInner::partial_assembly`].
+    partial_assembly: crate::partial_assembly::PartialAssemblyCell,
+    /// Mirror of [`PgProtocolInner::backend_key`]. Installed at
+    /// handshake completion by `<ConnectingPhase>::into_active`
+    /// (extracted from the per-phase Connecting cell during the
+    /// phase transition).
+    backend_key: crate::cancel::BackendKeyCell,
+    /// Mirror of [`PgProtocolInner::malformed_frame_count`].
+    malformed_frame_count: u32,
+    /// Mirror of [`PgProtocolInner::sync_marker`].
+    sync_marker: PhantomData<Cell<()>>,
+}
+
 /// DEF-279 Phase 1c prerequisite (2026-05-18) — dispatch-context bundle.
 ///
 /// Captures the eight per-connection mutable references the dispatch

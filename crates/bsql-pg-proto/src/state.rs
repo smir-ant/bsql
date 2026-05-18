@@ -1168,9 +1168,13 @@ impl core::fmt::Debug for ConnectingState {
 /// the same-named [`ProtoState`] field; doc duplication creates
 /// drift surface.
 ///
-/// **`#[allow(missing_debug_implementations)]`**: manual Debug lands
-/// in Commit 2.
-#[allow(missing_docs, missing_debug_implementations)]
+/// **Manual `Debug` impl** (DEF-279 Phase 2 Bundle Commit 9,
+/// 2026-05-18) — mirror of [`ProtoState`]'s manual Debug for the
+/// post-handshake variants. Active variants don't carry password /
+/// SCRAM secret material; `finish_non_exhaustive()` is used only
+/// for variants whose `param_oids` / streaming-mode bookkeeping the
+/// parent Debug elides per pre-DEF-279 convention.
+#[allow(missing_docs)]
 #[non_exhaustive]
 pub enum ActiveState {
     /// Mirror of [`ProtoState::Idle`].
@@ -1440,6 +1444,160 @@ impl ConnectingState {
             | Self::PostAuthAwaitingKey(_)
             | Self::PostAuthHaveKey { .. }
             | Self::HandshakeReady => StatePushClass::Connecting,
+        }
+    }
+}
+
+/// DEF-279 Phase 2 Bundle Commit 9 (2026-05-18) — per-phase
+/// classifier surface for [`ActiveState`].
+#[allow(dead_code)]
+impl ActiveState {
+    /// Per-phase mirror of [`ProtoState::take_inflight_reply_raw_id`].
+    /// Exhaustive over every variant — adding a `ReplyId<K>`-carrying
+    /// variant without routing it here fails the build.
+    ///
+    /// `Idle` / `DrainRfqAfterError` / `Errored` return `None`.
+    #[must_use]
+    pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
+        match self {
+            Self::Idle | Self::DrainRfqAfterError | Self::Errored(_) => None,
+            Self::PingAwaitingRfq(id) => Some(id.consume()),
+            Self::SimpleQueryAwaitingFirstResponse(id) => Some(id.consume()),
+            Self::SimpleQueryStreamingRows { reply }
+            | Self::SimpleQueryAwaitingRfq { reply, .. }
+            | Self::BindExecuteAwaitingBindCompleteSelect { reply }
+            | Self::BindExecuteAwaitingDataOrCompleteSelect { reply }
+            | Self::BindExecuteStreamingRows { reply }
+            | Self::BindExecuteAwaitingRfqSelect { reply, .. }
+            | Self::BindExecuteAwaitingRfqDml { reply, .. } => Some(reply.consume()),
+            Self::BindExecuteAwaitingBindCompleteDml(reply)
+            | Self::BindExecuteAwaitingCommandCompleteDml(reply) => Some(reply.consume()),
+            Self::ParseAwaitingParseComplete(reply) | Self::ParseAwaitingRfq(reply) => {
+                Some(reply.consume())
+            }
+            Self::DescribeStatementAwaitingParamDesc(reply)
+            | Self::DescribeStatementAwaitingRowDescOrNoData { reply, .. }
+            | Self::DescribeStatementAwaitingRfq { reply, .. } => Some(reply.consume()),
+            Self::DescribePortalAwaitingRowDescOrNoData(reply)
+            | Self::DescribePortalAwaitingRfq { reply } => Some(reply.consume()),
+        }
+    }
+
+    /// Per-phase mirror of [`ProtoState::push_class`]. Returns
+    /// [`StatePushClass::Idle`] for `Idle`, [`StatePushClass::PingAwaiting`]
+    /// for `PingAwaitingRfq`, [`StatePushClass::Errored`] for the
+    /// transient Errored signal, and [`StatePushClass::BusyQuery`] for
+    /// every post-startup in-flight variant.
+    ///
+    /// Connecting-only `StatePushClass::Connecting` is unreachable
+    /// from `ActiveState` (no Connecting variants exist) — tier-1 by
+    /// storage absence.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn push_class(&self) -> StatePushClass {
+        match self {
+            Self::Idle => StatePushClass::Idle,
+            Self::Errored(kind) => StatePushClass::Errored(*kind),
+            Self::PingAwaitingRfq(_) => StatePushClass::PingAwaiting,
+            Self::SimpleQueryAwaitingFirstResponse(_)
+            | Self::SimpleQueryStreamingRows { .. }
+            | Self::SimpleQueryAwaitingRfq { .. }
+            | Self::DrainRfqAfterError
+            | Self::ParseAwaitingParseComplete(_)
+            | Self::ParseAwaitingRfq(_)
+            | Self::BindExecuteAwaitingBindCompleteDml(_)
+            | Self::BindExecuteAwaitingCommandCompleteDml(_)
+            | Self::BindExecuteAwaitingRfqDml { .. }
+            | Self::BindExecuteAwaitingBindCompleteSelect { .. }
+            | Self::BindExecuteAwaitingDataOrCompleteSelect { .. }
+            | Self::BindExecuteStreamingRows { .. }
+            | Self::BindExecuteAwaitingRfqSelect { .. }
+            | Self::DescribeStatementAwaitingParamDesc(_)
+            | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
+            | Self::DescribeStatementAwaitingRfq { .. }
+            | Self::DescribePortalAwaitingRowDescOrNoData(_)
+            | Self::DescribePortalAwaitingRfq { .. } => StatePushClass::BusyQuery,
+        }
+    }
+}
+
+/// DEF-279 Phase 2 Bundle Commit 9 (2026-05-18) — manual `Debug` for
+/// [`ActiveState`] mirroring [`ProtoState`]'s field rendering.
+///
+/// Active variants don't carry SCRAM / MD5 / Cleartext password
+/// material (those secrets live only in [`ConnectingState`]).
+/// `finish_non_exhaustive()` is used only for variants whose
+/// `param_oids` / streaming-mode bookkeeping the parent Debug elides
+/// per pre-DEF-279 convention.
+impl core::fmt::Debug for ActiveState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("Idle"),
+            Self::PingAwaitingRfq(id) => write!(f, "PingAwaitingRfq({id:?})"),
+            Self::SimpleQueryAwaitingFirstResponse(id) => {
+                write!(f, "SimpleQueryAwaitingFirstResponse({id:?})")
+            }
+            Self::SimpleQueryStreamingRows { reply } => f
+                .debug_struct("SimpleQueryStreamingRows")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::SimpleQueryAwaitingRfq { reply, command_tag } => f
+                .debug_struct("SimpleQueryAwaitingRfq")
+                .field("reply", reply)
+                .field("command_tag", command_tag)
+                .finish(),
+            Self::DrainRfqAfterError => f.write_str("DrainRfqAfterError"),
+            Self::ParseAwaitingParseComplete(id) => {
+                write!(f, "ParseAwaitingParseComplete({id:?})")
+            }
+            Self::ParseAwaitingRfq(id) => write!(f, "ParseAwaitingRfq({id:?})"),
+            Self::BindExecuteAwaitingBindCompleteDml(id) => {
+                write!(f, "BindExecuteAwaitingBindCompleteDml({id:?})")
+            }
+            Self::BindExecuteAwaitingCommandCompleteDml(id) => {
+                write!(f, "BindExecuteAwaitingCommandCompleteDml({id:?})")
+            }
+            Self::BindExecuteAwaitingRfqDml { reply, command_tag } => f
+                .debug_struct("BindExecuteAwaitingRfqDml")
+                .field("reply", reply)
+                .field("command_tag", command_tag)
+                .finish(),
+            Self::BindExecuteAwaitingBindCompleteSelect { reply } => f
+                .debug_struct("BindExecuteAwaitingBindCompleteSelect")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::BindExecuteAwaitingDataOrCompleteSelect { reply } => f
+                .debug_struct("BindExecuteAwaitingDataOrCompleteSelect")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::BindExecuteStreamingRows { reply } => f
+                .debug_struct("BindExecuteStreamingRows")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::BindExecuteAwaitingRfqSelect { reply, command_tag } => f
+                .debug_struct("BindExecuteAwaitingRfqSelect")
+                .field("reply", reply)
+                .field("command_tag", command_tag)
+                .finish_non_exhaustive(),
+            Self::DescribeStatementAwaitingParamDesc(id) => {
+                write!(f, "DescribeStatementAwaitingParamDesc({id:?})")
+            }
+            Self::DescribeStatementAwaitingRowDescOrNoData { reply, .. } => f
+                .debug_struct("DescribeStatementAwaitingRowDescOrNoData")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::DescribeStatementAwaitingRfq { reply, .. } => f
+                .debug_struct("DescribeStatementAwaitingRfq")
+                .field("reply", reply)
+                .finish_non_exhaustive(),
+            Self::DescribePortalAwaitingRowDescOrNoData(id) => {
+                write!(f, "DescribePortalAwaitingRowDescOrNoData({id:?})")
+            }
+            Self::DescribePortalAwaitingRfq { reply } => f
+                .debug_struct("DescribePortalAwaitingRfq")
+                .field("reply", reply)
+                .finish(),
+            Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }
 }
