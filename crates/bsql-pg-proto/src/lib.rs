@@ -852,26 +852,24 @@ const _: () = assert!(
      (CREDO §3 + §4.12).",
 );
 
-// DEF-246 Phase 1 (2026-05-16): branch-collapse typestate layout pins.
+// DEF-246 Phase 1 (2026-05-16) + DEF-279 Phase 2 Bundle Commit 13
+// (2026-05-18): branch-collapse typestate layout pins.
 //
 // `PgProtocol<P: SealedPhase>` is `#[repr(transparent)]` over
-// `PgProtocolInner` + a ZST `PhantomData<fn() -> P>`. Layout MUST be
-// byte-identical for all 4 phases (ZST phantom propagates no bytes;
-// repr(transparent) propagates inner layout). If any of these trips,
-// either (a) PhantomData was rendered non-ZST under a future rustc
-// heuristic (CREDO §3 — file an issue, do NOT relax the pin),
-// (b) repr(transparent) was removed from PgProtocol<P> (review the
-// commit), or (c) a new non-ZST field was added to PgProtocol<P>
-// outside `inner` (architectural violation — Phase 1 forbids this).
+// `<P as SealedPhase>::Inner` + a ZST `PhantomData<fn() -> P>`.
+// Layout per phase is determined by the per-phase Inner. Post-
+// Commit-13 PgProtocolInner is DELETED; each phase has its own
+// Inner with its own size pin:
+//   - DisconnectedPhase → DisconnectedInner (0 B, ZST)
+//   - ConnectingPhase  → ConnectingInner   (504 B)
+//   - ActivePhase      → ActiveInner       (536 B)
+//   - ClosedPhase      → ClosedInner       (16 B)
 //
-// The `PgProtocolInner == 528` pin is the single source of truth;
-// all 4 phase pins reduce to it via repr(transparent) + ZST phantom.
-const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocolInner>() == 536,
-    "PgProtocolInner exact size — must match pre-DEF-246 PgProtocol \
-     size. If this trips, a field was added/removed/reshaped on the \
-     inner data struct; audit budget at the original 528 B pin above.",
-);
+// If any trips, either (a) PhantomData was rendered non-ZST under
+// a future rustc heuristic (CREDO §3 — file an issue, do NOT relax
+// the pin), (b) repr(transparent) was removed from PgProtocol<P>
+// (review the commit), or (c) a non-ZST field was added to
+// PgProtocol<P> outside `inner` (architectural violation).
 // DEF-279 Phase 1a (2026-05-18): <DisconnectedPhase>::Inner is the
 // ZST `DisconnectedInner` — `PgProtocol<DisconnectedPhase>` is now 0 B.
 // Pre-Bundle was byte-identical to PgProtocolInner (536 B); the storage
@@ -915,13 +913,12 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 536,
-    "PgProtocol<ActivePhase> layout drift — should be byte-identical \
-     to PgProtocolInner. This is also the type that the bare \
-     `PgProtocol` pin above resolves to (via the default phase \
-     parameter), so both pins are over the same concrete type. \
-     Kept separate for documentation: the bare pin pre-dates DEF-246 \
-     (preserved for git-blame continuity), this one names the phase \
-     explicitly.",
+    "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
+     (8 fields: state ActiveState 80 B + read_buf 264 B + 4 cells \
+     × 8 B + 1 u32 + alignment). If this trips, audit \
+     `mod protocol::ActiveInner` for unexpected field changes. \
+     DEF-279 Phase 2 Bundle Commit 13: PgProtocolInner DELETED — \
+     the size is now sourced from ActiveInner directly.",
 );
 // DEF-279 Phase 1b (2026-05-18): <ClosedPhase>::Inner is now
 // `ClosedInner` (~16 B) — state_kind 1B + 7B pad + error_arena
