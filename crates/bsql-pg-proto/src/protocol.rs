@@ -821,6 +821,56 @@ pub struct PgProtocolInner {
     sync_marker: PhantomData<Cell<()>>,
 }
 
+/// DEF-279 Phase 1c prerequisite (2026-05-18) — dispatch-context bundle.
+///
+/// Captures the eight per-connection mutable references the dispatch
+/// path consumes inside a single struct, so the dispatch body lives
+/// as a **free function** (not a method on `PgProtocolInner`). Phase
+/// 1c introduces per-phase `Inner` types whose fields are a SUBSET
+/// of `PgProtocolInner`'s; the free-function form lets each phase's
+/// inherent method assemble its own `DispatchContext` (built from
+/// the fields IT carries) and forward to the same dispatch body
+/// without method-resolution forcing the body to live on a single
+/// concrete `Self`.
+///
+/// **Construction**: the disjoint-field-borrow rule (Rust 2018+)
+/// lets `DispatchContext { state: &mut self.state, ... }` build the
+/// struct from eight distinct `&mut self.<field>` borrows in one
+/// struct literal — the borrow checker splits the borrow per-field.
+///
+/// **Tier impact**: refactoring-only. The free function
+/// [`feed_bytes_dispatch`] body is bit-identical to the pre-refactor
+/// `PgProtocolInner::feed_bytes_impl` body (asm-diff verified);
+/// the eight `&mut` parameters compile down to register pressure
+/// equivalent to `&mut self` since each field's offset is a
+/// constant displacement from `self`. LLVM inlines the wrapper
+/// methods unconditionally (`#[inline]` not needed — single-call
+/// thin delegate with no other code).
+///
+/// **Why not a method on a per-phase trait?** A trait method bound
+/// `T: HasDispatchFields` would re-introduce the by-discipline gap
+/// (any future phase could `impl HasDispatchFields` and reach the
+/// dispatch body without `unsafe`). The free function takes the
+/// `DispatchContext` by value — only code that already has eight
+/// disjoint `&mut` refs to the right field types can call it. The
+/// phase-narrow `Inner` types in Phase 1c lack some of these fields
+/// (e.g. `DisconnectedInner` has no `state`/`read_buf`) and
+/// physically cannot construct a `DispatchContext` — tier-1 closure
+/// at the type level.
+pub(in crate::protocol) struct DispatchContext<'a> {
+    pub(in crate::protocol) state: &'a mut ProtoState,
+    pub(in crate::protocol) read_buf: &'a mut ReadBuf,
+    pub(in crate::protocol) row_desc_slot: &'a mut crate::schema_slot::RowDescSlotCell,
+    pub(in crate::protocol) session_params:
+        &'a mut crate::session_params_slot::SessionParamsCell,
+    pub(in crate::protocol) error_arena:
+        &'a mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    pub(in crate::protocol) partial_assembly:
+        &'a mut crate::partial_assembly::PartialAssemblyCell,
+    pub(in crate::protocol) backend_key: &'a mut crate::cancel::BackendKeyCell,
+    pub(in crate::protocol) malformed_count: &'a mut u32,
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // DEF-246 Phase 1 — Branch-collapse typestate scaffolding (2026-05-16)
 //
@@ -3452,6 +3502,678 @@ impl PgProtocol<ActivePhase> {
     // surface unchanged.
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// DEF-279 Phase 1c prerequisite (2026-05-18) — dispatch path as free
+// functions over `DispatchContext`.
+//
+// Pre-refactor: the dispatch body lived as methods on
+// `PgProtocolInner` (`feed_bytes_impl`, `advance_one_frame`,
+// `clear_session_residue_for_class`). Method resolution forced the
+// body to type-check against `&mut PgProtocolInner` (one concrete
+// `Self`), so a per-phase narrow `Inner` type with FEWER fields could
+// not reuse the same code without manual `self.X` rewrites or a
+// trait-bound `HasDispatchFields` (the latter re-introducing tier-2
+// by-discipline — any future phase impl could reach the dispatch
+// body).
+//
+// Post-refactor: the dispatch body lives as **free functions** over
+// `DispatchContext<'r>` (eight `&mut` field refs). `PgProtocolInner`
+// methods become thin delegates that build a `DispatchContext` from
+// `&mut self.<field>` and forward. The disjoint-field-borrow rule
+// (Rust 2018+) lets the struct-literal construction split the
+// `&mut self` borrow across eight fields in one expression.
+//
+// **Tier impact**: refactoring-only. LLVM inlines the thin delegate
+// unconditionally (single-call body, no other code); asm-diff is
+// bit-equivalent versus the pre-refactor method bodies. Bench
+// `feed_bytes/ping_amortised` and `push_command/ping_amortised`
+// target 0% delta.
+//
+// **Why free fn over trait method**: a trait method (`fn dispatch
+// (&mut self, ...)`) on a `HasDispatchFields` trait would require
+// `impl HasDispatchFields for PgProtocolInner` (legal today) AND
+// `impl HasDispatchFields for ConnectingInner / ActiveInner` once
+// Phase 1c lands. The trait surface is tier-2: discipline gates
+// "only the right `Inner` types impl it". The free-function form
+// is tier-1 — only code that already holds the eight specific `&mut
+// T` refs can build a `DispatchContext`, and those refs come from
+// the field types directly. Phase 1c's narrow `Inner` types (e.g.
+// `DisconnectedInner` with zero relevant fields) physically cannot
+// construct a `DispatchContext` at the type level.
+// ═════════════════════════════════════════════════════════════════════
+
+/// DEF-279 Phase 1c prerequisite (2026-05-18) — residue-clear body
+/// as a free function over four `&mut` field refs + a class.
+///
+/// Body extracted from the pre-refactor
+/// `PgProtocolInner::clear_session_residue_for_class` method.
+/// `self.row_desc_slot` → `row_desc_slot`, `self.error_arena` →
+/// `error_arena`, `self.session_params` → `session_params`,
+/// `self.partial_assembly` → `partial_assembly`. The exhaustive
+/// match on `StatePushClass` is unchanged — tier-1 closure preserved
+/// (a future variant fails the build here until its residue policy
+/// is decided).
+///
+/// **Callers**: `PgProtocolInner::clear_session_residue_for_class`
+/// (delegate) and `feed_bytes_dispatch` (direct call BEFORE
+/// destructuring the `DispatchContext` into local re-bindings).
+#[inline]
+pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
+    row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+    session_params: &mut crate::session_params_slot::SessionParamsCell,
+    error_arena: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    partial_assembly: &mut crate::partial_assembly::PartialAssemblyCell,
+    class: crate::state::StatePushClass,
+) {
+    match class {
+        crate::state::StatePushClass::Idle => {
+            _clear_residue_leaf::clear_schema_slot_residue(row_desc_slot);
+            if let Some(arena) = error_arena.as_deref_mut() {
+                arena.clear();
+            }
+            _clear_residue_leaf::clear_partial_assembly_residue(partial_assembly);
+        }
+        crate::state::StatePushClass::Errored(_) => {
+            _clear_residue_leaf::clear_schema_slot_residue(row_desc_slot);
+            if let Some(arena) = error_arena.as_deref_mut() {
+                arena.clear();
+            }
+            // DEF-189 Q8-C3 + DEF-205 step 3: session-state forfeit on
+            // tear-down; `SessionParams::clear`'s Drop chain scrubs
+            // `SecretBoundedStr` bytes.
+            _clear_residue_leaf::clear_session_params_residue(session_params);
+            // DEF-248 Sub-B (2026-05-12): also clear partial assembly
+            // on Errored entry.
+            _clear_residue_leaf::clear_partial_assembly_residue(partial_assembly);
+        }
+        crate::state::StatePushClass::Connecting
+        | crate::state::StatePushClass::PingAwaiting
+        | crate::state::StatePushClass::BusyQuery => {}
+    }
+}
+
+/// DEF-279 Phase 1c prerequisite (2026-05-18) — dispatch body as a
+/// free function over [`DispatchContext`].
+///
+/// Body extracted from the pre-refactor
+/// `PgProtocolInner::feed_bytes_impl::<BOUNDED>` method. The eight
+/// `self.<field>` field references became local re-bindings on the
+/// destructured `DispatchContext`; the `self.clear_session_residue_for_class`
+/// method call became a direct call to
+/// [`clear_session_residue_for_class_dispatch`] over four `&mut`
+/// reborrows.
+///
+/// **`const BOUNDED: bool` specialisation** preserved unchanged: in
+/// the `BOUNDED = false` monomorphisation LLVM eliminates the
+/// `if BOUNDED && dispatches_this_call >= max_dispatches { break; }`
+/// gate at compile time. Two monomorphised copies live in the
+/// binary; release profile (LTO fat + codegen-units=1) deduplicates
+/// common sub-expressions.
+///
+/// **Tier impact**: refactoring-only. The method-form caller (the
+/// delegate on `PgProtocolInner`) inlines unconditionally — the
+/// emitted machine code at every existing call site (row_stream
+/// slow path, `<ActivePhase>::feed_bytes`, `<ConnectingPhase>::feed_bytes`)
+/// is bit-equivalent to the pre-refactor code (asm-diff verified
+/// gate).
+pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'r, const BOUNDED: bool>(
+    ctx: DispatchContext<'r>,
+    bytes: &[u8],
+    write_buf: &'w mut WriteBuf,
+    max_dispatches: u16,
+) -> OutActions<'w, 'r> {
+    let DispatchContext {
+        state,
+        read_buf,
+        row_desc_slot: terminal_row_desc,
+        session_params: session_params_slot,
+        error_arena: error_arena_slot,
+        partial_assembly: partial_assembly_slot,
+        backend_key: backend_key_slot,
+        malformed_count: malformed_counter,
+    } = ctx;
+
+    write_buf.clear();
+    // DEF-211 FAKE-01: feed_bytes can be called in any state.
+    // Compute `push_class()` ONCE here and pass to the residue
+    // helper — pre-FAKE-01 the helper computed `push_class`
+    // internally (~+10 ns per call). Caching at the entry point
+    // amortises one classification across the full feed_bytes
+    // dispatch loop.
+    let entry_class = state.push_class();
+    clear_session_residue_for_class_dispatch(
+        terminal_row_desc,
+        session_params_slot,
+        error_arena_slot,
+        partial_assembly_slot,
+        entry_class,
+    );
+
+    // DEF-154 (H+V) pending_advance DELETED 2026-04-24: the
+    // deferred-advance slot existed because `StagedAction::StreamRowRange`
+    // once carried `row_bytes: &'r [u8]` into read_buf — cursor
+    // advance while that borrow was alive = borrow-check
+    // conflict. DEF-154 (Y) DELETED `StreamRowRange` entirely.
+    // Post-(Y) no StagedAction variant carries a read_buf borrow,
+    // so cursor advance can fire IN-SCOPE inside the dispatch
+    // loop with no conflict. See struct docstring field
+    // comment for full post-mortem.
+
+    // DEF-185 P1-6 (audit 2026-04-24): consolidated control flow.
+    //
+    // Pre-fix: scattered state checks at lines 871-875 (decide
+    // whether to append), 892-898 (short-circuit if Errored), and
+    // 902-918 (handle append_err). Logically identical but the
+    // borrow-checker constraints forced the append to fire before
+    // split-borrows, creating a visual disconnect between the
+    // first Errored check and the subsequent handler.
+    //
+    // Post-fix: single point of classification. The
+    // `IngressClassification` enum enumerates every legal entry
+    // condition (Errored / AppendFailed / Ok) so the dispatcher
+    // match is tier-1 exhaustive. Each arm has one canonical
+    // handler path.
+    #[derive(Debug)]
+    enum IngressClassification {
+        AlreadyErrored,
+        AppendFailed { attempted: usize, available: usize },
+        Ok,
+    }
+
+    // DEF-248 Sub-B (2026-05-12) — partial-mode bytes routing.
+    // When the partial-assembly cell is active (an oversize non-`'D'`
+    // body is mid-flight), inbound bytes route to the assembly
+    // accumulator FIRST. Up to `body_remaining` bytes are consumed
+    // (copied to the bounded prefix or counted-and-skipped beyond
+    // the cap); only the leftover (bytes belonging to the NEXT
+    // frame) flows to ReadBuf.
+    //
+    // Routing is gated on `is_active() -> bool`, a single byte-load
+    // on the `Option<Box<_>>` niche discriminant. The inactive arm
+    // runs `read_buf.append(bytes)` byte-for-byte as before — no
+    // perf delta on the hot path.
+    let bytes_for_readbuf: &[u8] = if !matches!(*state, ProtoState::Errored(_))
+        && partial_assembly_slot.is_active()
+    {
+        core::hint::cold_path();
+        let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+            partial_assembly_slot,
+            bytes,
+        );
+        // DEF-280 sweep (2026-05-18): explicit bounds-check before
+        // the `.unwrap_or(&[])` syntactic fallback. `absorb_partial_*`
+        // returns the count of bytes it consumed from `bytes`, so
+        // `absorbed <= bytes.len()` by the function's contract; the
+        // None arm of `bytes.get(absorbed..)` is architecturally dead.
+        if absorbed > bytes.len() {
+            core::hint::cold_path();
+            &[]
+        } else {
+            bytes.get(absorbed..).unwrap_or(&[])
+        }
+    } else {
+        bytes
+    };
+
+    let classification = if matches!(*state, ProtoState::Errored(_)) {
+        IngressClassification::AlreadyErrored
+    } else {
+        match read_buf.append(bytes_for_readbuf) {
+            Ok(()) => IngressClassification::Ok,
+            Err(ReadBufFull { attempted, available, .. }) => {
+                IngressClassification::AppendFailed { attempted, available }
+            }
+        }
+    };
+
+    // DEF-185 P1-6: single classification-driven dispatch.
+    // Exhaustive match on `IngressClassification` — adding a new
+    // variant fails the build here until handler exists.
+    match classification {
+        IngressClassification::AlreadyErrored => {
+            // DEF-238 (audit 2026-05-05): cold-path hint. Reaching
+            // here means caller fed bytes after a fatal teardown
+            // — adversarial / mis-driven state.
+            core::hint::cold_path();
+            read_buf.clear();
+            let terminal_ref: Option<&crate::decode::RowDesc> =
+                (*terminal_row_desc).as_ref();
+            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+                let staged: StagedActions = StagedActions::new();
+                materialise(staged, wb.into_bytes(), terminal_ref)
+            });
+        }
+        IngressClassification::AppendFailed { attempted, available } => {
+            // DEF-238 (audit 2026-05-05): cold-path hint. ReadBuf
+            // overflow = fatal connection teardown (FailReply +
+            // CloseSocket) on a path the production hot loop never
+            // hits — keep this body out of the inlined ingress arm.
+            core::hint::cold_path();
+            // DEF-186 P1-4 ordering invariant (audit 2026-04-24):
+            // `read_buf.clear()` MUST precede `fail_inflight_no_readbuf`
+            // here. The clear() zero-on-clear path (P0-C) scrubs any
+            // residual SCRAM server-frame bytes (server-first /
+            // server-final containing password-correlated material)
+            // BEFORE the state transition consumes the SCRAM variant.
+            // If a future refactor reorders these two calls, the
+            // residue window opens — partial inbound bytes survive
+            // into the post-Errored phase until the wrapper drops
+            // the connection.
+            read_buf.clear();
+            return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
+                let mut staged: StagedActions = StagedActions::new();
+                fail_inflight_no_readbuf(
+                    state,
+                    ProtocolError::ReadBufferFull { attempted, available },
+                    &mut staged,
+                    malformed_counter,
+                );
+                let terminal_ref: Option<&crate::decode::RowDesc> =
+                    (*terminal_row_desc).as_ref();
+                materialise(staged, wb.into_bytes(), terminal_ref)
+            });
+        }
+        IngressClassification::Ok => {
+            // Fall through to main dispatch.
+        }
+    }
+
+    // Main dispatch. Take shared borrow of populated + cursor
+    // (both via immutable reborrow of read_buf's &mut).
+    write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
+        let mut staged: StagedActions = StagedActions::new();
+        let populated: &[u8] = read_buf.populated();
+        let cursor: u16 = read_buf.cursor_position_u16();
+        let mut frames_consumed: u16 = 0_u16;
+        let mut dispatches_this_call: u16 = 0_u16;
+
+        // DEF-248 Sub-B (2026-05-12): post-loop staging for
+        // partial-assembly entry.
+        //
+        // The dispatch loop's `populated` shared borrow conflicts
+        // with `partial_assembly_slot` mut access inside the loop
+        // body. The `FrameTooLarge` arm stages the entry work
+        // here; the post-loop block applies the mutation after
+        // NLL closes `populated`'s borrow.
+        let mut staged_partial_entry:
+            Option<(u8, u32, &[u8])> = None;
+
+        // Dispatch loop block: `reserved` holds `&mut wb.buf`
+        // which must release before `wb.into_bytes()` post-loop.
+        {
+        let mut reserved = wb.reserve();
+        // DEF-248 Sub-B (2026-05-12): assembly-completion dispatch
+        // fires BEFORE the parse-header loop. If the prior
+        // `feed_inbound` / `read_buf_append` / top-of-feed-bytes
+        // bytes-routing path completed the in-flight body
+        // (`body_remaining == 0`), take the assembly out, route
+        // its prefix through the existing per-tag `dispatch()`,
+        // and free the Box.
+        if partial_assembly_slot.is_active()
+            && matches!(
+                partial_assembly_slot.as_inner(),
+                Some(inner) if inner.is_complete(),
+            )
+            && staged
+                .len()
+                .saturating_add(WORST_CASE_PER_DISPATCH)
+                <= MAX_STAGED_PER_CALL
+            && let Some(assembly_box) =
+                _partial_assembly_dispatch_leaf::take_completed_partial_assembly_at_dispatch(
+                    partial_assembly_slot,
+                )
+        {
+            core::hint::cold_path();
+            let assembled_tag = assembly_box.typed_tag();
+            let outcome = dispatch(
+                state,
+                assembled_tag,
+                assembly_box.prefix(),
+                &mut reserved,
+                terminal_row_desc,
+                error_arena_slot,
+                backend_key_slot,
+            );
+            match outcome {
+                DispatchOutcome::AdvancedSilent => {
+                    dispatches_this_call =
+                        dispatches_this_call.saturating_add(1);
+                }
+                DispatchOutcome::AdvancedWithAction { action } => {
+                    dispatches_this_call =
+                        dispatches_this_call.saturating_add(1);
+                    emit_actions!(&mut staged, budget: 1, [
+                        action,
+                    ]);
+                }
+                DispatchOutcome::Errored { reply_id, cause } => {
+                    match reply_id {
+                        Some(id) => {
+                            emit_actions!(&mut staged, budget: 2, [
+                                StagedAction::FailReply { id, cause },
+                                StagedAction::CloseSocket,
+                            ]);
+                        }
+                        None => {
+                            emit_actions!(&mut staged, budget: 1, [
+                                StagedAction::CloseSocket,
+                            ]);
+                        }
+                    }
+                }
+            }
+            // assembly_box drops here — heapless::Vec releases its
+            // inline allocation; no leak across iterations.
+            drop(assembly_box);
+        }
+        loop {
+            // DEF-184 (B6): `const BOUNDED: bool` specialisation
+            // — in the `BOUNDED=false` monomorphisation the
+            // short-circuit `BOUNDED &&` evaluates at compile
+            // time; LLVM eliminates the entire gate.
+            if BOUNDED && dispatches_this_call >= max_dispatches {
+                break;
+            }
+            let absolute_start = cursor.saturating_add(frames_consumed);
+            let after_consumed = populated
+                .get(usize::from(absolute_start)..)
+                .unwrap_or(&[]);
+
+            let header = parse_header(after_consumed);
+            match header {
+                HeaderParse::Empty | HeaderParse::Incomplete => break,
+                HeaderParse::MalformedLength { declared } => {
+                    fail_inflight_no_readbuf(
+                        state,
+                        ProtocolError::MalformedFrameLength { declared },
+                        &mut staged,
+                        malformed_counter,
+                    );
+                    break;
+                }
+                HeaderParse::FrameTooLarge { declared } => {
+                    // DEF-248 Sub-B (2026-05-12): universal-coverage
+                    // entry to partial-assembly mode for non-`'D'`
+                    // streaming-eligible tags. The actual mutation
+                    // (enter + absorb + advance) is deferred to
+                    // post-loop because the loop's `populated`
+                    // shared borrow conflicts with
+                    // `partial_assembly_slot` / `read_buf` mut
+                    // access here.
+                    let tag_byte = after_consumed.first().copied().unwrap_or(0);
+                    let body_len_opt = declared.checked_sub(4);
+                    match body_len_opt {
+                        Some(body_len)
+                            if crate::partial_assembly::is_streaming_eligible_tag(
+                                tag_byte,
+                            ) =>
+                        {
+                            let already_buffered_body = after_consumed
+                                .get(HEADER_LEN..)
+                                .unwrap_or(&[]);
+                            let header_plus_body = u16::try_from(
+                                HEADER_LEN.saturating_add(already_buffered_body.len()),
+                            )
+                            .unwrap_or(u16::MAX);
+                            staged_partial_entry = Some((
+                                tag_byte,
+                                body_len,
+                                already_buffered_body,
+                            ));
+                            frames_consumed = frames_consumed
+                                .saturating_add(header_plus_body);
+                            break;
+                        }
+                        _ => {
+                            fail_inflight_no_readbuf(
+                                state,
+                                ProtocolError::FrameTooLarge { declared },
+                                &mut staged,
+                                malformed_counter,
+                            );
+                            break;
+                        }
+                    }
+                }
+                HeaderParse::Ok { tag, total_len } => {
+                    let total_len_usize = usize::from(total_len);
+                    if after_consumed.len() < total_len_usize {
+                        break;
+                    }
+                    // DEF-182 site 1 (payload extraction):
+                    // length-arith invariant — parse_header Ok
+                    // ⇒ total_len >= HEADER_LEN; the len-check
+                    // above ensures total_len <= after_consumed
+                    // .len(). Classified as tier-2 structural
+                    // shield (architecturally dead None).
+                    let payload_opt =
+                        after_consumed.get(HEADER_LEN..total_len_usize);
+                    debug_assert!(
+                        payload_opt.is_some(),
+                        "DEF-182: payload slice .get(HEADER_LEN..total_len) None",
+                    );
+                    let payload = payload_opt.unwrap_or(&[]);
+
+                    // Pre-dispatch filters.
+                    if tag == crate::wire::TAG_PARAMETER_STATUS
+                        && allows_unsolicited_param_status(state)
+                    {
+                        let _outcome: ParamStatusRecordOutcome =
+                            _parameter_status_admit_leaf::admit_parameter_status_frame(
+                                session_params_slot,
+                                payload,
+                            );
+                        frames_consumed =
+                            frames_consumed.saturating_add(total_len);
+                        continue;
+                    }
+                    if tag == crate::wire::TAG_NOTICE_RESPONSE
+                        && allows_unsolicited_notice_response(state)
+                    {
+                        _notice_response_admit_leaf::admit_notice_response_frame(
+                            session_params_slot,
+                        );
+                        frames_consumed =
+                            frames_consumed.saturating_add(total_len);
+                        continue;
+                    }
+
+                    // DEF-154 (L): gate uses `MAX_STAGED_PER_CALL`
+                    // — NOT `MAX_ACTIONS_PER_CALL`. Pre-(L) both
+                    // consts were 8 and aliased; post-(L) they
+                    // differ and `staged` overflowing its own
+                    // `heapless::Vec<_, MAX_STAGED_PER_CALL>`
+                    // cap would panic in `emit_actions!`.
+                    if staged
+                        .len()
+                        .saturating_add(WORST_CASE_PER_DISPATCH)
+                        > MAX_STAGED_PER_CALL
+                    {
+                        break;
+                    }
+
+                    let outcome = dispatch(
+                        state,
+                        tag,
+                        payload,
+                        &mut reserved,
+                        terminal_row_desc,
+                        error_arena_slot,
+                        backend_key_slot,
+                    );
+                    match outcome {
+                        DispatchOutcome::AdvancedSilent => {
+                            frames_consumed =
+                                frames_consumed.saturating_add(total_len);
+                            dispatches_this_call =
+                                dispatches_this_call.saturating_add(1);
+                        }
+                        DispatchOutcome::AdvancedWithAction { action } => {
+                            frames_consumed =
+                                frames_consumed.saturating_add(total_len);
+                            dispatches_this_call =
+                                dispatches_this_call.saturating_add(1);
+                            emit_actions!(&mut staged, budget: 1, [
+                                action,
+                            ]);
+                        }
+                        DispatchOutcome::Errored { reply_id, cause } => {
+                            // DEF-154 (Q) P1-6: terminal FailReply
+                            // + CloseSocket MUST reach the caller
+                            // (reply promise resolution, socket
+                            // teardown signal).
+                            match reply_id {
+                                Some(id) => {
+                                    emit_actions!(&mut staged, budget: 2, [
+                                        StagedAction::FailReply { id, cause },
+                                        StagedAction::CloseSocket,
+                                    ]);
+                                }
+                                None => {
+                                    emit_actions!(&mut staged, budget: 1, [
+                                        StagedAction::CloseSocket,
+                                    ]);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        } // end of reserved scope
+
+        // DEF-248 Sub-B (2026-05-12): apply staged partial-mode
+        // entry, if any.
+        if let Some((tag, body_len, body_bytes)) = staged_partial_entry.take() {
+            _partial_assembly_dispatch_leaf::enter_partial_assembly_at_dispatch(
+                partial_assembly_slot,
+                tag,
+                body_len,
+            );
+            if !body_bytes.is_empty() {
+                let _absorbed_n =
+                    _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+                        partial_assembly_slot,
+                        body_bytes,
+                    );
+                debug_assert_eq!(
+                    _absorbed_n,
+                    body_bytes.len(),
+                    "DEF-248 Sub-B: partial-mode entry absorbed all \
+                     body bytes (absorbed={}, body_bytes.len={})",
+                    _absorbed_n,
+                    body_bytes.len(),
+                );
+            }
+        }
+
+        // DEF-184 audit (2026-04-24) — advance IN-SCOPE.
+        //
+        // Skip advance on Errored transition —
+        // `clear_session_residue_if_idle_or_errored` on the NEXT
+        // entry call clears the read_buf anyway, so any partial-
+        // frame remnant doesn't matter.
+        //
+        // `advance()` returns `Result<(), AdvancePastEnd>` —
+        // architecturally dead post-validated frames_consumed
+        // sum, but we classify via InternalCrateBug locus
+        // `ReadCursorAdvance` if it ever fires.
+        if !matches!(state, ProtoState::Errored(_))
+            && frames_consumed > 0
+            && read_buf.advance(usize::from(frames_consumed)).is_err()
+        {
+            core::hint::cold_path();
+            fail_inflight_no_readbuf(
+                state,
+                ProtocolError::InternalCrateBug {
+                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                },
+                &mut staged,
+                malformed_counter,
+            );
+        }
+
+        // DEF-188: dispatch may have written to `terminal_row_desc`
+        // during the loop (Z arms park schemas). NLL ends the
+        // dispatch loop's `&mut` reborrow at the loop close brace
+        // above; reborrow as immutable here for materialise.
+        let terminal_ref: Option<&crate::decode::RowDesc> =
+            (*terminal_row_desc).as_ref();
+        materialise(staged, wb.into_bytes(), terminal_ref)
+    })
+}
+
+/// DEF-279 Phase 1c prerequisite (2026-05-18) — single-frame variant
+/// over [`DispatchContext`]. Mirror of
+/// `PgProtocolInner::advance_one_frame` as a free function.
+///
+/// Performs the same three fast-path classifications (StreamingRows
+/// / Errored / Idle+empty) BEFORE delegating to
+/// [`feed_bytes_dispatch::<true>`] with `max_dispatches = 1`. The
+/// fast-path checks read `*ctx.state` / `ctx.read_buf` immutably;
+/// NLL releases those borrows before `ctx` is moved into
+/// `feed_bytes_dispatch`.
+#[must_use = "FeedEvent variants carry side-effect contracts: \
+              SendBytes/Deliver MUST be processed; Fail/Close MUST \
+              trigger socket teardown"]
+pub(in crate::protocol) fn advance_one_frame_dispatch<'w, 'r>(
+    ctx: DispatchContext<'r>,
+    write_buf: &'w mut WriteBuf,
+) -> crate::action::FeedEvent<'w, 'r> {
+    use crate::action::{Action, FeedEvent};
+
+    // Fast-path classifications BEFORE reusing feed_bytes_dispatch
+    // (which calls write_buf.clear() unconditionally — we want to
+    // avoid that on these "no work" paths to preserve any caller
+    // residue in wb across spurious advance calls).
+    if matches!(
+        *ctx.state,
+        ProtoState::SimpleQueryStreamingRows { .. }
+            | ProtoState::BindExecuteStreamingRows { .. }
+    ) {
+        return FeedEvent::StreamingRows;
+    }
+
+    // Errored terminal: the connection is dead. Caller closes.
+    if matches!(*ctx.state, ProtoState::Errored(_)) {
+        return FeedEvent::Close;
+    }
+
+    // Idle + empty read_buf: nothing to process — caller can push.
+    if matches!(*ctx.state, ProtoState::Idle) && ctx.read_buf.unread().is_empty() {
+        return FeedEvent::Idle;
+    }
+
+    // Drive the bounded dispatch loop with empty bytes (no append)
+    // and max_dispatches=1 (one actionable frame). The result is
+    // an OutActions with 0..=2 actions corresponding to one frame
+    // event.
+    let actions = feed_bytes_dispatch::<true>(ctx, b"", write_buf, 1);
+
+    // Map actions → FeedEvent. The exhaustive match below is the
+    // tier-1 contract: any future Action variant addition fails
+    // the build until classified here.
+    match actions.as_slice() {
+        [] => FeedEvent::NeedMoreBytes,
+        [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
+        [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
+        // FailReply [+ CloseSocket]: per M2, Fail implies close.
+        [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
+        // CloseSocket alone (no in-flight reply): adversarial
+        // frame in Idle, post-handshake fatal. Caller closes.
+        [Action::CloseSocket] => FeedEvent::Close,
+        // Architecturally unreachable: feed_bytes_dispatch with
+        // max_dispatches=1 emits AT MOST 2 actions per cycle
+        // (FailReply+CloseSocket pair from install_errored). Any
+        // other shape indicates a regression in dispatch's
+        // emit-budget invariants. CREDO §V banned
+        // `debug_assert!(false, ...)` defensive-for-impossible —
+        // instead, classify to the conservative `Close`.
+        _ => FeedEvent::Close,
+    }
+}
+
 impl PgProtocolInner {
     /// DEF-246 Phase 2 (2026-05-16): saturation-classifier mutation
     /// surface lives on `PgProtocolInner` so blanket
@@ -3523,772 +4245,37 @@ impl PgProtocolInner {
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
     ) -> OutActions<'w, 'r> {
-        write_buf.clear();
-        // DEF-211 FAKE-01: feed_bytes can be called in any state.
-        // Compute `push_class()` ONCE here and pass to the residue
-        // helper — pre-FAKE-01 the helper computed `push_class`
-        // internally (~+10 ns per call). Caching at the entry point
-        // amortises one classification across the full feed_bytes
-        // dispatch loop.
-        let entry_class = self.state.push_class();
-        self.clear_session_residue_for_class(entry_class);
-
-        // DEF-154 (H+V) pending_advance DELETED 2026-04-24: the
-        // deferred-advance slot existed because `StagedAction::StreamRowRange`
-        // once carried `row_bytes: &'r [u8]` into read_buf — cursor
-        // advance while that borrow was alive = borrow-check
-        // conflict. DEF-154 (Y) DELETED `StreamRowRange` entirely.
-        // Post-(Y) no StagedAction variant carries a read_buf borrow,
-        // so cursor advance can fire IN-SCOPE inside the dispatch
-        // loop with no conflict. See struct docstring field
-        // comment for full post-mortem.
-
-        // DEF-185 P1-6 (audit 2026-04-24): consolidated control flow.
+        // DEF-279 Phase 1c prerequisite (2026-05-18): thin delegate
+        // to the free function `feed_bytes_dispatch::<BOUNDED>`. The
+        // eight `&mut self.<field>` borrows split disjointly through
+        // the `DispatchContext` struct literal (disjoint-field-borrow
+        // rule, Rust 2018+); the free function consumes the context
+        // by value and runs the identical body that previously lived
+        // here as an inline method body.
         //
-        // Pre-fix: scattered state checks at lines 871-875 (decide
-        // whether to append), 892-898 (short-circuit if Errored), and
-        // 902-918 (handle append_err). Logically identical but the
-        // borrow-checker constraints forced the append to fire before
-        // split-borrows, creating a visual disconnect between the
-        // first Errored check and the subsequent handler. A future
-        // refactor touching any single site could easily break the
-        // invariant (e.g. swapping the first check's Some/None
-        // polarity).
-        //
-        // Post-fix: single point of classification. The
-        // `IngressClassification` enum enumerates every legal entry
-        // condition (Errored / AppendFailed / Ok) so the dispatcher
-        // match is tier-1 exhaustive. Each arm has one canonical
-        // handler path.
-        #[derive(Debug)]
-        enum IngressClassification {
-            /// State was already Errored before this call. Skip append,
-            /// clear read_buf, return empty OutActions.
-            AlreadyErrored,
-            /// Append overflowed the read buffer. Clear + FailReply +
-            /// CloseSocket.
-            AppendFailed { attempted: usize, available: usize },
-            /// Append succeeded (or was a no-op for empty bytes). Normal
-            /// dispatch loop.
-            Ok,
-        }
-
-        // DEF-248 Sub-B (2026-05-12) — partial-mode bytes routing.
-        //
-        // When the partial-assembly cell is active (an oversize non-`'D'`
-        // body is mid-flight), inbound bytes route to the assembly
-        // accumulator FIRST. Up to `body_remaining` bytes are consumed
-        // (copied to the bounded prefix or counted-and-skipped beyond
-        // the cap); only the leftover (bytes belonging to the NEXT
-        // frame) flows to ReadBuf.
-        //
-        // Routing is gated on `is_active() -> bool`, a single byte-load
-        // on the `Option<Box<_>>` niche discriminant. The inactive arm
-        // runs `read_buf.append(bytes)` byte-for-byte as before — no
-        // perf delta on the hot path.
-        //
-        // Tier-1 closure: ReadBuf cannot hold > 4 KB; routing through
-        // the assembly absorber for active partial mode is the ONLY
-        // path that handles bytes 5..= the body's last byte. Without
-        // this hook, a 5 KB body would fail `read_buf.append` with
-        // `ReadBufFull` on the chunk completing the body.
-        // DEF-246 Option α: `self.inner.X` references rewritten to
-        // `self.X` for the moved body (on `PgProtocolInner` directly).
-        let bytes_for_readbuf: &[u8] = if !matches!(self.state, ProtoState::Errored(_))
-            && self.partial_assembly.is_active()
-        {
-            // DEF-248 Sub-B (2026-05-12): cold-path hint. Partial mode
-            // is rare (only oversize non-`'D'` bodies engage it); the
-            // inactive arm is the hot path. Keep the routing body out
-            // of the I-cache footprint of the standard ingress.
-            core::hint::cold_path();
-            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
-                &mut self.partial_assembly,
-                bytes,
-            );
-            // DEF-280 sweep (2026-05-18): explicit bounds-check before
-            // the `.unwrap_or(&[])` syntactic fallback. `absorb_partial_*`
-            // returns the count of bytes it consumed from `bytes`, so
-            // `absorbed <= bytes.len()` by the function's contract; the
-            // None arm of `bytes.get(absorbed..)` is architecturally dead.
-            // Pre-Bundle the silent `.unwrap_or(&[])` would have masked a
-            // future regression on absorb's contract (wire bytes silently
-            // dropped from read_buf's input). Post-Bundle the explicit
-            // pre-check makes the architectural-dead arm load-bearing
-            // visible: if `absorbed > bytes.len()` (impossible under intact
-            // contract), the empty-tail fallback fires AND the cold-path
-            // marker flags the regression to LLVM (forcing the cold arm
-            // out of the I-cache footprint of the hot ingress path).
-            if absorbed > bytes.len() {
-                core::hint::cold_path();
-                &[]
-            } else {
-                bytes.get(absorbed..).unwrap_or(&[])
-            }
-        } else {
-            bytes
-        };
-
-        let classification = if matches!(self.state, ProtoState::Errored(_)) {
-            IngressClassification::AlreadyErrored
-        } else {
-            match self.read_buf.append(bytes_for_readbuf) {
-                Ok(()) => IngressClassification::Ok,
-                Err(ReadBufFull { attempted, available, .. }) => {
-                    IngressClassification::AppendFailed { attempted, available }
-                }
-            }
-        };
-
-        // DEF-154 (E): field-level destructure. Closures cannot see
-        // disjoint field borrows through `self`; splitting into
-        // separate `&mut` bindings gives each consumer a single-field
-        // borrow. `state` + `read_buf` are held DISJOINTLY — the
-        // dispatch loop reads `populated` / `cursor_position` from
-        // `read_buf` while `state` is separately `&mut` for
-        // transitions, AND advances `read_buf` cursor in-scope
-        // after each frame is consumed.
-        let state = &mut self.state;
-        let read_buf = &mut self.read_buf;
-        let terminal_row_desc = &mut self.row_desc_slot;
-        // DEF-196 (2026-04-28): three independent cold slots, each
-        // lazy-allocated only at its specific write site:
-        //   - session_params slot: ParameterStatus + NoticeResponse filters.
-        //   - error_arena slot:    ErrorResponse arms in dispatch.rs.
-        //   - malformed_counter:   inline u32, direct write (no Box).
-        let session_params_slot = &mut self.session_params;
-        let error_arena_slot = &mut self.error_arena;
-        let malformed_counter = &mut self.malformed_frame_count;
-        // DEF-248 Sub-B (2026-05-12): partial-assembly cell mut borrow
-        // threaded through the dispatch loop. Used at:
-        // 1. `HeaderParse::FrameTooLarge` for streaming-eligible tags
-        //    — enter partial mode + absorb the already-buffered prefix.
-        // 2. Top of dispatch loop — if the assembly is complete, take
-        //    + dispatch the assembled prefix through the existing
-        //    per-tag dispatch arm.
-        let partial_assembly_slot = &mut self.partial_assembly;
-        // DEF-278 Bundle D (2026-05-17): backend-key cell mut borrow
-        // threaded through the dispatch loop. Written by exactly one
-        // arm in `dispatch()`:
-        // `(ConnectingPostAuthHaveKey, TAG_READY_FOR_QUERY)` —
-        // installs `(pid, secret_key)` at handshake-complete via the
-        // token-gated `_backend_key_install_leaf` helper.
-        //
-        // Hot-path cost: the parameter is a fat pointer (8 B on
-        // arm64). Passed by `&mut` to every dispatch call; the cell
-        // itself is touched only when the matching arm fires (one
-        // arm out of ~70). Pre-arm `mem::replace` is unaffected — no
-        // additional memcpy. Bench gate: `feed_bytes/ping_amortised`
-        // must stay within ±1% of baseline.
-        let backend_key_slot = &mut self.backend_key;
-
-        // DEF-185 P1-6: single classification-driven dispatch.
-        // Exhaustive match on `IngressClassification` — adding a new
-        // variant fails the build here until handler exists.
-        match classification {
-            IngressClassification::AlreadyErrored => {
-                // DEF-238 (audit 2026-05-05): cold-path hint. Reaching
-                // here means caller fed bytes after a fatal teardown
-                // — adversarial / mis-driven state. Push the empty-
-                // OutActions emit out of the hot I-cache footprint.
-                core::hint::cold_path();
-                read_buf.clear();
-                // DEF-188: materialise needs an immutable view of
-                // terminal_row_desc. NLL collapses the prior `&mut`
-                // binding at the last use; reborrow here as `&Option<_>`
-                // for the duration of the closure.
-                let terminal_ref: Option<&crate::decode::RowDesc> =
-                    (*terminal_row_desc).as_ref();
-                return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                    let staged: StagedActions = StagedActions::new();
-                    materialise(staged, wb.into_bytes(), terminal_ref)
-                });
-            }
-            IngressClassification::AppendFailed { attempted, available } => {
-                // DEF-238 (audit 2026-05-05): cold-path hint. ReadBuf
-                // overflow = fatal connection teardown (FailReply +
-                // CloseSocket) on a path the production hot loop never
-                // hits — keep this body out of the inlined ingress
-                // arm.
-                core::hint::cold_path();
-                // DEF-186 P1-4 ordering invariant (audit 2026-04-24):
-                // `read_buf.clear()` MUST precede `fail_inflight_no_readbuf`
-                // here. The clear() zero-on-clear path (P0-C) scrubs any
-                // residual SCRAM server-frame bytes (server-first /
-                // server-final containing password-correlated material)
-                // BEFORE the state transition consumes the SCRAM variant.
-                // If a future refactor reorders these two calls, the
-                // residue window opens — partial inbound bytes survive
-                // into the post-Errored phase until the wrapper drops
-                // the connection.
-                //
-                // Bundled-helper-style refactor (single fn that does
-                // both) deferred to keep call-site ordering grep-able.
-                read_buf.clear();
-                // DEF-196: malformed_counter is inline u32, direct
-                // mutation — no Box, no lazy-init.
-                return write_buf.with_branded(|wb| -> OutActions<'w, 'r> {
-                    let mut staged: StagedActions = StagedActions::new();
-                    fail_inflight_no_readbuf(
-                        state,
-                        ProtocolError::ReadBufferFull { attempted, available },
-                        &mut staged,
-                        malformed_counter,
-                    );
-                    // DEF-188: fail_inflight_no_readbuf doesn't touch
-                    // terminal_row_desc; reborrow as immutable for
-                    // materialise here. NLL ends the outer `&mut`
-                    // binding at fail_inflight's return.
-                    let terminal_ref: Option<&crate::decode::RowDesc> =
-                        (*terminal_row_desc).as_ref();
-                    materialise(staged, wb.into_bytes(), terminal_ref)
-                });
-            }
-            IngressClassification::Ok => {
-                // Fall through to main dispatch.
-            }
-        }
-
-        // Main dispatch. Take shared borrow of populated + cursor
-        // (both via immutable reborrow of read_buf's &mut).
-        write_buf.with_branded(|mut wb| -> OutActions<'w, 'r> {
-            let mut staged: StagedActions = StagedActions::new();
-            // DEF-184 audit (2026-04-24): `populated` + `cursor`
-            // bindings moved INSIDE the closure (post-DEF-154 Y
-            // no staged action borrows from read_buf). The shared
-            // borrow drops at end of loop body via NLL, unblocking
-            // `read_buf.advance()` in-scope after the loop.
-            let populated: &[u8] = read_buf.populated();
-            let cursor: u16 = read_buf.cursor_position_u16();
-            // DEF-154 (G): cursor math stays in u16 end-to-end,
-            // bounded by `READ_BUF_CAP <= u16::MAX` const-assert in
-            // buf.rs. No silent narrowing anywhere.
-            let mut frames_consumed: u16 = 0_u16;
-            // DEF-154 (X): dispatch-count budget for RowStream's
-            // slow path. `feed_bytes` supplies `u16::MAX`
-            // (unbounded); `feed_bytes_bounded` from RowStream
-            // supplies `1` so silent-state-transition frames
-            // (e.g. `RowDescription`) return control to the
-            // fast-path loop after exactly one frame.
-            let mut dispatches_this_call: u16 = 0_u16;
-
-            // DEF-248 Sub-B (2026-05-12): post-loop staging for
-            // partial-assembly entry.
-            //
-            // The dispatch loop's `populated` shared borrow conflicts
-            // with `partial_assembly_slot` mut access inside the loop
-            // body. The `FrameTooLarge` arm stages the entry work
-            // here; the post-loop block applies the mutation after
-            // NLL closes `populated`'s borrow.
-            //
-            // Carries: (tag_byte, body_remaining_at_entry,
-            // body_prefix_already_buffered: &[u8]). The prefix slice
-            // is a sub-slice of `populated` — its lifetime ends at
-            // the loop's `}` brace (NLL); the apply site at line
-            // 2470+ runs BEFORE the closing brace's NLL hits.
-            let mut staged_partial_entry:
-                Option<(u8, u32, &[u8])> = None;
-
-            // Dispatch loop block: `reserved` holds `&mut wb.buf`
-            // which must release before `wb.into_bytes()`
-            // post-loop. NLL ends `reserved`'s borrow at the `}`.
-            {
-            let mut reserved = wb.reserve();
-            // DEF-248 Sub-B (2026-05-12): assembly-completion dispatch
-            // fires BEFORE the parse-header loop. If the prior
-            // `feed_inbound` / `read_buf_append` / top-of-feed-bytes
-            // bytes-routing path completed the in-flight body
-            // (`body_remaining == 0`), take the assembly out, route
-            // its prefix through the existing per-tag `dispatch()`,
-            // and free the Box. The standard parse-header loop below
-            // then runs against ReadBuf's tail (containing any
-            // bytes that arrived alongside the completing chunk —
-            // typically a trailing `'Z'`).
-            //
-            // Identical-event-semantics contract: the dispatch arm
-            // sees the (truncated-to-PREFIX_CAP) prefix in the place
-            // it would have seen the inline payload. Every non-`'D'`
-            // parser is inline-bounded; observation matches the
-            // inline-arrival path byte-for-byte.
-            // Check completion + budget BEFORE taking the box. If the
-            // staged-actions slot is full, defer the dispatch to the
-            // next `feed_bytes` call — the assembly stays in the cell
-            // (calling code routes any additional inbound bytes
-            // through the absorber, which no-ops for complete bodies).
-            // Universal coverage preserved: every wire-legal frame
-            // eventually dispatches; the budget gate just rate-limits
-            // per-call.
-            //
-            // **Hot-path cost**: `partial_assembly_slot.as_inner()` is
-            // a single byte-load on the niche-packed `Option<Box<_>>`
-            // discriminator. Common case (no partial mode) is `None`
-            // — `matches!` returns false in one compare. `cold_path()`
-            // marks the taken-and-dispatch body as the rare branch so
-            // LLVM emits it after the parse-header loop in machine
-            // code, keeping the hot loop's I-cache footprint
-            // unaffected.
-            // Fast-path gate: `is_active()` is a single byte-load on
-            // the niche-packed Option<Box> discriminator. Returns false
-            // 99.99% of the time (no oversize body in flight). The
-            // remaining checks (`is_complete()` + budget) only run on
-            // the cold arm where partial mode is active.
-            if partial_assembly_slot.is_active()
-                && matches!(
-                    partial_assembly_slot.as_inner(),
-                    Some(inner) if inner.is_complete(),
-                )
-                && staged
-                    .len()
-                    .saturating_add(WORST_CASE_PER_DISPATCH)
-                    <= MAX_STAGED_PER_CALL
-                && let Some(assembly_box) =
-                    _partial_assembly_dispatch_leaf::take_completed_partial_assembly_at_dispatch(
-                        partial_assembly_slot,
-                    )
-            {
-                core::hint::cold_path();
-                let assembled_tag = assembly_box.typed_tag();
-                let outcome = dispatch(
-                    state,
-                    assembled_tag,
-                    assembly_box.prefix(),
-                    &mut reserved,
-                    terminal_row_desc,
-                    error_arena_slot,
-                    backend_key_slot,
-                );
-                match outcome {
-                    DispatchOutcome::AdvancedSilent => {
-                        dispatches_this_call =
-                            dispatches_this_call.saturating_add(1);
-                    }
-                    DispatchOutcome::AdvancedWithAction { action } => {
-                        dispatches_this_call =
-                            dispatches_this_call.saturating_add(1);
-                        emit_actions!(&mut staged, budget: 1, [
-                            action,
-                        ]);
-                    }
-                    DispatchOutcome::Errored { reply_id, cause } => {
-                        match reply_id {
-                            Some(id) => {
-                                emit_actions!(&mut staged, budget: 2, [
-                                    StagedAction::FailReply { id, cause },
-                                    StagedAction::CloseSocket,
-                                ]);
-                            }
-                            None => {
-                                emit_actions!(&mut staged, budget: 1, [
-                                    StagedAction::CloseSocket,
-                                ]);
-                            }
-                        }
-                    }
-                }
-                // assembly_box drops here — heapless::Vec releases its
-                // inline allocation; no leak across iterations.
-                drop(assembly_box);
-            }
-            loop {
-                // DEF-154 (X): frame-budget gate. Transparent-skip
-                // frames (ParameterStatus / NoticeResponse) do NOT
-                // count — they're noise. Only
-                // AdvancedSilent / AdvancedWithAction / Errored
-                // increment `dispatches_this_call`.
-                //
-                // DEF-184 (B6): `const BOUNDED: bool` specialisation
-                // — in the `BOUNDED=false` monomorphisation the
-                // short-circuit `BOUNDED &&` evaluates at compile
-                // time; LLVM eliminates the entire gate. Production
-                // `feed_bytes` no longer pays the per-iter check.
-                if BOUNDED && dispatches_this_call >= max_dispatches {
-                    break;
-                }
-                // Logical-cursor peek into unread: skip already-
-                // dispatched prefix. `frames_consumed` is
-                // addend-only; each increment is gated on
-                // `after_consumed.len() >= total_len` so the
-                // subsequent slice is always in bounds.
-                let absolute_start = cursor.saturating_add(frames_consumed);
-                let after_consumed = populated
-                    .get(usize::from(absolute_start)..)
-                    .unwrap_or(&[]);
-
-                let header = parse_header(after_consumed);
-                match header {
-                    HeaderParse::Empty | HeaderParse::Incomplete => break,
-                    HeaderParse::MalformedLength { declared } => {
-                        // DEF-196: malformed_counter is inline; pass the
-                        // top-of-fn binding directly — no Box, no lazy.
-                        fail_inflight_no_readbuf(
-                            state,
-                            ProtocolError::MalformedFrameLength { declared },
-                            &mut staged,
-                            malformed_counter,
-                        );
-                        break;
-                    }
-                    HeaderParse::FrameTooLarge { declared } => {
-                        // DEF-248 Sub-B (2026-05-12): universal-coverage
-                        // entry to partial-assembly mode for non-`'D'`
-                        // streaming-eligible tags.
-                        //
-                        // Pre-Sub-B: every `FrameTooLarge` tore the
-                        // connection down. Sub-A delivered partial mode
-                        // for `'D'` only, routed through
-                        // `RowStream::dispatch_next_frame` (not here).
-                        // Sub-B delivers the residue: `{T, E, N, A, C,
-                        // S, R, v}` tags whose body > READ_BUF_CAP
-                        // route through this arm.
-                        //
-                        // Decision:
-                        // 1. Streaming-eligible? If not → existing
-                        //    teardown.
-                        // 2. Else: stage partial-mode entry. Snapshot
-                        //    the body bytes already buffered
-                        //    (`after_consumed[HEADER_LEN..]`); the rest
-                        //    of the body arrives via subsequent
-                        //    `feed_bytes` calls and routes through the
-                        //    top-of-feed-bytes absorb path. **No
-                        //    frequency-based cap** — bodies up to ~2 GiB
-                        //    pass through; bytes beyond the 8 KB
-                        //    prefix cap are counted-and-skipped by
-                        //    the assembly absorber.
-                        //
-                        // The actual mutation (enter + absorb +
-                        // advance) is deferred to post-loop because
-                        // the loop's `populated` shared borrow
-                        // conflicts with `partial_assembly_slot` /
-                        // `read_buf` mut access here.
-                        let tag_byte = after_consumed.first().copied().unwrap_or(0);
-                        let body_len_opt = declared.checked_sub(4);
-                        match body_len_opt {
-                            Some(body_len)
-                                if crate::partial_assembly::is_streaming_eligible_tag(
-                                    tag_byte,
-                                ) =>
-                            {
-                                // Body bytes already in ReadBuf
-                                // (portion buffered alongside header).
-                                let already_buffered_body = after_consumed
-                                    .get(HEADER_LEN..)
-                                    .unwrap_or(&[]);
-                                // The slice we snapshot is bounded by
-                                // ReadBuf's unread length — at most
-                                // READ_BUF_CAP - HEADER_LEN bytes.
-                                // u16 storage suffices for the cursor
-                                // arithmetic below.
-                                let header_plus_body = u16::try_from(
-                                    HEADER_LEN.saturating_add(already_buffered_body.len()),
-                                )
-                                .unwrap_or(u16::MAX);
-                                staged_partial_entry = Some((
-                                    tag_byte,
-                                    body_len,
-                                    already_buffered_body,
-                                ));
-                                frames_consumed = frames_consumed
-                                    .saturating_add(header_plus_body);
-                                // Break — no more frames after partial
-                                // entry; the rest of the body arrives
-                                // out-of-band via subsequent calls.
-                                break;
-                            }
-                            _ => {
-                                // Tag is NOT streaming-eligible (fixed-size
-                                // bodies — K/Z/I/1/2/3/n — or D-tag
-                                // which Sub-A handles via column
-                                // streaming). Existing teardown path.
-                                fail_inflight_no_readbuf(
-                                    state,
-                                    ProtocolError::FrameTooLarge { declared },
-                                    &mut staged,
-                                    malformed_counter,
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    HeaderParse::Ok { tag, total_len } => {
-                        // total_len: u16 (DEF-154 (G)), bounded
-                        // `5..=READ_BUF_CAP` by parse_header.
-                        let total_len_usize = usize::from(total_len);
-                        if after_consumed.len() < total_len_usize {
-                            break;
-                        }
-                        // DEF-182 site 1 (payload extraction):
-                        // length-arith invariant — parse_header Ok
-                        // ⇒ total_len >= HEADER_LEN; the len-check
-                        // above ensures total_len <= after_consumed
-                        // .len(). Classified as tier-2 structural
-                        // shield (architecturally dead None).
-                        let payload_opt =
-                            after_consumed.get(HEADER_LEN..total_len_usize);
-                        debug_assert!(
-                            payload_opt.is_some(),
-                            "DEF-182: payload slice .get(HEADER_LEN..total_len) None",
-                        );
-                        let payload = payload_opt.unwrap_or(&[]);
-
-                        // Pre-dispatch filters.
-                        if tag == crate::wire::TAG_PARAMETER_STATUS
-                            && allows_unsolicited_param_status(state)
-                        {
-                            // DEF-185 P2-B (audit 2026-04-24): surface
-                            // MalformedPayload via counter. Pre-fix
-                            // `{}` silently collapsed the outcome;
-                            // post-fix mirrors `n_malformed_bool_dropped`
-                            // for ops diagnostic visibility.
-                            //
-                            // DEF-196: lazy-init session_params Box only
-                            // when actually writing (here).
-                            //
-                            // DEF-272 cluster β (2026-05-10): admit goes
-                            // through `_parameter_status_admit_leaf::
-                            // admit_parameter_status_frame` which mints a
-                            // `ParamStatusToken` (private-field, leaf-
-                            // gated mint) and routes to
-                            // `SessionParamsCell::admit_at_param_status`.
-                            // The cell internally parses + records on
-                            // success / bumps malformed counter on parse
-                            // failure — single mutation site behind the
-                            // token-gated cell method.
-                            // Outcome is signalled to the caller for
-                            // potential future logging/test observation;
-                            // current consumers (this site) discard it.
-                            let _outcome: ParamStatusRecordOutcome =
-                                _parameter_status_admit_leaf::admit_parameter_status_frame(
-                                    session_params_slot,
-                                    payload,
-                                );
-                            frames_consumed =
-                                frames_consumed.saturating_add(total_len);
-                            continue;
-                        }
-                        // DEF-185 P1-E (audit 2026-04-24): NoticeResponse
-                        // filter gated by exhaustive per-variant classifier
-                        // `allows_unsolicited_notice_response`. Pre-auth
-                        // states reject the notice (fall through to the
-                        // dispatch arm which classifies as UnexpectedFrame
-                        // + teardown) — prevents pre-auth attacker-
-                        // controlled text from landing in wrapper logs.
-                        //
-                        // DEF-185 P2-3 (audit 2026-04-24): bump counter
-                        // for operator visibility (adversarial notice
-                        // flood detection).
-                        if tag == crate::wire::TAG_NOTICE_RESPONSE
-                            && allows_unsolicited_notice_response(state)
-                        {
-                            // DEF-196: lazy-init session_params Box only
-                            // when actually writing (here, bumping the
-                            // notice counter).
-                            //
-                            // DEF-272 cluster β (2026-05-10): admit goes
-                            // through `_notice_response_admit_leaf::
-                            // admit_notice_response_frame` which mints a
-                            // `NoticeResponseToken` (leaf-gated mint) and
-                            // routes to `SessionParamsCell::admit_at_notice_response`.
-                            _notice_response_admit_leaf::admit_notice_response_frame(
-                                session_params_slot,
-                            );
-                            frames_consumed =
-                                frames_consumed.saturating_add(total_len);
-                            continue;
-                        }
-
-                        // DEF-154 (L): gate uses `MAX_STAGED_PER_CALL`
-                        // (dispatch-side cap) — NOT `MAX_ACTIONS_PER_CALL`
-                        // (output-side cap which is 2× larger for
-                        // fanout). Pre-(L) both consts were 8 and
-                        // aliased; post-(L) they differ and `staged`
-                        // overflowing its own `heapless::Vec<_, MAX_STAGED_PER_CALL>`
-                        // cap would panic in `emit_actions!`.
-                        if staged
-                            .len()
-                            .saturating_add(WORST_CASE_PER_DISPATCH)
-                            > MAX_STAGED_PER_CALL
-                        {
-                            break;
-                        }
-
-                        // DEF-184 (B21/C6): dispatch takes `&mut state`
-                        // and writes transitions directly. No
-                        // `mem::take` + `*state = new` round-trip —
-                        // one mutable borrow, one in-place store.
-                        // DEF-188: terminal_row_desc threaded through
-                        // for the Z arms to park the in-flight schema.
-                        // DEF-196: pass error_arena_slot only.
-                        // Dispatch arms (ErrorResponse) lazy-init the
-                        // Box<ErrorArena> when actually writing.
-                        // DEF-278 Bundle D (2026-05-17): also pass
-                        // `backend_key_slot` so the
-                        // `(ConnectingPostAuthHaveKey, 'Z')` arm can
-                        // install at handshake-complete.
-                        let outcome = dispatch(
-                            state,
-                            tag,
-                            payload,
-                            &mut reserved,
-                            terminal_row_desc,
-                            error_arena_slot,
-                            backend_key_slot,
-                        );
-                        match outcome {
-                            DispatchOutcome::AdvancedSilent => {
-                                // State already written by dispatch arm.
-                                frames_consumed =
-                                    frames_consumed.saturating_add(total_len);
-                                dispatches_this_call =
-                                    dispatches_this_call.saturating_add(1);
-                            }
-                            DispatchOutcome::AdvancedWithAction { action } => {
-                                // State already written by dispatch arm.
-                                frames_consumed =
-                                    frames_consumed.saturating_add(total_len);
-                                dispatches_this_call =
-                                    dispatches_this_call.saturating_add(1);
-                                // DEF-154 (Q) P1-6: use default
-                                // infallible emit (budget: 1, no
-                                // on_overflow) — the dispatch gate
-                                // above reserves WORST_CASE_PER_DISPATCH
-                                // = 2 slots before entry, so
-                                // staged.len() + 1 ≤ MAX_STAGED_PER_CALL
-                                // is guaranteed. Pre-(Q) the
-                                // `on_overflow: break` form was
-                                // architecturally dead but had a
-                                // silent-loss footgun if the gate ever
-                                // drifted.
-                                emit_actions!(&mut staged, budget: 1, [
-                                    action,
-                                ]);
-                            }
-                            DispatchOutcome::Errored { reply_id, cause } => {
-                                // State already written to
-                                // `ProtoState::Errored(_)` by the
-                                // install_errored helper inside dispatch.
-                                // DEF-154 (Q) P1-6: terminal
-                                // FailReply + CloseSocket MUST reach
-                                // the caller (reply promise
-                                // resolution, socket teardown signal).
-                                // Pre-(Q) the `on_overflow: break`
-                                // form could silently drop these if
-                                // staged was near-full — state is
-                                // Errored but caller sees no
-                                // FailReply, no CloseSocket, orphaned
-                                // oneshot receiver. Post-(Q) infallible
-                                // emit: dispatch gate reserves 2 slots,
-                                // push always fits.
-                                match reply_id {
-                                    Some(id) => {
-                                        emit_actions!(&mut staged, budget: 2, [
-                                            StagedAction::FailReply { id, cause },
-                                            StagedAction::CloseSocket,
-                                        ]);
-                                    }
-                                    None => {
-                                        emit_actions!(&mut staged, budget: 1, [
-                                            StagedAction::CloseSocket,
-                                        ]);
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            } // end of reserved scope
-
-            // DEF-248 Sub-B (2026-05-12): apply staged partial-mode
-            // entry, if any. The dispatch loop's FrameTooLarge arm
-            // (for streaming-eligible tags) deferred enter+absorb to
-            // this point because the loop's `populated` shared borrow
-            // conflicted with `partial_assembly_slot` mut access.
-            //
-            // Sequence:
-            // 1. Enter partial mode for (tag, body_remaining_at_entry).
-            //    This either reuses the existing Box (capacity-
-            //    preserving reset) or allocates a fresh
-            //    Box<PartialAssemblyInner>.
-            // 2. Absorb the already-buffered body prefix. The first
-            //    PREFIX_CAP bytes land in `prefix_buf`; bytes beyond
-            //    are counted-and-skipped (body_remaining decrements).
-            // 3. The cursor advance below moves past
-            //    `HEADER_LEN + body_bytes.len()` — the bytes we just
-            //    absorbed are gone from ReadBuf.
-            if let Some((tag, body_len, body_bytes)) = staged_partial_entry.take() {
-                _partial_assembly_dispatch_leaf::enter_partial_assembly_at_dispatch(
-                    partial_assembly_slot,
-                    tag,
-                    body_len,
-                );
-                if !body_bytes.is_empty() {
-                    let _absorbed_n =
-                        _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
-                            partial_assembly_slot,
-                            body_bytes,
-                        );
-                    debug_assert_eq!(
-                        _absorbed_n,
-                        body_bytes.len(),
-                        "DEF-248 Sub-B: partial-mode entry absorbed all \
-                         body bytes (absorbed={}, body_bytes.len={})",
-                        _absorbed_n,
-                        body_bytes.len(),
-                    );
-                }
-            }
-
-            // DEF-184 audit (2026-04-24) — advance IN-SCOPE.
-            //
-            // Pre: recorded `pending_advance` for next call's entry,
-            // because `StagedAction::StreamRowRange` held `&'r [u8]`
-            // into populated. Post-DEF-154 (Y) deletion of that
-            // variant + the dispatch loop's narrow `populated: &[u8]`
-            // (which drops at end of loop body via NLL), we can now
-            // call `read_buf.advance()` right here.
-            //
-            // Skip advance on Errored transition — `clear_session_residue_if_idle_or_errored`
-            // on the NEXT entry call clears the read_buf anyway, so
-            // any partial-frame remnant doesn't matter.
-            //
-            // `advance()` returns `Result<(), AdvancePastEnd>` —
-            // architecturally dead post-validated frames_consumed
-            // sum, but we classify via InternalCrateBug locus
-            // `ReadCursorAdvance` if it ever fires.
-            if !matches!(state, ProtoState::Errored(_))
-                && frames_consumed > 0
-                && read_buf.advance(usize::from(frames_consumed)).is_err()
-            {
-                // DEF-238 (audit 2026-05-05): cold-path hint on the
-                // dead-arm body. Reaching here implies a regression in
-                // cursor math (parse_header validates total_len <=
-                // populated.len() before each advance contribution).
-                // Marked cold so LLVM keeps fail_inflight_no_readbuf
-                // out of the hot post-loop epilogue.
-                core::hint::cold_path();
-                // Classified dead-arm — a regression in cursor math
-                // would land here. Transition to Errored and emit
-                // FailReply via fail_inflight.
-                // DEF-196: malformed_counter is inline u32, direct.
-                fail_inflight_no_readbuf(
-                    state,
-                    ProtocolError::InternalCrateBug {
-                        locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-                    },
-                    &mut staged,
-                    malformed_counter,
-                );
-            }
-
-            // DEF-188: dispatch may have written to `terminal_row_desc`
-            // during the loop (Z arms park schemas). NLL ends the
-            // dispatch loop's `&mut` reborrow at the loop close brace
-            // above; reborrow as immutable here for materialise.
-            let terminal_ref: Option<&crate::decode::RowDesc> =
-                (*terminal_row_desc).as_ref();
-            materialise(staged, wb.into_bytes(), terminal_ref)
-        })
+        // **Cost model (asm-diff verified)**: LLVM inlines this
+        // single-call thin delegate unconditionally. The emitted
+        // machine code at every existing call site (row_stream slow
+        // path, `<ActivePhase>::feed_bytes`, `<ConnectingPhase>::feed_bytes`)
+        // is bit-equivalent to the pre-refactor inline-method form.
+        // The eight `&mut` field refs become register-resident
+        // displacements from `self`'s base; the struct-literal
+        // construction has no heap or stack-spill cost.
+        feed_bytes_dispatch::<BOUNDED>(
+            DispatchContext {
+                state: &mut self.state,
+                read_buf: &mut self.read_buf,
+                row_desc_slot: &mut self.row_desc_slot,
+                session_params: &mut self.session_params,
+                error_arena: &mut self.error_arena,
+                partial_assembly: &mut self.partial_assembly,
+                backend_key: &mut self.backend_key,
+                malformed_count: &mut self.malformed_frame_count,
+            },
+            bytes,
+            write_buf,
+            max_dispatches,
+        )
     }
 
     /// DEF-184 (X) P0-2(c): frame-bounded variant of [`Self::feed_bytes_impl`]
@@ -4400,76 +4387,28 @@ impl PgProtocolInner {
         &'r mut self,
         write_buf: &'w mut WriteBuf,
     ) -> crate::action::FeedEvent<'w, 'r> {
-        use crate::action::{Action, FeedEvent};
-
-        // Fast-path classifications BEFORE reusing feed_bytes_bounded
-        // (which calls write_buf.clear() unconditionally — we want to
-        // avoid that on these "no work" paths to preserve any caller
-        // residue in wb across spurious advance calls).
-        //
-        // Streaming-rows transition signal: the caller should use
-        // `iter_rows()` for per-row decoding while in this state. We
-        // detect BEFORE feed_bytes_bounded would consume DataRows in
-        // its dispatch loop (which is the wrong shape for the per-
-        // event API).
-        if matches!(
-            self.state,
-            ProtoState::SimpleQueryStreamingRows { .. }
-                | ProtoState::BindExecuteStreamingRows { .. }
-        ) {
-            return FeedEvent::StreamingRows;
-        }
-
-        // Errored terminal: the connection is dead. Caller closes.
-        if matches!(self.state, ProtoState::Errored(_)) {
-            return FeedEvent::Close;
-        }
-
-        // Idle + empty read_buf: nothing to process — caller can push.
-        if matches!(self.state, ProtoState::Idle) && self.read_buf.unread().is_empty() {
-            return FeedEvent::Idle;
-        }
-
-        // Drive the bounded dispatch loop with empty bytes (no append)
-        // and max_dispatches=1 (one actionable frame). The result is
-        // an OutActions with 0..=2 actions corresponding to one frame
-        // event.
-        let actions = self.feed_bytes_bounded(b"", write_buf, 1);
-
-        // Map actions → FeedEvent. The exhaustive match below is the
-        // tier-1 contract: any future Action variant addition fails
-        // the build until classified here.
-        match actions.as_slice() {
-            // No actionable frame in this cycle. Caller needs more
-            // bytes from network (state was non-Idle non-Errored, so
-            // a partial frame is buffered or none at all).
-            [] => FeedEvent::NeedMoreBytes,
-            // Single SendBytes — outbound message (e.g., SCRAM
-            // client-final). The slice borrows into the caller's wb.
-            [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
-            // Single DeliverReply — terminal happy reply.
-            [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
-            // FailReply [+ CloseSocket]: per M2, Fail implies close.
-            // Caller learns "close required" from the Fail variant
-            // documentation; no separate CloseSocket event needed.
-            // Pre-(212) feed_bytes returned a 2-Action slice; post-Phase-2
-            // the FeedEvent::Fail collapses both into one.
-            [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
-            // CloseSocket alone (no in-flight reply): adversarial
-            // frame in Idle, post-handshake fatal. Caller closes.
-            [Action::CloseSocket] => FeedEvent::Close,
-            // Architecturally unreachable: feed_bytes_bounded with
-            // max_dispatches=1 emits AT MOST 2 actions per cycle
-            // (FailReply+CloseSocket pair from install_errored). Any
-            // other shape indicates a regression in dispatch's
-            // emit-budget invariants.
-            //
-            // CREDO §V banned `debug_assert!(false, ...)` defensive-
-            // for-impossible — instead, classify to the conservative
-            // `Close` (forces caller to discard connection, avoiding
-            // any silent-state-corruption window).
-            _ => FeedEvent::Close,
-        }
+        // DEF-279 Phase 1c prerequisite (2026-05-18): thin delegate
+        // to the free function `advance_one_frame_dispatch`. The
+        // eight `&mut self.<field>` borrows split disjointly through
+        // the `DispatchContext` struct literal (disjoint-field-borrow
+        // rule, Rust 2018+); the free function consumes the context
+        // by value, performs the same three fast-path
+        // classifications (StreamingRows / Errored / Idle+empty),
+        // then routes to `feed_bytes_dispatch::<true>` for the
+        // single-frame dispatch when none of the fast paths fire.
+        advance_one_frame_dispatch(
+            DispatchContext {
+                state: &mut self.state,
+                read_buf: &mut self.read_buf,
+                row_desc_slot: &mut self.row_desc_slot,
+                session_params: &mut self.session_params,
+                error_arena: &mut self.error_arena,
+                partial_assembly: &mut self.partial_assembly,
+                backend_key: &mut self.backend_key,
+                malformed_count: &mut self.malformed_frame_count,
+            },
+            write_buf,
+        )
     }
 
     /// DEF-188 — entry-point terminal-row-desc reclamation.
@@ -4546,91 +4485,38 @@ impl PgProtocolInner {
         &mut self,
         class: crate::state::StatePushClass,
     ) {
-        // DEF-211 FAKE-01 (audit 2026-05-04, 5th-pass architect-agent):
-        // takes pre-computed `StatePushClass` rather than re-classifying
-        // here. Tier-1 closure of the wildcard `_ => {}` arm-body-swap
-        // surface: production callers compute `push_class()` ONCE at
-        // the entry point and pass it through. The 5-arm exhaustive
-        // match on `StatePushClass` below means a future variant added
-        // to `StatePushClass` (which is itself driven by an exhaustive
-        // match on every `ProtoState` variant in `state.rs::push_class`)
-        // forces an explicit residue policy decision here at build
-        // time. **No wildcard, no escape hatch** — tier-1 by-construction.
+        // DEF-279 Phase 1c prerequisite: thin delegate to the free
+        // function `clear_session_residue_for_class_dispatch`. Body
+        // unchanged — same exhaustive `StatePushClass` match, same
+        // four cell-clear calls, same tier-1 closure on future
+        // variants. The four `&mut self.<field>` borrows split
+        // disjointly through the call (disjoint-field-borrow rule).
         //
-        // Bench history of alternatives tried/rejected:
+        // Bench history of alternatives tried/rejected (preserved
+        // for future contributors who consider re-inlining):
         // - Routing through `state.push_class()` IN THIS function
         //   (uncached): ~+10 ns on `push_command/ping_amortised`
         //   (LLVM declined to fold the dual match across the
         //   entry-point hot path).
         // - Enumerated 25-variant or-pattern on `ProtoState`: ~+4 ns
-        //   (per-variant compares instead of single discriminant range
-        //   check).
-        // - Extracted `residue_policy(class) -> ResiduePolicy` helper:
-        //   ~+21 ns (LLVM's inline budget rejected the function call
-        //   despite `#[inline]`).
+        //   (per-variant compares instead of single discriminant
+        //   range check).
+        // - Extracted `residue_policy(class) -> ResiduePolicy`
+        //   helper: ~+21 ns (LLVM's inline budget rejected the
+        //   function call despite `#[inline]`).
         // - **Cached classification at entry point** (this form):
         //   bench-neutral. push_command paths pass
-        //   `StatePushClass::Idle` as a STATIC const argument so LLVM
-        //   specialises to the Idle-only arm body. feed_bytes pays one
-        //   `push_class()` call (28-arm match) per call — amortised
-        //   over the full dispatch loop.
-        //
-        // DEF-246 Option α (2026-05-16): moved from
-        // `impl PgProtocol<ActivePhase>` to `impl PgProtocolInner`;
-        // `self.inner.X` references became `self.X` in the move.
-        match class {
-            crate::state::StatePushClass::Idle => {
-                // DEF-272 cluster α: clear via leaf submodule
-                // `_clear_residue_leaf` which mints a
-                // `ClearResidueSchemaToken` (leaf-gated) and routes to
-                // `RowDescSlotCell::clear_at_residue`.
-                _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
-                // DEF-196: only clear arena if it was ever allocated.
-                if let Some(arena) = self.error_arena.as_deref_mut() {
-                    arena.clear();
-                }
-                // DEF-248 Sub-B (2026-05-12): clear any in-flight
-                // partial assembly. Architecturally rare on Idle entry
-                // (a completed partial frame transitions state away
-                // from Idle via dispatch's terminal arms), but
-                // classifies any leftover Box from a torn-down
-                // partial-mode sequence — Box drops, inner
-                // heapless::Vec releases its inline allocation.
-                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.partial_assembly);
-            }
-            crate::state::StatePushClass::Errored(_) => {
-                // DEF-272 cluster α: same leaf-submodule helper as the
-                // Idle arm above.
-                _clear_residue_leaf::clear_schema_slot_residue(&mut self.row_desc_slot);
-                if let Some(arena) = self.error_arena.as_deref_mut() {
-                    arena.clear();
-                }
-                // DEF-189 Q8-C3 + DEF-205 step 3: session-state
-                // forfeit on tear-down; `SessionParams::clear`'s Drop
-                // chain scrubs `SecretBoundedStr` bytes.
-                //
-                // DEF-272 cluster β: clear via the same leaf submodule
-                // `_clear_residue_leaf` which hosts both schema and
-                // session-side concrete tokens (`ClearResidueSchemaToken`
-                // and `ClearResidueSessionToken`). Each clear method on
-                // its respective Cell takes the matching token by value.
-                _clear_residue_leaf::clear_session_params_residue(&mut self.session_params);
-                // DEF-248 Sub-B (2026-05-12): also clear partial
-                // assembly on Errored entry — any in-flight oversize
-                // body is forfeit alongside the connection's other
-                // session state. The Box drops; the Vec releases its
-                // inline allocation; no leak across the post-Errored
-                // window.
-                _clear_residue_leaf::clear_partial_assembly_residue(&mut self.partial_assembly);
-            }
-            // In-flight states — preserve residue. The exhaustive
-            // match here is the load-bearing tier-1 closure: adding
-            // a new `StatePushClass` variant fails the build until
-            // its residue policy is decided.
-            crate::state::StatePushClass::Connecting
-            | crate::state::StatePushClass::PingAwaiting
-            | crate::state::StatePushClass::BusyQuery => {}
-        }
+        //   `StatePushClass::Idle` as a STATIC const argument so
+        //   LLVM specialises to the Idle-only arm body. feed_bytes
+        //   pays one `push_class()` call (28-arm match) per call —
+        //   amortised over the full dispatch loop.
+        clear_session_residue_for_class_dispatch(
+            &mut self.row_desc_slot,
+            &mut self.session_params,
+            &mut self.error_arena,
+            &mut self.partial_assembly,
+            class,
+        );
     }
 }
 
