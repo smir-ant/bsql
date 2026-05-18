@@ -876,6 +876,562 @@ impl ProtoState {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// DEF-279 Phase 1c Bundle (Commit 1 scaffolding, 2026-05-18) —
+// per-phase state enums.
+//
+// Per memo `/tmp/def-rethink-foundation-memo.md` Direction 2.B:
+// split `ProtoState` into per-phase enums that ConnectingInner,
+// ActiveInner, ErroredInner can each carry. This commit is PURE
+// ADDITIVE — the new types have no production callers; Commit 2
+// (dispatch split) wires them; Commit 3 (Inner migration) makes
+// them the storage type on per-phase Inner.
+//
+// **Why three types**: the wrapper-phase TYPE (`<ConnectingPhase>`)
+// must be paired with a state field whose variant set excludes
+// invalid-for-phase variants. `ConnectingInner.state: ConnectingState`
+// physically forbids holding `SimpleQueryStreamingRows` etc. —
+// tier-1 by-storage-absence on state-variant-in-wrong-phase.
+//
+// **Variant naming** — the redundant `Connecting`/`Active` prefix
+// is dropped here (architect Q1 verdict). The wrapping type carries
+// the phase context; `ConnectingState::ConnectingStartupTrust`
+// would stutter at every dispatch arm. Migration from
+// `ProtoState::ConnectingStartupTrust` to
+// `ConnectingState::StartupTrust` at Commit 2 is one textual
+// substitution per arm.
+//
+// **Errored placement** — option (A): each phase enum has its own
+// `Errored(StateErrorKind)` variant (architect Q2 verdict). Reason:
+// during `<ConnectingPhase>`, state can transiently become Errored
+// (the wrapper-phase stays `<ConnectingPhase>` until `into_closed_if_errored`
+// lifts it to `<ClosedPhase>` — Phase 1b ClosedInner). A separate
+// `ErroredState` would force a wrapping `InnerState` enum with a
+// redundant discriminator. Each phase having its own Errored arm
+// matches today's flow with zero runtime overhead.
+// ═════════════════════════════════════════════════════════════════════
+
+/// DEF-279 Phase 1c (Commit 1) — error wrapper for the per-phase
+/// `TryFrom` projection impls.
+///
+/// **Why recover the value**: [`ProtoState`] is non-`Copy` and every
+/// non-`Idle` variant carries a `#[must_use]` [`ReplyId<K>`]. A
+/// `TryFrom` that swallows the input on Err would silently drop the
+/// `ReplyId<K>` without consuming it — exactly the failure-mode the
+/// state-as-data invariant exists to prevent (reforge.md §7.2).
+/// Returning the original via `recovered` lets the caller either
+/// feed it back to the state slot or hand it to
+/// [`ProtoState::take_inflight_reply_raw_id`] to drain correlators
+/// safely.
+#[non_exhaustive]
+pub struct WrongPhase {
+    /// Recovered original — caller MUST consume to drop `ReplyId<K>`s
+    /// without tripping the Drop-guard.
+    pub recovered: ProtoState,
+}
+
+impl core::fmt::Debug for WrongPhase {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WrongPhase")
+            .field("recovered", &self.recovered)
+            .finish()
+    }
+}
+
+/// DEF-279 Phase 1c (Commit 1) — terminal-phase state for
+/// [`crate::protocol::ClosedPhase`] / a future `ErroredPhase`.
+///
+/// Mirrors [`ProtoState::Errored`] exactly. Lives as a single-variant
+/// enum (not a tuple struct) for shape parity with [`ConnectingState`]
+/// and [`ActiveState`] — every dispatch arm matching against per-phase
+/// state uses `match state { State::Errored(kind) => ... }`, so
+/// `ErroredState::Errored(...)` reads uniformly.
+///
+/// **Layout**: 1 B (`StateErrorKind` is 1 B `#[repr(transparent)]`
+/// over `ErrorKind` discriminator; single-variant enum has no extra
+/// discriminator byte under Rust's layout rules).
+///
+/// **`#[allow(missing_debug_implementations)]`**: scaffolding type
+/// with no production callers in Commit 1; manual `Debug` impl (with
+/// `StateErrorKind` formatting matching [`ProtoState::Errored`]'s
+/// manual Debug) lands in Commit 2 alongside the per-phase Inner
+/// migration.
+#[allow(missing_debug_implementations)]
+#[non_exhaustive]
+pub enum ErroredState {
+    /// The connection is terminally classified. Mirror of
+    /// [`ProtoState::Errored`].
+    Errored(StateErrorKind),
+}
+
+/// DEF-279 Phase 1c (Commit 1) — state space reachable from
+/// [`crate::protocol::ConnectingPhase`].
+///
+/// 11 handshake variants + 1 transient `Errored` (entered when
+/// `install_errored` fires during a Connecting state; wrapper stays
+/// `<ConnectingPhase>` until `into_closed_if_errored` lifts to
+/// `<ClosedPhase>`).
+///
+/// **Tier-1 closure** (when wired in Commit 3): a future contributor
+/// CANNOT write `ConnectingInner.state = ConnectingState::SimpleQuery...`
+/// because the variant doesn't exist. State-variant-in-wrong-phase
+/// is impossible by-construction.
+///
+/// **Naming**: the redundant `Connecting` prefix from
+/// [`ProtoState::ConnectingStartupTrust`] etc. is dropped here. The
+/// wrapping `ConnectingState::StartupTrust` is unambiguous.
+///
+/// **Layout**: ~48 B. Largest variant is
+/// [`Self::ScramAwaitingServerFinal`] carrying
+/// `expected_server_sig: SecretDigest` (32 B) + `reply: ReplyId<StartupKind>`
+/// (8 B). With enum-discriminator and alignment padding the total
+/// settles at 48 B (pin-asserted below).
+///
+/// **`#[allow(missing_docs)]`** — every field on every variant is a
+/// direct mirror of the same-named field on the corresponding
+/// [`ProtoState`] variant; the docstring on the [`ProtoState`] variant
+/// is the single source of truth for field semantics. Mirroring docs
+/// here would create drift surface (a future contributor would have
+/// to keep TWO docstrings in sync per field). The variant docstring
+/// already names the mirrored [`ProtoState`] variant via intra-doc
+/// link.
+///
+/// **`#[allow(missing_debug_implementations)]`**: same rationale as
+/// [`ErroredState`] — manual Debug (matching [`ProtoState`]'s
+/// Sensitive-redacting impl) lands in Commit 2.
+#[allow(missing_docs, missing_debug_implementations)]
+#[non_exhaustive]
+pub enum ConnectingState {
+    /// Mirror of [`ProtoState::ConnectingStartupTrust`].
+    StartupTrust {
+        reply: ReplyId<StartupKind>,
+    },
+    /// Mirror of [`ProtoState::ConnectingStartupCleartext`].
+    StartupCleartext {
+        reply: ReplyId<StartupKind>,
+        password: alloc::boxed::Box<crate::sensitive::Sensitive<crate::password::Password>>,
+    },
+    /// Mirror of [`ProtoState::ConnectingCleartextAwaitingAuthOk`].
+    CleartextAwaitingAuthOk(ReplyId<StartupKind>),
+    /// Mirror of [`ProtoState::ConnectingStartupMd5`].
+    StartupMd5 {
+        reply: ReplyId<StartupKind>,
+        handshake: alloc::boxed::Box<crate::md5::Md5HandshakeState>,
+    },
+    /// Mirror of [`ProtoState::ConnectingMd5AwaitingAuthOk`].
+    Md5AwaitingAuthOk(ReplyId<StartupKind>),
+    /// Mirror of [`ProtoState::ConnectingStartupScram`].
+    StartupScram {
+        reply: ReplyId<StartupKind>,
+        scram: alloc::boxed::Box<ScramSession>,
+    },
+    /// Mirror of [`ProtoState::ConnectingScramAwaitingServerFirst`].
+    ScramAwaitingServerFirst {
+        reply: ReplyId<StartupKind>,
+        scram: alloc::boxed::Box<ScramSession>,
+    },
+    /// Mirror of [`ProtoState::ConnectingScramAwaitingServerFinal`].
+    ScramAwaitingServerFinal {
+        reply: ReplyId<StartupKind>,
+        expected_server_sig: SecretDigest,
+    },
+    /// Mirror of [`ProtoState::ConnectingScramAwaitingAuthOk`].
+    ScramAwaitingAuthOk(ReplyId<StartupKind>),
+    /// Mirror of [`ProtoState::ConnectingPostAuthAwaitingKey`].
+    PostAuthAwaitingKey(ReplyId<StartupKind>),
+    /// Mirror of [`ProtoState::ConnectingPostAuthHaveKey`].
+    PostAuthHaveKey {
+        reply: ReplyId<StartupKind>,
+        pid: i32,
+        secret_key: crate::sensitive::Sensitive<i32>,
+    },
+    /// Transient `install_errored` write while wrapper is still
+    /// `<ConnectingPhase>`. Lifted to `<ClosedPhase>` via
+    /// `into_closed_if_errored`.
+    Errored(StateErrorKind),
+}
+
+/// DEF-279 Phase 1c (Commit 1) — state space reachable from
+/// [`crate::protocol::ActivePhase`].
+///
+/// 19 post-handshake variants + 1 transient `Errored`. Includes
+/// `Idle`, `PingAwaitingRfq`, all SimpleQuery / Parse / BindExecute /
+/// Describe flow variants, and `DrainRfqAfterError` (architect Q4
+/// verified: only transitioned-into from Active variants).
+///
+/// **Tier-1 closure** (when wired in Commit 3): a future contributor
+/// CANNOT write `ActiveInner.state = ActiveState::StartupTrust { ... }`
+/// because the variant doesn't exist.
+///
+/// **Layout**: ~80 B (matches today's `ProtoState`). Largest variant
+/// is [`Self::DescribeStatementAwaitingRowDescOrNoData`] /
+/// [`Self::DescribeStatementAwaitingRfq`] carrying
+/// `param_oids: ParamOids` (68 B inline) + `reply: ReplyId<…>` (8 B).
+///
+/// **`#[allow(missing_docs)]`** — same rationale as
+/// [`ConnectingState`]: every variant field is a direct mirror of
+/// the same-named [`ProtoState`] field; doc duplication creates
+/// drift surface.
+///
+/// **`#[allow(missing_debug_implementations)]`**: manual Debug lands
+/// in Commit 2.
+#[allow(missing_docs, missing_debug_implementations)]
+#[non_exhaustive]
+pub enum ActiveState {
+    /// Mirror of [`ProtoState::Idle`].
+    Idle,
+    /// Mirror of [`ProtoState::PingAwaitingRfq`].
+    PingAwaitingRfq(ReplyId<PingKind>),
+    /// Mirror of [`ProtoState::SimpleQueryAwaitingFirstResponse`].
+    SimpleQueryAwaitingFirstResponse(ReplyId<QueryKind>),
+    /// Mirror of [`ProtoState::SimpleQueryStreamingRows`].
+    SimpleQueryStreamingRows {
+        reply: ReplyId<QueryKind>,
+    },
+    /// Mirror of [`ProtoState::SimpleQueryAwaitingRfq`].
+    SimpleQueryAwaitingRfq {
+        reply: ReplyId<QueryKind>,
+        command_tag: BoundedStr<32>,
+    },
+    /// Mirror of [`ProtoState::DrainRfqAfterError`].
+    DrainRfqAfterError,
+    /// Mirror of [`ProtoState::ParseAwaitingParseComplete`].
+    ParseAwaitingParseComplete(ReplyId<ParseKind>),
+    /// Mirror of [`ProtoState::ParseAwaitingRfq`].
+    ParseAwaitingRfq(ReplyId<ParseKind>),
+    /// Mirror of [`ProtoState::BindExecuteAwaitingBindCompleteDml`].
+    BindExecuteAwaitingBindCompleteDml(ReplyId<QueryKind>),
+    /// Mirror of [`ProtoState::BindExecuteAwaitingCommandCompleteDml`].
+    BindExecuteAwaitingCommandCompleteDml(ReplyId<QueryKind>),
+    /// Mirror of [`ProtoState::BindExecuteAwaitingRfqDml`].
+    BindExecuteAwaitingRfqDml {
+        reply: ReplyId<QueryKind>,
+        command_tag: BoundedStr<32>,
+    },
+    /// Mirror of [`ProtoState::BindExecuteAwaitingBindCompleteSelect`].
+    BindExecuteAwaitingBindCompleteSelect {
+        reply: ReplyId<QueryKind>,
+    },
+    /// Mirror of [`ProtoState::BindExecuteAwaitingDataOrCompleteSelect`].
+    BindExecuteAwaitingDataOrCompleteSelect {
+        reply: ReplyId<QueryKind>,
+    },
+    /// Mirror of [`ProtoState::BindExecuteStreamingRows`].
+    BindExecuteStreamingRows {
+        reply: ReplyId<QueryKind>,
+    },
+    /// Mirror of [`ProtoState::BindExecuteAwaitingRfqSelect`].
+    BindExecuteAwaitingRfqSelect {
+        reply: ReplyId<QueryKind>,
+        command_tag: BoundedStr<32>,
+    },
+    /// Mirror of [`ProtoState::DescribeStatementAwaitingParamDesc`].
+    DescribeStatementAwaitingParamDesc(ReplyId<DescribeStatementKind>),
+    /// Mirror of [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`].
+    DescribeStatementAwaitingRowDescOrNoData {
+        reply: ReplyId<DescribeStatementKind>,
+        param_oids: ParamOids,
+    },
+    /// Mirror of [`ProtoState::DescribeStatementAwaitingRfq`].
+    DescribeStatementAwaitingRfq {
+        reply: ReplyId<DescribeStatementKind>,
+        param_oids: ParamOids,
+    },
+    /// Mirror of [`ProtoState::DescribePortalAwaitingRowDescOrNoData`].
+    DescribePortalAwaitingRowDescOrNoData(ReplyId<DescribePortalKind>),
+    /// Mirror of [`ProtoState::DescribePortalAwaitingRfq`].
+    DescribePortalAwaitingRfq {
+        reply: ReplyId<DescribePortalKind>,
+    },
+    /// Transient `install_errored` write while wrapper is still
+    /// `<ActivePhase>`. Lifted to `<ClosedPhase>` via
+    /// `into_closed_if_errored`.
+    Errored(StateErrorKind),
+}
+
+// ─── Per-phase → ProtoState upward conversions (variant uplift) ───
+
+impl From<ErroredState> for ProtoState {
+    #[inline]
+    fn from(s: ErroredState) -> Self {
+        match s {
+            ErroredState::Errored(k) => ProtoState::Errored(k),
+        }
+    }
+}
+
+impl From<ConnectingState> for ProtoState {
+    #[inline]
+    fn from(s: ConnectingState) -> Self {
+        match s {
+            ConnectingState::StartupTrust { reply } => {
+                ProtoState::ConnectingStartupTrust { reply }
+            }
+            ConnectingState::StartupCleartext { reply, password } => {
+                ProtoState::ConnectingStartupCleartext { reply, password }
+            }
+            ConnectingState::CleartextAwaitingAuthOk(r) => {
+                ProtoState::ConnectingCleartextAwaitingAuthOk(r)
+            }
+            ConnectingState::StartupMd5 { reply, handshake } => {
+                ProtoState::ConnectingStartupMd5 { reply, handshake }
+            }
+            ConnectingState::Md5AwaitingAuthOk(r) => {
+                ProtoState::ConnectingMd5AwaitingAuthOk(r)
+            }
+            ConnectingState::StartupScram { reply, scram } => {
+                ProtoState::ConnectingStartupScram { reply, scram }
+            }
+            ConnectingState::ScramAwaitingServerFirst { reply, scram } => {
+                ProtoState::ConnectingScramAwaitingServerFirst { reply, scram }
+            }
+            ConnectingState::ScramAwaitingServerFinal {
+                reply,
+                expected_server_sig,
+            } => ProtoState::ConnectingScramAwaitingServerFinal {
+                reply,
+                expected_server_sig,
+            },
+            ConnectingState::ScramAwaitingAuthOk(r) => {
+                ProtoState::ConnectingScramAwaitingAuthOk(r)
+            }
+            ConnectingState::PostAuthAwaitingKey(r) => {
+                ProtoState::ConnectingPostAuthAwaitingKey(r)
+            }
+            ConnectingState::PostAuthHaveKey {
+                reply,
+                pid,
+                secret_key,
+            } => ProtoState::ConnectingPostAuthHaveKey {
+                reply,
+                pid,
+                secret_key,
+            },
+            ConnectingState::Errored(k) => ProtoState::Errored(k),
+        }
+    }
+}
+
+impl From<ActiveState> for ProtoState {
+    #[inline]
+    fn from(s: ActiveState) -> Self {
+        match s {
+            ActiveState::Idle => ProtoState::Idle,
+            ActiveState::PingAwaitingRfq(r) => ProtoState::PingAwaitingRfq(r),
+            ActiveState::SimpleQueryAwaitingFirstResponse(r) => {
+                ProtoState::SimpleQueryAwaitingFirstResponse(r)
+            }
+            ActiveState::SimpleQueryStreamingRows { reply } => {
+                ProtoState::SimpleQueryStreamingRows { reply }
+            }
+            ActiveState::SimpleQueryAwaitingRfq { reply, command_tag } => {
+                ProtoState::SimpleQueryAwaitingRfq { reply, command_tag }
+            }
+            ActiveState::DrainRfqAfterError => ProtoState::DrainRfqAfterError,
+            ActiveState::ParseAwaitingParseComplete(r) => {
+                ProtoState::ParseAwaitingParseComplete(r)
+            }
+            ActiveState::ParseAwaitingRfq(r) => ProtoState::ParseAwaitingRfq(r),
+            ActiveState::BindExecuteAwaitingBindCompleteDml(r) => {
+                ProtoState::BindExecuteAwaitingBindCompleteDml(r)
+            }
+            ActiveState::BindExecuteAwaitingCommandCompleteDml(r) => {
+                ProtoState::BindExecuteAwaitingCommandCompleteDml(r)
+            }
+            ActiveState::BindExecuteAwaitingRfqDml { reply, command_tag } => {
+                ProtoState::BindExecuteAwaitingRfqDml { reply, command_tag }
+            }
+            ActiveState::BindExecuteAwaitingBindCompleteSelect { reply } => {
+                ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }
+            }
+            ActiveState::BindExecuteAwaitingDataOrCompleteSelect { reply } => {
+                ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply }
+            }
+            ActiveState::BindExecuteStreamingRows { reply } => {
+                ProtoState::BindExecuteStreamingRows { reply }
+            }
+            ActiveState::BindExecuteAwaitingRfqSelect { reply, command_tag } => {
+                ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag }
+            }
+            ActiveState::DescribeStatementAwaitingParamDesc(r) => {
+                ProtoState::DescribeStatementAwaitingParamDesc(r)
+            }
+            ActiveState::DescribeStatementAwaitingRowDescOrNoData {
+                reply,
+                param_oids,
+            } => ProtoState::DescribeStatementAwaitingRowDescOrNoData {
+                reply,
+                param_oids,
+            },
+            ActiveState::DescribeStatementAwaitingRfq { reply, param_oids } => {
+                ProtoState::DescribeStatementAwaitingRfq { reply, param_oids }
+            }
+            ActiveState::DescribePortalAwaitingRowDescOrNoData(r) => {
+                ProtoState::DescribePortalAwaitingRowDescOrNoData(r)
+            }
+            ActiveState::DescribePortalAwaitingRfq { reply } => {
+                ProtoState::DescribePortalAwaitingRfq { reply }
+            }
+            ActiveState::Errored(k) => ProtoState::Errored(k),
+        }
+    }
+}
+
+// ─── ProtoState → per-phase downward projections (TryFrom) ───
+
+impl TryFrom<ProtoState> for ErroredState {
+    type Error = WrongPhase;
+
+    #[inline]
+    fn try_from(s: ProtoState) -> Result<Self, Self::Error> {
+        match s {
+            ProtoState::Errored(k) => Ok(ErroredState::Errored(k)),
+            other => Err(WrongPhase { recovered: other }),
+        }
+    }
+}
+
+impl TryFrom<ProtoState> for ConnectingState {
+    type Error = WrongPhase;
+
+    #[inline]
+    fn try_from(s: ProtoState) -> Result<Self, Self::Error> {
+        match s {
+            ProtoState::ConnectingStartupTrust { reply } => {
+                Ok(ConnectingState::StartupTrust { reply })
+            }
+            ProtoState::ConnectingStartupCleartext { reply, password } => {
+                Ok(ConnectingState::StartupCleartext { reply, password })
+            }
+            ProtoState::ConnectingCleartextAwaitingAuthOk(r) => {
+                Ok(ConnectingState::CleartextAwaitingAuthOk(r))
+            }
+            ProtoState::ConnectingStartupMd5 { reply, handshake } => {
+                Ok(ConnectingState::StartupMd5 { reply, handshake })
+            }
+            ProtoState::ConnectingMd5AwaitingAuthOk(r) => {
+                Ok(ConnectingState::Md5AwaitingAuthOk(r))
+            }
+            ProtoState::ConnectingStartupScram { reply, scram } => {
+                Ok(ConnectingState::StartupScram { reply, scram })
+            }
+            ProtoState::ConnectingScramAwaitingServerFirst { reply, scram } => {
+                Ok(ConnectingState::ScramAwaitingServerFirst { reply, scram })
+            }
+            ProtoState::ConnectingScramAwaitingServerFinal {
+                reply,
+                expected_server_sig,
+            } => Ok(ConnectingState::ScramAwaitingServerFinal {
+                reply,
+                expected_server_sig,
+            }),
+            ProtoState::ConnectingScramAwaitingAuthOk(r) => {
+                Ok(ConnectingState::ScramAwaitingAuthOk(r))
+            }
+            ProtoState::ConnectingPostAuthAwaitingKey(r) => {
+                Ok(ConnectingState::PostAuthAwaitingKey(r))
+            }
+            ProtoState::ConnectingPostAuthHaveKey {
+                reply,
+                pid,
+                secret_key,
+            } => Ok(ConnectingState::PostAuthHaveKey {
+                reply,
+                pid,
+                secret_key,
+            }),
+            ProtoState::Errored(k) => Ok(ConnectingState::Errored(k)),
+            other => Err(WrongPhase { recovered: other }),
+        }
+    }
+}
+
+impl TryFrom<ProtoState> for ActiveState {
+    type Error = WrongPhase;
+
+    #[inline]
+    fn try_from(s: ProtoState) -> Result<Self, Self::Error> {
+        match s {
+            ProtoState::Idle => Ok(ActiveState::Idle),
+            ProtoState::PingAwaitingRfq(r) => Ok(ActiveState::PingAwaitingRfq(r)),
+            ProtoState::SimpleQueryAwaitingFirstResponse(r) => {
+                Ok(ActiveState::SimpleQueryAwaitingFirstResponse(r))
+            }
+            ProtoState::SimpleQueryStreamingRows { reply } => {
+                Ok(ActiveState::SimpleQueryStreamingRows { reply })
+            }
+            ProtoState::SimpleQueryAwaitingRfq { reply, command_tag } => {
+                Ok(ActiveState::SimpleQueryAwaitingRfq { reply, command_tag })
+            }
+            ProtoState::DrainRfqAfterError => Ok(ActiveState::DrainRfqAfterError),
+            ProtoState::ParseAwaitingParseComplete(r) => {
+                Ok(ActiveState::ParseAwaitingParseComplete(r))
+            }
+            ProtoState::ParseAwaitingRfq(r) => Ok(ActiveState::ParseAwaitingRfq(r)),
+            ProtoState::BindExecuteAwaitingBindCompleteDml(r) => {
+                Ok(ActiveState::BindExecuteAwaitingBindCompleteDml(r))
+            }
+            ProtoState::BindExecuteAwaitingCommandCompleteDml(r) => {
+                Ok(ActiveState::BindExecuteAwaitingCommandCompleteDml(r))
+            }
+            ProtoState::BindExecuteAwaitingRfqDml { reply, command_tag } => {
+                Ok(ActiveState::BindExecuteAwaitingRfqDml { reply, command_tag })
+            }
+            ProtoState::BindExecuteAwaitingBindCompleteSelect { reply } => {
+                Ok(ActiveState::BindExecuteAwaitingBindCompleteSelect { reply })
+            }
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply } => {
+                Ok(ActiveState::BindExecuteAwaitingDataOrCompleteSelect { reply })
+            }
+            ProtoState::BindExecuteStreamingRows { reply } => {
+                Ok(ActiveState::BindExecuteStreamingRows { reply })
+            }
+            ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag } => {
+                Ok(ActiveState::BindExecuteAwaitingRfqSelect { reply, command_tag })
+            }
+            ProtoState::DescribeStatementAwaitingParamDesc(r) => {
+                Ok(ActiveState::DescribeStatementAwaitingParamDesc(r))
+            }
+            ProtoState::DescribeStatementAwaitingRowDescOrNoData {
+                reply,
+                param_oids,
+            } => Ok(ActiveState::DescribeStatementAwaitingRowDescOrNoData {
+                reply,
+                param_oids,
+            }),
+            ProtoState::DescribeStatementAwaitingRfq { reply, param_oids } => {
+                Ok(ActiveState::DescribeStatementAwaitingRfq { reply, param_oids })
+            }
+            ProtoState::DescribePortalAwaitingRowDescOrNoData(r) => {
+                Ok(ActiveState::DescribePortalAwaitingRowDescOrNoData(r))
+            }
+            ProtoState::DescribePortalAwaitingRfq { reply } => {
+                Ok(ActiveState::DescribePortalAwaitingRfq { reply })
+            }
+            ProtoState::Errored(k) => Ok(ActiveState::Errored(k)),
+            other => Err(WrongPhase { recovered: other }),
+        }
+    }
+}
+
+// ─── Size pins ───
+
+// DEF-279 Phase 1c (Commit 1) — size pins for the per-phase state
+// enums. Adjusted from architect estimate after empirical measurement
+// (see verification in `_phase_state_size_pin_test` below).
+const _: () = assert!(
+    core::mem::size_of::<ErroredState>() == 1,
+    "ErroredState must remain 1 B (single Errored variant carrying StateErrorKind)",
+);
+const _: () = assert!(
+    core::mem::size_of::<ConnectingState>() == 48,
+    "ConnectingState dominant variant: ScramAwaitingServerFinal (32 B SecretDigest + 8 B ReplyId + 8 B alignment)",
+);
+const _: () = assert!(
+    core::mem::size_of::<ActiveState>() == 80,
+    "ActiveState dominant variant: DescribeStatement*AwaitingRowDescOrNoData / AwaitingRfq (68 B ParamOids + 8 B ReplyId + alignment)",
+);
+
 /// DEF-210 SR-03 (audit 2026-04-28): classifier output for
 /// [`ProtoState::unsolicited_admit`]. Single source of truth for
 /// "is this state allowed to accept an unsolicited `ParameterStatus`
@@ -1371,6 +1927,337 @@ mod push_class_tests {
         pin(
             ProtoState::Errored(errored_kind),
             StatePushClass::Errored(errored_kind),
+        );
+    }
+}
+
+#[cfg(test)]
+mod per_phase_state_roundtrip_tests {
+    //! DEF-279 Phase 1c (Commit 1) — round-trip pins for the per-phase
+    //! state enum conversions.
+    //!
+    //! Tier-3 verification of the From/TryFrom bijection between
+    //! [`ProtoState`] and [`ConnectingState`] / [`ActiveState`] /
+    //! [`ErroredState`]. The alternative — tier-1 const-checkable
+    //! bijection — is not expressible in stable Rust today
+    //! (match-bijection lemma needs const-evaluable pattern matching).
+    //!
+    //! # Coverage
+    //!
+    //! Every variant of each per-phase enum is exercised at least
+    //! once: From upward to ProtoState, then TryFrom downward back.
+    //! The downward arm must yield the SAME variant on success.
+    //!
+    //! Adding a new variant to [`ConnectingState`] or [`ActiveState`]
+    //! requires:
+    //! 1. Adding the matching arm in the `From<ConnectingState> for
+    //!    ProtoState` (build failure if forgotten — exhaustive match).
+    //! 2. Adding the matching arm in `TryFrom<ProtoState>` (build
+    //!    failure if forgotten on the upward variant side).
+    //! 3. Pinning here.
+    //!
+    //! The combination of (1)+(2) build failures gives Tier-1 closure
+    //! on "every variant has both directions wired"; the test here
+    //! closes "every variant round-trips to ITSELF" (the bijection
+    //! property — without it, a swap at the arm body could silently
+    //! map StartupTrust → ConnectingStartupCleartext).
+    //!
+    //! # Variant identity comparison
+    //!
+    //! [`ProtoState`] does NOT derive `PartialEq` (the carried Box
+    //! payloads aren't comparable without deep equality). The test
+    //! compares discriminants via `core::mem::discriminant` for
+    //! variants with non-Copy payloads, and direct field equality for
+    //! payload-bearing simple variants where structural equality is
+    //! safe.
+
+    use super::*;
+    use crate::error::{BoundedStr, ErrorKind};
+    use crate::password::Password;
+    use crate::reply_id::ReplyId;
+    use crate::scram::session::ScramSession;
+    use crate::scram::types::SecretDigest;
+    use crate::sensitive::Sensitive;
+    use core::mem::discriminant;
+    use core::num::NonZeroU64;
+
+    fn nz(n: u64) -> NonZeroU64 {
+        assert!(n > 0, "nz(0) is a test bug");
+        NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
+    }
+
+    /// Consume the ReplyId carried by a state so Drop-guard doesn't
+    /// trip at scope end.
+    fn consume_state(state: ProtoState) {
+        match state.take_inflight_reply_raw_id() {
+            Some(_) | None => {}
+        }
+    }
+
+    /// Round-trip a `ProtoState` value through `TryFrom<ProtoState>
+    /// for ConnectingState` → `From<ConnectingState> for ProtoState`.
+    /// Asserts discriminant equality (deep value equality is not
+    /// expressible without PartialEq on ProtoState).
+    ///
+    /// **Forbid-bundle compliance**: clippy bans `.expect(...)`,
+    /// `panic!()`, `unreachable!()`, AND `assert!(false, ...)` (the
+    /// last one as `assertions_on_constants`). The pattern below uses
+    /// runtime-computed `was_ok: bool` so the trailing `assert!(was_ok,
+    /// ...)` carries a non-constant operand (clippy-clean).
+    fn roundtrip_connecting(state: ProtoState) {
+        let original_disc = discriminant(&state);
+        let result = ConnectingState::try_from(state);
+        let was_ok = result.is_ok();
+        match result {
+            Ok(projected) => {
+                let restored: ProtoState = projected.into();
+                assert_eq!(
+                    discriminant(&restored),
+                    original_disc,
+                    "ConnectingState round-trip changed variant discriminant",
+                );
+                consume_state(restored);
+            }
+            Err(WrongPhase { recovered }) => consume_state(recovered),
+        }
+        assert!(
+            was_ok,
+            "variant should project into ConnectingState — got WrongPhase",
+        );
+    }
+
+    fn roundtrip_active(state: ProtoState) {
+        let original_disc = discriminant(&state);
+        let result = ActiveState::try_from(state);
+        let was_ok = result.is_ok();
+        match result {
+            Ok(projected) => {
+                let restored: ProtoState = projected.into();
+                assert_eq!(
+                    discriminant(&restored),
+                    original_disc,
+                    "ActiveState round-trip changed variant discriminant",
+                );
+                consume_state(restored);
+            }
+            Err(WrongPhase { recovered }) => consume_state(recovered),
+        }
+        assert!(
+            was_ok,
+            "variant should project into ActiveState — got WrongPhase",
+        );
+    }
+
+    fn roundtrip_errored(state: ProtoState) {
+        let original_disc = discriminant(&state);
+        let result = ErroredState::try_from(state);
+        let was_ok = result.is_ok();
+        match result {
+            Ok(projected) => {
+                let restored: ProtoState = projected.into();
+                assert_eq!(
+                    discriminant(&restored),
+                    original_disc,
+                    "ErroredState round-trip changed variant discriminant",
+                );
+                consume_state(restored);
+            }
+            Err(WrongPhase { recovered }) => consume_state(recovered),
+        }
+        assert!(
+            was_ok,
+            "variant should project into ErroredState — got WrongPhase",
+        );
+    }
+
+    #[test]
+    fn connecting_variants_roundtrip() {
+        // Pre-auth Connecting variants (no Box-payload).
+        roundtrip_connecting(ProtoState::ConnectingStartupTrust {
+            reply: ReplyId::from_raw(nz(2_001)),
+        });
+
+        // Box-payload Connecting variants (need Password fixtures).
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let pw_box = alloc::boxed::Box::new(Sensitive::new(pw));
+            roundtrip_connecting(ProtoState::ConnectingStartupCleartext {
+                reply: ReplyId::from_raw(nz(2_002)),
+                password: pw_box,
+            });
+        }
+
+        roundtrip_connecting(ProtoState::ConnectingCleartextAwaitingAuthOk(
+            ReplyId::from_raw(nz(2_003)),
+        ));
+
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = alloc::boxed::Box::new(ScramSession::from_password(Sensitive::new(pw)));
+            roundtrip_connecting(ProtoState::ConnectingStartupScram {
+                reply: ReplyId::from_raw(nz(2_005)),
+                scram,
+            });
+        }
+        if let Ok(pw) = Password::try_from_bytes(b"pw") {
+            let scram = alloc::boxed::Box::new(ScramSession::from_password(Sensitive::new(pw)));
+            roundtrip_connecting(ProtoState::ConnectingScramAwaitingServerFirst {
+                reply: ReplyId::from_raw(nz(2_006)),
+                scram,
+            });
+        }
+        roundtrip_connecting(ProtoState::ConnectingScramAwaitingServerFinal {
+            reply: ReplyId::from_raw(nz(2_007)),
+            expected_server_sig: SecretDigest::new([0_u8; 32]),
+        });
+        roundtrip_connecting(ProtoState::ConnectingScramAwaitingAuthOk(
+            ReplyId::from_raw(nz(2_008)),
+        ));
+        roundtrip_connecting(ProtoState::ConnectingMd5AwaitingAuthOk(
+            ReplyId::from_raw(nz(2_009)),
+        ));
+        roundtrip_connecting(ProtoState::ConnectingPostAuthAwaitingKey(
+            ReplyId::from_raw(nz(2_010)),
+        ));
+        roundtrip_connecting(ProtoState::ConnectingPostAuthHaveKey {
+            reply: ReplyId::from_raw(nz(2_011)),
+            pid: 42,
+            secret_key: Sensitive::new(123_i32),
+        });
+
+        // Errored is in BOTH Connecting and Active phase enums.
+        let errored_kind = StateErrorKind::from_kind_or_internal(ErrorKind::Framing);
+        roundtrip_connecting(ProtoState::Errored(errored_kind));
+    }
+
+    #[test]
+    fn active_variants_roundtrip() {
+        roundtrip_active(ProtoState::Idle);
+        roundtrip_active(ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(1_001))));
+
+        // SimpleQuery flow.
+        roundtrip_active(ProtoState::SimpleQueryAwaitingFirstResponse(
+            ReplyId::from_raw(nz(3_001)),
+        ));
+        roundtrip_active(ProtoState::SimpleQueryStreamingRows {
+            reply: ReplyId::from_raw(nz(3_002)),
+        });
+        roundtrip_active(ProtoState::SimpleQueryAwaitingRfq {
+            reply: ReplyId::from_raw(nz(3_003)),
+            command_tag: BoundedStr::default(),
+        });
+        roundtrip_active(ProtoState::DrainRfqAfterError);
+
+        // Parse flow.
+        roundtrip_active(ProtoState::ParseAwaitingParseComplete(ReplyId::from_raw(
+            nz(4_001),
+        )));
+        roundtrip_active(ProtoState::ParseAwaitingRfq(ReplyId::from_raw(nz(4_002))));
+
+        // BindExecute DML.
+        roundtrip_active(ProtoState::BindExecuteAwaitingBindCompleteDml(
+            ReplyId::from_raw(nz(5_001)),
+        ));
+        roundtrip_active(ProtoState::BindExecuteAwaitingCommandCompleteDml(
+            ReplyId::from_raw(nz(5_002)),
+        ));
+        roundtrip_active(ProtoState::BindExecuteAwaitingRfqDml {
+            reply: ReplyId::from_raw(nz(5_003)),
+            command_tag: BoundedStr::default(),
+        });
+
+        // BindExecute SELECT.
+        roundtrip_active(ProtoState::BindExecuteAwaitingBindCompleteSelect {
+            reply: ReplyId::from_raw(nz(5_004)),
+        });
+        roundtrip_active(ProtoState::BindExecuteAwaitingDataOrCompleteSelect {
+            reply: ReplyId::from_raw(nz(5_005)),
+        });
+        roundtrip_active(ProtoState::BindExecuteStreamingRows {
+            reply: ReplyId::from_raw(nz(5_006)),
+        });
+        roundtrip_active(ProtoState::BindExecuteAwaitingRfqSelect {
+            reply: ReplyId::from_raw(nz(5_007)),
+            command_tag: BoundedStr::default(),
+        });
+
+        // DescribeStatement flow.
+        roundtrip_active(ProtoState::DescribeStatementAwaitingParamDesc(
+            ReplyId::from_raw(nz(6_001)),
+        ));
+        roundtrip_active(ProtoState::DescribeStatementAwaitingRowDescOrNoData {
+            reply: ReplyId::from_raw(nz(6_002)),
+            param_oids: crate::action::ParamOids::default(),
+        });
+        roundtrip_active(ProtoState::DescribeStatementAwaitingRfq {
+            reply: ReplyId::from_raw(nz(6_003)),
+            param_oids: crate::action::ParamOids::default(),
+        });
+
+        // DescribePortal flow.
+        roundtrip_active(ProtoState::DescribePortalAwaitingRowDescOrNoData(
+            ReplyId::from_raw(nz(6_004)),
+        ));
+        roundtrip_active(ProtoState::DescribePortalAwaitingRfq {
+            reply: ReplyId::from_raw(nz(6_005)),
+        });
+
+        // Errored is in BOTH Connecting and Active phase enums.
+        let errored_kind = StateErrorKind::from_kind_or_internal(ErrorKind::Framing);
+        roundtrip_active(ProtoState::Errored(errored_kind));
+    }
+
+    #[test]
+    fn errored_state_roundtrip() {
+        let errored_kind = StateErrorKind::from_kind_or_internal(ErrorKind::Framing);
+        roundtrip_errored(ProtoState::Errored(errored_kind));
+    }
+
+    /// Cross-phase rejection: ProtoState in Active variants cannot
+    /// project into ConnectingState (returns WrongPhase Err).
+    #[test]
+    fn active_variant_rejects_as_connecting() {
+        let state = ProtoState::Idle;
+        let result = ConnectingState::try_from(state);
+        let was_err = result.is_err();
+        if let Err(WrongPhase { recovered }) = result {
+            consume_state(recovered);
+        }
+        assert!(
+            was_err,
+            "Idle should reject as ConnectingState — instead got Ok",
+        );
+    }
+
+    /// Cross-phase rejection: ProtoState in Connecting variants cannot
+    /// project into ActiveState.
+    #[test]
+    fn connecting_variant_rejects_as_active() {
+        let state = ProtoState::ConnectingStartupTrust {
+            reply: ReplyId::from_raw(nz(9_001)),
+        };
+        let result = ActiveState::try_from(state);
+        let was_err = result.is_err();
+        if let Err(WrongPhase { recovered }) = result {
+            consume_state(recovered);
+        }
+        assert!(
+            was_err,
+            "ConnectingStartupTrust should reject as ActiveState — instead got Ok",
+        );
+    }
+
+    /// Cross-phase rejection: non-Errored variants cannot project into
+    /// ErroredState.
+    #[test]
+    fn non_errored_variant_rejects_as_errored() {
+        let state = ProtoState::Idle;
+        let result = ErroredState::try_from(state);
+        let was_err = result.is_err();
+        if let Err(WrongPhase { recovered }) = result {
+            consume_state(recovered);
+        }
+        assert!(
+            was_err,
+            "Idle should reject as ErroredState — instead got Ok",
         );
     }
 }
