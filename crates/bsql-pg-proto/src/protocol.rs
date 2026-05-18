@@ -2447,8 +2447,9 @@ pub(crate) mod _replyid_saturation_drain_leaf {
     /// [`crate::PgProtocol::install_errored_replyid_saturation`].
     #[inline]
     #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id (if any). \
-                  Caller `install_errored_replyid_saturation` binds it to `_drained_id_at_saturation` \
-                  for documentation; saturation has no FailReply emission context."]
+                  Caller `install_errored_replyid_saturation` consumes it via \
+                  `match drain(...) { Some(_) | None => {} }`; saturation has no \
+                  FailReply emission context."]
     pub(in crate::protocol) fn drain(
         state: &mut crate::state::ProtoState,
         kind: crate::error::StateErrorKind,
@@ -2607,11 +2608,11 @@ pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
     /// `RowStream`'s Drop impl).
     #[inline]
     #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
-                  by the Errored install. Drop-site caller binds it to `_drained_at_drop` for \
-                  documentation; drop has no FailReply emission context, but the next \
-                  operation on the connection surfaces ConnectionAlreadyClosed { prior_kind: \
-                  ClientOrdering } so the user's oneshot is not silently leaked at the \
-                  wrapper layer."]
+                  by the Errored install. Drop-site caller consumes it via \
+                  `match drain(...) { Some(_) | None => {} }`; drop has no FailReply \
+                  emission context, but the next operation on the connection surfaces \
+                  ConnectionAlreadyClosed { prior_kind: ClientOrdering } so the user's \
+                  oneshot is not silently leaked at the wrapper layer."]
     pub(in crate::protocol) fn drain(
         state: &mut crate::state::ProtoState,
         kind: crate::error::StateErrorKind,
@@ -4187,11 +4188,18 @@ where
                     if tag == crate::wire::TAG_PARAMETER_STATUS
                         && allows_unsolicited_param_status(state)
                     {
-                        let _outcome: ParamStatusRecordOutcome =
-                            _parameter_status_admit_leaf::admit_parameter_status_frame(
-                                session_params_slot,
-                                payload,
-                            );
+                        match _parameter_status_admit_leaf::admit_parameter_status_frame(
+                            session_params_slot,
+                            payload,
+                        ) {
+                            // Both variants intentionally consumed here.
+                            // Phase 1d may surface MalformedPayload via a
+                            // wrapper-advisory action; until then, the
+                            // exhaustive arms pin the discard policy and
+                            // ensure any new variant addition fails build.
+                            ParamStatusRecordOutcome::Processed
+                            | ParamStatusRecordOutcome::MalformedPayload => {}
+                        }
                         frames_consumed =
                             frames_consumed.saturating_add(total_len);
                         continue;
@@ -4281,17 +4289,16 @@ where
                 body_len,
             );
             if !body_bytes.is_empty() {
-                let _absorbed_n =
+                let absorbed_n =
                     _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
                         partial_assembly_slot,
                         body_bytes,
                     );
                 debug_assert_eq!(
-                    _absorbed_n,
+                    absorbed_n,
                     body_bytes.len(),
                     "DEF-248 Sub-B: partial-mode entry absorbed all \
-                     body bytes (absorbed={}, body_bytes.len={})",
-                    _absorbed_n,
+                     body bytes (absorbed={absorbed_n}, body_bytes.len={})",
                     body_bytes.len(),
                 );
             }
@@ -4815,8 +4822,15 @@ impl ConnectingInner {
         let sentinel = ConnectingState::Errored(kind);
         let lifted = core::mem::replace(&mut self.state, sentinel);
         let mut proto_state: ProtoState = lifted.into();
-        let _drained_id_at_saturation =
-            _replyid_saturation_drain_leaf::drain(&mut proto_state, kind);
+        // Drain return is the in-flight reply id, deliberately
+        // discarded: saturation has no FailReply emission context
+        // (architecturally dead under the 2^64-saturated counter). The
+        // explicit `Some(_) | None => {}` arm satisfies the leaf's
+        // `#[must_use]` without re-introducing the banned
+        // `let _drained = ...;` underscore-bind form.
+        match _replyid_saturation_drain_leaf::drain(&mut proto_state, kind) {
+            Some(_) | None => {}
+        }
         match ConnectingState::try_from(proto_state) {
             Ok(cs) => self.state = cs,
             Err(WrongPhase { recovered }) => {
@@ -5019,8 +5033,13 @@ impl ActiveInner {
         let sentinel = ActiveState::Errored(kind);
         let lifted = core::mem::replace(&mut self.state, sentinel);
         let mut proto_state: ProtoState = lifted.into();
-        let _drained_id_at_saturation =
-            _replyid_saturation_drain_leaf::drain(&mut proto_state, kind);
+        // Drain return is the in-flight reply id, deliberately
+        // discarded: saturation has no FailReply emission context.
+        // Explicit `Some(_) | None => {}` arm satisfies `#[must_use]`
+        // without the banned `let _drained = ...;` underscore-bind.
+        match _replyid_saturation_drain_leaf::drain(&mut proto_state, kind) {
+            Some(_) | None => {}
+        }
         match ActiveState::try_from(proto_state) {
             Ok(cs) => self.state = cs,
             Err(WrongPhase { recovered }) => {
@@ -5876,13 +5895,18 @@ impl PgProtocol<ActivePhase> {
         let cause = ProtocolError::InternalCrateBug {
             locus: crate::error::CrateBugLocus::StreamDroppedMidStream,
         };
-        // The drained id has no caller context here (Drop). Bind to
-        // `_drained_at_drop` for the `#[must_use]` discoverability
-        // contract — see the leaf submodule docstring.
-        let _drained_at_drop: Option<NonZeroU64> = self.drain_via_leaf(
+        // Drop-path drain: the in-flight reply id has no caller
+        // context here (the RowStream is being dropped without a
+        // FailReply emission target). Explicit `Some(_) | None => {}`
+        // arm consumes the `#[must_use]` return without re-introducing
+        // the banned `let _drained = ...;` underscore-bind. See the
+        // leaf submodule docstring for the must_use rationale.
+        match self.drain_via_leaf(
             cause.state_kind(),
             _stream_dropped_mid_stream_drain_leaf::drain,
-        );
+        ) {
+            Some(_) | None => {}
+        }
         // DEF-248 Sub-A: clear read_buf so a subsequent feed_bytes on
         // the post-Errored connection does not classify mid-frame
         // bytes as a fresh frame header. The state is already Errored
