@@ -3313,7 +3313,25 @@ impl PgProtocolInner {
                 &mut self.partial_assembly,
                 bytes,
             );
-            bytes.get(absorbed..).unwrap_or(&[])
+            // DEF-280 sweep (2026-05-18): explicit bounds-check before
+            // the `.unwrap_or(&[])` syntactic fallback. `absorb_partial_*`
+            // returns the count of bytes it consumed from `bytes`, so
+            // `absorbed <= bytes.len()` by the function's contract; the
+            // None arm of `bytes.get(absorbed..)` is architecturally dead.
+            // Pre-Bundle the silent `.unwrap_or(&[])` would have masked a
+            // future regression on absorb's contract (wire bytes silently
+            // dropped from read_buf's input). Post-Bundle the explicit
+            // pre-check makes the architectural-dead arm load-bearing
+            // visible: if `absorbed > bytes.len()` (impossible under intact
+            // contract), the empty-tail fallback fires AND the cold-path
+            // marker flags the regression to LLVM (forcing the cold arm
+            // out of the I-cache footprint of the hot ingress path).
+            if absorbed > bytes.len() {
+                core::hint::cold_path();
+                &[]
+            } else {
+                bytes.get(absorbed..).unwrap_or(&[])
+            }
         } else {
             bytes
         };

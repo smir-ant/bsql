@@ -2435,11 +2435,29 @@ fn parse_error_response(
         // messages can be up to 128 bytes). ~3× on server-error
         // parsing hot path — fired on every ServerErrorResponse.
         let start = pos;
-        let tail = payload.get(start..).unwrap_or(&[]);
+        // DEF-280 sweep (2026-05-18): explicit bounds-check before the
+        // `.unwrap_or(&[])` syntactic fallback. `pos` is incremented
+        // via `checked_add(1)` in the surrounding loop which `break`s
+        // on overflow; so `start = pos <= payload.len()` is the loop
+        // invariant. None arm architecturally dead.
+        let tail: &[u8] = if start > payload.len() {
+            core::hint::cold_path();
+            &[]
+        } else {
+            payload.get(start..).unwrap_or(&[])
+        };
         let value_bytes;
         match tail.iter().position(|&b| b == 0) {
             Some(n) => {
-                value_bytes = tail.get(..n).unwrap_or(&[]);
+                // DEF-280 sweep (2026-05-18): same explicit-check pattern.
+                // `n` is an index from `iter().position()`, so `n < tail
+                // .len()`; the None arm of `tail.get(..n)` is dead.
+                value_bytes = if n > tail.len() {
+                    core::hint::cold_path();
+                    &[]
+                } else {
+                    tail.get(..n).unwrap_or(&[])
+                };
                 // Advance past value + NUL. `start + n + 1 ≤
                 // payload.len()` by construction (n is an index
                 // into tail = payload[start..]), so checked_add

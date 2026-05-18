@@ -467,7 +467,21 @@ impl PartialAssemblyInner {
         // the prefix gets up to PREFIX_CAP - prefix_buf.len() of them.
         let prefix_headroom = PREFIX_CAP.saturating_sub(self.prefix_buf.len());
         let copy_take = core::cmp::min(take, prefix_headroom);
-        let copy_slice = bytes.get(..copy_take).unwrap_or(&[]);
+        // DEF-280 sweep (2026-05-18): explicit bounds-check.
+        // `copy_take = min(take, prefix_headroom)` and `take <= bytes
+        // .len()`, so `copy_take <= bytes.len()` by transitive
+        // min-bound; the None arm of `bytes.get(..copy_take)` is
+        // architecturally dead. Pre-Bundle the silent `.unwrap_or(&[])`
+        // masked a future regression on min-arithmetic contracts
+        // (silent prefix-byte loss without wire-desync). Post-Bundle
+        // the explicit pre-check + cold_path marker keeps the fallback
+        // syntactic but tier-1-by-construction-unreachable.
+        let copy_slice: &[u8] = if copy_take > bytes.len() {
+            core::hint::cold_path();
+            &[]
+        } else {
+            bytes.get(..copy_take).unwrap_or(&[])
+        };
         // `extend_from_slice` returns `Result<(), _>` on overflow of
         // the const-generic cap. The slicing above (`copy_take =
         // min(take, prefix_headroom)`) guarantees fit; the explicit
