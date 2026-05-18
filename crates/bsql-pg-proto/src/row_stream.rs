@@ -529,8 +529,24 @@ impl<'p, 'w> RowStream<'p, 'w> {
                             *slot = Some(s);
                         }
                     }
-                    let formats_slice = col_formats.get(..n_used).unwrap_or(&[]);
-                    let bytes_slice = col_bytes.get(..n_used).unwrap_or(&[]);
+                    // DEF-281 Sites E+F (2026-05-18): explicit-match form
+                    // mirroring `session_params.rs:258-261`'s tier-1
+                    // documented-dead-arm pattern. Pre-Bundle silent
+                    // `.unwrap_or(&[])` on architecturally-dead None
+                    // (n_used = col_count.min(MAX_ROW_COLUMNS) ≤
+                    // MAX_ROW_COLUMNS, both arrays are [_; MAX_ROW_COLUMNS],
+                    // so `.get(..n_used)` is provably-Some). Match form
+                    // documents the dead arm at the call site; CREDO §V
+                    // ban on silent fallback applies here too even
+                    // though the None is mathematically unreachable.
+                    let formats_slice = match col_formats.get(..n_used) {
+                        Some(s) => s,
+                        None => &[],
+                    };
+                    let bytes_slice = match col_bytes.get(..n_used) {
+                        Some(s) => s,
+                        None => &[],
+                    };
                     let decoded = R::decode(bytes_slice, formats_slice)
                         .map_err(ProtocolError::DecodeFailure)?;
                     return Ok(Some(decoded));
