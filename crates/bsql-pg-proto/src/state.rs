@@ -1045,6 +1045,38 @@ pub enum ConnectingState {
         pid: i32,
         secret_key: crate::sensitive::Sensitive<i32>,
     },
+    /// **DEF-279 Phase 1c Bundle Commit 3 — per-phase transition
+    /// signal**. The handshake's `(PostAuthHaveKey, RFQ)` dispatch
+    /// arm transitions `ProtoState` to `Idle` (post-handshake) AND
+    /// installs the backend-key cell. The shared dispatch body
+    /// operates on `ProtoState`; the per-phase `ConnectingInner`
+    /// wrapper lifts state into `ProtoState` before dispatch and
+    /// projects back via [`TryFrom`] after. The `ProtoState::Idle`
+    /// has no `ConnectingState` mirror, so `TryFrom` rejects it —
+    /// the rejection is caught at the per-phase `feed_bytes_impl`'s
+    /// epilogue and translated to **this variant** as the transition
+    /// signal. `<ConnectingPhase>::into_active` observes this variant
+    /// and lifts the wrapper to `<ActivePhase>` (the `BackendKeyCell`
+    /// install was already completed by the dispatch arm; into_active
+    /// only needs to materialise the new `PgProtocolInner` wrapper).
+    ///
+    /// **Unit variant — no payload**. The `(pid, secret_key)` material
+    /// already lives in [`crate::protocol::ConnectingInner`]'s
+    /// `backend_key` cell at this point (installed atomically with
+    /// the dispatch arm's `*state = Idle` write). No retention
+    /// surface — Bundle D' tier elevation preserved by the cell's
+    /// existing zero-on-drop chain.
+    ///
+    /// **No `ProtoState` mirror** — `HandshakeReady` exists only in
+    /// the per-phase `ConnectingState`. The
+    /// `From<ConnectingState> for ProtoState` impl's arm for this
+    /// variant maps to `ProtoState::Idle` (the post-handshake state
+    /// the dispatch body actually saw). The round-trip via TryFrom
+    /// then maps `ProtoState::Idle → ActiveState::Idle` (legitimate
+    /// — handshake DID complete) — which means the
+    /// roundtrip-via-ConnectingState test excludes this variant
+    /// (architecturally non-roundtripping).
+    HandshakeReady,
     /// Transient `install_errored` write while wrapper is still
     /// `<ConnectingPhase>`. Lifted to `<ClosedPhase>` via
     /// `into_closed_if_errored`.
@@ -1207,6 +1239,15 @@ impl From<ConnectingState> for ProtoState {
                 pid,
                 secret_key,
             },
+            // DEF-279 Phase 1c Commit 3: HandshakeReady maps to Idle
+            // (the post-handshake ProtoState that dispatch produced
+            // before the per-phase wrapper translated it to this
+            // signal variant). Used at the `feed_bytes_impl` epilogue
+            // when re-lifting state for the SHARED dispatch path on
+            // a subsequent call (won't happen in practice — the next
+            // call goes through `into_active` first — but the
+            // conversion stays semantically correct).
+            ConnectingState::HandshakeReady => ProtoState::Idle,
             ConnectingState::Errored(k) => ProtoState::Errored(k),
         }
     }
