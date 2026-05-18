@@ -5463,6 +5463,212 @@ impl core::fmt::Debug for ConnectingInner {
     }
 }
 
+/// DEF-279 Phase 2 Bundle Commit 11 (2026-05-18) — per-phase Inner
+/// API surface for `<ActivePhase>`. Mirror of `impl ConnectingInner`
+/// from Phase 1c Commit 7.
+///
+/// All methods `#[allow(dead_code)]` — they become reachable in
+/// Commit 12 when `SealedPhase::Inner = ActiveInner` flips and the
+/// `<ActivePhase>::*` delegate methods route through `self.inner.X`
+/// (where `self.inner: ActiveInner`).
+#[allow(dead_code)]
+impl ActiveInner {
+    /// DEF-279 Phase 2 Bundle Commit 11 — per-phase saturation
+    /// classifier. Mirror of
+    /// [`PgProtocolInner::install_errored_replyid_saturation`].
+    /// Routes through the same token-gated
+    /// [`_replyid_saturation_drain_leaf::drain`] via lift+lower.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn install_errored_replyid_saturation(&mut self) {
+        use crate::state::{ActiveState, WrongPhase};
+        if matches!(self.state, ActiveState::Errored(_)) {
+            return;
+        }
+        let cause = crate::error::ProtocolError::InternalCrateBug {
+            locus: crate::error::CrateBugLocus::ReplyIdSaturation,
+        };
+        let kind = cause.state_kind();
+
+        let sentinel = ActiveState::Errored(kind);
+        let lifted = core::mem::replace(&mut self.state, sentinel);
+        let mut proto_state: ProtoState = lifted.into();
+        let _drained_id_at_saturation =
+            _replyid_saturation_drain_leaf::drain(&mut proto_state, kind);
+        match ActiveState::try_from(proto_state) {
+            Ok(cs) => self.state = cs,
+            Err(WrongPhase { recovered }) => {
+                // Drain always produces ProtoState::Errored(kind)
+                // which projects cleanly to ActiveState::Errored.
+                // Defensive: drain any residual ReplyId from
+                // `recovered` (no-op on Errored).
+                match recovered.take_inflight_reply_raw_id() {
+                    Some(_) | None => {}
+                }
+            }
+        }
+    }
+
+    /// DEF-279 Phase 2 Bundle Commit 11 — mint a fresh ReplyId.
+    /// Mirror of `<ActivePhase>::next_reply_id` body but on the
+    /// Inner type. Uses the shared
+    /// `super::PROCESS_REPLY_ID_COUNTER` static atomic.
+    #[inline]
+    pub(crate) fn next_reply_id<K: crate::reply_id::ReplyKind>(
+        &mut self,
+    ) -> crate::reply_id::ReplyId<K> {
+        use core::sync::atomic::Ordering;
+        let raw_old = PROCESS_REPLY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if raw_old == u64::MAX {
+            self.install_errored_replyid_saturation();
+        }
+        let raw = raw_old.saturating_add(1);
+        let nz = core::num::NonZeroU64::new(raw)
+            .unwrap_or(core::num::NonZeroU64::MIN);
+        crate::reply_id::ReplyId::from_raw(nz)
+    }
+
+    /// DEF-279 Phase 2 Bundle Commit 11 — feed_bytes dispatch loop
+    /// for Active. Thin delegate to
+    /// [`feed_bytes_dispatch_active::<BOUNDED>`].
+    pub(crate) fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
+        &'r mut self,
+        bytes: &[u8],
+        write_buf: &'w mut WriteBuf,
+        max_dispatches: u16,
+    ) -> OutActions<'w, 'r> {
+        feed_bytes_dispatch_active::<BOUNDED>(
+            ActiveDispatchContext {
+                state: &mut self.state,
+                read_buf: &mut self.read_buf,
+                row_desc_slot: &mut self.row_desc_slot,
+                session_params: &mut self.session_params,
+                error_arena: &mut self.error_arena,
+                partial_assembly: &mut self.partial_assembly,
+                backend_key: &mut self.backend_key,
+                malformed_count: &mut self.malformed_frame_count,
+            },
+            bytes,
+            write_buf,
+            max_dispatches,
+        )
+    }
+
+    /// DEF-279 Phase 2 Bundle Commit 11 — frame-bounded feed_bytes.
+    #[inline]
+    pub(crate) fn feed_bytes_bounded<'w, 'r>(
+        &'r mut self,
+        bytes: &[u8],
+        write_buf: &'w mut WriteBuf,
+        max_dispatches: u16,
+    ) -> OutActions<'w, 'r> {
+        self.feed_bytes_impl::<true>(bytes, write_buf, max_dispatches)
+    }
+
+    /// DEF-279 Phase 2 Bundle Commit 11 — append inbound bytes
+    /// (no dispatch). Mirror of `PgProtocolInner::feed_inbound`
+    /// with `ProtoState::Errored(k) => *k` replaced by
+    /// `ActiveState::Errored(k) => *k`.
+    pub(crate) fn feed_inbound(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), crate::error::ProtocolError> {
+        use crate::state::ActiveState;
+        if matches!(self.state, ActiveState::Errored(_)) {
+            core::hint::cold_path();
+            return Err(crate::error::ProtocolError::ConnectionAlreadyClosed {
+                prior_kind: match &self.state {
+                    ActiveState::Errored(k) => *k,
+                    _ => crate::error::ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                    }.state_kind(),
+                },
+            });
+        }
+        if self.partial_assembly.is_active() {
+            core::hint::cold_path();
+            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+                &mut self.partial_assembly,
+                bytes,
+            );
+            let leftover = bytes.get(absorbed..).unwrap_or(&[]);
+            if leftover.is_empty() {
+                return Ok(());
+            }
+            return self.read_buf.append(leftover).map_err(|e| {
+                let crate::buf::ReadBufFull { attempted, available, .. } = e;
+                crate::error::ProtocolError::ReadBufferFull { attempted, available }
+            });
+        }
+        self.read_buf.append(bytes).map_err(|e| {
+            let crate::buf::ReadBufFull { attempted, available, .. } = e;
+            crate::error::ProtocolError::ReadBufferFull { attempted, available }
+        })
+    }
+
+    /// DEF-279 Phase 2 Bundle Commit 11 — single-frame advance.
+    /// Thin delegate to [`advance_one_frame_dispatch_active`].
+    #[must_use = "FeedEvent variants carry side-effect contracts: \
+                  SendBytes/Deliver MUST be processed; Fail/Close MUST \
+                  trigger socket teardown"]
+    pub(crate) fn advance_one_frame<'w, 'r>(
+        &'r mut self,
+        write_buf: &'w mut WriteBuf,
+    ) -> crate::action::FeedEvent<'w, 'r> {
+        advance_one_frame_dispatch_active(
+            ActiveDispatchContext {
+                state: &mut self.state,
+                read_buf: &mut self.read_buf,
+                row_desc_slot: &mut self.row_desc_slot,
+                session_params: &mut self.session_params,
+                error_arena: &mut self.error_arena,
+                partial_assembly: &mut self.partial_assembly,
+                backend_key: &mut self.backend_key,
+                malformed_count: &mut self.malformed_frame_count,
+            },
+            write_buf,
+        )
+    }
+
+    /// DEF-279 Phase 2 Bundle Commit 11 — per-phase residue clear.
+    /// Mirror of [`PgProtocolInner::clear_session_residue_for_class`].
+    /// Thin delegate to [`clear_session_residue_for_class_dispatch`]
+    /// — the helper is state-agnostic (operates only on the four
+    /// cell &muts + class). Same `#[inline]` for DEF-211 FAKE-01
+    /// const-class specialisation by the inliner.
+    #[inline]
+    pub(crate) fn clear_session_residue_for_class(
+        &mut self,
+        class: crate::state::StatePushClass,
+    ) {
+        clear_session_residue_for_class_dispatch(
+            &mut self.row_desc_slot,
+            &mut self.session_params,
+            &mut self.error_arena,
+            &mut self.partial_assembly,
+            class,
+        );
+    }
+}
+
+/// DEF-279 Phase 2 Bundle Commit 11 (2026-05-18) — manual Debug
+/// impl for `ActiveInner`. Mirror of `PgProtocolInner`'s Debug
+/// (3-field `finish_non_exhaustive`).
+impl core::fmt::Debug for ActiveInner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        static EMPTY: SessionParams = SessionParams::new();
+        let session_params: &SessionParams = match self.session_params.as_deref() {
+            Some(p) => p,
+            None => &EMPTY,
+        };
+        f.debug_struct("PgProtocol")
+            .field("state", &self.state)
+            .field("read_buf", &self.read_buf)
+            .field("session_params", session_params)
+            .finish_non_exhaustive()
+    }
+}
+
 // DEF-246 Option α (2026-05-16): re-open `impl PgProtocol<ActivePhase>`
 // for the remaining methods. The five methods moved to
 // `impl PgProtocolInner` above (feed_bytes_impl, feed_bytes_bounded,
