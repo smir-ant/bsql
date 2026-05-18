@@ -4681,6 +4681,182 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     actions
 }
 
+/// DEF-279 Phase 2 Bundle Commit 10 (2026-05-18) — per-phase
+/// dispatch-context bundle for `<ActivePhase>`'s `ActiveInner`.
+///
+/// Mirror of [`DispatchContext`] with `state: &mut ActiveState`
+/// instead of `&mut ProtoState`. The other seven fields are
+/// byte-identical (ActiveInner has the same 8-field shape as
+/// PgProtocolInner — every cell is reachable from at least one
+/// Active variant).
+///
+/// **Two lifetimes** mirror Commit 5.5's lifetime split: `'state`
+/// for the state borrow (lifted-local in `feed_bytes_dispatch_active`),
+/// `'r` for the seven other `&mut` field borrows that flow into
+/// `OutActions<'_, 'r>` via `materialise`.
+///
+/// **Construction**: only by `ActiveInner` methods (Commit 11) via
+/// disjoint-field-borrow from `&mut self`. Tier-1 closure by
+/// construction — only code that already has eight disjoint `&mut`
+/// refs to the right field types can call the wrapper.
+#[allow(dead_code)]
+pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
+    pub(in crate::protocol) state: &'state mut crate::state::ActiveState,
+    pub(in crate::protocol) read_buf: &'r mut ReadBuf,
+    pub(in crate::protocol) row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
+    pub(in crate::protocol) session_params:
+        &'r mut crate::session_params_slot::SessionParamsCell,
+    pub(in crate::protocol) error_arena:
+        &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    pub(in crate::protocol) partial_assembly:
+        &'r mut crate::partial_assembly::PartialAssemblyCell,
+    pub(in crate::protocol) backend_key: &'r mut crate::cancel::BackendKeyCell,
+    pub(in crate::protocol) malformed_count: &'r mut u32,
+}
+
+/// DEF-279 Phase 2 Bundle Commit 10 (2026-05-18) — per-phase
+/// dispatch entry for `<ActivePhase>`'s `ActiveInner`.
+///
+/// **Lift+lower wrapper** over [`feed_bytes_dispatch`] — mirror of
+/// [`feed_bytes_dispatch_connecting`]. Lifts `ActiveState → ProtoState`
+/// once per call via `mem::replace` + `Into`; invokes the shared
+/// dispatch body; projects back via `TryFrom<ProtoState> for ActiveState`.
+///
+/// **No transition-signal translation needed**: unlike Connecting's
+/// `Idle → HandshakeReady` mapping (which encoded the post-
+/// handshake transition signal), Active's lower step is a direct
+/// projection. The only legitimate ProtoState outcomes from an
+/// Active LHS are Active-mirror variants — anything else is a
+/// dispatch.rs bug.
+///
+/// **Sentinel choice during lift**: `ActiveState::Errored(Framing)`
+/// as a transient placeholder; always overwritten by the lower
+/// step before any reader sees it.
+///
+/// **`#[allow(dead_code)]`** until Commit 11 wires
+/// `ActiveInner.feed_bytes_impl` to call this.
+#[allow(dead_code)]
+pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: bool>(
+    ctx: ActiveDispatchContext<'_, 'r>,
+    bytes: &[u8],
+    write_buf: &'w mut WriteBuf,
+    max_dispatches: u16,
+) -> OutActions<'w, 'r> {
+    use crate::state::{ActiveState, WrongPhase};
+
+    let ActiveDispatchContext {
+        state,
+        read_buf,
+        row_desc_slot,
+        session_params,
+        error_arena,
+        partial_assembly,
+        backend_key,
+        malformed_count,
+    } = ctx;
+
+    let sentinel = ActiveState::Errored(
+        crate::error::StateErrorKind::from_kind_or_internal(
+            crate::error::ErrorKind::Framing,
+        ),
+    );
+    let lifted: ActiveState = core::mem::replace(state, sentinel);
+    let mut proto_state: ProtoState = lifted.into();
+
+    let actions = feed_bytes_dispatch::<BOUNDED>(
+        DispatchContext {
+            state: &mut proto_state,
+            read_buf,
+            row_desc_slot,
+            session_params,
+            error_arena,
+            partial_assembly,
+            backend_key,
+            malformed_count,
+        },
+        bytes,
+        write_buf,
+        max_dispatches,
+    );
+
+    // Lower: project proto_state back to ActiveState. Any
+    // non-Active outcome (Connecting* variants) is a dispatch.rs
+    // bug — defensive Errored tears down the connection after
+    // draining any carried ReplyId<K>.
+    match ActiveState::try_from(proto_state) {
+        Ok(cs) => *state = cs,
+        Err(WrongPhase { recovered }) => {
+            core::hint::cold_path();
+            match recovered.take_inflight_reply_raw_id() {
+                Some(_) | None => {}
+            }
+            *state = ActiveState::Errored(
+                crate::error::StateErrorKind::from_kind_or_internal(
+                    crate::error::ErrorKind::Internal,
+                ),
+            );
+        }
+    }
+
+    actions
+}
+
+/// DEF-279 Phase 2 Bundle Commit 10 (2026-05-18) — per-phase
+/// single-frame variant over [`ActiveDispatchContext`]. Mirror of
+/// [`advance_one_frame_dispatch`] for the Active phase.
+///
+/// **Active-specific fast paths** (parity with the parent
+/// [`advance_one_frame_dispatch`]):
+/// - `ActiveState::SimpleQueryStreamingRows { .. }` or
+///   `ActiveState::BindExecuteStreamingRows { .. }` →
+///   [`FeedEvent::StreamingRows`].
+/// - `ActiveState::Errored(_)` → [`FeedEvent::Close`].
+/// - `ActiveState::Idle` + empty `read_buf` → [`FeedEvent::Idle`].
+///
+/// All other Active variants delegate to
+/// [`feed_bytes_dispatch_active::<true>`] with `max_dispatches = 1`.
+///
+/// **`#[allow(dead_code)]`** until Commit 11 wires
+/// `ActiveInner.advance_one_frame` to call this.
+#[must_use = "FeedEvent variants carry side-effect contracts: \
+              SendBytes/Deliver MUST be processed; Fail/Close MUST \
+              trigger socket teardown"]
+#[allow(dead_code)]
+pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
+    ctx: ActiveDispatchContext<'_, 'r>,
+    write_buf: &'w mut WriteBuf,
+) -> crate::action::FeedEvent<'w, 'r> {
+    use crate::action::{Action, FeedEvent};
+    use crate::state::ActiveState;
+
+    if matches!(
+        *ctx.state,
+        ActiveState::SimpleQueryStreamingRows { .. }
+            | ActiveState::BindExecuteStreamingRows { .. }
+    ) {
+        return FeedEvent::StreamingRows;
+    }
+
+    if matches!(*ctx.state, ActiveState::Errored(_)) {
+        return FeedEvent::Close;
+    }
+
+    if matches!(*ctx.state, ActiveState::Idle) && ctx.read_buf.unread().is_empty() {
+        return FeedEvent::Idle;
+    }
+
+    let actions = feed_bytes_dispatch_active::<true>(ctx, b"", write_buf, 1);
+
+    match actions.as_slice() {
+        [] => FeedEvent::NeedMoreBytes,
+        [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
+        [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
+        [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
+        [Action::CloseSocket] => FeedEvent::Close,
+        _ => FeedEvent::Close,
+    }
+}
+
 /// DEF-279 Phase 1c Bundle Commit 6 (2026-05-18) — per-phase
 /// single-frame variant over [`ConnectingDispatchContext`]. Mirror
 /// of [`advance_one_frame_dispatch`] for the Connecting phase.
