@@ -641,7 +641,7 @@ impl PartialAssemblyCell {
     #[inline]
     pub(crate) fn enter_at_dispatch(
         &mut self,
-        _t: crate::protocol::_partial_assembly_dispatch_leaf::PartialAssemblyEnterToken,
+        _token: crate::protocol::_partial_assembly_dispatch_leaf::PartialAssemblyEnterToken,
         tag: u8,
         declared_body_len: u32,
     ) {
@@ -663,7 +663,7 @@ impl PartialAssemblyCell {
     #[inline]
     pub(crate) fn absorb_at_dispatch(
         &mut self,
-        _t: crate::protocol::_partial_assembly_dispatch_leaf::PartialAssemblyAbsorbToken,
+        _token: crate::protocol::_partial_assembly_dispatch_leaf::PartialAssemblyAbsorbToken,
         bytes: &[u8],
     ) -> usize {
         match self.inner.as_mut() {
@@ -687,7 +687,7 @@ impl PartialAssemblyCell {
     #[must_use]
     pub(crate) fn take_completed(
         &mut self,
-        _t: crate::protocol::_partial_assembly_dispatch_leaf::PartialAssemblyTakeToken,
+        _token: crate::protocol::_partial_assembly_dispatch_leaf::PartialAssemblyTakeToken,
     ) -> Option<Box<PartialAssemblyInner>> {
         let inner_ref = self.inner.as_ref()?;
         if !inner_ref.is_complete() {
@@ -706,7 +706,7 @@ impl PartialAssemblyCell {
     #[inline]
     pub(crate) fn clear_at_residue(
         &mut self,
-        _t: crate::protocol::_clear_residue_leaf::ClearResiduePartialAssemblyToken,
+        _token: crate::protocol::_clear_residue_leaf::ClearResiduePartialAssemblyToken,
     ) {
         self.inner = None;
     }

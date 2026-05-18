@@ -146,7 +146,7 @@ impl SessionParamsCell {
     pub(crate) fn admit_at_param_status(
         &mut self,
         payload: &[u8],
-        _t: crate::protocol::_parameter_status_admit_leaf::ParamStatusToken,
+        _token: crate::protocol::_parameter_status_admit_leaf::ParamStatusToken,
     ) -> crate::protocol::ParamStatusRecordOutcome {
         let params = self
             .inner
@@ -182,7 +182,7 @@ impl SessionParamsCell {
     #[inline]
     pub(crate) fn admit_at_notice_response(
         &mut self,
-        _t: crate::protocol::_notice_response_admit_leaf::NoticeResponseToken,
+        _token: crate::protocol::_notice_response_admit_leaf::NoticeResponseToken,
     ) {
         let params = self
             .inner
@@ -204,7 +204,7 @@ impl SessionParamsCell {
     #[inline]
     pub(crate) fn clear_at_residue(
         &mut self,
-        _t: crate::protocol::_clear_residue_leaf::ClearResidueSessionToken,
+        _token: crate::protocol::_clear_residue_leaf::ClearResidueSessionToken,
     ) {
         if let Some(params) = self.inner.as_deref_mut() {
             params.clear();

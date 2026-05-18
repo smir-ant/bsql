@@ -36,7 +36,7 @@
 //!    defining leaf submodule — the field's privacy is the seal, no
 //!    trait, no sealed-supertrait. Each `RowDescSlotCell` write method
 //!    takes a CONCRETE token type by value (consumed by the call):
-//!    `park_at_be_select(&mut self, desc, _t: BeSelectToken)`.
+//!    `park_at_be_select(&mut self, desc, _token: BeSelectToken)`.
 //!
 //! # Tier-1 closure (within-crate, by-construction)
 //!
@@ -166,7 +166,7 @@ impl RowDescSlotCell {
     pub(crate) fn park_at_be_select(
         &mut self,
         desc: RowDesc,
-        _t: crate::protocol::_bind_execute_select_install_leaf::BeSelectToken,
+        _token: crate::protocol::_bind_execute_select_install_leaf::BeSelectToken,
     ) {
         self.inner = Some(desc);
     }
@@ -178,7 +178,7 @@ impl RowDescSlotCell {
     pub(crate) fn park_at_t_dispatch(
         &mut self,
         desc: RowDesc,
-        _t: crate::dispatch::_row_description_dispatch_leaf::TDispatchToken,
+        _token: crate::dispatch::_row_description_dispatch_leaf::TDispatchToken,
     ) {
         self.inner = Some(desc);
     }
@@ -188,7 +188,7 @@ impl RowDescSlotCell {
     #[inline]
     pub(crate) fn clear_at_residue(
         &mut self,
-        _t: crate::protocol::_clear_residue_leaf::ClearResidueSchemaToken,
+        _token: crate::protocol::_clear_residue_leaf::ClearResidueSchemaToken,
     ) {
         self.inner = None;
     }

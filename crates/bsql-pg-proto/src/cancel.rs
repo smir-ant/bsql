@@ -192,7 +192,9 @@ impl BackendKeyCell {
     /// [`crate::protocol::PgProtocol::<crate::DisconnectedPhase>::new`].
     #[inline]
     #[must_use]
-    pub(crate) const fn empty(_t: crate::protocol::_proto_init_leaf::ProtoInitToken) -> Self {
+    pub(crate) const fn empty(
+        _token: crate::protocol::_proto_init_leaf::ProtoInitToken,
+    ) -> Self {
         Self { inner: None }
     }
 

@@ -416,11 +416,11 @@ impl<'a> FeedStateSetter<'a> {
 #[inline]
 #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id (if any) \
               released by the saturation transition. Caller is `install_errored_replyid_saturation` \
-              which has no FailReply emission context (no &mut StagedActions); the value \
-              is bound to `_drained_id_at_saturation` for documentation + lint compliance."]
+              which has no FailReply emission context (no &mut StagedActions); the caller \
+              consumes the value via `match drain(...) { Some(_) | None => {} }`."]
 pub(crate) fn drain_at_replyid_saturation(
     state: &mut ProtoState,
-    _t: crate::protocol::_replyid_saturation_drain_leaf::ReplyIdSaturationToken,
+    _token: crate::protocol::_replyid_saturation_drain_leaf::ReplyIdSaturationToken,
     kind: StateErrorKind,
 ) -> Option<NonZeroU64> {
     FeedStateSetter::new(state).drain_and_install_errored(kind)
@@ -436,7 +436,7 @@ pub(crate) fn drain_at_replyid_saturation(
               dropping it leaks the user's oneshot-receiver (zombie-reply class)."]
 pub(crate) fn drain_at_read_cursor_advance(
     state: &mut ProtoState,
-    _t: crate::protocol::_read_cursor_advance_drain_leaf::ReadCursorAdvanceToken,
+    _token: crate::protocol::_read_cursor_advance_drain_leaf::ReadCursorAdvanceToken,
     kind: StateErrorKind,
 ) -> Option<NonZeroU64> {
     FeedStateSetter::new(state).drain_and_install_errored(kind)
@@ -453,7 +453,7 @@ pub(crate) fn drain_at_read_cursor_advance(
               dropping it leaks the user's oneshot-receiver (zombie-reply class)."]
 pub(crate) fn drain_at_partial_mode_reentry(
     state: &mut ProtoState,
-    _t: crate::protocol::_partial_mode_reentry_drain_leaf::PartialModeReentryToken,
+    _token: crate::protocol::_partial_mode_reentry_drain_leaf::PartialModeReentryToken,
     kind: StateErrorKind,
 ) -> Option<NonZeroU64> {
     FeedStateSetter::new(state).drain_and_install_errored(kind)
@@ -470,7 +470,7 @@ pub(crate) fn drain_at_partial_mode_reentry(
               dropping it leaks the user's oneshot-receiver (zombie-reply class)."]
 pub(crate) fn drain_at_partial_mode_exit_undrained(
     state: &mut ProtoState,
-    _t: crate::protocol::_partial_mode_exit_undrained_drain_leaf::PartialModeExitUndrainedToken,
+    _token: crate::protocol::_partial_mode_exit_undrained_drain_leaf::PartialModeExitUndrainedToken,
     kind: StateErrorKind,
 ) -> Option<NonZeroU64> {
     FeedStateSetter::new(state).drain_and_install_errored(kind)
@@ -485,7 +485,7 @@ pub(crate) fn drain_at_partial_mode_exit_undrained(
               by the Errored install. Caller MUST emit ColEvent::EndQuery::Err or equivalent."]
 pub(crate) fn drain_at_malformed_data_row(
     state: &mut ProtoState,
-    _t: crate::protocol::_malformed_data_row_drain_leaf::MalformedDataRowToken,
+    _token: crate::protocol::_malformed_data_row_drain_leaf::MalformedDataRowToken,
     kind: StateErrorKind,
 ) -> Option<NonZeroU64> {
     FeedStateSetter::new(state).drain_and_install_errored(kind)
@@ -500,7 +500,7 @@ pub(crate) fn drain_at_malformed_data_row(
               by the Errored install. Caller emits FailReply with the cause."]
 pub(crate) fn drain_at_fail_inflight_no_readbuf(
     state: &mut ProtoState,
-    _t: crate::protocol::_fail_inflight_no_readbuf_drain_leaf::FailInflightNoReadbufToken,
+    _token: crate::protocol::_fail_inflight_no_readbuf_drain_leaf::FailInflightNoReadbufToken,
     kind: StateErrorKind,
 ) -> Option<NonZeroU64> {
     FeedStateSetter::new(state).drain_and_install_errored(kind)
@@ -524,14 +524,14 @@ pub(crate) fn drain_at_fail_inflight_no_readbuf(
 /// FailReply path here should consume the id).
 #[inline]
 #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
-              by the Errored install. Drop-site caller binds it to `_drained_at_drop` \
-              for documentation — drop has no FailReply emission context, but the next \
-              operation on the connection surfaces ConnectionAlreadyClosed { prior_kind: \
-              ClientOrdering } so the user's oneshot is not silently leaked at the \
-              wrapper layer."]
+              by the Errored install. Drop-site caller consumes the value via \
+              `match drain(...) { Some(_) | None => {} }` — drop has no FailReply emission \
+              context, but the next operation on the connection surfaces \
+              ConnectionAlreadyClosed { prior_kind: ClientOrdering } so the user's \
+              oneshot is not silently leaked at the wrapper layer."]
 pub(crate) fn drain_at_stream_dropped_mid_stream(
     state: &mut ProtoState,
-    _t: crate::protocol::_stream_dropped_mid_stream_drain_leaf::StreamDroppedMidStreamToken,
+    _token: crate::protocol::_stream_dropped_mid_stream_drain_leaf::StreamDroppedMidStreamToken,
     kind: StateErrorKind,
 ) -> Option<NonZeroU64> {
     FeedStateSetter::new(state).drain_and_install_errored(kind)
