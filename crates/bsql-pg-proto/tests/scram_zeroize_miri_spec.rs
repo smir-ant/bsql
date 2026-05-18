@@ -127,8 +127,16 @@ fn sensitive_password_drop_zeros_backing_buffer() {
             Err(_) => return,
         };
         let sensitive = Sensitive::new(pw);
-        let raw_ptr: *const u8 = sensitive.get().as_bytes().as_ptr();
-        let len = sensitive.get().as_bytes().len();
+        // DEF-280 Bundle E (2026-05-18): closure-scope `with_inner`
+        // replaces the pre-Bundle E `sensitive.get().as_bytes()`
+        // chain. The address (`*const u8`) is captured as `R` from
+        // the closure return; `R` is independent of the inner
+        // borrow's lifetime, so the pointer survives the closure
+        // (the underlying buffer also survives because `sensitive`
+        // itself is still owned by the outer scope). The probe's
+        // post-Drop read is unchanged in semantics.
+        let raw_ptr: *const u8 = sensitive.with_inner(|p| p.as_bytes().as_ptr());
+        let len = sensitive.with_inner(|p| p.as_bytes().len());
         // Verify MAGIC is there.
         let pre = unsafe { read_bytes_at(raw_ptr, len) };
         assert_eq!(pre.as_slice(), MAGIC);

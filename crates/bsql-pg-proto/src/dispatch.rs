@@ -632,8 +632,14 @@ pub(crate) fn dispatch(
                     // zeroize crate's blanket impl for primitive ints
                     // writes `0`). `Deref` exposes the inner `i32` for
                     // the two consumers below without cloning.
+                    // DEF-280 Bundle E (2026-05-18): closure-scope
+                    // Sensitive::with_inner replaces the pre-Bundle E
+                    // `*secret_key.get()` shape. The inner `i32` is
+                    // Copy, so the closure body dereferences and
+                    // returns a copy; the &i32 borrow is HRTB-scoped
+                    // and cannot escape.
                     let secret_key_inner: zeroize::Zeroizing<i32> =
-                        zeroize::Zeroizing::new(*secret_key.get());
+                        zeroize::Zeroizing::new(secret_key.with_inner(|s| *s));
                     crate::protocol::_backend_key_install_leaf::install_at_dispatch_arm(
                         backend_key_slot,
                         pid,
@@ -1750,11 +1756,10 @@ fn dispatch_auth_sasl_continue(
             }
         };
 
-    // Password bytes come from the typed SCRAM session — no
-    // Trust-vs-ScramPassword discrimination here (audit A2).
-    let password_bytes = scram.password_bytes();
-
-    // Build client-final-without-proof.
+    // Build client-final-without-proof. (Order-of-bindings note:
+    // Bundle E moved this above the password computation since the
+    // closure-scoped `with_password_bytes` borrows `scram` and
+    // forces all `scram.*` reads outside its scope.)
     let client_final_without_proof =
         match crate::scram::wire::build_client_final_without_proof(
             server_first.server_nonce.as_bytes(),
@@ -1776,14 +1781,29 @@ fn dispatch_auth_sasl_continue(
     // dead `HmacKeyRejected` path. On Err (supply-chain compromise of
     // RustCrypto's HMAC, etc.), tear down the handshake with a typed
     // diagnostic — don't continue with zero-filled bytes. Fail-closed.
-    let (proof, expected_server_sig) = match crate::scram::crypto::compute_client_proof(
-        password_bytes,
-        &server_first.salt,
-        server_first.iterations,
-        scram.client_first_bare.as_slice(),
-        rest,
-        &client_final_without_proof,
-    ) {
+    //
+    // DEF-280 Bundle E (2026-05-18): closure-scope
+    // `ScramSession::with_password_bytes` replaces the pre-Bundle E
+    // `let password_bytes = scram.password_bytes()` borrow that
+    // could (per Rust lifetimes) live across the subsequent code
+    // until scram's scope-exit but explicitly invited the
+    // discipline-by-docstring «callers must not cache it past the
+    // call boundary». Post-Bundle E the `&[u8]` is HRTB-scoped to
+    // the closure body — the compute_client_proof call — and cannot
+    // escape. Password bytes physically die at closure return; only
+    // the resulting `(proof, expected_server_sig)` tuple survives.
+    let client_first_bare = scram.client_first_bare.as_slice();
+    let proof_result = scram.with_password_bytes(|password_bytes| {
+        crate::scram::crypto::compute_client_proof(
+            password_bytes,
+            &server_first.salt,
+            server_first.iterations,
+            client_first_bare,
+            rest,
+            &client_final_without_proof,
+        )
+    });
+    let (proof, expected_server_sig) = match proof_result {
         Ok(v) => v,
         Err(e) => return install_errored(state, Some(reply.consume()), ProtocolError::Scram(e)),
     };
@@ -2075,8 +2095,14 @@ fn build_password_message(
     let start = reserved.len();
     let buf = reserved.as_write_buf_mut();
     buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte())?;
+    // DEF-280 Bundle E (2026-05-18): closure-scope
+    // Sensitive::with_inner replaces the pre-Bundle E
+    // `password.get().as_bytes()` chain. The `&Password` borrow is
+    // HRTB-scoped to the inner closure; the `as_bytes()` slice
+    // borrows from `&Password` and cannot escape past the closure
+    // either (transitively HRTB-bounded).
     buf.with_length_prefix(|w| {
-        w.push_bytes(password.get().as_bytes())?;
+        password.with_inner(|pwd| w.push_bytes(pwd.as_bytes()))?;
         // PG requires NUL-terminated password in the PasswordMessage
         // body. The length-prefix above includes the NUL byte.
         w.push_u8(0)?;
@@ -2226,11 +2252,18 @@ fn build_md5_password_message(
     // caller cannot accidentally pass a wrong-size buffer or a
     // buffer that wouldn't be fully overwritten). The returned
     // array scrubs on drop at fn return.
-    let body = crate::md5::compute_response_body(
-        handshake.password.get(),
-        handshake.user.as_bytes(),
-        salt,
-    );
+    //
+    // DEF-280 Bundle E (2026-05-18): closure-scope
+    // Sensitive::with_inner replaces the pre-Bundle E
+    // `handshake.password.get()` borrow. The `&Password` lives
+    // HRTB-scoped to the closure body — `compute_response_body`
+    // reads it for the MD5 digest computation, the digest result
+    // (35-byte Zeroizing array) is the value returned from the
+    // closure (R is independent of the password borrow lifetime).
+    let user_bytes = handshake.user.as_bytes();
+    let body = handshake.password.with_inner(|pwd| {
+        crate::md5::compute_response_body(pwd, user_bytes, salt)
+    });
 
     let start = reserved.len();
     let buf = reserved.as_write_buf_mut();

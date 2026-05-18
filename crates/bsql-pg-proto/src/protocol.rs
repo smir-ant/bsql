@@ -2382,8 +2382,12 @@ impl PgProtocol<ActivePhase> {
         // `panic = "abort"` (release; documented gap) the process
         // exits before the unscrubbed slot matters. Tier-1 within
         // scope.
+        // DEF-280 Bundle E (2026-05-18): closure-scope
+        // Sensitive::with_inner replaces the pre-Bundle E
+        // `*key.secret_key.get()` shape. Same elevation as the
+        // dispatch.rs:636 sibling site.
         let secret_key_guard: zeroize::Zeroizing<i32> =
-            zeroize::Zeroizing::new(*key.secret_key.get());
+            zeroize::Zeroizing::new(key.secret_key.with_inner(|s| *s));
         // Materialise the wire frame inside a Zeroizing guard. The
         // `cancel_request_bytes` const-fn returns `[u8; 16]` on the
         // stack; the move into `Zeroizing::new(...)` is NRVO-friendly

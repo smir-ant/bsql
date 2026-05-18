@@ -43,13 +43,47 @@ impl<T: Zeroize> Sensitive<T> {
         Self { inner: value }
     }
 
-    /// Borrow the inner value.
+    /// DEF-280 Bundle E (2026-05-18): closure-scope borrow of the
+    /// inner value. The HRTB-quantified `&'a T` lifetime cannot
+    /// escape the call — retention attacks via the borrowed
+    /// reference are structurally impossible. Pre-Bundle E this was
+    /// `pub const fn get(&self) -> &T` with a docstring saying «the
+    /// borrow is intentionally short-lived — the caller must not
+    /// store the reference beyond the immediate computation» (tier-2
+    /// by-discipline). Post-Bundle E the closure-scope makes the
+    /// discipline by-construction.
     ///
-    /// The borrow is intentionally short-lived — the caller must not
-    /// store the reference beyond the immediate computation.
+    /// The closure receives `&T` and returns `R`. `R` is independent
+    /// of the borrow lifetime, so the inner value can be **copied
+    /// out** (for `T: Copy`) or **digested** (for `T: !Copy`, e.g.,
+    /// `R` is a hash digest computed inside the closure). Retention
+    /// of the borrow ITSELF past the call is rejected by HRTB.
+    ///
+    /// # Use cases
+    ///
+    /// ```ignore
+    /// // Copy out a Copy primitive (i32, u64, etc.):
+    /// let pid = sensitive_pid.with_inner(|p| *p);
+    ///
+    /// // Compute over the inner value:
+    /// let hash = sensitive_pwd.with_inner(|pwd| sha256(pwd.as_bytes()));
+    ///
+    /// // Pass through to a function that needs &T:
+    /// sensitive.with_inner(|inner| use_inner(inner));
+    /// ```
+    ///
+    /// # Pairs with `mem::replace` Drop chain
+    ///
+    /// The `Sensitive<T>` wrapper itself runs `Zeroize::zeroize` on
+    /// Drop (via `#[derive(ZeroizeOnDrop)]`); the closure-scoped
+    /// `with_inner` is the borrow-side complement to that owned-side
+    /// scrub. Together: tier-1 on retention (by-construction via
+    /// HRTB) and tier-1 on owned-storage (by-construction via
+    /// ZeroizeOnDrop) — both modes route through structural
+    /// enforcement, not discipline.
     #[inline]
-    pub const fn get(&self) -> &T {
-        &self.inner
+    pub fn with_inner<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        f(&self.inner)
     }
 }
 

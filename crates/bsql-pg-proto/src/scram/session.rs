@@ -129,14 +129,20 @@ impl ScramSession {
         }
     }
 
-    /// Borrow the password bytes for HMAC / PBKDF2 computation.
+    /// DEF-280 Bundle E (2026-05-18): closure-scope password bytes
+    /// for HMAC / PBKDF2 computation. The HRTB-quantified `&'a [u8]`
+    /// borrow cannot escape the call.
     ///
-    /// The returned slice lives for the shared borrow of `self`;
-    /// callers must not cache it past the call boundary (the
-    /// underlying `Sensitive` may be zeroed at any later moment).
+    /// Pre-Bundle E this was `pub(crate) fn password_bytes(&self)
+    /// -> &[u8]` with a docstring saying «callers must not cache it
+    /// past the call boundary» (tier-2 by-discipline; Rust
+    /// lifetimes prevented use-after-Drop but not the discipline
+    /// breach itself). Post-Bundle E the closure-scope makes the
+    /// discipline by-construction; routing through `Sensitive::with_inner`
+    /// inherits its HRTB-scoped retention guarantee.
     #[inline]
-    pub(crate) fn password_bytes(&self) -> &[u8] {
-        self.password.get().as_bytes()
+    pub(crate) fn with_password_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.password.with_inner(|pwd| f(pwd.as_bytes()))
     }
 }
 
