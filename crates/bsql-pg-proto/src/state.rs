@@ -1318,6 +1318,69 @@ impl From<ActiveState> for ProtoState {
     }
 }
 
+// ─── Per-phase classifier methods ───
+
+#[allow(dead_code)] // Used in Commit 4+ (per-phase Inner migration). See deferred.md DEF-279.
+impl ConnectingState {
+    /// DEF-279 Phase 1c Bundle Commit 3 — mirror of
+    /// [`ProtoState::take_inflight_reply_raw_id`] for the per-phase
+    /// enum. Consumes the variant's `ReplyId<K>` (if any) and
+    /// returns its raw [`core::num::NonZeroU64`].
+    ///
+    /// **Exhaustive match** — adding a variant to [`ConnectingState`]
+    /// that carries a `ReplyId<_>` without routing it here is a
+    /// build failure. Centralises the "every in-flight reply has
+    /// exactly one consume-site on the tear-down path" rule.
+    ///
+    /// **HandshakeReady + Errored** return `None` — neither carries
+    /// a correlator (HandshakeReady is post-RFQ; the reply was
+    /// already consumed at the dispatch arm).
+    #[must_use]
+    pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
+        match self {
+            Self::HandshakeReady | Self::Errored(_) => None,
+            Self::StartupTrust { reply }
+            | Self::StartupScram { reply, .. }
+            | Self::StartupCleartext { reply, .. }
+            | Self::StartupMd5 { reply, .. }
+            | Self::ScramAwaitingServerFirst { reply, .. }
+            | Self::ScramAwaitingServerFinal { reply, .. }
+            | Self::ScramAwaitingAuthOk(reply)
+            | Self::CleartextAwaitingAuthOk(reply)
+            | Self::Md5AwaitingAuthOk(reply)
+            | Self::PostAuthAwaitingKey(reply)
+            | Self::PostAuthHaveKey { reply, .. } => Some(reply.consume()),
+        }
+    }
+
+    /// DEF-279 Phase 1c Bundle Commit 3 — per-phase mirror of
+    /// [`ProtoState::push_class`]. Always returns either
+    /// [`StatePushClass::Connecting`] (handshake-in-flight variants)
+    /// or [`StatePushClass::Errored`] (the transient Errored signal).
+    /// `HandshakeReady` classifies as `Connecting` — the wrapper-
+    /// phase is still `<ConnectingPhase>` until `into_active` lifts
+    /// it.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn push_class(&self) -> StatePushClass {
+        match self {
+            Self::Errored(kind) => StatePushClass::Errored(*kind),
+            Self::StartupTrust { .. }
+            | Self::StartupScram { .. }
+            | Self::StartupCleartext { .. }
+            | Self::StartupMd5 { .. }
+            | Self::ScramAwaitingServerFirst { .. }
+            | Self::ScramAwaitingServerFinal { .. }
+            | Self::ScramAwaitingAuthOk(_)
+            | Self::CleartextAwaitingAuthOk(_)
+            | Self::Md5AwaitingAuthOk(_)
+            | Self::PostAuthAwaitingKey(_)
+            | Self::PostAuthHaveKey { .. }
+            | Self::HandshakeReady => StatePushClass::Connecting,
+        }
+    }
+}
+
 // ─── ProtoState → per-phase downward projections (TryFrom) ───
 
 impl TryFrom<ProtoState> for ErroredState {
