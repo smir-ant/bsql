@@ -907,10 +907,34 @@ const _: () = assert!(
      (preserved for git-blame continuity), this one names the phase \
      explicitly.",
 );
+// DEF-279 Phase 1b (2026-05-18): <ClosedPhase>::Inner is now
+// `ClosedInner` (~16 B) — state_kind 1B + 7B pad + error_arena
+// Option<Box> 8B. Pre-Bundle was 536 B (full PgProtocolInner).
+// The 520-B savings derives from storage absence: post-Errored
+// only state_kind + arena are reachable via the legitimate
+// <ClosedPhase> API (cause(), get_server_error(),
+// error_arena_overwrite_count()); read_buf / row_desc_slot /
+// session_params / partial_assembly / backend_key / counter /
+// full ProtoState union space were architecturally dead but kept
+// allocated until the protocol itself dropped. Post-Bundle they
+// Drop at the transition boundary (into_closed_if_errored /
+// into_active Closed arm), releasing stack + Box-niche heap.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ClosedPhase>>() == 536,
-    "PgProtocol<ClosedPhase> layout drift — should be byte-identical \
-     to PgProtocolInner.",
+    core::mem::size_of::<protocol::PgProtocol<protocol::ClosedPhase>>() == 16,
+    "PgProtocol<ClosedPhase> layout drift — should be 16 B \
+     (ClosedInner: state_kind 1B + 7B pad + error_arena Box-niche 8B \
+     + ZST sync_marker + ZST phase_marker). If this trips, a field \
+     was added/removed/reshaped on `ClosedInner` — audit `mod \
+     protocol::ClosedInner`.",
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::ClosedInner>() == 16,
+    "ClosedInner exact size — must be 16 B post-Phase-1b. If this \
+     trips, a field was added/removed/reshaped on `ClosedInner`. \
+     Pre-Phase-1b was the full PgProtocolInner (536 B); Phase 1b \
+     narrowed to state_kind + error_arena. Future Phase 1d or \
+     follow-up may further narrow if get_server_error access \
+     class diverges.",
 );
 
 // DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B

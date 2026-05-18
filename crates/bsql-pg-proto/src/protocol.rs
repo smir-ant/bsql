@@ -1023,6 +1023,53 @@ pub struct DisconnectedInner {
     sync_marker: PhantomData<core::cell::Cell<()>>,
 }
 
+/// DEF-279 Phase 1b (2026-05-18) — Per-phase Inner for the Closed
+/// (terminally-Errored) phase.
+///
+/// **Tier-1 by storage absence**: pre-Bundle `<ClosedPhase>` shared
+/// the 536-B `PgProtocolInner` with all other phases — but
+/// post-Errored only `state_kind` (carried in `inner.state =
+/// Errored(k)`) and `error_arena` (carried for follow-up server-error
+/// lookup) are reachable through the legitimate `<ClosedPhase>` API.
+/// The remaining ~512 B (read_buf, row_desc_slot, session_params,
+/// partial_assembly, backend_key, malformed_frame_count, sync_marker,
+/// full ProtoState union space) were architecturally dead post-transition
+/// but kept allocated until the protocol itself dropped.
+///
+/// Post-Bundle the storage IS the proof: `ClosedInner` carries only
+/// the cause + the arena handle. `into_closed_if_errored` and the
+/// `<ConnectingPhase>::into_active` Closed arm extract `state_kind`
+/// (Copy from `&inner.state`'s Errored arm) + `mem::take` the
+/// error_arena Box; the rest of PgProtocolInner Drops at the
+/// transition boundary, releasing ~520 B of stack + any heap behind
+/// the Box-niche cells.
+///
+/// `size_of::<ClosedInner>() == 16 B` (state_kind 1B + 7B pad +
+/// error_arena Option<Box> 8B). `<DisconnectedInner>` (Phase 1a)
+/// was 0 B; `<ClosedInner>` is the second-narrowest phase Inner.
+/// Phase 1c will narrow `<ConnectingInner>` (~296 B); Phase 1d
+/// the `<ActivePhase>` Cell collapse closes the bundle.
+#[derive(Debug)]
+pub struct ClosedInner {
+    /// `!Sync` auto-trait propagation; same role as
+    /// `PgProtocolInner::sync_marker`.
+    sync_marker: PhantomData<core::cell::Cell<()>>,
+    /// Terminal cause classifier — extracted from
+    /// `PgProtocolInner::state.Errored(state_kind)` at the transition
+    /// boundary. The full `ProtoState` enum (80 B) is not retained
+    /// post-Bundle: the only legal Closed-state variant is `Errored(_)`
+    /// and `state_kind` IS the variant payload.
+    state_kind: crate::error::StateErrorKind,
+    /// Server-error arena handle — preserved across the transition
+    /// for follow-up `ErrorRef → ErrorPayload` lookups (the wrapper
+    /// layer may stash an `ErrorRef` from a `ServerErrorResponse`
+    /// classified during `<ActivePhase>` / `<ConnectingPhase>`).
+    /// `None` if no server error was buffered before the transition.
+    /// Box drops on `<ClosedPhase>` Drop, releasing the arena heap
+    /// (typically ~290 B if populated).
+    error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+}
+
 impl SealedPhase for DisconnectedPhase {
     type Inner = DisconnectedInner;
 }
@@ -1033,7 +1080,14 @@ impl SealedPhase for ActivePhase {
     type Inner = PgProtocolInner;
 }
 impl SealedPhase for ClosedPhase {
-    type Inner = PgProtocolInner;
+    // DEF-279 Phase 1b (2026-05-18): switched from `PgProtocolInner`
+    // (536 B) to `ClosedInner` (~16 B). The transition sites
+    // (`<ActivePhase>::into_closed_if_errored` and
+    // `<ConnectingPhase>::into_active` Closed arm) materialise a
+    // fresh ClosedInner via `state_kind` extract + `mem::take` of
+    // the error_arena, letting the remaining PgProtocolInner fields
+    // Drop at the boundary.
+    type Inner = ClosedInner;
 }
 
 /// DEF-246 Phase 1 — Phase-typed wrapper over [`PgProtocolInner`].
@@ -1576,6 +1630,17 @@ pub(crate) mod _proto_init_leaf {
               enum would either redact (defeating purpose) or print the full inner state. \
               Deferred until a concrete diagnostic surface needs the trait."
 )]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "DEF-279 Phase 1b (2026-05-18): variant size asymmetry surfaces post-Bundle — \
+              `StillConnecting` carries the full 536-B `PgProtocol<ConnectingPhase>` while \
+              `Closed` shrinks to 32 B (16-B `ClosedInner` + 16-B alignment with phase marker). \
+              Pre-Bundle both were 536 B. Box-wrapping the larger variant would penalise the \
+              hot recovery path with an alloc on the StillConnecting branch (the typical \
+              mid-handshake retry case). Tracked clippy lint; the size asymmetry is a \
+              by-product of the foundation rethink's per-phase Inner shape, not a design \
+              regression."
+)]
 #[must_use = "IntoActiveError consumes the protocol — the caller must observe the variant \
               to recover the typed wrapper or terminate"]
 pub enum IntoActiveError {
@@ -1979,10 +2044,23 @@ impl PgProtocol<ConnectingPhase> {
                   wrappers (~520 B) by value so the caller can recover the next-phase \
                   state without an alloc. Boxing would penalise every handshake path."
     )]
-    pub fn into_active(self) -> Result<PgProtocol<ActivePhase>, IntoActiveError> {
-        if matches!(self.inner.state, ProtoState::Errored(_)) {
+    pub fn into_active(mut self) -> Result<PgProtocol<ActivePhase>, IntoActiveError> {
+        // DEF-279 Phase 1b (2026-05-18): Closed arm materialises
+        // `ClosedInner` (~16 B) instead of moving the full 536-B
+        // `PgProtocolInner`. Extract state_kind (Copy, from &state's
+        // Errored arm) + mem::take the error_arena Box; the remaining
+        // PgProtocolInner fields Drop at this scope's end, releasing
+        // ~520 B of stack + any heap behind the Box-niche cells
+        // (Box<ScramSession>, Box<Password>, etc.).
+        if let ProtoState::Errored(state_kind) = &self.inner.state {
+            let state_kind = *state_kind;
+            let error_arena = core::mem::take(&mut self.inner.error_arena);
             return Err(IntoActiveError::Closed(PgProtocol {
-                inner: self.inner,
+                inner: ClosedInner {
+                    sync_marker: PhantomData,
+                    state_kind,
+                    error_arena,
+                },
                 phase_marker: PhantomData,
             }));
         }
@@ -2090,12 +2168,18 @@ impl PgProtocol<ClosedPhase> {
     /// DEF-246 Phase 4 (2026-05-16) — typed error accessor for a
     /// terminally-Errored protocol.
     ///
-    /// Reconstructs a `ProtocolError::ConnectionAlreadyClosed
-    /// { prior_kind }` from the stored `StateErrorKind`. Full arena
-    /// lookup (server ErrorResponse details) is reachable separately
-    /// via the still-living `inner.error_arena` if the wrapper layer
-    /// stashed an `ErrorRef` before the consume-self transition; see
-    /// follow-up surfaces for the multi-phase arena handle plan.
+    /// **DEF-279 Phase 1b (2026-05-18) — tier elevation**: pre-Bundle
+    /// the body matched `&self.inner.state` against `ProtoState::Errored(k)`,
+    /// with an "architecturally unreachable" defensive arm
+    /// (`_ => ProtocolError::InternalCrateBug { locus:
+    /// CrateBugLocus::ReadCursorAdvance }`) for the impossible
+    /// non-Errored case. Post-Bundle `<ClosedPhase>::Inner = ClosedInner`
+    /// stores only `state_kind: StateErrorKind` — there is no
+    /// `ProtoState` at all on Closed. The defensive arm IS GONE
+    /// by storage absence (the type system cannot construct a Closed
+    /// protocol with non-Errored state since the variant simply
+    /// isn't there). Tier-3-by-state-machine-reasoning →
+    /// tier-1-by-storage-absence.
     ///
     /// # Tier-1 closure
     ///
@@ -2108,29 +2192,43 @@ impl PgProtocol<ClosedPhase> {
     #[must_use = "the returned ProtocolError carries the terminal cause; observing it is the only \
                   legitimate operation on a Closed protocol"]
     pub fn cause(&self) -> crate::error::ProtocolError {
-        match &self.inner.state {
-            ProtoState::Errored(k) => {
-                crate::error::ProtocolError::ConnectionAlreadyClosed { prior_kind: *k }
-            }
-            // Architecturally unreachable: `<ClosedPhase>` is reached
-            // ONLY via `<ActivePhase>::into_closed_if_errored` (guard
-            // `matches!(state, Errored(_))`) or
-            // `<ConnectingPhase>::into_active` (Closed arm — same
-            // guard). The non-Errored arm is dead at the type level
-            // but the runtime field type does not know that.
-            // CREDO §V: classify defensively rather than debug_assert.
-            _ => crate::error::ProtocolError::InternalCrateBug {
-                locus: crate::error::CrateBugLocus::ReadCursorAdvance,
-            },
+        crate::error::ProtocolError::ConnectionAlreadyClosed {
+            prior_kind: self.inner.state_kind,
         }
     }
 
-    /// DEF-246 Phase 4 (2026-05-16) — public read-only state
-    /// accessor for the closed protocol (mirrors `<ActivePhase>::state`).
+    /// DEF-279 Phase 1b (2026-05-18) — resolve a server `ErrorRef`
+    /// against the preserved arena. Mirror of
+    /// [`PgProtocol::<ActivePhase>::get_server_error`] — useful
+    /// when the wrapper layer stashed an `ErrorRef` from a
+    /// `ServerErrorResponse` classified before the transition to
+    /// `<ClosedPhase>`. Returns `Stale` (arena's generation classifier)
+    /// if the arena was cleared or the ref is from a different
+    /// generation.
+    #[inline]
+    pub fn get_server_error(
+        &self,
+        r: crate::error_arena::ErrorRef,
+    ) -> Result<&crate::error_arena::ErrorPayload, crate::error_arena::ArenaError> {
+        static EMPTY: crate::error_arena::ErrorArena =
+            crate::error_arena::ErrorArena::new();
+        let arena: &crate::error_arena::ErrorArena = match self.inner.error_arena.as_deref() {
+            Some(a) => a,
+            None => &EMPTY,
+        };
+        arena.get(r)
+    }
+
+    /// DEF-279 Phase 1b (2026-05-18) — preserved diagnostic counter
+    /// from the arena. Returns 0 if no arena was buffered before the
+    /// transition.
     #[inline]
     #[must_use]
-    pub fn state(&self) -> &ProtoState {
-        &self.inner.state
+    pub fn error_arena_overwrite_count(&self) -> u16 {
+        match self.inner.error_arena.as_deref() {
+            Some(a) => a.overwrite_count(),
+            None => 0,
+        }
     }
 }
 
@@ -4587,11 +4685,24 @@ impl PgProtocol<ActivePhase> {
                   with an alloc the wrapper does not need."
     )]
     pub fn into_closed_if_errored(
-        self,
+        mut self,
     ) -> Result<PgProtocol<ClosedPhase>, PgProtocol<ActivePhase>> {
-        if matches!(self.inner.state, ProtoState::Errored(_)) {
+        // DEF-279 Phase 1b (2026-05-18): Ok arm materialises
+        // `ClosedInner` (~16 B) instead of moving the full 536-B
+        // `PgProtocolInner`. Same extract-and-drop shape as
+        // `<ConnectingPhase>::into_active`'s Closed arm: state_kind
+        // is Copy from `&state`; error_arena is mem::take'd; the
+        // remaining PgProtocolInner Drops at scope end, releasing
+        // ~520 B of stack + any heap behind the Box-niche cells.
+        if let ProtoState::Errored(state_kind) = &self.inner.state {
+            let state_kind = *state_kind;
+            let error_arena = core::mem::take(&mut self.inner.error_arena);
             Ok(PgProtocol {
-                inner: self.inner,
+                inner: ClosedInner {
+                    sync_marker: PhantomData,
+                    state_kind,
+                    error_arena,
+                },
                 phase_marker: PhantomData,
             })
         } else {
@@ -7088,7 +7199,16 @@ impl core::fmt::Debug for PgProtocol<ActivePhase> {
 
 impl core::fmt::Debug for PgProtocol<ClosedPhase> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.inner.fmt(f)
+        // DEF-279 Phase 1b (2026-05-18): `<ClosedPhase>::Inner =
+        // ClosedInner` (not PgProtocolInner) — delegates to
+        // `ClosedInner`'s derived Debug. The arena overwrite count
+        // is surfaced as a numeric diagnostic; state_kind is the
+        // terminal cause classifier.
+        f.debug_struct("PgProtocol")
+            .field("phase", &"ClosedPhase")
+            .field("state_kind", &self.inner.state_kind)
+            .field("error_arena_overwrite_count", &self.error_arena_overwrite_count())
+            .finish_non_exhaustive()
     }
 }
 
