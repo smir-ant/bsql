@@ -4295,6 +4295,219 @@ pub(in crate::protocol) fn advance_one_frame_dispatch<'w, 'state, 'r>(
     }
 }
 
+/// DEF-279 Phase 1c Bundle Commit 6 (2026-05-18) — per-phase
+/// dispatch-context bundle for `<ConnectingPhase>`'s `ConnectingInner`.
+///
+/// Mirror of [`DispatchContext`] with `state: &mut ConnectingState`
+/// instead of `&mut ProtoState`. The other seven fields are
+/// identical — `ConnectingInner` currently holds the same 8-field
+/// shape as `PgProtocolInner` (per Commit 2's scaffolding) and the
+/// `feed_bytes_dispatch_connecting` lift+lower wrapper forwards each
+/// field unchanged into the inner `DispatchContext`.
+///
+/// **Two lifetimes** mirror the Commit 5.5 lifetime split:
+/// `'state` for the state borrow (lifted-local in
+/// `feed_bytes_dispatch_connecting`), `'r` for the seven other
+/// `&mut` field borrows that flow into `OutActions<'_, 'r>`.
+///
+/// **Construction**: only by `ConnectingInner` methods (Commit 7+)
+/// via disjoint-field-borrow from `&mut self`. Free function
+/// shape (not a method) per the same rationale as
+/// [`DispatchContext`] — tier-1 closure by construction (each
+/// `&'r mut <FieldType>` must come from somewhere; the only
+/// somewhere is `ConnectingInner`'s fields).
+///
+/// **`#[allow(dead_code)]`** until Commit 7+ wires
+/// `ConnectingInner.feed_bytes_impl` to assemble + pass this.
+#[allow(dead_code)]
+pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
+    pub(in crate::protocol) state: &'state mut crate::state::ConnectingState,
+    pub(in crate::protocol) read_buf: &'r mut ReadBuf,
+    pub(in crate::protocol) row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
+    pub(in crate::protocol) session_params:
+        &'r mut crate::session_params_slot::SessionParamsCell,
+    pub(in crate::protocol) error_arena:
+        &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    pub(in crate::protocol) partial_assembly:
+        &'r mut crate::partial_assembly::PartialAssemblyCell,
+    pub(in crate::protocol) backend_key: &'r mut crate::cancel::BackendKeyCell,
+    pub(in crate::protocol) malformed_count: &'r mut u32,
+}
+
+/// DEF-279 Phase 1c Bundle Commit 6 (2026-05-18) — per-phase
+/// dispatch entry for `<ConnectingPhase>`'s `ConnectingInner`.
+///
+/// **Lift+lower wrapper** over [`feed_bytes_dispatch`]. Lifts
+/// `ConnectingState → ProtoState` once per call (via
+/// [`core::mem::replace`] with a transient sentinel), invokes the
+/// shared dispatch body, then projects back via
+/// `TryFrom<ProtoState> for ConnectingState`. Single source of
+/// truth for the dispatch loop preserved; per-phase wrapper
+/// amortises ~5-10 ns of lift+lower overhead over the entire
+/// feed-bytes call (vs Alt D's per-frame lift+lower at ~8× cost).
+///
+/// **Lifetime decoupling** (Commit 5.5 substrate): the lifted local
+/// `proto_state` has lifetime `'tmp` (shorter than caller's `'r`);
+/// the inner [`feed_bytes_dispatch`] signature
+/// `<'w, 'state, 'r, BOUNDED>` accepts `'state = 'tmp` while
+/// preserving `'r = 'r_outer` for the `OutActions<'w, 'r_outer>`
+/// return. Without the 5.5 split this wrapper would be
+/// inexpressible (lifetime-widening 'tmp → 'r is contravariant,
+/// requires `mem::transmute` — forbidden under
+/// `#![forbid(unsafe_code)]`).
+///
+/// **Tier-1 closure at the per-phase boundary**: caller (typically
+/// `ConnectingInner.feed_bytes_impl` in Commit 7+) holds a
+/// `ConnectingState`-typed reference. The type system prevents
+/// the caller from constructing a non-Connecting state outside this
+/// wrapper. The lift widens to `ProtoState` only INSIDE this
+/// function for the shared dispatch's exhaustive-match arms; the
+/// lower projects back to `ConnectingState` before returning.
+///
+/// **HandshakeReady transition signal**: the only legitimate non-
+/// Connecting outcome the shared dispatch can produce from a
+/// Connecting LHS is `ProtoState::Idle` (post-handshake success
+/// from the `(PostAuthHaveKey, RFQ)` arm). The lower step catches
+/// this and translates to
+/// [`crate::state::ConnectingState::HandshakeReady`] — the signal
+/// `<ConnectingPhase>::into_active` observes in Commit 8+.
+///
+/// **Sentinel choice during lift**: a transient
+/// `ConnectingState::Errored(Framing)` placeholder fills the state
+/// slot for the lift window. Kind doesn't matter semantically — the
+/// slot is always overwritten in the lower step (either with the
+/// legitimate new state, with `HandshakeReady`, or with the
+/// defensive `Errored(Internal)` on a dispatch.rs bug). The
+/// placeholder is unobservable: no reader sees the state between
+/// `mem::replace` and the lower-step write.
+///
+/// **`#[allow(dead_code)]`** until Commit 7+ wires
+/// `ConnectingInner.feed_bytes_impl` to call this.
+#[allow(dead_code)]
+pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED: bool>(
+    ctx: ConnectingDispatchContext<'_, 'r>,
+    bytes: &[u8],
+    write_buf: &'w mut WriteBuf,
+    max_dispatches: u16,
+) -> OutActions<'w, 'r> {
+    use crate::state::{ConnectingState, WrongPhase};
+
+    let ConnectingDispatchContext {
+        state,
+        read_buf,
+        row_desc_slot,
+        session_params,
+        error_arena,
+        partial_assembly,
+        backend_key,
+        malformed_count,
+    } = ctx;
+
+    let sentinel = ConnectingState::Errored(
+        crate::error::StateErrorKind::from_kind_or_internal(
+            crate::error::ErrorKind::Framing,
+        ),
+    );
+    let lifted: ConnectingState = core::mem::replace(state, sentinel);
+    let mut proto_state: ProtoState = lifted.into();
+
+    let actions = feed_bytes_dispatch::<BOUNDED>(
+        DispatchContext {
+            state: &mut proto_state,
+            read_buf,
+            row_desc_slot,
+            session_params,
+            error_arena,
+            partial_assembly,
+            backend_key,
+            malformed_count,
+        },
+        bytes,
+        write_buf,
+        max_dispatches,
+    );
+
+    // Lower: project proto_state back to ConnectingState.
+    match ConnectingState::try_from(proto_state) {
+        Ok(cs) => *state = cs,
+        Err(WrongPhase { recovered }) => match recovered {
+            // Legitimate `(PostAuthHaveKey, RFQ)` handshake success.
+            ProtoState::Idle => *state = ConnectingState::HandshakeReady,
+            // Defensive arm — dispatch produced a state shape not
+            // reachable from a Connecting LHS under current dispatch
+            // arms. Drain any `ReplyId<K>` carried in the variant
+            // (Drop-guard discipline; `match { Some(_) | None => {} }`
+            // form per crate convention) and tear down to Errored.
+            other => {
+                match other.take_inflight_reply_raw_id() {
+                    Some(_) | None => {}
+                }
+                *state = ConnectingState::Errored(
+                    crate::error::StateErrorKind::from_kind_or_internal(
+                        crate::error::ErrorKind::Internal,
+                    ),
+                );
+            }
+        },
+    }
+
+    actions
+}
+
+/// DEF-279 Phase 1c Bundle Commit 6 (2026-05-18) — per-phase
+/// single-frame variant over [`ConnectingDispatchContext`]. Mirror
+/// of [`advance_one_frame_dispatch`] for the Connecting phase.
+///
+/// **Connecting-specific fast paths**:
+/// - No `StreamingRows` equivalent in `ConnectingState` (the
+///   parent arm in [`advance_one_frame_dispatch`] doesn't apply).
+/// - `ConnectingState::Errored(_)` → [`FeedEvent::Close`] (mirror
+///   of `ProtoState::Errored(_)` fast path).
+/// - `ConnectingState::HandshakeReady` + empty `read_buf` →
+///   [`FeedEvent::Idle`] (mirror of `ProtoState::Idle` fast path —
+///   HandshakeReady is the per-phase representation of post-
+///   handshake Idle, with the caller-visible expectation that the
+///   next user action is `into_active()`).
+///
+/// All other Connecting variants delegate to
+/// [`feed_bytes_dispatch_connecting::<true>`] with
+/// `max_dispatches = 1`.
+///
+/// **`#[allow(dead_code)]`** until Commit 7+ wires
+/// `ConnectingInner.advance_one_frame` to call this.
+#[must_use = "FeedEvent variants carry side-effect contracts: \
+              SendBytes/Deliver MUST be processed; Fail/Close MUST \
+              trigger socket teardown"]
+#[allow(dead_code)]
+pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
+    ctx: ConnectingDispatchContext<'_, 'r>,
+    write_buf: &'w mut WriteBuf,
+) -> crate::action::FeedEvent<'w, 'r> {
+    use crate::action::{Action, FeedEvent};
+    use crate::state::ConnectingState;
+
+    if matches!(*ctx.state, ConnectingState::Errored(_)) {
+        return FeedEvent::Close;
+    }
+
+    if matches!(*ctx.state, ConnectingState::HandshakeReady)
+        && ctx.read_buf.unread().is_empty()
+    {
+        return FeedEvent::Idle;
+    }
+
+    let actions = feed_bytes_dispatch_connecting::<true>(ctx, b"", write_buf, 1);
+
+    match actions.as_slice() {
+        [] => FeedEvent::NeedMoreBytes,
+        [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
+        [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
+        [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
+        [Action::CloseSocket] => FeedEvent::Close,
+        _ => FeedEvent::Close,
+    }
+}
+
 impl PgProtocolInner {
     /// DEF-246 Phase 2 (2026-05-16): saturation-classifier mutation
     /// surface lives on `PgProtocolInner` so blanket
