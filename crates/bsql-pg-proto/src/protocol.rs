@@ -821,6 +821,103 @@ pub struct PgProtocolInner {
     sync_marker: PhantomData<Cell<()>>,
 }
 
+/// DEF-279 Phase 1c Bundle Commit 2 (2026-05-18) — per-phase Inner
+/// for `<ConnectingPhase>`.
+///
+/// **Narrowed vs [`PgProtocolInner`]** — drops `row_desc_slot` (140 B;
+/// no `RowDescription` reachable from any Connecting state — every
+/// dispatch arm writing `row_desc_slot` is gated on a non-Connecting
+/// state variant in `dispatch.rs`) and `backend_key` (12 B; cell
+/// install deferred to `into_active` via
+/// [`crate::state::ConnectingState::HandshakeReady`] state-variant
+/// signal — `(PostAuthHaveKey, RFQ)` dispatch arm parks
+/// `(pid, secret_key)` in the variant data, `into_active` extracts
+/// them and constructs the `BackendKeyCell` on the destination
+/// `PgProtocolInner` (`<ActivePhase>::Inner`)).
+///
+/// **Tier-1 closure by storage absence**:
+/// - `<ConnectingPhase>` CANNOT physically hold a non-Connecting
+///   state variant (e.g. `SimpleQueryStreamingRows`) because
+///   `ConnectingState` doesn't have those variants
+/// - `<ConnectingPhase>` CANNOT physically write to `row_desc_slot`
+///   (the field doesn't exist on `ConnectingInner`)
+/// - `<ConnectingPhase>` CANNOT physically write to `backend_key`
+///   (the field doesn't exist; install happens at the phase
+///   boundary in `into_active`)
+///
+/// **Layout** (target): state ConnectingState (~48 B) + read_buf
+/// 264 B + 4× 8 B cells/slots + u32 + alignment ≈ **344 B**.
+/// vs PgProtocolInner 536 B → **-192 B per `<ConnectingPhase>`**.
+/// (Memo target was ~296 B based on smaller read_buf assumption;
+/// actual size depends on ReadBuf 264 B which can shrink later via
+/// DEF-058 ring-buffer migration.)
+///
+/// **Construction**: only via
+/// [`_proto_init_leaf::fresh_connecting_inner`] (token-gated,
+/// leaf-private) called from `<DisconnectedPhase>::push_startup`.
+///
+/// **Field visibility**: private. The same `pub` promotion applied
+/// to `PgProtocolInner`/`DisconnectedInner`/`ClosedInner` (E0446
+/// mitigation for the `SealedPhase::Inner` associated type) applies
+/// here — fields stay private, constructors stay leaf-gated.
+///
+/// **Scaffolding stage** (Commit 2): this type is defined but not
+/// yet used as `<ConnectingPhase>::Inner` (still `PgProtocolInner`
+/// in this commit). Commit 3 lands the SealedPhase migration plus
+/// the dispatch-side machinery (connecting_dispatch +
+/// feed_bytes_dispatch_connecting + ConnectingState::HandshakeReady
+/// state-variant signal + method body migration on all
+/// `<ConnectingPhase>::*` methods). Multi-hour work deferred to
+/// next session per CREDO §0 «no half-shipped tier elevations».
+///
+/// **`#[allow(dead_code)]`** justified by the explicit Commit-3
+/// purpose documented above + deferred.md queue entry tracking
+/// the migration as in-flight work.
+#[allow(dead_code, missing_debug_implementations)]
+pub struct ConnectingInner {
+    /// State narrowed to [`crate::state::ConnectingState`] variants
+    /// (11 handshake states + transient Errored). **Tier-1 closure**:
+    /// state-variant-in-wrong-phase is impossible by type — Active
+    /// variants don't exist in `ConnectingState`.
+    state: crate::state::ConnectingState,
+    /// Mirror of [`PgProtocolInner::row_desc_slot`].
+    ///
+    /// **Phase 1c Commit 3 (deferred)**: this field will be dropped
+    /// — no `RowDescription` reachable from Connecting states.
+    /// Kept here in Commit 2 to enable reuse of the existing
+    /// `feed_bytes_dispatch` / `DispatchContext` body (8-field shape)
+    /// without forcing field-narrow + state-variant signal work
+    /// into the same commit.
+    row_desc_slot: crate::schema_slot::RowDescSlotCell,
+    /// Mirror of [`PgProtocolInner::read_buf`].
+    read_buf: ReadBuf,
+    /// Mirror of [`PgProtocolInner::session_params`]. Populated by
+    /// `ParameterStatus` / `NoticeResponse` filter arms during post-
+    /// auth Connecting states (ConnectingPostAuthAwaitingKey +
+    /// ConnectingPostAuthHaveKey).
+    session_params: crate::session_params_slot::SessionParamsCell,
+    /// Mirror of [`PgProtocolInner::error_arena`]. Populated by
+    /// `TAG_ERROR_RESPONSE` arms during any Connecting state's
+    /// `'E'`-frame handling.
+    error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    /// Mirror of [`PgProtocolInner::partial_assembly`]. Used for
+    /// oversize ErrorResponse / NoticeResponse frames during
+    /// handshake.
+    partial_assembly: crate::partial_assembly::PartialAssemblyCell,
+    /// Mirror of [`PgProtocolInner::backend_key`].
+    ///
+    /// **Phase 1c Commit 3 (deferred)**: this field will be dropped
+    /// once the `ConnectingState::HandshakeReady` state-variant
+    /// signal lands — the backend-key install moves to
+    /// `into_active` (extracted from the state variant data).
+    /// Kept here in Commit 2 for the same reason as `row_desc_slot`.
+    backend_key: crate::cancel::BackendKeyCell,
+    /// Mirror of [`PgProtocolInner::malformed_frame_count`].
+    malformed_frame_count: u32,
+    /// Mirror of [`PgProtocolInner::sync_marker`].
+    sync_marker: PhantomData<Cell<()>>,
+}
+
 /// DEF-279 Phase 1c prerequisite (2026-05-18) — dispatch-context bundle.
 ///
 /// Captures the eight per-connection mutable references the dispatch
@@ -1124,6 +1221,15 @@ impl SealedPhase for DisconnectedPhase {
     type Inner = DisconnectedInner;
 }
 impl SealedPhase for ConnectingPhase {
+    // DEF-279 Phase 1c Bundle Commit 3 target (next session): migrate
+    // from PgProtocolInner to per-phase ConnectingInner (the struct
+    // type defined above). Tier-1 closure on state-variant-in-wrong-
+    // phase + row_desc_slot/backend_key physically absent during
+    // handshake. Multi-hour migration: requires per-phase
+    // connecting_dispatch + feed_bytes_dispatch_connecting +
+    // ConnectingState::HandshakeReady transition signal + method
+    // body migration on all <ConnectingPhase>::* methods. Deferred
+    // from this commit to keep the scope manageable.
     type Inner = PgProtocolInner;
 }
 impl SealedPhase for ActivePhase {
