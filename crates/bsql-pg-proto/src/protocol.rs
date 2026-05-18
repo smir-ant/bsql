@@ -546,7 +546,17 @@ pub(crate) fn error_arena_or_init(
 /// preserves the DEF-272 cluster's token-gated mutation surface
 /// (cells live in private fields; mutations route through token-gated
 /// methods).
-pub(crate) struct PgProtocolInner {
+// DEF-279 Phase 1a (2026-05-18): struct visibility promoted from
+// `pub(crate)` to `pub` to satisfy E0446 (associated type
+// `SealedPhase::Inner = PgProtocolInner` cannot leak a crate-private
+// type through the public trait surface). The struct's fields remain
+// private (no `pub` fields), its constructor is `_proto_init_leaf::
+// fresh_inner` (`pub(in crate::protocol)`, leaf-private), and its
+// pub fns are externally unreachable since external code has no way
+// to obtain a `PgProtocolInner` instance. The promoted name visibility
+// adds no new capability — external code can name `PgProtocolInner`
+// but cannot construct, mutate, or borrow one outside the crate.
+pub struct PgProtocolInner {
     // DEF-189 hot-path field ordering: per-row fast-path touches
     // `state` (discriminant + reply_id), `row_desc_slot` (Option
     // projection), and `read_buf` (cursor + populated() slice). All
@@ -866,7 +876,42 @@ pub(crate) mod _sealed_phase {
     label = "phases are `DisconnectedPhase`, `ConnectingPhase`, `ActivePhase`, `ClosedPhase`",
     note = "the phase set is sealed by `_sealed_phase::Sealed`; downstream cannot add phases. Extend by editing `mod protocol` in the bsql-pg-proto crate."
 )]
-pub trait SealedPhase: _sealed_phase::Sealed + 'static {}
+pub trait SealedPhase: _sealed_phase::Sealed + 'static {
+    /// DEF-279 Phase 1a (2026-05-18): per-phase Inner storage type.
+    ///
+    /// The associated type is a non-GAT plain assoc-type (no lifetime
+    /// parameters). Each phase's `Inner` carries only the fields that
+    /// phase legally touches; phases that touch no protocol state
+    /// (e.g. [`DisconnectedPhase`]) use a ZST Inner with no fields
+    /// other than `sync_marker: PhantomData<Cell<()>>` for `!Sync`
+    /// propagation.
+    ///
+    /// # Phase 1a scope
+    ///
+    /// Phase 1a (this commit) introduces the associated type and
+    /// SPLITS the Disconnected phase:
+    /// - [`DisconnectedPhase`]: `type Inner = DisconnectedInner` (ZST,
+    ///   0 B). The fields `state` / `read_buf` / `row_desc_slot` /
+    ///   `session_params` / `error_arena` / `partial_assembly` /
+    ///   `backend_key` are STORAGE-ABSENT pre-Startup; pre-Bundle they
+    ///   lived on a shared `PgProtocolInner` and were null/empty by
+    ///   discipline, tier-3-by-construction. Post-Bundle the storage
+    ///   physically does not exist on `<DisconnectedPhase>` —
+    ///   tier-1-by-storage-absence.
+    /// - [`ConnectingPhase`] / [`ActivePhase`] / [`ClosedPhase`]:
+    ///   `type Inner = PgProtocolInner` (536 B unchanged). Future
+    ///   Phase 1b/1c/1d will diverge `ClosedInner` (small) and
+    ///   `ConnectingInner` (medium), keeping `ActiveInner` at full
+    ///   weight per Direction 1.B memo §1 final recommendation.
+    ///
+    /// # Verification
+    ///
+    /// Layout pins in `lib.rs:868-893` assert per-phase size:
+    /// - `size_of::<PgProtocol<DisconnectedPhase>>() == 0` (Phase 1a).
+    /// - `size_of::<PgProtocol<{Connecting,Active,Closed}>>() == 536`
+    ///   (unchanged through Phase 1a; will diverge per phase).
+    type Inner;
+}
 
 /// DEF-246 Phase 1 — Disconnected phase marker.
 ///
@@ -921,10 +966,75 @@ impl _sealed_phase::Sealed for ConnectingPhase {}
 impl _sealed_phase::Sealed for ActivePhase {}
 impl _sealed_phase::Sealed for ClosedPhase {}
 
-impl SealedPhase for DisconnectedPhase {}
-impl SealedPhase for ConnectingPhase {}
-impl SealedPhase for ActivePhase {}
-impl SealedPhase for ClosedPhase {}
+/// DEF-279 Phase 1a (2026-05-18) — process-global reply-id counter.
+///
+/// Shared across all four phases' `next_reply_id` mint sites.
+/// Pre-Bundle this was a function-local `static COUNTER` inside
+/// `PgProtocolInner::next_reply_id` (line ~3347); Disconnected
+/// delegated via `self.inner.next_reply_id::<K>()`. Post-Bundle
+/// `<DisconnectedPhase>::Inner` is the ZST `DisconnectedInner` with
+/// no `next_reply_id` method to delegate to — the counter must live
+/// at a layer reachable from BOTH `<DisconnectedPhase>` (via
+/// `super::PROCESS_REPLY_ID_COUNTER`) and `PgProtocolInner::
+/// next_reply_id` (the other three phases route through here).
+///
+/// **Process-global uniqueness** is the load-bearing invariant: a
+/// reply id minted on a Disconnected → push_startup path AND a
+/// reply id minted on a parallel `<ActivePhase>::push_command`
+/// on a different `PgProtocol` instance MUST never collide.
+/// `static AtomicU64` at module scope guarantees this; per-instance
+/// or per-phase counters would not.
+pub(crate) static PROCESS_REPLY_ID_COUNTER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// DEF-279 Phase 1a (2026-05-18) — Per-phase Inner for the Disconnected phase.
+///
+/// **Tier-1 by storage absence**: pre-Bundle `<DisconnectedPhase>` shared
+/// the 536-B `PgProtocolInner` with all other phases (`state` /
+/// `read_buf` / `row_desc_slot` / `session_params` / `error_arena` /
+/// `partial_assembly` / `backend_key`). All of these were null/empty
+/// pre-Startup by construction (the state machine has no transition
+/// into Disconnected that populates them), but the storage existed
+/// for them — tier-3 by-state-machine-reasoning.
+///
+/// Post-Bundle the storage IS the proof: `DisconnectedInner` carries
+/// only `sync_marker: PhantomData<Cell<()>>` for `!Sync` auto-trait
+/// propagation. `size_of::<DisconnectedInner>() == 0` (ZST).
+///
+/// Forward to Phase 1b/1c: `ClosedInner` will be similarly narrowed
+/// (state_kind only); `ConnectingInner` will drop `row_desc_slot` /
+/// `backend_key`. `ActiveInner` stays at full weight in Phase 1.
+// DEF-279 Phase 1a (2026-05-18): struct visibility `pub` for the
+// same E0446 reason as `PgProtocolInner` (associated type can't leak
+// a crate-private type through the public `SealedPhase` trait
+// surface). Fields are private; construction is via
+// `<PgProtocol<DisconnectedPhase>>::new()` only — promoted name
+// visibility adds no new external capability.
+#[derive(Debug)]
+#[expect(
+    missing_copy_implementations,
+    reason = "DisconnectedInner is a ZST whose only field (PhantomData) is Copy-eligible, but PgProtocol<P> is intentionally !Copy by design: consume-self phase transitions (push_startup/into_active/into_closed) take self by-value, and a Copy wrapper would allow the caller to retain a stale duplicate post-transition (defeating the type-level proof that the phase has moved). The PhantomData<Cell<()>> sync_marker is the !Sync witness; non-Copy preserves the consume-self lifecycle."
+)]
+pub struct DisconnectedInner {
+    /// `!Sync` auto-trait propagation via `PhantomData<Cell<()>>` —
+    /// mirror of `PgProtocolInner::sync_marker`. Layout-zero, named
+    /// without leading underscore (user-feedback convention: structurally
+    /// load-bearing fields are not `_`-prefixed).
+    sync_marker: PhantomData<core::cell::Cell<()>>,
+}
+
+impl SealedPhase for DisconnectedPhase {
+    type Inner = DisconnectedInner;
+}
+impl SealedPhase for ConnectingPhase {
+    type Inner = PgProtocolInner;
+}
+impl SealedPhase for ActivePhase {
+    type Inner = PgProtocolInner;
+}
+impl SealedPhase for ClosedPhase {
+    type Inner = PgProtocolInner;
+}
 
 /// DEF-246 Phase 1 — Phase-typed wrapper over [`PgProtocolInner`].
 ///
@@ -971,7 +1081,18 @@ impl SealedPhase for ClosedPhase {}
 /// visibility rules).
 #[repr(transparent)]
 pub struct PgProtocol<P: SealedPhase = ActivePhase> {
-    inner: PgProtocolInner,
+    // DEF-279 Phase 1a (2026-05-18): per-phase `Inner` storage via the
+    // associated type `<P as SealedPhase>::Inner`. The compiler normalises
+    // this through the impl blocks (`type Inner = …`) before the
+    // `#[repr(transparent)]` layout check fires, so each monomorphisation
+    // has a concrete layout:
+    //   PgProtocol<DisconnectedPhase> ≡ DisconnectedInner (ZST, 0 B)
+    //   PgProtocol<ConnectingPhase>   ≡ PgProtocolInner   (536 B)
+    //   PgProtocol<ActivePhase>       ≡ PgProtocolInner   (536 B)
+    //   PgProtocol<ClosedPhase>       ≡ PgProtocolInner   (536 B)
+    // Future phases (Phase 1b ClosedInner / 1c ConnectingInner) diverge
+    // independently.
+    inner: <P as SealedPhase>::Inner,
     /// ZST phase marker. Load-bearing for the type-level phase
     /// proof; named without leading-underscore per the user-feedback
     /// convention that structurally-used fields must not be
@@ -1323,12 +1444,22 @@ pub(crate) mod _proto_init_leaf {
     }
 
     impl super::PgProtocol<super::DisconnectedPhase> {
-        /// Construct a new protocol in [`crate::state::ProtoState::Idle`],
-        /// typed `PgProtocol<DisconnectedPhase>` — the only legal next
-        /// step is [`Self::push_startup`].
+        /// Construct a new protocol typed `PgProtocol<DisconnectedPhase>`
+        /// — the only legal next step is [`Self::push_startup`].
         ///
-        /// **DEF-246 Phase 2 (2026-05-16):** the constructor now
-        /// produces `<DisconnectedPhase>` (pre-DEF-246 Phase 2 produced
+        /// **DEF-279 Phase 1a (2026-05-18):** `<DisconnectedPhase>::Inner`
+        /// is a ZST [`super::DisconnectedInner`]. Constructor allocates
+        /// ZERO bytes — `size_of::<PgProtocol<DisconnectedPhase>>() == 0`.
+        /// Pre-Bundle the constructor materialised a full 536-B
+        /// `PgProtocolInner` (state Idle, read_buf empty, four cells,
+        /// counter, sync marker), all of which were architecturally
+        /// dead until [`Self::push_startup`] consumed self. Post-Bundle
+        /// none of that storage exists pre-Startup; the materialisation
+        /// is deferred to [`super::_proto_init_leaf::fresh_inner`]
+        /// called inside `push_startup`.
+        ///
+        /// **DEF-246 Phase 2 (2026-05-16):** the constructor produces
+        /// `<DisconnectedPhase>` (pre-DEF-246 Phase 2 produced
         /// `<ActivePhase>`). Tier-1 elevation #1: the
         /// `PgCommand::Startup` enum + `push_command::Startup` struct +
         /// `impl PushCommand for Startup` are deleted; the only path
@@ -1341,45 +1472,61 @@ pub(crate) mod _proto_init_leaf {
         /// [`crate::push_command::PushCommand`] which is reachable
         /// only through `<ActivePhase>::push_command_internal`.
         ///
-        /// Lives inside `_proto_init_leaf` (DEF-272 P6 closure 2026-05-10):
-        /// the token-gated [`crate::schema_slot::RowDescSlotCell::empty`]
-        /// and [`crate::session_params_slot::SessionParamsCell::empty`]
-        /// constructors require a [`ProtoInitToken`], which can only be
-        /// minted here. Wholesale-replacement of cell fields is therefore
-        /// narrowed to this submodule by construction.
+        /// `<DisconnectedPhase>` has no cells, so the per-DEF-272 P6
+        /// [`ProtoInitToken`] is not needed at this constructor —
+        /// only [`super::_proto_init_leaf::fresh_inner`] (called when
+        /// `push_startup` materialises a fresh `PgProtocolInner` for
+        /// the `<ConnectingPhase>` transition) needs the token. The
+        /// leaf-private mint stays inside `_proto_init_leaf`.
         #[must_use]
         pub const fn new() -> Self {
-            let token = ProtoInitToken::mint();
             Self {
-                inner: super::PgProtocolInner {
-                    state: super::ProtoState::Idle,
-                    read_buf: super::ReadBuf::new(),
-                    row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
-                    // DEF-196: three independent cold slots — none allocated
-                    // at construction. Trust auth + no errors + no malformed
-                    // frames + no notice/param frames = lifetime-zero heap.
-                    session_params: crate::session_params_slot::SessionParamsCell::empty(token),
-                    error_arena: None,
-                    // DEF-248 Sub-B (2026-05-12): partial-assembly cell —
-                    // 8 B niche, `None` at construction. Heap-allocates a
-                    // single Box<PartialAssemblyInner> (8 KB prefix + ~12 B
-                    // meta) only on the first oversize non-`'D'` frame.
-                    // Re-used across subsequent oversize frames on the
-                    // same connection.
-                    partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
-                    // DEF-278 Bundle D (2026-05-17): backend-key cell —
-                    // None at construction; installed by the dispatch arm
-                    // at `(ConnectingPostAuthHaveKey, 'Z')` once the
-                    // handshake completes. The same `ProtoInitToken`
-                    // gates this empty constructor (mirror of the
-                    // schema_slot / session_params / partial_assembly
-                    // pattern).
-                    backend_key: crate::cancel::BackendKeyCell::empty(token),
-                    malformed_frame_count: 0,
+                inner: super::DisconnectedInner {
                     sync_marker: super::PhantomData,
                 },
                 phase_marker: super::PhantomData,
             }
+        }
+    }
+
+    /// DEF-279 Phase 1a (2026-05-18) — materialise a fresh
+    /// [`super::PgProtocolInner`] for use by a phase transition.
+    ///
+    /// **Sole caller**: [`super::PgProtocol::<super::DisconnectedPhase>::push_startup`],
+    /// which transitions ZST `<DisconnectedPhase>` → full-weight
+    /// `<ConnectingPhase>` and needs to materialise the post-transition
+    /// inner state. The body is the pre-Bundle `PgProtocol::new()` inner
+    /// literal, moved here verbatim to preserve the
+    /// [`ProtoInitToken`]-gated cell construction discipline (DEF-272 P6
+    /// closure — only this submodule can mint the token).
+    ///
+    /// `pub(in crate::protocol)` so push_startup (a sibling submodule
+    /// item within `mod protocol`) can call it. External crates and
+    /// sibling files outside `mod protocol` cannot reach it.
+    #[must_use]
+    pub(in crate::protocol) const fn fresh_inner() -> super::PgProtocolInner {
+        let token = ProtoInitToken::mint();
+        super::PgProtocolInner {
+            state: super::ProtoState::Idle,
+            read_buf: super::ReadBuf::new(),
+            row_desc_slot: crate::schema_slot::RowDescSlotCell::empty(token),
+            // DEF-196: three independent cold slots — none allocated
+            // at construction. Trust auth + no errors + no malformed
+            // frames + no notice/param frames = lifetime-zero heap.
+            session_params: crate::session_params_slot::SessionParamsCell::empty(token),
+            error_arena: None,
+            // DEF-248 Sub-B (2026-05-12): partial-assembly cell —
+            // 8 B niche, `None` at construction. Heap-allocates a
+            // single Box<PartialAssemblyInner> (8 KB prefix + ~12 B
+            // meta) only on the first oversize non-`'D'` frame.
+            partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
+            // DEF-278 Bundle D (2026-05-17): backend-key cell —
+            // None at construction; installed by the dispatch arm
+            // at `(ConnectingPostAuthHaveKey, 'Z')` once the
+            // handshake completes.
+            backend_key: crate::cancel::BackendKeyCell::empty(token),
+            malformed_frame_count: 0,
+            sync_marker: super::PhantomData,
         }
     }
 }
@@ -1442,60 +1589,80 @@ pub enum IntoActiveError {
 }
 
 impl PgProtocol<DisconnectedPhase> {
-    /// DEF-246 Phase 2 (2026-05-16) — diagnostic accessor mirror of
-    /// `<ActivePhase>::error_arena_overwrite_count`. A fresh
-    /// disconnected protocol has no errors yet (counter = 0); the
-    /// accessor exposes the same field for diagnostic compatibility.
+    /// DEF-279 Phase 1a (2026-05-18) — pre-Startup the protocol has
+    /// no storage at all (DisconnectedInner is ZST). The diagnostic
+    /// counter is always 0; pre-Bundle this read `inner.error_arena`
+    /// which was always None on a fresh protocol. Tier-1-by-storage-
+    /// absence: the error_arena slot doesn't exist on
+    /// `<DisconnectedPhase>::Inner`.
     #[inline]
     #[must_use]
     pub fn error_arena_overwrite_count(&self) -> u16 {
-        match self.inner.error_arena.as_deref() {
-            Some(a) => a.overwrite_count(),
-            None => 0,
-        }
+        0
     }
 
-    /// DEF-246 Phase 2 (2026-05-16) — `connection_status` accessor on
-    /// `<DisconnectedPhase>`. A fresh protocol reports `Ready` (the
-    /// Idle bucket) since `push_startup` is the legal next operation.
-    /// This mirrors the runtime state (`ProtoState::Idle`) classifier;
-    /// the phase marker is orthogonal to the runtime status.
+    /// DEF-279 Phase 1a (2026-05-18) — `<DisconnectedPhase>` is
+    /// pre-Startup; the state is provably `Ready` by storage absence
+    /// (no `inner.state` field on `DisconnectedInner`). Pre-Bundle
+    /// this matched `inner.state.push_class()` which was always
+    /// `Idle → Ready` on a fresh protocol; post-Bundle the answer is
+    /// a compile-time const.
     #[inline]
     #[must_use]
     pub fn connection_status(&self) -> crate::guard::ConnectionStatus {
-        use crate::guard::ConnectionStatus;
-        use crate::state::StatePushClass;
-        match self.inner.state.push_class() {
-            StatePushClass::Idle => ConnectionStatus::Ready,
-            StatePushClass::Errored(kind) => ConnectionStatus::Errored(kind),
-            StatePushClass::PingAwaiting | StatePushClass::BusyQuery => ConnectionStatus::Busy,
-            StatePushClass::Connecting => ConnectionStatus::Handshaking,
-        }
+        crate::guard::ConnectionStatus::Ready
     }
 
-    /// DEF-246 Phase 2 (2026-05-16) — public state accessor on
-    /// `<DisconnectedPhase>`. Fresh protocols always report `Idle`;
-    /// callers comparing against `ProtoState::Idle` in tests or
-    /// diagnostics use this.
+    /// DEF-279 Phase 1a (2026-05-18) — `<DisconnectedPhase>::state()`
+    /// always returns `&ProtoState::Idle`. Pre-Bundle this read
+    /// `&self.inner.state` which was tautologically Idle on a fresh
+    /// protocol; post-Bundle the storage doesn't exist
+    /// (`DisconnectedInner` is ZST). The reference points to a
+    /// promoted-static const expression — same `&'static` lifetime
+    /// as the pre-Bundle accessor returned (`&self.inner.state` was
+    /// `&'_ ProtoState` tied to self's lifetime; this is strictly
+    /// longer-lived).
     #[inline]
     #[must_use]
     pub fn state(&self) -> &ProtoState {
-        &self.inner.state
+        const IDLE_REF: &ProtoState = &ProtoState::Idle;
+        IDLE_REF
     }
 
     /// Mint a fresh `ReplyId<K>` for the impending Startup push.
     ///
-    /// DEF-246 Phase 2 (2026-05-16): mirror of
-    /// `<ActivePhase>::next_reply_id` — the disconnect-state needs a
-    /// ReplyId before `push_startup` so the wrapper can route the
-    /// Reply::StartupComplete back to the caller's oneshot. Same
-    /// static-atomic counter as the other phases (process-global
-    /// uniqueness preserved).
+    /// DEF-279 Phase 1a (2026-05-18): inlined here (was a 1-line
+    /// delegate to `inner.next_reply_id::<K>()`). Pre-Bundle the
+    /// inner had a method on `PgProtocolInner` that combined the
+    /// static AtomicU64 counter increment with a saturation-
+    /// classifier (writes `Errored(StateErrorKind::ReplyIdSaturation)`
+    /// into `inner.state`). On `<DisconnectedPhase>` there is no
+    /// `inner.state` to classify into — `DisconnectedInner` is ZST
+    /// post-Bundle. Saturation here is architecturally distant
+    /// (a connection that exhausted u64 reply ids during the
+    /// disconnect window — i.e., before the very first Startup —
+    /// would have been driven by ~10^19 next_reply_id calls without
+    /// ever calling push_startup, a non-physical workload).
+    ///
+    /// **Shared counter pin**: `PROCESS_REPLY_ID_COUNTER` is the
+    /// crate-private static AtomicU64 shared with
+    /// [`PgProtocolInner::next_reply_id`] — process-global
+    /// uniqueness preserved.
     #[inline]
     pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
     ) -> crate::reply_id::ReplyId<K> {
-        self.inner.next_reply_id::<K>()
+        use core::sync::atomic::Ordering;
+        let raw_old = PROCESS_REPLY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Saturation classifier omitted on <DisconnectedPhase>:
+        // architecturally distant + no inner.state to write Errored
+        // into. The returned NonZeroU64::MIN sentinel is matched by
+        // the next-push surface's saturation guard when push_startup
+        // attempts to consume the wrap-mintinted reply id.
+        let raw = raw_old.saturating_add(1);
+        let nz = core::num::NonZeroU64::new(raw)
+            .unwrap_or(core::num::NonZeroU64::MIN);
+        crate::reply_id::ReplyId::from_raw(nz)
     }
 
     /// DEF-246 Phase 2 elevation #1 (2026-05-16) — initiate the
@@ -1552,7 +1719,7 @@ impl PgProtocol<DisconnectedPhase> {
     // (below the 128 B threshold); no `result_large_err` exception
     // needed.
     pub fn push_startup<'w>(
-        mut self,
+        self,
         user: crate::ident::Ident,
         database: Option<crate::ident::DatabaseName>,
         app_name: Option<crate::ident::ApplicationName>,
@@ -1566,17 +1733,34 @@ impl PgProtocol<DisconnectedPhase> {
         ),
         crate::action::PushFailure,
     > {
+        // DEF-279 Phase 1a (2026-05-18): `self.inner` is the ZST
+        // `DisconnectedInner` — no protocol storage pre-Startup. We
+        // materialise a fresh `PgProtocolInner` here (the post-transition
+        // storage). Pre-Bundle the inner was already in `self.inner` (a
+        // 536-B `PgProtocolInner` that was tautologically Idle + empty);
+        // moving the construction here makes the storage allocation
+        // strictly post-Startup — the `<DisconnectedPhase>` constructor
+        // does zero work. `fresh_inner` is leaf-private inside
+        // `_proto_init_leaf` (DEF-272 P6) so the cell-construction
+        // tokens stay gated.
+        //
+        // Drop `self` early — `DisconnectedInner` is ZST, drop is
+        // trivial; explicit `_ = self;` documents the consume.
+        let _ = self;
+        let mut new_inner = _proto_init_leaf::fresh_inner();
+
         // Mirror of push_command_internal: clear residue + branded
         // scope + materialise. The Idle precondition is structurally
-        // guaranteed by the `<DisconnectedPhase>` marker (fresh
-        // protocols start at `state == Idle`; this method consumes
-        // self so a second call is type-impossible).
+        // guaranteed: `fresh_inner` materialises `state: Idle` and
+        // no other code has access to mutate it before this point.
+        // `clear_session_residue_for_class` is a no-op on a fresh
+        // inner (all cells start empty) but kept for shape parity
+        // with the post-Bundle materialise path.
         write_buf.clear();
-        self.inner
-            .clear_session_residue_for_class(crate::state::StatePushClass::Idle);
+        new_inner.clear_session_residue_for_class(crate::state::StatePushClass::Idle);
 
-        let state = &mut self.inner.state;
-        let row_desc_slot = &mut self.inner.row_desc_slot;
+        let state = &mut new_inner.state;
+        let row_desc_slot = &mut new_inner.row_desc_slot;
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
             None => {
@@ -1671,13 +1855,19 @@ impl PgProtocol<DisconnectedPhase> {
         let _: () = row_desc_slot.consume_unused_witness();
         match result {
             Ok(out) => {
-                // Move self.inner into the new <ConnectingPhase>
-                // wrapper. The inner state is now one of
-                // ConnectingStartup{Trust|Scram|Cleartext|Md5}.
+                // DEF-279 Phase 1a: move the locally-materialised
+                // `new_inner` (whose state is now one of
+                // ConnectingStartup{Trust|Scram|Cleartext|Md5}, written
+                // by `compute_push_startup_idle_only`'s setter
+                // consumption) into the new `<ConnectingPhase>` wrapper.
+                // Pre-Bundle this was `self.inner` (the
+                // already-storage-allocated PgProtocolInner); post-Bundle
+                // `<DisconnectedPhase>::Inner` is ZST so the storage was
+                // newly minted here.
                 Ok((
                     out,
                     PgProtocol {
-                        inner: self.inner,
+                        inner: new_inner,
                         phase_marker: PhantomData,
                     },
                 ))
@@ -3194,9 +3384,14 @@ impl PgProtocolInner {
     pub(crate) fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
     ) -> crate::reply_id::ReplyId<K> {
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let raw_old = COUNTER.fetch_add(1, Ordering::Relaxed);
+        use core::sync::atomic::Ordering;
+        // DEF-279 Phase 1a (2026-05-18): counter promoted to module-
+        // level `super::PROCESS_REPLY_ID_COUNTER` for cross-phase
+        // sharing with `<DisconnectedPhase>::next_reply_id` (which
+        // has no `inner.next_reply_id` to delegate to post-Bundle —
+        // DisconnectedInner is ZST). Process-global uniqueness pinned
+        // by single static across all four phases' mint sites.
+        let raw_old = PROCESS_REPLY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         if raw_old == u64::MAX {
             self.install_errored_replyid_saturation();
         }
@@ -6858,25 +7053,70 @@ impl Default for PgProtocol<DisconnectedPhase> {
     }
 }
 
-// DEF-246 Phase 1 + 2 (2026-05-16): blanket `Debug` for every phase.
-// Phase-specific marker is the `phase_marker: PhantomData<fn() -> P>`
-// ZST; the human-readable contents are inner fields that exist in
-// every phase (no phase-conditional Debug output). The previous
-// `<ActivePhase>`-only impl is upgraded to `<P: SealedPhase>` so
-// `eprintln!("{:?}", proto)` works in handshake / closed contexts too.
-impl<P: SealedPhase> core::fmt::Debug for PgProtocol<P> {
+// DEF-279 Phase 1a (2026-05-18): per-phase `Debug` impls. Pre-Bundle
+// a single blanket `impl<P: SealedPhase> Debug for PgProtocol<P>`
+// accessed inner fields directly (session_params/state/read_buf),
+// which compiled because every phase's Inner was PgProtocolInner.
+// Post-Bundle `<DisconnectedPhase>::Inner` is the ZST
+// `DisconnectedInner` (no fields); blanket access fails to compile.
+// Split into 4 phase-specific impls — DisconnectedPhase's output is
+// a phase-name marker (the storage IS the proof: nothing to show);
+// the other three keep the pre-Bundle body bit-identical.
+
+impl core::fmt::Debug for PgProtocol<DisconnectedPhase> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `<DisconnectedPhase>::Inner` is ZST — no fields to surface.
+        // Phase marker is the only meaningful signal; state is provably
+        // Idle by storage absence.
+        f.debug_struct("PgProtocol")
+            .field("phase", &"DisconnectedPhase")
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for PgProtocol<ConnectingPhase> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl core::fmt::Debug for PgProtocol<ActivePhase> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl core::fmt::Debug for PgProtocol<ClosedPhase> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+/// DEF-279 Phase 1a (2026-05-18) — `Debug` impl moved onto
+/// `PgProtocolInner` itself. Pre-Bundle the body lived inline in a
+/// blanket `impl<P: SealedPhase> Debug for PgProtocol<P>`. With the
+/// trait-split into `<P>::Inner`, `<DisconnectedPhase>::Inner` is the
+/// ZST `DisconnectedInner` (no fields to show) — the blanket impl
+/// no longer compiles. The Inner Debug body lives here once and the
+/// 3 non-Disconnected phase impls delegate via `self.inner.fmt(f)`.
+/// `<DisconnectedPhase>` has its own Debug printing the phase name
+/// (no inner fields exist).
+///
+/// Body bit-identical to pre-Bundle: same field set (state,
+/// read_buf, session_params), same `finish_non_exhaustive()`.
+impl core::fmt::Debug for PgProtocolInner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // Inline routing mirrors `cold_session_params`: prefer the
         // boxed contents if allocated, else fall back to a static
         // empty `SessionParams::new()` (pristine, never dropped).
         static EMPTY: SessionParams = SessionParams::new();
-        let session_params: &SessionParams = match self.inner.session_params.as_deref() {
+        let session_params: &SessionParams = match self.session_params.as_deref() {
             Some(p) => p,
             None => &EMPTY,
         };
         f.debug_struct("PgProtocol")
-            .field("state", &self.inner.state)
-            .field("read_buf", &self.inner.read_buf)
+            .field("state", &self.state)
+            .field("read_buf", &self.read_buf)
             .field("session_params", session_params)
             .finish_non_exhaustive()
     }
@@ -7114,16 +7354,44 @@ mod residue_policy_per_class_tests {
         alloc::boxed::Box::new(params)
     }
 
+    /// DEF-279 Phase 1a (2026-05-18) — test-only constructor for an
+    /// `<ActivePhase>` proto. Pre-Bundle the residue tests called
+    /// `PgProtocol::new()` (which returned `<DisconnectedPhase>` with
+    /// a fully-allocated `PgProtocolInner` carrying empty cells).
+    /// Post-Bundle `<DisconnectedPhase>::Inner` is the ZST
+    /// `DisconnectedInner` — the tests need a phase whose Inner is
+    /// `PgProtocolInner` to exercise residue clear-paths. This helper
+    /// uses the leaf-private `_proto_init_leaf::fresh_inner()`
+    /// (callable from sibling tests within mod protocol) wrapped in
+    /// `<ActivePhase>`. NOT a production bypass: leaf visibility
+    /// gates external access; `phase_marker` is ZST without external
+    /// construction; this `fn` is `#[cfg(test)]` private to the
+    /// test module.
+    fn fresh_active_proto() -> PgProtocol<ActivePhase> {
+        PgProtocol {
+            inner: _proto_init_leaf::fresh_inner(),
+            phase_marker: PhantomData,
+        }
+    }
+
     /// Populate every observable residue field on `proto`:
     /// `row_desc_slot = Some(EMPTY)`, `session_params` non-pristine,
     /// `error_arena` allocated. After the test we observe how each
     /// arm of `clear_session_residue_*` mutated them.
     ///
-    /// DEF-246 Phase 2 (2026-05-16): generic over `P: SealedPhase` so
-    /// the same helper drives both the new `<DisconnectedPhase>`
-    /// protocols (from `PgProtocol::new()`) and the legacy
-    /// `<ActivePhase>` set-up paths inside `mod compute_push_tests`.
-    fn populate_residue<P: SealedPhase>(proto: &mut PgProtocol<P>) {
+    /// DEF-279 Phase 1a (2026-05-18): constraint tightened from
+    /// `<P: SealedPhase>` to `<P: SealedPhase<Inner = PgProtocolInner>>`
+    /// — the helper accesses inner fields that exist only on the
+    /// three non-Disconnected phases (Disconnected uses ZST
+    /// DisconnectedInner post-Bundle). Callers using
+    /// `<DisconnectedPhase>` constructed from `PgProtocol::new()` must
+    /// now drive through `push_startup` then `into_active` (legitimate
+    /// handshake path) OR use the
+    /// `_proto_init_leaf::fresh_inner()` bypass for `<ActivePhase>`
+    /// (test-only, pub(in crate::protocol)).
+    fn populate_residue<P: SealedPhase<Inner = PgProtocolInner>>(
+        proto: &mut PgProtocol<P>,
+    ) {
         proto.inner.row_desc_slot._set_for_test(Some(RowDesc::EMPTY));
         proto.inner.session_params._set_for_test(Some(dirty_session_params()));
         proto.inner.error_arena = Some(alloc::boxed::Box::new(
@@ -7133,16 +7401,20 @@ mod residue_policy_per_class_tests {
 
     /// Replace `proto.inner.state` with `Idle` so the destructor doesn't
     /// trip the in-flight `ReplyId<_>` Drop-guard at scope end.
-    /// DEF-246 Phase 2 (2026-05-16): generic over `P: SealedPhase`.
-    fn quench_inflight<P: SealedPhase>(proto: &mut PgProtocol<P>) {
+    /// DEF-279 Phase 1a (2026-05-18): constrained to `<P: SealedPhase<Inner = PgProtocolInner>>`.
+    fn quench_inflight<P: SealedPhase<Inner = PgProtocolInner>>(
+        proto: &mut PgProtocol<P>,
+    ) {
         let prev = core::mem::replace(&mut proto.inner.state, ProtoState::Idle);
         match prev.take_inflight_reply_raw_id() {
             Some(_) | None => {}
         }
     }
 
-    /// DEF-246 Phase 2 (2026-05-16): generic over `P: SealedPhase`.
-    fn session_params_is_pristine<P: SealedPhase>(proto: &PgProtocol<P>) -> bool {
+    /// DEF-279 Phase 1a (2026-05-18): constrained to `<P: SealedPhase<Inner = PgProtocolInner>>`.
+    fn session_params_is_pristine<P: SealedPhase<Inner = PgProtocolInner>>(
+        proto: &PgProtocol<P>,
+    ) -> bool {
         // DEF-211 INNO-01 (2026-05-04): trait method via `Pristine` import.
         // Inherent `__pristine_const` would also work but trait dispatch
         // here matches polymorphic intent (test helper takes any
@@ -7156,8 +7428,8 @@ mod residue_policy_per_class_tests {
 
     #[test]
     fn idle_clears_row_desc_preserves_session_params() {
-        let mut proto = PgProtocol::new();
-        // Default state is `Idle` post-`new()`.
+        let mut proto = fresh_active_proto();
+        // Default state is `Idle` post-`fresh_inner()`.
         populate_residue(&mut proto);
         let class = proto.inner.state.push_class();
         proto.inner.clear_session_residue_for_class(class);
@@ -7182,7 +7454,7 @@ mod residue_policy_per_class_tests {
 
     #[test]
     fn errored_clears_everything_including_session_params() {
-        let mut proto = PgProtocol::new();
+        let mut proto = fresh_active_proto();
         proto.inner.state = ProtoState::Errored(
             StateErrorKind::from_kind_or_internal(ErrorKind::Framing),
         );
@@ -7209,7 +7481,7 @@ mod residue_policy_per_class_tests {
 
     #[test]
     fn connecting_preserves_all_residue() {
-        let mut proto = PgProtocol::new();
+        let mut proto = fresh_active_proto();
         proto.inner.state = ProtoState::ConnectingStartupTrust {
             reply: ReplyId::from_raw(nz(11)),
         };
@@ -7238,7 +7510,7 @@ mod residue_policy_per_class_tests {
 
     #[test]
     fn ping_awaiting_preserves_all_residue() {
-        let mut proto = PgProtocol::new();
+        let mut proto = fresh_active_proto();
         proto.inner.state = ProtoState::PingAwaitingRfq(ReplyId::from_raw(nz(12)));
         populate_residue(&mut proto);
         let class = proto.inner.state.push_class();
@@ -7261,7 +7533,7 @@ mod residue_policy_per_class_tests {
 
     #[test]
     fn busy_query_preserves_all_residue() {
-        let mut proto = PgProtocol::new();
+        let mut proto = fresh_active_proto();
         proto.inner.state = ProtoState::SimpleQueryStreamingRows {
             reply: ReplyId::from_raw(nz(13)),
         };
@@ -7836,9 +8108,21 @@ mod compute_push_tests {
         // crates cannot reach the `inner` field (module-private to
         // `mod protocol`) and the `phase_marker` is reachable only
         // from sibling `cfg(test)` code (no `pub`).
-        let proto_disconnected = PgProtocol::<DisconnectedPhase>::new();
+        // DEF-279 Phase 1a (2026-05-18): test-only phase bypass for
+        // `<ActivePhase>` setup without driving the handshake.
+        // Pre-Bundle this borrowed `proto_disconnected.inner` (a
+        // 536-B PgProtocolInner that lived on the Disconnected proto).
+        // Post-Bundle `<DisconnectedPhase>::Inner` is the ZST
+        // `DisconnectedInner` — no PgProtocolInner to extract.
+        // `_proto_init_leaf::fresh_inner()` is the leaf-private
+        // (`pub(in crate::protocol)`) helper that materialises a fresh
+        // PgProtocolInner, callable from sibling tests inside mod
+        // protocol but unreachable from outside the crate. This is
+        // NOT a production bypass: external crates cannot reach
+        // `fresh_inner` (leaf visibility) and the `phase_marker` is
+        // ZST without external construction.
         let mut proto: PgProtocol<ActivePhase> = PgProtocol {
-            inner: proto_disconnected.inner,
+            inner: _proto_init_leaf::fresh_inner(),
             phase_marker: PhantomData,
         };
         let mut wb = WriteBuf::new();

@@ -865,11 +865,32 @@ const _: () = assert!(
      size. If this trips, a field was added/removed/reshaped on the \
      inner data struct; audit budget at the original 528 B pin above.",
 );
+// DEF-279 Phase 1a (2026-05-18): <DisconnectedPhase>::Inner is the
+// ZST `DisconnectedInner` — `PgProtocol<DisconnectedPhase>` is now 0 B.
+// Pre-Bundle was byte-identical to PgProtocolInner (536 B); the storage
+// pre-Startup carried tautologically-empty cells (state Idle, read_buf
+// empty, all 4 cells None, malformed_count 0). Post-Bundle the storage
+// physically doesn't exist — tier-1 by-storage-absence.
+//
+// The drop from 536 B → 0 B is the SINGLE largest size win in the
+// foundation bundle. A fresh `PgProtocol::new()` allocates exactly
+// zero protocol bytes; the materialisation cost is moved to
+// `push_startup` (which now calls `_proto_init_leaf::fresh_inner()`
+// to construct the post-transition `PgProtocolInner` for the
+// `<ConnectingPhase>` wrapper).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::DisconnectedPhase>>() == 536,
-    "PgProtocol<DisconnectedPhase> layout drift — should be \
-     byte-identical to PgProtocolInner via repr(transparent) + ZST \
-     PhantomData<fn() -> DisconnectedPhase>.",
+    core::mem::size_of::<protocol::PgProtocol<protocol::DisconnectedPhase>>() == 0,
+    "PgProtocol<DisconnectedPhase> layout drift — should be 0 B \
+     (ZST DisconnectedInner + ZST phase_marker PhantomData<fn() -> \
+     DisconnectedPhase>). If this trips, a non-ZST field crept onto \
+     DisconnectedInner — audit `mod protocol::DisconnectedInner`.",
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::DisconnectedInner>() == 0,
+    "DisconnectedInner exact size — must be 0 B (the only field is \
+     `sync_marker: PhantomData<Cell<()>>`, which is ZST). If this \
+     trips, a non-ZST field was added to DisconnectedInner — \
+     architectural violation of Phase 1a tier-1-by-storage-absence.",
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 536,
