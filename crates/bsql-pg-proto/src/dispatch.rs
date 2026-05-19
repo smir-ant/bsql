@@ -221,6 +221,37 @@ fn install_errored(
     DispatchOutcome::Errored { reply_id, cause }
 }
 
+/// Tier-3 audit #77 (2026-05-19): zero-body-payload validator for PG
+/// §55.7 frames that carry no data (EmptyQueryResponse, ParseComplete,
+/// BindComplete, NoData, CloseComplete, etc.). Returns `Ok(())` iff
+/// `payload.is_empty()`; otherwise classifies as
+/// [`ProtocolError::UnexpectedFrameBody`] with the wire tag + observed
+/// body length.
+///
+/// Unifies the `match payload { [] => Ok(()), other => Err(...) }`
+/// pattern that previously appeared inline at 6 dispatch arms. The
+/// audit's "EmptyBody ZST" suggestion was discarded as cosmetic — no
+/// caller takes a typed witness as a parameter; the helper-function
+/// shape carries identical bundle-compliance with a smaller surface.
+///
+/// `#[inline(always)]` — verified ASM-neutral on `feed_bytes` hot
+/// path (0 codegen delta); locks the inlining guarantee against
+/// future opt-level shifts.
+#[inline(always)]
+fn validate_empty_body(
+    payload: &[u8],
+    tag: crate::wire::InboundTag,
+) -> Result<(), ProtocolError> {
+    if payload.is_empty() {
+        Ok(())
+    } else {
+        Err(ProtocolError::UnexpectedFrameBody {
+            tag,
+            payload_len: payload.len(),
+        })
+    }
+}
+
 /// DEF-279 Phase 1c Bundle Commit 5 — per-phase mirror of
 /// [`install_errored`] for [`crate::state::ConnectingState`].
 ///
@@ -840,26 +871,18 @@ pub(crate) fn dispatch(
             advance_to_awaiting_rfq(state, reply, payload)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
-            // DEF-185 P0-F (audit 2026-04-24): PG §55.7 specifies
-            // EmptyQueryResponse has a zero-byte body. Enforce tier-2
-            // structural — non-empty body classifies as
-            // UnexpectedFrameBody. Pre-fix: payload was ignored entirely.
-            match payload {
-                [] => {
+            // PG §55.7 EmptyQueryResponse has a zero-body payload.
+            // Routed through `validate_empty_body` for uniform
+            // classification across all zero-body frames.
+            match validate_empty_body(payload, TAG_EMPTY_QUERY_RESPONSE) {
+                Ok(()) => {
                     *state = ProtoState::SimpleQueryAwaitingRfq {
                         reply,
                         command_tag: crate::error::BoundedStr::default(),
                     };
                     DispatchOutcome::AdvancedSilent
                 }
-                other => install_errored(
-                    state,
-                    Some(reply.consume()),
-                    ProtocolError::UnexpectedFrameBody {
-                        tag: TAG_EMPTY_QUERY_RESPONSE,
-                        payload_len: other.len(),
-                    },
-                ),
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ERROR_RESPONSE) => {
@@ -965,21 +988,13 @@ pub(crate) fn dispatch(
         // =============================================================
 
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_PARSE_COMPLETE) => {
-            // DEF-185 P0-F: ParseComplete body must be empty per
-            // PG §55.7.
-            match payload {
-                [] => {
+            // PG §55.7 ParseComplete body must be empty.
+            match validate_empty_body(payload, TAG_PARSE_COMPLETE) {
+                Ok(()) => {
                     *state = ProtoState::ParseAwaitingRfq(reply);
                     DispatchOutcome::AdvancedSilent
                 }
-                other => install_errored(
-                    state,
-                    Some(reply.consume()),
-                    ProtocolError::UnexpectedFrameBody {
-                        tag: TAG_PARSE_COMPLETE,
-                        payload_len: other.len(),
-                    },
-                ),
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_ERROR_RESPONSE) => {
@@ -1053,21 +1068,13 @@ pub(crate) fn dispatch(
         // ─── DML path ───
 
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_BIND_COMPLETE) => {
-            // DEF-185 P0-F: BindComplete body must be empty per
-            // PG §55.7.
-            match payload {
-                [] => {
+            // PG §55.7 BindComplete body must be empty.
+            match validate_empty_body(payload, TAG_BIND_COMPLETE) {
+                Ok(()) => {
                     *state = ProtoState::BindExecuteAwaitingCommandCompleteDml(reply);
                     DispatchOutcome::AdvancedSilent
                 }
-                other => install_errored(
-                    state,
-                    Some(reply.consume()),
-                    ProtocolError::UnexpectedFrameBody {
-                        tag: TAG_BIND_COMPLETE,
-                        payload_len: other.len(),
-                    },
-                ),
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
         // DEF-244 (2026-05-13): the prepared! macro path bundles Parse
@@ -1157,22 +1164,14 @@ pub(crate) fn dispatch(
             ProtoState::BindExecuteAwaitingBindCompleteSelect { reply },
             TAG_BIND_COMPLETE,
         ) => {
-            // DEF-185 P0-F: BindComplete body must be empty per
-            // PG §55.7.
-            match payload {
-                [] => {
+            // PG §55.7 BindComplete body must be empty.
+            match validate_empty_body(payload, TAG_BIND_COMPLETE) {
+                Ok(()) => {
                     *state =
                         ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply };
                     DispatchOutcome::AdvancedSilent
                 }
-                other => install_errored(
-                    state,
-                    Some(reply.consume()),
-                    ProtocolError::UnexpectedFrameBody {
-                        tag: TAG_BIND_COMPLETE,
-                        payload_len: other.len(),
-                    },
-                ),
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
         // DEF-244 (2026-05-13): prepared! macro path — same silent
@@ -1344,26 +1343,18 @@ pub(crate) fn dispatch(
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, param_oids },
             TAG_NO_DATA,
         ) => {
-            // DEF-185 P0-F: NoData body must be empty per PG §55.7.
-            // DEF-210 SR-01-D Path D: row_desc_slot stays `None`
-            // (no 'T' fired); materialise reads the slot at Z and
-            // emits Reply::DescribeStatementComplete with `NoData`.
-            match payload {
-                [] => {
+            // PG §55.7 NoData body must be empty. row_desc_slot stays
+            // `None` (no 'T' fired); materialise reads the slot at Z
+            // and emits Reply::DescribeStatementComplete with `NoData`.
+            match validate_empty_body(payload, TAG_NO_DATA) {
+                Ok(()) => {
                     *state = ProtoState::DescribeStatementAwaitingRfq {
                         reply,
                         param_oids,
                     };
                     DispatchOutcome::AdvancedSilent
                 }
-                other => install_errored(
-                    state,
-                    Some(reply.consume()),
-                    ProtocolError::UnexpectedFrameBody {
-                        tag: TAG_NO_DATA,
-                        payload_len: other.len(),
-                    },
-                ),
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
         (
@@ -1424,22 +1415,15 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_NO_DATA) => {
-            // DEF-185 P0-F: NoData body must be empty per PG §55.7.
-            // DEF-210 SR-01-D Path D: row_desc_slot stays None (no
-            // 'T' fired); materialise reads slot at Z and emits NoData.
-            match payload {
-                [] => {
+            // PG §55.7 NoData body must be empty. row_desc_slot stays
+            // None (no 'T' fired); materialise reads slot at Z and
+            // emits NoData.
+            match validate_empty_body(payload, TAG_NO_DATA) {
+                Ok(()) => {
                     *state = ProtoState::DescribePortalAwaitingRfq { reply };
                     DispatchOutcome::AdvancedSilent
                 }
-                other => install_errored(
-                    state,
-                    Some(reply.consume()),
-                    ProtocolError::UnexpectedFrameBody {
-                        tag: TAG_NO_DATA,
-                        payload_len: other.len(),
-                    },
-                ),
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ERROR_RESPONSE) => {
