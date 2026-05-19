@@ -5664,50 +5664,50 @@ fn fail_inflight_no_readbuf(
     if matches!(state, ProtoState::Errored(_)) {
         return;
     }
-    // DEF-185 P2-9 (audit 2026-04-24): bump counter before transitioning.
-    // This fires on every classified fatal wire event — operator-facing
-    // canary (exposed via `PgProtocol::malformed_frame_count`). Saturating
-    // add keeps the counter pinned at u32::MAX on extreme flood.
+    // Bump counter before transitioning. This fires on every
+    // classified fatal wire event — operator-facing canary (exposed
+    // via `PgProtocol::malformed_frame_count`). Saturating add keeps
+    // the counter pinned at u32::MAX on extreme flood.
     //
-    // **Tier-3 #76 (audit 2026-05-19)**: the saturation policing happens
-    // at `MALFORMED_STORM_THRESHOLD = 10_000` below (tier-3 classified
-    // via `ErrorKind::MalformedStorm`), not at `u32::MAX`. Once the
-    // threshold fires, the connection transitions to `Errored`; subsequent
-    // increments still saturate the counter but no code path reads it
-    // past the Errored transition — the `u32::MAX` arm is architecturally
-    // dead (post-Errored short-circuit elsewhere). Promoting the type to
+    // **Tier-3 audit #76 (2026-05-19, verified)**: the saturation
+    // policing happens at `MALFORMED_STORM_THRESHOLD = 10_000` below
+    // (tier-3 classified via `ErrorKind::MalformedStorm`), not at
+    // `u32::MAX`. Once the threshold fires, the connection
+    // transitions to `Errored`; subsequent increments still saturate
+    // the counter but no code path reads it past the Errored
+    // transition — the `u32::MAX` arm is architecturally dead
+    // (post-Errored short-circuit elsewhere). Promoting the type to
     // `Saturating<u32>` or `MintSaturated`-classified panic would
     // duplicate the policing already in place at the 10_000 boundary.
     *malformed_counter = malformed_counter.saturating_add(1);
-    // DEF-189 Q8-C4: counter-storm classifier. If the counter has
-    // accumulated past `MALFORMED_STORM_THRESHOLD` (10_000), the
-    // `Errored` transition classifies as `MalformedStorm` regardless
-    // of the per-frame `cause.state_kind()`. Defensive tier-3: under
-    // current single-event-then-Errored semantics the counter caps
-    // at 1 in practice (the early-return above prevents re-entry).
-    // The classifier activates if a future flow change unblocks
-    // counter accumulation — without this branch the saturation
-    // event would be tier-4 silent (counter pins at u32::MAX, no
-    // diagnostic signal).
+    // Counter-storm classifier. If the counter has accumulated past
+    // `MALFORMED_STORM_THRESHOLD` (10_000), the `Errored` transition
+    // classifies as `MalformedStorm` regardless of the per-frame
+    // `cause.state_kind()`. Defensive tier-3: under current
+    // single-event-then-Errored semantics the counter caps at 1 in
+    // practice (the early-return above prevents re-entry). The
+    // classifier activates if a future flow change unblocks counter
+    // accumulation — without this branch the saturation event would
+    // be tier-4 silent (counter pins at u32::MAX, no diagnostic
+    // signal).
     let state_kind = if *malformed_counter >= MALFORMED_STORM_THRESHOLD {
         StateErrorKind::from_kind_or_internal(crate::error::ErrorKind::MalformedStorm)
     } else {
-        // DEF-154 (I): total state_kind — no unwrap_or_else + debug_assert.
+        // Total state_kind — no unwrap_or_else + debug_assert dance.
         cause.state_kind()
     };
-    // DEF-184 (A10/B22 revert 2026-04-24): `mem::replace` drops the
-    // previous state, which may be a SCRAM variant carrying
-    // `ScramSession`. `ScramSession`'s `ZeroizeOnDrop` fires here
-    // automatically — password bytes scrubbed in the drop path of
-    // `prev`. No explicit `scram_state = None` step needed post-revert
-    // because there IS no separate scram_state field — SCRAM data
-    // lives inline in the state variant and rides the drop glue.
+    // `mem::replace` drops the previous state, which may be a SCRAM
+    // variant carrying `ScramSession`. `ScramSession`'s
+    // `ZeroizeOnDrop` fires here automatically — password bytes
+    // scrubbed in the drop path of `prev`. No explicit
+    // `scram_state = None` step needed because there IS no separate
+    // scram_state field — SCRAM data lives inline in the state
+    // variant and rides the drop glue.
     //
-    // DEF-271 cluster A (2026-05-10): route through FeedStateSetter
-    // for tier-1 by-construction drain+install atomicity. Same
-    // mem::replace under the hood; the `#[must_use]` returned id is
-    // consumed in the FailReply emission below — explicit handling
-    // (no fallback, no leak).
+    // Route through FeedStateSetter for tier-1 by-construction
+    // drain+install atomicity. Same mem::replace under the hood; the
+    // `#[must_use]` returned id is consumed in the FailReply
+    // emission below — explicit handling (no fallback, no leak).
     let raw_id = _fail_inflight_no_readbuf_drain_leaf::drain(state, state_kind);
     match raw_id {
         Some(id) => {
@@ -5724,8 +5724,8 @@ fn fail_inflight_no_readbuf(
     }
 }
 
-/// DEF-189 Q8-C4 — malformed-frame-count threshold for the
-/// `MalformedStorm` classifier in `fail_inflight_no_readbuf`.
+/// Malformed-frame-count threshold for the `MalformedStorm`
+/// classifier in `fail_inflight_no_readbuf`.
 ///
 /// 10_000 is high enough to rule out single-event noise (a single
 /// transient malformed frame on a healthy connection) and low enough
@@ -5738,7 +5738,7 @@ const MALFORMED_STORM_THRESHOLD: u32 = 10_000;
 
 /// Compute the state transition and actions for a command push.
 ///
-/// # Pure compute / apply split (DEF-059)
+/// # Pure compute / apply split
 ///
 /// This free function owns the entire push-path decision: given the
 /// command and current [`ProtoState`] *by value*, it produces the new
@@ -5754,12 +5754,12 @@ const MALFORMED_STORM_THRESHOLD: u32 = 10_000;
 ///   in the crate are restricted to `push_command` and `feed_bytes`.
 ///   Adding a new command variant grows the match here, not the
 ///   mutable surface of `PgProtocol`.
-/// - **Errored pre-check dissolves.** The DEF-093 workaround (reading
-///   `&self.inner.state` *before* `core::mem::take` to avoid a transient
-///   `Idle` window) is no longer needed. `ProtoState::Errored` is a
+/// - **Errored as a first-class arm.** `ProtoState::Errored` is a
 ///   first-class arm: it preserves the cause (returns
 ///   `ProtoState::Errored(cause)` unchanged) and emits the
-///   `FailReply`. No intermediate-value peek, no empty unreachable arm.
+///   `FailReply`. A naive shape would peek `&self.inner.state`
+///   *before* `core::mem::take` to avoid a transient `Idle` window;
+///   passing state by value here makes the peek unnecessary.
 ///
 /// Per-command semantics live in dedicated helpers
 /// ([`compute_push_ping`], [`compute_push_startup`]); `compute_push`
@@ -5771,28 +5771,26 @@ fn compute_push(
     state: &mut ProtoState,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> StagedActions<'static> {
-    // DEF-160 (Z2): the cfg(test) dispatcher operates on the legacy
-    // owned-`Sql` `PgCommand` enum. Although the `PgCommand` variants
-    // own their `Sql`, the SimpleQuery / Parse arms route through
+    // The cfg(test) dispatcher operates on the owned-`Sql`
+    // `PgCommand` enum. Although `PgCommand` variants own their
+    // `Sql`, the SimpleQuery / Parse arms route through
     // `compute_push_simple_query` / `compute_push_parse` (cfg(test))
-    // which take `&'a Sql` and stage `&'a [u8]` via SendBytesBorrowed
-    // — so `staged` borrows from the locally-owned Sql for the
-    // duration of this function. Returning the staged container
-    // out of scope is safe because the inner StagedAction-lifetime
-    // tracks the caller's expectation; the local Sql lives for the
-    // 'static lifetime of `PgCommand` (variants are owned). Bind
-    // staged's 'sql to the function-local 'a to keep the borrow
-    // checker honest, then return as 'static (subtype) once we know
-    // no SendBytesBorrowed survives past the local scope.
+    // which take `&'a Sql` and stage `&'a [u8]` via
+    // SendBytesBorrowed — so `staged` borrows from the locally-owned
+    // Sql for the duration of this function. Returning the staged
+    // container out of scope is safe because the local Sql lives for
+    // the 'static lifetime of `PgCommand` (variants are owned).
+    // Bind staged's 'sql to the function-local 'a to keep the
+    // borrow checker honest, then return as 'static (subtype) once
+    // we know no SendBytesBorrowed survives past the local scope.
     let mut staged: StagedActions<'_> = StagedActions::new();
     match cmd {
         PgCommand::Ping { reply } => compute_push_ping(state, reply, &mut staged),
-        // DEF-246 Phase 2 (2026-05-16): `PgCommand::Startup` arm
-        // deleted alongside the variant itself. Startup is the only
-        // command with a phase-typed entry-point
+        // No PgCommand::Startup arm. Startup is the only command
+        // with a phase-typed entry-point
         // (`<DisconnectedPhase>::push_startup`); the test-only
-        // dispatcher no longer needs the arm because
-        // `compute_push_startup` (cfg(test)) is also deleted.
+        // dispatcher does not need the arm because there is no
+        // `compute_push_startup` cfg(test) variant.
         PgCommand::SimpleQuery { sql, reply } => {
             compute_push_simple_query(state, &sql, reply, &mut staged, reserved)
         }
@@ -5811,12 +5809,12 @@ fn compute_push(
     staged
 }
 
-// DEF-269 v2 (T) backwards-compat slow-path `compute_push_idle_only`
-// DELETED at DEF-270 Phase 2 (2026-05-10). Real call sites were zero
-// (audit grep `push_command(PgCommand::...)` returned only doc-comment
-// references); the legacy `impl PushCommand for PgCommand` blanket
-// impl was removed in the same commit. `PgCommand` enum survives for
-// the test-only `compute_push_tests` 5-arm dispatchers.
+// No backwards-compat slow-path `compute_push_idle_only` ships.
+// A naive shape would expose `impl PushCommand for PgCommand` as a
+// blanket impl over the runtime-polymorphic enum — but the per-
+// command structs are the sole production entry point; `PgCommand`
+// survives only for the test-only `compute_push_tests` 5-arm
+// dispatchers.
 
 /// Compute the transition for [`PgCommand::Ping`] against the current
 /// [`ProtoState`]. Pure; see [`compute_push`] for framing.
@@ -5841,23 +5839,20 @@ fn compute_push_ping(
     reply: ReplyId<crate::reply_id::PingKind>,
     staged: &mut StagedActions,
 ) {
-    // DEF-186 perf-recovery 2026-04-24: signature changed from
-    // by-value `state: ProtoState` to `&mut ProtoState`. Idle arm
-    // writes new state via `*state = ...`; preserve arms (Errored,
-    // PingAwaiting, BusyQuery, Connecting) leave state untouched —
-    // saves the 712 B mem::take + 712 B write-back per non-Idle push.
+    // `&mut ProtoState` signature: the Idle arm writes new state
+    // via `*state = ...`; preserve arms (Errored, PingAwaiting,
+    // BusyQuery, Connecting) leave state untouched — saves the
+    // 712 B mem::take + 712 B write-back per non-Idle push that a
+    // by-value `state: ProtoState` signature would force.
     //
-    // DEF-146: classifier dispatch. Pre-DEF-146 this function had 5
-    // arms over explicit state variants (with 18-way or-patterns for
-    // the tail catch-alls). Post-DEF-146, the enumeration lives once
-    // in `ProtoState::push_class`; this match is 5 arms over the
-    // classifier's 5 variants — exhaustive, no `_` fallback, tier-1
-    // preserved.
+    // Classifier dispatch over `ProtoState::push_class`: 5 arms over
+    // the classifier's 5 variants — exhaustive, no `_` fallback,
+    // tier-1 preserved. A naive shape would match explicit state
+    // variants directly with 18-way or-patterns for the tail
+    // catch-alls; the classifier centralises the enumeration.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-272 cluster γ (2026-05-10): IdleState typestate
-            // replaces (state, IdleStateProof). Idle arm of
-            // push_class() classification is the precondition; the
+            // IdleState typestate is the precondition; the
             // typestate's try_from re-checks at the boundary.
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
@@ -5909,7 +5904,7 @@ fn compute_push_ping(
     }
 }
 
-/// DEF-208 — Idle-only path for [`PgCommand::Ping`] push.
+/// Idle-only path for the Ping push.
 ///
 /// Caller must guarantee `state == ProtoState::Idle` (production
 /// callsite is `ReadyGuard::push_command` which proves this via the
@@ -5917,36 +5912,36 @@ fn compute_push_ping(
 /// dispatch in `compute_push_ping`, avoiding ~3 ns of branch +
 /// dispatch overhead per push.
 ///
-/// Tier-1 closure of DEF-198 surface 6 (internal compute_push
-/// 5-arm dispatch was dead code from the public API path through
-/// ReadyGuard).
+/// Tier-1 closure: the public API path through `ReadyGuard` only
+/// reaches the Idle classification; the 5-arm dispatch surface
+/// stays on the cfg(test) `compute_push_ping` for the
+/// per-classification spec tests.
 #[inline]
 pub(crate) fn compute_push_ping_idle_only(
     setter: crate::state_setter::StateSetter<'_, crate::push_command::PingAwaitingRfqInstall>,
     reply: ReplyId<crate::reply_id::PingKind>,
     staged: &mut StagedActions,
 ) {
-    // DEF-094: Sync is a compile-time const (5 bytes). Emit
+    // Sync is a compile-time const (5 bytes). Emit
     // `StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES)` so the
     // materialiser passes the static reference through directly —
     // zero write to write_buf, zero copy.
     emit_actions!(staged, budget: 1, [
         StagedAction::SendBytesStatic(&SYNC_WIRE_BYTES),
     ]);
-    // DEF-270 N-D: typed witness pairs Ping → PingAwaitingRfq.
+    // Typed witness pairs Ping → PingAwaitingRfq.
     setter.install_post_state(crate::push_command::PingAwaitingRfqInstall { reply });
 }
 
-// DEF-246 Phase 2 (2026-05-16): `compute_push_startup` cfg(test) +
-// `compute_push_tests::push_startup_*` retired tests deleted —
+// No `compute_push_startup` cfg(test) dispatcher.
 // `<DisconnectedPhase>::push_startup`'s consume-self signature
 // physically forbids pushing Startup from non-Disconnected states,
-// so the per-state dispatcher (Idle / Errored / Connecting /
-// PingAwaiting / BusyQuery) is dead. The remaining `Idle` path
-// lives in `compute_push_startup_idle_only` below (still reached
-// from `<DisconnectedPhase>::push_startup`).
+// so a per-state dispatcher (Idle / Errored / Connecting /
+// PingAwaiting / BusyQuery) would be dead. The `Idle` path lives
+// in `compute_push_startup_idle_only` below (reached from
+// `<DisconnectedPhase>::push_startup`).
 
-/// DEF-208 — Idle-only path for the Startup handshake push.
+/// Idle-only path for the Startup handshake push.
 ///
 /// Caller must guarantee `state == ProtoState::Idle`. See
 /// [`compute_push_ping_idle_only`] for closure rationale.
@@ -5962,8 +5957,8 @@ pub(crate) fn compute_push_startup_idle_only(
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    // DEF-154 (B) P0-2: builder returns Result; Err →
-    // FailReply + CloseSocket + Errored via `try_builder!`.
+    // Builder returns Result; Err → FailReply + CloseSocket +
+    // Errored via `try_builder!`.
     let range = try_builder!(
         build_startup_message(
             &user,
@@ -5978,28 +5973,27 @@ pub(crate) fn compute_push_startup_idle_only(
     emit_actions!(staged, budget: 1, [
         StagedAction::SendBytesRange(range),
     ]);
-    // DEF-097: discriminate Trust vs Scram *here* — the
-    // post-push state carries only what its auth method
-    // needs. Trust: 24 bytes. Scram: 24 + ScramSession
-    // (~1040).
-    // DEF-270 N-D: typed witness pairs Startup → ConnectingStartup{Trust|Scram|Cleartext|Md5}.
+    // Discriminate auth method *here* — the post-push state
+    // carries only what its auth method needs. Trust: 24 bytes.
+    // SCRAM: 24 + ScramSession (~1040). Typed witness pairs Startup
+    // → ConnectingStartup{Trust|Scram|Cleartext|Md5}.
     let post_install = match credentials {
         Credentials::Trust => crate::push_command::StartupPostInstall::Trust { reply },
         Credentials::ScramPassword(password) => {
-            // DEF-184 (A10/B22 revert 2026-04-24): tier-1
-            // restored — ScramSession lives INSIDE the
-            // variant. Variant-carries-field invariant is
-            // compile-enforced (CREDO §1: safety > tier-1 > perf).
+            // Tier-1 variant-carries-field: ScramSession lives
+            // INSIDE the variant; the variant cannot exist without
+            // a valid `Box<ScramSession>`. ZeroizeOnDrop fires on
+            // every exit path through the Box's Drop.
             let scram = alloc::boxed::Box::new(
                 crate::scram::session::ScramSession::from_password(password),
             );
             crate::push_command::StartupPostInstall::Scram { reply, scram }
         }
         Credentials::CleartextPassword(password) => {
-            // DEF-215 (2026-05-05): mirror of the SCRAM construction
-            // above. `Sensitive<Password>` is heap-boxed so the
-            // variant footprint stays within the `ProtoState == 80`
-            // size pin. Variant-carries-field invariant is
+            // Mirror of the SCRAM construction above.
+            // `Sensitive<Password>` is heap-boxed so the variant
+            // footprint stays within the `ProtoState == 80` size
+            // pin. Variant-carries-field invariant is
             // compile-enforced — the variant cannot exist without a
             // valid `Box<Sensitive<Password>>`. ZeroizeOnDrop fires
             // on every exit path through the Box's Drop.
@@ -6007,17 +6001,17 @@ pub(crate) fn compute_push_startup_idle_only(
             crate::push_command::StartupPostInstall::Cleartext { reply, password }
         }
         Credentials::Md5Password(password) => {
-            // DEF-216 (2026-05-05): MD5 needs BOTH password AND
-            // username at digest-construction time (server's
-            // 4-byte salt arrives later in
-            // AuthenticationMD5Password). Bundle them in a single
-            // Box<Md5HandshakeState> — same single-Box pattern as
-            // SCRAM PERF-02. Tier-1 variant-carries-field; the
-            // Box can never be None and ZeroizeOnDrop fires on
-            // every exit path through Box::drop →
-            // Md5HandshakeState::drop → Sensitive::drop →
-            // Password::drop. `user` is non-secret (cleartext on
-            // wire in StartupMessage above) and not zeroized.
+            // MD5 needs BOTH password AND username at
+            // digest-construction time (server's 4-byte salt
+            // arrives later in AuthenticationMD5Password). Bundle
+            // them in a single Box<Md5HandshakeState> — same
+            // single-Box pattern as SCRAM. Tier-1
+            // variant-carries-field; the Box can never be None and
+            // ZeroizeOnDrop fires on every exit path through
+            // Box::drop → Md5HandshakeState::drop →
+            // Sensitive::drop → Password::drop. `user` is
+            // non-secret (cleartext on wire in StartupMessage
+            // above) and not zeroized.
             let handshake = alloc::boxed::Box::new(crate::md5::Md5HandshakeState {
                 password,
                 user,
@@ -6049,17 +6043,16 @@ fn compute_push_simple_query(
     staged: &mut StagedActions<'_>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    // DEF-160 Z2: `sql`'s lifetime is intentionally decoupled from
-    // `staged`'s `'sql` parameter. The cfg(test) legacy path copies
-    // SQL bytes into `reserved` (via build_query_message_cfgtest)
-    // and stages a single SendBytesRange — no borrow flows into
-    // staged, so staged's `'_` is independent and compute_push can
-    // return staged out of scope safely.
-    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
+    // `sql`'s lifetime is intentionally decoupled from `staged`'s
+    // `'sql` parameter. The cfg(test) legacy path copies SQL bytes
+    // into `reserved` (via build_query_message_cfgtest) and stages
+    // a single SendBytesRange — no borrow flows into staged, so
+    // staged's `'_` is independent and compute_push can return
+    // staged out of scope safely. `&mut ProtoState` signature: see
+    // `compute_push_ping` rationale.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-272 cluster γ (2026-05-10): IdleState typestate
-            // replaces (state, IdleStateProof).
+            // IdleState typestate is the precondition.
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
@@ -6071,16 +6064,18 @@ fn compute_push_simple_query(
                 }
             };
             let setter = idle.into_setter::<crate::push_command::SimpleQueryAwaitingFirstResponseInstall>();
-            // DEF-160 (Z2 cfg(test) legacy path): the typed-surface
-            // `SimpleQuery<'a>` uses `compute_push_simple_query_idle_only`
-            // with `SendBytesBorrowed` for zero-copy SQL. The cfg(test)
-            // dispatcher operates on the legacy `PgCommand::SimpleQuery`
-            // enum which owns `Sql` (FixedStr<2048>) and is consumed by
-            // value through `compute_push`. To keep the legacy path's
-            // staged-actions lifetime-portable (returnable from compute_push
-            // out of scope) we build the full single-frame here via the
-            // cfg(test)-only helper and emit one `SendBytesRange` —
-            // identical wire output, no SendBytesBorrowed surface.
+            // cfg(test) legacy path: the typed-surface
+            // `SimpleQuery<'a>` uses
+            // `compute_push_simple_query_idle_only` with
+            // `SendBytesBorrowed` for zero-copy SQL. The cfg(test)
+            // dispatcher operates on the owned-`Sql`
+            // `PgCommand::SimpleQuery` enum which is consumed
+            // by-value through `compute_push`. To keep the legacy
+            // path's staged-actions lifetime-portable (returnable
+            // from compute_push out of scope) the full single-frame
+            // is built here via the cfg(test)-only helper and one
+            // `SendBytesRange` is emitted — identical wire output,
+            // no SendBytesBorrowed surface.
             let range_result = build_query_message_cfgtest(sql, reserved);
             let range = try_builder!(range_result, setter, reply, staged);
             emit_actions!(staged, budget: 1, [
@@ -6118,13 +6113,15 @@ fn compute_push_simple_query(
     }
 }
 
-/// DEF-208 — Idle-only path for [`PgCommand::SimpleQuery`] (legacy
-/// cfg(test) enum) / [`crate::push_command::SimpleQuery<'a>`] (typed
-/// surface).
+/// Idle-only path for [`crate::push_command::SimpleQuery<'a>`] (typed
+/// surface) and the cfg(test) [`PgCommand::SimpleQuery`] enum.
 ///
-/// DEF-160 Z2 (2026-05-11): emits **3** staged actions (was 1 pre-Z2)
-/// — `SendBytesRange(header) + SendBytesBorrowed(sql) + SendBytesRange(trailer)`.
-/// SQL is borrowed end-to-end, never copied into `WriteBuf`.
+/// Emits **3** staged actions:
+/// `SendBytesRange(header) + SendBytesBorrowed(sql) + SendBytesRange(trailer)`.
+/// SQL is borrowed end-to-end, never copied into `WriteBuf`. A
+/// naive shape would copy SQL bytes into `reserved` and emit one
+/// `SendBytesRange` covering the whole frame; for large SQL strings
+/// that adds a memcpy on every push.
 #[inline]
 pub(crate) fn compute_push_simple_query_idle_only<'sql>(
     setter: crate::state_setter::StateSetter<
@@ -6153,26 +6150,24 @@ pub(crate) fn compute_push_simple_query_idle_only<'sql>(
         StagedAction::SendBytesBorrowed(sql_bytes),
         StagedAction::SendBytesRange(trailer_range),
     ]);
-    // DEF-270 N-D: typed witness pairs SimpleQuery → SimpleQueryAwaitingFirstResponse.
+    // Typed witness pairs SimpleQuery → SimpleQueryAwaitingFirstResponse.
     setter.install_post_state(
         crate::push_command::SimpleQueryAwaitingFirstResponseInstall { reply },
     );
 }
 
-// DEF-154 (B) Phase B4: `from_write_span_infallible` deleted.
-// Branded builders now use
+// No `from_write_span_infallible` helper. Branded builders use
 // [`crate::action::WriteRange::from_write_span`] directly —
 // identical shield logic, plus brand-identity binding.
 
 /// Build the PG simple-query (`'Q'`) frame **header** — tag plus the
 /// upfront-computed length prefix.
 ///
-/// DEF-160 Z2 (2026-05-11): split from the pre-Z2 monolithic
-/// `build_query_message`. The PG length-prefix INCLUDES itself
-/// (PG §55.7 wire spec); for SimpleQuery the body is `sql + NUL`,
-/// so length = 4 (length self) + sql_len + 1 (NUL). Both inputs
-/// are known at the call site, so the length is computed upfront
-/// here — no `with_length_prefix` back-patch needed.
+/// The PG length-prefix INCLUDES itself (PG §55.7 wire spec); for
+/// SimpleQuery the body is `sql + NUL`, so
+/// length = 4 (length self) + sql_len + 1 (NUL). Both inputs are
+/// known at the call site, so the length is computed upfront here —
+/// no `with_length_prefix` back-patch needed.
 ///
 /// PG frame body layout (§55.7 "Simple Query"):
 /// - Tag: `'Q'` (1 byte) ← in this header
@@ -6207,7 +6202,7 @@ fn build_query_header(
 }
 
 /// Build the PG simple-query (`'Q'`) frame **trailer** — the NUL
-/// terminator that follows the borrowed SQL bytes. DEF-160 Z2.
+/// terminator that follows the borrowed SQL bytes.
 fn build_query_trailer(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<crate::action::WriteRange, ProtocolError> {
@@ -6239,7 +6234,7 @@ fn build_query_message_cfgtest(
 }
 
 /// Build the PG Extended Query `Parse` (`'P'`) frame **header** —
-/// tag, length prefix, NUL-terminated statement name. DEF-160 Z2.
+/// tag, length prefix, NUL-terminated statement name.
 ///
 /// PG frame body layout (§55.7 "Parse"):
 /// - Tag: `'P'` (1 byte) ← in this header
@@ -6247,7 +6242,7 @@ fn build_query_message_cfgtest(
 /// - Statement name: NUL-terminated ← in this header
 /// - SQL text ← `SendBytesBorrowed` (NOT in WriteBuf)
 /// - NUL terminator (1 byte) ← in trailer
-/// - n_param_types: i16 BE (always 0 in Phase 1c-3a) ← in trailer
+/// - n_param_types: i16 BE (always 0 in current scope) ← in trailer
 fn build_parse_header(
     stmt_name: &crate::ident::StmtName,
     sql_len: usize,
@@ -6274,13 +6269,14 @@ fn build_parse_header(
 
 /// Build the PG Extended Query `Parse` (`'P'`) frame **trailer** —
 /// NUL terminator after the borrowed SQL bytes, plus the i16 BE
-/// parameter-type count (always 0 in Phase 1c-3a). DEF-160 Z2.
+/// parameter-type count (always 0 in current scope).
 fn build_parse_trailer(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<crate::action::WriteRange, ProtocolError> {
     let start = reserved.len();
     reserved.push_u8(0)?; // NUL terminator for the SQL string
-    // n_param_types = 0; Phase 1c-3b will widen to push actual OIDs here.
+    // n_param_types = 0; a future Parse-with-OIDs variant would
+    // widen this to push actual OIDs.
     reserved.push_i16_be(0)?;
     crate::action::WriteRange::from_write_span(start, reserved)
 }
@@ -6332,13 +6328,12 @@ fn compute_push_parse(
     staged: &mut StagedActions<'_>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    // DEF-160 Z2: see `compute_push_simple_query` — sql lifetime
-    // decoupled from staged's `'_`.
-    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
+    // `sql` lifetime decoupled from staged's `'_` (see
+    // `compute_push_simple_query`). `&mut ProtoState` signature
+    // matches the other compute_push_* arms.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-272 cluster γ (2026-05-10): IdleState typestate
-            // replaces (state, IdleStateProof).
+            // IdleState typestate is the precondition.
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
@@ -6350,7 +6345,7 @@ fn compute_push_parse(
                 }
             };
             let setter = idle.into_setter::<crate::push_command::ParseAwaitingParseCompleteInstall>();
-            // DEF-160 Z2 cfg(test) legacy path — see compute_push_simple_query above.
+            // cfg(test) legacy path — see compute_push_simple_query above.
             let range_result = build_parse_message_cfgtest(stmt_name, sql, reserved);
             let range = try_builder!(range_result, setter, reply, staged);
             emit_actions!(staged, budget: 2, [
@@ -6389,13 +6384,14 @@ fn compute_push_parse(
     }
 }
 
-/// DEF-208 — Idle-only path for [`PgCommand::Parse`] (legacy
-/// cfg(test) enum) / [`crate::push_command::Parse<'a>`] (typed
-/// surface).
+/// Idle-only path for [`crate::push_command::Parse<'a>`] (typed
+/// surface) and the cfg(test) [`PgCommand::Parse`] enum.
 ///
-/// DEF-160 Z2 (2026-05-11): emits **4** staged actions (was 2 pre-Z2)
-/// — `SendBytesRange(header) + SendBytesBorrowed(sql) + SendBytesRange(trailer) + SendBytesStatic(SYNC)`.
-/// SQL is borrowed end-to-end, never copied into `WriteBuf`.
+/// Emits **4** staged actions:
+/// `SendBytesRange(header) + SendBytesBorrowed(sql) + SendBytesRange(trailer) + SendBytesStatic(SYNC)`.
+/// SQL is borrowed end-to-end, never copied into `WriteBuf`. A
+/// naive shape would copy SQL bytes into `reserved` and emit one
+/// `SendBytesRange` + the static Sync trailer.
 #[inline]
 pub(crate) fn compute_push_parse_idle_only<'sql>(
     setter: crate::state_setter::StateSetter<
@@ -6426,16 +6422,16 @@ pub(crate) fn compute_push_parse_idle_only<'sql>(
         StagedAction::SendBytesRange(trailer_range),
         StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
     ]);
-    // DEF-270 N-D: typed witness pairs Parse → ParseAwaitingParseComplete.
+    // Typed witness pairs Parse → ParseAwaitingParseComplete.
     setter.install_post_state(crate::push_command::ParseAwaitingParseCompleteInstall { reply });
 }
 
-// DEF-154 (A) closed pass-#7 F16: `frame_build_unreachable` helper
-// + `CrateBugLocus::OutboundFrameBuild { stage }` variant +
-// `FrameBuildStage` enum all DELETED. The `build_*_message`
-// builders are now infallible via the `WriteReserved` capacity
-// witness in `write_buf.rs`; no Err branch exists at call sites,
-// no cold helper needed, no locus variant to classify a null case.
+// No `frame_build_unreachable` helper or
+// `CrateBugLocus::OutboundFrameBuild { stage }` variant.  The
+// `build_*_message` builders use the `WriteReserved` capacity
+// witness in `write_buf.rs` — calls return Result where the Err
+// arm is reachable (BuilderCapacityOverflow on >4 GB inputs); the
+// dispatch via `try_builder!` covers it without a cold helper.
 
 /// Build a PostgreSQL Extended Query `Describe` (`'D'`) frame
 /// (PG §55.2.2).
@@ -6444,14 +6440,14 @@ pub(crate) fn compute_push_parse_idle_only<'sql>(
 /// single target byte (`'S'` statement or `'P'` portal via
 /// [`crate::wire::DescribeTargetByte`]), NUL-terminated name.
 ///
-/// # Tier-1 target-byte pairing (F12, pass-#7)
+/// # Tier-1 target-byte pairing
 ///
 /// `target` is a typed enum; the wire byte it encodes is pinned
 /// by const-asserts in `wire.rs`. The `name: &impl DescribeName`
 /// constraint (sealed trait in `ident.rs`) restricts callers to
 /// `StmtName` or `PortalName` — passing a raw `&[u8]` is a type
-/// error, closing the tier-3 "caller always passes the right
-/// typed name" audit seam.
+/// error, closing the "caller always passes the right typed name"
+/// tier-3 discipline gap.
 ///
 /// `#[inline]` because the function is zero-generic monomorphic
 /// over `N: DescribeName`, the body is ~10 lines of direct buffer
@@ -6475,7 +6471,7 @@ fn build_describe_message<N: crate::ident::DescribeName>(
 
 /// Compute the transition for [`PgCommand::DescribeStatement`]
 /// against the current [`ProtoState`]. Pure; see [`compute_push`]
-/// for framing. 1c-3c.
+/// for framing.
 ///
 /// Happy path emits TWO actions: `SendBytes(Describe frame)` and
 /// `SendBytes(SYNC)`. The Sync is a static const
@@ -6488,7 +6484,6 @@ fn build_describe_message<N: crate::ident::DescribeName>(
 /// | current state                | action                              | new state                                   |
 /// |------------------------------|-------------------------------------|---------------------------------------------|
 /// | `Idle` (build OK)            | 2× `SendBytes(Describe, SYNC)`      | `DescribeStatementAwaitingParamDesc(reply)` |
-/// | (build infallible post-DEF-154) | —                                           | —                                    |
 /// | `Errored(kind)`              | `FailReply(ConnectionAlreadyClosed)`| `Errored(kind)` preserved                   |
 /// | `Connecting*`                | `FailReply(StartupAlreadyInProgress)`| same                                       |
 /// | any other in-flight          | `FailReply(CommandInProgress)`      | same                                        |
@@ -6500,11 +6495,10 @@ fn compute_push_describe_statement(
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
+    // `&mut ProtoState` signature: see `compute_push_ping` rationale.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-272 cluster γ (2026-05-10): IdleState typestate
-            // replaces (state, IdleStateProof).
+            // IdleState typestate is the precondition.
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
@@ -6546,7 +6540,7 @@ fn compute_push_describe_statement(
     }
 }
 
-/// DEF-208 — Idle-only path for [`PgCommand::DescribeStatement`].
+/// Idle-only path for the `DescribeStatement` push.
 #[inline]
 pub(crate) fn compute_push_describe_statement_idle_only(
     setter: crate::state_setter::StateSetter<
@@ -6572,7 +6566,7 @@ pub(crate) fn compute_push_describe_statement_idle_only(
         StagedAction::SendBytesRange(range),
         StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
     ]);
-    // DEF-270 N-D: typed witness pairs DescribeStatement → DescribeStatementAwaitingParamDesc.
+    // Typed witness pairs DescribeStatement → DescribeStatementAwaitingParamDesc.
     setter.install_post_state(
         crate::push_command::DescribeStatementAwaitingParamDescInstall { reply },
     );
@@ -6580,7 +6574,7 @@ pub(crate) fn compute_push_describe_statement_idle_only(
 
 /// Compute the transition for [`PgCommand::DescribePortal`] against
 /// the current [`ProtoState`]. Pure; see [`compute_push`] for
-/// framing. 1c-3c.
+/// framing.
 ///
 /// Mirrors [`compute_push_describe_statement`] — differs only in
 /// the target byte (`'P'` vs `'S'`) and the initial post-send
@@ -6597,11 +6591,10 @@ fn compute_push_describe_portal(
     staged: &mut StagedActions,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) {
-    // DEF-186 perf-recovery 2026-04-24: &mut state signature.
+    // `&mut ProtoState` signature: see `compute_push_ping` rationale.
     match state.push_class() {
         crate::state::StatePushClass::Idle => {
-            // DEF-272 cluster γ (2026-05-10): IdleState typestate
-            // replaces (state, IdleStateProof).
+            // IdleState typestate is the precondition.
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
@@ -6643,7 +6636,7 @@ fn compute_push_describe_portal(
     }
 }
 
-/// DEF-208 — Idle-only path for [`PgCommand::DescribePortal`].
+/// Idle-only path for the `DescribePortal` push.
 #[inline]
 pub(crate) fn compute_push_describe_portal_idle_only(
     setter: crate::state_setter::StateSetter<
@@ -6669,15 +6662,14 @@ pub(crate) fn compute_push_describe_portal_idle_only(
         StagedAction::SendBytesRange(range),
         StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
     ]);
-    // DEF-270 N-D: typed witness pairs DescribePortal → DescribePortalAwaitingRowDescOrNoData.
+    // Typed witness pairs DescribePortal → DescribePortalAwaitingRowDescOrNoData.
     setter.install_post_state(
         crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall { reply },
     );
 }
 
-/// DEF-270 P-ordering (Phase 2, 2026-05-10) — typed
-/// [`crate::action::WriteRange`] newtype identifying a `Bind` frame
-/// body. Constructed by [`build_bind_message`]; consumed by
+/// Typed [`crate::action::WriteRange`] newtype identifying a `Bind`
+/// frame body. Constructed by [`build_bind_message`]; consumed by
 /// [`stage_bind_execute_sync`] (the only caller). Swapping with
 /// [`ExecuteRange`] at the consumer is a type error.
 ///
@@ -6686,16 +6678,14 @@ pub(crate) fn compute_push_describe_portal_idle_only(
 /// type-distinct from `ExecuteRange`, no path to silent reorder.
 struct BindRange(crate::action::WriteRange);
 
-/// DEF-270 P-ordering (Phase 2, 2026-05-10) — typed
-/// [`crate::action::WriteRange`] newtype identifying an `Execute`
-/// frame body. Sibling of [`BindRange`].
+/// Typed [`crate::action::WriteRange`] newtype identifying an
+/// `Execute` frame body. Sibling of [`BindRange`].
 struct ExecuteRange(crate::action::WriteRange);
 
-/// DEF-270 P-ordering (Phase 2, 2026-05-10) — single-purpose
-/// stager for the `Bind`+`Execute`+`Sync` frame triple. Argument
-/// order pins frame order; the const-asserted `budget: 3` matches
-/// the three actions emitted; `Sync` is the static
-/// [`crate::wire::SYNC_WIRE_BYTES`] reference (zero-copy).
+/// Single-purpose stager for the `Bind`+`Execute`+`Sync` frame
+/// triple. Argument order pins frame order; the const-asserted
+/// `budget: 3` matches the three actions emitted; `Sync` is the
+/// static [`crate::wire::SYNC_WIRE_BYTES`] reference (zero-copy).
 ///
 /// **Tier-1 closures:**
 /// - argument-order swap (`(execute, bind)`) → type error.
@@ -6703,10 +6693,10 @@ struct ExecuteRange(crate::action::WriteRange);
 /// - missing `Bind` or `Execute` → impossible (function takes both
 ///   by value, function must be called to stage anything).
 ///
-/// Pre-DEF-270-P-ordering the same wire-frame triple was open-coded
-/// inside `compute_push_bind_execute_idle_only` as three
-/// `emit_actions!` arms. Tier-3 by-discipline: a refactor that
-/// reordered them or dropped Sync would compile.
+/// A naive shape would open-code the wire-frame triple inside
+/// `compute_push_bind_execute_idle_only` as three `emit_actions!`
+/// arms — tier-3 by-discipline: a refactor that reordered them or
+/// dropped Sync would compile.
 #[inline]
 fn stage_bind_execute_sync(
     staged: &mut StagedActions,
@@ -6742,57 +6732,48 @@ fn stage_bind_execute_sync(
 /// `write_buf` via [`crate::params::ParamsWriter::write_params`];
 /// no intermediate buffer.
 ///
-/// # DEF-270 P-ordering (Phase 2): typed return
+/// # Typed return
 ///
 /// Returns [`BindRange`], not raw [`crate::action::WriteRange`]. The
 /// typed newtype binds at the boundary so [`stage_bind_execute_sync`]
 /// statically rejects an `ExecuteRange` in the bind slot.
-// DEF-184 (A1+A13): ProtocolError shrunk 312 → ~72 B post-
-// ErrorArena externalisation; Err path below 128 B
-// result_large_err threshold.
+// ProtocolError is ~72 B post-ErrorArena externalisation, so the
+// Err path stays below the 128 B `result_large_err` threshold.
 fn build_bind_message<P: crate::params::ParamsWriter>(
     portal_name: &crate::ident::PortalName,
     stmt_name: &crate::ident::StmtName,
     params: &P,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<BindRange, ProtocolError> {
-    // Builder fns all return Result post-B4-W P0-2+P0-3 fix.
     let start = reserved.len();
     reserved.push_u8(crate::wire::TAG_BIND.byte())?;
-    // DEF-154 (B4-W + P0-3 fix from architect audit):
     // `params.write_params` can return Err from a user-impl that
     // overflows its advertised budget OR from a drift between
     // MAX_PARAMS_DATA_TOTAL and MAX_OWNED_SEND_LEN.
     //
-    // DEF-154 (M): push_* now returns Result<(), WriteBufFull>;
-    // ? propagates through the closure's new
-    // `-> Result<(), WriteBufFull>` return, and through this
-    // builder's `Result<_, ProtocolError>` via `From<WriteBufFull>
-    // for ProtocolError` → `BuilderCapacityOverflow`. The
-    // params_err out-param handles the OTHER failure (user-impl
-    // overflow) which is still classified as
+    // push_* returns Result<(), WriteBufFull>; `?` propagates
+    // through the closure's `-> Result<(), WriteBufFull>` return,
+    // and through this builder's `Result<_, ProtocolError>` via
+    // `From<WriteBufFull> for ProtocolError` →
+    // `BuilderCapacityOverflow`. The `params_err` out-param handles
+    // the OTHER failure (user-impl overflow) which is classified as
     // `ParamsWriterOverflow`.
     let mut params_err: Option<ProtocolError> = None;
     reserved.with_length_prefix(|w| {
         w.push_nul_terminated(portal_name.as_bytes())?;
         w.push_nul_terminated(stmt_name.as_bytes())?;
-        // DEF-184 (A14): compact format-code block.
-        //
-        // Pre-(184) sent `n_format_codes = P::COUNT` followed by
-        // `P::COUNT × u16_be(1)` — for N=16 that's 34 bytes of
-        // format codes + 2 bytes of count. Post-(184) uses the PG
-        // §55.7 Bind spec's compact form: "The number of parameter
-        // format codes can be zero (all default/text), or ONE
-        // (specified code applied to all parameters), or equal the
-        // actual number of parameters". For N ≥ 1 all params use
-        // binary uniformly → send `n_format_codes = 1, [1]` = 4
-        // bytes, independent of N. For N = 0 keep
-        // `n_format_codes = 0` (text-default, irrelevant with no
-        // params) — avoids server-side "1 format code but 0 params"
-        // edge case some PG forks might log.
-        //
-        // Wire-size saving: N=2 → 2 B, N=3 → 4 B, ..., N=16 → 30 B.
-        // Loop eliminated entirely (one push_bytes for N ≥ 1).
+        // Compact format-code block per PG §55.7 Bind spec: "The
+        // number of parameter format codes can be zero (all
+        // default/text), or ONE (specified code applied to all
+        // parameters), or equal the actual number of parameters".
+        // For N ≥ 1 all params use binary uniformly → send
+        // `n_format_codes = 1, [1]` = 4 bytes, independent of N.
+        // For N = 0 keep `n_format_codes = 0` (text-default,
+        // irrelevant with no params) — avoids the server-side
+        // "1 format code but 0 params" edge case some PG forks
+        // might log. A naive shape would send `n_format_codes =
+        // P::COUNT` followed by `P::COUNT × u16_be(1)` (for N=16
+        // that's 34 bytes of format codes + 2 bytes of count).
         if P::COUNT == 0 {
             w.push_u16_be(0)?;
         } else {
@@ -6810,9 +6791,9 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
                 locus: crate::error::CrateBugLocus::ParamsWriterOverflow,
             });
         }
-        // n_result_formats = 0 → server default (all text). 1c-3b
-        // does not negotiate per-column result formats; the user
-        // dispatches between text and binary decoders via the
+        // n_result_formats = 0 → server default (all text). This
+        // crate does not negotiate per-column result formats; the
+        // user dispatches between text and binary decoders via the
         // `ColumnDesc::format_code` in the provided row_desc.
         w.push_u16_be(0)?;
         Ok(())
@@ -6833,11 +6814,11 @@ fn build_bind_message<P: crate::params::ParamsWriter>(
 /// ```
 ///
 /// `max_rows` is derived from the caller's [`crate::FetchRows`] —
-/// 1c-3b scope produces `0` (fetch all). F83: the enum narrows the
-/// API to only variants the sub-phase supports, turning tier-3 docs
-/// into tier-1 compile.
+/// currently always `0` (fetch all). The enum narrows the API to
+/// only variants the current scope supports, turning what would be
+/// tier-3 docs into tier-1 compile.
 ///
-/// # DEF-270 P-ordering (Phase 2): typed return
+/// # Typed return
 ///
 /// Returns [`ExecuteRange`], not raw [`crate::action::WriteRange`].
 /// See [`build_bind_message`] / [`stage_bind_execute_sync`] for the
@@ -6885,19 +6866,18 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
         reply,
         staged
     );
-    // DEF-270 P-ordering (Phase 2): typed builder fn pins frame order
-    // (Bind → Execute → Sync). Argument-order swap → type error.
+    // Typed builder fn pins frame order (Bind → Execute → Sync).
+    // Argument-order swap → type error.
     stage_bind_execute_sync(staged, bind_range, execute_range);
-    // DEF-189: caller-supplied RowDesc lands in the protocol's
-    // single slot BEFORE the state transition. The variant
-    // shape (Select vs Dml) is the tier-1 signal that the
-    // slot is populated.
-    // DEF-270 N-D (Phase 2): typed witness pairs BindExecute →
-    // BindExecuteAwaitingBindComplete{Dml,Select}.
-    // DEF-272 cluster α: park via leaf submodule
-    // `_bind_execute_select_install_leaf::install_select_transition`
-    // which mints a `BeSelectToken` (private-field, leaf-gated mint)
-    // and routes to `RowDescSlotCell::park_at_be_select`.
+    // Caller-supplied RowDesc lands in the protocol's single slot
+    // BEFORE the state transition. The variant shape (Select vs
+    // Dml) is the tier-1 signal that the slot is populated.
+    //
+    // Typed witness pairs BindExecute →
+    // BindExecuteAwaitingBindComplete{Dml,Select}. Park via leaf
+    // submodule `_bind_execute_select_install_leaf::install_select_transition`
+    // which mints a `BeSelectToken` (private-field, leaf-gated
+    // mint) and routes to `RowDescSlotCell::park_at_be_select`.
     let post_install = match row_desc {
         Some(desc) => {
             _bind_execute_select_install_leaf::install_select_transition(row_desc_slot, desc);
@@ -6909,8 +6889,8 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-244 (2026-05-13) — Idle-only push path for the `prepared!`
-// macro's `BindPrepared<'q, P, R>` command. Sister to
+// Idle-only push path for the `prepared!` macro's
+// `BindPrepared<'q, P, R>` command. Sister to
 // `compute_push_bind_execute_idle_only` above but routed through
 // the macro's pre-baked Parse + Bind-prefix bytes.
 //
@@ -6933,11 +6913,11 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
 
 /// Idle-only push path for [`BindPrepared`](crate::push_command::BindPrepared).
 ///
-/// Per the design memo §6.2 + §5.3: emits the pre-baked Parse and
-/// Bind-prefix bytes (the macro computed them at expansion time;
-/// caller pays zero CPU on the header construction), appends the
-/// per-param payload via the existing `ParamsWriter` path, and
-/// stages the static Execute + Sync frames at the end.
+/// Emits the pre-baked Parse and Bind-prefix bytes (the macro
+/// computed them at expansion time; caller pays zero CPU on the
+/// header construction), appends the per-param payload via the
+/// existing `ParamsWriter` path, and stages the static Execute +
+/// Sync frames at the end.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors compute_push_bind_execute_idle_only's argument-list shape (sister helper for the prepared! macro's push path); collapsing into a struct would obscure the wire-frame parameter order"
@@ -6970,10 +6950,10 @@ pub(crate) fn compute_push_bind_prepared_idle_only<'sql, P, R>(
     let post_install = if q.row_oids.is_empty() {
         crate::push_command::BindExecutePostInstall::Dml { reply }
     } else {
-        // Synthesise a RowDesc from `q.row_oids` (all-text format,
-        // memo §5.4). The macro's row_oids list is small (≤ 16) and
-        // bounded by MAX_ROW_COLUMNS = 32; the construction is
-        // infallible at runtime.
+        // Synthesise a RowDesc from `q.row_oids` (all-text format).
+        // The macro's row_oids list is small (≤ 16) and bounded by
+        // MAX_ROW_COLUMNS = 32; the construction is infallible at
+        // runtime.
         let row_desc = match build_synthetic_row_desc(q.row_oids) {
             Ok(desc) => desc,
             Err(cause) => {
@@ -6996,7 +6976,8 @@ pub(crate) fn compute_push_bind_prepared_idle_only<'sql, P, R>(
                 return;
             }
         };
-        // Park via the leaf-private token mint (DEF-272 cluster α).
+        // Park via the leaf-private token mint
+        // (`_bind_execute_select_install_leaf` above).
         _bind_execute_select_install_leaf::install_select_transition(row_desc_slot, row_desc);
         crate::push_command::BindExecutePostInstall::Select { reply }
     };
@@ -7062,7 +7043,7 @@ where
 
 /// Build a synthetic [`crate::decode::RowDesc`] from a static OID
 /// list for the `prepared!` macro's path. All columns use
-/// [`FormatCode::Text`] (memo §5.4 — text format in v1).
+/// [`FormatCode::Text`] (text format in v1).
 ///
 /// Bounded above by [`crate::decode::MAX_ROW_COLUMNS`] = 32. The
 /// macro's RowDecode trait impls cap arity at 16 < 32, so this
@@ -7079,20 +7060,16 @@ fn build_synthetic_row_desc(
     crate::decode::RowDesc::from_static_oids_text_format(oids)
 }
 
-// Pass-#7 F6 / DEF-146 closure (2026-04-22):
-//
-// Pass-#7's F6 audit proposed a `const fn is_busy_in_flight(&ProtoState)
-// -> bool` helper to centralise the "busy-state set" — rejected at
-// the time because a guarded match arm is not exhaustive (needs a
-// `_ =>` fallback, and every forbid-bundle-legal fallback loses the
-// "new variant forces decision" property).
-//
-// DEF-146 landed the correct form: the classifier is an ENUM
-// (`StatePushClass`), not a bool. Each compute_push_* matches the
-// classifier exhaustively (5 variants, no `_` fallback) → tier-1
-// preserved; the variant enumeration lives once in
-// `ProtoState::push_class` (7 × duplication → 1 × authoritative).
-// Adding a new ProtoState variant fails the build at push_class if
+// No `is_busy_in_flight(&ProtoState) -> bool` helper. A naive
+// shape would centralise the "busy-state set" as a bool helper,
+// but a guarded match arm is not exhaustive (needs a `_ =>`
+// fallback, and every forbid-bundle-legal fallback loses the "new
+// variant forces decision" property). Instead the classifier is an
+// ENUM (`StatePushClass`); each compute_push_* matches it
+// exhaustively (5 variants, no `_` fallback) → tier-1 preserved;
+// the variant enumeration lives once in `ProtoState::push_class`
+// (no duplication across the 7 compute_push_* helpers). Adding a
+// new ProtoState variant fails the build at push_class if
 // uncategorised; the 7 compute_push_* helpers flow through
 // automatically.
 
@@ -7114,46 +7091,47 @@ fn build_synthetic_row_desc(
 /// the dispatcher classifies those as `UnexpectedFrame` and tears the
 /// connection down.
 ///
-/// # DEF-210 SR-03 (audit 2026-04-28): unified classifier
+/// # Unified classifier
 ///
-/// Pre-Path-3 this function had its OWN exhaustive match over
+/// Routes through [`crate::state::ProtoState::unsolicited_admit`]
+/// — one exhaustive match, two bool projections. A naive shape
+/// would have this function carry its OWN exhaustive match over
 /// `ProtoState`, mirrored byte-for-byte in
 /// [`allows_unsolicited_notice_response`] below. Tier-1 closure
-/// existed PER FUNCTION (each `match` was exhaustive) but NOT
+/// would exist PER FUNCTION (each `match` exhaustive) but NOT
 /// across the pair: a new variant added to one classifier without
-/// the other would silently classify asymmetrically (PS accepted,
-/// NR rejected, or vice versa). Path-3 routes both classifiers
-/// through [`crate::state::ProtoState::unsolicited_admit`] — one
-/// exhaustive match, two bool projections. **Drift between the
-/// two classifiers is structurally impossible**.
-// DEF-236 (audit 2026-05-05): hot inbound dispatch, called per frame.
-// LLVM already inlines transparently — `#[inline]` makes the intent
-// explicit (explicit > implicit) and pins behaviour against future
-// heuristic shifts.
+/// the other could silently classify asymmetrically (PS accepted,
+/// NR rejected, or vice versa). Routing both through the single
+/// `unsolicited_admit` source makes drift between the two
+/// classifiers structurally impossible.
+// Hot inbound dispatch, called per frame. LLVM already inlines
+// transparently — `#[inline]` makes the intent explicit (explicit
+// > implicit) and pins behaviour against future heuristic shifts.
 #[inline]
 const fn allows_unsolicited_param_status(state: &ProtoState) -> bool {
     state.unsolicited_admit().allow_param_status
 }
 
-/// DEF-185 P1-E (audit 2026-04-24) → DEF-210 SR-03 (audit 2026-04-28):
-/// classifier for `NoticeResponse` frame acceptance, today identical
+/// Classifier for `NoticeResponse` frame acceptance, today identical
 /// to [`allows_unsolicited_param_status`] in policy.
 ///
-/// PG server behaviour (§48.5 "Asynchronous Operations"): NoticeResponse
-/// may arrive at any time after connection start, BUT our client
-/// enforces a stricter client-side invariant: notices are only accepted
-/// in states where they would be delivered to the wrapper's async
-/// logging channel. Pre-auth states (Connecting*) reject notices to
-/// ensure nothing from the server is trusted before authentication
-/// completes — a pre-auth MITM-injected notice could carry
-/// attacker-controlled text that ends up in operator logs.
+/// PG server behaviour (§48.5 "Asynchronous Operations"):
+/// NoticeResponse may arrive at any time after connection start,
+/// BUT this client enforces a stricter client-side invariant:
+/// notices are only accepted in states where they would be
+/// delivered to the wrapper's async logging channel. Pre-auth
+/// states (Connecting*) reject notices to ensure nothing from the
+/// server is trusted before authentication completes — a pre-auth
+/// MITM-injected notice could carry attacker-controlled text that
+/// ends up in operator logs.
 ///
 /// Routes through [`crate::state::ProtoState::unsolicited_admit`].
-/// See [`allows_unsolicited_param_status`] for the SR-03 unification
-/// rationale (single exhaustive source, no parallel-classifier drift).
-// DEF-236 (audit 2026-05-05): same reasoning as
-// `allows_unsolicited_param_status` — LLVM already inlines; `#[inline]`
-// pins intent.
+/// See [`allows_unsolicited_param_status`] for the unification
+/// rationale (single exhaustive source, no parallel-classifier
+/// drift).
+// Same reasoning as `allows_unsolicited_param_status` — LLVM
+// already inlines; `#[inline]` pins intent against future heuristic
+// shifts.
 #[inline]
 const fn allows_unsolicited_notice_response(state: &ProtoState) -> bool {
     state.unsolicited_admit().allow_notice_response
@@ -7161,14 +7139,15 @@ const fn allows_unsolicited_notice_response(state: &ProtoState) -> bool {
 
 /// Classification of a `record_param_status` call's outcome.
 ///
-/// F35 (2026-04-21): pre-F35 the function returned `()` and
-/// silently dropped malformed payloads (missing NUL separator, etc.).
-/// Now the outcome is typed so the caller has diagnostic info — and
-/// a future Phase 1d wrapper-advisory channel (e.g.,
-/// `Action::EmitPsAdvisory`) can forward `MalformedPayload` events
-/// to the user for proxy-interference detection. Current caller
-/// exhaustive-matches both variants, silently consuming for now,
-/// but the compile surface is ready for the upgrade.
+/// The two-variant typed outcome gives the caller diagnostic info
+/// (and leaves the compile surface ready for a future
+/// wrapper-advisory channel like `Action::EmitPsAdvisory` that
+/// could forward `MalformedPayload` events to the user for
+/// proxy-interference detection). A naive shape would return `()`
+/// and silently drop malformed payloads (missing NUL separator,
+/// etc.). Current caller exhaustive-matches both variants,
+/// silently consuming for now, but the compile surface is ready
+/// for the upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParamStatusRecordOutcome {
     /// Payload was well-formed (key NUL + value NUL body); routing
@@ -7198,12 +7177,11 @@ fn build_startup_message(
     app_name: Option<&ApplicationName>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<crate::action::WriteRange, ProtocolError> {
-    // DEF-094: write in-place into the caller-owned `write_buf`.
-    // DEF-100: return a typed non-empty range — length invariant.
-    // DEF-154 (A): infallible via capacity witness.
-    // DEF-154 (B): branded → `WriteRange` ties the range
-    // to the same buffer `reserved` writes into, enabling infallible
-    // apply at materialise time.
+    // Write in-place into the caller-owned `write_buf` and return a
+    // typed non-empty `WriteRange` covering the StartupMessage. The
+    // branded `BrandedWriteReserved` ties the returned range to the
+    // same buffer `reserved` writes into, enabling infallible apply
+    // at materialise time.
     let start = reserved.len();
     reserved.with_length_prefix(|w| {
         // Protocol version 3.0 = 196608
