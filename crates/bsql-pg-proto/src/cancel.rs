@@ -1,5 +1,4 @@
-//! DEF-278 Bundle D' (2026-05-18) — PostgreSQL §55.2.7 CancelRequest
-//! mechanism.
+//! PostgreSQL §55.2.7 CancelRequest mechanism.
 //!
 //! Surfaces the `(pid, secret_key)` material captured at
 //! `BackendKeyData` ('K') receipt during the handshake. The public
@@ -9,27 +8,26 @@
 //! `&[u8; 16]` to the caller. On closure return (Ok / Err / unwind
 //! panic), the guard's `Drop` scrubs the bytes via `zeroize::Zeroize`.
 //!
-//! # Tier-1 by closure scope (Bundle D' elevation, 2026-05-18)
+//! # Tier-1 by closure scope
 //!
-//! Pre-D' (Bundle D, 2026-05-17): the public surface was a
-//! `pub struct CancelRequestCredentials { pid, secret_key:
-//! Sensitive<i32> }` returned by value. Drop fired
+//! The closure-scoped API materialises the wire bytes on
+//! `with_cancel_request`'s STACK inside a `Zeroizing<[u8; 16]>` guard.
+//! The closure receives `&[u8; 16]` borrowed from that guard. The
+//! guard is OWNED by the function frame — neither the closure nor
+//! any outer scope can reach it. `mem::forget(guard)`,
+//! `Box::leak(guard)`, `ManuallyDrop::new(guard)` are all unreachable
+//! because the guard is not in scope where the caller writes code.
+//! Retention of the `&[u8; 16]` itself is rejected at compile time:
+//! the HRTB on `FnOnce(&[u8; 16], i32) -> R` quantifies over `'a`, so
+//! the borrow cannot escape the call.
+//!
+//! A by-value `pub struct CancelRequestCredentials { pid, secret_key:
+//! Sensitive<i32> }` alternative would fire
 //! `Sensitive<i32>::ZeroizeOnDrop` on the secret — tier-1 by-Drop,
-//! but retention was possible via `mem::forget`, `Box::leak`,
-//! `ManuallyDrop::new`, which all bypass `Drop`. Invariant lived on
-//! tier-1 by-Drop-fire (suppressible) — the principal classified this
-//! as residue.
-//!
-//! Post-D' (Bundle D', 2026-05-18): the closure-scoped API materialises
-//! the wire bytes on `with_cancel_request`'s STACK inside a
-//! `Zeroizing<[u8; 16]>` guard. The closure receives `&[u8; 16]`
-//! borrowed from that guard. The guard is OWNED by the function
-//! frame — neither the closure nor any outer scope can reach it.
-//! `mem::forget(guard)`, `Box::leak(guard)`, `ManuallyDrop::new(guard)`
-//! are all unreachable because the guard is not in scope where the
-//! caller writes code. Retention of the `&[u8; 16]` itself is
-//! rejected at compile time: the HRTB on `FnOnce(&[u8; 16], i32) -> R`
-//! quantifies over `'a`, so the borrow cannot escape the call.
+//! but retention is possible via `mem::forget`, `Box::leak`,
+//! `ManuallyDrop::new`, all of which bypass `Drop`. The closure
+//! shape moves the invariant from tier-1-by-Drop-fire (suppressible)
+//! to tier-1-by-construction.
 //!
 //! What the caller CAN do: copy bytes contents into their own memory
 //! (e.g. `bytes.to_vec()`). That copy lives in caller-controlled
@@ -41,10 +39,10 @@
 //! # Sans-I/O contract
 //!
 //! This module **does not** open the side TCP connection. The driver
-//! (Phase 1e `bsql-driver-postgres`) is responsible for opening a
-//! SEPARATE TCP connection to the same backend, writing the 16-byte
-//! payload lent through the closure, and closing the socket. The
-//! server does not respond on this socket.
+//! crate is responsible for opening a SEPARATE TCP connection to
+//! the same backend, writing the 16-byte payload lent through the
+//! closure, and closing the socket. The server does not respond on
+//! this socket.
 //!
 //! # Lifecycle of the captured `(pid, secret_key)` pair
 //!
@@ -95,12 +93,12 @@
 //! - Under `panic = "abort"` (workspace `release` profile): process
 //!   terminates without running `Drop` glue. The OS reclaims the
 //!   stack frame on exit; the bytes are not explicitly scrubbed.
-//!   Aligned with DEF-185 P0-A policy.
+//!   Aligned with the crate-wide panic-abort zeroize policy.
 
 use crate::sensitive::Sensitive;
 
-/// DEF-278 Bundle D / D' — cell-level storage for the
-/// `(pid, secret_key)` pair captured at `BackendKeyData` receipt.
+/// Cell-level storage for the `(pid, secret_key)` pair captured at
+/// `BackendKeyData` receipt.
 ///
 /// Lives on [`crate::protocol::PgProtocolInner::backend_key`] wrapped
 /// in [`BackendKeyCell`]; installed exactly once per connection via
@@ -125,10 +123,10 @@ use crate::sensitive::Sensitive;
 /// # Debug
 ///
 /// Manual `Debug` impl redacts `secret_key` (delegates to
-/// `Sensitive<i32>`'s `Debug` which prints `<REDACTED>`). Per DEF-048,
-/// every type containing a `Sensitive<T>` field needs a manual Debug
-/// or no Debug — here we provide a manual one that prints the pid
-/// for diagnostic value and redacts the secret.
+/// `Sensitive<i32>`'s `Debug` which prints `<REDACTED>`). Every type
+/// containing a `Sensitive<T>` field needs a manual Debug or no
+/// Debug; here we provide a manual one that prints the pid for
+/// diagnostic value and redacts the secret.
 pub(crate) struct BackendKey {
     pub(crate) pid: i32,
     pub(crate) secret_key: Sensitive<i32>,
@@ -145,14 +143,13 @@ impl core::fmt::Debug for BackendKey {
     }
 }
 
-/// DEF-278 Bundle D — `#[repr(transparent)]` newtype wrapper over
-/// `Option<BackendKey>` enforcing tier-1 within-crate write
-/// provenance.
+/// `#[repr(transparent)]` newtype wrapper over `Option<BackendKey>`
+/// enforcing tier-1 within-crate write provenance.
 ///
 /// Mirror of [`crate::schema_slot::RowDescSlotCell`] /
 /// [`crate::session_params_slot::SessionParamsCell`] /
-/// [`crate::partial_assembly::PartialAssemblyCell`] (DEF-272 cluster
-/// α/β/Sub-B family). The inner `Option<BackendKey>` is private to
+/// [`crate::partial_assembly::PartialAssemblyCell`] (token-gated
+/// cell family). The inner `Option<BackendKey>` is private to
 /// `mod cancel`; mutation routes through the token-gated
 /// [`Self::install_at_handshake`] method on a per-leaf concrete token
 /// minted inside
@@ -181,14 +178,14 @@ pub(crate) struct BackendKeyCell {
 }
 
 impl BackendKeyCell {
-    /// DEF-278 Bundle D — construct an empty cell. Token-gated to the
-    /// proto-init leaf so a future caller cannot bypass the
-    /// install-on-handshake invariant by minting a pre-populated cell.
+    /// Construct an empty cell. Token-gated to the proto-init leaf
+    /// so a future caller cannot bypass the install-on-handshake
+    /// invariant by minting a pre-populated cell.
     ///
     /// Takes a [`crate::protocol::_proto_init_leaf::ProtoInitToken`]
-    /// — the same construction-gate used by all DEF-272 cluster
-    /// cells. The token is field-private to its leaf submodule, so
-    /// the only call site is
+    /// — the same construction-gate used by all token-gated cells.
+    /// The token is field-private to its leaf submodule, so the only
+    /// call site is
     /// [`crate::protocol::PgProtocol::<crate::DisconnectedPhase>::new`].
     #[inline]
     #[must_use]
@@ -198,9 +195,8 @@ impl BackendKeyCell {
         Self { inner: None }
     }
 
-    /// DEF-278 Bundle D — install `(pid, secret_key)` at the dispatch
-    /// arm that processes the first `ReadyForQuery` after
-    /// `BackendKeyData`. Token-gated to
+    /// Install `(pid, secret_key)` at the dispatch arm that processes
+    /// the first `ReadyForQuery` after `BackendKeyData`. Token-gated to
     /// [`crate::protocol::_backend_key_install_leaf::BackendKeyInstallToken`]
     /// so the install site is structurally confined to one leaf.
     ///
@@ -225,8 +221,8 @@ impl BackendKeyCell {
         self.inner = Some(key);
     }
 
-    /// DEF-278 Bundle D / D' — read-only access to the inner payload
-    /// for the closure-scoped public API
+    /// Read-only access to the inner payload for the closure-scoped
+    /// public API
     /// [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`].
     ///
     /// Returns `None` before the handshake's `BackendKeyData`/`RFQ`
@@ -256,9 +252,9 @@ impl core::fmt::Debug for BackendKeyCell {
     }
 }
 
-/// DEF-278 Bundle D' — `pub(crate)` re-export of the wire-length
-/// constant for the CancelRequest packet. The single source of truth
-/// lives in [`crate::wire::CANCEL_REQUEST_LEN`] (next to
+/// `pub(crate)` re-export of the wire-length constant for the
+/// CancelRequest packet. The single source of truth lives in
+/// [`crate::wire::CANCEL_REQUEST_LEN`] (next to
 /// [`crate::wire::CANCEL_REQUEST_VERSION`] for proximity to the
 /// magic-version constant family). The drift-pin block below
 /// cross-checks it against the

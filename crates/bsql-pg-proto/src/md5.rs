@@ -1,4 +1,4 @@
-//! MD5-password authentication helpers — DEF-216 (2026-05-05).
+//! MD5-password authentication helpers.
 //!
 //! Encapsulates the cryptographic primitives + memory-hygiene
 //! discipline for PG's `AuthenticationMD5Password` (sub-code 5)
@@ -20,9 +20,9 @@
 //! passive on-wire observation by an attacker who lacks
 //! offline-cracking compute. This module exists for legacy
 //! compatibility with on-prem PG ≤ 13 deployments. The driver
-//! wrapper (Phase 1e) is responsible for warning operators on
-//! cleartext-equivalent auth methods and preferring SCRAM where
-//! the server offers it.
+//! wrapper is responsible for warning operators on cleartext-
+//! equivalent auth methods and preferring SCRAM where the server
+//! offers it.
 //!
 //! # Memory hygiene
 //!
@@ -38,11 +38,11 @@
 //!
 //! Uses `md-5` from RustCrypto (audited, 1M+ downloads/month,
 //! sibling to existing `sha2`/`hmac`/`pbkdf2` deps). Hand-rolled
-//! MD5 is forbidden per DEF-META-01 policy 9 (never hand-roll
-//! expert-domain code), even though MD5's algorithm is fully
-//! documented and could be implemented in <200 LoC — the risk is
-//! drift between our implementation and the spec, not the
-//! algorithmic weakness (which is the protocol's, not ours).
+//! MD5 is forbidden by policy (never hand-roll expert-domain code),
+//! even though MD5's algorithm is fully documented and could be
+//! implemented in <200 LoC — the risk is drift between our
+//! implementation and the spec, not the algorithmic weakness
+//! (which is the protocol's, not ours).
 
 use crate::password::Password;
 use crate::sensitive::Sensitive;
@@ -51,8 +51,7 @@ use zeroize::Zeroizing;
 
 /// Bundled MD5-handshake state — username + password — carried
 /// inside [`crate::state::ProtoState::ConnectingStartupMd5`] via a
-/// single `Box`. DEF-216 (2026-05-05); mirrors the SCRAM PERF-02
-/// single-Box pattern.
+/// single `Box`. Mirrors the SCRAM single-Box handshake pattern.
 ///
 /// # Drop chain
 ///
@@ -80,16 +79,15 @@ use zeroize::Zeroizing;
 ///
 /// # Tier-1 ZeroizeOnDrop enforcement
 ///
-/// DEF-216 audit (2026-05-07): the struct derives
-/// [`zeroize::ZeroizeOnDrop`] explicitly. Every field MUST either
-/// implement [`zeroize::Zeroize`] OR carry the `#[zeroize(skip)]`
-/// annotation — adding a new field without one of these is a
-/// build error. Pre-elevation, drop semantics relied on auto-
-/// generated field-by-field drop (which DOES fire ZeroizeOnDrop
-/// on the password field today), but a future contributor adding
-/// e.g. a `[u8; 64]` derivation buffer for SCRAM-SHA-512 would
-/// silently bypass scrubbing. Post-elevation, that contributor
-/// is forced to make an explicit decision: zeroize-aware type or
+/// The struct derives [`zeroize::ZeroizeOnDrop`] explicitly. Every
+/// field MUST either implement [`zeroize::Zeroize`] OR carry the
+/// `#[zeroize(skip)]` annotation — adding a new field without one of
+/// these is a build error. Without the derive, drop semantics would
+/// rely on auto-generated field-by-field drop (which DOES fire
+/// ZeroizeOnDrop on the password field today), but a future
+/// contributor adding e.g. a `[u8; 64]` derivation buffer would
+/// silently bypass scrubbing. The explicit derive forces that
+/// contributor to make an explicit decision: zeroize-aware type or
 /// explicit skip annotation.
 #[derive(Debug, zeroize::ZeroizeOnDrop)]
 pub struct Md5HandshakeState {
@@ -107,8 +105,7 @@ pub struct Md5HandshakeState {
 
 /// MD5 password-message body length: 3-byte literal `"md5"`
 /// prefix + 32-byte lowercase-hex outer digest = 35 bytes total.
-/// DEF-216 audit (2026-05-07): tier-1 layout pin to prevent drift
-/// in the response shape.
+/// Tier-1 layout pin to prevent drift in the response shape.
 pub(crate) const MD5_RESPONSE_BODY_LEN: usize = 35;
 
 /// MD5 prefix length — literal ASCII `"md5"`. PG §55.4 mandates
@@ -214,14 +211,9 @@ pub(crate) fn compute_response_body(
     // auth-fail, loud). The layout-pin asserts above + the
     // exhaustive integration tests close the surface.
     //
-    // DEF-244 modernisation audit (edition 2024, rust-version 1.88
-    // let-chains): the nested `if let Some(...)` pair becomes a
-    // single let-chain. Semantics are bit-identical (each clause
-    // short-circuits; the inner block runs iff both clauses bind),
-    // but the chain expresses «both must be Some» as a single
-    // conjunction rather than two nested guards. The
-    // architecturally-impossible None arms remain silent — the
-    // chain just rephrases the same condition more readably.
+    // Let-chain (Rust 1.88+) — both `Option`s bind in a single
+    // conjunction; the inner block runs iff both clauses succeed.
+    // The architecturally-impossible None arms remain silent.
     if let Some((prefix_slot, rest)) = response.split_first_chunk_mut::<MD5_RESPONSE_PREFIX_LEN>()
         && let Some(hex_slot) = rest.first_chunk_mut::<MD5_RESPONSE_HEX_LEN>()
     {
@@ -236,8 +228,8 @@ pub(crate) fn compute_response_body(
 }
 
 /// Compute lowercase hex of a 16-byte input as a fresh `[u8; 32]`
-/// owned array. DEF-216 audit (2026-05-07): tier-1 type-level
-/// signature — caller cannot mistake the output size.
+/// owned array. Tier-1 type-level signature — caller cannot
+/// mistake the output size.
 fn hex_lowercase(input: &[u8; 16]) -> [u8; MD5_RESPONSE_HEX_LEN] {
     let mut out = [0u8; MD5_RESPONSE_HEX_LEN];
     write_hex_lowercase(input, &mut out);
@@ -245,23 +237,19 @@ fn hex_lowercase(input: &[u8; 16]) -> [u8; MD5_RESPONSE_HEX_LEN] {
 }
 
 /// Map a 4-bit nibble to its lowercase ASCII hex character.
-/// DEF-216 audit (2026-05-07): tier-1 fallback elimination.
 ///
 /// # Tier-1 by branchless arithmetic
 ///
-/// Pre-audit: `HEX_TABLE.get(n).copied().unwrap_or(b'?')` — silent
-/// fallback to `'?'`, a VALID ASCII character that could be
-/// confused with real content. If the table lookup ever failed
-/// (architecturally impossible since `n & 0x0f` is in 0..=15 and
-/// the table has 16 entries), the digest would silently contain
-/// `?` characters and the server would reject the auth without
-/// any client-side hint of the cause.
+/// Branchless `if/else` over the masked nibble value (`n & 0x0f`
+/// ∈ 0..=15). Both branches produce a valid lowercase hex char —
+/// the function has NO wildcard arm, NO fallback, NO sentinel.
+/// Every legal input yields a structurally correct output.
 ///
-/// Post-audit: branchless `if/else` over the masked nibble value
-/// (`n & 0x0f` ∈ 0..=15). Both branches produce a valid
-/// lowercase hex char — the function has NO wildcard arm, NO
-/// fallback, NO sentinel. Every legal input yields a structurally
-/// correct output.
+/// A naive `HEX_TABLE.get(n).copied().unwrap_or(b'?')` form would
+/// silently fall back to `'?'`, a VALID ASCII character that could
+/// be confused with real content. If the table lookup ever failed,
+/// the digest would silently contain `?` characters and the server
+/// would reject the auth without any client-side hint of the cause.
 ///
 /// - For `n & 0x0f` in 0..=9: `b'0' + masked` = `b'0'`..=`b'9'`.
 /// - For `n & 0x0f` in 10..=15: `b'a' + (masked - 10)` = `b'a'`..=`b'f'`.
@@ -309,11 +297,10 @@ const _: () = {
 };
 
 /// Write 16 input bytes as 32 lowercase ASCII hex characters into
-/// `out`. DEF-216 audit (2026-05-07): tier-1 elevation — pair-
-/// chunked iteration with type-level `&mut [u8; 2]` access via
-/// `chunks_exact_mut`. No lookup-table fallback (replaced by
+/// `out`. Pair-chunked iteration with type-level `&mut [u8; 2]`
+/// access via `chunks_exact_mut`. No lookup-table fallback (uses
 /// branchless [`nibble_to_lowercase_hex`]); no per-position
-/// indexing fallback (replaced by typed array assignment).
+/// indexing fallback (uses typed array assignment).
 ///
 /// # Tier-1 properties
 ///
@@ -350,19 +337,16 @@ fn write_hex_lowercase(input: &[u8; 16], out: &mut [u8; 32]) {
 
 #[cfg(test)]
 mod drop_witness_tests {
-    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
-    //! for [`Md5HandshakeState`] via [`crate::drop_witness::DropCounter`].
-    //!
-    //! Pre-DEF-259: `Md5HandshakeState`'s drop was untested at the
-    //! per-type level. Coverage was transitive through MD5 dispatch
-    //! integration tests that happened to drop the state. The
-    //! "happens not to fail" anti-pattern (CREDO §1).
-    //!
-    //! Post-DEF-259: every `cargo test` run increments the counter
-    //! when `Md5HandshakeState::drop` (derive-generated
-    //! `ZeroizeOnDrop` body) fires, transitively scrubbing
-    //! `Sensitive<Password>` field bytes (the `Ident` field is
-    //! `#[zeroize(skip)]` per non-secret classification).
+    //! Tier-1-by-construction Drop-fire witness for
+    //! [`Md5HandshakeState`] via [`crate::drop_witness::DropCounter`].
+    //! Every `cargo test` run increments the counter when
+    //! `Md5HandshakeState::drop` (derive-generated `ZeroizeOnDrop`
+    //! body) fires, transitively scrubbing `Sensitive<Password>`
+    //! field bytes (the `Ident` field is `#[zeroize(skip)]` per
+    //! non-secret classification). Without this witness, coverage
+    //! would be transitive through MD5 dispatch integration tests
+    //! that happen to drop the state along the way — the "happens
+    //! not to fail" anti-pattern (CREDO §1).
 
     use super::Md5HandshakeState;
     use crate::drop_witness::{DropCounter, DropProbe};

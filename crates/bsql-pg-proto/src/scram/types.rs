@@ -1,10 +1,10 @@
 //! SCRAM-specific newtypes for secret values and bounded nonces.
 //!
 //! [`SecretDigest`] — 32-byte wrapper that deliberately omits `PartialEq`
-//! / `Eq`, forcing all comparisons through constant-time `ct_eq`. DEF-039.
+//! / `Eq`, forcing all comparisons through constant-time `ct_eq`.
 //!
 //! [`CappedServerNonce`] — bounded byte buffer for the server's SCRAM
-//! nonce. DEF-040.
+//! nonce.
 
 use core::fmt;
 use subtle::ConstantTimeEq;
@@ -15,10 +15,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// **Deliberately does NOT implement `PartialEq` / `Eq`.** Any attempt
 /// to `==`-compare two `SecretDigest` values is a compile error — the
 /// only comparison path is [`SecretDigest::ct_eq`], which uses
-/// [`subtle::ConstantTimeEq`] to prevent timing side-channels. DEF-039.
+/// [`subtle::ConstantTimeEq`] to prevent timing side-channels.
 ///
-/// Scrubbed on drop via [`ZeroizeOnDrop`]. DEF-093: `#[repr(transparent)]`
-/// for formal zero-cost ABI layout over `[u8; 32]`.
+/// Scrubbed on drop via [`ZeroizeOnDrop`]. `#[repr(transparent)]` for
+/// formal zero-cost ABI layout over `[u8; 32]`.
 #[derive(Zeroize, ZeroizeOnDrop)]
 #[repr(transparent)]
 pub struct SecretDigest {
@@ -77,12 +77,12 @@ impl fmt::Debug for SecretDigest {
 /// any reasonable server implementation.
 pub const MAX_SERVER_NONCE_LEN: usize = 256;
 
-/// A bounded server nonce for SCRAM authentication. DEF-040.
+/// A bounded server nonce for SCRAM authentication.
 ///
 /// Constructible only via [`CappedServerNonce::try_from_bytes`], which
 /// enforces the capacity bound. Downstream builders of
 /// `client-final-message` accept only this type — an unbounded nonce
-/// cannot reach the wire. DEF-093: `#[repr(transparent)]`.
+/// cannot reach the wire. `#[repr(transparent)]` for zero-cost ABI.
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct CappedServerNonce {
@@ -106,8 +106,6 @@ impl fmt::Display for ServerNonceTooLong {
     }
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
-// `core::error::Error` impl on the server-nonce-too-long sentinel.
 impl core::error::Error for ServerNonceTooLong {}
 
 impl CappedServerNonce {
@@ -153,16 +151,13 @@ impl fmt::Debug for CappedServerNonce {
 
 #[cfg(test)]
 mod drop_witness_tests {
-    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
-    //! for [`SecretDigest`] via [`crate::drop_witness::DropCounter`].
-    //!
-    //! Pre-DEF-259: `SecretDigest` had no per-type Drop-fire witness.
-    //! Coverage was transitive through SCRAM integration tests that
-    //! exercised the dispatch flow happening to drop a digest. The
-    //! "happens not to fail" anti-pattern (CREDO §1).
-    //!
-    //! Post-DEF-259: every `cargo test` increments the counter when
-    //! `SecretDigest::drop` fires its `ZeroizeOnDrop` body.
+    //! Tier-1-by-construction Drop-fire witness for [`SecretDigest`]
+    //! via [`crate::drop_witness::DropCounter`]. Every `cargo test`
+    //! increments the counter when `SecretDigest::drop` fires its
+    //! `ZeroizeOnDrop` body. Without this witness, coverage would be
+    //! transitive through SCRAM integration tests that happen to drop
+    //! a digest along the way — the "happens not to fail" anti-pattern
+    //! (CREDO §1).
 
     use super::SecretDigest;
     use crate::drop_witness::{DropCounter, DropProbe};
@@ -212,8 +207,6 @@ mod tests {
     /// Invariant (spec): `CappedServerNonce::try_from_bytes` with a
     /// slice at the capacity bound succeeds; one byte beyond the
     /// bound returns `ServerNonceTooLong` with the actual length.
-    ///
-    /// DEF-040 regression guard.
     #[test]
     fn capped_server_nonce_bound_classification() {
         // At bound: OK.
