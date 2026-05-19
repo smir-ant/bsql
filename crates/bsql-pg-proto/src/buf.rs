@@ -481,7 +481,7 @@ pub struct ReadBuf {
     /// Read cursor into the active storage. Tier-1 invariant:
     /// `cursor <= active_storage.len() <= cap <= 65_535`.
     cursor: u16,
-    /// **Tier-3 audit #34 (2026-05-19)** — partial-frame mode tracker.
+    /// Partial-frame mode tracker.
     ///
     /// **Type-level state encoding**: `Option<NonZeroU32>` where
     /// `None` = not in partial mode (the common case: every frame
@@ -489,23 +489,23 @@ pub struct ReadBuf {
     /// classifies it as `FrameTooLarge` and tears down).
     ///
     /// `Some(remaining)` = in partial mode; `remaining.get()` is the
-    /// count of body bytes the wire still owes us before the in-
-    /// flight frame body is complete. Decremented as bytes are
+    /// count of body bytes the wire still owes us before the
+    /// in-flight frame body is complete. Decremented as bytes are
     /// consumed via [`Self::subtract_partial_remaining`]; transitions
     /// to `None` when the counter reaches `0`.
     ///
-    /// # Tier-3 audit #34 closure
+    /// # Tier-1 closure
     ///
     /// A naive `partial_remaining: u32` shape with the convention
-    /// `0 ⟺ not in partial mode` is a value-level invariant (tier-2
-    /// by-discipline). A future bug `self.partial_remaining = 0`
-    /// while intending to stay in partial mode would be a
-    /// compile-clean silent desync. The `Option<NonZeroU32>`
-    /// encoding captures the "in partial mode" state at type level
-    /// — writing `partial_remaining = 0` no longer typechecks; only
-    /// explicit `partial_remaining = None` (exit) or
-    /// `partial_remaining = NonZeroU32::new(_)` (which is itself a
-    /// Result-returning shape).
+    /// `0 ⟺ not in partial mode` is a value-level invariant
+    /// (tier-2-by-discipline). A future bug
+    /// `self.partial_remaining = 0` while intending to stay in
+    /// partial mode would be a compile-clean silent desync. The
+    /// `Option<NonZeroU32>` encoding captures the "in partial
+    /// mode" state at type level — writing `partial_remaining = 0`
+    /// no longer typechecks; only explicit `partial_remaining =
+    /// None` (exit) or `partial_remaining = NonZeroU32::new(_)`
+    /// (which is itself a Result-returning shape).
     ///
     /// Tier-1 by-construction: the field is `pub(crate)`-visible
     /// only via the `partial_*` accessors below, and the mutators
@@ -882,9 +882,9 @@ impl ReadBuf {
                 new_declared_len: declared_len,
             });
         }
-        // Tier-3 audit #34 (2026-05-19): typed transition. The `Some`
-        // arm of the type-state means "in partial mode"; the None-to-
-        // Some flip happens here exactly once per partial frame.
+        // Typed transition. The `Some` arm of the type-state means
+        // "in partial mode"; the None-to-Some flip happens here
+        // exactly once per partial frame.
         // `NonZeroU32::new(declared_len)` returns None for the
         // architecturally-dead `declared_len == 0` case — a PG wire
         // frame with body length < 5 (header is 5 bytes inclusive) is
@@ -937,11 +937,11 @@ impl ReadBuf {
                 remaining: remaining.get(),
             });
         }
-        // Tier-3 audit #34 (2026-05-19): explicit type-state exit
-        // transition. The assignment mirrors the enter-side's
-        // `self.partial_remaining = NonZeroU32::new(declared_len)`
-        // symmetry. Already None at this point — the explicit write
-        // makes the intent visible.
+        // Explicit type-state exit transition. The assignment
+        // mirrors the enter-side's `self.partial_remaining =
+        // NonZeroU32::new(declared_len)` symmetry. Already `None`
+        // at this point — the explicit write makes the intent
+        // visible.
         self.partial_remaining = None;
         Ok(())
     }
@@ -962,11 +962,11 @@ impl ReadBuf {
         _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
         n: u32,
     ) -> Result<(), AdvancePastEnd> {
-        // Tier-3 audit #34 (2026-05-19): map the type-state into the
-        // u32 representation for the subtract arithmetic. The None
-        // arm (not in partial mode) is treated as "0 remaining" for
-        // diagnostic purposes — a caller subtracting while not in
-        // partial mode trips the n > current check immediately.
+        // Map the type-state into the u32 representation for the
+        // subtract arithmetic. The `None` arm (not in partial mode)
+        // is treated as "0 remaining" for diagnostic purposes — a
+        // caller subtracting while not in partial mode trips the
+        // `n > current` check immediately.
         let current = match self.partial_remaining {
             Some(remaining) => remaining.get(),
             None => 0,

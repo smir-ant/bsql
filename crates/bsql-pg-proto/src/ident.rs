@@ -752,13 +752,13 @@ const _: fn() = || {
 };
 
 // ═════════════════════════════════════════════════════════════════
-// Tier-3 audit #46 (2026-05-19): `LossyText<'a>` typed boundary
+// `LossyText<'a>` typed boundary
 //
 // Wraps wire bytes that *may* require ASCII coercion at storage
 // time. A naive call like
-// `SecretBoundedStr::from_bytes_lossy(value_bytes)` hides the lossy
-// contract inside the function name and discards the raw pre-coercion
-// bytes — forensic callers cannot recover them.
+// `SecretBoundedStr::from_bytes_lossy(value_bytes)` hides the
+// lossy contract inside the function name and discards the raw
+// pre-coercion bytes — forensic callers cannot recover them.
 //
 // `LossyText<'a>` re-shapes the boundary:
 //   - construction is zero-cost (`#[repr(transparent)]` around the
@@ -1573,16 +1573,15 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
         // audit-#56 rationale block above for why the structural
         // lift (Result return) is BREAKING-API blocked.
         out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
-        // Tier-3 audit #48 (2026-05-19): length-overflow truncation
-        // is also a form of information loss — flag it. A naive
-        // `was_lossy` that tripped only on byte-coercion (slow path
-        // through `from_bytes_lossy`) would leave was_lossy false
-        // for truncation in the fast/slow path through
-        // `from_str_truncating` despite the visible "…" marker.
-        // Programmatic detection of truncation (e.g. for CommandTag
-        // handlers that want to surface a "tag was longer than
-        // buffer" diagnostic) needs to work without parsing the
-        // buffer for the marker suffix.
+        // Length-overflow truncation is also a form of information
+        // loss — flag it. A naive `was_lossy` that tripped only on
+        // byte-coercion (slow path through `from_bytes_lossy`)
+        // would leave `was_lossy` `false` for truncation in the
+        // fast/slow path through `from_str_truncating` despite the
+        // visible "…" marker. Programmatic detection of truncation
+        // (e.g. for `CommandTag` handlers that want to surface a
+        // "tag was longer than buffer" diagnostic) needs to work
+        // without parsing the buffer for the marker suffix.
         out.was_lossy_flag = 1;
         out
     }
@@ -1656,8 +1655,8 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             // rationale block above); dead-arm fallback is
             // LenT::default()==0.
             out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
-            // Tier-3 audit #48: length-overflow truncation also
-            // counts as lossy. See mirror block in
+            // Length-overflow truncation also counts as lossy.
+            // Mirror of the equivalent block in
             // `from_str_truncating`'s slow path.
             out.was_lossy_flag = 1;
         } else {
@@ -1676,19 +1675,19 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
     /// `true` iff this value lost information during construction —
     /// either via byte-coercion or via length-overflow truncation.
     ///
-    /// Two trip conditions, both audit-anchored:
+    /// Two trip conditions:
     ///
     /// - **Byte-coercion**: at least one source byte was outside
     ///   `0x20..=0x7e` plus whitespace and got coerced to `b'?'`
     ///   during [`Self::from_bytes_lossy`]'s slow path. Lets
-    ///   operators distinguish legitimate `?` characters in server
-    ///   text from the lossy coercion.
-    /// - **Length-overflow truncation** (Tier-3 audit #48,
-    ///   2026-05-19): the source exceeded the buffer's capacity
-    ///   minus the 3-byte `OVERFLOW_MARKER` (`"…"`) length, so the
-    ///   constructor copied as much as fit and appended the marker.
-    ///   Tripped from BOTH [`Self::from_str_truncating`]'s slow path
-    ///   and [`Self::from_bytes_lossy`]'s slow path. Lets callers
+    ///   operators distinguish legitimate `?` characters in
+    ///   server text from the lossy coercion.
+    /// - **Length-overflow truncation**: the source exceeded the
+    ///   buffer's capacity minus the 3-byte `OVERFLOW_MARKER`
+    ///   (`"…"`) length, so the constructor copied as much as fit
+    ///   and appended the marker. Tripped from BOTH
+    ///   [`Self::from_str_truncating`]'s slow path and
+    ///   [`Self::from_bytes_lossy`]'s slow path. Lets callers
     ///   surface "tag was longer than buffer" diagnostics without
     ///   parsing the buffer tail for the marker.
     ///
@@ -1818,8 +1817,8 @@ mod drop_witness_tests {
 
 #[cfg(test)]
 mod lossy_text_tests {
-    //! Tier-3 audit #46 (2026-05-19): contract pins for [`LossyText`]
-    //! and [`LossyDisplay`]. Verifies the four invariants:
+    //! Contract pins for [`LossyText`] and [`LossyDisplay`].
+    //! Verifies the four invariants:
     //!
     //! 1. `from_bytes_lossy` is non-allocating, non-coercing — the
     //!    bytes flow through verbatim until commitment.
@@ -1831,7 +1830,7 @@ mod lossy_text_tests {
     //! 4. `to_secret_bounded::<N>()` commits to bounded ASCII storage
     //!    with the same byte-coercion + truncation policy as the
     //!    direct `SecretBoundedStr::from_bytes_lossy` call (the
-    //!    audit migration is behaviour-preserving).
+    //!    `LossyText` indirection is behaviour-preserving).
     use super::{BoundedStr, LossyText, SecretBoundedStr};
     use alloc::format;
 

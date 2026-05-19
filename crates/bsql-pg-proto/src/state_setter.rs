@@ -64,16 +64,16 @@ pub(crate) mod sealed {
 // having `install_body_seal::InstallBodySealed` as a supertrait, this seals
 // the install-body trait against IN-CRATE callers outside this module.
 //
-// Anchor (HISTORICAL — closed by InstallBodySealed private supertrait;
-// Tier-3 audit #26, 2026-05-19, verified): pre-closure the shape was
-// `PostStateProof: sealed::Sealed { fn install_into(self, &mut ProtoState); }`.
-// `sealed::Sealed` is `pub(crate)` (not module-private), so any in-crate module
-// could write `impl Sealed for HostileWitness {} impl PostStateProof for
-// HostileWitness { fn install_into(self, state) { *state = arbitrary_variant; } }`
-// then mint a `StateSetter<HostileWitness>` via the generic `IdleState::into_setter::<W>`
-// and call `setter.install_post_state(HostileWitness)`, dispatching to the
-// hostile body. Pre-state was tier-2-by-discipline within-crate; current
-// shape below is tier-1-by-construction.
+// Historical naive shape (closed by `InstallBodySealed` private
+// supertrait below): `PostStateProof: sealed::Sealed { fn install_into(self, &mut ProtoState); }`.
+// `sealed::Sealed` is `pub(crate)` (not module-private), so any
+// in-crate module could write
+// `impl Sealed for HostileWitness {} impl PostStateProof for HostileWitness { fn install_into(self, state) { *state = arbitrary_variant; } }`
+// then mint a `StateSetter<HostileWitness>` via the generic
+// `IdleState::into_setter::<W>` and call
+// `setter.install_post_state(HostileWitness)`, dispatching to the
+// hostile body. That shape was tier-2-by-discipline within-crate;
+// the form below is tier-1-by-construction.
 //
 // Current shape: install bodies live in `impl InstallBody for *` blocks here in
 // `mod state_setter`. `InstallBody` has private supertrait `InstallBodySealed`.

@@ -473,12 +473,12 @@ where
 /// out-of-scope adversarial usage that doesn't affect the
 /// SQL-injection class for users who follow the contract.
 ///
-/// # Tier-3 audit #1+#27+#28 (2026-05-19) — DEFERRED with rationale
+/// # Why this is not tier-1 closed
 ///
-/// Audit proposed closing this to tier-1 via a `pub(in crate::prepared)
-/// mod _macro_token { pub struct PreparedMacroSeal(()); }` parameter.
-/// Investigation found Phase A unsound under stable-Rust proc-macro
-/// hygiene + `#![forbid(unsafe_code)]`:
+/// A naive "macro-only call" closure via `pub(in crate::prepared)
+/// mod _macro_token { pub struct PreparedMacroSeal(()); }` parameter
+/// is unsound under stable-Rust proc-macro hygiene +
+/// `#![forbid(unsafe_code)]`:
 ///
 ///   - Macro expansion runs in the **caller's hygiene context**. The
 ///     emitted code references `::bsql_pg_proto::...` paths but enjoys
@@ -518,11 +518,11 @@ where
 ///   - Add lint-level `unused-must-use` enforcement via a typed
 ///     `MustGoThroughMacro` ZST inside `PreparedQuery` (cosmetic).
 ///
-/// Audit verdict: ACCEPT-but-DEFER. Class remains tier-3 by-discipline
-/// documented; the discipline is "go through the macro, do not
-/// hand-call new_prepared_query". CREDO §0 documented-discipline
-/// boundary holds. SQL-injection class for users-who-follow-the-
-/// contract remains tier-1-by-construction via the macro's lex +
+/// Conclusion: class remains tier-3 by-discipline documented; the
+/// discipline is "go through the macro, do not hand-call
+/// `new_prepared_query`". CREDO §0 documented-discipline boundary
+/// holds. SQL-injection class for users-who-follow-the-contract
+/// remains tier-1-by-construction via the macro's lex +
 /// cast-annotation validation pipeline.
 #[doc(hidden)]
 #[inline]

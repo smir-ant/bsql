@@ -1220,16 +1220,16 @@ pub enum ErrorKind {
 pub struct StateErrorKind(ErrorKind);
 
 impl StateErrorKind {
-    // Tier-3 audit #53 (2026-05-19, verified): no public
-    // `INTERNAL_FALLBACK` const. A naive shape would expose one to
-    // supply the `unwrap_or_else` landing pad for three
-    // `state_kind().unwrap_or_else(|| { debug_assert!(false, ...);
-    // INTERNAL_FALLBACK })` call sites — the exact "release silent +
-    // debug loud" pattern that is banned crate-wide. Instead
-    // `state_kind() -> StateErrorKind` is total (see
-    // `ProtocolError::state_kind` at the end of this module) and the
-    // internal `Self(ErrorKind::Internal)` sentinel is encapsulated
-    // inside `from_kind_or_internal`.
+    // No public `INTERNAL_FALLBACK` const. A naive shape would
+    // expose one to supply the `unwrap_or_else` landing pad for
+    // three
+    // `state_kind().unwrap_or_else(|| { debug_assert!(false, ...); INTERNAL_FALLBACK })`
+    // call sites — the exact "release silent + debug loud" pattern
+    // that is banned crate-wide. Instead `state_kind() ->
+    // StateErrorKind` is total (see `ProtocolError::state_kind` at
+    // the end of this module) and the internal
+    // `Self(ErrorKind::Internal)` sentinel is encapsulated inside
+    // `from_kind_or_internal`.
 
     /// Construct from a full [`ErrorKind`]. Returns `None` when
     /// passed [`ErrorKind::AlreadyClosed`] — that variant is the
@@ -1379,7 +1379,7 @@ impl ProtocolError {
     /// feed_bytes + builder paths NEVER see it as a cause —
     /// architectural invariant of the `StateErrorKind` seal.
     ///
-    /// # Tier-3 audit #53 (2026-05-19, verified): total typed projection
+    /// # Total typed projection
     ///
     /// A naive shape would return `Option<StateErrorKind>` and let
     /// call sites open-code
@@ -1389,10 +1389,9 @@ impl ProtocolError {
     /// атрибутов хрупкой и стеклянной структуры"). Instead the
     /// projection is **total**: `AlreadyClosed → Internal`. That
     /// IS an honest classification ("something went wrong at the
-    /// crate level") — not silent corruption. Architecturally
-    /// dead under the `StateErrorKind` seal; preserved as
-    /// behavioural fallback rather than a panic + silent-release
-    /// split.
+    /// crate level") — not silent corruption. Architecturally dead
+    /// under the `StateErrorKind` seal; preserved as behavioural
+    /// fallback rather than a panic + silent-release split.
     #[inline]
     #[must_use]
     pub const fn state_kind(&self) -> StateErrorKind {

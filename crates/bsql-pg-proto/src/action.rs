@@ -510,13 +510,12 @@ mod range_newtype_tests {
 /// unchanged (`[MaybeUninit<Action>; N]` still allocates the
 /// slots), but the write bandwidth disappears.
 ///
-/// # Tier-3 audit #25 (2026-05-19): 2-lifetime form retained
+/// # 2-lifetime form retained — documentation-bearing
 ///
-/// The audit hypothesised that `OutActions<'w, 'r>` could collapse to
-/// a single lifetime under the assumption that "both lifetimes
-/// originate from `&'_ mut PgProtocol` reborrows". Investigation
-/// found the premise inaccurate — the two lifetimes track
-/// **structurally distinct borrows** with different origins:
+/// A naive collapse to a single lifetime would assume "both
+/// lifetimes originate from `&'_ mut PgProtocol` reborrows", but
+/// the two lifetimes track **structurally distinct borrows** with
+/// different origins:
 ///
 /// **`'w` (write-buffer)** binds [`Action::SendBytes(&'w [u8])`] back
 /// to the **caller-owned** [`crate::write_buf::WriteBuf`] passed as a
@@ -546,11 +545,9 @@ mod range_newtype_tests {
 ///   distinction.
 ///
 /// Net: the 2-lifetime form is documentation-bearing rather than
-/// strictly load-bearing for borrow-check soundness. The audit's
-/// allowed fallback ("If lifetime elision exposes hidden divergence,
-/// document the dependency and keep the 2-lifetime form") covers
-/// this outcome — explicit signatures are preferred over signatures
-/// that depend on prose-doc explanation.
+/// strictly load-bearing for borrow-check soundness. Explicit
+/// signatures are preferred over signatures that depend on
+/// prose-doc explanation.
 #[derive(Debug)]
 pub struct OutActions<'w, 'r> {
     /// ManuallyDrop-wrapped heapless vec. `ManuallyDrop` makes the

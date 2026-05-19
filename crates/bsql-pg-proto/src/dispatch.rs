@@ -43,18 +43,18 @@ use crate::state::ProtoState;
 // ═════════════════════════════════════════════════════════════════════
 // Schema-side concrete-token leaf
 //
-// Tier-3 audit #29 (2026-05-19, verified): the leaf hosts a CONCRETE
-// `TDispatchToken` type with a private tuple-struct field; the literal
-// `Self(())` mint is callable ONLY inside this submodule. The cell's
-// `park_at_t_dispatch` method takes `TDispatchToken` by value — there
-// is no trait to `impl` for hostile types, no sealed-supertrait to
-// route around. Three call sites (simple-query, describe-statement,
+// The leaf hosts a CONCRETE `TDispatchToken` type with a private
+// tuple-struct field; the literal `Self(())` mint is callable
+// ONLY inside this submodule. The cell's `park_at_t_dispatch`
+// method takes `TDispatchToken` by value — there is no trait to
+// `impl` for hostile types, no sealed-supertrait to route around.
+// Three call sites (simple-query, describe-statement,
 // describe-portal 'T' arms) all invoke the leaf helper.
 //
 // A naive `impl SchemaWriteAuth for AtRowDescriptionDispatch`
-// sealed-trait shape would be tier-1 EXTERNAL but tier-2 by-discipline
-// WITHIN-CRATE: any in-crate file could `impl Sealed + SchemaWriteAuth
-// for HostileTag` and bypass.
+// sealed-trait shape would be tier-1 EXTERNAL but
+// tier-2-by-discipline WITHIN-CRATE: any in-crate file could
+// `impl Sealed + SchemaWriteAuth for HostileTag` and bypass.
 //
 // See `mod protocol` for the parallel schema-slot leaves and the
 // session_params leaves.
@@ -203,18 +203,18 @@ fn install_errored(
     DispatchOutcome::Errored { reply_id, cause }
 }
 
-/// Tier-3 audit #77 (2026-05-19): zero-body-payload validator for PG
-/// §55.7 frames that carry no data (EmptyQueryResponse, ParseComplete,
-/// BindComplete, NoData, CloseComplete, etc.). Returns `Ok(())` iff
+/// Zero-body-payload validator for PG §55.7 frames that carry no
+/// data (`EmptyQueryResponse`, `ParseComplete`, `BindComplete`,
+/// `NoData`, `CloseComplete`, etc.). Returns `Ok(())` iff
 /// `payload.is_empty()`; otherwise classifies as
-/// [`ProtocolError::UnexpectedFrameBody`] with the wire tag + observed
-/// body length.
+/// [`ProtocolError::UnexpectedFrameBody`] with the wire tag +
+/// observed body length.
 ///
 /// Unifies the `match payload { [] => Ok(()), other => Err(...) }`
-/// pattern that previously appeared inline at 6 dispatch arms. The
-/// audit's "EmptyBody ZST" suggestion was discarded as cosmetic — no
-/// caller takes a typed witness as a parameter; the helper-function
-/// shape carries identical bundle-compliance with a smaller surface.
+/// pattern shared by 6 dispatch arms. An "`EmptyBody` ZST" witness
+/// alternative was considered and rejected as cosmetic — no caller
+/// takes a typed witness as a parameter; the helper-function shape
+/// carries identical bundle-compliance with a smaller surface.
 ///
 /// `#[inline(always)]` — verified ASM-neutral on `feed_bytes` hot
 /// path (0 codegen delta); locks the inlining guarantee against
@@ -2559,14 +2559,14 @@ fn parse_error_response(
             // `from_utf8(..).unwrap_or("")` silently dropped the entire
             // field on any single invalid byte — tier-3 diagnostic loss.
             //
-            // Tier-3 audit #46 (2026-05-19): funnel the wire bytes
-            // through the `LossyText` typed witness before committing
-            // to bounded storage. The type name surfaces the lossy
-            // contract at the call site (no longer hidden inside
-            // `from_bytes_lossy(value_bytes)`); `raw_bytes()` on the
-            // LossyText instance is the escape hatch for forensic
-            // byte-fidelity callers that may want pre-coercion access
-            // in a future codepath.
+            // Funnel the wire bytes through the `LossyText` typed
+            // witness before committing to bounded storage. The
+            // type name surfaces the lossy contract at the call
+            // site (no longer hidden inside
+            // `from_bytes_lossy(value_bytes)`); `raw_bytes()` on
+            // the `LossyText` instance is the escape hatch for
+            // forensic byte-fidelity callers that may want
+            // pre-coercion access in a future codepath.
             b'M' => {
                 message = crate::ident::LossyText::from_bytes_lossy(value_bytes)
                     .to_secret_bounded::<128>();
