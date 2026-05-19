@@ -1,6 +1,5 @@
-//! DEF-211 SAFE-06 (audit 2026-05-04, 5th-pass architect-agent):
 //! `SecretZeroize` trait + driver-side panic-hook integration
-//! contract. Closes the BS-01 `panic = "abort"` zeroize gap from
+//! contract. Closes the `panic = "abort"` zeroize gap from
 //! "policy-only acknowledgement" to "trait-mediated structural
 //! contract".
 //!
@@ -48,27 +47,26 @@
 //!
 //! # Today's surface (without driver registry)
 //!
-//! Without a driver crate (`bsql-driver-postgres` is Phase 1d+),
-//! this trait is ALONE — types implement it, but nothing walks
-//! the registered set. The trait still buys:
+//! Without a driver crate, this trait is ALONE — types implement it,
+//! but nothing walks the registered set. The trait still buys:
 //!
 //! - **Type-system documentation**: a contributor adding a new
 //!   secret-bearing type can discover the contract by searching
 //!   for `impl SecretZeroize`. Forces explicit decision.
 //! - **Ready-made API surface for the driver**: when the driver
-//!   crate lands, `bsql-driver-postgres` adds ~30 LoC of
-//!   `std::panic::set_hook` + atomic-registered-set walker and the
-//!   gap closes structurally — no API change in this crate.
+//!   crate lands, it adds ~30 LoC of `std::panic::set_hook` +
+//!   atomic-registered-set walker and the gap closes structurally
+//!   — no API change in this crate.
 //! - **Audit anchor**: every secret-bearing type is grep-discoverable
-//!   via `impl SecretZeroize`. Contrast: today's `Sensitive<T>` and
+//!   via `impl SecretZeroize`. Contrast: `Sensitive<T>` and
 //!   `SecretBoundedStr<N>` are zeroize-on-drop but the panic-gap
 //!   surface they sit on is implicit.
 //!
 //! Per CREDO §1 (safety > tier > perf): defining the trait now
 //! ships zero structural improvement until the driver lands, but
-//! prevents the API from drifting between now and Phase 1d. The
-//! trait is `pub(crate)` (driver will dep on this crate and
-//! re-export); not part of the external public API.
+//! prevents the API from drifting before then. The trait is
+//! `pub(crate)` (driver will dep on this crate and re-export); not
+//! part of the external public API.
 
 /// Trait for types holding zeroize-on-drop secret bytes that
 /// require pre-abort scrubbing under `panic = "abort"`.
@@ -97,11 +95,10 @@
 /// only and out of this crate's `no_std` scope).
 #[expect(
     dead_code,
-    reason = "DEF-211 SAFE-06: trait is the API anchor for the driver-side panic-hook \
-              registry walker (Phase 1d). No in-crate caller until the driver lands. \
-              Once the driver is built, `#[expect]` triggers a build error reminding \
-              the contributor to remove the attribute (the trait will then have a \
-              live caller via the registry walker)."
+    reason = "trait is the API anchor for the driver-side panic-hook registry walker. \
+              No in-crate caller until the driver lands. Once the driver is built, \
+              `#[expect]` triggers a build error reminding the contributor to remove \
+              the attribute (the trait will then have a live caller via the registry walker)."
 )]
 pub(crate) trait SecretZeroize {
     /// Zero out the secret bytes held by `self`. Idempotent;

@@ -1,12 +1,12 @@
 //! SCRAM-SHA-256 authentication (RFC 5802 + RFC 7677).
 //!
 //! - [`crypto`] — cryptographic operations composed over RustCrypto
-//!   crates. Never hand-rolled (DEF-META-01).
+//!   crates. Never hand-rolled (expert-domain policy).
 //! - [`wire`] — SCRAM text-protocol message construction and parsing.
-//! - [`types`] — [`SecretDigest`] (no `PartialEq`, DEF-039) and
-//!   [`CappedServerNonce`] (DEF-040).
+//! - [`types`] — [`SecretDigest`] (no `PartialEq`; constant-time compare
+//!   only) and [`CappedServerNonce`].
 //! - [`session`] — [`ScramSession`] typestate eliminating the
-//!   `Trust`-vs-`ScramPassword` double-match seam (audit A2).
+//!   `Trust`-vs-`ScramPassword` double-match seam.
 //!
 //! # Exchange flow (RFC 5802 mapped to our state machine)
 //!
@@ -77,13 +77,13 @@
 //! - `getrandom` for client nonce — OS-provided entropy, never
 //!   `SystemTime`-seeded.
 //! - RustCrypto primitives only (sha2, hmac, pbkdf2, base64ct,
-//!   subtle) — expert-domain per DEF-META-01.
+//!   subtle) — expert-domain code is never hand-rolled.
 //! - On any Errored mid-SCRAM, `dispatch()` clears `scram_state`
-//!   immediately (DEF-184 audit-P0-1 zeroize hygiene) so password
-//!   material doesn't linger in memory on terminal connections.
+//!   immediately so password material doesn't linger in memory on
+//!   terminal connections.
 //!
-//! Channel binding (SCRAM-SHA-256-PLUS) is deferred to Phase 1e
-//! (DEF-053). The GS2 header is always `n,,` and the channel binding
+//! Channel binding (SCRAM-SHA-256-PLUS) is not supported in this
+//! crate yet. The GS2 header is always `n,,` and the channel binding
 //! data is always `biws`.
 //!
 //! [`ScramSession`]: session::ScramSession

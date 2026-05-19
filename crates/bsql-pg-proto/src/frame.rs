@@ -22,7 +22,7 @@
 /// 4 KiB is the historical default for PG client read buffers and
 /// matches one OS page on aarch64-Apple, x86\_64-Linux, and most other
 /// targets bsql ships on. Tunable per-connection in a later phase via
-/// const generic; the const here is the Phase 1a constant.
+/// const generic; this is the current crate-wide constant.
 ///
 /// **Internal sizing choice, NOT a PostgreSQL spec commitment.**
 /// PostgreSQL does not limit frame sizes; the value here is our memory
@@ -72,16 +72,15 @@ pub const HEADER_LEN: usize = 5;
 // in `const fn` context (RU-01) and `as` casts are forbidden by
 // the workspace clippy bundle (`cast_possible_truncation` etc.).
 //
-// **DEF-211 FAKE-11 (audit 2026-05-04, 5th-pass architect-agent):**
-// the prior pair-pin form (separate `READ_BUF_CAP == 4096` +
-// `MAX_FRAME_LEN_FIELD == 4095` asserts) caught either-side drift
-// but left the **relationship** as documentation only — a
-// contributor could see one assert fail, update only that const,
-// and ship a binary with a different formula (e.g.
-// `MAX_FRAME_LEN_FIELD = 4096`, `READ_BUF_CAP = 4096`, off-by-one
-// frame-cap for the lifetime of the connection). Single-equation
-// form below makes the relationship load-bearing: the third
-// conjunct expresses the formula directly via `saturating_add` in
+// A pair-pin form (separate `READ_BUF_CAP == 4096` +
+// `MAX_FRAME_LEN_FIELD == 4095` asserts) would catch either-side drift
+// but leave the **relationship** as documentation only — a contributor
+// could see one assert fail, update only that const, and ship a
+// binary with a different formula (e.g. `MAX_FRAME_LEN_FIELD = 4096`,
+// `READ_BUF_CAP = 4096`, off-by-one frame-cap for the lifetime of the
+// connection). The single-equation form below makes the relationship
+// load-bearing: the third conjunct expresses the formula directly via
+// `saturating_add` in
 // u32-space (the type both values fit in given the
 // `READ_BUF_CAP <= u16::MAX` const-assert below + `protocol.rs`
 // drift pin coupling `READ_BUF_CAP` to `frames_consumed: u16`).
@@ -152,10 +151,10 @@ pub enum HeaderParse {
         /// `FrameTotalLen::new`, feed_bytes cursor math) work in
         /// u16 without silent narrowing.
         ///
-        /// DEF-154 (G): pre-(G) this was `total_len: usize`, which
-        /// forced every downstream callsite that wanted to store it
-        /// in a u16 newtype to call `u16::try_from(v).unwrap_or(u16::MAX)`
-        /// — silent clamp on drift.
+        /// `u16` (not `usize`) — every downstream callsite would
+        /// otherwise have to call `u16::try_from(v).unwrap_or(u16::MAX)`,
+        /// a silent clamp on drift. Narrowing once at the parser keeps
+        /// every consumer on a typed bound.
         total_len: u16,
     },
     /// Header malformed: length-field below 4.
@@ -215,14 +214,14 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
             // declared >= 4 and declared <= MAX_FRAME_LEN_FIELD <= READ_BUF_CAP - 1;
             // total_len = 1 + declared <= READ_BUF_CAP.
             //
-            // DEF-154 (G): narrow to u16 in one step — `declared: u32`,
+            // Narrow to u16 in one step — `declared: u32`,
             // `declared + 1` fits u32 always; the `u16::try_from`
             // narrowing is routed through the classified
             // `FrameTooLarge` variant on Err (architecturally dead
             // under `const _ = assert!(READ_BUF_CAP <= 65_535)` in
             // `buf.rs`, but structurally classified — NOT a silent
-            // fallback). Post-(G) there is no silent narrowing
-            // anywhere on the ingress path.
+            // fallback). There is no silent narrowing anywhere on
+            // the ingress path.
             let total_len_u32 = declared.saturating_add(1);
             let total_len = match u16::try_from(total_len_u32) {
                 Ok(n) => n,
@@ -231,13 +230,10 @@ pub fn parse_header(unread: &[u8]) -> HeaderParse {
                     return HeaderParse::FrameTooLarge { declared };
                 }
             };
-            // DEF-144: at this point `declared >= 4` is proved by the
-            // early-return at the top of this arm; the pre-DEF-144
-            // `NonZeroU32::new(declared).is_some()` guard was
+            // At this point `declared >= 4` is proved by the
+            // early-return at the top of this arm; a
+            // `NonZeroU32::new(declared).is_some()` guard would be
             // architecturally dead (declared >= 4 implies non-zero).
-            // The else branch was tier-3 defence-in-depth, reached
-            // only via a Rust or LLVM correctness regression — removed
-            // per audit A015.
             HeaderParse::Ok {
                 tag: crate::wire::InboundTag::from_byte(*tag),
                 total_len,

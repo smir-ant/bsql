@@ -17,8 +17,8 @@
 //! harmless (e.g. a scratch `[u8; 32]` that is never named in user
 //! diagnostics).
 //!
-//! Per DEF-048: every type containing a `Sensitive<T>` field gets a
-//! manual `Debug` that redacts the field, or no `Debug` at all.
+//! Every type containing a `Sensitive<T>` field gets a manual
+//! `Debug` that redacts the field, or no `Debug` at all.
 
 use core::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -27,9 +27,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///
 /// See [module-level documentation](self) for design rationale.
 ///
-/// `#[repr(transparent)]` (DEF-093) — formal zero-cost ABI layout
-/// identical to the inner `T`. `Sensitive<T>` is a compile-time-only
-/// wrapper; at runtime the memory is literally a `T`.
+/// `#[repr(transparent)]` — formal zero-cost ABI layout identical
+/// to the inner `T`. `Sensitive<T>` is a compile-time-only wrapper;
+/// at runtime the memory is literally a `T`.
 #[derive(Zeroize, ZeroizeOnDrop)]
 #[repr(transparent)]
 pub struct Sensitive<T: Zeroize> {
@@ -43,15 +43,12 @@ impl<T: Zeroize> Sensitive<T> {
         Self { inner: value }
     }
 
-    /// DEF-280 Bundle E (2026-05-18): closure-scope borrow of the
-    /// inner value. The HRTB-quantified `&'a T` lifetime cannot
-    /// escape the call — retention attacks via the borrowed
-    /// reference are structurally impossible. Pre-Bundle E this was
-    /// `pub const fn get(&self) -> &T` with a docstring saying «the
-    /// borrow is intentionally short-lived — the caller must not
-    /// store the reference beyond the immediate computation» (tier-2
-    /// by-discipline). Post-Bundle E the closure-scope makes the
-    /// discipline by-construction.
+    /// Closure-scope borrow of the inner value. The HRTB-quantified
+    /// `&'a T` lifetime cannot escape the call — retention attacks
+    /// via the borrowed reference are structurally impossible. A
+    /// plain `pub const fn get(&self) -> &T` would be tier-2 by
+    /// discipline (only a docstring "don't retain the borrow" stops
+    /// abuse); the closure shape makes the discipline by-construction.
     ///
     /// The closure receives `&T` and returns `R`. `R` is independent
     /// of the borrow lifetime, so the inner value can be **copied
@@ -106,17 +103,17 @@ impl<T: Zeroize> fmt::Debug for Sensitive<T> {
 
 #[cfg(test)]
 mod drop_witness_tests {
-    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
-    //! for [`Sensitive<T>`] via [`crate::drop_witness::DropCounter`].
+    //! Tier-1-by-construction Drop-fire witness for [`Sensitive<T>`]
+    //! via [`crate::drop_witness::DropCounter`]. Runs on every
+    //! `cargo test`. The `DropCounter` wrapper observes that
+    //! `Sensitive<T>::drop` reached its `ZeroizeOnDrop` body, which
+    //! transitively fires `T::zeroize` (Drop-glue rules).
     //!
-    //! Pre-DEF-259: `Sensitive<Password>` Drop was verified only by
-    //! the `#[ignore]`-gated memory-probe test
-    //! `tests/scram_zeroize_miri_spec.rs::sensitive_password_drop_zeros_backing_buffer`.
-    //!
-    //! Post-DEF-259: this test runs on every `cargo test`. The
-    //! `DropCounter` wrapper observes that `Sensitive<T>::drop`
-    //! reached its `ZeroizeOnDrop` body, which transitively fires
-    //! `T::zeroize` (Drop-glue rules).
+    //! A memory-probe alternative
+    //! (`tests/scram_zeroize_miri_spec.rs::sensitive_password_drop_zeros_backing_buffer`,
+    //! `#[ignore]`-gated and miri-only) verifies that the cleared
+    //! bytes actually become zero in the backing buffer; the witness
+    //! here verifies that Drop fires on the wrapper.
 
     use super::Sensitive;
     use crate::drop_witness::{DropCounter, DropProbe};

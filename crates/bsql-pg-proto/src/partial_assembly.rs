@@ -1,6 +1,6 @@
-//! **DEF-248 Sub-B (2026-05-12)** — universal-coverage streaming
-//! sink for **non-`'D'`** PostgreSQL backend frames whose declared
-//! body exceeds [`crate::frame::READ_BUF_CAP`] (4096 B).
+//! Universal-coverage streaming sink for **non-`'D'`** PostgreSQL
+//! backend frames whose declared body exceeds
+//! [`crate::frame::READ_BUF_CAP`] (4096 B).
 //!
 //! # Universal coverage at constant memory
 //!
@@ -168,7 +168,7 @@ use alloc::boxed::Box;
 ///    prefix-buffered byte range".
 ///
 /// 2. **Future-proof**: if a contributor bumps `SecretBoundedStr<128>`
-///    → `<256>` (e.g., DEF-2XX widening message-field cap), the
+///    → `<256>` (e.g., a future message-field cap widening), the
 ///    worst-case parser read grows to ≈ 8 KB. 8 KB `PREFIX_CAP`
 ///    absorbs that growth without touching this const.
 ///
@@ -475,16 +475,13 @@ impl PartialAssemblyInner {
         // the prefix gets up to PREFIX_CAP - prefix_buf.len() of them.
         let prefix_headroom = PREFIX_CAP.saturating_sub(self.prefix_buf.len());
         let copy_take = core::cmp::min(take, prefix_headroom);
-        // DEF-280 sweep (2026-05-18) + Tier-4 Cluster D #58 (2026-05-19):
-        // single-shot bounds-check via `split_at_checked`.
+        // Single-shot bounds-check via `split_at_checked`.
         // `copy_take = min(take, prefix_headroom)` and `take <= bytes
         // .len()`, so `copy_take <= bytes.len()` by transitive
         // min-bound; the `None` arm of `split_at_checked(copy_take)` is
-        // architecturally dead. Pre-#58 the explicit `if copy_take >
-        // bytes.len()` + `unwrap_or(&[])` layered two dead checks; the
-        // `split_at_checked` form collapses them into one match while
-        // preserving the fail-closed semantic (no-op copy + counter
-        // still decrements → wire stays in sync) on the dead None arm.
+        // architecturally dead. The fail-closed semantic on that dead
+        // arm (no-op copy + counter still decrements → wire stays in
+        // sync) is preserved as belt-and-braces.
         let copy_slice: &[u8] = match bytes.split_at_checked(copy_take) {
             Some((head, _tail)) => head,
             None => {

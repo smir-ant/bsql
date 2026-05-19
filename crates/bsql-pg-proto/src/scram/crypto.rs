@@ -118,14 +118,14 @@ fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[
 /// outcome while adding a typed diagnostic that `ScramError::HmacKeyRejected`
 /// propagates — the wrapper sees a classified fault, not a timeout
 /// on the SASLFinal step.
-/// DEF-185 P0-D (audit 2026-04-24): returns `Zeroizing<[u8; 32]>`
-/// instead of bare `[u8; 32]`. Rust move semantics copy the callee's
-/// 32-byte return slot into the caller's local — without a Zeroize
-/// wrapper, the callee's stack slot persists in memory until a later
-/// call frame overwrites it. `Zeroizing` forces Drop-on-exit of the
-/// returned wrapper, scrubbing the callee slot when the caller
-/// consumes the value (normal path). On `panic = "abort"` Drop is
-/// vacuous but the normal-path hygiene is structurally guaranteed.
+/// Returns `Zeroizing<[u8; 32]>` rather than bare `[u8; 32]`. Rust
+/// move semantics copy the callee's 32-byte return slot into the
+/// caller's local — without a Zeroize wrapper, the callee's stack
+/// slot persists in memory until a later call frame overwrites it.
+/// `Zeroizing` forces Drop-on-exit of the returned wrapper, scrubbing
+/// the callee slot when the caller consumes the value (normal path).
+/// On `panic = "abort"` Drop is vacuous but the normal-path hygiene
+/// is structurally guaranteed.
 fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<Zeroizing<[u8; 32]>, ScramError> {
     let mut mac = HmacSha256::new_from_slice(key).map_err(|_| ScramError::HmacKeyRejected)?;
     mac.update(message);
@@ -143,12 +143,12 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<Zeroizing<[u8; 32]>, ScramE
 /// Tier-1 by construction: overflow is impossible because HMAC accepts
 /// arbitrarily many `update()` calls with arbitrarily sized slices.
 ///
-/// F54: returns `Result` on the architecturally-dead HMAC-key-reject
+/// Returns `Result` on the architecturally-dead HMAC-key-reject
 /// path — see [`hmac_sha256`] for the full fail-closed rationale.
-/// DEF-185 P0-D (audit 2026-04-24): returns `Zeroizing<[u8; 32]>`.
-/// Same rationale as [`hmac_sha256`] — the HMAC output over the
-/// AuthMessage is password-correlated (used as ClientSignature for the
-/// XOR into ClientProof, and as ServerSignature for server verification).
+/// Returns `Zeroizing<[u8; 32]>` for the same hygiene reason as
+/// [`hmac_sha256`] — the HMAC output over the AuthMessage is
+/// password-correlated (used as ClientSignature for the XOR into
+/// ClientProof, and as ServerSignature for server verification).
 /// Wrapping in `Zeroizing` scrubs both the callee's return slot and the
 /// caller's local on scope exit.
 fn hmac_auth_message(
@@ -198,19 +198,19 @@ pub fn compute_client_proof(
 ) -> Result<(Zeroizing<[u8; 32]>, SecretDigest), ScramError> {
     let salted_pw = salted_password(password, salt, iterations);
 
-    // F54: propagate HMAC errors as typed `ScramError::HmacKeyRejected`
+    // Propagate HMAC errors as typed `ScramError::HmacKeyRejected`
     // rather than silently computing over zeros. All four HMAC calls
     // below are architecturally dead Err (RustCrypto HMAC accepts any
     // key length), but a fail-closed typed error is the correct
     // discipline for crypto primitives.
     //
-    // DEF-185 P0-D (audit 2026-04-24): all password-correlated
-    // intermediates wrapped in `Zeroizing`. `stored_key` is
-    // `SHA-256(ClientKey)` — on PG server side THIS is the password-
-    // equivalent (PG stores StoredKey as the authenticator); a core-dump
-    // attacker with `stored_key` can replay against any server indefinitely.
-    // `client_signature` leaks StoredKey via `XOR(proof, signature)`
-    // algebra. Both now zeroed on scope exit.
+    // All password-correlated intermediates are wrapped in
+    // `Zeroizing`. `stored_key` is `SHA-256(ClientKey)` — on PG
+    // server side THIS is the password-equivalent (PG stores StoredKey
+    // as the authenticator); a core-dump attacker with `stored_key`
+    // can replay against any server indefinitely. `client_signature`
+    // leaks StoredKey via `XOR(proof, signature)` algebra. Both
+    // zeroed on scope exit.
     let client_key = hmac_sha256(salted_pw.as_ref(), b"Client Key")?;
     let stored_key: Zeroizing<[u8; 32]> =
         Zeroizing::new(Sha256::digest(client_key.as_ref()).into());
