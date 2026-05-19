@@ -365,7 +365,8 @@ pub use error::{CrateBugLocus, ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use guard::{ConnectionStatus, ReadyGuard};
 pub use ident::{
-    ApplicationName, DatabaseName, Ident, IdentError, PortalName, SecretBoundedStr, Sql, StmtName,
+    ApplicationName, DatabaseName, Ident, IdentError, LossyDisplay, LossyText, PortalName,
+    SecretBoundedStr, Sql, StmtName,
 };
 pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{

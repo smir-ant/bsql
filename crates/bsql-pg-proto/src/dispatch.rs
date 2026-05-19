@@ -2602,18 +2602,30 @@ fn parse_error_response(
             }
             // F22: text fields come in as bytes. PG encodes them in
             // `client_encoding` which MAY be non-UTF-8 on legacy
-            // servers; `from_bytes_lossy` preserves the ASCII subset
+            // servers; the lossy path preserves the ASCII subset
             // and visibly marks non-ASCII bytes with `?`. Previously
             // `from_utf8(..).unwrap_or("")` silently dropped the entire
             // field on any single invalid byte — tier-3 diagnostic loss.
+            //
+            // Tier-3 audit #46 (2026-05-19): funnel the wire bytes
+            // through the `LossyText` typed witness before committing
+            // to bounded storage. The type name surfaces the lossy
+            // contract at the call site (no longer hidden inside
+            // `from_bytes_lossy(value_bytes)`); `raw_bytes()` on the
+            // LossyText instance is the escape hatch for forensic
+            // byte-fidelity callers that may want pre-coercion access
+            // in a future codepath.
             b'M' => {
-                message = SecretBoundedStr::from_bytes_lossy(value_bytes);
+                message = crate::ident::LossyText::from_bytes_lossy(value_bytes)
+                    .to_secret_bounded::<128>();
             }
             b'D' => {
-                detail = SecretBoundedStr::from_bytes_lossy(value_bytes);
+                detail = crate::ident::LossyText::from_bytes_lossy(value_bytes)
+                    .to_secret_bounded::<96>();
             }
             b'H' => {
-                hint = SecretBoundedStr::from_bytes_lossy(value_bytes);
+                hint = crate::ident::LossyText::from_bytes_lossy(value_bytes)
+                    .to_secret_bounded::<64>();
             }
             _ => {} // Unknown field type — skip.
         }

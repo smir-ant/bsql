@@ -771,6 +771,167 @@ const _: fn() = || {
 };
 
 // ═════════════════════════════════════════════════════════════════
+// Tier-3 audit #46 (2026-05-19): `LossyText<'a>` typed boundary
+//
+// Wraps wire bytes that *may* require ASCII coercion at storage
+// time. Pre-audit, sites in `dispatch.rs::parse_error_response`
+// called `SecretBoundedStr::from_bytes_lossy(value_bytes)` directly:
+// the lossy contract was hidden in the function name, and the raw
+// pre-coercion bytes were unavailable to forensic callers.
+//
+// `LossyText<'a>` re-shapes the boundary:
+//   - construction is zero-cost (`#[repr(transparent)]` around the
+//     borrowed slice; no allocation, no coercion);
+//   - the type name *itself* surfaces the lossy contract at the
+//     call site — `LossyText::from_bytes_lossy(b)` makes the
+//     deferred coercion impossible to miss;
+//   - `raw_bytes()` returns the original wire bytes verbatim
+//     (escape hatch for byte-fidelity / forensic callers);
+//   - `to_bounded::<N>()` / `to_secret_bounded::<N>()` commit to
+//     the bounded ASCII storage form (the coercion happens here,
+//     not at LossyText construction).
+//
+// Note: the audit's `as_str(&self) -> &str` shape is deliberately
+// *not* provided — it would require either pre-coercion (alloc on
+// every construction) or a degraded silent-empty fallback. Use
+// `display()` for zero-alloc rendering or `to_bounded::<N>()` for
+// owned storage instead. See LossyDisplay below.
+// ═════════════════════════════════════════════════════════════════
+
+/// Typed wrapper around wire bytes that may need ASCII coercion at
+/// storage / display time. See module-level header above for the
+/// design rationale.
+///
+/// # Layout
+///
+/// `#[repr(transparent)]` over `&'a [u8]`: same size (16 B on
+/// 64-bit) and codegen as a bare slice reference.
+///
+/// # Use site
+///
+/// PG ErrorResponse text fields (M / D / H per §55.7) come in as
+/// `&[u8]` whose encoding follows the server's `client_encoding`.
+/// Storage in [`SecretBoundedStr<N>`] requires UTF-8 — the lossy
+/// path in [`BoundedStr::from_bytes_lossy`] substitutes non-ASCII
+/// with `b'?'`. Funnel the wire slice through `LossyText` to make
+/// the coercion visible *at the call site*.
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug)]
+pub struct LossyText<'a> {
+    raw: &'a [u8],
+}
+
+impl<'a> LossyText<'a> {
+    /// Wrap wire bytes that may need lossy ASCII coercion for
+    /// bounded storage or display. Construction is zero-cost; the
+    /// coercion is deferred to [`Self::to_bounded`],
+    /// [`Self::to_secret_bounded`], or [`Self::display`].
+    ///
+    /// The `_lossy` suffix on the constructor name flags the
+    /// downstream commitment at the call site — readers see at a
+    /// glance that the bytes are about to flow through an
+    /// ASCII-coercing pipeline.
+    #[inline]
+    #[must_use]
+    pub const fn from_bytes_lossy(raw: &'a [u8]) -> Self {
+        Self { raw }
+    }
+
+    /// Escape hatch: borrow the original wire bytes, unchanged.
+    /// Lets forensic / byte-fidelity callers inspect or
+    /// alternative-encode the input before committing to bounded
+    /// ASCII storage.
+    #[inline]
+    #[must_use]
+    pub const fn raw_bytes(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Populated byte length of the wrapped slice.
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.raw.len()
+    }
+
+    /// Whether the wrapped slice is empty.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    /// Zero-alloc [`fmt::Display`] adapter rendering as ASCII with
+    /// non-ASCII bytes replaced by `?`. Use when you need to format
+    /// the lossy view without committing to bounded storage.
+    #[inline]
+    #[must_use]
+    pub const fn display(&self) -> LossyDisplay<'a> {
+        LossyDisplay { bytes: self.raw }
+    }
+
+    /// Commit to bounded ASCII-coerced [`BoundedStr<N>`] storage.
+    /// The lossy coercion + truncation policy is applied here per
+    /// [`BoundedStr::from_bytes_lossy`].
+    #[inline]
+    #[must_use]
+    pub fn to_bounded<const N: usize>(self) -> BoundedStr<N> {
+        BoundedStr::<N>::from_bytes_lossy(self.raw)
+    }
+
+    /// Commit to bounded ASCII-coerced [`SecretBoundedStr<N>`]
+    /// storage with zeroize-on-drop. Mirrors [`Self::to_bounded`]
+    /// for fields holding sensitive forensic material.
+    #[inline]
+    #[must_use]
+    pub fn to_secret_bounded<const N: usize>(self) -> SecretBoundedStr<N> {
+        SecretBoundedStr::<N>::from_bytes_lossy(self.raw)
+    }
+}
+
+/// Zero-alloc [`fmt::Display`] adapter for [`LossyText`]. Renders
+/// each input byte as ASCII printable / `b'\t'` / `b'\n'` / `b'\r'`
+/// verbatim; everything else becomes `?`. Matches the slow-path
+/// substitution in [`BoundedStr::from_bytes_lossy`].
+///
+/// Not exposed for external construction — obtain via
+/// [`LossyText::display`].
+#[derive(Copy, Clone, Debug)]
+pub struct LossyDisplay<'a> {
+    bytes: &'a [u8],
+}
+
+impl fmt::Display for LossyDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use core::fmt::Write as _;
+        for &b in self.bytes {
+            // `b` is `u8`; in the matched range it's ASCII (single
+            // Unicode codepoint U+00..=U+7F). `char::from(u8)` is
+            // the `#![forbid(unsafe_code)]` + `clippy::as_conversions`
+            // compatible coercion (every u8 maps to a valid scalar
+            // U+0000..U+00FF via Latin-1 supplement, no panic).
+            let c = if matches!(b, 0x20..=0x7e | b'\t' | b'\n' | b'\r') {
+                char::from(b)
+            } else {
+                '?'
+            };
+            f.write_char(c)?;
+        }
+        Ok(())
+    }
+}
+
+// Layout pin — `LossyText<'a>` must stay layout-identical to
+// `&'a [u8]`. A future field addition that breaks this trips the
+// assertion at compile time.
+const _: () = {
+    assert!(
+        core::mem::size_of::<LossyText<'_>>() == core::mem::size_of::<&[u8]>(),
+        "LossyText must be layout-identical to &[u8] (repr(transparent))",
+    );
+};
+
+// ═════════════════════════════════════════════════════════════════
 // 1c-3c F12 (pass-#7 audit): sealed `DescribeName` trait
 //
 // Narrows the `build_describe_message` builder's `name` parameter
@@ -1624,5 +1785,142 @@ mod drop_witness_tests {
             1,
             "empty SecretBoundedStr drop must still fire",
         );
+    }
+}
+
+#[cfg(test)]
+mod lossy_text_tests {
+    //! Tier-3 audit #46 (2026-05-19): contract pins for [`LossyText`]
+    //! and [`LossyDisplay`]. Verifies the four invariants:
+    //!
+    //! 1. `from_bytes_lossy` is non-allocating, non-coercing — the
+    //!    bytes flow through verbatim until commitment.
+    //! 2. `raw_bytes` returns the original slice unchanged (escape
+    //!    hatch for forensic byte-fidelity callers).
+    //! 3. `display()` renders ASCII printables + `\t\n\r` verbatim,
+    //!    everything else as `?` (matches the slow-path coercion in
+    //!    [`BoundedStr::from_bytes_lossy`]).
+    //! 4. `to_secret_bounded::<N>()` commits to bounded ASCII storage
+    //!    with the same byte-coercion + truncation policy as the
+    //!    direct `SecretBoundedStr::from_bytes_lossy` call (the
+    //!    audit migration is behaviour-preserving).
+    use super::{BoundedStr, LossyText, SecretBoundedStr};
+    use alloc::format;
+
+    #[test]
+    fn raw_bytes_returns_input_unchanged() {
+        let src: &[u8] = b"hello \xff world";
+        let lt = LossyText::from_bytes_lossy(src);
+        assert_eq!(lt.raw_bytes(), src);
+        assert_eq!(lt.len(), src.len());
+        assert!(!lt.is_empty());
+    }
+
+    #[test]
+    fn empty_input_round_trip() {
+        let lt = LossyText::from_bytes_lossy(b"");
+        assert!(lt.is_empty());
+        assert_eq!(lt.len(), 0);
+        assert_eq!(lt.raw_bytes(), b"");
+        assert_eq!(format!("{}", lt.display()), "");
+    }
+
+    #[test]
+    fn display_preserves_ascii_printable_verbatim() {
+        let lt = LossyText::from_bytes_lossy(b"Hello, World! 123");
+        assert_eq!(format!("{}", lt.display()), "Hello, World! 123");
+    }
+
+    #[test]
+    fn display_preserves_tab_newline_carriage_return() {
+        let lt = LossyText::from_bytes_lossy(b"a\tb\nc\rd");
+        assert_eq!(format!("{}", lt.display()), "a\tb\nc\rd");
+    }
+
+    #[test]
+    fn display_coerces_non_ascii_to_question_mark() {
+        // 0xff is non-ASCII, 0x00 is control (NUL), 0x1f is control.
+        let lt = LossyText::from_bytes_lossy(b"a\xffb\x00c\x1fd");
+        assert_eq!(format!("{}", lt.display()), "a?b?c?d");
+    }
+
+    #[test]
+    fn display_coerces_high_ascii_supplement() {
+        // Latin-1 supplement bytes (0x80..=0xff) are NOT ASCII and
+        // must be coerced.
+        let lt = LossyText::from_bytes_lossy(b"\x80\x90\xa0\xff");
+        assert_eq!(format!("{}", lt.display()), "????");
+    }
+
+    #[test]
+    fn to_secret_bounded_matches_direct_from_bytes_lossy() {
+        // Migration must be behaviour-preserving — the LossyText
+        // funnel must produce byte-identical output to the old
+        // direct `SecretBoundedStr::from_bytes_lossy` call.
+        let inputs: &[&[u8]] = &[
+            b"hello",
+            b"non-utf8: \xff\xfe",
+            b"\xc3\xa9\xc3\xa8",  // valid UTF-8 (é è)
+            b"",
+            // Larger than capacity → triggers truncation marker
+            &[b'A'; 200],
+        ];
+        for src in inputs {
+            let via_lossy_text =
+                LossyText::from_bytes_lossy(src).to_secret_bounded::<64>();
+            let direct = SecretBoundedStr::<64>::from_bytes_lossy(src);
+            assert_eq!(
+                via_lossy_text.as_bytes(),
+                direct.as_bytes(),
+                "LossyText migration must be byte-identical to direct call",
+            );
+            assert_eq!(via_lossy_text.was_lossy(), direct.was_lossy());
+        }
+    }
+
+    #[test]
+    fn to_bounded_mirrors_to_secret_bounded() {
+        // BoundedStr<N> and SecretBoundedStr<N> share storage shape
+        // (the latter is repr(transparent) over the former); both
+        // commitment paths must give identical bytes.
+        let src: &[u8] = b"mixed: ABC \xff XYZ";
+        let bounded: BoundedStr<32> = LossyText::from_bytes_lossy(src).to_bounded();
+        let secret: SecretBoundedStr<32> =
+            LossyText::from_bytes_lossy(src).to_secret_bounded();
+        assert_eq!(bounded.as_bytes(), secret.as_bytes());
+    }
+
+    #[test]
+    fn raw_bytes_preserves_pre_coercion_data() {
+        // The escape hatch — `raw_bytes()` MUST return the original
+        // pre-coercion bytes even when those bytes are non-ASCII.
+        let src: &[u8] = b"\xff\xfe\xfd";
+        let lt = LossyText::from_bytes_lossy(src);
+        assert_eq!(lt.raw_bytes(), src);
+        // After committing to bounded storage, the bytes are coerced.
+        let bounded = lt.to_bounded::<16>();
+        assert_eq!(bounded.as_bytes(), b"???");
+        assert!(bounded.was_lossy());
+    }
+
+    /// `LossyText<'a>` is `repr(transparent)` over `&'a [u8]` — same
+    /// size, same alignment, zero-cost construction.
+    #[test]
+    fn lossy_text_is_layout_identical_to_slice_ref() {
+        assert_eq!(
+            core::mem::size_of::<LossyText<'_>>(),
+            core::mem::size_of::<&[u8]>(),
+        );
+        assert_eq!(
+            core::mem::align_of::<LossyText<'_>>(),
+            core::mem::align_of::<&[u8]>(),
+        );
+    }
+
+    /// `Copy` + `Clone` derive — LossyText is a zero-cost transient.
+    #[test]
+    fn lossy_text_is_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<LossyText<'static>>();
     }
 }
