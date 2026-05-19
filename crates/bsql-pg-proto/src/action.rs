@@ -17,13 +17,21 @@
 //! (each entry-point call clears the buffer at entry).
 //!
 //! The borrow-checker enforces the "consume before next call"
-//! invariant at compile time: [`OutActions<'buf>`] borrows the
-//! caller's `WriteBuf` for `'buf`; the next `&mut WriteBuf` call is
-//! rejected while any `Action<'buf>` is alive. Zero-copy with tier-1
-//! compile enforcement. **Inspection via `proto.state()` still works
-//! alongside** — `OutActions` does NOT borrow `PgProtocol`, only the
-//! separate `WriteBuf`, so shared `&self` reads on the protocol are
-//! never blocked.
+//! invariant at compile time: [`OutActions<'w, 'r>`] holds two
+//! distinct borrows — `'w` ties [`Action::SendBytes`] back to the
+//! caller's [`crate::write_buf::WriteBuf`] (`&mut WriteBuf` is
+//! rejected while any `Action<'w, _>` is alive), and `'r` ties row-
+//! arena slices inside `Reply<'r>` payloads back to `PgProtocol`'s
+//! shared read state (the next `&mut PgProtocol` call is rejected
+//! while any arena-borrowing Reply is alive). Both are zero-copy
+//! with tier-1 compile enforcement. **Inspection via `proto.state()`
+//! still works alongside** — `'r` is a *shared* (`&self`) reborrow,
+//! so `&self`-method calls on the protocol are never blocked; only
+//! `&mut self`-method reentry is gated.
+//!
+//! See the type-level doc on [`OutActions`] for the audit
+//! investigation (Tier-3 #25, 2026-05-19) that confirmed the
+//! 2-lifetime form is structurally load-bearing.
 //!
 //! Internally, dispatchers emit [`StagedAction`] values (range-based,
 //! no refs) during the write phase; the entry-point materialises them
@@ -581,6 +589,48 @@ mod phase_b3_tests {
 /// .slow_path_once` → **0 B init**. Stack reservation size
 /// unchanged (`[MaybeUninit<Action>; N]` still allocates the
 /// slots), but the write bandwidth disappears.
+///
+/// # Tier-3 audit #25 (2026-05-19): 2-lifetime form retained
+///
+/// The audit hypothesised that `OutActions<'w, 'r>` could collapse to
+/// a single lifetime under the assumption that "both lifetimes
+/// originate from `&'_ mut PgProtocol` reborrows". Investigation
+/// found the premise inaccurate — the two lifetimes track
+/// **structurally distinct borrows** with different origins:
+///
+/// **`'w` (write-buffer)** binds [`Action::SendBytes(&'w [u8])`] back
+/// to the **caller-owned** [`crate::write_buf::WriteBuf`] passed as a
+/// separate `&'w mut WriteBuf` parameter to every entry-point. It
+/// is **not** a reborrow of `self`.
+///
+/// **`'r` (read-state)** binds the row-arena slices inside
+/// [`QueryCompletePayload::row_desc`] + sibling
+/// `Describe*Payload<'r>` fields back to `PgProtocol`'s internal
+/// `row_desc_slot` / `error_arena` — a shared `&'r PgProtocol`
+/// reborrow (NOT `&mut`; module-doc explains the read-only nature).
+///
+/// Unification to a single lifetime `'a = min('w, 'r)` would compile
+/// in practice (covariance handles the coercion at every current
+/// call site, all of which already see `'w` and `'r` originate from
+/// the same scope). The retained 2-lifetime form delivers:
+///
+/// - **Type-level documentation**: the two parameters make the two
+///   distinct borrow sources visible in every signature, instead of
+///   collapsing them into one opaque lifetime that requires reading
+///   doc-prose to disambiguate.
+/// - **Push-path expressivity**: `OutActions<'w, 'static>` returned
+///   from [`crate::PgProtocol::push_command_internal`] (16 sites)
+///   states *at the type level* that the outbound batch carries no
+///   arena-borrowed Reply variants — only the WriteBuf borrow
+///   constrains the caller's hold-time. Unification erases this
+///   distinction.
+///
+/// Net: the 2-lifetime form is documentation-bearing rather than
+/// strictly load-bearing for borrow-check soundness. The audit's
+/// allowed fallback ("If lifetime elision exposes hidden divergence,
+/// document the dependency and keep the 2-lifetime form") covers
+/// this outcome — explicit signatures are preferred over signatures
+/// that depend on prose-doc explanation.
 #[derive(Debug)]
 pub struct OutActions<'w, 'r> {
     /// ManuallyDrop-wrapped heapless vec. `ManuallyDrop` makes the
