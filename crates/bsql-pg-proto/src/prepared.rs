@@ -481,13 +481,57 @@ where
 /// out-of-scope adversarial usage that doesn't affect the
 /// SQL-injection class for users who follow the contract.
 ///
-/// To close this fully (tier-2 by-construction) at a future major:
-/// could use a sealed-via-private-token pattern (token type lives
-/// in a `pub(crate)` module the proc-macro pair-crate doesn't
-/// reach — but that breaks the macro's expansion path since
-/// `bsql-pg-proto-derive` can't construct `pub(crate)` tokens).
-/// Open for DEF-244 follow-up; documented as tier-3-by-discipline
-/// here per memo §7 P3 closing remarks.
+/// # Tier-3 audit #1+#27+#28 (2026-05-19) — DEFERRED with rationale
+///
+/// Audit proposed closing this to tier-1 via a `pub(in crate::prepared)
+/// mod _macro_token { pub struct PreparedMacroSeal(()); }` parameter.
+/// Investigation found Phase A unsound under stable-Rust proc-macro
+/// hygiene + `#![forbid(unsafe_code)]`:
+///
+///   - Macro expansion runs in the **caller's hygiene context**. The
+///     emitted code references `::bsql_pg_proto::...` paths but enjoys
+///     no privileged access to private items in the macro-defining
+///     crate — same visibility rules as any external code.
+///   - A seal with a private field (`PreparedMacroSeal(())`) can only
+///     be constructed inside `mod prepared`. Neither the user crate
+///     nor the macro's emitted code (which lives in the user crate)
+///     can construct it.
+///   - Exposing a `pub const __MACRO_SEAL: PreparedMacroSeal =
+///     PreparedMacroSeal(());` re-export is reachable by hand-written
+///     user code too — friction-based deflection, not type-safe
+///     enforcement. Same effective tier as the current `pub fn`.
+///   - Phase B (compile-time `(file!(), line!(), column!())`
+///     fingerprint as a const-generic str triple) requires unstable
+///     `feature(adt_const_params)` / unstable const-generic strings.
+///     Off-table for stable v1.0.
+///   - `macro_rules!` `$crate::` does NOT grant cross-crate access
+///     to `pub(crate)` items — hygiene resolves the path but the
+///     visibility check still fires at the external use site.
+///
+/// **Conclusion**: tier-1 closure of the macro-only-call contract is
+/// not expressible in stable-Rust safe code with cross-crate proc-
+/// macros. The current shape is the optimum under the constraint
+/// set: `#[doc(hidden)]` + `pub` (macro plumbing), `__BSQL_PREPARED_*`
+/// const naming + double-underscore hygiene (macro internals signal),
+/// `PreparedQuery`'s `pub(crate)` fields (direct struct init from
+/// external crates fails E0451 — closes the OTHER bypass leg).
+///
+/// **Defense-in-depth that IS expressible** (not pursued this cycle —
+/// deferred for a future Tier-4 sweep):
+///   - Add a `__macro_internals` umbrella module re-exporting all
+///     macro-required types under one ugly path (#40 Cluster B).
+///   - Add a `#[track_caller]` runtime debug check that logs/panics
+///     if `new_prepared_query` is called from outside a `const`
+///     context (heuristic; macro emits inside `const` block).
+///   - Add lint-level `unused-must-use` enforcement via a typed
+///     `MustGoThroughMacro` ZST inside `PreparedQuery` (cosmetic).
+///
+/// Audit verdict: ACCEPT-but-DEFER. Class remains tier-3 by-discipline
+/// documented; the discipline is "go through the macro, do not
+/// hand-call new_prepared_query". CREDO §0 documented-discipline
+/// boundary holds. SQL-injection class for users-who-follow-the-
+/// contract remains tier-1-by-construction via the macro's lex +
+/// cast-annotation validation pipeline (memo §7 P3-P12).
 #[doc(hidden)]
 #[inline]
 #[must_use]
