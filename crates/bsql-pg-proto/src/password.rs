@@ -9,8 +9,8 @@
 //!
 //! - Passwords are never exposed in `Debug` output (tier-1 via
 //!   `Sensitive` wrapper + manual `Debug` on `Credentials`).
-//! - Empty passwords are rejected at construction time (DEF-051) —
-//!   tier-1 via `Result` return.
+//! - Empty passwords are rejected at construction time — tier-1 via
+//!   `Result` return.
 //! - Password bytes are scrubbed on drop via `zeroize`.
 //! - NUL bytes inside the password are allowed (PG supports binary
 //!   passwords via md5/scram).
@@ -23,22 +23,19 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///
 /// PostgreSQL does not impose a hard limit on password length, but
 /// SCRAM-SHA-256 with PBKDF2 processes the full password on every
-/// authentication.
+/// authentication. SCRAM uses SASLprep normalisation on the password
+/// bytes; UTF-8 NFKC expansion is bounded at ~4× the input-char count
+/// in the pathological case (combining marks). 512 B accommodates 128
+/// normalized UTF-8 chars — a huge password for any realistic
+/// workflow (industry practice: argon2 accepts arbitrary input but
+/// real deployments cap at ~128; bcrypt truncates at 72).
 ///
-/// DEF-154 (O) P1-5: shrunk 1024 → 512 B. SCRAM-SHA-256 uses
-/// SASLprep normalisation on the password bytes; UTF-8 NFKC
-/// expansion is bounded at ~4x the input-char count on the
-/// pathological case (combining marks). 512 B accommodates 128
-/// normalized UTF-8 chars — a HUGE password for any realistic
-/// workflow (industry practice: argon2 accepts arbitrary input
-/// but real deployments cap at ~128; bcrypt truncates at 72).
-/// Shrinking 1024→512 halves `Password` size → halves
-/// `Credentials::ScramPassword` variant → halves
+/// Halves of this cap propagate through `Password` size →
+/// `Sensitive<Password>` → `Credentials::ScramPassword` →
 /// `PgCommand::Startup` enum payload (which pays the worst-case
-/// cost on every caller-side allocation). Zero safety impact:
-/// `try_from_bytes` classifies oversize as `PasswordError::TooLong`,
-/// surfacing a clean error at construction rather than silently
-/// accepting.
+/// cost on every caller-side allocation). `try_from_bytes` classifies
+/// oversize as `PasswordError::TooLong`, surfacing a clean error at
+/// construction rather than silently accepting.
 pub const MAX_PASSWORD_LEN: usize = 512;
 
 /// Compile-time drift guard: `MAX_PASSWORD_LEN` must fit the `u16`
@@ -52,30 +49,21 @@ const _: () = assert!(
 
 /// A bounded, zeroize-on-drop password buffer.
 ///
-/// Constructed via [`Password::try_from_bytes`]. Rejects empty
-/// (DEF-051) and over-length inputs. NUL bytes are allowed.
+/// Constructed via [`Password::try_from_bytes`]. Rejects empty and
+/// over-length inputs. NUL bytes are allowed.
 ///
 /// The inner storage is a fixed-size array with a length field,
 /// avoiding heap allocation. `#[derive(Zeroize, ZeroizeOnDrop)]`
 /// scrubs the full array (not just the used portion) on drop —
-/// self-zeroizing regardless of wrapper context (DEF-093). A
-/// compile-time `const _: () = assert!(needs_drop::<Password>())`
-/// in `lib.rs` enforces this invariant structurally.
+/// self-zeroizing regardless of wrapper context. A compile-time
+/// `const _: () = assert!(needs_drop::<Password>())` in `lib.rs`
+/// enforces this invariant structurally.
 ///
-/// `len` is a `u16` (not `usize`) because `MAX_PASSWORD_LEN`
-/// (512 — DEF-154 (O) P1-5) trivially fits; the narrower type saves
-/// 6 bytes per `Password` instance which compounds through
-/// `Sensitive<Password>` → `Credentials::ScramPassword` →
-/// `PgCommand::Startup` → `ProtoState::ConnectingStartup`. (DEF-095)
-///
-/// # DEF-185 P2-E (audit 2026-04-24): doc sync
-///
-/// Pre-fix: this comment said `(1024)` — drift from the actual 512
-/// after DEF-154 (O) P1-5 shrunk the const. Comment vs source had
-/// been out of step for ~3 weeks. Pairs with the startup_spec test
-/// boundary which uses `"a".repeat(1025)` and happens to pass
-/// (1025 > 512) but not at the exact +1-over-cap boundary; that
-/// test should assert at `MAX_PASSWORD_LEN + 1` symbolically.
+/// `len` is a `u16` (not `usize`) because `MAX_PASSWORD_LEN` (512)
+/// trivially fits; the narrower type saves 6 bytes per `Password`
+/// instance which compounds through `Sensitive<Password>` →
+/// `Credentials::ScramPassword` → `PgCommand::Startup` →
+/// `ProtoState::ConnectingStartup`.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Password {
     /// Fixed-size backing store. The full array is zeroed on drop,
@@ -87,10 +75,10 @@ pub struct Password {
 
 /// Errors from [`Password`] construction.
 ///
-/// # `#[non_exhaustive]` (DEF-256, audit 2026-05-08)
+/// # `#[non_exhaustive]`
 ///
 /// New rejection classes may land as future password validation
-/// rules tighten (e.g. NUL-byte rejection mirroring [`Ident`],
+/// rules tighten (e.g. NUL-byte rejection mirroring [`crate::ident::Ident`],
 /// UTF-8-only requirements for SCRAM normalisation). Sealing via
 /// `non_exhaustive` forces downstream `match` callers to retain
 /// a catch-all arm so a new variant cannot silently fall through
@@ -98,8 +86,8 @@ pub struct Password {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PasswordError {
-    /// The password was empty. DEF-051: empty passwords are rejected
-    /// at construction as a tier-1 visible choice (via `Result`).
+    /// The password was empty. Empty passwords are rejected at
+    /// construction as a tier-1 visible choice (via `Result`).
     Empty,
     /// The password exceeds [`MAX_PASSWORD_LEN`] bytes.
     TooLong {
@@ -108,8 +96,6 @@ pub enum PasswordError {
     },
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
-// `core::error::Error` impl on the public password-validation error.
 impl core::error::Error for PasswordError {}
 
 impl fmt::Display for PasswordError {
@@ -125,9 +111,7 @@ impl fmt::Display for PasswordError {
 }
 
 impl Password {
-    /// Construct from raw bytes.
-    ///
-    /// Rejects empty (DEF-051) and over-length passwords.
+    /// Construct from raw bytes. Rejects empty and over-length inputs.
     pub fn try_from_bytes(input: &[u8]) -> Result<Self, PasswordError> {
         if input.is_empty() {
             return Err(PasswordError::Empty);
@@ -149,22 +133,19 @@ impl Password {
         Ok(Self { buf, len })
     }
 
-    /// Construct from a UTF-8 string.
-    ///
-    /// Convenience wrapper over [`Password::try_from_bytes`].
+    /// Construct from a UTF-8 string. Convenience wrapper over
+    /// [`Password::try_from_bytes`].
     pub fn try_from_str(s: &str) -> Result<Self, PasswordError> {
         Self::try_from_bytes(s.as_bytes())
     }
 
     /// Borrow the password bytes.
     ///
-    /// DEF-154 (S) P1-1: explicit `split_at_checked` match —
     /// `self.len ≤ MAX_PASSWORD_LEN ≤ self.buf.len()` by construction
-    /// (see `try_from_bytes` bound check). None arm architecturally
-    /// unreachable; returns empty slice as no-silent-op sentinel
-    /// (matches semantically "no password bytes", same surface as
-    /// a zeroized post-drop). Pre-(S) was `self.buf.get(..len)
-    /// .unwrap_or(&[])` — silent fallback banned by user directive.
+    /// (see `try_from_bytes` bound check). `split_at_checked`'s `None`
+    /// arm is architecturally unreachable; the empty-slice fallback
+    /// matches semantically "no password bytes" (same surface as a
+    /// zeroized post-drop).
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -194,30 +175,18 @@ impl fmt::Debug for Password {
 /// Authentication credentials for a PostgreSQL connection.
 ///
 /// `Trust` means no password is sent — the server is configured to
-/// accept the connection based on pg_hba.conf rules alone.
+/// accept the connection based on `pg_hba.conf` rules alone.
 /// `ScramPassword` carries a password for SCRAM-SHA-256 authentication.
-// DEF-154 (O): originally `#[expect(clippy::large_enum_variant)]`.
-// DEF-215 (2026-05-05): downgraded to `#[allow]` after adding
-// `Credentials::CleartextPassword(Sensitive<Password>)` — clippy
-// no longer fires `large_enum_variant` once two distinct large
-// variants exist (the lint warns on dominant single-variant
-// imbalance, not symmetric large variants). The reason for
-// suppression remains load-bearing: `Credentials` is constructed
-// once per connection (cold path), the password lives on the
-// caller's stack by design, and boxing inside the enum would
-// require allocation that the no_alloc crate forbids at the
-// `Credentials` construction site.
-// DEF-244 modernisation audit (rust-version 1.81 sweep): the
-// `clippy::large_enum_variant` lint does NOT currently fire on
-// `Credentials` (Password+Sensitive padding interactions with the
-// default 200 B threshold + `#[non_exhaustive]` semantics). The
-// historical `#[allow]` was dead; attribute removed entirely. If a
-// future clippy version reintroduces the warning, the design
-// rationale stays load-bearing: Credentials is a cold-path enum
-// constructed once per connection, Password is 512 B by design
-// (MAX_PASSWORD_LEN), and boxing at the variant layer would require
-// allocation in user code — breaking the no_alloc-from-outside
-// contract.
+///
+/// # Design: large enum variants are intentional
+///
+/// `Credentials` is a cold-path enum constructed once per connection,
+/// `Password` is 512 B by design ([`MAX_PASSWORD_LEN`]), and boxing at
+/// the variant layer would require allocation in user code — breaking
+/// the no_alloc-from-outside contract. `clippy::large_enum_variant`
+/// would warn only if a single variant dominated the size; the three
+/// password-bearing variants are symmetric and the lint does not fire
+/// on the current shape.
 #[non_exhaustive]
 pub enum Credentials {
     /// Trust authentication — no password required.
@@ -228,25 +197,24 @@ pub enum Credentials {
     /// debug redaction.
     ScramPassword(Sensitive<Password>),
     /// Cleartext password authentication (PG `AuthenticationCleartextPassword`,
-    /// sub-code 3). DEF-215 (2026-05-05).
+    /// sub-code 3).
     ///
     /// The server requests the password as a NUL-terminated cleartext
     /// string in a `PasswordMessage`. Common in legacy on-prem PG
     /// configurations (PG ≤ 13 era).
     ///
     /// **Security**: cleartext password is sent as-is over the wire.
-    /// The connection MUST be TLS-protected (DEF-214) before the
-    /// startup phase begins, otherwise the password leaks.
-    /// `bsql-pg-proto` itself does not enforce the TLS gate; the
-    /// driver wrapper (`bsql-driver-postgres`, Phase 1e) is
-    /// responsible for refusing cleartext-credential constructs on
-    /// non-TLS connections.
+    /// The connection MUST be TLS-protected before the startup phase
+    /// begins, otherwise the password leaks. `bsql-pg-proto` itself
+    /// does not enforce the TLS gate; the driver wrapper is responsible
+    /// for refusing cleartext-credential constructs on non-TLS
+    /// connections.
     ///
     /// The password is wrapped in [`Sensitive`] for zero-on-drop and
     /// debug redaction; same Drop chain as [`Self::ScramPassword`].
     CleartextPassword(Sensitive<Password>),
     /// MD5 password authentication (PG `AuthenticationMD5Password`,
-    /// sub-code 5). DEF-216 (2026-05-05).
+    /// sub-code 5).
     ///
     /// Server sends a 4-byte salt; client responds with
     /// `"md5" || md5_hex(md5_hex(password || username) || salt)` in
@@ -270,8 +238,7 @@ pub enum Credentials {
 }
 
 impl fmt::Debug for Credentials {
-    /// Manual impl — exhaustive match per variant. See module-level
-    /// design rationale.
+    /// Manual impl — exhaustive match per variant.
     ///
     /// # `#[non_exhaustive]` + exhaustive-inside-crate match
     ///
@@ -281,7 +248,7 @@ impl fmt::Debug for Credentials {
     /// build error HERE until the new variant's Debug path is
     /// declared. The combination is the tier-1 drift shield:
     /// a new internal variant cannot silently inherit a derived
-    /// Debug that would leak secrets. DEF-048.
+    /// Debug that would leak secrets.
     ///
     /// # Test-pinned invariant
     ///
@@ -303,22 +270,15 @@ impl fmt::Debug for Credentials {
 
 #[cfg(test)]
 mod drop_witness_tests {
-    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
-    //! for [`Password`] via [`crate::drop_witness::DropCounter`].
+    //! Tier-1-by-construction Drop-fire witness for [`Password`] via
+    //! [`crate::drop_witness::DropCounter`].
     //!
-    //! Pre-DEF-259: `Password`'s Drop was verified only by the
-    //! `#[ignore]`-gated memory-probe test
-    //! `tests/scram_zeroize_miri_spec.rs::password_drop_zeros_backing_buffer`.
-    //! That test uses `unsafe` pointer reads of post-drop memory and
-    //! runs only via `cargo test -- --ignored` or `cargo miri test`.
-    //!
-    //! Post-DEF-259: this test runs deterministically on every
-    //! `cargo test` invocation. The `DropCounter<Password>` wrapper
-    //! observes the drop event via an atomic counter; the production
-    //! `ZeroizeOnDrop` impl on `Password` fires unchanged. Both
-    //! together: the counter increment witnesses that
-    //! `ZeroizeOnDrop::drop` was reached (Rust drop-glue rules
-    //! guarantee field drops fire on enclosing-struct drop).
+    //! The `DropCounter<Password>` wrapper observes the drop event via
+    //! an atomic counter; the production `ZeroizeOnDrop` impl on
+    //! `Password` fires unchanged. Both together: the counter
+    //! increment witnesses that `ZeroizeOnDrop::drop` was reached
+    //! (Rust drop-glue rules guarantee field drops fire on enclosing-
+    //! struct drop).
 
     use super::Password;
     use crate::drop_witness::{DropCounter, DropProbe};
