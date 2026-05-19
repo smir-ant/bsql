@@ -1335,10 +1335,6 @@ impl From<ActiveState> for ProtoState {
 
 // ─── Per-phase classifier methods ───
 
-#[allow(
-    dead_code,
-    reason = "Per-phase Inner migration awaits wiring; the surface is implemented additively here so that per-phase enums offer the same classifier API as `ProtoState` once the per-phase dispatch routes through them."
-)]
 impl ConnectingState {
     /// Mirror of [`ProtoState::take_inflight_reply_raw_id`] for the
     /// per-phase enum. Consumes the variant's `ReplyId<K>` (if any)
@@ -1352,6 +1348,10 @@ impl ConnectingState {
     /// **HandshakeReady + Errored** return `None` — neither carries
     /// a correlator (HandshakeReady is post-RFQ; the reply was
     /// already consumed at the dispatch arm).
+    #[allow(
+        dead_code,
+        reason = "exercised by `#[cfg(test)]` sibling tests; lib-only build sees no production caller — keep the allow until per-phase Inner dispatch wiring routes through this method"
+    )]
     #[must_use]
     pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
         match self {
@@ -1398,16 +1398,16 @@ impl ConnectingState {
 }
 
 /// Per-phase classifier surface for [`ActiveState`].
-#[allow(
-    dead_code,
-    reason = "Per-phase Inner migration awaits wiring (mirror of the `ConnectingState` block above); the surface is implemented additively so that per-phase enums offer the same classifier API as `ProtoState` once dispatch routes through them."
-)]
 impl ActiveState {
     /// Per-phase mirror of [`ProtoState::take_inflight_reply_raw_id`].
     /// Exhaustive over every variant — adding a `ReplyId<K>`-carrying
     /// variant without routing it here fails the build.
     ///
     /// `Idle` / `DrainRfqAfterError` / `Errored` return `None`.
+    #[allow(
+        dead_code,
+        reason = "exercised by `#[cfg(test)]` sibling tests in `mod protocol`; lib-only build sees no production caller — keep the allow until per-phase Inner dispatch wiring routes through this method"
+    )]
     #[must_use]
     pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
         match self {
