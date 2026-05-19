@@ -1517,35 +1517,29 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             if let Some(dst) = out.buf.get_mut(..src.len()) {
                 dst.copy_from_slice(src);
             }
-            // Tier-4 Cluster D #56 (2026-05-19): narrow usize → LenT
-            // (BoundedU8 / BoundedU16) on the populated-len
-            // assignment. Invariants holding here:
+            // Narrow `usize → LenT` (`BoundedU8` / `BoundedU16`) on
+            // the populated-len assignment. Invariants holding here:
             //
-            //   - `src.len() ≤ N` (gate above checks `src.len() > N`
-            //     → returns early with PodBytesOverflow).
+            //   - `src.len() ≤ N` (the gate above checks
+            //     `src.len() > N` → returns early with the marker).
             //   - `N ≤ u16::MAX` (const-asserted at struct decl).
             //
             // `try_new_usize(src.len())` therefore always returns
             // `Some` — the `None` arm is architecturally unreachable.
-            // `LenT::default()` (== 0) is the dead-arm fallback (the
-            // same effective shape as the prior `unwrap_or(0)`, with
-            // the typed `LenT::try_new_usize` form making the
-            // narrowing explicit).
+            // `LenT::default()` (== 0) is the dead-arm fallback,
+            // making the narrowing explicit at the call site.
             //
-            // Audit's recommendation (surface overflow as Result<(),
-            // IdentError::TooLong>) is structurally blocked: this is
-            // inside the INFALLIBLE `from_str_truncating` constructor
-            // whose API contract is "always succeed, truncate with
-            // marker on overflow". Returning Result would be a
-            // BREAKING constructor-API change rippling through every
-            // truncating call site (~40+). DEFER to a post-1.0
-            // constructor-API redesign.
-            //
-            // Structural lift via a `LenT::saturating_new_usize`
-            // method that clamps without Option also blocked under
+            // A `Result<(), IdentError::TooLong>` lift is structurally
+            // blocked: this is inside the INFALLIBLE
+            // `from_str_truncating` constructor whose API contract is
+            // "always succeed, truncate with marker on overflow".
+            // Returning `Result` would be a breaking constructor-API
+            // change rippling through every truncating call site
+            // (~40+). A structural `LenT::saturating_new_usize` that
+            // clamps without `Option` is also blocked under the
             // forbid-bundle — `usize → u8`/`u16` requires `as`
-            // (forbidden) or `try_from` (Result-returning, same
-            // shape under the hood).
+            // (forbidden) or `try_from` (Result-returning, same shape
+            // under the hood).
             out.len = LenT::try_new_usize(src.len()).unwrap_or_default();
             return out;
         }

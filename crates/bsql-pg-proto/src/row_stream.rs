@@ -92,9 +92,9 @@ use crate::protocol::PgProtocol;
 use crate::wire::TAG_DATA_ROW;
 use crate::write_buf::WriteBuf;
 
-/// Tier-4 audit #59 (2026-05-19) — single-source-of-truth sentinel
-/// reply-id for post-error terminal events emitted before any
-/// streaming state was ever observed (`cached_reply_id` is `None`).
+/// Single-source-of-truth sentinel reply-id for post-error terminal
+/// events emitted before any streaming state was ever observed
+/// (`cached_reply_id` is `None`).
 ///
 /// # Why a sentinel is acceptable here
 ///

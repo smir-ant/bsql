@@ -50,23 +50,23 @@ pub const MIN_SCRAM_ITERATIONS: u32 = 4096;
 /// in iteration count. A malicious or mis-configured server sending
 /// `iterations = u32::MAX` (~4 billion) would stall the client for
 /// minutes to hours per connection attempt — a client-side DoS
-/// surface (pass-#6 audit BS8).
+/// surface.
 ///
-/// # DEF-185 P2-A (audit 2026-04-24): lowered from 10_000_000 to 100_000
+/// # Why `100_000`
 ///
-/// Pre-fix: `10_000_000` permitted ~2 seconds of PBKDF2-SHA-256 per
-/// connection attempt on modern x86. 100 concurrent malicious servers
-/// = 100 CPU-seconds of work before teardown. Legitimate DoS surface
-/// (bounded but real). Real PG deployments use `iterations ≤ 10_000`
-/// per `pg_hba.conf` defaults; 100× headroom covers every plausible
-/// production configuration.
+/// `100_000` is roughly 20ms per handshake on modern x86 — 100
+/// concurrent adversarial servers ≈ 2 CPU-seconds total, below the
+/// DoS-sensitivity threshold. Real PG deployments use
+/// `iterations ≤ 10_000` per `pg_hba.conf` defaults, so 10× headroom
+/// covers every plausible production configuration while preserving
+/// RFC 7677 §4.2 "legitimate upward scaling" (the RFC's recommended
+/// baseline was 4096; `100_000` supports every future iteration bump
+/// for the next decade of hardware).
 ///
-/// Post-fix: `100_000` — roughly 20ms per handshake on modern x86.
-/// 100 concurrent adversarial servers ≈ 2 CPU-seconds total. Below
-/// audit-sensitivity threshold while preserving RFC 7677 §4.2
-/// "legitimate upward scaling" (the recommended baseline was 4096
-/// at RFC time; 100K supports every future iteration bump for the
-/// next decade of hardware).
+/// A naive `10_000_000` cap would permit ~2 seconds of PBKDF2-SHA-256
+/// per connection attempt on modern x86 — 100 concurrent malicious
+/// servers = 100 CPU-seconds of work before teardown (legitimate DoS
+/// surface, bounded but real).
 ///
 /// A value above this classifies as [`ScramError::IterationsTooHigh`]
 /// — connection is torn down with a typed diagnostic, not a stuck
@@ -411,25 +411,26 @@ pub(crate) struct ServerFirst {
 /// - Iteration count >= 4096 (RFC 7677 section 4.2 MUST).
 /// - Salt base64-decodes and fits our bounded buffer.
 ///
-/// # DEF-185 P1-D (audit 2026-04-24): RFC 5802 extensions
+/// # RFC 5802 extensions
 ///
 /// RFC 5802 §5.1 grammar:
 /// `server-first-message = [reserved-mext ","] nonce "," salt ","
 ///                          iteration-count ["," extensions]`
 ///
-/// Pre-fix: `splitn(3, ',')` put any trailing extensions into the
-/// `i_part` tail, e.g. `i=4096,ext=foo` → parse_u32 failed with
-/// InvalidDigit → MalformedServerFirst. Legitimate RFC-compliant
-/// servers sending extensions (some proxies, non-PG SCRAM servers
-/// like MongoDB/Kafka) triggered authentication failure misclassified
-/// as "malformed frame".
+/// Splits the message on comma WITHOUT a max-parts cap, takes the 3
+/// required fields (r, s, i) in order, and silently ignores any
+/// trailing extension parts. The `reserved-mext` prefix is rejected
+/// with `MalformedServerFirst` per RFC §5.1 paragraph 4 ("If the
+/// server does not support the 'm' extension, it MUST treat the
+/// entire message as malformed") — a future `UnexpectedExtension`
+/// variant could split the diagnostic if needed, but fail-closed is
+/// the required behaviour for an unhandled mandatory extension.
 ///
-/// Post-fix: split on comma WITHOUT a max-parts cap, take exactly 3
-/// required fields (r, s, i), and silently ignore any trailing
-/// extension parts. The `reserved-mext` prefix is rejected with a
-/// dedicated `UnexpectedExtension` error — future clients MAY opt in
-/// by handling the specific extension value, but for now we fail-
-/// closed rather than ignore a reserved mandatory extension.
+/// A naive `splitn(3, ',')` would put trailing extensions into the
+/// `i_part` tail (e.g. `i=4096,ext=foo` → parse_u32 fails on
+/// `4096,ext=foo` with `InvalidDigit`), misclassifying legitimate
+/// RFC-compliant servers (some proxies, non-PG SCRAM servers like
+/// MongoDB/Kafka) as "malformed frame".
 pub(crate) fn parse_server_first(
     msg: &[u8],
     client_nonce_b64: &[u8],
@@ -437,11 +438,11 @@ pub(crate) fn parse_server_first(
     // Parse the comma-separated fields.
     let msg_str = core::str::from_utf8(msg).map_err(|_| ScramError::MalformedServerFirst)?;
 
-    // DEF-185 P1-D: iterate parts without a max-cap so extensions
-    // don't stick onto i_part. The first three parts must be r, s, i
-    // in that order; any additional parts are RFC extensions (skipped
-    // silently unless the first part looks like `reserved-mext =`
-    // which signals a mandatory extension we don't implement).
+    // Iterate parts without a max-cap so extensions don't stick onto
+    // `i_part`. The first three parts must be r, s, i in that order;
+    // any additional parts are RFC extensions (skipped silently
+    // unless the first part looks like `reserved-mext =` which
+    // signals a mandatory extension we don't implement).
     let mut parts = msg_str.split(',');
     let r_part = parts.next().ok_or(ScramError::MalformedServerFirst)?;
     // Reserved-mext detection per RFC 5802 §5.1: if the first part
@@ -547,26 +548,25 @@ pub(crate) fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError>
     let msg_str = core::str::from_utf8(msg).map_err(|_| ScramError::MalformedServerFinal)?;
 
     if let Some(verifier_tail) = msg_str.strip_prefix("v=") {
-        // DEF-185 P1-D (audit 2026-04-24): accept RFC 5802 extensions.
-        // Per §5.1: `server-final-message = (server-error / verifier)
-        //           ["," extensions]`. Split on the first comma to
-        // isolate the verifier from any trailing `,ext=...`. Pre-fix
-        // base64_decode_bounded on the full tail failed on the first
-        // comma — legitimate extensions caused false
-        // MalformedServerFinal classification.
+        // Accept RFC 5802 extensions. Per §5.1:
+        // `server-final-message = (server-error / verifier) ["," extensions]`.
+        // Split on the first comma to isolate the verifier from any
+        // trailing `,ext=...`. A naive `base64_decode_bounded` on the
+        // full tail fails on the first comma — legitimate extensions
+        // would be misclassified as `MalformedServerFinal`.
         let verifier_b64 = match verifier_tail.split_once(',') {
             Some((head, _ext)) => head,
             None => verifier_tail,
         };
         let decoded = base64_decode_bounded(verifier_b64.as_bytes())?;
-        // DEF-185 P1-B (audit 2026-04-24): use `<[u8; 32]>::try_from`
-        // over `&[u8]` — this infallibly succeeds iff the slice has
-        // length 32, classifying the size mismatch via
-        // `MalformedServerFinal`. Pre-fix: a dead-arm double-get with
+        // Use `<[u8; 32]>::try_from` over `&[u8]` — this infallibly
+        // succeeds iff the slice has length 32, classifying any size
+        // mismatch via `MalformedServerFinal` (tier-2 structural
+        // exact-length narrowing). A naive dead-arm double-get with
         // silent fallback `SecretDigest::new([0; 32])` on impossible
-        // None branches relied on downstream `ct_eq` rejecting the
-        // all-zero signature — fail-closed BY ACCIDENT (tier-4 per
-        // CREDO §7 ось 12). Post-fix: tier-2 structural via TryFrom.
+        // None branches would rely on downstream `ct_eq` rejecting
+        // the all-zero signature — fail-closed by accident (tier-4
+        // per CREDO §7 ось 12).
         let sig_bytes: [u8; 32] = <[u8; 32]>::try_from(decoded.as_slice())
             .map_err(|_| ScramError::MalformedServerFinal)?;
         Ok(SecretDigest::new(sig_bytes))
@@ -629,7 +629,7 @@ fn base64_decode_bounded(
 ) -> Result<heapless::Vec<u8, MAX_SALT_LEN>, ScramError> {
     use base64ct::{Base64, Encoding};
 
-    // DEF-185 P2-H (audit 2026-04-24): strict RFC 4648 decode.
+    // Strict RFC 4648 decode.
     //
     // `base64ct::Base64` is branchless + constant-time-audited and
     // enforces RFC 4648 §4 alphabet strictly — any whitespace,
@@ -695,14 +695,14 @@ pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NON
 
 /// Test-only nonce generator with deterministic injection.
 ///
-/// DEF-185 P3-4 (audit 2026-04-24): also supports `FORCE_RNG_FAILURE`
-/// thread-local flag — when set, the test path short-circuits to
-/// `Err(RandomnessUnavailable)` without calling `getrandom`. This
-/// lets tests exercise the RNG-failure classification path that is
-/// otherwise unreachable (getrandom rarely fails on test hosts).
+/// Also supports the `FORCE_RNG_FAILURE` thread-local flag — when
+/// set, the test path short-circuits to `Err(RandomnessUnavailable)`
+/// without calling `getrandom`. This lets tests exercise the
+/// RNG-failure classification path that is otherwise unreachable
+/// (getrandom rarely fails on test hosts).
 #[cfg(test)]
 pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
-    // DEF-185 P3-4: check forced-failure flag first.
+    // Check forced-failure flag first.
     let forced = FORCE_RNG_FAILURE.with(|cell| *cell.borrow());
     if forced {
         return Err(ScramError::RandomnessUnavailable);
@@ -738,15 +738,14 @@ pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NON
 std::thread_local! {
     static FIXED_TEST_NONCE: std::cell::RefCell<Option<std::string::String>> =
         const { std::cell::RefCell::new(None) };
-    /// DEF-185 P3-4: thread-local flag to force
-    /// `generate_client_nonce` to return `Err(RandomnessUnavailable)`
-    /// without calling `getrandom`. Lets tests exercise the
-    /// RNG-failure classification path.
+    /// Thread-local flag to force `generate_client_nonce` to return
+    /// `Err(RandomnessUnavailable)` without calling `getrandom`.
+    /// Lets tests exercise the RNG-failure classification path.
     static FORCE_RNG_FAILURE: std::cell::RefCell<bool> =
         const { std::cell::RefCell::new(false) };
 }
 
-/// DEF-185 P3-4: RAII guard for `FORCE_RNG_FAILURE`.
+/// RAII guard for `FORCE_RNG_FAILURE`.
 ///
 /// Mirrors [`ScopedTestNonce`] pattern for panic-safe cleanup.
 /// Constructing installs the flag; Drop clears it.
@@ -781,7 +780,7 @@ impl Drop for ScopedForceRngFailure {
 /// actually call it; the earlier `pub` was a dead-code-lint
 /// workaround from before the test-vector scaffolding landed.
 ///
-/// # DEF-185 P1-I (audit 2026-04-24): prefer [`ScopedTestNonce::new`]
+/// # Prefer [`ScopedTestNonce::new`]
 ///
 /// This function sets the thread-local without an automatic cleanup
 /// path. A test that calls `set_test_nonce(..)` and then panics
@@ -801,8 +800,7 @@ pub(crate) fn set_test_nonce(nonce: &str) {
     });
 }
 
-/// DEF-185 P1-I (audit 2026-04-24): RAII guard for
-/// [`FIXED_TEST_NONCE`] injection.
+/// RAII guard for [`FIXED_TEST_NONCE`] injection.
 ///
 /// Construct via [`ScopedTestNonce::new(nonce)`]; the constructor
 /// installs the nonce in the thread-local, and the Drop impl clears
@@ -894,10 +892,10 @@ mod tests {
     //!
     //! Test nonce injection (`ScopedTestNonce` / `FIXED_TEST_NONCE`)
     //! is exercised here — also serves as the "caller" that kills
-    //! the `dead_code` lint on the injection surface. DEF-185 P1-I
-    //! migrated this test from raw `set_test_nonce` + manual cleanup
-    //! to the RAII-guard pattern; a panic mid-test now cannot leak
-    //! a stale nonce into the next test on the same thread.
+    //! the `dead_code` lint on the injection surface. The RAII-guard
+    //! pattern replaces the prior raw `set_test_nonce` + manual
+    //! cleanup shape so a panic mid-test cannot leak a stale nonce
+    //! into the next test on the same thread.
     use super::{
         ParseU32Error, ScopedForceRngFailure, ScopedTestNonce, ScramError,
         generate_client_nonce, parse_u32,
@@ -906,10 +904,10 @@ mod tests {
     #[test]
     fn fixed_test_nonce_injection_round_trips() {
         let injected = "Fyko+d2lbbFgONRv9qkxdawL";
-        // DEF-185 P1-I: RAII guard — Drop clears the thread-local
-        // even on panic unwind. Pre-fix: manual `set_test_nonce` +
-        // explicit `FIXED_TEST_NONCE.with(..)` cleanup at end-of-test;
-        // a panic between the two would leak state.
+        // RAII guard — Drop clears the thread-local even on panic
+        // unwind. A naive `set_test_nonce` + explicit
+        // `FIXED_TEST_NONCE.with(..)` cleanup at end-of-test would
+        // leak state on any panic between the two calls.
         //
         // Named binding (not `_guard`) per no-underscore-vars user
         // feedback — explicit `drop(guard)` at end is the structural
@@ -941,13 +939,12 @@ mod tests {
         assert_eq!(parse_u32(b"4294967295"), Ok(u32::MAX));
     }
 
-    /// DEF-185 P3-4 (audit 2026-04-24): exercise the
-    /// `RandomnessUnavailable` error path via forced injection.
-    /// Pre-fix: this path was architecturally reachable only if
-    /// `getrandom` failed (rare on test hosts — containers with
-    /// restricted syscalls, /dev/urandom starvation, etc.); no test
-    /// covered it. Post-fix: `ScopedForceRngFailure` RAII guard
-    /// forces the Err branch deterministically.
+    /// Exercise the `RandomnessUnavailable` error path via forced
+    /// injection. The path is architecturally reachable only if
+    /// `getrandom` fails (rare on test hosts — containers with
+    /// restricted syscalls, /dev/urandom starvation, etc.); the
+    /// `ScopedForceRngFailure` RAII guard forces the Err branch
+    /// deterministically.
     #[test]
     fn forced_rng_failure_classifies_as_randomness_unavailable() {
         let guard = ScopedForceRngFailure::new();
