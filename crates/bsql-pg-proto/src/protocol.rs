@@ -2953,70 +2953,23 @@ impl PgProtocol<ActivePhase> {
     /// subsequent mint returns the same ID, surfacing as a
     /// duplicate-correlator failure at the wrapper's pending-replies
     /// table (post-Phase-1c-5).
+    ///
+    /// Tier-3 audit #32 (2026-05-19): delegates to
+    /// [`ActiveInner::next_reply_id`] which mints from the shared
+    /// `PROCESS_REPLY_ID_COUNTER` static (see line 961 — process-
+    /// global uniqueness across all four phases). Pre-audit this
+    /// method maintained a SEPARATE local `static COUNTER` —
+    /// a process-global counter, but distinct from the one used by
+    /// Disconnected/Connecting/ActiveInner. Two PgProtocol instances
+    /// on the same process could therefore mint overlapping IDs
+    /// across phase boundaries (e.g. Disconnected ID 1 on instance A,
+    /// Active ID 1 on instance B). Now closed: every phase mints
+    /// from the same atomic — tier-1 by-construction.
     #[inline]
     pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
     ) -> crate::reply_id::ReplyId<K> {
-        // DEF-270 U (post-bisect fix-up 2026-05-09): static atomic
-        // counter to keep PgProtocol size pin at 520 B. See method
-        // docstring for the bisect rationale.
-        use core::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let raw_old = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // DEF-271 cluster D (2026-05-10): saturation classifier.
-        // Pre-DEF-271 `saturating_add(1)` capped at `u64::MAX` and
-        // returned the duplicate id silently; the atomic itself wraps
-        // to 0 by Rust spec, so subsequent mints cycle through
-        // previously-issued values — the wrapper's pending-replies
-        // table would mis-route server replies to the wrong correlator.
-        // Post-DEF-271 the cold branch detects the saturation point
-        // (`raw_old == u64::MAX`, the value at which the next mint
-        // wraps) and transitions THIS PgProtocol instance to
-        // `Errored(ReplyIdSaturation)`. The duplicate id IS still
-        // returned (caller gets a `ReplyId<K>` carrying `u64::MAX` —
-        // `saturating_add(1)` at `u64::MAX` saturates at `u64::MAX`,
-        // never wrapping to zero, so the `NonZeroU64::new(raw)` Some
-        // arm is taken and the `unwrap_or(MIN)` fallback is dead
-        // here; the docstring previously claimed the saturated value
-        // wrapped to MIN — DEF-280 Bundle J 2026-05-18 audit corrected
-        // that), but the next push attempt sees Errored state and
-        // fails with `ConnectionAlreadyClosed { prior_kind:
-        // ReplyIdSaturation }` — the duplicate never reaches the
-        // server in a usable state.
-        //
-        // Cross-instance duplicate-ID risk after wrap remains tier-2
-        // (separate residue — architect's #1B brand-lifetime closure
-        // deferred to Phase 4+ pending invasive design review).
-        if raw_old == u64::MAX {
-            self.install_errored_replyid_saturation();
-        }
-        // saturating_add(1) prevents wrap to zero (NonZeroU64 niche
-        // violation) at u64::MAX. SAFETY contract: counter starts at
-        // 0, fetch_add returns pre-increment value, then we
-        // saturating_add(1). First call: pre=0, post=1.
-        // NonZeroU64::new(1) is Some; the unwrap_or fallback to MIN is
-        // dead in the non-saturated regime but keeps
-        // `forbid(clippy::unwrap_used)` happy on the proven-dead branch.
-        // In the saturated regime the fallback IS reached but the
-        // returned id is intentionally unusable (Errored state).
-        let raw = raw_old.saturating_add(1);
-        let nz = core::num::NonZeroU64::new(raw)
-            .unwrap_or(core::num::NonZeroU64::MIN);
-        crate::reply_id::ReplyId::from_raw(nz)
-    }
-
-    /// DEF-271 cluster D (2026-05-10): cold-path classifier for the
-    /// `next_reply_id` saturation case. Marked `#[cold]` + `#[inline(never)]`
-    /// so LLVM keeps it off the hot mint path.
-    ///
-    /// DEF-246 Phase 2 (2026-05-16): delegate to
-    /// `PgProtocolInner::install_errored_replyid_saturation` so the
-    /// blanket `impl<P: SealedPhase> PgProtocol<P>::next_reply_id`
-    /// can call the same machinery without an `<ActivePhase>` bound.
-    #[cold]
-    #[inline(never)]
-    fn install_errored_replyid_saturation(&mut self) {
-        self.inner.install_errored_replyid_saturation();
+        self.inner.next_reply_id::<K>()
     }
 
     // DEF-196 (2026-04-28): three-field split. Each cold slot
