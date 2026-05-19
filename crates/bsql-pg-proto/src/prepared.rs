@@ -280,23 +280,24 @@ row_decode_impl!(16, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9
 /// [`new_prepared_query`] which has `#[doc(hidden)]` visibility and
 /// is unstable; the only sanctioned consumer is the macro itself.
 ///
-/// # Tier-1 SQL-injection closure (memo §7)
+/// # Tier-1 SQL-injection closure
 ///
 /// External crates cannot construct or mutate this struct because:
-/// - **P1/P9** — all fields are `pub(crate)`; struct-literal
-///   construction from outside is `error[E0451]`.
-/// - **P2** — no inherent `new()` method exists.
-/// - **P3** — fields are `pub(crate)`; field access is `error[E0616]`.
-/// - **P6** — the macro accepts only `syn::LitStr` input.
-/// - **P7** — tuple types are nominally distinct; arg/queries with
+/// - all fields are `pub(crate)`; struct-literal construction from
+///   outside is `error[E0451]`.
+/// - no inherent `new()` method exists.
+/// - field access from outside the crate is `error[E0616]`.
+/// - the macro accepts only `syn::LitStr` input.
+/// - tuple types are nominally distinct; args / queries with
 ///   mismatched parameter tuples fail to type-check at the
 ///   `execute_prepared` boundary.
-/// - **P8** — `ParamsWriter` and `RowDecode` are sealed.
-/// - **P11** — stmt_name is content-addressed via SHA-256-96.
+/// - `ParamsWriter` and `RowDecode` are sealed.
+/// - `stmt_name` is content-addressed via SHA-256-96.
 ///
-/// P4/P5/P10/P12 are OS-level boundaries (`forbid(unsafe_code)` in
-/// this crate; user-side `unsafe` is the user's contract;
-/// `.rodata` writes segfault). Memo §12 framing.
+/// The remaining hostile-probe surface lives at OS-level
+/// boundaries: `forbid(unsafe_code)` in this crate, user-side
+/// `unsafe` as the user's contract, and `.rodata` writes that
+/// segfault rather than corrupt the prepared-query template.
 ///
 /// # Type parameters
 ///
@@ -337,7 +338,10 @@ where
     /// SQL string, lives in `.rodata` of the consumer crate.
     pub(crate) sql: &'static str,
     /// Content-addressed statement name (SHA-256-96 truncation +
-    /// `bsql_p_` prefix). Memo §7 P11 closure.
+    /// `bsql_p_` prefix). Closes the "predictable stmt-name
+    /// collision across consumers" probe — the digest depends on
+    /// the full SQL text, so two distinct queries cannot share a
+    /// stmt-name without colliding their content addresses.
     pub(crate) stmt_name: &'static str,
     /// Parameter OID list — exactly `Params::COUNT` entries.
     /// Drift-pinned via const-assert (per macro expansion) against
@@ -394,12 +398,12 @@ where
     /// want to inspect the query without re-routing through the
     /// macro. NOT a SQL-injection bypass: the returned `&str` is
     /// `'static` and read-only; the caller cannot route it to
-    /// `Parse`/`SimpleQuery` to mint a hostile prepared statement
+    /// `Parse` / `SimpleQuery` to mint a hostile prepared statement
     /// because the macro is the only path to `PreparedQuery`.
     ///
-    /// Memo §7 P3 framing — pub field reads are E0616 from outside
-    /// the crate; this accessor exposes the data through a typed
-    /// method with documented intent.
+    /// Direct field reads from outside the crate are `error[E0616]`
+    /// against the `pub(crate)` field; this typed accessor exposes
+    /// the data through a documented method with documented intent.
     #[inline]
     #[must_use]
     pub fn sql(&self) -> &'static str {

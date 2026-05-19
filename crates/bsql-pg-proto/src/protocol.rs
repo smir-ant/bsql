@@ -5478,8 +5478,8 @@ impl PgProtocol<ActivePhase> {
     /// Drop fires unconditionally on stack unwind by Rust spec. The
     /// crate runs under `panic = "unwind"` (workspace default); a
     /// downstream binary with `panic = "abort"` is an OS-level
-    /// boundary (process death → TCP RST → server-side teardown;
-    /// stronger than any library mechanism — see memo §3.3).
+    /// boundary (process death → TCP RST → server-side teardown —
+    /// stronger than any library mechanism can offer).
     ///
     /// # Why no FailReply emission here
     ///

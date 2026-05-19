@@ -231,7 +231,8 @@ pub enum ColEvent<'a> {
     },
 }
 
-/// **Mid-row column-cursor state** (memo §3, 16 B inline).
+/// **Mid-row column-cursor state** — 16 B inline (size pinned by
+/// the const-assert below).
 ///
 /// Carries the column-index counter and the in-progress chunked
 /// column's accounting (when streaming a column body that exceeds
@@ -279,12 +280,15 @@ impl RowProgress {
     }
 }
 
-// Compile-time size pin: keep `RowProgress` ≤ 16 B to preserve memo §3
-// budget. 2 + 2 + 4 + 4 = 12 B plus padding to 16 B alignment.
+// Compile-time size pin: keep `RowProgress` ≤ 16 B to fit
+// alongside the rest of `RowStream`'s state without bloating the
+// per-iter_rows stack frame. 2 + 2 + 4 + 4 = 12 B plus padding to
+// 16 B alignment.
 const _: () = assert!(
     core::mem::size_of::<RowProgress>() <= 16,
-    "RowProgress must stay ≤ 16 B per memo §3 footprint budget — \
-     adding a field requires explicit budget review.",
+    "RowProgress must stay ≤ 16 B — \
+     adding a field requires explicit budget review against the \
+     RowStream stack footprint.",
 );
 
 /// **Pull-based column streamer** over a [`PgProtocol`] connection.
@@ -620,8 +624,9 @@ impl<'p, 'w> RowStream<'p, 'w> {
     ///
     /// 1. If `drained`, return `NeedMore`.
     /// 2. If state is Errored, drain + return terminal `EndQuery`
-    ///    with an `Err` outcome carrying the prior cause's classifier
-    ///    (one terminal arm per memo §2.2).
+    ///    with an `Err` outcome carrying the prior cause's
+    ///    classifier (single terminal arm — see [`ColEvent::EndQuery`]
+    ///    for the contract).
     /// 3. If `flush_pending`, consume the trailing `'Z'` silently
     ///    and drain.
     /// 4. Otherwise drive the per-column / per-row / per-frame
