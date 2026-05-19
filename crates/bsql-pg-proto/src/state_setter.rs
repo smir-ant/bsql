@@ -1,21 +1,19 @@
-//! DEF-270 cluster (N-D letter, Phase 2 2026-05-10) — tier-1
-//! state-transition ↔ command-kind pairing.
+//! Tier-1 state-transition ↔ command-kind pairing.
 //!
-//! # Pre-DEF-270 N-D
+//! # Why a witness-typed install surface
 //!
-//! Each `compute_push_*_idle_only` helper received `state: &mut ProtoState`
-//! and wrote `*state = ProtoState::SomeVariant(...)` directly at the
-//! tail of the happy path. Nothing structural prevented a refactor
-//! that, say, transitioned [`crate::state::ProtoState::PingAwaitingRfq`]
-//! at the end of the [`crate::push_command::SimpleQuery`] impl: the
-//! types didn't pair the command kind to its post-state. **Tier-3
-//! by-discipline**: the audit invariant "Ping pushes leave state
-//! `PingAwaitingRfq`, SimpleQuery pushes leave it
-//! `SimpleQueryAwaitingFirstResponse`, …" was upheld by reviewer
-//! attention plus the `compute_push_tests` per-helper transition table.
-//! A swap at an arm body would compile.
+//! Without it, each `compute_push_*_idle_only` helper would receive
+//! `state: &mut ProtoState` and write `*state = ProtoState::SomeVariant(...)`
+//! directly at the tail of the happy path — nothing structural would
+//! prevent a refactor that, say, transitioned
+//! [`crate::state::ProtoState::PingAwaitingRfq`] at the end of the
+//! [`crate::push_command::SimpleQuery`] impl. **Tier-3 by-discipline**:
+//! the audit invariant "Ping pushes leave state `PingAwaitingRfq`,
+//! SimpleQuery pushes leave it `SimpleQueryAwaitingFirstResponse`, …"
+//! would be upheld by reviewer attention plus the `compute_push_tests`
+//! per-helper transition table. A swap at an arm body would compile.
 //!
-//! # Post-DEF-270 N-D
+//! # Current shape
 //!
 //! - [`crate::push_command::PushCommand`] declares
 //!   `type PostState: PostStateProof` per impl. Each impl pairs its
@@ -59,25 +57,25 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
-// DEF-280 Bundle F Phase 1 (2026-05-18) — within-crate hostile-witness closure
+// Within-crate hostile-witness closure
 //
 // The `mod install_body_seal` module below is PRIVATE to `mod state_setter`
 // (no visibility keyword → private to parent). Combined with `InstallBody`
 // having `install_body_seal::InstallBodySealed` as a supertrait, this seals
 // the install-body trait against IN-CRATE callers outside this module.
 //
-// Pre-Bundle-F shape (HISTORICAL — closed by Bundle F, see "Post-Bundle-F"
-// block below; Tier-3 audit #26, 2026-05-19, verified): `PostStateProof:
-// sealed::Sealed { fn install_into(self, &mut ProtoState); }`.
+// Anchor (HISTORICAL — closed by InstallBodySealed private supertrait;
+// Tier-3 audit #26, 2026-05-19, verified): pre-closure the shape was
+// `PostStateProof: sealed::Sealed { fn install_into(self, &mut ProtoState); }`.
 // `sealed::Sealed` is `pub(crate)` (not module-private), so any in-crate module
 // could write `impl Sealed for HostileWitness {} impl PostStateProof for
 // HostileWitness { fn install_into(self, state) { *state = arbitrary_variant; } }`
 // then mint a `StateSetter<HostileWitness>` via the generic `IdleState::into_setter::<W>`
 // and call `setter.install_post_state(HostileWitness)`, dispatching to the
-// hostile body. (Pre-state was tier-2-by-discipline within-crate; post-Bundle-F
-// shape closed below is tier-1-by-construction.)
+// hostile body. Pre-state was tier-2-by-discipline within-crate; current
+// shape below is tier-1-by-construction.
 //
-// Post-Bundle-F: install bodies live in `impl InstallBody for *` blocks here in
+// Current shape: install bodies live in `impl InstallBody for *` blocks here in
 // `mod state_setter`. `InstallBody` has private supertrait `InstallBodySealed`.
 // Any in-crate caller outside state_setter attempting `impl InstallBody for
 // HostileWitness` fails E0277 (HostileWitness: InstallBodySealed not satisfied),
@@ -85,7 +83,7 @@ pub(crate) mod sealed {
 // (mod install_body_seal is private to state_setter). Tier-1-by-construction
 // within-crate.
 //
-// `PostStateProof` becomes a pure marker (no method). It survives only for the
+// `PostStateProof` is a pure marker (no method). It survives for the
 // `#[diagnostic::on_unimplemented]` UX message and as the publicly-named
 // trait that PushCommand impls can satisfy at declaration time. The actual
 // installation surface is `InstallBody`, with bound tightened on
@@ -114,8 +112,7 @@ mod install_body_seal {
 /// `type PostState` declaration in the [`crate::push_command::PushCommand`]
 /// impl.
 //
-// DEF-270 N-D follow-up (rust-version 1.78 modernisation):
-// structural diagnostic for crate-internal contributors. The
+// Structural diagnostic for crate-internal contributors. The
 // PostStateProof set is closed at the crate boundary; the
 // witness-pairing rule is in module docs but a bare bound failure
 // is unactionable. Routes contributors to the matching `*Install`
@@ -123,12 +120,10 @@ mod install_body_seal {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a `PostStateProof` witness for a `PushCommand` post-state install",
     label = "valid witnesses live next to their command in `push_command.rs` (e.g. `PingAwaitingRfqInstall` for `Ping`, `StartupAwaitingAuthRequestInstall` for `Startup`, etc.)",
-    note = "`PostStateProof` is sealed crate-internal — each witness corresponds 1:1 to a `ProtoState` variant. To add a new command, define its struct in `push_command.rs` and add the matching `*Install` witness type with `impl PostStateProof` next to it (DEF-270 N-D pattern). The accompanying [`InstallBody`] impl must be added in `state_setter.rs` (DEF-280 Bundle F)."
+    note = "`PostStateProof` is sealed crate-internal — each witness corresponds 1:1 to a `ProtoState` variant. To add a new command, define its struct in `push_command.rs` and add the matching `*Install` witness type with `impl PostStateProof` next to it. The accompanying [`InstallBody`] impl must be added in `state_setter.rs`."
 )]
 pub(crate) trait PostStateProof: sealed::Sealed {
-    // DEF-280 Bundle F Phase 1: `fn install_into(self, state: &mut ProtoState)`
-    // moved to private [`InstallBody`] trait below. `PostStateProof` is now
-    // a pure marker — preserved for the `#[diagnostic::on_unimplemented]`
+    // Pure marker — preserved for the `#[diagnostic::on_unimplemented]`
     // UX message and as the publicly-named trait satisfied by `*Install`
     // witnesses in `push_command.rs`. The actual install surface
     // (`fn install(self, &mut ProtoState)`) lives on `InstallBody`, whose
@@ -151,16 +146,15 @@ pub(crate) trait PostStateProof: sealed::Sealed {
 ///
 /// ## Bound at consumer surfaces
 ///
-/// Tightened from `PostStateProof` → `InstallBody` on:
-/// - [`StateSetter::install_post_state`] (was the attacker-controllable
-///   dispatch site pre-Bundle-F)
+/// `InstallBody` (not `PostStateProof`) is the bound on:
+/// - [`StateSetter::install_post_state`] (the attacker-controllable
+///   dispatch site)
 /// - [`StateSetter::install_errored`] (mirror closure on the failure
-///   transition; pre-Bundle-F any in-crate `StateSetter<HostileWitness>`
+///   transition; without it, any in-crate `StateSetter<HostileWitness>`
 ///   could flip state to `Errored(_)` — limited blast radius but the
-///   same zombie-class hazard the audit table at lines 199-211
-///   was built to close on the feed-side)
+///   same zombie-class hazard the feed-side closure prevents)
 /// - [`IdleState::into_setter`] (declaration boundary closure: minting
-///   a `StateSetter<HostileWitness>` itself is now E0277 unless
+///   a `StateSetter<HostileWitness>` itself is E0277 unless
 ///   `HostileWitness: InstallBody` — unreachable for any non-state_setter
 ///   author)
 /// - [`crate::push_command::PushCommand::PostState`] associated type bound
@@ -204,33 +198,22 @@ pub(crate) struct StateSetter<'a, W: InstallBody> {
 }
 
 impl<'a, W: InstallBody> StateSetter<'a, W> {
-    /// Construct a new setter. **DEF-272 cluster γ (2026-05-10)**:
-    /// constructor is `pub(in crate::state_setter)` — only callable
-    /// from inside this module. The legitimate path to mint a setter
-    /// is [`IdleState::into_setter`], which structurally binds the
+    /// Construct a new setter. The constructor is
+    /// `pub(in crate::state_setter)` — only callable from inside this
+    /// module. The legitimate path to mint a setter is
+    /// [`IdleState::into_setter`], which structurally binds the
     /// `state == Idle` precondition via the typestate's `try_from`
     /// runtime check.
     ///
-    /// # Pre-γ (DEF-271 cluster A)
+    /// # Tier-1 closure
     ///
-    /// Constructor was `pub(crate) fn new(state, _proof: IdleStateProof)`.
-    /// `IdleStateProof::new()` was itself `pub(crate)` — any in-crate
-    /// caller could mint a proof regardless of actual state, then pair
-    /// with a non-Idle `&mut state` and trigger the Errored transition
-    /// from a non-Idle state (zombie-reply class). Tier-2
-    /// by-discipline within-crate; the precondition was a `debug_assert!`
-    /// (skipped in release).
-    ///
-    /// # Post-γ
-    ///
-    /// Constructor is private to `mod state_setter`. The only path to
-    /// a `StateSetter<'a, W>` value is [`IdleState::into_setter`]; the
-    /// only path to an [`IdleState<'a>`] is [`IdleState::try_from`],
-    /// which performs a runtime `matches!(state, ProtoState::Idle)`
-    /// check and returns `None` for non-Idle states. Tier-1
-    /// by-construction — pairing a proof with a non-Idle state is
-    /// impossible (the typestate IS the state borrow + the Idle proof,
-    /// inseparable).
+    /// The only path to a `StateSetter<'a, W>` value is
+    /// [`IdleState::into_setter`]; the only path to an
+    /// [`IdleState<'a>`] is [`IdleState::try_from`], which performs a
+    /// runtime `matches!(state, ProtoState::Idle)` check and returns
+    /// `None` for non-Idle states. Pairing a proof with a non-Idle
+    /// state is impossible by construction — the typestate IS the
+    /// state borrow + the Idle proof, inseparable.
     #[inline]
     pub(in crate::state_setter) fn new(state: &'a mut ProtoState) -> Self {
         Self {
@@ -269,11 +252,10 @@ impl<'a, W: InstallBody> StateSetter<'a, W> {
     ///
     /// Caller (the `try_builder!` macro) MUST ensure prev state was
     /// `Idle` — otherwise the previous variant's embedded `ReplyId`
-    /// would leak (zombie-class regression, mirror of the pre-DEF-186
-    /// `compute_push_*` perf-recovery audit). All current call sites
+    /// would leak (zombie-class regression). All current call sites
     /// are inside `Idle` arms of `compute_push_*_idle_only`; the
-    /// macro carries a `debug_assert!(state == Idle)` that mirrors
-    /// the pre-Phase 2 macro's same assertion.
+    /// macro carries a `debug_assert!(state == Idle)` for redundant
+    /// runtime confirmation.
     #[inline]
     pub(crate) fn install_errored(self, kind: StateErrorKind) {
         *self.state = ProtoState::Errored(kind);
@@ -281,18 +263,18 @@ impl<'a, W: InstallBody> StateSetter<'a, W> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-271 cluster A (2026-05-10) — feed-side state setter
+// Feed-side state setter
 //
 // Symmetric to push-side [`StateSetter<'_, W>`]. Mutates `ProtoState`
 // from feed-side dispatch / RowStream fast-paths via a single typed
 // surface that **atomically drains any in-flight reply id during the
 // transition to Errored**, returning it to the caller via a
-// `#[must_use]` Option. Pre-DEF-271 the feed-side `install_errored_*`
-// helpers wrote `*self.state = ProtoState::Errored(...)` directly and
-// the in-flight id was peeked separately at an earlier dispatch site —
-// a tier-3 dual-source-of-truth audit risk (peek-id vs would-be-drained-
-// id could diverge under refactor; the diverged path leaks the user's
-// oneshot-receiver as the **zombie-reply class**).
+// `#[must_use]` Option. Without the atomic drain + install pairing,
+// the in-flight id would have to be peeked separately at an earlier
+// dispatch site — a tier-3 dual-source-of-truth audit risk
+// (peek-id vs would-be-drained-id could diverge under refactor;
+// the diverged path leaks the user's oneshot-receiver as the
+// **zombie-reply class**).
 // ═════════════════════════════════════════════════════════════════════
 
 /// Tier-1 witness binding a mutable borrow of [`ProtoState`] to a
@@ -332,12 +314,12 @@ pub(crate) struct FeedStateSetter<'a> {
 }
 
 impl<'a> FeedStateSetter<'a> {
-    /// Construct a new feed-side setter. **DEF-272 cluster δ (2026-05-10)**:
-    /// constructor is `pub(in crate::state_setter)` — only callable
-    /// from inside this module. Legitimate construction goes through
-    /// the per-call-site free fns below ([`drain_at_replyid_saturation`]
-    /// and friends), each of which requires a per-call-site concrete
-    /// token type whose mint is gated to a specific leaf submodule in
+    /// Construct a new feed-side setter. The constructor is
+    /// `pub(in crate::state_setter)` — only callable from inside this
+    /// module. Legitimate construction goes through the per-call-site
+    /// free fns below ([`drain_at_replyid_saturation`] and friends),
+    /// each of which requires a per-call-site concrete token type
+    /// whose mint is gated to a specific leaf submodule in
     /// `mod protocol`.
     #[inline]
     pub(in crate::state_setter) fn new(state: &'a mut ProtoState) -> Self {
@@ -354,10 +336,7 @@ impl<'a> FeedStateSetter<'a> {
     /// `mem::replace` is the single atomic step: there is no partial
     /// state observable by an external borrower (`PgProtocol` is
     /// `!Sync`; the `&mut self` borrow chain rules out concurrent
-    /// observers). Pre-DEF-271 the feed-side install_errored_* helpers
-    /// transitioned without draining — the caller used a separately-
-    /// peeked id at the dispatch site, a tier-3 dual-source-of-truth
-    /// risk. Post-DEF-271 the drain and install are the same step, the
+    /// observers). The drain and install are the same step, the
     /// returned id is the **only** id the caller can use, and the
     /// `#[must_use]` lint rejects leaks at build time.
     ///
@@ -392,32 +371,33 @@ impl<'a> FeedStateSetter<'a> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-272 cluster δ (2026-05-10) — per-call-site token-gated FeedStateSetter constructors
+// Per-call-site token-gated FeedStateSetter constructors
 //
 // `FeedStateSetter::new` is `pub(in crate::state_setter)`; legitimate
-// construction goes through the 4 free fns below, each requiring a
+// construction goes through the free fns below, each requiring a
 // distinct concrete-type token whose mint is gated to a specific leaf
-// submodule in `mod protocol`. Same closure pattern as cluster α/β:
-// the token's tuple-struct field is private to its leaf, so `Self(())`
-// mints are callable ONLY inside the leaf submodule. Hostile in-crate
-// (outside the leaf) attempting to call any `drain_at_*` fn cannot
-// supply the required token type — type system rejects.
+// submodule in `mod protocol`. The token's tuple-struct field is
+// private to its leaf, so `Self(())` mints are callable ONLY inside
+// the leaf submodule. Hostile in-crate (outside the leaf) attempting
+// to call any `drain_at_*` fn cannot supply the required token
+// type — type system rejects.
 //
-// Pre-δ (HISTORICAL — closed by cluster δ, see "Post-δ" line below;
-// Tier-3 audit #26, 2026-05-19, verified): `FeedStateSetter::new` was
-// `pub(crate)`; any in-crate caller could mint a setter and trigger
-// `drain_and_install_errored` to transition any state to Errored.
-// (Pre-state was tier-2-by-discipline within-crate.)
-// Post-δ the call surface is exactly 4 named entry points, each
-// gated by its concrete-type token. Tier-1 within-crate by-construction.
+// Anchor (HISTORICAL — closed by per-leaf token gating; Tier-3 audit
+// #26, 2026-05-19, verified): pre-closure, `FeedStateSetter::new`
+// was `pub(crate)`; any in-crate caller could mint a setter and
+// trigger `drain_and_install_errored` to transition any state to
+// Errored. Pre-state was tier-2-by-discipline within-crate.
+// Post-closure the call surface is exactly the leaf entry points
+// below, each gated by its concrete-type token. Tier-1 within-crate
+// by-construction.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-272 cluster δ leaf entry point: ReplyId saturation transition.
-/// Used by `PgProtocol::install_errored_replyid_saturation` (the
-/// only legitimate caller; saturation classifier per cluster D).
-/// Returns the drained in-flight reply id if any (None for `Idle` /
-/// `Errored` / `DrainRfqAfterError` prior states — saturation can
-/// fire from any state).
+/// Leaf entry point: ReplyId saturation transition. Used by
+/// `PgProtocol::install_errored_replyid_saturation` (the only
+/// legitimate caller; saturation classifier per the saturation
+/// cluster). Returns the drained in-flight reply id if any (None
+/// for `Idle` / `Errored` / `DrainRfqAfterError` prior states —
+/// saturation can fire from any state).
 #[inline]
 #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id (if any) \
               released by the saturation transition. Caller is `install_errored_replyid_saturation` \
@@ -431,9 +411,9 @@ pub(crate) fn drain_at_replyid_saturation(
     FeedStateSetter::new(state).drain_and_install_errored(kind)
 }
 
-/// DEF-272 cluster δ leaf entry point: read-cursor advance failure
-/// transition. Used by `PgProtocol::install_errored_read_cursor_advance`
-/// (the only legitimate caller; classified as
+/// Leaf entry point: read-cursor advance failure transition. Used
+/// by `PgProtocol::install_errored_read_cursor_advance` (the only
+/// legitimate caller; classified as
 /// `CrateBugLocus::ReadCursorAdvance`).
 #[inline]
 #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
@@ -447,8 +427,7 @@ pub(crate) fn drain_at_read_cursor_advance(
     FeedStateSetter::new(state).drain_and_install_errored(kind)
 }
 
-/// DEF-280 Bundle K (2026-05-18) leaf entry point: partial-mode
-/// re-entry detection. Used by
+/// Leaf entry point: partial-mode re-entry detection. Used by
 /// `PgProtocol::install_errored_partial_mode_reentry` (the only
 /// legitimate caller; classified as
 /// `CrateBugLocus::PartialModeReentry`).
@@ -464,10 +443,9 @@ pub(crate) fn drain_at_partial_mode_reentry(
     FeedStateSetter::new(state).drain_and_install_errored(kind)
 }
 
-/// DEF-280 Bundle K-mirror (2026-05-18) leaf entry point:
-/// partial-mode exit-with-bytes-owed detection. Used by
-/// `PgProtocol::install_errored_partial_mode_exit_undrained` (the only
-/// legitimate caller; classified as
+/// Leaf entry point: partial-mode exit-with-bytes-owed detection.
+/// Used by `PgProtocol::install_errored_partial_mode_exit_undrained`
+/// (the only legitimate caller; classified as
 /// `CrateBugLocus::PartialModeExitUndrained`).
 #[inline]
 #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
@@ -481,8 +459,8 @@ pub(crate) fn drain_at_partial_mode_exit_undrained(
     FeedStateSetter::new(state).drain_and_install_errored(kind)
 }
 
-/// DEF-272 cluster δ leaf entry point: malformed-DataRow transition.
-/// Used by `PgProtocol::install_errored_malformed_data_row` (the only
+/// Leaf entry point: malformed-DataRow transition. Used by
+/// `PgProtocol::install_errored_malformed_data_row` (the only
 /// legitimate caller; classified as
 /// `ProtocolError::MalformedDataRow`).
 #[inline]
@@ -496,10 +474,10 @@ pub(crate) fn drain_at_malformed_data_row(
     FeedStateSetter::new(state).drain_and_install_errored(kind)
 }
 
-/// DEF-272 cluster δ leaf entry point: dispatch fail-inflight-no-readbuf
-/// transition. Used by `protocol::fail_inflight_no_readbuf` (the only
-/// legitimate caller; routes any `ProtocolError` cause that fires
-/// during dispatch when a read-buf state is unavailable).
+/// Leaf entry point: dispatch fail-inflight-no-readbuf transition.
+/// Used by `protocol::fail_inflight_no_readbuf` (the only legitimate
+/// caller; routes any `ProtocolError` cause that fires during
+/// dispatch when a read-buf state is unavailable).
 #[inline]
 #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
               by the Errored install. Caller emits FailReply with the cause."]
@@ -511,9 +489,9 @@ pub(crate) fn drain_at_fail_inflight_no_readbuf(
     FeedStateSetter::new(state).drain_and_install_errored(kind)
 }
 
-/// DEF-248 Sub-A (2026-05-12) leaf entry point: RowStream Drop fired
-/// while the stream was mid-frame (column events still pending or
-/// partial-frame mode active). Used by
+/// Leaf entry point: RowStream Drop fired while the stream was
+/// mid-frame (column events still pending or partial-frame mode
+/// active). Used by
 /// [`crate::PgProtocol::install_errored_stream_dropped_mid_stream`]
 /// from inside [`crate::row_stream::RowStream::drop`]; classified as
 /// [`crate::error::CrateBugLocus::StreamDroppedMidStream`].
@@ -543,17 +521,16 @@ pub(crate) fn drain_at_stream_dropped_mid_stream(
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-272 cluster γ (2026-05-10) — IdleState lifetime-bound typestate
+// IdleState lifetime-bound typestate
 //
-// Replaces the legacy [`crate::guard::IdleStateProof`] (DEF-198 ext +
-// DEF-271 cluster A). Pre-γ (HISTORICAL — closed by cluster γ, see
-// "Post-γ" block below; Tier-3 audit #26, 2026-05-19, verified): the
-// proof was a ZST with `pub(crate) const fn new()` — anyone in-crate
-// could mint a proof regardless of actual state, then pair it with
-// a `&mut ProtoState` for a different state. (Pre-state was tier-2-
-// by-discipline within-crate.)
+// Anchor (HISTORICAL — closed by lifetime-bound typestate; Tier-3
+// audit #26, 2026-05-19, verified): pre-closure the proof was a ZST
+// with `pub(crate) const fn new()` — anyone in-crate could mint a
+// proof regardless of actual state, then pair it with a `&mut
+// ProtoState` for a different state. Pre-state was tier-2-by-
+// discipline within-crate.
 //
-// Post-γ the typestate IS the state borrow + the Idle proof,
+// Current shape: the typestate IS the state borrow + the Idle proof,
 // inseparable. Construction via [`IdleState::try_from`] performs a
 // runtime `matches!(state, ProtoState::Idle)` check. The returned
 // `Option<Self>` is `None` for non-Idle states. The mut borrow
@@ -613,7 +590,7 @@ impl<'a> IdleState<'a> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-280 Bundle F Phase 1 (2026-05-18) — InstallBody impls
+// InstallBody impls
 //
 // All 7 install bodies live HERE (not in push_command.rs) because
 // `mod install_body_seal::InstallBodySealed` is private to state_setter.
@@ -621,11 +598,6 @@ impl<'a> IdleState<'a> {
 // for *Install` fails E0277 (witness: InstallBodySealed not satisfied),
 // because writing `impl InstallBodySealed for witness` fails E0603
 // (mod install_body_seal unreachable). Tier-1 within-crate by-construction.
-//
-// Pre-Bundle-F these bodies lived inside `impl PostStateProof for *Install`
-// blocks in push_command.rs, where any in-crate author could mint a
-// HostileWitness and supply an arbitrary `install_into` body. The trait
-// split moves the install-code authority to state_setter alone.
 //
 // Each witness type's fields are `pub(crate)`, so state_setter can read
 // them. The Cargo cross-module type reference (state_setter → push_command
@@ -724,10 +696,9 @@ mod tests {
         // Anchor for `git grep "state_setter.*seal"` searches.
     }
 
-    /// DEF-280 Bundle F Phase 1 (2026-05-18) — InstallBody seal pin
-    /// anchor. The `mod install_body_seal` module is PRIVATE to
-    /// `mod state_setter` (no visibility keyword). External crates AND
-    /// in-crate siblings cannot reach
+    /// InstallBody seal pin anchor. The `mod install_body_seal`
+    /// module is PRIVATE to `mod state_setter` (no visibility keyword).
+    /// External crates AND in-crate siblings cannot reach
     /// `state_setter::install_body_seal::InstallBodySealed`, so
     /// `impl InstallBody for HostileWitness` is structurally rejected
     /// (E0277: HostileWitness: InstallBodySealed not satisfied; the
@@ -736,7 +707,7 @@ mod tests {
     /// blocks live in this file (above the `tests` module).
     ///
     /// Negative-bound regression pin: see `push_command::tests::
-    /// bundle_f_hostile_witness_install_body_absent` — uses the no-dep
+    /// hostile_witness_install_body_absent_anchor` — uses the no-dep
     /// ambiguous-blanket-impl trick (mirror of `lib.rs:535`'s
     /// `assert_not_sync`) to assert at compile time that a HostileWitness
     /// constructed outside state_setter cannot satisfy InstallBody.
