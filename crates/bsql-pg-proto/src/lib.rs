@@ -4,10 +4,11 @@
 //! It contains zero I/O, zero `alloc`, zero async runtime. The same state
 //! machine drives:
 //!
-//! - the production async wrapper (`bsql-driver-postgres`, Phase 1e), where
-//!   it lives inside a tokio task that owns a `TcpStream` + `mpsc` channel;
-//! - the proc-macro online client (Phase 2), where it lives inside a
-//!   blocking helper executed during `cargo build`;
+//! - the production async wrapper (`bsql-driver-postgres`), where it
+//!   lives inside a tokio task that owns a `TcpStream` + `mpsc`
+//!   channel;
+//! - the proc-macro online client, where it lives inside a blocking
+//!   helper executed during `cargo build`;
 //! - test harnesses, where it is driven directly by feeding bytes.
 //!
 //! Architectural promises (CREDO §0):
@@ -23,20 +24,13 @@
 //!   plus a `PhantomData<core::cell::Cell<()>>` field on [`PgProtocol`]
 //!   guarantee `!Sync`. See reforge.md §52.
 //!
-//! # Phase 1a scope
+//! # Scope policy
 //!
-//! Only the **Ping** flow is implemented. The state machine starts in
-//! [`ProtoState::Idle`] (assumed already authenticated by an upstream layer
-//! that does not yet exist). A [`PgCommand::Ping`] emits a `Sync` frame on
-//! the wire; the matching `ReadyForQuery` reply transitions back to `Idle`
-//! and emits a [`Reply::Pong`] on the user's [`ReplyId`].
-//!
-//! Other variants of `ProtoState`, `PgCommand`, `Action`, and `Reply`
-//! are **deliberately omitted**. Per reforge.md §3.5 / §4.6, manufactured
-//! variants without entry/exit code are forbidden — they masquerade as
-//! tier-1 invariants while delivering tier-4 ("happens not to fail")
-//! protection. Variants land in the commit that implements their driving
-//! code end-to-end.
+//! Per reforge.md §3.5 / §4.6, manufactured variants of `ProtoState`,
+//! `PgCommand`, `Action`, and `Reply` without entry/exit code are
+//! forbidden — they masquerade as tier-1 invariants while delivering
+//! tier-4 ("happens not to fail") protection. Variants land in the
+//! commit that implements their driving code end-to-end.
 //!
 //! # Module layout
 //!
@@ -72,31 +66,29 @@
     clippy::arithmetic_side_effects,
     clippy::float_arithmetic,
     clippy::integer_division,
-    // DEF-184 (B18): even with `as` cast banned, infallible
-    // `From`/`try_from` can be subtly wrong if a narrowing happens
-    // at the type level (e.g. `i32 → u32` sign loss, `u64 → usize`
-    // on 32-bit targets). Tier-1 compile guard catches these.
+    // Even with `as` cast banned, infallible `From`/`try_from` can
+    // be subtly wrong if a narrowing happens at the type level
+    // (e.g. `i32 → u32` sign loss, `u64 → usize` on 32-bit targets).
+    // Tier-1 compile guard catches these.
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
     clippy::float_cmp,
-    // DEF-211 SAFE-05 (audit 2026-05-04, 5th-pass architect-agent):
-    // `clippy::let_underscore_must_use` catches `let _ = fn()` where
-    // the result carries a `#[must_use]` contract. The sibling
-    // `let_underscore_drop` was renamed/moved to a rustc lint —
-    // see the `#![deny(let_underscore_drop)]` line below. Tier-1
-    // closes the silent-discard class at build time; no production
-    // callsites trip these today (`cargo clippy` clean post-add).
+    // `clippy::let_underscore_must_use` catches `let _ = fn()`
+    // where the result carries a `#[must_use]` contract. The
+    // sibling `let_underscore_drop` was renamed/moved to a rustc
+    // lint — see the `#![deny(let_underscore_drop)]` line below.
+    // Tier-1 closes the silent-discard class at build time.
     clippy::let_underscore_must_use
 )]
-// DEF-211 SAFE-05 (continued): rustc-namespace `let_underscore_drop`
-// moved out of `clippy::*` after Rust 1.69. Catches the explicit
-// `let _ = drop_chain_value` form where the value's `Drop::drop`
-// still fires (so it is NOT a "leak" of secrets — `ZeroizeOnDrop`
-// chains still run) but the immediate discard is structurally
-// suspicious (a `let _binding = ...` or `drop(value)` makes the
-// intent explicit). Distinct from `unused_must_use` (which fires
-// on the call expression, not the let-pattern).
+// Rustc-namespace `let_underscore_drop` moved out of `clippy::*`
+// after Rust 1.69. Catches the explicit `let _ = drop_chain_value`
+// form where the value's `Drop::drop` still fires (so it is NOT a
+// "leak" of secrets — `ZeroizeOnDrop` chains still run) but the
+// immediate discard is structurally suspicious (a `let _binding =
+// ...` or `drop(value)` makes the intent explicit). Distinct from
+// `unused_must_use` (which fires on the call expression, not the
+// let-pattern).
 #![deny(let_underscore_drop)]
 #![deny(
     unused_must_use,
@@ -107,32 +99,28 @@
 )]
 #![warn(missing_debug_implementations, missing_copy_implementations)]
 
-// DEF-187 (architect 2026-04-26): committed `alloc` baseline.
-//
 // `bsql-pg-proto` is `no_std + alloc`. The crate uses `Box<T>` once
 // per connection during SCRAM-SHA-256 handshake to externalise
 // password-bearing session data; this enables a 9× reduction in
 // `ProtoState` size (712 → ~80 B) and corresponding hot-path latency
 // improvement on row streaming. Embedded targets without an
-// allocator should use Trust-auth (no Box allocated) or stay on a
-// pre-DEF-187 release.
+// allocator should use Trust-auth (no Box allocated).
 //
 // Trade-off documented per CREDO §4 (user-land крейты могут зависеть
-// от alloc, когда обоснованно). Feature-gating evaluated and rejected:
-// doubles test surface for the embedded-SCRAM use case which doesn't
-// exist in practice.
+// от alloc, когда обоснованно). Feature-gating evaluated and
+// rejected: doubles test surface for the embedded-SCRAM use case
+// which doesn't exist in practice.
 extern crate alloc;
 
-// DEF-233 (2026-05-04): self-alias enables generated code from
-// `bsql-pg-proto-derive` (e.g. `#[derive(Pristine)]`) to reference
+// Self-alias enables generated code from `bsql-pg-proto-derive`
+// (e.g. `#[derive(Pristine)]`) to reference
 // `::bsql_pg_proto::pristine::Pristine` via its absolute path —
 // resolves the same way both inside this crate AND in downstream
 // user crates. Standard Rust derive-pair convention (mirror
 // `serde`'s `extern crate self as serde;` at its lib root).
 extern crate self as bsql_pg_proto;
 
-// DEF-211 SAFE-02 (audit 2026-05-04, 5th-pass architect-agent):
-// **transitive-`unsafe` audit-trust chain**.
+// **Transitive-`unsafe` audit-trust chain**.
 //
 // `bsql-pg-proto` itself uses `#![forbid(unsafe_code)]` (line 61).
 // Every line of crate-internal Rust is `unsafe`-free by build-time
@@ -149,8 +137,8 @@ extern crate self as bsql_pg_proto;
 //    downloads/month, multiple production users including
 //    `simd-json`). Behaviour parity with `core::str::from_utf8`
 //    is property-tested upstream; we treat the validation
-//    boundary as authoritative. Bench (DEF-202): 2-4× speedup
-//    on Cyrillic / long-ASCII rows.
+//    boundary as authoritative. Benchmarked at 2-4× speedup on
+//    Cyrillic / long-ASCII rows vs `core::str::from_utf8`.
 //    **Scope of trust**: validate `simdutf8::basic::from_utf8`
 //    contract on every PG release. Failure mode: misclassified
 //    text → `DecodeError::NonUtf8` (tier-3, classified). Never
@@ -167,17 +155,15 @@ extern crate self as bsql_pg_proto;
 //    >= per-site budgets) ensure the heapless capacity is
 //    sufficient under our usage patterns.
 //
-//    **DEF-211 SAFE-01 / SAFE-01' REJECTED 2026-05-04** — see
-//    `deferred.md §B "Verified load-bearing (architect's concern
-//    falsified)"` entry for the full pre-implementation post-mortem.
-//    Two structural blockers:
-//    (a) Per-call init cost catastrophic — `[T; N]` POD-array storage
-//        eagerly initialises all N slots at construction; for per-call
-//        types (`StagedActions = [StagedAction; 8]` ≈ 704 B,
-//        `OutActions = [Action; 9]` ≈ 792 B) this ships ~700 B memset
-//        per push_command/feed_bytes call → projected +30-50% on
-//        push_command/ping_amortised (10.28 → 13-15 ns), violates the
-//        Q2 bench gate (max +3% on existing benches).
+//    **Replacement with locally-audited POD-array shape rejected**
+//    by two structural blockers:
+//    (a) Per-call init cost catastrophic — `[T; N]` POD-array
+//        storage eagerly initialises all N slots at construction;
+//        for per-call types (`StagedActions = [StagedAction; 8]` ≈
+//        704 B, `OutActions = [Action; 9]` ≈ 792 B) this ships ~700
+//        B memset per push_command/feed_bytes call → projected
+//        +30-50% on push_command/ping_amortised (10.28 → 13-15 ns),
+//        violates the bench gate (max +3% on existing benches).
 //    (b) `MaybeUninit`-based skip-init alternative requires
 //        crate-internal `unsafe { assume_init_read }` — breaks
 //        `#![forbid(unsafe_code)]` at the architectural-rule level
@@ -185,12 +171,11 @@ extern crate self as bsql_pg_proto;
 //        replacing ecosystem-trusted code (~1000 LoC well-audited
 //        embedded-Rust standard) with locally-audited equivalent.
 //
-//    The companion comment at `action.rs:672+` ("Why heapless::Vec,
-//    NOT the OutActions POD-array shape") covers the per-call type
-//    perf rationale in detail. Future audits raising SAFE-01 again
-//    require new measurement evidence per the deferred.md §B reopen
-//    contract — without it, the ecosystem-trusted heapless choice
-//    is the load-bearing decision.
+//    The companion comment in `action.rs` ("Why heapless::Vec, NOT
+//    the OutActions POD-array shape") covers the per-call type
+//    perf rationale in detail. Future audits raising replacement
+//    again require new measurement evidence — without it, the
+//    ecosystem-trusted heapless choice is the load-bearing decision.
 //
 // 3. RustCrypto: `sha2` + `hmac` + `pbkdf2` — SCRAM-SHA-256
 //    cryptographic primitives. Surface: const-time arithmetic,
@@ -237,8 +222,7 @@ extern crate self as bsql_pg_proto;
 //
 // Per-PR requirement: when bumping any of these deps, audit
 // the changelog for `unsafe` boundary changes (new `unsafe`
-// blocks, new platform inline-asm). Today's audit (2026-05-04)
-// confirmed all six sources at known-good versions.
+// blocks, new platform inline-asm).
 
 #[cfg(test)]
 extern crate std;
@@ -247,14 +231,11 @@ pub mod action;
 pub mod bounded;
 pub mod buf;
 pub mod command;
-// DEF-278 Bundle D / D' (2026-05-17 / 2026-05-18) — PostgreSQL
-// §55.2.7 CancelRequest mechanism. Bundle D shipped a public
-// `CancelRequestCredentials` struct + accessor; Bundle D' replaced
-// the entire public surface with the closure-scoped
-// `<ActivePhase>::with_cancel_request` accessor (see `protocol.rs`).
-// Internal types (`BackendKey`, `BackendKeyCell`) stay `pub(crate)`;
-// no public re-export from `mod cancel` post-Bundle-D' — the
-// closure-scoped lend handles materialisation inline.
+// PostgreSQL §55.2.7 CancelRequest mechanism. Public surface is
+// the closure-scoped `<ActivePhase>::with_cancel_request` accessor
+// (see `protocol.rs`); internal types (`BackendKey`,
+// `BackendKeyCell`) stay `pub(crate)` and have no public re-export
+// — the closure-scoped lend handles materialisation inline.
 pub mod cancel;
 pub mod decode;
 mod dispatch;
@@ -267,55 +248,47 @@ pub mod ident;
 pub(crate) mod md5;
 pub mod params;
 pub mod password;
-// DEF-244 (2026-05-13): runtime support for the `prepared!`
-// proc-macro. Hosts `PreparedQuery<P, R>`, `RowDecode` sealed
-// trait, and the `new_prepared_query` macro-plumbing constructor.
-// See `/tmp/def244-design-memo.md` for the full design.
+// Runtime support for the `prepared!` proc-macro. Hosts
+// `PreparedQuery<P, R>`, the `RowDecode` sealed trait, and the
+// `new_prepared_query` macro-plumbing constructor.
 pub mod prepared;
 pub mod protocol;
 pub mod push_command;
 pub mod row_stream;
 pub mod reply_id;
 
-// DEF-270 R-rephrased — tier-1 row_desc_slot write provenance.
-// Crate-internal module; no public re-exports.
+// Tier-1 row_desc_slot write provenance. Crate-internal module; no
+// public re-exports.
 pub(crate) mod schema_slot;
-// DEF-270 N-D (Phase 2) — tier-1 state-transition ↔ command-kind
-// pairing. Crate-internal module; no public re-exports. Per-command
-// witness types live in `push_command` alongside the impls; this
-// module owns the `StateSetter<'_, W>` machinery + sealed
-// `PostStateProof` trait.
+// Tier-1 state-transition ↔ command-kind pairing. Crate-internal
+// module; no public re-exports. Per-command witness types live in
+// `push_command` alongside the impls; this module owns the
+// `StateSetter<'_, W>` machinery + sealed `PostStateProof` trait.
 //
-// DEF-271 cluster A (Phase 3) — also hosts `FeedStateSetter<'_>` for
-// feed-side `Errored` transitions, atomically draining the in-flight
-// reply id from the prior state during `mem::replace`.
+// Also hosts `FeedStateSetter<'_>` for feed-side `Errored`
+// transitions, atomically draining the in-flight reply id from the
+// prior state during `mem::replace`.
 pub(crate) mod state_setter;
 
-// DEF-271 cluster B (Phase 3) — tier-1 SessionParams write provenance.
-// Crate-internal module; no public re-exports. Mirror of `schema_slot`
-// for the `PgProtocol::session_params` field.
+// Tier-1 SessionParams write provenance. Crate-internal module; no
+// public re-exports. Mirror of `schema_slot` for the
+// `PgProtocol::session_params` field.
 pub(crate) mod session_params_slot;
-// DEF-248 Sub-B (2026-05-12) — universal-coverage streaming sink for
-// non-`'D'` backend frames whose declared body exceeds READ_BUF_CAP.
-// Stream-and-truncate: bounded 8 KB prefix + counted-and-skipped
-// remainder; covers every wire-legal size from 0 to ~2 GiB in
-// constant memory. Crate-internal; no public re-exports.
+// Universal-coverage streaming sink for non-`'D'` backend frames
+// whose declared body exceeds READ_BUF_CAP. Stream-and-truncate:
+// bounded 8 KB prefix + counted-and-skipped remainder; covers every
+// wire-legal size from 0 to ~2 GiB in constant memory.
+// Crate-internal; no public re-exports.
 pub(crate) mod partial_assembly;
 pub mod scram;
-// DEF-188: schema_arena module DELETED — RowDesc lives inline in
-// state variants; terminal-reply schema parks into
-// PgProtocol::terminal_row_desc. See state.rs / protocol.rs for
-// the post-arena flow.
-// DEF-211 SAFE-06 (audit 2026-05-04): `SecretZeroize` trait —
-// driver-side panic-hook integration contract for closing the
-// `panic = "abort"` zeroize gap. See module docstring for the
-// full treatment.
+// `SecretZeroize` trait — driver-side panic-hook integration
+// contract for closing the `panic = "abort"` zeroize gap. See
+// module docstring for the full treatment.
 pub(crate) mod secret_zeroize;
-// DEF-259 (2026-05-08): test-only `DropCounter` machinery + sealed
-// `CrateZeroizeSecret` manifest. Tier-2 by-discipline (manual probes
-// per secret type, easy to forget) → tier-1 by-construction
-// (exhaustiveness gate fails build-time if manifest drifts from src;
-// per-type DropCounter witnesses run on every `cargo test`).
+// Test-only `DropCounter` machinery + sealed `CrateZeroizeSecret`
+// manifest. The exhaustiveness gate fails build-time if the
+// manifest drifts from src; per-type DropCounter witnesses run on
+// every `cargo test`.
 //
 // Module is `#[cfg(test)]`-only — production builds compile without
 // it, zero downstream API surface impact. See module docstring for
@@ -331,9 +304,9 @@ pub(crate) mod drop_witness;
 pub(crate) mod test_fixtures;
 pub mod sensitive;
 pub mod session_params;
-// DEF-211 INNO-01 / DEF-233: Pristine trait paired with
-// `#[derive(Pristine)]` from `bsql-pg-proto-derive`. See module
-// docstring for the BS-11 broad-scope tier-3 → tier-1 closure.
+// Pristine trait paired with `#[derive(Pristine)]` from
+// `bsql-pg-proto-derive`. See module docstring for the broad-scope
+// tier-3 → tier-1 closure.
 pub mod pristine;
 pub mod state;
 pub mod wire;
@@ -347,13 +320,14 @@ pub use action::{
 };
 pub use bounded::{BoundedLen, BoundedU8, BoundedU16};
 pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull, ReadBufN};
-// DEF-269 v2 (T): `PgCommand` enum no longer publicly re-exported.
-// External callers construct per-command structs directly:
-// `bsql_pg_proto::push_command::{Ping, Flush, Startup, ..., BindExecute}`.
-// The enum still exists internally (`crate::command::PgCommand`) and
-// is used by the `compute_push_tests` lib-internal test module +
-// the legacy `impl PushCommand for PgCommand` blanket impl which
-// preserves backwards-compat for the `compute_push` test dispatcher.
+// `PgCommand` enum is NOT publicly re-exported. External callers
+// construct per-command structs directly:
+// `bsql_pg_proto::push_command::{Ping, Flush, Startup, ...,
+// BindExecute}`. The enum still exists internally
+// (`crate::command::PgCommand`) and is used by the
+// `compute_push_tests` lib-internal test module + the
+// `impl PushCommand for PgCommand` blanket impl for the
+// `compute_push` test dispatcher.
 pub use command::FetchRows;
 pub use decode::{
     BinaryFmt, ColumnDesc, ColumnsIter, DataRowRef, DecodeError, DecodeFormat, FormatCode,
@@ -380,83 +354,77 @@ pub use reply_id::{
 pub use row_stream::{ColEvent, RowStream};
 pub use sensitive::Sensitive;
 pub use session_params::{Encoding, OtherEncoding, SessionParams};
-// DEF-211 INNO-01: re-export the `Pristine` trait + matching derive
-// macro under one name. Rust trait and derive macro live in DIFFERENT
-// namespaces (type vs macro), so identical-name re-exports do NOT
-// collide — `use bsql_pg_proto::Pristine` brings BOTH into scope:
-// trait usage `impl Pristine for T` resolves to the type-namespace
-// item, `#[derive(Pristine)]` resolves to the macro-namespace item.
-// This mirrors `serde`'s `pub use serde_derive::{Serialize,
+// Re-export the `Pristine` trait + matching derive macro under one
+// name. Rust trait and derive macro live in DIFFERENT namespaces
+// (type vs macro), so identical-name re-exports do NOT collide —
+// `use bsql_pg_proto::Pristine` brings BOTH into scope: trait usage
+// `impl Pristine for T` resolves to the type-namespace item,
+// `#[derive(Pristine)]` resolves to the macro-namespace item. This
+// mirrors `serde`'s `pub use serde_derive::{Serialize,
 // Deserialize}` + `pub trait Serialize { ... }` pattern.
 pub use bsql_pg_proto_derive::Pristine;
 pub use pristine::Pristine;
-// DEF-244 (2026-05-13): top-level re-export of `prepared!` +
-// `PreparedQuery` + `RowDecode`. The macro lives in
-// `bsql-pg-proto-derive` (proc-macros must live in a
-// `proc-macro = true` crate per Rust's language rule); the runtime
-// types live here. `use bsql_pg_proto::{prepared, PreparedQuery}`
-// brings both into scope — the trait + type live in the type
-// namespace, the macro in the macro namespace.
+// Top-level re-export of `prepared!` + `PreparedQuery` +
+// `RowDecode`. The macro lives in `bsql-pg-proto-derive`
+// (proc-macros must live in a `proc-macro = true` crate per Rust's
+// language rule); the runtime types live here. `use
+// bsql_pg_proto::{prepared, PreparedQuery}` brings both into scope
+// — the trait + type live in the type namespace, the macro in the
+// macro namespace.
 pub use bsql_pg_proto_derive::prepared;
 pub use prepared::{PreparedQuery, RowDecode};
 pub use state::ProtoState;
-// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): per-phase state
-// enums for the `<ConnectingPhase>` / `<ActivePhase>` / `<ClosedPhase>`
-// API. ConnectingState is the active surface (queried by
+// Per-phase state enums for the `<ConnectingPhase>` /
+// `<ActivePhase>` / `<ClosedPhase>` API. ConnectingState is the
+// active surface (queried by
 // `<ConnectingPhase>::connecting_state()`); ActiveState +
-// ErroredState are dead but pre-exported for the eventual
-// per-phase ActivePhase / ClosedPhase migrations.
+// ErroredState are pre-exported for the eventual per-phase
+// ActivePhase / ClosedPhase migrations.
 pub use state::{ActiveState, ConnectingState, ErroredState};
-// DEF-223 (2026-05-05): top-level re-export of the user-facing
-// `Terminate` wire literal. Drivers (`bsql-driver-postgres`,
-// async wrappers) write these bytes immediately before TCP
-// close to signal graceful shutdown. Convention matches
-// other top-level re-exports — wire-internal consts (e.g.
-// `SYNC_WIRE_BYTES`) stay `pub(crate)`; user-facing wire
-// primitives are re-exported here.
+// Top-level re-export of the user-facing `Terminate` wire literal.
+// Drivers (`bsql-driver-postgres`, async wrappers) write these
+// bytes immediately before TCP close to signal graceful shutdown.
+// Convention: wire-internal consts (e.g. `SYNC_WIRE_BYTES`) stay
+// `pub(crate)`; user-facing wire primitives are re-exported here.
 pub use wire::TERMINATE_WIRE_BYTES;
-// DEF-252 (audit 2026-05-08): top-level re-export of the
-// user-facing `Flush` wire literal. Phase 1c-5 pipelining drivers
-// write these bytes mid-batch to extract intermediate responses
-// without committing the implicit transaction (which would be
-// `Sync`'s job). Same convention as `TERMINATE_WIRE_BYTES`.
+// Top-level re-export of the user-facing `Flush` wire literal.
+// Pipelining drivers write these bytes mid-batch to extract
+// intermediate responses without committing the implicit
+// transaction (which would be `Sync`'s job).
 pub use wire::FLUSH_WIRE_BYTES;
-// DEF-214 (2026-05-05): top-level re-export of the user-facing
-// `SSLRequest` wire literal. Phase 1e wrapper drivers write
-// these bytes BEFORE `PgProtocol::new()` to negotiate TLS;
-// the 1-byte server response is OOB (driver handles it
-// outside the frame parser).
+// Top-level re-export of the user-facing `SSLRequest` wire
+// literal. Wrapper drivers write these bytes BEFORE
+// `PgProtocol::new()` to negotiate TLS; the 1-byte server response
+// is OOB (driver handles it outside the frame parser).
 pub use wire::SSL_REQUEST_WIRE_BYTES;
-// DEF-214 Phase 2 (2026-05-05): typed classification of the
-// 1-byte SSL response. Pairs with SSL_REQUEST_WIRE_BYTES — driver
-// reads 1 byte and calls `classify_ssl_response_byte` to obtain
-// a `SslNegotiationOutcome` instead of ad-hoc `match byte` logic.
-// Tier-1 enforcement of all 4 currently-defined outcomes with
-// `#[non_exhaustive]` for SemVer-safe future extension.
+// Typed classification of the 1-byte SSL response. Pairs with
+// SSL_REQUEST_WIRE_BYTES — driver reads 1 byte and calls
+// `classify_ssl_response_byte` to obtain a `SslNegotiationOutcome`
+// instead of ad-hoc `match byte` logic. Tier-1 enforcement of all
+// 4 currently-defined outcomes with `#[non_exhaustive]` for
+// SemVer-safe future extension.
 pub use wire::{SslNegotiationOutcome, classify_ssl_response_byte};
-// DEF-221 (2026-05-07): top-level re-export of the user-facing
-// `CancelRequest` builder. Drivers (`bsql-driver-postgres`) call
-// `cancel_request_bytes(pid, secret_key)` to materialise the
-// 16-byte cancel packet, open a parallel TCP connection, write
-// the bytes, and close. PG processes the cancel asynchronously;
-// no reply on the cancel socket. Pid + secret_key come from the
-// BackendKeyData ('K') frame on the original connection.
+// Top-level re-export of the user-facing `CancelRequest` builder.
+// Drivers call `cancel_request_bytes(pid, secret_key)` to
+// materialise the 16-byte cancel packet, open a parallel TCP
+// connection, write the bytes, and close. PG processes the cancel
+// asynchronously; no reply on the cancel socket. Pid + secret_key
+// come from the BackendKeyData ('K') frame on the original
+// connection.
 //
 // `MAGIC_VERSION_HIGH_HALF` + `CANCEL_REQUEST_VERSION` are
 // re-exported via the `wire` module path only — they're internal
 // composition primitives, not user-facing wire literals (the
 // builder fn is the user surface).
 pub use wire::cancel_request_bytes;
-// DEF-278 Bundle D' (2026-05-18) — closure-scoped API replaces the
-// Bundle-D public `CancelRequestCredentials` struct. The wire frame
-// is now lent through `<ActivePhase>::with_cancel_request(|bytes,
-// pid| ...)`, materialised on the function's stack inside a
-// `Zeroizing<[u8; 16]>` guard. The `BackendKey` / `BackendKeyCell`
-// cell-level types stay `pub(crate)`; there is no longer a public
-// re-export from `mod cancel`. Retention is structurally impossible
-// (HRTB bounded borrow + stack-local guard) — see
-// `with_cancel_request` doc and the `cancel.rs` module-level docs
-// for the tier elevation rationale.
+// Closure-scoped CancelRequest API. The wire frame is lent
+// through `<ActivePhase>::with_cancel_request(|bytes, pid| ...)`,
+// materialised on the function's stack inside a `Zeroizing<[u8;
+// 16]>` guard. The `BackendKey` / `BackendKeyCell` cell-level
+// types stay `pub(crate)`; no public re-export from `mod cancel`.
+// Retention is structurally impossible (HRTB bounded borrow +
+// stack-local guard) — see `with_cancel_request` doc and the
+// `cancel.rs` module-level docs for the tier-elevation rationale.
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------
@@ -468,24 +436,24 @@ pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 // ---------------------------------------------------------------------
 const _: fn() = || {
     fn assert_send<T: Send>() {}
-    // Phase 1a types. `Action<'_>` and `OutActions<'_>` carry a
-    // lifetime (DEF-094); asserting for `'static` implies Send for
-    // any shorter lifetime by covariance.
+    // Core types. `Action<'_>` and `OutActions<'_>` carry
+    // lifetimes; asserting for `'static` implies Send for any
+    // shorter lifetime by covariance.
     assert_send::<action::Action<'static, 'static>>();
     assert_send::<action::OutActions<'static, 'static>>();
     assert_send::<action::Reply<'static>>();
     assert_send::<command::PgCommand>();
     assert_send::<error::ProtocolError>();
     assert_send::<protocol::PgProtocol>();
-    // DEF-112: `ReplyId` is now generic over `K: ReplyKind`. The
-    // nominal kind parameter is `PhantomData<fn() -> K>` (ZST,
-    // unconditionally `Send + Sync`), so assert_send holds for
-    // every `K`; checking one concrete `K` is sufficient.
+    // `ReplyId` is generic over `K: ReplyKind`. The nominal kind
+    // parameter is `PhantomData<fn() -> K>` (ZST, unconditionally
+    // `Send + Sync`), so assert_send holds for every `K`; checking
+    // one concrete `K` is sufficient.
     assert_send::<reply_id::ReplyId<reply_id::PingKind>>();
     assert_send::<reply_id::ReplyId<reply_id::StartupKind>>();
     assert_send::<reply_id::ReplyId<reply_id::QueryKind>>();
     assert_send::<state::ProtoState>();
-    // Phase 1b types
+    // Bounded string types
     assert_send::<ident::Ident>();
     assert_send::<ident::DatabaseName>();
     assert_send::<ident::ApplicationName>();
@@ -495,7 +463,7 @@ const _: fn() = || {
     assert_send::<write_buf::WriteBuf>();
     assert_send::<scram::types::SecretDigest>();
     assert_send::<scram::types::CappedServerNonce>();
-    // Typestate wrappers (audit round 2 D1).
+    // Typestate wrappers.
     assert_send::<scram::session::ScramSession>();
     assert_send::<sensitive::Sensitive<password::Password>>();
     // Error sentinels — small Copy-like types that must stay Send so
@@ -507,23 +475,22 @@ const _: fn() = || {
     assert_send::<ident::IdentError>();
     assert_send::<password::PasswordError>();
     assert_send::<frame::HeaderParse>();
-    // DEF-198: witness-guard typestate.
+    // Witness-guard typestate.
     assert_send::<guard::ConnectionStatus>();
     // ReadyGuard<'a> is `&'a mut PgProtocol` — Send for 'static implies
     // Send for any shorter lifetime by covariance. Sync would defeat
     // its exclusive-access purpose, so only Send is asserted.
     assert_send::<guard::ReadyGuard<'static>>();
-    // DEF-212: bytes-only push API (Phase 1) + per-event feed API (Phase 2).
     // PushFailure is the typed Err arm of ReadyGuard::push_command;
     // FeedEvent is the per-event return of advance_one_frame. Both
-    // cross task boundaries in the async wrapper (Phase 1e) — Send
-    // is load-bearing.
+    // cross task boundaries in the async wrapper — Send is
+    // load-bearing.
     assert_send::<action::PushFailure>();
     assert_send::<action::FeedEvent<'static, 'static>>();
 };
 
 // ---------------------------------------------------------------------
-// Tier-1 compile gate on `!Sync` for `PgProtocol` (DEF-073).
+// Tier-1 compile gate on `!Sync` for `PgProtocol`.
 //
 // `PgProtocol` must be `!Sync` by construction so that concurrent
 // `&mut PgProtocol` access is architecturally unreachable — only one
@@ -560,7 +527,7 @@ const _: fn() = || {
 };
 
 // ---------------------------------------------------------------------
-// Tier-1 compile gates on enum / struct **size** (DEF-087).
+// Tier-1 compile gates on enum / struct **size**.
 //
 // Background: an enum's `size_of` is governed by its largest variant.
 // The `no_alloc` constraint forces variants to carry bounded inline
@@ -577,65 +544,23 @@ const _: fn() = || {
 // normal — the bound adjusts in the same commit, making the memory
 // cost part of the review surface instead of drifting silently.
 //
-// All bounds are generous — set slightly above current observed size
-// to leave room for ordinary evolution, tight enough to catch obvious
-// regression (2×, 4× blowups).
+// All bounds are exact where reproducible cross-platform; range pins
+// (±N B) tolerate alignment differences.
 //
-// ═══════════════════════════════════════════════════════════════════
-// CURRENT (aarch64-apple-darwin, post-DEF-184 A10/B22, 2026-04-24)
-// ═══════════════════════════════════════════════════════════════════
-// The live size budget. All const_asserts below pin against THESE
-// values. Any future refactor that changes a size must update the
-// pin + shift the matching line here in the same commit.
+// Current budget (aarch64-apple-darwin):
 //
 //   Ident:             66  (FixedStr<63, IdentTag>)
 //   DatabaseName:      66
 //   ApplicationName:  130
-//   ProtocolError:     72  (DEF-184 A1+A13 — ErrorArena cascade)
-//   Action<'_,'_>:     88  (DEF-184 A1+A13 — Reply-bounded)
-//   OutActions:       800  (DEF-184 — 9 × Action + len)
-//   DispatchOutcome:   88  (DEF-184 B21/C6 — by-ref state)
-//   Reply<'_>:         80  (DEF-119 — RowDesc externalised)
+//   ProtocolError:     72  (ErrorArena cascade)
+//   Action<'_,'_>:     88  (Reply-bounded)
+//   OutActions:       800  (9 × Action + len)
+//   DispatchOutcome:   88  (by-ref state)
+//   Reply<'_>:         80  (RowDesc externalised to slot)
 //   ReplyId:           16
 //   PgCommand:      ≤2176  (Parse dominates)
-//   ProtoState:      ~712  (SCRAM inline — tier-1 variant-carries-field;
-//                            DEF-184 A10/B22 REVERTED 2026-04-24 per CREDO §1)
-//   SchemaArena:      ~520
-//   ErrorArena:      ~290
-//   PgProtocol:    [6000, 6200]  (range tolerates alignment)
-//
-// ═══════════════════════════════════════════════════════════════════
-// HISTORICAL (for context on why the budget looks the way it does)
-// ═══════════════════════════════════════════════════════════════════
-// Pre-DEF-060 (2026-04-20, x86_64 Linux):
-//   ProtocolError:    856  (five heapless::String<N>, N<=256)
-//   Action:           864  (SendBuf::Owned contains 512-byte vec)
-// Post-DEF-095/096/097 (aarch64-apple-darwin):
-//   Ident:             66  (was 72 — heapless::Vec<u8,63>+usize → POD FixedStr)
-//   ProtocolError:    304  (DEF-060 typed variants + FixedStr tail)
-//   PgCommand:       2136  (Parse dominates: StmtName + Sql + ReplyId)
-// Post-DEF-119 (2026-04-21):
-//   Reply<'_>:         80  (was ~340 — RowDesc externalised to arena)
-//   Action<'_,'_>:    312  (was ~384 — FailReply.cause now dominant)
-//   OutActions:      2504  (was ~3072 — 8 × Action shrunk)
-//   ProtoState:      1224  (unchanged — SCRAM dominant)
-//   PgProtocol:      6272  (added 528 B arena, other shrinkage offset net)
-// Post-DEF-148 (2026-04-22):
-//   SchemaArena:     ~520   (post-DEF-171 has_any deleted)
-//   PgProtocol:      6272  (DEF-119 baseline preserved)
-// Post-DEF-184 A1+A13 (2026-04-23):
-//   ProtocolError:     72  (was 312 — ErrorArena cascade)
-//   Action:            88  (was 312 — Reply-bounded via ErrorRef)
-//   OutActions:       800  (was 2808 — 9 × Action shrink)
-// Post-DEF-184 B21/C6 (2026-04-24):
-//   DispatchOutcome:   88  (was 800 — by-ref state removes new_state payload)
-// Post-DEF-184 A10/B22 REVERTED (2026-04-24):
-//   ProtoState:       ~712  (SCRAM session restored INLINE in variant
-//                            per CREDO §1 tier-1 variant-carries-field;
-//                            safety > tier-1 > perf)
-//   scram_state field: REMOVED (no correlation invariant to maintain,
-//                            ZeroizeOnDrop fires on state transition
-//                            automatically via variant drop glue)
+//   ProtoState:        80  (per-phase state enum)
+//   PgProtocol:    [4300, 4400]  (range tolerates alignment)
 // ---------------------------------------------------------------------
 // Target architecture support bound: the crate uses `u32` body counters
 // and assumes `usize::BITS >= 32` for infallible `u32 → usize` widening
@@ -648,38 +573,31 @@ const _: () = assert!(
      are u32 and several call sites infallibly widen u32 → usize.",
 );
 
-// DEF-151: tight-range size asserts. Bound BOTH directions to catch
-// field additions (upper) AND accidental field removals (lower). The
-// ±8 B slack tolerates cross-platform alignment differences; on
-// aarch64-apple-darwin the actual is exactly at the lower bound, on
-// other targets it may drift up to +8.
+// Tight-range size asserts. Bound BOTH directions to catch field
+// additions (upper) AND accidental field removals (lower). Exact
+// pins where reproducible cross-platform.
 const _: () = assert!(
     core::mem::size_of::<error::ProtocolError>() == 72,
-    "ProtocolError exact size — 72 B post-(A1+A13). \
-     Pre-(184): 312 B dominated by ServerErrorResponse's 3 inline \
-     BoundedStr<N> fields (288 B). Post-(184): ServerErrorResponse \
-     carries `details_ref: ErrorRef` (2 B); bounded strings live in \
+    "ProtocolError exact size — 72 B. ServerErrorResponse carries \
+     `details_ref: ErrorRef` (2 B); bounded strings live in \
      PgProtocol::error_arena. Remaining 72 B dominated by other \
      large variants (e.g. Scram(ScramError), Malformed* with \
-     BoundedStr<32>). \
-     \
-     Exact pin catches any variant growth / layout drift.",
+     BoundedStr<32>). Exact pin catches any variant growth / layout \
+     drift.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Action<'static, 'static>>() == 88,
-    "Action<'_, '_> exact size — 88 B post-(A1+A13). \
-     Pre-(184) was 312 B dominated by FailReply.cause ProtocolError; \
-     post-(184) ProtocolError 72 B, so Action bounded by \
-     max(Reply 72, FailReply 72) + discriminant + padding = 88 B. \
-     Exact pin catches any variant growth.",
+    "Action<'_, '_> exact size — 88 B. ProtocolError 72 B, so Action \
+     bounded by max(Reply 72, FailReply 72) + discriminant + padding \
+     = 88 B. Exact pin catches any variant growth.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Reply<'static>>() >= 72
         && core::mem::size_of::<action::Reply<'static>>() <= 96,
-    "Reply<'r> size drift — post-DEF-119 actual is 80 B. Range [72, 96] \
-     catches variant payload changes. Dominating variant is \
-     DescribeStatementComplete (ParamOids ~68 B + DescribedRows ~16 B + \
-     TxStatus + padding).",
+    "Reply<'r> size drift — actual is 80 B. Range [72, 96] catches \
+     variant payload changes. Dominating variant is \
+     DescribeStatementComplete (ParamOids ~68 B + DescribedRows ~16 B \
+     + TxStatus + padding).",
 );
 const _: () = assert!(
     core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,
@@ -687,26 +605,23 @@ const _: () = assert!(
      tag is zero-size; ReplyId's footprint is u64 value + bool \
      delivered + padding. Did a bookkeeping field get added?",
 );
-// DEF-189 (architect 2026-04-25): RowDesc moved to PgProtocol single
-// slot; state variants no longer carry schema.
-// DEF-210 SR-01 Path C/D (audit 2026-04-28): duplicate flags
-// (`schema_present: bool` for SimpleQuery, `DescribedRowsStaged`
-// enum for Describe paths) deleted — `PgProtocol::row_desc_slot.is_some()`
-// is the single source of truth across all schema-bearing reply paths
-// (tier-1 by-construction).
-// DEF-210 SR-04 + REC-02 (audit 2026-04-28): tightened the prior
-// `>= 16 && <= 96` range pin (80-byte slack window) into exact `==`
-// value pin. Drift surface narrowed to a single arithmetic identity.
-// Cross-platform note: pinned for reference target aarch64-apple-darwin;
-// per-target `#[cfg(...)]` blocks set in the same commit that adds
-// another target to CI per the §A "Cross-platform CI matrix" policy
-// in `deferred.md`.
+// RowDesc lives in `PgProtocol::row_desc_slot` (single source of
+// truth); state variants do not carry schema. A naive shape would
+// have parallel `schema_present: bool` for SimpleQuery and
+// `DescribedRowsStaged` enum for Describe paths — these would
+// duplicate `PgProtocol::row_desc_slot.is_some()` and be tier-2
+// by-discipline. The slot-as-single-source shape is tier-1
+// by-construction.
+//
+// Exact `==` pin (rather than range) narrows drift surface to a
+// single arithmetic identity. Cross-platform: pinned for reference
+// target aarch64-apple-darwin; per-target `#[cfg(...)]` blocks
+// would land in the same commit that adds another target to CI.
 const _: () = assert!(
     core::mem::size_of::<state::ProtoState>() == 80,
-    "ProtoState size post-DEF-189 (RowDesc externalised) + DEF-210 \
-     SR-01 Path C/D (schema-presence flags deleted; row_desc_slot is \
-     single source of truth) + DEF-210 SR-04 (range pin tightened to \
-     exact). \
+    "ProtoState exact size pin: row_desc_slot externalised on \
+     PgProtocol; schema-presence flags deleted (`row_desc_slot. \
+     is_some()` is single source of truth). \
      \
      Layout on aarch64-apple-darwin: dominant variant is \
      `DescribeStatementAwaitingRfq` — `ReplyId<DescribeStatementKind>` \
@@ -715,15 +630,11 @@ const _: () = assert!(
      discriminant + 3 B align(8) tail-pad → 80 B. \
      \
      Other notable variants: \
-     - SCRAM `ConnectingScramAwaitingServerFirst` — 3 × Box (24 B) + \
-       ReplyId (8 B) + discriminant + align-pad → ~40-48 B. \
+     - SCRAM `ConnectingScramAwaitingServerFirst` — Box (8 B) + \
+       ReplyId (8 B) + discriminant + align-pad → ~24 B. \
      - `SimpleQueryAwaitingRfq` — ReplyId (8 B) + BoundedStr<32> \
        command_tag (~33 B) + discriminant + padding → ~48 B. \
      - Streaming variants — ReplyId (8 B) + discriminant → ~16 B. \
-     \
-     Pre-DEF-189: ProtoState ~320 B (dominant variant carried inline \
-     RowDesc 264 B + reply + command_tag). Net cumulative win across \
-     DEF-188/189 + DEF-210 SR-01 Path C/D: ~75% reduction. \
      \
      Per-row hot-path single state-projection retrieves just the \
      reply id; the descriptor is fetched via the protocol's \
@@ -733,8 +644,7 @@ const _: () = assert!(
      **The dominant constraint is `ParamOids` (68 B), not SCRAM.** A \
      refactor that wants to shrink ProtoState should target ParamOids \
      (16-OID arity) or split DescribeStatement* into a heap-boxed \
-     payload variant (DEF-187 SCRAM precedent — but pay-vs-tier \
-     tradeoff per CREDO §1). \
+     payload variant (pay-vs-tier tradeoff per CREDO §1). \
      \
      If a refactor changes this number on aarch64-apple-darwin, \
      update both the literal AND the layout comment above (drift-pin \
@@ -742,128 +652,73 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
-    "PgCommand size regression — post-1c-3a budget is 2176 bytes. \
+    "PgCommand size regression — budget is 2176 bytes. \
      Parse dominates: StmtName (66) + Sql (2050) + ReplyId<ParseKind> \
      (16) + discriminant + padding. Bumping MAX_SQL_LEN or \
      MAX_PG_NAME_LEN must move this limit in lockstep.",
 );
-// DEF-189 (architect 2026-04-25): RowDesc moved to single slot;
-// state variants stripped of inline schema. DEF-194 (2026-04-27):
-// bit-packed format_codes shrinks RowDesc 164 → 136 B; Option<RowDesc>
-// 168 → 140 B (exact pin in `decode.rs` const-assert).
+// Cross-platform stance: exact `==` pins are consistent with the
+// rest of the crate. Reference target: aarch64-apple-darwin (where
+// CI lives today). When CI matrix extends to x86_64-linux /
+// riscv64 / etc., per-target cfg-gated pins land in the same commit
+// that adds the target — not via permissive ranges. Drift surface
+// beats variance cushion every time.
 //
-// Cross-platform stance (2026-04-27): exact `==` pin consistent with
-// the rest of the crate (`ProtocolError == 72`, `Action == 88`,
-// `OutActions == 800`, `DispatchOutcome == 88`, `RowDesc == 136`,
-// etc.). Pre-DEF-194 follow-up I tried `5080 ±8 B` range under the
-// "cross-platform alignment cushion" framing — but that was
-// inconsistent with the project pattern AND permitted no-saving
-// regressions silently. Reference target: aarch64-apple-darwin (where
-// CI lives today). When CI matrix extends to x86_64-linux / riscv64 /
-// etc., per-target cfg-gated pins land in the same commit that adds
-// the target — not via permissive ranges. CREDO §3 skepticism: drift
-// surface beats variance cushion every time.
-// DEF-196 (2026-04-28): cold-path fields externalised into three
-// independent lazy slots — each cold field allocates its Box
-// independently only on first write.
-// DEF-265 (2026-05-08): ReadBuf two-tier inline (256 B inline + lazy
-// heap escape Box).
-// DEF-270 cluster (2026-05-09 — U letter, post-bisect): mint counter
-// kept as a `static AtomicU64` in `next_reply_id`, NOT inline on
-// PgProtocol — adding an inline u64 field shifted LLVM whole-crate
-// codegen heuristic +6% on the synthetic `iter_10cols` decode bench
-// (bisect-confirmed). Static-atomic mint preserves the 520 B size
-// AND strengthens the invariant: globally-unique IDs across all
-// instances (per-protocol field would have given per-instance only).
+// Cold-path fields are externalised into independent lazy slots —
+// each cold field allocates its Box independently only on first
+// write. ReadBuf is two-tier (256 B inline + lazy heap escape Box).
+// The reply-id mint counter is a `static AtomicU64` in
+// `next_reply_id`, NOT inline on PgProtocol — an inline u64 field
+// was bisect-shown to grow the struct and shift LLVM whole-crate
+// codegen heuristic +6% on the synthetic `iter_10cols` decode bench.
+// Static-atomic mint preserves the size AND strengthens the
+// invariant: globally-unique IDs across all instances (per-protocol
+// field would have given per-instance only).
 //
-// Layout breakdown (post-DEF-278 Bundle D):
+// Layout breakdown:
 //   ReadBuf inline:          ~256 B (heapless::Vec<u8, 256> + cursor)
 //   ReadBuf heap slot:          8 B (Option<Box<...>> niche)
 //   state:                    ~80 B (DescribeStatementAwaitingRfq dominant)
 //   row_desc_slot:           ~140 B (Option<RowDesc>)
 //   session_params:             8 B (Option<Box<SessionParams>> niche)
 //   error_arena:                8 B (Option<Box<ErrorArena>> niche)
-//   partial_assembly:           8 B (Option<Box<...>> niche, DEF-248 Sub-B)
-//   backend_key:                8 B (BackendKeyCell over Option<{pid:i32, secret:Sensitive<i32>}>, DEF-278 Bundle D)
+//   partial_assembly:           8 B (Option<Box<...>> niche)
+//   backend_key:                8 B (BackendKeyCell over Option<{pid:i32, secret:Sensitive<i32>}>)
 //   malformed_frame_count:      4 B (inline u32)
 //   sync_marker:                0 B (PhantomData)
 //   alignment padding:        ~16 B (to align(8))
 //   total:                    536 B
 //
-// Heap economics per connection pattern (unchanged by Bundle D —
-// the cell is inline, no allocation):
+// Heap economics per connection pattern:
 //   - Trust auth + no errors:        0 allocations.
 //   - Startup auth + no errors:      1 alloc (Box<SessionParams> 436 B).
 //   - Startup auth + errors:         2 allocs (~732 B total).
 //   - Malformed frame teardown:      0 allocations (counter inline).
 //   - First frame > 256 B:           1 alloc (Box<heapless::Vec<u8, 4096>>).
-// DEF-278 Bundle D (2026-05-17): PgProtocol grew by BackendKeyCell
-// payload. The cell wraps `Option<BackendKey>` where `BackendKey`
-// is `{ pid: i32, secret_key: Sensitive<i32> }` (8 B inline);
-// alignment + the inline-cell shape land at 8 B per the
-// `#[repr(transparent)]` chain (`BackendKeyCell` over `Option<...>`,
-// `Sensitive<i32>` over `i32`). The struct uses the niche-packing
-// rules to absorb the Option discriminant into existing padding.
-// Pre-Bundle-D was 528 B; post-Bundle-D measured 536 B (a +8 B
-// growth on the cell field). The pre-existing perf-justification
-// budget breakdown is preserved verbatim below the new total for
-// git-blame continuity; the +8 B Bundle-D delta is the only change.
 //
-// DEF-278 Bundle D' (2026-05-18): public API refactor from a
-// returned-by-value `CancelRequestCredentials` struct to a closure-
-// scoped `with_cancel_request<R>(&self, f) -> Option<R>` accessor.
-// The cell-level types (`BackendKey`, `BackendKeyCell`) are
-// UNCHANGED — `PgProtocolInner` field layout is byte-identical;
-// size pins remain at 536 B. The wire-frame Zeroizing guard lives
-// on the function's stack, not on `PgProtocolInner`. Tier elevation
-// of "secret bytes scrub on drop" from tier-1 by-Drop-fire
-// (suppressible by `mem::forget` / `Box::leak` / `ManuallyDrop`) to
-// tier-1 by-closure-scope (retention structurally impossible).
+// `BackendKey` is `{ pid: i32, secret_key: Sensitive<i32> }` (8 B
+// inline); the cell wraps `Option<BackendKey>` with niche-packing
+// absorbing the Option discriminant into padding. The cell installs
+// once per connection at the dispatch arm
+// `(ConnectingPostAuthHaveKey, 'Z')`; reads are O(1) Option
+// projection. Public API surfaces the cell via the closure-scoped
+// `<ActivePhase>::with_cancel_request<R>(&self, f) -> Option<R>`
+// accessor: the wire-frame Zeroizing<[u8;16]> guard lives on the
+// function's stack, not on `PgProtocolInner` — secret-scrub
+// retention is structurally impossible (HRTB closure bound +
+// stack-local guard).
 //
-// Tier-1 absolutism feedback (memory `feedback_regression_on_safety_change`):
-// the +8 B growth must be gated by `bench-stable.sh` on a quiet
-// system (`load avg < 8`). On regression, investigate (asm-diff,
-// alternative cell shapes), do NOT roll back the tier-elevation.
-// The cell shape itself is the minimum (8 B for two i32s); the
-// only knob is whether Bundle D belongs on `<ActivePhase>` at all
-// — and per the design memo §4 it does, so the +8 B is the
-// floor cost.
+// Tier-1 absolutism: size growth must be gated by `bench-stable.sh`
+// on a quiet system (`load avg < 8`). On regression, investigate
+// (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol>() == 536,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~80 + \
-     row_desc_slot ~140 (outer Extras post-DEF-279 follow-up) + \
-     session_params 8 + error_arena 8 + \
-     partial_assembly 8 (DEF-248 Sub-B) + \
-     backend_key 8 (DEF-278 Bundle D) + \
+     row_desc_slot ~140 (outer Extras) + session_params 8 + \
+     error_arena 8 + partial_assembly 8 + backend_key 8 + \
      malformed_frame_count 4 + alignment-pad to align(8) = 536 B. \
-     \
-     Pre-DEF-196 was 5080 B (cold fields inline). DEF-196 saves \
-     736 B via heap-boxed cold storage. DEF-265 (Idea-38) shrank \
-     ReadBuf 4096 → 256 inline + lazy heap escape (4352 → 520 B). \
-     DEF-270 U (2026-05-09): reply-id mint counter is a static \
-     AtomicU64 in `next_reply_id` (NOT a PgProtocol field) — bisect \
-     proved an inline u64 grew the struct 520 → 528 B and shifted \
-     LLVM heuristic +6% on iter_10cols. \
-     DEF-248 Sub-B (2026-05-12): partial-assembly cell `Option<Box<\
-     PartialAssemblyInner>>` niche-packed 8 B added; PgProtocol \
-     520 → 528 B. Bench-stable compare vs post-def248-suba is the \
-     load-bearing gate for this growth (Tier-1 absolutism feedback: \
-     regression on safety change is a signal to dig, not roll back). \
-     DEF-278 Bundle D (2026-05-17): `BackendKeyCell` carrying \
-     `Option<{{ pid: i32, secret_key: Sensitive<i32> }}>` adds 8 B \
-     (niche-optimized — Option discriminant absorbed via padding). \
-     PgProtocol 528 → 536 B. The cell installs once per connection \
-     at the dispatch arm `(ConnectingPostAuthHaveKey, 'Z')`; reads \
-     are O(1) Option projection. Bench-stable gate vs post-DEF-272 \
-     baseline on `feed_bytes/ping_amortised`. \
-     DEF-278 Bundle D' (2026-05-18): public API closure-scoped \
-     refactor (no `PgProtocolInner` layout change — same 536 B). \
-     Tier elevation of secret-scrub from by-Drop-fire to \
-     by-closure-scope; the wire frame's Zeroizing<[u8;16]> guard \
-     lives on the `with_cancel_request` stack frame, not on the \
-     struct. \
      \
      Cross-platform: when CI matrix extends, either (a) every target \
      lands at 536 (most likely — alignment-stable types), or \
@@ -872,37 +727,29 @@ const _: () = assert!(
      (CREDO §3 + §4.12).",
 );
 
-// DEF-246 Phase 1 (2026-05-16) + DEF-279 Phase 2 Bundle Commit 13
-// (2026-05-18): branch-collapse typestate layout pins.
+// Branch-collapse typestate layout pins.
 //
 // `PgProtocol<P: SealedPhase>` is `#[repr(transparent)]` over
 // `<P as SealedPhase>::Inner` + a ZST `PhantomData<fn() -> P>`.
-// Layout per phase is determined by the per-phase Inner. Post-
-// Commit-13 PgProtocolInner is DELETED; each phase has its own
-// Inner with its own size pin:
+// Layout per phase is determined by the per-phase Inner:
 //   - DisconnectedPhase → DisconnectedInner (0 B, ZST)
-//   - ConnectingPhase  → ConnectingInner   (504 B)
+//   - ConnectingPhase  → ConnectingInner   (368 B)
 //   - ActivePhase      → ActiveInner       (536 B)
 //   - ClosedPhase      → ClosedInner       (16 B)
 //
-// If any trips, either (a) PhantomData was rendered non-ZST under
-// a future rustc heuristic (CREDO §3 — file an issue, do NOT relax
-// the pin), (b) repr(transparent) was removed from PgProtocol<P>
+// If any pin trips, either (a) PhantomData was rendered non-ZST
+// under a future rustc heuristic (file an issue, do NOT relax the
+// pin), (b) repr(transparent) was removed from PgProtocol<P>
 // (review the commit), or (c) a non-ZST field was added to
 // PgProtocol<P> outside `inner` (architectural violation).
-// DEF-279 Phase 1a (2026-05-18): <DisconnectedPhase>::Inner is the
-// ZST `DisconnectedInner` — `PgProtocol<DisconnectedPhase>` is now 0 B.
-// Pre-Bundle was byte-identical to PgProtocolInner (536 B); the storage
-// pre-Startup carried tautologically-empty cells (state Idle, read_buf
-// empty, all 4 cells None, malformed_count 0). Post-Bundle the storage
-// physically doesn't exist — tier-1 by-storage-absence.
 //
-// The drop from 536 B → 0 B is the SINGLE largest size win in the
-// foundation bundle. A fresh `PgProtocol::new()` allocates exactly
-// zero protocol bytes; the materialisation cost is moved to
-// `push_startup` (which now calls `_proto_init_leaf::fresh_inner()`
-// to construct the post-transition `PgProtocolInner` for the
-// `<ConnectingPhase>` wrapper).
+// `<DisconnectedPhase>::Inner = DisconnectedInner` is ZST: a fresh
+// `PgProtocol::new()` allocates exactly zero protocol bytes; the
+// materialisation cost is moved to `push_startup` (which calls
+// `_proto_init_leaf::fresh_inner()` to construct the
+// post-transition Inner for the `<ConnectingPhase>` wrapper).
+// Tier-1 by-storage-absence: pre-Startup state cannot carry
+// in-flight payload because the storage physically does not exist.
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol<protocol::DisconnectedPhase>>() == 0,
     "PgProtocol<DisconnectedPhase> layout drift — should be 0 B \
@@ -915,59 +762,42 @@ const _: () = assert!(
     "DisconnectedInner exact size — must be 0 B (the only field is \
      `sync_marker: PhantomData<Cell<()>>`, which is ZST). If this \
      trips, a non-ZST field was added to DisconnectedInner — \
-     architectural violation of Phase 1a tier-1-by-storage-absence.",
+     architectural violation of the tier-1-by-storage-absence invariant.",
 );
-// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): switched from
-// PgProtocolInner (536 B; ProtoState 80 B) to ConnectingInner
-// (state: ConnectingState 48 B; saves 32 B on the state field
-// vs ProtoState 80 B).
-//
-// DEF-279 follow-up (2026-05-18, architect Interpretation B): row_desc_slot
-// HOISTED off `ConnectingInner` to outer `<ConnectingPhase>::Extras = ()`
-// (the slot doesn't exist on Connecting at all — no dispatch arm
-// reachable from a `ConnectingState` LHS writes it). ConnectingInner
-// shrinks by 144 B (RowDescSlotCell size) → ~360 B with alignment.
-// PgProtocol<ConnectingPhase> equals ConnectingInner + Extras=() (ZST)
-// + ZST phase_marker → same as ConnectingInner.
+// `<ConnectingPhase>::Inner = ConnectingInner` carries the
+// `ConnectingState` (48 B) variant of state; `row_desc_slot` is
+// hoisted off Inner because no dispatch arm reachable from a
+// `ConnectingState` LHS writes it (Extras = ()). PgProtocol<P>
+// = Inner + Extras + ZST phase_marker.
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 368,
     "PgProtocol<ConnectingPhase> layout drift — must equal \
-     ConnectingInner (7 fields post-DEF-279-follow-up: state \
-     ConnectingState 48 B + read_buf 264 B + 3 cells × 8 B + \
-     1 u32 + alignment) PLUS Extras = () (ZST) PLUS ZST phase_marker. \
-     Pre-follow-up was 504 B; row_desc_slot HOISTED off Inner \
-     (saves 136 B by alignment-aware narrowing). If this trips, \
-     audit `mod protocol::ConnectingInner` and the SealedPhase \
-     Extras = () mapping for ConnectingPhase.",
+     ConnectingInner (state ConnectingState 48 B + read_buf 264 B + \
+     3 cells × 8 B + 1 u32 + alignment) PLUS Extras = () (ZST) PLUS \
+     ZST phase_marker. If this trips, audit `mod \
+     protocol::ConnectingInner` and the SealedPhase Extras = () \
+     mapping for ConnectingPhase.",
 );
-// DEF-279 follow-up (2026-05-18): `<ActivePhase>::Extras = RowDescSlotCell`
-// (140 B; align 4). `ActiveInner` shrinks by the cell. PgProtocol<ActivePhase>
-// = ActiveInner + Extras + ZST phase_marker. Net byte-neutral vs
-// pre-follow-up (cell moved from Inner to outer Extras), measured at
-// 536 B on aarch64-apple-darwin.
+// `<ActivePhase>::Extras = RowDescSlotCell` (140 B; align 4); the
+// cell lives on outer Extras rather than inside ActiveInner.
+// PgProtocol<ActivePhase> = ActiveInner + Extras + ZST
+// phase_marker; measured 536 B on aarch64-apple-darwin.
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 536,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
-     (7 fields post-DEF-279-follow-up: state ActiveState 80 B + \
-     read_buf 264 B + 3 cells × 8 B + 1 u32 + alignment) PLUS \
-     Extras = RowDescSlotCell (140 B inline; align 4) PLUS ZST \
-     phase_marker. Pre-follow-up was 536 B (cell inside ActiveInner); \
-     net byte-neutral. If this trips, audit `mod protocol::ActiveInner` \
-     and the SealedPhase Extras = RowDescSlotCell mapping for \
-     ActivePhase.",
+     (state ActiveState 80 B + read_buf 264 B + 3 cells × 8 B + \
+     1 u32 + alignment) PLUS Extras = RowDescSlotCell (140 B inline; \
+     align 4) PLUS ZST phase_marker. If this trips, audit `mod \
+     protocol::ActiveInner` and the SealedPhase Extras = \
+     RowDescSlotCell mapping for ActivePhase.",
 );
-// DEF-279 Phase 1b (2026-05-18): <ClosedPhase>::Inner is now
-// `ClosedInner` (~16 B) — state_kind 1B + 7B pad + error_arena
-// Option<Box> 8B. Pre-Bundle was 536 B (full PgProtocolInner).
-// The 520-B savings derives from storage absence: post-Errored
-// only state_kind + arena are reachable via the legitimate
-// <ClosedPhase> API (cause(), get_server_error(),
-// error_arena_overwrite_count()); read_buf / row_desc_slot /
-// session_params / partial_assembly / backend_key / counter /
-// full ProtoState union space were architecturally dead but kept
-// allocated until the protocol itself dropped. Post-Bundle they
-// Drop at the transition boundary (into_closed_if_errored /
-// into_active Closed arm), releasing stack + Box-niche heap.
+// `<ClosedPhase>::Inner = ClosedInner` (~16 B) — state_kind 1B + 7B
+// pad + error_arena Option<Box> 8B. Post-Errored only state_kind +
+// arena are reachable via the legitimate <ClosedPhase> API
+// (`cause()`, `get_server_error()`,
+// `error_arena_overwrite_count()`); the full PgProtocolInner is
+// dropped at the transition boundary (`into_closed_if_errored` /
+// `into_active` Closed arm), releasing stack + Box-niche heap.
 const _: () = assert!(
     core::mem::size_of::<protocol::PgProtocol<protocol::ClosedPhase>>() == 16,
     "PgProtocol<ClosedPhase> layout drift — should be 16 B \
@@ -978,63 +808,44 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::ClosedInner>() == 16,
-    "ClosedInner exact size — must be 16 B post-Phase-1b. If this \
-     trips, a field was added/removed/reshaped on `ClosedInner`. \
-     Pre-Phase-1b was the full PgProtocolInner (536 B); Phase 1b \
-     narrowed to state_kind + error_arena. Future Phase 1d or \
-     follow-up may further narrow if get_server_error access \
-     class diverges.",
+    "ClosedInner exact size — must be 16 B. If this trips, a field \
+     was added/removed/reshaped on `ClosedInner`.",
 );
 
-// DEF-184 (B21/C6): DispatchOutcome size pin — must stay ≤ 96 B
-// post-`new_state` extraction. Pre-(B21/C6) each Advanced variant
-// carried a `ProtoState` payload (712 B); the total enum was dominated
-// by the Advanced variants at ~800 B. Post-(B21/C6) dispatch writes
-// state directly via `&mut ProtoState`, and DispatchOutcome carries
-// only the side-effect signal (StagedAction 88 B for WithAction,
-// reply_id + ProtocolError 72 B for Errored).
+// DispatchOutcome size pin — bounded by `AdvancedWithAction(
+// StagedAction 88 B)`. Dispatch writes state directly via
+// `&mut ProtoState`, so DispatchOutcome carries only the
+// side-effect signal (StagedAction for WithAction, reply_id +
+// ProtocolError 72 B for Errored).
 const _: () = assert!(
     core::mem::size_of::<dispatch::DispatchOutcome>() == 88,
-    "DispatchOutcome exact size — 88 B post-(B21/C6). \
-     Dominated by AdvancedWithAction(StagedAction 88 B); the \
-     discriminant + Errored variant payload fold into StagedAction's \
-     alignment + niches. \
-     \
-     Pre-(B21/C6) was ~800 B dominated by the Advanced variants' \
-     `new_state: ProtoState` payload. If this trips, either (a) a \
-     new ProtocolError variant inflated the Errored payload, (b) \
-     StagedAction grew (cascade into Action / OutActions), or (c) \
-     `new_state` was re-added to an Advanced variant — regression \
-     vs the B21/C6 refactor.",
+    "DispatchOutcome exact size — 88 B. Dominated by \
+     AdvancedWithAction(StagedAction 88 B); the discriminant + \
+     Errored variant payload fold into StagedAction's alignment + \
+     niches. If this trips, either (a) a new ProtocolError variant \
+     inflated the Errored payload, (b) StagedAction grew (cascade \
+     into Action / OutActions), or (c) `new_state` was added to an \
+     Advanced variant — regression vs the by-ref-state dispatch \
+     shape.",
 );
 
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static, 'static>>() == 800,
-    "OutActions<'_, '_> exact size drift — 800 B post-(A1+A13). \
+    "OutActions<'_, '_> exact size — 800 B \
+     = 9 (MAX_ACTIONS_PER_CALL) × 88 (Action) + 8 (usize len). \
      \
-     = 9 (MAX_ACTIONS_PER_CALL) × 88 (Action) + 8 (usize len) = \
-     800 B. \
-     \
-     Pre-(A1): 9 × 312 = 2808 B (ProtocolError-dominated). \
-     \
-     History: Post-(A15) MAX_ACTIONS_PER_CALL 16 → 9; \
-     Post-(A2/B1/B8) ManuallyDrop<heapless::Vec>, zero init; \
-     Post-(A1+A13) Action Reply-bounded via ErrorArena. \
-     \
-     Exact pin catches ANY layout drift. Change is decision-point \
-     (not silent regression): audit Action size, OutActions cap, \
-     ManuallyDrop shape.",
+     Exact pin catches ANY layout drift. Change is a contributor \
+     decision-point (not silent regression): audit Action size, \
+     OutActions cap, ManuallyDrop shape.",
 );
 
 // ---------------------------------------------------------------------
-// DEF-212 Phase 3 (M4 — architect-vetted impl plan, audit 2026-05-04):
-// exact `==` size pins for the new bytes-only push API + per-event
-// secondary feed API. Pinned per CREDO §III no-permissive-ranges
-// policy: relative pins (e.g., `<= 96`) cushion silent drift; exact
-// pins make every byte change a contributor decision-point.
+// Exact `==` size pins for the bytes-only push API + per-event feed
+// API. Relative pins (e.g., `<= 96`) cushion silent drift; exact pins
+// make every byte change a contributor decision-point.
 // ---------------------------------------------------------------------
 
-// `PushFailure` exact size — 80 B post-Phase-1.
+// `PushFailure` exact size — 80 B.
 //
 // Layout: NonZeroU64 (8 B, 8-aligned) + ProtocolError (72 B) = 80 B
 // total. Niche-packed: `Option<PushFailure>` is also 80 B (NonZeroU64
@@ -1042,8 +853,8 @@ const _: () = assert!(
 //
 // Drift surface: a future `ProtocolError` variant addition that
 // pushes the enum past 72 B would cascade here. The complementary
-// `ProtocolError == 72` pin (line 456+) catches drift at the source;
-// this pin catches the propagation.
+// `ProtocolError == 72` pin catches drift at the source; this pin
+// catches the propagation.
 const _: () = assert!(
     core::mem::size_of::<action::PushFailure>() == 80,
     "PushFailure exact size — 80 B (NonZeroU64 8 B + ProtocolError 72 B). \
@@ -1051,8 +862,7 @@ const _: () = assert!(
      at action::PushFailure docstring + error.rs ProtocolError pin), \
      or (b) NonZeroU64 alignment changed (architecturally impossible \
      under stable Rust). Cascade impact: Result<(), PushFailure> return \
-     frame on push paths grows in lockstep — the DEF-212 Phase 1 -88% \
-     headline (800 B → 80 B) erodes proportionally.",
+     frame on push paths grows in lockstep.",
 );
 const _: () = assert!(
     core::mem::size_of::<Option<action::PushFailure>>() == 80,
@@ -1062,7 +872,7 @@ const _: () = assert!(
      added to PushFailure that consumed the discriminant slot.",
 );
 
-// `FeedEvent<'static, 'static>` exact size — 88 B post-Phase-2.
+// `FeedEvent<'static, 'static>` exact size — 88 B.
 //
 // Layout: max variant is `Deliver(NonZeroU64, Reply<'r>)` =
 // 8 + 80 = 88 B; discriminant niche-optimised via NonZeroU64
@@ -1078,11 +888,11 @@ const _: () = assert!(
     "FeedEvent<'wb, 'r> exact size — 88 B (max variant = Deliver: \
      NonZeroU64 8 B + Reply<'r> 80 B). Discriminant niche-optimised \
      via NonZeroU64. If this trips: (a) Reply grew past 80 B (check \
-     sibling pin Reply<'r> in [72, 96] — tighten when Reply gets exact), \
-     (b) a new FeedEvent variant carries a payload > 80 B (rare — \
-     architectural change), or (c) niche optimisation lost. The DEF-212 \
-     Phase 2 design budget assumes ≤ 88 B per per-event return frame — \
-     larger means worse 1c-5 pipelining throughput per cycle.",
+     sibling pin Reply<'r> in [72, 96] — tighten when Reply gets \
+     exact), (b) a new FeedEvent variant carries a payload > 80 B \
+     (rare — architectural change), or (c) niche optimisation lost. \
+     The design budget assumes ≤ 88 B per per-event return frame — \
+     larger means worse pipelining throughput per cycle.",
 );
 const _: () = assert!(
     core::mem::size_of::<Option<action::FeedEvent<'static, 'static>>>() == 88,
@@ -1092,8 +902,6 @@ const _: () = assert!(
      a NonZero* slot.",
 );
 
-// DEF-244 (2026-05-13): PreparedQuery + BindPrepared size pins.
-//
 // `PreparedQuery<P, R>` is a struct of 6 × `&'static`-fat-pointers
 // + `PhantomData<fn(P) -> R>` = 6 × 16 B + 0 = 96 B. The pin's
 // upper bound is 128 B with cushion for alignment / future
@@ -1106,18 +914,16 @@ const _: () = assert!(
 // preserves the "static, small, .rodata-friendly" promise without
 // forcing per-target pins for a struct that's not perf-critical
 // at the per-byte level.
-//
-// Memo §10.5 specifies the 128 B ceiling; DEF-270 U pattern.
 const _: () = assert!(
     core::mem::size_of::<prepared::PreparedQuery<(i32,), (i32, &'static str)>>() <= 128,
     "PreparedQuery<(i32,), (i32, &'static str)> must stay ≤ 128 B \
      (6 × 16 B fat pointers + PhantomData = 96 B + padding cushion). \
      Larger sizes regress consumer crate .rodata footprint and \
-     LLVM whole-crate codegen heuristics per DEF-270 U precedent.",
+     LLVM whole-crate codegen heuristics.",
 );
 
 // ---------------------------------------------------------------------
-// Tier-1 compile gates on Drop semantics (DEF-093).
+// Tier-1 compile gates on Drop semantics.
 //
 // `core::mem::needs_drop::<T>()` is a const fn that returns true iff
 // T (or any of its fields transitively) has a non-trivial Drop impl.
@@ -1133,25 +939,25 @@ const _: () = assert!(
 // ---------------------------------------------------------------------
 const _: () = assert!(
     core::mem::needs_drop::<password::Password>(),
-    "Password must have Drop for zeroize-on-drop (DEF-051 / secret scrub)",
+    "Password must have Drop for zeroize-on-drop (secret scrub)",
 );
 const _: () = assert!(
     core::mem::needs_drop::<scram::types::SecretDigest>(),
     "SecretDigest must have Drop for zeroize-on-drop",
 );
-// DEF-154 (K): ReplyId<K> no longer has Drop. The panic-in-Drop
-// "consume-discipline guard" double-panicked under integration-test
-// unwind (SIGABRT masked original failure). Discipline enforced via
+// ReplyId<K> has no Drop. A panic-in-Drop "consume-discipline
+// guard" would double-panic under integration-test unwind (SIGABRT
+// masking original failure). Discipline is enforced via
 // `#[must_use]` + integration tests observing Action content. See
-// `reply_id.rs` `// DEF-154 (K):` block for the full rationale.
+// `reply_id.rs` for the full rationale.
 const _: () = assert!(
     !core::mem::needs_drop::<reply_id::ReplyId<reply_id::PingKind>>(),
-    "ReplyId<K> must stay drop-free — Drop was a footgun (see DEF-154 (K)).",
+    "ReplyId<K> must stay drop-free — Drop was a footgun.",
 );
 const _: () = assert!(
     !core::mem::needs_drop::<action::Reply<'static>>(),
     "Reply must stay drop-free — all variants are Copy-like (small value type). \
-     DEF-119: Reply<'r> borrows &'r RowDesc from the schema arena; borrows \
+     Reply<'r> borrows &'r RowDesc from the row_desc_slot; borrows \
      don't add Drop.",
 );
 const _: () = assert!(
@@ -1166,9 +972,9 @@ const _: () = assert!(
     !core::mem::needs_drop::<password::PasswordError>(),
     "PasswordError must stay drop-free — enum of Copy variants",
 );
-// Audit round 2 E1 — expanded coverage. Positives: types carrying
-// secrets / resources that MUST self-scrub. Negatives: small value
-// types that MUST stay Copy-friendly / drop-free.
+// Expanded coverage. Positives: types carrying secrets / resources
+// that MUST self-scrub. Negatives: small value types that MUST stay
+// Copy-friendly / drop-free.
 const _: () = assert!(
     core::mem::needs_drop::<scram::session::ScramSession>(),
     "ScramSession owns Sensitive<Password> — must Drop so the inner zeroize fires",
@@ -1197,9 +1003,9 @@ const _: () = assert!(
     !core::mem::needs_drop::<scram::types::ServerNonceTooLong>(),
     "ServerNonceTooLong must stay drop-free — error sentinel",
 );
-// DEF-094 follow-up: Action<'_> is Copy (post POD BoundedStr), so
-// `needs_drop::<Action<'static>>()` must be false — that's what
-// makes `OutActions<'buf>` releases-at-last-use under NLL (no
+// Action<'_> is Copy (POD BoundedStr + typed ProtocolError + Copy
+// variants), so `needs_drop::<Action<'static>>()` is false — that
+// makes `OutActions<'buf>` release-at-last-use under NLL (no
 // explicit `drop(out)` needed in tests).
 const _: () = assert!(
     !core::mem::needs_drop::<action::Action<'static, 'static>>(),
@@ -1207,16 +1013,16 @@ const _: () = assert!(
 );
 const _: () = assert!(
     !core::mem::needs_drop::<error::ProtocolError>(),
-    "ProtocolError must stay drop-free — all variants' fields are Copy (DEF-060 POD BoundedStr)",
+    "ProtocolError must stay drop-free — all variants' fields are Copy (POD BoundedStr)",
 );
 const _: () = assert!(
     !core::mem::needs_drop::<action::OutActions<'static, 'static>>(),
-    "OutActions<'_> must stay drop-free. Post-DEF-184 A2/B1/B8: \
-     inner heapless::Vec is wrapped in ManuallyDrop which inhibits \
-     the Vec's Drop impl. Since Action<'w, 'r> is Copy (POD refs + \
-     small payload), skipping inner Drop is sound (no-op body \
-     anyway). This preserves pre-(184) NLL last-use borrow-release \
-     semantics — the caller pattern `let out = proto.feed_bytes(..); \
-     match out.as_slice() {{ .. }}; proto.state()` compiles without \
-     explicit drop(out) between as_slice and next proto call.",
+    "OutActions<'_> must stay drop-free. The inner heapless::Vec \
+     is wrapped in ManuallyDrop which inhibits the Vec's Drop impl. \
+     Since Action<'w, 'r> is Copy (POD refs + small payload), \
+     skipping inner Drop is sound (no-op body anyway). This \
+     preserves NLL last-use borrow-release semantics — the caller \
+     pattern `let out = proto.feed_bytes(..); match out.as_slice() \
+     {{ .. }}; proto.state()` compiles without explicit drop(out) \
+     between as_slice and next proto call.",
 );

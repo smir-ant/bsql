@@ -1,8 +1,7 @@
 //! Classified protocol errors.
 //!
-//! Phase 1a ships only the variants the Ping flow can produce. Per
-//! reforge.md §3.5 / §4.6, manufactured variants are forbidden — a
-//! variant lands when its emission site lands.
+//! Per reforge.md §3.5 / §4.6, manufactured variants are forbidden
+//! — a variant lands when its emission site lands.
 //!
 //! Public surface is [`#[non_exhaustive]`][non_exhaustive] so adding
 //! variants in 1b/1c does not break user `match`es; user code is forced
@@ -13,10 +12,10 @@
 use core::fmt;
 
 // -----------------------------------------------------------------
-// DEF-060 part 2 — typed fields for ServerErrorResponse
+// Typed fields for ServerErrorResponse
 // -----------------------------------------------------------------
 
-/// Server-error severity classification. DEF-060 part 2.
+/// Server-error severity classification.
 ///
 /// Replaces the earlier `heapless::String<32>` with a 1-byte enum.
 /// Parsed from the PG "S" (localised) / "V" (non-localised) field
@@ -60,8 +59,8 @@ impl Severity {
     /// emits uppercase). Falls through to [`Severity::Unknown`] for
     /// anything else — never panics, never rejects.
     ///
-    /// DEF-154 (V): `const fn` so the round-trip pin below can
-    /// const-assert `from_bytes(as_str(v).as_bytes()) == v`.
+    /// `const fn` so the round-trip pin below can const-assert
+    /// `from_bytes(as_str(v).as_bytes()) == v`.
     #[must_use]
     pub const fn from_bytes(bytes: &[u8]) -> Self {
         match bytes {
@@ -100,16 +99,16 @@ impl fmt::Display for Severity {
     }
 }
 
-// DEF-154 (V) P2-6: round-trip compile pin for Severity.
+// Round-trip compile pin for Severity.
 // `from_bytes(as_str(v).as_bytes())` must equal v for every
 // variant. Catches body-swap drift between the 8 known variants'
 // literal mappings. `Unknown` is special — `as_str` returns
 // "UNKNOWN" which `from_bytes` does NOT recognize, falling through
 // to `Self::Unknown` correctly (round-trip preserved via fallthrough).
 //
-// `matches!` in const context (stable since Rust 1.46) avoids both
-// the `as u8` coercion (forbid-bundle bans) and the requirement for
-// a const `PartialEq` impl.
+// `matches!` in const context avoids both the `as u8` coercion
+// (forbid-bundle bans) and the requirement for a const
+// `PartialEq` impl.
 const _: () = {
     assert!(matches!(Severity::from_bytes(Severity::Error.as_str().as_bytes()), Severity::Error));
     assert!(matches!(Severity::from_bytes(Severity::Fatal.as_str().as_bytes()), Severity::Fatal));
@@ -122,15 +121,15 @@ const _: () = {
     assert!(matches!(Severity::from_bytes(Severity::Unknown.as_str().as_bytes()), Severity::Unknown));
 };
 
-// F-054 (pass-#8): niche-pack invariant pin. `Severity` is `#[repr(u8)]`
-// with 9 variants occupying discriminants 0..=8; values 9..=255 are
+// Niche-pack invariant pin. `Severity` is `#[repr(u8)]` with 9
+// variants occupying discriminants 0..=8; values 9..=255 are
 // unused, giving `Option<Severity>` a niche for `None` without
 // growing the layout. The 1-byte total for `Option<Severity>` is
 // load-bearing — `parse_error_response` uses it as the "seen /
-// not-seen" severity slot (DEF-060 pattern) and every byte of the
-// 280-byte ProtocolError variant matters. Adding a 248th+ variant
-// to Severity would overflow the niche and silently grow the
-// Option to 2 bytes — this assert fails the build instead.
+// not-seen" severity slot and every byte of the ProtocolError
+// variant matters. Adding a 248th+ variant to Severity would
+// overflow the niche and silently grow the Option to 2 bytes —
+// this assert fails the build instead.
 const _: () = assert!(
     core::mem::size_of::<Option<Severity>>() == 1,
     "Severity niche-pack: Option<Severity> must stay 1 byte via unused discriminant range",
@@ -177,15 +176,14 @@ impl SqlStateCode {
 
     /// The code as `&str` — guaranteed ASCII by construction.
     ///
-    /// DEF-154 (U) P2/P3: explicit match over `from_utf8` with a
-    /// documented-dead None arm. `self.bytes` is ASCII-only by
-    /// construction (`from_bytes` coerces every non-ASCII byte to
-    /// `b'?'`); ASCII is valid UTF-8 → Err arm architecturally
-    /// unreachable. Pre-(U) was `unwrap_or("")` — silent fallback
-    /// pattern user banned. Post-(U): empty-string sentinel on
-    /// the dead arm is explicit (no corruption vector at the
-    /// display-only boundary; empty code surfaces as visible
-    /// regression in logs).
+    /// Explicit match over `from_utf8` with a documented-dead None
+    /// arm. `self.bytes` is ASCII-only by construction
+    /// (`from_bytes` coerces every non-ASCII byte to `b'?'`); ASCII
+    /// is valid UTF-8 → Err arm architecturally unreachable. A
+    /// naive `unwrap_or("")` is the silent-fallback pattern this
+    /// crate bans. The explicit empty-string sentinel on the dead
+    /// arm has no corruption vector at the display-only boundary;
+    /// empty code surfaces as visible regression in logs.
     ///
     /// Bypass options considered: `unsafe { from_utf8_unchecked }`
     /// (forbid-bundle bans unsafe), `const fn` + stable
@@ -216,13 +214,12 @@ impl fmt::Display for SqlStateCode {
     }
 }
 
-// `BoundedStr<N>` moved to `crate::ident` as a type alias for
-// `FixedStr<N, BoundedStrTag>` (DEF-096). Re-exported here so
-// downstream code continues to write `error::BoundedStr<128>`.
+// `BoundedStr<N>` is a type alias in `crate::ident` for
+// `FixedStr<N, BoundedStrTag>`. Re-exported here so downstream code
+// can write `error::BoundedStr<128>`.
 pub use crate::ident::BoundedStr;
 
 /// Typed classification for [`ProtocolError::UnsupportedAuthMethod`].
-/// Architect finding #1 (2026-04-21).
 ///
 /// Distinguishes "server sent a sub-code we don't know about" from
 /// "server sent a known sub-code that's wrong for the current state"
@@ -230,7 +227,7 @@ pub use crate::ident::BoundedStr;
 /// enum so diagnostics can say *which* known method the server
 /// requested.
 ///
-/// # `#[non_exhaustive]` (DEF-256, audit 2026-05-08)
+/// # `#[non_exhaustive]`
 ///
 /// New variants may land if PG introduces additional sub-code
 /// classification dimensions (e.g., a separate "deprecated but
@@ -245,10 +242,10 @@ pub enum AuthSubCodeClass {
     /// A sub-code outside the 4 PG-defined values (0/10/11/12).
     /// Carries the raw u32 for forensic logging.
     ///
-    /// DEF-184 (B9): `NonZeroU32` (not `u32`) — tier-1 structural
-    /// proof that server sent a value other than 0 (AUTH_OK = 0 is
-    /// a known sub-code, classified via `KnownButWrong(AuthSubCode::Ok)`
-    /// if seen in wrong state, never in `Unknown`). Niche optimises
+    /// `NonZeroU32` (not `u32`) — tier-1 structural proof that
+    /// server sent a value other than 0 (AUTH_OK = 0 is a known
+    /// sub-code, classified via `KnownButWrong(AuthSubCode::Ok)` if
+    /// seen in wrong state, never in `Unknown`). Niche optimises
     /// `Option<AuthSubCodeClass>` and other nested options.
     Unknown(core::num::NonZeroU32),
     /// A recognised sub-code that's legal on the wire but wrong
@@ -271,12 +268,12 @@ impl fmt::Display for AuthSubCodeClass {
     }
 }
 
-// DEF-184 (B9): drift-pin — `Unknown(NonZeroU32)` must niche into
-// the same 8 bytes as `KnownButWrong(AuthSubCode)`. Pre-(184) was
-// `Unknown(u32)` — 8 bytes incl. discriminant + 4-byte padding.
-// Post-(184) NonZeroU32 carries the non-zero invariant at type
-// level; `Option<AuthSubCodeClass>` niche-optimises via the
-// 0-u32-bit-pattern slot.
+// Drift-pin — `Unknown(NonZeroU32)` must niche into the same 8
+// bytes as `KnownButWrong(AuthSubCode)`. NonZeroU32 carries the
+// non-zero invariant at type level; `Option<AuthSubCodeClass>`
+// niche-optimises via the 0-u32-bit-pattern slot. A naive
+// `Unknown(u32)` shape would be 8 bytes incl. discriminant +
+// 4-byte padding but lose the Option niche.
 const _: () = assert!(
     core::mem::size_of::<AuthSubCodeClass>() == 8,
     "AuthSubCodeClass: 4-byte discriminant + 4-byte NonZeroU32 payload",
@@ -290,17 +287,16 @@ const _: () = assert!(
 // ProtocolError (below)
 // -----------------------------------------------------------------
 
-// DEF-184 (audit #3 A-12): colocated drift-pin.
+// Colocated drift-pin.
 //
-// ProtocolError exact size must stay 72 B post-(A1+A13) ErrorArena
-// externalisation — a variant growth here cascades into
-// `Action<'w,'r>` (88 B), `OutActions = [Action; 9] + len` (800 B),
-// and `StreamItem<'a>` (~80 B). The cascade costs 1-2 KB of per-call
-// stack frame, so the pin catches:
+// ProtocolError exact size must stay 72 B — variant growth here
+// cascades into `Action<'w,'r>` (88 B), `OutActions = [Action; 9]
+// + len` (800 B), and `StreamItem<'a>` (~80 B). The cascade costs
+// 1-2 KB of per-call stack frame, so the pin catches:
 //
 //   • New payload field on any variant that exceeds the 72 B budget.
 //   • Refactor that re-inlines the 288 B bounded strings into
-//     `ServerErrorResponse` (defeating the A1+A13 goal).
+//     `ServerErrorResponse` (defeating the ErrorArena externalisation).
 //   • Alignment-driven padding bumps from field ordering changes.
 //
 // The complementary `Action` / `OutActions` pins live in lib.rs
@@ -309,7 +305,7 @@ const _: () = assert!(
 // than at first use.
 const _: () = assert!(
     core::mem::size_of::<ProtocolError>() == 72,
-    "ProtocolError exact size — 72 B post-(A1+A13). \
+    "ProtocolError exact size — 72 B. \
      Variant shape change detected. Run `cargo expand --test` and \
      audit each variant payload: ServerErrorResponse should carry \
      ErrorRef (8 B), not inline BoundedStr<N>. See lib.rs cascade \
@@ -321,11 +317,8 @@ const _: () = assert!(
 ///
 /// Errors are *transport-level* signals from the state machine to the
 /// async wrapper, not user-visible types — the wrapper translates them
-/// into its public `BackendError` (Phase 1e). Variants are kept narrow
-/// and self-describing; the wrapper never has to invent error context.
-// DEF-184 (A1+A13): ProtocolError shrunk 312 B → ~72 B post-
-// ServerErrorResponse arena externalisation; no longer triggers
-// `large_enum_variant` lint.
+/// into its public `BackendError`. Variants are kept narrow and
+/// self-describing; the wrapper never has to invent error context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProtocolError {
@@ -385,18 +378,18 @@ pub enum ProtocolError {
     /// - `NoData` (`'n'`) — body is always empty
     /// - `CloseComplete` (`'3'`) — body is always empty
     ///
-    /// # DEF-185 P0-F (audit 2026-04-24)
+    /// # Why the dispatch arms classify
     ///
-    /// Pre-fix: the dispatch arms for these frames ignored the
-    /// `payload` parameter entirely — a server sending 500 bytes of
-    /// body on `EmptyQueryResponse` was silently accepted, the bytes
-    /// consumed, state transitioned, no error emitted. **Tier-4 silent
-    /// spec drift.** A future PG version that legitimately added a
-    /// body field to one of these frames would be silently accepted
-    /// instead of classified — masking the protocol break.
+    /// A naive dispatch arm that ignores the `payload` parameter
+    /// would silently accept a server sending 500 bytes of body on
+    /// `EmptyQueryResponse` — the bytes consumed, state transitioned,
+    /// no error emitted. **Tier-4 silent spec drift.** A future PG
+    /// version that legitimately added a body field to one of these
+    /// frames would be silently accepted instead of classified —
+    /// masking the protocol break.
     ///
-    /// Post-fix: every zero-body arm explicitly slice-pattern matches
-    /// `[]` and classifies any other body as `UnexpectedFrameBody`.
+    /// Every zero-body arm explicitly slice-pattern matches `[]` and
+    /// classifies any other body as `UnexpectedFrameBody`.
     UnexpectedFrameBody {
         /// The offending tag.
         tag: crate::wire::InboundTag,
@@ -419,17 +412,16 @@ pub enum ProtocolError {
     },
 
     /// Server sent an `ErrorResponse` (tag `'E'`) during the startup
-    /// handshake or mid-query. DEF-060 part 2: typed
-    /// [`Severity`] + [`SqlStateCode`] (5-byte SQLSTATE); bounded
-    /// strings (message / detail / hint) live in
-    /// [`crate::PgProtocol`]'s `ErrorArena` post-(DEF-184).
+    /// handshake or mid-query. Carries typed [`Severity`] +
+    /// [`SqlStateCode`] (5-byte SQLSTATE); bounded strings (message
+    /// / detail / hint) live in [`crate::PgProtocol`]'s `ErrorArena`.
     ///
     /// Size: variant payload = `Severity` 1 B + `SqlStateCode` 5 B +
     /// `ErrorRef` 8 B = 14 B. The enclosing `ProtocolError` pins at
-    /// 72 B exact (A-12 const-assert in error.rs) — down from 312 B
-    /// pre-DEF-184 where the three bounded strings (288 B) were
-    /// inline. That shrink cascades: `Action<'w,'r>` 312 → 88 B,
-    /// `OutActions = [Action; 9]` 2808 → 800 B per feed_bytes call.
+    /// 72 B exact. A naive inline-bounded-string shape would balloon
+    /// the payload to ~288 B and cascade through `Action<'w,'r>`
+    /// (which dominates `OutActions = [Action; 9]` per feed_bytes
+    /// call).
     ServerErrorResponse {
         /// Severity classification.
         ///
@@ -455,18 +447,14 @@ pub enum ProtocolError {
         /// SQLSTATE code — always exactly 5 ASCII chars, packed as
         /// a `[u8; 5]` newtype. Space-padded if shorter; never empty.
         code: SqlStateCode,
-        /// DEF-184 (A1+A13): handle into [`crate::PgProtocol`]'s
-        /// `ErrorArena` for the bounded strings (message / detail /
-        /// hint). Pre-(184) these were inline `BoundedStr<N>` fields
-        /// (~288 B), cascading through `Action::FailReply.cause` →
-        /// `OutActions = [Action; 9]` (2808 B stack frame) →
-        /// `StreamItem::FailReply.cause` (320 B per-pull).
+        /// Handle into [`crate::PgProtocol`]'s `ErrorArena` for the
+        /// bounded strings (message / detail / hint).
         ///
-        /// Post-(184) carries 8 bytes: NonZeroU8 slot + u32
-        /// generation + 3 B struct padding (see `error_arena.rs`
-        /// size pin). A-04 widened gen u8→u32 for wrap-safety on
-        /// long-running connections; A-06 elevated the resolve API
-        /// to `Result<&ErrorPayload, ArenaError>` with classified
+        /// Carries 8 bytes: NonZeroU8 slot + u32 generation + 3 B
+        /// struct padding (see `error_arena.rs` size pin). The
+        /// generation is u32 (not u8) for wrap-safety on
+        /// long-running connections; the resolve API is
+        /// `Result<&ErrorPayload, ArenaError>` with classified
         /// `Empty` / `Stale` variants.
         ///
         /// Resolve via [`crate::PgProtocol::get_server_error`] or
@@ -481,8 +469,9 @@ pub enum ProtocolError {
     /// Server sent an authentication method we do not support.
     ///
     /// PG's Authentication message (tag `'R'`) carries a sub-code for
-    /// the method. Phase 1b supports only sub-code 0 (Ok), 10 (SASL),
-    /// 11 (SASLContinue), 12 (SASLFinal). Anything else lands here.
+    /// the method. Only sub-code 0 (Ok), 10 (SASL), 11
+    /// (SASLContinue), 12 (SASLFinal) are supported. Anything else
+    /// lands here.
     ///
     /// # Typed classification
     ///
@@ -494,7 +483,7 @@ pub enum ProtocolError {
     /// [`crate::wire::AuthSubCode`] enum rather than widening back
     /// to u32. Downstream wrappers can render "server insisted on
     /// SCRAM on a Trust connection" instead of "unsupported auth
-    /// method 10". Architect finding #1 (2026-04-21).
+    /// method 10".
     UnsupportedAuthMethod {
         /// Typed classification of the offending sub-code.
         sub_code: AuthSubCodeClass,
@@ -502,19 +491,19 @@ pub enum ProtocolError {
 
     /// Server sent `NegotiateProtocolVersion` (tag `'v'`) during
     /// startup, indicating it does not support a protocol option we
-    /// requested. DEF-044.
+    /// requested.
     UnsupportedProtocolOption,
 
     /// SCRAM authentication failure.
     ///
-    /// DEF-060: typed variant carrying the discrete [`scram::wire::ScramError`]
-    /// classification directly. The previous shape
-    /// `ScramError { detail: heapless::String<128> }` was a tier-3
-    /// silent-truncation seam (`.unwrap_or_default()` on
-    /// `heapless::String::try_from`) — formatted strings larger than
-    /// 128 bytes silently collapsed to empty. Now the cause is a
-    /// discrete enum; `Display` is computed from the variant, no
-    /// intermediate buffer, no truncation class.
+    /// Typed variant carrying the discrete
+    /// [`scram::wire::ScramError`] classification directly. A naive
+    /// `ScramError { detail: heapless::String<128> }` shape would
+    /// be a tier-3 silent-truncation seam (`.unwrap_or_default()`
+    /// on `heapless::String::try_from`) — formatted strings larger
+    /// than 128 bytes would silently collapse to empty. The typed
+    /// cause is a discrete enum; `Display` is computed from the
+    /// variant, no intermediate buffer, no truncation class.
     ///
     /// [`scram::wire::ScramError`]: crate::scram::wire::ScramError
     Scram(crate::scram::wire::ScramError),
@@ -537,14 +526,14 @@ pub enum ProtocolError {
     StartupAlreadyInProgress,
 
     /// Attempted to push a command while another query or the
-    /// startup handshake already occupies the connection. 1c-1b:
-    /// simple-query states reject new pushes with this error — the
+    /// startup handshake already occupies the connection.
+    /// Simple-query states reject new pushes with this error — the
     /// existing query must complete first.
     CommandInProgress,
 
     /// Server sent a `CommandComplete` (`'C'`) payload that was not
-    /// NUL-terminated or otherwise malformed. 1c-1b: the
-    /// `CommandComplete` body is an ASCII command tag
+    /// NUL-terminated or otherwise malformed. The `CommandComplete`
+    /// body is an ASCII command tag
     /// (`"SELECT 5"`, `"INSERT 0 3"`, …) terminated by a single
     /// NUL byte; a missing terminator or non-ASCII bytes beyond
     /// the cap signal framing desync.
@@ -556,7 +545,7 @@ pub enum ProtocolError {
     /// Server sent a malformed `RowDescription` (`'T'`) payload —
     /// short header, negative column count, missing name NUL,
     /// truncated per-column metadata, or trailing bytes after the
-    /// declared columns. 1c-2a framing-desync classification. The
+    /// declared columns. Framing-desync classification: the
     /// connection is torn down (the wire is out of sync with the
     /// per-column 18-byte stride).
     MalformedRowDescription {
@@ -564,19 +553,17 @@ pub enum ProtocolError {
         payload_len: usize,
     },
 
-    /// DEF-154 (F): server sent a `DataRow` (`'D'`) frame with no
-    /// body — the 5-byte header is followed by zero payload bytes
-    /// (`total_len == HEADER_LEN`). PG's wire spec mandates at
-    /// minimum a 2-byte column count in the body even for zero-
-    /// column rows; a 0-byte body signals framing desync or a
-    /// malformed/adversarial server.
+    /// Server sent a `DataRow` (`'D'`) frame with no body — the
+    /// 5-byte header is followed by zero payload bytes (`total_len
+    /// == HEADER_LEN`). PG's wire spec mandates at minimum a 2-byte
+    /// column count in the body even for zero-column rows; a 0-byte
+    /// body signals framing desync or a malformed/adversarial
+    /// server.
     ///
-    /// Pre-DEF-154 (F) this case routed to
-    /// `InternalCrateBug { locus: EmptyReadRange }` via the
-    /// `NonEmptyRange::new` None branch in `ReadRange::new` — a
-    /// misclassification: the crate isn't buggy, the server is.
-    /// Operators reading a log that says "internal bsql-pg-proto
-    /// bug" would chase the wrong target.
+    /// A naive classification of this case as `InternalCrateBug`
+    /// would mislead operators — the crate isn't buggy, the server
+    /// is. The distinct variant lets logs say "malformed data row"
+    /// instead of "internal bsql-pg-proto bug".
     MalformedDataRow {
         /// Declared frame total length (tag + length-prefix + body
         /// = HEADER_LEN + body_len). Valid DataRow has
@@ -588,7 +575,7 @@ pub enum ProtocolError {
     /// [`crate::MAX_ROW_COLUMNS`] — this crate's bounded inline
     /// storage cannot accommodate the result-set. The query is
     /// failed and the connection is torn down; the user retries
-    /// with a narrower projection. 1c-2a.
+    /// with a narrower projection.
     TooManyColumns {
         /// Column count declared by the server.
         count: usize,
@@ -597,9 +584,9 @@ pub enum ProtocolError {
     },
 
     /// Server's `RowDescription` carried a per-column format code
-    /// outside the legal `{0, 1}` range. Round-4 finding #5: text
-    /// (`0`) and binary (`1`) are the only values PG defines; any
-    /// other value is a server-side wire violation. 1c-2a.
+    /// outside the legal `{0, 1}` range. Text (`0`) and binary
+    /// (`1`) are the only values PG defines; any other value is a
+    /// server-side wire violation.
     UnexpectedFormatCode {
         /// The offending format code from the server.
         code: i16,
@@ -610,7 +597,7 @@ pub enum ProtocolError {
     /// count disagrees with the remaining byte length, or negative
     /// count. Wire violation; the connection is torn down.
     ///
-    /// 1c-3c: emitted by [`crate::decode::parse_parameter_description`].
+    /// Emitted by [`crate::decode::parse_parameter_description`].
     MalformedParameterDescription {
         /// Actual payload byte count.
         payload_len: usize,
@@ -625,7 +612,7 @@ pub enum ProtocolError {
     /// never Bound against — so the describe result is useless
     /// downstream.
     ///
-    /// 1c-3c. Mirrors [`Self::TooManyColumns`] shape.
+    /// Mirrors [`Self::TooManyColumns`] shape.
     TooManyParameters {
         /// Count declared by the server.
         count: usize,
@@ -641,19 +628,11 @@ pub enum ProtocolError {
     /// code path — emission indicates a bug inside `bsql-pg-proto`
     /// itself, not a wire-level event.
     ///
-    /// DEF-150: consolidates three pre-merge variants
-    /// (OutboundFrameBuildUnreachable / ReadCursorAdvanceUnreachable
-    /// / RowRangeConstructionUnreachable). DEF-188: the
-    /// `StaleSchemaRef` and `SchemaArenaAllocFull` loci were
-    /// DELETED with the schema arena — without a `SchemaRef`
-    /// handle, generation drift cannot occur (architecturally
-    /// impossible). Classification is always
+    /// Uniform "internal crate bug" shape — fewer discriminants
+    /// than per-locus variants, single diagnostic template,
+    /// additive locus enum for new dead-paths as they're
+    /// identified. Classification is always
     /// [`ErrorKind::Internal`].
-    ///
-    /// F6 / DEF-150: uniform "internal crate bug" shape replaces
-    /// three separate variants — fewer discriminants, single
-    /// diagnostic template, additive locus enum for new dead-paths
-    /// as they're identified.
     InternalCrateBug {
         /// Identifies the specific architecturally-dead code path
         /// that fired. Diagnostic only — every locus classifies as
@@ -661,8 +640,8 @@ pub enum ProtocolError {
         locus: CrateBugLocus,
     },
 
-    /// DEF-244 (2026-05-13): `RowStream::collect_tuple<R>` observed
-    /// a row with column count different from the prepared query's
+    /// `RowStream::collect_tuple<R>` observed a row with column
+    /// count different from the prepared query's
     /// `R::ARITY`. This is a server-side contract violation — the
     /// macro emitted the row OID list at compile time; PG would
     /// only ship rows with the matching arity for the same SQL.
@@ -674,23 +653,22 @@ pub enum ProtocolError {
         actual: u16,
     },
 
-    /// DEF-244 (2026-05-13): a column body exceeded the active
-    /// read-buf headroom during a typed `collect_tuple` call. The
-    /// v1 typed-decode path requires contiguous column bytes;
-    /// chunked columns are not assembled into typed values (would
-    /// require either caller-owned scratch buffer or heap-allocated
-    /// per-cell vectors — both outside the no_alloc contract).
+    /// A column body exceeded the active read-buf headroom during
+    /// a typed `collect_tuple` call. The typed-decode path requires
+    /// contiguous column bytes; chunked columns are not assembled
+    /// into typed values (would require either caller-owned scratch
+    /// buffer or heap-allocated per-cell vectors — both outside the
+    /// no_alloc contract).
     ///
     /// Caller falls back to `col_next` for the row to consume the
-    /// chunked bytes. Wider coverage tracks DEF-244 follow-up.
+    /// chunked bytes.
     ChunkedColumnInTypedRow,
 
-    /// DEF-244 (2026-05-13): a per-column `DecodeFormat::decode`
-    /// call returned an error during a typed `collect_tuple` row
-    /// assembly. The inner [`crate::decode::DecodeError`] is the
-    /// root cause (bad UTF-8, IntParse, NullInNonNullColumn, etc.).
-    /// The connection itself is healthy — the error is row-level,
-    /// not transport-level.
+    /// A per-column `DecodeFormat::decode` call returned an error
+    /// during a typed `collect_tuple` row assembly. The inner
+    /// [`crate::decode::DecodeError`] is the root cause (bad UTF-8,
+    /// IntParse, NullInNonNullColumn, etc.). The connection itself
+    /// is healthy — the error is row-level, not transport-level.
     DecodeFailure(crate::decode::DecodeError),
 
     /// A user command arrived on a connection that had already been
@@ -698,11 +676,11 @@ pub enum ProtocolError {
     /// the public error "connection closed, see earlier error" with
     /// the `prior_kind` as diagnostic context.
     ///
-    /// Introduced by DEF-061 — see [`ErrorKind`] for the ship-order
-    /// rationale. Before DEF-061, the full 856-byte `ProtocolError`
-    /// was cloned into every `FailReply` on an Errored connection;
-    /// now the prior cause is surfaced **once** in the first
-    /// `FailReply`, and subsequent pushes get a compact
+    /// See [`ErrorKind`] for the ship-order rationale. A naive
+    /// approach that cloned the full 856-byte `ProtocolError` into
+    /// every `FailReply` on an Errored connection is rejected; the
+    /// prior cause is surfaced **once** in the first `FailReply`
+    /// and subsequent pushes get a compact
     /// `ConnectionAlreadyClosed { prior_kind }` (17 bytes incl.
     /// discriminant + padding).
     ConnectionAlreadyClosed {
@@ -711,30 +689,28 @@ pub enum ProtocolError {
         /// the first `FailReply` action; the wrapper is expected to
         /// have preserved it.
         ///
-        /// DEF-142 (pass-#8 F-056): typed as [`StateErrorKind`] (not
-        /// [`ErrorKind`]) so the type system proves this field can
-        /// never recursively be `AlreadyClosed` — a
-        /// `ConnectionAlreadyClosed { prior_kind: AlreadyClosed }`
-        /// nonsense value is a type error at construction.
+        /// Typed as [`StateErrorKind`] (not [`ErrorKind`]) so the
+        /// type system proves this field can never recursively be
+        /// `AlreadyClosed` — a `ConnectionAlreadyClosed { prior_kind:
+        /// AlreadyClosed }` nonsense value is a type error at
+        /// construction.
         prior_kind: StateErrorKind,
     },
 }
 
-/// DEF-150 locus discriminator for
-/// [`ProtocolError::InternalCrateBug`]. Names the specific
-/// architecturally-dead code path that fired; every locus
-/// classifies as [`ErrorKind::Internal`].
+/// Locus discriminator for [`ProtocolError::InternalCrateBug`].
+/// Names the specific architecturally-dead code path that fired;
+/// every locus classifies as [`ErrorKind::Internal`].
 ///
-/// Additive: as new dead-paths are identified (e.g. DEF-154's
-/// buffer-witness stale-ref detection), variants grow WITHOUT
-/// expanding the top-level [`ProtocolError`] enum.
+/// Additive: as new dead-paths are identified, variants grow
+/// WITHOUT expanding the top-level [`ProtocolError`] enum.
 ///
-/// DEF-184 (B23): `#[repr(u8)]` makes the discriminant explicit
-/// 1-byte. `Option<CrateBugLocus>` niche-packs in the same byte —
+/// `#[repr(u8)]` makes the discriminant explicit 1-byte.
+/// `Option<CrateBugLocus>` niche-packs in the same byte —
 /// const-asserted below to catch drift if a future variant with
 /// payload lands.
 ///
-/// # `#[non_exhaustive]` (DEF-256, audit 2026-05-08)
+/// # `#[non_exhaustive]`
 ///
 /// This enum is the public catalogue of internal-bug classifications.
 /// New loci land as new architectural dead-arms get classified — every
@@ -752,43 +728,42 @@ pub enum CrateBugLocus {
     /// `total_len <= populated.len()`. The two checks happen in
     /// the same `feed_bytes` iteration with no interleaving
     /// mutation; emission indicates a ReadBuf lifecycle or coords
-    /// bug. Pre-DEF-150: `ReadCursorAdvanceUnreachable`.
+    /// bug.
     ReadCursorAdvance,
 
     /// [`crate::action::NonEmptyRange::new`] returned None when
     /// constructing a row-range for a `DataRow` frame.
     /// `parse_header` validates `payload_end <= populated_len`;
     /// emission indicates a [`crate::dispatch::FrameCoords`] math
-    /// bug. Pre-DEF-150: `RowRangeConstructionUnreachable`.
+    /// bug.
     RowRangeConstruction,
 
-    /// DEF-154 (B) Phase B4-W P0-3: a `ParamsWriter::write_params`
-    /// impl returned `Err(WriteBufFull)` while the `Bind` frame was
-    /// being built. `ParamsWriter` is a `pub` sealed trait —
-    /// user impls of arity 0..=16 exist via derive/macro. A
-    /// well-behaved impl never triggers this: the crate's
-    /// `MAX_OWNED_SEND_LEN` is const-asserted against the worst-
-    /// case `max_bind_message_size()` sum. Emission indicates
-    /// either a drift between `MAX_PARAMS_DATA_TOTAL` and the
-    /// builder's size budget, or an adversarial/buggy user impl
-    /// that writes past its advertised bound. Pre-B4-W P0-3 fix,
-    /// this Err was silently discarded with a `debug_assert!(false)`,
-    /// shipping a truncated Bind frame with miscomputed length
-    /// prefix — tier-4 silent corruption. Tier-3 classified now.
+    /// A `ParamsWriter::write_params` impl returned
+    /// `Err(WriteBufFull)` while the `Bind` frame was being built.
+    /// `ParamsWriter` is a `pub` sealed trait — user impls of arity
+    /// 0..=16 exist via derive/macro. A well-behaved impl never
+    /// triggers this: the crate's `MAX_OWNED_SEND_LEN` is
+    /// const-asserted against the worst-case
+    /// `max_bind_message_size()` sum. Emission indicates either a
+    /// drift between `MAX_PARAMS_DATA_TOTAL` and the builder's size
+    /// budget, or an adversarial/buggy user impl that writes past
+    /// its advertised bound. Classified tier-3 (vs a naive silent
+    /// discard with `debug_assert!(false)` that would ship a
+    /// truncated Bind frame with miscomputed length prefix —
+    /// tier-4 silent corruption).
     ParamsWriterOverflow,
 
-    /// DEF-154 (M) P0-3: a crate-internal frame builder
-    /// (`build_query_message`, `build_parse_message`, etc.) saw
-    /// `Err(WriteBufFull)` from a `BrandedWriteReserved::push_*`
-    /// call. Pre-(M), the 7 push_* methods accepted `WriteBufFull`
-    /// with `debug_assert! + silent discard` — release builds kept
-    /// writing a frame whose length-prefix had already been emitted
+    /// A crate-internal frame builder (`build_query_message`,
+    /// `build_parse_message`, etc.) saw `Err(WriteBufFull)` from a
+    /// `BrandedWriteReserved::push_*` call. A naive `debug_assert!
+    /// + silent discard` would let release builds keep writing a
+    /// frame whose length-prefix had already been emitted
     /// ASSUMING body bytes would follow, producing a
     /// correct-looking-length `Action::SendBytes` with TRUNCATED
     /// content (bit-junk on wire, PG server sees framing desync).
-    /// Post-(M): every push_* returns Result, builders `?`
-    /// propagate, builder-return Err classified as this locus and
-    /// routed through `FailReply + CloseSocket`.
+    /// Instead every push_* returns Result, builders `?`
+    /// propagate, builder-return Err classifies as this locus and
+    /// routes through `FailReply + CloseSocket`.
     ///
     /// Architecturally dead under
     /// `const _: () = assert!(MAX_OWNED_SEND_LEN >= max_*_message_size())`
@@ -798,9 +773,8 @@ pub enum CrateBugLocus {
     /// cap) lands here rather than silently ships corrupt bytes.
     BuilderCapacityOverflow,
 
-    /// DEF-154 (B) Phase B4-W P0-2: a `build_*_message` branded
-    /// builder produced a zero-length span when
-    /// `WriteRange::from_write_span` invoked
+    /// A `build_*_message` branded builder produced a zero-length
+    /// span when `WriteRange::from_write_span` invoked
     /// `NonEmptyRange::new(start, reserved.len(), reserved.len())`
     /// and got `None`.
     ///
@@ -810,56 +784,56 @@ pub enum CrateBugLocus {
     /// indicates a builder bug (missed push) or const-assert drift
     /// on `MAX_OWNED_SEND_LEN`.
     ///
-    /// Pre-P0-2 fix, the None case silently fell back to a
-    /// unit-length `NonEmptyRange (start=0, len=1)` — applied against
-    /// an empty buffer in materialise, produced a 0-byte
-    /// `Action::SendBytes`, handshake hangs at the wire (tier-4
-    /// silent corruption). Tier-3 classified now: builders return
-    /// `Result<WriteRange, ProtocolError>`; `compute_push_*`
-    /// routes `Err` through `FailReply + CloseSocket`.
+    /// Classified tier-3 (vs a naive silent fallback to unit-length
+    /// `NonEmptyRange (start=0, len=1)` which — applied against an
+    /// empty buffer in materialise — would produce a 0-byte
+    /// `Action::SendBytes` and hang the handshake at the wire).
+    /// Builders return `Result<WriteRange, ProtocolError>`;
+    /// `compute_push_*` routes `Err` through `FailReply +
+    /// CloseSocket`.
     EmptyWriteRange,
 
-    /// DEF-184 (B9): `AuthSubCode::try_from_u32` returned Err
-    /// carrying raw value 0 — architecturally impossible because
-    /// `AUTH_OK = 0` is the first match arm and returns Ok. The
+    /// `AuthSubCode::try_from_u32` returned Err carrying raw value
+    /// 0 — architecturally impossible because `AUTH_OK = 0` is the
+    /// first match arm and returns Ok. The
     /// `AuthSubCodeClass::Unknown(NonZeroU32)` niche-packed variant
     /// rejects zero values at the type level; this locus classifies
     /// the dead arm that would otherwise require either silent
     /// fallback (tier-4, CREDO §5) or new-variant-with-payload.
     AuthSubCodeZeroInErr,
 
-    /// DEF-271 cluster D (2026-05-10): the static `AtomicU64` counter
-    /// backing [`crate::PgProtocol::next_reply_id`] reached `u64::MAX`
-    /// and the next mint would produce a duplicate ID (atomics wrap
-    /// to 0 by spec; subsequent mints cycle through previously-issued
+    /// The static `AtomicU64` counter backing
+    /// [`crate::PgProtocol::next_reply_id`] reached `u64::MAX` and
+    /// the next mint would produce a duplicate ID (atomics wrap to
+    /// 0 by spec; subsequent mints cycle through previously-issued
     /// values). Architecturally distant (~10^19 mints process-wide)
     /// but a real ceiling.
     ///
-    /// Pre-DEF-271 the saturation point silently allowed the
-    /// duplicate-ID return; the wrapper's pending-replies table would
-    /// mis-route subsequent server replies to the wrong correlator.
-    /// Post-DEF-271 saturation detection transitions the affected
-    /// `PgProtocol` instance to `Errored(ReplyIdSaturation)`, so the
-    /// next push fails with `ConnectionAlreadyClosed`-classified the
-    /// duplicate never reaches the server in a usable state. Cross-
-    /// instance duplicate-ID risk remains tier-2 (separate residue —
-    /// architect's #1B brand-lifetime closure, deferred to Phase 4+).
+    /// A naive shape that allowed the saturation point to silently
+    /// return a duplicate-ID would let the wrapper's
+    /// pending-replies table mis-route subsequent server replies to
+    /// the wrong correlator. Instead saturation detection
+    /// transitions the affected `PgProtocol` instance to
+    /// `Errored(ReplyIdSaturation)`, so the next push fails with
+    /// `ConnectionAlreadyClosed`-classified before the duplicate
+    /// reaches the server. Cross-instance duplicate-ID risk remains
+    /// tier-2 (separate residue — brand-lifetime closure deferred).
     ReplyIdSaturation,
 
-    /// DEF-272 cluster γ (2026-05-10): `push_command_internal` was
-    /// invoked from a non-Idle state — a contract violation between
-    /// the only legitimate caller (`ReadyGuard::push_command`, which
-    /// classifies state as Idle via `as_ready` upstream) and
-    /// `push_command_internal`. Reaching this locus implies a
-    /// structural regression in the ReadyGuard → push_command_internal
-    /// pipeline; production-built binaries never reach it under the
-    /// existing call graph (state cannot transition between
-    /// `as_ready`'s check and `push_command_internal`'s entry — the
-    /// `&mut PgProtocol` borrow chain rules out interleaving).
+    /// `push_command_internal` was invoked from a non-Idle state —
+    /// a contract violation between the only legitimate caller
+    /// (`ReadyGuard::push_command`, which classifies state as Idle
+    /// via `as_ready` upstream) and `push_command_internal`.
+    /// Reaching this locus implies a structural regression in the
+    /// ReadyGuard → push_command_internal pipeline; production
+    /// binaries never reach it under the existing call graph (state
+    /// cannot transition between `as_ready`'s check and
+    /// `push_command_internal`'s entry — the `&mut PgProtocol`
+    /// borrow chain rules out interleaving).
     PushCommandInternalNonIdle,
 
-    /// DEF-248 Sub-A (2026-05-12): the closure passed to
-    /// [`crate::PgProtocol::iter_rows`] returned (normal exit, early
+    /// The closure passed to [`crate::PgProtocol::iter_rows`]
+    /// returned (normal exit, early
     /// return, or panic unwind) while a `RowStream` was mid-frame —
     /// either inside a row body (column events still pending) or in
     /// partial-frame mode (frame body bytes still in flight on the
@@ -881,68 +855,64 @@ pub enum CrateBugLocus {
     /// surfaces `ConnectionAlreadyClosed { prior_kind: ClientOrdering }`.
     StreamDroppedMidStream,
 
-    /// DEF-280 Bundle G (2026-05-18): a `compute_push_*` family function
-    /// staged a `StagedAction::DeliverReply` action — architecturally
-    /// dead because replies come from the server via `feed_bytes` only;
+    /// A `compute_push_*` family function staged a
+    /// `StagedAction::DeliverReply` action — architecturally dead
+    /// because replies come from the server via `feed_bytes` only;
     /// the push path never emits DeliverReply. Reaching this locus
-    /// indicates a `compute_push` refactor regression (or pipelining
-    /// work that didn't update DEF-160 Z2 invariant).
+    /// indicates a `compute_push` refactor regression.
     ///
-    /// Pre-Bundle G the dead arm in the materialise closure for the
-    /// push path used `debug_assert!(false, …)` plus a silent drop on
-    /// release — the CREDO §V glass pattern. Post-Bundle G the dead
-    /// arm classifies via `PushFailure { id: …, cause: InternalCrateBug
-    /// { locus: PushEmittedDeliverReply } }` (same sentinel-id shape
-    /// as `PushCommandInternalNonIdle`); both modes return Err
-    /// uniformly. Post-DEF-280 Bundle J the sentinel id is the distinct
-    /// [`crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL`] (= NonZeroU64::MAX),
-    /// not `NonZeroU64::MIN` — the latter collided with the legitimate
-    /// first id minted by `next_reply_id` on every connection's first
-    /// command. Closed by-construction by the distinct sentinel.
+    /// A naive `debug_assert!(false, …)` shield + silent drop on
+    /// release would match the CREDO §V glass pattern. Instead the
+    /// dead arm classifies via `PushFailure { id: …, cause:
+    /// InternalCrateBug { locus: PushEmittedDeliverReply } }`; both
+    /// dev and release route uniformly. The sentinel id is the
+    /// distinct [`crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL`]
+    /// (= NonZeroU64::MAX), not `NonZeroU64::MIN` — the latter would
+    /// collide with the legitimate first id minted by
+    /// `next_reply_id` on every connection's first command. Closed
+    /// by-construction by the distinct sentinel.
     PushEmittedDeliverReply,
 
-    /// DEF-280 Bundle K (2026-05-18): [`crate::buf::ReadBuf::enter_partial_mode`]
-    /// was called while the buffer was already in partial-frame mode
+    /// [`crate::buf::ReadBuf::enter_partial_mode`] was called while
+    /// the buffer was already in partial-frame mode
     /// (`partial_remaining > 0`). The streaming dispatcher's state
-    /// machine guarantees the precondition (`exit_partial_mode` runs
-    /// before re-entry), so reaching this locus indicates an internal
-    /// refactor regression in the dispatch loop.
+    /// machine guarantees the precondition (`exit_partial_mode`
+    /// runs before re-entry), so reaching this locus indicates an
+    /// internal refactor regression in the dispatch loop.
     ///
-    /// Pre-Bundle K the same condition was a `debug_assert!` panic in
-    /// dev builds + silent overwrite of the prior `partial_remaining`
-    /// in release — the CREDO §V glass pattern, with wire-desync
-    /// consequence (forgotten body-byte count: the next inbound bytes
-    /// classified as a fresh frame header instead of body
-    /// continuation). Post-Bundle K both modes return typed `Err` and
-    /// route through this locus + `Errored` state install.
+    /// A naive `debug_assert!` panic in dev builds + silent
+    /// overwrite of the prior `partial_remaining` in release would
+    /// match the CREDO §V glass pattern, with wire-desync
+    /// consequence (forgotten body-byte count: the next inbound
+    /// bytes classified as a fresh frame header instead of body
+    /// continuation). Instead both dev and release return typed
+    /// `Err` and route through this locus + `Errored` state install.
     PartialModeReentry,
 
-    /// DEF-280 Bundle K-mirror (2026-05-18): [`crate::buf::ReadBuf::exit_partial_mode`]
-    /// was called while the buffer still owed wire body bytes
-    /// (`partial_remaining > 0`). The streaming dispatcher's
-    /// state machine guarantees the precondition (every wire-legal
-    /// streaming row drains its body before reaching the
-    /// end-of-row code path), so reaching this locus indicates
-    /// either an internal refactor regression in the dispatch loop
-    /// OR an adversarial server emitting a malformed DataRow whose
-    /// `col_count`/per-column length sum doesn't match the
-    /// frame-header body length.
+    /// [`crate::buf::ReadBuf::exit_partial_mode`] was called while
+    /// the buffer still owed wire body bytes (`partial_remaining >
+    /// 0`). The streaming dispatcher's state machine guarantees the
+    /// precondition (every wire-legal streaming row drains its body
+    /// before reaching the end-of-row code path), so reaching this
+    /// locus indicates either an internal refactor regression in
+    /// the dispatch loop OR an adversarial server emitting a
+    /// malformed DataRow whose `col_count`/per-column length sum
+    /// doesn't match the frame-header body length.
     ///
-    /// Pre-Bundle-K-mirror the same condition was a `debug_assert!`
-    /// plus silent reset of `partial_remaining` to `0` on release —
-    /// the CREDO §V glass pattern, mirror of [`Self::PartialModeReentry`]'s
-    /// entry-side hazard. Wire-desync consequence: previously-pending
-    /// body bytes never drained from the wire, next inbound bytes
-    /// mis-classified as a fresh frame header. Post-Bundle-K-mirror
-    /// both modes return typed `Err`, the counter is preserved, and
-    /// the caller routes through this locus and `Errored` state install.
+    /// A naive `debug_assert!` + silent reset of `partial_remaining`
+    /// to `0` on release would match the CREDO §V glass pattern
+    /// (mirror of [`Self::PartialModeReentry`]'s entry-side hazard).
+    /// Wire-desync consequence: previously-pending body bytes never
+    /// drained from the wire, next inbound bytes mis-classified as
+    /// a fresh frame header. Instead both dev and release return
+    /// typed `Err`, the counter is preserved, and the caller routes
+    /// through this locus and `Errored` state install.
     PartialModeExitUndrained,
 }
 
-// DEF-184 (B23): niche-packed `Option<CrateBugLocus>` — 1 byte
-// since all variants are C-like + `#[repr(u8)]`. Drift pin catches
-// any future variant that adds a payload (would bump size to ≥ 2B
-// and break the niche).
+// Niche-packed `Option<CrateBugLocus>` — 1 byte since all variants
+// are C-like + `#[repr(u8)]`. Drift pin catches any future variant
+// that adds a payload (would bump size to ≥ 2B and break the niche).
 const _: () = assert!(
     core::mem::size_of::<CrateBugLocus>() == 1,
     "CrateBugLocus must stay 1-byte (repr(u8), C-like variants) — \
@@ -957,12 +927,11 @@ const _: () = assert!(
 );
 
 impl fmt::Display for CrateBugLocus {
-    /// DEF-173 (audit2 A006 + A031): dedicated Display impl for
-    /// operator-facing log output. Pre-DEF-173,
-    /// [`ProtocolError::InternalCrateBug`]'s Display used `{locus:?}`
-    /// (Debug) which renders `OutboundFrameBuild { stage: Query }`
-    /// as a Rust struct-expression — cluttered in operator logs and
-    /// fragile to a future Debug derive change.
+    /// Dedicated Display impl for operator-facing log output. A
+    /// naive `{locus:?}` (Debug) rendering would produce Rust
+    /// struct-expression output (`OutboundFrameBuild { stage:
+    /// Query }`) — cluttered in operator logs and fragile to a
+    /// future Debug derive change.
     ///
     /// This impl renders each locus as a stable kebab-case tag:
     /// - `ReadCursorAdvance` → `"read-cursor-advance"`
@@ -975,9 +944,6 @@ impl fmt::Display for CrateBugLocus {
     /// Test module `crate_bug_locus_display_tests` pins each string
     /// literal — a future variant rename cannot silently change
     /// operator logs without tripping the test.
-    ///
-    /// DEF-188: `SchemaArenaAllocFull` and `StaleSchemaRef` loci
-    /// removed alongside the schema arena's deletion.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReadCursorAdvance => f.write_str("read-cursor-advance"),
@@ -998,10 +964,10 @@ impl fmt::Display for CrateBugLocus {
 
 #[cfg(test)]
 mod crate_bug_locus_display_tests {
-    //! DEF-173 pin: each [`CrateBugLocus`] variant renders to its
-    //! canonical operator-facing string. A rename or Debug-derive
-    //! refactor that breaks the rendering will trip these tests
-    //! loudly instead of silently corrupting production log output.
+    //! Each [`CrateBugLocus`] variant renders to its canonical
+    //! operator-facing string. A rename or Debug-derive refactor
+    //! that breaks the rendering will trip these tests loudly
+    //! instead of silently corrupting production log output.
 
     use super::*;
     extern crate alloc;
@@ -1029,13 +995,6 @@ mod crate_bug_locus_display_tests {
         );
     }
 
-    // DEF-188: `schema_arena_alloc_full_display` and
-    // `stale_schema_ref_display` tests DELETED — `CrateBugLocus`
-    // variants `SchemaArenaAllocFull` and `StaleSchemaRef` removed
-    // alongside the schema arena. The ref-handle is gone; arena
-    // allocation no longer exists. No corresponding production
-    // emission site remains.
-
     #[test]
     fn params_writer_overflow_display() {
         let e = ProtocolError::InternalCrateBug {
@@ -1058,17 +1017,10 @@ mod crate_bug_locus_display_tests {
         );
     }
 
-    // DEF-154 (A): `outbound_frame_build_display_per_stage` test and
-    // the `FrameBuildStage` enum it exercised were DELETED alongside
-    // `CrateBugLocus::OutboundFrameBuild` variant — builders are now
-    // infallible via the `WriteReserved` capacity witness, so the
-    // locus variant + its stage-discriminator + the pin test all
-    // became dead code. See `crate::protocol::build_*_message`.
-
-    /// DEF-271 cluster D (2026-05-10) pin: ReplyIdSaturation locus
-    /// renders to its canonical operator-facing string. Trips loudly
-    /// if a future rename or display-impl edit silently changes the
-    /// log output a wrapper-level monitor relies on.
+    /// ReplyIdSaturation locus renders to its canonical
+    /// operator-facing string. Trips loudly if a future rename or
+    /// display-impl edit silently changes the log output a
+    /// wrapper-level monitor relies on.
     #[test]
     fn reply_id_saturation_display() {
         let e = ProtocolError::InternalCrateBug {
@@ -1080,10 +1032,10 @@ mod crate_bug_locus_display_tests {
         );
     }
 
-    /// DEF-248 Sub-A (2026-05-12) pin: StreamDroppedMidStream locus
-    /// renders to its canonical operator-facing string. Watches for
-    /// drift on the closure-scoped iter_rows Drop-install path's
-    /// operator-facing log signal.
+    /// StreamDroppedMidStream locus renders to its canonical
+    /// operator-facing string. Watches for drift on the
+    /// closure-scoped iter_rows Drop-install path's operator-facing
+    /// log signal.
     #[test]
     fn stream_dropped_mid_stream_display() {
         let e = ProtocolError::InternalCrateBug {
@@ -1095,11 +1047,11 @@ mod crate_bug_locus_display_tests {
         );
     }
 
-    /// DEF-280 Bundle G (2026-05-18) pin: PushEmittedDeliverReply locus
-    /// renders to its canonical operator-facing string. Watches for
-    /// drift on the compute_push pipeline classifier-bug signal —
-    /// replaces the pre-Bundle G `debug_assert!(false, …)` glass
-    /// pattern at protocol.rs:2881 with classified PushFailure.
+    /// PushEmittedDeliverReply locus renders to its canonical
+    /// operator-facing string. Watches for drift on the
+    /// compute_push pipeline classifier-bug signal — classified
+    /// PushFailure on what would otherwise be a `debug_assert!
+    /// (false, …)` glass pattern.
     #[test]
     fn push_emitted_deliver_reply_display() {
         let e = ProtocolError::InternalCrateBug {
@@ -1111,12 +1063,11 @@ mod crate_bug_locus_display_tests {
         );
     }
 
-    /// DEF-280 Bundle K (2026-05-18) pin: PartialModeReentry locus
-    /// renders to its canonical operator-facing string. Watches for
-    /// drift on the row-stream partial-mode classifier-bug signal —
-    /// replaces the pre-Bundle K `debug_assert!(partial_remaining
-    /// == 0, …)` glass pattern at buf.rs:855 with typed Err return
-    /// + classified install_errored routing.
+    /// PartialModeReentry locus renders to its canonical operator-
+    /// facing string. Watches for drift on the row-stream partial-
+    /// mode classifier-bug signal — typed Err return + classified
+    /// install_errored routing on what would otherwise be a
+    /// `debug_assert!(partial_remaining == 0, …)` glass pattern.
     #[test]
     fn partial_mode_reentry_display() {
         let e = ProtocolError::InternalCrateBug {
@@ -1128,13 +1079,12 @@ mod crate_bug_locus_display_tests {
         );
     }
 
-    /// DEF-280 Bundle K-mirror (2026-05-18) pin: PartialModeExitUndrained
-    /// locus renders to its canonical operator-facing string. Watches
-    /// for drift on the row-stream partial-mode exit-with-bytes-owed
-    /// classifier-bug signal — replaces the pre-Bundle-K-mirror
-    /// `debug_assert!(partial_remaining == 0, …)` glass pattern at
-    /// buf.rs:894 with typed Err return + classified install_errored
-    /// routing.
+    /// PartialModeExitUndrained locus renders to its canonical
+    /// operator-facing string. Watches for drift on the row-stream
+    /// partial-mode exit-with-bytes-owed classifier-bug signal —
+    /// typed Err return + classified install_errored routing on
+    /// what would otherwise be a `debug_assert!(partial_remaining
+    /// == 0, …)` glass pattern.
     #[test]
     fn partial_mode_exit_undrained_display() {
         let e = ProtocolError::InternalCrateBug {
@@ -1150,15 +1100,15 @@ mod crate_bug_locus_display_tests {
 /// Compact 1-byte classification of a [`ProtocolError`], stored in
 /// [`crate::state::ProtoState::Errored`].
 ///
-/// # DEF-061 rationale
+/// # Rationale
 ///
-/// Before DEF-061, the state carried the full `ProtocolError`
+/// A naive shape where state carries the full `ProtocolError`
 /// (~856 bytes dominated by `ServerErrorResponse`'s five
-/// `heapless::String<N>` fields). Every `push_command` on an Errored
-/// connection cloned the whole thing into a new `FailReply` —
-/// ~1.3 KB of stack churn per push on the cold path.
+/// `heapless::String<N>` fields) would mean every `push_command`
+/// on an Errored connection clones the whole thing into a new
+/// `FailReply` — ~1.3 KB of stack churn per push on the cold path.
 ///
-/// Now `ProtoState::Errored(ErrorKind)` is 2 bytes (1 for the
+/// Instead `ProtoState::Errored(ErrorKind)` is 2 bytes (1 for the
 /// discriminant + 1 for the outer variant tag). The full
 /// `ProtocolError` is emitted in `FailReply` **exactly once** (the
 /// first fatal); subsequent pushes emit
@@ -1171,17 +1121,16 @@ mod crate_bug_locus_display_tests {
 ///   exactly one `ErrorKind`": the `ProtocolError::kind` match is
 ///   exhaustive; adding a new `ProtocolError` variant without
 ///   classifying it is a build error.
-// DEF-211 SAFE-07 (audit 2026-05-04): `#[non_exhaustive]` pre-empts
-// the SemVer footgun — adding a new variant in a future release
-// would otherwise be a major-version break. With `non_exhaustive`,
-// downstream `match`es require a wildcard arm (or accept future
-// variants explicitly), so adding a variant is a minor-version
-// non-breaking change. Internal `match`es here remain exhaustive
-// because `#[non_exhaustive]` permits exhaustive matches WITHIN
-// the defining crate — only EXTERNAL crates are required to use
-// a wildcard. Tier-1 invariants on the internal exhaustive-match
-// shields (e.g., `ProtocolError::kind`, `StateErrorKind` mapping)
-// are preserved.
+// `#[non_exhaustive]` pre-empts the SemVer footgun — adding a new
+// variant in a future release would otherwise be a major-version
+// break. With `non_exhaustive`, downstream `match`es require a
+// wildcard arm (or accept future variants explicitly), so adding a
+// variant is a minor-version non-breaking change. Internal
+// `match`es here remain exhaustive because `#[non_exhaustive]`
+// permits exhaustive matches WITHIN the defining crate — only
+// EXTERNAL crates are required to use a wildcard. Tier-1 invariants
+// on the internal exhaustive-match shields (e.g.,
+// `ProtocolError::kind`, `StateErrorKind` mapping) are preserved.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -1204,21 +1153,18 @@ pub enum ErrorKind {
     /// [`ProtocolError::ScramError`] +
     /// [`ProtocolError::UnsupportedProtocolOption`].
     ///
-    /// **Pass-#8 F-052 (2026-04-21).** Prior to pass-#8 this bucket
-    /// also included `StartupAlreadyInProgress` and `CommandInProgress`
-    /// — both client-side push-ordering errors, NOT server-driven auth
-    /// failures. Wrappers reading `ConnectionAlreadyClosed { prior_kind }`
-    /// from a push-race would see `Auth` and report "authentication
-    /// error" when the real cause was the user pushing too fast. Those
-    /// variants now route to [`Self::ClientOrdering`].
+    /// `StartupAlreadyInProgress` and `CommandInProgress` are NOT
+    /// in this bucket — they're client-side push-ordering errors,
+    /// not server-driven auth failures. A naive bucketing here
+    /// would let wrappers reading `ConnectionAlreadyClosed
+    /// { prior_kind }` from a push-race see `Auth` and report
+    /// "authentication error" when the real cause was the user
+    /// pushing too fast. Those variants route to
+    /// [`Self::ClientOrdering`].
     Auth = 3,
     /// Internal invariant broken — bug in this crate. Covers
-    /// [`ProtocolError::InternalCrateBug`] (DEF-150 merge of the
-    /// former three `*Unreachable` variants plus the
-    /// builder/writer dead-arm loci. DEF-188 removed
-    /// `SchemaArenaAllocFull` and `StaleSchemaRef` along with the
-    /// schema arena — those classes are now structurally
-    /// impossible).
+    /// [`ProtocolError::InternalCrateBug`] (uniform shape over the
+    /// architecturally-dead loci enumerated in [`CrateBugLocus`]).
     Internal = 4,
     /// Pseudo-kind for a `ConnectionAlreadyClosed` meta-error. Only
     /// ever appears in `FailReply` replies, never in state (the state
@@ -1234,9 +1180,9 @@ pub enum ErrorKind {
     /// the wrapper-side bug class ("your code ordering") from genuine
     /// auth path errors ([`Self::Auth`]) so diagnostics in
     /// `ConnectionAlreadyClosed { prior_kind }` correctly identify
-    /// the culprit. Pass-#8 F-052. 1 byte (repr(u8)).
+    /// the culprit. 1 byte (repr(u8)).
     ClientOrdering = 6,
-    /// DEF-189 Q8-C4 — counter-storm classifier.
+    /// Counter-storm classifier.
     ///
     /// Lifts the `malformed_frame_count` saturation event from tier-4
     /// silent (the counter just clamps at u32::MAX) to tier-3 explicit:
@@ -1270,16 +1216,17 @@ pub enum ErrorKind {
 /// [`crate::state::ProtoState::Errored`] and carried as
 /// `prior_kind` of [`ProtocolError::ConnectionAlreadyClosed`].
 ///
-/// # DEF-142 (pass-#8 F-056): tier-1 compile invariant
+/// # Tier-1 compile invariant
 ///
-/// The invariant "state never holds `ErrorKind::AlreadyClosed`" was
-/// previously tier-3 audit — maintained by the `fail_inflight_and_close`
-/// early-return guard on already-Errored state. A future refactor
-/// that dropped the guard could route `AlreadyClosed` into state
-/// and the `prior_kind` field, producing nonsensical
-/// `ConnectionAlreadyClosed { prior_kind: AlreadyClosed }` diagnostics.
+/// "State never holds `ErrorKind::AlreadyClosed`" is enforced at the
+/// type level rather than left to audit. A naive shape that used
+/// `ErrorKind` directly inside `ProtoState::Errored(_)` and the
+/// `prior_kind` field would need a `fail_inflight_and_close` guard
+/// to reject `AlreadyClosed` reaching state — drop the guard and
+/// you get nonsensical `ConnectionAlreadyClosed { prior_kind:
+/// AlreadyClosed }` diagnostics.
 ///
-/// This newtype makes the invariant tier-1: the constructor
+/// This newtype lifts the invariant to tier-1: the constructor
 /// [`Self::try_from_kind`] rejects `AlreadyClosed`, so
 /// `ProtoState::Errored(StateErrorKind)` cannot type-check with
 /// an `AlreadyClosed` kind at the construction site.
@@ -1293,24 +1240,24 @@ pub enum ErrorKind {
 /// # Niche optimisation
 ///
 /// Wrapping `ErrorKind` (which is `#[repr(u8)]` with 8 variants
-/// 0..=7 post-DEF-189) preserves 247 unused discriminant values
-/// as niches, so `Option<StateErrorKind>` is still 1 byte just
-/// like `Option<ErrorKind>`.
+/// 0..=7) preserves 247 unused discriminant values as niches, so
+/// `Option<StateErrorKind>` is still 1 byte just like
+/// `Option<ErrorKind>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct StateErrorKind(ErrorKind);
 
 impl StateErrorKind {
-    // DEF-154 (I) — HISTORICAL: `INTERNAL_FALLBACK` const DELETED
-    // (Tier-3 audit #53, 2026-05-19, verified). It was exposed
-    // publicly only to supply the `unwrap_or_else` landing pad for
-    // three `state_kind().unwrap_or_else(|| { debug_assert!(false,
-    // ...); INTERNAL_FALLBACK })` call sites, which are now replaced
-    // by a total `state_kind() -> StateErrorKind` projection (see
-    // `ProtocolError::state_kind` at the end of this module). The
-    // internal `Self(ErrorKind::Internal)` sentinel lives on inside
-    // `from_kind_or_internal`. The "tier-4 debug-loud-release-silent"
-    // pattern the audit flagged is closed.
+    // Tier-3 audit #53 (2026-05-19, verified): no public
+    // `INTERNAL_FALLBACK` const. A naive shape would expose one to
+    // supply the `unwrap_or_else` landing pad for three
+    // `state_kind().unwrap_or_else(|| { debug_assert!(false, ...);
+    // INTERNAL_FALLBACK })` call sites — the exact "release silent +
+    // debug loud" pattern that is banned crate-wide. Instead
+    // `state_kind() -> StateErrorKind` is total (see
+    // `ProtocolError::state_kind` at the end of this module) and the
+    // internal `Self(ErrorKind::Internal)` sentinel is encapsulated
+    // inside `from_kind_or_internal`.
 
     /// Construct from a full [`ErrorKind`]. Returns `None` when
     /// passed [`ErrorKind::AlreadyClosed`] — that variant is the
@@ -1342,19 +1289,20 @@ impl StateErrorKind {
     /// implies a crate bug, which is precisely what `Internal`
     /// classifies).
     ///
-    /// DEF-154 (I): this is the sole infallible path production now.
-    /// `ProtocolError::state_kind()` is implemented on top of this.
-    /// Tests and fixture code use it to produce a `StateErrorKind`
-    /// from a known-valid literal without Option ceremony.
+    /// Sole infallible-path production. `ProtocolError::state_kind()`
+    /// is implemented on top of this. Tests and fixture code use it
+    /// to produce a `StateErrorKind` from a known-valid literal
+    /// without Option ceremony.
     #[inline]
     #[must_use]
     pub const fn from_kind_or_internal(k: ErrorKind) -> Self {
         match Self::try_from_kind(k) {
             Some(s) => s,
-            // DEF-154 (I): inline the Internal sentinel instead of a
-            // separate `INTERNAL_FALLBACK` const. Architecturally
-            // dead: AlreadyClosed never reaches the state-install
-            // paths (DEF-142 seal); call-site classification.
+            // Inline the Internal sentinel instead of a separate
+            // `INTERNAL_FALLBACK` const. Architecturally dead:
+            // AlreadyClosed never reaches the state-install paths
+            // (sealed by the `try_from_kind` rejection above);
+            // call-site classification.
             None => Self(ErrorKind::Internal),
         }
     }
@@ -1368,8 +1316,8 @@ impl StateErrorKind {
     }
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): see ProtocolError
-// `core::error::Error` impl below for the rationale.
+// See the `ProtocolError` `core::error::Error` impl below for the
+// rationale on satisfying the canonical error-trait contract.
 impl core::error::Error for StateErrorKind {}
 
 impl fmt::Display for StateErrorKind {
@@ -1391,7 +1339,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<Option<StateErrorKind>>() == 1,
-    "Option<StateErrorKind> must niche-pack to 1 byte (ErrorKind uses 8 of 256 u8 discriminants post-DEF-189)",
+    "Option<StateErrorKind> must niche-pack to 1 byte (ErrorKind uses 8 of 256 u8 discriminants)",
 );
 
 impl ProtocolError {
@@ -1419,9 +1367,9 @@ impl ProtocolError {
             Self::UnsupportedAuthMethod { .. }
             | Self::UnsupportedProtocolOption
             | Self::Scram(_) => ErrorKind::Auth,
-            // F-052 (pass-#8): client-side push-ordering bugs must
-            // NOT route to `Auth` — they're the user calling push_command
-            // out of order, not a server auth failure. Wrappers reading
+            // Client-side push-ordering bugs must NOT route to `Auth`
+            // — they're the user calling push_command out of order,
+            // not a server auth failure. Wrappers reading
             // `ConnectionAlreadyClosed { prior_kind: Auth }` would
             // report a misleading "authentication error" diagnostic.
             Self::StartupAlreadyInProgress | Self::CommandInProgress => ErrorKind::ClientOrdering,
@@ -1433,8 +1381,8 @@ impl ProtocolError {
             | Self::MalformedParameterDescription { .. }
             | Self::TooManyParameters { .. } => ErrorKind::Framing,
             Self::InternalCrateBug { .. } => ErrorKind::Internal,
-            // DEF-244: typed-row decoder errors. Column-count mismatch
-            // is a Framing-class issue (server vs prepared query
+            // Typed-row decoder errors. Column-count mismatch is a
+            // Framing-class issue (server vs prepared query
             // disagreement on schema shape); ChunkedColumnInTypedRow
             // is a Framing-class limitation (caller used typed decode
             // on a multi-MB column that doesn't fit one buffer).
@@ -1447,33 +1395,33 @@ impl ProtocolError {
         }
     }
 
-    /// DEF-176 (audit2 A016) + DEF-154 (I): total projection from
-    /// [`ProtocolError`] to the [`StateErrorKind`] subset storable
-    /// in [`crate::state::ProtoState::Errored`].
+    /// Total projection from [`ProtocolError`] to the
+    /// [`StateErrorKind`] subset storable in
+    /// [`crate::state::ProtoState::Errored`].
     ///
     /// `ErrorKind::AlreadyClosed` is the only kind that isn't
-    /// state-storable in principle (per DEF-142's seal); it only
-    /// arises in reply-only contexts (push_command /
-    /// push_bind_execute emitting `FailReply { cause: ConnectionAlreadyClosed }`
-    /// when the user invokes on an already-Errored state). The
-    /// dispatch + feed_bytes + builder paths NEVER see it as a
-    /// cause — architectural invariant per DEF-142.
+    /// state-storable in principle (sealed by `try_from_kind`); it
+    /// only arises in reply-only contexts (push_command /
+    /// push_bind_execute emitting
+    /// `FailReply { cause: ConnectionAlreadyClosed }` when the user
+    /// invokes on an already-Errored state). The dispatch +
+    /// feed_bytes + builder paths NEVER see it as a cause —
+    /// architectural invariant of the `StateErrorKind` seal.
     ///
-    /// Pre-(I) (HISTORICAL — closed by DEF-154 (I); Tier-3 audit
-    /// #53, 2026-05-19, verified): this method returned
-    /// `Option<StateErrorKind>` and three call sites open-coded
+    /// # Tier-3 audit #53 (2026-05-19, verified): total typed projection
+    ///
+    /// A naive shape would return `Option<StateErrorKind>` and let
+    /// call sites open-code
     /// `state_kind().unwrap_or_else(|| { debug_assert!(false, ...); INTERNAL_FALLBACK })`
-    /// — the exact "release silent + debug loud" pattern the user
-    /// has banned (
-    /// "никаких потенциальных паник и прочих атрибутов хрупкой и
-    /// стеклянной структуры").
-    ///
-    /// Post-(I), the projection is **total**: `AlreadyClosed →
-    /// Internal`. That IS an honest classification ("something went
-    /// wrong at the crate level") — not silent corruption.
-    /// Architecturally dead under DEF-142 seal; preserved as
+    /// — the exact "release silent + debug loud" pattern that is
+    /// banned crate-wide ("никаких потенциальных паник и прочих
+    /// атрибутов хрупкой и стеклянной структуры"). Instead the
+    /// projection is **total**: `AlreadyClosed → Internal`. That
+    /// IS an honest classification ("something went wrong at the
+    /// crate level") — not silent corruption. Architecturally
+    /// dead under the `StateErrorKind` seal; preserved as
     /// behavioural fallback rather than a panic + silent-release
-    /// split. Tier-2 typed-total per audit #53 plan.
+    /// split.
     #[inline]
     #[must_use]
     pub const fn state_kind(&self) -> StateErrorKind {
@@ -1481,12 +1429,11 @@ impl ProtocolError {
     }
 }
 
-/// DEF-154 (M) P0-3: convert `WriteBufFull` (write-side buffer
-/// overflow) to the crate-internal-bug classification
-/// `BuilderCapacityOverflow`. Enables `?`-propagation through
-/// builders that returned `Result<WriteRange, ProtocolError>`
-/// pre-(M) and whose push_* sites returned the raw
-/// `Result<(), WriteBufFull>` post-(M).
+/// Converts `WriteBufFull` (write-side buffer overflow) to the
+/// crate-internal-bug classification `BuilderCapacityOverflow`.
+/// Enables `?`-propagation through builders that return
+/// `Result<WriteRange, ProtocolError>` over raw push_* sites that
+/// return `Result<(), WriteBufFull>`.
 impl From<crate::write_buf::WriteBufFull> for ProtocolError {
     #[inline]
     fn from(_: crate::write_buf::WriteBufFull) -> Self {
@@ -1496,21 +1443,19 @@ impl From<crate::write_buf::WriteBufFull> for ProtocolError {
     }
 }
 
-// DEF-244 modernisation audit (rust-version 1.81 — `core::error::Error`
-// stabilised). Additive impl: `ProtocolError` now satisfies the
-// canonical error-trait contract from `core`. Downstream crates
-// (`bsql-driver-postgres`, async wrappers) can `?`-propagate
-// `ProtocolError` through `Box<dyn core::error::Error>` boundaries +
-// downstream `thiserror`-style enums without a manual `From`/Display
-// wrapping bridge. Empty body: the default `Error::source()` (returns
-// `None`) is correct — `ProtocolError` is a leaf error type (no inner
-// errors it wraps that satisfy `Error`); it has variants carrying typed
+// `ProtocolError` satisfies the canonical error-trait contract from
+// `core`. Downstream crates (`bsql-driver-postgres`, async wrappers)
+// can `?`-propagate `ProtocolError` through
+// `Box<dyn core::error::Error>` boundaries + downstream
+// `thiserror`-style enums without a manual `From`/Display wrapping
+// bridge. Empty body: the default `Error::source()` (returns `None`)
+// is correct — `ProtocolError` is a leaf error type (no inner errors
+// it wraps that satisfy `Error`); it has variants carrying typed
 // classifications (ScramError, DecodeError) but those are independent
 // errors, not chained sources.
 //
-// `no_std` note: `core::error::Error` is available in `no_std` since
-// Rust 1.81; we use the `core::` path (NOT `std::`) to keep the crate
-// `no_std`-clean.
+// `no_std` note: `core::error::Error` is available in `no_std`; the
+// crate uses the `core::` path (NOT `std::`) to keep `no_std` clean.
 impl core::error::Error for ProtocolError {}
 
 impl fmt::Display for ProtocolError {
@@ -1667,7 +1612,7 @@ impl fmt::Display for ProtocolError {
             Self::ChunkedColumnInTypedRow => f.write_str(
                 "prepared query: column body exceeds read-buf headroom and would require chunked \
                  assembly; v1 typed-decode requires contiguous columns. Use `col_next` directly \
-                 for multi-MB cells (DEF-244 follow-up will add chunk-aware typed decoders)",
+                 for multi-MB cells (chunk-aware typed decoders are a planned follow-up)",
             ),
             Self::DecodeFailure(err) => write!(
                 f,
