@@ -301,17 +301,20 @@ mod tests {
             Err(_) => return,
         };
 
+        // Tier-4 Cluster D #85 (2026-05-19): pre-audit had a three-
+        // layer fallback chain (`base64_encode_to_buf(...).unwrap_or(0)`
+        // → `buf.get(..len).unwrap_or(&[])` → `from_utf8(...).unwrap_or("")`)
+        // for each of two base64 verifications. Migrated to call
+        // `base64ct::Base64::encode` directly — it returns
+        // `Result<&str, InvalidLengthError>` borrowing into the
+        // caller-owned buf, eliminating the slice→bytes→str conversion
+        // chain. Single `unwrap_or("")` per call instead of three.
+        use base64ct::{Base64, Encoding};
+
         // Verify via base64 encoding of the proof.
         let mut proof_b64_buf = [0u8; 64];
-        let proof_b64_len = crate::scram::wire::base64_encode_to_buf(
-            proof.as_ref(),
-            &mut proof_b64_buf,
-        )
-        .unwrap_or(0);
-        let proof_b64 = core::str::from_utf8(
-            proof_b64_buf.get(..proof_b64_len).unwrap_or(&[]),
-        )
-        .unwrap_or("");
+        let proof_b64 =
+            Base64::encode(proof.as_ref(), &mut proof_b64_buf).unwrap_or("");
         assert_eq!(
             proof_b64,
             "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
@@ -320,15 +323,8 @@ mod tests {
 
         // Verify server signature via base64.
         let mut sig_b64_buf = [0u8; 64];
-        let sig_b64_len = crate::scram::wire::base64_encode_to_buf(
-            server_sig.as_bytes(),
-            &mut sig_b64_buf,
-        )
-        .unwrap_or(0);
-        let sig_b64 = core::str::from_utf8(
-            sig_b64_buf.get(..sig_b64_len).unwrap_or(&[]),
-        )
-        .unwrap_or("");
+        let sig_b64 =
+            Base64::encode(server_sig.as_bytes(), &mut sig_b64_buf).unwrap_or("");
         assert_eq!(
             sig_b64,
             "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=",
