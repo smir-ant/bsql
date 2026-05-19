@@ -1,5 +1,4 @@
-//! DEF-259 (2026-05-08): exhaustiveness gate for the per-secret
-//! zeroize-on-drop manifest.
+//! Exhaustiveness gate for the per-secret zeroize-on-drop manifest.
 //!
 //! # Tier-1-by-construction promise
 //!
@@ -530,7 +529,7 @@ fn manifest_covers_every_zeroize_on_drop_secret_type() {
 
     if !in_src_not_in_manifest.is_empty() || !in_manifest_not_in_src.is_empty() {
         let mut msg = String::new();
-        msg.push_str("DEF-259 manifest drift detected:\n");
+        msg.push_str("zeroize-on-drop manifest drift detected:\n");
         if !in_src_not_in_manifest.is_empty() {
             msg.push_str(
                 "\nThe following secret-bearing types are present in `src/**/*.rs` \
@@ -558,28 +557,28 @@ fn manifest_covers_every_zeroize_on_drop_secret_type() {
         }
         msg.push_str(
             "\nRationale: the manifest is the audit anchor for tier-1 \
-             zeroize-on-drop coverage (DEF-259). Drift between source and \
-             manifest indicates either an unmonitored secret type (missing \
-             entry) or a stale manifest (orphan entry).\n",
+             zeroize-on-drop coverage. Drift between source and manifest \
+             indicates either an unmonitored secret type (missing entry) \
+             or a stale manifest (orphan entry).\n",
         );
         panic!("{msg}");
     }
 }
 
 /// Sanity: the discovered set is non-empty. Catches a regression
-/// that breaks the source-scan logic (e.g., regex pattern drift)
-/// — pre-DEF-259, the crate has at least 6 derive(ZeroizeOnDrop)
-/// types and 2 manual impl Drop with .zeroize(). If we discover
-/// zero, the scanner is broken, not the source.
+/// that breaks the source-scan logic (e.g., regex pattern drift).
+/// The crate has at least 6 `derive(ZeroizeOnDrop)` types and 2
+/// manual `impl Drop` with `.zeroize()`. If we discover zero, the
+/// scanner is broken, not the source.
 #[test]
 fn source_scanner_finds_at_least_baseline_count() {
     let discovered = discover_zeroize_types();
     assert!(
         discovered.len() >= 8,
-        "DEF-259 source scanner regressed: discovered only {} types but \
-         baseline is ≥ 8 (Password, Sensitive, ScramSession, SecretDigest, \
-         Md5HandshakeState, ErrorPayload, SecretBoundedStr, ReadBufN, \
-         WriteBuf). Discovered: {discovered:?}",
+        "zeroize-on-drop source scanner regressed: discovered only {} types \
+         but baseline is ≥ 8 (Password, Sensitive, ScramSession, \
+         SecretDigest, Md5HandshakeState, ErrorPayload, SecretBoundedStr, \
+         ReadBufN, WriteBuf). Discovered: {discovered:?}",
         discovered.len(),
     );
 }
@@ -591,8 +590,8 @@ fn manifest_scanner_finds_at_least_baseline_count() {
     let manifest = discover_manifest_types();
     assert!(
         manifest.len() >= 8,
-        "DEF-259 manifest scanner regressed: manifest reads only {} types \
-         but baseline is ≥ 8. Manifest: {manifest:?}",
+        "zeroize-on-drop manifest scanner regressed: manifest reads only {} \
+         types but baseline is ≥ 8. Manifest: {manifest:?}",
         manifest.len(),
     );
 }

@@ -1,6 +1,5 @@
-//! **DEF-248 Sub-B (2026-05-12)** — universal-coverage streaming for
-//! non-`'D'` backend frames whose bodies exceed
-//! [`bsql_pg_proto::READ_BUF_CAP`] (4096 B).
+//! Universal-coverage streaming for non-`'D'` backend frames whose
+//! bodies exceed [`bsql_pg_proto::READ_BUF_CAP`] (4096 B).
 //!
 //! Design F: **stream-and-truncate**. Bodies up to ~2 GiB are
 //! consumable in constant 8 KB memory. The first

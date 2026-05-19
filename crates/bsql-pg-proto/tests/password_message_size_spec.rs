@@ -1,5 +1,5 @@
-//! DEF-215 + DEF-216 audit (2026-05-07): tier-1 size-pin coverage
-//! for the cleartext + MD5 PasswordMessage frame sizes.
+//! Tier-1 size-pin coverage for the cleartext + MD5
+//! `PasswordMessage` frame sizes.
 //!
 //! Internal `const _: () = assert!(MAX_OWNED_SEND_LEN >=
 //! max_password_message_size())` in `write_buf.rs` is a build-time

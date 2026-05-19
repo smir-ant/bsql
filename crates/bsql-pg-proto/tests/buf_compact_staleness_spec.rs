@@ -1,17 +1,17 @@
-//! DEF-204 (2026-04-27): memory-probe verification that
-//! `ReadBuf::compact()` zeroizes the abandoned tail in place before
-//! truncate. Without the DEF-204 fix, bytes physically at positions
-//! `[unread_len..pre_compact_len)` retain pre-compact content even
-//! after `truncate(unread_len)` shrinks `inner.len()` to the new
-//! compacted length — `heapless::Vec::truncate` only adjusts the
-//! length counter for `Copy` types, not the storage.
+//! Memory-probe verification that `ReadBuf::compact()` zeroizes
+//! the abandoned tail in place before truncate. Without the
+//! explicit zeroize, bytes physically at positions
+//! `[unread_len..pre_compact_len)` would retain pre-compact content
+//! even after `truncate(unread_len)` shrinks `inner.len()` to the
+//! new compacted length — `heapless::Vec::truncate` only adjusts
+//! the length counter for `Copy` types, not the storage.
 //!
 //! # Scope
 //!
 //! Verifies the staleness closure for the `compact()` path
-//! specifically. Sister test pattern to `scram_zeroize_miri_spec`
-//! (DEF-185 P3-1) — read-only pointer probing of memory after the
-//! library has logically discarded it.
+//! specifically. Sister test pattern to `scram_zeroize_miri_spec` —
+//! read-only pointer probing of memory after the library has
+//! logically discarded it.
 //!
 //! # Why unsafe here is acceptable
 //!
@@ -59,13 +59,13 @@ unsafe fn probe_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
     out
 }
 
-/// DEF-204: post-compact, the abandoned tail
+/// Post-compact, the abandoned tail
 /// `[unread_len..pre_compact_len)` is physically zeroized.
 ///
-/// **Pre-fix behaviour** (would be caught by this test): bytes at
-/// `[unread_len..pre_compact_len)` retain pre-compact content
-/// (specifically: the consumed prefix's content + the source side
-/// of the `copy_within`, which `copy_within` does NOT clear).
+/// A naive shape without the explicit zeroize would leave the tail
+/// holding pre-compact content (specifically: the consumed
+/// prefix's content + the source side of the `copy_within`, which
+/// `copy_within` does NOT clear) — caught by this test.
 ///
 /// **Post-fix behaviour** (verified here): bytes at
 /// `[unread_len..pre_compact_len)` are all-zero.
@@ -117,11 +117,11 @@ fn def204_compact_zeroizes_abandoned_tail() {
     let res = buf.append(&trigger);
     assert!(res.is_ok(), "append-after-compact must succeed");
 
-    // Post-compact: probe the abandoned tail. With the DEF-204 fix,
-    // bytes at positions [UNREAD + 1..READ_BUF_CAP) MUST be zero.
-    // Without the fix, those positions retain MAGIC (the original
-    // pattern that was at positions [advance_by..READ_BUF_CAP) before
-    // the copy_within shifted the unread tail to the start).
+    // Post-compact: probe the abandoned tail. Bytes at positions
+    // [UNREAD + 1..READ_BUF_CAP) MUST be zero. Without the explicit
+    // zeroize, those positions would retain MAGIC (the original
+    // pattern at positions [advance_by..READ_BUF_CAP) before the
+    // `copy_within` shifted the unread tail to the start).
     //
     // The first `UNREAD` bytes are the relocated unread tail (still
     // MAGIC). The next byte is the post-compact append (`0xCD`).
@@ -133,7 +133,7 @@ fn def204_compact_zeroizes_abandoned_tail() {
     let nonzero_count = probed.iter().filter(|&&b| b != 0).count();
     assert_eq!(
         nonzero_count, 0,
-        "DEF-204: abandoned tail [UNREAD+1..CAP) = [{}..{}) must be zero \
+        "abandoned tail [UNREAD+1..CAP) = [{}..{}) must be zero \
          post-compact. Found {} non-zero bytes (first non-zero at offset {}). \
          If this fails, ReadBuf::compact() is leaking pre-compact content \
          beyond the truncated len — secret-correlated bytes from prior frames \
