@@ -44,10 +44,12 @@ use crate::state::ProtoState;
 // ═════════════════════════════════════════════════════════════════════
 // DEF-272 cluster α (2026-05-10) — schema-side concrete-token leaf
 //
-// Pre-DEF-272-α the `AtRowDescriptionDispatch` tag impl'd
-// `SchemaWriteAuth` (sealed-trait pattern). Tier-1 EXTERNAL but tier-2
-// by-discipline WITHIN-CRATE: any in-crate file could `impl Sealed +
-// SchemaWriteAuth for HostileTag` and bypass.
+// Pre-DEF-272-α (HISTORICAL — closed by cluster α, see "Post-DEF-272-α"
+// block below; Tier-3 audit #29, 2026-05-19, verified): the
+// `AtRowDescriptionDispatch` tag impl'd `SchemaWriteAuth` (sealed-trait
+// pattern). Tier-1 EXTERNAL but tier-2 by-discipline WITHIN-CRATE: any
+// in-crate file could `impl Sealed + SchemaWriteAuth for HostileTag`
+// and bypass.
 //
 // Post-DEF-272-α the leaf hosts a CONCRETE `TDispatchToken` type with a
 // private tuple-struct field; the literal `Self(())` mint is callable

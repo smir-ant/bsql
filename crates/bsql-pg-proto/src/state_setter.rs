@@ -66,13 +66,16 @@ pub(crate) mod sealed {
 // having `install_body_seal::InstallBodySealed` as a supertrait, this seals
 // the install-body trait against IN-CRATE callers outside this module.
 //
-// Pre-Bundle-F shape: `PostStateProof: sealed::Sealed { fn install_into(self, &mut ProtoState); }`.
+// Pre-Bundle-F shape (HISTORICAL — closed by Bundle F, see "Post-Bundle-F"
+// block below; Tier-3 audit #26, 2026-05-19, verified): `PostStateProof:
+// sealed::Sealed { fn install_into(self, &mut ProtoState); }`.
 // `sealed::Sealed` is `pub(crate)` (not module-private), so any in-crate module
 // could write `impl Sealed for HostileWitness {} impl PostStateProof for
 // HostileWitness { fn install_into(self, state) { *state = arbitrary_variant; } }`
 // then mint a `StateSetter<HostileWitness>` via the generic `IdleState::into_setter::<W>`
 // and call `setter.install_post_state(HostileWitness)`, dispatching to the
-// hostile body. Tier-2-by-discipline within-crate.
+// hostile body. (Pre-state was tier-2-by-discipline within-crate; post-Bundle-F
+// shape closed below is tier-1-by-construction.)
 //
 // Post-Bundle-F: install bodies live in `impl InstallBody for *` blocks here in
 // `mod state_setter`. `InstallBody` has private supertrait `InstallBodySealed`.
@@ -400,11 +403,13 @@ impl<'a> FeedStateSetter<'a> {
 // (outside the leaf) attempting to call any `drain_at_*` fn cannot
 // supply the required token type — type system rejects.
 //
-// Pre-δ `FeedStateSetter::new` was `pub(crate)`; any in-crate caller
-// could mint a setter and trigger `drain_and_install_errored` to
-// transition any state to Errored. Tier-2 by-discipline within-crate.
+// Pre-δ (HISTORICAL — closed by cluster δ, see "Post-δ" line below;
+// Tier-3 audit #26, 2026-05-19, verified): `FeedStateSetter::new` was
+// `pub(crate)`; any in-crate caller could mint a setter and trigger
+// `drain_and_install_errored` to transition any state to Errored.
+// (Pre-state was tier-2-by-discipline within-crate.)
 // Post-δ the call surface is exactly 4 named entry points, each
-// gated by its concrete-type token. Tier-1 within-crate.
+// gated by its concrete-type token. Tier-1 within-crate by-construction.
 // ═════════════════════════════════════════════════════════════════════
 
 /// DEF-272 cluster δ leaf entry point: ReplyId saturation transition.
@@ -541,10 +546,12 @@ pub(crate) fn drain_at_stream_dropped_mid_stream(
 // DEF-272 cluster γ (2026-05-10) — IdleState lifetime-bound typestate
 //
 // Replaces the legacy [`crate::guard::IdleStateProof`] (DEF-198 ext +
-// DEF-271 cluster A). The pre-γ proof was a ZST with `pub(crate) const
-// fn new()` — anyone in-crate could mint a proof regardless of actual
-// state, then pair it with a `&mut ProtoState` for a different state.
-// Tier-2 by-discipline within-crate.
+// DEF-271 cluster A). Pre-γ (HISTORICAL — closed by cluster γ, see
+// "Post-γ" block below; Tier-3 audit #26, 2026-05-19, verified): the
+// proof was a ZST with `pub(crate) const fn new()` — anyone in-crate
+// could mint a proof regardless of actual state, then pair it with
+// a `&mut ProtoState` for a different state. (Pre-state was tier-2-
+// by-discipline within-crate.)
 //
 // Post-γ the typestate IS the state borrow + the Idle proof,
 // inseparable. Construction via [`IdleState::try_from`] performs a
