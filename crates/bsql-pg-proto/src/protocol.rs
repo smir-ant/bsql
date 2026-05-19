@@ -1232,6 +1232,39 @@ pub struct PgProtocol<P: SealedPhase = ActivePhase> {
 // pattern; cluster β (next subcluster) migrates them.
 //
 // Cost: visibility-only; LLVM erases everything; 0 ns / 0 B.
+//
+// ─────────────────────────────────────────────────────────────────────
+// Tier-4 Cluster C audit (2026-05-19) — DEFERRED with rationale
+//
+// Audit Cluster C proposed migrating every `_token: TokenType` leaf-
+// token consumer parameter to `token: &TokenType` (by-ref), motivated
+// by "drop the underscore prefix; non-underscore name is fine with
+// `&T`". Investigation found the proposal weakens tier-1:
+//
+//   - Every leaf token EXCEPT `_proto_init_leaf::ProtoInitToken` is a
+//     non-Copy ZST (no `#[derive(Clone, Copy)]`). Today, by-value
+//     `_token: TokenType` parameters give compile-checked single-use
+//     enforcement — a refactor that double-passes the token to two
+//     different cell methods fails the move-checker.
+//   - Switching to `token: &TokenType` erases that single-use shield:
+//     `&token` can be passed multiple times. A future bug where a
+//     leaf helper accidentally calls two state-mutating methods with
+//     the same token would compile cleanly.
+//   - The audit's stated win is purely aesthetic ("drop the `_`
+//     prefix"). The `_` prefix is the canonical Rust idiom for
+//     "intentionally unused function parameter" — not a code smell.
+//   - For `ProtoInitToken` (Copy ZST, used by `PgProtocol::new` to
+//     construct ~5 cells in one go), by-value and by-ref are
+//     equivalent at the call site (Copy makes single-use trivially
+//     achievable both ways).
+//
+// Conclusion: the by-value `_token: TokenType` pattern is retained
+// across all 14 production sites (`session_params_slot.rs` × 4,
+// `schema_slot.rs` × 4, `partial_assembly.rs` × 5, `cancel.rs` × 1).
+// The 2 macro-pattern `($_t:ident)` sites (params.rs:318/326) similarly
+// retained — `_t` is the unused-pattern-binding signal. Tier-1 single-
+// use proof beats stylistic cleanup.
+// ─────────────────────────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════
 
 /// DEF-272 cluster α leaf submodule for the BindExecute SELECT install
