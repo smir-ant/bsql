@@ -4,25 +4,16 @@
 //! state machine. Each variant carries a [`crate::ReplyId`] — the
 //! correlator the wrapper later uses to route the reply back to the
 //! correct caller's `oneshot::Sender`.
-//!
-//! Phase 1a ships exactly one variant: [`PgCommand::Ping`]. Other
-//! variants (`Query`, `Execute`, `Begin`, …) land with their drivers
-//! per reforge.md §3.5.
 
 use crate::ident::{PortalName, Sql, StmtName};
-// DEF-246 Phase 2 (2026-05-16): `ApplicationName`, `DatabaseName`,
-// `Ident`, `Credentials`, `StartupKind` imports were used by the
-// deleted `Startup` variant + `compute_push_startup` cfg(test)
-// dispatcher. Pulled out alongside the variant.
 use crate::reply_id::{
     DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
 };
 
 /// A command pushed by the wrapper into the protocol state machine.
 ///
-/// `#[non_exhaustive]` because new commands land in 1b–1d as their
-/// driving paths come online; user `match` arms must accommodate
-/// growth.
+/// `#[non_exhaustive]` because new commands land as their driving
+/// paths come online; user `match` arms must accommodate growth.
 ///
 /// `#[must_use]` because constructing a command without pushing it
 /// into [`crate::PgProtocol::push_command`] cannot deliver a reply —
@@ -35,22 +26,22 @@ use crate::reply_id::{
 /// cloneable id, which would break the tier-1 "no silent reply loss"
 /// invariant. If a caller needs multiple commands they mint multiple
 /// ids from the wrapper's monotonic counter and build multiple commands.
-/// DEF-269 v2 (T): demoted to `pub(crate)` — external callers construct
-/// per-command structs (`crate::push_command::{Ping, Startup, ...}`).
-/// The enum is retained for the lib-internal `compute_push_tests` mod
-/// and the legacy `impl PushCommand for PgCommand` blanket impl.
+///
+/// `pub(crate)` — external callers construct per-command structs in
+/// [`crate::push_command`] (`Ping`, `Parse`, `SimpleQuery`, etc.).
+/// This enum is retained only for the lib-internal `compute_push_tests`
+/// module and the blanket `impl PushCommand for PgCommand` slow-path.
 #[derive(Debug)]
 #[non_exhaustive]
 #[must_use = "a PgCommand has no effect until pushed via PgProtocol::push_command"]
-// DEF-244 modernisation audit (rust-version 1.81 sweep): kept as
-// `#[allow]` rather than `#[expect]` — the underlying `dead_code`
-// lint fires ONLY in non-test builds. In `--cfg test` builds, the
+// `#[allow(dead_code)]` rather than `#[expect]` — the underlying
+// `dead_code` lint fires ONLY in non-test builds. In `--cfg test` the
 // `compute_push_tests` module + the blanket `impl PushCommand for
-// PgCommand` legacy slow-path consume every variant, so the lint
-// doesn't fire and `#[expect]` would itself emit
-// `unfulfilled_lint_expectations`. The cfg-conditional firing makes
-// `#[expect]` the wrong tool here (CREDO §B-classify Skip + comment).
-#[allow(dead_code, reason = "DEF-269 v2: variants only constructed by lib-internal compute_push_tests mod + the blanket `impl PushCommand for PgCommand` (legacy slow-path). Cfg-conditional dead-code — see comment above for the #[expect] avoidance rationale.")]
+// PgCommand` consume every variant, so the lint doesn't fire and
+// `#[expect]` would itself emit `unfulfilled_lint_expectations`.
+// Cfg-conditional firing makes `#[expect]` the wrong tool (CREDO §B
+// classify Skip + comment).
+#[allow(dead_code, reason = "variants only constructed by lib-internal compute_push_tests mod + the blanket `impl PushCommand for PgCommand` slow-path; cfg-conditional dead-code")]
 pub(crate) enum PgCommand {
     /// Cheap server liveness probe.
     ///
@@ -59,32 +50,19 @@ pub(crate) enum PgCommand {
     /// [`crate::Reply::Pong`] under the supplied `reply` id.
     ///
     /// **Precondition:** the protocol must be in [`crate::ProtoState::Idle`].
-    /// In Phase 1a, that is the protocol's starting state. In later
-    /// sub-phases (transactions, mid-stream queries), pushing a Ping
-    /// outside `Idle` will be classified by the dispatcher.
+    /// Pushing a Ping outside `Idle` is classified by the dispatcher.
     Ping {
         /// Correlator the wrapper will use to route the matching
         /// [`crate::Reply::Pong`] back to the caller.
         ///
-        /// DEF-112: the type parameter `PingKind` binds the reply
-        /// payload to [`crate::action::PongPayload`] at compile
-        /// time — the dispatcher cannot produce any other payload
-        /// for this id.
+        /// The type parameter `PingKind` binds the reply payload to
+        /// [`crate::action::PongPayload`] at compile time — the
+        /// dispatcher cannot produce any other payload for this id.
         reply: ReplyId<PingKind>,
     },
 
-    // DEF-246 Phase 2 (2026-05-16): `Startup` variant deleted.
-    // The startup handshake is now driven by
-    // `<DisconnectedPhase>::push_startup` (consume-self transition
-    // to `<ConnectingPhase>`). Tier-1 elevation #1: the only legal
-    // entry point is from `<DisconnectedPhase>`; constructing a
-    // `PgCommand::Startup { ... }` was never reachable via the
-    // public API post-DEF-198, but the variant survived for the
-    // `compute_push_tests` per-state dispatcher. That dispatcher is
-    // also deleted in this commit.
-
     /// Prepare a named SQL statement via PG's Extended Query protocol
-    /// (`P`-frame + `S`-frame terminator). 1c-3a.
+    /// (`P`-frame + `S`-frame terminator).
     ///
     /// **Precondition:** protocol must be in [`crate::ProtoState::Idle`].
     /// A Parse while busy yields `FailReply(CommandInProgress)`.
@@ -104,19 +82,12 @@ pub(crate) enum PgCommand {
     /// a Parse frame followed by a Sync frame. Without the Sync,
     /// PG buffers Extended Query responses indefinitely; a bare
     /// Parse would never reach the client. Bundling keeps the
-    /// single-command API shape consistent with `Ping` / `SimpleQuery`;
-    /// pipelining (many commands before one Sync) lands in 1c-3e.
-    ///
-    /// # Parameter types
-    ///
-    /// 1c-3a does not ship parameter-type hints — the `n_param_types`
-    /// field is always zero on the wire. Type hints land in 1c-3b
-    /// alongside `Bind` + `ParamsWriter`.
+    /// single-command API shape consistent with `Ping` / `SimpleQuery`.
     ///
     /// # Stack cost per push
     ///
-    /// `PgCommand::Parse` is the dominant variant of the `PgCommand`
-    /// enum — ~2132 B (stmt_name 66 + sql 2050 + reply 16). Every
+    /// `PgCommand::Parse` is the dominant variant — ~2132 B
+    /// (stmt_name 66 + sql 2050 + reply 16). Every
     /// `push_command(PgCommand::Parse { .. })` call allocates this
     /// on the caller's stack even for a 10-byte SQL. The cost is
     /// inherent to the `no_alloc` design: we cannot `Box<Sql>` the
@@ -128,12 +99,10 @@ pub(crate) enum PgCommand {
     ///    win.
     /// 2. Streaming API `push_parse_streamed(stmt, |w| write_sql_to(w))`
     ///    — more complex user API, not compatible with the unified
-    ///    `PgCommand` enum; would require a separate method like
-    ///    `push_bind_execute`.
+    ///    `PgCommand` enum.
     ///
     /// Accept: 2 KB of stack per Parse push is fine on tokio / std;
-    /// more problematic on embedded `no_std` + thin stacks. Document
-    /// and move on.
+    /// more problematic on embedded `no_std` + thin stacks.
     Parse {
         /// The prepared-statement name. Empty (the "unnamed statement"
         /// per PG convention) or a validated `StmtName` up to
@@ -142,15 +111,14 @@ pub(crate) enum PgCommand {
         /// SQL text — bounded to [`crate::ident::MAX_SQL_LEN`] with
         /// truncating constructor.
         sql: Sql,
-        /// Correlator for the reply.
-        ///
-        /// DEF-112: typed `ReplyId<ParseKind>` binds the payload to
-        /// [`crate::action::ParseCompletePayload`] at compile time.
+        /// Correlator for the reply. The typed `ReplyId<ParseKind>`
+        /// binds the payload to [`crate::action::ParseCompletePayload`]
+        /// at compile time.
         reply: ReplyId<ParseKind>,
     },
 
     /// Execute a single SQL statement via PG's Simple Query protocol
-    /// (`Q`-frame). 1c-1b.
+    /// (`Q`-frame).
     ///
     /// **Precondition:** protocol must be in [`crate::ProtoState::Idle`].
     /// Any other state yields a `FailReply(CommandInProgress)` —
@@ -174,23 +142,22 @@ pub(crate) enum PgCommand {
     ///
     /// PG's Simple Query allows `;`-separated statement batches;
     /// each statement produces its own `C` response and they all
-    /// share a single trailing `Z`. 1c-1b-MVP accepts a single
-    /// statement; multi-statement batch support lands in 1c-1-multi.
+    /// share a single trailing `Z`. The current implementation
+    /// accepts a single statement.
     SimpleQuery {
         /// SQL text — bounded to [`crate::ident::MAX_SQL_LEN`] =
         /// 2048 bytes with explicit `"…"` truncation on overflow
         /// (no silent drop).
         sql: Sql,
-        /// Correlator for the reply.
-        ///
-        /// DEF-112: typed `ReplyId<QueryKind>` binds the payload to
-        /// [`crate::action::QueryCompletePayload`] at compile time.
+        /// Correlator for the reply. The typed `ReplyId<QueryKind>`
+        /// binds the payload to [`crate::action::QueryCompletePayload`]
+        /// at compile time.
         reply: ReplyId<QueryKind>,
     },
 
     /// Inspect a previously-[`PgCommand::Parse`]'d prepared
     /// statement via PG's Extended Query `Describe` + `Sync` bundle
-    /// (PG §55.2.2). 1c-3c.
+    /// (PG §55.2.2).
     ///
     /// **Precondition:** protocol must be in [`crate::ProtoState::Idle`].
     /// A Describe while busy yields `FailReply(CommandInProgress)`.
@@ -222,32 +189,28 @@ pub(crate) enum PgCommand {
     /// that literally cannot carry the wrong shape — no
     /// `Option<ParamOids>` runtime ambiguity, no chance of receiving
     /// a `DescribePortalComplete` when you asked for a statement.
-    /// DEF-112 kind-parameterisation binds the payload at the
+    /// Kind-parameterisation binds the payload at the
     /// `Action::DeliverReply` construction site.
     ///
     /// # Sync-bundling
     ///
     /// Emits TWO outbound wire frames in one push: a `Describe`
     /// frame followed by a `Sync`. Without the Sync, PG buffers
-    /// Extended Query responses indefinitely. Pipelining
-    /// (`Parse + Describe + Sync`, `Bind + Describe + Execute + Sync`)
-    /// lands in 1c-5 behind the witness-guard API.
+    /// Extended Query responses indefinitely.
     DescribeStatement {
         /// Prepared-statement name. Empty (the "unnamed statement"
         /// per PG) or a validated `StmtName` up to
         /// [`crate::ident::MAX_PG_NAME_LEN`] bytes.
         stmt_name: StmtName,
-        /// Correlator for the reply.
-        ///
-        /// DEF-112: typed `ReplyId<DescribeStatementKind>` binds
-        /// the payload to
+        /// Correlator for the reply. The typed
+        /// `ReplyId<DescribeStatementKind>` binds the payload to
         /// [`crate::action::DescribeStatementCompletePayload`] at
         /// compile time.
         reply: ReplyId<DescribeStatementKind>,
     },
 
     /// Inspect a previously-bound portal via PG's Extended Query
-    /// `Describe` + `Sync` bundle (PG §55.2.2). 1c-3c.
+    /// `Describe` + `Sync` bundle (PG §55.2.2).
     ///
     /// **Precondition:** protocol must be in [`crate::ProtoState::Idle`].
     ///
@@ -269,10 +232,8 @@ pub(crate) enum PgCommand {
         /// validated `PortalName` up to
         /// [`crate::ident::MAX_PG_NAME_LEN`] bytes.
         portal_name: PortalName,
-        /// Correlator for the reply.
-        ///
-        /// DEF-112: typed `ReplyId<DescribePortalKind>` binds the
-        /// payload to
+        /// Correlator for the reply. The typed
+        /// `ReplyId<DescribePortalKind>` binds the payload to
         /// [`crate::action::DescribePortalCompletePayload`] at
         /// compile time.
         reply: ReplyId<DescribePortalKind>,
@@ -284,40 +245,28 @@ pub(crate) enum PgCommand {
 /// Parameter of [`crate::PgProtocol::push_bind_execute`]. Encoded on
 /// the wire in the PG `Execute` frame as a 4-byte `i32` — but the
 /// type system narrows the user-facing API to the variants this
-/// sub-phase supports.
+/// codebase supports.
 ///
-/// # F83 (pass #6 audit, 2026-04-21)
+/// # Tier-1 enum vs tier-3 `u32`
 ///
-/// Pre-F83 `push_bind_execute` took `max_rows: u32`. User supplying
-/// any non-zero value caused the server to emit `PortalSuspended`
-/// which the dispatcher classified as `UnexpectedFrame` → connection
-/// teardown. Tier-3 runtime trap documented only in the method's
-/// docstring; the compiler gave users no signal.
+/// `max_rows: u32` would be a tier-3 runtime trap: any non-zero value
+/// would cause the server to emit `PortalSuspended`, which the
+/// dispatcher classifies as `UnexpectedFrame` → connection teardown.
+/// The compiler would give the caller no signal.
 ///
-/// F83 replaces `u32` with this enum. In 1c-3b scope, only
-/// [`Self::All`] exists — a user passing anything else is a build
-/// error. The `#[non_exhaustive]` leaves room for [`Self::Chunked`]
-/// in 1c-6 when the full chunked-fetch protocol flow lands (proper
-/// `PortalSuspended` handling with subsequent `Execute` calls to
-/// resume). When that ships, users transition from `All` to
-/// `Chunked(NonZeroU32)` and the variant-level dispatch threads the
-/// correct response shape.
-///
-/// # Tier uplift
-///
-/// `max_rows: u32` → tier-3 docs ("must be zero").
-/// `FetchRows::All` → tier-1 compile ("only variant exists").
+/// `FetchRows::All` makes the only currently-supported policy a
+/// compile-time constant — passing anything else is a build error.
+/// `#[non_exhaustive]` leaves room for a future `Chunked(NonZeroU32)`
+/// variant when chunked-fetch (`PortalSuspended` + subsequent
+/// `Execute` calls) ships; users would then transition from `All`
+/// to `Chunked(NonZeroU32)` and the variant-level dispatch threads
+/// the correct response shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FetchRows {
     /// Fetch all rows the portal produces (no `PortalSuspended`).
     /// Maps to the wire value `max_rows = 0`.
     All,
-    // Future (1c-6):
-    //   /// Cap the per-Execute row count. Server emits
-    //   /// `PortalSuspended` after the limit; resume with a
-    //   /// subsequent Execute.
-    //   Chunked(core::num::NonZeroU32),
 }
 
 impl FetchRows {
@@ -337,7 +286,7 @@ impl FetchRows {
 // rows without PortalSuspended). An arm-body edit in `as_wire_i32`
 // that silently returned `1` (or any non-zero) would cause the
 // server to emit PortalSuspended which the dispatcher classifies as
-// UnexpectedFrame → connection teardown. Pin the literal at build.
+// UnexpectedFrame → connection teardown.
 const _: () = assert!(
     FetchRows::All.as_wire_i32() == 0,
     "FetchRows::All MUST wire-encode as 0 per PG §55.2.2",
