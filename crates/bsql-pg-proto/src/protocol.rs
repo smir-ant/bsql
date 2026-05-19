@@ -529,7 +529,6 @@ pub(crate) fn error_arena_or_init(
 /// required to mention the type as an associated `SealedPhase::Inner`
 /// (E0446 mitigation); fields stay private, constructors stay
 /// leaf-gated.
-#[allow(missing_debug_implementations)]
 pub struct ConnectingInner {
     /// State narrowed to [`crate::state::ConnectingState`] variants
     /// (11 handshake states + transient Errored). **Tier-1 closure**:
@@ -582,7 +581,6 @@ pub struct ConnectingInner {
 ///
 /// **Construction**: only via [`_proto_init_leaf::fresh_active_inner`]
 /// called from `<ConnectingPhase>::into_active`.
-#[allow(missing_debug_implementations)]
 pub struct ActiveInner {
     /// State narrowed to [`crate::state::ActiveState`] variants
     /// (Idle + PingAwaitingRfq + all SimpleQuery/Parse/BindExecute/
@@ -1492,10 +1490,11 @@ pub(crate) mod _proto_init_leaf {
     /// **State sentinel**: `ActiveState::Idle` — the natural
     /// post-handshake state. Caller may overwrite if needed.
     ///
-    /// **`#[allow(dead_code)]`** until Commit 12 wires `into_active`
-    /// to produce ActiveInner.
     #[must_use]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "Production callers (`<ConnectingPhase>::into_active`) are pending wiring; the helper is exercised today by `#[cfg(test)]` sibling tests within `mod protocol`, but the lib-only build sees no production caller — keep the allow until the per-phase Inner transitions wire it in."
+    )]
     pub(in crate::protocol) fn fresh_active_inner() -> super::ActiveInner {
         let token = ProtoInitToken::mint();
         super::ActiveInner {

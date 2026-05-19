@@ -242,9 +242,10 @@ fn validate_empty_body(
 /// Returns the same [`DispatchOutcome::Errored`] shape — the state-
 /// agnostic `reply_id` + `cause` carry to the caller.
 ///
-/// `#[allow(dead_code)]` until the per-phase Inner method bodies
-/// wire it in.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Scaffolding for per-phase Inner method bodies that will route Connecting fail paths through this helper once wired in."
+)]
 fn install_errored_connecting(
     state: &mut crate::state::ConnectingState,
     reply_id: Option<core::num::NonZeroU64>,
@@ -283,9 +284,10 @@ fn install_errored_connecting(
 /// this and translates to [`crate::state::ConnectingState::HandshakeReady`]
 /// — the signal that `<ConnectingPhase>::into_active` observes.
 ///
-/// **`#[allow(dead_code)]`** until Commit 6+ wires this into
-/// `ConnectingInner.feed_bytes_impl`.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Scaffolding for `ConnectingInner::feed_bytes_impl` per-phase wiring (lift+lower wrapper around the shared `dispatch` body). Not yet routed from the per-phase Inner; retained to keep the lift/lower scaffolding intact across in-flight refactors."
+)]
 pub(crate) fn connecting_dispatch(
     state: &mut crate::state::ConnectingState,
     tag: crate::wire::InboundTag,

@@ -847,7 +847,10 @@ mod hostile_witness_seal_probe {
     /// Zero runtime cost (typeck-only); the const block emits no code.
     const _: fn() = || {
         trait AmbiguousIfInstallBody<A> {
-            #[allow(dead_code)]
+            #[allow(
+                dead_code,
+                reason = "Method exists only for typeck-time ambiguous-resolution check (overlapping-blanket-impl trick) — never invoked at runtime."
+            )]
             fn assert_not_install_body() {}
         }
         impl<T: ?Sized> AmbiguousIfInstallBody<()> for T {}

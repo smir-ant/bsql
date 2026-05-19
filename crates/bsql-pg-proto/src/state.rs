@@ -914,7 +914,10 @@ impl core::fmt::Debug for WrongPhase {
 /// **Layout**: 1 B (`StateErrorKind` is 1 B `#[repr(transparent)]`
 /// over `ErrorKind` discriminator; single-variant enum has no extra
 /// discriminator byte under Rust's layout rules).
-#[allow(missing_debug_implementations)]
+#[allow(
+    missing_debug_implementations,
+    reason = "Debug projection lives on the parent per-phase enums (ProtoState / ConnectingState / ActiveState); the standalone `ErroredState` type exists only as a uniform-shape mirror for the dispatch-arm pattern and isn't surfaced in `{:?}` output."
+)]
 #[non_exhaustive]
 pub enum ErroredState {
     /// The connection is terminally classified. Mirror of
@@ -944,22 +947,16 @@ pub enum ErroredState {
 /// (8 B). With enum-discriminator and alignment padding the total
 /// settles at 48 B (pin-asserted below).
 ///
-/// **`#[allow(missing_docs)]`** — every field on every variant is a
-/// direct mirror of the same-named field on the corresponding
-/// [`ProtoState`] variant; the docstring on the [`ProtoState`] variant
-/// is the single source of truth for field semantics. Mirroring docs
-/// here would create drift surface (a future contributor would have
-/// to keep TWO docstrings in sync per field). The variant docstring
-/// already names the mirrored [`ProtoState`] variant via intra-doc
-/// link.
-///
 /// **Manual `Debug` impl** — Sensitive-redaction parity with
 /// [`ProtoState`]'s manual Debug. Variants carrying SCRAM / MD5 /
 /// Cleartext password material or `Sensitive<i32>` secret keys use
 /// `finish_non_exhaustive()` to elide the secret fields from the
 /// formatted output; non-sensitive variants print all fields via
 /// `finish()` / `write!`.
-#[allow(missing_docs)]
+#[allow(
+    missing_docs,
+    reason = "Every field on every variant is a direct mirror of the same-named field on the corresponding `ProtoState` variant; the docstring on the `ProtoState` variant is the single source of truth for field semantics. Mirroring docs here would create a drift surface (a future contributor would have to keep TWO docstrings in sync per field). Each variant's own docstring already names the mirrored `ProtoState` variant via intra-doc link."
+)]
 #[non_exhaustive]
 pub enum ConnectingState {
     /// Mirror of [`ProtoState::ConnectingStartupTrust`].
@@ -1117,17 +1114,15 @@ impl core::fmt::Debug for ConnectingState {
 /// [`Self::DescribeStatementAwaitingRfq`] carrying
 /// `param_oids: ParamOids` (68 B inline) + `reply: ReplyId<…>` (8 B).
 ///
-/// **`#[allow(missing_docs)]`** — same rationale as
-/// [`ConnectingState`]: every variant field is a direct mirror of
-/// the same-named [`ProtoState`] field; doc duplication creates
-/// drift surface.
-///
 /// **Manual `Debug` impl** — mirror of [`ProtoState`]'s manual Debug
 /// for the post-handshake variants. Active variants don't carry
 /// password / SCRAM secret material; `finish_non_exhaustive()` is
 /// used only for variants whose `param_oids` / streaming-mode
 /// bookkeeping the parent Debug elides.
-#[allow(missing_docs)]
+#[allow(
+    missing_docs,
+    reason = "Same rationale as `ConnectingState`: every variant field is a direct mirror of the same-named `ProtoState` field; doc duplication would create a drift surface."
+)]
 #[non_exhaustive]
 pub enum ActiveState {
     /// Mirror of [`ProtoState::Idle`].
@@ -1340,8 +1335,10 @@ impl From<ActiveState> for ProtoState {
 
 // ─── Per-phase classifier methods ───
 
-#[allow(dead_code)] // Per-phase Inner migration awaits wiring; the
-// surface is implemented additively here.
+#[allow(
+    dead_code,
+    reason = "Per-phase Inner migration awaits wiring; the surface is implemented additively here so that per-phase enums offer the same classifier API as `ProtoState` once the per-phase dispatch routes through them."
+)]
 impl ConnectingState {
     /// Mirror of [`ProtoState::take_inflight_reply_raw_id`] for the
     /// per-phase enum. Consumes the variant's `ReplyId<K>` (if any)
@@ -1401,7 +1398,10 @@ impl ConnectingState {
 }
 
 /// Per-phase classifier surface for [`ActiveState`].
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "Per-phase Inner migration awaits wiring (mirror of the `ConnectingState` block above); the surface is implemented additively so that per-phase enums offer the same classifier API as `ProtoState` once dispatch routes through them."
+)]
 impl ActiveState {
     /// Per-phase mirror of [`ProtoState::take_inflight_reply_raw_id`].
     /// Exhaustive over every variant — adding a `ReplyId<K>`-carrying
