@@ -1,20 +1,12 @@
-//! DEF-198 — witness-guard typestate for client-initiated push operations.
+//! Witness-guard typestate for client-initiated push operations.
 //!
-//! # Summary
-//!
-//! Pre-DEF-198 [`crate::PgProtocol::push_command`] (and its sibling
-//! `push_bind_execute`) accepted any `&mut PgProtocol` and emitted
-//! `OutActions` that *could* contain `FailReply` actions when the
-//! protocol was not in `Idle` state. This was a tier-3 invariant
-//! ("the caller must inspect actions for `FailReply::ConnectionAlreadyClosed`
-//! / `CommandInProgress` / `StartupAlreadyInProgress`"): runtime
-//! classified, structurally bounded, but inspectable only at runtime.
-//!
-//! DEF-198 elevates the precondition `state == Idle` to **tier-1**
-//! (compile-rejected on the public API surface). The only path to
-//! `push_command` is through a [`ReadyGuard`], which is constructible
-//! only via [`crate::PgProtocol::as_ready`], which returns
-//! `Some(ReadyGuard)` iff `state == Idle`.
+//! The push surface (`push_command`, `push_bind_execute`,
+//! `execute_prepared`) requires `state == Idle` to be safe. The
+//! precondition is elevated to **tier-1** (compile-rejected) via a
+//! [`ReadyGuard`] witness type: the only path to push is through a
+//! `ReadyGuard`, which is constructible only via
+//! [`crate::PgProtocol::as_ready`], which returns `Some(ReadyGuard)`
+//! iff `state == Idle`.
 //!
 //! # Mechanism
 //!
@@ -91,7 +83,7 @@ use crate::write_buf::WriteBuf;
 /// `&mut PgProtocol` borrow is the only side effect of the guard
 /// going out of scope.
 ///
-/// # Compile-time invariants (DEF-198 tier-1 closure)
+/// # Compile-time invariants
 ///
 /// The following misuses are rejected at compile time:
 ///
@@ -171,15 +163,6 @@ pub struct ReadyGuard<'a> {
     proto: &'a mut PgProtocol,
 }
 
-// DEF-272 cluster γ (2026-05-10): `IdleStateProof` deleted; replaced
-// by [`crate::state_setter::IdleState<'a>`] lifetime-bound typestate.
-// The pre-γ proof was a ZST with `pub(crate) const fn new()` — anyone
-// in-crate could mint regardless of state, then pair with non-Idle
-// `&mut state` (zombie-reply class). Post-γ the typestate IS the
-// state borrow + the Idle proof, inseparable; pairing-with-different-
-// state is impossible by lifetime ownership. See `mod state_setter`
-// (cluster γ block) for the typestate.
-
 impl<'a> ReadyGuard<'a> {
     /// Construct internally — public callers acquire via
     /// [`PgProtocol::as_ready`].
@@ -194,11 +177,9 @@ impl<'a> ReadyGuard<'a> {
         Self { proto }
     }
 
-    /// Send a generic [`PgCommand`].
+    /// Send a generic [`crate::PgCommand`].
     ///
-    /// Tier-1 elevation of the pre-DEF-198 `PgProtocol::push_command`
-    /// public method: the guard's existence proves the precondition
-    /// (`state == Idle`).
+    /// The guard's existence proves the precondition (`state == Idle`).
     ///
     /// # Returns
     ///
@@ -219,42 +200,34 @@ impl<'a> ReadyGuard<'a> {
     ///   path (state ≠ Idle) is NOT reachable through this API —
     ///   `ReadyGuard` proves Idle at construction.
     ///
-    /// # DEF-160 Z2 (2026-05-11)
+    /// # Zero-copy SQL
     ///
-    /// Pre-DEF-160 returned `Result<(), PushFailure>` (~80 B); caller
-    /// drained `write_buf.as_bytes()` after a successful push, with the
-    /// SQL copied into `write_buf` (cap-bounded by `MAX_SQL_LEN`). The
-    /// fixed cap silently truncated colossal queries — a tier-3 hazard
-    /// (DEF-218 colossal-data audit). Post-DEF-160 the SQL is borrowed
-    /// end-to-end via `SendBytesBorrowed` and surfaced as
-    /// `Action::SendBytes(&[u8])` chunks in `OutActions` — no cap, no
-    /// copy, no truncation. `OutActions` retains the pre-DEF-212 fail
-    /// classification (`FailReply` arm) via the `Result::Err` short-circuit.
-    /// DEF-269 v2 (T): generic over `C: PushCommand`. Caller passes a
-    /// per-command struct (e.g. [`crate::push_command::Ping`]) instead
-    /// of a `PgCommand` enum value. Each `C` is monomorphised — the
-    /// 2176-B-by-value PgCommand argument move is gone.
+    /// SQL bodies are borrowed end-to-end via `SendBytesBorrowed` and
+    /// surfaced as `Action::SendBytes(&[u8])` chunks in `OutActions` —
+    /// no cap, no copy, no truncation. The per-command struct (`C`) is
+    /// monomorphised; there is no by-value enum argument move.
     #[inline]
     pub fn push_command<'w, C: crate::push_command::PushCommand + 'w>(
         self,
         cmd: C,
         write_buf: &'w mut WriteBuf,
     ) -> Result<OutActions<'w, 'static>, PushFailure> {
-        // DEF-272 cluster γ (2026-05-10): the Idle precondition is
-        // re-checked inside `push_command_internal` via
-        // `IdleState::try_from` (returns `Option<IdleState<'_>>`).
-        // ReadyGuard's existence still proves Idle via `as_ready`'s
-        // upstream classification; the typestate's runtime check is
-        // belt-and-braces (build-time tier-1 closure across in-crate
-        // call sites).
+        // The Idle precondition is re-checked inside
+        // `push_command_internal` via `IdleState::try_from` (returns
+        // `Option<IdleState<'_>>`). ReadyGuard's existence already
+        // proves Idle via `as_ready`'s upstream classification; the
+        // typestate's runtime check is belt-and-braces for in-crate
+        // call sites that mint `IdleState` directly without going
+        // through `as_ready`.
         self.proto.push_command_internal(cmd, write_buf)
     }
 
-    /// DEF-269 v2 (T): Extended-Query Bind+Execute is now a regular
-    /// `PushCommand` impl ([`crate::push_command::BindExecute`]).
-    /// Convenience wrapper preserved for callers that prefer the
-    /// argument-list shape; new callers should construct a
-    /// `BindExecute { ... }` and call `push_command` directly.
+    /// Extended-Query Bind+Execute as an argument-list-shaped wrapper.
+    ///
+    /// Convenience for callers that prefer the positional-args shape;
+    /// new callers should construct
+    /// [`crate::push_command::BindExecute`] and call
+    /// [`Self::push_command`] directly.
     #[expect(
         clippy::too_many_arguments,
         reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1; the wrapper preserves the same arg count by design"
@@ -283,14 +256,12 @@ impl<'a> ReadyGuard<'a> {
         )
     }
 
-    /// DEF-244 (2026-05-13): execute a [`crate::prepared::PreparedQuery`]
-    /// with typed arguments. The macro emits a `const` of
+    /// Execute a [`crate::prepared::PreparedQuery`] with typed
+    /// arguments. The proc-macro emits a `const` of
     /// `PreparedQuery<P, R>`; this helper wraps the (q, args, fetch,
-    /// reply) tuple into a [`crate::push_command::BindPrepared`]
-    /// and routes through the existing
-    /// [`Self::push_command`] path so the DEF-198 Idle precondition
-    /// and DEF-270 N-D typed post-state-install closures apply
-    /// unchanged.
+    /// reply) tuple into a [`crate::push_command::BindPrepared`] and
+    /// routes through [`Self::push_command`] — the Idle precondition
+    /// and typed post-state-install closures apply unchanged.
     ///
     /// Compared to [`Self::push_bind_execute`], the prepared path:
     /// - pays zero CPU on Parse + Bind-prefix header construction
@@ -309,12 +280,6 @@ impl<'a> ReadyGuard<'a> {
     ///   [`crate::params::ParamsWriter`].
     /// - `R`: row tuple type, sealed via
     ///   [`crate::prepared::RowDecode`].
-    ///
-    /// # Memo cross-reference
-    ///
-    /// Memo §6.2 D4-b + thin guard helper combination (caller-facing
-    /// surface is terse, mechanism reuses the sealed `PushCommand`
-    /// path). Tier-1 by-construction Idle precondition propagates.
     #[inline]
     pub fn execute_prepared<'w, P, R>(
         self,
@@ -350,12 +315,12 @@ impl<'a> ReadyGuard<'a> {
 /// Exhaustive match in `connection_status` — adding a `StatePushClass`
 /// variant is a build failure here.
 ///
-/// DEF-211 SAFE-07 (audit 2026-05-04): `#[non_exhaustive]` pre-empts
-/// SemVer footgun on future variant additions; downstream `match`es
-/// against `ConnectionStatus` from outside the crate must include a
-/// wildcard arm. Internal `match`es here remain exhaustive (per the
-/// CREDO §0 rule — the wildcard is forbidden inside the crate, but
-/// non_exhaustive allows external recovery).
+/// `#[non_exhaustive]` pre-empts a SemVer footgun on future variant
+/// additions; downstream `match`es against `ConnectionStatus` from
+/// outside the crate must include a wildcard arm. Internal `match`es
+/// here remain exhaustive (per the CREDO §0 rule — the wildcard is
+/// forbidden inside the crate, but `non_exhaustive` allows external
+/// recovery).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
