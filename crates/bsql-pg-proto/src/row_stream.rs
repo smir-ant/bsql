@@ -1,25 +1,25 @@
-//! **DEF-248 Sub-A (2026-05-12)** — column-by-column streaming
-//! consumer of in-flight PostgreSQL query replies.
+//! Column-by-column streaming consumer of in-flight PostgreSQL
+//! query replies.
 //!
 //! # Universal streaming for colossal data
 //!
-//! Pre-DEF-248: any single backend frame body exceeding `READ_BUF_CAP`
-//! (4096 B) was classified as `FrameTooLarge` and torn down the
-//! connection. Multi-MB JSONB / TEXT / BYTEA cells were unreachable.
-//! Unacceptable for v1.0.
+//! The `'D'` (DataRow) tag's frame body is streamed via a chunk-
+//! emission state machine on [`RowStream`]. Caller pulls [`ColEvent`]
+//! events; the column body of an arbitrarily large cell arrives as
+//! a sequence of `Chunk { bytes, total_len, remaining_len }` events
+//! followed by exactly one `ChunkEnd { idx, bytes }` event. Every
+//! wire-legal body size is handled — bodies larger than `READ_BUF_CAP`
+//! (4096 B) are streamed; without this machinery they would have to
+//! be classified as `FrameTooLarge` and tear down the connection,
+//! and multi-MB JSONB / TEXT / BYTEA cells would be unreachable.
 //!
-//! Post-Sub-A: the `'D'` (DataRow) tag's frame body is streamed via
-//! a chunk-emission state machine on [`RowStream`]. Caller pulls
-//! [`ColEvent`] events; the column body of an arbitrarily large cell
-//! arrives as a sequence of `Chunk { bytes, total_len, remaining_len }`
-//! events followed by exactly one `ChunkEnd { idx, bytes }` event.
-//! Every wire-legal body size is handled with no "future DEF" caveat.
-//!
-//! Sub-A scope: only `'D'` is exposed column-by-column. Other tags
-//! (`T` RowDescription, `E` ErrorResponse, …) continue to use the
-//! existing `feed_bytes` dispatch path; bodies > READ_BUF_CAP for
-//! those tags still tear down with `FrameTooLarge` (Sub-B's concern;
-//! all current PG drivers cap them well below 4 KB in practice).
+//! Only `'D'` is exposed column-by-column. Other tags (`T`
+//! RowDescription, `E` ErrorResponse, …) use the existing
+//! `feed_bytes` dispatch path; oversized bodies for those tags are
+//! handled by the separate streaming-sink path in
+//! [`crate::partial_assembly`]. (All current PG drivers cap them
+//! well below 4 KB in practice; the streaming sink handles the rare
+//! over-cap cases.)
 //!
 //! # Closure-scoped API
 //!
@@ -27,8 +27,7 @@
 //! Caller passes a closure that receives `&mut RowStream`; the
 //! `RowStream` value lives on `iter_rows`'s stack frame, dropped
 //! synchronously when the closure returns. **`mem::forget` is
-//! structurally closed** — caller has only a borrow, not the value
-//! (see memo `/tmp/def248-design-memo-v2.md` §3.2).
+//! structurally closed** — caller has only a borrow, not the value.
 //!
 //! Drop fires unconditionally on every closure exit — normal return,
 //! `?`-propagation, or panic unwind under `panic = "unwind"` (the
@@ -43,9 +42,9 @@
 //! `panic = "abort"` is a binary-level setting outside library reach;
 //! on process death the OS-level TCP RST tears down the connection
 //! server-side. Architectural boundary stronger than any library
-//! mechanism (memo §3.3).
+//! mechanism.
 //!
-//! # ColEvent variants (memo §2.2)
+//! # ColEvent variants
 //!
 //! - `Got { idx, bytes }` — a complete column body arrived inline
 //!   (column fit in the current read-buf headroom). Caller decodes
@@ -63,7 +62,7 @@
 //!   for the next column.
 //! - `NeedMore` — read-buf empty mid-row, awaiting more wire bytes.
 //!   Caller exits the closure loop turn and feeds more bytes on the
-//!   next turn (sans-I/O driver pattern — see memo §3.4).
+//!   next turn (sans-I/O driver pattern).
 //! - `EndQuery { id, outcome: Result<Reply<'a>, ProtocolError> }`
 //!   — terminal. `Ok(reply)` on `CommandComplete` + `ReadyForQuery`;
 //!   `Err(cause)` on `ErrorResponse` + `ReadyForQuery` or wire
@@ -93,7 +92,7 @@ use crate::protocol::PgProtocol;
 use crate::wire::TAG_DATA_ROW;
 use crate::write_buf::WriteBuf;
 
-/// Tier-4 #59 audit (2026-05-19): single-source-of-truth sentinel
+/// Tier-4 audit #59 (2026-05-19) — single-source-of-truth sentinel
 /// reply-id for post-error terminal events emitted before any
 /// streaming state was ever observed (`cached_reply_id` is `None`).
 ///
@@ -101,7 +100,7 @@ use crate::write_buf::WriteBuf;
 ///
 /// `ColEvent::EndQuery { id, outcome: Err(...) }` carries an `id`
 /// for downstream wrapper-layer routing. Pre-streaming Errored
-/// entries have no real cached id — we never reached the
+/// entries have no real cached id — execution never reached the
 /// `IterRowsClass::Streaming(id)` arm that populates
 /// `cached_reply_id`. The wrapper layer matches on the
 /// `outcome::Err` *cause* (`ProtocolError::*`), NOT on `id`
@@ -118,14 +117,14 @@ use crate::write_buf::WriteBuf;
 ///
 /// # Why not lift to `Option<NonZeroU64>` in the ColEvent API
 ///
-/// Audit Phase 3 proposed `ColEvent::EndQuery { id:
-/// Option<NonZeroU64>, ... }` — type-level None vs Some. Rejected
-/// for v1.0 as a BREAKING API change requiring every downstream
-/// consumer of the streaming API to migrate id-matching code.
-/// The 15+ sentinel sites collapse to one constant; the sentinel
-/// is type-system-clean (`NonZeroU64` by construction) and the
-/// rationale is anchored here so future refactors don't re-derive
-/// the analysis. Reopen path: post-1.0 API redesign sweep.
+/// A `ColEvent::EndQuery { id: Option<NonZeroU64>, ... }` shape
+/// (type-level None vs Some) is a BREAKING API change requiring
+/// every downstream consumer of the streaming API to migrate
+/// id-matching code. The 15+ sentinel sites collapse to one
+/// constant; the sentinel is type-system-clean (`NonZeroU64` by
+/// construction) and the rationale is anchored here so future
+/// refactors don't re-derive the analysis. Reopen path: post-1.0
+/// API redesign sweep.
 pub(crate) const POST_ERROR_SENTINEL_REPLY_ID: NonZeroU64 = NonZeroU64::MAX;
 
 /// **Event yielded by [`RowStream::col_next`]** — column-by-column
@@ -324,15 +323,15 @@ pub struct RowStream<'p, 'w> {
     /// outside a row (waiting for next frame, or in a non-streaming
     /// state).
     row_progress: Option<RowProgress>,
-    /// DEF-280 Bundle H (2026-05-18): force `RowStream: !Send + !Sync`
-    /// via a ZST `PhantomData<*const ()>` (`*const ()` is the canonical
+    /// Force `RowStream: !Send + !Sync` via a ZST
+    /// `PhantomData<*const ()>` (`*const ()` is the canonical
     /// non-`Send` / non-`Sync` witness in core). The closure-scoped
-    /// API already pins lifetime via HRTB on `iter_rows`'s closure, but
-    /// nothing prevented a caller from capturing `&mut RowStream`
-    /// inside a `tokio::spawn(async move { ... })` (the spawned future
-    /// requires `Send` on its captures — with `!Send` RowStream the
-    /// spawn fails to compile rather than running Drop on a foreign
-    /// thread after `iter_rows`'s frame returns).
+    /// API pins lifetime via HRTB on `iter_rows`'s closure, but
+    /// without this marker a caller could capture `&mut RowStream`
+    /// inside a `tokio::spawn(async move { ... })` (the spawned
+    /// future requires `Send` on its captures — with `!Send`
+    /// RowStream the spawn fails to compile rather than running
+    /// Drop on a foreign thread after `iter_rows`'s frame returns).
     ///
     /// ZST: no layout cost. `*const ()` carries no provenance — purely
     /// a marker type. Cannot be constructed by anyone outside this
@@ -400,8 +399,8 @@ impl<'p, 'w> RowStream<'p, 'w> {
         self.proto.current_row_desc()
     }
 
-    /// DEF-244 (2026-05-13): collect the next complete row into a
-    /// typed tuple via [`crate::prepared::RowDecode`].
+    /// Collect the next complete row into a typed tuple via
+    /// [`crate::prepared::RowDecode`].
     ///
     /// Drives [`Self::col_next`] internally, accumulating per-column
     /// byte ranges (`(start_offset, len)` pairs into the protocol's
@@ -433,9 +432,9 @@ impl<'p, 'w> RowStream<'p, 'w> {
     /// (a) caller-owned scratch buffer (out of the no_alloc contract)
     /// or (b) heap-allocated per-cell vectors (also out of contract).
     ///
-    /// Wider coverage tracks DEF-244 follow-up: chunk-aware decoders
-    /// for `&[u8]` (bytea) and `&str` (long text) would synthesise
-    /// a borrowed-or-stitched view; out of v1 scope.
+    /// Wider coverage would require chunk-aware decoders for `&[u8]`
+    /// (bytea) and `&str` (long text) that synthesise a borrowed-or-
+    /// stitched view; out of v1 scope.
     pub fn collect_tuple<R>(&mut self) -> Result<Option<R::Row<'_>>, ProtocolError>
     where
         R: crate::prepared::RowDecode,
@@ -481,13 +480,11 @@ impl<'p, 'w> RowStream<'p, 'w> {
                             locus: crate::error::CrateBugLocus::RowRangeConstruction,
                         });
                     };
-                    // DEF-244 modernisation audit (rust-version 1.82
-                    // is_none_or): `m.map(p).unwrap_or(true)` is the verbose
-                    // form of `m.is_none_or(p)`. Semantics: `None` ⇒ true
-                    // (no add — overflow path; reject as out-of-range);
-                    // `Some(end)` ⇒ `end > populated_total_len`. The
-                    // shorter form names the condition: «the end either
-                    // overflows OR exceeds the buffer».
+                    // `is_none_or` (Rust 1.82+) names the condition
+                    // directly: `None` ⇒ true (no add — overflow path;
+                    // reject as out-of-range); `Some(end)` ⇒
+                    // `end > populated_total_len`. "End either overflows
+                    // OR exceeds the buffer."
                     if offset.checked_add(len).is_none_or(|end| end > populated_total_len) {
                         return Err(ProtocolError::InternalCrateBug {
                             locus: crate::error::CrateBugLocus::RowRangeConstruction,
@@ -504,18 +501,16 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     }
                 }
                 ColEvent::Null { idx } => {
-                    // DEF-281 Site B (2026-05-18): pre-Bundle this arm
-                    // silently dropped Null events with `idx >= MAX_ROW_COLUMNS`
-                    // (the `if idx_usize < MAX_ROW_COLUMNS { … }` guard
-                    // simply skipped the col_count bump on overflow). A
-                    // server emitting a row with 33+ Null columns would
-                    // see `col_count` plateau at 32 + the R::ARITY check
-                    // pass false-positively if R::ARITY happened to equal
-                    // the truncated `col_count`. Silent data-corruption
-                    // class. Post-Bundle the Null path mirrors the Got
-                    // path immediately above (line ~433): classify oversize
-                    // index as `TooManyColumns` and surface a typed
-                    // ProtocolError.
+                    // Mirrors the `Got` path above (oversize index
+                    // classification). A silent `if idx_usize <
+                    // MAX_ROW_COLUMNS { … }` guard form would skip the
+                    // col_count bump on overflow: a server emitting a
+                    // row with 33+ Null columns would see `col_count`
+                    // plateau at 32 + the R::ARITY check pass false-
+                    // positively if R::ARITY happened to equal the
+                    // truncated value (silent data-corruption class).
+                    // The explicit `TooManyColumns` classification
+                    // surfaces a typed ProtocolError instead.
                     let idx_usize = usize::from(idx);
                     if idx_usize >= crate::decode::MAX_ROW_COLUMNS {
                         return Err(ProtocolError::TooManyColumns {
@@ -545,16 +540,9 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     let mut col_bytes: [Option<&[u8]>; crate::decode::MAX_ROW_COLUMNS] =
                         [None; crate::decode::MAX_ROW_COLUMNS];
                     let n_used = usize::from(col_count).min(crate::decode::MAX_ROW_COLUMNS);
-                    // DEF-244 modernisation audit (edition 2024, rust-version
-                    // 1.88 let-chains): pre-modernisation, the outer `if let
-                    // Some((off, len)) = entry` was distinct from the inner
-                    // `if let Some(s) = slice && let Some(slot) = ...` pair
-                    // via an intermediate `let slice = populated.get(...)`
-                    // binding. Flattened: the intermediate binding inlines
-                    // into the second clause of a single chain, eliminating
-                    // one indentation level + one `let`. Semantics bit-
-                    // identical (short-circuit evaluation; inner body runs
-                    // iff all three clauses bind).
+                    // Let-chain (Rust 1.88+) — short-circuit
+                    // evaluation; inner body runs iff all three clauses
+                    // bind.
                     for i in 0..n_used {
                         let entry = col_offsets.get(i).copied().flatten();
                         if let Some((off, len)) = entry
@@ -564,16 +552,14 @@ impl<'p, 'w> RowStream<'p, 'w> {
                             *slot = Some(s);
                         }
                     }
-                    // DEF-281 Sites E+F (2026-05-18): explicit-match form
-                    // mirroring `session_params.rs:258-261`'s tier-1
-                    // documented-dead-arm pattern. Pre-Bundle silent
-                    // `.unwrap_or(&[])` on architecturally-dead None
-                    // (n_used = col_count.min(MAX_ROW_COLUMNS) ≤
-                    // MAX_ROW_COLUMNS, both arrays are [_; MAX_ROW_COLUMNS],
-                    // so `.get(..n_used)` is provably-Some). Match form
-                    // documents the dead arm at the call site; CREDO §V
-                    // ban on silent fallback applies here too even
-                    // though the None is mathematically unreachable.
+                    // Explicit-match form on an architecturally-dead
+                    // None (n_used = col_count.min(MAX_ROW_COLUMNS) ≤
+                    // MAX_ROW_COLUMNS, both arrays are
+                    // [_; MAX_ROW_COLUMNS], so `.get(..n_used)` is
+                    // provably-Some). The match form documents the dead
+                    // arm at the call site; CREDO §V's ban on silent
+                    // fallback applies here even though the None is
+                    // mathematically unreachable.
                     let formats_slice = match col_formats.get(..n_used) {
                         Some(s) => s,
                         None => &[],
@@ -658,9 +644,9 @@ impl<'p, 'w> RowStream<'p, 'w> {
         if self.drained {
             return ColEvent::NeedMore;
         }
-        // DEF-189-style fused classification: one match on state
-        // observes (Errored / Streaming / Other) + returns the
-        // streaming reply id by value (Copy NonZeroU64).
+        // Fused classification: one match on state observes (Errored
+        // / Streaming / Other) + returns the streaming reply id by
+        // value (Copy NonZeroU64).
         let class = self.proto.classify_for_iter_rows();
         if matches!(class, crate::protocol::IterRowsClass::Errored) {
             self.drained = true;
@@ -769,12 +755,12 @@ impl<'p, 'w> RowStream<'p, 'w> {
         // any drift.
         let populated = self.proto.read_buf_populated();
         let cursor = usize::from(self.proto.read_buf_cursor_u16());
-        // DEF-281 Site G (2026-05-18): explicit-match form. None arm
-        // is architecturally-dead (cursor ≤ populated.len() upheld by
-        // read_buf invariants); downstream `parse_header(&[])` returns
-        // HeaderParse::Empty which routes to ColEvent::NeedMore — but
-        // the call-site silent-fallback `.unwrap_or(&[])` itself is
-        // banned per CREDO §V regardless of downstream classification.
+        // Explicit-match form. None arm is architecturally-dead
+        // (cursor ≤ populated.len() upheld by read_buf invariants);
+        // downstream `parse_header(&[])` returns HeaderParse::Empty
+        // which routes to ColEvent::NeedMore — but the call-site
+        // silent-fallback `.unwrap_or(&[])` is banned per CREDO §V
+        // regardless of downstream classification.
         let after_cursor = match populated.get(cursor..) {
             Some(s) => s,
             None => &[],
@@ -929,16 +915,15 @@ impl<'p, 'w> RowStream<'p, 'w> {
         // beyond the header.
         let body_remaining = declared.saturating_sub(4);
         let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
-        // DEF-280 Bundle K (2026-05-18): typed-Err propagation from
-        // ReadBuf::enter_partial_mode. Pre-Bundle K this call
-        // returned `()` and the re-entry condition was a silent
-        // overwrite in release (debug-assert panic in dev) — the
-        // CREDO §V glass pattern with wire-desync consequence.
-        // Post-Bundle K the Err arm classifies the bug via
+        // Typed-Err propagation from ReadBuf::enter_partial_mode. The
+        // Err arm classifies the re-entry bug via
         // `CrateBugLocus::PartialModeReentry`, installs Errored, and
-        // surfaces ColEvent::EndQuery::Err uniformly across both
-        // build modes. Architecturally dead under intact dispatcher
-        // (every begin_partial_data_row precedes a matching
+        // surfaces ColEvent::EndQuery::Err uniformly across build
+        // modes. A `()`-returning shape would silently overwrite in
+        // release (debug-assert panic in dev only) — the CREDO §V
+        // glass pattern with wire-desync consequence. The re-entry
+        // is architecturally dead under intact dispatcher (every
+        // begin_partial_data_row precedes a matching
         // exit_partial_mode), but the typed return closes the
         // by-construction shield.
         if self.proto.enter_partial_mode_for_data_row(&token, body_remaining).is_err() {
@@ -1028,19 +1013,14 @@ impl<'p, 'w> RowStream<'p, 'w> {
         self.row_progress = Some(progress);
         if n_cols == 0 {
             // Zero-column oversized row (architecturally pathological
-            // — a server emitting that exhausts our partial-mode
-            // counter only via the chunked-body path. We exit partial
-            // mode and emit EndRow.). Verify partial counter is 0 via
-            // the function's typed-Err precondition (Bundle K-mirror)
-            // — pre-Bundle-K-mirror this site pre-checked
-            // `partial_remaining == 0` upstream (tier-2 by-discipline);
-            // post-Bundle-K-mirror the exit function itself enforces
-            // the precondition (Approach B, single source of truth)
-            // and returns Err if the wire still owed bytes (would
-            // indicate a body-length protocol error since this case
-            // is unreachable from wire-legal perspective with a
-            // non-zero counter — same elevation as Bundle K's
-            // enter-side classified-Err routing).
+            // — a server emitting that exhausts the partial-mode
+            // counter only via the chunked-body path. Exit partial
+            // mode and emit EndRow.). The exit call's typed-Err
+            // return enforces `partial_remaining == 0` at the call
+            // site; if the wire still owed bytes (architecturally
+            // unreachable from a wire-legal frame with a non-zero
+            // counter) classify via Errored install + EndQuery::Err
+            // routing.
             let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
             if self.proto.exit_partial_mode_for_row_stream(&token).is_err() {
                 self.drained = true;
@@ -1083,21 +1063,20 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // parsed_cols == n_cols, partial_remaining MUST be 0
             // (else a body-length / column-length disagreement).
             //
-            // DEF-280 Bundle K-mirror (2026-05-18): the exit call
-            // returns `Result<(), PartialModeExitUndrained>` (Approach
-            // B — single source of truth: the function enforces the
-            // `partial_remaining == 0` precondition). Pre-Bundle-K-mirror
-            // this site pre-checked both `is_in_partial_mode` AND
-            // `partial_remaining == 0` upstream (tier-2 by-discipline)
-            // and silently skipped exit on non-zero remaining — the
-            // protocol-error classification was deferred to the
-            // dispatcher's next-frame entry (silent for the duration
-            // of this dispatch frame's body). Post-Bundle-K-mirror the
+            // The exit call returns
+            // `Result<(), PartialModeExitUndrained>` — single source
+            // of truth: the function enforces the
+            // `partial_remaining == 0` precondition. The
             // classification happens IMMEDIATELY at end-of-row via the
             // typed Err + install_errored_partial_mode_exit_undrained
-            // path. The `is_in_partial_mode` predicate-check is
-            // preserved as the fast-path gate (non-partial rows don't
-            // pay the exit-call cost).
+            // path; a discipline-based form (pre-check
+            // `is_in_partial_mode` AND `partial_remaining == 0` upstream
+            // + silent skip on non-zero remaining) would defer
+            // classification to the dispatcher's next-frame entry
+            // (silent for the duration of this dispatch frame's body).
+            // The `is_in_partial_mode` predicate-check is preserved as
+            // the fast-path gate (non-partial rows don't pay the
+            // exit-call cost).
             if self.proto.is_in_partial_mode_for_row_stream() {
                 let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
                 if self.proto.exit_partial_mode_for_row_stream(&token).is_err() {
@@ -1177,16 +1156,14 @@ impl<'p, 'w> RowStream<'p, 'w> {
             new_progress.parsed_cols = idx.saturating_add(1);
             self.row_progress = Some(new_progress);
 
-            // DEF-281 Site A (2026-05-18): two-phase defense for the
-            // body-slice projection. Pre-Bundle this site silently
-            // delivered an empty slice on architecturally-dead None
-            // via `.unwrap_or(&[])` — the CREDO §V glass pattern,
-            // user-visible-data-corruption-class if `read_buf_advance`'s
-            // contract ever broke.
+            // Two-phase defense for the body-slice projection. A
+            // silent `populated.get(...).unwrap_or(&[])` would be the
+            // CREDO §V glass pattern — user-visible-data-corruption-
+            // class if `read_buf_advance`'s contract ever broke.
             //
-            // Post-Bundle phase 1 (explicit pre-check, uses populated
-            // .len() as a copy so the borrow is fully released before
-            // any `&mut self` call): if the slice end exceeds the
+            // Phase 1 (explicit pre-check, uses populated.len() as a
+            // copy so the borrow is fully released before any
+            // `&mut self` call): if the slice end exceeds the
             // populated region OR bytes_offset arithmetic underflowed
             // (saturating_add could produce a smaller-than-offset end
             // only on usize wrap, architecturally impossible because
@@ -1199,11 +1176,11 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // because `terminal_internal_advance_err` takes `&mut self`
             // and the slice's lifetime ties to the populated borrow.
             //
-            // Post-Bundle phase 2: project the slice. The
-            // `.unwrap_or(&[])` fallback is preserved as the closing
-            // syntactic shape (no `clippy::indexing_slicing` use; no
-            // `unwrap()` / `expect()` panic class), but its None arm is
-            // now ARCHITECTURALLY UNREACHABLE per phase 1's pre-check.
+            // Phase 2: project the slice. The `.unwrap_or(&[])`
+            // fallback is preserved as the closing syntactic shape
+            // (no `clippy::indexing_slicing` use; no `unwrap()` /
+            // `expect()` panic class), but its None arm is
+            // ARCHITECTURALLY UNREACHABLE per phase 1's pre-check.
             // The pair is the tier-1 elevation: classified Err on the
             // hazard path, syntactic-shape fallback on the proven-dead
             // path.
@@ -1253,7 +1230,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
         self.row_progress = Some(new_progress);
 
         let remaining_len = col_len.saturating_sub(chunk_len_u32);
-        // DEF-281 Site A-mirror (2026-05-18): two-phase defense.
+        // Two-phase defense mirroring the Got-arm projection above.
         // `read_buf_advance(chunk_len)` succeeded above ⇒
         // `bytes_offset + chunk_len <= populated.len()`. Pre-check
         // via len-copy + classified Err on the architecturally-dead
@@ -1336,9 +1313,9 @@ impl<'p, 'w> RowStream<'p, 'w> {
         }
         self.row_progress = Some(new_progress);
 
-        // DEF-281 Site A-mirror (chunk continuation, 2026-05-18):
-        // two-phase defense, same pattern as the first-chunk site.
-        // `read_buf_advance(chunk_len_usize)` succeeded above ⇒
+        // Two-phase defense (chunk continuation), same pattern as
+        // the first-chunk site. `read_buf_advance(chunk_len_usize)`
+        // succeeded above ⇒
         // `bytes_offset + chunk_len_usize <= populated.len()`.
         let populated_len = self.proto.read_buf_populated().len();
         let slice_end = bytes_offset.saturating_add(chunk_len_usize);
@@ -1419,11 +1396,11 @@ impl<'p, 'w> RowStream<'p, 'w> {
     fn read_col_count(&self) -> Result<u16, ProtocolError> {
         let unread = self.proto.read_buf_populated();
         let cursor = usize::from(self.proto.read_buf_cursor_u16());
-        // DEF-281 Site H (2026-05-18): explicit-match. Architecturally-
-        // dead None arm (cursor ≤ unread.len() by ReadBuf invariant);
-        // the downstream `_ => Err(MalformedDataRow)` classifies the
-        // empty-slice case to a typed wire error, but the call-site
-        // silent `.unwrap_or(&[])` is banned per CREDO §V.
+        // Explicit-match. Architecturally-dead None arm (cursor ≤
+        // unread.len() by ReadBuf invariant); the downstream
+        // `_ => Err(MalformedDataRow)` classifies the empty-slice
+        // case to a typed wire error, but the call-site silent
+        // `.unwrap_or(&[])` is banned per CREDO §V.
         let after = match unread.get(cursor..) {
             Some(s) => s,
             None => &[],
@@ -1448,11 +1425,11 @@ impl<'p, 'w> RowStream<'p, 'w> {
     fn read_col_len(&self) -> Result<i32, ()> {
         let unread = self.proto.read_buf_populated();
         let cursor = usize::from(self.proto.read_buf_cursor_u16());
-        // DEF-281 Site I (2026-05-18): explicit-match. Architecturally-
-        // dead None arm (cursor ≤ unread.len() by ReadBuf invariant);
-        // downstream `_ => Err(())` classifies upstream into the
-        // caller's MalformedDataRow surface. Call-site silent
-        // `.unwrap_or(&[])` banned per CREDO §V.
+        // Explicit-match. Architecturally-dead None arm (cursor ≤
+        // unread.len() by ReadBuf invariant); downstream
+        // `_ => Err(())` classifies upstream into the caller's
+        // MalformedDataRow surface. Call-site silent `.unwrap_or(&[])`
+        // banned per CREDO §V.
         let after = match unread.get(cursor..) {
             Some(s) => s,
             None => &[],
@@ -1498,12 +1475,12 @@ impl<'p, 'w> RowStream<'p, 'w> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// DEF-248 Sub-A (2026-05-12) — Drop impl + mem::forget closure
+// Drop impl + mem::forget closure
 //
 // Drop fires unconditionally on every closure exit (normal return,
 // `?`-propagation, panic unwind under `panic = "unwind"`). The Drop
 // body installs Errored when the stream is mid-frame; the closure
-// scope (memo §3.2) closes `mem::forget` structurally.
+// scope closes `mem::forget` structurally.
 // ─────────────────────────────────────────────────────────────────────
 
 impl Drop for RowStream<'_, '_> {
@@ -1537,17 +1514,16 @@ impl Drop for RowStream<'_, '_> {
 // the import above to keep the symbol load-bearing.
 const _: () = assert!(MAX_FRAME_LEN_FIELD >= 4);
 
-/// **DEF-248 Sub-A leaf submodule** for partial-frame mode entry.
+/// Leaf submodule for partial-frame mode entry.
 ///
 /// Hosts the per-call-site concrete-type token gating
 /// [`crate::buf::ReadBuf::enter_partial_mode`] /
 /// [`crate::buf::ReadBuf::exit_partial_mode`] /
 /// [`crate::buf::ReadBuf::subtract_partial_remaining`]. The token's
 /// tuple-struct field is private to this submodule — `Self(())` mints
-/// are callable ONLY inside the leaf. Mirror of DEF-272 cluster δ
-/// pattern but with the leaf placed in `mod row_stream` (the caller
-/// module) rather than `mod buf` (the callee), because we need to
-/// restrict the call surface to the caller module.
+/// are callable ONLY inside the leaf. The leaf lives in `mod row_stream`
+/// (the caller module) rather than `mod buf` (the callee), because the
+/// call surface must be restricted to the caller module.
 ///
 /// **Tier-1 within-crate by-construction**: hostile callers outside
 /// `mod row_stream` attempting to call the partial-mode methods on
@@ -1557,16 +1533,13 @@ const _: () = assert!(MAX_FRAME_LEN_FIELD >= 4);
 /// [`mint_for_row_stream_dispatcher`], `pub(in crate::row_stream)`,
 /// callable only from inside this module.
 //
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
 pub(crate) mod _row_stream_partial_leaf {
     /// **Tier-1 leaf-scope token** for partial-frame mode entry/exit.
     ///
     /// Tuple-struct field private to leaf: `Self(())` mints are
     /// callable ONLY inside this submodule. Hostile in-crate code
     /// outside the leaf cannot construct the type — the type system
-    /// rejects. Mirror of DEF-272 cluster δ tokens.
+    /// rejects.
     pub(crate) struct PartialFrameToken(());
 
     /// Mint a fresh [`PartialFrameToken`] for the row-stream
@@ -1588,20 +1561,20 @@ pub(crate) mod _row_stream_partial_leaf {
     }
 }
 
-/// DEF-280 Bundle K (2026-05-18) — spec tests for the partial-mode
-/// re-entry tier elevation. Pins:
+/// Spec tests for the partial-mode re-entry / exit tier-1 invariants:
 /// - `enter_partial_mode` returns `Ok(())` on a fresh buffer (counter
 ///   was `0`).
 /// - `enter_partial_mode` returns `Err(AlreadyInPartialMode)` if called
 ///   while the counter is already non-zero, AND **does not overwrite**
 ///   the existing counter value (no silent state corruption).
+/// - `exit_partial_mode` returns `Err(PartialModeExitUndrained)` if
+///   called with bytes still owed, AND **does not reset** the counter.
 ///
-/// Pre-Bundle K both paths were `()`-typed; the re-entry path
-/// debug-asserted in dev and silently overwrote in release. Post-Bundle
-/// K both paths return typed Result and the re-entry path preserves the
-/// existing counter, leaving the caller to classify the bug.
+/// A `()`-returning shape would debug-assert in dev and silently
+/// overwrite/reset in release on the re-entry/exit-undrained paths;
+/// the typed Result return shape closes that wire-desync surface.
 #[cfg(test)]
-mod bundle_k_spec_tests {
+mod partial_mode_tier1_spec {
     use super::_row_stream_partial_leaf::mint_for_row_stream_dispatcher;
     use crate::buf::{AlreadyInPartialMode, ReadBuf};
 
@@ -1617,8 +1590,8 @@ mod bundle_k_spec_tests {
     }
 
     /// Re-entry while already in partial mode returns Err and does NOT
-    /// overwrite the existing counter. Pre-Bundle K this silently
-    /// overwrote on release builds — wire-desync class.
+    /// overwrite the existing counter. A silent-overwrite shape on
+    /// release builds would be a wire-desync class regression.
     #[test]
     fn enter_partial_mode_on_partial_buffer_returns_err_and_preserves_counter() {
         let mut buf = ReadBuf::new();
@@ -1627,7 +1600,7 @@ mod bundle_k_spec_tests {
         // unwrap_or shape for the precondition setup.
         assert!(
             buf.enter_partial_mode(&token1, 2048).is_ok(),
-            "Bundle K test fixture: first entry from idle must succeed",
+            "fixture: first entry from idle must succeed",
         );
 
         let token2 = mint_for_row_stream_dispatcher();
@@ -1638,15 +1611,14 @@ mod bundle_k_spec_tests {
                 prev_remaining: 2048,
                 new_declared_len: 4096,
             }),
-            "Bundle K: re-entry returns typed witness, not silent overwrite",
+            "re-entry returns typed witness, not silent overwrite",
         );
         // Counter preserved at its prior value (NOT overwritten to 4096).
         assert_eq!(
             buf.partial_remaining(),
             2048,
-            "Bundle K: Err arm leaves counter unchanged — pre-Bundle K \
-             release builds silently overwrote 2048 → 4096, dropping \
-             the 2048 bytes still owed on the wire",
+            "Err arm leaves counter unchanged — a silent-overwrite \
+             shape would drop the 2048 bytes still owed on the wire",
         );
     }
 
@@ -1667,7 +1639,7 @@ mod bundle_k_spec_tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // DEF-280 Bundle K-mirror (2026-05-18) — exit_partial_mode spec
+    // exit_partial_mode spec
     // ─────────────────────────────────────────────────────────────────
 
     /// Exit from `partial_remaining == 0` is the happy path — Ok and
@@ -1683,14 +1655,14 @@ mod bundle_k_spec_tests {
         let token = mint_for_row_stream_dispatcher();
         // Buffer starts with partial_remaining == 0 (idle).
         let result = buf.exit_partial_mode(&token);
-        assert!(result.is_ok(), "Bundle K-mirror: idle exit must succeed");
+        assert!(result.is_ok(), "idle exit must succeed");
         assert_eq!(buf.partial_remaining(), 0);
     }
 
     /// Exit while `partial_remaining > 0` returns Err and does NOT
-    /// reset the counter. Pre-Bundle-K-mirror this silently reset on
-    /// release builds — wire-desync class (body bytes still owed on
-    /// wire abandoned).
+    /// reset the counter. A silent-reset shape on release builds
+    /// would be a wire-desync class regression (body bytes still
+    /// owed on wire abandoned).
     #[test]
     fn exit_partial_mode_with_undrained_returns_err_and_preserves_counter() {
         use crate::buf::PartialModeExitUndrained;
@@ -1699,7 +1671,7 @@ mod bundle_k_spec_tests {
         // Set up partial-mode with 512 bytes still owed.
         assert!(
             buf.enter_partial_mode(&token, 512).is_ok(),
-            "Bundle K-mirror fixture: enter must succeed from idle",
+            "fixture: enter must succeed from idle",
         );
         assert_eq!(buf.partial_remaining(), 512);
 
@@ -1708,16 +1680,15 @@ mod bundle_k_spec_tests {
         assert_eq!(
             result,
             Err(PartialModeExitUndrained { remaining: 512 }),
-            "Bundle K-mirror: undrained exit returns typed witness, \
-             not silent counter reset",
+            "undrained exit returns typed witness, not silent \
+             counter reset",
         );
         // Counter preserved at its prior value (NOT reset to 0).
         assert_eq!(
             buf.partial_remaining(),
             512,
-            "Bundle K-mirror: Err arm leaves counter unchanged — \
-             pre-Bundle-K-mirror release builds silently reset 512 → 0, \
-             abandoning the 512 bytes still owed on the wire",
+            "Err arm leaves counter unchanged — a silent-reset \
+             shape would abandon the 512 bytes still owed on the wire",
         );
     }
 

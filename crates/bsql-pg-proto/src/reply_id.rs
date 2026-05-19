@@ -1,30 +1,28 @@
-//! Typed opaque correlator for in-flight commands (DEF-112).
+//! Typed opaque correlator for in-flight commands.
 //!
 //! `bsql-pg-proto` is `no_std` and oblivious to async runtimes; it cannot
 //! own `tokio::sync::oneshot::Sender`s itself. Instead, each
 //! [`crate::PgCommand`] carries a [`ReplyId<K>`] that the upstream
-//! wrapper crate (`bsql-driver-postgres`, Phase 1e) uses as the key
-//! in its pending-replies table.
+//! wrapper crate uses as the key in its pending-replies table.
 //!
-//! # DEF-112 — kind-parameterisation
+//! # Kind-parameterisation
 //!
-//! Before DEF-112 `ReplyId` was untyped (`{ value: NonZeroU64,
-//! delivered: bool }`). A dispatcher that emitted
-//! `Action::DeliverReply { id: ping_id, value: Reply::StartupComplete
-//! { .. } }` would compile cleanly — the value type was erased the
-//! moment it landed in the `Reply` sum. The wrapper's
-//! `HashMap<NonZeroU64, oneshot::Sender<Reply>>` would silently
-//! route a Pong-sender a StartupComplete payload. Tier-3 audit seam.
-//!
-//! DEF-112 elevates this to tier-1 compile. [`ReplyId<K>`] is now
-//! parameterised by a marker type `K: ReplyKind` that binds the
-//! **expected payload** via an associated type
+//! [`ReplyId<K>`] is parameterised by a marker type `K: ReplyKind`
+//! that binds the **expected payload** via an associated type
 //! [`ReplyKind::Payload`]. The only way to produce a
 //! `StagedAction::DeliverReply` carrying payload `P` is through
 //! [`crate::action::deliver`], whose signature is
 //! `fn deliver<K: ReplyKind>(id: ReplyId<K>, payload: K::Payload) -> StagedAction`
 //! — passing a `ReplyId<PingKind>` and a `StartupCompletePayload`
 //! is a type error at the call site, not a runtime misroute.
+//!
+//! Without kind-parameterisation, a dispatcher emitting
+//! `Action::DeliverReply { id: ping_id, value: Reply::StartupComplete
+//! { .. } }` would compile cleanly — the value type erases the moment
+//! it lands in the `Reply` sum. The wrapper's `HashMap<NonZeroU64,
+//! oneshot::Sender<Reply>>` would silently route a Pong-sender a
+//! StartupComplete payload. The kind tag closes that seam tier-1 at
+//! compile time.
 //!
 //! The [`crate::action::DeliverReplyEntry`] struct that backs the
 //! variant has module-private fields so direct struct-literal
@@ -48,12 +46,7 @@
 //! 2. **No sentinel collision.** Zero is reserved as "no ID"; the
 //!    constructor refuses it.
 //!
-//! `bsql-pg-proto` mints IDs internally via [`crate::PgProtocol::next_reply_id`]
-//! (DEF-270 cluster, 2026-05-09 — supersedes reforge.md §7.5 wrapper-mint
-//! discipline). Pre-DEF-270 the wrapper crate ran a per-connection
-//! monotonic counter and collision-freedom was the wrapper's
-//! responsibility — **tier-3 by audit** (cross-crate seal not
-//! expressible in stable Rust). Post-DEF-270:
+//! `bsql-pg-proto` mints IDs internally via [`crate::PgProtocol::next_reply_id`]:
 //!
 //! - **External fabrication: tier-1 by-visibility.** [`ReplyId::from_raw`]
 //!   is `pub(crate)` — external crates cannot construct a `ReplyId<K>`.
@@ -65,12 +58,11 @@
 //!   globally-unique IDs across all `PgProtocol` instances and
 //!   threads — stronger than per-instance uniqueness. Saturating
 //!   `u64` add — architecturally-distant ceiling (~10^19 mints
-//!   process-wide). The counter is NOT a `PgProtocol` field
-//!   (bisect 2026-05-09 proved an inline `u64` field would grow
-//!   the struct 520 → 528 B and shift LLVM whole-crate heuristic
-//!   +6% on `iter_10cols` decode bench). Linear types would lift
-//!   this to tier-1 ("counter has never returned this value");
-//!   not available pre-stable Rust.
+//!   process-wide). The counter is NOT a `PgProtocol` field: an
+//!   inline `u64` field grows the struct 520 → 528 B and shifts the
+//!   LLVM whole-crate heuristic +6% on the `iter_10cols` decode
+//!   bench. Linear types would lift this to tier-1 ("counter has
+//!   never returned this value"); not available in stable Rust.
 //! - **Niche optimization preserved.** `Option<ReplyId<K>>` stays the
 //!   same size as `ReplyId<K>` itself (the `NonZeroU64` niche).
 //! - **No sentinel collision.** Zero is reserved as "no ID"; the
@@ -80,34 +72,30 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
 
-/// DEF-280 Bundle J (2026-05-18): canonical sentinel raw value for a
+/// Canonical sentinel raw value for a
 /// [`crate::action::PushFailure::id`] field on a `PushFailure` whose
 /// `cause` is an [`crate::error::ProtocolError::InternalCrateBug`] and
 /// where no real in-flight `ReplyId` is associated.
 ///
 /// # Why a distinct sentinel
 ///
-/// Pre-Bundle J the two CrateBug PushFailure sites in `protocol.rs`
-/// (`push_command_internal` non-`Idle` precondition + Bundle G's
-/// `PushEmittedDeliverReply` arm) used `NonZeroU64::MIN` (= raw value
-/// `1`) as the sentinel. That value is **byte-identical** with the
-/// legitimate first `ReplyId` minted by
+/// A naive `NonZeroU64::MIN` (= raw value `1`) sentinel is
+/// **byte-identical** with the legitimate first `ReplyId` minted by
 /// [`crate::PgProtocol::next_reply_id`] (the static atomic counter
 /// returns `NonZeroU64::new(1)` on its first call). Monitoring code
 /// that distinguishes "CrateBug-classified failure" vs "first-command
-/// genuine failure" by inspecting the id alone false-positives every
-/// connection's first command.
+/// genuine failure" by inspecting the id alone would false-positive
+/// every connection's first command.
 ///
-/// Post-Bundle J both sites carry `CRATE_BUG_REPLY_ID_SENTINEL` which
-/// is set to [`NonZeroU64::MAX`] (raw value `u64::MAX`). Legitimate
-/// minting reaches `u64::MAX` only at the saturation edge of the
-/// global counter — architecturally distant (~10^19 mints
-/// process-wide) AND immediately followed by an Errored-state
-/// transition (`install_errored_replyid_saturation`) that drops the
-/// connection — so the sentinel can collide with a legitimate id only
-/// in a fully-quiescent test fixture that explicitly pre-loads the
-/// counter to `u64::MAX − 1`. Production wrappers never observe the
-/// collision.
+/// `CRATE_BUG_REPLY_ID_SENTINEL = NonZeroU64::MAX` (raw value
+/// `u64::MAX`) cannot collide with legitimate minting except at the
+/// saturation edge of the global counter — architecturally distant
+/// (~10^19 mints process-wide) AND immediately followed by an
+/// Errored-state transition (`install_errored_replyid_saturation`)
+/// that drops the connection — so the sentinel can collide with a
+/// legitimate id only in a fully-quiescent test fixture that
+/// explicitly pre-loads the counter to `u64::MAX − 1`. Production
+/// wrappers never observe the collision.
 ///
 /// # Monitoring contract
 ///
@@ -126,7 +114,7 @@ mod sealed {
 }
 
 /// Marker trait pairing a PG-command shape with the payload its
-/// eventual reply carries. Sealed (DEF-112).
+/// eventual reply carries. Sealed.
 ///
 /// Each impl is an uninhabited `enum` (structurally impossible to
 /// instantiate) that serves purely as a type-level nominal tag.
@@ -137,30 +125,29 @@ mod sealed {
 ///
 /// [`Payload`]: ReplyKind::Payload
 //
-// DEF-112 follow-up (rust-version 1.78 modernisation): structural
-// diagnostic. The sealed supertrait error «`T: Sealed` is not
-// satisfied» is not actionable from outside the crate — listing the
-// permitted kind tags here resolves that.
+// Structural diagnostic. The sealed supertrait error «`T: Sealed`
+// is not satisfied» is not actionable from outside the crate —
+// listing the permitted kind tags here resolves that.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid `ReplyKind` tag",
     label = "valid tags are the uninhabited enums `PingKind`, `StartupKind`, `QueryKind`, `ParseKind`, `CloseKind`, `DescribeStatementKind`, `DescribePortalKind`",
-    note = "`ReplyKind` is sealed (DEF-112) — the kind tag set is fixed at the crate boundary; downstream `impl ReplyKind for ...` is forbidden by construction"
+    note = "`ReplyKind` is sealed — the kind tag set is fixed at the crate boundary; downstream `impl ReplyKind for ...` is forbidden by construction"
 )]
 pub trait ReplyKind: sealed::Sealed {
     /// The typed STAGED payload constructed at dispatch time. Must
     /// convert to the internal [`crate::action::StagedReply`] sum.
     ///
-    /// # DEF-119 + DEF-188 + DEF-210 SR-01 — staged vs public payload split
+    /// # Staged vs public payload split
     ///
     /// The dispatch site constructs the staged payload (lifetime-free,
     /// no `&'r RowDesc` borrows); materialise converts to the public
     /// `Reply<'r>` by borrowing `PgProtocol::row_desc_slot` directly.
-    /// DEF-210 SR-01 Path C deleted the prior `schema_present: bool`
-    /// duplicate flag — the slot's `is_some()` IS the schema-presence
-    /// fact (single source of truth, tier-1 by-construction).
-    /// The DEF-112 kind-payload pairing is preserved — `ReplyId<K>`
-    /// still constrains what payload the dispatcher can stage, and
-    /// the `Into<StagedReply>` bound keeps the seal one-way.
+    /// The slot's `is_some()` IS the schema-presence fact (single
+    /// source of truth, tier-1 by-construction) — a duplicate
+    /// `schema_present: bool` flag would split that source of truth.
+    /// The kind-payload pairing is preserved — `ReplyId<K>` still
+    /// constrains what payload the dispatcher can stage, and the
+    /// `Into<StagedReply>` bound keeps the seal one-way.
     ///
     /// For schema-less kinds (Ping, Startup, Parse, Close),
     /// StagedPayload == PublicPayload (no schema to borrow). For
@@ -198,12 +185,11 @@ impl ReplyKind for StartupKind {
     const NAME: &'static str = "Startup";
 }
 
-// ───────────────── Phase 1c ReplyKind markers ─────────────────
+// ───────────────── Query-flow ReplyKind markers ─────────────────
 //
 // Each Query-flow command carries a typed `ReplyId<K>` binding
-// the final reply payload. Mirror the DEF-112 pattern
-// established for PingKind / StartupKind. Dispatch wiring lands
-// in sub-phases 1c-1 (Query) and 1c-3 (Parse / Close).
+// the final reply payload. Mirror the kind-marker pattern
+// established for PingKind / StartupKind.
 
 /// Kind marker for `PgCommand::SimpleQuery` and
 /// `PgCommand::BindExecute` replies. Payload type:
@@ -248,8 +234,8 @@ impl ReplyKind for CloseKind {
 /// (`RowDescription` → `Rows(..)` / `NoData` → `NoData`), and
 /// `tx_status` from the trailing RFQ.
 ///
-/// **Split vs Portal.** DEF-112 drives the kind-based split: a
-/// `ReplyId<DescribeStatementKind>` cannot produce a
+/// **Split vs Portal.** The kind-based split prevents a
+/// `ReplyId<DescribeStatementKind>` from producing a
 /// `DescribePortalCompletePayload` at the typed `deliver` call site.
 /// The user's oneshot receiver sees only the payload shape the
 /// command-variant invoked — no `Option<ParamOids>` surface-level
@@ -287,13 +273,15 @@ impl ReplyKind for DescribePortalKind {
 /// regardless of `K` — see [`crate::ident::FixedStr`] for the same
 /// pattern on the bounded-string hierarchy.
 ///
-/// # Consume discipline — tier-1 compile + tier-2 runtime
+/// # Consume discipline — tier-1 compile
 ///
-/// `ReplyId<K>` tracks whether its value has been **delivered**. The
-/// only way to extract the underlying `NonZeroU64` is
-/// [`ReplyId::consume`], which also marks the id as delivered.
-/// Dropping a `ReplyId<K>` for which `consume` was never called is a
-/// runtime failure (DEF-101).
+/// The only way to extract the underlying `NonZeroU64` is
+/// [`ReplyId::consume`]. `#[must_use]` on the struct warns when a
+/// `ReplyId<K>` is bound and then dropped without being consumed;
+/// the dispatch machinery routes every id through `.consume()`
+/// (into a NonZeroU64 for staging) or `.get()` (peek for staging
+/// into StagedAction variants), so an undropped id at runtime is
+/// possible only by deliberate bypass of the dispatcher.
 ///
 /// # Layered guarantees
 ///
@@ -304,21 +292,18 @@ impl ReplyKind for DescribePortalKind {
 /// - **Tier 1 compile** — kind-parameterised. A `ReplyId<PingKind>`
 ///   cannot produce anything other than a `PongPayload`-backed
 ///   delivery; attempting so is a type error at
-///   [`crate::action::deliver`]. DEF-112.
+///   [`crate::action::deliver`].
 /// - **Tier 2 structural** — cannot be silently ignored from a
 ///   pattern match. The crate-root `#[deny(unused_variables)]`
 ///   combined with the crate-wide CREDO bans on `let _ = expr;`
 ///   and `_varname` suppression forces a match arm that binds
 ///   `id: ReplyId<K>` to refer to `id` in the arm body.
-/// - **Tier 2 runtime** — Drop-guard asserts delivered on drop
-///   (see DEF-101 analysis in deferred.md §16 for why this is the
-///   stable-Rust ceiling, not tier-1).
 #[must_use = "a ReplyId should be consumed via `.consume()` into an Action — dropping it silently leaves the caller's receiver hanging (wrapper-layer timeout concern)"]
 pub struct ReplyId<K: ReplyKind> {
     /// The wire-level correlator value. Never changes after
     /// construction.
     ///
-    /// # DEF-163 A006 — NOT a secret, intentionally NOT zeroized
+    /// # NOT a secret, intentionally NOT zeroized
     ///
     /// The `value` is a monotonic correlator (matches commands to
     /// replies over the wire). It carries NO user data, NO
@@ -328,10 +313,10 @@ pub struct ReplyId<K: ReplyKind> {
     /// [`crate::sensitive::Sensitive`] wrappers on password /
     /// SCRAM-key material, which DO scrub on drop.
     value: NonZeroU64,
-    // DEF-154 (K): `delivered: bool` field DELETED — it only
-    // supported the panic-in-Drop safety net (now removed).
-    // Discipline enforced via `#[must_use]` + integration-test
-    // observation on OutActions content.
+    // No `delivered: bool` field — discipline is enforced via
+    // `#[must_use]` + integration-test observation on OutActions
+    // content. A `delivered` flag would only support a panic-in-Drop
+    // safety net (footgun under integration-test unwind).
     /// Phantom tag — zero-size, `fn() -> K` for unconditional
     /// autotraits. See [`crate::ident::FixedStr`] docstring for
     /// the full rationale of the `fn() -> K` phantom form.
@@ -342,16 +327,16 @@ impl<K: ReplyKind> ReplyId<K> {
     /// Construct a `ReplyId<K>` from a non-zero monotonic counter
     /// value.
     ///
-    /// # Visibility (DEF-270 cluster, 2026-05-09 — U letter)
+    /// # Visibility
     ///
     /// `pub(crate)` only. External crates cannot construct a
     /// `ReplyId<K>`; the sole public mint is
     /// [`crate::PgProtocol::next_reply_id`]. This closes the
-    /// "external fabrication" tier-3 seam: pre-DEF-270 the wrapper
-    /// crate (or any consumer) could mint duplicate IDs by accident,
-    /// causing the protocol to deliver replies to the wrong
-    /// correlator. Post-DEF-270, **fabrication is impossible from
-    /// outside this crate** — visibility tier-1.
+    /// "external fabrication" tier-3 seam — fabrication is
+    /// impossible from outside this crate (visibility tier-1). A
+    /// `pub` constructor would let the wrapper crate (or any
+    /// consumer) mint duplicate IDs by accident, causing the
+    /// protocol to deliver replies to the wrong correlator.
     ///
     /// # Internal mint contract (tier-2 by-construction)
     ///
@@ -370,10 +355,10 @@ impl<K: ReplyKind> ReplyId<K> {
     /// is by-test-discipline (each test picks a distinct value range:
     /// 1xxx for ping, 2xxx for startup, etc. — see `state::push_class_tests`).
     ///
-    /// DEF-154 (K): construct a fresh `ReplyId`. Pre-(K) carried a
-    /// `delivered: bool` field for Drop-time checking — now deleted
-    /// since the Drop panic is gone (footgun under integration-test
-    /// unwind; see Drop-impl deletion block above).
+    /// Construct a fresh `ReplyId`. No `delivered: bool` field —
+    /// discipline is enforced via `#[must_use]` rather than a
+    /// Drop-time panic (the panic-in-Drop pattern is a footgun under
+    /// integration-test unwind).
     #[inline]
     pub(crate) const fn from_raw(value: NonZeroU64) -> Self {
         Self {
@@ -412,16 +397,15 @@ impl<K: ReplyKind> ReplyId<K> {
 /// Typed saturation classifier for `NonZeroU64` mint from a raw `u64`
 /// counter value.
 ///
-/// Pre-audit, the call site at
-/// `protocol.rs::<DisconnectedPhase>::next_reply_id` used the form
-/// `NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN)` to satisfy
-/// `clippy::unwrap_used` (forbidden crate-wide) on an architecturally-
-/// dead `None` arm: `saturating_add(1)` of a `u64` is never `0`. The
-/// dead-fallback shape didn't surface the "counter saturation reached"
-/// case at type level — a future edit that swapped `saturating_add`
-/// for `wrapping_add` (or any operation that can produce `0`) would
-/// silently activate the dead arm, coercing every reply id to
-/// [`NonZeroU64::MIN`] and colliding with the real id `1`.
+/// A `NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN)` form would
+/// satisfy `clippy::unwrap_used` (forbidden crate-wide) on an
+/// architecturally-dead `None` arm (`saturating_add(1)` of a `u64`
+/// is never `0`). But the dead-fallback shape would not surface the
+/// "counter saturation reached" case at type level — a future edit
+/// that swapped `saturating_add` for `wrapping_add` (or any
+/// operation that can produce `0`) would silently activate the dead
+/// arm, coercing every reply id to [`NonZeroU64::MIN`] and colliding
+/// with the real id `1`.
 ///
 /// `MintSaturated` makes the saturation case classifiable at type
 /// level. The error is `Copy + Debug + PartialEq + Eq` — no
@@ -452,30 +436,16 @@ pub(crate) fn mint_or_saturate(raw: u64) -> Result<NonZeroU64, MintSaturated> {
     NonZeroU64::new(raw).ok_or(MintSaturated)
 }
 
-// DEF-154 (K): `Drop for ReplyId<K>` DELETED.
+// No `Drop` impl on `ReplyId<K>` — a `Drop` containing
+// `assert!(self.delivered, ...)` would be a tier-2 runtime guard
+// against "caller forgot to consume the reply", but panic-in-Drop is
+// a hard footgun: it double-panics under integration-test unwind
+// (a `#[cfg(test)]` early-return guard does NOT fire when the lib is
+// compiled as a dependency of an integration test crate in `tests/`,
+// so the SIGABRT masks the original failure), and under
+// `panic = "abort"` production profile it's a hard abort.
 //
-// Pre-(K), Drop contained a `assert!(self.delivered, ...)` safety
-// net — intended as a tier-2 runtime guard against "caller forgot
-// to consume the reply." Two fatal flaws for the user directive
-// "никаких потенциальных паник":
-//
-// 1. **Double-panic SIGABRT in integration tests.** The `#[cfg(test)]`
-//    + `std::thread::panicking()` early-return guard was scoped to
-//    the LIB's own test mode only — `#[cfg(test)]` evaluates to
-//    false when the lib is compiled as a dependency of an
-//    integration test crate (in `tests/`). Integration test
-//    assertion failures unwound `PgProtocol` which held a
-//    non-delivered `ReplyId` in its state → Drop asserted →
-//    double-panic → SIGABRT masked the original test failure.
-//    User reproduced this on `zero_body_data_row_classified_as_malformed_data_row`.
-//
-// 2. **Panic-in-Drop is a maintenance footgun**, period. In
-//    `panic = "abort"` production profile it's a hard abort;
-//    in `panic = "unwind"` any unwind through a ReplyId alive on
-//    the stack double-panics. Neither is acceptable per user's
-//    "никаких потенциальных паник" directive.
-//
-// Discipline is now enforced COMPILE-TIME via:
+// Discipline is enforced COMPILE-TIME via:
 //
 //   - `#[must_use]` on `ReplyId<K>` (warns on unused binding).
 //   - Every dispatch path routes `ReplyId` through `.consume()`
@@ -495,38 +465,27 @@ pub(crate) fn mint_or_saturate(raw: u64) -> Result<NonZeroU64, MintSaturated> {
 // panic target.
 
 // `PartialEq`, `Eq`, `Hash` are **deliberately NOT implemented** on
-// `ReplyId<K>` (DEF-088 tier raise, retained through DEF-112).
-// Callers that need to compare ids extract the wire-level
-// `NonZeroU64` via `.get()` and compare those.
+// `ReplyId<K>`. Callers that need to compare ids extract the
+// wire-level `NonZeroU64` via `.get()` and compare those.
 
 impl<K: ReplyKind> fmt::Debug for ReplyId<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Format: "ReplyId<KindName>(nzu_value)" — the kind name
-        // makes Debug output self-describing. `delivered` stays
-        // internal bookkeeping; wrapper / tests care only about the
-        // wire value and the kind.
+        // makes Debug output self-describing. Wrapper / tests care
+        // only about the wire value and the kind.
         write!(f, "ReplyId<{}>({})", K::NAME, self.value.get())
     }
 }
 
 #[cfg(test)]
 mod reply_id_semantics {
-    //! Per reforge.md §4.11, tests cover category (1) functional
-    //! spec-conformance or (2) tier-3 invariants only. Every test in
-    //! this module is labelled with its category in the docstring.
+    //! Tests cover (1) functional spec-conformance or (2) tier-3
+    //! invariants only. Every test in this module is labelled with
+    //! its category in the docstring.
 
     use super::*;
 
-    // DEF-154 (K): `undelivered_drop_panics` + per-kind siblings +
-    // `unrelated_panic_while_reply_id_alive_surfaces_original_message`
-    // — ALL DELETED. The panic-in-Drop guard was removed (it
-    // double-panicked under integration-test unwind, masking
-    // original failures with SIGABRT); the tests that pinned its
-    // behaviour no longer have a target to pin. Discipline is now
-    // `#[must_use]` on ReplyId + integration tests asserting
-    // delivery via OutActions content.
-
-    /// Category (2) — DEF-112 tier-1 compile verification.
+    /// Category (2) — tier-1 compile verification.
     ///
     /// The Debug output distinguishes `ReplyId<PingKind>` from
     /// `ReplyId<StartupKind>` via the `K::NAME` const — this makes
@@ -549,29 +508,21 @@ mod reply_id_semantics {
         startup.consume();
     }
 
-    // DEF-154 (K): per-kind drop-panic pins (startup/query/parse/
-    // close/describe_statement/describe_portal) DELETED along with
-    // the Drop impl itself. Each kind is exercised through
-    // dispatch flow tests in `tests/*.rs` which assert delivery by
-    // matching on Action variants — the tier ABOVE Drop-guard.
-
-    /// DEF-280 Bundle J (2026-05-18) — category (2) tier-1
-    /// verification: the `CRATE_BUG_REPLY_ID_SENTINEL` is distinct
-    /// from the legitimate first id minted by `next_reply_id`.
+    /// Category (2) — tier-1 verification: the
+    /// `CRATE_BUG_REPLY_ID_SENTINEL` is distinct from the legitimate
+    /// first id minted by `next_reply_id`.
     ///
-    /// Pre-Bundle J the two CrateBug PushFailure sites in protocol.rs
-    /// (`PushCommandInternalNonIdle` + `PushEmittedDeliverReply`) used
-    /// `NonZeroU64::MIN` (= raw `1`) as the sentinel. That value was
-    /// byte-identical with the legitimate first id returned by
+    /// A `NonZeroU64::MIN` (= raw `1`) sentinel would be byte-
+    /// identical with the legitimate first id returned by
     /// `next_reply_id` (the static atomic counter starts at 0 and the
     /// first `fetch_add(1) + saturating_add(1)` produces 1) — a
     /// monitoring system distinguishing CrateBug failures from
     /// genuine first-command failures by inspecting `push_failure.id`
-    /// alone false-positived every connection's first command.
+    /// alone would false-positive every connection's first command.
     ///
-    /// Post-Bundle J the sentinel is `NonZeroU64::MAX`. The
-    /// legitimate first id is `NonZeroU64::new(1).unwrap()` = `MIN`;
-    /// the sentinel is `MAX` — provably distinct.
+    /// The current sentinel is `NonZeroU64::MAX`. The legitimate
+    /// first id is `NonZeroU64::new(1).unwrap()` = `MIN`; the
+    /// sentinel is `MAX` — provably distinct.
     #[test]
     fn crate_bug_sentinel_distinct_from_first_mint() {
         // Legitimate first mint by `next_reply_id` cannot be
@@ -585,10 +536,10 @@ mod reply_id_semantics {
         assert_ne!(
             CRATE_BUG_REPLY_ID_SENTINEL,
             first_mint_shape,
-            "Bundle J invariant: CRATE_BUG_REPLY_ID_SENTINEL must be \
-             distinct from the legitimate first id (NonZeroU64::MIN) — \
-             pre-Bundle J they collided and monitoring systems false-\
-             positived every first-command genuine failure as CrateBug",
+            "CRATE_BUG_REPLY_ID_SENTINEL must be distinct from the \
+             legitimate first id (NonZeroU64::MIN) — a colliding \
+             sentinel would cause monitoring systems to false-\
+             positive every first-command genuine failure as CrateBug",
         );
         // Pin the exact value so a future edit that changes the
         // sentinel surfaces here loudly (and motivates updating the
@@ -596,8 +547,8 @@ mod reply_id_semantics {
         assert_eq!(
             CRATE_BUG_REPLY_ID_SENTINEL,
             NonZeroU64::MAX,
-            "Bundle J: CRATE_BUG_REPLY_ID_SENTINEL is canonical at \
-             NonZeroU64::MAX — see reply_id.rs docstring",
+            "CRATE_BUG_REPLY_ID_SENTINEL is canonical at NonZeroU64::MAX \
+             — see reply_id.rs docstring",
         );
     }
 }
