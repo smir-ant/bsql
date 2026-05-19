@@ -31,10 +31,10 @@ use heapless::{CapacityError, Vec};
 
 /// Bounded byte buffer for inbound wire data — generic-form.
 ///
-/// **DEF-199**: const-generic over capacity `N`. The default
-/// [`ReadBuf`] type alias picks `N = READ_BUF_CAP` (4096) for backward
-/// compat; bumping `N` lets callers handle larger frames (analytics
-/// workloads with wide `RowDescription`, large `DataRow` payloads).
+/// Const-generic over capacity `N`. The default [`ReadBuf`] type
+/// alias picks `N = READ_BUF_CAP` (4096); bumping `N` lets callers
+/// handle larger frames (analytics workloads with wide
+/// `RowDescription`, large `DataRow` payloads).
 ///
 /// Beyond capacity, [`append`] returns [`ReadBufFull`] — the protocol
 /// classifies this as a fatal connection error.
@@ -50,21 +50,20 @@ pub struct ReadBufN<const N: usize> {
     /// Invariant: `cursor <= inner.len() <= N <= 65_535`
     /// (enforced by every mutator path + the const-block assert below).
     ///
-    /// DEF-120: `u16` (not `usize`) — current N values fit
-    /// with headroom; narrower type saves bytes per `ReadBuf`
-    /// on 64-bit. The const-block in `new()` rejects `N > 65_535`
-    /// at monomorph time.
+    /// `u16` (not `usize`) — current N values fit with headroom;
+    /// narrower type saves bytes per `ReadBuf` on 64-bit. The
+    /// const-block in `new()` rejects `N > 65_535` at monomorph time.
     cursor: u16,
 }
 
-/// Inline-mode capacity for the two-tier [`ReadBuf`] introduced by
-/// DEF-265 Idea-38 (2026-05-08). Frames ≤ 256 B stay in stack-inline
-/// storage with full cache-locality (state + small_buf adjacent).
-/// Frames > 256 B trigger a one-time lazy escape: the inline contents
-/// copy into a heap-allocated 4096-byte storage, and subsequent
-/// operations work against the heap. Once escaped, the buffer stays
-/// in heap mode for the connection's lifetime (downgrading would
-/// require copying back, no perf benefit).
+/// Inline-mode capacity for the two-tier [`ReadBuf`]. Frames ≤
+/// 256 B stay in stack-inline storage with full cache-locality
+/// (state + small_buf adjacent). Frames > 256 B trigger a one-time
+/// lazy escape: the inline contents copy into a heap-allocated
+/// 4096-byte storage, and subsequent operations work against the
+/// heap. Once escaped, the buffer stays in heap mode for the
+/// connection's lifetime (downgrading would require copying back,
+/// no perf benefit).
 ///
 /// **Why 256 B**: Postgres protocol frames break down by typical size:
 /// - `Sync` (5 B), `Flush` (5 B), `Terminate` (5 B): always inline ✓
@@ -93,12 +92,12 @@ impl<const N: usize> Default for ReadBufN<N> {
 impl<const N: usize> ReadBufN<N> {
     /// Construct an empty buffer.
     ///
-    /// **Tier-1 cap invariant** (DEF-199): the const-block fires at
-    /// monomorphisation time. `ReadBufN<70_000>::new()` would compile
-    /// without this assertion but break the `cursor: u16` invariant
-    /// — any `advance()` past 65_535 bytes would trip a dead Err
-    /// branch silently. The assertion makes any `N > u16::MAX` a
-    /// **build failure**, not a runtime tier regression.
+    /// **Tier-1 cap invariant**: the const-block fires at
+    /// monomorphisation time. Without it, `ReadBufN<70_000>::new()`
+    /// would compile but break the `cursor: u16` invariant — any
+    /// `advance()` past 65_535 bytes would trip a dead Err branch
+    /// silently. The assertion makes any `N > u16::MAX` a **build
+    /// failure**, not a runtime tier regression.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -120,14 +119,15 @@ impl<const N: usize> ReadBufN<N> {
     /// Returns [`ReadBufFull`] if the resulting length would exceed
     /// [`READ_BUF_CAP`] even after reclaiming the consumed prefix.
     ///
-    /// **Lazy compaction (DEF-058).** We try to fit the incoming bytes
-    /// into the tail first — `heapless::Vec::extend_from_slice` checks
-    /// capacity before copying and returns `Err` without mutation, so
-    /// we can safely retry after compacting. On the typical workload
-    /// (8 KiB chunks on a 4 KiB buffer where previous frames have been
-    /// consumed) this saves one `memmove` per `append` call whenever
-    /// the tail already has room. Only when the tail is insufficient
-    /// do we reclaim `[0..cursor)` and try again.
+    /// **Lazy compaction.** Tries to fit the incoming bytes
+    /// into the tail first — `heapless::Vec::extend_from_slice`
+    /// checks capacity before copying and returns `Err` without
+    /// mutation, so a retry after compacting is safe. On the typical
+    /// workload (8 KiB chunks on a 4 KiB buffer where previous
+    /// frames have been consumed) this saves one `memmove` per
+    /// `append` call whenever the tail already has room. Only when
+    /// the tail is insufficient does the buffer reclaim
+    /// `[0..cursor)` and try again.
     #[inline]
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
         // Fast path: tail has room, no need to compact.
@@ -159,10 +159,10 @@ impl<const N: usize> ReadBufN<N> {
         // maintained `<= self.inner.len()` by every mutator, so the
         // slice expression cannot index out of bounds. We use `get`
         // rather than `[..]` because the forbid-bundle bans
-        // `indexing_slicing`. DEF-120: `u16 → usize` via infallible
+        // `indexing_slicing`. `u16 → usize` via infallible
         // widening `From` impl (no `as` cast).
         //
-        // F-014 (pass-#8): debug-builds actively assert the invariant
+        // Debug-builds actively assert the invariant
         // `cursor <= inner.len()` so a mutator regression would fail
         // the test suite before the dead unwrap_or(&[]) fallback
         // masked it silently.
@@ -177,9 +177,9 @@ impl<const N: usize> ReadBufN<N> {
 
     /// Borrow the full populated region, including bytes already
     /// advanced past the cursor. Used by the `StreamRow` materialiser
-    /// (1c-1b) which needs absolute-position slices into rows whose
-    /// frames were advanced-past during the dispatch loop but whose
-    /// bytes must remain valid until `OutActions` drops.
+    /// which needs absolute-position slices into rows whose frames
+    /// were advanced-past during the dispatch loop but whose bytes
+    /// must remain valid until `OutActions` drops.
     ///
     /// # Lifetime invariant
     ///
@@ -196,50 +196,36 @@ impl<const N: usize> ReadBufN<N> {
     ///
     /// [`unread`]: ReadBuf::unread
     ///
-    /// F-016 (pass-#8): visibility narrowed `pub` → `pub(crate)`.
-    /// Only `materialise` / dispatch resolution need this view; an
-    /// external caller reading `populated()` gets access to bytes
-    /// already consumed past the cursor with no user benefit. Surface
-    /// shrink closes a latent access hole.
+    /// Visibility is `pub(crate)`. Only `materialise` / dispatch
+    /// resolution need this view; an external caller reading
+    /// `populated()` would get access to bytes already consumed
+    /// past the cursor with no user benefit.
     ///
-    /// DEF-265 Idea-38 (2026-05-08): retained for completeness on the
-    /// `ReadBufN<N>` primitive type even though no production
-    /// callsite uses it (the wrapping `ReadBuf` two-tier struct is
-    /// the production read buffer). Marked `#[allow(dead_code)]`
-    /// rather than removed — `ReadBufN<N>` is a stable primitive
-    /// that may serve future wire-buffer types.
+    /// Retained on the `ReadBufN<N>` primitive type even though no
+    /// production callsite uses it (the wrapping `ReadBuf` two-tier
+    /// struct is the production read buffer). `ReadBufN<N>` is a
+    /// stable primitive that may serve future wire-buffer types.
     #[inline]
     #[must_use]
-    #[expect(dead_code, reason = "DEF-265 Idea-38: ReadBufN<N> is a stable \
-        primitive retained for future wire-buffer designs; production read \
-        buffer is the wrapping ReadBuf struct. Migrated #[allow]→#[expect] \
-        (Rust 1.81): if a future caller starts using this method, the \
-        attribute fires (the lint no longer triggers), forcing the contributor \
-        to remove the now-dead attribute — drift-detection.")]
+    #[expect(dead_code, reason = "`ReadBufN<N>` is a stable primitive retained for future \
+        wire-buffer designs; production read buffer is the wrapping `ReadBuf` struct. \
+        `#[expect]` triggers the lint if a caller is added — prompting attribute removal.")]
     pub(crate) fn populated(&self) -> &[u8] {
         self.inner.as_slice()
     }
 
     /// Absolute position of the read cursor, in bytes from the start
-    /// of [`populated`]. Used by the dispatch loop to compute absolute
-    /// row-range coordinates (1c-1b).
+    /// of [`populated`]. Used by the dispatch loop to compute
+    /// absolute row-range coordinates. `u16` accessor — storage type
+    /// itself, so dispatch cursor math stays in `u16` all the way
+    /// through `AbsFrameStart::new(u16)` without ever widening to
+    /// `usize`.
     ///
-    /// DEF-154 (G): u16 cursor accessor — storage type itself.
-    /// Used by dispatch cursor math that wants to stay in u16 all
-    /// the way through `AbsFrameStart::new(u16)` without ever
-    /// widening to usize. Pre-(G) there was also a
-    /// `cursor_position() -> usize` widening accessor, deleted
-    /// because the only production callsite
-    /// (`BrandedReadBuf::cursor_position_scope_local`) now returns
-    /// u16, and no other callers remain.
-    ///
-    /// DEF-265 Idea-38 (2026-05-08): same dead-code allowance as
-    /// `populated()` above.
+    /// Same dead-code allowance as `populated()` above.
     #[inline]
     #[must_use]
-    #[expect(dead_code, reason = "DEF-265 Idea-38: ReadBufN<N> is a stable \
-        primitive retained for future wire-buffer designs. Migrated \
-        #[allow]→#[expect] (Rust 1.81) — fires when a caller is added, \
+    #[expect(dead_code, reason = "`ReadBufN<N>` is a stable primitive retained for future \
+        wire-buffer designs. `#[expect]` triggers the lint when a caller is added, \
         prompting attribute removal.")]
     pub(crate) const fn cursor_position_u16(&self) -> u16 {
         self.cursor
@@ -260,10 +246,10 @@ impl<const N: usize> ReadBufN<N> {
                 available,
             });
         }
-        // DEF-120: cursor is `u16`. Widen to usize for the
-        // add-check, then narrow via `u16::try_from`. Both steps
-        // preserved for forbid-bundle safety (no `as`). Arithmetic
-        // is architecturally bounded: cursor + n <= inner.len() <=
+        // `cursor` is `u16`. Widen to usize for the add-check, then
+        // narrow via `u16::try_from`. Both steps preserved for
+        // forbid-bundle safety (no `as`). Arithmetic is
+        // architecturally bounded: cursor + n <= inner.len() <=
         // READ_BUF_CAP <= 65_535, so the `try_from` Err branch is
         // dead — kept as belt-and-braces.
         //
@@ -273,8 +259,8 @@ impl<const N: usize> ReadBufN<N> {
         // bound through the checked_add and folds the `u16::try_from`
         // Err arm out of the emitted code entirely. Release builds
         // carry ZERO instructions for the Err path — it's purely a
-        // type-level match-exhaustion concern. Verified by pass-#8
-        // audit (F-015). Do NOT replace with an `unsafe` cast.
+        // type-level match-exhaustion concern. Do NOT replace with an
+        // `unsafe` cast.
         let new_cursor_usize = usize::from(self.cursor).checked_add(n).ok_or(AdvancePastEnd {
             requested: n,
             available,
@@ -291,23 +277,22 @@ impl<const N: usize> ReadBufN<N> {
     ///
     /// Used on connection teardown / errored state transitions.
     ///
-    /// # DEF-185 P0-C (audit 2026-04-24): zero-on-clear discipline
+    /// # Zero-on-clear discipline
     ///
     /// `heapless::Vec::clear()` by itself only resets length to 0 —
     /// the backing bytes persist in the 4096-byte array until a later
-    /// `append()` overwrites them. For SCRAM handshakes this kept the
-    /// server-final message on the connection's stack: the bytes
-    /// `"v=<base64_signature>"` where `signature = HMAC(ServerKey,
-    /// AuthMessage)` and `ServerKey = HMAC(SaltedPassword, "Server Key")`
-    /// are **password-correlated** (though a passive wire attacker
-    /// already sees them, a core-dump attacker reads them directly
-    /// from client memory with one less network hop). More importantly,
-    /// long-lived connections accumulate arbitrary SQL statement
-    /// history — `INSERT INTO users (password) VALUES ('...')`,
-    /// `SELECT secret FROM vault WHERE id=...`, session tokens, API
-    /// keys — all in the backing array.
+    /// `append()` overwrites them. SCRAM server-final bytes
+    /// (`"v=<base64_signature>"` where `signature = HMAC(ServerKey,
+    /// AuthMessage)` and `ServerKey = HMAC(SaltedPassword, "Server
+    /// Key")`) are **password-correlated**: though a passive wire
+    /// attacker already sees them, a core-dump attacker reads them
+    /// directly from client memory with one less network hop. More
+    /// importantly, long-lived connections accumulate arbitrary SQL
+    /// statement history — `INSERT INTO users (password) VALUES
+    /// ('...')`, `SELECT secret FROM vault WHERE id=...`, session
+    /// tokens, API keys — all in the backing array.
     ///
-    /// Post-fix: overwrite the occupied prefix with zeros before
+    /// Mitigation: overwrite the occupied prefix with zeros before
     /// truncating the length. Cost: O(len) memset; on READ_BUF_CAP =
     /// 4 KiB and L1-cache resident, negligible vs. the typical syscall
     /// that preceded the clear.
@@ -326,7 +311,7 @@ impl<const N: usize> ReadBufN<N> {
     #[inline]
     #[must_use]
     pub fn unread_len(&self) -> usize {
-        // DEF-120: cursor is u16; widen via `usize::from` for the
+        // `cursor` is u16; widen via `usize::from` for the
         // subtraction (infallible, no `as`).
         self.inner.len().saturating_sub(usize::from(self.cursor))
     }
@@ -337,44 +322,42 @@ impl<const N: usize> ReadBufN<N> {
     /// (no-op); otherwise a `copy_within` of the unread tail followed
     /// by an in-place zeroize of the abandoned tail.
     ///
-    /// # DEF-204 (2026-04-27): staleness leak closure
+    /// # Staleness leak closure
     ///
-    /// Pre-(204) sequence was `copy_within → truncate`. After truncate,
-    /// `inner.len()` shrinks to `unread_len`, but bytes physically at
-    /// positions `[unread_len..len_before)` retain their pre-compact
-    /// content — `heapless::Vec::truncate` only adjusts the length
+    /// A naive `copy_within → truncate` sequence leaves the bytes at
+    /// positions `[unread_len..len_before)` physically present in the
+    /// array — `heapless::Vec::truncate` only adjusts the length
     /// counter for `Copy` types, it does NOT scrub the abandoned
     /// storage. Future `clear()`/`Drop` zeroize only
-    /// `[0..current_len)` (= `[0..unread_len)` post-compact), MISSING
+    /// `[0..current_len)` (= `[0..unread_len)` post-compact), missing
     /// the stale tail.
     ///
-    /// Concrete leak vector (pre-fix): a 2 KB
+    /// Concrete leak vector this closure prevents: a 2 KB
     /// `AuthenticationSASLContinue` frame containing server salt +
     /// nonce reaches `ReadBuf`; the dispatcher consumes it
     /// (`cursor → 2048`); a small `ReadyForQuery` arrives; `append()`
-    /// triggers `compact()` with `unread_len=0`; `truncate(0)` leaves
-    /// bytes `[0..2048)` physically present in the array — including
-    /// password-correlated salt + nonce bytes. The leak persists for
-    /// the connection lifetime until either a future response of
-    /// equal-or-larger size overwrites position-by-position OR `Drop`
-    /// fires (which only scrubs the post-compact `inner.len() = 0`,
-    /// missing the tail entirely).
+    /// triggers `compact()` with `unread_len=0`; a naive `truncate(0)`
+    /// would leave bytes `[0..2048)` physically present in the array
+    /// — including password-correlated salt + nonce bytes. The leak
+    /// would persist for the connection lifetime until either a
+    /// future response of equal-or-larger size overwrote
+    /// position-by-position OR `Drop` fired (which only scrubs the
+    /// post-compact `inner.len() = 0`, missing the tail entirely).
     ///
-    /// Post-(204): the abandoned range is zeroized in place BEFORE
+    /// Closure: the abandoned range is zeroized in place BEFORE
     /// truncate. `inner.as_mut_slice()` at that point still returns
     /// `[0..len_before)`; the slice view starting at `unread_len`
     /// covers exactly the abandoned bytes (the consumed prefix's
     /// physical content + the source side of the `copy_within` above,
     /// which `copy_within` does NOT zero on the source side).
     ///
-    /// **Tier**: tier-3 by-audit ("future push overwrites eventually")
-    /// → **tier-2 structural** (every compact is a scrub by
-    /// construction; no audit dependency on call patterns).
+    /// **Tier**: tier-2 structural — every compact is a scrub by
+    /// construction; no call-pattern audit dependency.
     fn compact(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        // DEF-120: cursor is u16; widen once for all uses.
+        // `cursor` is u16; widen once for all uses.
         let cursor = usize::from(self.cursor);
         let len = self.inner.len();
         // `cursor <= len` invariant; subtraction safe.
@@ -382,10 +365,10 @@ impl<const N: usize> ReadBufN<N> {
         // `copy_within` accepts a Range; the source range is
         // `cursor..len` and dest is `0`. Both inside `len`.
         self.inner.copy_within(cursor..len, 0);
-        // DEF-204: zeroize the abandoned tail BEFORE truncate. The
-        // slice `[unread_len..len_before)` covers the bytes that
-        // (a) were the consumed prefix `[unread_len..cursor)` (if
-        // any), and (b) were the source-side of the copy_within
+        // Zeroize the abandoned tail BEFORE truncate. The slice
+        // `[unread_len..len_before)` covers the bytes that (a) were
+        // the consumed prefix `[unread_len..cursor)` (if any), and
+        // (b) were the source-side of the copy_within
         // `[cursor..len_before)`. Both ranges retain pre-compact
         // physical content unless explicitly scrubbed here.
         //
@@ -407,8 +390,7 @@ impl<const N: usize> ReadBufN<N> {
     }
 }
 
-/// DEF-185 P0-C (audit 2026-04-24): manual Drop impl zeroizes the
-/// occupied prefix on scope teardown.
+/// Manual Drop impl zeroizes the occupied prefix on scope teardown.
 ///
 /// Rationale: `heapless::Vec` does NOT implement `zeroize::Zeroize`
 /// (upstream bound requires `Default + Copy` which Vec lacks). Scrub
@@ -417,11 +399,11 @@ impl<const N: usize> ReadBufN<N> {
 /// array is scrubbed — protocol-level SCRAM signatures and any SQL
 /// history from prior frames vanish from memory.
 ///
-/// Caveat per DEF-185 P0-A: under `panic = "abort"` Drop does NOT run
-/// on panic paths. This claim holds for the normal-control-flow path
-/// only; true memory hygiene under panic requires either `panic =
-/// "unwind"` or `mlock`+explicit scrub — flagged for separate design
-/// discussion.
+/// Caveat: under `panic = "abort"` Drop does NOT run on panic paths.
+/// This claim holds for the normal-control-flow path only; true
+/// memory hygiene under panic requires either `panic = "unwind"` or
+/// `mlock` + explicit scrub — handled by the driver-side panic hook
+/// for secret-bearing types.
 impl<const N: usize> Drop for ReadBufN<N> {
     fn drop(&mut self) {
         use zeroize::Zeroize;
@@ -439,23 +421,20 @@ impl<const N: usize> fmt::Debug for ReadBufN<N> {
 }
 
 /// Two-tier inbound read buffer with stack-inline fast path and
-/// lazy heap escape (DEF-265 Idea-38, 2026-05-08).
+/// lazy heap escape.
 ///
 /// # Design rationale
 ///
-/// `PgProtocol` previously embedded a 4096-byte inline buffer
-/// (`ReadBufN<4096>`), making `PgProtocol` 4352 B inline. This was
-/// cache-locality-friendly (state + buffer co-located on the same
-/// struct) but cost 4352 B per connection in pool scenarios.
+/// A single-tier 4096-byte inline buffer (`ReadBufN<4096>`) makes
+/// `PgProtocol` 4352 B inline. That is cache-locality-friendly (state +
+/// buffer co-located on the same struct) but costs 4352 B per
+/// connection in pool scenarios. Alternative single-tier shapes
+/// (`Box<ReadBuf>` and `&'buf mut ReadBuf` with lifetime parameter)
+/// either pay heap-alloc cost on every fresh `PgProtocol::new()` or
+/// split cache locality and add a pointer-chase per access — both
+/// measurably regress `ping_round_trip`.
 ///
-/// Two prior DEF-265 attempts (commits-then-revert, see
-/// `deferred.md` DEF-265 entry) tried `Box<ReadBuf>` and
-/// `&'buf mut ReadBuf` with lifetime parameter. Both regressed
-/// `ping_round_trip` (+54.65% and +18.01%) — the former from
-/// heap-alloc cost on every fresh `PgProtocol::new()`, the latter
-/// from cache-locality split + pointer-chase cost.
-///
-/// **Idea-38 design**: keep buffer storage *inline* for tiny frames
+/// **Two-tier design**: keep buffer storage *inline* for tiny frames
 /// (≤ 256 B), lazy-escape to heap only when inline overflows.
 ///
 /// - Frames that fit in 256 B: zero alloc, full cache locality
@@ -463,8 +442,8 @@ impl<const N: usize> fmt::Debug for ReadBufN<N> {
 /// - Frames > 256 B: one-time escape (Box::new + memcpy of inline
 ///   contents to heap), subsequent operations work against heap.
 ///
-/// PgProtocol with this two-tier ReadBuf shrinks from 4352 B inline
-/// to ~528 B inline (88% reduction) — without paying alloc cost on
+/// PgProtocol with this two-tier ReadBuf is ~528 B inline (88%
+/// reduction vs single-tier 4352 B) — without paying alloc cost on
 /// the common path.
 ///
 /// # Tier-1 invariant
@@ -483,13 +462,13 @@ impl<const N: usize> fmt::Debug for ReadBufN<N> {
 /// All operations use `heapless::Vec`'s safe API. No `MaybeUninit`,
 /// no raw pointers, no transmute.
 ///
-/// # Drop semantics (DEF-185 P0-C, DEF-204, DEF-259)
+/// # Drop semantics
 ///
 /// On Drop, both `inline` and `heap` (if Some) are zeroized. The
 /// `Box<heapless::Vec<…>>` heap allocation is then released by Box's
-/// own Drop. DEF-259 manifest registers `ReadBuf` as a
-/// secret-bearing type; DropCounter test verifies Drop fires on every
-/// teardown path.
+/// own Drop. The crate-level `SecretZeroize` manifest registers
+/// `ReadBuf` as a secret-bearing type; a `DropCounter` test verifies
+/// Drop fires on every teardown path.
 pub struct ReadBuf {
     /// Inline storage for tiny frames. Always present in the
     /// PgProtocol struct's stack/heap allocation; no extra alloc
@@ -502,8 +481,7 @@ pub struct ReadBuf {
     /// Read cursor into the active storage. Tier-1 invariant:
     /// `cursor <= active_storage.len() <= cap <= 65_535`.
     cursor: u16,
-    /// **DEF-248 Sub-A (2026-05-12) + Tier-3 audit #34 (2026-05-19)** —
-    /// partial-frame mode tracker.
+    /// **Tier-3 audit #34 (2026-05-19)** — partial-frame mode tracker.
     ///
     /// **Type-level state encoding**: `Option<NonZeroU32>` where
     /// `None` = not in partial mode (the common case: every frame
@@ -518,15 +496,16 @@ pub struct ReadBuf {
     ///
     /// # Tier-3 audit #34 closure
     ///
-    /// Pre-audit, the field was `partial_remaining: u32` with
-    /// `0 ⟺ not in partial mode` (value-level invariant, tier-2 by-
-    /// discipline). A future bug `self.partial_remaining = 0` while
-    /// intending to stay in partial mode would be a compile-clean
-    /// silent desync. With `Option<NonZeroU32>` the "in partial
-    /// mode" state is captured at type level — writing
-    /// `partial_remaining = 0` no longer typechecks, only explicit
-    /// `partial_remaining = None` (exit) or `partial_remaining =
-    /// NonZeroU32::new(_)` (which is itself a Result-returning shape).
+    /// A naive `partial_remaining: u32` shape with the convention
+    /// `0 ⟺ not in partial mode` is a value-level invariant (tier-2
+    /// by-discipline). A future bug `self.partial_remaining = 0`
+    /// while intending to stay in partial mode would be a
+    /// compile-clean silent desync. The `Option<NonZeroU32>`
+    /// encoding captures the "in partial mode" state at type level
+    /// — writing `partial_remaining = 0` no longer typechecks; only
+    /// explicit `partial_remaining = None` (exit) or
+    /// `partial_remaining = NonZeroU32::new(_)` (which is itself a
+    /// Result-returning shape).
     ///
     /// Tier-1 by-construction: the field is `pub(crate)`-visible
     /// only via the `partial_*` accessors below, and the mutators
@@ -535,12 +514,11 @@ pub struct ReadBuf {
     /// External callers cannot toggle partial mode; the
     /// leaf-submodule is the single proximate mint site.
     ///
-    /// Sub-A scope: partial mode is entered ONLY for D-tag
-    /// (`DataRow`) frames in row-streaming protocol state. Non-D
-    /// tags > `READ_BUF_CAP` continue to tear down with
-    /// `HeaderParse::FrameTooLarge` (memo §1 third bullet — Sub-B's
-    /// concern). The partial-mode counter itself is frame-agnostic;
-    /// only the policy that gates entry is tag-restricted.
+    /// Scope: partial mode is entered ONLY for D-tag (`DataRow`)
+    /// frames in row-streaming protocol state. Non-D tags >
+    /// `READ_BUF_CAP` tear down with `HeaderParse::FrameTooLarge`.
+    /// The partial-mode counter itself is frame-agnostic; only the
+    /// policy that gates entry is tag-restricted.
     partial_remaining: Option<NonZeroU32>,
 }
 
@@ -562,9 +540,8 @@ impl ReadBuf {
             inline: Vec::new(),
             heap: None,
             cursor: 0,
-            // DEF-248 Sub-A: `0` is the canonical "not in partial
-            // mode" sentinel. Entered only via the leaf-gated
-            // `enter_partial_mode` below.
+            // `None` = not in partial mode; entered only via the
+            // leaf-gated `enter_partial_mode` below.
             partial_remaining: None,
         }
     }
@@ -576,8 +553,7 @@ impl ReadBuf {
     /// memcpy of inline contents) and retry.
     #[inline]
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
-        // Heap-mode: append to heap with compact-on-overflow (mirrors
-        // the pre-DEF-265 single-mode compact behaviour).
+        // Heap-mode: append to heap with compact-on-overflow.
         if self.heap.is_some() {
             return self.append_heap(bytes);
         }
@@ -642,8 +618,8 @@ impl ReadBuf {
         pop.get(usize::from(self.cursor)..).unwrap_or(&[])
     }
 
-    /// Borrow the full populated region (used by 1c-1b
-    /// `StreamRow` materialiser for absolute-position slices).
+    /// Borrow the full populated region (used by the `StreamRow`
+    /// materialiser for absolute-position slices).
     #[inline]
     #[must_use]
     pub(crate) fn populated(&self) -> &[u8] {
@@ -653,7 +629,7 @@ impl ReadBuf {
         }
     }
 
-    /// Absolute cursor position in u16 (DEF-154 G).
+    /// Absolute cursor position in u16.
     #[inline]
     #[must_use]
     pub(crate) const fn cursor_position_u16(&self) -> u16 {
@@ -701,12 +677,12 @@ impl ReadBuf {
         // not a concern (clear runs at most a few times per conn).
         self.heap = None;
         self.cursor = 0;
-        // DEF-248 Sub-A: `clear` is the canonical "reset to fresh"
-        // operation (called on connection teardown, errored-state
-        // entry, post-fatal cleanup). Resetting partial_remaining
-        // here keeps the post-clear invariant tight: any subsequent
-        // header parse starts in non-partial mode regardless of
-        // whether the cleared state had been mid-frame.
+        // `clear` is the canonical "reset to fresh" operation (called
+        // on connection teardown, errored-state entry, post-fatal
+        // cleanup). Resetting partial_remaining here keeps the
+        // post-clear invariant tight: any subsequent header parse
+        // starts in non-partial mode regardless of whether the
+        // cleared state had been mid-frame.
         self.partial_remaining = None;
     }
 
@@ -720,8 +696,8 @@ impl ReadBuf {
     }
 
     /// Heap-mode append helper: try direct extend; on capacity
-    /// failure, compact heap and retry (mirrors pre-DEF-265
-    /// `ReadBufN<N>::append` lazy-compact discipline).
+    /// failure, compact heap and retry. Mirrors the
+    /// `ReadBufN<N>::append` lazy-compact discipline.
     #[inline]
     fn append_heap(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
         let Some(heap) = self.heap.as_mut() else {
@@ -773,7 +749,8 @@ impl ReadBuf {
         let len = self.inline.len();
         let unread_len = len.saturating_sub(cursor);
         self.inline.copy_within(cursor..len, 0);
-        // Zeroize abandoned tail (DEF-204 staleness leak closure).
+        // Zeroize abandoned tail (staleness leak closure: see
+        // `ReadBufN::compact` docstring for the leak vector).
         {
             use zeroize::Zeroize;
             if let Some(stale_tail) = self.inline.as_mut_slice().get_mut(unread_len..) {
@@ -797,7 +774,8 @@ impl ReadBuf {
         let len = heap.len();
         let unread_len = len.saturating_sub(cursor);
         heap.copy_within(cursor..len, 0);
-        // Zeroize abandoned tail (DEF-204 staleness leak closure).
+        // Zeroize abandoned tail (staleness leak closure: see
+        // `ReadBufN::compact` docstring for the leak vector).
         {
             use zeroize::Zeroize;
             if let Some(stale_tail) = heap.as_mut_slice().get_mut(unread_len..) {
@@ -809,10 +787,10 @@ impl ReadBuf {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // DEF-248 Sub-A (2026-05-12) — partial-frame mode substrate.
+    // Partial-frame mode substrate.
     //
-    // The counter `partial_remaining: u32` tracks bytes the wire still
-    // owes for the in-flight frame body. Entered via
+    // The counter `partial_remaining: Option<NonZeroU32>` tracks bytes
+    // the wire still owes for the in-flight frame body. Entered via
     // `enter_partial_mode`, exited via `exit_partial_mode`, queried via
     // `is_in_partial_mode` / `partial_remaining`. Bytes drain via
     // `subtract_partial_remaining`.
@@ -840,22 +818,18 @@ impl ReadBuf {
     /// count returned by `enter_partial_mode(declared_len)` minus the
     /// sum of all `subtract_partial_remaining` since entry.
     ///
-    /// # DEF-280 Bundle K-mirror (2026-05-18) — `#[cfg(test)]`-gated
+    /// # `#[cfg(test)]`-gated
     ///
-    /// Pre-Bundle-K-mirror this accessor was a `pub(crate)` predicate
-    /// for upstream callers in `row_stream.rs` that pre-checked
-    /// `partial_remaining == 0` before calling `exit_partial_mode`
-    /// (tier-2 by-discipline). Bundle K-mirror moved that precondition
-    /// INTO `exit_partial_mode` itself (Approach B); the upstream
-    /// predicate became dead and the wrapper
-    /// `PgProtocol::partial_remaining_for_row_stream` was deleted.
+    /// `exit_partial_mode` itself enforces the
+    /// `partial_remaining == 0` precondition via the typed Err
+    /// return; production code never reads the raw counter
+    /// (single-source-of-truth: the function enforces, callers
+    /// handle the Result).
     ///
-    /// The accessor is retained as `#[cfg(test)]` because Bundle K's
-    /// spec tests (`row_stream::bundle_k_spec_tests`) assert the
-    /// counter value directly on a `ReadBuf` fixture — pinning the
-    /// no-overwrite-on-Err invariant. Production code uses only the
-    /// Result return shape; there is no legitimate production read
-    /// path on the counter field.
+    /// The accessor is retained as `#[cfg(test)]` because the
+    /// row-stream spec tests assert the counter value directly on a
+    /// `ReadBuf` fixture — pinning the no-overwrite-on-Err invariant
+    /// against future refactor drift.
     #[cfg(test)]
     #[inline]
     #[must_use]
@@ -880,17 +854,17 @@ impl ReadBuf {
     ///   cursor past the header before chunked-body consumption
     ///   begins. The counter tracks body bytes, not header bytes.
     ///
-    /// # Re-entry protection (DEF-280 Bundle K, 2026-05-18)
+    /// # Re-entry protection
     ///
-    /// Pre-Bundle K re-entry while already in partial mode was a
-    /// tier-2 caller-bug condition: `debug_assert!(partial_remaining
-    /// == 0, ...)` panicked loudly in dev builds, while release
-    /// builds silently overwrote `partial_remaining` and dropped the
-    /// previously-pending body-byte count — wire-level desync once
-    /// the next inbound bytes were classified as a fresh frame
-    /// header. The CREDO §V glass pattern (dev loud + release silent).
+    /// Re-entry while already in partial mode would be a wire-desync
+    /// hazard: silently overwriting `partial_remaining` drops the
+    /// previously-pending body-byte count, and the next inbound
+    /// bytes get classified as a fresh frame header. A naive
+    /// `debug_assert!(partial_remaining == 0, ...)` matches the
+    /// CREDO §V glass pattern (loud dev + silent release) which
+    /// still leaves the release-mode hazard in place.
     ///
-    /// Post-Bundle K `enter_partial_mode` returns
+    /// Instead `enter_partial_mode` returns
     /// `Result<(), AlreadyInPartialMode>`. On Err the counter is
     /// left unchanged (no overwrite); the caller is expected to
     /// classify the bug via `CrateBugLocus::PartialModeReentry` and
@@ -915,11 +889,11 @@ impl ReadBuf {
         // architecturally-dead `declared_len == 0` case — a PG wire
         // frame with body length < 5 (header is 5 bytes inclusive) is
         // pre-rejected by `parse_header`, so the upstream caller never
-        // hands us 0. The unwrap_or path keeps partial_remaining at
-        // None (i.e., we silently fail to enter partial mode); that
-        // branch is dead but the typed Result return doesn't currently
-        // surface it (matching the pre-audit u32 shape which also did
-        // not surface `declared_len == 0`).
+        // hands us 0. The None path keeps `partial_remaining` at None
+        // (silent failure to enter partial mode); that branch is dead
+        // but the typed Result return doesn't currently surface it
+        // (the u32 representation also did not surface
+        // `declared_len == 0`).
         self.partial_remaining = NonZeroU32::new(declared_len);
         Ok(())
     }
@@ -927,34 +901,32 @@ impl ReadBuf {
     /// Exit partial-frame mode. The leaf-minted token gates this
     /// transition.
     ///
-    /// # Caller contract — DEF-280 Bundle K-mirror (2026-05-18)
+    /// # Caller contract
     ///
     /// Exit is only legal once the body has been fully drained
     /// (`partial_remaining == 0`).
     ///
-    /// Pre-Bundle-K-mirror: `debug_assert!(partial_remaining == 0)` +
-    /// silent reset of the counter to `0` on release builds. The
-    /// docstring claimed «tier-1 by-construction: counter is non-
-    /// negative regardless of caller drift» — but that argument only
-    /// covers counter-value correctness, NOT **wire-synchronisation
-    /// correctness**. A silent reset with `partial_remaining > 0`
-    /// means body bytes that the wire still owes are never drained;
-    /// the next inbound bytes get classified as a fresh frame header
-    /// instead of body continuation — wire-desync class (same hazard
-    /// class as Bundle K's enter-side silent overwrite, mirror
-    /// direction).
+    /// A naive `debug_assert!(partial_remaining == 0)` + silent reset
+    /// of the counter to `0` on release builds only covers counter-
+    /// value correctness, NOT **wire-synchronisation correctness**.
+    /// A silent reset with `partial_remaining > 0` means body bytes
+    /// that the wire still owes are never drained; the next inbound
+    /// bytes get classified as a fresh frame header instead of body
+    /// continuation — wire-desync class (mirror of the enter-side
+    /// silent-overwrite hazard documented on
+    /// [`AlreadyInPartialMode`]).
     ///
-    /// Post-Bundle-K-mirror: returns `Result<(), PartialModeExitUndrained>`.
-    /// On Err the counter is **left unchanged** (preserves the
-    /// caller's view of body bytes still owed); the caller classifies
-    /// via `CrateBugLocus::PartialModeExitUndrained` and transitions
-    /// to Errored. Both dev and release route through the same path.
+    /// Instead `exit_partial_mode` returns
+    /// `Result<(), PartialModeExitUndrained>`. On Err the counter is
+    /// **left unchanged** (preserves the caller's view of body bytes
+    /// still owed); the caller classifies via
+    /// `CrateBugLocus::PartialModeExitUndrained` and transitions to
+    /// Errored. Both dev and release route through the same path.
     ///
-    /// The pre-Bundle-K-mirror upstream `if partial_remaining == 0`
-    /// caller-side checks (defense by-discipline) were removed when
-    /// migrating callers to the Err-propagation shape (Approach B —
-    /// single source of truth: the function itself enforces the
-    /// precondition, caller handles the typed Err).
+    /// Caller-side `if partial_remaining == 0` defense-by-discipline
+    /// guards are unnecessary — the function itself enforces the
+    /// precondition (single source of truth) and the caller handles
+    /// the typed Err.
     #[inline]
     pub(crate) fn exit_partial_mode(
         &mut self,
@@ -965,10 +937,11 @@ impl ReadBuf {
                 remaining: remaining.get(),
             });
         }
-        // Already None; the explicit write makes the intent visible
-        // and mirrors the enter-side's `self.partial_remaining =
-        // NonZeroU32::new(declared_len)` symmetry. Post-audit #34:
-        // the assignment is the explicit type-state exit transition.
+        // Tier-3 audit #34 (2026-05-19): explicit type-state exit
+        // transition. The assignment mirrors the enter-side's
+        // `self.partial_remaining = NonZeroU32::new(declared_len)`
+        // symmetry. Already None at this point — the explicit write
+        // makes the intent visible.
         self.partial_remaining = None;
         Ok(())
     }
@@ -1024,28 +997,28 @@ impl ReadBuf {
     }
 }
 
-// DEF-248 Sub-A (2026-05-12) — the partial-frame token TYPE lives in
+// The partial-frame token TYPE lives in
 // `mod crate::row_stream::_row_stream_partial_leaf` so the mint is
 // `pub(in crate::row_stream)` (call surface restricted to row_stream).
 // `ReadBuf` imports the type and gates the partial_* methods above on
 // `&PartialFrameToken`. Tuple-struct field private to its leaf — no
 // in-crate caller outside the leaf can mint the token.
 //
-// Mirror of DEF-272 cluster δ pattern but inverted: the token type is
-// declared in the *caller* module (row_stream), not the *callee*
-// (buf), because we needed to restrict the call surface to a single
-// caller module that lives *outside* `mod buf`. The cluster δ pattern
-// declares tokens inside `mod protocol` for the same reason — same
-// shape, different module placement.
+// Mirror of the protocol-state token-leaf pattern but inverted: the
+// token type is declared in the *caller* module (row_stream), not
+// the *callee* (buf), because the call surface must be restricted to
+// a single caller module that lives *outside* `mod buf`. The
+// protocol-state pattern declares tokens inside `mod protocol` for
+// the same reason — same shape, different module placement.
 //
 // See [`crate::row_stream::_row_stream_partial_leaf`] for the type
 // + mint function.
 
-/// DEF-185 P0-C + DEF-265 Idea-38: zeroize both inline and heap
-/// storage on Drop. `heapless::Vec` doesn't implement Zeroize
-/// natively (upstream bound requires `Default + Copy`); manual
-/// scrub via slice's `Zeroize` impl. The Box's own Drop releases
-/// the heap allocation after our zeroize completes.
+/// Zeroize both inline and heap storage on Drop. `heapless::Vec`
+/// doesn't implement Zeroize natively (upstream bound requires
+/// `Default + Copy`); manual scrub via slice's `Zeroize` impl. The
+/// Box's own Drop releases the heap allocation after our zeroize
+/// completes.
 impl Drop for ReadBuf {
     fn drop(&mut self) {
         use zeroize::Zeroize;
@@ -1082,13 +1055,12 @@ pub struct ReadBufFull {
     /// How much room was actually available in the buffer.
     pub available: usize,
     /// Configured cap of the buffer (= the const-generic `N` of the
-    /// `ReadBuf<N>` instance that produced this error). DEF-199:
-    /// carried in the error so the Display impl reports the cap of
-    /// the specific protocol instance, not a hard-coded constant.
+    /// `ReadBuf<N>` instance that produced this error). Carried in
+    /// the error so the Display impl reports the cap of the specific
+    /// protocol instance, not a hard-coded constant.
     pub cap: usize,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
 // `core::error::Error` impl on the read-buf-overflow sentinel.
 impl core::error::Error for ReadBufFull {}
 
@@ -1116,7 +1088,6 @@ pub struct AdvancePastEnd {
     pub available: usize,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
 // `core::error::Error` impl on the advance-past-end sentinel.
 impl core::error::Error for AdvancePastEnd {}
 
@@ -1130,17 +1101,16 @@ impl fmt::Display for AdvancePastEnd {
     }
 }
 
-/// DEF-280 Bundle K (2026-05-18): returned by
-/// [`ReadBuf::enter_partial_mode`] when called while the buffer is
-/// already in partial-frame mode (`partial_remaining > 0`).
+/// Returned by [`ReadBuf::enter_partial_mode`] when called while the
+/// buffer is already in partial-frame mode (`partial_remaining > 0`).
 ///
-/// Pre-Bundle K the same condition was a `debug_assert!` that
-/// panicked in dev builds and silently overwrote the prior
-/// `partial_remaining` value in release — the CREDO §V glass pattern
-/// (loud dev + silent release). Post-Bundle K the counter is left
-/// unchanged on detection and a typed witness is returned for caller
-/// classification via `CrateBugLocus::PartialModeReentry`. Both dev
-/// and release route through the same path.
+/// A naive `debug_assert!` here would panic in dev builds and
+/// silently overwrite the prior `partial_remaining` value in release
+/// — the CREDO §V glass pattern (loud dev + silent release). Instead
+/// the counter is left unchanged on detection and a typed witness is
+/// returned for caller classification via
+/// `CrateBugLocus::PartialModeReentry`. Both dev and release route
+/// through the same path.
 ///
 /// Architecturally dead under intact callers — the streaming
 /// dispatcher in `row_stream.rs` guarantees `exit_partial_mode` runs
@@ -1157,7 +1127,6 @@ pub struct AlreadyInPartialMode {
     pub new_declared_len: u32,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
 // `core::error::Error` impl on the partial-mode re-entry sentinel.
 impl core::error::Error for AlreadyInPartialMode {}
 
@@ -1172,29 +1141,26 @@ impl fmt::Display for AlreadyInPartialMode {
     }
 }
 
-/// DEF-280 Bundle K-mirror (2026-05-18): returned by
-/// [`ReadBuf::exit_partial_mode`] when called while the buffer still
-/// owes wire body bytes (`partial_remaining > 0`).
+/// Returned by [`ReadBuf::exit_partial_mode`] when called while the
+/// buffer still owes wire body bytes (`partial_remaining > 0`).
 ///
-/// Pre-Bundle-K-mirror the same condition was a `debug_assert!`
-/// (panic in dev) plus a silent counter reset to `0` in release —
-/// the CREDO §V glass pattern (loud dev + silent release). The
-/// release-mode reset's hazard: the previously-pending body bytes
-/// are never drained from the wire; the next inbound bytes get
-/// mis-classified as a fresh frame header. Wire-desync class —
-/// mirror of [`AlreadyInPartialMode`]'s entry-side hazard.
+/// A naive `debug_assert!` (panic in dev) plus a silent counter
+/// reset to `0` in release is the CREDO §V glass pattern (loud dev,
+/// silent release). The release-mode reset's hazard: the
+/// previously-pending body bytes are never drained from the wire;
+/// the next inbound bytes get mis-classified as a fresh frame
+/// header. Wire-desync class — mirror of [`AlreadyInPartialMode`]'s
+/// entry-side hazard.
 ///
-/// Post-Bundle-K-mirror the counter is **left unchanged** on
-/// detection and a typed witness is returned for caller
-/// classification via `CrateBugLocus::PartialModeExitUndrained`.
-/// Both dev and release route through the same path.
+/// Instead the counter is **left unchanged** on detection and a
+/// typed witness is returned for caller classification via
+/// `CrateBugLocus::PartialModeExitUndrained`. Both dev and release
+/// route through the same path.
 ///
-/// Architecturally dead under intact callers — pre-Bundle-K-mirror
-/// the two callers in `row_stream.rs` did `if partial_remaining == 0
-/// { exit_partial_mode(...) }` upstream-defense; Bundle K-mirror
-/// moved that check INTO the function (Approach B — single source
-/// of truth) and the caller now routes Err through Errored install
-/// + `ColEvent::EndQuery::Err`.
+/// Architecturally dead under intact callers — the function itself
+/// enforces the `partial_remaining == 0` precondition (single source
+/// of truth) and the caller routes Err through Errored install +
+/// `ColEvent::EndQuery::Err`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartialModeExitUndrained {
     /// Body bytes still owed on the wire at the moment of the
@@ -1203,7 +1169,6 @@ pub struct PartialModeExitUndrained {
     pub remaining: u32,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
 // `core::error::Error` impl on the partial-mode exit-undrained
 // sentinel.
 impl core::error::Error for PartialModeExitUndrained {}
@@ -1219,43 +1184,20 @@ impl fmt::Display for PartialModeExitUndrained {
     }
 }
 
-// DEF-154 (H): read-side `BrandedReadBuf<'brand, 'a>` + its
-// `populated_branded` / `unread_branded` / `into_populated_branded`
-// / `advance_scope_local` / `clear_scope_local` / `cursor_position_scope_local`
-// methods + `ReadBuf::with_branded` HRTB entry — ALL DELETED.
-//
-// Read-side brand was introduced in (B) Phase B2 to prove
-// buffer-identity for `ReadRange<'brand>::apply` bounds-safety.
-// (H) deleted `ReadRange` entirely — `StagedAction::StreamRowRange`
-// now carries `row_bytes: &'r [u8]` slices of populated() directly,
-// with lifetime-enforced borrow safety (tier-1). The brand became
-// dead scaffolding and is removed per user directive:
-// "всё четко и однозначно должно быть; может что-то пригодится
-// потом, а может что-то просто избыточно" — избыточно, deleted.
-
-// DEF-154 (H): `BrandedReadBuf<'brand, 'a>` type + its impl +
-// `ReadBuf::with_branded` method + `phase_b2_tests` module —
-// ALL DELETED. See block comment above.
-
 #[cfg(test)]
 mod drop_witness_tests {
-    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
-    //! for [`ReadBufN<N>`] via [`crate::drop_witness::DropCounter`].
+    //! Tier-1-by-construction Drop-fire witness for [`ReadBufN<N>`]
+    //! via [`crate::drop_witness::DropCounter`].
     //!
-    //! Pre-DEF-259: `ReadBufN<N>::drop` had no per-type witness — it
-    //! is a manual `impl Drop` (`buf.rs:382`) that calls
-    //! `inner.as_mut_slice().zeroize()` (no `ZeroizeOnDrop` derive
-    //! because `heapless::Vec` doesn't impl `Default + Copy`,
-    //! upstream's `Zeroize` bound). Verified only transitively via
-    //! `dropping_proto_mid_scram_handshake_runs_drop_glue` (which
-    //! drops a `PgProtocol` containing a `ReadBuf` and checks no
-    //! panic).
-    //!
-    //! Post-DEF-259: the witness fires the same Drop chain
-    //! production runs and the counter increments deterministically
-    //! on every `cargo test`. Catches a regression that removes the
-    //! manual Drop impl (which would silently leak buffer content
-    //! across stack-frame teardown — passwords / SCRAM proofs).
+    //! `ReadBufN<N>::drop` is a manual `impl Drop` that calls
+    //! `inner.as_mut_slice().zeroize()` — `ZeroizeOnDrop` derive is
+    //! unavailable because `heapless::Vec` doesn't impl
+    //! `Default + Copy` (upstream's `Zeroize` bound). The witness
+    //! fires the same Drop chain production runs and the counter
+    //! increments deterministically on every `cargo test`. Catches
+    //! a regression that removes the manual Drop impl (which would
+    //! silently leak buffer content across stack-frame teardown —
+    //! passwords / SCRAM proofs).
 
     use super::ReadBufN;
     use crate::drop_witness::{DropCounter, DropProbe};

@@ -6,9 +6,7 @@
 //! "length includes itself but excludes tag" convention. Every mutator
 //! returns `Result<(), WriteBufFull>` — no panic, no silent truncation.
 //!
-//! DEF-012/013/014: `MAX_OWNED_SEND_LEN`, `SendBuf`, `WriteBuf`.
-//!
-//! # `MAX_OWNED_SEND_LEN` sizing — const fn derivation (DEF-057)
+//! # `MAX_OWNED_SEND_LEN` sizing — const fn derivation
 //!
 //! The cap is not a hardcoded magic number. [`max_startup_message_size`]
 //! computes the worst-case `StartupMessage` byte length from its
@@ -23,13 +21,13 @@ use core::fmt;
 
 /// Maximum byte capacity for an owned outbound frame.
 ///
-/// Derived from the worst case across StartupMessage, SASLInitialResponse,
-/// SASLResponse, SimpleQuery, **and Parse** (1c-3a). The cap is a
-/// const computed from the worst-case contributing inputs; const
-/// asserts below tie it to every frame-builder's size math so a
+/// Derived from the worst case across StartupMessage,
+/// SASLInitialResponse, SASLResponse, SimpleQuery, and Parse. The cap
+/// is a const computed from the worst-case contributing inputs;
+/// const asserts below tie it to every frame-builder's size math so a
 /// future change to any contributing constant (`MAX_SQL_LEN`,
-/// `MAX_PG_NAME_LEN`) without growing this cap becomes a build
-/// error, not a runtime overflow.
+/// `MAX_PG_NAME_LEN`) without growing this cap becomes a build error,
+/// not a runtime overflow.
 ///
 /// Size breakdown (current values):
 /// - StartupMessage worst case: ~305 bytes.
@@ -78,13 +76,13 @@ pub const fn max_startup_message_size() -> usize {
         .saturating_add(1) // trailing empty-key NUL
 }
 
-// DEF-057 drift guard. Bumping any contributing constant (MAX_IDENT_LEN,
+// Drift guard: bumping any contributing constant (MAX_IDENT_LEN,
 // MAX_APP_NAME_LEN) or adding a StartupMessage parameter without
 // growing MAX_OWNED_SEND_LEN fails the build here.
 const _: () = assert!(MAX_OWNED_SEND_LEN >= max_startup_message_size());
 
 /// Worst-case byte size of a PostgreSQL `Query` (`'Q'`) frame —
-/// Simple Query protocol. 1c-1b.
+/// Simple Query protocol.
 ///
 /// Layout (PG §55.7 Simple Query):
 /// - Tag: `'Q'` (1 byte)
@@ -105,14 +103,14 @@ pub const fn max_simple_query_message_size() -> usize {
         .saturating_add(1) // NUL terminator
 }
 
-// 1c-1b safety drift-pin: the `build_query_message` Err(WriteBufFull)
-// branch is architecturally unreachable if and only if
-// `MAX_OWNED_SEND_LEN >= max_simple_query_message_size()`. Previously
-// this invariant was NOT asserted — a full-size SQL (`MAX_SQL_LEN=2048`)
-// would in fact overflow a 512-byte WriteBuf at runtime, masquerading
-// as `ProtocolError::InternalCrateBug { locus: OutboundFrameBuild { stage: Query } }`
-// (DEF-150). Now: bumping
-// `MAX_SQL_LEN` without growing the WriteBuf cap is a build error.
+// Safety drift-pin: the `build_query_message` Err(WriteBufFull)
+// branch is architecturally unreachable iff
+// `MAX_OWNED_SEND_LEN >= max_simple_query_message_size()`. Without
+// this assert, a full-size SQL (`MAX_SQL_LEN=2048`) could overflow
+// a smaller WriteBuf cap at runtime, masquerading as
+// `ProtocolError::InternalCrateBug { locus: OutboundFrameBuild
+// { stage: Query } }`. With it: bumping `MAX_SQL_LEN` without
+// growing the WriteBuf cap is a build error.
 const _: () = assert!(
     MAX_OWNED_SEND_LEN >= max_simple_query_message_size(),
     "MAX_OWNED_SEND_LEN below worst-case SimpleQuery ('Q') frame size — \
@@ -121,23 +119,23 @@ const _: () = assert!(
 );
 
 /// Worst-case byte size of a PostgreSQL `Parse` (`'P'`) frame —
-/// Extended Query protocol, 1c-3a.
+/// Extended Query protocol.
 ///
 /// Layout (PG §55.7 Parse):
 /// - Tag: `'P'` (1 byte)
 /// - Length: `u32` BE including itself
 /// - Statement name: up to [`crate::ident::MAX_PG_NAME_LEN`] bytes + NUL
 /// - SQL text: up to [`crate::ident::MAX_SQL_LEN`] bytes + NUL
-/// - Parameter type-count: `i16` (can be 0 — no hints)
-/// - Parameter type OIDs: `i32` × count (0 for 1c-3a — no hints)
+/// - Parameter type-count: `i16` (currently always 0 — no hints)
+/// - Parameter type OIDs: `i32` × count (currently 0)
 ///
 /// # Drift guard
 ///
 /// Bumping [`crate::ident::MAX_PG_NAME_LEN`] or
 /// [`crate::ident::MAX_SQL_LEN`] without growing
-/// [`MAX_OWNED_SEND_LEN`] fails the `const _` assert below. 1c-3a
-/// does not yet support parameter type hints; when 1c-3b adds them,
-/// this size formula widens (+4 × MAX_PARAM_COUNT).
+/// [`MAX_OWNED_SEND_LEN`] fails the `const _` assert below.
+/// Parameter type hints are not yet supported; when they are, this
+/// size formula widens (+4 × MAX_PARAM_COUNT).
 pub const fn max_parse_message_size() -> usize {
     1usize // tag 'P'
         .saturating_add(4) // length prefix (includes itself)
@@ -146,12 +144,13 @@ pub const fn max_parse_message_size() -> usize {
         .saturating_add(crate::ident::MAX_SQL_LEN)
         .saturating_add(1) // sql NUL
         .saturating_add(2) // i16 param-type count
-    // No per-param-type OIDs in 1c-3a (count is zero).
+    // No per-param-type OIDs (count is zero — param hints not yet
+    // supported).
 }
 
-// 1c-3a drift-pin: same pattern as SimpleQuery above. Parse without
+// Drift-pin: same pattern as SimpleQuery above. Parse without
 // param-type hints fits comfortably under MAX_OWNED_SEND_LEN; param
-// hints will be added in 1c-3b with a corresponding cap bump.
+// hints would require a corresponding cap bump.
 const _: () = assert!(
     MAX_OWNED_SEND_LEN >= max_parse_message_size(),
     "MAX_OWNED_SEND_LEN below worst-case Parse ('P') frame size — \
@@ -160,24 +159,20 @@ const _: () = assert!(
      in lockstep.",
 );
 
-/// DEF-212 (M1, audit 2026-05-04, architect-vetted impl plan): drift-pin
-/// for `push_parse` Parse+Sync bundle. Pre-DEF-212 `push_parse` emitted
-/// `[Action::SendBytes(parse_frame), Action::SendBytes(SYNC_WIRE_BYTES)]`
-/// — the static `SendBytesStatic` variant did not consume `WriteBuf`
-/// capacity. Post-DEF-212 (Alt Y' bytes-only push) the SYNC_WIRE_BYTES
-/// is APPENDED inline to `WriteBuf` after the Parse frame, so the
-/// caller's buffer must fit both simultaneously. Without this assert,
-/// bumping `MAX_PG_NAME_LEN`/`MAX_SQL_LEN` could allow a Parse frame
-/// that fills the buffer, leaving no room for the trailing 5-byte
-/// Sync — a tier-4 "happens to fit" gap. With this assert: tier-1
-/// build failure on drift.
+/// Drift-pin for `push_parse` Parse+Sync bundle. `push_parse`
+/// appends `SYNC_WIRE_BYTES` inline to `WriteBuf` after the Parse
+/// frame (bytes-only push), so the caller's buffer must fit both
+/// simultaneously. Without this assert, bumping `MAX_PG_NAME_LEN` /
+/// `MAX_SQL_LEN` could allow a Parse frame that fills the buffer,
+/// leaving no room for the trailing 5-byte Sync — a tier-4 "happens
+/// to fit" gap. With this assert: tier-1 build failure on drift.
 ///
-/// Sibling to the existing Bind+Execute+Sync (line 208-217) and
-/// Describe+Sync (line 247-251) drift pins.
+/// Sibling to the Bind+Execute+Sync and Describe+Sync drift pins
+/// below.
 const _: () = assert!(
     MAX_OWNED_SEND_LEN >= max_parse_message_size().saturating_add(5),
-    "DEF-212 (M1): MAX_OWNED_SEND_LEN below worst-case Parse+Sync bundle. \
-     push_parse appends Sync inline post-DEF-212 (bytes-only push). \
+    "MAX_OWNED_SEND_LEN below worst-case Parse+Sync bundle. \
+     push_parse appends Sync inline (bytes-only push). \
      Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN / MAX_SQL_LEN \
      in lockstep. `5` here is `SYNC_WIRE_BYTES.len()`.",
 );
@@ -204,7 +199,7 @@ pub const fn max_bind_message_size() -> usize {
         .saturating_add(2) // n_params
         .saturating_add(crate::params::MAX_PARAMS_ARITY.saturating_mul(4)) // per-param length prefixes
         .saturating_add(crate::params::MAX_PARAMS_DATA_TOTAL) // param data
-        .saturating_add(2) // n_result_formats (= 0 in 1c-3b, but field is always present)
+        .saturating_add(2) // n_result_formats (currently 0; field always present)
 }
 
 /// Worst-case byte size of a PostgreSQL `Execute` (`'E'`) frame —
@@ -217,9 +212,9 @@ pub const fn max_execute_message_size() -> usize {
         .saturating_add(4) // max_rows i32
 }
 
-/// Drift-pin (1c-3b): the Bind + Execute + Sync bundle ships in
-/// a single `push_bind_execute` call, so the caller's WriteBuf must
-/// fit all three worst-case messages simultaneously. Bumping
+/// Drift-pin: the Bind + Execute + Sync bundle ships in a single
+/// `push_bind_execute` call, so the caller's WriteBuf must fit all
+/// three worst-case messages simultaneously. Bumping
 /// `MAX_PARAMS_DATA_TOTAL` / `MAX_PARAMS_ARITY` / `MAX_PG_NAME_LEN`
 /// without growing `MAX_OWNED_SEND_LEN` is a build failure.
 ///
@@ -232,14 +227,13 @@ const _: () = assert!(
         >= max_bind_message_size()
             .saturating_add(max_execute_message_size())
             .saturating_add(5),
-    "MAX_OWNED_SEND_LEN below worst-case Bind+Execute+Sync bundle \
-     (1c-3b: push_bind_execute emits all three). Grow MAX_OWNED_SEND_LEN \
-     or shrink params::MAX_PARAMS_ARITY / MAX_PARAMS_DATA_TOTAL / \
-     MAX_PG_NAME_LEN.",
+    "MAX_OWNED_SEND_LEN below worst-case Bind+Execute+Sync bundle. \
+     Grow MAX_OWNED_SEND_LEN or shrink params::MAX_PARAMS_ARITY / \
+     MAX_PARAMS_DATA_TOTAL / MAX_PG_NAME_LEN.",
 );
 
 /// Worst-case byte size of a PostgreSQL `Describe` (`'D'`) frame —
-/// Extended Query protocol, 1c-3c.
+/// Extended Query protocol.
 ///
 /// Wire layout per PG §55.2.2:
 ///
@@ -259,11 +253,10 @@ pub const fn max_describe_message_size() -> usize {
         .saturating_add(1) // name NUL
 }
 
-/// Drift-pin (1c-3c): `push_describe_*` emits a
-/// `Describe + Sync` bundle, so the caller's WriteBuf must fit
-/// `max_describe_message_size() + 5` simultaneously. Bumping
-/// `MAX_PG_NAME_LEN` without growing `MAX_OWNED_SEND_LEN` is a
-/// build failure.
+/// Drift-pin: `push_describe_*` emits a `Describe + Sync` bundle,
+/// so the caller's WriteBuf must fit `max_describe_message_size()
+/// + 5` simultaneously. Bumping `MAX_PG_NAME_LEN` without growing
+/// `MAX_OWNED_SEND_LEN` is a build failure.
 ///
 /// `5` here is `SYNC_WIRE_BYTES.len()` (tag `'S'` + BE u32 length=4).
 const _: () = assert!(
@@ -272,13 +265,13 @@ const _: () = assert!(
      Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN.",
 );
 
-/// Decomposition drift-pin (pass-#7 F15): PG §55.2.2 Describe frame
-/// is `'D' (1) + len (4) + target (1) + name (N) + NUL (1)`. A
+/// Decomposition drift-pin: PG §55.2.2 Describe frame is
+/// `'D' (1) + len (4) + target (1) + name (N) + NUL (1)`. A
 /// refactor that dropped the NUL, removed the target byte, or
 /// otherwise corrupted the layout formula inside
-/// `max_describe_message_size` would silently produce a wrong
-/// size without this pin. Ties the computed total to the literal
-/// sum of its documented parts.
+/// `max_describe_message_size` would silently produce a wrong size
+/// without this pin. Ties the computed total to the literal sum of
+/// its documented parts.
 const _: () = assert!(
     max_describe_message_size() == 7usize.saturating_add(crate::ident::MAX_PG_NAME_LEN),
     "Describe frame layout drift — PG §55.2.2: \
@@ -286,9 +279,8 @@ const _: () = assert!(
 );
 
 /// Worst-case byte size of a PostgreSQL `PasswordMessage` (`'p'`)
-/// frame for **cleartext** auth (DEF-215, 2026-05-05). PG §55.7
-/// "PasswordMessage" — the body is the password bytes followed
-/// by a single NUL terminator.
+/// frame for **cleartext** auth. PG §55.7 "PasswordMessage" — the
+/// body is the password bytes followed by a single NUL terminator.
 ///
 /// Wire layout:
 ///
@@ -309,11 +301,11 @@ pub const fn max_password_message_size_cleartext() -> usize {
 }
 
 /// Worst-case byte size of a PostgreSQL `PasswordMessage` (`'p'`)
-/// frame for **MD5** auth (DEF-216, 2026-05-05). The body is a
-/// fixed 35-byte digest response (`"md5"` + 32 lowercase hex
-/// chars) plus NUL terminator. Always smaller than the cleartext
-/// case; the [`max_password_message_size`] umbrella const takes
-/// the max of both for the global drift-pin.
+/// frame for **MD5** auth. The body is a fixed 35-byte digest
+/// response (`"md5"` + 32 lowercase hex chars) plus NUL terminator.
+/// Always smaller than the cleartext case; the
+/// [`max_password_message_size`] umbrella const takes the max of
+/// both for the global drift-pin.
 ///
 /// Wire layout:
 ///
@@ -341,17 +333,16 @@ pub const fn max_password_message_size() -> usize {
     if cleartext > md5 { cleartext } else { md5 }
 }
 
-// DEF-215 + DEF-216 drift-pin (audit 2026-05-07): the cleartext +
-// MD5 PasswordMessage builders' `Err(WriteBufFull)` arms are
-// **architecturally unreachable** if and only if
-// `MAX_OWNED_SEND_LEN >= max_password_message_size()`. Pre-pin the
-// builders propagated `WriteBufFull` via `?` to
-// `InternalCrateBug { BuilderCapacityOverflow }` (tier-3 by
-// classification — defence in depth, but not formally pinned to
-// be impossible). Post-pin: bumping `MAX_PASSWORD_LEN` without
-// growing `MAX_OWNED_SEND_LEN` is a build error. Tier-1
-// architectural-impossibility for the cleartext + MD5 outbound
-// frame paths.
+// PasswordMessage drift-pin: the cleartext + MD5 PasswordMessage
+// builders' `Err(WriteBufFull)` arms are **architecturally
+// unreachable** iff `MAX_OWNED_SEND_LEN >=
+// max_password_message_size()`. Without the pin the builders
+// propagate `WriteBufFull` via `?` to `InternalCrateBug
+// { BuilderCapacityOverflow }` (tier-3 by classification — defence
+// in depth, but not formally pinned to be impossible). With it:
+// bumping `MAX_PASSWORD_LEN` without growing `MAX_OWNED_SEND_LEN`
+// is a build error. Tier-1 architectural-impossibility for the
+// cleartext + MD5 outbound frame paths.
 const _: () = assert!(
     MAX_OWNED_SEND_LEN >= max_password_message_size(),
     "MAX_OWNED_SEND_LEN below worst-case PasswordMessage frame size — \
@@ -360,12 +351,12 @@ const _: () = assert!(
      MAX_OWNED_SEND_LEN or shrink MAX_PASSWORD_LEN in lockstep.",
 );
 
-// DEF-215 + DEF-216 layout-decomposition drift-pin: pin the
-// cleartext + MD5 size formulas to their literal documented
-// summations. A refactor that dropped the NUL, the length-prefix,
-// or the tag byte from the formula would silently produce a wrong
-// total without this pin. Ties the computed totals to the
-// architectural shapes per PG §55.7.
+// PasswordMessage layout-decomposition drift-pin: pin the cleartext
+// + MD5 size formulas to their literal documented summations. A
+// refactor that dropped the NUL, the length-prefix, or the tag byte
+// from the formula would silently produce a wrong total without
+// this pin. Ties the computed totals to the architectural shapes
+// per PG §55.7.
 const _: () = assert!(
     max_password_message_size_cleartext()
         == 6usize.saturating_add(crate::password::MAX_PASSWORD_LEN),
@@ -389,7 +380,6 @@ pub struct WriteBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteBufFull;
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
 // `core::error::Error` impl on the write-buf-overflow sentinel.
 impl core::error::Error for WriteBufFull {}
 
@@ -434,7 +424,7 @@ impl WriteBuf {
     /// Push a big-endian `i16`. Parallel to [`push_i32_be`] /
     /// [`push_u32_be`] — used by Extended Query frame builders
     /// (Parse's `n_param_types`, Bind's per-column format codes,
-    /// etc.). 1c-3a.
+    /// etc.).
     ///
     /// [`push_i32_be`]: Self::push_i32_be
     /// [`push_u32_be`]: Self::push_u32_be
@@ -466,8 +456,8 @@ impl WriteBuf {
     }
 
     /// Push a `u64` in big-endian — reserved for future unsigned
-    /// 8-byte PG wire fields (1c-3b has none, added for API symmetry
-    /// with the `u32` / `u16` pair).
+    /// 8-byte PG wire fields (none currently in use, added for API
+    /// symmetry with the `u32` / `u16` pair).
     pub fn push_u64_be(&mut self, val: u64) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
@@ -515,24 +505,24 @@ impl WriteBuf {
         let len_bytes = len_u32.to_be_bytes();
         // Patch the placeholder at `start..start+4`.
         //
-        // F61 (pass #6 audit): explicit Err on the architecturally-dead
-        // None branch. The `push_u32_be(0)` above guarantees
-        // `inner.len() >= start + 4` — so `get_mut(start..)` + chunk
-        // extraction cannot return None unless a future refactor
-        // removes or reorders the placeholder push. Converting the
-        // former silent no-op (`if let Some(slot)`) into an explicit
-        // Err means the refactor fails with a classified
-        // `WriteBufFull` at the first test run, rather than producing
-        // wire frames with a length field of `0` that the server would
-        // reject as `MalformedFrameLength`.
+        // Explicit Err on the architecturally-dead None branch. The
+        // `push_u32_be(0)` above guarantees `inner.len() >= start
+        // + 4` — so `get_mut(start..)` + chunk extraction cannot
+        // return None unless a future refactor removes or reorders
+        // the placeholder push. Converting the alternative silent
+        // no-op (`if let Some(slot)`) into an explicit Err means the
+        // refactor fails with a classified `WriteBufFull` at the
+        // first test run, rather than producing wire frames with a
+        // length field of `0` that the server would reject as
+        // `MalformedFrameLength`.
         //
-        // DEF-184 (B15): `first_chunk_mut::<4>()` returns
-        // `Option<&mut [u8; 4]>` — direct array assignment `*slot
-        // = len_bytes` compiles to a single 32-bit store on aligned
-        // targets, vs the pre-(184) `copy_from_slice(&len_bytes)`
-        // which internally bounds-checks src.len() == dst.len().
-        // Both bounds checks (get_mut range + copy_from_slice) fold
-        // into one `first_chunk_mut` check.
+        // `first_chunk_mut::<4>()` returns `Option<&mut [u8; 4]>` —
+        // direct array assignment `*slot = len_bytes` compiles to a
+        // single 32-bit store on aligned targets, vs the alternative
+        // `copy_from_slice(&len_bytes)` which internally bounds-
+        // checks `src.len() == dst.len()`. Both bounds checks
+        // (get_mut range + copy_from_slice) fold into one
+        // `first_chunk_mut` check.
         let Some(slot) = self
             .inner
             .get_mut(start..)
@@ -572,14 +562,14 @@ impl WriteBuf {
         let body_len = self.inner.len().saturating_sub(body_start);
         let body_len_i32 = i32::try_from(body_len).map_err(|_| WriteBufFull)?;
         let bytes = body_len_i32.to_be_bytes();
-        // F61: explicit Err on the architecturally-dead None branch
+        // Explicit Err on the architecturally-dead None branch
         // (mirrors `with_length_prefix`). A future refactor that
         // removes the placeholder push would fail with a typed error
         // at build-time tests instead of silently producing frames
         // with bogus length fields.
         //
-        // DEF-184 (B15): same `first_chunk_mut::<4>()` → single
-        // 32-bit store as `with_length_prefix`.
+        // Same `first_chunk_mut::<4>()` → single 32-bit store as
+        // `with_length_prefix`.
         let Some(slot) = self
             .inner
             .get_mut(len_offset..)
@@ -607,33 +597,34 @@ impl WriteBuf {
 
     /// Reset the buffer length to zero without deallocating.
     ///
-    /// DEF-094: called by [`crate::PgProtocol::push_command`] and
+    /// Called by [`crate::PgProtocol::push_command`] and
     /// [`crate::PgProtocol::feed_bytes`] at entry to reuse the
     /// caller-owned bounded storage across calls. Any previously
     /// issued `&[u8]` borrows into this buffer are invalidated — the
     /// borrow checker enforces that no such borrows exist at the
     /// point of `clear()` via the `&mut self` receiver.
     ///
-    /// # DEF-185 P0-B (audit 2026-04-24): zero-on-clear discipline
+    /// # Zero-on-clear discipline
     ///
-    /// `heapless::Vec::clear()` by itself only resets the length to 0 —
-    /// the backing bytes persist in the 2176-byte array until a later
-    /// `push_*` call overwrites them. This left **password-correlated
-    /// SCRAM SASLResponse frames** (including the base64-encoded
-    /// ClientProof) physically in RAM between SCRAM dispatch and the
-    /// next `feed_bytes()` / `push_command()` call. Core-dump attackers
-    /// on a long-lived connection would also find plaintext SQL from
-    /// prior queries (e.g. `UPDATE users SET password='...'`) sitting
-    /// in this buffer.
+    /// `heapless::Vec::clear()` by itself only resets the length to 0
+    /// — the backing bytes persist in the 2176-byte array until a
+    /// later `push_*` call overwrites them. Without zeroize, the
+    /// buffer would retain **password-correlated SCRAM SASLResponse
+    /// frames** (including the base64-encoded ClientProof) physically
+    /// in RAM between SCRAM dispatch and the next `feed_bytes()` /
+    /// `push_command()` call. Core-dump attackers on a long-lived
+    /// connection would also find plaintext SQL from prior queries
+    /// (e.g. `UPDATE users SET password='...'`) sitting in this
+    /// buffer.
     ///
-    /// Post-fix: overwrite the occupied prefix with zeros before
-    /// truncating the length. Unoccupied bytes don't need scrubbing —
-    /// they were either zero-initialised (fresh buffer) or already
-    /// zeroed by a previous clear. Cost: O(len) memset on the hot path,
-    /// which is L1-cache resident (≤ 2 KiB) and negligible relative to
-    /// the write system call that typically follows.
+    /// Mitigation: overwrite the occupied prefix with zeros before
+    /// truncating the length. Unoccupied bytes don't need scrubbing
+    /// — they were either zero-initialised (fresh buffer) or already
+    /// zeroed by a previous clear. Cost: O(len) memset on the hot
+    /// path, which is L1-cache resident (≤ 2 KiB) and negligible
+    /// relative to the write system call that typically follows.
     ///
-    /// Pairs with `ZeroizeOnDrop` below: the `clear()` path handles
+    /// Pairs with manual `Drop` below: the `clear()` path handles
     /// reuse; `Drop` handles stack-frame teardown.
     #[inline]
     pub fn clear(&mut self) {
@@ -657,23 +648,23 @@ impl Default for WriteBuf {
     }
 }
 
-/// DEF-185 P0-B (audit 2026-04-24): manual Drop impl zeroizes the
-/// occupied prefix on scope teardown.
+/// Manual Drop impl zeroizes the occupied prefix on scope teardown.
 ///
 /// Rationale: `heapless::Vec` does NOT implement `zeroize::Zeroize`
-/// (the upstream crate bounds `Zeroize` on `Default + Copy`, which Vec
-/// does not satisfy). We scrub manually via `Zeroize` on the mut slice
-/// (impl'd for `[u8]`). Ensures that on normal Drop — e.g. when a
-/// wrapper's connection handle goes out of scope — any residual
-/// password-correlated bytes (SASLResponse ClientProof) are scrubbed.
+/// (the upstream crate bounds `Zeroize` on `Default + Copy`, which
+/// Vec does not satisfy). Scrub manually via `Zeroize` on the mut
+/// slice (impl'd for `[u8]`). Ensures that on normal Drop — e.g.
+/// when a wrapper's connection handle goes out of scope — any
+/// residual password-correlated bytes (SASLResponse ClientProof) are
+/// scrubbed.
 ///
-/// Caveat per DEF-185 P0-A: under `panic = "abort"` in the release
-/// profile, Drop does NOT run on panic paths. The zeroize claim here
-/// is "best-effort on normal control flow"; hard memory hygiene under
-/// panic requires either `panic = "unwind"` or `mlock`+manual scrub.
-/// Current stance: accept abort's fail-fast benefits; document the
-/// limitation honestly; prefer explicit `Zeroizing<T>` wrappers on
-/// stack locals within secret-bearing call frames for defense-in-depth.
+/// Caveat: under `panic = "abort"` in the release profile, Drop does
+/// NOT run on panic paths. The zeroize claim here is "best-effort
+/// on normal control flow"; hard memory hygiene under panic requires
+/// either `panic = "unwind"` or `mlock` + manual scrub — handled by
+/// the driver-side panic hook for secret-bearing types. For
+/// defense-in-depth, prefer explicit `Zeroizing<T>` wrappers on
+/// stack locals within secret-bearing call frames.
 impl Drop for WriteBuf {
     fn drop(&mut self) {
         use zeroize::Zeroize;
@@ -691,129 +682,68 @@ impl fmt::Debug for WriteBuf {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-154 (B) Phase B1 — generatively-branded buffer scaffolding
+// Branded buffer scope — [`BrandedWriteBuf`] / [`BrandedWriteReserved`]
 // ═════════════════════════════════════════════════════════════════════
 //
-// Goal: upgrade [`WriteReserved<'a>`] (DEF-154 (A)) from capacity-only
-// witness to capacity + **buffer-identity** witness. The identity
-// proof comes from a generative lifetime `'brand` (GhostCell pattern):
-// two distinct `with_branded` closures produce disjoint brands that
-// the type system refuses to unify, closing the "apply range from
-// buffer A to buffer B of same lifetime" crossover seam that a plain
-// `&[u8]` lifetime cannot prove.
+// `WriteBuf::with_branded` wraps `&mut WriteBuf` in a typed scope
+// (`BrandedWriteBuf<'w>`) inside which builders take
+// `&mut BrandedWriteReserved<'_>` and return ranges. The scope is the
+// frame-builder boundary: builders see a capacity-witness shape,
+// `with_branded` callers see the underlying bytes after the scope
+// closes.
 //
-// Phase B1 scope — foundational types only:
-//   - [`BrandedBytes<'brand, 'a>`]       — invariant-branded slice view
-//   - [`BrandedWriteBuf<'a>`]    — invariant-branded WriteBuf
-//     mutable borrow
-//   - [`BrandedWriteReserved<'a>`] — branded capacity witness
-//   - [`WriteBuf::with_branded`]         — HRTB generative constructor
-//
-// Phase B1 does NOT:
-//   - Add push methods to `BrandedWriteReserved` (those land in B3
-//     when `NonEmptyRange<'brand>` consumers need them).
-//   - Touch existing `WriteReserved` / builder call sites (stays
-//     side-by-side until B3 swaps the builders to the branded form).
-//   - Thread brands through `StagedAction` / `dispatch` / `materialise`
-//     (those land in B3/B4/B5).
-//
-// # `#[cfg(test)]` gating rationale — temporary through Phase B2
-//
-// These types have NO production callers in B1 — production code
-// still uses the unbranded `WriteReserved` path. The crate-root
-// `-D warnings` flag turns rustc's `dead_code` warning into an
-// error, so pub(crate) items with zero call sites in non-test
-// builds would fail compilation.
-//
-// Each B1 branded item carries `#[cfg(test)]` individually below.
-// The gate is TEMPORARY: Phase B3 removes it when branded
-// builders land and push_* methods on `BrandedWriteReserved`
-// become production-reachable. Do NOT swap for
-// `#[allow(dead_code)]` or `#[expect(dead_code)]` — both are
-// project-banned per the "fix root cause, no lint hiding" policy.
-// `cfg(test)` is honest scaffolding; `allow/expect` is drift.
-//
-// # Invariance mechanism
-//
-// Each branded type carries `PhantomData<fn(&'brand ()) -> &'brand ()>`
-// — `'brand` appears in BOTH input and output position of the
-// phantom function pointer, making it **invariant**. Covariant
-// phantoms (e.g. `PhantomData<&'brand ()>`) would let the borrow
-// checker subtype `'brand` to `'static` or to a shorter lifetime,
-// breaking the generativity seal. This is the single most common
-// trap in the GhostCell-style pattern.
-//
-// # Generativity via HRTB
-//
-// [`WriteBuf::with_branded`] takes `F: for<'brand> FnOnce(...)` —
-// the higher-rank trait bound means `f` must accept ANY `'brand`
-// the caller picks, so the caller cannot pre-fix `'brand` to a
-// value they share with another scope. Each call creates a fresh,
-// disjoint brand.
+// The naming carries forward from an earlier generative-lifetime
+// design (GhostCell-style invariant `'brand` phantom + HRTB
+// closure-bound) that proved buffer-identity at the type level. The
+// brand machinery was retired when `WriteRange::apply` adopted a
+// runtime `Option<&[u8]>` shape; the wrapper types remain because
+// builders depend on the `BrandedWriteReserved` capacity-witness
+// surface, but they no longer carry phantom brands.
 
-// DEF-154 (W): `BrandedBytes<'brand, 'a>` struct + impls DELETED.
-//
-// Pre-(W) this was a `&'a [u8]` + `PhantomData<fn(&'brand())>`
-// wrapper claiming tier-1 infallible apply via brand-identity
-// proof. DEF-154 (N) reduced `WriteRange::apply` to
-// `Option<&'a [u8]>` (runtime-checked) — the brand's only tier-1
-// deliverable evaporated. Post-(W) callers use `&'a [u8]`
-// directly; `BrandedWriteBuf::{as_bytes, into_bytes}` and
-// `BrandedWriteReserved::as_bytes` return plain slices.
-
-/// Generatively-branded mutable borrow of a [`WriteBuf`].
+/// Frame-builder scope wrapper around a [`WriteBuf`] mutable borrow.
 ///
-/// Constructed via [`WriteBuf::with_branded`]. Inside the closure,
-/// `'brand` is fresh and unique — it cannot be unified with any
-/// brand outside the closure. Calling [`Self::reserve`] yields a
-/// [`BrandedWriteReserved<'_>`] that carries the same
-/// brand; builders (Phase B3) take `&mut BrandedWriteReserved`
-/// and return `WriteRange` ranges tied to this buffer.
-///
-/// See module-level "Invariance mechanism" and "Generativity via
-/// HRTB" for the soundness argument.
+/// Constructed via [`WriteBuf::with_branded`]. Calling
+/// [`Self::reserve`] yields a [`BrandedWriteReserved<'_>`] capacity
+/// witness; builders take `&mut BrandedWriteReserved` and return
+/// `WriteRange` ranges tied to this buffer.
 pub(crate) struct BrandedWriteBuf<'a> {
     /// Underlying mutable WriteBuf borrow. Access via
     /// [`Self::reserve`] → [`BrandedWriteReserved`] for builder
     /// scope, or via [`Self::into_bytes`] for the final
     /// materialise slice view.
     buf: &'a mut WriteBuf,
-    // DEF-154 (W): `_brand: PhantomData<fn(&'brand ()) -> &'brand ()>`
-    // DELETED. See module-level DEF-154 (W) block for rationale.
 }
 
 impl<'a> BrandedWriteBuf<'a> {
-    /// Reserve the buffer for a builder, producing a capacity +
-    /// brand witness. Mirrors [`WriteBuf::reserve`] (DEF-154 (A))
-    /// with the added brand binding.
+    /// Reserve the buffer for a builder, producing a capacity
+    /// witness. Mirrors the underlying [`WriteBuf::reserve`] shape.
     ///
     /// # Why `&mut self` (not `self`)
     ///
-    /// Phase B4 uses the "build then apply in same scope" pattern
+    /// Callers use the "build then apply in same scope" pattern
     /// (pseudo-code, reflecting crate-internal types):
     ///
     /// ```text
     /// wb.with_branded(|mut wb| {
     ///     let range = {
-    ///         let mut reserved = wb.reserve();        // &mut wb
-    ///         build_query_message(&mut reserved)       // → WriteRange
+    ///         let mut reserved = wb.reserve();    // &mut wb
+    ///         build_query_message(&mut reserved)  // → WriteRange
     ///         // reserved drops; &mut wb borrow ends
     ///     };
-    ///     let bytes = wb.as_bytes_branded();           // & wb — now re-accessible
-    ///     range.apply(bytes)                           // Option<&[u8]> (DEF-154 N)
+    ///     let bytes = wb.as_bytes();              // & wb — now re-accessible
+    ///     range.apply(bytes)                      // Option<&[u8]>
     /// })
     /// ```
     ///
-    /// DEF-154 (R) P1-3: reclassified from `rust,ignore` to
-    /// `text` — the example names crate-internal types
-    /// (`BrandedWriteBuf`, `build_query_message`, `WriteRange`)
-    /// that aren't `pub`, so compile-checking requires crate-test
-    /// wiring. The pattern itself is illustrative prose.
+    /// The example uses `text` (not `rust,ignore`) because it names
+    /// crate-internal types (`BrandedWriteBuf`,
+    /// `build_query_message`, `WriteRange`) not `pub` —
+    /// compile-checking would require crate-test wiring.
     ///
     /// A consuming `self` version would make `wb` unusable after
-    /// `reserve()` — the apply step requires `as_bytes_branded()`
-    /// after the build, so reserve takes `&mut self` and returns
-    /// a reserved with a shorter lifetime.
+    /// `reserve()` — the apply step requires `as_bytes()` after the
+    /// build, so reserve takes `&mut self` and returns a reserved
+    /// with a shorter lifetime.
     #[inline]
     #[must_use]
     pub(crate) fn reserve(&mut self) -> BrandedWriteReserved<'_> {
@@ -825,9 +755,7 @@ impl<'a> BrandedWriteBuf<'a> {
         BrandedWriteReserved { buf: self.buf }
     }
 
-    /// DEF-154 (W): test-only borrowing view of the buffer.
-    /// Pre-(W) returned `BrandedBytes<'brand, '_>`; post-(W) plain
-    /// `&[u8]`.
+    /// Test-only borrowing view of the buffer.
     #[cfg(test)]
     #[inline]
     #[must_use]
@@ -837,11 +765,6 @@ impl<'a> BrandedWriteBuf<'a> {
 
     /// Consume the scope and yield the underlying bytes with the
     /// full outer `'a` lifetime — the materialise-boundary op.
-    ///
-    /// DEF-154 (W): pre-(W) returned `BrandedBytes<'brand, 'a>`
-    /// claiming buffer-identity proof for tier-1 apply; DEF-154 (N)
-    /// had already reduced apply to `Option<&[u8]>` runtime-
-    /// checked. Post-(W) returns `&'a [u8]` directly.
     #[inline]
     #[must_use]
     pub(crate) fn into_bytes(self) -> &'a [u8] {
@@ -857,110 +780,103 @@ impl fmt::Debug for BrandedWriteBuf<'_> {
     }
 }
 
-/// Branded capacity witness — the Phase B3 successor to
-/// [`WriteReserved`] (DEF-154 (A)). Phase B1 defines the shape;
-/// push methods land when builders are migrated in Phase B3.
-///
-/// Constructed via [`BrandedWriteBuf::reserve`]; holds a mutable
-/// borrow of the underlying buffer. Same capacity guarantee as
-/// [`WriteReserved`] (const-asserted ≥ every builder's max message
-/// size) plus the brand-identity binding to the source
-/// [`BrandedWriteBuf`].
+/// Capacity witness for frame builders. Constructed via
+/// [`BrandedWriteBuf::reserve`]; holds a mutable borrow of the
+/// underlying buffer. Capacity is const-asserted ≥ every builder's
+/// max message size, so the `push_*` methods cannot overflow under
+/// any caller-shape that respects the per-frame max sizes computed
+/// in this module.
 pub(crate) struct BrandedWriteReserved<'a> {
     /// Underlying buffer — API-narrow wrapper preventing truncating
     /// ops mid-builder-scope.
     buf: &'a mut WriteBuf,
-    // DEF-154 (W): `_brand: PhantomData<...>` DELETED. See
-    // module-level (W) block.
 }
 
 impl BrandedWriteReserved<'_> {
     /// Current buffer length. Used by builder bodies to compute
-    /// emission-time range endpoints (the same pattern as
-    /// [`WriteReserved::len`]).
+    /// emission-time range endpoints.
     #[inline]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
     }
 
-    /// Mutable access to underlying WriteBuf for branded push ops
-    /// (see `push_*` methods below). Kept private — callers use the
-    /// typed push methods that forward through this.
+    /// Mutable access to underlying WriteBuf for push ops (see
+    /// `push_*` methods below). Kept private — callers use the typed
+    /// push methods that forward through this.
     #[inline]
     fn buf_mut(&mut self) -> &mut WriteBuf {
         self.buf
     }
 
-    // DEF-154 (M) P0-3: every `push_*` returns `Result<(), WriteBufFull>`.
-    // Pre-(M) these methods silently discarded Err under a
-    // `debug_assert!` shield — tier-4 silent corruption on capacity
-    // drift (frame header already written assuming body-bytes to
-    // follow; truncated body + correct-looking length prefix =
-    // server-side framing desync / bit-junk on wire). Post-(M)
-    // builders `?` propagate, Err classifies as
-    // `CrateBugLocus::BuilderCapacityOverflow` at the builder-return
-    // boundary.
+    // Every `push_*` returns `Result<(), WriteBufFull>`. A naive
+    // `debug_assert!` shield silently discards Err on release —
+    // tier-4 silent corruption on capacity drift (frame header
+    // already written assuming body-bytes to follow; truncated body
+    // + correct-looking length prefix = server-side framing desync
+    // / bit-junk on wire). Instead builders `?`-propagate; Err
+    // classifies as `CrateBugLocus::BuilderCapacityOverflow` at the
+    // builder-return boundary.
 
-    /// Push a single byte — branded mirror of [`WriteReserved::push_u8`].
+    /// Push a single byte. Forwards to [`WriteBuf::push_u8`].
     #[inline]
     pub(crate) fn push_u8(&mut self, byte: u8) -> Result<(), WriteBufFull> {
         self.buf_mut().push_u8(byte)
     }
 
-    /// Push big-endian u16 — branded mirror of [`WriteReserved::push_u16_be`].
+    /// Push big-endian u16. Forwards to [`WriteBuf::push_u16_be`].
     #[inline]
     pub(crate) fn push_u16_be(&mut self, val: u16) -> Result<(), WriteBufFull> {
         self.buf_mut().push_u16_be(val)
     }
 
-    /// Push big-endian i16 — branded mirror of [`WriteReserved::push_i16_be`].
+    /// Push big-endian i16. Forwards to [`WriteBuf::push_i16_be`].
     #[inline]
     pub(crate) fn push_i16_be(&mut self, val: i16) -> Result<(), WriteBufFull> {
         self.buf_mut().push_i16_be(val)
     }
 
-    /// Push big-endian u32 — branded mirror of [`WriteReserved::push_u32_be`].
+    /// Push big-endian u32. Forwards to [`WriteBuf::push_u32_be`].
     #[inline]
     pub(crate) fn push_u32_be(&mut self, val: u32) -> Result<(), WriteBufFull> {
         self.buf_mut().push_u32_be(val)
     }
 
-    /// Push big-endian i32 — branded mirror of [`WriteReserved::push_i32_be`].
+    /// Push big-endian i32. Forwards to [`WriteBuf::push_i32_be`].
     #[inline]
     pub(crate) fn push_i32_be(&mut self, val: i32) -> Result<(), WriteBufFull> {
         self.buf_mut().push_i32_be(val)
     }
 
-    /// Push NUL-terminated bytes — branded mirror of [`WriteReserved::push_nul_terminated`].
+    /// Push NUL-terminated bytes. Forwards to
+    /// [`WriteBuf::push_nul_terminated`].
     #[inline]
     pub(crate) fn push_nul_terminated(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
         self.buf_mut().push_nul_terminated(data)
     }
 
-    /// Push raw bytes — branded mirror of [`WriteReserved::push_bytes`].
+    /// Push raw bytes. Forwards to [`WriteBuf::push_bytes`].
     ///
-    /// DEF-184 (A14): used by `build_bind_message` for the compact
-    /// `[0, 1, 0, 1]` format-code block (n_format_codes=1 +
-    /// format[0]=Binary), one 4-byte bulk write replacing
-    /// `push_u16_be(1) + push_u16_be(1)` pair.
+    /// Used by `build_bind_message` for the compact `[0, 1, 0, 1]`
+    /// format-code block (n_format_codes=1 + format[0]=Binary), one
+    /// 4-byte bulk write replacing a `push_u16_be(1) +
+    /// push_u16_be(1)` pair.
     #[inline]
     pub(crate) fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
         self.buf_mut().push_bytes(data)
     }
 
-    /// Write a PG length-prefixed body via a nested branded closure.
-    /// Branded mirror of [`WriteReserved::with_length_prefix`].
+    /// Write a PG length-prefixed body via a nested closure.
+    /// Forwards to [`WriteBuf::with_length_prefix`].
     ///
-    /// The inner closure receives a short-lived branded reserved
-    /// with the SAME `'brand` as the outer — the brand is captured
-    /// from `self`'s `'brand` parameter, so ranges produced inside
-    /// the closure (via subsequent builders) are compatible with
-    /// the outer scope.
+    /// The inner closure receives a short-lived nested
+    /// `BrandedWriteReserved` borrowing the same underlying buffer,
+    /// so ranges produced inside the closure (via subsequent
+    /// builders) are compatible with the outer scope.
     ///
-    /// DEF-154 (M): body_fn returns `Result<(), WriteBufFull>`;
-    /// outer returns same. Builders `?`-propagate both the outer
-    /// length-prefix emission and the inner body's push results.
+    /// `body_fn` returns `Result<(), WriteBufFull>`; outer returns
+    /// same. Builders `?`-propagate both the outer length-prefix
+    /// emission and the inner body's push results.
     #[inline]
     pub(crate) fn with_length_prefix<F>(&mut self, body_fn: F) -> Result<(), WriteBufFull>
     where
@@ -972,28 +888,18 @@ impl BrandedWriteReserved<'_> {
         })
     }
 
-    /// DEF-154 (B) Phase B4 escape hatch — access underlying buffer
-    /// mutably for APIs predating the brand (e.g.
-    /// `ParamsWriter::write_params` in `build_bind_message`). Mirrors
-    /// [`WriteReserved::as_write_buf_mut`]. Caller is responsible
-    /// for shielding any `Result` return via `debug_assert!`.
+    /// Escape hatch — access underlying buffer mutably for APIs
+    /// that do not take a `BrandedWriteReserved` (e.g.
+    /// `ParamsWriter::write_params` in `build_bind_message`). Caller
+    /// `?`-propagates any `Result` return.
     ///
-    /// Safe because the branded scope's capacity invariant still
-    /// holds iff builders follow their `max_{kind}_message_size()`
+    /// Safe because the scope's capacity invariant still holds iff
+    /// builders follow their `max_{kind}_message_size()`
     /// const-asserted worst-case.
     #[inline]
     pub(crate) fn as_write_buf_mut(&mut self) -> &mut WriteBuf {
         self.buf
     }
-
-    // DEF-160 Z2 (2026-05-11): `as_bytes(&self) -> &[u8]` removed.
-    // Pre-Z2 it surfaced the WriteBuf's bytes inside the branded scope
-    // for `materialise_push`'s M5 verification. Post-Z2 push paths emit
-    // the wire frame via `OutActions` chunks (one of which carries the
-    // header range — verified by `materialise` directly against the
-    // unbranded `wb.as_bytes()` slice), so the in-branded read view is
-    // no longer reachable from any call site. Re-adding it requires
-    // identifying a new caller and re-justifying the brand exposure.
 }
 
 impl fmt::Debug for BrandedWriteReserved<'_> {
@@ -1005,45 +911,27 @@ impl fmt::Debug for BrandedWriteReserved<'_> {
 }
 
 impl WriteBuf {
-    /// Enter a generatively-branded scope.
+    /// Enter a frame-builder scope.
     ///
-    /// The HRTB `for<'brand>` in the closure bound forces the
-    /// caller to accept ANY `'brand` the compiler chooses —
-    /// producing a fresh, disjoint brand per call that cannot
-    /// unify with any other scope's brand. Inside the closure,
-    /// [`BrandedWriteBuf<'brand, '_>`] wraps `self` with that
-    /// brand. Builders (Phase B3) take
-    /// `&mut BrandedWriteReserved<'_>` and produce
-    /// ranges tied to this brand; [`Self::as_bytes_branded`] at
-    /// materialise time accepts only same-brand ranges.
+    /// Inside the closure, [`BrandedWriteBuf<'w>`] wraps `self`;
+    /// builders take `&mut BrandedWriteReserved<'_>` and produce
+    /// ranges tied to the buffer.
     ///
-    /// # Example (Phase B5 call site — illustrative)
+    /// # Example
     ///
     /// ```text
-    /// self.write_buf.with_branded(|wb| {
+    /// self.write_buf.with_branded(|mut wb| {
     ///     let mut reserved = wb.reserve();
     ///     let range = build_query_message(&mut reserved, &cmd);
-    ///     // range: WriteRange; wb.as_bytes_branded(): BrandedBytes<'brand, '_>
-    ///     let bytes = range.apply(wb.as_bytes_branded())?; // Option<&[u8]> (DEF-154 N)
-    ///     Action::SendBytes(bytes)  // &[u8] is unbranded — escapes the closure
+    ///     // range: WriteRange
+    ///     let bytes = range.apply(wb.into_bytes())?; // Option<&[u8]>
+    ///     Action::SendBytes(bytes)
     /// })
     /// ```
     ///
-    /// DEF-154 (R) P1-3: reclassified from `rust,ignore` to
-    /// `text` — the example names crate-internal types not `pub`.
-    ///
-    /// # Soundness argument
-    ///
-    /// Each call to [`Self::with_branded`] instantiates the `'brand`
-    /// parameter with a FRESH existential lifetime (HRTB semantics).
-    /// The invariant phantom `PhantomData<fn(&'brand ()) ->
-    /// &'brand ()>` on [`BrandedWriteBuf`] / [`BrandedBytes`] /
-    /// [`BrandedWriteReserved`] prevents the subtyping system from
-    /// equating two distinct brands. Therefore a range built under
-    /// brand X cannot be applied to bytes branded under Y — a
-    /// compile error, not a runtime check.
-    /// DEF-154 (W): HRTB `for<'brand>` stripped. Post-(W) no brand,
-    /// the closure is plain `FnOnce(BrandedWriteBuf<'w>) -> R`.
+    /// The example uses `text` (not `rust,ignore`) because it names
+    /// crate-internal types not `pub` — compile-checking would
+    /// require crate-test wiring.
     #[inline]
     pub(crate) fn with_branded<'w, R, F>(&'w mut self, f: F) -> R
     where
@@ -1055,17 +943,13 @@ impl WriteBuf {
 
 #[cfg(test)]
 mod drop_witness_tests {
-    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
-    //! for [`WriteBuf`] via [`crate::drop_witness::DropCounter`].
+    //! Tier-1-by-construction Drop-fire witness for [`WriteBuf`] via
+    //! [`crate::drop_witness::DropCounter`].
     //!
-    //! Pre-DEF-259: `WriteBuf::drop` had no per-type witness — it is
-    //! a manual `impl Drop` (`write_buf.rs:673`) that calls
+    //! `WriteBuf::drop` is a manual `impl Drop` that calls
     //! `inner.as_mut_slice().zeroize()` (no `ZeroizeOnDrop` derive
     //! because `heapless::Vec` doesn't implement `Zeroize` upstream).
-    //! Verified only transitively via integration tests dropping
-    //! `WriteBuf` mid-handshake.
-    //!
-    //! Post-DEF-259: every `cargo test` increments the counter when
+    //! Every `cargo test` increments the counter when
     //! `WriteBuf::drop` reaches its zeroize body. Catches regressions
     //! that remove the manual Drop impl (which would silently retain
     //! SCRAM proof / SQL bytes in the freed buffer's memory).
@@ -1101,25 +985,20 @@ mod drop_witness_tests {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-154 (B) Phase B1 — tests
+// BrandedWriteBuf / BrandedWriteReserved — tests
 // ═════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod phase_b1_tests {
-    //! Phase B1 behavioural + structural pins.
+    //! Behavioural + structural pins for the branded buffer scope.
     //!
-    //! Compile-fail cases (two brands rejected at the type level)
-    //! land in a trybuild harness during a later phase. Phase B1
-    //! pins: the happy path round-trips, brand-bearing types are
-    //! non-zero-size-neutral (phantom ZST), unbranding produces the
-    //! underlying slice.
+    //! The happy path round-trips a buffer through `with_branded` +
+    //! `reserve()` + slice view; size drift-pins ensure the wrapper
+    //! types stay at `&mut WriteBuf` size (no phantom overhead).
     use super::*;
 
-    /// B1-1 (post DEF-154 W): `with_branded` round-trip — construct
-    /// a buffer, wrap it in a BrandedWriteBuf scope, observe
-    /// `as_bytes()` slice. Pre-(W) this exercised the brand's
-    /// `as_slice()` discharge at the "unbranding boundary"; post-(W)
-    /// `BrandedBytes` is gone and `as_bytes()` just returns `&[u8]`.
+    /// `with_branded` round-trip — construct a buffer, wrap it in a
+    /// BrandedWriteBuf scope, observe `as_bytes()` slice.
     #[test]
     fn with_branded_round_trip_empty() {
         let mut buf = WriteBuf::new();
@@ -1127,8 +1006,8 @@ mod phase_b1_tests {
         assert_eq!(slice_len, 0, "fresh buffer has zero-length slice view");
     }
 
-    /// B1-2 (post W): `with_branded` produces a BrandedWriteReserved
-    /// via `reserve()` — capacity-witness path intact.
+    /// `with_branded` produces a BrandedWriteReserved via `reserve()`
+    /// — capacity-witness path intact.
     #[test]
     fn branded_reserve_preserves_len() {
         let mut buf = WriteBuf::new();
@@ -1136,19 +1015,8 @@ mod phase_b1_tests {
         assert_eq!(reserved_len, 0);
     }
 
-    // DEF-160 Z2 (2026-05-11): `branded_reserve_as_bytes_len_mirrors_buf`
-    // test DELETED. It pinned `BrandedWriteReserved::as_bytes` which has
-    // also been removed (orphan after `materialise_push` deletion — Z2
-    // unifies push / feed materialisation through the single feed-side
-    // `materialise` against the unbranded `wb.as_bytes()` slice).
-
-    // DEF-154 (W): `branded_bytes_empty_is_empty` test DELETED —
-    // it tested `BrandedBytes::empty()` factory which no longer
-    // exists (struct deleted; callers use `&[]` literal directly).
-
-    /// B1-4 (post W): drift pin on sizes — BrandedWriteBuf /
-    /// BrandedWriteReserved are `&mut WriteBuf` sized; no phantom,
-    /// no overhead.
+    /// Drift pin on sizes — BrandedWriteBuf / BrandedWriteReserved
+    /// are `&mut WriteBuf` sized; no phantom, no overhead.
     #[test]
     fn branded_wrapper_sizes_are_ref_only() {
         assert_eq!(

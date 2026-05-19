@@ -75,17 +75,18 @@ impl OutboundTag {
 
 /// Frontend `Sync` message tag (`'S'`).
 ///
-/// Sent by the client to flush a pipelined batch. In Phase 1a we use it
-/// as the Ping primitive: the only legal server response to a `Sync` in
-/// `Idle` is a `ReadyForQuery`. PG protocol spec §55.2.4 (Extended Query).
+/// Sent by the client to flush a pipelined batch. Used here as the
+/// Ping primitive: the only legal server response to a `Sync` in
+/// `Idle` is a `ReadyForQuery`. PG protocol spec §55.2.4
+/// (Extended Query).
 pub const TAG_SYNC: OutboundTag = OutboundTag::from_byte(b'S');
 
 /// Backend `ReadyForQuery` message tag (`'Z'`).
 ///
 /// Carries one byte of payload — the transaction status indicator
-/// (`'I'` idle, `'T'` in-transaction, `'E'` failed transaction). In
-/// Phase 1a we accept any of the three (we are layer-below the
-/// transaction state machine; it lands in 1c).
+/// (`'I'` idle, `'T'` in-transaction, `'E'` failed transaction). All
+/// three are accepted at this layer (the transaction state machine
+/// is a higher-level concern).
 pub const TAG_READY_FOR_QUERY: InboundTag = InboundTag::from_byte(b'Z');
 
 /// Backend `ErrorResponse` message tag (`'E'`).
@@ -105,21 +106,22 @@ pub const TAG_ERROR_RESPONSE: InboundTag = InboundTag::from_byte(b'E');
 /// This is a `&'static [u8]` because the message is parameter-free; we
 /// ship it via a zero-copy static reference through [`crate::action::Action::SendBytes`].
 ///
-/// # Visibility (F33 revision, 2026-04-21)
+/// # Visibility
 ///
-/// `pub(crate)` — NOT part of the user-facing API. Integration tests
-/// used to reference this const to assert emitted bytes matched it,
-/// but that was tautological (the emission IS this const, so the
-/// test was essentially `SYNC_WIRE_BYTES == SYNC_WIRE_BYTES`). The
-/// real drift-pin is the `const _: () = assert!(SYNC_WIRE_BYTES[0] == b'S')`
-/// / `SYNC_WIRE_BYTES[1..=4] == [0,0,0,4]` assertions below, which
-/// catch typo-induced wire breaks at BUILD time. Tests now assert
-/// the LITERAL `[b'S', 0, 0, 0, 4]` instead — a stronger check that
-/// fires if either the emission path OR the const drifts.
+/// `pub(crate)` — NOT part of the user-facing API. A test that
+/// referenced this const to assert emitted bytes matched it would
+/// be tautological (the emission IS this const, so the test
+/// collapses to `SYNC_WIRE_BYTES == SYNC_WIRE_BYTES`). The real
+/// drift-pin is the `const _: () = assert!(SYNC_WIRE_BYTES[0] ==
+/// b'S')` / `SYNC_WIRE_BYTES[1..=4] == [0,0,0,4]` assertions
+/// below, which catch typo-induced wire breaks at BUILD time.
+/// Tests assert the LITERAL `[b'S', 0, 0, 0, 4]` instead — a
+/// stronger check that fires if either the emission path OR the
+/// const drifts.
 pub(crate) const SYNC_WIRE_BYTES: [u8; 5] = [TAG_SYNC.byte(), 0, 0, 0, 4];
 
 // ---------------------------------------------------------------
-// Phase 1b tags
+// Authentication-flow tags
 // ---------------------------------------------------------------
 
 /// Backend `Authentication*` message tag (`'R'`).
@@ -145,18 +147,16 @@ pub const TAG_BACKEND_KEY_DATA: InboundTag = InboundTag::from_byte(b'K');
 /// Backend `NegotiateProtocolVersion` message tag (`'v'`).
 ///
 /// Sent when the server does not support a requested protocol option.
-/// DEF-044.
 pub const TAG_NEGOTIATE_PROTOCOL_VERSION: InboundTag = InboundTag::from_byte(b'v');
 
 /// Backend `NoticeResponse` message tag (`'N'`).
 ///
 /// PG emits `NoticeResponse` for advisory warnings (e.g. `NOTICE:
 /// identifier will be truncated`). Any state can receive one at any
-/// time — mid-query, during startup, in idle, etc. DEF-062 installs
-/// a pre-dispatch filter in `feed_bytes` that silently consumes
-/// notices and advances past, analogous to the `ParameterStatus`
-/// filter (DEF-054). Future `Action::EmitNotice(...)` in Phase 1c+
-/// will surface notices to the wrapper; Phase 1b drops them.
+/// time — mid-query, during startup, in idle, etc. The pre-dispatch
+/// filter in `feed_bytes` silently consumes notices and advances
+/// past, analogous to the `ParameterStatus` filter; a future
+/// `Action::EmitNotice(...)` would surface notices to the wrapper.
 pub const TAG_NOTICE_RESPONSE: InboundTag = InboundTag::from_byte(b'N');
 
 /// Frontend `SASLInitialResponse` / `SASLResponse` message tag (`'p'`).
@@ -166,7 +166,7 @@ pub const TAG_NOTICE_RESPONSE: InboundTag = InboundTag::from_byte(b'N');
 pub const TAG_SASL_RESPONSE: OutboundTag = OutboundTag::from_byte(b'p');
 
 // ---------------------------------------------------------------
-// Phase 1c tags — Simple Query + Extended Query flow (PG §55.7)
+// Simple Query + Extended Query flow tags (PG §55.7)
 // ---------------------------------------------------------------
 
 // Inbound responses (backend → frontend):
@@ -221,20 +221,16 @@ pub const TAG_BIND_COMPLETE: InboundTag = InboundTag::from_byte(b'2');
 /// Sent after a successful `Close` of a prepared statement or
 /// portal. Contains no body.
 ///
-/// # DEF-185 P1-F (audit 2026-04-24): deferred to sub-phase 1c-6
+/// # Visibility
 ///
-/// Visibility narrowed to `pub(crate)`. `PgCommand::CloseStatement` /
-/// `PgCommand::ClosePortal` are not yet implemented — the client
-/// never sends `Close` frames, so the server should not emit
-/// `CloseComplete`. Any server-sent `'3'` today falls through to the
-/// catch-all `UnexpectedFrame` dispatch arm → teardown (correct
-/// defensive behaviour: protocol desync → fatal).
-///
-/// Keeping it `pub` previously advertised a surface the dispatcher
-/// did not support — confusing for downstream consumers introspecting
-/// `InboundTag`. Narrowed to `pub(crate)` + drift-pinned below;
-/// widened back to `pub` + wired into dispatch when 1c-6 lands
-/// explicit Close-frame support.
+/// `pub(crate)` — `Close` frames are not currently sent by the
+/// client, so the server should not emit `CloseComplete`. Any
+/// server-sent `'3'` today falls through to the catch-all
+/// `UnexpectedFrame` dispatch arm → teardown (correct defensive
+/// behaviour: protocol desync → fatal). A `pub` visibility would
+/// advertise a surface the dispatcher does not support; the
+/// `pub(crate)` form keeps `InboundTag` introspection accurate
+/// for downstream consumers.
 pub(crate) const TAG_CLOSE_COMPLETE: InboundTag = InboundTag::from_byte(b'3');
 
 /// Backend `ParameterDescription` message tag (`'t'`).
@@ -249,11 +245,11 @@ pub const TAG_PARAMETER_DESCRIPTION: InboundTag = InboundTag::from_byte(b't');
 /// limit has produced its row quota. The portal is not closed —
 /// a subsequent `Execute` continues from where this one paused.
 ///
-/// **1c-3b scope:** `max_rows = 0` (fetch all) is the only
+/// **Current scope:** `max_rows = 0` (fetch all) is the only
 /// supported shape; if a user-supplied `max_rows != 0` causes
 /// the server to emit `PortalSuspended`, the dispatch path
 /// classifies as `UnexpectedFrame` (tier-2 structural). Chunked
-/// fetching with portal suspension is scheduled for 1c-6.
+/// fetching with portal suspension is not yet implemented.
 pub const TAG_PORTAL_SUSPENDED: InboundTag = InboundTag::from_byte(b's');
 
 // Outbound commands (frontend → backend):
@@ -276,22 +272,21 @@ pub const TAG_DESCRIBE: OutboundTag = OutboundTag::from_byte(b'D');
 /// Target-byte discriminator carried inside a frontend `Describe`
 /// frame (PG §55.2.2 field "S or P"). Typed enum with explicit
 /// byte-valued discriminants — the only two legal values at this
-/// wire slot are `'S'` (statement) and `'P'` (portal). 1c-3c.
+/// wire slot are `'S'` (statement) and `'P'` (portal).
 ///
 /// # Tier-1 vs raw `u8`
 ///
-/// Pre-uplift the builder would have taken a `target: u8`
-/// parameter; a call site passing `b'X'` would compile cleanly and
-/// produce a server `ErrorResponse` at runtime (tier-3 audit seam).
-/// The typed enum moves discrimination to the call site:
-/// `DescribeTargetByte::Statement` / `::Portal` are the only paths
-/// to construct a value, and the `byte()` method folds to a single
-/// literal at the monomorphic call site.
+/// A `target: u8` parameter would compile cleanly for a call site
+/// passing `b'X'` and produce a server `ErrorResponse` at runtime
+/// (tier-3 audit seam). The typed enum moves discrimination to the
+/// call site: `DescribeTargetByte::Statement` / `::Portal` are the
+/// only paths to construct a value, and the `byte()` method folds
+/// to a single literal at the monomorphic call site.
 ///
 /// Const-asserts below pin the wire bytes to PG spec; an arm-body
 /// edit swapping the two values would fail the build.
 ///
-/// # NOT `#[non_exhaustive]` — DEF-256 audit (2026-05-08)
+/// # NOT `#[non_exhaustive]`
 ///
 /// PG §55.2.2 defines exactly two Describe targets (`'S'` statement,
 /// `'P'` portal). Adding a third would be a major-protocol bump,
@@ -376,7 +371,7 @@ pub const TAG_CLOSE: OutboundTag = OutboundTag::from_byte(b'C');
 /// not.)
 pub const TAG_FLUSH: OutboundTag = OutboundTag::from_byte(b'H');
 
-/// The complete `Flush` frame on the wire — DEF-252 (audit 2026-05-08).
+/// The complete `Flush` frame on the wire.
 ///
 /// PG `Flush` has a 5-byte body: tag (`'H'`) + 4-byte length-field
 /// (BE u32 = 4, length includes itself but excludes the tag).
@@ -387,10 +382,10 @@ pub const TAG_FLUSH: OutboundTag = OutboundTag::from_byte(b'H');
 ///
 /// # Visibility
 ///
-/// `pub` — part of the user-facing API (parallels [`TERMINATE_WIRE_BYTES`]).
-/// Phase 1c-5 pipelining drivers will write `Flush` mid-batch to
-/// extract intermediate responses without committing the implicit
-/// transaction (that's `Sync`'s job).
+/// `pub` — part of the user-facing API (parallels
+/// [`TERMINATE_WIRE_BYTES`]). Pipelining drivers write `Flush`
+/// mid-batch to extract intermediate responses without committing
+/// the implicit transaction (that's `Sync`'s job).
 ///
 /// # Why a const, not a routed `Action::SendBytes`
 ///
@@ -398,10 +393,9 @@ pub const TAG_FLUSH: OutboundTag = OutboundTag::from_byte(b'H');
 /// the entire wire form is these 5 bytes regardless of context.
 /// Direct byte exposure lets driver code emit it without staging
 /// through the protocol's WriteBuf (matches `TERMINATE_WIRE_BYTES`
-/// convention). State-machine integration (a `PgCommand::Flush`
-/// variant) lands when the dispatch path is wired in 1c-5.
+/// convention).
 ///
-/// # Usage (Phase 1c-5+ pipelining drivers)
+/// # Usage
 ///
 /// ```ignore
 /// // Driver pseudocode — pipeline Bind+Execute then read partial
@@ -413,8 +407,8 @@ pub const TAG_FLUSH: OutboundTag = OutboundTag::from_byte(b'H');
 /// ```
 pub const FLUSH_WIRE_BYTES: [u8; 5] = [TAG_FLUSH.byte(), 0, 0, 0, 4];
 
-/// Frontend `Terminate` message tag (`'X'`) — DEF-223. Frontend
-/// graceful-close primitive (PG §55.7 "Message Formats").
+/// Frontend `Terminate` message tag (`'X'`) — graceful-close
+/// primitive (PG §55.7 "Message Formats").
 ///
 /// Sent immediately before TCP close. The server completes any
 /// in-flight query (best effort), releases locks, and closes the
@@ -429,7 +423,7 @@ pub const FLUSH_WIRE_BYTES: [u8; 5] = [TAG_FLUSH.byte(), 0, 0, 0, 4];
 /// itself, no payload).
 pub const TAG_TERMINATE: OutboundTag = OutboundTag::from_byte(b'X');
 
-/// The complete `Terminate` frame on the wire — DEF-223.
+/// The complete `Terminate` frame on the wire.
 ///
 /// Static byte literal. Mirrors [`SYNC_WIRE_BYTES`]: 5-byte body =
 /// tag (`'X'`) + 4-byte length-field (BE u32 = 4, length includes
@@ -437,15 +431,12 @@ pub const TAG_TERMINATE: OutboundTag = OutboundTag::from_byte(b'X');
 ///
 /// # Visibility
 ///
-/// `pub` — part of the user-facing API. Phase 1e wrapper drivers
-/// (`bsql-driver-postgres`, async wrappers) write these bytes to
-/// the socket immediately before TCP close to signal graceful
-/// shutdown. Direct byte exposure rather than a routed
+/// `pub` — part of the user-facing API. Wrapper drivers write these
+/// bytes to the socket immediately before TCP close to signal
+/// graceful shutdown. Direct byte exposure rather than a routed
 /// `Action::SendBytes` because Terminate happens OUTSIDE the
 /// state-machine envelope — it's the last frame, sent
-/// unconditionally regardless of `ProtoState`. The state-machine
-/// integration (an explicit `ProtoState::Closed` variant tracked
-/// by [`crate::ConnectionStatus`]) lands as DEF-009 in Phase 1e.
+/// unconditionally regardless of `ProtoState`.
 ///
 /// # Usage
 ///
@@ -458,8 +449,7 @@ pub const TAG_TERMINATE: OutboundTag = OutboundTag::from_byte(b'X');
 /// ```
 pub const TERMINATE_WIRE_BYTES: [u8; 5] = [TAG_TERMINATE.byte(), 0, 0, 0, 4];
 
-/// The complete `SSLRequest` packet on the wire — DEF-214
-/// (2026-05-05).
+/// The complete `SSLRequest` packet on the wire.
 ///
 /// 8-byte StartupMessage-shaped probe sent BEFORE the real
 /// StartupMessage on connections that want TLS. PG §55.10:
@@ -488,21 +478,22 @@ pub const TERMINATE_WIRE_BYTES: [u8; 5] = [TAG_TERMINATE.byte(), 0, 0, 0, 4];
 ///
 /// # Visibility
 ///
-/// `pub` — the user-facing wire primitive. Phase 1e wrapper drivers
-/// (`bsql-driver-postgres`) write these bytes BEFORE constructing
-/// the `PgProtocol` state machine; the byte handling for the
-/// 1-byte response is the driver's concern (it lives outside this
-/// crate's frame parser, which expects tagged + length-prefixed
-/// frames). Once TLS is established, the driver constructs
-/// `PgProtocol::new()` and pushes a normal `PgCommand::Startup`.
+/// `pub` — the user-facing wire primitive. Wrapper drivers write
+/// these bytes BEFORE constructing the `PgProtocol` state machine;
+/// the byte handling for the 1-byte response is the driver's
+/// concern (it lives outside this crate's frame parser, which
+/// expects tagged + length-prefixed frames). Once TLS is
+/// established, the driver constructs `PgProtocol::new()` and
+/// pushes a normal `PgCommand::Startup`.
 ///
-/// # State-machine integration (Phase 1e)
+/// # State-machine integration
 ///
-/// State-machine integration — explicit `ProtoState::ConnectingPreSsl
-/// AwaitingResponse` variant, response-byte feeder, transition
-/// logic — is deferred to Phase 1e alongside the driver wrapper.
-/// Today this primitive is wire-bytes-only, paralleling
-/// [`TERMINATE_WIRE_BYTES`].
+/// This primitive is wire-bytes-only, paralleling
+/// [`TERMINATE_WIRE_BYTES`]. A future
+/// `ProtoState::ConnectingPreSslAwaitingResponse` variant plus
+/// response-byte feeder would lift the SSL probe into the state-
+/// machine envelope; that integration is the driver wrapper's
+/// concern, not this crate's.
 ///
 /// # Usage
 ///
@@ -538,21 +529,15 @@ pub const SSL_REQUEST_WIRE_BYTES: [u8; 8] = [
 /// `AuthenticationOk` — sub-code 0.
 pub const AUTH_OK: u32 = 0;
 
-/// `AuthenticationCleartextPassword` — sub-code 3. DEF-215 (2026-05-05).
+/// `AuthenticationCleartextPassword` — sub-code 3.
 ///
 /// Server requests the user's password as a NUL-terminated
 /// cleartext string in a `PasswordMessage` ('p') frame. Most
 /// legacy on-prem PG configurations still default to this auth
 /// method; SCRAM (sub-code 10) became the default only in PG 14.
-///
-/// Wire-protocol-only constant in this commit — actual flow
-/// (`Credentials::CleartextPassword` variant + state-machine
-/// integration) lands in DEF-215 follow-up. Exhaustive matches on
-/// `AuthSubCode` will fail to build until handlers explicitly
-/// classify this code (currently rejected as `KnownButWrong`).
 pub const AUTH_CLEARTEXT_PASSWORD: u32 = 3;
 
-/// `AuthenticationMD5Password` — sub-code 5. DEF-216 (2026-05-05).
+/// `AuthenticationMD5Password` — sub-code 5.
 ///
 /// Server requests the password salted and hashed via the legacy
 /// MD5-based scheme. Client digest is `md5_hex(md5_hex(password
@@ -560,11 +545,6 @@ pub const AUTH_CLEARTEXT_PASSWORD: u32 = 3;
 /// `"md5"`, sent in a `PasswordMessage`. Salt is 4 bytes from the
 /// auth payload. Common in PG up to and including version 13 on
 /// enterprise on-prem installs; PG 14 and newer default to SCRAM.
-///
-/// Wire-protocol-only constant in this commit — actual flow
-/// (`Credentials::Md5Password` variant + `md5` RustCrypto
-/// dependency + state-machine integration) lands in DEF-216
-/// follow-up.
 pub const AUTH_MD5_PASSWORD: u32 = 5;
 
 /// `AuthenticationSASL` — sub-code 10. Mechanism list follows.
@@ -594,16 +574,16 @@ pub const AUTH_SASL_FINAL: u32 = 12;
 /// }
 /// ```
 ///
-/// DEF-154 (R) P1-3: reclassified from `rust,ignore` to `text` —
-/// the snippet is historical pre-`AuthSubCode` pseudo-code, not
-/// a runnable example. `rust,ignore` left it compiler-unchecked
-/// and drift-prone.
+/// The snippet above is `text`-fenced (not `rust,ignore`) because
+/// it is pre-`AuthSubCode` pseudo-code, not a runnable example —
+/// `rust,ignore` would leave it compiler-unchecked and drift-prone.
 ///
-/// The `_` arm swallowed unknown codes alongside unhandled-but-known
-/// codes. Adding a new legitimate sub-code (e.g., future
-/// `AuthenticationMD5Password` support) would have no compile-time
-/// indication at the handlers — they'd silently fall through to
-/// `UnsupportedAuthMethod` even in states where the code is legal.
+/// The `_` arm in that shape swallows unknown codes alongside
+/// unhandled-but-known codes. Adding a new legitimate sub-code
+/// (e.g., future `AuthenticationMD5Password` support) would have
+/// no compile-time indication at the handlers — they'd silently
+/// fall through to `UnsupportedAuthMethod` even in states where
+/// the code is legal.
 ///
 /// With [`AuthSubCode`] typed, handlers match on enum variants:
 /// adding a new variant (e.g., `Md5` for AUTH_MD5_PASSWORD) forces
@@ -628,11 +608,11 @@ pub const AUTH_SASL_FINAL: u32 = 12;
 pub enum AuthSubCode {
     /// `AuthenticationOk` (0). Server accepted authentication.
     Ok = 0,
-    /// `AuthenticationCleartextPassword` (3). DEF-215 (2026-05-05).
+    /// `AuthenticationCleartextPassword` (3).
     /// Server requests cleartext password in a `PasswordMessage`.
     /// Most legacy on-prem PG configs still default to this.
     CleartextPassword = 3,
-    /// `AuthenticationMD5Password` (5). DEF-216 (2026-05-05).
+    /// `AuthenticationMD5Password` (5).
     /// Server requests salted MD5 password digest in a
     /// `PasswordMessage`. Common in PG ≤ 13 enterprise installs.
     Md5Password = 5,
@@ -653,7 +633,6 @@ impl AuthSubCode {
     /// [`crate::action::TxStatus::try_from_byte`] shapes. Callers
     /// forward the raw value to
     /// `UnsupportedAuthMethod { sub_code: AuthSubCodeClass::Unknown(u) }`.
-    /// F-046 (pass-#8): consistent sealed-classifier family.
     #[inline]
     pub const fn try_from_u32(code: u32) -> Result<Self, u32> {
         match code {
@@ -684,7 +663,7 @@ impl AuthSubCode {
     }
 }
 
-// DEF-154 (V) P2-4: round-trip compile pin for AuthSubCode.
+// Round-trip compile pin for AuthSubCode.
 const _: () = {
     assert!(
         matches!(AuthSubCode::try_from_u32(AuthSubCode::Ok.raw()), Ok(AuthSubCode::Ok)),
@@ -725,7 +704,6 @@ pub const SCRAM_SHA_256_MECHANISM: &[u8] = b"SCRAM-SHA-256";
 pub const PROTOCOL_VERSION_3_0: u32 = 196608;
 
 /// PG `SSLRequest` magic version code = 80877103 (0x04d2162f).
-/// DEF-214 (2026-05-05).
 ///
 /// This is NOT a real protocol version — it's a sentinel value in
 /// the `version` field of the StartupMessage-shaped 8-byte
@@ -733,14 +711,13 @@ pub const PROTOCOL_VERSION_3_0: u32 = 196608;
 /// before sending the actual StartupMessage". PG §55.10
 /// "SSL Session Encryption". The companion code
 /// [`GSSENC_REQUEST_VERSION`] (80877104) is the GSS encryption
-/// counterpart, deferred to post-v1.0 (see DEF-230).
+/// counterpart (not yet supported in this crate).
 ///
 /// Composed of (1234 << 16) | 5679 — PG's standard "magic-version"
 /// shape (CancelRequest uses 1234 << 16 | 5678 = 80877102, etc.).
 pub const SSL_REQUEST_VERSION: u32 = 80877103;
 
 /// PG `CancelRequest` magic version code = 80877102 (0x04d2162e).
-/// DEF-221 (2026-05-07).
 ///
 /// Sentinel value sent in the version field of the StartupMessage-
 /// shaped 16-byte CancelRequest packet on a SEPARATE TCP connection
@@ -753,8 +730,7 @@ pub const SSL_REQUEST_VERSION: u32 = 80877103;
 /// [`MAGIC_VERSION_HIGH_HALF`] for the family-pin formula.
 pub const CANCEL_REQUEST_VERSION: u32 = 80877102;
 
-/// DEF-278 Bundle D (2026-05-17) — wire-length constant for the
-/// CancelRequest packet per PG §55.2.7.
+/// Wire-length constant for the CancelRequest packet per PG §55.2.7.
 ///
 /// 16 bytes total: 4 B length-field + 4 B magic version + 4 B pid +
 /// 4 B secret_key. The drift-pin below cross-checks against
@@ -798,17 +774,17 @@ const _CANCEL_REQUEST_LEN_DRIFT_PIN: () = {
 };
 
 /// Shared high half (1234 = 0x04d2) of every PG magic-version
-/// sentinel. DEF-221 (2026-05-07).
+/// sentinel.
 ///
 /// PG's StartupMessage-shaped magic packets all encode their
 /// "version" field as `(MAGIC_VERSION_HIGH_HALF << 16) | low`
 /// where `low` discriminates the variant:
 ///
-/// | low  | message        | const                                |
-/// |------|----------------|--------------------------------------|
-/// | 5678 | CancelRequest  | [`CANCEL_REQUEST_VERSION`]           |
-/// | 5679 | SSLRequest     | [`SSL_REQUEST_VERSION`]              |
-/// | 5680 | GSSENCRequest  | post-v1.0 (DEF-230); not yet a const |
+/// | low  | message        | const                                 |
+/// |------|----------------|---------------------------------------|
+/// | 5678 | CancelRequest  | [`CANCEL_REQUEST_VERSION`]            |
+/// | 5679 | SSLRequest     | [`SSL_REQUEST_VERSION`]               |
+/// | 5680 | GSSENCRequest  | not supported yet                     |
 ///
 /// Real protocol version codes (e.g. [`PROTOCOL_VERSION_3_0`] =
 /// `3 << 16 | 0`) use a different shape — the magic 1234 marker
@@ -816,16 +792,15 @@ const _CANCEL_REQUEST_LEN_DRIFT_PIN: () = {
 /// "this is a magic packet, not a real StartupMessage" by
 /// inspecting the high 16 bits alone.
 ///
-/// Pinning the formula (not just the values) means: when DEF-230
-/// ships GSSENCRequest, the new const must satisfy
+/// Pinning the formula (not just the values) means: a future
+/// GSSENCRequest const must satisfy
 /// `(MAGIC_VERSION_HIGH_HALF << 16) | 5680`; if a contributor
 /// types `1235 << 16` by mistake, the const-assert below fails at
 /// build time.
 pub const MAGIC_VERSION_HIGH_HALF: u32 = 1234;
 
 /// Typed classification of the single byte the server sends in
-/// response to an `SSLRequest` packet (PG §55.10). DEF-214
-/// (2026-05-05) Phase 2.
+/// response to an `SSLRequest` packet (PG §55.10).
 ///
 /// The SSL response byte is **out-of-band**: it has no length
 /// prefix and no tagged-frame envelope, so it cannot flow through
@@ -897,22 +872,21 @@ pub enum SslNegotiationOutcome {
 }
 
 /// Classify the single byte a PG server sends in response to an
-/// `SSLRequest` packet. DEF-214 (2026-05-05) Phase 2.
+/// `SSLRequest` packet.
 ///
 /// Pure mapping — no allocation, no panic, `const fn`. See
 /// [`SslNegotiationOutcome`] for the response-byte semantics.
 ///
 /// # Tier impact
 ///
-/// Pre-DEF-214 Phase 2, drivers wrote ad-hoc
+/// A driver-side ad-hoc
 /// `match byte { b'S' => ..., b'N' => ..., b'E' => ..., _ => ... }`
-/// at every call site — tier-3 by-discipline (forgetting a branch
-/// silently mishandles the connection). Post-Phase 2, the
-/// match scrutinee is the typed [`SslNegotiationOutcome`] with
-/// `#[non_exhaustive]`, lifting the dispatch to tier-1 for the
-/// known-byte arms (compiler enforces handling) and tier-3 for
-/// the future-extension arm (catch-all required by
-/// `#[non_exhaustive]`).
+/// at every call site would be tier-3 by-discipline (forgetting a
+/// branch silently mishandles the connection). The typed
+/// [`SslNegotiationOutcome`] with `#[non_exhaustive]` lifts the
+/// dispatch to tier-1 for the known-byte arms (compiler enforces
+/// handling) and tier-3 for the future-extension arm (catch-all
+/// required by `#[non_exhaustive]`).
 #[inline]
 #[must_use]
 pub const fn classify_ssl_response_byte(byte: u8) -> SslNegotiationOutcome {
@@ -924,10 +898,9 @@ pub const fn classify_ssl_response_byte(byte: u8) -> SslNegotiationOutcome {
     }
 }
 
-// DEF-214 Phase 2 (2026-05-05): tier-1 round-trip pin for
-// `classify_ssl_response_byte`. If the classifier's mapping
-// drifts (e.g. someone swaps the 'S' and 'N' arm bodies), these
-// asserts fire at build time.
+// Tier-1 round-trip pin for `classify_ssl_response_byte`. If the
+// classifier's mapping drifts (e.g. someone swaps the 'S' and 'N'
+// arm bodies), these asserts fire at build time.
 const _: () = {
     assert!(matches!(
         classify_ssl_response_byte(b'S'),
@@ -965,11 +938,10 @@ const _: () = assert!(
     "Sync length-field must be 4 (length includes itself, no payload)",
 );
 
-// DEF-223 (2026-05-05): drift-pin for `TERMINATE_WIRE_BYTES`. Same
-// shape as the `SYNC_WIRE_BYTES` block above. If a future edit
-// changes either the tag literal or the length field, these
-// asserts fail at build time. Tier-1 against typo-induced wire
-// breaks.
+// Drift-pin for `TERMINATE_WIRE_BYTES`. Same shape as the
+// `SYNC_WIRE_BYTES` block above. If a future edit changes either
+// the tag literal or the length field, these asserts fail at
+// build time. Tier-1 against typo-induced wire breaks.
 const _: () = assert!(TERMINATE_WIRE_BYTES.len() == 5);
 const _: () = assert!(TERMINATE_WIRE_BYTES[0] == b'X');
 const _: () = assert!(
@@ -980,11 +952,11 @@ const _: () = assert!(
     "Terminate length-field must be 4 (length includes itself, no payload)",
 );
 
-// DEF-252 (audit 2026-05-08): drift-pin for `FLUSH_WIRE_BYTES`. Same
-// shape as the `SYNC_WIRE_BYTES` / `TERMINATE_WIRE_BYTES` blocks
-// above. If a future edit changes either the tag literal or the
-// length field, these asserts fail at build time. Tier-1 against
-// typo-induced wire breaks.
+// Drift-pin for `FLUSH_WIRE_BYTES`. Same shape as the
+// `SYNC_WIRE_BYTES` / `TERMINATE_WIRE_BYTES` blocks above. If a
+// future edit changes either the tag literal or the length field,
+// these asserts fail at build time. Tier-1 against typo-induced
+// wire breaks.
 const _: () = assert!(FLUSH_WIRE_BYTES.len() == 5);
 const _: () = assert!(FLUSH_WIRE_BYTES[0] == b'H');
 const _: () = assert!(
@@ -1007,14 +979,13 @@ const _: () = assert!(
      ('H' / 'S' / 'X' per PG §55.7) — copy-paste safety net",
 );
 
-// DEF-214 (2026-05-05): drift-pin for `SSL_REQUEST_WIRE_BYTES` and
-// the underlying `SSL_REQUEST_VERSION` const. Sentinel value
-// 80877103 = 0x04d2162f per PG §55.10. The byte literal in the
-// array MUST match `SSL_REQUEST_VERSION.to_be_bytes()`; the
-// length field MUST be exactly 8 (length includes itself, version
-// is the only payload). A bump of either operand without
-// matching the other breaks the build here. Tier-1 against
-// typo-induced wire breaks.
+// Drift-pin for `SSL_REQUEST_WIRE_BYTES` and the underlying
+// `SSL_REQUEST_VERSION` const. Sentinel value 80877103 = 0x04d2162f
+// per PG §55.10. The byte literal in the array MUST match
+// `SSL_REQUEST_VERSION.to_be_bytes()`; the length field MUST be
+// exactly 8 (length includes itself, version is the only payload).
+// A bump of either operand without matching the other breaks the
+// build here. Tier-1 against typo-induced wire breaks.
 const _: () = assert!(SSL_REQUEST_WIRE_BYTES.len() == 8);
 const _: () = assert!(SSL_REQUEST_VERSION == 80_877_103);
 const _: () = assert!(
@@ -1040,16 +1011,16 @@ const _: () = {
     );
 };
 
-// DEF-221 (2026-05-07): magic-version family pin.
+// Magic-version family pin.
 //
-// Every magic-version sentinel in the PG protocol shares the
-// shape `(MAGIC_VERSION_HIGH_HALF << 16) | low_half`. Pinning
-// the FORMULA (not just the value) means: when DEF-230 ships
-// GSSENCRequest, the new const must satisfy this same formula
-// (with `low_half = 5680`); if a contributor types `1235 << 16`
-// by mistake, the assert below fires at build time.
+// Every magic-version sentinel in the PG protocol shares the shape
+// `(MAGIC_VERSION_HIGH_HALF << 16) | low_half`. Pinning the FORMULA
+// (not just the value) means: a future GSSENCRequest const must
+// satisfy this same formula (with `low_half = 5680`); if a
+// contributor types `1235 << 16` by mistake, the assert below
+// fires at build time.
 //
-// We also pin the disjointness vs real protocol version codes
+// The asserts also pin disjointness vs real protocol version codes
 // — `PROTOCOL_VERSION_3_0 = 3 << 16 | 0` uses high half 3, NOT
 // 1234 — so a copy-paste typo bumping the protocol version into
 // the magic band is caught.
@@ -1082,8 +1053,7 @@ const _: () = assert!(
     "SSL and CancelRequest magic versions must be distinct",
 );
 
-/// Build a `CancelRequest` packet on the wire — DEF-221
-/// (2026-05-07).
+/// Build a `CancelRequest` packet on the wire.
 ///
 /// 16-byte StartupMessage-shaped packet sent on a SEPARATE TCP
 /// connection to cancel an in-flight query on the ORIGINAL
@@ -1099,11 +1069,12 @@ const _: () = assert!(
 /// ```
 ///
 /// `pid` and `secret_key` come from the `BackendKeyData` ('K')
-/// frame the server emits during startup (currently captured in
-/// the [`crate::ProtoState::ConnectingPostAuthHaveKey`] variant;
-/// Phase 1e will surface them on the `Connection` typestate).
+/// frame the server emits during startup (captured in the
+/// [`crate::ProtoState::ConnectingPostAuthHaveKey`] variant; a
+/// future driver wrapper can surface them on a `Connection`
+/// typestate).
 ///
-/// # Driver protocol (Phase 1e wrapper concern)
+/// # Driver protocol
 ///
 /// 1. Open a NEW TCP socket to the same PG server (the cancel
 ///    cannot piggy-back on the connection running the query —
@@ -1142,7 +1113,7 @@ const _: () = assert!(
 /// # Usage
 ///
 /// ```ignore
-/// // Driver pseudocode (Phase 1e):
+/// // Driver pseudocode:
 /// async fn cancel_inflight(server_addr: SocketAddr, pid: i32, secret: i32) -> io::Result<()> {
 ///     let mut socket = TcpStream::connect(server_addr).await?;
 ///     socket.write_all(&bsql_pg_proto::cancel_request_bytes(pid, secret)).await?;
@@ -1152,13 +1123,12 @@ const _: () = assert!(
 #[inline]
 #[must_use]
 pub const fn cancel_request_bytes(pid: i32, secret_key: i32) -> [u8; 16] {
-    // DEF-278 Bundle D (2026-05-17): reference CANCEL_REQUEST_LEN
-    // instead of the hardcoded 16u32 so the constant is the single
-    // source of truth for the length-field byte composition. The
-    // drift-pin above asserts `CANCEL_REQUEST_LEN == 16` and the
-    // post-builder assert block below cross-checks the encoded
-    // length-field bytes — three independent pins on the same
-    // invariant.
+    // Reference `CANCEL_REQUEST_LEN` (not a hardcoded `16u32`) so
+    // the constant is the single source of truth for the length-
+    // field byte composition. The drift-pin above asserts
+    // `CANCEL_REQUEST_LEN == 16` and the post-builder assert block
+    // below cross-checks the encoded length-field bytes — three
+    // independent pins on the same invariant.
     let len = CANCEL_REQUEST_LEN.to_be_bytes();
     let ver = CANCEL_REQUEST_VERSION.to_be_bytes();
     let p = pid.to_be_bytes();
@@ -1171,11 +1141,10 @@ pub const fn cancel_request_bytes(pid: i32, secret_key: i32) -> [u8; 16] {
     ]
 }
 
-// DEF-221 (2026-05-07): tier-1 round-trip pins for
-// `cancel_request_bytes` layout. Same shape as the SSLRequest
-// drift-pins above. If a future edit reorders the fields, swaps
-// length/version positions, or breaks BE encoding, these
-// assertions fail at build time.
+// Tier-1 round-trip pins for `cancel_request_bytes` layout. Same
+// shape as the SSLRequest drift-pins above. If a future edit
+// reorders the fields, swaps length/version positions, or breaks
+// BE encoding, these assertions fail at build time.
 const _: () = {
     // Spec-canonical zero pid + zero secret_key — pins length
     // field + version field exactly; the dynamic-payload bytes
@@ -1239,7 +1208,7 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------
-// Tag collision defenses (§10 of DEF-094 audit round 2, 2026-04-20)
+// Tag collision defenses
 //
 // PG wire semantics: each direction has its own tag-space. Inside
 // a direction, two distinct messages MUST carry distinct tag
@@ -1264,7 +1233,7 @@ const _: () = {
 /// Pairwise `const _: () = assert!(A != B, …)` distinctness at
 /// build time — recursive macro expansion generates one
 /// anonymous const per pair, auto-scaling as the caller's ident
-/// list grows. Tier-1 compile. DEF-111 / DEF-116.
+/// list grows. Tier-1 compile.
 ///
 /// **Why macro, not `const fn`.** MSRV 1.95 blocks the obvious
 /// `const fn walk(arr: &[u8])` form: safe `<[T]>::get(i)` is not
@@ -1338,7 +1307,7 @@ assert_all_distinct!(
     TAG_BACKEND_KEY_DATA,
     TAG_NEGOTIATE_PROTOCOL_VERSION,
     TAG_NOTICE_RESPONSE,
-    // Phase 1c additions:
+    // Query-flow inbound tags:
     TAG_ROW_DESCRIPTION,
     TAG_DATA_ROW,
     TAG_COMMAND_COMPLETE,
@@ -1356,7 +1325,7 @@ assert_all_distinct!(
     "outbound PG wire tag",
     TAG_SYNC,
     TAG_SASL_RESPONSE,
-    // Phase 1c additions:
+    // Query-flow outbound tags:
     TAG_QUERY,
     TAG_PARSE,
     TAG_BIND,
@@ -1364,7 +1333,7 @@ assert_all_distinct!(
     TAG_EXECUTE,
     TAG_CLOSE,
     TAG_FLUSH,
-    // Phase 1e additions:
+    // Connection-teardown:
     TAG_TERMINATE,
 );
 
