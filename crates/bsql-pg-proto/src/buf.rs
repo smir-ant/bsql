@@ -26,6 +26,7 @@
 
 use crate::frame::READ_BUF_CAP;
 use core::fmt;
+use core::num::NonZeroU32;
 use heapless::{CapacityError, Vec};
 
 /// Bounded byte buffer for inbound wire data — generic-form.
@@ -501,17 +502,31 @@ pub struct ReadBuf {
     /// Read cursor into the active storage. Tier-1 invariant:
     /// `cursor <= active_storage.len() <= cap <= 65_535`.
     cursor: u16,
-    /// **DEF-248 Sub-A (2026-05-12)** — partial-frame mode tracker.
+    /// **DEF-248 Sub-A (2026-05-12) + Tier-3 audit #34 (2026-05-19)** —
+    /// partial-frame mode tracker.
     ///
-    /// `0` outside partial-frame mode (the common case: every frame
+    /// **Type-level state encoding**: `Option<NonZeroU32>` where
+    /// `None` = not in partial mode (the common case: every frame
     /// either fits whole in the active storage, or the dispatcher
     /// classifies it as `FrameTooLarge` and tears down).
     ///
-    /// Non-zero inside partial-frame mode: the count of body bytes
-    /// the wire still owes us before the in-flight frame body is
-    /// complete. Decremented as bytes are consumed (drained via
-    /// `subtract_partial_remaining`) by the streaming consumer
-    /// ([`crate::row_stream::RowStream::col_next`] in Sub-A scope).
+    /// `Some(remaining)` = in partial mode; `remaining.get()` is the
+    /// count of body bytes the wire still owes us before the in-
+    /// flight frame body is complete. Decremented as bytes are
+    /// consumed via [`Self::subtract_partial_remaining`]; transitions
+    /// to `None` when the counter reaches `0`.
+    ///
+    /// # Tier-3 audit #34 closure
+    ///
+    /// Pre-audit, the field was `partial_remaining: u32` with
+    /// `0 ⟺ not in partial mode` (value-level invariant, tier-2 by-
+    /// discipline). A future bug `self.partial_remaining = 0` while
+    /// intending to stay in partial mode would be a compile-clean
+    /// silent desync. With `Option<NonZeroU32>` the "in partial
+    /// mode" state is captured at type level — writing
+    /// `partial_remaining = 0` no longer typechecks, only explicit
+    /// `partial_remaining = None` (exit) or `partial_remaining =
+    /// NonZeroU32::new(_)` (which is itself a Result-returning shape).
     ///
     /// Tier-1 by-construction: the field is `pub(crate)`-visible
     /// only via the `partial_*` accessors below, and the mutators
@@ -526,7 +541,7 @@ pub struct ReadBuf {
     /// `HeaderParse::FrameTooLarge` (memo §1 third bullet — Sub-B's
     /// concern). The partial-mode counter itself is frame-agnostic;
     /// only the policy that gates entry is tag-restricted.
-    partial_remaining: u32,
+    partial_remaining: Option<NonZeroU32>,
 }
 
 impl Default for ReadBuf {
@@ -550,7 +565,7 @@ impl ReadBuf {
             // DEF-248 Sub-A: `0` is the canonical "not in partial
             // mode" sentinel. Entered only via the leaf-gated
             // `enter_partial_mode` below.
-            partial_remaining: 0,
+            partial_remaining: None,
         }
     }
 
@@ -692,7 +707,7 @@ impl ReadBuf {
         // here keeps the post-clear invariant tight: any subsequent
         // header parse starts in non-partial mode regardless of
         // whether the cleared state had been mid-frame.
-        self.partial_remaining = 0;
+        self.partial_remaining = None;
     }
 
     /// Number of bytes currently unread.
@@ -816,7 +831,7 @@ impl ReadBuf {
     #[inline]
     #[must_use]
     pub(crate) const fn is_in_partial_mode(&self) -> bool {
-        self.partial_remaining > 0
+        self.partial_remaining.is_some()
     }
 
     /// Bytes the wire still owes for the in-flight frame body.
@@ -845,7 +860,10 @@ impl ReadBuf {
     #[inline]
     #[must_use]
     pub(crate) const fn partial_remaining(&self) -> u32 {
-        self.partial_remaining
+        match self.partial_remaining {
+            Some(n) => n.get(),
+            None => 0,
+        }
     }
 
     /// Enter partial-frame mode. The leaf-minted token gates this
@@ -884,13 +902,25 @@ impl ReadBuf {
         _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
         declared_len: u32,
     ) -> Result<(), AlreadyInPartialMode> {
-        if self.partial_remaining != 0 {
+        if let Some(prev) = self.partial_remaining {
             return Err(AlreadyInPartialMode {
-                prev_remaining: self.partial_remaining,
+                prev_remaining: prev.get(),
                 new_declared_len: declared_len,
             });
         }
-        self.partial_remaining = declared_len;
+        // Tier-3 audit #34 (2026-05-19): typed transition. The `Some`
+        // arm of the type-state means "in partial mode"; the None-to-
+        // Some flip happens here exactly once per partial frame.
+        // `NonZeroU32::new(declared_len)` returns None for the
+        // architecturally-dead `declared_len == 0` case — a PG wire
+        // frame with body length < 5 (header is 5 bytes inclusive) is
+        // pre-rejected by `parse_header`, so the upstream caller never
+        // hands us 0. The unwrap_or path keeps partial_remaining at
+        // None (i.e., we silently fail to enter partial mode); that
+        // branch is dead but the typed Result return doesn't currently
+        // surface it (matching the pre-audit u32 shape which also did
+        // not surface `declared_len == 0`).
+        self.partial_remaining = NonZeroU32::new(declared_len);
         Ok(())
     }
 
@@ -930,15 +960,16 @@ impl ReadBuf {
         &mut self,
         _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
     ) -> Result<(), PartialModeExitUndrained> {
-        if self.partial_remaining != 0 {
+        if let Some(remaining) = self.partial_remaining {
             return Err(PartialModeExitUndrained {
-                remaining: self.partial_remaining,
+                remaining: remaining.get(),
             });
         }
-        // Already 0; the explicit write makes the intent visible and
-        // mirrors the enter-side's `self.partial_remaining = declared_len`
-        // shape symmetry.
-        self.partial_remaining = 0;
+        // Already None; the explicit write makes the intent visible
+        // and mirrors the enter-side's `self.partial_remaining =
+        // NonZeroU32::new(declared_len)` symmetry. Post-audit #34:
+        // the assignment is the explicit type-state exit transition.
+        self.partial_remaining = None;
         Ok(())
     }
 
@@ -958,7 +989,16 @@ impl ReadBuf {
         _token: &crate::row_stream::_row_stream_partial_leaf::PartialFrameToken,
         n: u32,
     ) -> Result<(), AdvancePastEnd> {
-        if n > self.partial_remaining {
+        // Tier-3 audit #34 (2026-05-19): map the type-state into the
+        // u32 representation for the subtract arithmetic. The None
+        // arm (not in partial mode) is treated as "0 remaining" for
+        // diagnostic purposes — a caller subtracting while not in
+        // partial mode trips the n > current check immediately.
+        let current = match self.partial_remaining {
+            Some(remaining) => remaining.get(),
+            None => 0,
+        };
+        if n > current {
             // Diagnostic-display saturation: `requested` and `available`
             // are `usize` fields on AdvancePastEnd whose sole role is
             // operator-visible error reporting. `try_from(u32) -> usize`
@@ -973,10 +1013,13 @@ impl ReadBuf {
             // through typed Result instead.
             return Err(AdvancePastEnd {
                 requested: usize::try_from(n).unwrap_or(usize::MAX),
-                available: usize::try_from(self.partial_remaining).unwrap_or(usize::MAX),
+                available: usize::try_from(current).unwrap_or(usize::MAX),
             });
         }
-        self.partial_remaining = self.partial_remaining.saturating_sub(n);
+        // Type-state transition: when `current - n` reaches 0 we exit
+        // partial mode automatically (Some(_) → None). Otherwise we
+        // stay in partial mode with the decremented count.
+        self.partial_remaining = NonZeroU32::new(current.saturating_sub(n));
         Ok(())
     }
 }
