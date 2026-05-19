@@ -1283,11 +1283,22 @@ pub enum StagedReply {
 /// from. **Tier-1 by-construction**.
 ///
 /// `#[doc(hidden)] pub` — see [`StagedReply`] for visibility rationale.
+///
+/// # Tier-4 Cluster B (2026-05-19) — field visibility tightened
+///
+/// Pre-Cluster-B fields were `pub` (with `#[doc(hidden)]`) for the
+/// same trait-bound reason as the type — but `pub` fields enable
+/// external struct-literal construction (`StagedQueryCompletePayload
+/// { command_tag, tx_status }`), bypassing the `From` impls'
+/// crate-internal construction path. Fields are now `pub(crate)`:
+/// the type stays `pub` (forced by `ReplyKind::StagedPayload` trait
+/// bound), but only in-crate code can construct via struct literal.
+/// Closes the "hidden-but-reachable" bypass class.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedQueryCompletePayload {
-    #[doc(hidden)] pub command_tag: crate::ident::BoundedStr<32>,
-    #[doc(hidden)] pub tx_status: TxStatus,
+    pub(crate) command_tag: crate::ident::BoundedStr<32>,
+    pub(crate) tx_status: TxStatus,
 }
 
 /// Lifetime-free staged counterpart to
@@ -1305,11 +1316,13 @@ pub struct StagedQueryCompletePayload {
 /// `debug_assert!(false)` arm for the architecturally-impossible
 /// `Rows`-without-slot mismatch — CREDO §V banned defensive-for-
 /// impossible) was deleted in the same closure. Tier-1 by-construction.
+/// Tier-4 Cluster B (2026-05-19): fields tightened to `pub(crate)`;
+/// see [`StagedQueryCompletePayload`] for the bypass-closure rationale.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribeStatementCompletePayload {
-    #[doc(hidden)] pub param_oids: ParamOids,
-    #[doc(hidden)] pub tx_status: TxStatus,
+    pub(crate) param_oids: ParamOids,
+    pub(crate) tx_status: TxStatus,
 }
 
 /// Lifetime-free staged counterpart to
@@ -1317,10 +1330,12 @@ pub struct StagedDescribeStatementCompletePayload {
 ///
 /// DEF-210 SR-01-D Path D — see the
 /// [`StagedDescribeStatementCompletePayload`] docstring.
+/// Tier-4 Cluster B (2026-05-19): field tightened to `pub(crate)`;
+/// see [`StagedQueryCompletePayload`] for the bypass-closure rationale.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribePortalCompletePayload {
-    #[doc(hidden)] pub tx_status: TxStatus,
+    pub(crate) tx_status: TxStatus,
 }
 
 // From impls: schema-less payloads wrap directly; schema-bearing
