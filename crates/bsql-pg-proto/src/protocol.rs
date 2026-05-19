@@ -3541,10 +3541,10 @@ where
     } = ctx;
 
     write_buf.clear();
-    // DEF-211 FAKE-01: feed_bytes can be called in any state.
-    // Compute `push_class()` ONCE here and pass to the residue
-    // helper — pre-FAKE-01 the helper computed `push_class`
-    // internally (~+10 ns per call). Caching at the entry point
+    // feed_bytes can be called in any state. Compute
+    // `push_class()` ONCE here and pass to the residue helper. A
+    // naive shape would have the helper compute `push_class`
+    // internally (~+10 ns per call); caching at the entry point
     // amortises one classification across the full feed_bytes
     // dispatch loop.
     let entry_class = state.push_class();
@@ -3556,30 +3556,25 @@ where
         entry_class,
     );
 
-    // DEF-154 (H+V) pending_advance DELETED 2026-04-24: the
-    // deferred-advance slot existed because `StagedAction::StreamRowRange`
-    // once carried `row_bytes: &'r [u8]` into read_buf — cursor
-    // advance while that borrow was alive = borrow-check
-    // conflict. DEF-154 (Y) DELETED `StreamRowRange` entirely.
-    // Post-(Y) no StagedAction variant carries a read_buf borrow,
-    // so cursor advance can fire IN-SCOPE inside the dispatch
-    // loop with no conflict. See struct docstring field
-    // comment for full post-mortem.
+    // No `pending_advance` slot is needed: cursor advance fires
+    // IN-SCOPE inside the dispatch loop because no `StagedAction`
+    // variant carries a read_buf borrow. A naive shape would have a
+    // `StreamRowRange { row_bytes: &'r [u8] }` variant that pulled
+    // into read_buf — cursor advance while that borrow is alive is
+    // a borrow-check conflict. Instead the row-streaming surface
+    // uses the typed Reply<'r> route via DeliverReply, never
+    // re-borrowing read_buf in StagedAction.
 
-    // DEF-185 P1-6 (audit 2026-04-24): consolidated control flow.
-    //
-    // Pre-fix: scattered state checks at lines 871-875 (decide
-    // whether to append), 892-898 (short-circuit if Errored), and
-    // 902-918 (handle append_err). Logically identical but the
-    // borrow-checker constraints forced the append to fire before
+    // Single point of classification. The `IngressClassification`
+    // enum enumerates every legal entry condition (Errored /
+    // AppendFailed / Ok) so the dispatcher match is tier-1
+    // exhaustive. Each arm has one canonical handler path. A naive
+    // shape would scatter state checks across the body (one to
+    // decide whether to append, one to short-circuit on Errored,
+    // one to handle the append-err) — logically identical, but
+    // the borrow-checker forces the append to fire before
     // split-borrows, creating a visual disconnect between the
-    // first Errored check and the subsequent handler.
-    //
-    // Post-fix: single point of classification. The
-    // `IngressClassification` enum enumerates every legal entry
-    // condition (Errored / AppendFailed / Ok) so the dispatcher
-    // match is tier-1 exhaustive. Each arm has one canonical
-    // handler path.
+    // initial Errored check and the subsequent handler.
     #[derive(Debug)]
     enum IngressClassification {
         AlreadyErrored,
@@ -3587,18 +3582,17 @@ where
         Ok,
     }
 
-    // DEF-248 Sub-B (2026-05-12) — partial-mode bytes routing.
-    // When the partial-assembly cell is active (an oversize non-`'D'`
-    // body is mid-flight), inbound bytes route to the assembly
-    // accumulator FIRST. Up to `body_remaining` bytes are consumed
-    // (copied to the bounded prefix or counted-and-skipped beyond
-    // the cap); only the leftover (bytes belonging to the NEXT
-    // frame) flows to ReadBuf.
+    // Partial-mode bytes routing. When the partial-assembly cell is
+    // active (an oversize non-`'D'` body is mid-flight), inbound
+    // bytes route to the assembly accumulator FIRST. Up to
+    // `body_remaining` bytes are consumed (copied to the bounded
+    // prefix or counted-and-skipped beyond the cap); only the
+    // leftover (bytes belonging to the NEXT frame) flows to ReadBuf.
     //
     // Routing is gated on `is_active() -> bool`, a single byte-load
     // on the `Option<Box<_>>` niche discriminant. The inactive arm
-    // runs `read_buf.append(bytes)` byte-for-byte as before — no
-    // perf delta on the hot path.
+    // runs `read_buf.append(bytes)` byte-for-byte — no perf delta
+    // on the hot path.
     let bytes_for_readbuf: &[u8] = if !matches!(*state, ProtoState::Errored(_))
         && partial_assembly_slot.is_active()
     {
@@ -3607,11 +3601,12 @@ where
             partial_assembly_slot,
             bytes,
         );
-        // DEF-280 sweep (2026-05-18): explicit bounds-check before
-        // the `.unwrap_or(&[])` syntactic fallback. `absorb_partial_*`
-        // returns the count of bytes it consumed from `bytes`, so
+        // Explicit bounds-check before the `.unwrap_or(&[])`
+        // syntactic fallback. `absorb_partial_*` returns the count
+        // of bytes it consumed from `bytes`, so
         // `absorbed <= bytes.len()` by the function's contract; the
-        // None arm of `bytes.get(absorbed..)` is architecturally dead.
+        // None arm of `bytes.get(absorbed..)` is architecturally
+        // dead.
         if absorbed > bytes.len() {
             core::hint::cold_path();
             &[]
@@ -3633,14 +3628,14 @@ where
         }
     };
 
-    // DEF-185 P1-6: single classification-driven dispatch.
-    // Exhaustive match on `IngressClassification` — adding a new
-    // variant fails the build here until handler exists.
+    // Single classification-driven dispatch. Exhaustive match on
+    // `IngressClassification` — adding a new variant fails the
+    // build here until a handler exists.
     match classification {
         IngressClassification::AlreadyErrored => {
-            // DEF-238 (audit 2026-05-05): cold-path hint. Reaching
-            // here means caller fed bytes after a fatal teardown
-            // — adversarial / mis-driven state.
+            // Cold-path hint. Reaching here means caller fed bytes
+            // after a fatal teardown — adversarial / mis-driven
+            // state.
             core::hint::cold_path();
             read_buf.clear();
             let terminal_ref: Option<&crate::decode::RowDesc> =
@@ -3651,21 +3646,20 @@ where
             });
         }
         IngressClassification::AppendFailed { attempted, available } => {
-            // DEF-238 (audit 2026-05-05): cold-path hint. ReadBuf
-            // overflow = fatal connection teardown (FailReply +
-            // CloseSocket) on a path the production hot loop never
-            // hits — keep this body out of the inlined ingress arm.
+            // Cold-path hint. ReadBuf overflow = fatal connection
+            // teardown (FailReply + CloseSocket) on a path the
+            // production hot loop never hits — keep this body out
+            // of the inlined ingress arm.
             core::hint::cold_path();
-            // DEF-186 P1-4 ordering invariant (audit 2026-04-24):
-            // `read_buf.clear()` MUST precede `fail_inflight_no_readbuf`
-            // here. The clear() zero-on-clear path (P0-C) scrubs any
-            // residual SCRAM server-frame bytes (server-first /
-            // server-final containing password-correlated material)
-            // BEFORE the state transition consumes the SCRAM variant.
-            // If a future refactor reorders these two calls, the
-            // residue window opens — partial inbound bytes survive
-            // into the post-Errored phase until the wrapper drops
-            // the connection.
+            // Ordering invariant: `read_buf.clear()` MUST precede
+            // `fail_inflight_no_readbuf` here. The clear's
+            // zero-on-clear path scrubs any residual SCRAM
+            // server-frame bytes (server-first / server-final
+            // containing password-correlated material) BEFORE the
+            // state transition consumes the SCRAM variant. A
+            // reorder would open a residue window — partial inbound
+            // bytes would survive into the post-Errored phase until
+            // the wrapper drops the connection.
             read_buf.clear();
             return write_buf.with_branded(|wb| -> R {
                 let mut staged: StagedActions = StagedActions::new();
@@ -3694,8 +3688,7 @@ where
         let mut frames_consumed: u16 = 0_u16;
         let mut dispatches_this_call: u16 = 0_u16;
 
-        // DEF-248 Sub-B (2026-05-12): post-loop staging for
-        // partial-assembly entry.
+        // Post-loop staging for partial-assembly entry.
         //
         // The dispatch loop's `populated` shared borrow conflicts
         // with `partial_assembly_slot` mut access inside the loop
@@ -3709,13 +3702,12 @@ where
         // which must release before `wb.into_bytes()` post-loop.
         {
         let mut reserved = wb.reserve();
-        // DEF-248 Sub-B (2026-05-12): assembly-completion dispatch
-        // fires BEFORE the parse-header loop. If the prior
-        // `feed_inbound` / `read_buf_append` / top-of-feed-bytes
-        // bytes-routing path completed the in-flight body
-        // (`body_remaining == 0`), take the assembly out, route
-        // its prefix through the existing per-tag `dispatch()`,
-        // and free the Box.
+        // Assembly-completion dispatch fires BEFORE the
+        // parse-header loop. If the prior `feed_inbound` /
+        // `read_buf_append` / top-of-feed-bytes bytes-routing path
+        // completed the in-flight body (`body_remaining == 0`),
+        // take the assembly out, route its prefix through the
+        // existing per-tag `dispatch()`, and free the Box.
         if partial_assembly_slot.is_active()
             && matches!(
                 partial_assembly_slot.as_inner(),
@@ -3774,10 +3766,10 @@ where
             drop(assembly_box);
         }
         loop {
-            // DEF-184 (B6): `const BOUNDED: bool` specialisation
-            // — in the `BOUNDED=false` monomorphisation the
-            // short-circuit `BOUNDED &&` evaluates at compile
-            // time; LLVM eliminates the entire gate.
+            // `const BOUNDED: bool` specialisation — in the
+            // `BOUNDED=false` monomorphisation the short-circuit
+            // `BOUNDED &&` evaluates at compile time; LLVM
+            // eliminates the entire gate.
             if BOUNDED && dispatches_this_call >= max_dispatches {
                 break;
             }
@@ -3799,13 +3791,12 @@ where
                     break;
                 }
                 HeaderParse::FrameTooLarge { declared } => {
-                    // DEF-248 Sub-B (2026-05-12): universal-coverage
-                    // entry to partial-assembly mode for non-`'D'`
-                    // streaming-eligible tags. The actual mutation
-                    // (enter + absorb + advance) is deferred to
-                    // post-loop because the loop's `populated`
-                    // shared borrow conflicts with
-                    // `partial_assembly_slot` / `read_buf` mut
+                    // Universal-coverage entry to partial-assembly
+                    // mode for non-`'D'` streaming-eligible tags.
+                    // The actual mutation (enter + absorb +
+                    // advance) is deferred to post-loop because the
+                    // loop's `populated` shared borrow conflicts
+                    // with `partial_assembly_slot` / `read_buf` mut
                     // access here.
                     let tag_byte = after_consumed.first().copied().unwrap_or(0);
                     let body_len_opt = declared.checked_sub(4);
@@ -3847,17 +3838,17 @@ where
                     if after_consumed.len() < total_len_usize {
                         break;
                     }
-                    // DEF-182 site 1 (payload extraction):
-                    // length-arith invariant — parse_header Ok
-                    // ⇒ total_len >= HEADER_LEN; the len-check
-                    // above ensures total_len <= after_consumed
-                    // .len(). Classified as tier-2 structural
-                    // shield (architecturally dead None).
+                    // Payload extraction — length-arith invariant:
+                    // parse_header Ok ⇒ total_len >= HEADER_LEN; the
+                    // len-check above ensures
+                    // total_len <= after_consumed.len(). Classified
+                    // as tier-2 structural shield (architecturally
+                    // dead None).
                     let payload_opt =
                         after_consumed.get(HEADER_LEN..total_len_usize);
                     debug_assert!(
                         payload_opt.is_some(),
-                        "DEF-182: payload slice .get(HEADER_LEN..total_len) None",
+                        "payload slice .get(HEADER_LEN..total_len) None",
                     );
                     let payload = payload_opt.unwrap_or(&[]);
 
@@ -3869,11 +3860,12 @@ where
                             session_params_slot,
                             payload,
                         ) {
-                            // Both variants intentionally consumed here.
-                            // Phase 1d may surface MalformedPayload via a
-                            // wrapper-advisory action; until then, the
-                            // exhaustive arms pin the discard policy and
-                            // ensure any new variant addition fails build.
+                            // Both variants intentionally consumed
+                            // here. A future revision could surface
+                            // MalformedPayload via a wrapper-advisory
+                            // action; until then, the exhaustive
+                            // arms pin the discard policy and ensure
+                            // any new variant addition fails build.
                             ParamStatusRecordOutcome::Processed
                             | ParamStatusRecordOutcome::MalformedPayload => {}
                         }
@@ -3892,12 +3884,13 @@ where
                         continue;
                     }
 
-                    // DEF-154 (L): gate uses `MAX_STAGED_PER_CALL`
-                    // — NOT `MAX_ACTIONS_PER_CALL`. Pre-(L) both
-                    // consts were 8 and aliased; post-(L) they
-                    // differ and `staged` overflowing its own
-                    // `heapless::Vec<_, MAX_STAGED_PER_CALL>`
-                    // cap would panic in `emit_actions!`.
+                    // Gate uses `MAX_STAGED_PER_CALL` — NOT
+                    // `MAX_ACTIONS_PER_CALL`. The two consts differ
+                    // (staged-side cap vs output-side cap); using
+                    // the output cap here would let `staged`
+                    // overflow its own
+                    // `heapless::Vec<_, MAX_STAGED_PER_CALL>` and
+                    // panic in `emit_actions!`.
                     if staged
                         .len()
                         .saturating_add(WORST_CASE_PER_DISPATCH)
@@ -3932,10 +3925,9 @@ where
                             ]);
                         }
                         DispatchOutcome::Errored { reply_id, cause } => {
-                            // DEF-154 (Q) P1-6: terminal FailReply
-                            // + CloseSocket MUST reach the caller
-                            // (reply promise resolution, socket
-                            // teardown signal).
+                            // Terminal FailReply + CloseSocket MUST
+                            // reach the caller (reply promise
+                            // resolution, socket teardown signal).
                             match reply_id {
                                 Some(id) => {
                                     emit_actions!(&mut staged, budget: 2, [
@@ -3957,8 +3949,7 @@ where
         }
         } // end of reserved scope
 
-        // DEF-248 Sub-B (2026-05-12): apply staged partial-mode
-        // entry, if any.
+        // Apply the staged partial-mode entry, if any.
         if let Some((tag, body_len, body_bytes)) = staged_partial_entry.take() {
             _partial_assembly_dispatch_leaf::enter_partial_assembly_at_dispatch(
                 partial_assembly_slot,
@@ -3974,14 +3965,14 @@ where
                 debug_assert_eq!(
                     absorbed_n,
                     body_bytes.len(),
-                    "DEF-248 Sub-B: partial-mode entry absorbed all \
-                     body bytes (absorbed={absorbed_n}, body_bytes.len={})",
+                    "partial-mode entry absorbed all body bytes \
+                     (absorbed={absorbed_n}, body_bytes.len={})",
                     body_bytes.len(),
                 );
             }
         }
 
-        // DEF-184 audit (2026-04-24) — advance IN-SCOPE.
+        // Cursor advance IN-SCOPE.
         //
         // Skip advance on Errored transition —
         // `clear_session_residue_if_idle_or_errored` on the NEXT
@@ -3989,8 +3980,8 @@ where
         // frame remnant doesn't matter.
         //
         // `advance()` returns `Result<(), AdvancePastEnd>` —
-        // architecturally dead post-validated frames_consumed
-        // sum, but we classify via InternalCrateBug locus
+        // architecturally dead post-validated frames_consumed sum,
+        // but we classify via InternalCrateBug locus
         // `ReadCursorAdvance` if it ever fires.
         if !matches!(state, ProtoState::Errored(_))
             && frames_consumed > 0
@@ -4007,10 +3998,10 @@ where
             );
         }
 
-        // DEF-188: dispatch may have written to `terminal_row_desc`
-        // during the loop (Z arms park schemas). NLL ends the
-        // dispatch loop's `&mut` reborrow at the loop close brace
-        // above; reborrow as immutable here for materialise.
+        // Dispatch may have written to `terminal_row_desc` during
+        // the loop (Z arms park schemas). NLL ends the dispatch
+        // loop's `&mut` reborrow at the loop close brace above;
+        // reborrow as immutable here for materialise.
         let terminal_ref: Option<&crate::decode::RowDesc> =
             (*terminal_row_desc).as_ref();
         materialise_fn(staged, wb.into_bytes(), terminal_ref)
@@ -4018,40 +4009,37 @@ where
 }
 
 
-/// DEF-279 Phase 1c Bundle Commit 6 (2026-05-18) — per-phase
-/// dispatch-context bundle for `<ConnectingPhase>`'s `ConnectingInner`.
+/// Per-phase dispatch-context bundle for `<ConnectingPhase>`'s
+/// `ConnectingInner`.
 ///
 /// Mirror of [`DispatchContext`] with `state: &mut ConnectingState`
-/// instead of `&mut ProtoState`. The other seven fields are
-/// identical — `ConnectingInner` currently holds the same 8-field
-/// shape as `PgProtocolInner` (per Commit 2's scaffolding) and the
-/// `feed_bytes_dispatch_connecting` lift+lower wrapper forwards each
-/// field unchanged into the inner `DispatchContext`.
+/// instead of `&mut ProtoState`. The other six fields are
+/// byte-identical to `DispatchContext`'s; the
+/// `feed_bytes_dispatch_connecting` lift+lower wrapper forwards
+/// each field unchanged into the inner `DispatchContext`.
 ///
-/// **Two lifetimes** mirror the Commit 5.5 lifetime split:
-/// `'state` for the state borrow (lifted-local in
-/// `feed_bytes_dispatch_connecting`), `'r` for the seven other
-/// `&mut` field borrows that flow into `OutActions<'_, 'r>`.
+/// **Two lifetimes** mirror the lifetime split in
+/// [`DispatchContext`]: `'state` for the state borrow (lifted-local
+/// in `feed_bytes_dispatch_connecting`), `'r` for the other `&mut`
+/// field borrows that flow into `OutActions<'_, 'r>`.
 ///
-/// **Construction**: only by `ConnectingInner` methods (Commit 7+)
-/// via disjoint-field-borrow from `&mut self`. Free function
-/// shape (not a method) per the same rationale as
-/// [`DispatchContext`] — tier-1 closure by construction (each
-/// `&'r mut <FieldType>` must come from somewhere; the only
-/// somewhere is `ConnectingInner`'s fields).
-///
-/// **`#[allow(dead_code)]`** until Commit 7+ wires
-/// `ConnectingInner.feed_bytes_impl` to assemble + pass this.
-// DEF-279 follow-up (2026-05-18, architect Interpretation B + Z'):
-// `row_desc_slot` FIELD DROPPED — the cell does not exist on the
-// outer for `<ConnectingPhase>` (Extras = ()). The
+/// **Construction**: only by `ConnectingInner` methods via
+/// disjoint-field-borrow from `&mut self`. Free function shape (not
+/// a method) per the same rationale as [`DispatchContext`] — tier-1
+/// closure by construction (each `&'r mut <FieldType>` must come
+/// from somewhere; the only somewhere is `ConnectingInner`'s
+/// fields).
+//
+// `row_desc_slot` is NOT a field here — the cell does not exist on
+// the outer for `<ConnectingPhase>` (Extras = ()). The
 // [`feed_bytes_dispatch_connecting`] wrapper mints a stack-local
-// transient via [`_proto_init_leaf::fresh_connecting_transient_row_desc_slot`]
-// and threads it into the shared dispatch body's `DispatchContext`.
-// The transient is empty (Connecting LHS arms never write it) and
-// drops with the wrapper's frame. Trybuild compile-fail probe pins
-// the field-absence at the outer (PgProtocol<ConnectingPhase>).
-#[allow(dead_code)]
+// transient via
+// [`_proto_init_leaf::fresh_connecting_transient_row_desc_slot`]
+// and threads it into the shared dispatch body's
+// `DispatchContext`. The transient is empty (Connecting LHS arms
+// never write it) and drops with the wrapper's frame. Trybuild
+// compile-fail probe pins the field-absence at the outer
+// (PgProtocol<ConnectingPhase>).
 pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
     pub(in crate::protocol) state: &'state mut crate::state::ConnectingState,
     pub(in crate::protocol) read_buf: &'r mut ReadBuf,
@@ -4065,8 +4053,8 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
     pub(in crate::protocol) malformed_count: &'r mut u32,
 }
 
-/// DEF-279 Phase 1c Bundle Commit 6 (2026-05-18) — per-phase
-/// dispatch entry for `<ConnectingPhase>`'s `ConnectingInner`.
+/// Per-phase dispatch entry for `<ConnectingPhase>`'s
+/// `ConnectingInner`.
 ///
 /// **Lift+lower wrapper** over [`feed_bytes_dispatch`]. Lifts
 /// `ConnectingState → ProtoState` once per call (via
@@ -4075,22 +4063,21 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
 /// `TryFrom<ProtoState> for ConnectingState`. Single source of
 /// truth for the dispatch loop preserved; per-phase wrapper
 /// amortises ~5-10 ns of lift+lower overhead over the entire
-/// feed-bytes call (vs Alt D's per-frame lift+lower at ~8× cost).
+/// feed-bytes call (vs ~8× cost if the lift+lower fired per-frame).
 ///
-/// **Lifetime decoupling** (Commit 5.5 substrate): the lifted local
-/// `proto_state` has lifetime `'tmp` (shorter than caller's `'r`);
-/// the inner [`feed_bytes_dispatch`] signature
-/// `<'w, 'state, 'r, BOUNDED>` accepts `'state = 'tmp` while
-/// preserving `'r = 'r_outer` for the `OutActions<'w, 'r_outer>`
-/// return. Without the 5.5 split this wrapper would be
-/// inexpressible (lifetime-widening 'tmp → 'r is contravariant,
-/// requires `mem::transmute` — forbidden under
-/// `#![forbid(unsafe_code)]`).
+/// **Lifetime decoupling**: the lifted local `proto_state` has
+/// lifetime `'tmp` (shorter than caller's `'r`); the inner
+/// [`feed_bytes_dispatch`] signature `<'w, 'state, 'r, BOUNDED>`
+/// accepts `'state = 'tmp` while preserving `'r = 'r_outer` for the
+/// `OutActions<'w, 'r_outer>` return. Without the independent
+/// `'state` / `'r` split this wrapper would be inexpressible
+/// (lifetime-widening 'tmp → 'r is contravariant, requires
+/// `mem::transmute` — forbidden under `#![forbid(unsafe_code)]`).
 ///
 /// **Tier-1 closure at the per-phase boundary**: caller (typically
-/// `ConnectingInner.feed_bytes_impl` in Commit 7+) holds a
-/// `ConnectingState`-typed reference. The type system prevents
-/// the caller from constructing a non-Connecting state outside this
+/// `ConnectingInner.feed_bytes_impl`) holds a
+/// `ConnectingState`-typed reference. The type system prevents the
+/// caller from constructing a non-Connecting state outside this
 /// wrapper. The lift widens to `ProtoState` only INSIDE this
 /// function for the shared dispatch's exhaustive-match arms; the
 /// lower projects back to `ConnectingState` before returning.
@@ -4101,20 +4088,16 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
 /// from the `(PostAuthHaveKey, RFQ)` arm). The lower step catches
 /// this and translates to
 /// [`crate::state::ConnectingState::HandshakeReady`] — the signal
-/// `<ConnectingPhase>::into_active` observes in Commit 8+.
+/// `<ConnectingPhase>::into_active` observes.
 ///
 /// **Sentinel choice during lift**: a transient
 /// `ConnectingState::Errored(Framing)` placeholder fills the state
 /// slot for the lift window. Kind doesn't matter semantically — the
 /// slot is always overwritten in the lower step (either with the
 /// legitimate new state, with `HandshakeReady`, or with the
-/// defensive `Errored(Internal)` on a dispatch.rs bug). The
+/// defensive `Errored(Internal)` on a dispatch bug). The
 /// placeholder is unobservable: no reader sees the state between
 /// `mem::replace` and the lower-step write.
-///
-/// **`#[allow(dead_code)]`** until Commit 7+ wires
-/// `ConnectingInner.feed_bytes_impl` to call this.
-#[allow(dead_code)]
 pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED: bool>(
     ctx: ConnectingDispatchContext<'_, 'r>,
     bytes: &[u8],
@@ -4133,7 +4116,6 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         malformed_count,
     } = ctx;
 
-    // DEF-279 follow-up (2026-05-18, architect Z' verdict):
     // `<ConnectingPhase>::Extras = ()` — no row_desc_slot on the
     // outer. Mint a stack-local transient via the leaf-private
     // constructor for the duration of the shared dispatch call.
@@ -4164,11 +4146,11 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     let lifted: ConnectingState = core::mem::replace(state, sentinel);
     let mut proto_state: ProtoState = lifted.into();
 
-    // DEF-279 follow-up (2026-05-18, architect Y verdict): no-schema
-    // closure. The closure ignores `terminal_ref` (architecturally
-    // `None` for Connecting LHS — no arm writes the slot) and calls
-    // `materialise` with `None::<&'static RowDesc>`. R is inferred
-    // as `OutActions<'w, 'static>`; covariance lets the wrapper's
+    // No-schema closure: the closure ignores `terminal_ref`
+    // (architecturally `None` for Connecting LHS — no arm writes
+    // the slot) and calls `materialise` with
+    // `None::<&'static RowDesc>`. R is inferred as
+    // `OutActions<'w, 'static>`; covariance lets the wrapper's
     // outer signature `OutActions<'w, 'r>` accept it (since
     // `'static: 'r` for any `'r`). The transient slot's local
     // lifetime never leaks into R.
@@ -4218,25 +4200,24 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     actions
 }
 
-/// DEF-279 Phase 2 Bundle Commit 10 (2026-05-18) — per-phase
-/// dispatch-context bundle for `<ActivePhase>`'s `ActiveInner`.
+/// Per-phase dispatch-context bundle for `<ActivePhase>`'s
+/// `ActiveInner`.
 ///
 /// Mirror of [`DispatchContext`] with `state: &mut ActiveState`
 /// instead of `&mut ProtoState`. The other seven fields are
-/// byte-identical (ActiveInner has the same 8-field shape as
-/// PgProtocolInner — every cell is reachable from at least one
-/// Active variant).
+/// byte-identical (ActiveInner has the full 8-field post-handshake
+/// shape — every cell is reachable from at least one Active
+/// variant).
 ///
-/// **Two lifetimes** mirror Commit 5.5's lifetime split: `'state`
-/// for the state borrow (lifted-local in `feed_bytes_dispatch_active`),
+/// **Two lifetimes** mirror the lifetime split: `'state` for the
+/// state borrow (lifted-local in `feed_bytes_dispatch_active`),
 /// `'r` for the seven other `&mut` field borrows that flow into
 /// `OutActions<'_, 'r>` via `materialise`.
 ///
-/// **Construction**: only by `ActiveInner` methods (Commit 11) via
+/// **Construction**: only by `ActiveInner` methods via
 /// disjoint-field-borrow from `&mut self`. Tier-1 closure by
 /// construction — only code that already has eight disjoint `&mut`
 /// refs to the right field types can call the wrapper.
-#[allow(dead_code)]
 pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     pub(in crate::protocol) state: &'state mut crate::state::ActiveState,
     pub(in crate::protocol) read_buf: &'r mut ReadBuf,
@@ -4251,8 +4232,7 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     pub(in crate::protocol) malformed_count: &'r mut u32,
 }
 
-/// DEF-279 Phase 2 Bundle Commit 10 (2026-05-18) — per-phase
-/// dispatch entry for `<ActivePhase>`'s `ActiveInner`.
+/// Per-phase dispatch entry for `<ActivePhase>`'s `ActiveInner`.
 ///
 /// **Lift+lower wrapper** over [`feed_bytes_dispatch`] — mirror of
 /// [`feed_bytes_dispatch_connecting`]. Lifts `ActiveState → ProtoState`
@@ -4264,15 +4244,11 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
 /// handshake transition signal), Active's lower step is a direct
 /// projection. The only legitimate ProtoState outcomes from an
 /// Active LHS are Active-mirror variants — anything else is a
-/// dispatch.rs bug.
+/// dispatch bug.
 ///
 /// **Sentinel choice during lift**: `ActiveState::Errored(Framing)`
 /// as a transient placeholder; always overwritten by the lower
 /// step before any reader sees it.
-///
-/// **`#[allow(dead_code)]`** until Commit 11 wires
-/// `ActiveInner.feed_bytes_impl` to call this.
-#[allow(dead_code)]
 pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: bool>(
     ctx: ActiveDispatchContext<'_, 'r>,
     bytes: &[u8],
@@ -4300,9 +4276,9 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
     let lifted: ActiveState = core::mem::replace(state, sentinel);
     let mut proto_state: ProtoState = lifted.into();
 
-    // DEF-279 follow-up (2026-05-18, architect Y verdict): with-schema
-    // closure. Reads the slot's RowDesc as `Option<&'r RowDesc>` and
-    // forwards to `materialise`; R is inferred as `OutActions<'w, 'r>`.
+    // With-schema closure: reads the slot's RowDesc as
+    // `Option<&'r RowDesc>` and forwards to `materialise`; R is
+    // inferred as `OutActions<'w, 'r>`.
     let actions = feed_bytes_dispatch::<_, _, BOUNDED>(
         DispatchContext {
             state: &mut proto_state,
@@ -4323,7 +4299,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
     );
 
     // Lower: project proto_state back to ActiveState. Any
-    // non-Active outcome (Connecting* variants) is a dispatch.rs
+    // non-Active outcome (Connecting* variants) is a dispatch
     // bug — defensive Errored tears down the connection after
     // draining any carried ReplyId<K>.
     match ActiveState::try_from(proto_state) {
@@ -4344,12 +4320,9 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
     actions
 }
 
-/// DEF-279 Phase 2 Bundle Commit 10 (2026-05-18) — per-phase
-/// single-frame variant over [`ActiveDispatchContext`]. Mirror of
-/// [`advance_one_frame_dispatch`] for the Active phase.
+/// Per-phase single-frame variant over [`ActiveDispatchContext`].
 ///
-/// **Active-specific fast paths** (parity with the parent
-/// [`advance_one_frame_dispatch`]):
+/// **Active-specific fast paths**:
 /// - `ActiveState::SimpleQueryStreamingRows { .. }` or
 ///   `ActiveState::BindExecuteStreamingRows { .. }` →
 ///   [`FeedEvent::StreamingRows`].
@@ -4357,14 +4330,11 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
 /// - `ActiveState::Idle` + empty `read_buf` → [`FeedEvent::Idle`].
 ///
 /// All other Active variants delegate to
-/// [`feed_bytes_dispatch_active::<true>`] with `max_dispatches = 1`.
-///
-/// **`#[allow(dead_code)]`** until Commit 11 wires
-/// `ActiveInner.advance_one_frame` to call this.
+/// [`feed_bytes_dispatch_active::<true>`] with
+/// `max_dispatches = 1`.
 #[must_use = "FeedEvent variants carry side-effect contracts: \
               SendBytes/Deliver MUST be processed; Fail/Close MUST \
               trigger socket teardown"]
-#[allow(dead_code)]
 pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
     ctx: ActiveDispatchContext<'_, 'r>,
     write_buf: &'w mut WriteBuf,
@@ -4400,31 +4370,23 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
     }
 }
 
-/// DEF-279 Phase 1c Bundle Commit 6 (2026-05-18) — per-phase
-/// single-frame variant over [`ConnectingDispatchContext`]. Mirror
-/// of [`advance_one_frame_dispatch`] for the Connecting phase.
+/// Per-phase single-frame variant over
+/// [`ConnectingDispatchContext`].
 ///
 /// **Connecting-specific fast paths**:
-/// - No `StreamingRows` equivalent in `ConnectingState` (the
-///   parent arm in [`advance_one_frame_dispatch`] doesn't apply).
-/// - `ConnectingState::Errored(_)` → [`FeedEvent::Close`] (mirror
-///   of `ProtoState::Errored(_)` fast path).
+/// - No `StreamingRows` equivalent in `ConnectingState`.
+/// - `ConnectingState::Errored(_)` → [`FeedEvent::Close`].
 /// - `ConnectingState::HandshakeReady` + empty `read_buf` →
-///   [`FeedEvent::Idle`] (mirror of `ProtoState::Idle` fast path —
-///   HandshakeReady is the per-phase representation of post-
-///   handshake Idle, with the caller-visible expectation that the
-///   next user action is `into_active()`).
+///   [`FeedEvent::Idle`] (HandshakeReady is the per-phase
+///   representation of post-handshake Idle, with the caller-visible
+///   expectation that the next user action is `into_active()`).
 ///
 /// All other Connecting variants delegate to
 /// [`feed_bytes_dispatch_connecting::<true>`] with
 /// `max_dispatches = 1`.
-///
-/// **`#[allow(dead_code)]`** until Commit 7+ wires
-/// `ConnectingInner.advance_one_frame` to call this.
 #[must_use = "FeedEvent variants carry side-effect contracts: \
               SendBytes/Deliver MUST be processed; Fail/Close MUST \
               trigger socket teardown"]
-#[allow(dead_code)]
 pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
     ctx: ConnectingDispatchContext<'_, 'r>,
     write_buf: &'w mut WriteBuf,
