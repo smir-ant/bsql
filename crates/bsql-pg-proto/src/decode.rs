@@ -1383,13 +1383,14 @@ impl<'a> DataRowRef<'a> {
             // Different classes; different operator diagnostics.
             return Err(DecodeError::InvalidColumnCount { count: n_columns_i16 });
         }
-        // `n_columns_i16 >= 0` (proved above) ⟹ `try_from` infallible.
-        // The Err arm is architecturally dead, but classified as
-        // `TruncatedRow` rather than silently fabricating a 0-column
-        // row — if a future refactor of the negative-check above
-        // introduces a seam, the dead arm becomes honest diagnostic
-        // output instead of "empty row with no error". Tier-3 audit
-        // → tier-2 structural: misfire classifies, does not mask.
+        // `n_columns_i16 >= 0` (proved above) ⟹ `try_from`
+        // infallible. The Err arm is architecturally dead, but
+        // classified as `TruncatedRow` rather than silently
+        // fabricating a 0-column row — if a future refactor of the
+        // negative-check above introduces a seam, the dead arm
+        // becomes honest diagnostic output instead of "empty row
+        // with no error". Tier-2 structural: misfire classifies,
+        // does not mask.
         let n_columns = u16::try_from(n_columns_i16).map_err(|_| DecodeError::TruncatedRow)?;
         Ok(Self { body_after_count, n_columns })
     }

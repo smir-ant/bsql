@@ -588,9 +588,10 @@ pub const AUTH_SASL_FINAL: u32 = 12;
 /// With [`AuthSubCode`] typed, handlers match on enum variants:
 /// adding a new variant (e.g., `Md5` for AUTH_MD5_PASSWORD) forces
 /// every handler to decide how to treat it — the compiler flags
-/// any handler whose match is not exhaustive. Tier-3 audit on
-/// "every sub-code is considered by every relevant handler" →
-/// tier-1 compile.
+/// any handler whose match is not exhaustive. The
+/// "every sub-code is considered by every relevant handler"
+/// invariant is now a tier-1 compile check, not a tier-3
+/// review-pass discipline.
 ///
 /// # Unknown codes
 ///
@@ -1222,12 +1223,12 @@ const _: () = {
 // `TAG_FOO: u8 = b'E'` duplicating `TAG_ERROR_RESPONSE` would
 // compile silently and silently hijack one message arm. The
 // exhaustive `match` in `dispatch.rs` would see both arms;
-// whichever is listed first wins. Tier-3 audit hazard.
+// whichever is listed first wins — a silent drift hazard.
 //
 // Per-direction pairwise distinctness is cheap to assert in
 // `const` (N = 6 inbound, 2 outbound — N² comparisons compiled
-// away). Lifts the invariant from tier-3 (audit) to tier-1 (build
-// failure on drift).
+// away). Lifts the invariant to tier-1 (build failure on drift)
+// instead of relying on review-pass discipline.
 // ---------------------------------------------------------------
 
 /// Pairwise `const _: () = assert!(A != B, …)` distinctness at

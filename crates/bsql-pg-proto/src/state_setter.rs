@@ -382,14 +382,13 @@ impl<'a> FeedStateSetter<'a> {
 // to call any `drain_at_*` fn cannot supply the required token
 // type — type system rejects.
 //
-// Anchor (HISTORICAL — closed by per-leaf token gating; Tier-3 audit
-// #26, 2026-05-19, verified): pre-closure, `FeedStateSetter::new`
-// was `pub(crate)`; any in-crate caller could mint a setter and
-// trigger `drain_and_install_errored` to transition any state to
-// Errored. Pre-state was tier-2-by-discipline within-crate.
-// Post-closure the call surface is exactly the leaf entry points
-// below, each gated by its concrete-type token. Tier-1 within-crate
-// by-construction.
+// Historical naive shape (closed by per-leaf token gating):
+// `FeedStateSetter::new` used to be `pub(crate)`; any in-crate
+// caller could mint a setter and trigger
+// `drain_and_install_errored` to transition any state to Errored.
+// That shape was tier-2-by-discipline within-crate. The current
+// call surface is exactly the leaf entry points below, each gated
+// by its concrete-type token — tier-1-within-crate by-construction.
 // ═════════════════════════════════════════════════════════════════════
 
 /// Leaf entry point: ReplyId saturation transition. Used by
