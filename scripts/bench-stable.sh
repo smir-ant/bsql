@@ -73,6 +73,51 @@ EOF
 CMD="${1:-}"
 [[ -z "$CMD" ]] && usage
 
+# Audit #73 quiet-system gate (2026-05-19) — bail out if load_avg
+# exceeds 4.0 on the bench-running modes (save/compare). Per
+# Phase 1c / DEF-279 measurement archaeology (deferred.md §A):
+# bench-stable's --measurement-time 30 sample windows are
+# noise-amplifying on contended hardware; a contended 1-minute
+# load_avg produces symmetric +400%/-73% deltas on benches that
+# have ZERO architectural connection to the code change. Fail
+# fast at the gate instead of letting the operator spend 10
+# minutes running a bench whose results will be statistically
+# invalid.
+#
+# Skipped for `list` (no bench run) and `help`/unknown (handled
+# by usage). The load_avg parsing handles macOS / Linux / BSD
+# `uptime` formats: the awk `gsub(/,/, ".")` normalises the
+# European-locale decimal comma (e.g. `0,52`) to a dot so the
+# subsequent numeric comparison works regardless of LC_ALL.
+check_quiet_system() {
+    local load_avg
+    load_avg="$(uptime | awk -F'load averages?:' '{print $2}' | awk '{gsub(/,/, "."); print $1}')"
+    if [[ -n "$load_avg" ]] && awk -v la="$load_avg" 'BEGIN { exit !(la+0 > 4.0) }'; then
+        cat >&2 <<EOF
+ABORT (audit #73 quiet-system gate): 1-minute load_avg=${load_avg} > 4.0.
+
+bench-stable.sh requires a quiet system: --measurement-time 30
+sample windows are noise-amplifying under load. A contended host
+produces statistically invalid results (symmetric +400%/-73% on
+benches unrelated to the code change — see deferred.md §A
+"Phase 2 Bundle bench-stable measurement" entry for the prior
+incident).
+
+Close foreground apps, wait for CI/builds to finish, then retry.
+Override (NOT recommended): BSQL_BENCH_FORCE=1 ${0} ${*}
+EOF
+        if [[ "${BSQL_BENCH_FORCE:-}" != "1" ]]; then
+            exit 1
+        fi
+        echo "WARN: BSQL_BENCH_FORCE=1 set, continuing despite load_avg=${load_avg}" >&2
+    fi
+}
+
+case "$CMD" in
+    save|compare) check_quiet_system ;;
+    *) ;;
+esac
+
 # Detect macOS for taskpolicy. On Linux the equivalent is `nice` or
 # `chrt`; we use `nice -n 19` as the cross-platform fallback.
 LOWER_PRIORITY=()
