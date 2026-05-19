@@ -1,7 +1,7 @@
 //! Sealed `ParamsWriter` trait — zero-alloc serialisation of PG
 //! Bind-frame parameter blocks from Rust tuples.
 //!
-//! # Phase 1c-3b
+//! # Wire format
 //!
 //! Extended Query (PG §55.2.2) sends a `Bind` frame containing:
 //! 1. Portal name (NUL-terminated)
@@ -32,27 +32,24 @@
 //! - **Zero alloc**: no heap, no stack fixture buffer. Direct stream
 //!   into the output `WriteBuf`.
 //!
-//! # Scope (1c-3b) — why arity 16
+//! # Scope — why arity 16
 //!
 //! Tuple arity 0..=16 covered. Each arity monomorphises into a
 //! distinct machine-code body (~30 LOC post-codegen); 16 arities
 //! × ~30 LOC ≈ 480 LOC of generated code per target build.
 //! `[ParamEncoder; 16]` inline array fits a single AVX2 register
-//! for the `FORMATS_WIRE` const (DEF-135, 1c-5 planned) — breaking
-//! the ≤64-byte bound would force a branch-on-length eq path and
-//! lose branch-free compare. The 16-cap also matches `ParamOids`'s
-//! MAX_PARAMS_ARITY (action.rs) so the describe-reply shape
-//! mirrors the bind-send shape.
+//! for the `FORMATS_WIRE` const — breaking the ≤64-byte bound
+//! would force a branch-on-length eq path and lose branch-free
+//! compare. The 16-cap also matches `ParamOids`'s MAX_PARAMS_ARITY
+//! (action.rs) so the describe-reply shape mirrors the bind-send
+//! shape.
 //!
 //! Tradeoff: callers wanting > 16 parameters must refactor into
-//! smaller statements. Cross-database universality (MySQL /
-//! MariaDB / SQLite) inherits this cap via `bsql-macros` Phase 2 —
-//! all three share the "few placeholders per query" norm in
-//! idiomatic usage.
+//! smaller statements. The "few placeholders per query" norm in
+//! idiomatic usage covers the typical case.
 //!
-//! If I-cache measurement (DEF-143, deferred) shows per-arity
-//! monomorphisation bloating hot paths, the HList-recursion path
-//! documented in deferred.md §21 F-068 becomes the drop-in
+//! If I-cache measurement shows per-arity monomorphisation
+//! bloating hot paths, the HList-recursion path is the drop-in
 //! replacement.
 //!
 //! Every element type must implement [`ParamEncoder`] — a sealed
@@ -78,7 +75,7 @@ use crate::write_buf::{WriteBuf, WriteBufFull};
 mod sealed {
     /// Supertrait seal for [`super::ParamsWriter`]. Module-private
     /// so external crates cannot impl it, closing downstream
-    /// "custom tuple-like types" holes (DEF-115-class seal).
+    /// "custom tuple-like types" holes.
     pub trait ParamsWriterSealed {}
 
     /// Supertrait seal for [`super::ParamEncoder`]. Gates which
@@ -108,8 +105,7 @@ mod sealed {
 /// apply to it, so the dedicated `Option` impl is the only
 /// candidate.
 //
-// DEF-244 follow-up (rust-version 1.78 modernisation): structural
-// diagnostic for sealed-trait E0277. A user writing
+// Structural diagnostic for sealed-trait E0277. A user writing
 // `prepared!("SELECT $1", (u64,))` (banned — see
 // `prepared_unsupported_types/numeric.rs`) hits a bound failure on
 // `u64: ParamEncoderSealed` — the sealed module is private, so the
@@ -119,7 +115,7 @@ mod sealed {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid prepared-query parameter type",
     label = "valid parameter types are those that implement `EncodeBinary` (e.g. `i16`, `i32`, `i64`, `bool`, `&str`) or `Option<T>` over such a type",
-    note = "`ParamEncoder` is sealed — extend the supported set by adding `impl EncodeBinary for ...` in `decode.rs`; downstream `impl ParamEncoder for ...` is forbidden by construction (DEF-244 memo §7 P8 closure on the params side)"
+    note = "`ParamEncoder` is sealed — extend the supported set by adding `impl EncodeBinary for ...` in `decode.rs`; downstream `impl ParamEncoder for ...` is forbidden by construction"
 )]
 pub trait ParamEncoder: sealed::ParamEncoderSealed {
     /// PG type OID this encoder targets. For `T: EncodeBinary`
@@ -185,15 +181,15 @@ pub const MAX_PARAMS_DATA_TOTAL: usize = 1024;
 /// analysis. `ParamsWriter` is sealed; the impls in this module
 /// cover tuple arity `0..=16`.
 //
-// DEF-244 follow-up (rust-version 1.78 modernisation): structural
-// diagnostic for sealed-trait E0277. A user passing a non-tuple
-// value (e.g. `prepared!("...", my_struct)`) or a tuple of arity > 16
-// hits `T: ParamsWriterSealed` failure with the bare bound message.
-// The attribute below routes them to the tuple-shape contract.
+// Structural diagnostic for sealed-trait E0277. A user passing a
+// non-tuple value (e.g. `prepared!("...", my_struct)`) or a tuple of
+// arity > 16 hits `T: ParamsWriterSealed` failure with the bare
+// bound message. The attribute below routes them to the tuple-shape
+// contract.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid parameter tuple for a prepared query",
     label = "expected a tuple `()` through `(T1, T2, ..., T16)` where each Ti implements `ParamEncoder`",
-    note = "`ParamsWriter` is sealed — only the crate-internal tuple impls (arity 0..=16) qualify; downstream `impl ParamsWriter for ...` is forbidden by construction (DEF-244 memo §7 P8 closure)"
+    note = "`ParamsWriter` is sealed — only the crate-internal tuple impls (arity 0..=16) qualify; downstream `impl ParamsWriter for ...` is forbidden by construction"
 )]
 pub trait ParamsWriter: sealed::ParamsWriterSealed {
     /// Number of parameters this tuple encodes. Compile-time
@@ -201,9 +197,8 @@ pub trait ParamsWriter: sealed::ParamsWriterSealed {
     const COUNT: u16;
 
     /// Per-parameter wire format codes. Always `[FormatCode::Binary; COUNT]`
-    /// in 1c-3b — text-format params aren't supported on the write
-    /// path because [`EncodeBinary`] is the only sealed encoder
-    /// available.
+    /// — text-format params aren't supported on the write path
+    /// because [`EncodeBinary`] is the only sealed encoder available.
     const FORMATS: &'static [FormatCode];
 
     /// Per-parameter PG type OIDs, derived from each element's
@@ -383,8 +378,8 @@ const _: () = {
     assert!(matches!(<(Option<bool>,) as ParamsWriter>::OIDS, [crate::decode::oids::BOOL]));
 };
 
-/// DEF-154 (B) Phase B4-W P0-3 + P2 test-only `ParamsWriter` impl
-/// that always returns `Err(WriteBufFull)` from `write_params`.
+/// Test-only `ParamsWriter` impl that always returns
+/// `Err(WriteBufFull)` from `write_params`.
 ///
 /// Used by `protocol.rs`'s internal tests to exercise the
 /// classified-Err routing from `build_bind_message` through

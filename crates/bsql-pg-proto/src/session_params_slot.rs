@@ -1,25 +1,10 @@
-//! DEF-272 cluster β (2026-05-10) — tier-1 within-crate
-//! `session_params` write provenance via concrete-token + Cell newtype.
+//! Tier-1 within-crate `session_params` write provenance via
+//! concrete-token + Cell newtype.
 //!
-//! Direct mirror of [`crate::schema_slot`] cluster α; the same
-//! architectural reasoning applies to this slot's mutation surface.
+//! Direct mirror of [`crate::schema_slot`]; the same architectural
+//! reasoning applies to this slot's mutation surface.
 //!
-//! # Pre-DEF-272 β
-//!
-//! - `PgProtocol::session_params: Option<Box<SessionParams>>` was
-//!   reachable via `&mut SessionParams` borrow that crate-internal
-//!   callers extracted (via `session_params_or_init` lazy-init).
-//! - `SessionParamsSlot<A: SessionParamsWriteAuth>` witness gated
-//!   writes via a sealed-trait auth tag; the `pub(crate) mod sealed`
-//!   surface allowed any in-crate file to write
-//!   `impl Sealed for HostileTag + impl SessionParamsWriteAuth for HostileTag`
-//!   and bypass `from_field_with_auth`. **Tier-1 EXTERNAL + tier-2
-//!   by-discipline WITHIN-CRATE** — verified empirically by the
-//!   architect's hostile probe (2026-05-10).
-//!
-//! # Post-DEF-272 β
-//!
-//! Same two structural changes as schema_slot α:
+//! # Architecture
 //!
 //! 1. **`SessionParamsCell` newtype** wraps `Option<Box<SessionParams>>`
 //!    with a PRIVATE `inner` field (private to `mod session_params_slot`).
@@ -27,11 +12,10 @@
 //!    `mod protocol` or anywhere else. Read accessor (`as_deref`) and
 //!    token-gated write methods are the only paths.
 //!
-//! 2. **Per-leaf concrete-type tokens** replace the sealed-trait
-//!    pattern. Each leaf hosts a `pub(crate) struct XToken(())` type
-//!    with a PRIVATE tuple-struct field (mintable only inside the
-//!    defining leaf). Cell methods take the concrete token type by
-//!    value:
+//! 2. **Per-leaf concrete-type tokens** are the seal. Each leaf hosts a
+//!    `pub(crate) struct XToken(())` type with a PRIVATE tuple-struct
+//!    field (mintable only inside the defining leaf). Cell methods
+//!    take the concrete token type by value:
 //!    - [`crate::protocol::_parameter_status_admit_leaf::ParamStatusToken`]
 //!      → [`SessionParamsCell::admit_at_param_status`]
 //!    - [`crate::protocol::_notice_response_admit_leaf::NoticeResponseToken`]
@@ -39,14 +23,21 @@
 //!    - [`crate::protocol::_clear_residue_leaf::ClearResidueSessionToken`]
 //!      → [`SessionParamsCell::clear_at_residue`]
 //!
+//! A sealed-trait-and-auth-tag alternative would seal the EXTERNAL
+//! API surface only — any in-crate file could write
+//! `impl Sealed for HostileTag + impl SessionParamsWriteAuth for HostileTag`
+//! and bypass the intent (tier-1 external + tier-2 by-discipline
+//! within-crate). The concrete-token shape closes the within-crate
+//! surface too.
+//!
 //! # Lazy-init absorbed into Cell methods
 //!
-//! Pre-β the `session_params_or_init` helper extracted `&mut SessionParams`
-//! by lazy-init-ing the inner `Box`. Post-β each `admit_*` Cell method
-//! lazy-inits internally on first call — the `&mut SessionParams`
-//! never escapes the cell. This eliminates the
-//! `pub(crate) fn session_params_or_init(slot: &mut Option<Box<SessionParams>>) -> &mut SessionParams`
-//! escape-hatch entirely (deleted in this commit).
+//! Each `admit_*` Cell method lazy-inits the inner `Box` internally
+//! on first call — the `&mut SessionParams` never escapes the cell.
+//! A `session_params_or_init` helper that returned `&mut SessionParams`
+//! by lazy-init-ing the inner `Box` would be an escape-hatch routing
+//! around the token gate; absorbing the lazy-init into the cell
+//! methods keeps the seal closed.
 //!
 //! # Tier-1 closure (within-crate, by-construction)
 //!
@@ -68,10 +59,9 @@
 //! # Bench cost
 //!
 //! Cell is `#[repr(transparent)]` over `Option<Box<SessionParams>>`.
-//! `as_deref` compiles identically. `admit_*` methods do the same
-//! `get_or_insert_with` pattern that `session_params_or_init` did,
-//! plus a no-op token consume; LLVM erases the token. 0 ns / 0 B perf
-//! delta vs. pre-β.
+//! `as_deref` compiles to the same code as the bare `Option`
+//! accessor. `admit_*` methods do `get_or_insert_with` plus a no-op
+//! token consume; LLVM erases the token. 0 ns / 0 B perf cost.
 
 use crate::session_params::SessionParams;
 
@@ -82,8 +72,7 @@ use crate::session_params::SessionParams;
 /// tokens (see module-level docs).
 ///
 /// `#[repr(transparent)]` so the layout is identical to the bare
-/// `Option<Box<SessionParams>>` — the niche-packed 8 B footprint pre-β
-/// is preserved.
+/// `Option<Box<SessionParams>>` — niche-packed 8 B footprint.
 #[repr(transparent)]
 pub(crate) struct SessionParamsCell {
     inner: Option<alloc::boxed::Box<SessionParams>>,
@@ -95,8 +84,7 @@ impl SessionParamsCell {
     /// the only mint site (private to that leaf submodule which also
     /// hosts the sole legitimate caller, `PgProtocol::new`). Closes
     /// wholesale-replacement (`*cell = SessionParamsCell::empty(...)`)
-    /// to the leaf by construction — DEF-272 P6 closure (2026-05-10),
-    /// architect hostile-probe-driven follow-up to DEF-272.
+    /// to the leaf by construction.
     ///
     /// The token is consumed (ZST, erased by LLVM); non-init code paths
     /// must use the token-gated `admit_at_*` / `clear_at_*` methods which
@@ -130,7 +118,7 @@ impl SessionParamsCell {
     /// Admit a `ParameterStatus` frame: parse the payload, on success
     /// record the (key, value) pair into the lazy-allocated
     /// [`SessionParams`]; on parse failure bump the malformed-payload
-    /// counter (DEF-185 P2-B operator-canary). Returns the
+    /// operator-canary counter. Returns the
     /// [`crate::protocol::ParamStatusRecordOutcome`] for caller
     /// observability.
     ///
@@ -138,9 +126,9 @@ impl SessionParamsCell {
     /// token's mint is gated to `_parameter_status_admit_leaf`.
     ///
     /// Payload format per PG §55.7: `key\0value\0` (two NUL-terminated
-    /// C-strings). Pre-β this logic lived in
-    /// `record_param_status_with_slot`; post-β it's a method on the
-    /// Cell so the `&mut SessionParams` borrow never escapes.
+    /// C-strings). The parse logic lives on the Cell (rather than in
+    /// a free function with `&mut SessionParams`) so the `&mut`
+    /// borrow never escapes.
     #[inline]
     #[must_use]
     pub(crate) fn admit_at_param_status(
@@ -176,7 +164,7 @@ impl SessionParamsCell {
     }
 
     /// Admit a `NoticeResponse` frame: bump the unsolicited-notice
-    /// counter (DEF-185 P2-3 operator-canary). Lazy-allocates the
+    /// operator-canary counter. Lazy-allocates the
     /// `Box<SessionParams>` on first call. The token's mint is gated
     /// to `_notice_response_admit_leaf`.
     #[inline]
@@ -191,16 +179,15 @@ impl SessionParamsCell {
     }
 
     /// Clear the session params CONTENTS at the residue-cleanup
-    /// transition (Errored entry per DEF-189 Q8-C3 + DEF-205 step 3 —
-    /// session-state forfeit on tear-down). Calls `params.clear()` on
-    /// the inner box (which scrubs `SecretBoundedStr` bytes via its
-    /// own Drop chain on each replaced field) but PRESERVES the
-    /// `Box<SessionParams>` allocation itself — the test fixture
+    /// transition (Errored entry — session-state forfeit on tear-
+    /// down). Calls `params.clear()` on the inner box (which scrubs
+    /// `SecretBoundedStr` bytes via its own Drop chain on each
+    /// replaced field) but PRESERVES the `Box<SessionParams>`
+    /// allocation itself — the test fixture
     /// `errored_clears_everything_including_session_params` pins this
     /// invariant: post-Errored, the box stays allocated, the contents
-    /// are pristine. Pre-β `params.clear()` was the operation; this
-    /// preserves the same semantics behind the cell. The token's mint
-    /// is gated to `_clear_residue_leaf`.
+    /// are pristine. The token's mint is gated to
+    /// `_clear_residue_leaf`.
     #[inline]
     pub(crate) fn clear_at_residue(
         &mut self,

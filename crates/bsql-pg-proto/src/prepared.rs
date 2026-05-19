@@ -1,6 +1,5 @@
-//! DEF-244 — `PreparedQuery<P, R>` runtime type + `RowDecode` trait.
+//! `PreparedQuery<P, R>` runtime type + `RowDecode` trait.
 //!
-//! See `/tmp/def244-design-memo.md` for the full design rationale.
 //! This module hosts the runtime artefacts that the `prepared!`
 //! proc-macro produces struct literals of:
 //!
@@ -12,27 +11,25 @@
 //!   call site.
 //! - `new_prepared_query<P, R>(...)` — the only constructor for
 //!   `PreparedQuery`. Crate-internal visibility on the function +
-//!   `pub(crate)` fields on the struct close the P1/P2/P3 hostile
-//!   probes (memo §7).
+//!   `pub(crate)` fields on the struct close the direct-construction
+//!   hostile probes.
 //!
-//! # Tier-1 SQL injection closure (memo §7)
+//! # Tier-1 SQL injection closure
 //!
-//! Eight of twelve hostile probes close tier-1 inside the language:
-//! private fields, sealed trait, content-addressed stmt_name. The
-//! remaining four (P4/P5/P10/P12) are OS-level boundaries where
-//! `forbid(unsafe_code)` in this crate ends and the user's `unsafe`
-//! contract or `.rodata` memory protection begins. This boundary
-//! framing matches DEF-248 Sub-A's `panic = "abort"` precedent.
+//! The hostile-probe matrix for SQL injection closes tier-1 inside
+//! the language for the in-source probes: private fields, sealed
+//! trait, content-addressed stmt_name. The remaining out-of-language
+//! probes are OS-level boundaries where `forbid(unsafe_code)` in
+//! this crate ends and the user's `unsafe` contract or `.rodata`
+//! memory protection begins.
 //!
 //! # Format choice — text in v1.0
 //!
 //! The macro emits `bind_execute_prefix` with the compact
 //! format-code block (`n_format_codes = 1, formats = [Text]` for
-//! N ≥ 1; `n_format_codes = 0` for N = 0). All-text per memo §5.4.
-//! When DEF-228 lands binary-format decoders for more types, a
-//! macro flag will allow elective binary; the runtime path remains
-//! unchanged (text is the safer default for ad-hoc primitive types
-//! and matches today's [`DecodeFormat<TextFmt>`] matrix).
+//! N ≥ 1; `n_format_codes = 0` for N = 0). All-text default —
+//! text is the safer choice for ad-hoc primitive types and matches
+//! today's [`DecodeFormat<TextFmt>`] matrix.
 
 use core::marker::PhantomData;
 
@@ -43,8 +40,7 @@ mod sealed {
     /// Module-private seal for [`super::RowDecode`]. Only the
     /// crate-internal tuple impls below may satisfy this trait.
     /// Adding a custom `impl RowDecode for MyRow` from a downstream
-    /// crate is impossible — closes the P8-equivalent hostile probe
-    /// for the row-decoder side.
+    /// crate is impossible — closes the row-decoder hostile probe.
     pub trait RowDecodeSealed {}
 }
 
@@ -82,23 +78,21 @@ mod sealed {
 /// `bytes_per_col[i]` is `Some(&'a [u8])` for non-NULL columns and
 /// `None` for SQL NULL. v1 requires every column non-NULL — NULL
 /// returns [`DecodeError::NullInNonNullColumn`]. Nullable columns
-/// (`Option<T>` elements) track DEF-228.
+/// (`Option<T>` elements) are not yet supported.
 //
-// DEF-244 follow-up (rust-version 1.78 modernisation): structural
-// diagnostic for sealed-trait E0277. Pre-attribute, a hostile user
-// trying `impl RowDecode for Foo {}` (memo §7 P8-equivalent) got the
-// raw «trait bound `Foo: RowDecodeSealed` is not satisfied» message
-// — the sealed supertrait is module-private, so they cannot fix it
-// from outside. Post-attribute, the same compile error carries the
-// instructive note explaining that only crate-internal tuple impls
-// (arity 0..=16) are valid, lifting the diagnostic-UX surface from
-// «contributor must remember to look up RowDecodeSealed» (tier-3
-// by-discipline) to «compiler itself instructs the user» (tier-1
-// at the diagnostic surface).
+// Structural diagnostic for sealed-trait E0277. Without the
+// attribute, a hostile user trying `impl RowDecode for Foo {}` gets
+// the raw «trait bound `Foo: RowDecodeSealed` is not satisfied»
+// message — the sealed supertrait is module-private, so they cannot
+// fix it from outside. The attribute carries an instructive note
+// explaining that only crate-internal tuple impls (arity 0..=16) are
+// valid, lifting the diagnostic-UX surface from «contributor must
+// remember to look up RowDecodeSealed» to «compiler itself instructs
+// the user».
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid prepared-query row type",
     label = "valid row types are tuples `()` through `(T1, T2, ..., T16)` where each Ti implements `ColTextAt`",
-    note = "`RowDecode` is sealed — only the crate-internal tuple impls (arity 0..=16) over primitive cell types (`i16`, `i32`, `i64`, `u32`, `bool`, `&'static str`) can satisfy it; downstream `impl RowDecode for ...` is forbidden by construction (DEF-244 memo §7 P8 closure)"
+    note = "`RowDecode` is sealed — only the crate-internal tuple impls (arity 0..=16) over primitive cell types (`i16`, `i32`, `i64`, `u32`, `bool`, `&'static str`) can satisfy it; downstream `impl RowDecode for ...` is forbidden by construction"
 )]
 pub trait RowDecode: sealed::RowDecodeSealed + Sized {
     /// Number of columns this row carries.
@@ -145,19 +139,17 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
 /// Crate-internal projection: marker type → at-`'a` decoded type.
 /// `i32 → i32` (no lifetime), `&'static str → &'a str`, etc.
 //
-// DEF-244 follow-up (rust-version 1.78 modernisation): structural
-// diagnostic for the cell-type rejection path. Pre-attribute, a
-// `prepared!("... ROW (i64, u64)")` or similar with `u64` (banned
-// — see `prepared_unsupported_types/numeric.rs` for the symmetric
-// rejection on the params side) emitted the bare «trait bound `u64:
-// col_text_at_sealed::Sealed` is not satisfied» message — the
-// sealed module is private, so the contributor cannot inspect the
-// candidates. The attribute below routes them to the supported
-// list directly.
+// Structural diagnostic for the cell-type rejection path. Without
+// the attribute, a `prepared!("... ROW (i64, u64)")` or similar
+// with `u64` (banned — see `prepared_unsupported_types/numeric.rs`)
+// emits the bare «trait bound `u64: col_text_at_sealed::Sealed` is
+// not satisfied» message — the sealed module is private, so the
+// contributor cannot inspect the candidates. The attribute below
+// routes them to the supported list directly.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a supported prepared-query row cell type",
     label = "supported cell types are `i16`, `i32`, `i64`, `u32`, `bool`, and `&'static str` (rendered as `&'a str` at decode time)",
-    note = "`ColTextAt` is sealed — extend the supported set by adding a `col_text_at_primitive!` invocation in `prepared.rs`; downstream `impl ColTextAt for ...` is forbidden by construction (DEF-244 memo §7 P8 closure on the row-decoder side)"
+    note = "`ColTextAt` is sealed — extend the supported set by adding a `col_text_at_primitive!` invocation in `prepared.rs`; downstream `impl ColTextAt for ...` is forbidden by construction"
 )]
 pub trait ColTextAt<'a>: col_text_at_sealed::Sealed {
     /// The type decoded from text-format bytes at lifetime `'a`.
@@ -531,7 +523,7 @@ where
 /// hand-call new_prepared_query". CREDO §0 documented-discipline
 /// boundary holds. SQL-injection class for users-who-follow-the-
 /// contract remains tier-1-by-construction via the macro's lex +
-/// cast-annotation validation pipeline (memo §7 P3-P12).
+/// cast-annotation validation pipeline.
 #[doc(hidden)]
 #[inline]
 #[must_use]
@@ -562,9 +554,9 @@ where
 // Static trailer bytes for the Bind frame.
 //
 // PG §55.2.2: after the per-param payload comes
-// `n_result_formats: u16_be`. v1 uses `0` (all-text default per
-// memo §5.4); when DEF-228 lands binary-result, this would conditionally
-// expand to `1, [Binary]` for prepared queries electing binary.
+// `n_result_formats: u16_be`. v1 uses `0` (all-text default). A
+// future binary-result extension would conditionally expand this
+// to `1, [Binary]` for prepared queries electing binary.
 // ═════════════════════════════════════════════════════════════════════
 
 /// `[0x00, 0x00]` — the static 2-byte `n_result_formats = 0`
@@ -582,8 +574,7 @@ pub(crate) const BIND_N_RESULT_FORMATS_ZERO: [u8; 2] = [0, 0];
 ///
 /// All-static for the macro: every prepared query uses the empty
 /// portal and `fetch-all` semantics in v1.0. PortalSuspended /
-/// max_rows ≠ 0 are out of scope (track DEF-035 stmt-cache + 1c-6
-/// portal-Close).
+/// max_rows ≠ 0 are not supported.
 pub(crate) const EXECUTE_EMPTY_PORTAL_NO_LIMIT: [u8; 10] = [
     b'E', // tag
     0, 0, 0, 9, // length = 9 (self-inclusive)

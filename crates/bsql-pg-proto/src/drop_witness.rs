@@ -1,22 +1,23 @@
-//! DEF-259 (2026-05-08): test-only drop-counter machinery for
-//! tier-1-by-construction zeroize-on-drop verification.
+//! Test-only drop-counter machinery for tier-1-by-construction
+//! zeroize-on-drop verification.
 //!
 //! # Why this module exists
 //!
-//! Pre-DEF-259 zeroize-on-drop verification was **tier-2 by-discipline**:
-//! manual memory-probe tests (`scram_zeroize_miri_spec.rs`,
-//! `error_arena_staleness_spec.rs`, `session_params_staleness_spec.rs`,
-//! `secret_bounded_str_spec.rs`) covered SOME secret-bearing types via
-//! `unsafe`-pointer reads of post-Drop memory, all `#[ignore]`-gated
-//! (run only via `cargo test -- --ignored` or `cargo miri test`).
-//! Other secret-bearing types (`ScramSession`, `SecretDigest`,
-//! `Md5HandshakeState`) had no per-type witness — coverage was
-//! transitive through SCRAM/MD5 integration tests that "happened to
-//! drop" them mid-flow. A new secret-bearing type added without a
-//! probe wired up would silently lack Drop-fire verification: the
-//! canonical tier-4 "happens not to fail" anti-pattern (CREDO §1).
+//! Without a uniform witness, zeroize-on-drop verification stays
+//! **tier-2 by-discipline**: manual memory-probe tests (e.g.
+//! `scram_zeroize_miri_spec.rs`, `error_arena_staleness_spec.rs`,
+//! `session_params_staleness_spec.rs`, `secret_bounded_str_spec.rs`)
+//! cover SOME secret-bearing types via `unsafe`-pointer reads of
+//! post-Drop memory, all `#[ignore]`-gated (run only via
+//! `cargo test -- --ignored` or `cargo miri test`). Other secret-
+//! bearing types (`ScramSession`, `SecretDigest`, `Md5HandshakeState`)
+//! have no per-type witness — coverage would be transitive through
+//! SCRAM/MD5 integration tests that "happen to drop" them mid-flow.
+//! A new secret-bearing type added without a probe wired up would
+//! silently lack Drop-fire verification: the canonical tier-4
+//! "happens not to fail" anti-pattern (CREDO §1).
 //!
-//! # What DEF-259 closes
+//! # What this module provides
 //!
 //! Two complementary structural mechanisms:
 //!
@@ -44,25 +45,20 @@
 //!    via `impl CrateZeroizeSecret` fails the test deterministically
 //!    on every `cargo test` run.
 //!
-//! # Tier elevation
+//! # Tier
 //!
-//! - Pre-DEF-259: tier-2 by-discipline (manual probes, easy to
-//!   forget, ignore-gated).
-//! - Post-DEF-259: **tier-1 by-construction**. The exhaustiveness
-//!   gate fails build-time if the manifest drifts from the source
-//!   reality; per-type `DropCounter<T>` witnesses run on every
-//!   `cargo test` (no `--ignored` required). Drop-fire is now a
-//!   compile-adjacent invariant rather than a discipline-adjacent
-//!   one.
+//! **Tier-1 by-construction**. The exhaustiveness gate fails
+//! build-time if the manifest drifts from the source reality;
+//! per-type `DropCounter<T>` witnesses run on every `cargo test`
+//! (no `--ignored` required). Drop-fire is a compile-adjacent
+//! invariant rather than a discipline-adjacent one.
 //!
 //! # Production impact
 //!
 //! Zero. The entire module is `#[cfg(test)]`. Production builds
 //! (`cargo build --release`) compile without this module; downstream
-//! consumers (`bsql-driver-postgres` Phase 1e, the proc-macro online
-//! client Phase 2) see no API surface change. Type signatures, Drop
-//! impls, layouts, and SemVer surface are identical pre- and
-//! post-DEF-259.
+//! consumers see no API surface change. Type signatures, Drop impls,
+//! layouts, and SemVer surface are unchanged.
 //!
 //! # Why no `unsafe`
 //!
@@ -89,11 +85,10 @@
 #![cfg(test)]
 #![allow(
     dead_code,
-    reason = "DEF-259 manifest impls and helper API surface are exercised by \
-              per-module tests + the integration coverage spec; some impls \
-              may be referenced only via the source-grep gate, not via direct \
-              call sites — that is the whole point of the exhaustiveness \
-              mechanism, not unused dead code."
+    reason = "manifest impls and helper API surface are exercised by per-module tests \
+              + the integration coverage spec; some impls may be referenced only via \
+              the source-grep gate, not via direct call sites — that is the whole \
+              point of the exhaustiveness mechanism, not unused dead code."
 )]
 
 use alloc::sync::Arc;
@@ -240,7 +235,7 @@ impl<T> Drop for DropCounter<T> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-259 manifest — every secret-bearing type in `bsql-pg-proto`.
+// Manifest — every secret-bearing type in `bsql-pg-proto`.
 // ═════════════════════════════════════════════════════════════════════
 //
 // **Tier-1 by-construction**: the integration test
@@ -294,11 +289,10 @@ pub(crate) trait CrateZeroizeSecret: sealed::Sealed {}
 impl<const N: usize> sealed::Sealed for crate::buf::ReadBufN<N> {}
 impl<const N: usize> CrateZeroizeSecret for crate::buf::ReadBufN<N> {}
 
-// `bsql-pg-proto::buf::ReadBuf` (DEF-265 Idea-38) — two-tier inline+heap
-// buffer. Manual Drop impl zeroizes BOTH inline storage and heap-Box
-// contents (if escaped). Production use replaces the previous inline
-// `ReadBufN<4096>`-as-`ReadBuf` alias. Inline path is the common case
-// (frames ≤ 256 B); heap escape on first overflow.
+// `bsql-pg-proto::buf::ReadBuf` — two-tier inline+heap buffer.
+// Manual Drop impl zeroizes BOTH inline storage and heap-Box
+// contents (if escaped). Inline path is the common case (frames
+// ≤ 256 B); heap escape on first overflow.
 impl sealed::Sealed for crate::buf::ReadBuf {}
 impl CrateZeroizeSecret for crate::buf::ReadBuf {}
 

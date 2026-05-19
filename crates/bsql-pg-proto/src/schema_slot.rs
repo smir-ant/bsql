@@ -1,25 +1,9 @@
-//! DEF-272 cluster α (2026-05-10) — tier-1 within-crate
-//! `row_desc_slot` write provenance via concrete-token + Cell newtype.
+//! Tier-1 within-crate `row_desc_slot` write provenance via
+//! concrete-token + Cell newtype.
 //!
-//! # Pre-DEF-272 α (post-DEF-270 R-rephrased + DEF-271 cluster B/C)
+//! # Architecture
 //!
-//! - `row_desc_slot: Option<RowDesc>` was a raw field of `PgProtocol`,
-//!   with all of `mod protocol` (~5K LoC) holding direct mut access via
-//!   `pg.row_desc_slot = ...`.
-//! - The `SchemaParkedSlot<A: SchemaWriteAuth>` witness gated writes via
-//!   a sealed-trait auth tag, but the seal was `pub(crate)` — any
-//!   in-crate file could write `impl SchemaWriteAuth for HostileTag`
-//!   (the seal only closed the **external** API surface, not the
-//!   within-crate surface). Tier-1 EXTERNAL + tier-2 by-discipline
-//!   WITHIN-CRATE.
-//! - Architect audit (2026-05-10) verified empirically by appending a
-//!   hostile probe to `lib.rs`: `cargo check --tests` accepted hostile
-//!   `impl Sealed for H + impl SchemaWriteAuth for H + from_field_with_auth(slot, H).park(...)`
-//!   from a non-leaf in-crate location.
-//!
-//! # Post-DEF-272 α
-//!
-//! Two structural changes close the within-crate hole:
+//! Two structural mechanisms close the within-crate write surface:
 //!
 //! 1. **`RowDescSlotCell` newtype** wraps the inner `Option<RowDesc>`
 //!    with a PRIVATE `inner` field (private to `mod schema_slot`). The
@@ -29,14 +13,22 @@
 //!    `is_some`, `is_none`) and write-methods that require a
 //!    per-call-site **token** (private-field tuple struct).
 //!
-//! 2. **Per-leaf concrete-type tokens** replace the sealed-trait pattern.
-//!    Each leaf submodule defines its own token type (`pub(crate) struct
+//! 2. **Per-leaf concrete-type tokens** are the seal. Each leaf
+//!    submodule defines its own token type (`pub(crate) struct
 //!    BeSelectToken(())` etc.) with a PRIVATE field. The token's
 //!    struct-literal mint `Self(())` is callable ONLY inside the
 //!    defining leaf submodule — the field's privacy is the seal, no
 //!    trait, no sealed-supertrait. Each `RowDescSlotCell` write method
 //!    takes a CONCRETE token type by value (consumed by the call):
 //!    `park_at_be_select(&mut self, desc, _token: BeSelectToken)`.
+//!
+//! A sealed-trait-and-auth-tag alternative (e.g.,
+//! `SchemaParkedSlot<A: SchemaWriteAuth>` with `Sealed: pub(crate)`)
+//! would seal the EXTERNAL API surface only — any in-crate file could
+//! still write `impl SchemaWriteAuth for HostileTag` and bypass the
+//! intent (tier-1 external + tier-2 by-discipline within-crate). The
+//! concrete-token shape closes the within-crate surface too
+//! (tier-1 by-construction everywhere).
 //!
 //! # Tier-1 closure (within-crate, by-construction)
 //!
@@ -77,9 +69,9 @@
 //!
 //! The Cell is `#[repr(transparent)]` over `Option<RowDesc>`. Read
 //! methods (`as_ref`, `is_some`, etc.) compile to the same code as the
-//! direct `Option` accessors LLVM produced before. Write methods are
-//! a single field assignment plus a no-op token consume; LLVM erases
-//! the token (zero-sized type). 0 ns / 0 B perf delta vs. pre-DEF-272.
+//! bare `Option` accessors. Write methods are a single field
+//! assignment plus a no-op token consume; LLVM erases the token
+//! (zero-sized type). 0 ns / 0 B perf cost.
 
 use crate::decode::RowDesc;
 
@@ -91,19 +83,17 @@ use crate::decode::RowDesc;
 /// `Option<RowDesc>` — `mem::size_of::<RowDescSlotCell>() ==
 /// mem::size_of::<Option<RowDesc>>()`.
 ///
-/// DEF-279 follow-up (2026-05-18): visibility raised to `pub` so the
-/// type can appear as the associated type
-/// `<protocol::ActivePhase as protocol::SealedPhase>::Extras`. The
-/// `inner` field stays private — external code cannot construct or
-/// observe the cell's contents except via the token-gated
+/// `pub` visibility (required so the type can appear as the associated
+/// type `<protocol::ActivePhase as protocol::SealedPhase>::Extras`).
+/// The `inner` field stays private — external code cannot construct
+/// or observe the cell's contents except via the token-gated
 /// `pub(crate)` constructor + read-only `as_ref` projection.
-// DEF-279 follow-up (2026-05-18): `#[allow]` for missing_copy /
-// missing_debug post-`pub` raise. `Copy` is BANNED on the cell —
-// the field-write protocol (token-gated `park_at_*` / `clear_at_*`)
-// would be subvertable by mass-copying. Debug is suppressed because
-// RowDesc itself prints column metadata that callers may not want
-// exposed via {:?}; production code observes via `as_ref()` and
-// projects through `RowDescBorrow`.
+// `#[allow]` for missing_copy / missing_debug post-`pub` raise.
+// `Copy` is BANNED on the cell — the field-write protocol (token-
+// gated `park_at_*` / `clear_at_*`) would be subvertable by mass-
+// copying. Debug is suppressed because RowDesc itself prints column
+// metadata that callers may not want exposed via {:?}; production
+// code observes via `as_ref()` and projects through `RowDescBorrow`.
 #[allow(missing_copy_implementations, missing_debug_implementations)]
 #[repr(transparent)]
 pub struct RowDescSlotCell {
@@ -116,8 +106,7 @@ impl RowDescSlotCell {
     /// the only mint site (private to that leaf submodule which also
     /// hosts the sole legitimate caller, `PgProtocol::new`). Closes
     /// wholesale-replacement (`*cell = RowDescSlotCell::empty(...)`)
-    /// to the leaf by construction — DEF-272 P6 closure (2026-05-10),
-    /// architect hostile-probe-driven follow-up to DEF-272.
+    /// to the leaf by construction.
     ///
     /// The token is consumed (ZST, erased by LLVM); non-init code paths
     /// must use the token-gated `park_at_*` / `clear_at_*` methods which
