@@ -1301,13 +1301,16 @@ pub enum ErrorKind {
 pub struct StateErrorKind(ErrorKind);
 
 impl StateErrorKind {
-    // DEF-154 (I): `INTERNAL_FALLBACK` const DELETED — it was
-    // exposed publicly only to supply the `unwrap_or_else` landing
-    // pad for three `state_kind().unwrap_or_else(|| { debug_assert!(false, ...); INTERNAL_FALLBACK })`
-    // call sites, which are now replaced by a total
-    // `state_kind() -> StateErrorKind` projection. The internal
-    // `Self(ErrorKind::Internal)` sentinel lives on inside
-    // `from_kind_or_internal`.
+    // DEF-154 (I) — HISTORICAL: `INTERNAL_FALLBACK` const DELETED
+    // (Tier-3 audit #53, 2026-05-19, verified). It was exposed
+    // publicly only to supply the `unwrap_or_else` landing pad for
+    // three `state_kind().unwrap_or_else(|| { debug_assert!(false,
+    // ...); INTERNAL_FALLBACK })` call sites, which are now replaced
+    // by a total `state_kind() -> StateErrorKind` projection (see
+    // `ProtocolError::state_kind` at the end of this module). The
+    // internal `Self(ErrorKind::Internal)` sentinel lives on inside
+    // `from_kind_or_internal`. The "tier-4 debug-loud-release-silent"
+    // pattern the audit flagged is closed.
 
     /// Construct from a full [`ErrorKind`]. Returns `None` when
     /// passed [`ErrorKind::AlreadyClosed`] — that variant is the
@@ -1456,19 +1459,21 @@ impl ProtocolError {
     /// dispatch + feed_bytes + builder paths NEVER see it as a
     /// cause — architectural invariant per DEF-142.
     ///
-    /// Pre-(I), this method returned `Option<StateErrorKind>` and
-    /// three call sites open-coded
+    /// Pre-(I) (HISTORICAL — closed by DEF-154 (I); Tier-3 audit
+    /// #53, 2026-05-19, verified): this method returned
+    /// `Option<StateErrorKind>` and three call sites open-coded
     /// `state_kind().unwrap_or_else(|| { debug_assert!(false, ...); INTERNAL_FALLBACK })`
     /// — the exact "release silent + debug loud" pattern the user
     /// has banned (
     /// "никаких потенциальных паник и прочих атрибутов хрупкой и
     /// стеклянной структуры").
     ///
-    /// Post-(I), the projection is total: `AlreadyClosed → Internal`.
-    /// That IS an honest classification ("something went wrong at
-    /// the crate level") — not silent corruption. Architecturally
-    /// dead under DEF-142 seal; preserved as behavioural fallback
-    /// rather than a panic + silent-release split.
+    /// Post-(I), the projection is **total**: `AlreadyClosed →
+    /// Internal`. That IS an honest classification ("something went
+    /// wrong at the crate level") — not silent corruption.
+    /// Architecturally dead under DEF-142 seal; preserved as
+    /// behavioural fallback rather than a panic + silent-release
+    /// split. Tier-2 typed-total per audit #53 plan.
     #[inline]
     #[must_use]
     pub const fn state_kind(&self) -> StateErrorKind {
