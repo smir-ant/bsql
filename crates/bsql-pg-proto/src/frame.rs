@@ -122,19 +122,16 @@ pub enum HeaderParse {
     Incomplete,
     /// Header parsed cleanly. The frame is fully described.
     ///
-    /// # F-058 (pass-#8): `declared_len` removed
+    /// # `declared_len` is not carried here
     ///
-    /// Pre-pass-#8 this variant carried both `declared_len: NonZeroU32`
-    /// (4 bytes on the wire) and `total_len: usize` (8 bytes on 64-bit)
-    /// — redundantly, since `total_len = 1 + declared_len` is a type
-    /// invariant (`parse_header` constructs both). Production code
-    /// ignored `declared_len` (`protocol.rs::feed_bytes` uses
-    /// `declared_len: _`); only frame-parse tests read it. Dropping
-    /// the field shrinks the variant by 8 B per return.
-    ///
-    /// Tests that need the declared length compute it inline:
+    /// The variant carries `total_len` only; `declared_len` is
+    /// derivable as `total_len - 1` (`parse_header` constructs both
+    /// fields in lock-step from the wire bytes). Production code at
+    /// `protocol.rs::feed_bytes` never reads `declared_len`. Tests
+    /// that need it compute it inline:
     /// `let declared = u32::try_from(total_len.saturating_sub(1))
     ///     .ok().and_then(NonZeroU32::new)`.
+    /// Dropping the field shrinks the variant by 8 B per return.
     Ok {
         /// The PG message tag, typed as [`crate::wire::InboundTag`]
         /// — bytes received from the server are wrapped here so

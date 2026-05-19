@@ -678,10 +678,10 @@ fn base64_decode_bounded(
 #[cfg(not(test))]
 pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
     let mut raw = zeroize::Zeroizing::new([0u8; 18]);
-    // F-025 (pass-#8): classify randomness failure separately from
-    // buffer overflow. Prior `map_err(|_| BufferOverflow)` produced
+    // Classify randomness failure separately from buffer overflow.
+    // A naive `map_err(|_| BufferOverflow)` would produce
     // misleading operator diagnostics on `/dev/urandom` EAGAIN or
-    // container-restricted getrandom calls.
+    // container-restricted `getrandom` calls.
     getrandom::getrandom(raw.as_mut()).map_err(|_| ScramError::RandomnessUnavailable)?;
     let mut b64_buf = [0u8; MAX_CLIENT_NONCE_B64_LEN];
     let written = base64_encode_to_buf(&*raw, &mut b64_buf)?;
@@ -717,8 +717,8 @@ pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NON
         } else {
             // No injection — use real randomness.
             let mut raw = zeroize::Zeroizing::new([0u8; 18]);
-            // F-025 (pass-#8): mirror the production path's typed
-            // classification — RandomnessUnavailable on getrandom failure.
+            // Mirror the production path's typed classification —
+            // `RandomnessUnavailable` on `getrandom` failure.
             getrandom::getrandom(raw.as_mut())
                 .map_err(|_| ScramError::RandomnessUnavailable)?;
             let mut b64_buf = [0u8; MAX_CLIENT_NONCE_B64_LEN];
@@ -868,13 +868,13 @@ pub(crate) enum ParseU32Error {
 
 /// Parse a decimal u32 from ASCII bytes with typed error classification.
 ///
-/// F-022 (pass-#8): swapped to stdlib `u32::from_str_radix` via
-/// `core::str::from_utf8` + `ParseIntError::kind()` mapping. Stdlib
-/// impl is heavily optimised (LLVM folds pure integer parsing,
-/// SIMD fast path on some targets). Kind-mapping preserves the
-/// three typed variants (`Empty`, `InvalidDigit`, `Overflow`) that
-/// callers may eventually surface; current SCRAM callers collapse
-/// all three via `.map_err(|_| MalformedServerFirst)`.
+/// Implementation routes through stdlib `u32::from_str_radix` via
+/// `core::str::from_utf8` + `ParseIntError::kind()` mapping. The
+/// stdlib impl is heavily optimised (LLVM folds pure integer
+/// parsing, SIMD fast path on some targets). Kind-mapping preserves
+/// the three typed variants (`Empty`, `InvalidDigit`, `Overflow`)
+/// that callers may eventually surface; current SCRAM callers
+/// collapse all three via `.map_err(|_| MalformedServerFirst)`.
 fn parse_u32(bytes: &[u8]) -> Result<u32, ParseU32Error> {
     use core::num::IntErrorKind;
     let s = core::str::from_utf8(bytes).map_err(|_| ParseU32Error::InvalidDigit)?;

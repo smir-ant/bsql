@@ -3979,16 +3979,16 @@ mod parse_long_uint_swar_tests {
             assert_eq!(
                 parse_long_uint_swar(input),
                 Some(expected),
-                // Tier-4 Cluster D #82 (2026-05-19): pre-audit was
-                // `from_utf8(input).unwrap_or("?")` — fallback dead
-                // for ASCII-decimal test data, but the `"?"` literal
-                // obscured the diagnostic contract. `String::
-                // from_utf8_lossy` (alloc) returns `Cow<'_, str>`
-                // (Borrowed for valid UTF-8, no alloc; Owned with
-                // `U+FFFD` substitution for invalid bytes — stronger
-                // preservation than `"?"`). `core::str::from_utf8_lossy`
-                // doesn't exist (`from_utf8_lossy` is in alloc-only),
-                // so we go through `alloc::string::String`.
+                // `String::from_utf8_lossy` (alloc) returns
+                // `Cow<'_, str>` (Borrowed for valid UTF-8, no
+                // alloc; Owned with `U+FFFD` substitution for
+                // invalid bytes — stronger diagnostic preservation
+                // than a naive `from_utf8(input).unwrap_or("?")`
+                // fallback that would silently collapse all
+                // non-ASCII to a literal `"?"`).
+                // `core::str::from_utf8_lossy` doesn't exist
+                // (`from_utf8_lossy` is alloc-only), so we go
+                // through `alloc::string::String`.
                 "input: {:?}",
                 alloc::string::String::from_utf8_lossy(input),
             );
@@ -4087,14 +4087,15 @@ mod parse_long_uint_swar_tests {
     /// inclusive-range semantic at one of these endpoints.
     #[test]
     fn def_266_long_swar_boundary_digits() {
-        // Tier-4 Cluster D #83 (2026-05-19): pre-audit was
+        // Compile-time table of explicit `(len, all-nines-value)`
+        // tuples — no `unwrap_or`, no `pow`, no `try_from`; each
+        // case is a literal pin that a future digit-grouping
+        // refactor cannot drift past. A naive
         // `(10_u64).pow(u32::try_from(len).unwrap_or(0)).saturating_sub(1)`
-        // — three layered fallbacks (try_from(usize→u32) Err, pow overflow,
-        // sub overflow) where every Err arm is architecturally dead at
-        // len ≤ 19 but the call sequence obscures intent. Replaced with a
-        // compile-time table of explicit `(len, all-nines-value)` tuples
-        // — no `unwrap_or`, no `pow`, no `try_from`; each case is a literal
-        // pin that a future digit-grouping refactor cannot drift past.
+        // form would stack three layered fallbacks (try_from
+        // usize→u32 Err, pow overflow, sub overflow) where every
+        // Err arm is architecturally dead at len ≤ 19 but the call
+        // sequence obscures the intent.
         let cases: &[(usize, u64)] = &[
             (5, 99_999),
             (6, 999_999),

@@ -58,17 +58,17 @@ fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[
 /// longer than block size are hashed first). The `Err` branch is
 /// architecturally dead under the intact RustCrypto `hmac` crate.
 ///
-/// **Pre-F54 code returned `[0u8; 32]` on the dead Err branch.** F54
-/// replaces this with explicit `Result<[u8; 32], ScramError>` so the
+/// The signature returns `Result<[u8; 32], ScramError>` so the
 /// "fail-closed" discipline is visible in the type system, not
-/// documentation-only. Rationale spelled out below.
+/// documentation-only. A naive shape returning `[0u8; 32]` on the
+/// dead `Err` branch would shift the fail-closed contract into prose.
 ///
-/// ## SCRAM fail-closed math (critical — pass-#6 agent got this wrong)
+/// ## SCRAM fail-closed math (critical)
 ///
-/// This is the actual math of what happens if the HMAC Err branch
-/// ever fires. The agent's initial audit claimed "server trivially
-/// accepts because ClientProof = [0; 32]." That is **WRONG**.
-/// Triple-check here so future readers don't re-make the mistake.
+/// This is the actual math of what happens if the HMAC `Err` branch
+/// ever fires. A surface-level reading might claim "server trivially
+/// accepts because ClientProof = [0; 32]" — that is **WRONG**.
+/// Triple-check below so future readers don't re-make the mistake.
 ///
 /// SCRAM-SHA-256 signature-check (RFC 5802 §3):
 ///
@@ -301,14 +301,15 @@ mod tests {
             Err(_) => return,
         };
 
-        // Tier-4 Cluster D #85 (2026-05-19): pre-audit had a three-
-        // layer fallback chain (`base64_encode_to_buf(...).unwrap_or(0)`
-        // → `buf.get(..len).unwrap_or(&[])` → `from_utf8(...).unwrap_or("")`)
-        // for each of two base64 verifications. Migrated to call
-        // `base64ct::Base64::encode` directly — it returns
+        // `base64ct::Base64::encode` returns
         // `Result<&str, InvalidLengthError>` borrowing into the
-        // caller-owned buf, eliminating the slice→bytes→str conversion
-        // chain. Single `unwrap_or("")` per call instead of three.
+        // caller-owned buf — a single `unwrap_or("")` per call.
+        // A naive three-layer chain
+        // (`base64_encode_to_buf(...).unwrap_or(0)` →
+        // `buf.get(..len).unwrap_or(&[])` →
+        // `from_utf8(...).unwrap_or("")`) would stack
+        // architecturally-dead fallbacks where the typed
+        // `&str`-returning shape collapses them into one.
         use base64ct::{Base64, Encoding};
 
         // Verify via base64 encoding of the proof.

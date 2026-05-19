@@ -1169,16 +1169,15 @@ pub enum StagedReply {
 ///
 /// `#[doc(hidden)] pub` — see [`StagedReply`] for visibility rationale.
 ///
-/// # Tier-4 Cluster B (2026-05-19) — field visibility tightened
+/// # Field visibility
 ///
-/// Pre-Cluster-B fields were `pub` (with `#[doc(hidden)]`) for the
-/// same trait-bound reason as the type — but `pub` fields enable
-/// external struct-literal construction (`StagedQueryCompletePayload
-/// { command_tag, tx_status }`), bypassing the `From` impls'
-/// crate-internal construction path. Fields are now `pub(crate)`:
-/// the type stays `pub` (forced by `ReplyKind::StagedPayload` trait
-/// bound), but only in-crate code can construct via struct literal.
-/// Closes the "hidden-but-reachable" bypass class.
+/// Fields are `pub(crate)`: the type stays `pub` (forced by the
+/// `ReplyKind::StagedPayload` trait bound), but only in-crate code
+/// can construct via struct literal. A naive `pub` fields shape
+/// would enable external struct-literal construction
+/// (`StagedQueryCompletePayload { command_tag, tx_status }`),
+/// bypassing the `From` impls' crate-internal construction path —
+/// the "hidden-but-reachable" bypass class.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedQueryCompletePayload {
@@ -1201,8 +1200,8 @@ pub struct StagedQueryCompletePayload {
 /// impossible `Rows`-without-slot mismatch (banned per CREDO §V
 /// "defensive-for-impossible"). Tier-1 by-construction.
 ///
-/// Tier-4 Cluster B (2026-05-19): fields tightened to `pub(crate)`;
-/// see [`StagedQueryCompletePayload`] for the bypass-closure rationale.
+/// Fields are `pub(crate)`; see [`StagedQueryCompletePayload`] for
+/// the bypass-closure rationale.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribeStatementCompletePayload {
@@ -1214,9 +1213,9 @@ pub struct StagedDescribeStatementCompletePayload {
 /// [`DescribePortalCompletePayload<'r>`].
 ///
 /// See [`StagedDescribeStatementCompletePayload`] for the
-/// single-source-of-truth rationale on schema presence.
-/// Tier-4 Cluster B (2026-05-19): field tightened to `pub(crate)`;
-/// see [`StagedQueryCompletePayload`] for the bypass-closure rationale.
+/// single-source-of-truth rationale on schema presence. Field is
+/// `pub(crate)`; see [`StagedQueryCompletePayload`] for the
+/// bypass-closure rationale.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribePortalCompletePayload {

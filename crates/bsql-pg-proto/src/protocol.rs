@@ -1091,13 +1091,12 @@ pub struct PgProtocol<P: SealedPhase = ActivePhase> {
 // Cost: visibility-only; LLVM erases everything; 0 ns / 0 B.
 //
 // ─────────────────────────────────────────────────────────────────────
-// Tier-4 Cluster C audit: by-value `_token: TokenType` parameters
-// kept, by-ref `token: &TokenType` REJECTED.
+// By-value `_token: TokenType` parameters kept, by-ref
+// `token: &TokenType` rejected.
 //
-// Audit Cluster C proposed migrating every `_token: TokenType` leaf-
-// token consumer parameter to `token: &TokenType` (by-ref), motivated
-// by "drop the underscore prefix; non-underscore name is fine with
-// `&T`". Investigation found the proposal weakens tier-1:
+// A naive migration to `token: &TokenType` (by-ref) — motivated by
+// "drop the underscore prefix; non-underscore name is fine with
+// `&T`" — would weaken tier-1:
 //
 //   - Every leaf token EXCEPT `_proto_init_leaf::ProtoInitToken` is a
 //     non-Copy ZST (no `#[derive(Clone, Copy)]`). Today, by-value
