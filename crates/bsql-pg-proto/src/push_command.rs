@@ -1,37 +1,36 @@
-//! DEF-269 v2 (T) — type-level command dispatch.
+//! Type-level command dispatch.
 //!
-//! Replaces the runtime `PgCommand` enum (~2176 B sized to its largest
-//! variant `Parse`) with per-command structs that each carry only their
-//! own size. Each struct implements the sealed [`PushCommand`] trait;
-//! [`crate::guard::ReadyGuard::push_command`] monomorphises per type.
+//! Each client→server command is its own struct that carries only
+//! its own size; each struct implements the sealed [`PushCommand`]
+//! trait; [`crate::guard::ReadyGuard::push_command`] monomorphises
+//! per type.
 //!
-//! # Why
+//! # Why per-command structs and not a runtime enum
 //!
-//! Pre-DEF-269-v2: every `proto.as_ready().unwrap().push_command(
-//! PgCommand::Ping { reply }, &mut wb)` call moved 2176 B by value
-//! across the stack to dispatch on a single discriminant byte. Logical
-//! Ping is ~16 B. Wasted 2160 B per call. The synthetic
-//! `push_command/ping` bench (fresh `PgProtocol` per iter) paid this
-//! cost on every iteration.
+//! A runtime `PgCommand` enum is sized to its largest variant
+//! (`Parse` at ~2176 B). Every
+//! `proto.as_ready().unwrap().push_command(PgCommand::Ping { reply },
+//! &mut wb)` call would move 2176 B by value across the stack to
+//! dispatch on a single discriminant byte. Logical Ping is ~16 B —
+//! 2160 B wasted per call.
 //!
-//! Post-DEF-269-v2: [`Ping`] is 16 B, [`Flush`] is 0 B, [`BindExecute`]
-//! is parameterised on `P: ParamsWriter` and carries only what its
-//! actual parameters need. Each push pays its own size.
+//! With the per-command shape: [`Ping`] is 16 B, [`Flush`] is 0 B,
+//! [`BindExecute`] is parameterised on `P: ParamsWriter` and carries
+//! only what its actual parameters need. Each push pays its own size.
 //!
 //! # Tier-1 invariants
 //!
 //! - **Push from Idle**: enforced at the
 //!   [`crate::PgProtocol::push_command_internal`] entry via the
 //!   [`crate::state_setter::IdleState::try_from`] lifetime-bound
-//!   typestate (DEF-272 cluster γ; supersedes the pre-γ `IdleStateProof`
-//!   ZST witness). The typestate IS the `&mut state` borrow + the Idle
-//!   proof, inseparable; pairing-with-different-state is impossible by
-//!   lifetime ownership. ReadyGuard's `as_ready` runtime check is the
-//!   upstream classifier; the typestate's `try_from` is belt-and-braces
-//!   tier-1 enforcement.
+//!   typestate. The typestate IS the `&mut state` borrow + the Idle
+//!   proof, inseparable; pairing-with-different-state is impossible
+//!   by lifetime ownership. ReadyGuard's `as_ready` runtime check is
+//!   the upstream classifier; the typestate's `try_from` is belt-
+//!   and-braces tier-1 enforcement.
 //! - **Reply correlator typed**: Each impl statically knows its
-//!   `ReplyId<K>` parameter type — DEF-112 kind-parameterisation
-//!   surfaces at the impl boundary, no runtime command-kind tagging.
+//!   `ReplyId<K>` parameter type — kind-parameterisation surfaces at
+//!   the impl boundary, no runtime command-kind tagging.
 //! - **Sealed**: Implementations are crate-internal only. Adding a
 //!   new command is a same-commit job (struct + impl + tests + bench
 //!   probe).
@@ -46,10 +45,10 @@
 
 use crate::command::FetchRows;
 use crate::ident::{PortalName, StmtName};
-// DEF-246 Phase 2 (2026-05-16): `ApplicationName`, `DatabaseName`,
-// `Ident`, `Credentials` were used by the deleted
-// `pub struct Startup` + `impl PushCommand for Startup`. They live
-// on `<DisconnectedPhase>::push_startup`'s signature directly
+// `ApplicationName`, `DatabaseName`, `Ident`, `Credentials` are not
+// imported here — the Startup command does not use the per-command
+// `impl PushCommand` shape. The types live on
+// `<DisconnectedPhase>::push_startup`'s signature directly
 // (`use crate::ident::{ApplicationName, DatabaseName, Ident}` /
 // `use crate::password::Credentials` inside `mod protocol`).
 use crate::reply_id::{
@@ -71,12 +70,11 @@ mod sealed {
 ///
 /// # Output
 ///
-/// `Output` is `()` for all current impls. Reserved for `prepared!`
-/// macro Phase 2 (DEF-244) typed handles (e.g.,
-/// `BoundPortalHandle<P>` for chunked-fetch pre-conditions).
-/// Including this associated type now is a 0-byte cost (phantom
-/// associated type) and avoids a future breaking API change when
-/// the macro lands.
+/// `Output` is `()` for all current impls. Reserved for future
+/// typed-handle returns (e.g., `BoundPortalHandle<P>` for chunked-
+/// fetch pre-conditions). Including this associated type now is a
+/// 0-byte cost (phantom associated type) and avoids a future
+/// breaking API change.
 ///
 /// # Sealed-trait visibility
 ///
@@ -88,7 +86,7 @@ mod sealed {
 #[expect(private_interfaces, private_bounds, reason = "sealed-trait pattern: trait method takes pub(crate) types — external crates cannot construct them or implement the trait, so the leakage is cosmetic only. Migrated #[allow]→#[expect] (Rust 1.81): if the referenced types become `pub`, the lint no longer fires, prompting attribute removal.")]
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid client→server command",
-    label = "valid commands are the per-command structs in `push_command`: `Ping`, `Parse`, `DescribeStatement`, `DescribePortal`, `SimpleQuery`, `BindExecute`, `BindPrepared<P, R>` (DEF-244). For startup, see `PgProtocol::<DisconnectedPhase>::push_startup` (DEF-246 Phase 2).",
+    label = "valid commands are the per-command structs in `push_command`: `Ping`, `Parse`, `DescribeStatement`, `DescribePortal`, `SimpleQuery`, `BindExecute`, `BindPrepared<P, R>`. For startup, see `PgProtocol::<DisconnectedPhase>::push_startup`.",
     note = "`PushCommand` is sealed — external crates cannot add command variants; extend the closed set inside `bsql-pg-proto::push_command` paired with the matching dispatcher arm and state-machine transition"
 )]
 pub trait PushCommand: sealed::PushCommandSealed {
@@ -98,25 +96,24 @@ pub trait PushCommand: sealed::PushCommandSealed {
 
     /// Per-command post-push state install witness.
     ///
-    /// DEF-270 N-D (Phase 2): tier-1 by-construction pairing of
-    /// command struct ↔ matching [`crate::state::ProtoState`] variant.
-    /// Each impl pairs its command (e.g. [`Ping`]) to a single
-    /// witness type (e.g. [`PingAwaitingRfqInstall`]) which carries
-    /// exactly the data the variant requires. The
+    /// Tier-1 by-construction pairing of command struct ↔ matching
+    /// [`crate::state::ProtoState`] variant. Each impl pairs its
+    /// command (e.g. [`Ping`]) to a single witness type (e.g.
+    /// [`PingAwaitingRfqInstall`]) which carries exactly the data
+    /// the variant requires. The
     /// [`crate::state_setter::StateSetter`] takes a
     /// `Self::PostState` proof at consumption time — there is no
     /// path to install a non-matching state variant from `execute()`.
-    ///
-    /// Pre-DEF-270-N-D `execute()` received `state: &mut ProtoState`
-    /// and could write any variant; tier-3 by-discipline relied on
-    /// reviewer attention + the `compute_push_tests` per-helper
-    /// transition table.
-    // DEF-280 Bundle F Phase 1 (2026-05-18): bound tightened
-    // `PostStateProof` → `InstallBody`. Closes the declaration boundary:
-    // a future `impl PushCommand for X` with `type PostState = HostileWitness`
-    // is rejected at the trait-impl declaration site (E0277:
-    // HostileWitness: InstallBody not satisfied), not just at the
-    // setter consumption call site. `InstallBody`'s private supertrait
+    /// A bare `execute(state: &mut ProtoState, …)` shape would be
+    /// tier-3 by-discipline (reviewer attention + the
+    /// `compute_push_tests` per-helper transition table); the
+    /// witness-typed shape closes that surface.
+    // Bound is `InstallBody`, not `PostStateProof` — closes the
+    // declaration boundary: a future `impl PushCommand for X` with
+    // `type PostState = HostileWitness` is rejected at the trait-impl
+    // declaration site (E0277: HostileWitness: InstallBody not
+    // satisfied), not just at the setter consumption call site.
+    // `InstallBody`'s private supertrait
     // `install_body_seal::InstallBodySealed` confines impls to mod
     // state_setter, so HostileWitness cannot satisfy the bound.
     type PostState: crate::state_setter::InstallBody;
@@ -137,15 +134,15 @@ pub trait PushCommand: sealed::PushCommandSealed {
     /// The `setter: StateSetter<'_, Self::PostState>` parameter
     /// inherits its `&mut state` borrow from the
     /// [`crate::state_setter::IdleState::try_from`] typestate
-    /// constructed inside `push_command_internal` (DEF-272 cluster γ).
-    /// The typestate IS the proof + the borrow; reaching `execute()`
-    /// implies the runtime Idle classification succeeded. ReadyGuard's
-    /// `as_ready` is the upstream classifier; the typestate is
-    /// belt-and-braces enforcement at the boundary.
+    /// constructed inside `push_command_internal`. The typestate IS
+    /// the proof + the borrow; reaching `execute()` implies the
+    /// runtime Idle classification succeeded. ReadyGuard's `as_ready`
+    /// is the upstream classifier; the typestate is belt-and-braces
+    /// enforcement at the boundary.
     ///
     /// # Tier-1 witness — post-state install
     ///
-    /// DEF-270 N-D (Phase 2): `setter` is the **only** path to mutate
+    /// `setter` is the **only** path to mutate
     /// [`crate::state::ProtoState`] from inside `execute()`. The raw
     /// `&mut ProtoState` lives privately inside
     /// [`crate::PgProtocol::push_command_internal`], never handed to
@@ -158,15 +155,16 @@ pub trait PushCommand: sealed::PushCommandSealed {
     ///
     /// Failing to consume the setter triggers an unused-`#[must_use]`
     /// build warning at the impl site.
-    /// DEF-160 Z2 (2026-05-11): `'sql` is the lifetime carried by
-    /// `Self` for impls that borrow caller-owned bytes (currently
-    /// [`Parse<'a>`] / [`SimpleQuery<'a>`] for the SQL string). The
-    /// `where Self: 'sql` bound tells the borrow checker that `Self`
-    /// outlives `'sql`, so an impl with `Self = Parse<'a>` can stage
-    /// `&'a [u8]` into `StagedActions<'sql>` (covariance via the
-    /// `'a >= 'sql` subtyping induced by the bound). Impls with no
-    /// borrowed surface (e.g., [`Ping`]) ignore `'sql` — the bound
-    /// is trivially satisfied by `Self: 'static`.
+    ///
+    /// `'sql` is the lifetime carried by `Self` for impls that borrow
+    /// caller-owned bytes (currently [`Parse<'a>`] / [`SimpleQuery<'a>`]
+    /// for the SQL string). The `where Self: 'sql` bound tells the
+    /// borrow checker that `Self` outlives `'sql`, so an impl with
+    /// `Self = Parse<'a>` can stage `&'a [u8]` into
+    /// `StagedActions<'sql>` (covariance via the `'a >= 'sql`
+    /// subtyping induced by the bound). Impls with no borrowed
+    /// surface (e.g., [`Ping`]) ignore `'sql` — the bound is
+    /// trivially satisfied by `Self: 'static`.
     fn execute<'sql>(
         self,
         setter: crate::state_setter::StateSetter<'_, Self::PostState>,
@@ -208,9 +206,9 @@ pub trait PushCommand: sealed::PushCommandSealed {
 ///
 /// # Size
 ///
-/// `size_of::<Ping>()` = 16 B (just the [`ReplyId<PingKind>`]). Pre-
-/// DEF-269-v2 the same Ping push moved 2176 B by value (PgCommand
-/// enum sized to Parse).
+/// `size_of::<Ping>()` = 16 B (just the [`ReplyId<PingKind>`]). A
+/// runtime `PgCommand` enum sized to its largest variant would move
+/// 2176 B by value on every Ping push.
 #[derive(Debug)]
 #[must_use = "a Ping has no effect until passed to push_command"]
 pub struct Ping {
@@ -248,25 +246,24 @@ impl PushCommand for Ping {
     }
 }
 
-// DEF-246 Phase 2 (2026-05-16): `pub struct Startup` +
-// `impl PushCommand for Startup` DELETED. The handshake entry-point
-// is now `PgProtocol<DisconnectedPhase>::push_startup(...)`
-// (consume-self → `<ConnectingPhase>`). Tier-1 elevation #1:
-// the only legal path into a Connecting state is from
-// `<DisconnectedPhase>`; pushing a Startup command from a Ready
-// `<ActivePhase>` is method-absent E0599 by construction (the struct
-// physically does not exist).
+// There is no `pub struct Startup` + `impl PushCommand for Startup`.
+// The handshake entry-point lives on
+// `PgProtocol<DisconnectedPhase>::push_startup(...)` (consume-self
+// → `<ConnectingPhase>`). Tier-1: the only legal path into a
+// Connecting state is from `<DisconnectedPhase>`; pushing a Startup
+// command from a Ready `<ActivePhase>` is method-absent E0599 by
+// construction (the struct physically does not exist on the
+// PushCommand path).
 
 /// Execute a single SQL statement via PG's Simple Query protocol
 /// (`Q`-frame).
 ///
-/// DEF-160 Z2 (2026-05-11): `sql` is `&'a str` (was owned `Sql =
-/// FixedStr<MAX_SQL_LEN, _>`). The bytes are streamed zero-copy via
-/// [`StagedAction::SendBytesBorrowed`](crate::action::StagedAction)
-/// — no protocol cap on SQL size, no truncation arena. Caller owns
+/// `sql` is `&'a str` — the bytes are streamed zero-copy via
+/// [`StagedAction::SendBytesBorrowed`](crate::action::StagedAction).
+/// No protocol cap on SQL size, no truncation arena. Caller owns
 /// the string allocation; for SQL containing secrets, hold it in
 /// `Zeroizing<String>` (zeroize-on-drop happens at the caller, not
-/// in our `WriteBuf::clear()`).
+/// in `WriteBuf::clear()`).
 #[derive(Debug)]
 #[must_use = "a SimpleQuery has no effect until passed to push_command"]
 pub struct SimpleQuery<'a> {
@@ -304,9 +301,8 @@ impl<'a> PushCommand for SimpleQuery<'a> {
 /// Prepare a named SQL statement via PG's Extended Query protocol
 /// (`P`-frame + `S`-frame terminator).
 ///
-/// DEF-160 Z2 (2026-05-11): `sql` is `&'a str` (was owned `Sql =
-/// FixedStr<MAX_SQL_LEN, _>`). See [`SimpleQuery`] for the rationale
-/// and zeroize-handoff contract.
+/// `sql` is `&'a str`. See [`SimpleQuery`] for the rationale and
+/// zeroize-handoff contract.
 #[derive(Debug)]
 #[must_use = "a Parse has no effect until passed to push_command"]
 pub struct Parse<'a> {
@@ -427,16 +423,14 @@ impl PushCommand for DescribePortal {
 
 /// Extended-Query Bind+Execute pipeline.
 ///
-/// Pipelines three frames in one push: Bind + Execute + Sync. Replaces
-/// the pre-DEF-269-v2 `push_bind_execute` separate method on
-/// [`crate::guard::ReadyGuard`].
+/// Pipelines three frames in one push: Bind + Execute + Sync.
 ///
 /// # Generic over `P: ParamsWriter`
 ///
-/// The parameters tuple type is parameterised — pre-DEF-269-v2 the
-/// `PgCommand` enum could not carry this generic, so `push_bind_execute`
-/// lived as a separate method. Post-DEF-269-v2, `BindExecute` is just
-/// another [`PushCommand`] impl with its own type parameter.
+/// The parameters tuple type is parameterised on the
+/// [`PushCommand`] impl. A runtime `PgCommand` enum could not carry
+/// this generic — every parameterised command would have to live as
+/// a separate method outside the trait.
 #[derive(Debug)]
 #[must_use = "a BindExecute has no effect until passed to push_command"]
 pub struct BindExecute<'a, P: crate::params::ParamsWriter> {
@@ -488,8 +482,7 @@ impl<P: crate::params::ParamsWriter> PushCommand for BindExecute<'_, P> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-270 Phase 2 (N-D, 2026-05-10) — per-command post-state install
-// witnesses.
+// Per-command post-state install witnesses
 //
 // Each per-command struct above pairs (via `type PostState`) with one
 // witness type below. Witnesses carry exactly the data the matching
@@ -501,15 +494,8 @@ impl<P: crate::params::ParamsWriter> PushCommand for BindExecute<'_, P> {
 // constructor in scope at the impl's `execute` body for the
 // post-state install is the matching witness type).
 //
-// # Pre-DEF-270-N-D PgCommand backwards-compat removed
-//
-// The transitional `impl PushCommand for crate::command::PgCommand`
-// blanket impl + `compute_push_idle_only` slow-path dispatcher were
-// deleted at this commit. Real call sites: zero (DEF-270 Phase 2
-// audit 2026-05-10 grep — only doc comments referenced
-// `push_command(PgCommand::...)`). The `PgCommand` enum itself
-// survives for the `compute_push_tests` test-only 5-arm dispatchers;
-// no production code path constructs it.
+// The `PgCommand` enum survives for the `compute_push_tests` test-
+// only 5-arm dispatchers; no production code path constructs it.
 // ═════════════════════════════════════════════════════════════════════
 
 use crate::state_setter::PostStateProof;
@@ -524,10 +510,10 @@ pub struct PingAwaitingRfqInstall {
     pub(crate) reply: ReplyId<PingKind>,
 }
 impl PostStateSealed for PingAwaitingRfqInstall {}
-// DEF-280 Bundle F Phase 1: `impl PostStateProof` is now an empty marker;
-// the install body lives in `state_setter::InstallBody` impl
-// (state_setter.rs). The trait split closes the within-crate hostile-
-// witness hole — see state_setter.rs's `InstallBody` doc for details.
+// `impl PostStateProof` is an empty marker; the install body lives
+// in `state_setter::InstallBody` impl (state_setter.rs). The trait
+// split closes the within-crate hostile-witness hole — see
+// state_setter.rs's `InstallBody` doc for details.
 impl PostStateProof for PingAwaitingRfqInstall {}
 
 /// Witness pairing [`Startup`] to one of four post-startup variants
@@ -573,7 +559,7 @@ pub enum StartupPostInstall {
     },
 }
 impl PostStateSealed for StartupPostInstall {}
-// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+// Install body lives in `state_setter::InstallBody` impl.
 impl PostStateProof for StartupPostInstall {}
 
 /// Witness pairing [`SimpleQuery`] to
@@ -584,7 +570,7 @@ pub struct SimpleQueryAwaitingFirstResponseInstall {
     pub(crate) reply: ReplyId<QueryKind>,
 }
 impl PostStateSealed for SimpleQueryAwaitingFirstResponseInstall {}
-// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+// Install body lives in `state_setter::InstallBody` impl.
 impl PostStateProof for SimpleQueryAwaitingFirstResponseInstall {}
 
 /// Witness pairing [`Parse`] to
@@ -595,7 +581,7 @@ pub struct ParseAwaitingParseCompleteInstall {
     pub(crate) reply: ReplyId<ParseKind>,
 }
 impl PostStateSealed for ParseAwaitingParseCompleteInstall {}
-// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+// Install body lives in `state_setter::InstallBody` impl.
 impl PostStateProof for ParseAwaitingParseCompleteInstall {}
 
 /// Witness pairing [`DescribeStatement`] to
@@ -606,7 +592,7 @@ pub struct DescribeStatementAwaitingParamDescInstall {
     pub(crate) reply: ReplyId<DescribeStatementKind>,
 }
 impl PostStateSealed for DescribeStatementAwaitingParamDescInstall {}
-// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+// Install body lives in `state_setter::InstallBody` impl.
 impl PostStateProof for DescribeStatementAwaitingParamDescInstall {}
 
 /// Witness pairing [`DescribePortal`] to
@@ -617,7 +603,7 @@ pub struct DescribePortalAwaitingRowDescOrNoDataInstall {
     pub(crate) reply: ReplyId<DescribePortalKind>,
 }
 impl PostStateSealed for DescribePortalAwaitingRowDescOrNoDataInstall {}
-// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+// Install body lives in `state_setter::InstallBody` impl.
 impl PostStateProof for DescribePortalAwaitingRowDescOrNoDataInstall {}
 
 /// Witness pairing [`BindExecute<P>`] to one of two post-bind+execute
@@ -625,18 +611,17 @@ impl PostStateProof for DescribePortalAwaitingRowDescOrNoDataInstall {}
 /// vs schema-less path structurally — schema parking via
 /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`] happens
 /// BEFORE the install, inside `compute_push_bind_execute_idle_only`
-/// (gated by the leaf-private `BeSelectToken` per DEF-272 cluster α);
-/// this witness only captures the variant choice + reply correlator.
+/// (gated by the leaf-private `BeSelectToken`); this witness only
+/// captures the variant choice + reply correlator.
 ///
-/// **Note (Phase 2 scope):** the witness does NOT carry the
-/// `RowDesc` payload itself. The Phase 2 plan (`deferred.md` DEF-270)
-/// noted folding row_desc into the SELECT variant as one closure
-/// path; the chosen design keeps row_desc parking in
-/// `RowDescSlotCell` (tier-1 within-crate by-construction post-DEF-272
-/// cluster α) and only narrows the state-install pairing here.
-/// Rationale: avoiding GAT-driven `Aux` machinery on the trait keeps
-/// the surface clean; per-leaf concrete-token mints close the
-/// pre-DEF-272 sealed-trait bypass surface.
+/// **Note:** the witness does NOT carry the `RowDesc` payload
+/// itself. Folding `row_desc` into the SELECT variant is one
+/// possible shape; the chosen design keeps row_desc parking in
+/// `RowDescSlotCell` (tier-1 within-crate by-construction via the
+/// per-leaf token-gated write surface) and only narrows the state-
+/// install pairing here. Avoiding GAT-driven `Aux` machinery on the
+/// trait keeps the surface clean; per-leaf concrete-token mints
+/// already close the sealed-trait bypass surface for row_desc.
 #[must_use = "a BindExecutePostInstall has no effect until passed to StateSetter::install_post_state"]
 #[expect(missing_debug_implementations, reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait. Migrated #[allow]→#[expect] (Rust 1.81): if a Debug impl is later added, the lint no longer fires, prompting attribute removal.")]
 pub enum BindExecutePostInstall {
@@ -655,13 +640,13 @@ pub enum BindExecutePostInstall {
     },
 }
 impl PostStateSealed for BindExecutePostInstall {}
-// DEF-280 Bundle F Phase 1: install body moved to state_setter::InstallBody.
+// Install body lives in `state_setter::InstallBody` impl.
 impl PostStateProof for BindExecutePostInstall {}
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-244 (2026-05-13) — BindPrepared<'q, P, R> wraps a PreparedQuery
-// + its argument tuple into a PushCommand impl. Caller-facing entry
-// is `ReadyGuard::execute_prepared` (see `guard.rs`).
+// `BindPrepared<'q, P, R>` wraps a PreparedQuery + its argument tuple
+// into a PushCommand impl. Caller-facing entry is
+// `ReadyGuard::execute_prepared` (see `guard.rs`).
 // ═════════════════════════════════════════════════════════════════════
 
 /// Pair a [`crate::prepared::PreparedQuery`] with its argument tuple
@@ -669,10 +654,9 @@ impl PostStateProof for BindExecutePostInstall {}
 ///
 /// Implements [`PushCommand`]; dispatched via the existing
 /// [`ReadyGuard::push_command`](crate::guard::ReadyGuard::push_command)
-/// path so the Idle precondition (DEF-198) + post-state typed
-/// witness (DEF-270 N-D) closures apply unchanged. The execute
-/// helper on `ReadyGuard` is the ergonomic surface; this struct is
-/// the underlying mechanism.
+/// path so the Idle precondition + post-state typed witness closures
+/// apply unchanged. The execute helper on `ReadyGuard` is the
+/// ergonomic surface; this struct is the underlying mechanism.
 ///
 /// # Lifetimes
 ///
@@ -687,12 +671,11 @@ impl PostStateProof for BindExecutePostInstall {}
 /// - `args`: tuple of parameter values, owned by value for the
 ///   move into `write_params`.
 /// - `fetch`: row-count scope. v1 only supports `FetchRows::All`
-///   (memo §5.3 + the existing closed-set enum from
-///   `crate::command`).
+///   (closed-set enum from `crate::command`).
 /// - `reply`: typed correlator the wrapper routes the matching
 ///   reply through.
 ///
-/// # Size pin (memo §10.5)
+/// # Size pin
 ///
 /// `size_of::<BindPrepared<'_, (i32,), (i32, &str)>>() <= 144`
 /// (reference 16 B + tuple 16 B + FetchRows ≤ 16 B + reply 16 B +
@@ -728,10 +711,10 @@ where
     R: crate::prepared::RowDecode,
 {
     type Output = ();
-    /// Reuses `BindExecutePostInstall` (DEF-270 N-D). Prepared
-    /// queries with result rows (`row_oids.is_empty() == false`)
-    /// route through the SELECT branch with a synthetic RowDesc
-    /// parked at push time; row-less queries route through DML.
+    /// Reuses `BindExecutePostInstall`. Prepared queries with result
+    /// rows (`row_oids.is_empty() == false`) route through the SELECT
+    /// branch with a synthetic RowDesc parked at push time; row-less
+    /// queries route through DML.
     type PostState = BindExecutePostInstall;
 
     #[inline]
@@ -758,7 +741,7 @@ where
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Size pins — DEF-269 v2 (T) drift guards
+// Size pins — per-command-struct drift guards
 // ═════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
@@ -777,38 +760,29 @@ mod size_pins {
         );
     }
 
-    /// Tier-1 drift guard: post-DEF-160 (Z2) Parse is small —
-    /// `&'a str` SQL replaces the pre-Z2 owned `Sql = FixedStr<2048>`
-    /// inline. Pin Parse + SimpleQuery sizes at "small" (≤ 128 B)
-    /// — a regression that re-embeds owned SQL would surface here
-    /// dramatically (jump from ~96 B to ~2132 B).
-    ///
-    /// Pre-DEF-160 the test pinned `parse_size >= ping_size * 100`
-    /// (Parse 2132 ≥ Ping 8 × 100). Post-DEF-160 Parse is ~96 B and
-    /// the structural value proposition shifts: small per-command
-    /// structs **and** zero-copy SQL via `SendBytesBorrowed`. The
-    /// per-call size win that DEF-269 v2 (T) measured (push_command
-    /// /ping −83.4%) survives because PgCommand enum is gone — the
-    /// 2176 B move was the enum's by-value payload, not Parse-the-
-    /// struct's; T's win is preserved.
+    /// Tier-1 drift guard: Parse + SimpleQuery sizes are bounded at
+    /// "small" (≤ 128 B for Parse, ≤ 64 B for SimpleQuery). `&'a str`
+    /// SQL is the load-bearing shape — re-embedding owned SQL would
+    /// surface here dramatically (jump from ~96 B to ~2132 B for
+    /// Parse).
     #[test]
     fn parse_and_simple_query_carry_no_inline_sql() {
         let parse_size = core::mem::size_of::<Parse<'static>>();
         let simple_query_size = core::mem::size_of::<SimpleQuery<'static>>();
         assert!(
             parse_size <= 128,
-            "Parse must be ≤ 128 B post-DEF-160 (no inline SQL); got {parse_size} B. \
-             A regression to ~2132 B would mean the owned-Sql field came back.",
+            "Parse must be ≤ 128 B (no inline SQL); got {parse_size} B. \
+             A regression to ~2132 B would mean an owned-Sql field came back.",
         );
         assert!(
             simple_query_size <= 64,
-            "SimpleQuery must be ≤ 64 B post-DEF-160; got {simple_query_size} B.",
+            "SimpleQuery must be ≤ 64 B; got {simple_query_size} B.",
         );
     }
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-280 Bundle F Phase 1 (2026-05-18) — hostile-witness seal pin
+// Hostile-witness seal pin
 //
 // Tier-1 within-crate closure of the install-body authority. This
 // `#[cfg(test)] mod` lives in push_command (a SIBLING module to
@@ -818,8 +792,8 @@ mod size_pins {
 // trick mirroring `lib.rs:535`'s `assert_not_sync`) that:
 //
 //   1. HostileWitness can `impl Sealed` (pub(crate) — accessible).
-//   2. HostileWitness can `impl PostStateProof` (now empty marker —
-//      accessible; post-Bundle-F PostStateProof carries no method).
+//   2. HostileWitness can `impl PostStateProof` (empty marker —
+//      accessible; PostStateProof carries no method).
 //   3. HostileWitness CANNOT `impl InstallBody` (private supertrait
 //      InstallBodySealed unreachable from this sibling module).
 //   4. THEREFORE `setter.install_post_state(HostileWitness)` is E0277
@@ -834,7 +808,7 @@ mod size_pins {
 
 #[cfg(test)]
 #[allow(dead_code, reason = "the impls + const block are compile-time pins; never invoked at runtime")]
-mod bundle_f_seal_probe {
+mod hostile_witness_seal_probe {
     use super::sealed::PushCommandSealed;
     use crate::state_setter::sealed::Sealed as PostStateSealed;
     use crate::state_setter::{InstallBody, PostStateProof};
@@ -849,10 +823,11 @@ mod bundle_f_seal_probe {
     /// blocked at this layer.
     impl PostStateSealed for HostileWitness {}
 
-    /// (2) `impl PostStateProof` — succeeds. Post-Bundle-F PostStateProof
-    /// is a pure marker with no methods; nothing prevents a hostile in-crate
-    /// type from implementing it. The closure is at the NEXT layer
-    /// (InstallBody) where the install body actually lives.
+    /// (2) `impl PostStateProof` — succeeds. PostStateProof is a
+    /// pure marker with no methods; nothing prevents a hostile
+    /// in-crate type from implementing it. The closure is at the
+    /// NEXT layer (InstallBody) where the install body actually
+    /// lives.
     impl PostStateProof for HostileWitness {}
 
     /// (3) `impl InstallBody for HostileWitness {}` — CANNOT BE WRITTEN.
@@ -886,14 +861,14 @@ mod bundle_f_seal_probe {
     };
 
     /// (4) HostileWitness also cannot satisfy `PushCommand::PostState`
-    /// (associated-type bound `: InstallBody`, post-Bundle-F). The pin
-    /// below would fail to compile if the bound regression-paired with
-    /// (3); demonstrated by the negative-bound assertion above —
-    /// the InstallBody pin transitively guards the PostState bound.
+    /// (associated-type bound `: InstallBody`). The pin below would
+    /// fail to compile if that bound regressed paired with (3);
+    /// demonstrated by the negative-bound assertion above — the
+    /// InstallBody pin transitively guards the PostState bound.
     /// Documented anchor; no separate runtime test needed.
     #[test]
     fn hostile_witness_install_body_absent_anchor() {
-        // Anchor for `git grep "bundle_f_seal_probe"` and
+        // Anchor for `git grep "hostile_witness_seal_probe"` and
         // `git grep "AmbiguousIfInstallBody"` searches. The const block
         // above is the structural pin — this fn is the named test
         // surface for discoverability.

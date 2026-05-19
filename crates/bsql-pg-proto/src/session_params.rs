@@ -4,18 +4,17 @@
 //! sends during the post-authentication handshake.
 //!
 //! Unknown keys are parsed and dropped — there is no growable map, so
-//! the "overflow" error class does not exist. DEF-042: tier-1 by
-//! absence of a growable container.
+//! the "overflow" error class does not exist (tier-1 by absence of a
+//! growable container).
 //!
-//! # DEF-114 — typed fields where semantics are structural
+//! # Typed fields where semantics are structural
 //!
 //! Four of the nine fields carry values whose semantics are
 //! enumerable (encoding name) or binary (boolean). Storing them as
-//! opaque bounded strings was tier-2 ("some bounded string body
-//! from the wire") — a consumer reading `params.is_superuser`
-//! had to re-parse `"on"`/`"off"` at every site, audit-enforced.
-//!
-//! DEF-114 elevates these four fields:
+//! opaque bounded strings would be tier-2 ("some bounded string body
+//! from the wire") — a consumer reading `params.is_superuser` would
+//! have to re-parse `"on"`/`"off"` at every site. The typed shape
+//! parses once at ingest:
 //!
 //! - [`is_superuser`](SessionParams::is_superuser): `Option<bool>` —
 //!   parsed from `"on"`/`"off"` at ingest; unrecognised values drop
@@ -33,20 +32,12 @@
 //! (`application_name`, `session_authorization`, `time_zone`) or a
 //! composite grammar (`server_version` = "major.minor[.patch]…",
 //! `date_style` = "ISO, MDY") that would need its own parser for
-//! no clear consumer benefit at Phase 1c.
+//! no clear consumer benefit.
 //!
-//! # Capacity
+//! # Per-field POD capacity + `BoundedStr`
 //!
-//! # DEF-106 — per-field POD capacity + `BoundedStr`
-//!
-//! Each string field was historically `Option<heapless::String<128>>`
-//! — uniform 128-byte capacity across all five freeform fields, 5 ×
-//! ~144 bytes ≈ 720 bytes plus a blanket `heapless::Vec::drop`
-//! propagation through `SessionParams` → `PgProtocol`.
-//!
-//! DEF-106 right-sizes per-field capacity via
-//! [`crate::ident::BoundedStr<N>`] (POD, `Copy`, Drop-free from
-//! DEF-096 / DEF-099):
+//! Each string field uses [`crate::ident::BoundedStr<N>`] (POD,
+//! `Copy`, Drop-free) at a right-sized per-field capacity:
 //!
 //! - `server_version`: 32 bytes (e.g. `"17.2 (Debian 17.2-1.pgdg120+1)"` fits).
 //! - `application_name`: 64 bytes.
@@ -56,15 +47,16 @@
 //!
 //! Total string footprint: 32 + 64 + 64 + 32 + 64 = 256 bytes of
 //! `buf` + `u16 len` per field + Option-discriminant + padding.
-//! About 400 bytes saved in `SessionParams` (and therefore in
-//! `PgProtocol`).
+//! A uniform 128-byte `Option<heapless::String<128>>` form would
+//! cost 5 × ~144 ≈ 720 bytes plus a blanket `heapless::Vec::drop`
+//! propagation through `SessionParams` → `PgProtocol`; the typed
+//! shape saves about 400 bytes.
 //!
 //! An over-length value from the server is **not silently dropped**
-//! anymore — `BoundedStr::from_str_truncating` appends a `"…"`
-//! marker, preserving information that the value was oversized.
-//! This is a slight behaviour upgrade from pre-DEF-106 (which used
-//! `heapless::String::try_from(s).ok()` — Err → `None`, i.e. the
-//! parameter appeared absent even though the server sent it).
+//! — `BoundedStr::from_str_truncating` appends a `"…"` marker,
+//! preserving information that the value was oversized. A naive
+//! `heapless::String::try_from(s).ok()` form would Err → None, i.e.
+//! the parameter would appear absent even though the server sent it.
 
 use core::fmt;
 use crate::ident::SecretBoundedStr;
@@ -84,11 +76,11 @@ const MAX_ENCODING_NAME_LEN: usize = 32;
 /// preserves them — so a consumer can still introspect an
 /// unexpected server encoding without information loss.
 ///
-/// DEF-114: elevates `server_encoding` / `client_encoding` from
-/// tier-3 audit (freeform string) to tier-2 typed variants. The
-/// consumer's "is this UTF-8?" check becomes a pattern match
-/// instead of a byte compare; typos in comparisons (e.g. `"UTF-8"`
-/// vs `"UTF8"`) become impossible at the call site.
+/// Typed variants lift `server_encoding` / `client_encoding` from
+/// a tier-3 freeform-string surface to tier-2 known-enum
+/// classification. The consumer's "is this UTF-8?" check becomes a
+/// pattern match instead of a byte compare; typos in comparisons
+/// (e.g. `"UTF-8"` vs `"UTF8"`) become impossible at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Encoding {
@@ -127,11 +119,10 @@ impl Encoding {
     ///
     /// Names longer than [`MAX_ENCODING_NAME_LEN`] are preserved via
     /// [`OtherEncoding::from_truncated_bytes`] — the visible prefix
-    /// plus a `"…"` truncation marker. Previously (pre-2026-04-21)
-    /// such names silently became `Other(empty)` — a tier-4 silent
-    /// drop that lost forensic information. Now the name is present
-    /// as "{visible-prefix}…" so downstream logging/diagnostics can
-    /// see what the server actually sent. Tier-4 → tier-2 structural.
+    /// plus a `"…"` truncation marker. A silent `Other(empty)`
+    /// fallback would be tier-4 (lost forensic information); the
+    /// "{visible-prefix}…" form lets downstream logging/diagnostics
+    /// see what the server actually sent (tier-2 structural).
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         match bytes {
@@ -151,18 +142,18 @@ impl Encoding {
 
 /// Raw bytes of an unrecognised PG encoding name, bounded at
 /// [`MAX_ENCODING_NAME_LEN`]. Preserves the byte-exact spelling
-/// the server sent. DEF-114.
+/// the server sent.
 ///
-/// # DEF-203 narrowing
+/// # `len` narrowing
 ///
-/// Pre-DEF-203 `len: u16` was 2 bytes. Post-DEF-203 `len:
-/// BoundedU8<32>` is 1 byte (NonZeroU8-backed offset-by-one
-/// niche), saving 1 B per `OtherEncoding` AND absorbing the
+/// `len: BoundedU8<32>` is 1 byte (NonZeroU8-backed offset-by-one
+/// niche). A bare `len: u16` would be 2 bytes; the `BoundedU8`
+/// form saves 1 B per `OtherEncoding` AND absorbs the
 /// `Option<OtherEncoding>` discriminant via the niche.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtherEncoding {
     buf: [u8; MAX_ENCODING_NAME_LEN],
-    /// DEF-203: tier-2 by-construct (`BoundedU8::try_new` rejects
+    /// Tier-2 by-construct (`BoundedU8::try_new` rejects
     /// `len > MAX_ENCODING_NAME_LEN`); tier-1 niche on
     /// `Option<OtherEncoding>`.
     len: crate::bounded::BoundedU8<MAX_ENCODING_NAME_LEN>,
@@ -237,7 +228,7 @@ impl OtherEncoding {
         if let Some(dst_marker) = out.buf.get_mut(budget..marker_end) {
             dst_marker.copy_from_slice(MARKER);
         }
-        // DEF-203: marker_end ≤ MAX_ENCODING_NAME_LEN = 32 by construction.
+        // `marker_end ≤ MAX_ENCODING_NAME_LEN = 32` by construction.
         // `BoundedLen::try_new_usize` encapsulates the narrowing chain;
         // the empty-fallback below maintains no-panic discipline if a
         // future refactor ever broke the bound.
@@ -249,21 +240,19 @@ impl OtherEncoding {
 
     /// Borrow the raw bytes.
     ///
-    /// DEF-154 (S) P1-1: explicit `split_at_checked` match with a
-    /// documented-dead None arm. `self.len ≤ self.buf.len()` by
-    /// construction in `try_from_bytes` / `from_bytes_truncating`,
-    /// so None is architecturally unreachable. The Some-arm has no
-    /// silent `unwrap_or(&[])`; the None-arm is a no-silent-op
+    /// Explicit `split_at_checked` match with a documented-dead None
+    /// arm. `self.len ≤ self.buf.len()` by construction in
+    /// `try_from_bytes` / `from_bytes_truncating`, so None is
+    /// architecturally unreachable. The None-arm is a no-silent-op
     /// sentinel (empty slice is semantically "no bytes to expose",
-    /// same as an empty encoding — no corruption vector). Pre-(S)
-    /// was `self.buf.get(..len).unwrap_or(&[])` — silent fallback
-    /// the user banned.
+    /// same as an empty encoding — no corruption vector). A silent
+    /// `self.buf.get(..len).unwrap_or(&[])` is banned per CREDO §V.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        // DEF-203: `self.len.get()` returns u8 in 0..=32; widen to
-        // usize via infallible `From`. Same architectural-dead None
-        // semantics as pre-DEF-203 (cursor invariant).
+        // `self.len.get()` returns u8 in 0..=32; widen to usize via
+        // infallible `From`. None remains architecturally unreachable
+        // (cursor invariant).
         let n = usize::from(self.len.get());
         match self.buf.split_at_checked(n) {
             Some((head, _)) => head,
@@ -272,21 +261,21 @@ impl OtherEncoding {
     }
 }
 
-/// DEF-203 size pins. The `Option<OtherEncoding>` niche win is the
-/// motivating saving (3 B vs pre-DEF-203 layout); the `OtherEncoding`
-/// in-place saving (1 B) cascades into any container holding it.
+// Size pins. `Option<OtherEncoding>` absorbing its discriminant into
+// the `BoundedU8` NonZeroU8 niche is the motivating saving; the
+// `OtherEncoding`-in-place saving cascades into every container.
 const _: () = assert!(
     core::mem::size_of::<OtherEncoding>() == 33,
-    "OtherEncoding exact pin: 33 B post-DEF-203 (= 32 buf + 1 BoundedU8 \
-     len, no alignment padding since the struct is 1-byte aligned). \
-     Pre-DEF-203 was 34 B (= 32 buf + 2 u16 len). If this trips, the \
-     BoundedU8 niche may have been lost or alignment changed.",
+    "OtherEncoding exact pin: 33 B (= 32 buf + 1 BoundedU8 len, no \
+     alignment padding since the struct is 1-byte aligned). If this \
+     trips, the BoundedU8 niche may have been lost or alignment changed.",
 );
 const _: () = assert!(
     core::mem::size_of::<Option<OtherEncoding>>() == 33,
-    "Option<OtherEncoding> exact pin: 33 B post-DEF-203 (NonZeroU8 niche \
-     in BoundedU8 absorbs the discriminant). Pre-DEF-203 was 36 B (34 \
-     OtherEncoding + 1 disc + 1 padding to align(2)). 3 B saved per Option.",
+    "Option<OtherEncoding> exact pin: 33 B (NonZeroU8 niche in \
+     BoundedU8 absorbs the discriminant). A bare u16 len would push \
+     Option<OtherEncoding> to 36 B (34 + 1 disc + 1 padding) — 3 B \
+     larger per Option.",
 );
 
 impl Default for OtherEncoding {
@@ -313,36 +302,33 @@ fn parse_pg_bool(value: &[u8]) -> Option<bool> {
 /// `ParameterStatus` messages. Read-only after handshake
 /// completes. Accessible via [`crate::PgProtocol::session_params`].
 ///
-/// Per DEF-042: fixed struct, no map, no overflow class.
+/// Fixed struct, no map, no overflow class.
 ///
-/// Per DEF-114: four fields are parsed to typed form at ingest:
-/// `is_superuser` / `integer_datetimes` → `Option<bool>`;
-/// `server_encoding` / `client_encoding` → `Option<Encoding>`.
+/// Four fields are parsed to typed form at ingest: `is_superuser`
+/// / `integer_datetimes` → `Option<bool>`; `server_encoding` /
+/// `client_encoding` → `Option<Encoding>`. Each string field uses
+/// a right-sized `BoundedStr<N>` (POD, Drop-free) at per-field
+/// capacity (see module doc).
 ///
-/// Per DEF-106: each string field uses a right-sized
-/// `BoundedStr<N>` (POD, Drop-free) instead of a uniform 128-byte
-/// `heapless::String`. Reduces `SessionParams` footprint by ~400
-/// bytes and breaks the `heapless::Vec::drop` chain through
-/// `PgProtocol`.
-/// # F-073 (pass-#8) — public fields are intentionally readable
+/// # Public fields are intentionally readable
 ///
-/// Every field below is `pub` so external code (tests today,
-/// `bsql-driver-postgres` wrapper in Phase 1e, user diagnostic code)
-/// can read server-reported session state without a 9-accessor
-/// boilerplate layer. Audit noted the risk of internal writes
-/// bypassing `set()` — acknowledged; internal writers are limited
-/// to `set()` by convention, pinned by the `session_params_set_key_routing_table`
-/// test which exercises every known key.
+/// Every field below is `pub` so external code (tests today, future
+/// driver wrappers, user diagnostic code) can read server-reported
+/// session state without a 9-accessor boilerplate layer. Internal
+/// writers are limited to `set()` by convention, pinned by the
+/// `session_params_set_key_routing_table` test which exercises
+/// every known key.
 ///
 /// A future refactor that adds a second writer path must either
 /// call through `set()` (preserving validation) or explicitly
 /// document why a raw assignment is correct.
-// DEF-211 INNO-01 (2026-05-04): `#[derive(Pristine)]` lifts BS-11
-// broad-scope tier-3 (contributor must remember to update is_pristine
-// when adding fields) → tier-1 by-construction. The macro inspects
-// every declared field; missed-field is structurally impossible. See
-// `crates/bsql-pg-proto/src/pristine.rs` for the trait + design and
-// `crates/bsql-pg-proto-derive/src/lib.rs` for the macro.
+// `#[derive(Pristine)]` lifts the is-this-struct-still-pristine
+// invariant from tier-3 (contributor must remember to update
+// `is_pristine` when adding fields) to tier-1 by-construction. The
+// macro inspects every declared field; missed-field is structurally
+// impossible. See `crates/bsql-pg-proto/src/pristine.rs` for the
+// trait + design and `crates/bsql-pg-proto-derive/src/lib.rs` for
+// the macro.
 //
 // Generates BOTH:
 //   - `impl Pristine for SessionParams { fn is_pristine(&self) -> bool { ... } }`
@@ -354,100 +340,78 @@ pub struct SessionParams {
     /// PostgreSQL server version string (e.g. `"17.2"`,
     /// `"17.2 (Debian 17.2-1.pgdg120+1)"`). BoundedStr<32> — PG's
     /// version string is occasionally embellished with build
-    /// provenance but stays under 32 bytes. DEF-106.
+    /// provenance but stays under 32 bytes.
     pub server_version: Option<SecretBoundedStr<32>>,
-    /// Server-side encoding, parsed to a typed enum. DEF-114.
+    /// Server-side encoding, parsed to a typed enum.
     pub server_encoding: Option<Encoding>,
-    /// Client-side encoding, parsed to a typed enum. DEF-114.
+    /// Client-side encoding, parsed to a typed enum.
     pub client_encoding: Option<Encoding>,
     /// Application name echoed back by the server. Capacity 128
     /// bytes — matches the client-side [`crate::ident::MAX_APP_NAME_LEN`]
     /// so the server-echoed value is byte-faithful for any name the
-    /// client legitimately sent. Pre-uplift capacity was 64, which
-    /// would truncate client-sent names in the 64..128 range with a
-    /// `"…"` marker — a fidelity gap for long deployment-tagged
-    /// names. DEF-106 + architect finding #66 (2026-04-21).
+    /// client legitimately sent. A smaller capacity (e.g. 64) would
+    /// truncate client-sent names in the 64..128 range with a `"…"`
+    /// marker, a fidelity gap for long deployment-tagged names.
     pub application_name: Option<SecretBoundedStr<128>>,
-    /// Whether the connected role is a superuser. DEF-114.
-    /// `Some(true)` / `Some(false)` / `None` (server sent neither
-    /// `"on"` nor `"off"`).
+    /// Whether the connected role is a superuser. `Some(true)` /
+    /// `Some(false)` / `None` (server sent neither `"on"` nor
+    /// `"off"`).
     pub is_superuser: Option<bool>,
     /// The authorised session user. BoundedStr<64> — role names
     /// are bounded like PG's `NAMEDATALEN` (63 usable chars).
-    /// DEF-106.
     pub session_authorization: Option<SecretBoundedStr<64>>,
     /// DateStyle setting (e.g. `"ISO, MDY"`). BoundedStr<32> —
-    /// the grammar is `"<format>, <order>"` with short
-    /// components. DEF-106.
+    /// the grammar is `"<format>, <order>"` with short components.
     pub date_style: Option<SecretBoundedStr<32>>,
-    /// Whether integer datetimes are used. DEF-114.
+    /// Whether integer datetimes are used.
     pub integer_datetimes: Option<bool>,
     /// Server timezone (e.g. `"UTC"`, `"America/New_York"`).
     /// BoundedStr<64> — longest documented IANA zone
-    /// `"America/Argentina/Buenos_Aires"` = 33 bytes. DEF-106.
+    /// `"America/Argentina/Buenos_Aires"` = 33 bytes.
     pub time_zone: Option<SecretBoundedStr<64>>,
     /// Number of unknown `ParameterStatus` keys the server sent that
-    /// we couldn't classify.
-    ///
-    /// F-074 (pass-#8): prior to this, unknown keys were silently
-    /// dropped (DEF-042 forward-compat policy). That's still the
-    /// right behaviour — PG may add new keys in future versions —
-    /// but operator visibility was zero. Counting lets diagnostics
-    /// surface "we dropped N keys; upgrade the client or report".
-    /// Saturating `u16` — overflows stay pinned at `u16::MAX` rather
-    /// than wrapping.
+    /// we couldn't classify. Unknown keys are still silently dropped
+    /// (forward-compat policy: PG may add new keys in future
+    /// versions); this counter lets diagnostics surface "we dropped
+    /// N keys; upgrade the client or report". Saturating `u16` —
+    /// overflows stay pinned at `u16::MAX` rather than wrapping.
     pub n_unknown_dropped: u16,
     /// Number of `ParameterStatus` bool-valued fields (`is_superuser`,
     /// `integer_datetimes`) whose value failed PG's `on`/`off` form.
+    /// A non-standard value (e.g. `is_superuser=yes` — a common
+    /// human-error or legacy proxy variant vs PG's canonical
+    /// `on` / `off`) leaves the field as `None`, indistinguishable
+    /// from "server never sent the parameter" — operators
+    /// investigating "why does the client not see superuser state"
+    /// would have no diagnostic signal without this counter.
     ///
-    /// DEF-153 (audit A003): prior to this, non-standard bool values
-    /// (e.g. `is_superuser=yes` — a common human-error or legacy
-    /// proxy variant vs PG's canonical `on` / `off`) left the field
-    /// as `None`, indistinguishable from "server never sent the
-    /// parameter." Operators investigating "why does the client not
-    /// see superuser state" had no diagnostic signal. Mirrors the
-    /// F-074 `n_unknown_dropped` pattern.
-    ///
-    /// Saturating `u16` — overflows stay pinned at `u16::MAX` rather
-    /// than wrapping.
+    /// Saturating `u16` — overflows stay pinned at `u16::MAX`.
     pub n_malformed_bool_dropped: u16,
     /// Number of `ParameterStatus` frames with malformed payload
     /// (e.g. missing NUL separator between key and value, or missing
-    /// trailing NUL) the protocol layer consumed without surfacing.
+    /// trailing NUL) the protocol layer consumed without surfacing
+    /// to the caller. A silent `{}` arm at the dispatch filter site
+    /// would give operators no visibility for proxy-injection /
+    /// wire-corruption incidents — this counter increments on each
+    /// malformed payload for diagnostic parity with
+    /// `n_unknown_dropped` / `n_malformed_bool_dropped`.
     ///
-    /// # DEF-185 P2-B (audit 2026-04-24)
-    ///
-    /// Pre-fix: [`crate::record_param_status`]'s
-    /// `ParamStatusRecordOutcome::MalformedPayload` outcome was
-    /// silently collapsed into `{}` at the dispatch filter site
-    /// (`protocol.rs` pre-dispatch filter). No visibility for
-    /// operators investigating proxy-injection / wire-corruption
-    /// incidents. Post-fix: this counter increments on each malformed
-    /// payload — mirrors the existing `n_unknown_dropped` /
-    /// `n_malformed_bool_dropped` pattern for ops diagnostic parity.
-    ///
-    /// Saturating `u16` — overflows stay pinned at `u16::MAX`.
+    /// Saturating `u32` — overflows stay pinned at `u32::MAX`.
     pub n_malformed_param_status_dropped: u32,
-    /// Number of `NoticeResponse` frames the protocol silently consumed.
+    /// Number of `NoticeResponse` frames the protocol silently
+    /// consumed. The pre-dispatch filter gates `NoticeResponse` by
+    /// state (skipped during handshake / steady state); this counter
+    /// surfaces the count for operator diagnostics — parallel to
+    /// `n_unknown_dropped` / `n_malformed_bool_dropped` /
+    /// `n_malformed_param_status_dropped`. A non-zero value signals
+    /// the server is emitting notices that bsql-pg-proto is
+    /// discarding at the protocol layer (a future driver wrapper
+    /// will route these to a notice stream; for now the counter
+    /// lets ops detect the pattern).
     ///
-    /// # DEF-185 P2-3 (audit 2026-04-24)
-    ///
-    /// Pre-fix: `NoticeResponse` was unconditionally skipped by the
-    /// pre-dispatch filter with no visibility. A server flooding the
-    /// client with notices (adversarial or mis-configured) burned
-    /// bandwidth silently. Post-DEF-185 P1-E the filter gates by state,
-    /// and now this counter surfaces the count for operator
-    /// diagnostics — parallel to `n_unknown_dropped` /
-    /// `n_malformed_bool_dropped` / `n_malformed_param_status_dropped`.
-    ///
-    /// A non-zero value signals the server is emitting notices that
-    /// bsql-pg-proto is discarding at the protocol layer (Phase 1d
-    /// will route these to an `Action::EmitNotice` stream; for now
-    /// the counter lets ops detect the pattern).
-    ///
-    /// Saturating `u32` (DEF-186 P1-5 widened from u16) — overflows
-    /// stay pinned at `u32::MAX` rather than collapsing diagnostic
-    /// fidelity at 65k events on long-lived adversarial-flood paths.
+    /// Saturating `u32` — overflows stay pinned at `u32::MAX`
+    /// rather than collapsing diagnostic fidelity at 65k events on
+    /// long-lived adversarial-flood paths.
     pub n_notice_response_dropped: u32,
 }
 
@@ -473,36 +437,26 @@ impl SessionParams {
         }
     }
 
-    // DEF-210 BS-11 + REC-08 (audit 2026-04-28) → DEF-211 INNO-01
-    // (2026-05-04, SHIPPED): pristine-state predicate.
-    //
-    // **Pre-INNO-01**: hand-rolled `pub const fn is_pristine(&self) ->
-    // bool { self.f1.is_none() && ... }` — tier-1 narrow (build-pin
-    // catches default-changes on currently-listed fields), tier-3
-    // broad (contributor must remember to extend the predicate when
-    // adding a new field; missing extension = silent leak of any
-    // secret-bearing default).
-    //
-    // **Post-INNO-01**: `#[derive(Pristine)]` on the struct generates
-    // BOTH `impl Pristine for SessionParams` (runtime, polymorphic)
-    // AND `pub const fn __pristine_const(&self) -> bool` (inherent,
-    // for compile-time pin contexts). The macro inspects every
-    // declared field via `syn::Fields::Named`; missing a new field
-    // is **structurally impossible**.
-    //
-    // Tier elevation: tier-3 broad-scope → **tier-1
-    // by-construction**. The maintenance contract is now
-    // self-enforcing.
+    // Pristine-state predicate. `#[derive(Pristine)]` on the struct
+    // generates BOTH `impl Pristine for SessionParams` (runtime,
+    // polymorphic) AND `pub const fn __pristine_const(&self) -> bool`
+    // (inherent, for compile-time pin contexts). The macro inspects
+    // every declared field via `syn::Fields::Named`; missing a new
+    // field is **structurally impossible** — tier-1 by-construction.
+    // A hand-rolled `pub const fn is_pristine(&self) -> bool
+    // { self.f1.is_none() && ... }` would be tier-3 broad (contributor
+    // must remember to extend the predicate when adding a new field;
+    // missing extension = silent leak of any secret-bearing default).
     //
     // Compile-time call site (`protocol.rs` const-assert on
     // `static EMPTY: SessionParams`) uses `__pristine_const()`.
     // Runtime polymorphic dispatch uses the trait method
     // `<SessionParams as Pristine>::is_pristine()`.
 
-    /// DEF-189 Q8-C3: reset all session parameters to their `new()`
-    /// state. Called from `clear_session_residue_if_idle_or_errored`
-    /// when state transitions to `Errored` — a tear-down forfeits all
-    /// session state.
+    /// Reset all session parameters to their `new()` state. Called
+    /// from `clear_session_residue_if_idle_or_errored` when state
+    /// transitions to `Errored` — a tear-down forfeits all session
+    /// state.
     ///
     /// # Why a method, not `*self = Self::new()`
     ///
@@ -516,8 +470,8 @@ impl SessionParams {
         *self = Self::new();
     }
 
-    /// DEF-185 P2-B: bump the `n_malformed_param_status_dropped`
-    /// counter. Called from `protocol.rs`'s pre-dispatch filter when
+    /// Bump the `n_malformed_param_status_dropped` counter. Called
+    /// from `protocol.rs`'s pre-dispatch filter when
     /// `record_param_status` returns `MalformedPayload` outcome.
     #[inline]
     pub fn bump_malformed_param_status(&mut self) {
@@ -525,9 +479,9 @@ impl SessionParams {
             self.n_malformed_param_status_dropped.saturating_add(1);
     }
 
-    /// DEF-185 P2-3: bump the `n_notice_response_dropped` counter.
-    /// Called from `protocol.rs`'s pre-dispatch filter when a
-    /// NoticeResponse is silently consumed.
+    /// Bump the `n_notice_response_dropped` counter. Called from
+    /// `protocol.rs`'s pre-dispatch filter when a NoticeResponse is
+    /// silently consumed.
     #[inline]
     pub fn bump_notice_response(&mut self) {
         self.n_notice_response_dropped =
@@ -536,14 +490,14 @@ impl SessionParams {
 
     /// Record a parameter from the server.
     ///
-    /// Known keys dispatch to typed parsers (DEF-114: booleans,
-    /// encodings) or bounded-string storage (freeform fields).
-    /// Unknown keys are ignored. Values that fail parsing / exceed
-    /// capacity bounds are silently dropped — the parameter is
-    /// treated as if the server never sent it (DEF-042).
+    /// Known keys dispatch to typed parsers (booleans, encodings) or
+    /// bounded-string storage (freeform fields). Unknown keys are
+    /// ignored. Values that fail parsing / exceed capacity bounds
+    /// are silently dropped — the parameter is treated as if the
+    /// server never sent it.
     pub fn set(&mut self, key: &[u8], value: &[u8]) {
         match key {
-            // ═══ DEF-114 typed fields ═══
+            // ═══ Typed fields ═══
             b"server_encoding" => {
                 self.server_encoding = Some(Encoding::from_bytes(value));
             }
@@ -554,8 +508,8 @@ impl SessionParams {
                 if let Some(b) = parse_pg_bool(value) {
                     self.is_superuser = Some(b);
                 } else {
-                    // DEF-153: bump diagnostic counter on malformed
-                    // bool (e.g. `is_superuser=yes` vs PG's `on`/`off`).
+                    // Bump diagnostic counter on malformed bool
+                    // (e.g. `is_superuser=yes` vs PG's `on`/`off`).
                     // Field stays None; the counter surfaces the drop.
                     self.n_malformed_bool_dropped =
                         self.n_malformed_bool_dropped.saturating_add(1);
@@ -565,26 +519,21 @@ impl SessionParams {
                 if let Some(b) = parse_pg_bool(value) {
                     self.integer_datetimes = Some(b);
                 } else {
-                    // DEF-153: same treatment as is_superuser above.
+                    // Same treatment as is_superuser above.
                     self.n_malformed_bool_dropped =
                         self.n_malformed_bool_dropped.saturating_add(1);
                 }
             }
 
-            // ═══ Remaining freeform / composite fields (DEF-106) ═══
+            // ═══ Freeform / composite fields ═══
             //
-            // BoundedStr::from_str_truncating right-sizes per-field:
-            // oversized input trims to N-3 bytes + "…" marker
-            // (no silent value-drop, unlike the prior
-            // heapless::String::try_from → None path).
-            // F55 (pass #6 audit): non-UTF-8 bytes no longer silently
-            // drop the whole field. A PG server configured with
-            // LATIN1 / legacy client_encoding may emit non-UTF-8
-            // bytes in freeform string fields (application_name
-            // echo with non-UTF-8 user input, etc.). `from_bytes_lossy`
-            // preserves the ASCII subset, coerces non-ASCII bytes to
-            // `?` placeholders, and guarantees valid UTF-8 output —
-            // same F22 treatment used for ErrorResponse M/D/H fields.
+            // `BoundedStr::from_bytes_lossy` right-sizes per-field:
+            // oversized input trims to N-3 bytes + "…" marker, and
+            // non-UTF-8 bytes are coerced to `?` placeholders rather
+            // than silently dropping the whole field. A PG server
+            // configured with LATIN1 / legacy client_encoding may
+            // emit non-UTF-8 bytes in freeform string fields
+            // (application_name echo with non-UTF-8 user input, etc.).
             b"server_version" => {
                 self.server_version = Some(SecretBoundedStr::<32>::from_bytes_lossy(value));
             }
@@ -601,9 +550,10 @@ impl SessionParams {
                 self.time_zone = Some(SecretBoundedStr::<64>::from_bytes_lossy(value));
             }
             _ => {
-                // Unknown key — silently dropped (DEF-042).
-                // F-074 (pass-#8): count the drop so operators can
-                // detect PG-version mismatches via `n_unknown_dropped`.
+                // Unknown key — silently dropped (forward-compat:
+                // PG may add new keys). Count the drop so operators
+                // can detect PG-version mismatches via
+                // `n_unknown_dropped`.
                 self.n_unknown_dropped = self.n_unknown_dropped.saturating_add(1);
             }
         }

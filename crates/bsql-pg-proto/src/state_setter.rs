@@ -706,7 +706,7 @@ mod tests {
     /// at the path). All 7 legitimate `impl InstallBody for *Install`
     /// blocks live in this file (above the `tests` module).
     ///
-    /// Negative-bound regression pin: see `push_command::tests::
+    /// Negative-bound regression pin: see `push_command::hostile_witness_seal_probe::
     /// hostile_witness_install_body_absent_anchor` — uses the no-dep
     /// ambiguous-blanket-impl trick (mirror of `lib.rs:535`'s
     /// `assert_not_sync`) to assert at compile time that a HostileWitness
