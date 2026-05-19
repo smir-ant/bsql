@@ -60,7 +60,7 @@ use core::num::NonZeroU64;
 #[cfg(test)]
 use crate::command::PgCommand;
 use crate::dispatch::{DispatchOutcome, dispatch};
-use crate::error::{ProtocolError, StateErrorKind};
+use crate::error::ProtocolError;
 use crate::frame::{HEADER_LEN, HeaderParse, parse_header};
 use crate::ident::{ApplicationName, DatabaseName, Ident};
 use crate::password::Credentials;
@@ -1637,21 +1637,11 @@ impl PgProtocol<DisconnectedPhase> {
         let raw_old = PROCESS_REPLY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         // Saturation classifier omitted on <DisconnectedPhase>:
         // architecturally distant + no inner.state to write Errored
-        // into. The returned NonZeroU64::MIN sentinel is matched by
-        // the next-push surface's saturation guard when push_startup
-        // attempts to consume the wrap-minted reply id.
-        //
-        // Tier-3 audit #17 (2026-05-19, verified): routed through the
-        // typed `mint_or_saturate` helper. `saturating_add(1)` of a
-        // `u64` has floor `1`, so the `Err(MintSaturated)` arm is
-        // architecturally unreachable — but the typed classifier
-        // captures the contract at type level. A future edit that
-        // swapped `saturating_add` for `wrapping_add` would surface
-        // the saturation case as a typed Err rather than silently
-        // coercing to MIN.
-        let raw = raw_old.saturating_add(1);
-        let nz = crate::reply_id::mint_or_saturate(raw)
-            .unwrap_or(core::num::NonZeroU64::MIN);
+        // into. The returned `NonZeroU64::MIN` sentinel from the
+        // shared mint helper is matched by the next-push surface's
+        // saturation guard when push_startup attempts to consume the
+        // wrap-minted reply id.
+        let nz = crate::reply_id::saturating_inc_to_nonzero(raw_old);
         crate::reply_id::ReplyId::from_raw(nz)
     }
 
@@ -2366,20 +2356,54 @@ pub(crate) mod _fail_inflight_no_readbuf_drain_leaf {
     /// Leaf-scope token. Field private to leaf.
     pub(crate) struct FailInflightNoReadbufToken(());
 
+    /// Outcome of a drain attempt — separates "no transition,
+    /// preserved Errored" from "transition occurred (with or
+    /// without an inflight reply id)". The two cases would collide
+    /// under a single `Option<NonZeroU64>` return, breaking the
+    /// caller's ability to bump the malformed-event canary on a
+    /// transition where the prior state was non-inflight (e.g.
+    /// `Idle`): old `None`-on-no-inflight and new
+    /// `None`-on-already-Errored would be indistinguishable.
+    #[derive(Debug, Clone, Copy)]
+    pub(in crate::protocol) enum DrainOutcome {
+        /// Transition `non-Errored → Errored(kind)` occurred. Inner
+        /// `Option<NonZeroU64>` carries the prior inflight reply id
+        /// (Some) or signals "no inflight reply on the prior state"
+        /// (None — e.g. `Idle`, `DrainRfqAfterError`).
+        Transitioned(Option<core::num::NonZeroU64>),
+        /// No transition — state was already `Errored(prior_kind)`
+        /// at entry. Original kind is preserved; no actions should
+        /// be re-emitted by the caller for this fail attempt.
+        AlreadyErrored,
+    }
+
     /// Mint a [`FailInflightNoReadbufToken`] and route through
     /// [`crate::state_setter::drain_at_fail_inflight_no_readbuf`].
+    ///
+    /// **Idempotent on sticky-Errored**: a re-entrant fail attempt
+    /// returns [`DrainOutcome::AlreadyErrored`] and preserves the
+    /// existing `Errored(prior_kind)` rather than overwriting it.
+    /// A naive `mem::replace`-only path would clobber the original
+    /// cause classifier on the second call, hiding the first
+    /// malformed event behind the second one.
     #[inline]
-    #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically drained \
-                  by the Errored install. Caller emits FailReply with the cause."]
+    #[must_use = "the returned DrainOutcome carries the in-flight reply id (if any) atomically \
+                  drained by the Errored install, or AlreadyErrored when the state was already \
+                  Errored. Caller decides FailReply/CloseSocket emission on the Transitioned \
+                  arm; AlreadyErrored returns no actions."]
     pub(in crate::protocol) fn drain(
         state: &mut crate::state::ProtoState,
         kind: crate::error::StateErrorKind,
-    ) -> Option<core::num::NonZeroU64> {
-        crate::state_setter::drain_at_fail_inflight_no_readbuf(
+    ) -> DrainOutcome {
+        if matches!(state, crate::state::ProtoState::Errored(_)) {
+            return DrainOutcome::AlreadyErrored;
+        }
+        let inflight = crate::state_setter::drain_at_fail_inflight_no_readbuf(
             state,
             FailInflightNoReadbufToken(()),
             kind,
-        )
+        );
+        DrainOutcome::Transitioned(inflight)
     }
 }
 
@@ -2751,17 +2775,19 @@ impl PgProtocol<ActivePhase> {
     /// duplicate-correlator failure at the wrapper's pending-replies
     /// table.
     ///
-    /// Tier-3 audit #32 (2026-05-19, verified): delegates to
-    /// [`ActiveInner::next_reply_id`] which mints from the shared
-    /// `PROCESS_REPLY_ID_COUNTER` static (process-global uniqueness
-    /// across all four phases). A naive shape would maintain a
-    /// SEPARATE local `static COUNTER` on this `impl PgProtocol<ActivePhase>`
-    /// path — a process-global counter, but distinct from the one
-    /// used by Disconnected/Connecting/ActiveInner: two PgProtocol
+    /// # Tier-1 by-construction: single shared atomic
+    ///
+    /// Delegates to [`ActiveInner::next_reply_id`] which mints from
+    /// the shared `PROCESS_REPLY_ID_COUNTER` static (process-global
+    /// uniqueness across all four phases). A naive shape would
+    /// maintain a SEPARATE local `static COUNTER` on this
+    /// `impl PgProtocol<ActivePhase>` path — a process-global
+    /// counter, but distinct from the one used by
+    /// Disconnected/Connecting/ActiveInner: two `PgProtocol`
     /// instances on the same process could mint overlapping IDs
     /// across phase boundaries (e.g. Disconnected ID 1 on instance
-    /// A, Active ID 1 on instance B). Tier-1 by-construction here:
-    /// every phase mints from the same atomic.
+    /// A, Active ID 1 on instance B). Tier-1 here: every phase
+    /// mints from the same atomic.
     #[inline]
     pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
@@ -4490,9 +4516,7 @@ impl ConnectingInner {
         if raw_old == u64::MAX {
             self.install_errored_replyid_saturation();
         }
-        let raw = raw_old.saturating_add(1);
-        let nz = core::num::NonZeroU64::new(raw)
-            .unwrap_or(core::num::NonZeroU64::MIN);
+        let nz = crate::reply_id::saturating_inc_to_nonzero(raw_old);
         crate::reply_id::ReplyId::from_raw(nz)
     }
 
@@ -4670,9 +4694,7 @@ impl ActiveInner {
         if raw_old == u64::MAX {
             self.install_errored_replyid_saturation();
         }
-        let raw = raw_old.saturating_add(1);
-        let nz = core::num::NonZeroU64::new(raw)
-            .unwrap_or(core::num::NonZeroU64::MIN);
+        let nz = crate::reply_id::saturating_inc_to_nonzero(raw_old);
         crate::reply_id::ReplyId::from_raw(nz)
     }
 
@@ -5659,80 +5681,65 @@ fn fail_inflight_no_readbuf(
     staged: &mut StagedActions,
     malformed_counter: &mut u32,
 ) {
-    if matches!(state, ProtoState::Errored(_)) {
-        return;
-    }
-    // Bump counter before transitioning. This fires on every
-    // classified fatal wire event — operator-facing canary (exposed
-    // via `PgProtocol::malformed_frame_count`). Saturating add keeps
-    // the counter pinned at u32::MAX on extreme flood.
+    // Drain is idempotent on sticky-Errored: `Some(raw_id)` on the
+    // first transition out of any non-Errored variant, `None` when
+    // state is already Errored (original kind preserved). Counter
+    // increment and `FailReply` emission ride the `Some`-arm —
+    // physically gated by the state transition itself.
     //
-    // **Tier-3 audit #76 (2026-05-19, verified)**: the saturation
-    // policing happens at `MALFORMED_STORM_THRESHOLD = 10_000` below
-    // (tier-3 classified via `ErrorKind::MalformedStorm`), not at
-    // `u32::MAX`. Once the threshold fires, the connection
-    // transitions to `Errored`; subsequent increments still saturate
-    // the counter but no code path reads it past the Errored
-    // transition — the `u32::MAX` arm is architecturally dead
-    // (post-Errored short-circuit elsewhere). Promoting the type to
-    // `Saturating<u32>` or `MintSaturated`-classified panic would
-    // duplicate the policing already in place at the 10_000 boundary.
-    *malformed_counter = malformed_counter.saturating_add(1);
-    // Counter-storm classifier. If the counter has accumulated past
-    // `MALFORMED_STORM_THRESHOLD` (10_000), the `Errored` transition
-    // classifies as `MalformedStorm` regardless of the per-frame
-    // `cause.state_kind()`. Defensive tier-3: under current
-    // single-event-then-Errored semantics the counter caps at 1 in
-    // practice (the early-return above prevents re-entry). The
-    // classifier activates if a future flow change unblocks counter
-    // accumulation — without this branch the saturation event would
-    // be tier-4 silent (counter pins at u32::MAX, no diagnostic
-    // signal).
-    let state_kind = if *malformed_counter >= MALFORMED_STORM_THRESHOLD {
-        StateErrorKind::from_kind_or_internal(crate::error::ErrorKind::MalformedStorm)
-    } else {
-        // Total state_kind — no unwrap_or_else + debug_assert dance.
-        cause.state_kind()
-    };
-    // `mem::replace` drops the previous state, which may be a SCRAM
-    // variant carrying `ScramSession`. `ScramSession`'s
-    // `ZeroizeOnDrop` fires here automatically — password bytes
-    // scrubbed in the drop path of `prev`. No explicit
-    // `scram_state = None` step needed because there IS no separate
-    // scram_state field — SCRAM data lives inline in the state
-    // variant and rides the drop glue.
+    // # Tier-1 by-construction: counter capped at 1
     //
-    // Route through FeedStateSetter for tier-1 by-construction
-    // drain+install atomicity. Same mem::replace under the hood; the
-    // `#[must_use]` returned id is consumed in the FailReply
-    // emission below — explicit handling (no fallback, no leak).
-    let raw_id = _fail_inflight_no_readbuf_drain_leaf::drain(state, state_kind);
-    match raw_id {
-        Some(id) => {
-            emit_actions!(staged, budget: 2, [
-                StagedAction::FailReply { id, cause },
-                StagedAction::CloseSocket,
-            ]);
+    // Each `PgProtocol` instance witnesses at most one
+    // non-Errored → Errored transition in its lifetime
+    // (`drain_and_install_errored` writes `Errored(kind)` only
+    // when prior was non-Errored, per the leaf-helper's
+    // `matches!(state, Errored(_))` short-circuit above). Counter
+    // bump lives inside the `Some`-arm here, so it fires exactly
+    // once per instance. A naive flow that bumped the counter
+    // unconditionally and routed `MalformedStorm` via a
+    // `>= 10_000` threshold would document the cap "by discipline
+    // + early-return"; the fused-increment form pins the cap "by
+    // sticky-Errored drain semantic".
+    //
+    // # `mem::replace` SCRAM zeroization
+    //
+    // `drain_and_install_errored`'s underlying `mem::replace`
+    // drops the previous state, which may be a SCRAM variant
+    // carrying `ScramSession`. `ScramSession`'s `ZeroizeOnDrop`
+    // fires automatically — password bytes scrubbed in the drop
+    // path of the replaced state. No explicit
+    // `scram_state = None` step needed because there is no
+    // separate scram_state field — SCRAM data lives inline in
+    // the state variant and rides the drop glue.
+    use _fail_inflight_no_readbuf_drain_leaf::DrainOutcome;
+    match _fail_inflight_no_readbuf_drain_leaf::drain(state, cause.state_kind()) {
+        DrainOutcome::Transitioned(inflight) => {
+            // Real transition occurred: bump the canary regardless
+            // of whether prior state carried an inflight reply.
+            *malformed_counter = malformed_counter.saturating_add(1);
+            match inflight {
+                Some(id) => {
+                    emit_actions!(staged, budget: 2, [
+                        StagedAction::FailReply { id, cause },
+                        StagedAction::CloseSocket,
+                    ]);
+                }
+                None => {
+                    emit_actions!(staged, budget: 1, [
+                        StagedAction::CloseSocket,
+                    ]);
+                }
+            }
         }
-        None => {
-            emit_actions!(staged, budget: 1, [
-                StagedAction::CloseSocket,
-            ]);
+        DrainOutcome::AlreadyErrored => {
+            // No transition — state preserved as `Errored(prior_kind)`.
+            // Canary not bumped (this re-entry doesn't represent a
+            // fresh malformed event). No actions emitted: the
+            // original `FailReply` + `CloseSocket` were already
+            // emitted on the first call that transitioned the state.
         }
     }
 }
-
-/// Malformed-frame-count threshold for the `MalformedStorm`
-/// classifier in `fail_inflight_no_readbuf`.
-///
-/// 10_000 is high enough to rule out single-event noise (a single
-/// transient malformed frame on a healthy connection) and low enough
-/// to fire well below `u32::MAX` saturation (4 billion).
-///
-/// Under current single-event-then-Errored semantics this threshold
-/// is unreachable; see `ErrorKind::MalformedStorm` docstring for the
-/// defensive-classifier rationale.
-const MALFORMED_STORM_THRESHOLD: u32 = 10_000;
 
 /// Compute the state transition and actions for a command push.
 ///

@@ -391,49 +391,46 @@ impl<K: ReplyKind> ReplyId<K> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Tier-3 audit #17 (2026-05-19) — typed mint helper
+// Shared NonZeroU64 mint helper for the three PROCESS_REPLY_ID_COUNTER
+// mint sites (Disconnected / Connecting / Active phases).
 // ═════════════════════════════════════════════════════════════════════
 
-/// Typed saturation classifier for `NonZeroU64` mint from a raw `u64`
-/// counter value.
+/// Mint a [`NonZeroU64`] from `prev.saturating_add(1)`.
 ///
-/// A `NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN)` form would
-/// satisfy `clippy::unwrap_used` (forbidden crate-wide) on an
-/// architecturally-dead `None` arm (`saturating_add(1)` of a `u64`
-/// is never `0`). But the dead-fallback shape would not surface the
-/// "counter saturation reached" case at type level — a future edit
-/// that swapped `saturating_add` for `wrapping_add` (or any
-/// operation that can produce `0`) would silently activate the dead
-/// arm, coercing every reply id to [`NonZeroU64::MIN`] and colliding
-/// with the real id `1`.
+/// # Floor invariant (const-asserted)
 ///
-/// `MintSaturated` makes the saturation case classifiable at type
-/// level. The error is `Copy + Debug + PartialEq + Eq` — no
-/// `Display`, no allocation, no payload (the saturation *is* the
-/// state; there is no additional context to carry).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MintSaturated;
-
-/// Mint a [`NonZeroU64`] from a raw `u64`, classifying `0` as a
-/// [`MintSaturated`] error (instead of silently coercing to a
-/// fallback sentinel).
+/// `saturating_add(1)` of any `u64` returns a value `≥ 1`:
+/// - `u64::MAX.saturating_add(1) == u64::MAX` (saturates at `MAX`)
+/// - `0_u64.saturating_add(1) == 1`
 ///
-/// # Architectural-deadness contract
+/// The two `const _: () = assert!(…)` lines below pin both bounds
+/// at compile time. The `NonZeroU64::new(raw).unwrap_or(MIN)` arm
+/// is therefore architecturally dead (build-time-pinned). A future
+/// edit swapping `saturating_add` for `wrapping_add` (which CAN
+/// produce `0`) leaves the const-asserts intact but **silently
+/// activates the dead arm** — there is no `unsafe`-free way on
+/// stable Rust to convert `u64 → NonZeroU64` without a runtime
+/// branch. The const-asserts capture the invariant; the dead arm
+/// remains as a clippy-`unwrap_used`-compliant landing pad.
 ///
-/// The single production call site in `<DisconnectedPhase>::
-/// next_reply_id` (protocol.rs) feeds `raw =
-/// PROCESS_REPLY_ID_COUNTER.fetch_add(1).saturating_add(1)`. The
-/// `saturating_add(1)` floor is `1`, so the `Err(MintSaturated)` arm
-/// is architecturally unreachable in practice — but the typed
-/// classifier puts that contract in the type signature instead of
-/// relying on the caller to remember it.
+/// # Mint sites
 ///
-/// The actual saturation pinch-point (u64 counter wrap at 2^64
-/// reply ids) is enforced upstream by `saturating_add` at the
-/// counter site, not by this mint helper.
+/// - `<DisconnectedPhase>::next_reply_id` — pre-handshake mint
+///   (no inner state for a saturation classifier).
+/// - `ConnectingInner::next_reply_id` — handshake-window mint
+///   (`install_errored_replyid_saturation` fires on `raw_old ==
+///   u64::MAX` BEFORE this helper, so the saturation case is
+///   classified at the call site).
+/// - `ActiveInner::next_reply_id` — active-phase mint (same
+///   saturation classifier pattern as Connecting).
+///
+/// All three sites share the contract via this helper.
 #[inline]
-pub(crate) fn mint_or_saturate(raw: u64) -> Result<NonZeroU64, MintSaturated> {
-    NonZeroU64::new(raw).ok_or(MintSaturated)
+pub(crate) fn saturating_inc_to_nonzero(prev: u64) -> NonZeroU64 {
+    const _: () = assert!(u64::MAX.saturating_add(1) >= 1);
+    const _: () = assert!(0_u64.saturating_add(1) >= 1);
+    let raw = prev.saturating_add(1);
+    NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN)
 }
 
 // No `Drop` impl on `ReplyId<K>` — a `Drop` containing

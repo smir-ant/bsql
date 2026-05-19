@@ -1182,34 +1182,6 @@ pub enum ErrorKind {
     /// `ConnectionAlreadyClosed { prior_kind }` correctly identify
     /// the culprit. 1 byte (repr(u8)).
     ClientOrdering = 6,
-    /// Counter-storm classifier.
-    ///
-    /// Lifts the `malformed_frame_count` saturation event from tier-4
-    /// silent (the counter just clamps at u32::MAX) to tier-3 explicit:
-    /// when the per-connection malformed-frame counter crosses the
-    /// `MALFORMED_STORM_THRESHOLD` (10_000) inside
-    /// `fail_inflight_no_readbuf`, the resulting `Errored` transition
-    /// classifies as `MalformedStorm` instead of the underlying
-    /// per-frame cause.
-    ///
-    /// # Today: defensive classifier, architecturally hard-to-reach
-    ///
-    /// Under the current single-event-then-Errored semantics
-    /// (`fail_inflight_no_readbuf` early-returns when state is already
-    /// Errored, dispatch loop breaks on first malformed frame, post-
-    /// Errored feed_bytes short-circuits without dispatching), the
-    /// counter caps at 1 in practice. The threshold (10_000) is
-    /// unreachable with today's flow.
-    ///
-    /// The variant is retained as **defensive tier-3 classification**:
-    /// if a future flow change (e.g., soft-recovery, batched dispatch
-    /// with continue-on-error) lets the counter accumulate, the
-    /// classifier activates at the documented threshold without a
-    /// silent saturation surprise. Without the variant, an adversary
-    /// flooding a partially-tolerant flow with malformed frames would
-    /// see the counter pin at u32::MAX with **no diagnostic signal** —
-    /// pure tier-4.
-    MalformedStorm = 7,
 }
 
 /// Subset of [`ErrorKind`] that CAN be stored in
@@ -1279,8 +1251,7 @@ impl StateErrorKind {
             | ErrorKind::ServerError
             | ErrorKind::Auth
             | ErrorKind::Internal
-            | ErrorKind::ClientOrdering
-            | ErrorKind::MalformedStorm => Some(Self(k)),
+            | ErrorKind::ClientOrdering => Some(Self(k)),
         }
     }
 
